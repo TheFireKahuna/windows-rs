@@ -2869,6 +2869,56 @@ unsafe impl Send for DatePickerSelectedValueChangedEventArgs {}
 unsafe impl Sync for DatePickerSelectedValueChangedEventArgs {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecimalFormatter(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    DecimalFormatter,
+    windows_core::IUnknown,
+    windows_core::IInspectable,
+    INumberFormatter
+);
+windows_core::imp::required_hierarchy!(
+    DecimalFormatter,
+    INumberFormatter2,
+    INumberFormatterOptions
+);
+impl DecimalFormatter {
+    pub(crate) fn new() -> windows_core::Result<Self> {
+        Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+    }
+    fn IActivationFactory<
+        R,
+        F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+    >(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<
+            DecimalFormatter,
+            windows_core::imp::IGenericFactory,
+        > = windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
+impl windows_core::RuntimeType for DecimalFormatter {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, INumberFormatter>();
+}
+unsafe impl windows_core::Interface for DecimalFormatter {
+    type Vtable = <INumberFormatter as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <INumberFormatter as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for DecimalFormatter {
+    type Target = INumberFormatter;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for DecimalFormatter {
+    const NAME: &'static str = "Windows.Globalization.NumberFormatting.DecimalFormatter";
+}
+unsafe impl Send for DecimalFormatter {}
+unsafe impl Sync for DecimalFormatter {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyObject(windows_core::IUnknown);
 windows_core::imp::interface_hierarchy!(
     DependencyObject,
@@ -9093,6 +9143,18 @@ impl IControl {
             .ok()
         }
     }
+    pub(crate) fn SetHorizontalContentAlignment(
+        &self,
+        value: HorizontalAlignment,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetHorizontalContentAlignment)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetBackground<P0>(&self, value: P0) -> windows_core::Result<()>
     where
         P0: windows_core::Param<Brush>,
@@ -9151,7 +9213,10 @@ pub struct IControl_Vtbl {
     pub SetPadding:
         unsafe extern "system" fn(*mut core::ffi::c_void, Thickness) -> windows_core::HRESULT,
     HorizontalContentAlignment: usize,
-    SetHorizontalContentAlignment: usize,
+    pub SetHorizontalContentAlignment: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        HorizontalAlignment,
+    ) -> windows_core::HRESULT,
     VerticalContentAlignment: usize,
     SetVerticalContentAlignment: usize,
     Background: usize,
@@ -12585,6 +12650,30 @@ impl IMenuFlyoutItem {
             .ok()
         }
     }
+    pub(crate) fn SetIcon<P0>(&self, value: P0) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<IconElement>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetIcon)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetKeyboardAcceleratorTextOverride(
+        &self,
+        value: &str,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetKeyboardAcceleratorTextOverride)(
+                windows_core::Interface::as_raw(self),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(value)),
+            )
+            .ok()
+        }
+    }
     pub(crate) fn Click<F>(&self, handler: F) -> windows_core::Result<windows_core::EventRevoker>
     where
         F: Fn(windows_core::Ref<windows_core::IInspectable>, windows_core::Ref<RoutedEventArgs>)
@@ -12629,9 +12718,15 @@ pub struct IMenuFlyoutItem_Vtbl {
     CommandParameter: usize,
     SetCommandParameter: usize,
     Icon: usize,
-    SetIcon: usize,
+    pub SetIcon: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     KeyboardAcceleratorTextOverride: usize,
-    SetKeyboardAcceleratorTextOverride: usize,
+    pub SetKeyboardAcceleratorTextOverride: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     TemplateSettings: usize,
     pub Click: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -13359,12 +13454,42 @@ impl INumberBox {
             .ok()
         }
     }
+    pub(crate) fn SetSmallChange(&self, value: f64) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetSmallChange)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetLargeChange(&self, value: f64) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetLargeChange)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetHeader<P0>(&self, value: P0) -> windows_core::Result<()>
     where
         P0: windows_core::Param<windows_core::IInspectable>,
     {
         unsafe {
             (windows_core::Interface::vtable(self).SetHeader)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetNumberFormatter<P0>(&self, value: P0) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<INumberFormatter2>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetNumberFormatter)(
                 windows_core::Interface::as_raw(self),
                 value.param().abi(),
             )
@@ -13415,9 +13540,11 @@ pub struct INumberBox_Vtbl {
     Value: usize,
     pub SetValue: unsafe extern "system" fn(*mut core::ffi::c_void, f64) -> windows_core::HRESULT,
     SmallChange: usize,
-    SetSmallChange: usize,
+    pub SetSmallChange:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f64) -> windows_core::HRESULT,
     LargeChange: usize,
-    SetLargeChange: usize,
+    pub SetLargeChange:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f64) -> windows_core::HRESULT,
     Text: usize,
     SetText: usize,
     Header: usize,
@@ -13448,7 +13575,10 @@ pub struct INumberBox_Vtbl {
     AcceptsExpression: usize,
     SetAcceptsExpression: usize,
     NumberFormatter: usize,
-    SetNumberFormatter: usize,
+    pub SetNumberFormatter: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub ValueChanged: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
@@ -13503,6 +13633,97 @@ pub struct INumberBoxValueChangedEventArgs_Vtbl {
     OldValue: usize,
     pub NewValue:
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    INumberFormatter,
+    INumberFormatter_Vtbl,
+    0xa5007c49_7676_4db7_8631_1b6ff265caa9
+);
+impl windows_core::RuntimeType for INumberFormatter {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+windows_core::imp::interface_hierarchy!(
+    INumberFormatter,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeName for INumberFormatter {
+    const NAME: &'static str = "Windows.Globalization.NumberFormatting.INumberFormatter";
+}
+#[repr(C)]
+pub struct INumberFormatter_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    INumberFormatter2,
+    INumberFormatter2_Vtbl,
+    0xd4a8c1f0_80d0_4b0d_a89e_882c1e8f8310
+);
+impl windows_core::RuntimeType for INumberFormatter2 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+windows_core::imp::interface_hierarchy!(
+    INumberFormatter2,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeName for INumberFormatter2 {
+    const NAME: &'static str = "Windows.Globalization.NumberFormatting.INumberFormatter2";
+}
+#[repr(C)]
+pub struct INumberFormatter2_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    INumberFormatterOptions,
+    INumberFormatterOptions_Vtbl,
+    0x80332d21_aee1_4a39_baa2_07ed8c96daf6
+);
+impl windows_core::RuntimeType for INumberFormatterOptions {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+windows_core::imp::interface_hierarchy!(
+    INumberFormatterOptions,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl INumberFormatterOptions {
+    pub(crate) fn SetIntegerDigits(&self, value: i32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetIntegerDigits)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetFractionDigits(&self, value: i32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetFractionDigits)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+impl windows_core::RuntimeName for INumberFormatterOptions {
+    const NAME: &'static str = "Windows.Globalization.NumberFormatting.INumberFormatterOptions";
+}
+#[repr(C)]
+pub struct INumberFormatterOptions_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    Languages: usize,
+    GeographicRegion: usize,
+    IntegerDigits: usize,
+    pub SetIntegerDigits:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i32) -> windows_core::HRESULT,
+    FractionDigits: usize,
+    pub SetFractionDigits:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i32) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IOverlappedPresenter3,
@@ -14055,6 +14276,19 @@ pub struct IPivotItemFactory_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    IPointer,
+    IPointer_Vtbl,
+    0x1f9afbf5_11a3_5e68_aa1b_72febfa0ab23
+);
+impl windows_core::RuntimeType for IPointer {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IPointer_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
     IPointerPoint,
     IPointerPoint_Vtbl,
     0x0d430ee6_252c_59a4_b2a2_d44264dc6a40
@@ -14139,6 +14373,16 @@ impl IPointerPointProperties {
             .map(|| result__)
         }
     }
+    pub(crate) fn MouseWheelDelta(&self) -> windows_core::Result<i32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).MouseWheelDelta)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
 }
 #[repr(C)]
 pub struct IPointerPointProperties_Vtbl {
@@ -14157,6 +14401,10 @@ pub struct IPointerPointProperties_Vtbl {
     IsPrimary: usize,
     pub IsRightButtonPressed:
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+    IsXButton1Pressed: usize,
+    IsXButton2Pressed: usize,
+    pub MouseWheelDelta:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IPointerRoutedEventArgs,
@@ -14168,6 +14416,16 @@ impl windows_core::RuntimeType for IPointerRoutedEventArgs {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl IPointerRoutedEventArgs {
+    pub(crate) fn Pointer(&self) -> windows_core::Result<Pointer> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Pointer)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) fn GetCurrentPoint<P0>(&self, relativeto: P0) -> windows_core::Result<PointerPoint>
     where
         P0: windows_core::Param<UIElement>,
@@ -14186,7 +14444,10 @@ impl IPointerRoutedEventArgs {
 #[repr(C)]
 pub struct IPointerRoutedEventArgs_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
-    Pointer: usize,
+    pub Pointer: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     KeyModifiers: usize,
     Handled: usize,
     SetHandled: usize,
@@ -19550,6 +19811,38 @@ impl IUIElement {
             ))
         }
     }
+    pub(crate) fn PointerWheelChanged<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(
+                windows_core::Ref<windows_core::IInspectable>,
+                windows_core::Ref<PointerRoutedEventArgs>,
+            ) + 'static,
+    {
+        let handler: PointerEventHandler = {
+            let com = windows_core::imp::DelegateBox::<PointerEventHandler, F>::new(
+                &PointerEventHandlerBox::<F>::VTABLE,
+                handler,
+            );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).PointerWheelChanged)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemovePointerWheelChanged,
+            ))
+        }
+    }
     pub(crate) fn Tapped<F>(&self, handler: F) -> windows_core::Result<windows_core::EventRevoker>
     where
         F: Fn(
@@ -19609,6 +19902,32 @@ impl IUIElement {
                 token__,
                 windows_core::Interface::vtable(self).RemoveRightTapped,
             ))
+        }
+    }
+    pub(crate) fn CapturePointer<P0>(&self, value: P0) -> windows_core::Result<bool>
+    where
+        P0: windows_core::Param<Pointer>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CapturePointer)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn ReleasePointerCapture<P0>(&self, value: P0) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<Pointer>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).ReleasePointerCapture)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
         }
     }
     pub(crate) fn UpdateLayout(&self) -> windows_core::Result<()> {
@@ -19843,8 +20162,13 @@ pub struct IUIElement_Vtbl {
     RemovePointerCaptureLost: usize,
     PointerCanceled: usize,
     RemovePointerCanceled: usize,
-    PointerWheelChanged: usize,
-    RemovePointerWheelChanged: usize,
+    pub PointerWheelChanged: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemovePointerWheelChanged:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
     pub Tapped: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
@@ -19899,8 +20223,15 @@ pub struct IUIElement_Vtbl {
     RemoveBringIntoViewRequested: usize,
     Measure: usize,
     Arrange: usize,
-    CapturePointer: usize,
-    ReleasePointerCapture: usize,
+    pub CapturePointer: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut bool,
+    ) -> windows_core::HRESULT,
+    pub ReleasePointerCapture: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     ReleasePointerCaptures: usize,
     AddHandler: usize,
     RemoveHandler: usize,
@@ -23157,6 +23488,33 @@ impl windows_core::RuntimeType for Point {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.Foundation.Point;f4;f4)");
 }
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Pointer(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    Pointer,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for Pointer {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IPointer>();
+}
+unsafe impl windows_core::Interface for Pointer {
+    type Vtable = <IPointer as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IPointer as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for Pointer {
+    type Target = IPointer;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for Pointer {
+    const NAME: &'static str = "Microsoft.UI.Xaml.Input.Pointer";
+}
+unsafe impl Send for Pointer {}
+unsafe impl Sync for Pointer {}
 windows_core::imp::define_interface!(
     PointerEventHandler,
     PointerEventHandler_Vtbl,

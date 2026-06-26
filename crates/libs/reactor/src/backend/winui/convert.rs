@@ -118,9 +118,41 @@ pub(super) fn build_menu_flyout_item_base(
     def: &MenuItemDef,
 ) -> Result<bindings::MenuFlyoutItemBase> {
     match def {
-        MenuItemDef::Item { text } => {
+        MenuItemDef::Item {
+            text,
+            icon,
+            danger,
+            enabled,
+            shortcut,
+        } => {
             let item = bindings::MenuFlyoutItem::new()?;
             item.SetText(text)?;
+            if let Some(sym) = icon {
+                let icon_elem = bindings::SymbolIcon::CreateInstanceWithSymbol(*sym)?;
+                let icon_elem: bindings::IconElement = icon_elem.cast()?;
+                item.SetIcon(&icon_elem)?;
+            }
+            if let Some(s) = shortcut {
+                item.SetKeyboardAcceleratorTextOverride(s)?;
+            }
+            // `IsEnabled` / `Foreground` live on `Control`.
+            if !*enabled || *danger {
+                let ctl: bindings::IControl = item.cast()?;
+                if !*enabled {
+                    ctl.SetIsEnabled(false)?;
+                }
+                if *danger {
+                    // Destructive actions: error-red text (matches the WinUI
+                    // SystemFillColorCritical accent used for danger affordances).
+                    let brush = solid_brush(Color {
+                        a: 255,
+                        r: 196,
+                        g: 43,
+                        b: 28,
+                    })?;
+                    ctl.SetForeground(&brush)?;
+                }
+            }
             item.cast()
         }
         MenuItemDef::Separator => {

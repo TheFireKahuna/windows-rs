@@ -213,6 +213,22 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
+    /// Draws a pre-measured [`TextLayout`] with its top-left at `origin` (DIPs).
+    ///
+    /// Prefer this over [`draw_text`](Self::draw_text) whenever you also need to
+    /// measure / hit-test / trim the text — build the [`TextLayout`] once, size
+    /// your UI from [`TextLayout::metrics`], then draw it here.
+    pub fn draw_text_layout(&self, origin: Vector2, layout: &TextLayout, brush: &impl Paint) {
+        unsafe {
+            self.context.DrawTextLayout(
+                origin,
+                layout.raw(),
+                brush.as_raw_brush(),
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+        }
+    }
+
     /// Draws the outline of a path.
     pub fn draw_path(&self, path: &Path, brush: &impl Paint, width: f32) {
         unsafe {
