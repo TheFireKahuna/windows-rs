@@ -46,7 +46,7 @@
     Windows::Win32::Graphics::Direct2D::ID2D1Geometry::{GetBounds, FillContainsPoint, StrokeContainsPoint}
     Windows::Win32::Graphics::Direct2D::ID2D1GeometrySink::{AddLine, AddBezier}
     Windows::Win32::Graphics::Direct2D::ID2D1PathGeometry::Open
-    Windows::Win32::Graphics::Direct2D::ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize}
+    Windows::Win32::Graphics::Direct2D::ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawTextLayout, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize}
     Windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush::SetColor
     Windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE
     Windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP
@@ -64,8 +64,17 @@
     Windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_LEADING
     Windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_TRAILING
     Windows::Win32::Graphics::DirectWrite::DWriteCreateFactory
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory::CreateTextFormat
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat::{SetTextAlignment, SetParagraphAlignment}
+    Windows::Win32::Graphics::DirectWrite::DWRITE_HIT_TEST_METRICS
+    Windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS
+    Windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING
+    Windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING_GRANULARITY_NONE
+    Windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING_GRANULARITY_CHARACTER
+    Windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING_GRANULARITY_WORD
+    Windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP
+    Windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_WRAP
+    Windows::Win32::Graphics::DirectWrite::IDWriteFactory::{CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign}
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat::{SetTextAlignment, SetParagraphAlignment, SetWordWrapping, SetTrimming}
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout::{SetMaxWidth, SetMaxHeight, GetMetrics, HitTestPoint, HitTestTextPosition}
     Windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_PREMULTIPLIED
     Windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM
     Windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN

@@ -159,6 +159,7 @@ fn recorded_handler_invokes_with_pointer_info() {
         is_left_button_pressed: true,
         is_right_button_pressed: false,
         is_middle_button_pressed: false,
+        wheel_delta: 0,
     };
     bundle.on_pointer_moved.unwrap().invoke(info);
 
