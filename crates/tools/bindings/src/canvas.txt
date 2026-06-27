@@ -27,6 +27,7 @@
     Windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE
     Windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE
     Windows::Win32::Graphics::Direct2D::D2D1_EXTEND_MODE_CLAMP
+    Windows::Win32::Graphics::Direct2D::D2D1_FACTORY_TYPE_MULTI_THREADED
     Windows::Win32::Graphics::Direct2D::D2D1_FACTORY_TYPE_SINGLE_THREADED
     Windows::Win32::Graphics::Direct2D::D2D1_GAMMA_2_2
     Windows::Win32::Graphics::Direct2D::D2D1_INTERPOLATION_MODE_LINEAR
@@ -45,6 +46,7 @@
     Windows::Win32::Graphics::Direct2D::ID2D1Factory1::CreatePathGeometry
     Windows::Win32::Graphics::Direct2D::ID2D1Geometry::{GetBounds, FillContainsPoint, StrokeContainsPoint}
     Windows::Win32::Graphics::Direct2D::ID2D1GeometrySink::{AddLine, AddBezier}
+    Windows::Win32::Graphics::Direct2D::ID2D1Multithread::{Enter, Leave}
     Windows::Win32::Graphics::Direct2D::ID2D1PathGeometry::Open
     Windows::Win32::Graphics::Direct2D::ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawTextLayout, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize}
     Windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush::SetColor
@@ -83,13 +85,14 @@
     Windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_RESET
     Windows::Win32::Graphics::Dxgi::DXGI_ERROR_DRIVER_INTERNAL_ERROR
     Windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1
+    Windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
     Windows::Win32::Graphics::Dxgi::DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
     Windows::Win32::Graphics::Dxgi::DXGI_USAGE_RENDER_TARGET_OUTPUT
     Windows::Win32::Graphics::Dxgi::IDXGIDevice::GetAdapter
     Windows::Win32::Graphics::Dxgi::IDXGIFactory2::{CreateSwapChainForComposition, CreateSwapChainForHwnd}
     Windows::Win32::Graphics::Dxgi::IDXGIObject::GetParent
     Windows::Win32::Graphics::Dxgi::IDXGISwapChain::{Present, GetBuffer, ResizeBuffers}
-    Windows::Win32::Graphics::Dxgi::IDXGISwapChain2::SetMatrixTransform
+    Windows::Win32::Graphics::Dxgi::IDXGISwapChain2::{SetMatrixTransform, GetFrameLatencyWaitableObject, SetMaximumFrameLatency}
     Windows::Win32::Graphics::Imaging::CLSID_WICImagingFactory
     Windows::Win32::Graphics::Imaging::GUID_WICPixelFormat32bppPBGRA
     Windows::Win32::Graphics::Imaging::IWICBitmapDecoder::GetFrame
@@ -99,3 +102,4 @@
     Windows::Win32::Graphics::Imaging::WICBitmapPaletteTypeMedianCut
     Windows::Win32::Graphics::Imaging::WICDecodeMetadataCacheOnDemand
     Windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance}
+    Windows::Win32::System::Threading::WaitForSingleObjectEx
