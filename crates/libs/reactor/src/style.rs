@@ -628,6 +628,7 @@ pub struct PointerHandlers {
     pub on_pointer_moved: Option<Callback<PointerEventInfo>>,
     pub on_pointer_entered: Option<Callback<PointerEventInfo>>,
     pub on_pointer_exited: Option<Callback<()>>,
+    pub on_pointer_wheel: Option<Callback<PointerEventInfo>>,
 }
 
 impl PointerHandlers {
@@ -639,14 +640,17 @@ impl PointerHandlers {
             && self.on_pointer_moved.is_none()
             && self.on_pointer_entered.is_none()
             && self.on_pointer_exited.is_none()
+            && self.on_pointer_wheel.is_none()
     }
 }
 
 /// Pointer state captured at a pointer callback (`PointerPressed`,
-/// `PointerReleased`, `PointerMoved`, or `PointerEntered`). `x`/`y` are the
-/// pointer position in DIPs, relative to the top-left of the element the
-/// handler is attached to. Non-mouse pointer kinds report all three button
-/// flags as `false`.
+/// `PointerReleased`, `PointerMoved`, `PointerEntered`, or
+/// `PointerWheelChanged`). `x`/`y` are the pointer position in DIPs, relative
+/// to the top-left of the element the handler is attached to. Non-mouse
+/// pointer kinds report all three button flags as `false`. `wheel_delta` is
+/// the raw `MouseWheelDelta` (120 per detent, signed) and is only meaningful
+/// in a wheel callback.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct PointerEventInfo {
     pub x: f64,
@@ -654,6 +658,7 @@ pub struct PointerEventInfo {
     pub is_left_button_pressed: bool,
     pub is_right_button_pressed: bool,
     pub is_middle_button_pressed: bool,
+    pub wheel_delta: i32,
 }
 
 // --- Accessibility ---

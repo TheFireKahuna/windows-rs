@@ -903,4 +903,244 @@ mod tests {
             "animated_canvas must install an on_unmounted teardown"
         );
     }
+    // --- Waitable swap chain (frame-latency waitable object) ---
+
+    #[test]
+    fn normal_swap_chain_is_not_waitable() {
+        let device = GpuDevice::new_warp().unwrap();
+        let chain = device.create_swap_chain(64, 64).unwrap();
+        assert!(
+            chain.frame_latency_waitable().is_none(),
+            "a non-waitable chain must not expose a frame-latency object"
+        );
+    }
+
+    #[test]
+    fn create_waitable_swap_chain() {
+        let device = GpuDevice::new_warp().unwrap();
+        let chain = device.create_waitable_swap_chain(64, 64).unwrap();
+        assert_eq!((chain.width(), chain.height()), (64, 64));
+        let wait = chain
+            .frame_latency_waitable()
+            .expect("a waitable chain exposes its frame-latency object");
+        assert!(
+            !wait.0.is_null(),
+            "frame-latency waitable handle should be non-null"
+        );
+    }
+
+    #[test]
+    fn waitable_draw_and_present_paces() {
+        // The built-in wait must complete each frame, not hang: several frames in
+        // a row exercise the wait -> draw -> present -> re-signal cycle. If the
+        // wait deadlocked, the 1s timeout in begin_draw would still let it proceed,
+        // so a hang here would be a real bug.
+        let device = GpuDevice::new_warp().unwrap();
+        let mut chain = device.create_waitable_swap_chain(64, 64).unwrap();
+        for _ in 0..5 {
+            let session = chain.begin_draw().unwrap();
+            session.clear(ColorF::CORNFLOWER_BLUE);
+            drop(session);
+            assert!(chain.present().unwrap());
+        }
+    }
+
+    #[test]
+    fn waitable_resize_preserves_flag() {
+        // Resizing a waitable chain must replay the waitable flag; passing the
+        // wrong flags to ResizeBuffers makes it fail. The object survives the
+        // resize and the chain stays usable.
+        let device = GpuDevice::new_warp().unwrap();
+        let mut chain = device.create_waitable_swap_chain(64, 64).unwrap();
+        chain.resize(128, 96).unwrap();
+        assert_eq!((chain.width(), chain.height()), (128, 96));
+        assert!(chain.frame_latency_waitable().is_some());
+
+        let session = chain.begin_draw().unwrap();
+        session.clear(ColorF::BLACK);
+        drop(session);
+        chain.present().unwrap();
+    }
+
+    #[test]
+    fn set_wait_object_none_disables_wait() {
+        // Clearing the wait lets a consumer pace the frame themselves; begin_draw
+        // must not block.
+        let device = GpuDevice::new_warp().unwrap();
+        let mut chain = device.create_waitable_swap_chain(64, 64).unwrap();
+        assert!(chain.frame_latency_waitable().is_some());
+        chain.set_wait_object(None);
+        for _ in 0..3 {
+            let session = chain.begin_draw().unwrap();
+            session.clear(ColorF::RED);
+            drop(session);
+            chain.present().unwrap();
+        }
+    }
+
+    #[test]
+    fn set_wait_object_custom_event() {
+        // Substitute our own already-signalled manual-reset event: begin_draw must
+        // wait on it (and return promptly because it is signalled).
+        unsafe {
+            windows_core::link!("kernel32.dll" "system" fn CreateEventW(attrs: *const core::ffi::c_void, manual_reset: windows_core::BOOL, initial: windows_core::BOOL, name: *const u16) -> *mut core::ffi::c_void);
+            windows_core::link!("kernel32.dll" "system" fn CloseHandle(handle: *mut core::ffi::c_void) -> windows_core::BOOL);
+
+            let event = CreateEventW(
+                core::ptr::null(),
+                true.into(),
+                true.into(),
+                core::ptr::null(),
+            );
+            assert!(!event.is_null(), "CreateEventW failed");
+
+            let device = GpuDevice::new_warp().unwrap();
+            let mut chain = device.create_waitable_swap_chain(64, 64).unwrap();
+            chain.set_wait_object(Some(WaitObject(event)));
+
+            let session = chain.begin_draw().unwrap();
+            session.clear(ColorF::GREEN);
+            drop(session);
+            chain.present().unwrap();
+
+            let _ = CloseHandle(event);
+        }
+    }
+
+    #[test]
+    fn set_composition_scale_and_dpi() {
+        // Exercises the DPI/retarget path and the `IDXGISwapChain2` cast +
+        // `SetMatrixTransform` path (composition scale). Both must succeed on a
+        // WARP composition chain and leave the chain drawable.
+        let device = GpuDevice::new_warp().unwrap();
+        let mut chain = device.create_swap_chain(64, 64).unwrap();
+        chain.set_dpi(192.0, 192.0);
+        chain.set_composition_scale(2.0, 2.0);
+
+        let session = chain.begin_draw().unwrap();
+        session.clear(ColorF::BLACK);
+        drop(session);
+        chain.present().unwrap();
+    }
+
+    // --- Stress ---
+
+    #[test]
+    fn stress_many_swap_chains() {
+        // Create, draw, present and drop many swap chains from one device, to
+        // shake out resource lifetime / target-recreation issues.
+        let device = GpuDevice::new_warp().unwrap();
+        for i in 0..64u32 {
+            let n = 32 + i % 64;
+            let mut chain = device.create_swap_chain(n, n).unwrap();
+            let session = chain.begin_draw().unwrap();
+            session.clear(ColorF::BLACK);
+            drop(session);
+            chain.present().unwrap();
+        }
+    }
+
+    #[test]
+    fn stress_waitable_many_frames() {
+        // Hammer the wait -> draw -> present -> re-signal cycle for many frames so
+        // a deadlock or a leaked/never-signalled waitable object would surface.
+        let device = GpuDevice::new_warp().unwrap();
+        let mut chain = device.create_waitable_swap_chain(64, 64).unwrap();
+        for _ in 0..300 {
+            let session = chain.begin_draw().unwrap();
+            session.clear(ColorF::CORNFLOWER_BLUE);
+            drop(session);
+            assert!(chain.present().unwrap());
+        }
+    }
+
+    #[test]
+    fn stress_resize_churn() {
+        // Rapidly resize a waitable chain between frames: exercises ResizeBuffers
+        // + target recreation and the waitable-flag replay under churn.
+        let device = GpuDevice::new_warp().unwrap();
+        let mut chain = device.create_waitable_swap_chain(64, 64).unwrap();
+        for i in 0..64u32 {
+            let n = 16 + (i * 7) % 200;
+            chain.resize(n, n).unwrap();
+            assert_eq!((chain.width(), chain.height()), (n, n));
+            let session = chain.begin_draw().unwrap();
+            session.clear(ColorF::BLACK);
+            drop(session);
+            chain.present().unwrap();
+        }
+        assert!(chain.frame_latency_waitable().is_some());
+    }
+
+    // --- Multi-threaded (shared multi-threaded factory device) ---
+    //
+    // These share one multi-threaded-factory device across threads, each
+    // rendering through its own swap chain. The concurrent
+    // CreateSwapChainForComposition / GetBuffer / Present / ResizeBuffers calls on
+    // the shared Direct3D device are serialized by the crate's internal
+    // `ID2D1Multithread` factory lock; without correct locking this races and
+    // typically crashes, corrupts, or hangs. WARP keeps them GPU-independent.
+
+    const STRESS_THREADS: usize = 8;
+    const STRESS_FRAMES: usize = 200;
+
+    #[test]
+    fn multi_threaded_shared_device_stress() {
+        let device = GpuDevice::new_warp_multi_threaded().unwrap();
+        let mut handles = Vec::with_capacity(STRESS_THREADS);
+        for t in 0..STRESS_THREADS {
+            let device = device.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut chain = device.create_swap_chain(64, 64).unwrap();
+                for f in 0..STRESS_FRAMES {
+                    {
+                        let session = chain.begin_draw().unwrap();
+                        session.clear(if (t + f) % 2 == 0 {
+                            ColorF::RED
+                        } else {
+                            ColorF::BLUE
+                        });
+                    }
+                    chain.present().unwrap();
+                    // Periodically churn the buffers to exercise ResizeBuffers and
+                    // GetBuffer on the shared device under contention.
+                    if f % 16 == 15 {
+                        let n = 48 + (f as u32 % 32);
+                        chain.resize(n, n).unwrap();
+                    }
+                }
+            }));
+        }
+        handles.into_iter().for_each(|h| h.join().unwrap());
+    }
+
+    #[test]
+    fn multi_threaded_waitable_and_normal_mix() {
+        // Mixed workload on the shared device: half the threads use waitable
+        // chains (auto-wait pacing), half use normal chains, all presenting
+        // concurrently — so the lock is exercised around the waitable setup and
+        // the per-frame wait as well as Present.
+        const THREADS: usize = 6;
+        const FRAMES: usize = 120;
+        let device = GpuDevice::new_warp_multi_threaded().unwrap();
+        let mut handles = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let device = device.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut chain = if t % 2 == 0 {
+                    device.create_waitable_swap_chain(64, 64).unwrap()
+                } else {
+                    device.create_swap_chain(64, 64).unwrap()
+                };
+                for _ in 0..FRAMES {
+                    {
+                        let session = chain.begin_draw().unwrap();
+                        session.clear(ColorF::GREEN);
+                    }
+                    chain.present().unwrap();
+                }
+            }));
+        }
+        handles.into_iter().for_each(|h| h.join().unwrap());
+    }
 }

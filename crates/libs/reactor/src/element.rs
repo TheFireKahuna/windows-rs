@@ -896,6 +896,16 @@ pub trait ElementExt: Sized {
         self
     }
 
+    /// Register a `PointerWheelChanged` handler; the callback receives the
+    /// element-relative position and the signed wheel delta
+    /// ([`PointerEventInfo::wheel_delta`], 120 per detent).
+    fn on_pointer_wheel(mut self, f: impl IntoCallback<PointerEventInfo>) -> Self {
+        if let Some(m) = self.modifiers_mut() {
+            ensure_pointer_handlers(m).on_pointer_wheel = Some(f.into_callback());
+        }
+        self
+    }
+
     // ── Accessibility modifiers ──────────────────────────────────────────
 
     fn automation_name(mut self, name: impl Into<String>) -> Self {

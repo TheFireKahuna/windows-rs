@@ -168,6 +168,7 @@ struct PointerRevokerSet {
     moved: Option<windows_core::EventRevoker>,
     entered: Option<windows_core::EventRevoker>,
     exited: Option<windows_core::EventRevoker>,
+    wheel: Option<windows_core::EventRevoker>,
 }
 
 #[derive(Default)]
@@ -1341,6 +1342,26 @@ impl Backend for WinUIBackend {
                     s.SetStepFrequency(1.0)?;
                     s.cast::<bindings::IRangeBase>()?.SetSmallChange(1.0)
                 }
+                (Prop::Step, PropValue::F64(v), Handle::NumberBox(nb)) => nb.SetSmallChange(*v),
+                (Prop::Step, PropValue::Unset, Handle::NumberBox(nb)) => nb.SetSmallChange(1.0),
+                (Prop::LargeChange, PropValue::F64(v), Handle::NumberBox(nb)) => {
+                    nb.SetLargeChange(*v)
+                }
+                (Prop::Precision, PropValue::I32(v), Handle::NumberBox(nb)) => {
+                    // A DecimalFormatter pinned to `v` fraction digits gives the
+                    // NumberBox a fixed display precision.
+                    let fmt = bindings::DecimalFormatter::new()?;
+                    let opts: bindings::INumberFormatterOptions = fmt.cast()?;
+                    opts.SetFractionDigits(*v)?;
+                    // Allow the integer part to render with no left-padding.
+                    opts.SetIntegerDigits(1)?;
+                    let fmt2: bindings::INumberFormatter2 = fmt.cast()?;
+                    nb.SetNumberFormatter(&fmt2)
+                }
+                (Prop::HorizontalContentAlignment, PropValue::I32(v), Handle::NumberBox(nb)) => {
+                    let ctl: bindings::IControl = nb.cast()?;
+                    ctl.SetHorizontalContentAlignment(HorizontalAlignment(*v))
+                }
                 (Prop::NavigateUri, PropValue::Str(s), Handle::HyperlinkButton(h)) => {
                     let uri = bindings::Uri::CreateUri(s.as_str())?;
                     h.SetNavigateUri(&uri)
@@ -1737,6 +1758,30 @@ impl Backend for WinUIBackend {
                     let tb = string_as_textblock(s)?;
                     flyout.SetContent(&tb)?;
                     b.SetFlyout(&flyout)?;
+                    Ok(())
+                }
+                (Prop::FlyoutContent, PropValue::FlyoutDef(def), Handle::Button(b)) => {
+                    let flyout = bindings::Flyout::new()?;
+                    // Rich element-tree content takes precedence over plain text.
+                    if let Some(elem) = &def.rich {
+                        if let Some(ui) = mount_static_tooltip_element(elem) {
+                            flyout.SetContent(&ui)?;
+                        }
+                    } else {
+                        let tb = string_as_textblock(&def.text)?;
+                        flyout.SetContent(&tb)?;
+                    }
+                    if def.placement != FlyoutPlacementMode::default() {
+                        let _ = flyout
+                            .cast::<bindings::IFlyoutBase>()?
+                            .SetPlacement(def.placement);
+                    }
+                    b.SetFlyout(&flyout)?;
+                    // The button's native click opens the attached flyout, and
+                    // light-dismiss / Escape closes it. `def.open` / `def.on_closed`
+                    // are part of the API surface; programmatic show/hide and the
+                    // Closed callback require IFlyoutBase::ShowAt/Closed, which a
+                    // metadata regen will surface (see base.txt note).
                     Ok(())
                 }
                 (Prop::FlyoutPlacement, PropValue::I32(v), Handle::Button(b)) => {
@@ -3073,6 +3118,16 @@ impl Backend for WinUIBackend {
                 .ok();
         }
 
+        if let Some(cb) = handlers.on_pointer_wheel.clone() {
+            let element = ui.clone();
+            tokens.wheel = ui
+                .PointerWheelChanged(move |_sender, args| {
+                    let info = pointer_event_info(&element, args);
+                    cb.invoke(info);
+                })
+                .ok();
+        }
+
         self.pointer_revokers.borrow_mut().insert(id, tokens);
     }
 
@@ -3499,6 +3554,7 @@ fn pointer_event_info(
     info.is_left_button_pressed = props.IsLeftButtonPressed().unwrap_or(false);
     info.is_right_button_pressed = props.IsRightButtonPressed().unwrap_or(false);
     info.is_middle_button_pressed = props.IsMiddleButtonPressed().unwrap_or(false);
+    info.wheel_delta = props.MouseWheelDelta().unwrap_or(0);
     info
 }
 

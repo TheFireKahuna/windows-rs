@@ -47,6 +47,245 @@ impl SwapChainPanelHandle {
             }
         })
     }
+
+    /// Open a live [`PointerSurface`] over this panel's native `UIElement`.
+    ///
+    /// Unlike the declarative [`on_pointer_moved`](crate::ElementExt::on_pointer_moved)
+    /// / [`on_pointer_wheel`](crate::ElementExt::on_pointer_wheel) modifiers, this
+    /// imperative surface also supports **pointer capture** — the piece a knob /
+    /// slider / EQ-node drag needs so moves keep arriving when the pointer leaves
+    /// the element bounds. Subscribe down / move / up / wheel via the returned
+    /// surface's builder methods; the registrations (and any held capture) are
+    /// revoked on `Drop`. Coordinates in every [`PointerEventInfo`] are
+    /// element-relative DIPs.
+    pub fn pointer_surface(&self) -> Result<PointerSurface> {
+        open_pointer_surface(&self.0)
+    }
+}
+
+/// Open a capture-capable [`PointerSurface`] over any mounted native
+/// `UIElement`. Shared by [`SwapChainPanelHandle::pointer_surface`] and
+/// [`ElementHandle::pointer_surface`].
+fn open_pointer_surface(native: &windows_core::IInspectable) -> Result<PointerSurface> {
+    let element: bindings::UIElement = native.cast()?;
+    Ok(PointerSurface {
+        element,
+        captured: Rc::new(RefCell::new(None)),
+        revokers: RefCell::new(Vec::new()),
+    })
+}
+
+/// Opaque handle to a mounted native `UIElement`, handed to a widget's
+/// `on_mounted` callback (e.g. [`Image::on_mounted`](crate::Image::on_mounted)).
+///
+/// Unlike [`SwapChainPanelHandle`] it carries no swap-chain plumbing — its sole
+/// purpose is to expose the imperative, capture-capable
+/// [`PointerSurface`](Self::pointer_surface) over the element. That is what a
+/// custom-drawn control hosted in an `Image` / `SurfaceImageSource` needs so a
+/// knob / slider / node drag keeps tracking after the pointer leaves the element
+/// bounds — the declarative [`on_pointer_moved`](crate::ElementExt::on_pointer_moved)
+/// modifier cannot capture.
+#[derive(Clone)]
+pub struct ElementHandle(pub(crate) windows_core::IInspectable);
+
+impl ElementHandle {
+    /// Open a live [`PointerSurface`] over this element's native `UIElement`.
+    /// See [`SwapChainPanelHandle::pointer_surface`] for the capture semantics.
+    pub fn pointer_surface(&self) -> Result<PointerSurface> {
+        open_pointer_surface(&self.0)
+    }
+
+    /// Subscribe `SizeChanged` on this element; the callback receives the new
+    /// `(width, height)` in DIPs and also fires once after the first layout
+    /// pass. Returns the [`EventRevoker`](windows_core::EventRevoker) — **store
+    /// it** (e.g. in a `use_ref`, alongside the [`PointerSurface`]); the
+    /// subscription is revoked when the revoker drops (on unmount), so nothing
+    /// leaks. Use it to recreate a fixed-size [`SurfaceImageSource`] at the new
+    /// size so it stays crisp.
+    pub fn on_size_changed(
+        &self,
+        f: impl Fn(f64, f64) + 'static,
+    ) -> Result<windows_core::EventRevoker> {
+        let fe: bindings::IFrameworkElement = self.0.cast()?;
+        fe.SizeChanged(move |_sender, args| {
+            if let Some(args) = args.as_ref()
+                && let Ok(s) = args.NewSize()
+            {
+                f(s.width as f64, s.height as f64);
+            }
+        })
+    }
+}
+
+/// Live pointer interop bound to one native `UIElement` (obtained from a
+/// [`SwapChainPanelHandle::pointer_surface`]).
+///
+/// Subscribe the pointer transitions you care about with [`on_down`](Self::on_down)
+/// / [`on_move`](Self::on_move) / [`on_up`](Self::on_up) / [`on_wheel`](Self::on_wheel),
+/// then [`capture`](Self::capture) on a down that begins a drag and
+/// [`release`](Self::release) on the matching up. The subscriptions and any
+/// outstanding capture are torn down when the surface is dropped, so store it
+/// alongside the panel (e.g. in a `use_ref`).
+///
+/// The most recently seen pointer is tracked internally on every down / move, so
+/// [`capture`](Self::capture) works without the caller threading a pointer id
+/// through.
+pub struct PointerSurface {
+    element: bindings::UIElement,
+    captured: Rc<RefCell<Option<bindings::Pointer>>>,
+    revokers: RefCell<Vec<windows_core::EventRevoker>>,
+}
+
+impl PointerSurface {
+    fn subscribe_pointer<S>(
+        &self,
+        f: impl Fn(PointerEventInfo) + 'static,
+        track: bool,
+        subscribe: S,
+    ) -> Result<()>
+    where
+        S: FnOnce(
+            &bindings::IUIElement,
+            Box<
+                dyn Fn(
+                    windows_core::Ref<windows_core::IInspectable>,
+                    windows_core::Ref<bindings::PointerRoutedEventArgs>,
+                ),
+            >,
+        ) -> Result<windows_core::EventRevoker>,
+    {
+        let iue: bindings::IUIElement = self.element.cast()?;
+        let captured = self.captured.clone();
+        let handler = Box::new(
+            move |sender: windows_core::Ref<windows_core::IInspectable>,
+                  args: windows_core::Ref<bindings::PointerRoutedEventArgs>| {
+                if track
+                    && let Some(a) = args.as_ref()
+                    && let Ok(iargs) = a.cast::<bindings::IPointerRoutedEventArgs>()
+                {
+                    *captured.borrow_mut() = iargs.Pointer().ok();
+                }
+                f(pointer_event_info(sender, args));
+            },
+        );
+        let revoker = subscribe(&iue, handler)?;
+        self.revokers.borrow_mut().push(revoker);
+        Ok(())
+    }
+
+    /// Subscribe `PointerPressed`. Also records the active pointer so a
+    /// subsequent [`capture`](Self::capture) can grab it.
+    pub fn on_down(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        self.subscribe_pointer(f, true, |iue, h| iue.PointerPressed(h))?;
+        Ok(self)
+    }
+
+    /// Subscribe `PointerPressed` and **capture** the pointer to this element as
+    /// part of the same handler, so a drag that leaves the element keeps
+    /// delivering `PointerMoved`. Convenience for the common scrub / drag start;
+    /// pair with [`release`](Self::release) on the matching up.
+    pub fn on_down_capture(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        let element = self.element.clone();
+        let captured = self.captured.clone();
+        self.subscribe_pointer(
+            move |info| {
+                if let Some(p) = captured.borrow().as_ref() {
+                    let _ = element.CapturePointer(p);
+                }
+                f(info);
+            },
+            true,
+            |iue, h| iue.PointerPressed(h),
+        )?;
+        Ok(self)
+    }
+
+    /// Subscribe `PointerMoved`. Also refreshes the active pointer.
+    pub fn on_move(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        self.subscribe_pointer(f, true, |iue, h| iue.PointerMoved(h))?;
+        Ok(self)
+    }
+
+    /// Subscribe `PointerReleased`.
+    pub fn on_up(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        self.subscribe_pointer(f, false, |iue, h| iue.PointerReleased(h))?;
+        Ok(self)
+    }
+
+    /// Subscribe `PointerWheelChanged`; read [`PointerEventInfo::wheel_delta`].
+    pub fn on_wheel(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        self.subscribe_pointer(f, false, |iue, h| iue.PointerWheelChanged(h))?;
+        Ok(self)
+    }
+
+    /// Capture the most recently seen pointer to this element for the duration
+    /// of a drag, so moves keep arriving even when the pointer leaves the
+    /// element bounds. Call on a `Down` that begins a scrub / drag; pair with
+    /// [`release`](Self::release). No-op if no pointer has been seen yet.
+    pub fn capture(&self) {
+        if let Some(p) = self.captured.borrow().as_ref() {
+            let _ = self.element.CapturePointer(p);
+        }
+    }
+
+    /// Release a pointer captured by [`capture`](Self::capture) (call on `Up`).
+    pub fn release(&self) {
+        if let Some(p) = self.captured.borrow().as_ref() {
+            let _ = self.element.ReleasePointerCapture(p);
+        }
+    }
+}
+
+impl Drop for PointerSurface {
+    fn drop(&mut self) {
+        // Release any held capture; the EventRevokers in `revokers` revoke their
+        // subscriptions on their own Drop.
+        self.release();
+    }
+}
+
+/// Build a [`PointerEventInfo`] from a routed-pointer event. Mirrors the backend
+/// `pointer_event_info`: element-relative DIP position (relative to the sender),
+/// button state, and signed wheel delta.
+fn pointer_event_info(
+    sender: windows_core::Ref<windows_core::IInspectable>,
+    args: windows_core::Ref<bindings::PointerRoutedEventArgs>,
+) -> PointerEventInfo {
+    let mut info = PointerEventInfo::default();
+    let Some(args) = args.as_ref() else {
+        return info;
+    };
+    let Ok(iargs) = args.cast::<bindings::IPointerRoutedEventArgs>() else {
+        return info;
+    };
+    let relative: Option<bindings::UIElement> = sender
+        .as_ref()
+        .and_then(|s| s.cast::<bindings::UIElement>().ok());
+    let point = match relative.as_ref() {
+        Some(ue) => iargs.GetCurrentPoint(ue),
+        None => iargs.GetCurrentPoint(None),
+    };
+    let Ok(point) = point else {
+        return info;
+    };
+    let Ok(ipoint) = point.cast::<bindings::IPointerPoint>() else {
+        return info;
+    };
+    if let Ok(pos) = ipoint.Position() {
+        info.x = pos.x as f64;
+        info.y = pos.y as f64;
+    }
+    let Ok(props) = ipoint.Properties() else {
+        return info;
+    };
+    let Ok(iprops) = props.cast::<bindings::IPointerPointProperties>() else {
+        return info;
+    };
+    info.is_left_button_pressed = iprops.IsLeftButtonPressed().unwrap_or(false);
+    info.is_right_button_pressed = iprops.IsRightButtonPressed().unwrap_or(false);
+    info.is_middle_button_pressed = iprops.IsMiddleButtonPressed().unwrap_or(false);
+    info.wheel_delta = iprops.MouseWheelDelta().unwrap_or(0);
+    info
 }
 
 /// Built-in widget for `Microsoft.UI.Xaml.Controls.SwapChainPanel` — hosts

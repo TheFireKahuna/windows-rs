@@ -68,7 +68,7 @@ impl Widget for Button {
         if let Some(ref fly) = self.flyout {
             out.push(Binding::Prop(
                 Prop::FlyoutContent,
-                PropValue::Str(fly.text.clone()),
+                PropValue::FlyoutDef(fly.clone()),
             ));
             if fly.placement != FlyoutPlacementMode::default() {
                 out.push(Binding::Prop(
@@ -125,10 +125,7 @@ impl Button {
     }
 
     pub fn flyout(mut self, text: impl Into<String>) -> Self {
-        self.flyout = Some(FlyoutDef {
-            text: text.into(),
-            placement: FlyoutPlacementMode::default(),
-        });
+        self.flyout = Some(FlyoutDef::text(text));
         self
     }
 
@@ -137,10 +134,20 @@ impl Button {
         text: impl Into<String>,
         placement: FlyoutPlacementMode,
     ) -> Self {
-        self.flyout = Some(FlyoutDef {
-            text: text.into(),
-            placement,
-        });
+        self.flyout = Some(FlyoutDef::text(text).placement(placement));
+        self
+    }
+
+    /// Attach a rich element-tree flyout (band panel, color picker, …).
+    pub fn flyout_element(mut self, element: impl Into<Element>) -> Self {
+        self.flyout = Some(FlyoutDef::rich(element));
+        self
+    }
+
+    /// Attach a fully-specified [`FlyoutDef`] (text/rich content + placement +
+    /// open + on_closed).
+    pub fn flyout_def(mut self, def: FlyoutDef) -> Self {
+        self.flyout = Some(def);
         self
     }
 
