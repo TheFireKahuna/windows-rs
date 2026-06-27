@@ -2,6 +2,7 @@ windows_core::link!("ole32.dll" "system" fn CoCreateInstance(rclsid : *const win
 windows_core::link!("d2d1.dll" "system" fn D2D1CreateFactory(factorytype : D2D1_FACTORY_TYPE, riid : *const windows_core::GUID, pfactoryoptions : *const D2D1_FACTORY_OPTIONS, ppifactory : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
 windows_core::link!("d3d11.dll" "system" fn D3D11CreateDevice(padapter : *mut core::ffi::c_void, drivertype : D3D_DRIVER_TYPE, software : HMODULE, flags : D3D11_CREATE_DEVICE_FLAG, pfeaturelevels : *const D3D_FEATURE_LEVEL, featurelevels : u32, sdkversion : u32, ppdevice : *mut *mut core::ffi::c_void, pfeaturelevel : *mut D3D_FEATURE_LEVEL, ppimmediatecontext : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
 windows_core::link!("dwrite.dll" "system" fn DWriteCreateFactory(factorytype : DWRITE_FACTORY_TYPE, iid : *const windows_core::GUID, factory : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
+windows_core::link!("kernel32.dll" "system" fn WaitForSingleObjectEx(hhandle : HANDLE, dwmilliseconds : u32, balertable : windows_core::BOOL) -> WAIT_EVENT);
 pub type CLSCTX = u32;
 pub const CLSCTX_INPROC_SERVER: CLSCTX = 1;
 pub const CLSID_D2D1Shadow: windows_core::GUID =
@@ -74,6 +75,7 @@ pub struct D2D1_FACTORY_OPTIONS {
     pub debugLevel: D2D1_DEBUG_LEVEL,
 }
 pub type D2D1_FACTORY_TYPE = i32;
+pub const D2D1_FACTORY_TYPE_MULTI_THREADED: D2D1_FACTORY_TYPE = 1;
 pub const D2D1_FACTORY_TYPE_SINGLE_THREADED: D2D1_FACTORY_TYPE = 0;
 pub type D2D1_FIGURE_BEGIN = i32;
 pub const D2D1_FIGURE_BEGIN_FILLED: D2D1_FIGURE_BEGIN = 0;
@@ -276,6 +278,7 @@ pub struct DXGI_SWAP_CHAIN_DESC1 {
     pub Flags: u32,
 }
 pub type DXGI_SWAP_CHAIN_FLAG = i32;
+pub const DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT: DXGI_SWAP_CHAIN_FLAG = 64;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DXGI_SWAP_CHAIN_FULLSCREEN_DESC {
@@ -292,6 +295,7 @@ pub type GENERIC_ACCESS_RIGHTS = u32;
 pub const GENERIC_READ: GENERIC_ACCESS_RIGHTS = 2147483648;
 pub const GUID_WICPixelFormat32bppPBGRA: windows_core::GUID =
     windows_core::GUID::from_u128(0x6fddc324_4e03_4bfe_b185_3d77768dc910);
+pub type HANDLE = *mut core::ffi::c_void;
 pub type HMODULE = *mut core::ffi::c_void;
 pub type HWND = *mut core::ffi::c_void;
 windows_core::imp::define_interface!(
@@ -1089,6 +1093,34 @@ pub struct ID2D1LinearGradientBrush_Vtbl {
 unsafe impl Send for ID2D1LinearGradientBrush {}
 unsafe impl Sync for ID2D1LinearGradientBrush {}
 impl windows_core::RuntimeName for ID2D1LinearGradientBrush {}
+windows_core::imp::define_interface!(
+    ID2D1Multithread,
+    ID2D1Multithread_Vtbl,
+    0x31e6e7bc_e0ff_4d46_8c64_a0a8c41c15d3
+);
+windows_core::imp::interface_hierarchy!(ID2D1Multithread, windows_core::IUnknown);
+impl ID2D1Multithread {
+    pub(crate) unsafe fn Enter(&self) {
+        unsafe {
+            (windows_core::Interface::vtable(self).Enter)(windows_core::Interface::as_raw(self));
+        }
+    }
+    pub(crate) unsafe fn Leave(&self) {
+        unsafe {
+            (windows_core::Interface::vtable(self).Leave)(windows_core::Interface::as_raw(self));
+        }
+    }
+}
+#[repr(C)]
+pub struct ID2D1Multithread_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetMultithreadProtected: usize,
+    pub Enter: unsafe extern "system" fn(*mut core::ffi::c_void),
+    pub Leave: unsafe extern "system" fn(*mut core::ffi::c_void),
+}
+unsafe impl Send for ID2D1Multithread {}
+unsafe impl Sync for ID2D1Multithread {}
+impl windows_core::RuntimeName for ID2D1Multithread {}
 windows_core::imp::define_interface!(
     ID2D1PathGeometry,
     ID2D1PathGeometry_Vtbl,
@@ -2996,6 +3028,25 @@ windows_core::imp::interface_hierarchy!(
     IDXGISwapChain1
 );
 impl IDXGISwapChain2 {
+    pub(crate) unsafe fn SetMaximumFrameLatency(
+        &self,
+        maxlatency: u32,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetMaximumFrameLatency)(
+                windows_core::Interface::as_raw(self),
+                maxlatency,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn GetFrameLatencyWaitableObject(&self) -> HANDLE {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetFrameLatencyWaitableObject)(
+                windows_core::Interface::as_raw(self),
+            )
+        }
+    }
     pub(crate) unsafe fn SetMatrixTransform(
         &self,
         pmatrix: *const DXGI_MATRIX_3X2_F,
@@ -3014,9 +3065,10 @@ pub struct IDXGISwapChain2_Vtbl {
     pub base__: IDXGISwapChain1_Vtbl,
     SetSourceSize: usize,
     GetSourceSize: usize,
-    SetMaximumFrameLatency: usize,
+    pub SetMaximumFrameLatency:
+        unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> windows_core::HRESULT,
     GetMaximumFrameLatency: usize,
-    GetFrameLatencyWaitableObject: usize,
+    pub GetFrameLatencyWaitableObject: unsafe extern "system" fn(*mut core::ffi::c_void) -> HANDLE,
     pub SetMatrixTransform: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *const DXGI_MATRIX_3X2_F,
@@ -3269,6 +3321,7 @@ pub struct IWICPalette_Vtbl {
     HasAlpha: usize,
 }
 impl windows_core::RuntimeName for IWICPalette {}
+pub type WAIT_EVENT = u32;
 pub type WICBitmapDitherType = i32;
 pub const WICBitmapDitherTypeNone: WICBitmapDitherType = 0;
 pub type WICBitmapPaletteType = i32;

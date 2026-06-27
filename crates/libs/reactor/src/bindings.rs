@@ -6908,6 +6908,92 @@ pub struct ICubicBezierEasingFunction_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
+    ID2D1Factory,
+    ID2D1Factory_Vtbl,
+    0x06152247_6f50_465a_9245_118bfd3b6007
+);
+windows_core::imp::interface_hierarchy!(ID2D1Factory, windows_core::IUnknown);
+#[repr(C)]
+pub struct ID2D1Factory_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    ReloadSystemMetrics: usize,
+    GetDesktopDpi: usize,
+    CreateRectangleGeometry: usize,
+    CreateRoundedRectangleGeometry: usize,
+    CreateEllipseGeometry: usize,
+    CreateGeometryGroup: usize,
+    CreateTransformedGeometry: usize,
+    CreatePathGeometry: usize,
+    CreateStrokeStyle: usize,
+    CreateDrawingStateBlock: usize,
+    CreateWicBitmapRenderTarget: usize,
+    CreateHwndRenderTarget: usize,
+    CreateDxgiSurfaceRenderTarget: usize,
+    CreateDCRenderTarget: usize,
+}
+unsafe impl Send for ID2D1Factory {}
+unsafe impl Sync for ID2D1Factory {}
+windows_core::imp::define_interface!(
+    ID2D1Multithread,
+    ID2D1Multithread_Vtbl,
+    0x31e6e7bc_e0ff_4d46_8c64_a0a8c41c15d3
+);
+windows_core::imp::interface_hierarchy!(ID2D1Multithread, windows_core::IUnknown);
+impl ID2D1Multithread {
+    pub(crate) unsafe fn GetMultithreadProtected(&self) -> windows_core::BOOL {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetMultithreadProtected)(
+                windows_core::Interface::as_raw(self),
+            )
+        }
+    }
+    pub(crate) unsafe fn Enter(&self) {
+        unsafe {
+            (windows_core::Interface::vtable(self).Enter)(windows_core::Interface::as_raw(self));
+        }
+    }
+    pub(crate) unsafe fn Leave(&self) {
+        unsafe {
+            (windows_core::Interface::vtable(self).Leave)(windows_core::Interface::as_raw(self));
+        }
+    }
+}
+#[repr(C)]
+pub struct ID2D1Multithread_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub GetMultithreadProtected:
+        unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::BOOL,
+    pub Enter: unsafe extern "system" fn(*mut core::ffi::c_void),
+    pub Leave: unsafe extern "system" fn(*mut core::ffi::c_void),
+}
+unsafe impl Send for ID2D1Multithread {}
+unsafe impl Sync for ID2D1Multithread {}
+windows_core::imp::define_interface!(
+    ID2D1Resource,
+    ID2D1Resource_Vtbl,
+    0x2cd90691_12e2_11dc_9fed_001143a055f9
+);
+windows_core::imp::interface_hierarchy!(ID2D1Resource, windows_core::IUnknown);
+impl ID2D1Resource {
+    pub(crate) unsafe fn GetFactory(&self) -> windows_core::Result<ID2D1Factory> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFactory)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            );
+            windows_core::Type::from_abi(result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct ID2D1Resource_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub GetFactory: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void),
+}
+unsafe impl Send for ID2D1Resource {}
+unsafe impl Sync for ID2D1Resource {}
+windows_core::imp::define_interface!(
     IDataPackageView,
     IDataPackageView_Vtbl,
     0x7b840471_5900_4d85_a90b_10cb85fe3552

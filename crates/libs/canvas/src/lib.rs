@@ -30,13 +30,14 @@ use windows_core::*;
 
 pub use bitmap::Bitmap;
 pub use color::ColorF;
+pub(crate) use device::D2dLock;
 pub use device::GpuDevice;
 pub use effect::Effect;
 pub use geometry::*;
 #[cfg(feature = "reactor")]
 pub use reactor::{DrawContext, animated_canvas};
 pub use session::DrawingSession;
-pub use swap_chain::SwapChain;
+pub use swap_chain::{SwapChain, WaitObject};
 pub use text::*;
 pub use types::*;
 
