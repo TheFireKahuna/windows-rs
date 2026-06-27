@@ -123,21 +123,23 @@ fn surface_pixels(dip: f32, scale: f32) -> u32 {
     ((dip * scale) as u32).max(1)
 }
 
-/// Debug-build warning for the source-less-`Image` footgun: a surface-backed
-/// element laid out with *exactly one* axis collapsed to zero (e.g. `400x0`) is
-/// stretched on one axis but content-sized on the other, where a null `Source`
-/// has no intrinsic size — so it stays blank. `0x0` is the normal pre-layout
-/// state and is not reported. Compiles to nothing in release.
+/// Debug-build warning for the one collapse the layout-driven host can't solve:
+/// the host fills the axes its parent *constrains*, but an axis the parent leaves
+/// open (a vertical `StackPanel`'s height, an `Auto` grid track, a `ScrollViewer`)
+/// has nothing to size to while the inner `Image` is empty, so it collapses to
+/// zero (e.g. `400x0`) and nothing is drawn. This is the same requirement Win2D's
+/// `CanvasControl` has — give it a size on the open axis. `0x0` is the normal
+/// pre-layout state and is not reported. Compiles to nothing in release.
 fn warn_if_collapsed(_what: &str, _w: u32, _h: u32) {
     #[cfg(debug_assertions)]
     if (_w == 0) != (_h == 0) {
         eprintln!(
-            "windows-canvas: {_what} laid out at {_w}x{_h}: a source-less Image has \
-             no intrinsic size, so an unconstrained layout axis (a vertical \
-             StackPanel, an Auto grid track, a ScrollViewer) collapses it to zero \
-             and nothing is drawn. Set `.min_height(..)`/`.min_width(..)` on the \
-             returned element — that stops the collapse while still stretching to \
-             fill — or give it an explicit size or a *-sized grid track."
+            "windows-canvas: {_what} laid out at {_w}x{_h}: the host fills the axes \
+             its parent constrains, but an axis the parent leaves open (a vertical \
+             StackPanel's height, an Auto grid track, a ScrollViewer) collapses to \
+             zero. Set `.height(..)`/`.min_height(..)` (or `.width(..)`/`.min_width(..)`) \
+             on the returned element, or place it in a *-sized grid track. (Win2D's \
+             CanvasControl needs the same in a StackPanel.)"
         );
     }
 }
@@ -292,18 +294,24 @@ pub fn animated_canvas(draw: impl Fn(&DrawContext<'_>) + 'static) -> SwapChainPa
 /// Create an `Image` element backed by a [`SurfaceImage`] that is drawn with
 /// `draw` and kept correctly sized and DPI-crisp automatically.
 ///
-/// Call this from a render function: it tracks the element's layout size (via
+/// Call this from a render function: it tracks the host's layout size (via
 /// `on_size_changed`) and the window DPI (via [`RenderCx::use_dpi`]), and
 /// rebuilds and redraws the surface whenever either changes or the device is
-/// lost. The surface is allocated at the element's pixel size and stretched to
+/// lost. The surface is allocated at the host's pixel size and stretched to
 /// fill it, so it stays sharp at any scale.
+///
+/// The returned element is a layout-driven `Border` host wrapping the `Image`
+/// (the reactor port of how Win2D's `CanvasControl` hosts its surface in a
+/// `UserControl`), so it **fills the width** of a star `Grid` cell or a stretched
+/// parent natively. Only an axis the parent leaves *open* needs a hint: in a
+/// vertical `StackPanel` / `Auto` row give it a [`height`](windows_reactor::ElementExt::height)
+/// (or [`min_height`](windows_reactor::ElementExt::min_height)) — the same
+/// requirement `CanvasControl` has in a `StackPanel`.
 ///
 /// `draw` is called once per (re)build — suited to static or event-driven
 /// content (the `SurfaceImageSource` model). For per-frame animation use
 /// [`animated_canvas`]; for content larger than the screen use
-/// [`virtual_surface_image`]. Place the returned element in a container that
-/// gives it bounds (a star `Grid` cell, a stretched parent, …) so it receives a
-/// non-zero size.
+/// [`virtual_surface_image`].
 pub fn surface_image(cx: &mut RenderCx, draw: impl Fn(&DrawContext) + 'static) -> Element {
     let dpi = cx.use_dpi() as f32;
     let (size, set_size) = cx.use_state::<(u32, u32)>((0, 0));
@@ -347,8 +355,16 @@ pub fn surface_image(cx: &mut RenderCx, draw: impl Fn(&DrawContext) + 'static) -
         }
     });
 
-    Image::new(source.into())
-        .stretch(Stretch::Fill)
+    // Faithful port of Win2D's `CanvasControl`: an inner `Image` (Stretch::Fill)
+    // that only *displays* the surface, hosted in a layout-driven `Border` whose
+    // own `SizeChanged` drives the surface size. `Image` is content-sized — it
+    // adopts its `Source`'s natural size, so a null/not-yet-created source has no
+    // width to report and could never bootstrap. The `Border` is layout-driven:
+    // it fills the space its parent offers regardless of its child, so it reports
+    // the real available size and the surface is created to match. (Win2D
+    // measures its `UserControl` host for the same reason, not the inner `Image`.)
+    let inner = Image::new(source.into()).stretch(Stretch::Fill);
+    Border::new(inner)
         .on_mounted(move |handle| {
             let set_size = set_size.clone();
             if let Ok(rev) = handle.on_size_changed(move |w, h| {
@@ -589,31 +605,50 @@ impl SurfacePainter {
         }
     }
 
-    /// The `Image` element to return from your render function. It hosts the
-    /// surface and tracks its layout size; if a mount hook was set with
-    /// [`on_mounted`](Self::on_mounted), it also runs that.
+    /// The element to return from your render function. A faithful port of
+    /// Win2D's `CanvasControl` structure: an inner `Image` (`Stretch::Fill`) that
+    /// *displays* the surface, hosted in a layout-driven `Border` whose own
+    /// `SizeChanged` drives the surface size.
+    ///
+    /// The split matters. `Image` is content-sized — it adopts its `Source`'s
+    /// natural size, so a not-yet-created (null) source has no width to report and
+    /// could never bootstrap a fill. The `Border` is layout-driven: it fills the
+    /// space its parent offers regardless of its child, so it reports the real
+    /// available size and the surface is created to match. This is exactly why
+    /// Win2D measures its `UserControl` host rather than the inner `Image`. Layout
+    /// size therefore tracks on the host; the user mount hook (pointer capture)
+    /// runs on the inner `Image`, where the drawn surface — and the pointer — live.
     pub fn element(&self) -> Element {
         let source = self.inner.source.borrow().clone();
-        let weak = Rc::downgrade(&self.inner);
-        Image::new(source.into())
+
+        // Inner Image: displays the surface and runs the user mount hook. Pointer
+        // capture belongs here, over the drawn surface. `Cell::take` lends no
+        // borrow, so the hook may freely re-enter the painter.
+        let mount_weak = Rc::downgrade(&self.inner);
+        let inner = Image::new(source.into())
             .stretch(Stretch::Fill)
             .on_mounted(move |handle| {
-                let Some(inner) = weak.upgrade() else {
+                if let Some(inner) = mount_weak.upgrade()
+                    && let Some(mounted) = inner.mounted.take()
+                {
+                    mounted(handle);
+                }
+            });
+
+        // Layout-driven host: its `SizeChanged` is the available size, which is
+        // what the surface is sized to.
+        let size_weak = Rc::downgrade(&self.inner);
+        Border::new(inner)
+            .on_mounted(move |handle| {
+                let Some(inner) = size_weak.upgrade() else {
                     return;
                 };
-                // Track the element's layout size to (re)size the surface.
                 if let Some(set_size) = inner.set_size.borrow().clone()
                     && let Ok(rev) = handle.on_size_changed(move |w, h| {
                         set_size.call((w.round().max(0.0) as u32, h.round().max(0.0) as u32));
                     })
                 {
                     *inner.size_revoker.borrow_mut() = Some(rev);
-                }
-                // Hand the same handle to the control's mount hook (pointer
-                // capture, etc.). `Cell::take` lends no borrow, so the hook may
-                // freely re-enter the painter (even call `on_mounted` again).
-                if let Some(mounted) = inner.mounted.take() {
-                    mounted(handle);
                 }
             })
             .into()
@@ -1049,16 +1084,16 @@ struct PainterConfig {
 /// painter.element() // place it in the render tree
 /// ```
 ///
-/// **The hosting [`element`](SurfacePainter::element) needs a non-zero size on
-/// every axis.** It is an `Image`, and until the first surface exists its `Source`
-/// is null, so it has *no intrinsic size*. On an axis the parent measures with an
-/// infinite constraint — a vertical `StackPanel`, an `Auto` grid track, a
-/// `ScrollViewer` — it collapses to zero, the surface is never created, and it
-/// stays blank. (This is ordinary XAML layout — a `Rectangle` collapses the same
-/// way, and it is the same constraint Win2D's `CanvasControl` has.) The lightest
-/// fix preserves stretching: set
-/// [`min_height`](windows_reactor::ElementExt::min_height) /
-/// [`min_width`](windows_reactor::ElementExt::min_width) on the returned element.
+/// The hosting [`element`](SurfacePainter::element) is a layout-driven `Border`
+/// wrapping the surface `Image` — the reactor port of how `CanvasControl` hosts
+/// its surface in a `UserControl` and measures *that*, not the inner `Image`. So
+/// it **fills the width** of a star `Grid` cell or a stretched parent natively,
+/// no size hint needed. Only an axis the parent leaves *open* still needs one: in
+/// a vertical `StackPanel` / `Auto` row the height has nothing to size to while
+/// the surface is empty, so give it a
+/// [`height`](windows_reactor::ElementExt::height) /
+/// [`min_height`](windows_reactor::ElementExt::min_height) — the same requirement
+/// `CanvasControl` has in a `StackPanel`.
 pub struct SurfacePainterBuilder<'a> {
     cx: &'a mut RenderCx,
     config: PainterConfig,
