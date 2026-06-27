@@ -215,6 +215,8 @@ impl VirtualSurfaceImageSource {
         let callback: IVirtualSurfaceUpdatesCallbackNative = UpdatesCallback {
             native: self.native.clone(),
             on_updates: Box::new(on_updates),
+            raw: core::cell::RefCell::new(Vec::new()),
+            rects: core::cell::RefCell::new(Vec::new()),
         }
         .into();
         unsafe { self.native.RegisterForUpdatesNeeded(callback.as_raw())? };
@@ -259,22 +261,121 @@ impl Drop for UpdatesRegistration {
 struct UpdatesCallback {
     native: IVirtualSurfaceImageSourceNative,
     on_updates: Box<dyn Fn(&[UpdateRect])>,
+    // Scratch buffers reused across callbacks so `UpdatesNeeded` allocates
+    // nothing in steady state; `cap_scratch` reclaims the excess after a one-off
+    // large batch so capacity stays bounded. Only ever touched on the UI thread,
+    // where the framework delivers the callback.
+    raw: core::cell::RefCell<Vec<bindings::RECT>>,
+    rects: core::cell::RefCell<Vec<UpdateRect>>,
 }
 
 implement_decl! {
     impl UpdatesCallback as UpdatesCallback_Impl: [IVirtualSurfaceUpdatesCallbackNative]
 }
 
+/// Headroom (in elements) retained on a reused scratch buffer above its last
+/// use, so the common small-batch case never reallocates.
+const SCRATCH_HEADROOM: usize = 32;
+
+/// Cap a reused scratch buffer's retained capacity so a one-off large update
+/// batch (e.g. panning a huge surface) doesn't pin memory for the registration's
+/// lifetime. Reclaims only when the capacity is more than double the working set
+/// plus headroom — and only down to that headroom — so steady state runs
+/// realloc-free (the test fails) and a spike costs a single reclaim afterwards.
+fn cap_scratch<T>(buf: &mut Vec<T>) {
+    let target = buf.len() + SCRATCH_HEADROOM;
+    if buf.capacity() > target * 2 {
+        buf.shrink_to(target);
+    }
+}
+
 impl IVirtualSurfaceUpdatesCallbackNative_Impl for UpdatesCallback_Impl {
     fn UpdatesNeeded(&self) -> Result<()> {
-        let count = unsafe { self.native.GetUpdateRectCount()? };
+        let count = unsafe { self.native.GetUpdateRectCount()? } as usize;
         if count == 0 {
             return Ok(());
         }
-        let mut raw = vec![bindings::RECT::default(); count as usize];
-        unsafe { self.native.GetUpdateRects(raw.as_mut_ptr(), count)? };
-        let rects: Vec<UpdateRect> = raw.into_iter().map(UpdateRect::from_abi).collect();
+        // Fill the reusable buffers (resize/extend reuse their capacity).
+        let mut rects = self.rects.borrow_mut();
+        rects.clear();
+        {
+            let mut raw = self.raw.borrow_mut();
+            raw.resize(count, bindings::RECT::default());
+            unsafe { self.native.GetUpdateRects(raw.as_mut_ptr(), count as u32)? };
+            rects.extend(raw.iter().map(|r| UpdateRect::from_abi(*r)));
+            cap_scratch(&mut raw);
+        }
         (self.on_updates)(&rects);
+        cap_scratch(&mut rects);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SCRATCH_HEADROOM, UpdateRect, bindings, cap_scratch};
+
+    #[test]
+    fn update_rect_roundtrips_through_abi() {
+        let r = UpdateRect {
+            x: 3,
+            y: 7,
+            width: 20,
+            height: 5,
+        };
+        let abi = r.to_abi();
+        // `UpdateRect` is x/y/width/height; the ABI `RECT` is left/top/right/bottom.
+        assert_eq!((abi.left, abi.top, abi.right, abi.bottom), (3, 7, 23, 12));
+        assert_eq!(UpdateRect::from_abi(abi), r);
+    }
+
+    #[test]
+    fn update_rect_from_abi_derives_width_and_height() {
+        let abi = bindings::RECT {
+            left: 10,
+            top: 20,
+            right: 35,
+            bottom: 26,
+        };
+        assert_eq!(
+            UpdateRect::from_abi(abi),
+            UpdateRect {
+                x: 10,
+                y: 20,
+                width: 25,
+                height: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn cap_scratch_preserves_steady_state_capacity() {
+        // A buffer whose capacity is close to its length is left alone — no realloc
+        // churn on the common small-batch path.
+        let mut v: Vec<u8> = Vec::with_capacity(SCRATCH_HEADROOM + 4);
+        v.resize(4, 0);
+        let before = v.capacity();
+        cap_scratch(&mut v);
+        assert_eq!(v.capacity(), before);
+    }
+
+    #[test]
+    fn cap_scratch_reclaims_after_a_spike() {
+        // One-off large batch then back to small: the excess capacity is released,
+        // but never below the live length or the retained headroom.
+        let mut v: Vec<u8> = Vec::with_capacity(10_000);
+        v.resize(4, 0);
+        cap_scratch(&mut v);
+        assert!(v.capacity() < 10_000, "excess reclaimed");
+        assert!(v.capacity() >= v.len(), "never below live length");
+        assert!(v.capacity() >= SCRATCH_HEADROOM, "headroom retained");
+    }
+
+    #[test]
+    fn cap_scratch_never_shrinks_below_length() {
+        let mut v: Vec<u8> = Vec::with_capacity(10_000);
+        v.resize(500, 0);
+        cap_scratch(&mut v);
+        assert!(v.capacity() >= 500);
     }
 }

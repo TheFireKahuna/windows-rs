@@ -3,6 +3,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use windows_reactor::*;
 
+/// How [`DrawContext::convert_dips_to_pixels`] rounds a fractional pixel result.
+/// Mirrors Win2D's `CanvasDpiRounding`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DpiRounding {
+    /// Round down to the nearest whole pixel.
+    Floor,
+    /// Round to the nearest whole pixel.
+    Round,
+    /// Round up to the nearest whole pixel.
+    Ceiling,
+}
+
 /// Per-frame draw context.
 pub struct DrawContext<'a> {
     session: DrawingSession<'a>,
@@ -11,6 +23,7 @@ pub struct DrawContext<'a> {
     pub width: f32,
     /// Height of the drawing surface, in device-independent pixels.
     pub height: f32,
+    dpi: f32,
     changed: bool,
     update: Rect,
 }
@@ -24,6 +37,7 @@ impl<'a> DrawContext<'a> {
         device: &'a GpuDevice,
         width: f32,
         height: f32,
+        dpi: f32,
         changed: bool,
         update: Rect,
     ) -> Self {
@@ -32,6 +46,7 @@ impl<'a> DrawContext<'a> {
             device,
             width,
             height,
+            dpi,
             changed,
             update,
         }
@@ -40,6 +55,30 @@ impl<'a> DrawContext<'a> {
     /// Returns the GPU device backing this context.
     pub fn device(&self) -> &GpuDevice {
         self.device
+    }
+
+    /// The dots-per-inch the surface renders at (96 = 100%). Mirrors
+    /// `CanvasControl.Dpi`.
+    pub fn dpi(&self) -> f32 {
+        self.dpi
+    }
+
+    /// Converts a length in device-independent pixels (DIPs) to physical pixels
+    /// at this context's DPI, rounded per `rounding`. Mirrors
+    /// `CanvasControl.ConvertDipsToPixels`.
+    pub fn convert_dips_to_pixels(&self, dips: f32, rounding: DpiRounding) -> f32 {
+        let px = dips * self.dpi / 96.0;
+        match rounding {
+            DpiRounding::Floor => px.floor(),
+            DpiRounding::Round => px.round(),
+            DpiRounding::Ceiling => px.ceil(),
+        }
+    }
+
+    /// Converts a length in physical pixels to device-independent pixels (DIPs)
+    /// at this context's DPI. Mirrors `CanvasControl.ConvertPixelsToDips`.
+    pub fn convert_pixels_to_dips(&self, pixels: f32) -> f32 {
+        pixels * 96.0 / self.dpi
     }
 
     /// Returns `true` on the first frame after device loss or resize.
@@ -81,6 +120,27 @@ struct RenderState {
 /// (a swap chain must be at least 1x1).
 fn surface_pixels(dip: f32, scale: f32) -> u32 {
     ((dip * scale) as u32).max(1)
+}
+
+/// Debug-build warning for the one collapse the layout-driven host can't solve:
+/// the host fills the axes its parent *constrains*, but an axis the parent leaves
+/// open (a vertical `StackPanel`'s height, an `Auto` grid track, a `ScrollViewer`)
+/// has nothing to size to while the inner `Image` is empty, so it collapses to
+/// zero (e.g. `400x0`) and nothing is drawn. This is the same requirement Win2D's
+/// `CanvasControl` has — give it a size on the open axis. `0x0` is the normal
+/// pre-layout state and is not reported. Compiles to nothing in release.
+fn warn_if_collapsed(_what: &str, _w: u32, _h: u32) {
+    #[cfg(debug_assertions)]
+    if (_w == 0) != (_h == 0) {
+        eprintln!(
+            "windows-canvas: {_what} laid out at {_w}x{_h}: the host fills the axes \
+             its parent constrains, but an axis the parent leaves open (a vertical \
+             StackPanel's height, an Auto grid track, a ScrollViewer) collapses to \
+             zero. Set `.height(..)`/`.min_height(..)` (or `.width(..)`/`.min_width(..)`) \
+             on the returned element, or place it in a *-sized grid track. (Win2D's \
+             CanvasControl needs the same in a StackPanel.)"
+        );
+    }
 }
 
 impl RenderState {
@@ -185,6 +245,7 @@ pub fn animated_canvas(draw: impl Fn(&DrawContext<'_>) + 'static) -> SwapChainPa
                         device: &rs.device,
                         width: w,
                         height: h,
+                        dpi: 96.0 * rs.scale,
                         changed: render_changed.replace(false),
                         update: Rect::from_xywh(0.0, 0.0, w, h),
                     };
@@ -232,18 +293,24 @@ pub fn animated_canvas(draw: impl Fn(&DrawContext<'_>) + 'static) -> SwapChainPa
 /// Create an `Image` element backed by a [`SurfaceImage`] that is drawn with
 /// `draw` and kept correctly sized and DPI-crisp automatically.
 ///
-/// Call this from a render function: it tracks the element's layout size (via
+/// Call this from a render function: it tracks the host's layout size (via
 /// `on_size_changed`) and the window DPI (via [`RenderCx::use_dpi`]), and
 /// rebuilds and redraws the surface whenever either changes or the device is
-/// lost. The surface is allocated at the element's pixel size and stretched to
+/// lost. The surface is allocated at the host's pixel size and stretched to
 /// fill it, so it stays sharp at any scale.
+///
+/// The returned element is a layout-driven `Border` host wrapping the `Image`
+/// (the reactor port of how Win2D's `CanvasControl` hosts its surface in a
+/// `UserControl`), so it **fills the width** of a star `Grid` cell or a stretched
+/// parent natively. Only an axis the parent leaves *open* needs a hint: in a
+/// vertical `StackPanel` / `Auto` row give it a [`height`](windows_reactor::ElementExt::height)
+/// (or [`min_height`](windows_reactor::ElementExt::min_height)) — the same
+/// requirement `CanvasControl` has in a `StackPanel`.
 ///
 /// `draw` is called once per (re)build — suited to static or event-driven
 /// content (the `SurfaceImageSource` model). For per-frame animation use
 /// [`animated_canvas`]; for content larger than the screen use
-/// [`virtual_surface_image`]. Place the returned element in a container that
-/// gives it bounds (a star `Grid` cell, a stretched parent, …) so it receives a
-/// non-zero size.
+/// [`virtual_surface_image`].
 pub fn surface_image(cx: &mut RenderCx, draw: impl Fn(&DrawContext) + 'static) -> Element {
     let dpi = cx.use_dpi() as f32;
     let (size, set_size) = cx.use_state::<(u32, u32)>((0, 0));
@@ -256,6 +323,7 @@ pub fn surface_image(cx: &mut RenderCx, draw: impl Fn(&DrawContext) + 'static) -
 
     cx.use_effect((dpi.to_bits(), size, generation), move || {
         if w == 0 || h == 0 {
+            warn_if_collapsed("surface_image", w, h);
             set_source.call(None);
             return;
         }
@@ -286,8 +354,16 @@ pub fn surface_image(cx: &mut RenderCx, draw: impl Fn(&DrawContext) + 'static) -
         }
     });
 
-    Image::new(source.into())
-        .stretch(Stretch::Fill)
+    // Faithful port of Win2D's `CanvasControl`: an inner `Image` (Stretch::Fill)
+    // that only *displays* the surface, hosted in a layout-driven `Border` whose
+    // own `SizeChanged` drives the surface size. `Image` is content-sized — it
+    // adopts its `Source`'s natural size, so a null/not-yet-created source has no
+    // width to report and could never bootstrap. The `Border` is layout-driven:
+    // it fills the space its parent offers regardless of its child, so it reports
+    // the real available size and the surface is created to match. (Win2D
+    // measures its `UserControl` host for the same reason, not the inner `Image`.)
+    let inner = Image::new(source.into()).stretch(Stretch::Fill);
+    Border::new(inner)
         .on_mounted(move |handle| {
             let set_size = set_size.clone();
             if let Ok(rev) = handle.on_size_changed(move |w, h| {
@@ -356,3 +432,13 @@ pub fn virtual_surface_image(
 
     Image::new(source.into()).stretch(Stretch::Fill).into()
 }
+
+mod builder;
+mod device;
+mod painter;
+
+pub use builder::{
+    CreateReason, ResourceCx, ResourcePainterBuilder, SurfacePainterBuilder, surface_painter,
+};
+pub use device::DeviceSource;
+pub use painter::{FrameTiming, PumpHold, Step, SurfacePainter};

@@ -5,6 +5,7 @@
 
 use windows_reactor::*;
 
+mod canvas_spring;
 mod canvas_surface;
 mod canvas_virtual;
 mod device;

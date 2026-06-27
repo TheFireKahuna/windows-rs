@@ -6,6 +6,7 @@
 //! recovery signal) through the [`Gpu`](crate::device::Gpu) context, so every
 //! sample renders with the same device.
 
+use crate::canvas_spring::canvas_spring_sample;
 use crate::canvas_surface::canvas_surface_sample;
 use crate::canvas_virtual::canvas_virtual_sample;
 use crate::device::{Device, Gpu, gpu_context};
@@ -55,12 +56,16 @@ pub fn shell(cx: &mut RenderCx) -> Element {
         NavViewItem::new("Canvas Virtual Surface")
             .tag("canvas-virtual")
             .icon(Symbol::ViewAll),
+        NavViewItem::new("Canvas Spring (painter)")
+            .tag("canvas-spring")
+            .icon(Symbol::Refresh),
     ];
 
     let content: Element = match selected_tag.as_str() {
         "surface-image-source" => component(surface_image_source_sample, ()),
         "canvas-surface" => component(canvas_surface_sample, ()),
         "canvas-virtual" => component(canvas_virtual_sample, ()),
+        "canvas-spring" => component(canvas_spring_sample, ()),
         _ => component(swap_chain_sample, ()),
     };
 
