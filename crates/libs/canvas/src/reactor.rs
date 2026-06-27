@@ -12,9 +12,31 @@ pub struct DrawContext<'a> {
     /// Height of the drawing surface, in device-independent pixels.
     pub height: f32,
     changed: bool,
+    update: Rect,
 }
 
 impl<'a> DrawContext<'a> {
+    /// Builds a context over a session whose bracket is owned elsewhere (a
+    /// [`SurfaceImage`]/[`VirtualSurfaceImage`] update). `update` is the region
+    /// being (re)drawn, in DIPs, in surface-local coordinates.
+    pub(crate) fn new(
+        session: DrawingSession<'a>,
+        device: &'a GpuDevice,
+        width: f32,
+        height: f32,
+        changed: bool,
+        update: Rect,
+    ) -> Self {
+        Self {
+            session,
+            device,
+            width,
+            height,
+            changed,
+            update,
+        }
+    }
+
     /// Returns the GPU device backing this context.
     pub fn device(&self) -> &GpuDevice {
         self.device
@@ -23,6 +45,14 @@ impl<'a> DrawContext<'a> {
     /// Returns `true` on the first frame after device loss or resize.
     pub fn device_changed(&self) -> bool {
         self.changed
+    }
+
+    /// The region being (re)drawn this call, in DIPs (surface-local
+    /// coordinates). For a full redraw this is the whole surface; for a
+    /// dirty-rect update it is just the changed rectangle. Drawing outside it has
+    /// no effect, so callers can clip work to it for performance.
+    pub fn update_rect(&self) -> Rect {
+        self.update
     }
 
     /// Clears the surface to the given color.
@@ -156,6 +186,7 @@ pub fn animated_canvas(draw: impl Fn(&DrawContext<'_>) + 'static) -> SwapChainPa
                         width: w,
                         height: h,
                         changed: render_changed.replace(false),
+                        update: Rect::from_xywh(0.0, 0.0, w, h),
                     };
                     render_draw(&ctx);
                     drop(ctx);
@@ -196,4 +227,132 @@ pub fn animated_canvas(draw: impl Fn(&DrawContext<'_>) + 'static) -> SwapChainPa
                 changed.set(true);
             }
         })
+}
+
+/// Create an `Image` element backed by a [`SurfaceImage`] that is drawn with
+/// `draw` and kept correctly sized and DPI-crisp automatically.
+///
+/// Call this from a render function: it tracks the element's layout size (via
+/// `on_size_changed`) and the window DPI (via [`RenderCx::use_dpi`]), and
+/// rebuilds and redraws the surface whenever either changes or the device is
+/// lost. The surface is allocated at the element's pixel size and stretched to
+/// fill it, so it stays sharp at any scale.
+///
+/// `draw` is called once per (re)build — suited to static or event-driven
+/// content (the `SurfaceImageSource` model). For per-frame animation use
+/// [`animated_canvas`]; for content larger than the screen use
+/// [`virtual_surface_image`]. Place the returned element in a container that
+/// gives it bounds (a star `Grid` cell, a stretched parent, …) so it receives a
+/// non-zero size.
+pub fn surface_image(cx: &mut RenderCx, draw: impl Fn(&DrawContext) + 'static) -> Element {
+    let dpi = cx.use_dpi() as f32;
+    let (size, set_size) = cx.use_state::<(u32, u32)>((0, 0));
+    let (generation, set_generation) = cx.use_state::<u32>(0);
+    let (source, set_source) = cx.use_state::<Option<SurfaceImageSource>>(None);
+    let device_ref = cx.use_ref::<Option<GpuDevice>>(None);
+    let revoker = cx.use_ref::<Option<EventRevoker>>(None);
+    let draw = Rc::new(draw);
+    let (w, h) = size;
+
+    cx.use_effect((dpi.to_bits(), size, generation), move || {
+        if w == 0 || h == 0 {
+            set_source.call(None);
+            return;
+        }
+        // Reuse the device across resizes; only recreate it after a loss.
+        let device = {
+            let mut slot = device_ref.borrow_mut();
+            if slot.is_none() {
+                *slot = GpuDevice::new_or_warp().ok();
+            }
+            slot.clone()
+        };
+        let Some(device) = device else {
+            set_source.call(None);
+            return;
+        };
+        let Ok(image) = SurfaceImage::new(&device, w as f32, h as f32, dpi) else {
+            set_source.call(None);
+            return;
+        };
+        match image.draw_all(|ctx| draw(ctx)) {
+            Ok(()) => set_source.call(Some(image.surface())),
+            Err(e) if is_device_lost(e.code()) => {
+                // Drop the lost device and retry with a fresh one.
+                *device_ref.borrow_mut() = None;
+                set_generation.call(generation.wrapping_add(1));
+            }
+            Err(_) => set_source.call(None),
+        }
+    });
+
+    Image::new(source.into())
+        .stretch(Stretch::Fill)
+        .on_mounted(move |handle| {
+            let set_size = set_size.clone();
+            if let Ok(rev) = handle.on_size_changed(move |w, h| {
+                set_size.call((w.round().max(0.0) as u32, h.round().max(0.0) as u32));
+            }) {
+                revoker.set(Some(rev));
+            }
+        })
+        .into()
+}
+
+/// Create an `Image` element backed by a [`VirtualSurfaceImage`] of the given
+/// content size (DIPs), drawn with `draw`.
+///
+/// The framework virtualizes the surface: `draw` is called for each region as it
+/// becomes visible (place the element in a `ScrollViewer` to pan a large canvas).
+/// DPI is tracked via [`RenderCx::use_dpi`], and the surface is rebuilt when the
+/// DPI or content size changes. The draw handler receives a [`DrawContext`] whose
+/// [`update_rect`](DrawContext::update_rect) is the region to paint.
+pub fn virtual_surface_image(
+    cx: &mut RenderCx,
+    content_width: f32,
+    content_height: f32,
+    draw: impl Fn(&DrawContext) + 'static,
+) -> Element {
+    let dpi = cx.use_dpi() as f32;
+    let (source, set_source) = cx.use_state::<Option<VirtualSurfaceImageSource>>(None);
+    // Holds the live `VirtualSurfaceImage` so its update registration stays
+    // registered; dropping it (on rebuild or unmount) unregisters.
+    let surface_ref = cx.use_ref::<Option<VirtualSurfaceImage>>(None);
+    let device_ref = cx.use_ref::<Option<GpuDevice>>(None);
+    let draw = Rc::new(draw);
+
+    cx.use_effect(
+        (
+            dpi.to_bits(),
+            content_width.to_bits(),
+            content_height.to_bits(),
+        ),
+        move || {
+            let device = {
+                let mut slot = device_ref.borrow_mut();
+                if slot.is_none() {
+                    *slot = GpuDevice::new_or_warp().ok();
+                }
+                slot.clone()
+            };
+            let Some(device) = device else {
+                set_source.call(None);
+                return;
+            };
+            let Ok(image) = VirtualSurfaceImage::new(&device, content_width, content_height, dpi)
+            else {
+                set_source.call(None);
+                return;
+            };
+            if image.on_draw(move |ctx| draw(ctx)).is_err() {
+                set_source.call(None);
+                return;
+            }
+            set_source.call(Some(image.surface()));
+            // Keep the image (and its registration) alive across renders.
+            surface_ref.set(Some(image));
+        },
+    );
+
+    Image::new(source.into()).stretch(Stretch::Fill).into()
 }

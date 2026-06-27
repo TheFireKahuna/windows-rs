@@ -5,6 +5,8 @@
 
 use windows_reactor::*;
 
+mod canvas_surface;
+mod canvas_virtual;
 mod device;
 mod shell;
 mod surface_image_source;

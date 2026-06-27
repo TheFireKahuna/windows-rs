@@ -22,6 +22,39 @@ mod extras {
         fn ResumeDraw(&self) -> HRESULT;
     }
 
+    // VirtualSurfaceImageSource interop (Microsoft.UI.Xaml WinUI 3 variant).
+    //
+    // `IVirtualSurfaceImageSourceNative` inherits `ISurfaceImageSourceNative`, so
+    // the latter must be declared to lay out the vtable correctly; drawing itself
+    // still goes through `ISurfaceImageSourceNativeWithD2D` (cast from the same
+    // object), exactly as for the non-virtual surface.
+    //
+    // GUIDs are the WinUI 3 (microsoft.ui.xaml.media.dxinterop.h) IIDs, which
+    // differ from the system (windows.ui.xaml) ones — just as
+    // `ISurfaceImageSourceNativeWithD2D` above is `cb833102…` (WinUI 3), not the
+    // system `54298223…`.
+    #[guid(0xe4cecd6c_f14b_4f46_83c3_8bbda27c6504)]
+    interface ISurfaceImageSourceNative : Windows::Win32::System::Com::IUnknown {
+        fn SetDevice(&self, device: *mut void) -> HRESULT;
+        fn BeginDraw(&self, updateRect: Windows::Win32::Foundation::RECT, surface: *mut *mut void, offset: *mut Windows::Win32::Foundation::POINT) -> HRESULT;
+        fn EndDraw(&self) -> HRESULT;
+    }
+
+    #[guid(0x9e43c18e_7816_474c_840f_5c9c8b0e2207)]
+    interface IVirtualSurfaceImageSourceNative : ISurfaceImageSourceNative {
+        fn Invalidate(&self, updateRect: Windows::Win32::Foundation::RECT) -> HRESULT;
+        fn GetUpdateRectCount(&self, count: *mut u32) -> HRESULT;
+        fn GetUpdateRects(&self, updates: *mut Windows::Win32::Foundation::RECT, count: u32) -> HRESULT;
+        fn GetVisibleBounds(&self, bounds: *mut Windows::Win32::Foundation::RECT) -> HRESULT;
+        fn RegisterForUpdatesNeeded(&self, callback: *mut void) -> HRESULT;
+        fn Resize(&self, newWidth: i32, newHeight: i32) -> HRESULT;
+    }
+
+    #[guid(0xe8e84ac7_b7b8_40f4_b033_f877a756c52b)]
+    interface IVirtualSurfaceUpdatesCallbackNative : Windows::Win32::System::Com::IUnknown {
+        fn UpdatesNeeded(&self) -> HRESULT;
+    }
+
     // Sourced from Microsoft.WindowsAppSDK.Runtime 2.0.1
 
     #[library("Microsoft.WindowsAppRuntime.Bootstrap.dll")]

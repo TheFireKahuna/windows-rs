@@ -11,7 +11,7 @@ use super::*;
 #[derive(Clone, Debug)]
 pub struct SurfaceImageSource {
     // Cast to `ImageSource` and applied as the native `Image.Source`.
-    pub source: bindings::SurfaceImageSource,
+    source: bindings::SurfaceImageSource,
     native: bindings::ISurfaceImageSourceNativeWithD2D,
     // `Some` only when [`set_device`](Self::set_device) is given a device backed
     // by a *multi-threaded* Direct2D factory. It lets the DXGI-touching native
@@ -61,6 +61,24 @@ impl SurfaceImageSource {
         let source = bindings::SurfaceImageSource::CreateInstanceWithDimensions(
             pixel_width,
             pixel_height,
+        )?;
+        let native = source.cast()?;
+        Ok(Self {
+            source,
+            native,
+            multithread: core::cell::RefCell::new(None),
+        })
+    }
+
+    /// Create an **opaque** `SurfaceImageSource` of the given pixel size. An
+    /// opaque surface has no alpha channel, so the compositor skips per-pixel
+    /// alpha blending when drawing it — cheaper than [`new`](Self::new) when the
+    /// content fully covers its bounds (you must clear every pixel each frame).
+    pub fn new_opaque(pixel_width: i32, pixel_height: i32) -> Result<Self> {
+        let source = bindings::SurfaceImageSource::CreateInstanceWithDimensionsAndOpacity(
+            pixel_width,
+            pixel_height,
+            true,
         )?;
         let native = source.cast()?;
         Ok(Self {
@@ -151,7 +169,7 @@ impl SurfaceImageSource {
 
     /// Cast the underlying source to the `ImageSource` the backend assigns to
     /// `Image.Source`.
-    pub fn image_source(&self) -> Result<bindings::ImageSource> {
+    pub(crate) fn image_source(&self) -> Result<bindings::ImageSource> {
         self.source.cast()
     }
 }

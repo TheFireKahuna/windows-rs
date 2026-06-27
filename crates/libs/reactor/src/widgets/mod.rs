@@ -79,6 +79,7 @@ widget_modules! {
     stack_panel,
     surface_image_source,
     swap_chain_panel,
+    virtual_surface_image_source,
     tab_view,
     teaching_tip,
     text_block,
