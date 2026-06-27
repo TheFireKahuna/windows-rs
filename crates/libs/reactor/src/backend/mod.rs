@@ -276,6 +276,7 @@ pub enum PropValue {
     Unset,
     GridLengths(Vec<GridLength>),
     SurfaceImageSource(SurfaceImageSource),
+    VirtualSurfaceImageSource(VirtualSurfaceImageSource),
     LineEndpoints(LineEndpoints),
     NavMenuItems(Vec<NavViewItem>),
     StrList(Vec<String>),

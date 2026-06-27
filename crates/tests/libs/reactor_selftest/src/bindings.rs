@@ -17040,7 +17040,31 @@ pub struct ISurfaceImageSourceFactory_Vtbl {
         *mut *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
+    pub CreateInstanceWithDimensionsAndOpacity: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        i32,
+        bool,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    )
+        -> windows_core::HRESULT,
 }
+windows_core::imp::define_interface!(
+    ISurfaceImageSourceNative,
+    ISurfaceImageSourceNative_Vtbl,
+    0xe4cecd6c_f14b_4f46_83c3_8bbda27c6504
+);
+windows_core::imp::interface_hierarchy!(ISurfaceImageSourceNative, windows_core::IUnknown);
+#[repr(C)]
+pub struct ISurfaceImageSourceNative_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    SetDevice: usize,
+    BeginDraw: usize,
+    EndDraw: usize,
+}
+impl windows_core::RuntimeName for ISurfaceImageSourceNative {}
 windows_core::imp::define_interface!(
     ISurfaceImageSourceNativeWithD2D,
     ISurfaceImageSourceNativeWithD2D_Vtbl,
@@ -20517,6 +20541,155 @@ pub struct IViewbox_Vtbl {
     pub SetStretch:
         unsafe extern "system" fn(*mut core::ffi::c_void, Stretch) -> windows_core::HRESULT,
 }
+windows_core::imp::define_interface!(
+    IVirtualSurfaceImageSource,
+    IVirtualSurfaceImageSource_Vtbl,
+    0xe4ff96a6_fede_589c_a007_4178b53b6739
+);
+impl windows_core::RuntimeType for IVirtualSurfaceImageSource {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IVirtualSurfaceImageSource_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    IVirtualSurfaceImageSourceFactory,
+    IVirtualSurfaceImageSourceFactory_Vtbl,
+    0x08490f2c_04a8_5031_b9c7_707060d7cd48
+);
+impl windows_core::RuntimeType for IVirtualSurfaceImageSourceFactory {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IVirtualSurfaceImageSourceFactory_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub CreateInstanceWithDimensions: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        i32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IVirtualSurfaceImageSourceNative,
+    IVirtualSurfaceImageSourceNative_Vtbl,
+    0x9e43c18e_7816_474c_840f_5c9c8b0e2207
+);
+impl core::ops::Deref for IVirtualSurfaceImageSourceNative {
+    type Target = ISurfaceImageSourceNative;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IVirtualSurfaceImageSourceNative,
+    windows_core::IUnknown,
+    ISurfaceImageSourceNative
+);
+impl IVirtualSurfaceImageSourceNative {
+    pub(crate) unsafe fn Invalidate(&self, updaterect: RECT) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).Invalidate)(
+                windows_core::Interface::as_raw(self),
+                updaterect,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn GetUpdateRectCount(&self) -> windows_core::Result<u32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetUpdateRectCount)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetUpdateRects(
+        &self,
+        updates: *mut RECT,
+        count: u32,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetUpdateRects)(
+                windows_core::Interface::as_raw(self),
+                updates as _,
+                count,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn GetVisibleBounds(&self) -> windows_core::Result<RECT> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetVisibleBounds)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn RegisterForUpdatesNeeded(
+        &self,
+        callback: *mut core::ffi::c_void,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).RegisterForUpdatesNeeded)(
+                windows_core::Interface::as_raw(self),
+                callback as _,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn Resize(&self, newwidth: i32, newheight: i32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).Resize)(
+                windows_core::Interface::as_raw(self),
+                newwidth,
+                newheight,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct IVirtualSurfaceImageSourceNative_Vtbl {
+    pub base__: ISurfaceImageSourceNative_Vtbl,
+    pub Invalidate:
+        unsafe extern "system" fn(*mut core::ffi::c_void, RECT) -> windows_core::HRESULT,
+    pub GetUpdateRectCount:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+    pub GetUpdateRects:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut RECT, u32) -> windows_core::HRESULT,
+    pub GetVisibleBounds:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut RECT) -> windows_core::HRESULT,
+    pub RegisterForUpdatesNeeded: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub Resize:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i32, i32) -> windows_core::HRESULT,
+}
+impl windows_core::RuntimeName for IVirtualSurfaceImageSourceNative {}
+windows_core::imp::define_interface!(
+    IVirtualSurfaceUpdatesCallbackNative,
+    IVirtualSurfaceUpdatesCallbackNative_Vtbl,
+    0xe8e84ac7_b7b8_40f4_b033_f877a756c52b
+);
+windows_core::imp::interface_hierarchy!(
+    IVirtualSurfaceUpdatesCallbackNative,
+    windows_core::IUnknown
+);
+#[repr(C)]
+pub struct IVirtualSurfaceUpdatesCallbackNative_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    UpdatesNeeded: usize,
+}
+impl windows_core::RuntimeName for IVirtualSurfaceUpdatesCallbackNative {}
 windows_core::imp::define_interface!(
     IVisual,
     IVisual_Vtbl,
@@ -25958,6 +26131,25 @@ impl SurfaceImageSource {
             .and_then(|| windows_core::Type::from_abi(result__))
         })
     }
+    pub(crate) fn CreateInstanceWithDimensionsAndOpacity(
+        pixelwidth: i32,
+        pixelheight: i32,
+        isopaque: bool,
+    ) -> windows_core::Result<Self> {
+        Self::ISurfaceImageSourceFactory(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).CreateInstanceWithDimensionsAndOpacity)(
+                windows_core::Interface::as_raw(this),
+                pixelwidth,
+                pixelheight,
+                isopaque,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
     fn ISurfaceImageSourceFactory<
         R,
         F: FnOnce(&ISurfaceImageSourceFactory) -> windows_core::Result<R>,
@@ -28155,6 +28347,68 @@ impl core::ops::Not for VirtualKeyModifiers {
         Self(self.0.not())
     }
 }
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualSurfaceImageSource(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    VirtualSurfaceImageSource,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    VirtualSurfaceImageSource,
+    SurfaceImageSource,
+    ImageSource,
+    DependencyObject
+);
+impl VirtualSurfaceImageSource {
+    pub(crate) fn CreateInstanceWithDimensions(
+        pixelwidth: i32,
+        pixelheight: i32,
+    ) -> windows_core::Result<Self> {
+        Self::IVirtualSurfaceImageSourceFactory(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).CreateInstanceWithDimensions)(
+                windows_core::Interface::as_raw(this),
+                pixelwidth,
+                pixelheight,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    fn IVirtualSurfaceImageSourceFactory<
+        R,
+        F: FnOnce(&IVirtualSurfaceImageSourceFactory) -> windows_core::Result<R>,
+    >(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<
+            VirtualSurfaceImageSource,
+            IVirtualSurfaceImageSourceFactory,
+        > = windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
+impl windows_core::RuntimeType for VirtualSurfaceImageSource {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IVirtualSurfaceImageSource>();
+}
+unsafe impl windows_core::Interface for VirtualSurfaceImageSource {
+    type Vtable = <IVirtualSurfaceImageSource as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IVirtualSurfaceImageSource as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for VirtualSurfaceImageSource {
+    type Target = IVirtualSurfaceImageSource;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for VirtualSurfaceImageSource {
+    const NAME: &'static str = "Microsoft.UI.Xaml.Media.Imaging.VirtualSurfaceImageSource";
+}
+unsafe impl Send for VirtualSurfaceImageSource {}
+unsafe impl Sync for VirtualSurfaceImageSource {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Visual(windows_core::IUnknown);

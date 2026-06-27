@@ -4,6 +4,12 @@ use super::*;
 pub struct DrawingSession<'a> {
     context: &'a ID2D1DeviceContext,
     device_lost_flag: &'a Cell<bool>,
+    // Whether this session owns the Direct2D `BeginDraw`/`EndDraw` bracket. A
+    // swap-chain session does (it brackets the frame itself); a session adopted
+    // over a `SurfaceImageSource` does not, because that surface's native
+    // `BeginDraw`/`EndDraw` already opens and closes the draw — issuing a nested
+    // Direct2D `BeginDraw` there is `D2DERR_WRONG_STATE`.
+    owns_bracket: bool,
 }
 
 impl<'a> DrawingSession<'a> {
@@ -15,7 +21,25 @@ impl<'a> DrawingSession<'a> {
         Ok(Self {
             context,
             device_lost_flag,
+            owns_bracket: true,
         })
+    }
+
+    /// Adopt a context that is *already* in a draw (its `BeginDraw`/`EndDraw`
+    /// bracket is owned elsewhere — e.g. a `SurfaceImageSource`'s native
+    /// `BeginDraw`). This session issues no `BeginDraw` and no `EndDraw`; the
+    /// owner is responsible for ending the draw and for observing device-loss
+    /// from that call. Only the reactor-feature surface bridges adopt sessions.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn new_borrowed(
+        context: &'a ID2D1DeviceContext,
+        device_lost_flag: &'a Cell<bool>,
+    ) -> Self {
+        Self {
+            context,
+            device_lost_flag,
+            owns_bracket: false,
+        }
     }
 
     /// Clears the entire session to the given color.
@@ -381,6 +405,12 @@ impl<'a> DrawingSession<'a> {
 
 impl Drop for DrawingSession<'_> {
     fn drop(&mut self) {
+        // A borrowed session does not own the bracket: the `SurfaceImageSource`
+        // that opened the draw is responsible for `EndDraw` and for reporting
+        // device-loss from it.
+        if !self.owns_bracket {
+            return;
+        }
         unsafe {
             let result = self.context.EndDraw(None, None);
             if let Err(e) = &result
