@@ -83,7 +83,7 @@ impl SurfaceImage {
 
     /// Redraw the whole surface.
     pub fn draw_all(&self, f: impl FnOnce(&DrawContext)) -> Result<()> {
-        self.draw(Rect::from_xywh(0.0, 0.0, self.width, self.height), f)
+        self.draw_region(None, false, f)
     }
 
     /// Redraw a single dirty rectangle (in DIPs, surface-local). Only those
@@ -91,6 +91,20 @@ impl SurfaceImage {
     /// change. The closure draws in surface-local DIP coordinates; use
     /// [`DrawContext::update_rect`] to clip work to the dirty region.
     pub fn draw(&self, rect: Rect, f: impl FnOnce(&DrawContext)) -> Result<()> {
+        self.draw_region(Some(rect), false, f)
+    }
+
+    /// Core draw. `region` is the dirty rectangle (DIPs, surface-local) or `None`
+    /// for the whole surface; `changed` is forwarded to
+    /// [`DrawContext::device_changed`] so a caller can rebuild device-specific
+    /// resources on the first frame after the surface was (re)created.
+    pub(crate) fn draw_region(
+        &self,
+        region: Option<Rect>,
+        changed: bool,
+        f: impl FnOnce(&DrawContext),
+    ) -> Result<()> {
+        let rect = region.unwrap_or_else(|| Rect::from_xywh(0.0, 0.0, self.width, self.height));
         let scale = self.dpi / 96.0;
         let (px, py, pw, ph) = dip_rect_to_pixels(rect, self.width, self.height, self.dpi);
 
@@ -113,7 +127,15 @@ impl SurfaceImage {
         {
             let session = DrawingSession::new_borrowed(&context, &self.device_lost);
             session.set_transform(&Matrix3x2::translation(tx, ty));
-            let ctx = DrawContext::new(session, &self.device, self.width, self.height, false, rect);
+            let ctx = DrawContext::new(
+                session,
+                &self.device,
+                self.width,
+                self.height,
+                self.dpi,
+                changed,
+                rect,
+            );
             f(&ctx);
         }
 

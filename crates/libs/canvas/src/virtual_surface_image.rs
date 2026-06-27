@@ -196,6 +196,7 @@ impl Inner {
                 &self.device,
                 self.content_width.get(),
                 self.content_height.get(),
+                dpi,
                 false,
                 update,
             );
