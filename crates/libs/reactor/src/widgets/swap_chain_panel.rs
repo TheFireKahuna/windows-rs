@@ -59,11 +59,60 @@ impl SwapChainPanelHandle {
     /// revoked on `Drop`. Coordinates in every [`PointerEventInfo`] are
     /// element-relative DIPs.
     pub fn pointer_surface(&self) -> Result<PointerSurface> {
-        let element: bindings::UIElement = self.0.cast()?;
-        Ok(PointerSurface {
-            element,
-            captured: Rc::new(RefCell::new(None)),
-            revokers: RefCell::new(Vec::new()),
+        open_pointer_surface(&self.0)
+    }
+}
+
+/// Open a capture-capable [`PointerSurface`] over any mounted native
+/// `UIElement`. Shared by [`SwapChainPanelHandle::pointer_surface`] and
+/// [`ElementHandle::pointer_surface`].
+fn open_pointer_surface(native: &windows_core::IInspectable) -> Result<PointerSurface> {
+    let element: bindings::UIElement = native.cast()?;
+    Ok(PointerSurface {
+        element,
+        captured: Rc::new(RefCell::new(None)),
+        revokers: RefCell::new(Vec::new()),
+    })
+}
+
+/// Opaque handle to a mounted native `UIElement`, handed to a widget's
+/// `on_mounted` callback (e.g. [`Image::on_mounted`](crate::Image::on_mounted)).
+///
+/// Unlike [`SwapChainPanelHandle`] it carries no swap-chain plumbing — its sole
+/// purpose is to expose the imperative, capture-capable
+/// [`PointerSurface`](Self::pointer_surface) over the element. That is what a
+/// custom-drawn control hosted in an `Image` / `SurfaceImageSource` needs so a
+/// knob / slider / node drag keeps tracking after the pointer leaves the element
+/// bounds — the declarative [`on_pointer_moved`](crate::ElementExt::on_pointer_moved)
+/// modifier cannot capture.
+#[derive(Clone)]
+pub struct ElementHandle(pub(crate) windows_core::IInspectable);
+
+impl ElementHandle {
+    /// Open a live [`PointerSurface`] over this element's native `UIElement`.
+    /// See [`SwapChainPanelHandle::pointer_surface`] for the capture semantics.
+    pub fn pointer_surface(&self) -> Result<PointerSurface> {
+        open_pointer_surface(&self.0)
+    }
+
+    /// Subscribe `SizeChanged` on this element; the callback receives the new
+    /// `(width, height)` in DIPs and also fires once after the first layout
+    /// pass. Returns the [`EventRevoker`](windows_core::EventRevoker) — **store
+    /// it** (e.g. in a `use_ref`, alongside the [`PointerSurface`]); the
+    /// subscription is revoked when the revoker drops (on unmount), so nothing
+    /// leaks. Use it to recreate a fixed-size [`SurfaceImageSource`] at the new
+    /// size so it stays crisp.
+    pub fn on_size_changed(
+        &self,
+        f: impl Fn(f64, f64) + 'static,
+    ) -> Result<windows_core::EventRevoker> {
+        let fe: bindings::IFrameworkElement = self.0.cast()?;
+        fe.SizeChanged(move |_sender, args| {
+            if let Some(args) = args.as_ref()
+                && let Ok(s) = args.NewSize()
+            {
+                f(s.width as f64, s.height as f64);
+            }
         })
     }
 }
