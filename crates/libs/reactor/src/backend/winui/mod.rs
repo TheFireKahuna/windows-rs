@@ -387,6 +387,11 @@ fn classify_container(h: &Handle) -> Option<ContainerChildren<'_>> {
             r.cast::<bindings::IPanel>().ok()?.Children().ok()?,
         )),
         Handle::Border(_) | Handle::Viewbox(_) => Some(ContainerChildren::SingleChild(h)),
+        // A Button is a ContentControl: when a `content_element` child is supplied
+        // it is mounted here (the text-content path emits no child, so plain text
+        // buttons report `Children::None` and never reach this). Lets a real
+        // Button host rich visuals while keeping its InvokePattern peer.
+        Handle::Button(b) => Some(ContainerChildren::ContentControl(b.cast().ok()?)),
         Handle::ScrollViewer(s) => Some(ContainerChildren::ContentControl(s.cast().ok()?)),
         Handle::Expander(e) => Some(ContainerChildren::ContentControl(e.cast().ok()?)),
         Handle::TabViewItem(ti) => Some(ContainerChildren::ContentControl(ti.cast().ok()?)),
