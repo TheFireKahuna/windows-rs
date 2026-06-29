@@ -55,6 +55,34 @@ mod extras {
         fn UpdatesNeeded(&self) -> HRESULT;
     }
 
+    // Lifted Microsoft.UI.Composition interop (WinAppSDK 2.1). These are the WinUI 3
+    // (microsoft.ui.composition.interop.h) variants — their IIDs differ from the system
+    // ABI::Windows::UI::Composition interop interfaces, exactly as
+    // ISurfaceImageSourceNativeWithD2D (cb833102…) above is the WinUI 3 IID, not the
+    // system 54298223… one. The lifted ICompositorInterop carries ONLY
+    // CreateGraphicsDevice (the swap-chain surface factories sit on a separate
+    // ICompositorSwapChainInterop), so its vtable is a single method — do NOT copy the
+    // system 3-method shape. Used to host an off-XAML-tree, off-thread D2D-drawn
+    // composition surface as a child visual of a XAML element.
+    #[guid(0xfab19398_6d19_4d8a_b752_8f096c396069)]
+    interface ICompositorInterop : Windows::Win32::System::Com::IUnknown {
+        // renderingDevice: an ID2D1Device (for D2D-drawn surfaces) passed as IUnknown*.
+        // result: ICompositionGraphicsDevice** (opaque WinRT object) -> *mut *mut void.
+        fn CreateGraphicsDevice(&self, renderingDevice: *mut void, result: *mut *mut void) -> HRESULT;
+    }
+
+    #[guid(0x2d6355c2_ad57_4eae_92e4_4c3eff65d578)]
+    interface ICompositionDrawingSurfaceInterop : Windows::Win32::System::Com::IUnknown {
+        // BeginDraw hands back an ID2D1DeviceContext (pass its IID) already inside a
+        // native BeginDraw/EndDraw bracket, plus the atlas offset to translate drawing by.
+        fn BeginDraw(&self, updateRect: *const Windows::Win32::Foundation::RECT, iid: *const GUID, updateObject: *mut *mut void, updateOffset: *mut Windows::Win32::Foundation::POINT) -> HRESULT;
+        fn EndDraw(&self) -> HRESULT;
+        fn Resize(&self, sizePixels: Windows::Win32::Foundation::SIZE) -> HRESULT;
+        fn Scroll(&self, scrollRect: *const Windows::Win32::Foundation::RECT, clipRect: *const Windows::Win32::Foundation::RECT, offsetX: i32, offsetY: i32) -> HRESULT;
+        fn ResumeDraw(&self) -> HRESULT;
+        fn SuspendDraw(&self) -> HRESULT;
+    }
+
     // Sourced from Microsoft.WindowsAppSDK.Runtime 2.0.1
 
     #[library("Microsoft.WindowsAppRuntime.Bootstrap.dll")]

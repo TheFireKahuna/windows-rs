@@ -31,14 +31,15 @@ impl PartialEq for SurfaceImageSource {
 }
 
 /// RAII guard over the Direct2D factory lock ([`bindings::ID2D1Multithread`])
-/// wrapping a single native `SurfaceImageSource` DXGI-interop call: `Enter` on
+/// wrapping a single native DXGI-interop call (`BeginDraw`/`EndDraw` of a
+/// `SurfaceImageSource` or a composition drawing surface): `Enter` on
 /// construction, the paired `Leave` on `Drop` (released even on an early `?`
 /// return or a panic). Holds an owned clone of the lock so it never borrows the
-/// source's `RefCell` across the call. A no-op for a single-threaded device.
-struct D2dLock(Option<bindings::ID2D1Multithread>);
+/// caller's state across the call. A no-op for a single-threaded device.
+pub(crate) struct D2dLock(Option<bindings::ID2D1Multithread>);
 
 impl D2dLock {
-    fn enter(multithread: Option<bindings::ID2D1Multithread>) -> Self {
+    pub(crate) fn enter(multithread: Option<bindings::ID2D1Multithread>) -> Self {
         if let Some(multithread) = &multithread {
             unsafe { multithread.Enter() };
         }
@@ -52,6 +53,20 @@ impl Drop for D2dLock {
             unsafe { multithread.Leave() };
         }
     }
+}
+
+/// Walk `device` -> Direct2D factory -> [`bindings::ID2D1Multithread`], keeping it
+/// only when the factory is actually multi-threaded — so a single-threaded device
+/// yields `None` and the [`D2dLock`] guard becomes a no-op. Shared by the surfaces
+/// (SIS and composition) that serialize their DXGI-interop draw calls against
+/// background work on a shared device.
+pub(crate) fn device_factory_lock(device: &impl Interface) -> Option<bindings::ID2D1Multithread> {
+    device
+        .cast::<bindings::ID2D1Resource>()
+        .ok()
+        .and_then(|resource| unsafe { resource.GetFactory() }.ok())
+        .and_then(|factory| factory.cast::<bindings::ID2D1Multithread>().ok())
+        .filter(|multithread| unsafe { multithread.GetMultithreadProtected() }.as_bool())
 }
 
 impl SurfaceImageSource {
@@ -97,15 +112,7 @@ impl SurfaceImageSource {
     /// single-threaded device captures nothing and pays no cost.
     pub fn set_device(&self, device: &impl Interface) -> Result<()> {
         unsafe { self.native.SetDevice(device.as_raw())? };
-        // Walk device -> factory -> ID2D1Multithread, keeping it only when the
-        // factory is actually multi-threaded (so single-threaded stays a no-op).
-        let lock = device
-            .cast::<bindings::ID2D1Resource>()
-            .ok()
-            .and_then(|resource| unsafe { resource.GetFactory() }.ok())
-            .and_then(|factory| factory.cast::<bindings::ID2D1Multithread>().ok())
-            .filter(|multithread| unsafe { multithread.GetMultithreadProtected() }.as_bool());
-        *self.multithread.borrow_mut() = lock;
+        *self.multithread.borrow_mut() = device_factory_lock(device);
         Ok(())
     }
 

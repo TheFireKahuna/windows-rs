@@ -5,6 +5,9 @@
     non_snake_case,
     non_upper_case_globals,
     non_camel_case_types,
+    // Whole WinRT enums are pulled by value (e.g. only one `DirectXPixelFormat`
+    // variant of ~190 is used), so generated bindings always carry unused variants.
+    dead_code,
     clippy::upper_case_acronyms,
     clippy::missing_transmute_annotations
 )]

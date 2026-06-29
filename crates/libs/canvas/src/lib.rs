@@ -11,6 +11,8 @@
 mod bindings;
 mod bitmap;
 mod color;
+#[cfg(feature = "reactor")]
+mod composition;
 mod device;
 mod device_lost;
 mod effect;
@@ -34,6 +36,8 @@ use windows_core::*;
 
 pub use bitmap::Bitmap;
 pub use color::ColorF;
+#[cfg(feature = "reactor")]
+pub use composition::CompositionDrawTarget;
 pub(crate) use device::D2dLock;
 pub use device::GpuDevice;
 pub use effect::Effect;

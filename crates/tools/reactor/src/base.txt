@@ -20,6 +20,19 @@ Microsoft::UI::Composition::ScalarKeyFrameAnimation
 Microsoft::UI::Composition::SystemBackdrops::MicaKind
 Microsoft::UI::Composition::Vector3KeyFrameAnimation
 Microsoft::UI::Composition::Visual
+Microsoft::UI::Composition::CompositionBrush
+Microsoft::UI::Composition::CompositionDrawingSurface
+Microsoft::UI::Composition::CompositionGraphicsDevice
+Microsoft::UI::Composition::CompositionStretch
+Microsoft::UI::Composition::CompositionSurfaceBrush
+Microsoft::UI::Composition::ContainerVisual
+Microsoft::UI::Composition::ICompositionGraphicsDevice2::CreateDrawingSurface2
+Microsoft::UI::Composition::ICompositionSurface
+Microsoft::UI::Composition::ICompositionSurfaceBrush::put_Stretch
+Microsoft::UI::Composition::ICompositor::{CreateSpriteVisual, CreateSurfaceBrushWithSurface}
+Microsoft::UI::Composition::ISpriteVisual::put_Brush
+Microsoft::UI::Composition::IVisual::put_Size
+Microsoft::UI::Composition::SpriteVisual
 Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread
 Microsoft::UI::Dispatching::DispatcherQueueHandler
 Microsoft::UI::Dispatching::DispatcherQueuePriority
@@ -243,6 +256,7 @@ Microsoft::UI::Xaml::GridLength
 Microsoft::UI::Xaml::GridUnitType
 Microsoft::UI::Xaml::HorizontalAlignment
 Microsoft::UI::Xaml::Hosting::ElementCompositionPreview::GetElementVisual
+Microsoft::UI::Xaml::Hosting::ElementCompositionPreview::SetElementChildVisual
 Microsoft::UI::Xaml::IApplication::get_Resources
 Microsoft::UI::Xaml::IApplicationOverrides
 Microsoft::UI::Xaml::IDragEventArgs::{put_AcceptedOperation, get_DataView, get_DragUIOverride, GetDeferral}
@@ -355,6 +369,8 @@ Windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
 Windows::Win32::UI::WindowsAndMessaging::SetWindowPos
 Windows::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE
 Windows::Win32::UI::WindowsAndMessaging::WM_SETCURSOR
+extras::ICompositorInterop::CreateGraphicsDevice
+extras::ICompositionDrawingSurfaceInterop::{BeginDraw, EndDraw}
 extras::ISurfaceImageSourceNativeWithD2D::{SetDevice, BeginDraw, EndDraw, SuspendDraw, ResumeDraw}
 extras::IVirtualSurfaceImageSourceNative::{Invalidate, GetUpdateRectCount, GetUpdateRects, GetVisibleBounds, RegisterForUpdatesNeeded, Resize}
 extras::IVirtualSurfaceUpdatesCallbackNative
