@@ -8,6 +8,7 @@ pub struct Border {
     pub border_brush: Option<BrushBinding>,
     pub border_thickness: Option<Thickness>,
     pub child: Box<Element>,
+    pub mounted: Option<Callback<Option<windows_core::IInspectable>>>,
 }
 impl Border {
     pub fn new(child: impl Into<Element>) -> Self {
@@ -18,7 +19,25 @@ impl Border {
             border_brush: None,
             border_thickness: None,
             child: Box::new(child.into()),
+            mounted: None,
         }
+    }
+
+    /// Callback invoked once after the native control is created, handed an
+    /// [`ElementHandle`] for the native `Border`. Use it to subscribe
+    /// [`ElementHandle::on_size_changed`] — a `Border` is layout-driven (it
+    /// fills the space its parent offers), so its `SizeChanged` reports the
+    /// available size even when its child has no intrinsic size yet. This is the
+    /// hook a surface host uses to size a `SurfaceImageSource` to the space it
+    /// occupies (the reactor analogue of how Win2D's `CanvasControl` measures its
+    /// `UserControl` host rather than the inner `Image`).
+    pub fn on_mounted(mut self, f: impl Fn(ElementHandle) + 'static) -> Self {
+        self.mounted = Some(Callback::new(move |native: Option<_>| {
+            if let Some(native) = native {
+                f(ElementHandle(native));
+            }
+        }));
+        self
     }
 
     /// Uniform corner radius in DIPs. Maps to WinUI `Border.CornerRadius`
@@ -58,12 +77,16 @@ impl Default for Border {
             border_brush: None,
             border_thickness: None,
             child: Box::new(Element::Empty),
+            mounted: None,
         }
     }
 }
 
 impl Widget for Border {
     widget_header!(ControlKind::Border);
+    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+        self.mounted.as_ref()
+    }
     fn bindings(&self) -> PropBindings {
         let mut out = generated::border_bindings(self);
         if let Some(BrushBinding::Direct(br)) = &self.border_brush {

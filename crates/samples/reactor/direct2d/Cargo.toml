@@ -8,6 +8,7 @@ publish = false
 windows-core = { workspace = true }
 windows-reactor = { workspace = true }
 windows-numerics = { workspace = true }
+windows-canvas = { workspace = true, features = ["reactor"] }
 
 [build-dependencies]
 windows-reactor-setup = { workspace = true }

@@ -4,6 +4,12 @@ use super::*;
 pub struct DrawingSession<'a> {
     context: &'a ID2D1DeviceContext,
     device_lost_flag: &'a Cell<bool>,
+    // Whether this session owns the Direct2D `BeginDraw`/`EndDraw` bracket. A
+    // swap-chain session does (it brackets the frame itself); a session adopted
+    // over a `SurfaceImageSource` does not, because that surface's native
+    // `BeginDraw`/`EndDraw` already opens and closes the draw — issuing a nested
+    // Direct2D `BeginDraw` there is `D2DERR_WRONG_STATE`.
+    owns_bracket: bool,
 }
 
 impl<'a> DrawingSession<'a> {
@@ -15,7 +21,25 @@ impl<'a> DrawingSession<'a> {
         Ok(Self {
             context,
             device_lost_flag,
+            owns_bracket: true,
         })
+    }
+
+    /// Adopt a context that is *already* in a draw (its `BeginDraw`/`EndDraw`
+    /// bracket is owned elsewhere — e.g. a `SurfaceImageSource`'s native
+    /// `BeginDraw`). This session issues no `BeginDraw` and no `EndDraw`; the
+    /// owner is responsible for ending the draw and for observing device-loss
+    /// from that call. Only the reactor-feature surface bridges adopt sessions.
+    #[cfg(feature = "reactor")]
+    pub(crate) fn new_borrowed(
+        context: &'a ID2D1DeviceContext,
+        device_lost_flag: &'a Cell<bool>,
+    ) -> Self {
+        Self {
+            context,
+            device_lost_flag,
+            owns_bracket: false,
+        }
     }
 
     /// Clears the entire session to the given color.
@@ -328,11 +352,33 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
-    /// Creates a shadow effect from the given bitmap.
-    pub fn create_shadow(&self, source: &Bitmap) -> Result<Effect> {
+    /// Creates a Gaussian shadow/glow effect from `source`: the source's alpha channel
+    /// is blurred by `blur_standard_deviation` (DIPs) and tinted with `color`. Draw its
+    /// output with [`draw_effect`](Self::draw_effect) — at the identity transform it
+    /// reads as a centered glow; under a translation, a drop shadow. `source` must be an
+    /// effect-readable image (e.g. a [`create_bitmap_target`](Self::create_bitmap_target)
+    /// bitmap that has been drawn into and is not the current target).
+    pub fn create_shadow(
+        &self,
+        source: &Bitmap,
+        blur_standard_deviation: f32,
+        color: ColorF,
+    ) -> Result<Effect> {
         unsafe {
             let effect = self.context.CreateEffect(&CLSID_D2D1Shadow)?;
             effect.SetInput(0, &source.0, true);
+            // Blur is a FLOAT; color is a straight-RGBA VECTOR4 (D2D1_COLOR_F layout).
+            effect.SetValue(
+                D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &blur_standard_deviation.to_le_bytes(),
+            )?;
+            let mut rgba = [0u8; 16];
+            rgba[0..4].copy_from_slice(&color.r.to_le_bytes());
+            rgba[4..8].copy_from_slice(&color.g.to_le_bytes());
+            rgba[8..12].copy_from_slice(&color.b.to_le_bytes());
+            rgba[12..16].copy_from_slice(&color.a.to_le_bytes());
+            effect.SetValue(D2D1_SHADOW_PROP_COLOR as u32, D2D1_PROPERTY_TYPE_VECTOR4, &rgba)?;
             Ok(Effect(effect))
         }
     }
@@ -381,6 +427,12 @@ impl<'a> DrawingSession<'a> {
 
 impl Drop for DrawingSession<'_> {
     fn drop(&mut self) {
+        // A borrowed session does not own the bracket: the `SurfaceImageSource`
+        // that opened the draw is responsible for `EndDraw` and for reporting
+        // device-loss from it.
+        if !self.owns_bracket {
+            return;
+        }
         unsafe {
             let result = self.context.EndDraw(None, None);
             if is_device_lost(result) {

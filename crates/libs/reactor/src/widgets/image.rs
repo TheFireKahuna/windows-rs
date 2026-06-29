@@ -25,6 +25,7 @@ pub enum ImageSource {
     None,
     Uri(String),
     Surface(SurfaceImageSource),
+    Virtual(VirtualSurfaceImageSource),
 }
 impl From<SurfaceImageSource> for ImageSource {
     fn from(source: SurfaceImageSource) -> Self {
@@ -34,6 +35,16 @@ impl From<SurfaceImageSource> for ImageSource {
 impl From<Option<SurfaceImageSource>> for ImageSource {
     fn from(source: Option<SurfaceImageSource>) -> Self {
         source.map_or(Self::None, ImageSource::Surface)
+    }
+}
+impl From<VirtualSurfaceImageSource> for ImageSource {
+    fn from(source: VirtualSurfaceImageSource) -> Self {
+        Self::Virtual(source)
+    }
+}
+impl From<Option<VirtualSurfaceImageSource>> for ImageSource {
+    fn from(source: Option<VirtualSurfaceImageSource>) -> Self {
+        source.map_or(Self::None, ImageSource::Virtual)
     }
 }
 impl Image {
@@ -86,6 +97,12 @@ impl Widget for Image {
                 out.push(Binding::Prop(
                     Prop::ImageSource,
                     PropValue::SurfaceImageSource(s.clone()),
+                ));
+            }
+            ImageSource::Virtual(s) => {
+                out.push(Binding::Prop(
+                    Prop::ImageSource,
+                    PropValue::VirtualSurfaceImageSource(s.clone()),
                 ));
             }
             ImageSource::None => {}

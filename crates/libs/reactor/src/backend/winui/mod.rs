@@ -442,6 +442,11 @@ fn classify_container(h: &Handle) -> Option<ContainerChildren<'_>> {
             r.cast::<bindings::IPanel>().ok()?.Children().ok()?,
         )),
         Handle::Border(_) | Handle::Viewbox(_) => Some(ContainerChildren::SingleChild(h)),
+        // A Button is a ContentControl: when a `content_element` child is supplied
+        // it is mounted here (the text-content path emits no child, so plain text
+        // buttons report `Children::None` and never reach this). Lets a real
+        // Button host rich visuals while keeping its InvokePattern peer.
+        Handle::Button(b) => Some(ContainerChildren::ContentControl(b.cast().ok()?)),
         Handle::ScrollViewer(s) => Some(ContainerChildren::ContentControl(s.cast().ok()?)),
         Handle::Expander(e) => Some(ContainerChildren::ContentControl(e.cast().ok()?)),
         Handle::TabViewItem(ti) => Some(ContainerChildren::ContentControl(ti.cast().ok()?)),
@@ -1458,6 +1463,11 @@ impl Backend for WinUIBackend {
                 (Prop::ImageSource, PropValue::SurfaceImageSource(sis), Handle::Image(img)) => {
                     img.SetSource(&sis.image_source()?)
                 }
+                (
+                    Prop::ImageSource,
+                    PropValue::VirtualSurfaceImageSource(vsis),
+                    Handle::Image(img),
+                ) => img.SetSource(&vsis.image_source()?),
                 (Prop::ImageSource, PropValue::Unset, Handle::Image(img)) => img.SetSource(None),
                 (Prop::Header, PropValue::Str(s), Handle::TabViewItem(ti)) => {
                     let tb = string_as_textblock(s)?;
@@ -3607,6 +3617,11 @@ fn mount_static_tooltip_element(el: &Element) -> Option<bindings::UIElement> {
                 ImageSource::Surface(sis) => {
                     if let Ok(src) = sis.image_source() {
                         diag::dropped(i.SetSource(&src));
+                    }
+                }
+                ImageSource::Virtual(vsis) => {
+                    if let Ok(src) = vsis.image_source() {
+                        let _ = i.SetSource(&src);
                     }
                 }
                 ImageSource::None => {}

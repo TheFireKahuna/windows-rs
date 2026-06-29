@@ -109,6 +109,9 @@ pub struct D2D1_PIXEL_FORMAT {
     pub format: DXGI_FORMAT,
     pub alphaMode: D2D1_ALPHA_MODE,
 }
+pub type D2D1_PROPERTY_TYPE = i32;
+pub const D2D1_PROPERTY_TYPE_FLOAT: D2D1_PROPERTY_TYPE = 5;
+pub const D2D1_PROPERTY_TYPE_VECTOR4: D2D1_PROPERTY_TYPE = 8;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
@@ -124,6 +127,9 @@ pub struct D2D1_ROUNDED_RECT {
     pub radiusX: f32,
     pub radiusY: f32,
 }
+pub type D2D1_SHADOW_PROP = i32;
+pub const D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION: D2D1_SHADOW_PROP = 0;
+pub const D2D1_SHADOW_PROP_COLOR: D2D1_SHADOW_PROP = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct D2D1_STROKE_STYLE_PROPERTIES1 {
@@ -1196,6 +1202,25 @@ windows_core::imp::define_interface!(
     0x483473d7_cd46_4f9d_9d3a_3112aa80159d
 );
 windows_core::imp::interface_hierarchy!(ID2D1Properties, windows_core::IUnknown);
+impl ID2D1Properties {
+    pub(crate) unsafe fn SetValue(
+        &self,
+        index: u32,
+        r#type: D2D1_PROPERTY_TYPE,
+        data: &[u8],
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetValue)(
+                windows_core::Interface::as_raw(self),
+                index,
+                r#type,
+                data.as_ptr(),
+                data.len().try_into().unwrap(),
+            )
+            .ok()
+        }
+    }
+}
 #[repr(C)]
 pub struct ID2D1Properties_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -1205,7 +1230,13 @@ pub struct ID2D1Properties_Vtbl {
     GetType: usize,
     GetPropertyIndex: usize,
     SetValueByName: usize,
-    SetValue: usize,
+    pub SetValue: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        D2D1_PROPERTY_TYPE,
+        *const u8,
+        u32,
+    ) -> windows_core::HRESULT,
     GetValueByName: usize,
     GetValue: usize,
     GetValueSize: usize,

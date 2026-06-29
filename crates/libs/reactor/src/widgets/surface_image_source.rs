@@ -11,7 +11,7 @@ use super::*;
 #[derive(Clone, Debug)]
 pub struct SurfaceImageSource {
     // Cast to `ImageSource` and applied as the native `Image.Source`.
-    pub source: bindings::SurfaceImageSource,
+    source: bindings::SurfaceImageSource,
     native: bindings::ISurfaceImageSourceNativeWithD2D,
     // `Some` only when [`set_device`](Self::set_device) is given a device backed
     // by a *multi-threaded* Direct2D factory. It lets the DXGI-touching native
@@ -31,14 +31,15 @@ impl PartialEq for SurfaceImageSource {
 }
 
 /// RAII guard over the Direct2D factory lock ([`bindings::ID2D1Multithread`])
-/// wrapping a single native `SurfaceImageSource` DXGI-interop call: `Enter` on
+/// wrapping a single native DXGI-interop call (`BeginDraw`/`EndDraw` of a
+/// `SurfaceImageSource` or a composition drawing surface): `Enter` on
 /// construction, the paired `Leave` on `Drop` (released even on an early `?`
 /// return or a panic). Holds an owned clone of the lock so it never borrows the
-/// source's `RefCell` across the call. A no-op for a single-threaded device.
-struct D2dLock(Option<bindings::ID2D1Multithread>);
+/// caller's state across the call. A no-op for a single-threaded device.
+pub(crate) struct D2dLock(Option<bindings::ID2D1Multithread>);
 
 impl D2dLock {
-    fn enter(multithread: Option<bindings::ID2D1Multithread>) -> Self {
+    pub(crate) fn enter(multithread: Option<bindings::ID2D1Multithread>) -> Self {
         if let Some(multithread) = &multithread {
             unsafe { multithread.Enter() };
         }
@@ -52,6 +53,20 @@ impl Drop for D2dLock {
             unsafe { multithread.Leave() };
         }
     }
+}
+
+/// Walk `device` -> Direct2D factory -> [`bindings::ID2D1Multithread`], keeping it
+/// only when the factory is actually multi-threaded — so a single-threaded device
+/// yields `None` and the [`D2dLock`] guard becomes a no-op. Shared by the surfaces
+/// (SIS and composition) that serialize their DXGI-interop draw calls against
+/// background work on a shared device.
+pub(crate) fn device_factory_lock(device: &impl Interface) -> Option<bindings::ID2D1Multithread> {
+    device
+        .cast::<bindings::ID2D1Resource>()
+        .ok()
+        .and_then(|resource| unsafe { resource.GetFactory() }.ok())
+        .and_then(|factory| factory.cast::<bindings::ID2D1Multithread>().ok())
+        .filter(|multithread| unsafe { multithread.GetMultithreadProtected() }.as_bool())
 }
 
 impl SurfaceImageSource {
@@ -70,6 +85,24 @@ impl SurfaceImageSource {
         })
     }
 
+    /// Create an **opaque** `SurfaceImageSource` of the given pixel size. An
+    /// opaque surface has no alpha channel, so the compositor skips per-pixel
+    /// alpha blending when drawing it — cheaper than [`new`](Self::new) when the
+    /// content fully covers its bounds (you must clear every pixel each frame).
+    pub fn new_opaque(pixel_width: i32, pixel_height: i32) -> Result<Self> {
+        let source = bindings::SurfaceImageSource::CreateInstanceWithDimensionsAndOpacity(
+            pixel_width,
+            pixel_height,
+            true,
+        )?;
+        let native = source.cast()?;
+        Ok(Self {
+            source,
+            native,
+            multithread: core::cell::RefCell::new(None),
+        })
+    }
+
     /// Associate the Direct2D device used for drawing. Pass an `ID2D1Device`
     /// (or `IDXGIDevice`). Must be called before [`begin_draw`](Self::begin_draw).
     ///
@@ -79,15 +112,7 @@ impl SurfaceImageSource {
     /// single-threaded device captures nothing and pays no cost.
     pub fn set_device(&self, device: &impl Interface) -> Result<()> {
         unsafe { self.native.SetDevice(device.as_raw()).ok()? };
-        // Walk device -> factory -> ID2D1Multithread, keeping it only when the
-        // factory is actually multi-threaded (so single-threaded stays a no-op).
-        let lock = device
-            .cast::<bindings::ID2D1Resource>()
-            .ok()
-            .and_then(|resource| unsafe { resource.GetFactory() }.ok())
-            .and_then(|factory| factory.cast::<bindings::ID2D1Multithread>().ok())
-            .filter(|multithread| unsafe { multithread.GetMultithreadProtected() }.as_bool());
-        *self.multithread.borrow_mut() = lock;
+        *self.multithread.borrow_mut() = device_factory_lock(device);
         Ok(())
     }
 
@@ -152,7 +177,7 @@ impl SurfaceImageSource {
 
     /// Cast the underlying source to the `ImageSource` the backend assigns to
     /// `Image.Source`.
-    pub fn image_source(&self) -> Result<bindings::ImageSource> {
+    pub(crate) fn image_source(&self) -> Result<bindings::ImageSource> {
         self.source.cast()
     }
 }

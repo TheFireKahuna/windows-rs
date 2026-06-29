@@ -91,6 +91,7 @@ fn generate_reactor_bindings() {
         "--implement",
         "Microsoft.UI.Xaml.IApplicationOverrides",
         "Microsoft.UI.Xaml.Markup.IXamlMetadataProvider",
+        "extras.IVirtualSurfaceUpdatesCallbackNative",
         "--minimal",
         "--dead-code",
         "--flat",

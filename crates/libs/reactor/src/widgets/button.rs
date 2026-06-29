@@ -23,6 +23,11 @@ pub struct Button {
     pub key: Option<String>,
     pub modifiers: Modifiers,
     pub content: String,
+    /// Optional rich element content, mounted via the child reconciler into the
+    /// button's `ContentControl` slot. When set, `content` (text) is ignored.
+    /// The element is `None` for the common text-button case, so this stays a
+    /// zero-cost addition for existing call sites.
+    pub content_element: Option<Box<Element>>,
     pub is_enabled: bool,
     pub style: ButtonStyle,
     pub icon: Option<Symbol>,
@@ -46,12 +51,23 @@ impl Button {
 
 impl Widget for Button {
     widget_header!(ControlKind::Button);
+    fn children(&self) -> Children<'_> {
+        match &self.content_element {
+            Some(el) => Children::PositionalSingle(el),
+            None => Children::None,
+        }
+    }
     fn bindings(&self) -> PropBindings {
         let mut out = generated::button_bindings(self);
-        out.push(Binding::Prop(
-            Prop::Content,
-            PropValue::Str(self.content.clone()),
-        ));
+        // A rich element child (mounted by the child reconciler into the
+        // ContentControl slot) owns the Content; binding the text Content too
+        // would clobber it on the next prop-apply. Bind text only without a child.
+        if self.content_element.is_none() {
+            out.push(Binding::Prop(
+                Prop::Content,
+                PropValue::Str(self.content.clone()),
+            ));
+        }
         if let Some(v) = self.icon {
             out.push(Binding::Prop(Prop::Icon, PropValue::I32(v.0)));
         }
@@ -96,6 +112,18 @@ impl Widget for Button {
 impl Button {
     pub fn on_click(mut self, f: impl IntoUnitCallback) -> Self {
         self.on_click = Some(f.into_unit_callback());
+        self
+    }
+
+    /// Host a rich element tree as the button's content instead of the `content`
+    /// text. The button stays a real WinUI `Button`, so it keeps its
+    /// `InvokePattern` automation peer, keyboard activation (Space/Enter), and
+    /// accessibility — while rendering arbitrary visuals. When set, the text
+    /// `content` is ignored. Pair with [`Button::subtle`] (or a chromeless style)
+    /// plus zeroed `padding`/`min_width`/`min_height` to use the button as a
+    /// tappable, automatable wrapper around custom-drawn or composed visuals.
+    pub fn content_element(mut self, element: impl Into<Element>) -> Self {
+        self.content_element = Some(Box::new(element.into()));
         self
     }
 
