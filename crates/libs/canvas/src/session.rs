@@ -352,11 +352,33 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
-    /// Creates a shadow effect from the given bitmap.
-    pub fn create_shadow(&self, source: &Bitmap) -> Result<Effect> {
+    /// Creates a Gaussian shadow/glow effect from `source`: the source's alpha channel
+    /// is blurred by `blur_standard_deviation` (DIPs) and tinted with `color`. Draw its
+    /// output with [`draw_effect`](Self::draw_effect) — at the identity transform it
+    /// reads as a centered glow; under a translation, a drop shadow. `source` must be an
+    /// effect-readable image (e.g. a [`create_bitmap_target`](Self::create_bitmap_target)
+    /// bitmap that has been drawn into and is not the current target).
+    pub fn create_shadow(
+        &self,
+        source: &Bitmap,
+        blur_standard_deviation: f32,
+        color: ColorF,
+    ) -> Result<Effect> {
         unsafe {
             let effect = self.context.CreateEffect(&CLSID_D2D1Shadow)?;
             effect.SetInput(0, &source.0, true);
+            // Blur is a FLOAT; color is a straight-RGBA VECTOR4 (D2D1_COLOR_F layout).
+            effect.SetValue(
+                D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &blur_standard_deviation.to_le_bytes(),
+            )?;
+            let mut rgba = [0u8; 16];
+            rgba[0..4].copy_from_slice(&color.r.to_le_bytes());
+            rgba[4..8].copy_from_slice(&color.g.to_le_bytes());
+            rgba[8..12].copy_from_slice(&color.b.to_le_bytes());
+            rgba[12..16].copy_from_slice(&color.a.to_le_bytes());
+            effect.SetValue(D2D1_SHADOW_PROP_COLOR as u32, D2D1_PROPERTY_TYPE_VECTOR4, &rgba)?;
             Ok(Effect(effect))
         }
     }

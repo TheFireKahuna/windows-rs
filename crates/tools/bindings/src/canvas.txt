@@ -35,8 +35,13 @@
     Windows::Win32::Graphics::Direct2D::D2D1_LINE_JOIN_MITER
     Windows::Win32::Graphics::Direct2D::D2D1_LINE_JOIN_ROUND
     Windows::Win32::Graphics::Direct2D::D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES
+    Windows::Win32::Graphics::Direct2D::D2D1_PROPERTY_TYPE_FLOAT
+    Windows::Win32::Graphics::Direct2D::D2D1_PROPERTY_TYPE_VECTOR4
     Windows::Win32::Graphics::Direct2D::D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES
     Windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT
+    Windows::Win32::Graphics::Direct2D::D2D1_SHADOW_PROP
+    Windows::Win32::Graphics::Direct2D::D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION
+    Windows::Win32::Graphics::Direct2D::D2D1_SHADOW_PROP_COLOR
     Windows::Win32::Graphics::Direct2D::D2D1CreateFactory
     Windows::Win32::Graphics::Direct2D::ID2D1Bitmap::GetSize
     Windows::Win32::Graphics::Direct2D::ID2D1Device::CreateDeviceContext
@@ -48,6 +53,7 @@
     Windows::Win32::Graphics::Direct2D::ID2D1GeometrySink::{AddLine, AddBezier}
     Windows::Win32::Graphics::Direct2D::ID2D1Multithread::{Enter, Leave}
     Windows::Win32::Graphics::Direct2D::ID2D1PathGeometry::Open
+    Windows::Win32::Graphics::Direct2D::ID2D1Properties::SetValue
     Windows::Win32::Graphics::Direct2D::ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawTextLayout, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize}
     Windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush::SetColor
     Windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE
