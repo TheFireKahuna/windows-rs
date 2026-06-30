@@ -34,6 +34,13 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
     // `size: auto` fills the cell, while an item with a fixed size or an explicit
     // non-stretch alignment is honoured — and its margin insets it correctly
     // (`percent(1.0)` would overflow by the margin and ignore the offset).
+    //
+    // The cell uses `flex(1.0)` (`minmax(0, 1fr)`), **not** bare `fr(1.0)`: an `fr`
+    // track has a min-content floor, so a root whose content (a long scrollable
+    // chain) exceeds the window would inflate the cell to its content height
+    // instead of clamping to the viewport — every descendant Star then resolves
+    // against the inflated height and inner ScrollViewers never receive a bounded
+    // extent. The zero-floor cell clamps the root to the window; overflow scrolls.
     let viewport = {
         let mut s = Style {
             display: Display::Grid,
@@ -43,8 +50,8 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
             },
             ..Style::default()
         };
-        s.grid_template_columns = vec![fr(1.0)];
-        s.grid_template_rows = vec![fr(1.0)];
+        s.grid_template_columns = vec![flex(1.0)];
+        s.grid_template_rows = vec![flex(1.0)];
         tree.new_with_children(s, &[root_taffy]).unwrap()
     };
 
@@ -229,7 +236,14 @@ fn track(g: &GridLength) -> GridTemplateComponent<String> {
     GridTemplateComponent::Single(match g {
         GridLength::Auto => auto(),
         GridLength::Pixel(p) => length(*p as f32),
-        GridLength::Star(f) => fr(*f as f32),
+        // WinUI `Star` (`*`) divides the *available* track space with a **zero**
+        // minimum: a tall child overflows (and an inner ScrollViewer clips/scrolls)
+        // rather than inflating the track. Taffy's bare `fr()` is CSS `minmax(auto,
+        // 1fr)` — a min-content floor that lets a tall child (a long processor
+        // chain) inflate its row and starve the sibling Star row to its min-content
+        // (collapsing the analyzer/viz panel above it). `flex()` is `minmax(0, Nfr)`,
+        // the exact Star semantics, so equal Star tracks stay equal under overflow.
+        GridLength::Star(f) => flex(*f as f32),
     })
 }
 
