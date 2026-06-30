@@ -145,6 +145,17 @@ impl DCompHost {
     /// Create the window, compositor, backend, and render host, mount `root`, and
     /// paint the first frame. Call [`run`](Self::run) to enter the message loop.
     pub fn new(title: impl AsRef<str>, root: Box<dyn Component>) -> windows_core::Result<Self> {
+        // Default client size matches the WinUI shell's `.inner_size(1200, 800)`.
+        Self::new_sized(title, 1200.0, 800.0, root)
+    }
+
+    /// Like [`new`](Self::new) but opens at a specific client size (DIPs).
+    pub fn new_sized(
+        title: impl AsRef<str>,
+        client_w_dip: f64,
+        client_h_dip: f64,
+        root: Box<dyn Component>,
+    ) -> windows_core::Result<Self> {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
@@ -153,7 +164,7 @@ impl DCompHost {
         UI_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
         ensure_dispatcher_queue()?;
 
-        let (hwnd, dpi, (pw, ph)) = create_window(title.as_ref(), 960, 640)?;
+        let (hwnd, dpi, (pw, ph)) = create_window(title.as_ref(), client_w_dip, client_h_dip)?;
         let scale = (dpi as f32 / 96.0).max(0.01);
         let dip = (pw as f32 / scale, ph as f32 / scale);
 
@@ -244,6 +255,27 @@ impl DCompHost {
             }
         }
         let host = Self::new(title, Box::new(RenderFn(f)))?;
+        host.run();
+        Ok(())
+    }
+
+    /// Like [`render`](Self::render) but opens at a specific client size (DIPs).
+    pub fn render_sized<F>(
+        title: impl AsRef<str>,
+        client_w_dip: f64,
+        client_h_dip: f64,
+        f: F,
+    ) -> windows_core::Result<()>
+    where
+        F: Fn(&mut RenderCx) -> Element + 'static,
+    {
+        struct RenderFn<F>(F);
+        impl<F: Fn(&mut RenderCx) -> Element + 'static> Component for RenderFn<F> {
+            fn render(&self, _props: &(), cx: &mut RenderCx) -> Element {
+                (self.0)(cx)
+            }
+        }
+        let host = Self::new_sized(title, client_w_dip, client_h_dip, Box::new(RenderFn(f)))?;
         host.run();
         Ok(())
     }
@@ -353,9 +385,26 @@ unsafe fn wide_str(ptr: *const u16) -> String {
     }
 }
 
-fn dpi_scale(hwnd: HWND) -> f32 {
+/// Window DPI from `GetDpiForWindow`, falling back to 96 (100%) when it is
+/// unavailable (e.g. the window is not yet on a monitor).
+///
+/// A `NEWAPO_DCOMP_FORCE_DPI` env override forces the whole DPI→pixel pipeline
+/// to a chosen value (e.g. `144` = 150%), so high-DPI layout can be exercised on a
+/// 100%-scaled development monitor. It is read only when the variable is present,
+/// so it has zero effect on a normal run.
+fn effective_dpi(hwnd: HWND) -> u32 {
+    if let Ok(v) = std::env::var("NEWAPO_DCOMP_FORCE_DPI")
+        && let Ok(d) = v.trim().parse::<u32>()
+        && d >= 48
+    {
+        return d;
+    }
     let dpi = unsafe { GetDpiForWindow(hwnd) };
-    (if dpi == 0 { 96 } else { dpi } as f32) / 96.0
+    if dpi == 0 { 96 } else { dpi }
+}
+
+fn dpi_scale(hwnd: HWND) -> f32 {
+    effective_dpi(hwnd) as f32 / 96.0
 }
 
 /// `(x, y)` from a mouse LPARAM, converted from physical pixels to DIPs.
@@ -693,8 +742,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let pw = (lparam & 0xFFFF) as i32;
                 let ph = ((lparam >> 16) & 0xFFFF) as i32;
                 if pw > 0 && ph > 0 {
-                    let dpi = unsafe { GetDpiForWindow(hwnd) };
-                    let dpi = if dpi == 0 { 96 } else { dpi };
+                    let dpi = effective_dpi(hwnd);
                     let scale = dpi as f32 / 96.0;
                     s.render_host.set_dpi(dpi);
                     s.render_host.set_inner_size(WindowSize {
@@ -736,10 +784,13 @@ fn ensure_dispatcher_queue() -> windows_core::Result<()> {
     Ok(())
 }
 
+/// Create the window at a desired CLIENT size in DIPs (DPI-scaled to pixels,
+/// non-client area added, centered on the nearest monitor's work area), and
+/// return its HWND, DPI, and actual client pixel size.
 fn create_window(
     title: &str,
-    width: i32,
-    height: i32,
+    client_w_dip: f64,
+    client_h_dip: f64,
 ) -> windows_core::Result<(HWND, u32, (i32, i32))> {
     static CLASS: &[u16] = &[
         b'D' as u16, b'C' as u16, b'o' as u16, b'm' as u16, b'p' as u16, b'H' as u16, b'o' as u16,
@@ -771,6 +822,8 @@ fn create_window(
     let mut title_w: Vec<u16> = title.encode_utf16().collect();
     title_w.push(0);
 
+    // Create at a provisional size; we resize to the exact client size below once
+    // we know the window's DPI and non-client metrics.
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP,
@@ -779,8 +832,8 @@ fn create_window(
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            width,
-            height,
+            1000,
+            700,
             core::ptr::null_mut(),
             core::ptr::null_mut(),
             hinstance,
@@ -791,8 +844,35 @@ fn create_window(
         return Err(windows_core::Error::empty());
     }
 
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
-    let dpi = if dpi == 0 { 96 } else { dpi };
+    let dpi = effective_dpi(hwnd);
+    let scale = dpi as f64 / 96.0;
+
+    unsafe {
+        // Desired client size in physical pixels.
+        let cw = (client_w_dip * scale).round() as i32;
+        let ch = (client_h_dip * scale).round() as i32;
+        // Non-client delta (borders + caption) for this window at this DPI.
+        let mut wr = RECT::default();
+        let mut cr = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut wr);
+        let _ = GetClientRect(hwnd, &mut cr);
+        let nc_w = (wr.right - wr.left) - (cr.right - cr.left);
+        let nc_h = (wr.bottom - wr.top) - (cr.bottom - cr.top);
+        let win_w = cw + nc_w;
+        let win_h = ch + nc_h;
+        // Center on the nearest monitor's work area.
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = core::mem::zeroed();
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        let (mut x, mut y) = (CW_USEDEFAULT, CW_USEDEFAULT);
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            let work_w = mi.rcWork.right - mi.rcWork.left;
+            let work_h = mi.rcWork.bottom - mi.rcWork.top;
+            x = mi.rcWork.left + (work_w - win_w).max(0) / 2;
+            y = mi.rcWork.top + (work_h - win_h).max(0) / 2;
+        }
+        let _ = SetWindowPos(hwnd, core::ptr::null_mut(), x, y, win_w, win_h, SWP_NOZORDER);
+    }
 
     let mut rc = RECT::default();
     unsafe {

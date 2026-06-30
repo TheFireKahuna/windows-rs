@@ -460,7 +460,13 @@ fn default_style(kind: ControlKind) -> taffy::Style {
             s.display = Display::Block;
         }
         ControlKind::Border => {
-            s.display = Display::Flex;
+            // A Border is a WinUI ContentControl: it sizes to its single child +
+            // padding, and stretches that child to fill its content box (the child's
+            // own alignment/size still win). A one-cell Grid is the faithful Taffy
+            // model — a Flex row leaves the child at its content width (no main-axis
+            // stretch), which collapses a full-bleed Border to its content. Grid
+            // items default to align/justify-self Stretch, so the child fills.
+            s.display = Display::Grid;
         }
         ControlKind::ScrollViewer | ControlKind::ScrollView => {
             // Visual clipping is done by a composition InsetClip on the node's
@@ -506,6 +512,16 @@ fn default_style(kind: ControlKind) -> taffy::Style {
             s.display = Display::Flex;
         }
     }
+    // XAML Grid parity: a child with no explicit `Grid.Row`/`Grid.Column` belongs to
+    // cell (0,0) and *overlaps* any sibling that also has none — XAML Grid has no
+    // auto-flow. Taffy would otherwise auto-place each unplaced item into the next
+    // free cell, stacking same-cell children (e.g. a backdrop + shell that both sit
+    // at row 0 / col 0). Default the start lines to the first track; an explicit
+    // `grid_row(n)`/`grid_column(n)` overrides it (the reconciler only emits the
+    // attached prop for a non-zero value). `grid_*` is inert unless the parent is a
+    // Grid, so this is harmless for flex/block/canvas parents.
+    s.grid_row.start = line(1);
+    s.grid_column.start = line(1);
     s
 }
 
