@@ -2480,7 +2480,7 @@ impl ID2D1RenderTarget {
             .ok()
         }
     }
-    pub(crate) unsafe fn SetDpi(&self, dpix: f32, dpiy: f32) {
+    pub unsafe fn SetDpi(&self, dpix: f32, dpiy: f32) {
         unsafe {
             (windows_core::Interface::vtable(self).SetDpi)(
                 windows_core::Interface::as_raw(self),

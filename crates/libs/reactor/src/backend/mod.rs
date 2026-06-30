@@ -11,6 +11,12 @@ mod winui;
 
 pub use winui::WinUIBackend;
 
+#[cfg(feature = "dcomp-backend")]
+mod dcomp;
+
+#[cfg(feature = "dcomp-backend")]
+pub use dcomp::{DCompBackend, DCompHost, Win32Dispatcher};
+
 /// Opaque, non-zero handle the backend assigns to every live control.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct ControlId(pub NonZeroU32);
