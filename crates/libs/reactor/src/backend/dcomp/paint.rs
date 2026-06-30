@@ -209,6 +209,21 @@ fn draw_surface(
     comp.device_lost.set(false);
     let ctx: ID2D1DeviceContext = unsafe { interop.BeginDraw(None, &mut offset)? };
 
+    // Editable nodes: rebuild the cached text layout + re-scroll the caret into
+    // view (mutable) before the immutable chrome paint below.
+    if arena.get(id).is_some_and(|n| n.editor.is_some()) {
+        let (kind, w, fs, weight, align) = {
+            let n = arena.get(id).unwrap();
+            (n.kind, n.rect.w, n.paint.font_size, n.paint.font_weight, n.ctrl.content_align)
+        };
+        let (_, content_w) = editor::editor_content(kind, w);
+        if let Some(n) = arena.get_mut(id)
+            && let Some(ed) = &mut n.editor
+        {
+            ed.prepare(fs, weight, content_w, align);
+        }
+    }
+
     let session = DrawingSession::new_borrowed(&ctx, &comp.device_lost);
     // Grayscale text AA is mandatory on premultiplied/transparent surfaces.
     session.set_grayscale_text_antialiasing();

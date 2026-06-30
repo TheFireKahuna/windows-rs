@@ -4,7 +4,8 @@
 //! `node::Ctrl`. All colours/metrics come from [`theme`]; nothing here is a raw
 //! literal except geometric ratios and glyph codepoints.
 
-use super::node::{linear, lerp_color, Node};
+use super::editor;
+use super::node::{is_text_editable, linear, lerp_color, Node};
 use super::theme;
 use crate::backend::ControlKind;
 use crate::Color;
@@ -26,6 +27,12 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
     } else {
         theme::DISABLED_OPACITY
     };
+    // The editable text kinds draw their own box + caret + selection (and their
+    // own focus affordance), so they bypass the shared focus-ring tail below.
+    if is_text_editable(node.kind) {
+        paint_editor(session, brush, node, rect, dim);
+        return true;
+    }
     match node.kind {
         ControlKind::Button
         | ControlKind::ToggleButton
@@ -580,6 +587,136 @@ fn paint_nav(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, d
             ParagraphAlignment::Center,
             dim,
         );
+    }
+}
+
+// ── Text editor (NumberBox / TextBox / PasswordBox / AutoSuggestBox) ─────────
+
+const GLYPH_CHEVRON_UP: u32 = 0xE70E;
+
+fn editor_text_alignment(align: i32) -> TextAlignment {
+    match align {
+        1 => TextAlignment::Center,
+        2 => TextAlignment::Trailing,
+        _ => TextAlignment::Leading,
+    }
+}
+
+fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
+    let radius = theme::RADIUS_SM;
+    // Box: raised surface fill + a border that turns accent on focus.
+    fill_rr(session, brush, rect, radius, theme::SURFACE_RAISED, dim);
+    let border_c = if node.focused {
+        theme::ACCENT
+    } else {
+        theme::stroke()
+    };
+    let border_w = if node.focused { 1.5 } else { theme::BORDER_W };
+    stroke_rr(session, brush, rect, radius, border_c, border_w, dim);
+
+    let Some(ed) = &node.editor else { return };
+    let align = node.ctrl.content_align;
+    let (pad_left, content_w) = editor::editor_content(node.kind, rect.width());
+    let cx0 = rect.left + pad_left;
+    let font_size = node.paint.font_size;
+
+    // Vertical centering from the measured line height.
+    let text_h = ed
+        .layout
+        .as_ref()
+        .and_then(|l| l.measure().ok())
+        .map(|(_, h)| h)
+        .filter(|h| *h > 0.0)
+        .unwrap_or(font_size * 1.4);
+    let origin_y = rect.top + (rect.height() - text_h) / 2.0;
+    // Left-aligned fields scroll; centered/right fields keep `scroll_x == 0` and
+    // let DWrite position the run within `content_w`.
+    let origin_x = cx0 - ed.scroll_x;
+
+    // Confine drawing to the content column (clip overflow / spin area).
+    let clip = Rect::from_xywh(cx0, rect.top, content_w, rect.height());
+    session.push_clip(&clip);
+
+    if ed.buf.is_empty() {
+        // Placeholder.
+        text(
+            session,
+            brush,
+            &node.ctrl.placeholder,
+            Rect::new(cx0, rect.top, cx0 + content_w, rect.bottom),
+            "Segoe UI",
+            font_size,
+            400,
+            theme::TEXT_TERTIARY,
+            editor_text_alignment(align),
+            ParagraphAlignment::Center,
+            dim,
+        );
+    } else {
+        // Selection highlight (accent wash) behind the text.
+        if node.focused
+            && ed.has_selection()
+            && let Some(layout) = &ed.layout
+        {
+            let (a, b) = ed.sel();
+            if let Ok(rects) =
+                layout.hit_test_range(a as u32, (b - a) as u32, origin_x, origin_y)
+            {
+                put(brush, theme::with_alpha(theme::ACCENT, 0.32), dim);
+                for (x, y, w, h) in rects {
+                    session.fill_rect(&Rect::from_xywh(x, y, w, h), brush);
+                }
+            }
+        }
+        // The text run.
+        if let Some(layout) = &ed.layout {
+            put(brush, node.paint.foreground.unwrap_or(theme::TEXT), dim);
+            session.draw_text_layout(Vector2::new(origin_x, origin_y), layout, brush);
+        }
+    }
+
+    // Caret (blink-gated).
+    if node.focused && ed.blink_on {
+        let caret_x = origin_x + ed.caret_x();
+        put(brush, theme::TEXT, dim);
+        session.draw_line(
+            Vector2::new(caret_x, origin_y + 1.0),
+            Vector2::new(caret_x, origin_y + text_h - 1.0),
+            brush,
+            1.0,
+        );
+    }
+
+    session.pop_clip();
+
+    // Spin buttons (wide NumberBox only).
+    if node.kind == ControlKind::NumberBox && rect.width() >= editor::SPIN_MIN_BOX_W {
+        draw_spin(session, brush, rect, node.hover.x, dim);
+    }
+}
+
+/// Two stacked up/down chevrons on the trailing edge of a wide `NumberBox`.
+fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, hover: f32, dim: f32) {
+    let col_x = rect.right - editor::SPIN_W;
+    let mid = rect.top + rect.height() / 2.0;
+    // Hairline divider before the spin column.
+    put(brush, theme::stroke(), dim);
+    session.draw_line(
+        Vector2::new(col_x, rect.top + theme::SPACE_4),
+        Vector2::new(col_x, rect.bottom - theme::SPACE_4),
+        brush,
+        theme::BORDER_W,
+    );
+    let color = theme::with_alpha(theme::TEXT_SECONDARY, 0.6 + 0.4 * hover.clamp(0.0, 1.0));
+    let cr_up = Rect::new(col_x, rect.top, rect.right, mid);
+    let cr_down = Rect::new(col_x, mid, rect.right, rect.bottom);
+    if let Some(g) = glyph_str(GLYPH_CHEVRON_UP) {
+        text(session, brush, &g, cr_up, theme::FONT_ICON, 6.0, 400, color,
+            TextAlignment::Center, ParagraphAlignment::Center, dim);
+    }
+    if let Some(g) = glyph_str(GLYPH_CHEVRON_DOWN) {
+        text(session, brush, &g, cr_down, theme::FONT_ICON, 6.0, 400, color,
+            TextAlignment::Center, ParagraphAlignment::Center, dim);
     }
 }
 

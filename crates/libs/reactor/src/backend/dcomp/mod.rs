@@ -17,6 +17,7 @@ use crate::backend::ControlId;
 mod bootstrap;
 mod controls;
 mod dispatch;
+mod editor;
 mod host;
 mod input;
 mod layout;
@@ -66,10 +67,12 @@ pub struct DCompBackend {
     popup: Option<popup::Popup>,
     /// Whether the open popup's reveal animation has settled.
     popup_settled: bool,
+    /// The host window handle (as `isize`) — used for clipboard ownership.
+    hwnd: isize,
 }
 
 impl DCompBackend {
-    pub(crate) fn new(comp: Compositing, dip_size: (f32, f32), dpi: f32) -> Self {
+    pub(crate) fn new(comp: Compositing, dip_size: (f32, f32), dpi: f32, hwnd: isize) -> Self {
         Self {
             arena: Arena::default(),
             comp,
@@ -86,6 +89,7 @@ impl DCompBackend {
             focused_id: None,
             popup: None,
             popup_settled: true,
+            hwnd,
         }
     }
 
@@ -251,8 +255,41 @@ impl Backend for DCompBackend {
             }
 
             (Prop::Content | Prop::Text, PropValue::Str(s)) => {
-                node.paint.text = s.clone();
-                node.text_dirty = true;
+                // For an editable kind (AutoSuggestBox carries its text via
+                // `Prop::Text`), seed the editor buffer instead of the label.
+                if node.editor.is_some() {
+                    seed_editor_text(node, s);
+                } else {
+                    node.paint.text = s.clone();
+                    node.text_dirty = true;
+                }
+                node.mark_dirty();
+            }
+            // TextBox / PasswordBox carry their text via `Prop::Value(Str)`.
+            (Prop::Value, PropValue::Str(s)) if node.editor.is_some() => {
+                seed_editor_text(node, s);
+                node.mark_dirty();
+            }
+            (Prop::Precision, PropValue::I32(v)) => {
+                node.ctrl.precision = Some(*v);
+                // Reformat the seeded value to the new precision (the `Value`
+                // prop usually arrives before `Precision`). Never while focused
+                // — the user owns the buffer mid-edit.
+                if node.kind == ControlKind::NumberBox && !node.focused {
+                    let value = node.ctrl.value;
+                    if let Some(ed) = &mut node.editor {
+                        ed.seeded = false;
+                    }
+                    seed_number_text(node, value);
+                    node.mark_dirty();
+                }
+            }
+            (Prop::LargeChange, PropValue::F64(v)) => node.ctrl.large_change = Some(*v),
+            (Prop::HorizontalContentAlignment, PropValue::I32(v)) => {
+                node.ctrl.content_align = *v;
+                if let Some(ed) = &mut node.editor {
+                    ed.layout_dirty = true;
+                }
                 node.mark_dirty();
             }
             (Prop::FontSize, PropValue::F64(v)) => {
@@ -375,6 +412,12 @@ impl Backend for DCompBackend {
                 node.anim.target = ctrl_value_frac(node) as f32;
                 start_anim = node.kind == ControlKind::Slider
                     && (node.anim.x - node.anim.target).abs() > 1e-3;
+                // NumberBox: reflect the programmatic value as formatted text
+                // (unless the user is mid-edit — the editor owns the buffer
+                // while focused).
+                if node.kind == ControlKind::NumberBox {
+                    seed_number_text(node, *v);
+                }
                 node.mark_dirty();
             }
             (Prop::Minimum, PropValue::F64(v)) => {
@@ -552,6 +595,32 @@ impl Backend for DCompBackend {
 
 fn clone_lengths(g: &[GridLength]) -> Vec<GridLength> {
     g.to_vec()
+}
+
+/// Seed an editor's buffer from a programmatic string prop. Skipped while the
+/// field is focused so the user's in-progress edit is never clobbered.
+fn seed_editor_text(node: &mut Node, s: &str) {
+    let focused = node.focused;
+    if let Some(ed) = &mut node.editor
+        && (!focused || !ed.seeded)
+    {
+        ed.set_text(s);
+        ed.seeded = true;
+    }
+}
+
+/// Seed a NumberBox editor from a programmatic numeric value, formatted to the
+/// configured precision. Skipped while focused (the user owns the buffer).
+fn seed_number_text(node: &mut Node, v: f64) {
+    let focused = node.focused;
+    let precision = node.ctrl.precision;
+    if let Some(ed) = &mut node.editor
+        && (!focused || !ed.seeded)
+    {
+        let digits = precision.unwrap_or(2).clamp(0, 12) as usize;
+        ed.set_text(&format!("{v:.digits$}"));
+        ed.seeded = true;
+    }
 }
 
 /// The control's value as a 0..1 fraction of its `[min, max]` range.

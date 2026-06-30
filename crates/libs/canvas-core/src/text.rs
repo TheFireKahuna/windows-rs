@@ -310,6 +310,61 @@ impl TextLayout {
         ))
     }
 
+    /// Selection / range geometry: the rectangles (layout-relative DIPs,
+    /// offset by `origin`) covering the code-unit range `[position,
+    /// position + length)`. One rect per line the range spans. Drives the
+    /// editor's selection highlight and IME candidate-window placement.
+    /// Returns an empty vec for a zero-length range.
+    pub fn hit_test_range(
+        &self,
+        position: u32,
+        length: u32,
+        origin_x: f32,
+        origin_y: f32,
+    ) -> Result<Vec<(f32, f32, f32, f32)>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        // First call (no buffer) reports the required metric count via the
+        // `actual` out-param; the HRESULT is the expected insufficient-buffer
+        // error, so it is deliberately ignored.
+        let mut count = 0u32;
+        unsafe {
+            let _ = self
+                .raw
+                .HitTestTextRange(position, length, origin_x, origin_y, None, &mut count);
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut metrics = vec![DWRITE_HIT_TEST_METRICS::default(); count as usize];
+        unsafe {
+            self.raw.HitTestTextRange(
+                position,
+                length,
+                origin_x,
+                origin_y,
+                Some(&mut metrics),
+                &mut count,
+            )?;
+        }
+        Ok(metrics
+            .iter()
+            .take(count as usize)
+            .map(|m| (m.left, m.top, m.width, m.height))
+            .collect())
+    }
+
+    /// Toggle an underline over the code-unit range `[start, start + length)`.
+    /// Used to mark the active IME composition span.
+    pub fn set_underline(&self, has_underline: bool, start: u32, length: u32) -> Result<()> {
+        let range = DWRITE_TEXT_RANGE {
+            startPosition: start,
+            length,
+        };
+        unsafe { self.raw.SetUnderline(has_underline, range) }
+    }
+
     /// Returns the underlying `IDWriteTextLayout`.
     pub fn raw(&self) -> &IDWriteTextLayout {
         &self.raw

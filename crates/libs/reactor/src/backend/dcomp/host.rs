@@ -16,6 +16,17 @@ use crate::{Component, Element, RenderCx, WindowSize};
 use windows_core::PCWSTR;
 
 const TIMER_ID: usize = 1;
+/// Caret-blink timer — the one allowed at-rest timer, running only while a text
+/// field holds focus (and the window is active), killed on blur.
+const BLINK_TIMER_ID: usize = 2;
+/// `GetCaretBlinkTime` sentinel meaning "blinking disabled" (solid caret).
+const BLINK_INFINITE: u32 = u32::MAX;
+
+thread_local! {
+    /// Whether the caret-blink timer is currently scheduled (avoids resetting
+    /// the blink phase on unrelated input).
+    static BLINK_RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Per-thread state the WndProc reaches into. `render_host` is a clone (an `Rc`
 /// bump) of the host's render host; `local`/`send` are the dispatcher's queues.
@@ -48,7 +59,7 @@ impl DCompHost {
         let dip = (pw as f32 / scale, ph as f32 / scale);
 
         let comp = Compositing::new(hwnd, pw, ph, dpi as f32)?;
-        let mut backend = DCompBackend::new(comp, dip, dpi as f32);
+        let mut backend = DCompBackend::new(comp, dip, dpi as f32, hwnd as isize);
         // Honour the OS light/dark app theme for the window backdrop at startup
         // (the same flip the `WM_SETTINGCHANGE` handler applies when it changes).
         backend.apply_theme(system_prefers_dark());
@@ -212,6 +223,23 @@ fn is_immersive_color_set(lparam: LPARAM) -> bool {
     s == "ImmersiveColorSet"
 }
 
+/// Read an IMM composition string (`GCS_COMPSTR` / `GCS_RESULTSTR`) into a
+/// `String`. Two calls: size probe, then fetch.
+unsafe fn imm_string(himc: HIMC, gcs: u32) -> Option<String> {
+    let bytes = unsafe { ImmGetCompositionStringW(himc, gcs, core::ptr::null_mut(), 0) };
+    if bytes <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; (bytes as usize).div_ceil(2)];
+    let got = unsafe {
+        ImmGetCompositionStringW(himc, gcs, buf.as_mut_ptr().cast(), bytes as u32)
+    };
+    if got <= 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..(got as usize) / 2]))
+}
+
 /// Read a NUL-terminated UTF-16 string at `ptr` (bounded) into a `String`.
 unsafe fn wide_str(ptr: *const u16) -> String {
     if ptr.is_null() {
@@ -259,6 +287,46 @@ fn start_timer(hwnd: HWND, needed: bool) {
     }
 }
 
+/// Start or stop the caret-blink timer to match whether a text field is
+/// focused. Only toggles on a change of state so the blink phase is preserved
+/// across unrelated input. A `GetCaretBlinkTime` of 0 / INFINITE (blinking
+/// disabled) keeps the timer off — the caret then stays solid.
+fn sync_blink(hwnd: HWND) {
+    let want = shared()
+        .map(|s| {
+            s.render_host
+                .with_reconciler_mut(|r| r.backend.wants_blink_timer())
+        })
+        .unwrap_or(false);
+    let interval = unsafe { GetCaretBlinkTime() };
+    let blink = want && interval != 0 && interval != BLINK_INFINITE;
+    BLINK_RUNNING.with(|c| {
+        if blink && !c.get() {
+            unsafe {
+                SetTimer(hwnd, BLINK_TIMER_ID, interval, None);
+            }
+            c.set(true);
+        } else if !blink && c.get() {
+            unsafe {
+                let _ = KillTimer(hwnd, BLINK_TIMER_ID);
+            }
+            c.set(false);
+        }
+    });
+}
+
+/// Force the caret-blink timer off (window deactivated).
+fn stop_blink(hwnd: HWND) {
+    BLINK_RUNNING.with(|c| {
+        if c.get() {
+            unsafe {
+                let _ = KillTimer(hwnd, BLINK_TIMER_ID);
+            }
+            c.set(false);
+        }
+    });
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_ERASEBKGND => 1, // the compositor owns every pixel; never erase/flash.
@@ -299,6 +367,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 }
                 start_timer(hwnd, timer);
+                sync_blink(hwnd);
             }
             0
         }
@@ -339,20 +408,101 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(s) = shared() {
                 let vk = (wparam & 0xFFFF) as u32;
                 let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-                let started = s.render_host.with_reconciler_mut(|r| r.backend.on_key(vk, shift));
+                let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+                let started = s
+                    .render_host
+                    .with_reconciler_mut(|r| r.backend.on_key(vk, shift, ctrl));
                 start_timer(hwnd, started);
+                sync_blink(hwnd);
             }
+            0
+        }
+
+        WM_CHAR => {
+            if let Some(s) = shared() {
+                let ch = (wparam & 0xFFFF) as u16;
+                s.render_host.with_reconciler_mut(|r| r.backend.on_char(ch));
+                sync_blink(hwnd);
+            }
+            0
+        }
+
+        // ── IME (IMM32 composition fallback) ─────────────────────────────
+        WM_IME_STARTCOMPOSITION => {
+            if let Some(s) = shared()
+                && s.render_host.with_reconciler_mut(|r| r.backend.ime_begin())
+            {
+                // A text field owns composition: suppress the default IME window.
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_IME_COMPOSITION => {
+            if let Some(s) = shared()
+                && s.render_host.with_reconciler_mut(|r| r.backend.has_text_focus())
+            {
+                let himc = unsafe { ImmGetContext(hwnd) };
+                if !himc.is_null() {
+                    let flags = lparam as u32;
+                    if flags & GCS_RESULTSTR != 0
+                        && let Some(res) = unsafe { imm_string(himc, GCS_RESULTSTR) }
+                    {
+                        s.render_host
+                            .with_reconciler_mut(|r| r.backend.ime_commit(&res));
+                    }
+                    if flags & GCS_COMPSTR != 0 {
+                        let comp = unsafe { imm_string(himc, GCS_COMPSTR) }.unwrap_or_default();
+                        s.render_host
+                            .with_reconciler_mut(|r| r.backend.ime_update(&comp));
+                    }
+                    unsafe {
+                        let _ = ImmReleaseContext(hwnd, himc);
+                    }
+                }
+                sync_blink(hwnd);
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_IME_ENDCOMPOSITION => {
+            if let Some(s) = shared()
+                && s.render_host.with_reconciler_mut(|r| r.backend.has_text_focus())
+            {
+                s.render_host.with_reconciler_mut(|r| r.backend.ime_end());
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_SETFOCUS => {
+            if let Some(s) = shared() {
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.window_focus_changed(true));
+            }
+            sync_blink(hwnd);
             0
         }
 
         WM_KILLFOCUS => {
             if let Some(s) = shared() {
-                s.render_host.with_reconciler_mut(|r| r.backend.on_focus_lost());
+                s.render_host.with_reconciler_mut(|r| {
+                    r.backend.window_focus_changed(false);
+                    r.backend.on_focus_lost();
+                });
             }
+            stop_blink(hwnd);
             0
         }
 
         WM_TIMER => {
+            if wparam == BLINK_TIMER_ID {
+                if let Some(s) = shared() {
+                    s.render_host.with_reconciler_mut(|r| r.backend.blink_tick());
+                }
+                return 0;
+            }
             if wparam == TIMER_ID
                 && let Some(s) = shared()
             {

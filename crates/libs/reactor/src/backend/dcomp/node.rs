@@ -11,6 +11,7 @@
 //! surface only when its own content or size changed.
 
 use super::bootstrap::NodeSurface;
+use super::editor::Editor;
 use super::*;
 use crate::backend::{ControlKind, Event, EventHandler};
 use crate::style::{AccessibilityModifiers, PointerHandlers};
@@ -153,6 +154,12 @@ pub(crate) struct Ctrl {
     pub placeholder: String,
     /// ScrollViewer: total content height in DIPs (computed at layout).
     pub content_h: f32,
+    /// NumberBox: fraction digits shown / rounded to on commit.
+    pub precision: Option<i32>,
+    /// NumberBox: PageUp/PageDown increment (`LargeChange`).
+    pub large_change: Option<f64>,
+    /// Text field content alignment (WinRT `HorizontalAlignment`; -1 = unset).
+    pub content_align: i32,
 }
 
 impl Default for Ctrl {
@@ -175,6 +182,9 @@ impl Default for Ctrl {
             menu: Vec::new(),
             placeholder: String::new(),
             content_h: 0.0,
+            precision: None,
+            large_change: None,
+            content_align: -1,
         }
     }
 }
@@ -248,6 +258,10 @@ pub(crate) struct Node {
     pub focusable: bool,
     /// This node currently holds keyboard focus (draws the focus ring).
     pub focused: bool,
+
+    /// Text-editor state for the editable text kinds (NumberBox / TextBox /
+    /// PasswordBox / AutoSuggestBox); `None` for every other kind.
+    pub editor: Option<Editor>,
 }
 
 impl Node {
@@ -302,6 +316,7 @@ impl Node {
             phase: 0.0,
             focusable,
             focused: false,
+            editor: is_text_editable(kind).then(|| Editor::new(kind)),
         }
     }
 
@@ -312,6 +327,7 @@ impl Node {
     /// True for nodes that respond to a press (hover/press ink + activate).
     pub fn is_clickable(&self) -> bool {
         is_interactive_kind(self.kind)
+            || is_text_editable(self.kind)
             || self.handler(Event::Click).is_some()
             || self
                 .pointer
@@ -388,7 +404,19 @@ pub(crate) fn is_interactive_kind(kind: ControlKind) -> bool {
 /// Kinds that always own a paint surface (they draw chrome unconditionally).
 fn draws_own_chrome(kind: ControlKind) -> bool {
     is_interactive_kind(kind)
+        || is_text_editable(kind)
         || matches!(kind, ControlKind::ProgressBar | ControlKind::ProgressRing)
+}
+
+/// The editable text kinds, each backed by a shared [`Editor`].
+pub(crate) fn is_text_editable(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::NumberBox
+            | ControlKind::TextBox
+            | ControlKind::PasswordBox
+            | ControlKind::AutoSuggestBox
+    )
 }
 
 /// Kinds that take keyboard focus in the Tab ring.
@@ -407,6 +435,10 @@ fn is_focusable_kind(kind: ControlKind) -> bool {
             | ControlKind::DropDownButton
             | ControlKind::SplitButton
             | ControlKind::Expander
+            | ControlKind::NumberBox
+            | ControlKind::TextBox
+            | ControlKind::PasswordBox
+            | ControlKind::AutoSuggestBox
     )
 }
 
@@ -461,6 +493,14 @@ fn default_style(kind: ControlKind) -> taffy::Style {
                 width: length(0.0),
                 height: length(30.0),
             };
+        }
+        ControlKind::NumberBox
+        | ControlKind::TextBox
+        | ControlKind::PasswordBox
+        | ControlKind::AutoSuggestBox => {
+            // The editor draws its own box chrome + caret on its surface.
+            s.display = Display::Block;
+            s.min_size.height = length(theme::ROW_H);
         }
         _ => {
             s.display = Display::Flex;

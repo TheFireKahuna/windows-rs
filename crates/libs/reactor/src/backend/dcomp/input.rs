@@ -6,21 +6,36 @@
 //! light-dismiss / Up-Down-Enter-Esc). Coordinates arrive in DIPs.
 
 use super::controls;
+use super::editor;
 use super::popup::Popup;
 use super::*;
 use crate::backend::Event;
 use crate::style::PointerEventInfo;
+use crate::system_bindings::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, GlobalAlloc, GlobalLock, GlobalUnlock,
+    OpenClipboard, SetClipboardData, CF_UNICODETEXT, GMEM_MOVEABLE, HWND,
+};
 use windows_canvas_core::Rect as CanvasRect;
 
 // Virtual-key codes used by keyboard handling.
+const VK_BACK: u32 = 0x08;
 const VK_TAB: u32 = 0x09;
 const VK_RETURN: u32 = 0x0D;
 const VK_ESCAPE: u32 = 0x1B;
 const VK_SPACE: u32 = 0x20;
+const VK_PRIOR: u32 = 0x21; // PageUp
+const VK_NEXT: u32 = 0x22; // PageDown
+const VK_END: u32 = 0x23;
+const VK_HOME: u32 = 0x24;
 const VK_LEFT: u32 = 0x25;
 const VK_UP: u32 = 0x26;
 const VK_RIGHT: u32 = 0x27;
 const VK_DOWN: u32 = 0x28;
+const VK_DELETE: u32 = 0x2E;
+const VK_A: u32 = 0x41;
+const VK_C: u32 = 0x43;
+const VK_V: u32 = 0x56;
+const VK_X: u32 = 0x58;
 
 impl DCompBackend {
     // ── Hit-testing ──────────────────────────────────────────────────────────
@@ -121,6 +136,14 @@ impl DCompBackend {
             return false;
         }
 
+        // A pressed text field drag-selects 1:1 with the pointer.
+        if let Some(pid) = self.pressed_id
+            && self.node(pid).is_some_and(|n| n.editor.is_some())
+        {
+            self.extend_selection(pid, x);
+            return true;
+        }
+
         // A pressed slider scrubs 1:1 with the pointer.
         if let Some(pid) = self.pressed_id
             && self.node(pid).map(|n| n.kind) == Some(ControlKind::Slider)
@@ -204,6 +227,21 @@ impl DCompBackend {
         // Pointer focus (no visible ring) follows the click.
         self.set_focus(target.filter(|id| self.node(*id).is_some_and(|n| n.focusable)), false);
 
+        // Editable text field: place the caret / handle a spin-button press
+        // (no press ink, and the click starts a possible drag-select).
+        if let Some(id) = target
+            && self.node(id).is_some_and(|n| n.editor.is_some())
+        {
+            if self.node(id).map(|n| n.kind) == Some(ControlKind::NumberBox)
+                && self.spin_hit(id, x, y)
+            {
+                return (true, false);
+            }
+            self.place_caret(id, x);
+            self.pressed_id = Some(id);
+            return (true, false);
+        }
+
         if let Some(id) = target {
             if let Some(n) = self.node_mut(id) {
                 n.pressed = true;
@@ -240,6 +278,14 @@ impl DCompBackend {
                 self.commit_popup(idx);
             }
             return self.popup.is_some() && !self.popup_settled;
+        }
+
+        // A text-field drag ended: just drop the press (no activation / ink).
+        if let Some(pid) = self.pressed_id
+            && self.node(pid).is_some_and(|n| n.editor.is_some())
+        {
+            self.pressed_id = None;
+            return false;
         }
 
         let Some(id) = self.pressed_id.take() else {
@@ -451,8 +497,15 @@ impl DCompBackend {
         self.popup_settled = true;
     }
 
-    /// Window lost activation: light-dismiss any open popup.
+    /// Window lost activation: commit a focused NumberBox and light-dismiss any
+    /// open popup. The keyboard focus itself is retained so re-activating the
+    /// window resumes editing where it left off.
     pub(crate) fn on_focus_lost(&mut self) {
+        if let Some(id) = self.focused_editable()
+            && self.node(id).map(|n| n.kind) == Some(ControlKind::NumberBox)
+        {
+            self.commit_number(id);
+        }
         self.close_popup();
     }
 
@@ -479,6 +532,15 @@ impl DCompBackend {
     /// Mouse wheel at (x, y) DIPs, `delta` in WHEEL_DELTA (120) units. Returns
     /// `true` if a scroll spring started.
     pub(crate) fn on_wheel(&mut self, x: f32, y: f32, delta: i32) -> bool {
+        // A focused NumberBox under the pointer steps on the wheel.
+        if let Some(id) = self.focused_editable()
+            && self.node(id).map(|n| n.kind) == Some(ControlKind::NumberBox)
+            && self.node(id).is_some_and(|n| n.rect.contains(x, y))
+        {
+            self.number_step(id, if delta > 0 { 1.0 } else { -1.0 }, false);
+            return false;
+        }
+
         if let Some(id) = self.scroll_at(x, y) {
             // 48 DIPs per detent, downward wheel scrolls content up.
             let step = -(delta as f32 / 120.0) * 48.0;
@@ -497,9 +559,16 @@ impl DCompBackend {
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
 
-    /// A key was pressed (`shift` held?). Returns `true` if a spring/timer
-    /// should run.
-    pub(crate) fn on_key(&mut self, vk: u32, shift: bool) -> bool {
+    /// A key was pressed (`shift` / `ctrl` held?). Returns `true` if a
+    /// spring/timer should run.
+    pub(crate) fn on_key(&mut self, vk: u32, shift: bool, ctrl: bool) -> bool {
+        // A focused text editor consumes editing keys before the generic ring.
+        if let Some(id) = self.focused_editable()
+            && let Some(needs) = self.editor_key(id, vk, shift, ctrl)
+        {
+            return needs;
+        }
+
         // Popup keyboard navigation takes priority.
         if self.popup.is_some() {
             match vk {
@@ -542,6 +611,398 @@ impl DCompBackend {
             VK_RIGHT | VK_DOWN => self.focus_arrow(1),
             _ => false,
         }
+    }
+
+    // ── Text editor ────────────────────────────────────────────────────────
+
+    /// The focused node, if it is an editable text field.
+    fn focused_editable(&self) -> Option<ControlId> {
+        let id = self.focused_id?;
+        self.node(id)
+            .is_some_and(|n| n.editor.is_some())
+            .then_some(id)
+    }
+
+    /// Whether the caret-blink timer should be running (a text field is focused).
+    pub(crate) fn wants_blink_timer(&self) -> bool {
+        self.focused_editable().is_some()
+    }
+
+    /// Show / hide the focused field's caret when the host window gains or
+    /// loses activation (keyboard focus is retained either way).
+    pub(crate) fn window_focus_changed(&mut self, focused: bool) {
+        if let Some(id) = self.focused_editable() {
+            if let Some(n) = self.node_mut(id) {
+                if let Some(e) = &mut n.editor {
+                    e.blink_on = focused;
+                }
+                n.mark_dirty();
+            }
+            self.repaint();
+        }
+    }
+
+    /// Flip the focused field's caret-blink phase and repaint just that field.
+    pub(crate) fn blink_tick(&mut self) {
+        if let Some(id) = self.focused_editable() {
+            if let Some(n) = self.node_mut(id) {
+                if let Some(e) = &mut n.editor {
+                    e.blink_on = !e.blink_on;
+                }
+                n.mark_dirty();
+            }
+            self.repaint();
+        }
+    }
+
+    fn with_editor<R>(&mut self, id: ControlId, f: impl FnOnce(&mut editor::Editor) -> R) -> Option<R> {
+        self.node_mut(id).and_then(|n| n.editor.as_mut()).map(f)
+    }
+
+    /// Route an editing key to the focused editor. Returns `Some(needs_timer)`
+    /// when consumed, or `None` to let the generic ring handle it (e.g. Tab).
+    fn editor_key(&mut self, id: ControlId, vk: u32, shift: bool, ctrl: bool) -> Option<bool> {
+        let kind = self.node(id)?.kind;
+        if vk == VK_TAB {
+            return None; // Tab leaves the field (commit happens in set_focus).
+        }
+        if ctrl {
+            match vk {
+                VK_A => {
+                    self.with_editor(id, |e| e.select_all());
+                    self.editor_caret_moved(id);
+                    return Some(false);
+                }
+                VK_C => {
+                    self.editor_copy(id);
+                    return Some(false);
+                }
+                VK_X => {
+                    self.editor_cut(id);
+                    return Some(false);
+                }
+                VK_V => {
+                    self.editor_paste(id);
+                    return Some(false);
+                }
+                VK_LEFT => {
+                    self.with_editor(id, |e| e.move_left(true, shift));
+                    self.editor_caret_moved(id);
+                    return Some(false);
+                }
+                VK_RIGHT => {
+                    self.with_editor(id, |e| e.move_right(true, shift));
+                    self.editor_caret_moved(id);
+                    return Some(false);
+                }
+                _ => {}
+            }
+        }
+        match vk {
+            VK_LEFT => {
+                self.with_editor(id, |e| e.move_left(false, shift));
+                self.editor_caret_moved(id);
+            }
+            VK_RIGHT => {
+                self.with_editor(id, |e| e.move_right(false, shift));
+                self.editor_caret_moved(id);
+            }
+            VK_HOME => {
+                self.with_editor(id, |e| e.home(shift));
+                self.editor_caret_moved(id);
+            }
+            VK_END => {
+                self.with_editor(id, |e| e.end(shift));
+                self.editor_caret_moved(id);
+            }
+            VK_BACK => {
+                self.with_editor(id, |e| e.backspace());
+                self.editor_after_edit(id);
+            }
+            VK_DELETE => {
+                self.with_editor(id, |e| e.delete_forward());
+                self.editor_after_edit(id);
+            }
+            VK_RETURN => {
+                if kind == ControlKind::NumberBox {
+                    self.commit_number(id);
+                } else if kind == ControlKind::AutoSuggestBox {
+                    let t = self.with_editor(id, |e| e.text()).unwrap_or_default();
+                    self.fire_string(id, Event::QuerySubmitted, t);
+                }
+            }
+            VK_UP if kind == ControlKind::NumberBox => self.number_step(id, 1.0, false),
+            VK_DOWN if kind == ControlKind::NumberBox => self.number_step(id, -1.0, false),
+            VK_PRIOR if kind == ControlKind::NumberBox => self.number_step(id, 1.0, true),
+            VK_NEXT if kind == ControlKind::NumberBox => self.number_step(id, -1.0, true),
+            _ => {} // consume; printable input arrives via WM_CHAR
+        }
+        Some(false)
+    }
+
+    /// IME composition started (IMM32 fallback): anchor the composition span.
+    /// Returns `true` if a focused editor will handle composition (so the host
+    /// can suppress the default IME composition window).
+    pub(crate) fn ime_begin(&mut self) -> bool {
+        if let Some(id) = self.focused_editable() {
+            self.with_editor(id, |e| e.ime_begin());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// IME composition update (the in-progress, underlined run).
+    pub(crate) fn ime_update(&mut self, s: &str) {
+        if let Some(id) = self.focused_editable() {
+            self.with_editor(id, |e| e.ime_replace(s, true));
+            self.editor_caret_moved(id);
+        }
+    }
+
+    /// IME committed a result string into the field.
+    pub(crate) fn ime_commit(&mut self, s: &str) {
+        if let Some(id) = self.focused_editable() {
+            self.with_editor(id, |e| e.ime_replace(s, false));
+            self.editor_after_edit(id);
+        }
+    }
+
+    /// IME composition ended (cancelled / finished).
+    pub(crate) fn ime_end(&mut self) {
+        if let Some(id) = self.focused_editable() {
+            self.with_editor(id, |e| e.ime_end());
+            self.editor_caret_moved(id);
+        }
+    }
+
+    /// Whether a text field currently has keyboard focus (host gates IME).
+    pub(crate) fn has_text_focus(&self) -> bool {
+        self.focused_editable().is_some()
+    }
+
+    /// A printable character (WM_CHAR, UTF-16 code unit). Returns `true` if a
+    /// focused editor consumed it.
+    pub(crate) fn on_char(&mut self, ch: u16) -> bool {
+        let Some(id) = self.focused_editable() else {
+            return false;
+        };
+        // Drop control characters (Tab/Enter/Backspace handled in `on_key`).
+        if ch < 0x20 || ch == 0x7F {
+            return false;
+        }
+        let Some(c) = char::from_u32(ch as u32) else {
+            return false;
+        };
+        let numeric = self
+            .node(id)
+            .and_then(|n| n.editor.as_ref())
+            .is_some_and(|e| e.numeric);
+        if numeric && !editor::numeric_char_ok(c) {
+            return false;
+        }
+        let s = c.to_string();
+        self.with_editor(id, |e| e.insert(&s));
+        self.editor_after_edit(id);
+        true
+    }
+
+    /// Caret moved (no text change): reset blink, repaint the field.
+    fn editor_caret_moved(&mut self, id: ControlId) {
+        if let Some(n) = self.node_mut(id) {
+            if let Some(e) = &mut n.editor {
+                e.blink_on = true;
+            }
+            n.mark_dirty();
+        }
+        self.repaint();
+    }
+
+    /// Text changed: reset blink, repaint, and fire the per-kind change event
+    /// (NumberBox fires only on commit).
+    fn editor_after_edit(&mut self, id: ControlId) {
+        let (kind, text) = match self.node_mut(id) {
+            Some(n) => {
+                let kind = n.kind;
+                if let Some(e) = &mut n.editor {
+                    e.blink_on = true;
+                    e.seeded = true;
+                }
+                let text = n.editor.as_ref().map(|e| e.text()).unwrap_or_default();
+                n.mark_dirty();
+                (kind, text)
+            }
+            None => return,
+        };
+        self.repaint();
+        match kind {
+            ControlKind::TextBox | ControlKind::AutoSuggestBox => {
+                self.fire_string(id, Event::TextChanged, text)
+            }
+            ControlKind::PasswordBox => self.fire_string(id, Event::PasswordChanged, text),
+            _ => {}
+        }
+    }
+
+    /// Commit a NumberBox: parse (with inline arithmetic) → clamp → round →
+    /// format → write back → fire `ValueChanged`.
+    fn commit_number(&mut self, id: ControlId) {
+        let (text, fallback) = match self.node(id) {
+            Some(n) => (
+                n.editor.as_ref().map(|e| e.text()).unwrap_or_default(),
+                n.ctrl.value,
+            ),
+            None => return,
+        };
+        let value = editor::eval_numeric(&text).unwrap_or(fallback);
+        self.apply_number(id, value);
+    }
+
+    /// Step a NumberBox value by ±`dir`·(step|largeChange), folding in any
+    /// pending text edit first, then commit.
+    fn number_step(&mut self, id: ControlId, dir: f64, large: bool) {
+        let value = match self.node(id) {
+            Some(n) => {
+                let text = n.editor.as_ref().map(|e| e.text()).unwrap_or_default();
+                let cur = editor::eval_numeric(&text).unwrap_or(n.ctrl.value);
+                let step = n.ctrl.step.unwrap_or(1.0);
+                let inc = if large {
+                    n.ctrl.large_change.unwrap_or(step * 10.0)
+                } else {
+                    step
+                };
+                cur + dir * inc
+            }
+            None => return,
+        };
+        self.apply_number(id, value);
+    }
+
+    /// Clamp/round/format `value`, write it into the NumberBox, repaint, and
+    /// fire `ValueChanged`.
+    fn apply_number(&mut self, id: ControlId, value: f64) {
+        let (min, max, precision) = match self.node(id) {
+            Some(n) => (n.ctrl.min, n.ctrl.max, n.ctrl.precision),
+            None => return,
+        };
+        let (v, s) = editor::commit_format(value, min, max, precision);
+        if let Some(n) = self.node_mut(id) {
+            n.ctrl.value = v;
+            if let Some(e) = &mut n.editor {
+                e.set_text(&s);
+                e.seeded = true;
+                e.blink_on = true;
+            }
+            n.mark_dirty();
+        }
+        self.repaint();
+        self.fire_f64(id, Event::ValueChanged, v);
+    }
+
+    // ── Editor pointer + clipboard ───────────────────────────────────────────
+
+    /// The caret index for an absolute-DIP x over editable node `id`.
+    fn caret_index_at(&self, id: ControlId, x: f32) -> Option<usize> {
+        let n = self.node(id)?;
+        let ed = n.editor.as_ref()?;
+        let (pad_left, _w) = editor::editor_content(n.kind, n.rect.w);
+        Some(ed.index_at_x(x - n.rect.x, pad_left - ed.scroll_x))
+    }
+
+    /// Place the caret (collapsing the selection) from a pointer press.
+    fn place_caret(&mut self, id: ControlId, x: f32) {
+        let Some(idx) = self.caret_index_at(id, x) else {
+            return;
+        };
+        if let Some(n) = self.node_mut(id) {
+            if let Some(e) = &mut n.editor {
+                e.caret = idx;
+                e.anchor = idx;
+                e.blink_on = true;
+            }
+            n.mark_dirty();
+        }
+        self.repaint();
+    }
+
+    /// Extend the selection to a pointer position (drag-select).
+    fn extend_selection(&mut self, id: ControlId, x: f32) {
+        let Some(idx) = self.caret_index_at(id, x) else {
+            return;
+        };
+        if let Some(n) = self.node_mut(id) {
+            if let Some(e) = &mut n.editor {
+                e.caret = idx;
+                e.blink_on = true;
+            }
+            n.mark_dirty();
+        }
+        self.repaint();
+    }
+
+    /// Press on a wide NumberBox's spin column: step up (top half) or down.
+    fn spin_hit(&mut self, id: ControlId, x: f32, y: f32) -> bool {
+        let (col_x, mid, wide) = match self.node(id) {
+            Some(n) => (
+                n.rect.x + n.rect.w - editor::SPIN_W,
+                n.rect.y + n.rect.h / 2.0,
+                n.rect.w >= editor::SPIN_MIN_BOX_W,
+            ),
+            None => return false,
+        };
+        if !wide || x < col_x {
+            return false;
+        }
+        self.number_step(id, if y < mid { 1.0 } else { -1.0 }, false);
+        true
+    }
+
+    fn editor_copy(&self, id: ControlId) {
+        if let Some(n) = self.node(id)
+            && let Some(e) = &n.editor
+            && e.has_selection()
+            && !e.mask
+        {
+            clipboard_set(self.hwnd(), &e.selected_text());
+        }
+    }
+
+    fn editor_cut(&mut self, id: ControlId) {
+        self.editor_copy(id);
+        let removed = self
+            .with_editor(id, |e| {
+                if e.has_selection() {
+                    e.backspace();
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if removed {
+            self.editor_after_edit(id);
+        }
+    }
+
+    fn editor_paste(&mut self, id: ControlId) {
+        let Some(text) = clipboard_get(self.hwnd()) else {
+            return;
+        };
+        let numeric = self
+            .node(id)
+            .and_then(|n| n.editor.as_ref())
+            .is_some_and(|e| e.numeric);
+        // Single-line: strip newlines; numeric: keep only admissible chars.
+        let s: String = text
+            .chars()
+            .filter(|c| *c != '\n' && *c != '\r')
+            .filter(|c| !numeric || editor::numeric_char_ok(*c))
+            .collect();
+        if s.is_empty() {
+            return;
+        }
+        self.with_editor(id, |e| e.insert(&s));
+        self.editor_after_edit(id);
     }
 
     /// Left/Right (or Up/Down) on the focused control: nudge a slider or move a
@@ -617,6 +1078,13 @@ impl DCompBackend {
         {
             return;
         }
+        // Commit a NumberBox losing focus before clearing it.
+        if let Some(old) = self.focused_id
+            && Some(old) != id
+            && self.node(old).map(|n| n.kind) == Some(ControlKind::NumberBox)
+        {
+            self.commit_number(old);
+        }
         if let Some(old) = self.focused_id
             && let Some(n) = self.node_mut(old)
         {
@@ -628,6 +1096,13 @@ impl DCompBackend {
             && let Some(n) = self.node_mut(new)
         {
             n.focused = visible;
+            // Keyboard focus (Tab) selects the whole field for quick replace.
+            if visible
+                && let Some(e) = &mut n.editor
+            {
+                e.select_all();
+                e.blink_on = true;
+            }
             n.mark_dirty();
         }
         self.repaint();
@@ -746,5 +1221,63 @@ impl DCompBackend {
     /// True while any spring, indeterminate progress, or the popup is animating.
     pub(crate) fn is_animating(&self) -> bool {
         !self.animating.is_empty() || (self.popup.is_some() && !self.popup_settled)
+    }
+
+    fn hwnd(&self) -> HWND {
+        self.hwnd as HWND
+    }
+}
+
+/// Read CF_UNICODETEXT from the clipboard as a `String`.
+fn clipboard_get(hwnd: HWND) -> Option<String> {
+    unsafe {
+        if !OpenClipboard(hwnd).as_bool() {
+            return None;
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT as u32);
+        let result = if !handle.is_null() {
+            let ptr = GlobalLock(handle as _) as *const u16;
+            if ptr.is_null() {
+                None
+            } else {
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let s = String::from_utf16_lossy(core::slice::from_raw_parts(ptr, len));
+                let _ = GlobalUnlock(handle as _);
+                Some(s)
+            }
+        } else {
+            None
+        };
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+/// Write `s` to the clipboard as CF_UNICODETEXT.
+fn clipboard_set(hwnd: HWND, s: &str) {
+    let utf16: Vec<u16> = s.encode_utf16().chain(core::iter::once(0)).collect();
+    unsafe {
+        if !OpenClipboard(hwnd).as_bool() {
+            return;
+        }
+        let _ = EmptyClipboard();
+        let bytes = utf16.len() * 2; // UTF-16 code units
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if !hmem.is_null() {
+            let dst = GlobalLock(hmem) as *mut u16;
+            if !dst.is_null() {
+                core::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
+                let _ = GlobalUnlock(hmem);
+                // Ownership transfers to the clipboard on success.
+                if SetClipboardData(CF_UNICODETEXT as u32, hmem as _).is_null() {
+                    // Failed to set: the system did not take ownership; free it.
+                    let _ = crate::system_bindings::GlobalFree(hmem);
+                }
+            }
+        }
+        let _ = CloseClipboard();
     }
 }

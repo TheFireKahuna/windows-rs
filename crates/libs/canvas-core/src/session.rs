@@ -322,6 +322,19 @@ impl<'a> DrawingSession<'a> {
         self.set_transform(&prev);
     }
 
+    /// Push an axis-aligned (aliased) clip rectangle. Subsequent drawing is
+    /// confined to `rect` until the matching [`pop_clip`](Self::pop_clip). Used
+    /// by the text editor to confine an overflowing single-line run to its box.
+    pub fn push_clip(&self, rect: &Rect) {
+        // 1 == D2D1_ANTIALIAS_MODE_ALIASED (crisp box edges, no clip-edge AA).
+        unsafe { self.context.PushAxisAlignedClip(&rect.to_abi(), 1) };
+    }
+
+    /// Pop the clip pushed by [`push_clip`](Self::push_clip).
+    pub fn pop_clip(&self) {
+        unsafe { self.context.PopAxisAlignedClip() };
+    }
+
     /// Returns the underlying `ID2D1DeviceContext`.
     pub fn raw(&self) -> &ID2D1DeviceContext {
         self.context
