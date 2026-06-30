@@ -48,7 +48,10 @@ impl DCompHost {
         let dip = (pw as f32 / scale, ph as f32 / scale);
 
         let comp = Compositing::new(hwnd, pw, ph, dpi as f32)?;
-        let backend = DCompBackend::new(comp, dip, dpi as f32);
+        let mut backend = DCompBackend::new(comp, dip, dpi as f32);
+        // Honour the OS light/dark app theme for the window backdrop at startup
+        // (the same flip the `WM_SETTINGCHANGE` handler applies when it changes).
+        backend.apply_theme(system_prefers_dark());
 
         let dispatcher = Win32Dispatcher::new(hwnd);
         let marshaller = dispatcher.marshaller();
@@ -152,12 +155,52 @@ pub(crate) fn window_backdrop(dark: bool) -> Color {
     }
 }
 
-/// Best-effort read of the system app theme. Detection of the live setting needs
-/// a registry/uxtheme binding not yet wired here, so this defaults to dark (the
-/// app's design default); the flip *mechanism* (re-resolve + repaint) is in
-/// place for when detection lands.
+windows_core::link!("advapi32.dll" "system" fn RegGetValueW(
+    hkey: *mut core::ffi::c_void,
+    lpsubkey: PCWSTR,
+    lpvalue: PCWSTR,
+    dwflags: u32,
+    pdwtype: *mut u32,
+    pvdata: *mut core::ffi::c_void,
+    pcbdata: *mut u32,
+) -> i32);
+
+/// Live read of the system **app** theme: the per-user
+/// `…\Themes\Personalize\AppsUseLightTheme` DWORD (`0` = dark, `1` = light) the OS
+/// Settings UI writes and broadcasts (`WM_SETTINGCHANGE` "ImmersiveColorSet") when
+/// the user flips it. Defaults to dark — the app's design default — if the value
+/// is absent or unreadable.
 fn system_prefers_dark() -> bool {
-    true
+    // HKEY_CURRENT_USER, sign-extended to a pointer as the Win32 headers define it.
+    const HKEY_CURRENT_USER: *mut core::ffi::c_void =
+        (0x8000_0001u32 as i32) as isize as *mut core::ffi::c_void;
+    // RRF_RT_REG_DWORD: only succeed if the value really is a DWORD.
+    const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+
+    let subkey: Vec<u16> =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+            .encode_utf16()
+            .collect();
+    let value: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+    let mut data: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_DWORD,
+            core::ptr::null_mut(),
+            (&mut data as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    // ERROR_SUCCESS == 0; AppsUseLightTheme == 0 means dark. Unreadable → dark.
+    if status == 0 {
+        data == 0
+    } else {
+        true
+    }
 }
 
 /// Whether a `WM_SETTINGCHANGE` lParam names the immersive colour set (theme).

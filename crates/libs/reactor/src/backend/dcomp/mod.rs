@@ -23,6 +23,7 @@ mod layout;
 mod node;
 mod paint;
 mod popup;
+mod scroll;
 mod size;
 mod theme;
 
@@ -55,6 +56,10 @@ pub struct DCompBackend {
     /// The clickable node currently under the pointer (hover) / pressed.
     hovered_id: Option<ControlId>,
     pressed_id: Option<ControlId>,
+    /// The scroll container currently under the pointer (drives thumb fade-in).
+    hovered_scroll: Option<ControlId>,
+    /// The scroll container whose thumb is being dragged, if any.
+    dragging_thumb: Option<ControlId>,
     /// The node holding keyboard focus (drives the focus ring + Space/Enter).
     focused_id: Option<ControlId>,
     /// The live popup overlay (Select/menu dropdown), if one is open.
@@ -76,6 +81,8 @@ impl DCompBackend {
             animating: FxHashSet::default(),
             hovered_id: None,
             pressed_id: None,
+            hovered_scroll: None,
+            dragging_thumb: None,
             focused_id: None,
             popup: None,
             popup_settled: true,

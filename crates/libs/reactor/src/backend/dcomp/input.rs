@@ -42,6 +42,55 @@ impl DCompBackend {
         best
     }
 
+    /// Whether `(x, y)` (absolute DIP) lies over scroll container `id`'s thumb.
+    /// Returns the pointer→thumb-top offset (for drag tracking) when it does.
+    fn thumb_at(&self, id: ControlId, x: f32, y: f32) -> Option<f32> {
+        let n = self.node(id)?;
+        let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, n.anim.x);
+        if !g.overflow {
+            return None;
+        }
+        let tx0 = n.rect.x + n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
+        let ty0 = n.rect.y + g.thumb_y;
+        if x >= tx0 && x < tx0 + scroll::THUMB_W && y >= ty0 && y < ty0 + g.thumb_h {
+            Some(y - ty0)
+        } else {
+            None
+        }
+    }
+
+    /// Switch which scroll container's thumb is shown (fade the old out, the new
+    /// in). The actual targets are (re)applied per tick; this only records the
+    /// hovered id and ensures both are stepped.
+    fn update_hovered_scroll(&mut self, now: Option<ControlId>) {
+        if now == self.hovered_scroll {
+            return;
+        }
+        if let Some(old) = self.hovered_scroll {
+            self.animating.insert(old);
+        }
+        if let Some(new) = now {
+            self.animating.insert(new);
+        }
+        self.hovered_scroll = now;
+    }
+
+    /// Drag the thumb of scroll container `id` so its top follows the pointer.
+    fn drag_thumb_to(&mut self, id: ControlId, y: f32) {
+        let (ny, vh, content_h, grab) = match self.node(id) {
+            Some(n) => (n.rect.y, n.rect.h, n.ctrl.content_h, n.thumb_drag.unwrap_or(0.0)),
+            None => return,
+        };
+        let thumb_y = (y - ny) - grab;
+        let scroll = scroll::scroll_for_thumb_y(thumb_y, vh, content_h);
+        if let Some(n) = self.node_mut(id) {
+            n.anim.x = scroll; // 1:1 tracking — bypass the settle spring while dragging
+            n.anim.target = scroll;
+        }
+        self.animating.insert(id);
+        self.apply_scroll(id);
+    }
+
     /// Walk the tree; `y` is pre-adjusted for ancestor scroll. When
     /// `want_interactive` collect clickable nodes, else collect scroll nodes.
     fn hit_walk(&self, id: ControlId, x: f32, y: f32, out: &mut Option<ControlId>, want_interactive: bool) {
@@ -80,6 +129,15 @@ impl DCompBackend {
             return true;
         }
 
+        // A dragged scroll thumb tracks the pointer 1:1.
+        if let Some(sid) = self.dragging_thumb {
+            self.drag_thumb_to(sid, y);
+            return true;
+        }
+
+        // Fade the scrollbar thumb in for whichever scroll container is hovered.
+        self.update_hovered_scroll(self.scroll_at(x, y));
+
         let now = self.interactive_at(x, y);
         if now == self.hovered_id {
             return false;
@@ -111,6 +169,8 @@ impl DCompBackend {
             n.hover.target = 0.0;
             self.animating.insert(old);
         }
+        // Fade out the scrollbar thumb when the pointer leaves the window.
+        self.update_hovered_scroll(None);
         !self.animating.is_empty()
     }
 
@@ -125,6 +185,19 @@ impl DCompBackend {
                 self.close_popup();
             }
             return (false, false);
+        }
+
+        // Pressing the overlay scrollbar thumb starts a drag-to-scroll (the thumb
+        // sits above the content, so it wins over any node beneath it).
+        if let Some(sid) = self.scroll_at(x, y)
+            && let Some(grab) = self.thumb_at(sid, x, y)
+        {
+            if let Some(n) = self.node_mut(sid) {
+                n.thumb_drag = Some(grab);
+            }
+            self.dragging_thumb = Some(sid);
+            self.update_hovered_scroll(Some(sid));
+            return (true, true);
         }
 
         let target = self.interactive_at(x, y);
@@ -151,6 +224,15 @@ impl DCompBackend {
 
     /// Left button up. Returns `needs_timer`.
     pub(crate) fn on_pointer_up(&mut self, x: f32, y: f32) -> bool {
+        // End a scrollbar-thumb drag (keep the timer so the thumb can fade out).
+        if let Some(sid) = self.dragging_thumb.take() {
+            if let Some(n) = self.node_mut(sid) {
+                n.thumb_drag = None;
+            }
+            self.animating.insert(sid);
+            return true;
+        }
+
         // Popup open: a click on a row selects it, then dismisses.
         if self.popup.is_some() {
             let hit = self.popup.as_ref().and_then(|p| p.hit(x, y));
@@ -231,6 +313,10 @@ impl DCompBackend {
                 }
                 self.animating.insert(id);
                 self.fire_bool(id, Event::Expanding, ex);
+                // The body subtree's `Display::None` flips with `expanded`, so the
+                // layout must be recomputed for the body to reclaim/release space
+                // (the chevron keeps animating via the timer).
+                self.relayout_and_paint();
             }
             ControlKind::ComboBox | ControlKind::DropDownButton | ControlKind::SplitButton => {
                 self.open_popup(id);
@@ -400,6 +486,9 @@ impl DCompBackend {
             if let Some(n) = self.node_mut(id) {
                 n.anim.target = (n.anim.target + step).clamp(0.0, max);
             }
+            // Reveal the thumb while scrolling (it auto-hides once the pointer
+            // leaves and the scroll spring settles).
+            self.update_hovered_scroll(Some(id));
             self.animating.insert(id);
             return true;
         }
@@ -591,6 +680,7 @@ impl DCompBackend {
     /// Advance all in-flight springs by `dt` and repaint. Returns `true` while
     /// any animation (node spring, indeterminate progress, or popup) remains.
     pub(crate) fn tick(&mut self, dt: f32) -> bool {
+        let hovered_scroll = self.hovered_scroll;
         let ids: Vec<ControlId> = self.animating.iter().copied().collect();
         for id in ids {
             let (settled, scroll) = match self.node_mut(id) {
@@ -598,13 +688,23 @@ impl DCompBackend {
                     let h = n.hover.step(dt);
                     let p = n.press.step(dt);
                     let a = n.anim.step(dt);
+                    // Scroll thumb auto-hide: visible while hovered, dragging, or the
+                    // scroll spring is still in flight; fades out otherwise.
+                    let mut tf = true;
+                    if n.is_scroll() {
+                        let active = hovered_scroll == Some(id)
+                            || n.thumb_drag.is_some()
+                            || (n.anim.x - n.anim.target).abs() > 1e-3;
+                        n.thumb_fade.target = if active { 1.0 } else { 0.0 };
+                        tf = n.thumb_fade.step(dt);
+                    }
                     let indeterminate = n.ctrl.indeterminate
                         && matches!(n.kind, ControlKind::ProgressBar | ControlKind::ProgressRing);
                     if indeterminate {
                         n.phase = (n.phase + dt * 0.6) % 1_000_000.0;
                     }
                     n.mark_dirty();
-                    let settled = h && p && a && !indeterminate;
+                    let settled = h && p && a && tf && !indeterminate;
                     (settled, n.is_scroll())
                 }
                 None => (true, false),

@@ -23,10 +23,33 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
     resolve_align(arena, root, false, false);
 
     let mut tree: TaffyTree<ControlId> = TaffyTree::new();
-    let root_taffy = build(arena, &mut tree, root);
+    let root_taffy = build(arena, &mut tree, root, false);
+
+    // Taffy sizes a *root* node with `size: auto` to its content, not to the
+    // available space — so a full-bleed reactor root (default alignment Stretch,
+    // no explicit size) would collapse to 0 on both axes and drag the whole tree
+    // (every Star track resolves against 0) down with it. Mirror WinUI's
+    // "root fills the window" by wrapping the real root in a synthetic 1×1
+    // Star×Star grid cell sized to the viewport: a stretch grid item with
+    // `size: auto` fills the cell, while an item with a fixed size or an explicit
+    // non-stretch alignment is honoured — and its margin insets it correctly
+    // (`percent(1.0)` would overflow by the margin and ignore the offset).
+    let viewport = {
+        let mut s = Style {
+            display: Display::Grid,
+            size: Size {
+                width: length(width),
+                height: length(height),
+            },
+            ..Style::default()
+        };
+        s.grid_template_columns = vec![fr(1.0)];
+        s.grid_template_rows = vec![fr(1.0)];
+        tree.new_with_children(s, &[root_taffy]).unwrap()
+    };
 
     let _ = tree.compute_layout_with_measure(
-        root_taffy,
+        viewport,
         Size {
             width: AvailableSpace::Definite(width),
             height: AvailableSpace::Definite(height),
@@ -153,11 +176,27 @@ fn build_text_layout(
 
 /// Build a Taffy node (and its subtree) from the arena, recording the mapping in
 /// each node's `taffy_id` and applying grid templates to grid containers.
-fn build(arena: &mut Arena, tree: &mut TaffyTree<ControlId>, id: ControlId) -> NodeId {
+///
+/// `hidden` is set for the body subtree of a collapsed [`Expander`]: such nodes
+/// map to `Display::None` so the body reclaims its layout space (height 0) while
+/// staying mounted (its visuals collapse to 0×0). The flag is sticky — it
+/// propagates to the whole subtree so every descendant collapses with it.
+fn build(arena: &mut Arena, tree: &mut TaffyTree<ControlId>, id: ControlId, hidden: bool) -> NodeId {
     let children = arena.get(id).map(|n| n.children.clone()).unwrap_or_default();
-    let child_ids: Vec<NodeId> = children.iter().map(|c| build(arena, tree, *c)).collect();
+    // A collapsed Expander hides its body children (the header is drawn on the
+    // node's own surface, so every child is body content).
+    let collapse_children = arena
+        .get(id)
+        .is_some_and(|n| n.kind == ControlKind::Expander && !n.ctrl.expanded);
+    let child_ids: Vec<NodeId> = children
+        .iter()
+        .map(|c| build(arena, tree, *c, hidden || collapse_children))
+        .collect();
 
-    let style = finalize_style(arena.get(id).unwrap());
+    let mut style = finalize_style(arena.get(id).unwrap());
+    if hidden {
+        style.display = Display::None;
+    }
     let taffy_id = if child_ids.is_empty() {
         tree.new_leaf_with_context(style, id).unwrap()
     } else {
@@ -293,6 +332,13 @@ fn sync(arena: &mut Arena, id: ControlId) {
             .and_then(|n| n.surf.as_ref())
             .and_then(|s| s.sprite.cast::<crate::system_bindings::Visual>().ok());
 
+        // The scroll thumb is an overlay sprite (a top child not tracked in the
+        // arena children); preserve it above the re-synced content.
+        let thumb_sprite = arena
+            .get(id)
+            .and_then(|n| n.scroll_thumb.as_ref())
+            .and_then(|s| s.sprite.cast::<crate::system_bindings::Visual>().ok());
+
         if let Some(coll) = arena.get(id).and_then(|n| n.container.Children().ok()) {
             let _ = coll.RemoveAll();
             if let Some(sp) = &surf_sprite {
@@ -300,6 +346,9 @@ fn sync(arena: &mut Arena, id: ControlId) {
             }
             for (_, _, v) in &kids {
                 let _ = coll.InsertAtTop(v);
+            }
+            if let Some(tp) = &thumb_sprite {
+                let _ = coll.InsertAtTop(tp);
             }
         }
 

@@ -97,12 +97,32 @@ fn main() -> windows_reactor::Result<()> {
             .columns([GridLength::STAR, GridLength::STAR])
             .column_spacing(16.0);
 
+        // Full-bleed stretch leaf in a Star×Star grid cell: a bare Border with no
+        // explicit size and the default (Stretch) alignment must FILL the cell on
+        // both axes — the layout-collapse regression this backend had to fix. It
+        // renders as a thin tinted band that spans the whole width.
+        let fill_band: Element = border(
+            text_block("full-bleed stretch leaf (fills its Star×Star cell)")
+                .font_size(11.0)
+                .foreground(Color::rgb(0x9A, 0xD0, 0xC0)),
+        )
+        .background(Color::rgb(0x1E, 0x2A, 0x26))
+        .corner_radius(8.0)
+        .padding(Thickness::uniform(8.0))
+        .grid_row(0)
+        .grid_column(0)
+        .into();
+        let band = grid((fill_band,))
+            .rows([GridLength::STAR])
+            .columns([GridLength::STAR]);
+
         border(
             vstack((
                 text_block("DComp backend \u{2014} layout & props")
                     .font_size(22.0)
                     .semibold(),
                 Element::from(body),
+                Element::from(band),
             ))
             .spacing(16.0),
         )

@@ -205,6 +205,15 @@ pub(crate) struct Node {
     pub vis: IVisual,
     /// Painted-chrome surface — created lazily for nodes that draw something.
     pub surf: Option<NodeSurface>,
+    /// ScrollViewer only: the auto-hiding overlay scrollbar thumb sprite (a top
+    /// child of the container, above the scrolled content), created lazily.
+    pub scroll_thumb: Option<NodeSurface>,
+    /// Thumb opacity (0 hidden … 1 shown); sprung in on hover/scroll, out at rest.
+    pub thumb_fade: Spring,
+    /// Thumb height (DIP) the thumb surface was last drawn at (redraw on change).
+    pub thumb_drawn_h: f32,
+    /// While dragging the thumb: the pointer-to-thumb-top offset captured at press.
+    pub thumb_drag: Option<f32>,
     /// Bounds clip (ScrollViewer/overflow); tracks the container's own size.
     pub clip: Option<InsetClip>,
     /// WinRT alignment requests (-1 = unset; 0..3 mirror WinRT enums).
@@ -271,6 +280,10 @@ impl Node {
             container,
             vis,
             surf: None,
+            scroll_thumb: None,
+            thumb_fade: Spring::new(0.0),
+            thumb_drawn_h: 0.0,
+            thumb_drag: None,
             clip: None,
             h_align: -1,
             v_align: -1,

@@ -198,6 +198,19 @@ impl Compositing {
         px_w: i32,
         px_h: i32,
     ) -> windows_core::Result<NodeSurface> {
+        self.new_surface_at(parent, px_w, px_h, false)
+    }
+
+    /// Like [`new_surface`](Self::new_surface) but inserts the sprite at the top of
+    /// `parent` (above child-node visuals) — used for overlay chrome such as the
+    /// ScrollViewer thumb that must paint over the scrolled content.
+    pub fn new_surface_at(
+        &self,
+        parent: &ContainerVisual,
+        px_w: i32,
+        px_h: i32,
+        at_top: bool,
+    ) -> windows_core::Result<NodeSurface> {
         let (px_w, px_h) = (px_w.max(1), px_h.max(1));
         let surface = self.graphics.CreateDrawingSurface(
             Size {
@@ -214,8 +227,15 @@ impl Compositing {
 
         let sprite = self.compositor.CreateSpriteVisual()?;
         sprite.SetBrush(&brush.cast::<crate::system_bindings::CompositionBrush>()?)?;
-        // Bottom of the parent so the node's own chrome sits behind its children.
-        parent.Children()?.InsertAtBottom(&sprite.cast::<Visual>()?)?;
+        // Bottom of the parent so the node's own chrome sits behind its children;
+        // top for an overlay (the scroll thumb draws over the scrolled content).
+        let children = parent.Children()?;
+        let v = sprite.cast::<Visual>()?;
+        if at_top {
+            children.InsertAtTop(&v)?;
+        } else {
+            children.InsertAtBottom(&v)?;
+        }
 
         let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
         Ok(NodeSurface {
@@ -250,6 +270,20 @@ impl NodeSurface {
     pub fn set_dip_size(&self, w: f32, h: f32) {
         if let Ok(v) = self.sprite.cast::<IVisual>() {
             let _ = v.SetSize(Vector2::new(w.max(0.0), h.max(0.0)));
+        }
+    }
+
+    /// Set the sprite's offset (DIP) within its parent container.
+    pub fn set_offset(&self, x: f32, y: f32) {
+        if let Ok(v) = self.sprite.cast::<IVisual>() {
+            let _ = v.SetOffset(Vector3::new(x, y, 0.0));
+        }
+    }
+
+    /// Set the sprite's opacity (used to fade the scroll thumb in/out).
+    pub fn set_opacity(&self, a: f32) {
+        if let Ok(v) = self.sprite.cast::<IVisual>() {
+            let _ = v.SetOpacity(a.clamp(0.0, 1.0));
         }
     }
 }

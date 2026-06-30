@@ -93,6 +93,105 @@ fn paint_node(
     for c in children {
         paint_node(comp, cache, arena, c, scale)?;
     }
+
+    // Overlay scrollbar thumb (above the scrolled children) for scroll containers.
+    if arena.get(id).is_some_and(|n| n.is_scroll()) {
+        update_scroll_thumb(comp, cache, arena, id, scale)?;
+    }
+    Ok(())
+}
+
+/// Ensure / size / position / fade the auto-hiding overlay scrollbar thumb of a
+/// scroll container. The thumb is a top child sprite (drawn over the content);
+/// its height tracks viewport/content, its offset tracks the scroll fraction, and
+/// its opacity is the node's `thumb_fade` spring (stepped on hover/scroll).
+fn update_scroll_thumb(
+    comp: &Compositing,
+    cache: &mut PaintCache,
+    arena: &mut Arena,
+    id: ControlId,
+    scale: f32,
+) -> windows_core::Result<()> {
+    use scroll::{thumb_geom, THUMB_MARGIN, THUMB_W};
+    let (vh, content_h, sc, fade) = match arena.get(id) {
+        Some(n) => (n.rect.h, n.ctrl.content_h, n.anim.x, n.thumb_fade.x),
+        None => return Ok(()),
+    };
+    let g = thumb_geom(vh, content_h, sc);
+    if !g.overflow {
+        if let Some(n) = arena.get(id)
+            && let Some(t) = &n.scroll_thumb
+        {
+            t.set_opacity(0.0);
+        }
+        return Ok(());
+    }
+
+    let pw = (THUMB_W * scale).ceil() as i32;
+    let ph = (g.thumb_h * scale).ceil() as i32;
+    if arena.get(id).is_some_and(|n| n.scroll_thumb.is_none()) {
+        let container = arena.get(id).unwrap().container.clone();
+        let surf = comp.new_surface_at(&container, pw, ph, true)?;
+        if let Some(n) = arena.get_mut(id) {
+            n.scroll_thumb = Some(surf);
+        }
+    }
+
+    // Re-rasterize the bar only when its height (hence corner geometry) changed.
+    if arena.get(id).is_some_and(|n| (n.thumb_drawn_h - g.thumb_h).abs() > 0.5) {
+        if let Some(n) = arena.get_mut(id)
+            && let Some(s) = &mut n.scroll_thumb
+        {
+            let _ = s.resize(pw, ph);
+            s.set_dip_size(THUMB_W, g.thumb_h);
+        }
+        draw_thumb(comp, cache, arena, id, scale, g.thumb_h)?;
+        if let Some(n) = arena.get_mut(id) {
+            n.thumb_drawn_h = g.thumb_h;
+        }
+    }
+
+    if let Some(n) = arena.get(id)
+        && let Some(s) = &n.scroll_thumb
+    {
+        s.set_offset(n.rect.w - THUMB_W - THUMB_MARGIN, g.thumb_y);
+        s.set_opacity(fade);
+    }
+    Ok(())
+}
+
+/// Draw the thumb bar (a rounded, stroke-strong pill) into its own surface.
+fn draw_thumb(
+    comp: &Compositing,
+    cache: &mut PaintCache,
+    arena: &mut Arena,
+    id: ControlId,
+    scale: f32,
+    thumb_h: f32,
+) -> windows_core::Result<()> {
+    let interop = arena.get(id).unwrap().scroll_thumb.as_ref().unwrap().interop.clone();
+    let mut offset = crate::system_bindings::POINT::default();
+    comp.device_lost.set(false);
+    let ctx: ID2D1DeviceContext = unsafe { interop.BeginDraw(None, &mut offset)? };
+    let session = DrawingSession::new_borrowed(&ctx, &comp.device_lost);
+    session.set_transform(&Matrix3x2 {
+        m11: scale,
+        m12: 0.0,
+        m21: 0.0,
+        m22: scale,
+        m31: offset.x as f32,
+        m32: offset.y as f32,
+    });
+    session.clear(CLEAR);
+    if cache.brush.is_none() {
+        cache.brush = session.create_solid_brush(ColorF::BLACK).ok();
+    }
+    if let Some(brush) = &cache.brush {
+        brush.set_color(linear(theme::stroke_strong()));
+        let r = Rect::from_xywh(0.0, 0.0, scroll::THUMB_W, thumb_h);
+        session.fill_rounded_rect(&RoundedRect::uniform(r, scroll::THUMB_W / 2.0), brush);
+    }
+    unsafe { interop.EndDraw()? };
     Ok(())
 }
 
