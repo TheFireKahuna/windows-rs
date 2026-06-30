@@ -95,6 +95,16 @@ impl ElementHandle {
         open_pointer_surface(&self.0)
     }
 
+    /// The underlying native object for this mounted element: the XAML
+    /// `UIElement` on the WinUI backend, or the node's system-compositor
+    /// `ContainerVisual` on the self-hosted DirectComposition backend. Cast it to
+    /// the interface you need — e.g. a `ContainerVisual` to host a child-visual
+    /// composition surface under it (see
+    /// [`CompositionSurfaceFactory::from_node`](crate::CompositionSurfaceFactory::from_node)).
+    pub fn native(&self) -> &windows_core::IInspectable {
+        &self.0
+    }
+
     /// Subscribe `SizeChanged` on this element; the callback receives the new
     /// `(width, height)` in DIPs and also fires once after the first layout
     /// pass. Returns the [`EventRevoker`](windows_core::EventRevoker) — **store
@@ -106,14 +116,29 @@ impl ElementHandle {
         &self,
         f: impl Fn(f64, f64) + 'static,
     ) -> Result<windows_core::EventRevoker> {
-        let fe: bindings::IFrameworkElement = self.0.cast()?;
-        fe.SizeChanged(move |_sender, args| {
-            if let Some(args) = args.as_ref()
-                && let Ok(s) = args.NewSize()
-            {
-                f(s.width as f64, s.height as f64);
-            }
-        })
+        // WinUI backend: the native element is a XAML FrameworkElement.
+        if let Ok(fe) = self.0.cast::<bindings::IFrameworkElement>() {
+            return fe.SizeChanged(move |_sender, args| {
+                if let Some(args) = args.as_ref()
+                    && let Ok(s) = args.NewSize()
+                {
+                    f(s.width as f64, s.height as f64);
+                }
+            });
+        }
+        // DirectComposition backend: the native element is a system
+        // `ContainerVisual` whose size the Taffy layout pass sets each reconcile.
+        // Register with the backend's size registry, which fires on a size change
+        // (see `backend::dcomp::fire_element_size`). Returns an `EventRevoker`
+        // that unregisters on drop, so the call site is identical to the XAML path.
+        #[cfg(feature = "dcomp-backend")]
+        if let Ok(cv) = self.0.cast::<system_bindings::ContainerVisual>() {
+            use backend::dcomp::register_element_size;
+            return register_element_size(&cv, move |w, h| {
+                f(w as f64, h as f64);
+            });
+        }
+        Err(Error::empty())
     }
 }
 

@@ -58,20 +58,44 @@ impl Drop for DispatcherTimer {
     }
 }
 
-/// RAII handle for a `CompositionTarget::Rendering` subscription; detaches on drop.
+/// RAII handle for a per-frame subscription; detaches on drop. Backed by the
+/// XAML `CompositionTarget::Rendering` event on the WinUI backend, or by the
+/// backend frame tick (see [`on_frame_tick`]) when a host frame pump is driving
+/// the current thread (the self-hosted DirectComposition backend, which has no
+/// XAML `CompositionTarget`).
 pub struct Rendering {
-    _revoker: windows_core::EventRevoker,
+    // One of the two pacing sources is kept alive for the subscription's life.
+    _xaml: Option<windows_core::EventRevoker>,
+    _tick: Option<FrameTick>,
 }
 
-/// Subscribe `f` to `CompositionTarget::Rendering` for the current thread.
+/// Subscribe `f` to the current thread's per-frame tick.
+///
+/// On the WinUI backend this is `CompositionTarget::Rendering`. When a host owns
+/// the backend frame pump (the DirectComposition backend installs one via
+/// [`set_frame_pump_wake`]), there is no XAML static to subscribe to, so the
+/// callback is paced by the backend frame tick instead — transparently, so
+/// canvas/viz code (`SurfacePainter`, `animated_canvas`) need not know which
+/// backend hosts them.
 pub fn on_rendering<F>(f: F) -> Result<Rendering>
 where
     F: Fn() + 'static,
 {
+    // A host frame pump (DComp) being installed is the runtime signal that we are
+    // not under XAML; pace via the backend frame tick in that case.
+    if FRAME_PUMP_WAKE.with(|w| w.borrow().is_some()) {
+        return Ok(Rendering {
+            _xaml: None,
+            _tick: Some(on_frame_tick(f)),
+        });
+    }
     let revoker = CompositionTarget::Rendering(move |_, _| {
         f();
     })?;
-    Ok(Rendering { _revoker: revoker })
+    Ok(Rendering {
+        _xaml: Some(revoker),
+        _tick: None,
+    })
 }
 
 fn duration_to_timespan(d: Duration) -> TimeSpan {

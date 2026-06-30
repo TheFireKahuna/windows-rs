@@ -95,6 +95,42 @@ impl CompositionSurfaceFactory {
         })
     }
 
+    /// Build a factory from a DComp backend **node's container visual** — the
+    /// `IInspectable` returned by
+    /// [`ElementHandle::native`](crate::ElementHandle::native) (or
+    /// `get_native_element`) on the self-hosted DirectComposition backend. The
+    /// system `Compositor` is derived from the visual, so the whole live-viz
+    /// hand-off is driven from that one public handle. Pair with
+    /// [`create_under_node`](Self::create_under_node). `d2d_device` is an
+    /// `ID2D1Device` (multi-threaded to draw off the UI thread).
+    pub fn from_node(
+        container: &windows_core::IInspectable,
+        d2d_device: &impl Interface,
+    ) -> Result<Self> {
+        let cv: system_bindings::ContainerVisual = container.cast()?;
+        let compositor = cv
+            .cast::<system_bindings::ICompositionObject>()?
+            .Compositor()?;
+        Self::from_compositor(&compositor, d2d_device)
+    }
+
+    /// Host a live surface under a DComp backend node's container visual, given
+    /// the node's `IInspectable` (from
+    /// [`ElementHandle::native`](crate::ElementHandle::native)). The
+    /// `IInspectable`-typed analogue of [`create_under`](Self::create_under) — the
+    /// factory must have been built with [`from_node`](Self::from_node) /
+    /// [`from_compositor`](Self::from_compositor).
+    pub fn create_under_node(
+        &self,
+        container: &windows_core::IInspectable,
+        pixel_size: (i32, i32),
+        dip_size: (f32, f32),
+        opaque: bool,
+    ) -> Result<(CompositionChildVisual, CompositionDrawSurface)> {
+        let cv: system_bindings::ContainerVisual = container.cast()?;
+        self.create_under(&cv, pixel_size, dip_size, opaque)
+    }
+
     /// Create a surface `pixel_size` pixels large, presented at `dip_size` DIPs, and
     /// attach it as `element`'s child visual. `opaque` skips alpha blending (clear
     /// every pixel each frame); the brush fills the visual, so the pixel buffer

@@ -23,10 +23,12 @@ mod layout;
 mod node;
 mod paint;
 mod popup;
+mod size;
 mod theme;
 
 pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;
+pub(crate) use size::register_element_size;
 
 use bootstrap::Compositing;
 use node::{Arena, MenuRow, Node};

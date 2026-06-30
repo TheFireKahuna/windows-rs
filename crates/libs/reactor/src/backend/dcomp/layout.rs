@@ -218,6 +218,15 @@ fn assign(arena: &mut Arena, tree: &TaffyTree<ControlId>, id: ControlId, ox: f32
         let _ = n.vis.SetSize(Vector2::new(w, h));
         if resized {
             n.mark_dirty();
+            // Notify any viz host (SurfacePainter / composition surface) bound to
+            // this node's container that its size changed (the DComp analogue of
+            // XAML's FrameworkElement.SizeChanged). Skip the identity cast entirely
+            // when nothing is subscribed (the common case).
+            if size::has_listeners()
+                && let Some(key) = size::container_key(&n.container)
+            {
+                size::fire_element_size(key, w, h);
+            }
         }
     }
     for c in &children {

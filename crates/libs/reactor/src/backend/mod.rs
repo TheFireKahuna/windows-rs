@@ -12,7 +12,7 @@ mod winui;
 pub use winui::WinUIBackend;
 
 #[cfg(feature = "dcomp-backend")]
-mod dcomp;
+pub(crate) mod dcomp;
 
 #[cfg(feature = "dcomp-backend")]
 pub use dcomp::{DCompBackend, DCompHost, Win32Dispatcher};
