@@ -1,17 +1,24 @@
-//! The retained node arena: one [`Node`] per live [`ControlId`], holding its
-//! Taffy layout inputs, its painted content, children, handlers, and the small
-//! amount of interaction state (hover/press springs) the spine animates.
+//! The retained node arena: one [`Node`] per live [`ControlId`]. Each node owns
+//! a composition `ContainerVisual` (parented to mirror the logical tree), its
+//! Taffy layout inputs, an optional painted-chrome [`NodeSurface`], children,
+//! handlers, and the small interaction state (hover/press springs) the spine
+//! animates.
 //!
-//! The arena is the single source of truth. Taffy trees are rebuilt from it each
-//! layout pass (the spine's trees are small and this keeps node identity simple),
-//! and the composition surface is repainted from it each change.
+//! The arena is the single source of truth for layout and paint. The composition
+//! tree is kept in lock-step incrementally: structural edits mark a parent's
+//! child order dirty (re-synced once per layout pass), layout writes each node's
+//! offset/size/opacity/clip onto its container, and paint redraws a node's
+//! surface only when its own content or size changed.
 
+use super::bootstrap::NodeSurface;
 use super::*;
 use crate::backend::{ControlKind, Event, EventHandler};
 use crate::style::{AccessibilityModifiers, PointerHandlers};
-use crate::LineEndpoints;
+use crate::system_bindings::{ContainerVisual, IVisual, InsetClip};
 use crate::Color;
+use crate::LineEndpoints;
 use windows_canvas_core::{ColorF, TextLayout};
+use windows_core::Interface;
 
 /// sRGB 8-bit channel -> linear. The single ingestion decode: every reactor
 /// [`Color`] is authored in sRGB and lands in the FP16 scRGB surface linearly.
@@ -67,6 +74,7 @@ impl Spring {
 }
 
 /// An absolute laid-out rectangle, in DIPs (top-left origin, window-relative).
+/// Used for hit-testing; composition offsets are stored relatively per node.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LaidRect {
     pub x: f32,
@@ -99,6 +107,7 @@ pub(crate) struct Paint {
     pub font_size: f32,
     pub font_weight: u16,
     pub font_family: Option<String>,
+    pub wrap: bool,
     /// Button accent/subtle/etc. variant (0 = default).
     pub style_variant: i32,
     pub is_enabled: bool,
@@ -122,6 +131,28 @@ pub(crate) struct Node {
     pub handlers: Vec<(Event, EventHandler)>,
     pub pointer: Option<PointerHandlers>,
     pub accessibility: Option<AccessibilityModifiers>,
+
+    // ── Composition ──────────────────────────────────────────────────────
+    /// This node's container visual (always present); mirrors the logical tree.
+    pub container: ContainerVisual,
+    /// Cached `IVisual` view of `container` for frequent offset/size/opacity ops.
+    pub vis: IVisual,
+    /// Painted-chrome surface — created lazily for nodes that draw something.
+    pub surf: Option<NodeSurface>,
+    /// Bounds clip (ScrollViewer/overflow); tracks the container's own size.
+    pub clip: Option<InsetClip>,
+    /// WinRT alignment requests (-1 = unset; 0..3 mirror WinRT enums).
+    pub h_align: i32,
+    pub v_align: i32,
+    /// Canvas Z-order (composition child order is resynced by it).
+    pub z_index: i32,
+    /// This node's Z-order changed; its parent must re-sync child order.
+    pub z_dirty: bool,
+    /// The composition child order under this node needs re-syncing.
+    pub children_dirty: bool,
+    /// This node's surface needs a repaint (content/size/state changed).
+    pub dirty: bool,
+
     /// Transient: the Taffy node this maps to in the current layout pass.
     pub taffy_id: Option<taffy::NodeId>,
     pub rect: LaidRect,
@@ -132,7 +163,8 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    pub fn new(kind: ControlKind) -> Self {
+    pub fn new(kind: ControlKind, container: ContainerVisual) -> Self {
+        let vis: IVisual = container.cast().expect("ContainerVisual is an IVisual");
         let mut paint = Paint {
             font_size: default_font_size(kind),
             font_weight: 400,
@@ -156,6 +188,16 @@ impl Node {
             handlers: Vec::new(),
             pointer: None,
             accessibility: None,
+            container,
+            vis,
+            surf: None,
+            clip: None,
+            h_align: -1,
+            v_align: -1,
+            z_index: 0,
+            z_dirty: false,
+            children_dirty: false,
+            dirty: true,
             taffy_id: None,
             rect: LaidRect::default(),
             hover: Spring::new(0.0),
@@ -178,13 +220,34 @@ impl Node {
                 .as_ref()
                 .is_some_and(|p| p.on_tapped.is_some() || p.on_pointer_pressed.is_some())
     }
+
+    /// Whether this node draws any chrome (and therefore needs a surface).
+    pub fn has_chrome(&self) -> bool {
+        match self.kind {
+            ControlKind::Button => true,
+            ControlKind::TextBlock => !self.paint.text.is_empty(),
+            ControlKind::Line => self.paint.stroke.is_some(),
+            ControlKind::Ellipse | ControlKind::Rectangle => {
+                self.paint.fill.is_some()
+                    || self.paint.background.is_some()
+                    || (self.paint.stroke.is_some() && self.paint.stroke_thickness > 0.0)
+                    || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
+            }
+            _ => {
+                self.paint.background.is_some()
+                    || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
+            }
+        }
+    }
+
+    /// Mark this node's surface for repaint.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
 }
 
-fn default_font_size(kind: ControlKind) -> f32 {
-    match kind {
-        ControlKind::Button => 14.0,
-        _ => 14.0,
-    }
+fn default_font_size(_kind: ControlKind) -> f32 {
+    14.0
 }
 
 /// Per-kind default Taffy style (display mode + the small intrinsic defaults a
@@ -206,6 +269,11 @@ fn default_style(kind: ControlKind) -> taffy::Style {
         }
         ControlKind::Border => {
             s.display = Display::Flex;
+        }
+        ControlKind::ScrollViewer | ControlKind::ScrollView => {
+            // Visual clipping is done by a composition InsetClip on the node's
+            // container (see `Backend::create`); layout treats it as a block.
+            s.display = Display::Block;
         }
         ControlKind::Button => {
             s.display = Display::Flex;
@@ -257,6 +325,11 @@ impl Arena {
         self.slots
             .get_mut((id.get() - 1) as usize)
             .and_then(|s| s.as_mut())
+    }
+
+    /// Iterate every live node mutably (order unspecified).
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.slots.iter_mut().filter_map(|s| s.as_mut())
     }
 
     pub fn remove(&mut self, id: ControlId) -> Option<Node> {

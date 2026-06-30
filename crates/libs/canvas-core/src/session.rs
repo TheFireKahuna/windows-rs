@@ -327,6 +327,16 @@ impl<'a> DrawingSession<'a> {
         self.context
     }
 
+    /// Switch text antialiasing to grayscale. Required for correct text on
+    /// premultiplied / transparent composition surfaces: ClearType subpixel AA
+    /// blends against an assumed-opaque background and is invalid there.
+    pub fn set_grayscale_text_antialiasing(&self) {
+        unsafe {
+            self.context
+                .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE)
+        };
+    }
+
     /// Creates a bitmap suitable for use as a render target.
     pub fn create_bitmap_target(&self) -> Result<Bitmap> {
         unsafe {

@@ -47,7 +47,7 @@ impl DCompHost {
         let scale = (dpi as f32 / 96.0).max(0.01);
         let dip = (pw as f32 / scale, ph as f32 / scale);
 
-        let comp = Compositing::new(hwnd, pw, ph)?;
+        let comp = Compositing::new(hwnd, pw, ph, dpi as f32)?;
         let backend = DCompBackend::new(comp, dip, dpi as f32);
 
         let dispatcher = Win32Dispatcher::new(hwnd);
@@ -86,6 +86,14 @@ impl DCompHost {
             }));
         });
 
+        // Frame-tick pump: when a canvas/viz subscriber appears (via
+        // `on_frame_tick`) while the timer is idle, start it; the WM_TIMER handler
+        // drives the ticks and stops the timer once no subscriber and no spring
+        // remain (true idle).
+        crate::set_frame_pump_wake(Some(Rc::new(move || unsafe {
+            SetTimer(hwnd, TIMER_ID, 16, None);
+        })));
+
         render_host.kick();
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);
@@ -102,6 +110,7 @@ impl DCompHost {
                 DispatchMessageW(&msg);
             }
         }
+        crate::set_frame_pump_wake(None);
         DCOMP.with(|c| *c.borrow_mut() = None);
     }
 
@@ -129,6 +138,49 @@ impl DCompHost {
 
 fn shared() -> Option<Rc<HostShared>> {
     DCOMP.with(|c| c.borrow().clone())
+}
+
+/// Static light/dark token table for the window backdrop, resolved to a WinRT
+/// `Color` (the system compositor encodes it into the FP16 scRGB surface). Node
+/// colours are the GUI's responsibility (it re-emits theme-bound `Prop`s); the
+/// backend only owns the window backdrop, which flips with the system theme.
+pub(crate) fn window_backdrop(dark: bool) -> Color {
+    if dark {
+        Color { a: 255, r: 14, g: 14, b: 17 }
+    } else {
+        Color { a: 255, r: 243, g: 243, b: 245 }
+    }
+}
+
+/// Best-effort read of the system app theme. Detection of the live setting needs
+/// a registry/uxtheme binding not yet wired here, so this defaults to dark (the
+/// app's design default); the flip *mechanism* (re-resolve + repaint) is in
+/// place for when detection lands.
+fn system_prefers_dark() -> bool {
+    true
+}
+
+/// Whether a `WM_SETTINGCHANGE` lParam names the immersive colour set (theme).
+fn is_immersive_color_set(lparam: LPARAM) -> bool {
+    if lparam == 0 {
+        return false;
+    }
+    let s = unsafe { wide_str(lparam as *const u16) };
+    s == "ImmersiveColorSet"
+}
+
+/// Read a NUL-terminated UTF-16 string at `ptr` (bounded) into a `String`.
+unsafe fn wide_str(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 && len < 256 {
+            len += 1;
+        }
+        String::from_utf16_lossy(core::slice::from_raw_parts(ptr, len))
+    }
 }
 
 fn dpi_scale(hwnd: HWND) -> f32 {
@@ -224,12 +276,52 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if wparam == TIMER_ID
                 && let Some(s) = shared()
             {
-                let keep = s.render_host.with_reconciler_mut(|r| r.backend.tick(1.0 / 60.0));
-                if !keep {
+                // Pace any backend frame-tick subscribers (canvas/viz) first…
+                crate::drive_frame_ticks();
+                // …then advance button ink springs.
+                let springs = s.render_host.with_reconciler_mut(|r| r.backend.tick(1.0 / 60.0));
+                // Keep the timer only while work remains; otherwise return to
+                // a blocking, zero-CPU pump.
+                if !springs && !crate::frame_ticks_active() {
                     unsafe {
                         let _ = KillTimer(hwnd, TIMER_ID);
                     }
                 }
+            }
+            0
+        }
+
+        WM_DPICHANGED => {
+            // lParam is the suggested new window rectangle; move/resize to it and
+            // let the ensuing WM_SIZE re-fold the new DPI into layout + surfaces.
+            let rc = lparam as *const RECT;
+            if !rc.is_null() {
+                let rc = unsafe { &*rc };
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        core::ptr::null_mut(),
+                        rc.left,
+                        rc.top,
+                        rc.right - rc.left,
+                        rc.bottom - rc.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            0
+        }
+
+        WM_SETTINGCHANGE => {
+            // An "ImmersiveColorSet" change flips the system light/dark theme.
+            if is_immersive_color_set(lparam)
+                && let Some(s) = shared()
+            {
+                let dark = system_prefers_dark();
+                s.render_host.with_reconciler_mut(|r| {
+                    r.backend.apply_theme(dark);
+                    r.backend.mark_all_dirty_and_repaint();
+                });
             }
             0
         }

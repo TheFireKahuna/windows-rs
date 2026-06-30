@@ -34,14 +34,29 @@ use super::*;
 /// surfaces off the UI thread (the returned [`CompositionDrawSurface`] is then
 /// `Send`). Build it on the UI thread.
 pub struct CompositionSurfaceFactory {
-    compositor: bindings::Compositor,
-    graphics: bindings::CompositionGraphicsDevice,
+    backing: Backing,
+}
+
+/// Which compositor namespace a factory is bound to. The lifted
+/// `Microsoft.UI.Composition` path hosts surfaces as XAML element child visuals
+/// (the WinUI backend); the system `Windows.UI.Composition` path hosts them as
+/// child visuals under an arbitrary `ContainerVisual` (the self-hosted
+/// DirectComposition backend). Both mint surfaces from one Direct2D device.
+enum Backing {
+    Lifted {
+        compositor: bindings::Compositor,
+        graphics: bindings::CompositionGraphicsDevice,
+    },
+    System {
+        compositor: system_bindings::Compositor,
+        graphics: system_bindings::CompositionGraphicsDevice,
+    },
 }
 
 impl CompositionSurfaceFactory {
     /// Create the factory on the UI thread. `element` supplies the per-thread
-    /// compositor (any live element's `Visual` carries it); `d2d_device` is an
-    /// `ID2D1Device` — pass a multi-threaded one (its factory created with
+    /// (lifted) compositor (any live element's `Visual` carries it); `d2d_device`
+    /// is an `ID2D1Device` — pass a multi-threaded one (its factory created with
     /// `D2D1_FACTORY_TYPE_MULTI_THREADED`) to draw the surfaces off the UI thread.
     pub fn new(element: &ElementHandle, d2d_device: &impl Interface) -> Result<Self> {
         let ui: bindings::UIElement = element.0.cast()?;
@@ -54,7 +69,30 @@ impl CompositionSurfaceFactory {
             interop.CreateGraphicsDevice(d2d_device.as_raw(), &mut graphics_raw)?;
             bindings::CompositionGraphicsDevice::from_raw(graphics_raw)
         };
-        Ok(Self { compositor, graphics })
+        Ok(Self {
+            backing: Backing::Lifted { compositor, graphics },
+        })
+    }
+
+    /// Create the factory from a **system** `Windows.UI.Composition.Compositor`
+    /// (the self-hosted DirectComposition backend's compositor), skipping the
+    /// XAML `ElementCompositionPreview` path. Pair with
+    /// [`create_under`](Self::create_under) to host surfaces under a backend
+    /// node's `ContainerVisual`. `d2d_device` is an `ID2D1Device` (multi-threaded
+    /// to draw off the UI thread).
+    pub fn from_compositor(
+        compositor: &system_bindings::Compositor,
+        d2d_device: &impl Interface,
+    ) -> Result<Self> {
+        let interop: system_bindings::ICompositorInterop = compositor.cast()?;
+        let device: windows_core::IUnknown = d2d_device.cast()?;
+        let graphics = unsafe { interop.CreateGraphicsDevice(&device)? };
+        Ok(Self {
+            backing: Backing::System {
+                compositor: compositor.clone(),
+                graphics,
+            },
+        })
     }
 
     /// Create a surface `pixel_size` pixels large, presented at `dip_size` DIPs, and
@@ -73,8 +111,13 @@ impl CompositionSurfaceFactory {
         dip_size: (f32, f32),
         opaque: bool,
     ) -> Result<(CompositionChildSurface, CompositionDrawSurface)> {
+        let Backing::Lifted { compositor, graphics } = &self.backing else {
+            // `create` hosts the surface as a XAML element child visual; a
+            // system-backed factory must use `create_under` instead.
+            return Err(Error::empty());
+        };
         let ui: bindings::UIElement = element.0.cast()?;
-        let graphics: bindings::ICompositionGraphicsDevice2 = self.graphics.cast()?;
+        let graphics: bindings::ICompositionGraphicsDevice2 = graphics.cast()?;
         let alpha = if opaque {
             bindings::DirectXAlphaMode::Ignore
         } else {
@@ -89,9 +132,9 @@ impl CompositionSurfaceFactory {
         // Sprite visual filled by a surface brush: surface pixels stretch to the
         // visual's DIP size (crisp when pixels == DIPs x rasterization scale).
         let brush =
-            self.compositor.CreateSurfaceBrushWithSurface(&surface.cast::<bindings::ICompositionSurface>()?)?;
+            compositor.CreateSurfaceBrushWithSurface(&surface.cast::<bindings::ICompositionSurface>()?)?;
         brush.SetStretch(bindings::CompositionStretch::Fill)?;
-        let sprite = self.compositor.CreateSpriteVisual()?;
+        let sprite = compositor.CreateSpriteVisual()?;
         sprite
             .cast::<bindings::IVisual>()?
             .SetSize(windows_numerics::Vector2 { x: dip_size.0, y: dip_size.1 })?;
@@ -102,6 +145,85 @@ impl CompositionSurfaceFactory {
 
         let draw = CompositionDrawSurface { interop: surface.cast()? };
         Ok((CompositionChildSurface { element: ui, _visual: visual }, draw))
+    }
+
+    /// Create an FP16 surface `pixel_size` pixels large, presented at `dip_size`
+    /// DIPs, and parent its sprite **at the top** of `parent`'s child collection
+    /// — the system-compositor analogue of [`create`](Self::create), used to host
+    /// live viz under a DirectComposition backend node's `ContainerVisual`. The
+    /// factory must have been built with [`from_compositor`](Self::from_compositor).
+    ///
+    /// Returns a [`CompositionChildVisual`] (drop removes the sprite from
+    /// `parent`) and a [`CompositionDrawSurface`] that draws the content.
+    pub fn create_under(
+        &self,
+        parent: &system_bindings::ContainerVisual,
+        pixel_size: (i32, i32),
+        dip_size: (f32, f32),
+        opaque: bool,
+    ) -> Result<(CompositionChildVisual, CompositionDrawSurface)> {
+        use crate::system_bindings as sys;
+        let Backing::System { compositor, graphics } = &self.backing else {
+            // `create_under` parents under a system ContainerVisual; a lifted
+            // (XAML) factory must use `create` instead.
+            return Err(Error::empty());
+        };
+        let graphics2: sys::ICompositionGraphicsDevice2 = graphics.cast()?;
+        let alpha = if opaque {
+            sys::DirectXAlphaMode::Ignore
+        } else {
+            sys::DirectXAlphaMode::Premultiplied
+        };
+        // FP16 scRGB to match the backend's HDR composition pipeline.
+        let surface = graphics2.CreateDrawingSurface2(
+            sys::SizeInt32 { width: pixel_size.0.max(1), height: pixel_size.1.max(1) },
+            sys::DirectXPixelFormat::R16G16B16A16Float,
+            alpha,
+        )?;
+
+        let brush = compositor
+            .CreateSurfaceBrushWithSurface(&surface.cast::<sys::ICompositionSurface>()?)?;
+        brush.SetStretch(sys::CompositionStretch::Fill)?;
+        let sprite = compositor.CreateSpriteVisual()?;
+        sprite
+            .cast::<sys::IVisual>()?
+            .SetSize(windows_numerics::Vector2 { x: dip_size.0, y: dip_size.1 })?;
+        sprite.SetBrush(&brush.cast::<sys::CompositionBrush>()?)?;
+
+        let visual: sys::Visual = sprite.cast()?;
+        parent.Children()?.InsertAtTop(&visual)?;
+
+        // The interop IID is namespace-agnostic, so the system surface reuses the
+        // same `CompositionDrawSurface` the canvas draw stack already consumes.
+        let draw = CompositionDrawSurface {
+            interop: surface.cast::<bindings::ICompositionDrawingSurfaceInterop>()?,
+        };
+        Ok((
+            CompositionChildVisual {
+                parent: parent.clone(),
+                visual,
+            },
+            draw,
+        ))
+    }
+}
+
+/// The UI-thread side of a system-compositor child-visual surface: keeps the
+/// sprite parented under its host `ContainerVisual`. **Dropping it removes the
+/// sprite** from the parent. Not `Send` — the visual tree belongs to the UI
+/// thread. The system analogue of [`CompositionChildSurface`].
+pub struct CompositionChildVisual {
+    parent: system_bindings::ContainerVisual,
+    // Held so the visual (and its brush + surface) outlives this handle even if
+    // the draw side drops first; also the thing we detach on drop.
+    visual: system_bindings::Visual,
+}
+
+impl Drop for CompositionChildVisual {
+    fn drop(&mut self) {
+        if let Ok(children) = self.parent.Children() {
+            let _ = children.Remove(&self.visual);
+        }
     }
 }
 

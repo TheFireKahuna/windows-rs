@@ -1,8 +1,13 @@
-//! Paint the laid-out tree into the one FP16 scRGB composition surface via the
-//! canvas [`DrawingSession`]. A small [`PaintCache`] holds a single recolorable
-//! solid brush so painting allocates nothing per frame.
+//! Per-node surface painting. Each node with chrome owns a `SpriteVisual` backed
+//! by an FP16 `CompositionDrawingSurface` sized to its rect; this module ensures
+//! that surface exists, resizes it when the node's size changes, and redraws it
+//! **only when the node's own content/size/state changed** (its `dirty` flag).
+//! Pure layout containers never get a surface. A small [`PaintCache`] holds a
+//! single recolorable solid brush, shared across every node's surface (all
+//! surfaces derive from one Direct2D device), so painting allocates nothing per
+//! frame.
 
-use super::bootstrap::Surface;
+use super::bootstrap::Compositing;
 use super::node::{linear, lerp_color, Arena, Node};
 use super::*;
 use crate::backend::ControlKind;
@@ -12,7 +17,9 @@ use windows_canvas_core::{
 };
 use windows_numerics::Matrix3x2;
 
-/// Per-device paint resources. One recolorable brush, reused every frame.
+/// Per-device paint resources. One recolorable brush, reused every frame across
+/// all node surfaces (Direct2D brushes are shareable across device contexts of
+/// the same device).
 #[derive(Default)]
 pub(crate) struct PaintCache {
     brush: Option<windows_canvas_core::Brush>,
@@ -25,22 +32,87 @@ impl PaintCache {
     }
 }
 
-/// The window background (opaque, dark) used to clear before painting the tree.
-const WINDOW_BG: ColorF = ColorF::new(0.012, 0.012, 0.014, 1.0);
+/// Transparent clear color for premultiplied node surfaces.
+const CLEAR: ColorF = ColorF::new(0.0, 0.0, 0.0, 0.0);
 
-/// Repaint the whole surface from the arena tree rooted at `root`.
+/// Walk the tree, repainting each dirty node's own surface. Returns `Err` on
+/// device loss so the caller can drop and rebuild cached resources.
 pub(crate) fn paint(
-    surface: &Surface,
+    comp: &Compositing,
     cache: &mut PaintCache,
-    arena: &Arena,
+    arena: &mut Arena,
     root: ControlId,
     scale: f32,
 ) -> windows_core::Result<()> {
-    let mut offset = crate::system_bindings::POINT::default();
-    surface.device_lost.set(false);
-    let ctx: ID2D1DeviceContext = unsafe { surface.interop.BeginDraw(None, &mut offset)? };
+    paint_node(comp, cache, arena, root, scale)
+}
 
-    let session = DrawingSession::new_borrowed(&ctx, &surface.device_lost);
+fn paint_node(
+    comp: &Compositing,
+    cache: &mut PaintCache,
+    arena: &mut Arena,
+    id: ControlId,
+    scale: f32,
+) -> windows_core::Result<()> {
+    let needs = arena
+        .get(id)
+        .is_some_and(|n| n.has_chrome() || n.surf.is_some());
+    if needs {
+        let (w, h) = arena.get(id).map(|n| (n.rect.w, n.rect.h)).unwrap_or((0.0, 0.0));
+        let pw = (w * scale).ceil() as i32;
+        let ph = (h * scale).ceil() as i32;
+
+        let has_surface = arena.get(id).is_some_and(|n| n.surf.is_some());
+        if !has_surface {
+            let container = arena.get(id).unwrap().container.clone();
+            let surf = comp.new_surface(&container, pw, ph)?;
+            if let Some(n) = arena.get_mut(id) {
+                n.surf = Some(surf);
+            }
+        } else if let Some(n) = arena.get_mut(id)
+            && let Some(s) = &mut n.surf
+        {
+            let _ = s.resize(pw, ph);
+        }
+        if let Some(n) = arena.get(id)
+            && let Some(s) = &n.surf
+        {
+            s.set_dip_size(w, h);
+        }
+
+        let dirty = arena.get(id).is_some_and(|n| n.dirty);
+        if dirty && w > 0.0 && h > 0.0 {
+            draw_surface(comp, cache, arena, id, scale)?;
+            if let Some(n) = arena.get_mut(id) {
+                n.dirty = false;
+            }
+        }
+    }
+
+    let children = arena.get(id).map(|n| n.children.clone()).unwrap_or_default();
+    for c in children {
+        paint_node(comp, cache, arena, c, scale)?;
+    }
+    Ok(())
+}
+
+/// Redraw one node's surface: its own chrome at local (0,0)-origin DIP coords.
+fn draw_surface(
+    comp: &Compositing,
+    cache: &mut PaintCache,
+    arena: &mut Arena,
+    id: ControlId,
+    scale: f32,
+) -> windows_core::Result<()> {
+    let interop = arena.get(id).unwrap().surf.as_ref().unwrap().interop.clone();
+
+    let mut offset = crate::system_bindings::POINT::default();
+    comp.device_lost.set(false);
+    let ctx: ID2D1DeviceContext = unsafe { interop.BeginDraw(None, &mut offset)? };
+
+    let session = DrawingSession::new_borrowed(&ctx, &comp.device_lost);
+    // Grayscale text AA is mandatory on premultiplied/transparent surfaces.
+    session.set_grayscale_text_antialiasing();
     // pixel = dip * scale + atlas offset (uniform scale keeps strokes/text crisp).
     session.set_transform(&Matrix3x2 {
         m11: scale,
@@ -50,46 +122,42 @@ pub(crate) fn paint(
         m31: offset.x as f32,
         m32: offset.y as f32,
     });
-    session.clear(WINDOW_BG);
+    session.clear(CLEAR);
 
     if cache.brush.is_none() {
         cache.brush = session.create_solid_brush(ColorF::BLACK).ok();
     }
     if let Some(brush) = &cache.brush {
-        paint_node(&session, brush, arena, root);
+        let node = arena.get(id).unwrap();
+        // Local rect: the node's own box at the surface origin.
+        let local = Rect::from_xywh(0.0, 0.0, node.rect.w, node.rect.h);
+        paint_chrome(&session, brush, node, local);
     }
 
-    drop(session);
-    unsafe { surface.interop.EndDraw()? };
+    unsafe { interop.EndDraw()? };
     Ok(())
 }
 
-fn paint_node(
+/// Draw a node's own chrome into its surface (no recursion — children own their
+/// own surfaces).
+fn paint_chrome(
     session: &DrawingSession,
     brush: &windows_canvas_core::Brush,
-    arena: &Arena,
-    id: ControlId,
+    node: &Node,
+    rect: Rect,
 ) {
-    let Some(node) = arena.get(id) else { return };
-    let r = node.rect;
-    let rect = Rect::from_xywh(r.x, r.y, r.w, r.h);
-
     match node.kind {
         ControlKind::Button => paint_button(session, brush, node, rect),
         ControlKind::TextBlock => paint_text(session, brush, node, rect),
         ControlKind::Rectangle => {
-            fill_and_stroke(session, brush, node, rect, node.paint.corner_radius);
+            fill_and_stroke(session, brush, node, rect, node.paint.corner_radius)
         }
         ControlKind::Ellipse => paint_ellipse(session, brush, node, rect),
         ControlKind::Line => paint_line(session, brush, node, rect),
         _ => {
-            // Border / StackPanel / Grid / Canvas: background + border box.
-            fill_and_stroke(session, brush, node, rect, node.paint.corner_radius);
+            // Border / StackPanel / Grid / Canvas / ScrollViewer: bg + border box.
+            fill_and_stroke(session, brush, node, rect, node.paint.corner_radius)
         }
-    }
-
-    for c in &node.children {
-        paint_node(session, brush, arena, *c);
     }
 }
 

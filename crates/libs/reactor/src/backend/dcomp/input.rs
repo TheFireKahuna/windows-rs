@@ -143,6 +143,8 @@ impl DCompBackend {
                 Some(n) => {
                     let h = n.hover.step(dt);
                     let p = n.press.step(dt);
+                    // The ink colour changed: the node's own surface must repaint.
+                    n.mark_dirty();
                     h && p
                 }
                 None => true,
