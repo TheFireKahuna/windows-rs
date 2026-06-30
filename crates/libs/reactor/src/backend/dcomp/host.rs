@@ -6,14 +6,110 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Once};
 
 use super::dispatch::{drain, LocalQueue, SendInner, WM_APP_DISPATCH};
+use super::uia;
 use super::*;
 use crate::engine::RenderHost;
 use crate::system_bindings::*;
 use crate::{Component, Element, RenderCx, WindowSize};
-use windows_core::PCWSTR;
+use windows_core::{Interface, PCWSTR};
+
+/// `WM_GETOBJECT` `lParam` value that asks for the window's root UI Automation
+/// provider (`UiaRootObjectId`, defined as `-25` in `uiautomationcore.h`).
+const UIA_ROOT_OBJECT_ID: i32 = -25;
+
+/// App message used to marshal a single UI-Automation provider call onto the UI
+/// thread. `wParam` is a `*mut Box<dyn FnOnce() + Send>` the WndProc runs and
+/// frees. See [`marshal_to_ui`].
+pub(crate) const WM_APP_UIA: u32 = WM_APP + 0x43;
+
+/// The thread id of the UI (message-pump) thread, captured at host creation.
+/// UIA provider methods arrive on UIA's own worker threads; they compare against
+/// this to take the in-thread fast path or marshal (see [`marshal_to_ui`]).
+static UI_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+windows_core::link!("kernel32.dll" "system" fn GetCurrentThreadId() -> u32);
+
+/// Whether the caller is already running on the UI thread.
+pub(crate) fn on_ui_thread() -> bool {
+    UI_THREAD_ID.load(Ordering::Relaxed) == unsafe { GetCurrentThreadId() }
+}
+
+thread_local! {
+    /// Set while a `with_backend` call holds the reconciler borrow, so a
+    /// re-entrant call (e.g. a UIA event raised synchronously from inside a
+    /// backend mutation) refuses rather than double-borrowing the `RefCell`.
+    static IN_BACKEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` against the backend on the UI thread. Returns `None` when there is no
+/// live host on this thread, or when called re-entrantly (the outer borrow is
+/// still active). Must be called on the UI thread (the UIA layer reaches it
+/// through [`marshal_to_ui`]).
+pub(crate) fn with_backend<R>(f: impl FnOnce(&mut DCompBackend) -> R) -> Option<R> {
+    if IN_BACKEND.with(|c| c.get()) {
+        return None;
+    }
+    IN_BACKEND.with(|c| c.set(true));
+    let r = shared().map(|s| s.render_host.with_reconciler_mut(|r| f(&mut r.backend)));
+    IN_BACKEND.with(|c| c.set(false));
+    r
+}
+
+/// Marshal `f` onto the UI thread and block until it completes, returning its
+/// result. When already on the UI thread it runs inline (re-entrancy-safe — a
+/// provider call triggered synchronously from our own thread never deadlocks on
+/// the pump). Otherwise it posts [`WM_APP_UIA`] and waits on a condvar the
+/// WndProc signals. `None` means the post failed (window gone) — surfaced as
+/// "element not available" by the provider.
+pub(crate) fn marshal_to_ui<R, F>(hwnd: isize, f: F) -> Option<R>
+where
+    R: Send + 'static,
+    F: FnOnce() -> R + Send + 'static,
+{
+    if on_ui_thread() {
+        return Some(f());
+    }
+    let slot: Arc<(Mutex<Option<R>>, Condvar)> = Arc::new((Mutex::new(None), Condvar::new()));
+    let slot2 = Arc::clone(&slot);
+    let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let r = f();
+        let (m, c) = &*slot2;
+        *m.lock().unwrap() = Some(r);
+        c.notify_one();
+    });
+    // Double-box: the message carries one pointer-sized `*mut Box<dyn FnOnce()>`.
+    let raw = Box::into_raw(Box::new(job));
+    let ok = unsafe {
+        PostMessageW(hwnd as HWND, WM_APP_UIA, raw as WPARAM, 0 as LPARAM).as_bool()
+    };
+    if !ok {
+        // Nothing will run the job; reclaim it so it isn't leaked.
+        drop(unsafe { Box::from_raw(raw) });
+        return None;
+    }
+    let (m, c) = &*slot;
+    let mut g = m.lock().unwrap();
+    while g.is_none() {
+        g = c.wait(g).unwrap();
+    }
+    g.take()
+}
+
+/// Post a closure to run on the UI thread without waiting (fire-and-forget). Runs
+/// outside any backend borrow, so it is safe for deferred UIA event raising that
+/// must not re-enter an in-progress input handler.
+pub(crate) fn post_ui(hwnd: isize, f: impl FnOnce() + Send + 'static) {
+    let job: Box<dyn FnOnce() + Send> = Box::new(f);
+    let raw = Box::into_raw(Box::new(job));
+    let ok = unsafe { PostMessageW(hwnd as HWND, WM_APP_UIA, raw as WPARAM, 0 as LPARAM).as_bool() };
+    if !ok {
+        drop(unsafe { Box::from_raw(raw) });
+    }
+}
 
 const TIMER_ID: usize = 1;
 /// Caret-blink timer — the one allowed at-rest timer, running only while a text
@@ -52,6 +148,9 @@ impl DCompHost {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
+        // Record the UI thread so UIA provider calls can detect the in-thread
+        // fast path versus needing to marshal (see `marshal_to_ui`).
+        UI_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
         ensure_dispatcher_queue()?;
 
         let (hwnd, dpi, (pw, ph)) = create_window(title.as_ref(), 960, 640)?;
@@ -336,6 +435,39 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 drain(&s.local, &s.send);
             }
             0
+        }
+
+        // A UIA worker thread asked us to run a provider call on the UI thread.
+        WM_APP_UIA => {
+            let raw = wparam as *mut Box<dyn FnOnce() + Send>;
+            if !raw.is_null() {
+                let job = unsafe { Box::from_raw(raw) };
+                job();
+                // A UIA-driven action (Invoke/Toggle/SetValue) may have started a
+                // spring; keep the animation timer running if so.
+                if let Some(s) = shared() {
+                    let anim =
+                        s.render_host.with_reconciler_mut(|r| r.backend.is_animating());
+                    start_timer(hwnd, anim);
+                }
+            }
+            0
+        }
+
+        // UI Automation root request: hand back our window's root fragment
+        // provider. Any other object id (MSAA client, etc.) falls through to the
+        // default handler.
+        WM_GETOBJECT => {
+            if lparam as i32 == UIA_ROOT_OBJECT_ID
+                && let Some(s) = shared()
+                && let Some(root) = s.render_host.with_reconciler_mut(|r| r.backend.uia_root())
+            {
+                let provider = uia::root_provider(hwnd as isize, root);
+                return unsafe {
+                    UiaReturnRawElementProvider(hwnd, wparam, lparam, provider.as_raw())
+                };
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
         WM_MOUSEMOVE => {

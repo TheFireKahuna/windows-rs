@@ -27,6 +27,7 @@ mod popup;
 mod scroll;
 mod size;
 mod theme;
+mod uia;
 
 pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;

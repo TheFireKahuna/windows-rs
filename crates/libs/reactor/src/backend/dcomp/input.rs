@@ -416,6 +416,12 @@ impl DCompBackend {
         }
         let rel = y - node.rect.y;
         let i = ((rel / controls::NAV_ITEM_H).floor() as i32).clamp(0, n as i32 - 1);
+        self.set_nav_index(id, i);
+    }
+
+    /// Select NavigationView item `i` (the by-index core `select_nav` and UIA
+    /// `SelectionItem::Select` both route through).
+    fn set_nav_index(&mut self, id: ControlId, i: i32) {
         let tag = {
             let Some(nd) = self.node_mut(id) else { return };
             if nd.ctrl.selected_index == i {
@@ -428,6 +434,21 @@ impl DCompBackend {
         };
         self.animating.insert(id);
         self.fire_string(id, Event::SelectionChanged, tag);
+    }
+
+    /// Select ComboBox item `i` directly (UIA `SelectionItem::Select`), mirroring
+    /// the popup-commit path without opening the dropdown.
+    fn set_combo_index(&mut self, id: ControlId, i: i32) {
+        {
+            let Some(n) = self.node_mut(id) else { return };
+            if n.ctrl.selected_index == i {
+                return;
+            }
+            n.ctrl.selected_index = i;
+            n.mark_dirty();
+        }
+        self.repaint();
+        self.fire_i32(id, Event::SelectionChanged, i);
     }
 
     /// Map pointer x to a slider value, clamp/quantize, and report it.
@@ -1106,6 +1127,105 @@ impl DCompBackend {
             n.mark_dirty();
         }
         self.repaint();
+        // Notify any listening UI Automation client of the focus move (no-op when
+        // no AT / test harness is attached — see `uia_raise_focus`).
+        if let Some(new) = id {
+            self.uia_raise_focus(new);
+        }
+    }
+
+    // ── UIA action bridge ────────────────────────────────────────────────────
+    //
+    // Each method translates one UI-Automation pattern call into the *same* typed
+    // event dispatch a pointer/keyboard interaction would take — there is a single
+    // action path. Called on the UI thread (the provider marshals here).
+
+    /// Invoke / Toggle: identical to a click or Space activation.
+    pub(crate) fn uia_activate(&mut self, id: ControlId) {
+        self.activate(id);
+    }
+
+    /// `IRawElementProviderFragment::SetFocus`: give the control keyboard focus
+    /// (with the visible ring), the same as Tabbing to it.
+    pub(crate) fn uia_focus_node(&mut self, id: ControlId) {
+        if self.node(id).is_some_and(|n| n.focusable) {
+            self.set_focus(Some(id), true);
+        }
+    }
+
+    /// `Value::SetValue` for an editable text field (TextBox / PasswordBox /
+    /// AutoSuggestBox / NumberBox): replace the buffer and fire the field's change
+    /// event, as if typed and committed.
+    pub(crate) fn uia_set_text(&mut self, id: ControlId, s: &str) {
+        let kind = match self.node(id) {
+            Some(n) if n.editor.is_some() => n.kind,
+            _ => return,
+        };
+        if let Some(n) = self.node_mut(id) {
+            if let Some(e) = &mut n.editor {
+                e.set_text(s);
+                e.seeded = true;
+                e.blink_on = true;
+            }
+            n.mark_dirty();
+        }
+        if kind == ControlKind::NumberBox {
+            // Parse / clamp / round / format and fire ValueChanged.
+            self.commit_number(id);
+        } else {
+            self.editor_after_edit(id);
+        }
+    }
+
+    /// `RangeValue::SetValue` for a Slider (and NumberBox): clamp into range and
+    /// fire `ValueChanged`, the same as an arrow-key nudge.
+    pub(crate) fn uia_set_range(&mut self, id: ControlId, v: f64) {
+        if self.node(id).map(|n| n.kind) == Some(ControlKind::NumberBox) {
+            self.apply_number(id, v);
+            return;
+        }
+        let value = {
+            let Some(n) = self.node_mut(id) else { return };
+            let v = v.clamp(n.ctrl.min, n.ctrl.max);
+            n.ctrl.value = v;
+            n.anim.target = ctrl_value_frac(n) as f32;
+            n.mark_dirty();
+            v
+        };
+        self.animating.insert(id);
+        self.fire_f64(id, Event::ValueChanged, value);
+    }
+
+    /// `SelectionItem::Select` on item `i` of a SelectorBar / ComboBox /
+    /// NavigationView, routed through the existing per-kind selection path.
+    pub(crate) fn uia_select_item(&mut self, id: ControlId, i: i32) {
+        match self.node(id).map(|n| n.kind) {
+            Some(ControlKind::SelectorBar) => self.set_segment(id, i),
+            Some(ControlKind::NavigationView) => self.set_nav_index(id, i),
+            Some(ControlKind::ComboBox) => self.set_combo_index(id, i),
+            _ => {}
+        }
+    }
+
+    /// `ExpandCollapse::Expand` / `Collapse`. Expander toggles through `activate`;
+    /// the dropdown kinds open/close their popup.
+    pub(crate) fn uia_set_expanded(&mut self, id: ControlId, want: bool) {
+        match self.node(id).map(|n| n.kind) {
+            Some(ControlKind::Expander) => {
+                let cur = self.node(id).map(|n| n.ctrl.expanded).unwrap_or(false);
+                if cur != want {
+                    self.activate(id);
+                }
+            }
+            Some(ControlKind::ComboBox | ControlKind::DropDownButton | ControlKind::SplitButton) => {
+                if want {
+                    self.open_popup(id);
+                } else {
+                    self.close_popup();
+                }
+            }
+            _ => {}
+        }
     }
 
     // ── Event dispatch ───────────────────────────────────────────────────────
