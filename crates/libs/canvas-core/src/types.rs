@@ -143,20 +143,36 @@ pub trait Paint: sealed::Sealed {
 }
 
 /// A solid color brush.
-pub struct Brush(pub(crate) ID2D1SolidColorBrush);
+///
+/// `linearize` records whether the brush draws onto a linear scRGB (FP16) target:
+/// when set, every color it is given is sRGB→linear converted before reaching
+/// Direct2D, so the same sRGB authoring renders correctly whether the brush ends
+/// up on an 8-bit sRGB surface (`linearize` false, color passes through) or an
+/// FP16 linear one (`linearize` true). The flag is stamped at creation from the
+/// owning [`DrawingSession`], so a recolorable brush reused via
+/// [`set_color`](Self::set_color) converts on every recolor too.
+pub struct Brush {
+    pub(crate) raw: ID2D1SolidColorBrush,
+    linearize: bool,
+}
 
 impl Brush {
-    /// Sets the color of the brush.
+    pub(crate) fn new(raw: ID2D1SolidColorBrush, linearize: bool) -> Self {
+        Self { raw, linearize }
+    }
+
+    /// Sets the color of the brush (sRGB→linear converted on a linear target).
     pub fn set_color(&self, color: ColorF) {
+        let color = if self.linearize { color.to_linear() } else { color };
         let c: D2D1_COLOR_F = color.into();
-        unsafe { self.0.SetColor(&c) };
+        unsafe { self.raw.SetColor(&c) };
     }
 }
 
 impl sealed::Sealed for Brush {}
 impl Paint for Brush {
     fn as_raw_brush(&self) -> &ID2D1Brush {
-        &self.0
+        &self.raw
     }
 }
 
@@ -193,13 +209,6 @@ impl GradientStop {
     /// Creates a gradient stop at the given position and color.
     pub const fn new(position: f32, color: ColorF) -> Self {
         Self { position, color }
-    }
-
-    pub(crate) fn to_abi(self) -> D2D1_GRADIENT_STOP {
-        D2D1_GRADIENT_STOP {
-            position: self.position,
-            color: self.color.into(),
-        }
     }
 }
 

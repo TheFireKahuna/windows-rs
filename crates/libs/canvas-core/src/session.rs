@@ -10,6 +10,12 @@ pub struct DrawingSession<'a> {
     // `BeginDraw`/`EndDraw` already opens and closes the draw — issuing a nested
     // Direct2D `BeginDraw` there is `D2DERR_WRONG_STATE`.
     owns_bracket: bool,
+    // Whether the draw target is a linear scRGB (FP16) surface. When set, every
+    // color this session sends to Direct2D — solid brushes (including later
+    // recolors), gradient stops, the clear color, effect tints — is sRGB→linear
+    // converted, so sRGB-authored draws render correctly on a linear surface. An
+    // 8-bit sRGB surface leaves this false and passes colors through unchanged.
+    linearize: bool,
 }
 
 impl<'a> DrawingSession<'a> {
@@ -22,6 +28,7 @@ impl<'a> DrawingSession<'a> {
             context,
             device_lost_flag,
             owns_bracket: true,
+            linearize: false,
         })
     }
 
@@ -39,12 +46,36 @@ impl<'a> DrawingSession<'a> {
             context,
             device_lost_flag,
             owns_bracket: false,
+            linearize: false,
+        }
+    }
+
+    /// Mark this session's target as a linear scRGB (FP16) surface (or not).
+    ///
+    /// On a linear target, sRGB-authored colors must be gamma-decoded before they
+    /// are written — set this and the session converts every color it forwards to
+    /// Direct2D (solid brushes and their recolors, gradient stops, clears, effect
+    /// tints). Leave it off (the default) for an 8-bit sRGB surface, where authored
+    /// sRGB is stored directly. Chain it on construction:
+    /// `DrawingSession::new_borrowed(ctx, flag).linearize_target(surface_is_fp16)`.
+    pub fn linearize_target(mut self, on: bool) -> Self {
+        self.linearize = on;
+        self
+    }
+
+    /// Convert an authored sRGB color for this session's target: linear on an FP16
+    /// surface, unchanged on an 8-bit sRGB one.
+    fn resolve(&self, color: ColorF) -> ColorF {
+        if self.linearize {
+            color.to_linear()
+        } else {
+            color
         }
     }
 
     /// Clears the entire session to the given color.
     pub fn clear(&self, color: ColorF) {
-        let c: D2D1_COLOR_F = color.into();
+        let c: D2D1_COLOR_F = self.resolve(color).into();
         unsafe { self.context.Clear(Some(&c)) };
     }
 
@@ -165,10 +196,37 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
-    /// Creates a solid color brush.
+    /// Creates a solid color brush. The brush inherits this session's target color
+    /// space, so a later [`set_color`](Brush::set_color) on a linear target converts
+    /// too (the recolorable-brush path that immediate-mode draws reuse every frame).
     pub fn create_solid_brush(&self, color: ColorF) -> Result<Brush> {
-        let c: D2D1_COLOR_F = color.into();
-        unsafe { self.context.CreateSolidColorBrush(&c, None).map(Brush) }
+        let c: D2D1_COLOR_F = self.resolve(color).into();
+        unsafe {
+            self.context
+                .CreateSolidColorBrush(&c, None)
+                .map(|b| Brush::new(b, self.linearize))
+        }
+    }
+
+    /// Resolve a stop list for this session's target and pick the interpolation
+    /// gamma. On a linear (FP16) target the stop colors are gamma-decoded and
+    /// interpolation runs in linear space (`GAMMA_1_0`) to match those endpoints;
+    /// on an 8-bit sRGB target the colors pass through and interpolation stays in
+    /// the perceptual `GAMMA_2_2` space (the previous behaviour).
+    fn resolve_stops(&self, stops: &[GradientStop]) -> (Vec<D2D1_GRADIENT_STOP>, D2D1_GAMMA) {
+        let abi: Vec<D2D1_GRADIENT_STOP> = stops
+            .iter()
+            .map(|s| D2D1_GRADIENT_STOP {
+                position: s.position,
+                color: self.resolve(s.color).into(),
+            })
+            .collect();
+        let gamma = if self.linearize {
+            D2D1_GAMMA_1_0
+        } else {
+            D2D1_GAMMA_2_2
+        };
+        (abi, gamma)
     }
 
     /// Stops define colors at positions 0.0–1.0 along the axis from `start` to `end`.
@@ -178,11 +236,11 @@ impl<'a> DrawingSession<'a> {
         end: Vector2,
         stops: &[GradientStop],
     ) -> Result<LinearGradient> {
-        let abi_stops: Vec<D2D1_GRADIENT_STOP> = stops.iter().map(|s| s.to_abi()).collect();
+        let (abi_stops, gamma) = self.resolve_stops(stops);
         unsafe {
             let collection = self.context.CreateGradientStopCollection(
                 &abi_stops,
-                D2D1_GAMMA_2_2,
+                gamma,
                 D2D1_EXTEND_MODE_CLAMP,
             )?;
             let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
@@ -203,11 +261,11 @@ impl<'a> DrawingSession<'a> {
         radius_y: f32,
         stops: &[GradientStop],
     ) -> Result<RadialGradient> {
-        let abi_stops: Vec<D2D1_GRADIENT_STOP> = stops.iter().map(|s| s.to_abi()).collect();
+        let (abi_stops, gamma) = self.resolve_stops(stops);
         unsafe {
             let collection = self.context.CreateGradientStopCollection(
                 &abi_stops,
-                D2D1_GAMMA_2_2,
+                gamma,
                 D2D1_EXTEND_MODE_CLAMP,
             )?;
             let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
@@ -396,6 +454,9 @@ impl<'a> DrawingSession<'a> {
                 D2D1_PROPERTY_TYPE_FLOAT,
                 &blur_standard_deviation.to_le_bytes(),
             )?;
+            // The tint composites into the surface, so it follows the same color
+            // space: linear on an FP16 target, sRGB passthrough otherwise.
+            let color = self.resolve(color);
             let mut rgba = [0u8; 16];
             rgba[0..4].copy_from_slice(&color.r.to_le_bytes());
             rgba[4..8].copy_from_slice(&color.g.to_le_bytes());

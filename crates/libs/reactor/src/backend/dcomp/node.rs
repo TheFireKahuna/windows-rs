@@ -21,20 +21,12 @@ use crate::LineEndpoints;
 use windows_canvas_core::{ColorF, TextLayout};
 use windows_core::Interface;
 
-/// sRGB 8-bit channel -> linear. The single ingestion decode: every reactor
-/// [`Color`] is authored in sRGB and lands in the FP16 scRGB surface linearly.
-fn s2l(c: u8) -> f32 {
-    let c = c as f32 / 255.0;
-    if c <= 0.04045 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-/// Convert a reactor (sRGB) [`Color`] to a linear scRGB [`ColorF`] for D2D.
+/// Convert a reactor (sRGB) [`Color`] to a linear scRGB [`ColorF`] for D2D — the
+/// chrome's ingestion decode, since every reactor [`Color`] is authored in sRGB and
+/// the node-chrome surfaces are FP16 scRGB (linear). Shares the one sRGB EOTF with
+/// [`ColorF::to_linear`], the same decode the viz draw sessions apply.
 pub(crate) fn linear(c: Color) -> ColorF {
-    ColorF::new(s2l(c.r), s2l(c.g), s2l(c.b), c.a as f32 / 255.0)
+    ColorF::from_rgba8(c.r, c.g, c.b, c.a).to_linear()
 }
 
 /// Linearly interpolate two scRGB colors.

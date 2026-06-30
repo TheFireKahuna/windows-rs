@@ -179,7 +179,11 @@ impl CompositionSurfaceFactory {
         let visual: bindings::Visual = sprite.cast()?;
         bindings::ElementCompositionPreview::SetElementChildVisual(&ui, &visual)?;
 
-        let draw = CompositionDrawSurface { interop: SurfaceInterop::Lifted(surface.cast()?) };
+        // Lifted (WinUI) surface: 8-bit `B8G8R8A8UIntNormalized` (sRGB) — not linear.
+        let draw = CompositionDrawSurface {
+            interop: SurfaceInterop::Lifted(surface.cast()?),
+            linear: false,
+        };
         Ok((CompositionChildSurface { element: ui, _visual: visual }, draw))
     }
 
@@ -210,7 +214,14 @@ impl CompositionSurfaceFactory {
         } else {
             sys::DirectXAlphaMode::Premultiplied
         };
-        // FP16 scRGB to match the backend's HDR composition pipeline.
+        // FP16 scRGB (`R16G16B16A16Float`), matching the backend's HDR composition
+        // pipeline (the node-chrome surfaces and the whole-window FP16 path) so a
+        // future meter/accent can author values past 1.0 and pop. The system
+        // compositor presents this surface as scRGB-*linear*; the viz draw closures
+        // author colours in sRGB, so the surface is flagged linear below and the draw
+        // session (see `CompositionDrawTarget`) gamma-decodes every colour onto it —
+        // a near-black #1c1c1c backdrop lands near-black, not the mid-grey that writing
+        // sRGB values raw onto a linear surface would produce.
         let surface = graphics2.CreateDrawingSurface2(
             sys::SizeInt32 { width: pixel_size.0.max(1), height: pixel_size.1.max(1) },
             sys::DirectXPixelFormat::R16G16B16A16Float,
@@ -238,6 +249,8 @@ impl CompositionSurfaceFactory {
             interop: SurfaceInterop::System(
                 surface.cast::<system_bindings::ICompositionDrawingSurfaceInterop>()?,
             ),
+            // System (DComp) viz surface: FP16 `R16G16B16A16Float`, linear scRGB.
+            linear: true,
         };
         Ok((
             CompositionChildVisual {
@@ -295,6 +308,20 @@ impl Drop for CompositionChildSurface {
 /// the factory lock then serializes its DXGI interop against the device.
 pub struct CompositionDrawSurface {
     interop: SurfaceInterop,
+    // Whether the backing surface is linear scRGB (FP16). The system-backed viz
+    // surfaces are FP16 (HDR); the lifted (WinUI) ones are 8-bit sRGB. A draw target
+    // reads this (via [`is_linear`](Self::is_linear)) to decide whether to gamma-decode
+    // sRGB-authored colors onto the surface.
+    linear: bool,
+}
+
+impl CompositionDrawSurface {
+    /// Whether the backing surface stores linear scRGB (an FP16 `R16G16B16A16Float`
+    /// surface) rather than 8-bit sRGB. A draw path uses this to enable sRGB→linear
+    /// color conversion so sRGB-authored content renders correctly on the FP16 surface.
+    pub fn is_linear(&self) -> bool {
+        self.linear
+    }
 }
 
 /// The surface's drawing interop, in whichever composition namespace minted it.

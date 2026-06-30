@@ -47,7 +47,10 @@ impl CompositionDrawTarget {
     pub fn draw<R>(&self, scale: f32, f: impl FnOnce(&DrawingSession<'_>) -> R) -> Result<R> {
         let (context, (offset_x, offset_y)) = self.surface.begin_draw::<ID2D1DeviceContext>()?;
         self.device_lost.set(false);
-        let session = DrawingSession::new_borrowed(&context, &self.device_lost);
+        // An FP16 (scRGB-linear) surface needs sRGB-authored colors gamma-decoded; an
+        // 8-bit sRGB surface passes them through. The surface knows which it is.
+        let session = DrawingSession::new_borrowed(&context, &self.device_lost)
+            .linearize_target(self.surface.is_linear());
         // pixel = dip * scale + atlas offset. The surface hands back an offset into a
         // shared atlas texture, so every frame must translate by it (it is not always
         // zero); the uniform scale keeps strokes/text crisp at the display DPI.
@@ -98,7 +101,10 @@ impl CompositionDrawTarget {
                 }
             })?;
         {
-            let session = DrawingSession::new_borrowed(&context, &self.device_lost);
+            // An FP16 (scRGB-linear) surface needs sRGB-authored colors gamma-decoded;
+            // an 8-bit sRGB surface passes them through. The surface knows which it is.
+            let session = DrawingSession::new_borrowed(&context, &self.device_lost)
+                .linearize_target(self.surface.is_linear());
             // Grayscale text AA: ClearType's subpixel coverage is invalid on a
             // premultiplied/transparent surface (it would fringe).
             session.set_grayscale_text_antialiasing();

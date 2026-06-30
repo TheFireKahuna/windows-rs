@@ -250,10 +250,15 @@ impl SwapChain {
         result.map(|()| true)
     }
 
-    /// Creates a solid color brush.
+    /// Creates a solid color brush. A swap-chain target is 8-bit sRGB, so the brush
+    /// does no sRGB→linear conversion (colors pass through unchanged).
     pub fn create_solid_brush(&self, color: ColorF) -> Result<Brush> {
         let c: D2D1_COLOR_F = color.into();
-        unsafe { self.d2d_context.CreateSolidColorBrush(&c, None).map(Brush) }
+        unsafe {
+            self.d2d_context
+                .CreateSolidColorBrush(&c, None)
+                .map(|b| Brush::new(b, false))
+        }
     }
 
     /// Loads a bitmap from an image file.
