@@ -681,9 +681,13 @@ impl CppMethod {
                             };
                             // In minimal mode, when the param type is a raw pointer
                             // (not PCWSTR/PCSTR wrapper), the element type matches the
-                            // vtable signature — no transmute needed.
+                            // vtable signature — no transmute needed. Output arrays are
+                            // the exception: the slice is borrowed immutably and
+                            // `as_ptr()` yields a `*const` that must be coerced to the
+                            // vtable's `*mut`, so they still need the transmute.
                             if config.bindgen.style.is_minimal()
                                 && matches!(param.ty, Type::PtrConst(..) | Type::PtrMut(..))
+                                && param.is_input()
                             {
                                 quote! { #map, }
                             } else {
@@ -732,8 +736,17 @@ impl CppMethod {
                                 }
                             } else if config.bindgen.style.is_minimal() {
                                 // In minimal mode, blittable types ARE their ABI
-                                // representation — no transmute needed.
-                                quote! { #name, }
+                                // representation — no transmute needed. Pointer
+                                // params are the exception: a `*mut Option<Interface>`
+                                // (interface out-param) is layout-compatible with the
+                                // vtable's `*mut *mut c_void` but not type-identical,
+                                // so it needs a pointer cast (a no-op when the pointee
+                                // already matches).
+                                if matches!(param.ty, Type::PtrConst(..) | Type::PtrMut(..)) {
+                                    quote! { #name as _, }
+                                } else {
+                                    quote! { #name, }
+                                }
                             } else {
                                 quote! { core::mem::transmute(#name), }
                             }

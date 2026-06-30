@@ -5,12 +5,15 @@ windows_core::link!("dwrite.dll" "system" fn DWriteCreateFactory(factorytype : D
 windows_core::link!("kernel32.dll" "system" fn WaitForSingleObjectEx(hhandle : HANDLE, dwmilliseconds : u32, balertable : windows_core::BOOL) -> WAIT_EVENT);
 pub type CLSCTX = u32;
 pub const CLSCTX_INPROC_SERVER: CLSCTX = 1;
+pub const CLSID_D2D1ColorManagement: windows_core::GUID =
+    windows_core::GUID::from_u128(0x1a28524c_fdd6_4aa4_ae8f_837eb8267b37);
 pub const CLSID_D2D1Shadow: windows_core::GUID =
     windows_core::GUID::from_u128(0xc67ea361_1863_4e69_89db_695d3e9a5b6b);
 pub const CLSID_WICImagingFactory: windows_core::GUID =
     windows_core::GUID::from_u128(0xcacaf262_9370_4615_a13b_9f5539da4c0a);
 pub type D2D1_ALPHA_MODE = i32;
 pub const D2D1_ALPHA_MODE_PREMULTIPLIED: D2D1_ALPHA_MODE = 1;
+pub type D2D1_ANTIALIAS_MODE = i32;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct D2D1_BEZIER_SEGMENT {
@@ -20,6 +23,7 @@ pub struct D2D1_BEZIER_SEGMENT {
 }
 pub type D2D1_BITMAP_OPTIONS = i32;
 pub const D2D1_BITMAP_OPTIONS_CANNOT_DRAW: D2D1_BITMAP_OPTIONS = 2;
+pub const D2D1_BITMAP_OPTIONS_NONE: D2D1_BITMAP_OPTIONS = 0;
 pub const D2D1_BITMAP_OPTIONS_TARGET: D2D1_BITMAP_OPTIONS = 1;
 #[repr(C)]
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -36,6 +40,7 @@ pub struct D2D1_BRUSH_PROPERTIES {
     pub opacity: f32,
     pub transform: windows_numerics::Matrix3x2,
 }
+pub type D2D1_BUFFER_PRECISION = i32;
 pub type D2D1_CAP_STYLE = i32;
 pub const D2D1_CAP_STYLE_FLAT: D2D1_CAP_STYLE = 0;
 pub const D2D1_CAP_STYLE_ROUND: D2D1_CAP_STYLE = 2;
@@ -49,6 +54,7 @@ pub struct D2D1_COLOR_F {
     pub b: f32,
     pub a: f32,
 }
+pub type D2D1_COLOR_SPACE = i32;
 pub type D2D1_COMPOSITE_MODE = i32;
 pub type D2D1_DASH_STYLE = i32;
 pub const D2D1_DASH_STYLE_DASH: D2D1_DASH_STYLE = 1;
@@ -57,8 +63,11 @@ pub const D2D1_DASH_STYLE_DOT: D2D1_DASH_STYLE = 2;
 pub const D2D1_DASH_STYLE_SOLID: D2D1_DASH_STYLE = 0;
 pub type D2D1_DEBUG_LEVEL = i32;
 pub type D2D1_DEVICE_CONTEXT_OPTIONS = i32;
+pub const D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS:
+    D2D1_DEVICE_CONTEXT_OPTIONS = 1;
 pub const D2D1_DEVICE_CONTEXT_OPTIONS_NONE: D2D1_DEVICE_CONTEXT_OPTIONS = 0;
 pub type D2D1_DRAW_TEXT_OPTIONS = i32;
+pub const D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT: D2D1_DRAW_TEXT_OPTIONS = 4;
 pub const D2D1_DRAW_TEXT_OPTIONS_NONE: D2D1_DRAW_TEXT_OPTIONS = 0;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -84,6 +93,7 @@ pub type D2D1_FIGURE_END = i32;
 pub const D2D1_FIGURE_END_CLOSED: D2D1_FIGURE_END = 1;
 pub const D2D1_FIGURE_END_OPEN: D2D1_FIGURE_END = 0;
 pub type D2D1_GAMMA = i32;
+pub const D2D1_GAMMA_1_0: D2D1_GAMMA = 1;
 pub const D2D1_GAMMA_2_2: D2D1_GAMMA = 0;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -143,6 +153,8 @@ pub struct D2D1_STROKE_STYLE_PROPERTIES1 {
     pub transformType: D2D1_STROKE_TRANSFORM_TYPE,
 }
 pub type D2D1_STROKE_TRANSFORM_TYPE = i32;
+pub type D2D1_TEXT_ANTIALIAS_MODE = i32;
+pub const D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE: D2D1_TEXT_ANTIALIAS_MODE = 2;
 pub const D2DERR_RECREATE_TARGET: windows_core::HRESULT =
     windows_core::HRESULT(0x8899000C_u32 as _);
 #[repr(C)]
@@ -173,13 +185,80 @@ pub const D3D_DRIVER_TYPE_HARDWARE: D3D_DRIVER_TYPE = 1;
 pub const D3D_DRIVER_TYPE_WARP: D3D_DRIVER_TYPE = 5;
 pub type D3D_FEATURE_LEVEL = i32;
 pub const D3D_FEATURE_LEVEL_11_0: D3D_FEATURE_LEVEL = 45056;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DWRITE_COLOR_F {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+#[repr(C)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DWRITE_COLOR_GLYPH_RUN {
+    pub glyphRun: DWRITE_GLYPH_RUN,
+    pub glyphRunDescription: *mut DWRITE_GLYPH_RUN_DESCRIPTION,
+    pub baselineOriginX: f32,
+    pub baselineOriginY: f32,
+    pub runColor: DWRITE_COLOR_F,
+    pub paletteIndex: u16,
+}
+impl Default for DWRITE_COLOR_GLYPH_RUN {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 pub type DWRITE_FACTORY_TYPE = i32;
 pub const DWRITE_FACTORY_TYPE_SHARED: DWRITE_FACTORY_TYPE = 0;
+pub type DWRITE_FONT_AXIS_TAG = u32;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DWRITE_FONT_AXIS_VALUE {
+    pub axisTag: DWRITE_FONT_AXIS_TAG,
+    pub value: f32,
+}
 pub type DWRITE_FONT_STRETCH = i32;
 pub const DWRITE_FONT_STRETCH_NORMAL: DWRITE_FONT_STRETCH = 5;
 pub type DWRITE_FONT_STYLE = i32;
 pub const DWRITE_FONT_STYLE_NORMAL: DWRITE_FONT_STYLE = 0;
 pub type DWRITE_FONT_WEIGHT = i32;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DWRITE_GLYPH_OFFSET {
+    pub advanceOffset: f32,
+    pub ascenderOffset: f32,
+}
+#[repr(C)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DWRITE_GLYPH_RUN {
+    pub fontFace: core::mem::ManuallyDrop<Option<IDWriteFontFace>>,
+    pub fontEmSize: f32,
+    pub glyphCount: u32,
+    pub glyphIndices: *const u16,
+    pub glyphAdvances: *const f32,
+    pub glyphOffsets: *const DWRITE_GLYPH_OFFSET,
+    pub isSideways: windows_core::BOOL,
+    pub bidiLevel: u32,
+}
+impl Default for DWRITE_GLYPH_RUN {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DWRITE_GLYPH_RUN_DESCRIPTION {
+    pub localeName: windows_core::PCWSTR,
+    pub string: windows_core::PCWSTR,
+    pub stringLength: u32,
+    pub clusterMap: *const u16,
+    pub textPosition: u32,
+}
+impl Default for DWRITE_GLYPH_RUN_DESCRIPTION {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DWRITE_HIT_TEST_METRICS {
@@ -192,6 +271,16 @@ pub struct DWRITE_HIT_TEST_METRICS {
     pub bidiLevel: u32,
     pub isText: windows_core::BOOL,
     pub isTrimmed: windows_core::BOOL,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DWRITE_MATRIX {
+    pub m11: f32,
+    pub m12: f32,
+    pub m21: f32,
+    pub m22: f32,
+    pub dx: f32,
+    pub dy: f32,
 }
 pub type DWRITE_MEASURING_MODE = i32;
 pub type DWRITE_PARAGRAPH_ALIGNMENT = i32;
@@ -217,6 +306,12 @@ pub struct DWRITE_TEXT_METRICS {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DWRITE_TEXT_RANGE {
+    pub startPosition: u32,
+    pub length: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DWRITE_TRIMMING {
     pub granularity: DWRITE_TRIMMING_GRANULARITY,
     pub delimiter: u32,
@@ -231,6 +326,9 @@ pub const DWRITE_WORD_WRAPPING_NO_WRAP: DWRITE_WORD_WRAPPING = 1;
 pub const DWRITE_WORD_WRAPPING_WRAP: DWRITE_WORD_WRAPPING = 0;
 pub type DXGI_ALPHA_MODE = i32;
 pub const DXGI_ALPHA_MODE_PREMULTIPLIED: DXGI_ALPHA_MODE = 1;
+pub const DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709: DXGI_COLOR_SPACE_TYPE = 1;
+pub const DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: DXGI_COLOR_SPACE_TYPE = 0;
+pub type DXGI_COLOR_SPACE_TYPE = i32;
 pub const DXGI_ERROR_DEVICE_HUNG: windows_core::HRESULT =
     windows_core::HRESULT(0x887A0006_u32 as _);
 pub const DXGI_ERROR_DEVICE_REMOVED: windows_core::HRESULT =
@@ -241,6 +339,7 @@ pub const DXGI_ERROR_DRIVER_INTERNAL_ERROR: windows_core::HRESULT =
     windows_core::HRESULT(0x887A0020_u32 as _);
 pub type DXGI_FORMAT = i32;
 pub const DXGI_FORMAT_B8G8R8A8_UNORM: DXGI_FORMAT = 87;
+pub const DXGI_FORMAT_R16G16B16A16_FLOAT: DXGI_FORMAT = 10;
 pub const DXGI_FORMAT_UNKNOWN: DXGI_FORMAT = 0;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -252,8 +351,32 @@ pub struct DXGI_MATRIX_3X2_F {
     pub _31: f32,
     pub _32: f32,
 }
+pub type DXGI_MODE_ROTATION = i32;
 pub type DXGI_MODE_SCALING = i32;
 pub type DXGI_MODE_SCANLINE_ORDER = i32;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DXGI_OUTPUT_DESC1 {
+    pub DeviceName: [u16; 32],
+    pub DesktopCoordinates: RECT,
+    pub AttachedToDesktop: windows_core::BOOL,
+    pub Rotation: DXGI_MODE_ROTATION,
+    pub Monitor: HMONITOR,
+    pub BitsPerColor: u32,
+    pub ColorSpace: DXGI_COLOR_SPACE_TYPE,
+    pub RedPrimary: [f32; 2],
+    pub GreenPrimary: [f32; 2],
+    pub BluePrimary: [f32; 2],
+    pub WhitePoint: [f32; 2],
+    pub MinLuminance: f32,
+    pub MaxLuminance: f32,
+    pub MaxFullFrameLuminance: f32,
+}
+impl Default for DXGI_OUTPUT_DESC1 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 pub type DXGI_PRESENT = u32;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -303,6 +426,7 @@ pub const GUID_WICPixelFormat32bppPBGRA: windows_core::GUID =
     windows_core::GUID::from_u128(0x6fddc324_4e03_4bfe_b185_3d77768dc910);
 pub type HANDLE = *mut core::ffi::c_void;
 pub type HMODULE = *mut core::ffi::c_void;
+pub type HMONITOR = *mut core::ffi::c_void;
 pub type HWND = *mut core::ffi::c_void;
 windows_core::imp::define_interface!(
     ID2D1Bitmap,
@@ -423,6 +547,59 @@ unsafe impl Send for ID2D1ColorContext {}
 unsafe impl Sync for ID2D1ColorContext {}
 impl windows_core::RuntimeName for ID2D1ColorContext {}
 windows_core::imp::define_interface!(
+    ID2D1ColorContext1,
+    ID2D1ColorContext1_Vtbl,
+    0x1ab42875_c57f_4be9_bd85_9cd78d6f55ee
+);
+impl core::ops::Deref for ID2D1ColorContext1 {
+    type Target = ID2D1ColorContext;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1ColorContext1,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1ColorContext
+);
+#[repr(C)]
+pub struct ID2D1ColorContext1_Vtbl {
+    pub base__: ID2D1ColorContext_Vtbl,
+    GetColorContextType: usize,
+    GetDXGIColorSpace: usize,
+    GetSimpleColorProfile: usize,
+}
+unsafe impl Send for ID2D1ColorContext1 {}
+unsafe impl Sync for ID2D1ColorContext1 {}
+impl windows_core::RuntimeName for ID2D1ColorContext1 {}
+windows_core::imp::define_interface!(
+    ID2D1CommandList,
+    ID2D1CommandList_Vtbl,
+    0xb4f34a19_2383_4d76_94f6_ec343657c3dc
+);
+impl core::ops::Deref for ID2D1CommandList {
+    type Target = ID2D1Image;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1CommandList,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Image
+);
+#[repr(C)]
+pub struct ID2D1CommandList_Vtbl {
+    pub base__: ID2D1Image_Vtbl,
+    Stream: usize,
+    Close: usize,
+}
+unsafe impl Send for ID2D1CommandList {}
+unsafe impl Sync for ID2D1CommandList {}
+impl windows_core::RuntimeName for ID2D1CommandList {}
+windows_core::imp::define_interface!(
     ID2D1Device,
     ID2D1Device_Vtbl,
     0x47dd575d_ac05_4cdd_8049_9b02cd16f44c
@@ -467,6 +644,177 @@ unsafe impl Send for ID2D1Device {}
 unsafe impl Sync for ID2D1Device {}
 impl windows_core::RuntimeName for ID2D1Device {}
 windows_core::imp::define_interface!(
+    ID2D1Device1,
+    ID2D1Device1_Vtbl,
+    0xd21768e1_23a4_4823_a14b_7c3eba85d658
+);
+impl core::ops::Deref for ID2D1Device1 {
+    type Target = ID2D1Device;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Device1,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Device
+);
+#[repr(C)]
+pub struct ID2D1Device1_Vtbl {
+    pub base__: ID2D1Device_Vtbl,
+    GetRenderingPriority: usize,
+    SetRenderingPriority: usize,
+    CreateDeviceContext: usize,
+}
+unsafe impl Send for ID2D1Device1 {}
+unsafe impl Sync for ID2D1Device1 {}
+impl windows_core::RuntimeName for ID2D1Device1 {}
+windows_core::imp::define_interface!(
+    ID2D1Device2,
+    ID2D1Device2_Vtbl,
+    0xa44472e1_8dfb_4e60_8492_6e2861c9ca8b
+);
+impl core::ops::Deref for ID2D1Device2 {
+    type Target = ID2D1Device1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Device2,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Device,
+    ID2D1Device1
+);
+#[repr(C)]
+pub struct ID2D1Device2_Vtbl {
+    pub base__: ID2D1Device1_Vtbl,
+    CreateDeviceContext: usize,
+    FlushDeviceContexts: usize,
+    GetDxgiDevice: usize,
+}
+unsafe impl Send for ID2D1Device2 {}
+unsafe impl Sync for ID2D1Device2 {}
+impl windows_core::RuntimeName for ID2D1Device2 {}
+windows_core::imp::define_interface!(
+    ID2D1Device3,
+    ID2D1Device3_Vtbl,
+    0x852f2087_802c_4037_ab60_ff2e7ee6fc01
+);
+impl core::ops::Deref for ID2D1Device3 {
+    type Target = ID2D1Device2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Device3,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Device,
+    ID2D1Device1,
+    ID2D1Device2
+);
+#[repr(C)]
+pub struct ID2D1Device3_Vtbl {
+    pub base__: ID2D1Device2_Vtbl,
+    CreateDeviceContext: usize,
+}
+unsafe impl Send for ID2D1Device3 {}
+unsafe impl Sync for ID2D1Device3 {}
+impl windows_core::RuntimeName for ID2D1Device3 {}
+windows_core::imp::define_interface!(
+    ID2D1Device4,
+    ID2D1Device4_Vtbl,
+    0xd7bdb159_5683_4a46_bc9c_72dc720b858b
+);
+impl core::ops::Deref for ID2D1Device4 {
+    type Target = ID2D1Device3;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Device4,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Device,
+    ID2D1Device1,
+    ID2D1Device2,
+    ID2D1Device3
+);
+#[repr(C)]
+pub struct ID2D1Device4_Vtbl {
+    pub base__: ID2D1Device3_Vtbl,
+    CreateDeviceContext: usize,
+    SetMaximumColorGlyphCacheMemory: usize,
+    GetMaximumColorGlyphCacheMemory: usize,
+}
+unsafe impl Send for ID2D1Device4 {}
+unsafe impl Sync for ID2D1Device4 {}
+impl windows_core::RuntimeName for ID2D1Device4 {}
+windows_core::imp::define_interface!(
+    ID2D1Device5,
+    ID2D1Device5_Vtbl,
+    0xd55ba0a4_6405_4694_aef5_08ee1a4358b4
+);
+impl core::ops::Deref for ID2D1Device5 {
+    type Target = ID2D1Device4;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Device5,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Device,
+    ID2D1Device1,
+    ID2D1Device2,
+    ID2D1Device3,
+    ID2D1Device4
+);
+#[repr(C)]
+pub struct ID2D1Device5_Vtbl {
+    pub base__: ID2D1Device4_Vtbl,
+    CreateDeviceContext: usize,
+}
+unsafe impl Send for ID2D1Device5 {}
+unsafe impl Sync for ID2D1Device5 {}
+impl windows_core::RuntimeName for ID2D1Device5 {}
+windows_core::imp::define_interface!(
+    ID2D1Device6,
+    ID2D1Device6_Vtbl,
+    0x7bfef914_2d75_4bad_be87_e18ddb077b6d
+);
+impl core::ops::Deref for ID2D1Device6 {
+    type Target = ID2D1Device5;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Device6,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Device,
+    ID2D1Device1,
+    ID2D1Device2,
+    ID2D1Device3,
+    ID2D1Device4,
+    ID2D1Device5
+);
+#[repr(C)]
+pub struct ID2D1Device6_Vtbl {
+    pub base__: ID2D1Device5_Vtbl,
+    CreateDeviceContext: usize,
+}
+unsafe impl Send for ID2D1Device6 {}
+unsafe impl Sync for ID2D1Device6 {}
+impl windows_core::RuntimeName for ID2D1Device6 {}
+windows_core::imp::define_interface!(
     ID2D1DeviceContext,
     ID2D1DeviceContext_Vtbl,
     0xe8f7fe7a_191c_466d_ad95_975678bda998
@@ -498,7 +846,7 @@ impl ID2D1DeviceContext {
                 size,
                 sourcedata.unwrap_or(core::mem::zeroed()) as _,
                 pitch,
-                bitmapproperties,
+                bitmapproperties as _,
                 &mut result__,
             )
             .and_then(|| windows_core::Type::from_abi(result__))
@@ -551,6 +899,16 @@ impl ID2D1DeviceContext {
             (windows_core::Interface::vtable(self).CreateEffect)(
                 windows_core::Interface::as_raw(self),
                 effectid,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn CreateCommandList(&self) -> windows_core::Result<ID2D1CommandList> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateCommandList)(
+                windows_core::Interface::as_raw(self),
                 &mut result__,
             )
             .and_then(|| windows_core::Type::from_abi(result__))
@@ -656,7 +1014,10 @@ pub struct ID2D1DeviceContext_Vtbl {
     CreateGradientStopCollection: usize,
     CreateImageBrush: usize,
     CreateBitmapBrush: usize,
-    CreateCommandList: usize,
+    pub CreateCommandList: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     IsDxgiFormatSupported: usize,
     IsBufferPrecisionSupported: usize,
     GetImageLocalBounds: usize,
@@ -700,6 +1061,294 @@ pub struct ID2D1DeviceContext_Vtbl {
 unsafe impl Send for ID2D1DeviceContext {}
 unsafe impl Sync for ID2D1DeviceContext {}
 impl windows_core::RuntimeName for ID2D1DeviceContext {}
+windows_core::imp::define_interface!(
+    ID2D1DeviceContext1,
+    ID2D1DeviceContext1_Vtbl,
+    0xd37f57e4_6908_459f_a199_e72f24f79987
+);
+impl core::ops::Deref for ID2D1DeviceContext1 {
+    type Target = ID2D1DeviceContext;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1DeviceContext1,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1RenderTarget,
+    ID2D1DeviceContext
+);
+impl ID2D1DeviceContext1 {
+    pub(crate) unsafe fn CreateFilledGeometryRealization<P0>(
+        &self,
+        geometry: P0,
+        flatteningtolerance: f32,
+    ) -> windows_core::Result<ID2D1GeometryRealization>
+    where
+        P0: windows_core::Param<ID2D1Geometry>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateFilledGeometryRealization)(
+                windows_core::Interface::as_raw(self),
+                geometry.param().abi(),
+                flatteningtolerance,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn CreateStrokedGeometryRealization<P0, P3>(
+        &self,
+        geometry: P0,
+        flatteningtolerance: f32,
+        strokewidth: f32,
+        strokestyle: P3,
+    ) -> windows_core::Result<ID2D1GeometryRealization>
+    where
+        P0: windows_core::Param<ID2D1Geometry>,
+        P3: windows_core::Param<ID2D1StrokeStyle>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateStrokedGeometryRealization)(
+                windows_core::Interface::as_raw(self),
+                geometry.param().abi(),
+                flatteningtolerance,
+                strokewidth,
+                strokestyle.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn DrawGeometryRealization<P0, P1>(&self, geometryrealization: P0, brush: P1)
+    where
+        P0: windows_core::Param<ID2D1GeometryRealization>,
+        P1: windows_core::Param<ID2D1Brush>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).DrawGeometryRealization)(
+                windows_core::Interface::as_raw(self),
+                geometryrealization.param().abi(),
+                brush.param().abi(),
+            );
+        }
+    }
+}
+#[repr(C)]
+pub struct ID2D1DeviceContext1_Vtbl {
+    pub base__: ID2D1DeviceContext_Vtbl,
+    pub CreateFilledGeometryRealization: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        f32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub CreateStrokedGeometryRealization: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        f32,
+        f32,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub DrawGeometryRealization: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ),
+}
+unsafe impl Send for ID2D1DeviceContext1 {}
+unsafe impl Sync for ID2D1DeviceContext1 {}
+impl windows_core::RuntimeName for ID2D1DeviceContext1 {}
+windows_core::imp::define_interface!(
+    ID2D1DeviceContext2,
+    ID2D1DeviceContext2_Vtbl,
+    0x394ea6a3_0c34_4321_950b_6ca20f0be6c7
+);
+impl core::ops::Deref for ID2D1DeviceContext2 {
+    type Target = ID2D1DeviceContext1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1DeviceContext2,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1RenderTarget,
+    ID2D1DeviceContext,
+    ID2D1DeviceContext1
+);
+#[repr(C)]
+pub struct ID2D1DeviceContext2_Vtbl {
+    pub base__: ID2D1DeviceContext1_Vtbl,
+    CreateInk: usize,
+    CreateInkStyle: usize,
+    CreateGradientMesh: usize,
+    CreateImageSourceFromWic: usize,
+    CreateLookupTable3D: usize,
+    CreateImageSourceFromDxgi: usize,
+    GetGradientMeshWorldBounds: usize,
+    DrawInk: usize,
+    DrawGradientMesh: usize,
+    DrawGdiMetafile: usize,
+    CreateTransformedImageSource: usize,
+}
+unsafe impl Send for ID2D1DeviceContext2 {}
+unsafe impl Sync for ID2D1DeviceContext2 {}
+impl windows_core::RuntimeName for ID2D1DeviceContext2 {}
+windows_core::imp::define_interface!(
+    ID2D1DeviceContext3,
+    ID2D1DeviceContext3_Vtbl,
+    0x235a7496_8351_414c_bcd4_6672ab2d8e00
+);
+impl core::ops::Deref for ID2D1DeviceContext3 {
+    type Target = ID2D1DeviceContext2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1DeviceContext3,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1RenderTarget,
+    ID2D1DeviceContext,
+    ID2D1DeviceContext1,
+    ID2D1DeviceContext2
+);
+#[repr(C)]
+pub struct ID2D1DeviceContext3_Vtbl {
+    pub base__: ID2D1DeviceContext2_Vtbl,
+    CreateSpriteBatch: usize,
+    DrawSpriteBatch: usize,
+}
+unsafe impl Send for ID2D1DeviceContext3 {}
+unsafe impl Sync for ID2D1DeviceContext3 {}
+impl windows_core::RuntimeName for ID2D1DeviceContext3 {}
+windows_core::imp::define_interface!(
+    ID2D1DeviceContext4,
+    ID2D1DeviceContext4_Vtbl,
+    0x8c427831_3d90_4476_b647_c4fae349e4db
+);
+impl core::ops::Deref for ID2D1DeviceContext4 {
+    type Target = ID2D1DeviceContext3;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1DeviceContext4,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1RenderTarget,
+    ID2D1DeviceContext,
+    ID2D1DeviceContext1,
+    ID2D1DeviceContext2,
+    ID2D1DeviceContext3
+);
+#[repr(C)]
+pub struct ID2D1DeviceContext4_Vtbl {
+    pub base__: ID2D1DeviceContext3_Vtbl,
+    CreateSvgGlyphStyle: usize,
+    DrawText: usize,
+    DrawTextLayout: usize,
+    DrawColorBitmapGlyphRun: usize,
+    DrawSvgGlyphRun: usize,
+    GetColorBitmapGlyphImage: usize,
+    GetSvgGlyphImage: usize,
+}
+unsafe impl Send for ID2D1DeviceContext4 {}
+unsafe impl Sync for ID2D1DeviceContext4 {}
+impl windows_core::RuntimeName for ID2D1DeviceContext4 {}
+windows_core::imp::define_interface!(
+    ID2D1DeviceContext5,
+    ID2D1DeviceContext5_Vtbl,
+    0x7836d248_68cc_4df6_b9e8_de991bf62eb7
+);
+impl core::ops::Deref for ID2D1DeviceContext5 {
+    type Target = ID2D1DeviceContext4;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1DeviceContext5,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1RenderTarget,
+    ID2D1DeviceContext,
+    ID2D1DeviceContext1,
+    ID2D1DeviceContext2,
+    ID2D1DeviceContext3,
+    ID2D1DeviceContext4
+);
+impl ID2D1DeviceContext5 {
+    pub(crate) unsafe fn CreateColorContextFromDxgiColorSpace(
+        &self,
+        colorspace: DXGI_COLOR_SPACE_TYPE,
+    ) -> windows_core::Result<ID2D1ColorContext1> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateColorContextFromDxgiColorSpace)(
+                windows_core::Interface::as_raw(self),
+                colorspace,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct ID2D1DeviceContext5_Vtbl {
+    pub base__: ID2D1DeviceContext4_Vtbl,
+    CreateSvgDocument: usize,
+    DrawSvgDocument: usize,
+    pub CreateColorContextFromDxgiColorSpace: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DXGI_COLOR_SPACE_TYPE,
+        *mut *mut core::ffi::c_void,
+    )
+        -> windows_core::HRESULT,
+    CreateColorContextFromSimpleColorProfile: usize,
+}
+unsafe impl Send for ID2D1DeviceContext5 {}
+unsafe impl Sync for ID2D1DeviceContext5 {}
+impl windows_core::RuntimeName for ID2D1DeviceContext5 {}
+windows_core::imp::define_interface!(
+    ID2D1DeviceContext6,
+    ID2D1DeviceContext6_Vtbl,
+    0x985f7e37_4ed0_4a19_98a3_15b0edfde306
+);
+impl core::ops::Deref for ID2D1DeviceContext6 {
+    type Target = ID2D1DeviceContext5;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1DeviceContext6,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1RenderTarget,
+    ID2D1DeviceContext,
+    ID2D1DeviceContext1,
+    ID2D1DeviceContext2,
+    ID2D1DeviceContext3,
+    ID2D1DeviceContext4,
+    ID2D1DeviceContext5
+);
+#[repr(C)]
+pub struct ID2D1DeviceContext6_Vtbl {
+    pub base__: ID2D1DeviceContext5_Vtbl,
+    BlendImage: usize,
+}
+unsafe impl Send for ID2D1DeviceContext6 {}
+unsafe impl Sync for ID2D1DeviceContext6 {}
+impl windows_core::RuntimeName for ID2D1DeviceContext6 {}
 windows_core::imp::define_interface!(
     ID2D1Effect,
     ID2D1Effect_Vtbl,
@@ -870,6 +1519,171 @@ unsafe impl Send for ID2D1Factory1 {}
 unsafe impl Sync for ID2D1Factory1 {}
 impl windows_core::RuntimeName for ID2D1Factory1 {}
 windows_core::imp::define_interface!(
+    ID2D1Factory2,
+    ID2D1Factory2_Vtbl,
+    0x94f81a73_9212_4376_9c58_b16a3a0d3992
+);
+impl core::ops::Deref for ID2D1Factory2 {
+    type Target = ID2D1Factory1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Factory2,
+    windows_core::IUnknown,
+    ID2D1Factory,
+    ID2D1Factory1
+);
+#[repr(C)]
+pub struct ID2D1Factory2_Vtbl {
+    pub base__: ID2D1Factory1_Vtbl,
+    CreateDevice: usize,
+}
+unsafe impl Send for ID2D1Factory2 {}
+unsafe impl Sync for ID2D1Factory2 {}
+impl windows_core::RuntimeName for ID2D1Factory2 {}
+windows_core::imp::define_interface!(
+    ID2D1Factory3,
+    ID2D1Factory3_Vtbl,
+    0x0869759f_4f00_413f_b03e_2bda45404d0f
+);
+impl core::ops::Deref for ID2D1Factory3 {
+    type Target = ID2D1Factory2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Factory3,
+    windows_core::IUnknown,
+    ID2D1Factory,
+    ID2D1Factory1,
+    ID2D1Factory2
+);
+#[repr(C)]
+pub struct ID2D1Factory3_Vtbl {
+    pub base__: ID2D1Factory2_Vtbl,
+    CreateDevice: usize,
+}
+unsafe impl Send for ID2D1Factory3 {}
+unsafe impl Sync for ID2D1Factory3 {}
+impl windows_core::RuntimeName for ID2D1Factory3 {}
+windows_core::imp::define_interface!(
+    ID2D1Factory4,
+    ID2D1Factory4_Vtbl,
+    0xbd4ec2d2_0662_4bee_ba8e_6f29f032e096
+);
+impl core::ops::Deref for ID2D1Factory4 {
+    type Target = ID2D1Factory3;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Factory4,
+    windows_core::IUnknown,
+    ID2D1Factory,
+    ID2D1Factory1,
+    ID2D1Factory2,
+    ID2D1Factory3
+);
+#[repr(C)]
+pub struct ID2D1Factory4_Vtbl {
+    pub base__: ID2D1Factory3_Vtbl,
+    CreateDevice: usize,
+}
+unsafe impl Send for ID2D1Factory4 {}
+unsafe impl Sync for ID2D1Factory4 {}
+impl windows_core::RuntimeName for ID2D1Factory4 {}
+windows_core::imp::define_interface!(
+    ID2D1Factory5,
+    ID2D1Factory5_Vtbl,
+    0xc4349994_838e_4b0f_8cab_44997d9eeacc
+);
+impl core::ops::Deref for ID2D1Factory5 {
+    type Target = ID2D1Factory4;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Factory5,
+    windows_core::IUnknown,
+    ID2D1Factory,
+    ID2D1Factory1,
+    ID2D1Factory2,
+    ID2D1Factory3,
+    ID2D1Factory4
+);
+#[repr(C)]
+pub struct ID2D1Factory5_Vtbl {
+    pub base__: ID2D1Factory4_Vtbl,
+    CreateDevice: usize,
+}
+unsafe impl Send for ID2D1Factory5 {}
+unsafe impl Sync for ID2D1Factory5 {}
+impl windows_core::RuntimeName for ID2D1Factory5 {}
+windows_core::imp::define_interface!(
+    ID2D1Factory6,
+    ID2D1Factory6_Vtbl,
+    0xf9976f46_f642_44c1_97ca_da32ea2a2635
+);
+impl core::ops::Deref for ID2D1Factory6 {
+    type Target = ID2D1Factory5;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Factory6,
+    windows_core::IUnknown,
+    ID2D1Factory,
+    ID2D1Factory1,
+    ID2D1Factory2,
+    ID2D1Factory3,
+    ID2D1Factory4,
+    ID2D1Factory5
+);
+#[repr(C)]
+pub struct ID2D1Factory6_Vtbl {
+    pub base__: ID2D1Factory5_Vtbl,
+    CreateDevice: usize,
+}
+unsafe impl Send for ID2D1Factory6 {}
+unsafe impl Sync for ID2D1Factory6 {}
+impl windows_core::RuntimeName for ID2D1Factory6 {}
+windows_core::imp::define_interface!(
+    ID2D1Factory7,
+    ID2D1Factory7_Vtbl,
+    0xbdc2bdd3_b96c_4de6_bdf7_99d4745454de
+);
+impl core::ops::Deref for ID2D1Factory7 {
+    type Target = ID2D1Factory6;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1Factory7,
+    windows_core::IUnknown,
+    ID2D1Factory,
+    ID2D1Factory1,
+    ID2D1Factory2,
+    ID2D1Factory3,
+    ID2D1Factory4,
+    ID2D1Factory5,
+    ID2D1Factory6
+);
+#[repr(C)]
+pub struct ID2D1Factory7_Vtbl {
+    pub base__: ID2D1Factory6_Vtbl,
+    CreateDevice: usize,
+}
+unsafe impl Send for ID2D1Factory7 {}
+unsafe impl Sync for ID2D1Factory7 {}
+impl windows_core::RuntimeName for ID2D1Factory7 {}
+windows_core::imp::define_interface!(
     ID2D1Geometry,
     ID2D1Geometry_Vtbl,
     0x2cd906a1_12e2_11dc_9fed_001143a055f9
@@ -978,6 +1792,29 @@ pub struct ID2D1Geometry_Vtbl {
 unsafe impl Send for ID2D1Geometry {}
 unsafe impl Sync for ID2D1Geometry {}
 impl windows_core::RuntimeName for ID2D1Geometry {}
+windows_core::imp::define_interface!(
+    ID2D1GeometryRealization,
+    ID2D1GeometryRealization_Vtbl,
+    0xa16907d7_bc02_4801_99e8_8cf7f485f774
+);
+impl core::ops::Deref for ID2D1GeometryRealization {
+    type Target = ID2D1Resource;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1GeometryRealization,
+    windows_core::IUnknown,
+    ID2D1Resource
+);
+#[repr(C)]
+pub struct ID2D1GeometryRealization_Vtbl {
+    pub base__: ID2D1Resource_Vtbl,
+}
+unsafe impl Send for ID2D1GeometryRealization {}
+unsafe impl Sync for ID2D1GeometryRealization {}
+impl windows_core::RuntimeName for ID2D1GeometryRealization {}
 windows_core::imp::define_interface!(
     ID2D1GeometrySink,
     ID2D1GeometrySink_Vtbl,
@@ -1586,6 +2423,34 @@ impl ID2D1RenderTarget {
             );
         }
     }
+    pub(crate) unsafe fn SetTextAntialiasMode(&self, textantialiasmode: D2D1_TEXT_ANTIALIAS_MODE) {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetTextAntialiasMode)(
+                windows_core::Interface::as_raw(self),
+                textantialiasmode,
+            );
+        }
+    }
+    pub(crate) unsafe fn PushAxisAlignedClip(
+        &self,
+        cliprect: *const D2D_RECT_F,
+        antialiasmode: D2D1_ANTIALIAS_MODE,
+    ) {
+        unsafe {
+            (windows_core::Interface::vtable(self).PushAxisAlignedClip)(
+                windows_core::Interface::as_raw(self),
+                cliprect,
+                antialiasmode,
+            );
+        }
+    }
+    pub(crate) unsafe fn PopAxisAlignedClip(&self) {
+        unsafe {
+            (windows_core::Interface::vtable(self).PopAxisAlignedClip)(
+                windows_core::Interface::as_raw(self),
+            );
+        }
+    }
     pub(crate) unsafe fn Clear(&self, clearcolor: Option<*const D2D1_COLOR_F>) {
         unsafe {
             (windows_core::Interface::vtable(self).Clear)(
@@ -1766,7 +2631,8 @@ pub struct ID2D1RenderTarget_Vtbl {
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut windows_numerics::Matrix3x2),
     SetAntialiasMode: usize,
     GetAntialiasMode: usize,
-    SetTextAntialiasMode: usize,
+    pub SetTextAntialiasMode:
+        unsafe extern "system" fn(*mut core::ffi::c_void, D2D1_TEXT_ANTIALIAS_MODE),
     GetTextAntialiasMode: usize,
     SetTextRenderingParams: usize,
     GetTextRenderingParams: usize,
@@ -1777,8 +2643,9 @@ pub struct ID2D1RenderTarget_Vtbl {
     Flush: usize,
     SaveDrawingState: usize,
     RestoreDrawingState: usize,
-    PushAxisAlignedClip: usize,
-    PopAxisAlignedClip: usize,
+    pub PushAxisAlignedClip:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *const D2D_RECT_F, D2D1_ANTIALIAS_MODE),
+    pub PopAxisAlignedClip: unsafe extern "system" fn(*mut core::ffi::c_void),
     pub Clear: unsafe extern "system" fn(*mut core::ffi::c_void, *const D2D1_COLOR_F),
     pub BeginDraw: unsafe extern "system" fn(*mut core::ffi::c_void),
     pub EndDraw: unsafe extern "system" fn(
@@ -2155,6 +3022,103 @@ unsafe impl Send for ID3D11DeviceContext {}
 unsafe impl Sync for ID3D11DeviceContext {}
 impl windows_core::RuntimeName for ID3D11DeviceContext {}
 windows_core::imp::define_interface!(
+    IDWriteColorGlyphRunEnumerator,
+    IDWriteColorGlyphRunEnumerator_Vtbl,
+    0xd31fbe17_f157_41a2_8d24_cb779e0560e8
+);
+windows_core::imp::interface_hierarchy!(IDWriteColorGlyphRunEnumerator, windows_core::IUnknown);
+impl IDWriteColorGlyphRunEnumerator {
+    pub(crate) unsafe fn MoveNext(&self) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).MoveNext)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetCurrentRun(&self) -> windows_core::Result<*mut DWRITE_COLOR_GLYPH_RUN> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetCurrentRun)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct IDWriteColorGlyphRunEnumerator_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub MoveNext: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub GetCurrentRun: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut DWRITE_COLOR_GLYPH_RUN,
+    ) -> windows_core::HRESULT,
+}
+unsafe impl Send for IDWriteColorGlyphRunEnumerator {}
+unsafe impl Sync for IDWriteColorGlyphRunEnumerator {}
+pub trait IDWriteColorGlyphRunEnumerator_Impl: windows_core::IUnknownImpl {
+    fn MoveNext(&self) -> windows_core::Result<windows_core::BOOL>;
+    fn GetCurrentRun(&self) -> windows_core::Result<*mut DWRITE_COLOR_GLYPH_RUN>;
+}
+impl IDWriteColorGlyphRunEnumerator_Vtbl {
+    pub const fn new<Identity: IDWriteColorGlyphRunEnumerator_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn MoveNext<
+            Identity: IDWriteColorGlyphRunEnumerator_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            hasrun: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IDWriteColorGlyphRunEnumerator_Impl::MoveNext(this) {
+                    Ok(ok__) => {
+                        hasrun.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetCurrentRun<
+            Identity: IDWriteColorGlyphRunEnumerator_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            colorglyphrun: *mut *mut DWRITE_COLOR_GLYPH_RUN,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IDWriteColorGlyphRunEnumerator_Impl::GetCurrentRun(this) {
+                    Ok(ok__) => {
+                        colorglyphrun.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            MoveNext: MoveNext::<Identity, OFFSET>,
+            GetCurrentRun: GetCurrentRun::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<IDWriteColorGlyphRunEnumerator as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for IDWriteColorGlyphRunEnumerator {}
+windows_core::imp::define_interface!(
     IDWriteFactory,
     IDWriteFactory_Vtbl,
     0xb859ee5a_d838_4b5b_a2e8_1adc7d93db48
@@ -2285,6 +3249,255 @@ unsafe impl Send for IDWriteFactory {}
 unsafe impl Sync for IDWriteFactory {}
 impl windows_core::RuntimeName for IDWriteFactory {}
 windows_core::imp::define_interface!(
+    IDWriteFactory1,
+    IDWriteFactory1_Vtbl,
+    0x30572f99_dac6_41db_a16e_0486307e606a
+);
+impl core::ops::Deref for IDWriteFactory1 {
+    type Target = IDWriteFactory;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(IDWriteFactory1, windows_core::IUnknown, IDWriteFactory);
+#[repr(C)]
+pub struct IDWriteFactory1_Vtbl {
+    pub base__: IDWriteFactory_Vtbl,
+    GetEudcFontCollection: usize,
+    CreateCustomRenderingParams: usize,
+}
+unsafe impl Send for IDWriteFactory1 {}
+unsafe impl Sync for IDWriteFactory1 {}
+impl windows_core::RuntimeName for IDWriteFactory1 {}
+windows_core::imp::define_interface!(
+    IDWriteFactory2,
+    IDWriteFactory2_Vtbl,
+    0x0439fc60_ca44_4994_8dee_3a9af7b732ec
+);
+impl core::ops::Deref for IDWriteFactory2 {
+    type Target = IDWriteFactory1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteFactory2,
+    windows_core::IUnknown,
+    IDWriteFactory,
+    IDWriteFactory1
+);
+impl IDWriteFactory2 {
+    pub(crate) unsafe fn TranslateColorGlyphRun(
+        &self,
+        baselineoriginx: f32,
+        baselineoriginy: f32,
+        glyphrun: *const DWRITE_GLYPH_RUN,
+        glyphrundescription: Option<*const DWRITE_GLYPH_RUN_DESCRIPTION>,
+        measuringmode: DWRITE_MEASURING_MODE,
+        worldtodevicetransform: Option<*const DWRITE_MATRIX>,
+        colorpaletteindex: u32,
+    ) -> windows_core::Result<IDWriteColorGlyphRunEnumerator> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TranslateColorGlyphRun)(
+                windows_core::Interface::as_raw(self),
+                baselineoriginx,
+                baselineoriginy,
+                glyphrun as _,
+                glyphrundescription.unwrap_or(core::mem::zeroed()) as _,
+                measuringmode,
+                worldtodevicetransform.unwrap_or(core::mem::zeroed()) as _,
+                colorpaletteindex,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct IDWriteFactory2_Vtbl {
+    pub base__: IDWriteFactory1_Vtbl,
+    GetSystemFontFallback: usize,
+    CreateFontFallbackBuilder: usize,
+    pub TranslateColorGlyphRun: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        f32,
+        f32,
+        *const DWRITE_GLYPH_RUN,
+        *const DWRITE_GLYPH_RUN_DESCRIPTION,
+        DWRITE_MEASURING_MODE,
+        *const DWRITE_MATRIX,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    CreateCustomRenderingParams: usize,
+    CreateGlyphRunAnalysis: usize,
+}
+unsafe impl Send for IDWriteFactory2 {}
+unsafe impl Sync for IDWriteFactory2 {}
+impl windows_core::RuntimeName for IDWriteFactory2 {}
+windows_core::imp::define_interface!(
+    IDWriteFactory3,
+    IDWriteFactory3_Vtbl,
+    0x9a1b41c3_d3bb_466a_87fc_fe67556a3b65
+);
+impl core::ops::Deref for IDWriteFactory3 {
+    type Target = IDWriteFactory2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteFactory3,
+    windows_core::IUnknown,
+    IDWriteFactory,
+    IDWriteFactory1,
+    IDWriteFactory2
+);
+#[repr(C)]
+pub struct IDWriteFactory3_Vtbl {
+    pub base__: IDWriteFactory2_Vtbl,
+    CreateGlyphRunAnalysis: usize,
+    CreateCustomRenderingParams: usize,
+    CreateFontFaceReference: usize,
+    CreateFontFaceReference2: usize,
+    GetSystemFontSet: usize,
+    CreateFontSetBuilder: usize,
+    CreateFontCollectionFromFontSet: usize,
+    GetSystemFontCollection: usize,
+    GetFontDownloadQueue: usize,
+}
+unsafe impl Send for IDWriteFactory3 {}
+unsafe impl Sync for IDWriteFactory3 {}
+impl windows_core::RuntimeName for IDWriteFactory3 {}
+windows_core::imp::define_interface!(
+    IDWriteFactory4,
+    IDWriteFactory4_Vtbl,
+    0x4b0b5bd3_0797_4549_8ac5_fe915cc53856
+);
+impl core::ops::Deref for IDWriteFactory4 {
+    type Target = IDWriteFactory3;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteFactory4,
+    windows_core::IUnknown,
+    IDWriteFactory,
+    IDWriteFactory1,
+    IDWriteFactory2,
+    IDWriteFactory3
+);
+#[repr(C)]
+pub struct IDWriteFactory4_Vtbl {
+    pub base__: IDWriteFactory3_Vtbl,
+    TranslateColorGlyphRun: usize,
+    ComputeGlyphOrigins: usize,
+    ComputeGlyphOrigins2: usize,
+}
+unsafe impl Send for IDWriteFactory4 {}
+unsafe impl Sync for IDWriteFactory4 {}
+impl windows_core::RuntimeName for IDWriteFactory4 {}
+windows_core::imp::define_interface!(
+    IDWriteFactory5,
+    IDWriteFactory5_Vtbl,
+    0x958db99a_be2a_4f09_af7d_65189803d1d3
+);
+impl core::ops::Deref for IDWriteFactory5 {
+    type Target = IDWriteFactory4;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteFactory5,
+    windows_core::IUnknown,
+    IDWriteFactory,
+    IDWriteFactory1,
+    IDWriteFactory2,
+    IDWriteFactory3,
+    IDWriteFactory4
+);
+#[repr(C)]
+pub struct IDWriteFactory5_Vtbl {
+    pub base__: IDWriteFactory4_Vtbl,
+    CreateFontSetBuilder: usize,
+    CreateInMemoryFontFileLoader: usize,
+    CreateHttpFontFileLoader: usize,
+    AnalyzeContainerType: usize,
+    UnpackFontFile: usize,
+}
+unsafe impl Send for IDWriteFactory5 {}
+unsafe impl Sync for IDWriteFactory5 {}
+impl windows_core::RuntimeName for IDWriteFactory5 {}
+windows_core::imp::define_interface!(
+    IDWriteFactory6,
+    IDWriteFactory6_Vtbl,
+    0xf3744d80_21f7_42eb_b35d_995bc72fc223
+);
+impl core::ops::Deref for IDWriteFactory6 {
+    type Target = IDWriteFactory5;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteFactory6,
+    windows_core::IUnknown,
+    IDWriteFactory,
+    IDWriteFactory1,
+    IDWriteFactory2,
+    IDWriteFactory3,
+    IDWriteFactory4,
+    IDWriteFactory5
+);
+#[repr(C)]
+pub struct IDWriteFactory6_Vtbl {
+    pub base__: IDWriteFactory5_Vtbl,
+    CreateFontFaceReference: usize,
+    CreateFontResource: usize,
+    GetSystemFontSet: usize,
+    GetSystemFontCollection: usize,
+    CreateFontCollectionFromFontSet: usize,
+    CreateFontSetBuilder: usize,
+    CreateTextFormat: usize,
+}
+unsafe impl Send for IDWriteFactory6 {}
+unsafe impl Sync for IDWriteFactory6 {}
+impl windows_core::RuntimeName for IDWriteFactory6 {}
+windows_core::imp::define_interface!(
+    IDWriteFactory7,
+    IDWriteFactory7_Vtbl,
+    0x35d0e0b3_9076_4d2e_a016_a91b568a06b4
+);
+impl core::ops::Deref for IDWriteFactory7 {
+    type Target = IDWriteFactory6;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteFactory7,
+    windows_core::IUnknown,
+    IDWriteFactory,
+    IDWriteFactory1,
+    IDWriteFactory2,
+    IDWriteFactory3,
+    IDWriteFactory4,
+    IDWriteFactory5,
+    IDWriteFactory6
+);
+#[repr(C)]
+pub struct IDWriteFactory7_Vtbl {
+    pub base__: IDWriteFactory6_Vtbl,
+    GetSystemFontSet: usize,
+    GetSystemFontCollection: usize,
+}
+unsafe impl Send for IDWriteFactory7 {}
+unsafe impl Sync for IDWriteFactory7 {}
+impl windows_core::RuntimeName for IDWriteFactory7 {}
+windows_core::imp::define_interface!(
     IDWriteFontCollection,
     IDWriteFontCollection_Vtbl,
     0xa84cee02_3eea_4eee_a827_87c1a02a0fcc
@@ -2301,6 +3514,34 @@ pub struct IDWriteFontCollection_Vtbl {
 unsafe impl Send for IDWriteFontCollection {}
 unsafe impl Sync for IDWriteFontCollection {}
 impl windows_core::RuntimeName for IDWriteFontCollection {}
+windows_core::imp::define_interface!(
+    IDWriteFontFace,
+    IDWriteFontFace_Vtbl,
+    0x5f49804d_7024_4d43_bfa9_d25984f53849
+);
+windows_core::imp::interface_hierarchy!(IDWriteFontFace, windows_core::IUnknown);
+#[repr(C)]
+pub struct IDWriteFontFace_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetType: usize,
+    GetFiles: usize,
+    GetIndex: usize,
+    GetSimulations: usize,
+    IsSymbolFont: usize,
+    GetMetrics: usize,
+    GetGlyphCount: usize,
+    GetDesignGlyphMetrics: usize,
+    GetGlyphIndices: usize,
+    TryGetFontTable: usize,
+    ReleaseFontTable: usize,
+    GetGlyphRunOutline: usize,
+    GetRecommendedRenderingMode: usize,
+    GetGdiCompatibleMetrics: usize,
+    GetGdiCompatibleGlyphMetrics: usize,
+}
+unsafe impl Send for IDWriteFontFace {}
+unsafe impl Sync for IDWriteFontFace {}
+impl windows_core::RuntimeName for IDWriteFontFace {}
 windows_core::imp::define_interface!(
     IDWriteInlineObject,
     IDWriteInlineObject_Vtbl,
@@ -2425,6 +3666,112 @@ unsafe impl Send for IDWriteTextFormat {}
 unsafe impl Sync for IDWriteTextFormat {}
 impl windows_core::RuntimeName for IDWriteTextFormat {}
 windows_core::imp::define_interface!(
+    IDWriteTextFormat1,
+    IDWriteTextFormat1_Vtbl,
+    0x5f174b49_0d8b_4cfb_8bca_f1cce9d06c67
+);
+impl core::ops::Deref for IDWriteTextFormat1 {
+    type Target = IDWriteTextFormat;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteTextFormat1,
+    windows_core::IUnknown,
+    IDWriteTextFormat
+);
+#[repr(C)]
+pub struct IDWriteTextFormat1_Vtbl {
+    pub base__: IDWriteTextFormat_Vtbl,
+    SetVerticalGlyphOrientation: usize,
+    GetVerticalGlyphOrientation: usize,
+    SetLastLineWrapping: usize,
+    GetLastLineWrapping: usize,
+    SetOpticalAlignment: usize,
+    GetOpticalAlignment: usize,
+    SetFontFallback: usize,
+    GetFontFallback: usize,
+}
+unsafe impl Send for IDWriteTextFormat1 {}
+unsafe impl Sync for IDWriteTextFormat1 {}
+impl windows_core::RuntimeName for IDWriteTextFormat1 {}
+windows_core::imp::define_interface!(
+    IDWriteTextFormat2,
+    IDWriteTextFormat2_Vtbl,
+    0xf67e0edd_9e3d_4ecc_8c32_4183253dfe70
+);
+impl core::ops::Deref for IDWriteTextFormat2 {
+    type Target = IDWriteTextFormat1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteTextFormat2,
+    windows_core::IUnknown,
+    IDWriteTextFormat,
+    IDWriteTextFormat1
+);
+#[repr(C)]
+pub struct IDWriteTextFormat2_Vtbl {
+    pub base__: IDWriteTextFormat1_Vtbl,
+    SetLineSpacing: usize,
+    GetLineSpacing: usize,
+}
+unsafe impl Send for IDWriteTextFormat2 {}
+unsafe impl Sync for IDWriteTextFormat2 {}
+impl windows_core::RuntimeName for IDWriteTextFormat2 {}
+windows_core::imp::define_interface!(
+    IDWriteTextFormat3,
+    IDWriteTextFormat3_Vtbl,
+    0x6d3b5641_e550_430d_a85b_b7bf48a93427
+);
+impl core::ops::Deref for IDWriteTextFormat3 {
+    type Target = IDWriteTextFormat2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteTextFormat3,
+    windows_core::IUnknown,
+    IDWriteTextFormat,
+    IDWriteTextFormat1,
+    IDWriteTextFormat2
+);
+impl IDWriteTextFormat3 {
+    pub(crate) unsafe fn SetFontAxisValues(
+        &self,
+        fontaxisvalues: &[DWRITE_FONT_AXIS_VALUE],
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetFontAxisValues)(
+                windows_core::Interface::as_raw(self),
+                fontaxisvalues.as_ptr(),
+                fontaxisvalues.len().try_into().unwrap(),
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct IDWriteTextFormat3_Vtbl {
+    pub base__: IDWriteTextFormat2_Vtbl,
+    pub SetFontAxisValues: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const DWRITE_FONT_AXIS_VALUE,
+        u32,
+    ) -> windows_core::HRESULT,
+    GetFontAxisValueCount: usize,
+    GetFontAxisValues: usize,
+    GetAutomaticFontAxes: usize,
+    SetAutomaticFontAxes: usize,
+}
+unsafe impl Send for IDWriteTextFormat3 {}
+unsafe impl Sync for IDWriteTextFormat3 {}
+impl windows_core::RuntimeName for IDWriteTextFormat3 {}
+windows_core::imp::define_interface!(
     IDWriteTextLayout,
     IDWriteTextLayout_Vtbl,
     0x53737037_6d14_410b_9bfe_0b182bb70961
@@ -2455,6 +3802,93 @@ impl IDWriteTextLayout {
             (windows_core::Interface::vtable(self).SetMaxHeight)(
                 windows_core::Interface::as_raw(self),
                 maxheight,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn SetFontWeight(
+        &self,
+        fontweight: DWRITE_FONT_WEIGHT,
+        textrange: DWRITE_TEXT_RANGE,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetFontWeight)(
+                windows_core::Interface::as_raw(self),
+                fontweight,
+                textrange,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn SetFontStyle(
+        &self,
+        fontstyle: DWRITE_FONT_STYLE,
+        textrange: DWRITE_TEXT_RANGE,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetFontStyle)(
+                windows_core::Interface::as_raw(self),
+                fontstyle,
+                textrange,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn SetFontStretch(
+        &self,
+        fontstretch: DWRITE_FONT_STRETCH,
+        textrange: DWRITE_TEXT_RANGE,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetFontStretch)(
+                windows_core::Interface::as_raw(self),
+                fontstretch,
+                textrange,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn SetUnderline(
+        &self,
+        hasunderline: bool,
+        textrange: DWRITE_TEXT_RANGE,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetUnderline)(
+                windows_core::Interface::as_raw(self),
+                hasunderline.into(),
+                textrange,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn SetStrikethrough(
+        &self,
+        hasstrikethrough: bool,
+        textrange: DWRITE_TEXT_RANGE,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetStrikethrough)(
+                windows_core::Interface::as_raw(self),
+                hasstrikethrough.into(),
+                textrange,
+            )
+            .ok()
+        }
+    }
+    pub(crate) unsafe fn SetDrawingEffect<P0>(
+        &self,
+        drawingeffect: P0,
+        textrange: DWRITE_TEXT_RANGE,
+    ) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<windows_core::IUnknown>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetDrawingEffect)(
+                windows_core::Interface::as_raw(self),
+                drawingeffect.param().abi(),
+                textrange,
             )
             .ok()
         }
@@ -2511,6 +3945,35 @@ impl IDWriteTextLayout {
             .ok()
         }
     }
+    pub(crate) unsafe fn HitTestTextRange(
+        &self,
+        textposition: u32,
+        textlength: u32,
+        originx: f32,
+        originy: f32,
+        hittestmetrics: Option<&mut [DWRITE_HIT_TEST_METRICS]>,
+        actualhittestmetricscount: *mut u32,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).HitTestTextRange)(
+                windows_core::Interface::as_raw(self),
+                textposition,
+                textlength,
+                originx,
+                originy,
+                core::mem::transmute(
+                    hittestmetrics
+                        .as_deref()
+                        .map_or(core::ptr::null(), |slice| slice.as_ptr()),
+                ),
+                hittestmetrics
+                    .as_deref()
+                    .map_or(0, |slice| slice.len().try_into().unwrap()),
+                actualhittestmetricscount as _,
+            )
+            .ok()
+        }
+    }
 }
 #[repr(C)]
 pub struct IDWriteTextLayout_Vtbl {
@@ -2521,13 +3984,37 @@ pub struct IDWriteTextLayout_Vtbl {
         unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
     SetFontCollection: usize,
     SetFontFamilyName: usize,
-    SetFontWeight: usize,
-    SetFontStyle: usize,
-    SetFontStretch: usize,
+    pub SetFontWeight: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DWRITE_FONT_WEIGHT,
+        DWRITE_TEXT_RANGE,
+    ) -> windows_core::HRESULT,
+    pub SetFontStyle: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DWRITE_FONT_STYLE,
+        DWRITE_TEXT_RANGE,
+    ) -> windows_core::HRESULT,
+    pub SetFontStretch: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DWRITE_FONT_STRETCH,
+        DWRITE_TEXT_RANGE,
+    ) -> windows_core::HRESULT,
     SetFontSize: usize,
-    SetUnderline: usize,
-    SetStrikethrough: usize,
-    SetDrawingEffect: usize,
+    pub SetUnderline: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_core::BOOL,
+        DWRITE_TEXT_RANGE,
+    ) -> windows_core::HRESULT,
+    pub SetStrikethrough: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_core::BOOL,
+        DWRITE_TEXT_RANGE,
+    ) -> windows_core::HRESULT,
+    pub SetDrawingEffect: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        DWRITE_TEXT_RANGE,
+    ) -> windows_core::HRESULT,
     SetInlineObject: usize,
     SetTypography: usize,
     SetLocaleName: usize,
@@ -2572,11 +4059,170 @@ pub struct IDWriteTextLayout_Vtbl {
         *mut f32,
         *mut DWRITE_HIT_TEST_METRICS,
     ) -> windows_core::HRESULT,
-    HitTestTextRange: usize,
+    pub HitTestTextRange: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        u32,
+        f32,
+        f32,
+        *mut DWRITE_HIT_TEST_METRICS,
+        u32,
+        *mut u32,
+    ) -> windows_core::HRESULT,
 }
 unsafe impl Send for IDWriteTextLayout {}
 unsafe impl Sync for IDWriteTextLayout {}
 impl windows_core::RuntimeName for IDWriteTextLayout {}
+windows_core::imp::define_interface!(
+    IDWriteTextLayout1,
+    IDWriteTextLayout1_Vtbl,
+    0x9064d822_80a7_465c_a986_df65f78b8feb
+);
+impl core::ops::Deref for IDWriteTextLayout1 {
+    type Target = IDWriteTextLayout;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteTextLayout1,
+    windows_core::IUnknown,
+    IDWriteTextFormat,
+    IDWriteTextLayout
+);
+impl IDWriteTextLayout1 {
+    pub(crate) unsafe fn SetCharacterSpacing(
+        &self,
+        leadingspacing: f32,
+        trailingspacing: f32,
+        minimumadvancewidth: f32,
+        textrange: DWRITE_TEXT_RANGE,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetCharacterSpacing)(
+                windows_core::Interface::as_raw(self),
+                leadingspacing,
+                trailingspacing,
+                minimumadvancewidth,
+                textrange,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct IDWriteTextLayout1_Vtbl {
+    pub base__: IDWriteTextLayout_Vtbl,
+    SetPairKerning: usize,
+    GetPairKerning: usize,
+    pub SetCharacterSpacing: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        f32,
+        f32,
+        f32,
+        DWRITE_TEXT_RANGE,
+    ) -> windows_core::HRESULT,
+    GetCharacterSpacing: usize,
+}
+unsafe impl Send for IDWriteTextLayout1 {}
+unsafe impl Sync for IDWriteTextLayout1 {}
+impl windows_core::RuntimeName for IDWriteTextLayout1 {}
+windows_core::imp::define_interface!(
+    IDWriteTextLayout2,
+    IDWriteTextLayout2_Vtbl,
+    0x1093c18f_8d5e_43f0_b064_0917311b525e
+);
+impl core::ops::Deref for IDWriteTextLayout2 {
+    type Target = IDWriteTextLayout1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteTextLayout2,
+    windows_core::IUnknown,
+    IDWriteTextFormat,
+    IDWriteTextLayout,
+    IDWriteTextLayout1
+);
+#[repr(C)]
+pub struct IDWriteTextLayout2_Vtbl {
+    pub base__: IDWriteTextLayout1_Vtbl,
+    GetMetrics: usize,
+    SetVerticalGlyphOrientation: usize,
+    GetVerticalGlyphOrientation: usize,
+    SetLastLineWrapping: usize,
+    GetLastLineWrapping: usize,
+    SetOpticalAlignment: usize,
+    GetOpticalAlignment: usize,
+    SetFontFallback: usize,
+    GetFontFallback: usize,
+}
+unsafe impl Send for IDWriteTextLayout2 {}
+unsafe impl Sync for IDWriteTextLayout2 {}
+impl windows_core::RuntimeName for IDWriteTextLayout2 {}
+windows_core::imp::define_interface!(
+    IDWriteTextLayout3,
+    IDWriteTextLayout3_Vtbl,
+    0x07ddcd52_020e_4de8_ac33_6c953d83f92d
+);
+impl core::ops::Deref for IDWriteTextLayout3 {
+    type Target = IDWriteTextLayout2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteTextLayout3,
+    windows_core::IUnknown,
+    IDWriteTextFormat,
+    IDWriteTextLayout,
+    IDWriteTextLayout1,
+    IDWriteTextLayout2
+);
+#[repr(C)]
+pub struct IDWriteTextLayout3_Vtbl {
+    pub base__: IDWriteTextLayout2_Vtbl,
+    InvalidateLayout: usize,
+    SetLineSpacing: usize,
+    GetLineSpacing: usize,
+    GetLineMetrics: usize,
+}
+unsafe impl Send for IDWriteTextLayout3 {}
+unsafe impl Sync for IDWriteTextLayout3 {}
+impl windows_core::RuntimeName for IDWriteTextLayout3 {}
+windows_core::imp::define_interface!(
+    IDWriteTextLayout4,
+    IDWriteTextLayout4_Vtbl,
+    0x05a9bf42_223f_4441_b5fb_8263685f55e9
+);
+impl core::ops::Deref for IDWriteTextLayout4 {
+    type Target = IDWriteTextLayout3;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDWriteTextLayout4,
+    windows_core::IUnknown,
+    IDWriteTextFormat,
+    IDWriteTextLayout,
+    IDWriteTextLayout1,
+    IDWriteTextLayout2,
+    IDWriteTextLayout3
+);
+#[repr(C)]
+pub struct IDWriteTextLayout4_Vtbl {
+    pub base__: IDWriteTextLayout3_Vtbl,
+    SetFontAxisValues: usize,
+    GetFontAxisValueCount: usize,
+    GetFontAxisValues: usize,
+    GetAutomaticFontAxes: usize,
+    SetAutomaticFontAxes: usize,
+}
+unsafe impl Send for IDWriteTextLayout4 {}
+unsafe impl Sync for IDWriteTextLayout4 {}
+impl windows_core::RuntimeName for IDWriteTextLayout4 {}
 windows_core::imp::define_interface!(
     IDXGIAdapter,
     IDXGIAdapter_Vtbl,
@@ -2877,6 +4523,190 @@ unsafe impl Send for IDXGIOutput {}
 unsafe impl Sync for IDXGIOutput {}
 impl windows_core::RuntimeName for IDXGIOutput {}
 windows_core::imp::define_interface!(
+    IDXGIOutput1,
+    IDXGIOutput1_Vtbl,
+    0x00cddea8_939b_4b83_a340_a685226666cc
+);
+impl core::ops::Deref for IDXGIOutput1 {
+    type Target = IDXGIOutput;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGIOutput1,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIOutput
+);
+#[repr(C)]
+pub struct IDXGIOutput1_Vtbl {
+    pub base__: IDXGIOutput_Vtbl,
+    GetDisplayModeList1: usize,
+    FindClosestMatchingMode1: usize,
+    GetDisplaySurfaceData1: usize,
+    DuplicateOutput: usize,
+}
+unsafe impl Send for IDXGIOutput1 {}
+unsafe impl Sync for IDXGIOutput1 {}
+impl windows_core::RuntimeName for IDXGIOutput1 {}
+windows_core::imp::define_interface!(
+    IDXGIOutput2,
+    IDXGIOutput2_Vtbl,
+    0x595e39d1_2724_4663_99b1_da969de28364
+);
+impl core::ops::Deref for IDXGIOutput2 {
+    type Target = IDXGIOutput1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGIOutput2,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIOutput,
+    IDXGIOutput1
+);
+#[repr(C)]
+pub struct IDXGIOutput2_Vtbl {
+    pub base__: IDXGIOutput1_Vtbl,
+    SupportsOverlays: usize,
+}
+unsafe impl Send for IDXGIOutput2 {}
+unsafe impl Sync for IDXGIOutput2 {}
+impl windows_core::RuntimeName for IDXGIOutput2 {}
+windows_core::imp::define_interface!(
+    IDXGIOutput3,
+    IDXGIOutput3_Vtbl,
+    0x8a6bb301_7e7e_41f4_a8e0_5b32f7f99b18
+);
+impl core::ops::Deref for IDXGIOutput3 {
+    type Target = IDXGIOutput2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGIOutput3,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIOutput,
+    IDXGIOutput1,
+    IDXGIOutput2
+);
+#[repr(C)]
+pub struct IDXGIOutput3_Vtbl {
+    pub base__: IDXGIOutput2_Vtbl,
+    CheckOverlaySupport: usize,
+}
+unsafe impl Send for IDXGIOutput3 {}
+unsafe impl Sync for IDXGIOutput3 {}
+impl windows_core::RuntimeName for IDXGIOutput3 {}
+windows_core::imp::define_interface!(
+    IDXGIOutput4,
+    IDXGIOutput4_Vtbl,
+    0xdc7dca35_2196_414d_9f53_617884032a60
+);
+impl core::ops::Deref for IDXGIOutput4 {
+    type Target = IDXGIOutput3;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGIOutput4,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIOutput,
+    IDXGIOutput1,
+    IDXGIOutput2,
+    IDXGIOutput3
+);
+#[repr(C)]
+pub struct IDXGIOutput4_Vtbl {
+    pub base__: IDXGIOutput3_Vtbl,
+    CheckOverlayColorSpaceSupport: usize,
+}
+unsafe impl Send for IDXGIOutput4 {}
+unsafe impl Sync for IDXGIOutput4 {}
+impl windows_core::RuntimeName for IDXGIOutput4 {}
+windows_core::imp::define_interface!(
+    IDXGIOutput5,
+    IDXGIOutput5_Vtbl,
+    0x80a07424_ab52_42eb_833c_0c42fd282d98
+);
+impl core::ops::Deref for IDXGIOutput5 {
+    type Target = IDXGIOutput4;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGIOutput5,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIOutput,
+    IDXGIOutput1,
+    IDXGIOutput2,
+    IDXGIOutput3,
+    IDXGIOutput4
+);
+#[repr(C)]
+pub struct IDXGIOutput5_Vtbl {
+    pub base__: IDXGIOutput4_Vtbl,
+    DuplicateOutput1: usize,
+}
+unsafe impl Send for IDXGIOutput5 {}
+unsafe impl Sync for IDXGIOutput5 {}
+impl windows_core::RuntimeName for IDXGIOutput5 {}
+windows_core::imp::define_interface!(
+    IDXGIOutput6,
+    IDXGIOutput6_Vtbl,
+    0x068346e8_aaec_4b84_add7_137f513f77a1
+);
+impl core::ops::Deref for IDXGIOutput6 {
+    type Target = IDXGIOutput5;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGIOutput6,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIOutput,
+    IDXGIOutput1,
+    IDXGIOutput2,
+    IDXGIOutput3,
+    IDXGIOutput4,
+    IDXGIOutput5
+);
+impl IDXGIOutput6 {
+    pub(crate) unsafe fn GetDesc1(&self) -> windows_core::Result<DXGI_OUTPUT_DESC1> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetDesc1)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct IDXGIOutput6_Vtbl {
+    pub base__: IDXGIOutput5_Vtbl,
+    pub GetDesc1: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut DXGI_OUTPUT_DESC1,
+    ) -> windows_core::HRESULT,
+    CheckHardwareCompositionSupport: usize,
+}
+unsafe impl Send for IDXGIOutput6 {}
+unsafe impl Sync for IDXGIOutput6 {}
+impl windows_core::RuntimeName for IDXGIOutput6 {}
+windows_core::imp::define_interface!(
     IDXGISurface,
     IDXGISurface_Vtbl,
     0xcafcb56c_6ac3_4889_bf47_9e23bbd260ec
@@ -3109,6 +4939,72 @@ pub struct IDXGISwapChain2_Vtbl {
 unsafe impl Send for IDXGISwapChain2 {}
 unsafe impl Sync for IDXGISwapChain2 {}
 impl windows_core::RuntimeName for IDXGISwapChain2 {}
+windows_core::imp::define_interface!(
+    IDXGISwapChain3,
+    IDXGISwapChain3_Vtbl,
+    0x94d99bdb_f1f8_4ab0_b236_7da0170edab1
+);
+impl core::ops::Deref for IDXGISwapChain3 {
+    type Target = IDXGISwapChain2;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGISwapChain3,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIDeviceSubObject,
+    IDXGISwapChain,
+    IDXGISwapChain1,
+    IDXGISwapChain2
+);
+impl IDXGISwapChain3 {
+    pub(crate) unsafe fn CheckColorSpaceSupport(
+        &self,
+        colorspace: DXGI_COLOR_SPACE_TYPE,
+    ) -> windows_core::Result<u32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CheckColorSpaceSupport)(
+                windows_core::Interface::as_raw(self),
+                colorspace,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn SetColorSpace1(
+        &self,
+        colorspace: DXGI_COLOR_SPACE_TYPE,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetColorSpace1)(
+                windows_core::Interface::as_raw(self),
+                colorspace,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct IDXGISwapChain3_Vtbl {
+    pub base__: IDXGISwapChain2_Vtbl,
+    GetCurrentBackBufferIndex: usize,
+    pub CheckColorSpaceSupport: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DXGI_COLOR_SPACE_TYPE,
+        *mut u32,
+    ) -> windows_core::HRESULT,
+    pub SetColorSpace1: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DXGI_COLOR_SPACE_TYPE,
+    ) -> windows_core::HRESULT,
+    ResizeBuffers1: usize,
+}
+unsafe impl Send for IDXGISwapChain3 {}
+unsafe impl Sync for IDXGISwapChain3 {}
+impl windows_core::RuntimeName for IDXGISwapChain3 {}
 windows_core::imp::define_interface!(
     IWICBitmapDecoder,
     IWICBitmapDecoder_Vtbl,
@@ -3352,6 +5248,14 @@ pub struct IWICPalette_Vtbl {
     HasAlpha: usize,
 }
 impl windows_core::RuntimeName for IWICPalette {}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RECT {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
 pub type WAIT_EVENT = u32;
 pub type WICBitmapDitherType = i32;
 pub const WICBitmapDitherTypeNone: WICBitmapDitherType = 0;

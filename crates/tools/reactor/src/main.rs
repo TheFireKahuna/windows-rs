@@ -115,6 +115,41 @@ fn generate_reactor_bindings() {
         "crates/tools/reactor/src/test.txt",
     ];
     windows_bindgen::bindgen(test_args);
+
+    // System (Windows.UI.Composition) bindings for the self-hosted
+    // DirectComposition HDR backend. Generated into a SEPARATE module
+    // (`system_bindings.rs`) because the reactor's main `bindings.rs` already
+    // binds the LIFTED `Microsoft.UI.Composition` types under the same flat
+    // short names (Compositor, Visual, DispatcherQueue, …). Keeping the system
+    // compositor in its own module avoids the flat-namespace collision while
+    // the XAML/lifted path still exists. UIA + TSF provider interfaces are
+    // server-implemented, so they are emitted with `_Impl` scaffolding.
+    let system_args = [
+        "--in",
+        "winmd",
+        "--out",
+        "crates/libs/reactor/src/system_bindings.rs",
+        "--implement",
+        "Windows.Win32.UI.Accessibility.IRawElementProviderSimple",
+        "Windows.Win32.UI.Accessibility.IRawElementProviderFragment",
+        "Windows.Win32.UI.Accessibility.IRawElementProviderFragmentRoot",
+        "Windows.Win32.UI.Accessibility.IInvokeProvider",
+        "Windows.Win32.UI.Accessibility.IToggleProvider",
+        "Windows.Win32.UI.Accessibility.IValueProvider",
+        "Windows.Win32.UI.Accessibility.IRangeValueProvider",
+        "Windows.Win32.UI.Accessibility.ISelectionProvider",
+        "Windows.Win32.UI.Accessibility.ISelectionItemProvider",
+        "Windows.Win32.UI.Accessibility.IExpandCollapseProvider",
+        "Windows.Win32.UI.Accessibility.IScrollProvider",
+        "Windows.Win32.UI.TextServices.ITextStoreACP",
+        "--minimal",
+        "--dead-code",
+        "--flat",
+        "--filter",
+        "--etc",
+        "crates/tools/reactor/src/system.txt",
+    ];
+    windows_bindgen::bindgen(system_args);
 }
 
 /// Write `content` to `path` if changed. Runs `rustfmt` when `format` is true.

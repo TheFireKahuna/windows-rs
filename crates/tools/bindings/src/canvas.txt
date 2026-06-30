@@ -109,3 +109,63 @@
     Windows::Win32::Graphics::Imaging::WICDecodeMetadataCacheOnDemand
     Windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance}
     Windows::Win32::System::Threading::WaitForSingleObjectEx
+    Windows::Win32::Graphics::Direct2D::ID2D1Factory2
+    Windows::Win32::Graphics::Direct2D::ID2D1Factory3
+    Windows::Win32::Graphics::Direct2D::ID2D1Factory4
+    Windows::Win32::Graphics::Direct2D::ID2D1Factory5
+    Windows::Win32::Graphics::Direct2D::ID2D1Factory6
+    Windows::Win32::Graphics::Direct2D::ID2D1Factory7
+    Windows::Win32::Graphics::Direct2D::ID2D1Device1
+    Windows::Win32::Graphics::Direct2D::ID2D1Device2
+    Windows::Win32::Graphics::Direct2D::ID2D1Device3
+    Windows::Win32::Graphics::Direct2D::ID2D1Device4
+    Windows::Win32::Graphics::Direct2D::ID2D1Device5
+    Windows::Win32::Graphics::Direct2D::ID2D1Device6
+    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext::CreateCommandList
+    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext1::{CreateFilledGeometryRealization, CreateStrokedGeometryRealization, DrawGeometryRealization}
+    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext2
+    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext3
+    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext4
+    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext5::CreateColorContextFromDxgiColorSpace
+    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext6
+    Windows::Win32::Graphics::Direct2D::ID2D1RenderTarget::{PushAxisAlignedClip, PopAxisAlignedClip, SetTextAntialiasMode}
+    Windows::Win32::Graphics::Direct2D::ID2D1CommandList
+    Windows::Win32::Graphics::Direct2D::ID2D1GeometryRealization
+    Windows::Win32::Graphics::Direct2D::ID2D1ColorContext1
+    Windows::Win32::Graphics::Direct2D::CLSID_D2D1ColorManagement
+    Windows::Win32::Graphics::Direct2D::D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS
+    Windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
+    Windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_NONE
+    Windows::Win32::Graphics::Direct2D::D2D1_GAMMA_1_0
+    Windows::Win32::Graphics::Direct2D::D2D1_COLOR_SPACE
+    Windows::Win32::Graphics::Direct2D::D2D1_BUFFER_PRECISION
+    Windows::Win32::Graphics::Direct2D::D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout::{SetFontWeight, SetFontStyle, SetFontStretch, SetUnderline, SetStrikethrough, SetDrawingEffect, HitTestTextRange}
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout1::SetCharacterSpacing
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout2
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout3
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout4
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat1
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat2
+    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat3::SetFontAxisValues
+    Windows::Win32::Graphics::DirectWrite::IDWriteFactory1
+    Windows::Win32::Graphics::DirectWrite::IDWriteFactory2::TranslateColorGlyphRun
+    Windows::Win32::Graphics::DirectWrite::IDWriteFactory3
+    Windows::Win32::Graphics::DirectWrite::IDWriteFactory4
+    Windows::Win32::Graphics::DirectWrite::IDWriteFactory5
+    Windows::Win32::Graphics::DirectWrite::IDWriteFactory6
+    Windows::Win32::Graphics::DirectWrite::IDWriteFactory7
+    Windows::Win32::Graphics::DirectWrite::IDWriteColorGlyphRunEnumerator::{MoveNext, GetCurrentRun}
+    Windows::Win32::Graphics::DirectWrite::DWRITE_COLOR_GLYPH_RUN
+    Windows::Win32::Graphics::DirectWrite::DWRITE_FONT_AXIS_VALUE
+    Windows::Win32::Graphics::Dxgi::IDXGISwapChain3::{SetColorSpace1, CheckColorSpaceSupport}
+    Windows::Win32::Graphics::Dxgi::IDXGIOutput1
+    Windows::Win32::Graphics::Dxgi::IDXGIOutput2
+    Windows::Win32::Graphics::Dxgi::IDXGIOutput3
+    Windows::Win32::Graphics::Dxgi::IDXGIOutput4
+    Windows::Win32::Graphics::Dxgi::IDXGIOutput5
+    Windows::Win32::Graphics::Dxgi::IDXGIOutput6::GetDesc1
+    Windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC1
+    Windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT
+    Windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+    Windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
