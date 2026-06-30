@@ -179,7 +179,7 @@ impl CompositionSurfaceFactory {
         let visual: bindings::Visual = sprite.cast()?;
         bindings::ElementCompositionPreview::SetElementChildVisual(&ui, &visual)?;
 
-        let draw = CompositionDrawSurface { interop: surface.cast()? };
+        let draw = CompositionDrawSurface { interop: SurfaceInterop::Lifted(surface.cast()?) };
         Ok((CompositionChildSurface { element: ui, _visual: visual }, draw))
     }
 
@@ -229,10 +229,15 @@ impl CompositionSurfaceFactory {
         let visual: sys::Visual = sprite.cast()?;
         parent.Children()?.InsertAtTop(&visual)?;
 
-        // The interop IID is namespace-agnostic, so the system surface reuses the
-        // same `CompositionDrawSurface` the canvas draw stack already consumes.
+        // The system (`Windows.UI.Composition`) interop interface has a *different*
+        // IID than the lifted (`Microsoft.UI.Composition`) one — they are parallel
+        // bridges for the two composition stacks — so a system surface must be cast
+        // to the system interop. The vtables are layout-identical, so the same
+        // `CompositionDrawSurface` drives both (it dispatches on the variant).
         let draw = CompositionDrawSurface {
-            interop: surface.cast::<bindings::ICompositionDrawingSurfaceInterop>()?,
+            interop: SurfaceInterop::System(
+                surface.cast::<system_bindings::ICompositionDrawingSurfaceInterop>()?,
+            ),
         };
         Ok((
             CompositionChildVisual {
@@ -289,7 +294,17 @@ impl Drop for CompositionChildSurface {
 /// the factory's device is multi-threaded, so it can be moved to a worker thread;
 /// the factory lock then serializes its DXGI interop against the device.
 pub struct CompositionDrawSurface {
-    interop: bindings::ICompositionDrawingSurfaceInterop,
+    interop: SurfaceInterop,
+}
+
+/// The surface's drawing interop, in whichever composition namespace minted it.
+/// The lifted (`Microsoft.UI.Composition`) and system (`Windows.UI.Composition`)
+/// `ICompositionDrawingSurfaceInterop` interfaces carry different IIDs but
+/// layout-identical `BeginDraw`/`EndDraw` vtables, so one [`CompositionDrawSurface`]
+/// serves both backends — it just dispatches on the variant.
+enum SurfaceInterop {
+    Lifted(bindings::ICompositionDrawingSurfaceInterop),
+    System(system_bindings::ICompositionDrawingSurfaceInterop),
 }
 
 // SAFETY: the surface's drawing interop is used from one thread at a time (the worker
@@ -304,18 +319,31 @@ impl CompositionDrawSurface {
     /// `ID2D1DeviceContext`) and the `(x, y)` pixel offset within the backing atlas
     /// to translate drawing by. Pair with [`end_draw`](Self::end_draw).
     pub fn begin_draw<T: Interface>(&self) -> Result<(T, (i32, i32))> {
-        let mut offset = bindings::POINT::default();
-        let mut object = core::ptr::null_mut();
         unsafe {
             // Null update rect = redraw the whole surface (we repaint every frame).
-            self.interop
-                .BeginDraw(core::ptr::null(), &T::IID, &mut object, &mut offset)?;
-            Ok((T::from_raw(object), (offset.x, offset.y)))
+            match &self.interop {
+                SurfaceInterop::Lifted(i) => {
+                    let mut offset = bindings::POINT::default();
+                    let mut object = core::ptr::null_mut();
+                    i.BeginDraw(core::ptr::null(), &T::IID, &mut object, &mut offset)?;
+                    Ok((T::from_raw(object), (offset.x, offset.y)))
+                }
+                SurfaceInterop::System(i) => {
+                    let mut offset = system_bindings::POINT::default();
+                    let object: T = i.BeginDraw::<T>(None, &mut offset)?;
+                    Ok((object, (offset.x, offset.y)))
+                }
+            }
         }
     }
 
     /// Finish drawing and commit the surface contents to the compositor.
     pub fn end_draw(&self) -> Result<()> {
-        unsafe { self.interop.EndDraw() }
+        unsafe {
+            match &self.interop {
+                SurfaceInterop::Lifted(i) => i.EndDraw(),
+                SurfaceInterop::System(i) => i.EndDraw(),
+            }
+        }
     }
 }

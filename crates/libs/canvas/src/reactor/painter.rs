@@ -65,10 +65,123 @@ fn union_rects(a: Rect, b: Rect) -> Rect {
 
 type Stepper = Box<dyn FnMut(FrameTiming) -> Step>;
 
+/// The drawable backing of a [`SurfacePainter`]. On the WinUI backend it is a XAML
+/// [`SurfaceImage`] (a `SurfaceImageSource` shown through an `Image`); on the
+/// self-hosted DirectComposition backend it is a child-visual composition surface
+/// parented under the host's `ContainerVisual`. The per-frame draw closures are
+/// identical across both — only the surface origin differs — so the painter routes
+/// every repaint through [`draw_region`](Self::draw_region) without caring which it
+/// holds.
+pub(crate) enum PaintSurface {
+    Image(SurfaceImage),
+    Comp(CompSurface),
+}
+
+/// A DirectComposition child-visual composition surface, drawn through a
+/// [`CompositionDrawTarget`]. FP16 (`R16G16B16A16Float`) so the viz is HDR — see
+/// [`CompositionSurfaceFactory::create_under_node`].
+pub(crate) struct CompSurface {
+    target: CompositionDrawTarget,
+    // Keeps the sprite parented under the host element's `ContainerVisual`; dropping
+    // it removes the sprite (so replacing the surface on resize detaches the old one).
+    _visual: CompositionChildVisual,
+    device: GpuDevice,
+    width: f32,
+    height: f32,
+    dpi: f32,
+}
+
+impl PaintSurface {
+    /// Build the surface for the current backend. Tries the DirectComposition path
+    /// first — a child-visual composition surface under `host`'s `ContainerVisual`
+    /// — and falls back to a XAML [`SurfaceImage`] when the host is not a system
+    /// `ContainerVisual` (the WinUI backend) or no host is available yet.
+    pub(crate) fn build(
+        host: Option<&ElementHandle>,
+        device: &GpuDevice,
+        width: f32,
+        height: f32,
+        dpi: f32,
+        opaque: bool,
+    ) -> Result<Self> {
+        // dcomp backend: host a composition child-visual surface under the node.
+        // `from_node` only succeeds when `host.native()` is a system
+        // `ContainerVisual`, so this cleanly no-ops on WinUI.
+        if let Some(host) = host
+            && let Ok(factory) = CompositionSurfaceFactory::from_node(host.native(), device.d2d_device())
+        {
+            let scale = dpi / 96.0;
+            let pw = ((width * scale).round() as i32).max(1);
+            let ph = ((height * scale).round() as i32).max(1);
+            let (visual, draw) =
+                factory.create_under_node(host.native(), (pw, ph), (width, height), opaque)?;
+            return Ok(Self::Comp(CompSurface {
+                target: CompositionDrawTarget::new(draw),
+                _visual: visual,
+                device: device.clone(),
+                width,
+                height,
+                dpi,
+            }));
+        }
+
+        // WinUI backend: a XAML `SurfaceImageSource`.
+        let img = if opaque {
+            SurfaceImage::new_opaque(device, width, height, dpi)?
+        } else {
+            SurfaceImage::new(device, width, height, dpi)?
+        };
+        Ok(Self::Image(img))
+    }
+
+    fn width(&self) -> f32 {
+        match self {
+            Self::Image(i) => i.width(),
+            Self::Comp(c) => c.width,
+        }
+    }
+
+    fn height(&self) -> f32 {
+        match self {
+            Self::Image(i) => i.height(),
+            Self::Comp(c) => c.height,
+        }
+    }
+
+    /// The reactor `SurfaceImageSource` to display in the host `Image`, or `None`
+    /// for a composition surface (whose content is shown by its own sprite visual,
+    /// not a XAML `ImageSource`).
+    pub(crate) fn image_source(&self) -> Option<SurfaceImageSource> {
+        match self {
+            Self::Image(i) => Some(i.surface()),
+            Self::Comp(_) => None,
+        }
+    }
+
+    /// Bracket a draw, handing the closure a [`DrawContext`]. `region` is a
+    /// surface-local DIP dirty rect (honoured on the `SurfaceImage` path; the
+    /// composition path always redraws the whole surface). `changed` is forwarded
+    /// to [`DrawContext::device_changed`].
+    pub(crate) fn draw_region(
+        &self,
+        region: Option<Rect>,
+        changed: bool,
+        f: impl FnOnce(&DrawContext),
+    ) -> Result<()> {
+        match self {
+            Self::Image(img) => img.draw_region(region, changed, f),
+            Self::Comp(c) => {
+                c.target
+                    .draw_context(&c.device, c.width, c.height, c.dpi, changed, f)
+            }
+        }
+    }
+}
+
 pub(crate) struct PainterInner {
     // The drawable surface; `None` until first sized, and while a lost device is
     // being recreated. Swapped by the reconciler-driven effect in `surface_painter`.
-    pub(crate) surface: RefCell<Option<SurfaceImage>>,
+    pub(crate) surface: RefCell<Option<PaintSurface>>,
     // Latest user draw callback (refreshed every render so imperative redraws use
     // current state).
     pub(crate) draw: RefCell<Rc<dyn Fn(&DrawContext)>>,
@@ -105,6 +218,10 @@ pub(crate) struct PainterInner {
     // surface. Refreshed by the reconciler-driven effect.
     pub(crate) device: RefCell<Option<GpuDevice>>,
     pub(crate) dpi: Cell<f32>,
+    // The host `Border`'s `ElementHandle`, captured on mount. On the dcomp backend
+    // its `native()` is the `ContainerVisual` the composition surface parents under;
+    // the build effect reads it to choose (and host) the composition variant.
+    pub(crate) host: RefCell<Option<ElementHandle>>,
 }
 
 /// A `SurfaceImageSource`-backed drawing surface you repaint **imperatively** and
@@ -170,6 +287,7 @@ impl SurfacePainter {
                 ready: Cell::new(false),
                 device: RefCell::new(None),
                 dpi: Cell::new(96.0),
+                host: RefCell::new(None),
             }),
         }
     }
@@ -212,6 +330,11 @@ impl SurfacePainter {
                 let Some(inner) = size_weak.upgrade() else {
                     return;
                 };
+                // Capture the host for the build effect: on dcomp its `native()` is
+                // the `ContainerVisual` the composition surface parents under. Stored
+                // before the size subscription below, so it is always present by the
+                // time a non-zero size triggers the effect.
+                *inner.host.borrow_mut() = Some(handle.clone());
                 if let Some(set_size) = inner.set_size.borrow().clone()
                     && let Ok(rev) = handle.on_size_changed(move |w, h| {
                         set_size.call((w.round().max(0.0) as u32, h.round().max(0.0) as u32));
