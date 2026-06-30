@@ -113,6 +113,72 @@ pub(crate) struct Paint {
     pub is_enabled: bool,
 }
 
+/// A single command row in a popup menu / dropdown list.
+#[derive(Clone, Default)]
+pub(crate) struct MenuRow {
+    pub text: String,
+    pub tag: String,
+    /// Icon glyph codepoint (a `Symbol`'s integer value), 0 = none.
+    pub icon: u32,
+    pub shortcut: String,
+    pub enabled: bool,
+    pub danger: bool,
+    pub separator: bool,
+}
+
+/// Control-specific state, distinct from generic layout/paint. Populated by
+/// `set_prop` for the stateful drawn controls (toggle, slider, segmented, …).
+#[derive(Clone)]
+pub(crate) struct Ctrl {
+    pub is_on: bool,
+    pub is_checked: bool,
+    pub value: f64,
+    pub min: f64,
+    pub max: f64,
+    pub step: Option<f64>,
+    pub indeterminate: bool,
+    pub is_active: bool,
+    pub selected_index: i32,
+    /// Display labels (SelectorBar segments / ComboBox items / nav item names).
+    pub items: Vec<String>,
+    /// Per-item tag (NavigationView) — parallel to `items` when present.
+    pub tags: Vec<String>,
+    /// Per-item icon glyph codepoint (NavigationView), 0 = none.
+    pub icons: Vec<u32>,
+    pub expanded: bool,
+    /// Selected tag requested via `Prop::SelectedTag` before items arrived.
+    pub selected_tag: Option<String>,
+    /// Menu rows for DropDownButton / SplitButton / MenuFlyout popups.
+    pub menu: Vec<MenuRow>,
+    pub placeholder: String,
+    /// ScrollViewer: total content height in DIPs (computed at layout).
+    pub content_h: f32,
+}
+
+impl Default for Ctrl {
+    fn default() -> Self {
+        Self {
+            is_on: false,
+            is_checked: false,
+            value: 0.0,
+            min: 0.0,
+            max: 100.0,
+            step: None,
+            indeterminate: false,
+            is_active: true,
+            selected_index: -1,
+            items: Vec::new(),
+            tags: Vec::new(),
+            icons: Vec::new(),
+            expanded: false,
+            selected_tag: None,
+            menu: Vec::new(),
+            placeholder: String::new(),
+            content_h: 0.0,
+        }
+    }
+}
+
 /// One live control.
 pub(crate) struct Node {
     pub kind: ControlKind,
@@ -160,6 +226,19 @@ pub(crate) struct Node {
     pub press: Spring,
     pub hovered: bool,
     pub pressed: bool,
+
+    // ── Control library state ────────────────────────────────────────────
+    /// Stateful drawn-control data (toggle/slider/segmented/select/nav/…).
+    pub ctrl: Ctrl,
+    /// The control's primary animated quantity: toggle-knob / segmented-pill /
+    /// nav-indicator position, slider-thumb fraction, or scroll offset.
+    pub anim: Spring,
+    /// Continuous phase for indeterminate progress (advanced by the frame tick).
+    pub phase: f32,
+    /// This node accepts keyboard focus (Tab) + Space/Enter activation.
+    pub focusable: bool,
+    /// This node currently holds keyboard focus (draws the focus ring).
+    pub focused: bool,
 }
 
 impl Node {
@@ -175,6 +254,7 @@ impl Node {
         if kind == ControlKind::Button {
             paint.corner_radius = 6.0;
         }
+        let focusable = is_focusable_kind(kind);
         Self {
             kind,
             style: default_style(kind),
@@ -204,6 +284,11 @@ impl Node {
             press: Spring::new(0.0),
             hovered: false,
             pressed: false,
+            ctrl: Ctrl::default(),
+            anim: Spring::new(0.0),
+            phase: 0.0,
+            focusable,
+            focused: false,
         }
     }
 
@@ -211,9 +296,9 @@ impl Node {
         self.handlers.iter().find(|(e, _)| *e == event).map(|(_, h)| h)
     }
 
-    /// True for nodes that respond to a click (fire chrome + invoke).
+    /// True for nodes that respond to a press (hover/press ink + activate).
     pub fn is_clickable(&self) -> bool {
-        self.kind == ControlKind::Button
+        is_interactive_kind(self.kind)
             || self.handler(Event::Click).is_some()
             || self
                 .pointer
@@ -233,11 +318,19 @@ impl Node {
                     || (self.paint.stroke.is_some() && self.paint.stroke_thickness > 0.0)
                     || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
             }
+            // Every drawn control owns a surface (it always paints its chrome).
+            _ if draws_own_chrome(self.kind) => true,
             _ => {
                 self.paint.background.is_some()
                     || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
+                    || self.focused
             }
         }
+    }
+
+    /// Whether the node should consume vertical mouse-wheel input (scrolling).
+    pub fn is_scroll(&self) -> bool {
+        matches!(self.kind, ControlKind::ScrollViewer | ControlKind::ScrollView)
     }
 
     /// Mark this node's surface for repaint.
@@ -246,8 +339,62 @@ impl Node {
     }
 }
 
-fn default_font_size(_kind: ControlKind) -> f32 {
-    14.0
+fn default_font_size(kind: ControlKind) -> f32 {
+    match kind {
+        ControlKind::ToggleSwitch
+        | ControlKind::CheckBox
+        | ControlKind::SelectorBar
+        | ControlKind::ComboBox
+        | ControlKind::DropDownButton
+        | ControlKind::SplitButton => theme::FONT_SIZE_SM,
+        _ => 14.0,
+    }
+}
+
+/// Control kinds the backend draws and interacts with directly (a press toggles
+/// / selects / activates them and they get hover/press ink + a focus ring).
+pub(crate) fn is_interactive_kind(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::Button
+            | ControlKind::ToggleSwitch
+            | ControlKind::CheckBox
+            | ControlKind::ToggleButton
+            | ControlKind::RepeatButton
+            | ControlKind::HyperlinkButton
+            | ControlKind::SelectorBar
+            | ControlKind::Slider
+            | ControlKind::ComboBox
+            | ControlKind::DropDownButton
+            | ControlKind::SplitButton
+            | ControlKind::NavigationView
+            | ControlKind::Expander
+    )
+}
+
+/// Kinds that always own a paint surface (they draw chrome unconditionally).
+fn draws_own_chrome(kind: ControlKind) -> bool {
+    is_interactive_kind(kind)
+        || matches!(kind, ControlKind::ProgressBar | ControlKind::ProgressRing)
+}
+
+/// Kinds that take keyboard focus in the Tab ring.
+fn is_focusable_kind(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::Button
+            | ControlKind::ToggleSwitch
+            | ControlKind::CheckBox
+            | ControlKind::ToggleButton
+            | ControlKind::RepeatButton
+            | ControlKind::HyperlinkButton
+            | ControlKind::SelectorBar
+            | ControlKind::Slider
+            | ControlKind::ComboBox
+            | ControlKind::DropDownButton
+            | ControlKind::SplitButton
+            | ControlKind::Expander
+    )
 }
 
 /// Per-kind default Taffy style (display mode + the small intrinsic defaults a
@@ -274,6 +421,18 @@ fn default_style(kind: ControlKind) -> taffy::Style {
             // Visual clipping is done by a composition InsetClip on the node's
             // container (see `Backend::create`); layout treats it as a block.
             s.display = Display::Block;
+        }
+        ControlKind::NavigationView => {
+            // The icon rail is drawn on the node's own surface; the single
+            // content child is inset to the right of it.
+            s.display = Display::Flex;
+            s.padding.left = length(theme::NAV_RAIL_W);
+        }
+        ControlKind::Expander => {
+            // A header band is drawn on the node's surface; content sits below.
+            s.display = Display::Flex;
+            s.flex_direction = FlexDirection::Column;
+            s.padding.top = length(theme::ROW_H + theme::SPACE_8 + theme::SPACE_4);
         }
         ControlKind::Button => {
             s.display = Display::Flex;

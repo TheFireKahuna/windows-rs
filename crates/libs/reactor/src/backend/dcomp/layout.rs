@@ -220,8 +220,37 @@ fn assign(arena: &mut Arena, tree: &TaffyTree<ControlId>, id: ControlId, ox: f32
             n.mark_dirty();
         }
     }
-    for c in children {
-        assign(arena, tree, c, ax, ay);
+    for c in &children {
+        assign(arena, tree, *c, ax, ay);
+    }
+
+    // Scroll containers: measure content extent, clamp the offset, and apply the
+    // scroll translation to children (a compositor offset — no repaint).
+    let is_scroll = arena.get(id).is_some_and(|n| n.is_scroll());
+    if is_scroll {
+        let (nx, ny, vh) = arena.get(id).map(|n| (n.rect.x, n.rect.y, n.rect.h)).unwrap();
+        let mut content_h = 0.0_f32;
+        for c in &children {
+            if let Some(cn) = arena.get(*c) {
+                content_h = content_h.max(cn.rect.y + cn.rect.h - ny);
+            }
+        }
+        let max_scroll = (content_h - vh).max(0.0);
+        if let Some(n) = arena.get_mut(id) {
+            n.ctrl.content_h = content_h;
+            n.anim.target = n.anim.target.clamp(0.0, max_scroll);
+            n.anim.x = n.anim.x.clamp(0.0, max_scroll);
+        }
+        let scroll = arena.get(id).map(|n| n.anim.x).unwrap_or(0.0);
+        for c in &children {
+            if let Some(cn) = arena.get_mut(*c) {
+                let _ = cn.vis.SetOffset(Vector3::new(
+                    cn.rect.x - nx,
+                    cn.rect.y - ny - scroll,
+                    0.0,
+                ));
+            }
+        }
     }
 }
 

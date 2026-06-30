@@ -8,7 +8,7 @@
 //! frame.
 
 use super::bootstrap::Compositing;
-use super::node::{linear, lerp_color, Arena, Node};
+use super::node::{linear, Arena, Node};
 use super::*;
 use crate::backend::ControlKind;
 use crate::Color;
@@ -146,8 +146,12 @@ fn paint_chrome(
     node: &Node,
     rect: Rect,
 ) {
+    // The drawn control library handles its own kinds (button, toggle, slider,
+    // segmented, select, nav, progress, …) including ink + focus ring.
+    if controls::paint(session, brush, node, rect) {
+        return;
+    }
     match node.kind {
-        ControlKind::Button => paint_button(session, brush, node, rect),
         ControlKind::TextBlock => paint_text(session, brush, node, rect),
         ControlKind::Rectangle => {
             fill_and_stroke(session, brush, node, rect, node.paint.corner_radius)
@@ -187,42 +191,6 @@ fn fill_and_stroke(
         } else {
             session.draw_rect(&inset, brush, t);
         }
-    }
-}
-
-fn paint_button(
-    session: &DrawingSession,
-    brush: &windows_canvas_core::Brush,
-    node: &Node,
-    rect: Rect,
-) {
-    let radius = node.paint.corner_radius.max(6.0);
-    // Base palette by variant; hover lightens, press darkens (spring-driven).
-    let (base, hover, press) = match node.paint.style_variant {
-        1 => (
-            Color::rgb(0x0E, 0xA5, 0xE9),
-            Color::rgb(0x38, 0xB6, 0xF0),
-            Color::rgb(0x0B, 0x86, 0xBD),
-        ),
-        _ => (
-            Color::rgb(0x3A, 0x3A, 0x3D),
-            Color::rgb(0x4A, 0x4A, 0x4E),
-            Color::rgb(0x2C, 0x2C, 0x2F),
-        ),
-    };
-    let mut c = lerp_color(linear(base), linear(hover), node.hover.x.clamp(0.0, 1.0));
-    c = lerp_color(c, linear(press), node.press.x.clamp(0.0, 1.0));
-    brush.set_color(c);
-    session.fill_rounded_rect(&RoundedRect::uniform(rect, radius), brush);
-
-    // Centered label.
-    if let Some(layout) = &node.text_layout {
-        let fg = node.paint.foreground.unwrap_or(Color::rgb(0xF2, 0xF2, 0xF4));
-        brush.set_color(linear(fg));
-        let (tw, th) = layout.measure().unwrap_or((0.0, 0.0));
-        let ox = rect.left + (rect.width() - tw) / 2.0;
-        let oy = rect.top + (rect.height() - th) / 2.0;
-        session.draw_text_layout(Vector2::new(ox, oy), layout, brush);
     }
 }
 

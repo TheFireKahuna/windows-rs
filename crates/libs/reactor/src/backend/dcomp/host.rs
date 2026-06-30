@@ -272,6 +272,43 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             0
         }
 
+        WM_MOUSEWHEEL => {
+            if let Some(s) = shared() {
+                // wheel lParam carries SCREEN coords; convert to client DIPs.
+                let mut pt = POINT {
+                    x: (lparam & 0xFFFF) as i16 as i32,
+                    y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+                };
+                unsafe {
+                    let _ = ScreenToClient(hwnd, &mut pt);
+                }
+                let scale = dpi_scale(hwnd);
+                let delta = ((wparam >> 16) & 0xFFFF) as i16 as i32;
+                let (x, y) = (pt.x as f32 / scale, pt.y as f32 / scale);
+                let started =
+                    s.render_host.with_reconciler_mut(|r| r.backend.on_wheel(x, y, delta));
+                start_timer(hwnd, started);
+            }
+            0
+        }
+
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if let Some(s) = shared() {
+                let vk = (wparam & 0xFFFF) as u32;
+                let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+                let started = s.render_host.with_reconciler_mut(|r| r.backend.on_key(vk, shift));
+                start_timer(hwnd, started);
+            }
+            0
+        }
+
+        WM_KILLFOCUS => {
+            if let Some(s) = shared() {
+                s.render_host.with_reconciler_mut(|r| r.backend.on_focus_lost());
+            }
+            0
+        }
+
         WM_TIMER => {
             if wparam == TIMER_ID
                 && let Some(s) = shared()

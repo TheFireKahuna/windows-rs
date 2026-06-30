@@ -157,6 +157,34 @@ impl Compositing {
         self.compositor.CreateContainerVisual()
     }
 
+    /// Mint a top-level overlay container (popup host) above the reactor tree,
+    /// backed by one FP16 surface of `px_w`×`px_h`. The container is inserted at
+    /// the very top of the compositor root so it draws above all content.
+    pub fn new_overlay(
+        &self,
+        px_w: i32,
+        px_h: i32,
+    ) -> windows_core::Result<(ContainerVisual, NodeSurface)> {
+        let container = self.compositor.CreateContainerVisual()?;
+        self.root
+            .Children()?
+            .InsertAtTop(&container.cast::<Visual>()?)?;
+        let surf = self.new_surface(&container, px_w, px_h)?;
+        Ok((container, surf))
+    }
+
+    /// Remove an overlay container previously inserted by [`Self::new_overlay`].
+    pub fn remove_overlay(&self, container: &ContainerVisual) {
+        if let (Ok(children), Ok(v)) = (self.root.Children(), container.cast::<Visual>()) {
+            let _ = children.Remove(&v);
+        }
+    }
+
+    /// The DIP scale (`dpi/96`) the root applies — popups draw in DIPs too.
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
     /// Mint an inset clip that tracks a visual's own bounds (for scroll/overflow).
     pub fn new_inset_clip(&self) -> windows_core::Result<InsetClip> {
         self.compositor.CreateInsetClip()

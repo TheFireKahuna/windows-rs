@@ -15,18 +15,21 @@
 use crate::backend::ControlId;
 
 mod bootstrap;
+mod controls;
 mod dispatch;
 mod host;
 mod input;
 mod layout;
 mod node;
 mod paint;
+mod popup;
+mod theme;
 
 pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;
 
 use bootstrap::Compositing;
-use node::{Arena, Node};
+use node::{Arena, MenuRow, Node};
 use paint::PaintCache;
 use rustc_hash::FxHashSet;
 
@@ -50,6 +53,12 @@ pub struct DCompBackend {
     /// The clickable node currently under the pointer (hover) / pressed.
     hovered_id: Option<ControlId>,
     pressed_id: Option<ControlId>,
+    /// The node holding keyboard focus (drives the focus ring + Space/Enter).
+    focused_id: Option<ControlId>,
+    /// The live popup overlay (Select/menu dropdown), if one is open.
+    popup: Option<popup::Popup>,
+    /// Whether the open popup's reveal animation has settled.
+    popup_settled: bool,
 }
 
 impl DCompBackend {
@@ -65,6 +74,9 @@ impl DCompBackend {
             animating: FxHashSet::default(),
             hovered_id: None,
             pressed_id: None,
+            focused_id: None,
+            popup: None,
+            popup_settled: true,
         }
     }
 
@@ -170,8 +182,12 @@ impl Backend for DCompBackend {
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
         use taffy::prelude::*;
-        let Some(node) = self.node_mut(id) else { return };
-        match (prop, value) {
+        // Set inside an arm to slide the control's primary spring to a new
+        // target after the node borrow ends (programmatic state change).
+        let mut start_anim = false;
+        {
+            let Some(node) = self.node_mut(id) else { return };
+            match (prop, value) {
             // ── Paint props (mark the node's surface dirty) ──────────────
             (Prop::Background, PropValue::Color(c)) => {
                 node.paint.background = Some(*c);
@@ -331,7 +347,109 @@ impl Backend for DCompBackend {
                 node.z_index = *v;
                 node.z_dirty = true;
             }
+
+            // ── Control state (stateful drawn controls) ──────────────────
+            (Prop::IsOn, PropValue::Bool(v)) => {
+                node.ctrl.is_on = *v;
+                node.anim.target = if *v { 1.0 } else { 0.0 };
+                start_anim = (node.anim.x - node.anim.target).abs() > 1e-3;
+                node.mark_dirty();
+            }
+            (Prop::IsChecked, PropValue::Bool(v)) => {
+                node.ctrl.is_checked = *v;
+                node.anim.target = if *v { 1.0 } else { 0.0 };
+                start_anim = (node.anim.x - node.anim.target).abs() > 1e-3;
+                node.mark_dirty();
+            }
+            (Prop::Value, PropValue::F64(v)) => {
+                node.ctrl.value = *v;
+                node.anim.target = ctrl_value_frac(node) as f32;
+                start_anim = node.kind == ControlKind::Slider
+                    && (node.anim.x - node.anim.target).abs() > 1e-3;
+                node.mark_dirty();
+            }
+            (Prop::Minimum, PropValue::F64(v)) => {
+                node.ctrl.min = *v;
+                node.anim.x = ctrl_value_frac(node) as f32;
+                node.anim.target = node.anim.x;
+                node.mark_dirty();
+            }
+            (Prop::Maximum, PropValue::F64(v)) => {
+                node.ctrl.max = *v;
+                node.anim.x = ctrl_value_frac(node) as f32;
+                node.anim.target = node.anim.x;
+                node.mark_dirty();
+            }
+            (Prop::Step, PropValue::F64(v)) => node.ctrl.step = Some(*v),
+            (Prop::IsIndeterminate, PropValue::Bool(v)) => {
+                node.ctrl.indeterminate = *v;
+                node.mark_dirty();
+            }
+            (Prop::IsActive, PropValue::Bool(v)) => {
+                node.ctrl.is_active = *v;
+                node.mark_dirty();
+            }
+            (Prop::IsExpanded, PropValue::Bool(v)) => {
+                node.ctrl.expanded = *v;
+                node.anim.target = if *v { 1.0 } else { 0.0 };
+                start_anim = (node.anim.x - node.anim.target).abs() > 1e-3;
+                node.mark_dirty();
+            }
+            (Prop::SelectedIndex, PropValue::I32(v)) => {
+                node.ctrl.selected_index = *v;
+                node.anim.target = (*v).max(0) as f32;
+                start_anim = node.kind == ControlKind::SelectorBar
+                    && (node.anim.x - node.anim.target).abs() > 1e-3;
+                node.mark_dirty();
+            }
+            (Prop::SelectedTag, PropValue::Str(s)) => {
+                node.ctrl.selected_tag = Some(s.clone());
+                sync_selected_tag(node);
+                node.mark_dirty();
+            }
+            (Prop::PlaceholderText, PropValue::Str(s)) => {
+                node.ctrl.placeholder = s.clone();
+                node.mark_dirty();
+            }
+            (Prop::Items, PropValue::StrList(list)) => {
+                node.ctrl.items = list.clone();
+                node.mark_dirty();
+            }
+            (Prop::Items, PropValue::SelectorBarItems(items)) => {
+                node.ctrl.items = items.iter().map(|i| i.text.clone()).collect();
+                if node.ctrl.selected_index < 0 && !node.ctrl.items.is_empty() {
+                    node.ctrl.selected_index = 0;
+                    node.anim.x = 0.0;
+                    node.anim.target = 0.0;
+                }
+                node.mark_dirty();
+            }
+            (Prop::MenuItems, PropValue::NavMenuItems(items)) => {
+                node.ctrl.items.clear();
+                node.ctrl.tags.clear();
+                node.ctrl.icons.clear();
+                for it in items {
+                    if it.is_header {
+                        continue;
+                    }
+                    node.ctrl.items.push(it.content.clone());
+                    node.ctrl
+                        .tags
+                        .push(it.tag.clone().unwrap_or_else(|| it.content.clone()));
+                    node.ctrl.icons.push(it.icon.map(|s| s.0 as u32).unwrap_or(0));
+                }
+                sync_selected_tag(node);
+                node.mark_dirty();
+            }
+            (Prop::MenuFlyoutItems, PropValue::MenuFlyoutItems(items)) => {
+                node.ctrl.menu = items.iter().map(menu_row).collect();
+                node.mark_dirty();
+            }
             _ => {}
+            }
+        }
+        if start_anim {
+            self.animating.insert(id);
         }
     }
 
@@ -425,6 +543,61 @@ impl Backend for DCompBackend {
 
 fn clone_lengths(g: &[GridLength]) -> Vec<GridLength> {
     g.to_vec()
+}
+
+/// The control's value as a 0..1 fraction of its `[min, max]` range.
+pub(crate) fn ctrl_value_frac(node: &Node) -> f64 {
+    let span = node.ctrl.max - node.ctrl.min;
+    if span.abs() < f64::EPSILON {
+        0.0
+    } else {
+        ((node.ctrl.value - node.ctrl.min) / span).clamp(0.0, 1.0)
+    }
+}
+
+/// Resolve a pending `selected_tag` against the loaded `tags` into a
+/// `selected_index` (NavigationView), snapping the indicator spring.
+fn sync_selected_tag(node: &mut Node) {
+    if let Some(tag) = &node.ctrl.selected_tag
+        && let Some(i) = node.ctrl.tags.iter().position(|t| t == tag)
+    {
+        node.ctrl.selected_index = i as i32;
+        node.anim.x = i as f32;
+        node.anim.target = i as f32;
+    }
+}
+
+/// Lower a frontend [`crate::MenuItemDef`] to a flat painted [`MenuRow`].
+fn menu_row(def: &crate::MenuItemDef) -> MenuRow {
+    use crate::MenuItemDef as M;
+    match def {
+        M::Separator => MenuRow {
+            separator: true,
+            enabled: false,
+            ..MenuRow::default()
+        },
+        M::SubItem { text, .. } => MenuRow {
+            text: text.clone(),
+            tag: text.clone(),
+            enabled: true,
+            ..MenuRow::default()
+        },
+        M::Item {
+            text,
+            icon,
+            danger,
+            enabled,
+            shortcut,
+        } => MenuRow {
+            text: text.clone(),
+            tag: text.clone(),
+            icon: icon.map(|s| s.0 as u32).unwrap_or(0),
+            shortcut: shortcut.clone().unwrap_or_default(),
+            enabled: *enabled,
+            danger: *danger,
+            separator: false,
+        },
+    }
 }
 
 /// Apply a StackPanel's spacing to the correct Taffy gap axis for its direction.
