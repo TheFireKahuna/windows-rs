@@ -1551,7 +1551,9 @@ impl Backend for WinUIBackend {
                     &c.cast::<bindings::IItemsControl>()?.Items()?.cast()?,
                     items,
                 ),
-                (Prop::ColorValue, PropValue::Color(c), Handle::ColorPicker(cp)) => cp.SetColor(*c),
+                (Prop::ColorValue, PropValue::Color(c), Handle::ColorPicker(cp)) => {
+                    cp.SetColor(to_winrt(*c))
+                }
                 (Prop::Items, PropValue::StrList(items), Handle::ListBox(lb)) => set_str_items(
                     &lb.cast::<bindings::IItemsControl>()?.Items()?.cast()?,
                     items,
@@ -2566,15 +2568,12 @@ impl Backend for WinUIBackend {
             (Event::ColorChanged, Handle::ColorPicker(cp)) => {
                 revokers.push(
                     cp.ColorChanged(move |_sender, args| {
+                        // `NewColor` is a WinRT `Windows.UI.Color` (8-bit sRGB); the
+                        // picker payload is raw ARGB bytes, so it stays in that ABI type.
                         let color =
                             args.as_ref()
                                 .and_then(|a| a.NewColor().ok())
-                                .unwrap_or(Color {
-                                    a: 255,
-                                    r: 0,
-                                    g: 0,
-                                    b: 0,
-                                });
+                                .unwrap_or(bindings::Color { a: 255, r: 0, g: 0, b: 0 });
                         handler.invoke_color((color.a, color.r, color.g, color.b));
                     })
                     .unwrap(),

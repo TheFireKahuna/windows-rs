@@ -12,6 +12,12 @@ readme = "readme.md"
 [features]
 default = []
 test = []
+# Self-hosted DirectComposition + Direct2D 1.3 backend (DCompBackend / DCompHost),
+# beside the default WinUI backend. Pulls in the canvas crate's D2D/DWrite drawing
+# primitives and Taffy for layout. `windows-canvas` is taken with default features
+# off so it does NOT activate its own `reactor` feature here (which would form a
+# canvas -> reactor -> canvas package cycle).
+dcomp-backend = ["dep:windows-canvas-core", "dep:taffy"]
 
 [dependencies]
 rustc-hash = { workspace = true }
@@ -22,6 +28,8 @@ windows-future = { workspace = true }
 windows-reference = { workspace = true, features = ["std"] }
 windows-threading = { workspace = true }
 windows-time = { workspace = true }
+windows-canvas-core = { workspace = true, optional = true }
+taffy = { version = "0.11", optional = true }
 
 [lints]
 workspace = true

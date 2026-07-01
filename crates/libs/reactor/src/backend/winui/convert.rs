@@ -24,9 +24,18 @@ pub(super) fn to_xaml_gridlength(v: GridLength) -> Result<bindings::GridLength> 
     }
 }
 
+/// Encode a reactor [`Color`] (linear scRGB) into a WinRT `Windows.UI.Color`
+/// (8-bit sRGB, the ABI `Microsoft.UI.Xaml` consumes). This is the SDR-fallback
+/// boundary: the linear channels are clamped to `[0, 1]` and sRGB-encoded so the
+/// WinUI backend renders visually identical to the FP16 path's SDR appearance.
+pub(super) fn to_winrt(c: Color) -> bindings::Color {
+    let (r, g, b, a) = c.to_srgb8();
+    bindings::Color { a, r, g, b }
+}
+
 pub(super) fn solid_brush(c: Color) -> Result<bindings::SolidColorBrush> {
     let brush = bindings::SolidColorBrush::new()?;
-    brush.SetColor(c)?;
+    brush.SetColor(to_winrt(c))?;
     Ok(brush)
 }
 
@@ -138,12 +147,7 @@ pub(super) fn build_menu_flyout_item_base(
                 if *danger {
                     // Destructive actions: error-red text (matches the WinUI
                     // SystemFillColorCritical accent used for danger affordances).
-                    let brush = solid_brush(Color {
-                        a: 255,
-                        r: 196,
-                        g: 43,
-                        b: 28,
-                    })?;
+                    let brush = solid_brush(Color::rgb(196, 43, 28))?;
                     ctl.SetForeground(&brush)?;
                 }
             }

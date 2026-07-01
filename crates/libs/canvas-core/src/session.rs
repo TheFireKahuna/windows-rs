@@ -10,6 +10,13 @@ pub struct DrawingSession<'a> {
     // `BeginDraw`/`EndDraw` already opens and closes the draw — issuing a nested
     // Direct2D `BeginDraw` there is `D2DERR_WRONG_STATE`.
     owns_bracket: bool,
+    // Whether the draw target is an 8-bit sRGB surface. Every color entering a
+    // session is *linear* scRGB; when this is set, each color the session forwards
+    // to Direct2D — solid brushes (including later recolors), gradient stops, the
+    // clear color, effect tints — is linear→sRGB encoded (+ clamped) on the way out,
+    // so a linear value lands correctly on a UNORM sRGB surface. A linear FP16 scRGB
+    // surface leaves this false and passes colors through raw (its native encoding).
+    encode_srgb: bool,
 }
 
 impl<'a> DrawingSession<'a> {
@@ -22,6 +29,7 @@ impl<'a> DrawingSession<'a> {
             context,
             device_lost_flag,
             owns_bracket: true,
+            encode_srgb: false,
         })
     }
 
@@ -39,12 +47,37 @@ impl<'a> DrawingSession<'a> {
             context,
             device_lost_flag,
             owns_bracket: false,
+            encode_srgb: false,
+        }
+    }
+
+    /// Mark this session's target as an 8-bit sRGB surface (or not).
+    ///
+    /// Every color entering a session is linear scRGB. On an 8-bit sRGB target the
+    /// linear value must be gamma-*encoded* (+ clamped) before it is written — set
+    /// this and the session encodes every color it forwards to Direct2D (solid
+    /// brushes and their recolors, gradient stops, clears, effect tints). Leave it
+    /// off (the default) for a linear FP16 scRGB surface, which stores linear values
+    /// raw. Chain it on construction:
+    /// `DrawingSession::new_borrowed(ctx, flag).encode_srgb_target(surface_is_8bit)`.
+    pub fn encode_srgb_target(mut self, on: bool) -> Self {
+        self.encode_srgb = on;
+        self
+    }
+
+    /// Prepare a linear color for this session's target: linear→sRGB encoded on an
+    /// 8-bit sRGB surface, passed through raw on a linear FP16 one.
+    fn resolve(&self, color: ColorF) -> ColorF {
+        if self.encode_srgb {
+            color.to_srgb()
+        } else {
+            color
         }
     }
 
     /// Clears the entire session to the given color.
     pub fn clear(&self, color: ColorF) {
-        let c: D2D_COLOR_F = color.into();
+        let c: D2D_COLOR_F = self.resolve(color).into();
         unsafe { self.context.Clear(Some(&c)) };
     }
 
@@ -165,10 +198,37 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
-    /// Creates a solid color brush.
+    /// Creates a solid color brush. The brush inherits this session's target color
+    /// space, so a later [`set_color`](Brush::set_color) on a linear target converts
+    /// too (the recolorable-brush path that immediate-mode draws reuse every frame).
     pub fn create_solid_brush(&self, color: ColorF) -> Result<Brush> {
-        let c: D2D_COLOR_F = color.into();
-        unsafe { self.context.CreateSolidColorBrush(&c, None).map(Brush) }
+        let c: D2D_COLOR_F = self.resolve(color).into();
+        unsafe {
+            self.context
+                .CreateSolidColorBrush(&c, None)
+                .map(|b| Brush::new(b, self.encode_srgb))
+        }
+    }
+
+    /// Resolve a stop list for this session's target and pick the interpolation
+    /// gamma. Stops enter linear. On a linear (FP16) target the colors pass through
+    /// raw and interpolation runs in linear space (`GAMMA_1_0`) to match them; on an
+    /// 8-bit sRGB target the colors are linear→sRGB encoded and interpolation stays
+    /// in the perceptual `GAMMA_2_2` space (matching the encoded endpoints).
+    fn resolve_stops(&self, stops: &[GradientStop]) -> (Vec<D2D1_GRADIENT_STOP>, D2D1_GAMMA) {
+        let abi: Vec<D2D1_GRADIENT_STOP> = stops
+            .iter()
+            .map(|s| D2D1_GRADIENT_STOP {
+                position: s.position,
+                color: self.resolve(s.color).into(),
+            })
+            .collect();
+        let gamma = if self.encode_srgb {
+            D2D1_GAMMA_2_2
+        } else {
+            D2D1_GAMMA_1_0
+        };
+        (abi, gamma)
     }
 
     /// Stops define colors at positions 0.0–1.0 along the axis from `start` to `end`.
@@ -178,11 +238,11 @@ impl<'a> DrawingSession<'a> {
         end: Vector2,
         stops: &[GradientStop],
     ) -> Result<LinearGradient> {
-        let abi_stops: Vec<D2D1_GRADIENT_STOP> = stops.iter().map(|s| s.to_abi()).collect();
+        let (abi_stops, gamma) = self.resolve_stops(stops);
         unsafe {
             let collection = self.context.CreateGradientStopCollection(
                 &abi_stops,
-                D2D1_GAMMA_2_2,
+                gamma,
                 D2D1_EXTEND_MODE_CLAMP,
             )?;
             let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
@@ -203,11 +263,11 @@ impl<'a> DrawingSession<'a> {
         radius_y: f32,
         stops: &[GradientStop],
     ) -> Result<RadialGradient> {
-        let abi_stops: Vec<D2D1_GRADIENT_STOP> = stops.iter().map(|s| s.to_abi()).collect();
+        let (abi_stops, gamma) = self.resolve_stops(stops);
         unsafe {
             let collection = self.context.CreateGradientStopCollection(
                 &abi_stops,
-                D2D1_GAMMA_2_2,
+                gamma,
                 D2D1_EXTEND_MODE_CLAMP,
             )?;
             let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
@@ -322,9 +382,32 @@ impl<'a> DrawingSession<'a> {
         self.set_transform(&prev);
     }
 
+    /// Push an axis-aligned (aliased) clip rectangle. Subsequent drawing is
+    /// confined to `rect` until the matching [`pop_clip`](Self::pop_clip). Used
+    /// by the text editor to confine an overflowing single-line run to its box.
+    pub fn push_clip(&self, rect: &Rect) {
+        // 1 == D2D1_ANTIALIAS_MODE_ALIASED (crisp box edges, no clip-edge AA).
+        unsafe { self.context.PushAxisAlignedClip(&rect.to_abi(), 1) };
+    }
+
+    /// Pop the clip pushed by [`push_clip`](Self::push_clip).
+    pub fn pop_clip(&self) {
+        unsafe { self.context.PopAxisAlignedClip() };
+    }
+
     /// Returns the underlying `ID2D1DeviceContext`.
     pub fn raw(&self) -> &ID2D1DeviceContext {
         self.context
+    }
+
+    /// Switch text antialiasing to grayscale. Required for correct text on
+    /// premultiplied / transparent composition surfaces: ClearType subpixel AA
+    /// blends against an assumed-opaque background and is invalid there.
+    pub fn set_grayscale_text_antialiasing(&self) {
+        unsafe {
+            self.context
+                .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE)
+        };
     }
 
     /// Creates a bitmap suitable for use as a render target.
@@ -373,6 +456,9 @@ impl<'a> DrawingSession<'a> {
                 D2D1_PROPERTY_TYPE_FLOAT,
                 &blur_standard_deviation.to_le_bytes(),
             )?;
+            // The tint composites into the surface, so it follows the same color
+            // space: linear on an FP16 target, sRGB passthrough otherwise.
+            let color = self.resolve(color);
             let mut rgba = [0u8; 16];
             rgba[0..4].copy_from_slice(&color.r.to_le_bytes());
             rgba[4..8].copy_from_slice(&color.g.to_le_bytes());
@@ -407,6 +493,59 @@ impl<'a> DrawingSession<'a> {
                 0, // D2D1_COMPOSITE_MODE_SOURCE_OVER
             );
         }
+    }
+
+    /// Paint a soft Gaussian drop shadow beneath an arbitrary shape. `draw_shape`
+    /// renders the opaque silhouette into a transparent off-screen bitmap (only its
+    /// alpha matters); that alpha is blurred by `blur_standard_deviation` (DIPs),
+    /// tinted with `color`, and composited at `offset` DIPs `(dx, dy)` — positive
+    /// values push the shadow down/right for a classic drop. The caller paints the
+    /// real surface on top afterwards (the shape's own ink is not redrawn here).
+    ///
+    /// This is the chrome counterpart to the viz `glow` (a centered halo): same
+    /// off-screen `D2D1Shadow` mechanism, but translated. It mirrors the glow path's
+    /// atlas-offset handling so it is correct on a DirectComposition composition
+    /// surface (whose transform carries the atlas slot in `m31`/`m32`). Returns
+    /// `false` if any off-screen step fails (e.g. under device loss), so callers can
+    /// fall back to an approximate shadow.
+    pub fn drop_shadow(
+        &self,
+        blur_standard_deviation: f32,
+        color: ColorF,
+        offset: (f32, f32),
+        draw_shape: impl FnOnce(),
+    ) -> bool {
+        let Ok(shape) = self.create_bitmap_target() else {
+            return false;
+        };
+        // Render the silhouette at scale only — strip the atlas translation so it is
+        // not baked into the bitmap and then re-applied at composite (double-offset).
+        let live = self.get_transform();
+        let scale_only = Matrix3x2 { m31: 0.0, m32: 0.0, ..live };
+        self.with_target(&shape, || {
+            self.with_transform(&scale_only, || {
+                self.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
+                draw_shape();
+            });
+        });
+        let Ok(shadow) = self.create_shadow(&shape, blur_standard_deviation, color) else {
+            return false;
+        };
+        // Composite the blurred shadow at the live atlas offset plus the drop offset
+        // (DIPs → pixels via the surface scale), scale forced to 1 — the shape bitmap
+        // already holds scaled pixels, so compositing under the scale transform would
+        // scale it twice.
+        let scale = live.m11;
+        let blit = Matrix3x2 {
+            m11: 1.0,
+            m12: 0.0,
+            m21: 0.0,
+            m22: 1.0,
+            m31: live.m31 + offset.0 * scale,
+            m32: live.m32 + offset.1 * scale,
+        };
+        self.with_transform(&blit, || self.draw_effect(&shadow));
+        true
     }
 
     /// Draws the output of an effect.

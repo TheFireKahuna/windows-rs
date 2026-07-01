@@ -213,7 +213,10 @@ impl SwapChain {
             unsafe { WaitForSingleObjectEx(wait.0, 1000, false.into()) };
         }
         self.device_lost_flag.set(false);
+        // A swap-chain target is 8-bit `B8G8R8A8_UNORM` (sRGB), so its session
+        // linear→sRGB encodes every color at the boundary (clears, gradients, …).
         DrawingSession::new(&self.d2d_context, &self.device_lost_flag)
+            .map(|s| s.encode_srgb_target(true))
     }
 
     /// Returns the chain's own frame-latency waitable object, or `None` when it
@@ -251,10 +254,15 @@ impl SwapChain {
         result.ok().map(|()| true)
     }
 
-    /// Creates a solid color brush.
+    /// Creates a solid color brush. A swap-chain target is 8-bit sRGB, so the brush
+    /// linear→sRGB encodes the (linear) color it is given, now and on every recolor.
     pub fn create_solid_brush(&self, color: ColorF) -> Result<Brush> {
-        let c: D2D_COLOR_F = color.into();
-        unsafe { self.d2d_context.CreateSolidColorBrush(&c, None).map(Brush) }
+        let c: D2D_COLOR_F = color.to_srgb().into();
+        unsafe {
+            self.d2d_context
+                .CreateSolidColorBrush(&c, None)
+                .map(|b| Brush::new(b, true))
+        }
     }
 
     /// Loads a bitmap from an image file.

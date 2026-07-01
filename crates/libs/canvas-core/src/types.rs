@@ -143,20 +143,36 @@ pub trait Paint: sealed::Sealed {
 }
 
 /// A solid color brush.
-pub struct Brush(pub(crate) ID2D1SolidColorBrush);
+///
+/// Every color a brush is given is linear scRGB. `encode_srgb` records whether the
+/// brush draws onto an 8-bit sRGB target: when set, each color is linear→sRGB
+/// encoded (+ clamped) before reaching Direct2D, so it lands correctly on a UNORM
+/// sRGB surface; when clear (a linear FP16 scRGB target) the linear value is written
+/// raw. The flag is stamped at creation from the owning [`DrawingSession`], so a
+/// recolorable brush reused via [`set_color`](Self::set_color) encodes on every
+/// recolor too.
+pub struct Brush {
+    pub(crate) raw: ID2D1SolidColorBrush,
+    encode_srgb: bool,
+}
 
 impl Brush {
-    /// Sets the color of the brush.
+    pub(crate) fn new(raw: ID2D1SolidColorBrush, encode_srgb: bool) -> Self {
+        Self { raw, encode_srgb }
+    }
+
+    /// Sets the color of the brush (linear→sRGB encoded on an 8-bit sRGB target).
     pub fn set_color(&self, color: ColorF) {
+        let color = if self.encode_srgb { color.to_srgb() } else { color };
         let c: D2D_COLOR_F = color.into();
-        unsafe { self.0.SetColor(&c) };
+        unsafe { self.raw.SetColor(&c) };
     }
 }
 
 impl sealed::Sealed for Brush {}
 impl Paint for Brush {
     fn as_raw_brush(&self) -> &ID2D1Brush {
-        &self.0
+        &self.raw
     }
 }
 
@@ -193,13 +209,6 @@ impl GradientStop {
     /// Creates a gradient stop at the given position and color.
     pub const fn new(position: f32, color: ColorF) -> Self {
         Self { position, color }
-    }
-
-    pub(crate) fn to_abi(self) -> D2D1_GRADIENT_STOP {
-        D2D1_GRADIENT_STOP {
-            position: self.position,
-            color: self.color.into(),
-        }
     }
 }
 

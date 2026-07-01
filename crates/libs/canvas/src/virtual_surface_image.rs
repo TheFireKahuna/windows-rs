@@ -189,7 +189,10 @@ impl Inner {
             ur.height as f32 / scale,
         );
         {
-            let session = DrawingSession::new_borrowed(&context, &self.device_lost);
+            // A `VirtualSurfaceImageSource` is an 8-bit `B8G8R8A8` sRGB surface, so
+            // the session linear→sRGB encodes the (linear) colors it is given.
+            let session = DrawingSession::new_borrowed(&context, &self.device_lost)
+                .encode_srgb_target(true);
             session.set_transform(&Matrix3x2::translation(tx, ty));
             let ctx = DrawContext::new(
                 session,

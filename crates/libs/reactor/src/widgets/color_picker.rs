@@ -74,14 +74,16 @@ impl Widget for ColorPicker {
     fn bindings(&self) -> PropBindings {
         let mut out = generated::color_picker_bindings(self);
         // ColorValue is a compound ARGB type not expressible in TOML.
+        // `ColorArgb` is 8-bit sRGB; decode to the linear reactor `Color` currency
+        // (the WinUI backend re-encodes it to `Windows.UI.Color` at its boundary).
         out.push(Binding::Prop(
             Prop::ColorValue,
-            PropValue::Color(Color {
-                a: self.color.a,
-                r: self.color.r,
-                g: self.color.g,
-                b: self.color.b,
-            }),
+            PropValue::Color(Color::rgba(
+                self.color.r,
+                self.color.g,
+                self.color.b,
+                self.color.a,
+            )),
         ));
         out
     }

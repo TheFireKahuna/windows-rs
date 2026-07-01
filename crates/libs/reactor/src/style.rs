@@ -372,7 +372,11 @@ impl ThemeRef {
 
 /// Brush slot that can be either a literal [`Color`]
 /// or a [`ThemeRef`]; used for `background` / `foreground` modifiers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// [`Color`] now carries `f32` linear channels (no `Eq`), so this derives only
+/// `PartialEq` — the reconciler diffs it by exact value, which is correct because
+/// tokens are computed deterministically.
+#[derive(Clone, Debug, PartialEq)]
 pub enum BrushBinding {
     Direct(Color),
     Theme(ThemeRef),

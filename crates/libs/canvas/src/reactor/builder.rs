@@ -1,4 +1,5 @@
 use super::device::{acquire_device, reset_device};
+use super::painter::PaintSurface;
 use super::*;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -317,13 +318,13 @@ fn build_painter<R: 'static>(
             painter.inner.dpi.set(dpi);
             *painter.inner.device.borrow_mut() = Some(device.clone());
 
-            // (Re)build the surface at the element's pixel size. A device-lost
-            // failure here triggers the same recovery as a lost repaint.
-            let built = if opaque {
-                SurfaceImage::new_opaque(&device, w as f32, h as f32, dpi)
-            } else {
-                SurfaceImage::new(&device, w as f32, h as f32, dpi)
-            };
+            // (Re)build the surface at the element's pixel size. The variant is
+            // chosen at runtime from the captured host: a DirectComposition
+            // child-visual surface on the dcomp backend, else a XAML
+            // `SurfaceImageSource`. A device-lost failure here triggers the same
+            // recovery as a lost repaint.
+            let host = painter.inner.host.borrow().clone();
+            let built = PaintSurface::build(host.as_ref(), &device, w as f32, h as f32, dpi, opaque);
             let surface = match built {
                 Ok(surface) => surface,
                 Err(e) => {
@@ -396,9 +397,11 @@ fn build_painter<R: 'static>(
             // resource failure we still attach the cleared surface so layout is
             // stable, but stay not-ready so `draw` is skipped.
             painter.inner.ready.set(!failed.get() && painted.is_ok());
-            let new_source = surface.surface();
+            // The `Image` source on the WinUI path; `None` on dcomp, where the
+            // composition sprite shows the content (the host `Image` stays empty).
+            let new_source = surface.image_source();
             *painter.inner.surface.borrow_mut() = Some(surface);
-            set_source.call(Some(new_source));
+            set_source.call(new_source);
         }
     });
 

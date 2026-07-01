@@ -30,6 +30,7 @@ mod app;
 mod app_shim;
 mod backend;
 mod bootstrap;
+mod color;
 mod diagnostics;
 mod drag;
 mod element;
@@ -46,9 +47,9 @@ mod widgets;
 
 pub use app::*;
 pub use backend::*;
+pub use color::Color;
 pub use bindings::AutomationHeadingLevel;
 pub use bindings::AutomationLiveSetting;
-pub use bindings::Color;
 pub use bindings::CommandBarDefaultLabelPosition;
 pub use bindings::DispatcherQueuePriority;
 pub use bindings::FlyoutPlacementMode;
