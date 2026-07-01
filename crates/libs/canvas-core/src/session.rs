@@ -29,9 +29,9 @@ impl<'a> DrawingSession<'a> {
     /// bracket is owned elsewhere — e.g. a `SurfaceImageSource`'s native
     /// `BeginDraw`). This session issues no `BeginDraw` and no `EndDraw`; the
     /// owner is responsible for ending the draw and for observing device-loss
-    /// from that call. Only the reactor-feature surface bridges adopt sessions.
-    #[cfg(feature = "reactor")]
-    pub(crate) fn new_borrowed(
+    /// from that call. Used by the reactor surface bridges and by the
+    /// self-hosted DirectComposition backend.
+    pub fn new_borrowed(
         context: &'a ID2D1DeviceContext,
         device_lost_flag: &'a Cell<bool>,
     ) -> Self {

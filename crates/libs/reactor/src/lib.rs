@@ -13,6 +13,19 @@
 )]
 mod bindings;
 
+// System (Windows.UI.Composition) bindings for the self-hosted DirectComposition
+// HDR backend. Separate module so its flat short names don't collide with the
+// lifted Microsoft.UI.Composition types in `bindings`.
+#[allow(
+    non_snake_case,
+    non_upper_case_globals,
+    non_camel_case_types,
+    dead_code,
+    clippy::upper_case_acronyms,
+    clippy::missing_transmute_annotations
+)]
+mod system_bindings;
+
 mod app;
 mod app_shim;
 mod backend;
