@@ -20,7 +20,13 @@ use windows_core::Interface;
 use windows_numerics::{Matrix3x2, Vector3};
 
 /// Shadow bleed margin baked into the surface around the drawn panel (DIPs).
-const MARGIN: f32 = 10.0;
+/// Sized to hold the soft Gaussian drop shadow (≈ `SHADOW_BLUR`·3 + drop offset)
+/// without clipping at the surface edge.
+const MARGIN: f32 = theme::SPACE_32;
+/// Gaussian standard deviation of the popup drop shadow (DIPs).
+const SHADOW_BLUR: f32 = theme::SPACE_8 - theme::BORDER_W;
+/// Vertical drop offset of the popup shadow (DIPs) — depth cue, lit from above.
+const SHADOW_DROP: f32 = theme::SPACE_4;
 /// One command/selection row height (DIPs).
 const ROW: f32 = theme::ROW_H;
 /// Separator row height (DIPs).
@@ -33,12 +39,19 @@ pub(crate) struct Popup {
     pub owner: ControlId,
     /// `true` = ComboBox selection list; `false` = command menu / dropdown.
     pub combo: bool,
+    /// `true` = AutoSuggestBox suggestion list (commit chooses a suggestion +
+    /// keeps the field focused, rather than closing a trigger control).
+    pub suggest: bool,
     container: ContainerVisual,
     vis: IVisual,
     surf: NodeSurface,
     items: Vec<MenuRow>,
     /// Drawn-panel rect in window DIPs (excludes the shadow margin).
     panel: Rect,
+    /// The trigger/field rect this popup is anchored under (window DIPs).
+    anchor: Rect,
+    /// The window viewport (w, h) DIPs the panel is clamped/flipped within.
+    window: (f32, f32),
     /// Currently highlighted row index (`usize::MAX` = none).
     pub hovered: usize,
     open: Spring,
@@ -46,6 +59,42 @@ pub(crate) struct Popup {
 }
 
 impl Popup {
+    /// Panel + surface geometry for `items` anchored under `anchor`, clamped /
+    /// flipped to fit `window`. Returns `(panel_rect, surf_w, surf_h)` in DIPs.
+    fn layout(items: &[MenuRow], anchor: Rect, window: (f32, f32)) -> (Rect, f32, f32) {
+        let h: f32 = items
+            .iter()
+            .map(|r| if r.separator { SEP } else { ROW })
+            .sum::<f32>()
+            + PANEL_PAD * 2.0;
+        let w = anchor.width().max(200.0).min(360.0);
+        // Anchor below the trigger; flip above on the bottom monitor edge.
+        let mut y = anchor.bottom + theme::SPACE_4;
+        if y + h > window.1 - theme::SPACE_4 {
+            y = (anchor.top - h - theme::SPACE_4).max(theme::SPACE_4);
+        }
+        let x = anchor.left.min(window.0 - w - theme::SPACE_4).max(theme::SPACE_4);
+        (Rect::from_xywh(x, y, w, h), w + MARGIN * 2.0, h + MARGIN * 2.0)
+    }
+
+    /// Mint the overlay surface for `panel`, position it (accounting for the shadow
+    /// margin), and size its backing bitmap to the DIP/scale.
+    fn build_surface(
+        comp: &Compositing,
+        panel: Rect,
+        surf_w: f32,
+        surf_h: f32,
+    ) -> windows_core::Result<(ContainerVisual, IVisual, NodeSurface)> {
+        let scale = comp.scale();
+        let (container, surf) =
+            comp.new_overlay((surf_w * scale).ceil() as i32, (surf_h * scale).ceil() as i32)?;
+        surf.set_dip_size(surf_w, surf_h);
+        let vis: IVisual = container.cast()?;
+        vis.SetOffset(Vector3::new(panel.left - MARGIN, panel.top - MARGIN, 0.0))?;
+        vis.SetSize(Vector2::new(surf_w, surf_h))?;
+        Ok((container, vis, surf))
+    }
+
     /// Open a popup of `items` anchored under `anchor` (window DIPs), clamped /
     /// flipped to fit the `window` (w, h) DIP viewport.
     #[allow(clippy::too_many_arguments)]
@@ -57,34 +106,10 @@ impl Popup {
         window: (f32, f32),
         combo: bool,
         selected: i32,
+        suggest: bool,
     ) -> windows_core::Result<Self> {
-        // Panel size from row metrics + a generous width tied to the trigger.
-        let h: f32 = items
-            .iter()
-            .map(|r| if r.separator { SEP } else { ROW })
-            .sum::<f32>()
-            + PANEL_PAD * 2.0;
-        let w = anchor.width().max(200.0).min(360.0);
-
-        // Anchor below the trigger; flip above on the bottom monitor edge.
-        let mut y = anchor.bottom + theme::SPACE_4;
-        if y + h > window.1 - theme::SPACE_4 {
-            y = (anchor.top - h - theme::SPACE_4).max(theme::SPACE_4);
-        }
-        let x = anchor.left.min(window.0 - w - theme::SPACE_4).max(theme::SPACE_4);
-        let panel = Rect::from_xywh(x, y, w, h);
-
-        let scale = comp.scale();
-        let surf_w = w + MARGIN * 2.0;
-        let surf_h = h + MARGIN * 2.0;
-        let (container, surf) =
-            comp.new_overlay((surf_w * scale).ceil() as i32, (surf_h * scale).ceil() as i32)?;
-        surf.set_dip_size(surf_w, surf_h);
-        let vis: IVisual = container.cast()?;
-        // Position the surface so the panel lands at (x, y) (account for margin).
-        vis.SetOffset(Vector3::new(x - MARGIN, y - MARGIN, 0.0))?;
-        vis.SetSize(Vector2::new(surf_w, surf_h))?;
-
+        let (panel, surf_w, surf_h) = Self::layout(&items, anchor, window);
+        let (container, vis, surf) = Self::build_surface(comp, panel, surf_w, surf_h)?;
         let hovered = if combo && selected >= 0 {
             selected as usize
         } else {
@@ -93,19 +118,46 @@ impl Popup {
         let mut popup = Self {
             owner,
             combo,
+            suggest,
             container,
             vis,
             surf,
             items,
             panel,
+            anchor,
+            window,
             hovered,
             open: Spring::new(0.0),
-            px: scale,
+            px: comp.scale(),
         };
         popup.open.target = 1.0;
         popup.apply_anim();
         popup.draw(comp);
         Ok(popup)
+    }
+
+    /// Replace a suggestion popup's rows in place (the filtered list changed as the
+    /// user typed). The open spring is preserved so the panel does not re-pop on
+    /// each keystroke; the backing surface is rebuilt only when the row count (and
+    /// thus the panel height) changes.
+    pub fn update_items(&mut self, comp: &Compositing, items: Vec<MenuRow>) {
+        let resized = items.len() != self.items.len();
+        self.items = items;
+        if self.hovered != usize::MAX && self.hovered >= self.items.len() {
+            self.hovered = usize::MAX;
+        }
+        if resized {
+            let (panel, surf_w, surf_h) = Self::layout(&self.items, self.anchor, self.window);
+            if let Ok((container, vis, surf)) = Self::build_surface(comp, panel, surf_w, surf_h) {
+                comp.remove_overlay(&self.container);
+                self.container = container;
+                self.vis = vis;
+                self.surf = surf;
+                self.panel = panel;
+                self.apply_anim();
+            }
+        }
+        self.draw(comp);
     }
 
     /// Advance the open animation; returns `true` once settled.
@@ -229,11 +281,22 @@ impl Popup {
         // Panel-local origin: the panel sits at (MARGIN, MARGIN) in the surface.
         let p = Rect::from_xywh(MARGIN, MARGIN, self.panel.width(), self.panel.height());
 
-        // Soft drop shadow: a black rounded rect bled below/right.
-        for (i, a) in [(6.0_f32, 0.10_f32), (3.0, 0.16), (1.0, 0.24)] {
-            let s = Rect::new(p.left - i + 1.0, p.top - i + 3.0, p.right + i + 1.0, p.bottom + i + 3.0);
-            set(brush, theme::b(a));
-            session.fill_rounded_rect(&RoundedRect::uniform(s, theme::RADIUS_MD + i), brush);
+        // Real soft Gaussian drop shadow: blur the panel silhouette's alpha and
+        // composite it tinted black, dropped down. Runs only on discrete open/hover
+        // repaints (the per-frame tick animates the visual's opacity/scale, never
+        // redraws the surface), so the blur is never a per-frame cost. Falls back to
+        // a layered approximation if the off-screen path fails (device loss).
+        let panel_rr = RoundedRect::uniform(p, theme::RADIUS_MD);
+        let real = session.drop_shadow(SHADOW_BLUR, linear(theme::b(0.6)), (0.0, SHADOW_DROP), || {
+            set(brush, theme::b(1.0));
+            session.fill_rounded_rect(&panel_rr, brush);
+        });
+        if !real {
+            for (i, a) in [(6.0_f32, 0.10_f32), (3.0, 0.16), (1.0, 0.24)] {
+                let s = Rect::new(p.left - i + 1.0, p.top - i + 3.0, p.right + i + 1.0, p.bottom + i + 3.0);
+                set(brush, theme::b(a));
+                session.fill_rounded_rect(&RoundedRect::uniform(s, theme::RADIUS_MD + i), brush);
+            }
         }
 
         // Raised surface + hairline.

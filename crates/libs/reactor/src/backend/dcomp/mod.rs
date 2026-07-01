@@ -199,6 +199,7 @@ impl Backend for DCompBackend {
         // Set inside an arm to slide the control's primary spring to a new
         // target after the node borrow ends (programmatic state change).
         let mut start_anim = false;
+        let mut refresh_suggest = false;
         {
             let Some(node) = self.node_mut(id) else { return };
             match (prop, value) {
@@ -467,6 +468,9 @@ impl Backend for DCompBackend {
             (Prop::Items, PropValue::StrList(list)) => {
                 node.ctrl.items = list.clone();
                 node.mark_dirty();
+                // A focused AutoSuggestBox whose filtered list just changed refreshes
+                // its open dropdown in place (deferred until the node borrow ends).
+                refresh_suggest = node.kind == ControlKind::AutoSuggestBox;
             }
             (Prop::Items, PropValue::SelectorBarItems(items)) => {
                 node.ctrl.items = items.iter().map(|i| i.text.clone()).collect();
@@ -503,6 +507,9 @@ impl Backend for DCompBackend {
         }
         if start_anim {
             self.animating.insert(id);
+        }
+        if refresh_suggest {
+            self.refresh_suggest(id);
         }
     }
 

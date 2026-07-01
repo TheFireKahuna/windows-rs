@@ -493,6 +493,59 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
+    /// Paint a soft Gaussian drop shadow beneath an arbitrary shape. `draw_shape`
+    /// renders the opaque silhouette into a transparent off-screen bitmap (only its
+    /// alpha matters); that alpha is blurred by `blur_standard_deviation` (DIPs),
+    /// tinted with `color`, and composited at `offset` DIPs `(dx, dy)` — positive
+    /// values push the shadow down/right for a classic drop. The caller paints the
+    /// real surface on top afterwards (the shape's own ink is not redrawn here).
+    ///
+    /// This is the chrome counterpart to the viz `glow` (a centered halo): same
+    /// off-screen `D2D1Shadow` mechanism, but translated. It mirrors the glow path's
+    /// atlas-offset handling so it is correct on a DirectComposition composition
+    /// surface (whose transform carries the atlas slot in `m31`/`m32`). Returns
+    /// `false` if any off-screen step fails (e.g. under device loss), so callers can
+    /// fall back to an approximate shadow.
+    pub fn drop_shadow(
+        &self,
+        blur_standard_deviation: f32,
+        color: ColorF,
+        offset: (f32, f32),
+        draw_shape: impl FnOnce(),
+    ) -> bool {
+        let Ok(shape) = self.create_bitmap_target() else {
+            return false;
+        };
+        // Render the silhouette at scale only — strip the atlas translation so it is
+        // not baked into the bitmap and then re-applied at composite (double-offset).
+        let live = self.get_transform();
+        let scale_only = Matrix3x2 { m31: 0.0, m32: 0.0, ..live };
+        self.with_target(&shape, || {
+            self.with_transform(&scale_only, || {
+                self.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
+                draw_shape();
+            });
+        });
+        let Ok(shadow) = self.create_shadow(&shape, blur_standard_deviation, color) else {
+            return false;
+        };
+        // Composite the blurred shadow at the live atlas offset plus the drop offset
+        // (DIPs → pixels via the surface scale), scale forced to 1 — the shape bitmap
+        // already holds scaled pixels, so compositing under the scale transform would
+        // scale it twice.
+        let scale = live.m11;
+        let blit = Matrix3x2 {
+            m11: 1.0,
+            m12: 0.0,
+            m21: 0.0,
+            m22: 1.0,
+            m31: live.m31 + offset.0 * scale,
+            m32: live.m32 + offset.1 * scale,
+        };
+        self.with_transform(&blit, || self.draw_effect(&shadow));
+        true
+    }
+
     /// Draws the output of an effect.
     pub fn draw_effect(&self, effect: &Effect) {
         if let Ok(output) = unsafe { effect.0.GetOutput() } {

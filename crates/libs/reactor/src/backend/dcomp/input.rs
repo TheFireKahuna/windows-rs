@@ -368,6 +368,12 @@ impl DCompBackend {
                 self.open_popup(id);
             }
             ControlKind::Button | ControlKind::RepeatButton | ControlKind::HyperlinkButton => {
+                // A Button carrying a MenuFlyout (e.g. "+ Add Processor") opens its
+                // menu in the popup overlay, mirroring the native WinUI button-flyout.
+                if self.node(id).is_some_and(|n| !n.ctrl.menu.is_empty()) {
+                    self.open_popup(id);
+                    return;
+                }
                 if let Some(h) = self.node(id).and_then(|n| n.handler(Event::Click)) {
                     h.invoke();
                 }
@@ -501,7 +507,7 @@ impl DCompBackend {
             return;
         }
         let selected = node.ctrl.selected_index;
-        match Popup::open(&self.comp, owner, rows, rect, self.dip_size, combo, selected) {
+        match Popup::open(&self.comp, owner, rows, rect, self.dip_size, combo, selected, false) {
             Ok(p) => {
                 self.close_popup();
                 self.popup = Some(p);
@@ -509,6 +515,82 @@ impl DCompBackend {
             }
             Err(_) => {}
         }
+    }
+
+    /// Open, refresh, or dismiss the suggestion dropdown for AutoSuggestBox `owner`
+    /// from its current `ctrl.items` (the app's filtered list, set via `Prop::Items`).
+    /// Only the focused field shows its list; an empty list dismisses. The popup is
+    /// refreshed in place while open so it does not re-pop on each keystroke.
+    pub(crate) fn refresh_suggest(&mut self, owner: ControlId) {
+        if self.node(owner).map(|n| n.kind) != Some(ControlKind::AutoSuggestBox) {
+            return;
+        }
+        let focused = self.focused_id == Some(owner);
+        let rows: Vec<MenuRow> = if focused {
+            self.node(owner)
+                .map(|n| {
+                    n.ctrl
+                        .items
+                        .iter()
+                        .map(|s| MenuRow {
+                            text: s.clone(),
+                            tag: s.clone(),
+                            enabled: true,
+                            ..Default::default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // An already-open suggestion popup for this field refreshes in place; a
+        // different/closed popup is (re)opened only when there are rows to show.
+        let mine = self
+            .popup
+            .as_ref()
+            .is_some_and(|p| p.suggest && p.owner == owner);
+        if rows.is_empty() {
+            if mine {
+                self.close_popup();
+            }
+            return;
+        }
+        if mine {
+            if let Some(p) = &mut self.popup {
+                p.update_items(&self.comp, rows);
+            }
+            return;
+        }
+        let rect = self
+            .node(owner)
+            .map(|n| CanvasRect::from_xywh(n.rect.x, n.rect.y, n.rect.w, n.rect.h));
+        let Some(rect) = rect else { return };
+        if let Ok(p) = Popup::open(&self.comp, owner, rows, rect, self.dip_size, false, -1, true) {
+            self.close_popup();
+            self.popup = Some(p);
+            self.popup_settled = false;
+        }
+    }
+
+    /// Commit a chosen suggestion to its AutoSuggestBox: set the field text to the
+    /// suggestion, fire `SuggestionChosen`, and dismiss the dropdown (focus stays).
+    fn choose_suggestion(&mut self, idx: usize) {
+        let Some(p) = &self.popup else { return };
+        let owner = p.owner;
+        let Some(text) = p.row_tag(idx) else { return };
+        self.close_popup();
+        if let Some(n) = self.node_mut(owner) {
+            if let Some(e) = &mut n.editor {
+                e.set_text(&text);
+                e.seeded = true;
+                e.blink_on = true;
+            }
+            n.mark_dirty();
+        }
+        self.repaint();
+        self.fire_string(owner, Event::SuggestionChosen, text);
     }
 
     fn close_popup(&mut self) {
@@ -533,6 +615,10 @@ impl DCompBackend {
     /// Commit the selected popup row to its owner and close.
     fn commit_popup(&mut self, idx: usize) {
         let Some(p) = &self.popup else { return };
+        if p.suggest {
+            self.choose_suggestion(idx);
+            return;
+        }
         let owner = p.owner;
         let combo = p.combo;
         let tag = p.row_tag(idx);
@@ -686,6 +772,45 @@ impl DCompBackend {
         let kind = self.node(id)?.kind;
         if vk == VK_TAB {
             return None; // Tab leaves the field (commit happens in set_focus).
+        }
+
+        // An open suggestion dropdown for this field captures arrow / Enter / Esc
+        // (printable input still falls through to the editor below).
+        let suggesting = self
+            .popup
+            .as_ref()
+            .is_some_and(|p| p.suggest && p.owner == id);
+        if suggesting {
+            match vk {
+                VK_DOWN => {
+                    if let Some(p) = &mut self.popup {
+                        p.move_highlight(1, &self.comp);
+                    }
+                    return Some(false);
+                }
+                VK_UP => {
+                    if let Some(p) = &mut self.popup {
+                        p.move_highlight(-1, &self.comp);
+                    }
+                    return Some(false);
+                }
+                VK_ESCAPE => {
+                    self.close_popup();
+                    return Some(false);
+                }
+                VK_RETURN => {
+                    let h = self.popup.as_ref().map(|p| p.hovered);
+                    if let Some(i) = h.filter(|&i| i != usize::MAX) {
+                        self.choose_suggestion(i);
+                    } else {
+                        let t = self.with_editor(id, |e| e.text()).unwrap_or_default();
+                        self.close_popup();
+                        self.fire_string(id, Event::QuerySubmitted, t);
+                    }
+                    return Some(false);
+                }
+                _ => {}
+            }
         }
         if ctrl {
             match vk {
@@ -857,8 +982,13 @@ impl DCompBackend {
         };
         self.repaint();
         match kind {
-            ControlKind::TextBox | ControlKind::AutoSuggestBox => {
-                self.fire_string(id, Event::TextChanged, text)
+            ControlKind::TextBox => self.fire_string(id, Event::TextChanged, text),
+            ControlKind::AutoSuggestBox => {
+                self.fire_string(id, Event::TextChanged, text);
+                // Reflect the edit in the suggestion dropdown from whatever rows the
+                // node currently carries; the app's filtered list (set on the next
+                // render via `Prop::Items`) refreshes it again in place.
+                self.refresh_suggest(id);
             }
             ControlKind::PasswordBox => self.fire_string(id, Event::PasswordChanged, text),
             _ => {}
@@ -1105,6 +1235,16 @@ impl DCompBackend {
             && self.node(old).map(|n| n.kind) == Some(ControlKind::NumberBox)
         {
             self.commit_number(old);
+        }
+        // Dismiss an AutoSuggestBox's open dropdown when its field loses focus.
+        if let Some(old) = self.focused_id
+            && Some(old) != id
+            && self
+                .popup
+                .as_ref()
+                .is_some_and(|p| p.suggest && p.owner == old)
+        {
+            self.close_popup();
         }
         if let Some(old) = self.focused_id
             && let Some(n) = self.node_mut(old)

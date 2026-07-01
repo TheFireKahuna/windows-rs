@@ -72,9 +72,26 @@ fn main() -> windows_reactor::Result<()> {
             .height(32.0)
             .into();
 
+        // Filter a small catalog by the live query (case-insensitive substring) so
+        // the suggestion dropdown shows matching rows as you type.
+        const CATALOG: [&str; 8] = [
+            "Warmth", "Clarity", "Presence", "Bass Boost", "Air", "Crossfeed",
+            "Loudness", "Flat Reference",
+        ];
+        let q = query.to_lowercase();
+        let matches: Vec<String> = if q.is_empty() {
+            Vec::new()
+        } else {
+            CATALOG
+                .iter()
+                .filter(|s| s.to_lowercase().contains(&q))
+                .map(|s| s.to_string())
+                .collect()
+        };
         let search: Element = border(
             auto_suggest_box(query.clone())
                 .placeholder_text("Search…")
+                .items(matches)
                 .on_text_changed(move |t| set_query.call(t)),
         )
         .width(200.0)
