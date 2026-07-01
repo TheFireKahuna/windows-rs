@@ -120,7 +120,13 @@ fn resolve_align(arena: &mut Arena, id: ControlId, parent_grid: bool, parent_row
         } else if let Some(a) = align(n.h_align) {
             n.style.align_self = Some(a);
         }
-        let is_grid = n.kind == ControlKind::Grid;
+        // Grid *alignment* semantics (h→justify_self, v→align_self) apply to any
+        // node laid out as a Taffy grid — that includes `Border` (a one-cell grid
+        // host), not just `ControlKind::Grid`. Keying on ControlKind here left a
+        // Border's child on flex-column semantics (h→align_self), which in a grid
+        // is the vertical axis — so a max-width Center child centered vertically
+        // but left-aligned horizontally.
+        let is_grid = matches!(n.style.display, Display::Grid);
         let is_row = matches!(n.style.display, Display::Flex)
             && matches!(
                 n.style.flex_direction,
