@@ -261,11 +261,20 @@ pub(crate) struct Node {
     pub title_content: Option<ControlId>,
     /// TitleBar only: the mounted `RightHeader`/footer (trailing) slot child.
     pub title_footer: Option<ControlId>,
+
+    /// Canonical `IUnknown` identity of `container` — the key the size and
+    /// pointer registries match registrations against (see `size.rs` /
+    /// `pointer.rs`). Cached once; the container never changes.
+    pub ident: *mut core::ffi::c_void,
 }
 
 impl Node {
     pub fn new(kind: ControlKind, container: ContainerVisual) -> Self {
         let vis: IVisual = container.cast().expect("ContainerVisual is an IVisual");
+        let ident = container
+            .cast::<windows_core::IUnknown>()
+            .map(|u| u.as_raw())
+            .unwrap_or(core::ptr::null_mut());
         let mut paint = Paint {
             font_size: default_font_size(kind),
             font_weight: 400,
@@ -318,6 +327,7 @@ impl Node {
             editor: is_text_editable(kind).then(|| Editor::new(kind)),
             title_content: None,
             title_footer: None,
+            ident,
         }
     }
 
@@ -543,47 +553,43 @@ fn default_style(kind: ControlKind) -> taffy::Style {
     s
 }
 
-/// Slot-map style arena keyed by [`ControlId`] (a `NonZeroU32`). Index `id-1`.
+/// Node arena keyed by [`ControlId`] (a `NonZeroU32`).
+///
+/// Ids are minted monotonically and NEVER reused. The reconciler tracks nodes
+/// by id across an unmount/mount sequence (`children_mirror`, the
+/// `new_id != old_id` graft check after a component remount), so a recycled id
+/// would alias a destroyed node and silently corrupt the diff — the freshly
+/// mounted subtree is never grafted and the destroyed subtree's visuals stay
+/// on screen. The WinUI backend upholds the same contract with its monotonic
+/// `next_id`. Map storage (vs. slots) releases a removed node's memory under
+/// remount churn.
 #[derive(Default)]
 pub(crate) struct Arena {
-    slots: Vec<Option<Node>>,
-    free: Vec<u32>,
+    nodes: rustc_hash::FxHashMap<u32, Node>,
     next: u32,
 }
 
 impl Arena {
     pub fn insert(&mut self, node: Node) -> ControlId {
-        if let Some(idx) = self.free.pop() {
-            self.slots[idx as usize] = Some(node);
-            ControlId::new(idx + 1)
-        } else {
-            self.next += 1;
-            self.slots.push(Some(node));
-            ControlId::new(self.next)
-        }
+        self.next += 1;
+        self.nodes.insert(self.next, node);
+        ControlId::new(self.next)
     }
 
     pub fn get(&self, id: ControlId) -> Option<&Node> {
-        self.slots.get((id.get() - 1) as usize).and_then(|s| s.as_ref())
+        self.nodes.get(&id.get())
     }
 
     pub fn get_mut(&mut self, id: ControlId) -> Option<&mut Node> {
-        self.slots
-            .get_mut((id.get() - 1) as usize)
-            .and_then(|s| s.as_mut())
+        self.nodes.get_mut(&id.get())
     }
 
     /// Iterate every live node mutably (order unspecified).
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Node> {
-        self.slots.iter_mut().filter_map(|s| s.as_mut())
+        self.nodes.values_mut()
     }
 
     pub fn remove(&mut self, id: ControlId) -> Option<Node> {
-        let idx = (id.get() - 1) as usize;
-        let taken = self.slots.get_mut(idx).and_then(|s| s.take());
-        if taken.is_some() {
-            self.free.push(idx as u32);
-        }
-        taken
+        self.nodes.remove(&id.get())
     }
 }

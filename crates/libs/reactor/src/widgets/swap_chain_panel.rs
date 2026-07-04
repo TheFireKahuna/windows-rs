@@ -63,16 +63,34 @@ impl SwapChainPanelHandle {
     }
 }
 
-/// Open a capture-capable [`PointerSurface`] over any mounted native
-/// `UIElement`. Shared by [`SwapChainPanelHandle::pointer_surface`] and
-/// [`ElementHandle::pointer_surface`].
+/// Open a capture-capable [`PointerSurface`] over any mounted native element.
+/// Shared by [`SwapChainPanelHandle::pointer_surface`] and
+/// [`ElementHandle::pointer_surface`]. On the WinUI backend the native object
+/// is a XAML `UIElement` (pointer events + `CapturePointer`); on the
+/// DirectComposition backend it is the node's system `ContainerVisual`, and
+/// the subscription registers with the backend's pointer registry instead
+/// (element-relative delivery + implicit capture — see `backend::dcomp::pointer`).
 fn open_pointer_surface(native: &windows_core::IInspectable) -> Result<PointerSurface> {
-    let element: bindings::UIElement = native.cast()?;
-    Ok(PointerSurface {
-        element,
-        captured: Rc::new(RefCell::new(None)),
-        revokers: RefCell::new(Vec::new()),
-    })
+    if let Ok(element) = native.cast::<bindings::UIElement>() {
+        return Ok(PointerSurface {
+            inner: PointerInner::Xaml {
+                element,
+                captured: Rc::new(RefCell::new(None)),
+                revokers: RefCell::new(Vec::new()),
+            },
+        });
+    }
+    #[cfg(feature = "dcomp-backend")]
+    if let Ok(cv) = native.cast::<system_bindings::ContainerVisual>() {
+        let (sinks, revoker) = backend::dcomp::register_element_pointer(&cv)?;
+        return Ok(PointerSurface {
+            inner: PointerInner::Dcomp {
+                sinks,
+                _revoker: revoker,
+            },
+        });
+    }
+    Err(Error::empty())
 }
 
 /// Opaque handle to a mounted native `UIElement`, handed to a widget's
@@ -156,9 +174,24 @@ impl ElementHandle {
 /// [`capture`](Self::capture) works without the caller threading a pointer id
 /// through.
 pub struct PointerSurface {
-    element: bindings::UIElement,
-    captured: Rc<RefCell<Option<bindings::Pointer>>>,
-    revokers: RefCell<Vec<windows_core::EventRevoker>>,
+    inner: PointerInner,
+}
+
+enum PointerInner {
+    /// WinUI: XAML pointer events + explicit `CapturePointer`.
+    Xaml {
+        element: bindings::UIElement,
+        captured: Rc<RefCell<Option<bindings::Pointer>>>,
+        revokers: RefCell<Vec<windows_core::EventRevoker>>,
+    },
+    /// DirectComposition: sinks the backend input router delivers to, with
+    /// implicit capture for the press-to-release span (see
+    /// `backend::dcomp::pointer`). The revoker unregisters on drop.
+    #[cfg(feature = "dcomp-backend")]
+    Dcomp {
+        sinks: Rc<backend::dcomp::PointerSinks>,
+        _revoker: windows_core::EventRevoker,
+    },
 }
 
 impl PointerSurface {
@@ -179,8 +212,16 @@ impl PointerSurface {
             >,
         ) -> Result<windows_core::EventRevoker>,
     {
-        let iue: bindings::IUIElement = self.element.cast()?;
-        let captured = self.captured.clone();
+        let PointerInner::Xaml {
+            element,
+            captured,
+            revokers,
+        } = &self.inner
+        else {
+            unreachable!("subscribe_pointer is only reached from the Xaml arms");
+        };
+        let iue: bindings::IUIElement = element.cast()?;
+        let captured = captured.clone();
         let handler = Box::new(
             move |sender: windows_core::Ref<windows_core::IInspectable>,
                   args: windows_core::Ref<bindings::PointerRoutedEventArgs>| {
@@ -194,13 +235,18 @@ impl PointerSurface {
             },
         );
         let revoker = subscribe(&iue, handler)?;
-        self.revokers.borrow_mut().push(revoker);
+        revokers.borrow_mut().push(revoker);
         Ok(())
     }
 
     /// Subscribe `PointerPressed`. Also records the active pointer so a
     /// subsequent [`capture`](Self::capture) can grab it.
     pub fn on_down(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        #[cfg(feature = "dcomp-backend")]
+        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
+            *sinks.down.borrow_mut() = Some(Box::new(f));
+            return Ok(self);
+        }
         self.subscribe_pointer(f, true, |iue, h| iue.PointerPressed(h))?;
         Ok(self)
     }
@@ -208,10 +254,23 @@ impl PointerSurface {
     /// Subscribe `PointerPressed` and **capture** the pointer to this element as
     /// part of the same handler, so a drag that leaves the element keeps
     /// delivering `PointerMoved`. Convenience for the common scrub / drag start;
-    /// pair with [`release`](Self::release) on the matching up.
+    /// pair with [`release`](Self::release) on the matching up. (The
+    /// DirectComposition backend captures implicitly for every surface press,
+    /// so there this is identical to [`on_down`](Self::on_down).)
     pub fn on_down_capture(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
-        let element = self.element.clone();
-        let captured = self.captured.clone();
+        #[cfg(feature = "dcomp-backend")]
+        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
+            *sinks.down.borrow_mut() = Some(Box::new(f));
+            return Ok(self);
+        }
+        let PointerInner::Xaml {
+            element, captured, ..
+        } = &self.inner
+        else {
+            return Ok(self);
+        };
+        let element = element.clone();
+        let captured = captured.clone();
         self.subscribe_pointer(
             move |info| {
                 if let Some(p) = captured.borrow().as_ref() {
@@ -227,18 +286,33 @@ impl PointerSurface {
 
     /// Subscribe `PointerMoved`. Also refreshes the active pointer.
     pub fn on_move(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        #[cfg(feature = "dcomp-backend")]
+        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
+            *sinks.moved.borrow_mut() = Some(Box::new(f));
+            return Ok(self);
+        }
         self.subscribe_pointer(f, true, |iue, h| iue.PointerMoved(h))?;
         Ok(self)
     }
 
     /// Subscribe `PointerReleased`.
     pub fn on_up(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        #[cfg(feature = "dcomp-backend")]
+        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
+            *sinks.up.borrow_mut() = Some(Box::new(f));
+            return Ok(self);
+        }
         self.subscribe_pointer(f, false, |iue, h| iue.PointerReleased(h))?;
         Ok(self)
     }
 
     /// Subscribe `PointerWheelChanged`; read [`PointerEventInfo::wheel_delta`].
     pub fn on_wheel(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+        #[cfg(feature = "dcomp-backend")]
+        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
+            *sinks.wheel.borrow_mut() = Some(Box::new(f));
+            return Ok(self);
+        }
         self.subscribe_pointer(f, false, |iue, h| iue.PointerWheelChanged(h))?;
         Ok(self)
     }
@@ -246,25 +320,34 @@ impl PointerSurface {
     /// Capture the most recently seen pointer to this element for the duration
     /// of a drag, so moves keep arriving even when the pointer leaves the
     /// element bounds. Call on a `Down` that begins a scrub / drag; pair with
-    /// [`release`](Self::release). No-op if no pointer has been seen yet.
+    /// [`release`](Self::release). No-op if no pointer has been seen yet, and on
+    /// the DirectComposition backend (capture there is implicit per press).
     pub fn capture(&self) {
-        if let Some(p) = self.captured.borrow().as_ref() {
-            let _ = self.element.CapturePointer(p);
+        if let PointerInner::Xaml {
+            element, captured, ..
+        } = &self.inner
+            && let Some(p) = captured.borrow().as_ref()
+        {
+            let _ = element.CapturePointer(p);
         }
     }
 
     /// Release a pointer captured by [`capture`](Self::capture) (call on `Up`).
     pub fn release(&self) {
-        if let Some(p) = self.captured.borrow().as_ref() {
-            let _ = self.element.ReleasePointerCapture(p);
+        if let PointerInner::Xaml {
+            element, captured, ..
+        } = &self.inner
+            && let Some(p) = captured.borrow().as_ref()
+        {
+            let _ = element.ReleasePointerCapture(p);
         }
     }
 }
 
 impl Drop for PointerSurface {
     fn drop(&mut self) {
-        // Release any held capture; the EventRevokers in `revokers` revoke their
-        // subscriptions on their own Drop.
+        // Release any held capture; the EventRevokers (XAML subscriptions or the
+        // dcomp registry entry) revoke on their own Drop.
         self.release();
     }
 }

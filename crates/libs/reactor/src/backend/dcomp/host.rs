@@ -145,8 +145,11 @@ impl DCompHost {
     /// Create the window, compositor, backend, and render host, mount `root`, and
     /// paint the first frame. Call [`run`](Self::run) to enter the message loop.
     pub fn new(title: impl AsRef<str>, root: Box<dyn Component>) -> windows_core::Result<Self> {
-        // Default client size matches the WinUI shell's `.inner_size(1200, 800)`.
-        Self::new_sized(title, 1200.0, 800.0, root)
+        // Default client size scales with the display: 80% of the monitor's work
+        // area (floored to a usable minimum), so the window opens proportionate
+        // on anything from a laptop panel to a 4K desktop. Explicit sizes go
+        // through [`new_sized`](Self::new_sized).
+        Self::new_impl(title, None, root)
     }
 
     /// Like [`new`](Self::new) but opens at a specific client size (DIPs).
@@ -154,6 +157,14 @@ impl DCompHost {
         title: impl AsRef<str>,
         client_w_dip: f64,
         client_h_dip: f64,
+        root: Box<dyn Component>,
+    ) -> windows_core::Result<Self> {
+        Self::new_impl(title, Some((client_w_dip, client_h_dip)), root)
+    }
+
+    fn new_impl(
+        title: impl AsRef<str>,
+        client_dip: Option<(f64, f64)>,
         root: Box<dyn Component>,
     ) -> windows_core::Result<Self> {
         unsafe {
@@ -164,7 +175,7 @@ impl DCompHost {
         UI_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
         ensure_dispatcher_queue()?;
 
-        let (hwnd, dpi, (pw, ph)) = create_window(title.as_ref(), client_w_dip, client_h_dip)?;
+        let (hwnd, dpi, (pw, ph)) = create_window(title.as_ref(), client_dip)?;
         let scale = (dpi as f32 / 96.0).max(0.01);
         let dip = (pw as f32 / scale, ph as f32 / scale);
 
@@ -791,8 +802,7 @@ fn ensure_dispatcher_queue() -> windows_core::Result<()> {
 /// return its HWND, DPI, and actual client pixel size.
 fn create_window(
     title: &str,
-    client_w_dip: f64,
-    client_h_dip: f64,
+    client_dip: Option<(f64, f64)>,
 ) -> windows_core::Result<(HWND, u32, (i32, i32))> {
     static CLASS: &[u16] = &[
         b'D' as u16, b'C' as u16, b'o' as u16, b'm' as u16, b'p' as u16, b'H' as u16, b'o' as u16,
@@ -850,9 +860,6 @@ fn create_window(
     let scale = dpi as f64 / 96.0;
 
     unsafe {
-        // Desired client size in physical pixels.
-        let cw = (client_w_dip * scale).round() as i32;
-        let ch = (client_h_dip * scale).round() as i32;
         // Non-client delta (borders + caption) for this window at this DPI.
         let mut wr = RECT::default();
         let mut cr = RECT::default();
@@ -860,16 +867,34 @@ fn create_window(
         let _ = GetClientRect(hwnd, &mut cr);
         let nc_w = (wr.right - wr.left) - (cr.right - cr.left);
         let nc_h = (wr.bottom - wr.top) - (cr.bottom - cr.top);
-        let win_w = cw + nc_w;
-        let win_h = ch + nc_h;
-        // Center on the nearest monitor's work area.
+        // The nearest monitor's work area (also the centering target).
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut mi: MONITORINFO = core::mem::zeroed();
         mi.cbSize = size_of::<MONITORINFO>() as u32;
+        let have_mi = GetMonitorInfoW(mon, &mut mi).as_bool();
+        let work_w = if have_mi { mi.rcWork.right - mi.rcWork.left } else { 0 };
+        let work_h = if have_mi { mi.rcWork.bottom - mi.rcWork.top } else { 0 };
+        // Desired client size in physical pixels: the caller's explicit DIP size,
+        // or a display-proportionate default — 80% of the work area, floored to a
+        // usable minimum — so a 4K desktop doesn't open a laptop-sized window.
+        let (cw, ch) = match client_dip {
+            Some((w, h)) => ((w * scale).round() as i32, (h * scale).round() as i32),
+            None => {
+                let min_w = (1200.0 * scale) as i32;
+                let min_h = (800.0 * scale) as i32;
+                let avail_w = (work_w - nc_w).max(1);
+                let avail_h = (work_h - nc_h).max(1);
+                (
+                    (work_w * 4 / 5).max(min_w).min(avail_w),
+                    (work_h * 4 / 5).max(min_h).min(avail_h),
+                )
+            }
+        };
+        let win_w = cw + nc_w;
+        let win_h = ch + nc_h;
+        // Center on the work area.
         let (mut x, mut y) = (CW_USEDEFAULT, CW_USEDEFAULT);
-        if GetMonitorInfoW(mon, &mut mi).as_bool() {
-            let work_w = mi.rcWork.right - mi.rcWork.left;
-            let work_h = mi.rcWork.bottom - mi.rcWork.top;
+        if have_mi {
             x = mi.rcWork.left + (work_w - win_w).max(0) / 2;
             y = mi.rcWork.top + (work_h - win_h).max(0) / 2;
         }

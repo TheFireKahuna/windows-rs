@@ -57,6 +57,69 @@ impl DCompBackend {
         best
     }
 
+    /// The deepest registered viz pointer surface (knob/slider/EQ canvas — see
+    /// `pointer.rs`) under the point, with its sinks and the scroll-adjusted
+    /// point for element-relative coordinates. Cheap `None` when nothing is
+    /// registered.
+    fn surface_at(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<(ControlId, std::rc::Rc<super::PointerSinks>, f32, f32)> {
+        if !super::pointer::has_listeners() {
+            return None;
+        }
+        let root = self.root?;
+        let mut best = None;
+        self.surface_walk(root, x, y, &mut best);
+        best
+    }
+
+    fn surface_walk(
+        &self,
+        id: ControlId,
+        x: f32,
+        y: f32,
+        out: &mut Option<(ControlId, std::rc::Rc<super::PointerSinks>, f32, f32)>,
+    ) {
+        let Some(node) = self.node(id) else { return };
+        if node.rect.contains(x, y)
+            && !node.ident.is_null()
+            && let Some(sinks) = super::pointer::sinks_for(node.ident)
+        {
+            *out = Some((id, sinks, x, y));
+        }
+        let child_y = if node.is_scroll() { y + node.anim.x } else { y };
+        for c in &node.children {
+            self.surface_walk(*c, x, child_y, out);
+        }
+    }
+
+    /// Deliver a pointer transition to a viz surface's sink with element-relative
+    /// DIP coordinates. `(x, y)` must be in the node's layout space (scroll-
+    /// adjusted, as returned by [`surface_at`](Self::surface_at)).
+    fn fire_surface(
+        &self,
+        id: ControlId,
+        cell: &std::cell::RefCell<Option<Box<dyn Fn(PointerEventInfo)>>>,
+        x: f32,
+        y: f32,
+        left: bool,
+        wheel_delta: i32,
+    ) {
+        let Some(node) = self.node(id) else { return };
+        let info = PointerEventInfo {
+            x: (x - node.rect.x) as f64,
+            y: (y - node.rect.y) as f64,
+            is_left_button_pressed: left,
+            wheel_delta,
+            ..PointerEventInfo::default()
+        };
+        if let Some(cb) = cell.borrow().as_ref() {
+            cb(info);
+        }
+    }
+
     /// Whether `(x, y)` (absolute DIP) lies over scroll container `id`'s thumb.
     /// Returns the pointer→thumb-top offset (for drag tracking) when it does.
     fn thumb_at(&self, id: ControlId, x: f32, y: f32) -> Option<f32> {
@@ -158,6 +221,31 @@ impl DCompBackend {
             return true;
         }
 
+        // A pressed viz pointer surface (knob/slider/EQ drag) receives every
+        // move 1:1 — including outside its bounds — until release (capture
+        // parity with XAML `CapturePointer`). Hover is frozen for the drag.
+        if let Some((sid, sinks, dy)) = self.pressed_surface.clone() {
+            self.fire_surface(sid, &sinks.moved, x, y + dy, true, 0);
+            // Repaint the dragged surface with THIS move rather than on the next
+            // WM_TIMER: the timer is a low-priority message a fast move stream
+            // can starve, which reads as drag lag. Moves are queue-coalesced, so
+            // this self-limits to the pump's processing rate.
+            crate::drive_frame_ticks();
+            return false;
+        }
+
+        // Pointer capture: a pressed node with pointer handlers (declarative
+        // `on_pointer_*` modifiers) receives every move 1:1 — including outside
+        // its bounds — until release. Hover is frozen for the drag's duration.
+        if let Some(pid) = self.pressed_id
+            && self.node(pid).is_some_and(|n| {
+                n.pointer.as_ref().is_some_and(|p| p.on_pointer_moved.is_some())
+            })
+        {
+            self.fire_pointer(pid, x, y, |p| p.on_pointer_moved.as_ref());
+            return false;
+        }
+
         // Fade the scrollbar thumb in for whichever scroll container is hovered.
         self.update_hovered_scroll(self.scroll_at(x, y));
 
@@ -181,6 +269,13 @@ impl DCompBackend {
             self.fire_pointer(new, x, y, |p| p.on_pointer_moved.as_ref());
         }
         self.hovered_id = now;
+
+        // Hover moves over a viz pointer surface (EQ node highlight etc.) —
+        // XAML `PointerMoved` fires on hover, not only during a press.
+        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y) {
+            self.fire_surface(sid, &sinks.moved, ax, ay, false, 0);
+        }
+
         !self.animating.is_empty()
     }
 
@@ -223,6 +318,15 @@ impl DCompBackend {
             return (true, true);
         }
 
+        // A registered viz pointer surface wins over generic controls: it is the
+        // deepest interactive thing under the point, and its press starts an
+        // implicitly captured drag.
+        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y) {
+            self.pressed_surface = Some((sid, std::rc::Rc::clone(&sinks), ay - y));
+            self.fire_surface(sid, &sinks.down, ax, ay, true, 0);
+            return (true, false);
+        }
+
         let target = self.interactive_at(x, y);
         // Pointer focus (no visible ring) follows the click.
         self.set_focus(target.filter(|id| self.node(*id).is_some_and(|n| n.focusable)), false);
@@ -262,6 +366,13 @@ impl DCompBackend {
 
     /// Left button up. Returns `needs_timer`.
     pub(crate) fn on_pointer_up(&mut self, x: f32, y: f32) -> bool {
+        // End a viz pointer-surface drag: the surface always sees the release
+        // (capture semantics), wherever the pointer is.
+        if let Some((sid, sinks, dy)) = self.pressed_surface.take() {
+            self.fire_surface(sid, &sinks.up, x, y + dy, false, 0);
+            return false;
+        }
+
         // End a scrollbar-thumb drag (keep the timer so the thumb can fade out).
         if let Some(sid) = self.dragging_thumb.take() {
             if let Some(n) = self.node_mut(sid) {
@@ -297,10 +408,11 @@ impl DCompBackend {
         }
         self.animating.insert(id);
 
-        // Activate only if the release is still over the pressed control.
-        let over = self.is_over(id, x, y);
-        if over {
-            self.fire_pointer(id, x, y, |p| p.on_pointer_released.as_ref());
+        // Capture semantics: the pressed node always sees the release (a drag
+        // must end even when the pointer strays off the control). Activation
+        // still requires releasing over the control.
+        self.fire_pointer(id, x, y, |p| p.on_pointer_released.as_ref());
+        if self.is_over(id, x, y) {
             self.activate_pointer(id, x, y);
         }
         true
@@ -383,7 +495,20 @@ impl DCompBackend {
                     cb.invoke(());
                 }
             }
-            _ => {}
+            // Any other node that hit-tested as clickable (a Border/panel made
+            // interactive via a Click handler or `on_tapped`, e.g. the nav-rail
+            // items) activates the same way a Button does — the press wouldn't
+            // have reached here otherwise.
+            _ => {
+                if let Some(h) = self.node(id).and_then(|n| n.handler(Event::Click)) {
+                    h.invoke();
+                }
+                if let Some(p) = self.node(id).and_then(|n| n.pointer.as_ref())
+                    && let Some(cb) = &p.on_tapped
+                {
+                    cb.invoke(());
+                }
+            }
         }
     }
 
@@ -639,6 +764,15 @@ impl DCompBackend {
     /// Mouse wheel at (x, y) DIPs, `delta` in WHEEL_DELTA (120) units. Returns
     /// `true` if a scroll spring started.
     pub(crate) fn on_wheel(&mut self, x: f32, y: f32, delta: i32) -> bool {
+        // A viz pointer surface that subscribed the wheel (EQ Q-adjust) consumes
+        // it; surfaces without a wheel sink fall through to scrolling.
+        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y)
+            && sinks.wheel.borrow().is_some()
+        {
+            self.fire_surface(sid, &sinks.wheel, ax, ay, false, delta);
+            return false;
+        }
+
         // A focused NumberBox under the pointer steps on the wheel.
         if let Some(id) = self.focused_editable()
             && self.node(id).map(|n| n.kind) == Some(ControlKind::NumberBox)

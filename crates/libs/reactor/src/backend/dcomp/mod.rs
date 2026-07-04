@@ -23,6 +23,7 @@ mod input;
 mod layout;
 mod node;
 mod paint;
+mod pointer;
 mod popup;
 mod scroll;
 mod size;
@@ -31,6 +32,7 @@ mod uia;
 
 pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;
+pub(crate) use pointer::{register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
 
 use bootstrap::Compositing;
@@ -64,6 +66,12 @@ pub struct DCompBackend {
     dragging_thumb: Option<ControlId>,
     /// The node holding keyboard focus (drives the focus ring + Space/Enter).
     focused_id: Option<ControlId>,
+    /// A registered viz pointer surface (knob/slider/EQ canvas) being dragged:
+    /// its node, sinks, and the ancestor scroll offset captured at press time
+    /// (added to raw move/up coords so element-relative positions stay correct
+    /// inside a scrolled chain). Set on down over the surface, cleared on up —
+    /// implicit capture for the drag's duration.
+    pressed_surface: Option<(ControlId, std::rc::Rc<PointerSinks>, f32)>,
     /// The live popup overlay (Select/menu dropdown), if one is open.
     popup: Option<popup::Popup>,
     /// Whether the open popup's reveal animation has settled.
@@ -88,6 +96,7 @@ impl DCompBackend {
             hovered_scroll: None,
             dragging_thumb: None,
             focused_id: None,
+            pressed_surface: None,
             popup: None,
             popup_settled: true,
             hwnd,
@@ -259,6 +268,9 @@ impl Backend for DCompBackend {
         {
             let Some(node) = self.node_mut(id) else { return };
             match (prop, value) {
+            // ── Prop removal — a conditional prop diffed away reverts to its
+            // default (e.g. a Segmented pill losing its active accent fill) ──
+            (_, PropValue::Unset) => reset_prop(node, prop),
             // ── Paint props (mark the node's surface dirty) ──────────────
             (Prop::Background, PropValue::Color(c)) => {
                 node.paint.background = Some(*c);
@@ -671,6 +683,62 @@ impl Backend for DCompBackend {
         // The node's container visual — what a viz host element (SurfacePainter /
         // composition-surface) attaches its child visual under via `on_mounted`.
         self.node(id).and_then(|n| n.container.cast().ok())
+    }
+}
+
+/// Revert a prop to its default when the reconciler diffs it away
+/// (`PropValue::Unset`). Covers the props elements set conditionally; anything
+/// else keeps its last value (matching WinUI's ClearValue granularity).
+fn reset_prop(node: &mut Node, prop: Prop) {
+    use taffy::prelude::*;
+    match prop {
+        Prop::Background => {
+            node.paint.background = None;
+            node.mark_dirty();
+        }
+        Prop::Foreground => {
+            node.paint.foreground = None;
+            node.mark_dirty();
+        }
+        Prop::BorderBrush => {
+            node.paint.border_brush = None;
+            node.mark_dirty();
+        }
+        Prop::BorderThickness => {
+            node.paint.border_thickness = 0.0;
+            node.style.border = Rect::zero();
+            node.mark_dirty();
+        }
+        Prop::CornerRadius => {
+            node.paint.corner_radius = 0.0;
+            node.mark_dirty();
+        }
+        Prop::Fill => {
+            node.paint.fill = None;
+            node.mark_dirty();
+        }
+        Prop::Stroke => {
+            node.paint.stroke = None;
+            node.mark_dirty();
+        }
+        Prop::StrokeThickness => {
+            node.paint.stroke_thickness = 0.0;
+            node.mark_dirty();
+        }
+        Prop::Opacity => {
+            let _ = node.vis.SetOpacity(1.0);
+        }
+        Prop::Padding => node.style.padding = Rect::zero(),
+        Prop::Margin => node.style.margin = Rect::zero(),
+        Prop::Width => node.style.size.width = auto(),
+        Prop::Height => node.style.size.height = auto(),
+        Prop::MinWidth => node.style.min_size.width = auto(),
+        Prop::MinHeight => node.style.min_size.height = auto(),
+        Prop::MaxWidth => node.style.max_size.width = auto(),
+        Prop::MaxHeight => node.style.max_size.height = auto(),
+        Prop::HorizontalAlignment => node.h_align = -1,
+        Prop::VerticalAlignment => node.v_align = -1,
+        _ => {}
     }
 }
 
