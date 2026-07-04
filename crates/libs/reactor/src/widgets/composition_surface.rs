@@ -231,11 +231,20 @@ impl CompositionSurfaceFactory {
         let brush = compositor
             .CreateSurfaceBrushWithSurface(&surface.cast::<sys::ICompositionSurface>()?)?;
         brush.SetStretch(sys::CompositionStretch::Fill)?;
+        // Compositor-side display white-level adjust (dcomp backend): wrap the
+        // surface brush in the shared Exposure effect so live-viz surfaces track
+        // the same white-level scale as the backend's node chrome. Passthrough
+        // unless the app opted in via `set_hdr_reference_white_nits`.
+        #[cfg(feature = "dcomp-backend")]
+        let content =
+            dcomp::white::wrap_surface_brush(compositor, &brush)?;
+        #[cfg(not(feature = "dcomp-backend"))]
+        let content = brush.cast::<sys::CompositionBrush>()?;
         let sprite = compositor.CreateSpriteVisual()?;
         sprite
             .cast::<sys::IVisual>()?
             .SetSize(windows_numerics::Vector2 { x: dip_size.0, y: dip_size.1 })?;
-        sprite.SetBrush(&brush.cast::<sys::CompositionBrush>()?)?;
+        sprite.SetBrush(&content)?;
 
         let visual: sys::Visual = sprite.cast()?;
         parent.Children()?.InsertAtTop(&visual)?;

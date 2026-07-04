@@ -6,6 +6,7 @@ windows_core::link!("user32.dll" "system" fn CreateWindowExW(dwexstyle : WINDOW_
 windows_core::link!("user32.dll" "system" fn DefWindowProcW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
 windows_core::link!("user32.dll" "system" fn DestroyWindow(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn DispatchMessageW(lpmsg : *const MSG) -> LRESULT);
+windows_core::link!("user32.dll" "system" fn DisplayConfigGetDeviceInfo(requestpacket : *mut DISPLAYCONFIG_DEVICE_INFO_HEADER) -> i32);
 windows_core::link!("user32.dll" "system" fn EmptyClipboard() -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn EnableMouseInPointer(fenable : windows_core::BOOL) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn EndPaint(hwnd : HWND, lppaint : *const PAINTSTRUCT) -> windows_core::BOOL);
@@ -14,6 +15,7 @@ windows_core::link!("user32.dll" "system" fn GetCapture() -> HWND);
 windows_core::link!("user32.dll" "system" fn GetCaretBlinkTime() -> u32);
 windows_core::link!("user32.dll" "system" fn GetClientRect(hwnd : HWND, lprect : *mut RECT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn GetClipboardData(uformat : u32) -> HANDLE);
+windows_core::link!("user32.dll" "system" fn GetDisplayConfigBufferSizes(flags : QUERY_DISPLAY_CONFIG_FLAGS, numpatharrayelements : *mut u32, nummodeinfoarrayelements : *mut u32) -> windows_core::WIN32_ERROR);
 windows_core::link!("user32.dll" "system" fn GetDpiForWindow(hwnd : HWND) -> u32);
 windows_core::link!("user32.dll" "system" fn GetKeyState(nvirtkey : i32) -> i16);
 windows_core::link!("user32.dll" "system" fn GetMessageW(lpmsg : *mut MSG, hwnd : HWND, wmsgfiltermin : u32, wmsgfiltermax : u32) -> windows_core::BOOL);
@@ -48,6 +50,7 @@ windows_core::link!("user32.dll" "system" fn OpenClipboard(hwndnewowner : HWND) 
 windows_core::link!("user32.dll" "system" fn PeekMessageW(lpmsg : *mut MSG, hwnd : HWND, wmsgfiltermin : u32, wmsgfiltermax : u32, wremovemsg : PEEK_MESSAGE_REMOVE_TYPE) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn PostMessageW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn PostQuitMessage(nexitcode : i32));
+windows_core::link!("user32.dll" "system" fn QueryDisplayConfig(flags : QUERY_DISPLAY_CONFIG_FLAGS, numpatharrayelements : *mut u32, patharray : *mut DISPLAYCONFIG_PATH_INFO, nummodeinfoarrayelements : *mut u32, modeinfoarray : *mut DISPLAYCONFIG_MODE_INFO, currenttopologyid : *mut DISPLAYCONFIG_TOPOLOGY_ID) -> windows_core::WIN32_ERROR);
 windows_core::link!("user32.dll" "system" fn RegisterClassExW(param0 : *const WNDCLASSEXW) -> u16);
 windows_core::link!("user32.dll" "system" fn RegisterClassW(lpwndclass : *const WNDCLASSW) -> u16);
 windows_core::link!("user32.dll" "system" fn ReleaseCapture() -> windows_core::BOOL);
@@ -97,6 +100,8 @@ impl windows_core::RuntimeType for AnimationIterationBehavior {
 }
 pub const CF_UNICODETEXT: CLIPBOARD_FORMAT = 13;
 pub type CLIPBOARD_FORMAT = u16;
+pub const CLSID_D2D1Exposure: windows_core::GUID =
+    windows_core::GUID::from_u128(0xb56c8cfa_f634_41ee_bee0_ffa617106004);
 pub const CLSID_TF_ThreadMgr: windows_core::GUID =
     windows_core::GUID::from_u128(0x529a9e6b_6587_4f23_ab9e_9c7d683e3c50);
 pub type COLORREF = u32;
@@ -339,6 +344,110 @@ unsafe impl Send for CompositionEasingFunction {}
 unsafe impl Sync for CompositionEasingFunction {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionEffectBrush(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionEffectBrush,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionEffectBrush, CompositionBrush, CompositionObject);
+impl windows_core::RuntimeType for CompositionEffectBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionEffectBrush>();
+}
+unsafe impl windows_core::Interface for CompositionEffectBrush {
+    type Vtable = <ICompositionEffectBrush as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionEffectBrush as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionEffectBrush {
+    type Target = ICompositionEffectBrush;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionEffectBrush {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionEffectBrush";
+}
+unsafe impl Send for CompositionEffectBrush {}
+unsafe impl Sync for CompositionEffectBrush {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionEffectFactory(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionEffectFactory,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionEffectFactory, CompositionObject);
+impl windows_core::RuntimeType for CompositionEffectFactory {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionEffectFactory>();
+}
+unsafe impl windows_core::Interface for CompositionEffectFactory {
+    type Vtable = <ICompositionEffectFactory as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionEffectFactory as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionEffectFactory {
+    type Target = ICompositionEffectFactory;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionEffectFactory {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionEffectFactory";
+}
+unsafe impl Send for CompositionEffectFactory {}
+unsafe impl Sync for CompositionEffectFactory {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionEffectSourceParameter(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionEffectSourceParameter,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionEffectSourceParameter, IGraphicsEffectSource);
+impl CompositionEffectSourceParameter {
+    pub(crate) fn Create(name: &str) -> windows_core::Result<Self> {
+        Self::ICompositionEffectSourceParameterFactory(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).Create)(
+                windows_core::Interface::as_raw(this),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(name)),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    fn ICompositionEffectSourceParameterFactory<
+        R,
+        F: FnOnce(&ICompositionEffectSourceParameterFactory) -> windows_core::Result<R>,
+    >(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<
+            CompositionEffectSourceParameter,
+            ICompositionEffectSourceParameterFactory,
+        > = windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
+impl windows_core::RuntimeType for CompositionEffectSourceParameter {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionEffectSourceParameter>();
+}
+unsafe impl windows_core::Interface for CompositionEffectSourceParameter {
+    type Vtable = <ICompositionEffectSourceParameter as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICompositionEffectSourceParameter as windows_core::Interface>::IID;
+}
+impl windows_core::RuntimeName for CompositionEffectSourceParameter {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionEffectSourceParameter";
+}
+unsafe impl Send for CompositionEffectSourceParameter {}
+unsafe impl Sync for CompositionEffectSourceParameter {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionGeometricClip(windows_core::IUnknown);
 windows_core::imp::interface_hierarchy!(
     CompositionGeometricClip,
@@ -452,6 +561,34 @@ impl windows_core::RuntimeName for CompositionObject {
 }
 unsafe impl Send for CompositionObject {}
 unsafe impl Sync for CompositionObject {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionPropertySet(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionPropertySet,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionPropertySet, CompositionObject);
+impl windows_core::RuntimeType for CompositionPropertySet {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionPropertySet>();
+}
+unsafe impl windows_core::Interface for CompositionPropertySet {
+    type Vtable = <ICompositionPropertySet as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionPropertySet as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionPropertySet {
+    type Target = ICompositionPropertySet;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionPropertySet {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionPropertySet";
+}
+unsafe impl Send for CompositionPropertySet {}
+unsafe impl Sync for CompositionPropertySet {}
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompositionStretch(pub i32);
@@ -684,6 +821,257 @@ pub type DISPATCHERQUEUE_THREAD_APARTMENTTYPE = i32;
 pub type DISPATCHERQUEUE_THREAD_TYPE = i32;
 pub type DPI_AWARENESS_CONTEXT = *mut core::ffi::c_void;
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT = -4 as _;
+// ── displayconfig (SDR white level query) — copied verbatim from the generated
+// Win32 bindings in crates/libs/windows (Windows/Win32/Devices/Display/mod.rs,
+// with LUID/POINTL/RECTL from Windows/Win32/Foundation/mod.rs). ──────────────
+pub const DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL: DISPLAYCONFIG_DEVICE_INFO_TYPE =
+    DISPLAYCONFIG_DEVICE_INFO_TYPE(11);
+pub const DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME: DISPLAYCONFIG_DEVICE_INFO_TYPE =
+    DISPLAYCONFIG_DEVICE_INFO_TYPE(1);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DISPLAYCONFIG_DEVICE_INFO_HEADER {
+    pub r#type: DISPLAYCONFIG_DEVICE_INFO_TYPE,
+    pub size: u32,
+    pub adapterId: LUID,
+    pub id: u32,
+}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_DEVICE_INFO_TYPE(pub i32);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DISPLAYCONFIG_DESKTOP_IMAGE_INFO {
+    pub PathSourceSize: POINTL,
+    pub DesktopImageRegion: RECTL,
+    pub DesktopImageClip: RECTL,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_2DREGION {
+    pub cx: u32,
+    pub cy: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DISPLAYCONFIG_MODE_INFO {
+    pub infoType: DISPLAYCONFIG_MODE_INFO_TYPE,
+    pub id: u32,
+    pub adapterId: LUID,
+    pub Anonymous: DISPLAYCONFIG_MODE_INFO_0,
+}
+impl Default for DISPLAYCONFIG_MODE_INFO {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union DISPLAYCONFIG_MODE_INFO_0 {
+    pub targetMode: DISPLAYCONFIG_TARGET_MODE,
+    pub sourceMode: DISPLAYCONFIG_SOURCE_MODE,
+    pub desktopImageInfo: DISPLAYCONFIG_DESKTOP_IMAGE_INFO,
+}
+impl Default for DISPLAYCONFIG_MODE_INFO_0 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_MODE_INFO_TYPE(pub i32);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DISPLAYCONFIG_PATH_INFO {
+    pub sourceInfo: DISPLAYCONFIG_PATH_SOURCE_INFO,
+    pub targetInfo: DISPLAYCONFIG_PATH_TARGET_INFO,
+    pub flags: u32,
+}
+impl Default for DISPLAYCONFIG_PATH_INFO {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DISPLAYCONFIG_PATH_SOURCE_INFO {
+    pub adapterId: LUID,
+    pub id: u32,
+    pub Anonymous: DISPLAYCONFIG_PATH_SOURCE_INFO_0,
+    pub statusFlags: u32,
+}
+impl Default for DISPLAYCONFIG_PATH_SOURCE_INFO {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union DISPLAYCONFIG_PATH_SOURCE_INFO_0 {
+    pub modeInfoIdx: u32,
+    pub Anonymous: DISPLAYCONFIG_PATH_SOURCE_INFO_0_0,
+}
+impl Default for DISPLAYCONFIG_PATH_SOURCE_INFO_0 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DISPLAYCONFIG_PATH_SOURCE_INFO_0_0 {
+    pub _bitfield: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DISPLAYCONFIG_PATH_TARGET_INFO {
+    pub adapterId: LUID,
+    pub id: u32,
+    pub Anonymous: DISPLAYCONFIG_PATH_TARGET_INFO_0,
+    pub outputTechnology: DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY,
+    pub rotation: DISPLAYCONFIG_ROTATION,
+    pub scaling: DISPLAYCONFIG_SCALING,
+    pub refreshRate: DISPLAYCONFIG_RATIONAL,
+    pub scanLineOrdering: DISPLAYCONFIG_SCANLINE_ORDERING,
+    pub targetAvailable: windows_core::BOOL,
+    pub statusFlags: u32,
+}
+impl Default for DISPLAYCONFIG_PATH_TARGET_INFO {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union DISPLAYCONFIG_PATH_TARGET_INFO_0 {
+    pub modeInfoIdx: u32,
+    pub Anonymous: DISPLAYCONFIG_PATH_TARGET_INFO_0_0,
+}
+impl Default for DISPLAYCONFIG_PATH_TARGET_INFO_0 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DISPLAYCONFIG_PATH_TARGET_INFO_0_0 {
+    pub _bitfield: u32,
+}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_PIXELFORMAT(pub i32);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DISPLAYCONFIG_RATIONAL {
+    pub Numerator: u32,
+    pub Denominator: u32,
+}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_ROTATION(pub i32);
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_SCALING(pub i32);
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_SCANLINE_ORDERING(pub i32);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DISPLAYCONFIG_SDR_WHITE_LEVEL {
+    pub header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    pub SDRWhiteLevel: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+    pub header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    pub viewGdiDeviceName: [u16; 32],
+}
+impl Default for DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DISPLAYCONFIG_SOURCE_MODE {
+    pub width: u32,
+    pub height: u32,
+    pub pixelFormat: DISPLAYCONFIG_PIXELFORMAT,
+    pub position: POINTL,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DISPLAYCONFIG_TARGET_MODE {
+    pub targetVideoSignalInfo: DISPLAYCONFIG_VIDEO_SIGNAL_INFO,
+}
+impl Default for DISPLAYCONFIG_TARGET_MODE {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_TOPOLOGY_ID(pub i32);
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY(pub i32);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
+    pub pixelRate: u64,
+    pub hSyncFreq: DISPLAYCONFIG_RATIONAL,
+    pub vSyncFreq: DISPLAYCONFIG_RATIONAL,
+    pub activeSize: DISPLAYCONFIG_2DREGION,
+    pub totalSize: DISPLAYCONFIG_2DREGION,
+    pub Anonymous: DISPLAYCONFIG_VIDEO_SIGNAL_INFO_0,
+    pub scanLineOrdering: DISPLAYCONFIG_SCANLINE_ORDERING,
+}
+impl Default for DISPLAYCONFIG_VIDEO_SIGNAL_INFO {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union DISPLAYCONFIG_VIDEO_SIGNAL_INFO_0 {
+    pub AdditionalSignalInfo: DISPLAYCONFIG_VIDEO_SIGNAL_INFO_0_0,
+    pub videoStandard: u32,
+}
+impl Default for DISPLAYCONFIG_VIDEO_SIGNAL_INFO_0 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DISPLAYCONFIG_VIDEO_SIGNAL_INFO_0_0 {
+    pub _bitfield: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LUID {
+    pub LowPart: u32,
+    pub HighPart: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct POINTL {
+    pub x: i32,
+    pub y: i32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RECTL {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+pub const QDC_ONLY_ACTIVE_PATHS: QUERY_DISPLAY_CONFIG_FLAGS = QUERY_DISPLAY_CONFIG_FLAGS(2);
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct QUERY_DISPLAY_CONFIG_FLAGS(pub u32);
+// ── end displayconfig ────────────────────────────────────────────────────────
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DVTARGETDEVICE {
@@ -1351,6 +1739,103 @@ pub struct ICompositionEasingFunction_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
+    ICompositionEffectBrush,
+    ICompositionEffectBrush_Vtbl,
+    0xbf7f795e_83cc_44bf_a447_3e3c071789ec
+);
+impl windows_core::RuntimeType for ICompositionEffectBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionEffectBrush {
+    pub(crate) fn SetSourceParameter<P1>(&self, name: &str, source: P1) -> windows_core::Result<()>
+    where
+        P1: windows_core::Param<CompositionBrush>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetSourceParameter)(
+                windows_core::Interface::as_raw(self),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(name)),
+                source.param().abi(),
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionEffectBrush_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    GetSourceParameter: usize,
+    pub SetSourceParameter: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionEffectFactory,
+    ICompositionEffectFactory_Vtbl,
+    0xbe5624af_ba7e_4510_9850_41c0b4ff74df
+);
+impl windows_core::RuntimeType for ICompositionEffectFactory {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionEffectFactory {
+    pub(crate) fn CreateBrush(&self) -> windows_core::Result<CompositionEffectBrush> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateBrush)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionEffectFactory_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub CreateBrush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    ExtendedError: usize,
+    LoadStatus: usize,
+}
+windows_core::imp::define_interface!(
+    ICompositionEffectSourceParameter,
+    ICompositionEffectSourceParameter_Vtbl,
+    0x858ab13a_3292_4e4e_b3bb_2b6c6544a6ee
+);
+impl windows_core::RuntimeType for ICompositionEffectSourceParameter {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionEffectSourceParameter_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    Name: usize,
+}
+windows_core::imp::define_interface!(
+    ICompositionEffectSourceParameterFactory,
+    ICompositionEffectSourceParameterFactory_Vtbl,
+    0xb3d9f276_aba3_4724_acf3_d0397464db1c
+);
+impl windows_core::RuntimeType for ICompositionEffectSourceParameterFactory {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionEffectSourceParameterFactory_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub Create: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     ICompositionGeometricClip,
     ICompositionGeometricClip_Vtbl,
     0xc840b581_81c9_4444_a2c1_ccaece3a50e5
@@ -1550,6 +2035,51 @@ pub struct ICompositionObject_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    ICompositionPropertySet,
+    ICompositionPropertySet_Vtbl,
+    0xc9d6d202_5f67_4453_9117_9eadd430d3c2
+);
+impl windows_core::RuntimeType for ICompositionPropertySet {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionPropertySet {
+    pub(crate) fn InsertScalar(&self, propertyname: &str, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).InsertScalar)(
+                windows_core::Interface::as_raw(self),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(propertyname)),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionPropertySet_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    InsertColor: usize,
+    InsertMatrix3x2: usize,
+    InsertMatrix4x4: usize,
+    InsertQuaternion: usize,
+    pub InsertScalar: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        f32,
+    ) -> windows_core::HRESULT,
+    InsertVector2: usize,
+    InsertVector3: usize,
+    InsertVector4: usize,
+    TryGetColor: usize,
+    TryGetMatrix3x2: usize,
+    TryGetMatrix4x4: usize,
+    TryGetQuaternion: usize,
+    TryGetScalar: usize,
+    TryGetVector2: usize,
+    TryGetVector3: usize,
+    TryGetVector4: usize,
+}
+windows_core::imp::define_interface!(
     ICompositionSurface,
     ICompositionSurface_Vtbl,
     0x1527540d_42c7_47a6_a408_668f79a90dfb
@@ -1709,6 +2239,43 @@ impl ICompositor {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn CreateEffectFactory<P0>(
+        &self,
+        graphicseffect: P0,
+    ) -> windows_core::Result<CompositionEffectFactory>
+    where
+        P0: windows_core::Param<IGraphicsEffect>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateEffectFactory)(
+                windows_core::Interface::as_raw(self),
+                graphicseffect.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn CreateEffectFactoryWithProperties<P0, P1>(
+        &self,
+        graphicseffect: P0,
+        animatableproperties: P1,
+    ) -> windows_core::Result<CompositionEffectFactory>
+    where
+        P0: windows_core::Param<IGraphicsEffect>,
+        P1: windows_core::Param<windows_collections::IIterable<windows_core::HSTRING>>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateEffectFactoryWithProperties)(
+                windows_core::Interface::as_raw(self),
+                graphicseffect.param().abi(),
+                animatableproperties.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) fn CreateExpressionAnimation(&self) -> windows_core::Result<ExpressionAnimation> {
         unsafe {
             let mut result__ = core::mem::zeroed();
@@ -1767,6 +2334,16 @@ impl ICompositor {
         unsafe {
             let mut result__ = core::mem::zeroed();
             (windows_core::Interface::vtable(self).CreateLinearEasingFunction)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn CreatePropertySet(&self) -> windows_core::Result<CompositionPropertySet> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreatePropertySet)(
                 windows_core::Interface::as_raw(self),
                 &mut result__,
             )
@@ -1870,8 +2447,17 @@ pub struct ICompositor_Vtbl {
         windows_numerics::Vector2,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    CreateEffectFactory: usize,
-    CreateEffectFactoryWithProperties: usize,
+    pub CreateEffectFactory: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub CreateEffectFactoryWithProperties: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub CreateExpressionAnimation: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
@@ -1898,7 +2484,10 @@ pub struct ICompositor_Vtbl {
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    CreatePropertySet: usize,
+    pub CreatePropertySet: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CreateQuaternionKeyFrameAnimation: usize,
     pub CreateScalarKeyFrameAnimation: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -2330,6 +2919,317 @@ pub struct IExpressionAnimation_Vtbl {
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
+}
+// ── Windows.Graphics.Effects + the D2D effect interop — copied verbatim from
+// the generated bindings (Windows/Graphics/Effects/mod.rs and
+// Windows/Win32/System/WinRT/Graphics/Direct2D/mod.rs). `GetProperty` is typed
+// `IInspectable` here instead of `IPropertyValue` (ABI-identical transparent
+// interface pointer); only boxed `PropertyValue` instances are ever returned. ──
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GRAPHICS_EFFECT_PROPERTY_MAPPING(pub i32);
+pub const GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT: GRAPHICS_EFFECT_PROPERTY_MAPPING =
+    GRAPHICS_EFFECT_PROPERTY_MAPPING(1);
+pub const GRAPHICS_EFFECT_PROPERTY_MAPPING_UNKNOWN: GRAPHICS_EFFECT_PROPERTY_MAPPING =
+    GRAPHICS_EFFECT_PROPERTY_MAPPING(0);
+windows_core::imp::define_interface!(
+    IGraphicsEffect,
+    IGraphicsEffect_Vtbl,
+    0xcb51c0ce_8fe6_4636_b202_861faa07d8f3
+);
+impl windows_core::RuntimeType for IGraphicsEffect {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+    const NAME: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"Windows.Graphics.Effects.IGraphicsEffect");
+}
+windows_core::imp::interface_hierarchy!(
+    IGraphicsEffect,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(IGraphicsEffect, IGraphicsEffectSource);
+impl windows_core::RuntimeName for IGraphicsEffect {
+    const NAME: &'static str = "Windows.Graphics.Effects.IGraphicsEffect";
+}
+pub trait IGraphicsEffect_Impl: IGraphicsEffectSource_Impl {
+    fn Name(&self) -> windows_core::Result<windows_core::HSTRING>;
+    fn SetName(&self, name: &windows_core::HSTRING) -> windows_core::Result<()>;
+}
+impl IGraphicsEffect_Vtbl {
+    pub const fn new<Identity: IGraphicsEffect_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn Name<Identity: IGraphicsEffect_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            result__: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IGraphicsEffect_Impl::Name(this) {
+                    Ok(ok__) => {
+                        result__.write(core::mem::transmute_copy(&ok__));
+                        core::mem::forget(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn SetName<Identity: IGraphicsEffect_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            name: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                IGraphicsEffect_Impl::SetName(this, core::mem::transmute(&name)).into()
+            }
+        }
+        Self {
+            base__: windows_core::IInspectable_Vtbl::new::<Identity, IGraphicsEffect, OFFSET>(),
+            Name: Name::<Identity, OFFSET>,
+            SetName: SetName::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<IGraphicsEffect as windows_core::Interface>::IID
+    }
+}
+#[repr(C)]
+pub struct IGraphicsEffect_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub Name: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub SetName: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IGraphicsEffectD2D1Interop,
+    IGraphicsEffectD2D1Interop_Vtbl,
+    0x2fc57384_a068_44d7_a331_30982fcf7177
+);
+windows_core::imp::interface_hierarchy!(IGraphicsEffectD2D1Interop, windows_core::IUnknown);
+#[repr(C)]
+pub struct IGraphicsEffectD2D1Interop_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub GetEffectId: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::GUID,
+    ) -> windows_core::HRESULT,
+    pub GetNamedPropertyMapping: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_core::PCWSTR,
+        *mut u32,
+        *mut GRAPHICS_EFFECT_PROPERTY_MAPPING,
+    ) -> windows_core::HRESULT,
+    pub GetPropertyCount:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+    pub GetProperty: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetSource: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetSourceCount:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+}
+pub trait IGraphicsEffectD2D1Interop_Impl: windows_core::IUnknownImpl {
+    fn GetEffectId(&self) -> windows_core::Result<windows_core::GUID>;
+    fn GetNamedPropertyMapping(
+        &self,
+        name: &windows_core::PCWSTR,
+        index: *mut u32,
+        mapping: *mut GRAPHICS_EFFECT_PROPERTY_MAPPING,
+    ) -> windows_core::Result<()>;
+    fn GetPropertyCount(&self) -> windows_core::Result<u32>;
+    fn GetProperty(&self, index: u32) -> windows_core::Result<windows_core::IInspectable>;
+    fn GetSource(&self, index: u32) -> windows_core::Result<IGraphicsEffectSource>;
+    fn GetSourceCount(&self) -> windows_core::Result<u32>;
+}
+impl IGraphicsEffectD2D1Interop_Vtbl {
+    pub const fn new<Identity: IGraphicsEffectD2D1Interop_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn GetEffectId<
+            Identity: IGraphicsEffectD2D1Interop_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            id: *mut windows_core::GUID,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IGraphicsEffectD2D1Interop_Impl::GetEffectId(this) {
+                    Ok(ok__) => {
+                        id.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetNamedPropertyMapping<
+            Identity: IGraphicsEffectD2D1Interop_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            name: windows_core::PCWSTR,
+            index: *mut u32,
+            mapping: *mut GRAPHICS_EFFECT_PROPERTY_MAPPING,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                IGraphicsEffectD2D1Interop_Impl::GetNamedPropertyMapping(
+                    this,
+                    core::mem::transmute(&name),
+                    core::mem::transmute_copy(&index),
+                    core::mem::transmute_copy(&mapping),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn GetPropertyCount<
+            Identity: IGraphicsEffectD2D1Interop_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            count: *mut u32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IGraphicsEffectD2D1Interop_Impl::GetPropertyCount(this) {
+                    Ok(ok__) => {
+                        count.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetProperty<
+            Identity: IGraphicsEffectD2D1Interop_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            index: u32,
+            value: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IGraphicsEffectD2D1Interop_Impl::GetProperty(
+                    this,
+                    core::mem::transmute_copy(&index),
+                ) {
+                    Ok(ok__) => {
+                        value.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetSource<
+            Identity: IGraphicsEffectD2D1Interop_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            index: u32,
+            source: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IGraphicsEffectD2D1Interop_Impl::GetSource(
+                    this,
+                    core::mem::transmute_copy(&index),
+                ) {
+                    Ok(ok__) => {
+                        source.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetSourceCount<
+            Identity: IGraphicsEffectD2D1Interop_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            count: *mut u32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match IGraphicsEffectD2D1Interop_Impl::GetSourceCount(this) {
+                    Ok(ok__) => {
+                        count.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            GetEffectId: GetEffectId::<Identity, OFFSET>,
+            GetNamedPropertyMapping: GetNamedPropertyMapping::<Identity, OFFSET>,
+            GetPropertyCount: GetPropertyCount::<Identity, OFFSET>,
+            GetProperty: GetProperty::<Identity, OFFSET>,
+            GetSource: GetSource::<Identity, OFFSET>,
+            GetSourceCount: GetSourceCount::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<IGraphicsEffectD2D1Interop as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for IGraphicsEffectD2D1Interop {}
+windows_core::imp::define_interface!(
+    IGraphicsEffectSource,
+    IGraphicsEffectSource_Vtbl,
+    0x2d8f9ddc_4339_4eb9_9216_f9deb75658a2
+);
+impl windows_core::RuntimeType for IGraphicsEffectSource {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+    const NAME: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"Windows.Graphics.Effects.IGraphicsEffectSource",
+    );
+}
+windows_core::imp::interface_hierarchy!(
+    IGraphicsEffectSource,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeName for IGraphicsEffectSource {
+    const NAME: &'static str = "Windows.Graphics.Effects.IGraphicsEffectSource";
+}
+pub trait IGraphicsEffectSource_Impl: windows_core::IUnknownImpl {}
+impl IGraphicsEffectSource_Vtbl {
+    pub const fn new<Identity: IGraphicsEffectSource_Impl, const OFFSET: isize>() -> Self {
+        Self {
+            base__: windows_core::IInspectable_Vtbl::new::<Identity, IGraphicsEffectSource, OFFSET>(
+            ),
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<IGraphicsEffectSource as windows_core::Interface>::IID
+    }
+}
+#[repr(C)]
+pub struct IGraphicsEffectSource_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
     IInsetClip,
@@ -5816,6 +6716,86 @@ impl Default for PAINTSTRUCT {
 }
 pub type PEEK_MESSAGE_REMOVE_TYPE = u32;
 pub const PM_REMOVE: PEEK_MESSAGE_REMOVE_TYPE = 1;
+windows_core::imp::define_interface!(
+    IPropertyValueStatics,
+    IPropertyValueStatics_Vtbl,
+    0x629bdbc8_d932_4ff4_96b9_8d96c5c1e858
+);
+impl windows_core::RuntimeType for IPropertyValueStatics {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IPropertyValueStatics_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    CreateEmpty: usize,
+    CreateUInt8: usize,
+    CreateInt16: usize,
+    CreateUInt16: usize,
+    CreateInt32: usize,
+    CreateUInt32: usize,
+    CreateInt64: usize,
+    CreateUInt64: usize,
+    pub CreateSingle: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        f32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    CreateDouble: usize,
+    CreateChar16: usize,
+    CreateBoolean: usize,
+    CreateString: usize,
+    CreateInspectable: usize,
+    CreateGuid: usize,
+    CreateDateTime: usize,
+    CreateTimeSpan: usize,
+    CreatePoint: usize,
+    CreateSize: usize,
+    CreateRect: usize,
+    CreateUInt8Array: usize,
+    CreateInt16Array: usize,
+    CreateUInt16Array: usize,
+    CreateInt32Array: usize,
+    CreateUInt32Array: usize,
+    CreateInt64Array: usize,
+    CreateUInt64Array: usize,
+    CreateSingleArray: usize,
+    CreateDoubleArray: usize,
+    CreateChar16Array: usize,
+    CreateBooleanArray: usize,
+    CreateStringArray: usize,
+    CreateInspectableArray: usize,
+    CreateGuidArray: usize,
+    CreateDateTimeArray: usize,
+    CreateTimeSpanArray: usize,
+    CreatePointArray: usize,
+    CreateSizeArray: usize,
+    CreateRectArray: usize,
+}
+pub struct PropertyValue;
+impl PropertyValue {
+    pub(crate) fn CreateSingle(value: f32) -> windows_core::Result<windows_core::IInspectable> {
+        Self::IPropertyValueStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).CreateSingle)(
+                windows_core::Interface::as_raw(this),
+                value,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    fn IPropertyValueStatics<R, F: FnOnce(&IPropertyValueStatics) -> windows_core::Result<R>>(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<PropertyValue, IPropertyValueStatics> =
+            windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
+impl windows_core::RuntimeName for PropertyValue {
+    const NAME: &'static str = "Windows.Foundation.PropertyValue";
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct POINT {

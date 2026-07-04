@@ -15,7 +15,7 @@ pub use winui::WinUIBackend;
 pub(crate) mod dcomp;
 
 #[cfg(feature = "dcomp-backend")]
-pub use dcomp::{DCompBackend, DCompHost, Win32Dispatcher};
+pub use dcomp::{set_hdr_reference_white_nits, DCompBackend, DCompHost, Win32Dispatcher};
 
 /// Opaque, non-zero handle the backend assigns to every live control.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]

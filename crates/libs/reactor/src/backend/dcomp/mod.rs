@@ -29,9 +29,11 @@ mod scroll;
 mod size;
 mod theme;
 mod uia;
+pub(crate) mod white;
 
 pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;
+pub use white::set_hdr_reference_white_nits;
 pub(crate) use pointer::{register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
 

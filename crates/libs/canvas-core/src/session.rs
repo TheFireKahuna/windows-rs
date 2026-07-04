@@ -66,7 +66,10 @@ impl<'a> DrawingSession<'a> {
     }
 
     /// Prepare a linear color for this session's target: linear→sRGB encoded on an
-    /// 8-bit sRGB surface, passed through raw on a linear FP16 one.
+    /// 8-bit sRGB surface, passed through raw on a linear FP16 one. (The display
+    /// SDR-white adjustment is NOT applied here — it lives compositor-side as a
+    /// per-visual effect, so cached surface content rescales without a repaint;
+    /// see the reactor dcomp backend's white-level module.)
     fn resolve(&self, color: ColorF) -> ColorF {
         if self.encode_srgb {
             color.to_srgb()
@@ -411,6 +414,13 @@ impl<'a> DrawingSession<'a> {
     }
 
     /// Creates a bitmap suitable for use as a render target.
+    ///
+    /// The pixel format follows the session's pipeline: **FP16
+    /// (`R16G16B16A16_FLOAT`) on a linear scRGB target**, so an offscreen
+    /// intermediate (a glow shape, a cached layer) carries extended-range values
+    /// — negatives and `> 1.0` headroom — without an SDR clamp on the way back
+    /// to the surface; 8-bit `B8G8R8A8` only when the session is encoding for an
+    /// 8-bit sRGB target, where the round-trip is clamped anyway.
     pub fn create_bitmap_target(&self) -> Result<Bitmap> {
         unsafe {
             let mut dpi_x = 0.0f32;
@@ -418,9 +428,14 @@ impl<'a> DrawingSession<'a> {
             self.context.GetDpi(&mut dpi_x, &mut dpi_y);
             let pixel_size = self.context.GetPixelSize();
 
+            let format = if self.encode_srgb {
+                DXGI_FORMAT_B8G8R8A8_UNORM
+            } else {
+                DXGI_FORMAT_R16G16B16A16_FLOAT
+            };
             let properties = D2D1_BITMAP_PROPERTIES1 {
                 pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    format,
                     alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
                 dpiX: dpi_x,

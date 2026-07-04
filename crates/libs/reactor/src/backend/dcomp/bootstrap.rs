@@ -81,9 +81,12 @@ impl Compositing {
         root.cast::<IVisual>()?
             .SetScale(Vector3::new(scale, scale, 1.0))?;
 
-        // Opaque window background (bottom-most visual), sized in DIPs.
+        // Opaque window background (bottom-most visual), sized in DIPs. A color
+        // brush can't be an effect input, so the white-level module rescales its
+        // registered base color directly on display refreshes.
         let bg = compositor.CreateSpriteVisual()?;
         let bg_brush = compositor.CreateColorBrushWithColor(WINDOW_BG)?;
+        super::white::register_color_brush(&bg_brush, WINDOW_BG);
         bg.SetBrush(&bg_brush.cast::<crate::system_bindings::CompositionBrush>()?)?;
         bg.cast::<IVisual>()?
             .SetSize(Vector2::new(dip_size.0, dip_size.1))?;
@@ -132,9 +135,11 @@ impl Compositing {
         }
     }
 
-    /// Recolor the window background (theme change).
+    /// Recolor the window background (theme change). Routed through the
+    /// white-level module so the stored base color is re-based and the applied
+    /// color carries the current display white-level scale.
     pub fn set_background(&self, color: Color) {
-        let _ = self.bg_brush.SetColor(color);
+        super::white::register_color_brush(&self.bg_brush, color);
     }
 
     /// Attach a reactor root node's container directly above the background.
@@ -224,9 +229,13 @@ impl Compositing {
             .compositor
             .CreateSurfaceBrushWithSurface(&surface.cast::<ICompositionSurface>()?)?;
         let _ = brush.SetStretch(CompositionStretch::Fill);
+        // Compositor-side display white-level adjust: wraps the surface brush in
+        // the shared Exposure effect (pure passthrough unless the app opted in
+        // via `set_hdr_reference_white_nits`).
+        let content = super::white::wrap_surface_brush(&self.compositor, &brush)?;
 
         let sprite = self.compositor.CreateSpriteVisual()?;
-        sprite.SetBrush(&brush.cast::<crate::system_bindings::CompositionBrush>()?)?;
+        sprite.SetBrush(&content)?;
         // Bottom of the parent so the node's own chrome sits behind its children;
         // top for an overlay (the scroll thumb draws over the scrolled content).
         let children = parent.Children()?;
