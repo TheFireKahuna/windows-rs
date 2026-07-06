@@ -494,9 +494,153 @@ fn stop_blink(hwnd: HWND) {
     });
 }
 
+/// Physical height of the resize frame at this DPI (also the maximized
+/// client-top overhang the frame extension must pad back in).
+fn frame_y_px(hwnd: HWND) -> i32 {
+    let dpi = effective_dpi(hwnd);
+    unsafe {
+        GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
+}
+
+/// Repaint the caption band after a hover/maximize state flip.
+fn repaint_caption() {
+    if let Some(s) = shared() {
+        s.render_host.with_reconciler_mut(|r| r.backend.repaint_caption());
+    }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_ERASEBKGND => 1, // the compositor owns every pixel; never erase/flash.
+
+        // ── Extended frame: remove the native caption, keep resize borders ──
+        WM_NCCALCSIZE if wparam != 0 => {
+            let params = lparam as *mut NCCALCSIZE_PARAMS;
+            if params.is_null() {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            let top = unsafe { (*params).rgrc[0].top };
+            let r = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            // DefWindowProc reserved borders + caption; restore the top so the
+            // client extends into the caption (the reactor TitleBar band is the
+            // caption). A maximized window overhangs the monitor by the frame,
+            // so pad that back in to keep the band on-screen.
+            let pad = if unsafe { IsZoomed(hwnd) }.as_bool() {
+                frame_y_px(hwnd)
+            } else {
+                0
+            };
+            unsafe {
+                (*params).rgrc[0].top = top + pad;
+            }
+            r
+        }
+
+        // Frame hit-testing: resize borders from DefWindowProc; then the top
+        // resize band, the drawn min/max/close cluster (HTMAXBUTTON is what
+        // summons Win11 snap layouts), interactive content, and finally the
+        // caption drag region.
+        WM_NCHITTEST => {
+            let def = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            if def as u32 != HTCLIENT {
+                return def;
+            }
+            let mut pt = POINT {
+                x: (lparam & 0xFFFF) as i16 as i32,
+                y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+            };
+            unsafe {
+                let _ = ScreenToClient(hwnd, &mut pt);
+            }
+            if !unsafe { IsZoomed(hwnd) }.as_bool() && pt.y < frame_y_px(hwnd) {
+                return HTTOP as LRESULT;
+            }
+            let scale = dpi_scale(hwnd);
+            let (x, y) = (pt.x as f32 / scale, pt.y as f32 / scale);
+            let Some(s) = shared() else {
+                return HTCLIENT as LRESULT;
+            };
+            if let Some((cx, cy, cw, ch)) =
+                s.render_host.with_reconciler_mut(|r| r.backend.caption_rect())
+                && x >= cx
+                && x < cx + cw
+                && y >= cy
+                && y < cy + ch
+            {
+                let from_right = (cx + cw) - x;
+                if from_right <= caption::BTN_W {
+                    return HTCLOSE as LRESULT;
+                }
+                if from_right <= 2.0 * caption::BTN_W {
+                    return HTMAXBUTTON as LRESULT;
+                }
+                if from_right <= 3.0 * caption::BTN_W {
+                    return HTMINBUTTON as LRESULT;
+                }
+                let keep_client = s
+                    .render_host
+                    .with_reconciler_mut(|r| r.backend.wants_client_at(x, y));
+                if !keep_client {
+                    return HTCAPTION as LRESULT;
+                }
+            }
+            HTCLIENT as LRESULT
+        }
+
+        // Hover feedback for the drawn caption buttons (non-client mouse).
+        WM_NCMOUSEMOVE => {
+            if caption::set_hover(caption::index_for_hit(wparam as u32)) {
+                repaint_caption();
+            }
+            let mut t = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE | TME_NONCLIENT,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            unsafe {
+                let _ = TrackMouseEvent(&mut t);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_NCMOUSELEAVE => {
+            if caption::set_hover(-1) {
+                repaint_caption();
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        // Swallow presses on the drawn buttons (DefWindowProc would render the
+        // classic non-client chrome); dispatch the command on release.
+        WM_NCLBUTTONDOWN => {
+            let idx = caption::index_for_hit(wparam as u32);
+            if idx >= 0 {
+                caption::set_pressed(idx);
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_NCLBUTTONUP => {
+            let idx = caption::index_for_hit(wparam as u32);
+            let pressed = caption::pressed();
+            caption::set_pressed(-1);
+            if idx >= 0 && idx == pressed {
+                let cmd = match idx {
+                    0 => SC_MINIMIZE,
+                    1 if unsafe { IsZoomed(hwnd) }.as_bool() => SC_RESTORE,
+                    1 => SC_MAXIMIZE,
+                    _ => SC_CLOSE,
+                };
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_SYSCOMMAND, cmd, 0);
+                }
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
 
         WM_APP_DISPATCH => {
             if let Some(s) = shared() {
@@ -539,6 +683,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
 
         WM_MOUSEMOVE => {
+            // The cursor is in the client area — any caption-button hover ends.
+            if caption::set_hover(-1) {
+                repaint_caption();
+            }
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
                 track_leave(hwnd);
@@ -774,6 +922,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
 
         WM_SIZE => {
+            // Maximize/restore flips the drawn max-button glyph.
+            if caption::set_maximized(wparam == SIZE_MAXIMIZED) {
+                repaint_caption();
+            }
+            // Notify the app of a visibility edge: minimizing hides the window
+            // (SIZE_MINIMIZED), restoring/maximizing shows it. De-duplicated inside
+            // `note_visibility`, so an ordinary resize (already-visible → visible) is a
+            // no-op. Lets the app pause expensive off-screen work while minimized.
+            visibility::note_visibility(wparam != SIZE_MINIMIZED);
             if let Some(s) = shared() {
                 let pw = (lparam & 0xFFFF) as i32;
                 let ph = ((lparam >> 16) & 0xFFFF) as i32;

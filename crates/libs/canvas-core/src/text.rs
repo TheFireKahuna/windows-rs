@@ -67,6 +67,17 @@ impl TextFormat {
     pub fn with_weight(family: &str, size: f32, weight: FontWeight) -> Result<Self> {
         let factory = dwrite_factory()?;
 
+        // "Segoe UI" is the legacy *static* name of the Win11 system UI face; request
+        // the variable font ("Segoe UI Variable") instead so the optical-size (`opsz`)
+        // axis is available (see the automatic-axes call below). DWrite falls back to
+        // the static face if the variable family is absent, and other families (mono,
+        // Fluent icons) pass through unchanged.
+        let family = if family == "Segoe UI" {
+            "Segoe UI Variable"
+        } else {
+            family
+        };
+
         let family_wide: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
         let locale_wide: Vec<u16> = "en-us\0".encode_utf16().collect();
 
@@ -81,6 +92,16 @@ impl TextFormat {
                 PCWSTR(locale_wide.as_ptr()),
             )?
         };
+
+        // Drive the optical-size (`opsz`) axis from the em size on variable fonts —
+        // DirectWrite derives the correct DIP→point mapping and selects the
+        // size-appropriate glyph outlines (crisper small UI text, better-proportioned
+        // large text). A no-op on static faces. The modern system-font path (v3 API).
+        if let Ok(fmt3) = Interface::cast::<IDWriteTextFormat3>(&raw) {
+            unsafe {
+                let _ = fmt3.SetAutomaticFontAxes(DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE);
+            }
+        }
 
         Ok(Self { raw })
     }
@@ -396,4 +417,68 @@ pub(crate) fn dwrite_factory() -> Result<IDWriteFactory> {
     }
     let factory = factory.ok_or_else(Error::empty)?;
     Ok(SHARED.get_or_init(|| SharedFactory(factory)).0.clone())
+}
+
+// `DWRITE_PIXEL_GEOMETRY_FLAT` — grayscale, no RGB/BGR subpixel channels.
+const PIXEL_GEOMETRY_FLAT: u32 = 0;
+// `DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC` — the high-quality symmetric
+// anti-aliased outline mode modern Windows UI text uses (v1 enum value 5, shared
+// by `DWRITE_RENDERING_MODE1`).
+const RENDERING_MODE1_NATURAL_SYMMETRIC: u32 = 5;
+// `DWRITE_GRID_FIT_MODE_ENABLED` — snap glyph outlines to the pixel grid
+// (hinting). This is what makes small UI text crisp instead of soft; the base v1
+// `CreateCustomRenderingParams` can't express it, hence the v3 call below.
+const GRID_FIT_MODE_ENABLED: u32 = 2;
+// Grayscale enhanced contrast for `CreateCustomRenderingParams`. No-op on this path:
+// on NATURAL_SYMMETRIC grayscale, sweeping it (0.5 / 1.5 / 2.5) produced byte-identical
+// output on the dcomp FP16 target. Left at 0.
+const GRAYSCALE_ENHANCED_CONTRAST: f32 = 0.0;
+// Gamma for the DirectWrite text-AA coverage ramp. Not a color-space encoding and does
+// not change text color — at full coverage the pixel is the exact linear scRGB
+// foreground; it only bends the partially-covered (anti-aliased) pixels, which at UI
+// sizes is most of a ~1px stem.
+//
+// The color-correct value for a linear FP16 scRGB target is 1.0 (coverage blended in
+// linear light). Direct2D does not auto-detect the linear surface — changing this value
+// changes the written pixels, so D2D applies it as the assumed target encoding; at 2.2
+// the coverage ramp is written non-linear into the linear buffer. At 1.0, light-on-dark
+// UI text is ~26% less ink over the same glyphs (measured). Grayscale enhanced contrast
+// does not compensate (inert, above); the variable `wght` axis plateaus below 2.2's
+// apparent weight and turns the UI semibold. 2.2 matches the weight small text is
+// designed for at the design weight.
+const TEXT_AA_COVERAGE_GAMMA: f32 = 2.2;
+
+/// Custom text rendering params for the self-hosted Direct2D backend: the v3
+/// DirectWrite params (`IDWriteFactory3::CreateCustomRenderingParams`) with grid-fit
+/// ENABLED, NATURAL_SYMMETRIC grayscale outline mode, ClearType off (subpixel AA is
+/// invalid on premultiplied / transparent surfaces), and the coverage gamma from
+/// [`TEXT_AA_COVERAGE_GAMMA`]. Grid-fit + NATURAL_SYMMETRIC provide the crispness; the
+/// gamma sets the anti-aliasing coverage ramp.
+///
+/// `linear` selects a cache slot only — both slots build identical params. Falls back
+/// to `None` (Direct2D defaults) if `IDWriteFactory3` is unavailable; always present
+/// on the Win11 target.
+pub(crate) fn text_rendering_params(linear: bool) -> Option<IDWriteRenderingParams> {
+    static LINEAR: std::sync::OnceLock<Option<IDWriteRenderingParams>> = std::sync::OnceLock::new();
+    static SRGB: std::sync::OnceLock<Option<IDWriteRenderingParams>> = std::sync::OnceLock::new();
+
+    let slot = if linear { &LINEAR } else { &SRGB };
+    slot.get_or_init(|| {
+        let factory = dwrite_factory().ok()?;
+        let factory3: IDWriteFactory3 = Interface::cast(&factory).ok()?;
+        unsafe {
+            factory3
+                .CreateCustomRenderingParams(
+                    TEXT_AA_COVERAGE_GAMMA,
+                    0.0, // enhanced contrast (ClearType) — unused for grayscale
+                    GRAYSCALE_ENHANCED_CONTRAST,
+                    0.0, // ClearType level — grayscale, no subpixel
+                    PIXEL_GEOMETRY_FLAT,
+                    RENDERING_MODE1_NATURAL_SYMMETRIC,
+                    GRID_FIT_MODE_ENABLED,
+                )
+                .ok()
+        }
+    })
+    .clone()
 }

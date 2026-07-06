@@ -25,7 +25,7 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
     let dim = if node.paint.is_enabled {
         1.0
     } else {
-        theme::DISABLED_OPACITY
+        theme::disabled_opacity()
     };
     // The editable text kinds draw their own box + caret + selection (and their
     // own focus affordance), so they bypass the shared focus-ring tail below.
@@ -50,6 +50,9 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         ControlKind::ProgressRing => paint_progress_ring(session, brush, node, rect, dim),
         ControlKind::NavigationView => paint_nav(session, brush, node, rect, dim),
         ControlKind::Expander => paint_expander(session, brush, node, rect, dim),
+        // The custom caption band: only the min/max/close cluster is drawn
+        // here (the band itself is transparent; slot children are real nodes).
+        ControlKind::TitleBar => super::caption::paint(session, brush, node, rect),
         _ => return false,
     }
     if node.focused {
@@ -112,7 +115,7 @@ fn circle(session: &DrawingSession, brush: &Brush, cx: f32, cy: f32, r: f32, c: 
 /// One-shot text draw inside `rect` (builds + caches nothing — only runs on a
 /// dirty repaint, never per frame). `align`/`valign` position within the box.
 #[allow(clippy::too_many_arguments)]
-fn text(
+pub(crate) fn text(
     session: &DrawingSession,
     brush: &Brush,
     s: &str,
@@ -183,7 +186,7 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
         // Chromeless / bare button: transparent at rest, wash appears via ink.
         theme::w(0.0)
     } else {
-        theme::SURFACE_RAISED
+        theme::surface_raised()
     };
     fill_rr(session, brush, rect, radius, base, dim);
 
@@ -199,9 +202,9 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     // Label (centered). A TextLink reads as an inline accent hyperlink.
     let fg = node.paint.foreground.unwrap_or(
         if accent || checked || node.paint.style_variant == 3 {
-            theme::ACCENT
+            theme::accent()
         } else {
-            theme::TEXT
+            theme::text()
         },
     );
     text(
@@ -220,7 +223,7 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
 }
 
 fn paint_hyperlink(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let c = lerp_color(linear(theme::ACCENT), linear(theme::accent_light()), node.hover.x);
+    let c = lerp_color(linear(theme::accent()), linear(theme::accent_light()), node.hover.x);
     put_f(brush, c, dim);
     let Ok(fmt) = TextFormat::with_weight(
         "Segoe UI",
@@ -248,7 +251,7 @@ fn paint_toggle_switch(session: &DrawingSession, brush: &Brush, node: &Node, rec
 
     // Track: neutral outline (off) cross-fading to accent fill (on).
     let off = ColorF::new(0.0, 0.0, 0.0, 0.0);
-    let on = linear(theme::ACCENT);
+    let on = linear(theme::accent());
     put_f(brush, lerp_color(off, on, t), dim);
     session.fill_rounded_rect(&RoundedRect::uniform(track, radius), brush);
     if t < 0.999 {
@@ -274,7 +277,7 @@ fn paint_check_box(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
     let on = node.anim.x.clamp(0.0, 1.0);
 
     // Box fill cross-fades transparent → accent.
-    put_f(brush, lerp_color(ColorF::new(0.0, 0.0, 0.0, 0.0), linear(theme::ACCENT), on), dim);
+    put_f(brush, lerp_color(ColorF::new(0.0, 0.0, 0.0, 0.0), linear(theme::accent()), on), dim);
     session.fill_rounded_rect(&RoundedRect::uniform(bx, theme::RADIUS_SM), brush);
     stroke_rr(
         session,
@@ -316,7 +319,7 @@ fn paint_check_box(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
             "Segoe UI",
             theme::FONT_SIZE_MD,
             400,
-            theme::TEXT,
+            theme::text(),
             TextAlignment::Leading,
             ParagraphAlignment::Center,
             dim,
@@ -352,7 +355,7 @@ fn paint_segmented(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
     let idx = node.anim.x.clamp(0.0, (n.saturating_sub(1)) as f32);
     let px = pad + idx * seg_w;
     let pill = Rect::from_xywh(px + 1.0, rect.top + 1.0, seg_w - 2.0, rect.height() - 2.0);
-    let fill = if accent { theme::ACCENT } else { theme::stroke() };
+    let fill = if accent { theme::accent() } else { theme::stroke() };
     fill_rr(session, brush, pill, seg_radius, fill, dim);
 
     // Segment labels.
@@ -360,7 +363,7 @@ fn paint_segmented(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
         let sx = pad + i as f32 * seg_w;
         let sr = Rect::from_xywh(sx, rect.top, seg_w, rect.height());
         let active = i as i32 == node.ctrl.selected_index;
-        let color = if active { theme::TEXT } else { theme::TEXT_TERTIARY };
+        let color = if active { theme::text() } else { theme::text_tertiary() };
         text(
             session,
             brush,
@@ -381,7 +384,7 @@ fn paint_segmented(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
 
 fn paint_select(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let radius = theme::RADIUS_SM;
-    fill_rr(session, brush, rect, radius, theme::SURFACE_RAISED, dim);
+    fill_rr(session, brush, rect, radius, theme::surface_raised(), dim);
     let wash = ink_wash(node);
     if wash > 0.0 {
         fill_rr(session, brush, rect, radius, theme::w(wash), dim);
@@ -401,9 +404,9 @@ fn paint_select(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     };
     let lr = Rect::new(rect.left + theme::SPACE_8, rect.top, rect.right - theme::SPACE_24, rect.bottom);
     let label_color = if node.ctrl.selected_index < 0 && node.kind == ControlKind::ComboBox {
-        theme::TEXT_TERTIARY
+        theme::text_tertiary()
     } else {
-        theme::TEXT
+        theme::text()
     };
     text(
         session,
@@ -430,7 +433,7 @@ fn paint_select(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
             theme::FONT_ICON,
             8.0,
             400,
-            theme::TEXT_SECONDARY,
+            theme::text_secondary(),
             TextAlignment::Center,
             ParagraphAlignment::Center,
             dim,
@@ -452,7 +455,7 @@ fn paint_slider(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     let groove = Rect::from_xywh(x0, cy - theme::SLIDER_TRACK / 2.0, x1 - x0, theme::SLIDER_TRACK);
     fill_rr(session, brush, groove, theme::SLIDER_TRACK / 2.0, theme::w(0.06), dim);
     let fill = Rect::from_xywh(x0, cy - theme::SLIDER_TRACK / 2.0, thumb_x - x0, theme::SLIDER_TRACK);
-    fill_rr(session, brush, fill, theme::SLIDER_TRACK / 2.0, theme::ACCENT, dim);
+    fill_rr(session, brush, fill, theme::SLIDER_TRACK / 2.0, theme::accent(), dim);
 
     // Thumb (white) with a faint hover halo.
     if node.hover.x > 0.01 || node.pressed {
@@ -475,12 +478,12 @@ fn paint_progress_bar(session: &DrawingSession, brush: &Brush, node: &Node, rect
         let travel = rect.width() + seg_w;
         let x = (node.phase % 1.0) * travel - seg_w;
         let seg = Rect::from_xywh(x.max(0.0), cy - h / 2.0, seg_w.min(rect.width()), h);
-        fill_rr(session, brush, seg, h / 2.0, theme::ACCENT, dim);
+        fill_rr(session, brush, seg, h / 2.0, theme::accent(), dim);
     } else {
         let frac = super::ctrl_value_frac(node) as f32;
         if frac > 0.0 {
             let fill = Rect::from_xywh(0.0, cy - h / 2.0, rect.width() * frac, h);
-            fill_rr(session, brush, fill, h / 2.0, theme::ACCENT, dim);
+            fill_rr(session, brush, fill, h / 2.0, theme::accent(), dim);
         }
     }
 }
@@ -502,7 +505,7 @@ fn paint_progress_ring(session: &DrawingSession, brush: &Brush, node: &Node, rec
         let frac = super::ctrl_value_frac(node) as f32;
         (-std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2 + frac * std::f32::consts::TAU)
     };
-    arc(session, brush, cx, cy, r, thick, a0, a1, theme::ACCENT, dim);
+    arc(session, brush, cx, cy, r, thick, a0, a1, theme::accent(), dim);
 }
 
 /// Tessellate an arc as short chords (PathBuilder has no arc; the surface only
@@ -538,7 +541,7 @@ pub(crate) const NAV_ITEM_H: f32 = theme::NAV_RAIL_W;
 
 fn paint_nav(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let rail = Rect::from_xywh(0.0, 0.0, theme::NAV_RAIL_W, rect.height());
-    fill_rr(session, brush, rail, 0.0, theme::SURFACE_SUNKEN, dim);
+    fill_rr(session, brush, rail, 0.0, theme::surface_sunken(), dim);
     // Right divider.
     put(brush, theme::stroke_divider(), dim);
     session.draw_line(
@@ -561,13 +564,13 @@ fn paint_nav(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, d
         fill_rr(session, brush, tile, theme::RADIUS_SM, theme::accent_fill(), dim);
         let bar_h = theme::SPACE_16;
         let bar = Rect::from_xywh(0.0, iy + (NAV_ITEM_H - bar_h) / 2.0, theme::BORDER_W * 3.0, bar_h);
-        fill_rr(session, brush, bar, theme::BORDER_W, theme::ACCENT, dim);
+        fill_rr(session, brush, bar, theme::BORDER_W, theme::accent(), dim);
     }
 
     for (i, label) in node.ctrl.items.iter().enumerate() {
         let iy = i as f32 * NAV_ITEM_H;
         let active = i as i32 == sel;
-        let color = if active { theme::ACCENT } else { theme::TEXT_TERTIARY };
+        let color = if active { theme::accent() } else { theme::text_tertiary() };
         let cell = Rect::from_xywh(0.0, iy, theme::NAV_RAIL_W, NAV_ITEM_H);
         let glyph = node
             .ctrl
@@ -613,9 +616,9 @@ fn editor_text_alignment(align: i32) -> TextAlignment {
 fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let radius = theme::RADIUS_SM;
     // Box: raised surface fill + a border that turns accent on focus.
-    fill_rr(session, brush, rect, radius, theme::SURFACE_RAISED, dim);
+    fill_rr(session, brush, rect, radius, theme::surface_raised(), dim);
     let border_c = if node.focused {
-        theme::ACCENT
+        theme::accent()
     } else {
         theme::stroke()
     };
@@ -655,7 +658,7 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
             "Segoe UI",
             font_size,
             400,
-            theme::TEXT_TERTIARY,
+            theme::text_tertiary(),
             editor_text_alignment(align),
             ParagraphAlignment::Center,
             dim,
@@ -670,7 +673,7 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
             if let Ok(rects) =
                 layout.hit_test_range(a as u32, (b - a) as u32, origin_x, origin_y)
             {
-                put(brush, theme::with_alpha(theme::ACCENT, 0.32), dim);
+                put(brush, theme::with_alpha(theme::accent(), 0.32), dim);
                 for (x, y, w, h) in rects {
                     session.fill_rect(&Rect::from_xywh(x, y, w, h), brush);
                 }
@@ -678,7 +681,7 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
         }
         // The text run.
         if let Some(layout) = &ed.layout {
-            put(brush, node.paint.foreground.unwrap_or(theme::TEXT), dim);
+            put(brush, node.paint.foreground.unwrap_or(theme::text()), dim);
             session.draw_text_layout(Vector2::new(origin_x, origin_y), layout, brush);
         }
     }
@@ -686,7 +689,7 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     // Caret (blink-gated).
     if node.focused && ed.blink_on {
         let caret_x = origin_x + ed.caret_x();
-        put(brush, theme::TEXT, dim);
+        put(brush, theme::text(), dim);
         session.draw_line(
             Vector2::new(caret_x, origin_y + 1.0),
             Vector2::new(caret_x, origin_y + text_h - 1.0),
@@ -715,7 +718,7 @@ fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, hover: f32, di
         brush,
         theme::BORDER_W,
     );
-    let color = theme::with_alpha(theme::TEXT_SECONDARY, 0.6 + 0.4 * hover.clamp(0.0, 1.0));
+    let color = theme::with_alpha(theme::text_secondary(), 0.6 + 0.4 * hover.clamp(0.0, 1.0));
     let cr_up = Rect::new(col_x, rect.top, rect.right, mid);
     let cr_down = Rect::new(col_x, mid, rect.right, rect.bottom);
     if let Some(g) = glyph_str(GLYPH_CHEVRON_UP) {
@@ -732,7 +735,7 @@ fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, hover: f32, di
 
 fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let header = Rect::from_xywh(0.0, 0.0, rect.width(), theme::ROW_H + theme::SPACE_8);
-    fill_rr(session, brush, header, theme::RADIUS_MD, theme::SURFACE_RAISED, dim);
+    fill_rr(session, brush, header, theme::RADIUS_MD, theme::surface_raised(), dim);
     let wash = ink_wash(node);
     if wash > 0.0 {
         fill_rr(session, brush, header, theme::RADIUS_MD, theme::w(wash), dim);
@@ -748,7 +751,7 @@ fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Re
         "Segoe UI",
         theme::FONT_SIZE_MD,
         600,
-        theme::TEXT,
+        theme::text(),
         TextAlignment::Leading,
         ParagraphAlignment::Center,
         dim,
@@ -766,7 +769,7 @@ fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Re
             theme::FONT_ICON,
             10.0,
             400,
-            theme::TEXT_SECONDARY,
+            theme::text_secondary(),
             TextAlignment::Center,
             ParagraphAlignment::Center,
             dim,

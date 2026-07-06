@@ -15,6 +15,7 @@
 use crate::backend::ControlId;
 
 mod bootstrap;
+mod caption;
 mod controls;
 mod dispatch;
 mod editor;
@@ -28,11 +29,14 @@ mod popup;
 mod scroll;
 mod size;
 mod theme;
+pub use theme::{set_host_tokens, HostTokens};
 mod uia;
+pub(crate) mod visibility;
 pub(crate) mod white;
 
 pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;
+pub use visibility::set_window_visibility_callback;
 pub use white::set_hdr_reference_white_nits;
 pub(crate) use pointer::{register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
@@ -132,7 +136,8 @@ impl DCompBackend {
     pub(crate) fn relayout_and_paint(&mut self) {
         if let Some(root) = self.root {
             let (w, h) = self.dip_size;
-            layout::compute(&mut self.arena, root, w, h);
+            let scale = self.scale();
+            layout::compute(&mut self.arena, root, w, h, scale);
             self.repaint();
         }
     }
@@ -222,12 +227,47 @@ impl DCompBackend {
                 child.style.grid_column.end = span(1);
                 child.v_align = 1;
             } else {
-                // Span both columns and center across the full caption width.
+                // Span both columns and stretch across the full caption width:
+                // the app's content row owns its own spread (brand hard-left,
+                // device centered — the mockup layout). A child with an
+                // explicit alignment still wins via `resolve_align`.
                 child.style.grid_column.start = line(1);
                 child.style.grid_column.end = span(2);
-                child.h_align = 1;
+                child.h_align = 3;
                 child.v_align = 1;
             }
+        }
+    }
+
+    /// The TitleBar node (the custom caption band), if the tree has one.
+    fn titlebar_id(&self) -> Option<ControlId> {
+        self.arena
+            .iter()
+            .find(|(_, n)| n.kind == ControlKind::TitleBar)
+            .map(|(id, _)| id)
+    }
+
+    /// The caption band's layout box in window DIPs (`(x, y, w, h)`), if a
+    /// TitleBar is mounted — the host's non-client hit-test region.
+    pub(crate) fn caption_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let n = self.arena.get(self.titlebar_id()?)?;
+        Some((n.rect.x, n.rect.y, n.rect.w, n.rect.h))
+    }
+
+    /// Whether the point sits over content that must stay client (an
+    /// interactive control or a registered viz pointer surface) — keeps the
+    /// caption drag region from swallowing the titlebar's own controls.
+    pub(crate) fn wants_client_at(&self, x: f32, y: f32) -> bool {
+        self.interactive_at(x, y).is_some() || self.surface_at(x, y).is_some()
+    }
+
+    /// Repaint the caption band (hover / maximized state changed).
+    pub(crate) fn repaint_caption(&mut self) {
+        if let Some(id) = self.titlebar_id() {
+            if let Some(n) = self.arena.get_mut(id) {
+                n.mark_dirty();
+            }
+            self.repaint();
         }
     }
 

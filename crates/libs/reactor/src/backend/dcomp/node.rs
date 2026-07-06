@@ -416,7 +416,10 @@ pub(crate) fn is_interactive_kind(kind: ControlKind) -> bool {
 fn draws_own_chrome(kind: ControlKind) -> bool {
     is_interactive_kind(kind)
         || is_text_editable(kind)
-        || matches!(kind, ControlKind::ProgressBar | ControlKind::ProgressRing)
+        || matches!(
+            kind,
+            ControlKind::ProgressBar | ControlKind::ProgressRing | ControlKind::TitleBar
+        )
 }
 
 /// The editable text kinds, each backed by a shared [`Editor`].
@@ -519,6 +522,24 @@ fn default_style(kind: ControlKind) -> taffy::Style {
             s.display = Display::Block;
             s.min_size.height = length(theme::ROW_H);
         }
+        ControlKind::ToggleSwitch => {
+            // Drawn control with no children: without an intrinsic size it
+            // measures 0×0 in a flex row and vanishes. Matches the painted
+            // 40×20 track (`paint_toggle_switch`).
+            s.display = Display::Flex;
+            s.min_size = Size {
+                width: length(40.0),
+                height: length(20.0),
+            };
+        }
+        ControlKind::CheckBox => {
+            // Intrinsic 18×18 painted box (`paint_check_box`).
+            s.display = Display::Flex;
+            s.min_size = Size {
+                width: length(18.0),
+                height: length(18.0),
+            };
+        }
         ControlKind::TitleBar => {
             // The custom caption strip. Its two slot children (Content and the
             // trailing RightHeader/footer) are attached by `set_header_element` /
@@ -531,10 +552,12 @@ fn default_style(kind: ControlKind) -> taffy::Style {
             s.grid_template_columns =
                 vec![GridTemplateComponent::Single(flex(1.0)), GridTemplateComponent::Single(auto())];
             s.grid_template_rows = vec![GridTemplateComponent::Single(auto())];
-            // Standard 48px caption height with the token side padding.
+            // Standard 48px caption height with the token side padding. The
+            // right padding additionally reserves the drawn min/max/close
+            // cluster (the frame is extended; the buttons are ours).
             s.min_size.height = length(theme::ROW_H + theme::SPACE_16);
             s.padding.left = length(theme::SPACE_16);
-            s.padding.right = length(theme::SPACE_16);
+            s.padding.right = length(theme::SPACE_16 + super::caption::CLUSTER_W);
         }
         _ => {
             s.display = Display::Flex;
@@ -587,6 +610,10 @@ impl Arena {
     /// Iterate every live node mutably (order unspecified).
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Node> {
         self.nodes.values_mut()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (ControlId, &Node)> {
+        self.nodes.iter().map(|(k, n)| (ControlId::new(*k), n))
     }
 
     pub fn remove(&mut self, id: ControlId) -> Option<Node> {

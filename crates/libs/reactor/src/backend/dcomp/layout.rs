@@ -18,7 +18,14 @@ use windows_numerics::{Vector2, Vector3};
 /// Compute layout for the tree rooted at `root` into a `width` x `height` (DIP)
 /// box, pushing each node's offset/size onto its container and recording its
 /// absolute [`LaidRect`](super::node::LaidRect) for hit-testing.
-pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f32) {
+///
+/// `scale` is the DIP→physical-pixel factor (dpi/96): every assigned rect is
+/// snapped to the physical pixel grid (WinUI's `UseLayoutRounding`). The root
+/// visual carries a `SetScale(scale)`, so a fractional DIP offset lands between
+/// physical pixels and the compositor bilinear-resamples the whole surface —
+/// text and hairlines blur. Snapping in DIP space by the physical grid keeps
+/// every surface on integer pixels.
+pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f32, scale: f32) {
     rebuild_text(arena, root);
     resolve_align(arena, root, false, false);
 
@@ -82,8 +89,14 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
         },
     );
 
-    assign(arena, &tree, root, 0.0, 0.0);
+    assign(arena, &tree, root, 0.0, 0.0, 0.0, 0.0, scale.max(0.01));
     sync(arena, root);
+}
+
+/// Snap a DIP coordinate to the physical pixel grid.
+#[inline]
+fn snap(v: f32, scale: f32) -> f32 {
+    (v * scale).round() / scale
 }
 
 /// WinRT alignment (`Left/Top`=0, `Center`=1, `Right/Bottom`=2, `Stretch`=3) to a
@@ -255,7 +268,24 @@ fn track(g: &GridLength) -> GridTemplateComponent<String> {
 
 /// Walk the computed tree: write each node's absolute (window-relative) rect for
 /// hit-testing and push its relative offset + size onto its container visual.
-fn assign(arena: &mut Arena, tree: &TaffyTree<ControlId>, id: ControlId, ox: f32, oy: f32) {
+///
+/// `(ox, oy)` is the parent's raw (Taffy) absolute origin — children accumulate
+/// raw positions so rounding never drifts down the tree — while `(sox, soy)` is
+/// the parent's *snapped* absolute origin: the visual's relative offset is the
+/// difference of snapped absolutes, so each node lands exactly on its snapped
+/// absolute rect on screen. Sizes snap by edge (`right - left`), keeping shared
+/// edges between siblings coincident.
+#[allow(clippy::too_many_arguments)]
+fn assign(
+    arena: &mut Arena,
+    tree: &TaffyTree<ControlId>,
+    id: ControlId,
+    ox: f32,
+    oy: f32,
+    sox: f32,
+    soy: f32,
+    scale: f32,
+) {
     let (taffy_id, children) = match arena.get(id) {
         Some(n) => (n.taffy_id, n.children.clone()),
         None => return,
@@ -267,29 +297,37 @@ fn assign(arena: &mut Arena, tree: &TaffyTree<ControlId>, id: ControlId, ox: f32
     };
     let rel = (l.location.x, l.location.y);
     let (ax, ay) = (ox + rel.0, oy + rel.1);
-    let (w, h) = (l.size.width, l.size.height);
+    let (aw, ah) = (l.size.width, l.size.height);
+    // Snapped absolute rect (edge-snapped so adjacent siblings stay flush).
+    let (sx, sy) = (snap(ax, scale), snap(ay, scale));
+    let w = snap(ax + aw, scale) - sx;
+    let h = snap(ay + ah, scale) - sy;
     if let Some(n) = arena.get_mut(id) {
         let resized = (n.rect.w, n.rect.h) != (w, h);
-        n.rect = LaidRect { x: ax, y: ay, w, h };
+        n.rect = LaidRect { x: sx, y: sy, w, h };
         // The compositor moves/sizes the node — no repaint for a move; a size
         // change does need the node's surface rebuilt at the new pixel extent.
-        let _ = n.vis.SetOffset(Vector3::new(rel.0, rel.1, 0.0));
+        let _ = n.vis.SetOffset(Vector3::new(sx - sox, sy - soy, 0.0));
         let _ = n.vis.SetSize(Vector2::new(w, h));
         if resized {
             n.mark_dirty();
-            // Notify any viz host (SurfacePainter / composition surface) bound to
-            // this node's container that its size changed (the DComp analogue of
-            // XAML's FrameworkElement.SizeChanged). Skip the identity cast entirely
-            // when nothing is subscribed (the common case).
-            if size::has_listeners()
-                && let Some(key) = size::container_key(&n.container)
-            {
-                size::fire_element_size(key, w, h);
-            }
+        }
+        // Notify any viz host (SurfacePainter / composition surface) bound to
+        // this node's container of its laid-out size (the DComp analogue of
+        // XAML's FrameworkElement.SizeChanged). Fired every pass — NOT gated on
+        // `resized` — because a listener may register after this node's size
+        // already settled (mount callbacks vs layout ordering); the registry
+        // change-gates per listener, so an unchanged size is a cheap no-op and a
+        // fresh listener is guaranteed its first delivery on the next pass. Skip
+        // the identity cast entirely when nothing is subscribed (the common case).
+        if size::has_listeners()
+            && let Some(key) = size::container_key(&n.container)
+        {
+            size::fire_element_size(key, w, h);
         }
     }
     for c in &children {
-        assign(arena, tree, *c, ax, ay);
+        assign(arena, tree, *c, ax, ay, sx, sy, scale);
     }
 
     // Scroll containers: measure content extent, clamp the offset, and apply the
@@ -309,7 +347,9 @@ fn assign(arena: &mut Arena, tree: &TaffyTree<ControlId>, id: ControlId, ox: f32
             n.anim.target = n.anim.target.clamp(0.0, max_scroll);
             n.anim.x = n.anim.x.clamp(0.0, max_scroll);
         }
-        let scroll = arena.get(id).map(|n| n.anim.x).unwrap_or(0.0);
+        // Snap the scroll translation too: rects are pixel-snapped, so a
+        // fractional scroll offset would push every child back off the grid.
+        let scroll = snap(arena.get(id).map(|n| n.anim.x).unwrap_or(0.0), scale);
         for c in &children {
             if let Some(cn) = arena.get_mut(*c) {
                 let _ = cn.vis.SetOffset(Vector3::new(

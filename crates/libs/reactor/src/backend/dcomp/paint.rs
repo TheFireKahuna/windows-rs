@@ -11,7 +11,6 @@ use super::bootstrap::Compositing;
 use super::node::{linear, Arena, Node};
 use super::*;
 use crate::backend::ControlKind;
-use crate::Color;
 use windows_canvas_core::{
     bindings::ID2D1DeviceContext, ColorF, DrawingSession, Ellipse, Rect, RoundedRect, Vector2,
 };
@@ -59,8 +58,11 @@ fn paint_node(
         .is_some_and(|n| n.has_chrome() || n.surf.is_some());
     if needs {
         let (w, h) = arena.get(id).map(|n| (n.rect.w, n.rect.h)).unwrap_or((0.0, 0.0));
-        let pw = (w * scale).ceil() as i32;
-        let ph = (h * scale).ceil() as i32;
+        // Layout rects are pixel-snapped, so `w * scale` is integral (mod FP
+        // noise); `round` keeps the surface exactly 1:1 with the visual where
+        // `ceil` could add a phantom pixel and force a resample.
+        let pw = (w * scale).round() as i32;
+        let ph = (h * scale).round() as i32;
 
         let has_surface = arena.get(id).is_some_and(|n| n.surf.is_some());
         if !has_surface {
@@ -315,7 +317,9 @@ fn paint_text(
     rect: Rect,
 ) {
     let Some(layout) = &node.text_layout else { return };
-    let fg = node.paint.foreground.unwrap_or(Color::rgb(0xEA, 0xEA, 0xEC));
+    // Un-styled text takes the themable primary text token — never a literal —
+    // so a host token table (e.g. HDR-anchored values) restyles default text too.
+    let fg = node.paint.foreground.unwrap_or_else(theme::text);
     brush.set_color(linear(fg));
     session.draw_text_layout(Vector2::new(rect.left, rect.top), layout, brush);
 }
@@ -355,7 +359,9 @@ fn paint_line(
     } else {
         1.0
     };
-    let color = node.paint.stroke.unwrap_or(Color::rgb(0x80, 0x80, 0x80));
+    // Un-styled lines take the themable strong stroke (the nearest Fluent role
+    // to the old mid-grey literal), keeping every default color host-restylable.
+    let color = node.paint.stroke.unwrap_or_else(theme::stroke_strong);
     brush.set_color(linear(color));
     session.draw_line(
         Vector2::new(rect.left + l.x1 as f32, rect.top + l.y1 as f32),

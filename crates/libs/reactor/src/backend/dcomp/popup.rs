@@ -300,7 +300,7 @@ impl Popup {
         }
 
         // Raised surface + hairline.
-        set(brush, theme::SURFACE_RAISED);
+        set(brush, theme::surface_raised());
         session.fill_rounded_rect(&RoundedRect::uniform(p, theme::RADIUS_MD), brush);
         set(brush, theme::stroke());
         let inset = Rect::new(p.left + 0.5, p.top + 0.5, p.right - 0.5, p.bottom - 0.5);
@@ -339,7 +339,7 @@ impl Popup {
             draw_text(session, brush, &row.text, lr, "Segoe UI", theme::FONT_SIZE_MD, 400, fg(row), TextAlignment::Leading);
             // Trailing shortcut hint.
             if !row.shortcut.is_empty() {
-                draw_text(session, brush, &row.shortcut, lr, "Segoe UI", theme::FONT_SIZE_SM, 400, theme::TEXT_TERTIARY, TextAlignment::Trailing);
+                draw_text(session, brush, &row.shortcut, lr, "Segoe UI", theme::FONT_SIZE_SM, 400, theme::text_tertiary(), TextAlignment::Trailing);
             }
             ry += ROW;
         }
@@ -348,11 +348,11 @@ impl Popup {
 
 fn fg(row: &MenuRow) -> crate::Color {
     if row.danger {
-        theme::BAD
+        theme::bad()
     } else if row.enabled {
-        theme::TEXT
+        theme::text()
     } else {
-        theme::TEXT_DISABLED
+        theme::text_disabled()
     }
 }
 

@@ -42,7 +42,7 @@ impl DCompBackend {
 
     /// The deepest interactive node containing the point, accounting for the
     /// scroll offset of any ancestor scroll container.
-    fn interactive_at(&self, x: f32, y: f32) -> Option<ControlId> {
+    pub(super) fn interactive_at(&self, x: f32, y: f32) -> Option<ControlId> {
         let root = self.root?;
         let mut best = None;
         self.hit_walk(root, x, y, &mut best, true);
@@ -61,7 +61,7 @@ impl DCompBackend {
     /// `pointer.rs`) under the point, with its sinks and the scroll-adjusted
     /// point for element-relative coordinates. Cheap `None` when nothing is
     /// registered.
-    fn surface_at(
+    pub(super) fn surface_at(
         &self,
         x: f32,
         y: f32,

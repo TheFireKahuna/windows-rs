@@ -406,11 +406,20 @@ impl<'a> DrawingSession<'a> {
     /// Switch text antialiasing to grayscale. Required for correct text on
     /// premultiplied / transparent composition surfaces: ClearType subpixel AA
     /// blends against an assumed-opaque background and is invalid there.
+    ///
+    /// Text rendering params (see [`crate::text::text_rendering_params`]) use a
+    /// display-referred **~2.2 blend gamma** on both the sRGB and the linear FP16
+    /// scRGB targets, grid-fit ENABLED, and the modern NATURAL_SYMMETRIC grayscale
+    /// outline mode. A linear (1.0) blend gamma erodes light text over fills, so
+    /// re-tuning must A/B on the dcomp backend.
     pub fn set_grayscale_text_antialiasing(&self) {
         unsafe {
             self.context
-                .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE)
-        };
+                .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            if let Some(params) = text_rendering_params(!self.encode_srgb) {
+                self.context.SetTextRenderingParams(&params);
+            }
+        }
     }
 
     /// Creates a bitmap suitable for use as a render target.
@@ -595,3 +604,4 @@ impl Drop for DrawingSession<'_> {
         }
     }
 }
+

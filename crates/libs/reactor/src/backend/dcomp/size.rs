@@ -58,14 +58,30 @@ pub(crate) fn register_element_size(
         t.set(v + 1);
         v
     });
+    let cb: Rc<dyn Fn(f32, f32)> = Rc::new(f);
+    // The node may already be laid out (registration runs from a mount callback,
+    // which can land after the layout pass that sized it). Deliver the current
+    // size immediately — the "fires once after the first layout pass" contract —
+    // and seed `last` with it so the next layout pass doesn't re-deliver. A
+    // not-yet-laid-out node reads (0,0): keep the NaN seed so the first real
+    // layout pass delivers.
+    let current = cv
+        .cast::<crate::system_bindings::IVisual>()
+        .ok()
+        .and_then(|v| v.Size().ok())
+        .map(|s| (s.x, s.y))
+        .filter(|&(w, h)| w > 0.0 && h > 0.0);
     LISTENERS.with(|l| {
         l.borrow_mut().push(Entry {
             token,
             key,
-            cb: Rc::new(f),
-            last: Cell::new((f32::NAN, f32::NAN)),
+            cb: cb.clone(),
+            last: Cell::new(current.unwrap_or((f32::NAN, f32::NAN))),
         })
     });
+    if let Some((w, h)) = current {
+        cb(w, h);
+    }
     // The revoker holds a ref to the container as its `source` (kept alive for the
     // subscription); `remove` ignores it and unregisters purely by `token`.
     let source: IUnknown = cv.cast()?;

@@ -217,6 +217,11 @@ pub struct DWRITE_FONT_AXIS_VALUE {
     pub axisTag: DWRITE_FONT_AXIS_TAG,
     pub value: f32,
 }
+pub type DWRITE_AUTOMATIC_FONT_AXES = i32;
+/// Let DirectWrite drive the `opsz` (optical-size) axis from the format's em
+/// size — the correct DIP→point mapping for a variable font (Segoe UI Variable),
+/// derived by DWrite rather than hand-computed.
+pub const DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE: DWRITE_AUTOMATIC_FONT_AXES = 1;
 pub type DWRITE_FONT_STRETCH = i32;
 pub const DWRITE_FONT_STRETCH_NORMAL: DWRITE_FONT_STRETCH = 5;
 pub type DWRITE_FONT_STYLE = i32;
@@ -2431,6 +2436,17 @@ impl ID2D1RenderTarget {
             );
         }
     }
+    pub(crate) unsafe fn SetTextRenderingParams<P0>(&self, textrenderingparams: P0)
+    where
+        P0: windows_core::Param<IDWriteRenderingParams>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetTextRenderingParams)(
+                windows_core::Interface::as_raw(self),
+                textrenderingparams.param().abi(),
+            );
+        }
+    }
     pub(crate) unsafe fn PushAxisAlignedClip(
         &self,
         cliprect: *const D2D_RECT_F,
@@ -2634,7 +2650,8 @@ pub struct ID2D1RenderTarget_Vtbl {
     pub SetTextAntialiasMode:
         unsafe extern "system" fn(*mut core::ffi::c_void, D2D1_TEXT_ANTIALIAS_MODE),
     GetTextAntialiasMode: usize,
-    SetTextRenderingParams: usize,
+    pub SetTextRenderingParams:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void),
     GetTextRenderingParams: usize,
     SetTags: usize,
     GetTags: usize,
@@ -3197,6 +3214,31 @@ impl IDWriteFactory {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    /// `gamma`/`enhancedcontrast`/`cleartypelevel` per DWrite; `pixelgeometry` is
+    /// `DWRITE_PIXEL_GEOMETRY` (0 = FLAT), `renderingmode` is
+    /// `DWRITE_RENDERING_MODE` (0 = DEFAULT).
+    pub(crate) unsafe fn CreateCustomRenderingParams(
+        &self,
+        gamma: f32,
+        enhancedcontrast: f32,
+        cleartypelevel: f32,
+        pixelgeometry: u32,
+        renderingmode: u32,
+    ) -> windows_core::Result<IDWriteRenderingParams> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateCustomRenderingParams)(
+                windows_core::Interface::as_raw(self),
+                gamma,
+                enhancedcontrast,
+                cleartypelevel,
+                pixelgeometry,
+                renderingmode,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
 }
 #[repr(C)]
 pub struct IDWriteFactory_Vtbl {
@@ -3210,7 +3252,15 @@ pub struct IDWriteFactory_Vtbl {
     CreateFontFace: usize,
     CreateRenderingParams: usize,
     CreateMonitorRenderingParams: usize,
-    CreateCustomRenderingParams: usize,
+    pub CreateCustomRenderingParams: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        f32,
+        f32,
+        f32,
+        u32,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     RegisterFontFileLoader: usize,
     UnregisterFontFileLoader: usize,
     pub CreateTextFormat: unsafe extern "system" fn(
@@ -3248,6 +3298,24 @@ pub struct IDWriteFactory_Vtbl {
 unsafe impl Send for IDWriteFactory {}
 unsafe impl Sync for IDWriteFactory {}
 impl windows_core::RuntimeName for IDWriteFactory {}
+windows_core::imp::define_interface!(
+    IDWriteRenderingParams,
+    IDWriteRenderingParams_Vtbl,
+    0x2f0da53a_2add_47cd_82ee_d9ec34688e75
+);
+windows_core::imp::interface_hierarchy!(IDWriteRenderingParams, windows_core::IUnknown);
+#[repr(C)]
+pub struct IDWriteRenderingParams_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetGamma: usize,
+    GetEnhancedContrast: usize,
+    GetClearTypeLevel: usize,
+    GetPixelGeometry: usize,
+    GetRenderingMode: usize,
+}
+unsafe impl Send for IDWriteRenderingParams {}
+unsafe impl Sync for IDWriteRenderingParams {}
+impl windows_core::RuntimeName for IDWriteRenderingParams {}
 windows_core::imp::define_interface!(
     IDWriteFactory1,
     IDWriteFactory1_Vtbl,
@@ -3354,11 +3422,57 @@ windows_core::imp::interface_hierarchy!(
     IDWriteFactory1,
     IDWriteFactory2
 );
+impl IDWriteFactory3 {
+    // Hand-exposed (the generator stubbed every IDWriteFactory3 method): the v3
+    // `CreateCustomRenderingParams` adds `grayscaleEnhancedContrast` and
+    // `gridFitMode` over the base v1 call, plus `DWRITE_RENDERING_MODE1`. It
+    // returns an `IDWriteRenderingParams3`; that derives from the base
+    // `IDWriteRenderingParams` (same vtable prefix), so we wrap the returned
+    // pointer as the base type and need neither the v3 interface nor its IID.
+    // Enum args are passed as raw `u32` (bit-identical to the C enums), matching
+    // the base `CreateCustomRenderingParams` binding above.
+    pub(crate) unsafe fn CreateCustomRenderingParams(
+        &self,
+        gamma: f32,
+        enhancedcontrast: f32,
+        grayscaleenhancedcontrast: f32,
+        cleartypelevel: f32,
+        pixelgeometry: u32,
+        renderingmode1: u32,
+        gridfitmode: u32,
+    ) -> windows_core::Result<IDWriteRenderingParams> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateCustomRenderingParams)(
+                windows_core::Interface::as_raw(self),
+                gamma,
+                enhancedcontrast,
+                grayscaleenhancedcontrast,
+                cleartypelevel,
+                pixelgeometry,
+                renderingmode1,
+                gridfitmode,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
 #[repr(C)]
 pub struct IDWriteFactory3_Vtbl {
     pub base__: IDWriteFactory2_Vtbl,
     CreateGlyphRunAnalysis: usize,
-    CreateCustomRenderingParams: usize,
+    pub CreateCustomRenderingParams: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        f32,
+        f32,
+        f32,
+        f32,
+        u32,
+        u32,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CreateFontFaceReference: usize,
     CreateFontFaceReference2: usize,
     GetSystemFontSet: usize,
@@ -3754,6 +3868,19 @@ impl IDWriteTextFormat3 {
             .ok()
         }
     }
+
+    pub(crate) unsafe fn SetAutomaticFontAxes(
+        &self,
+        automaticfontaxes: DWRITE_AUTOMATIC_FONT_AXES,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetAutomaticFontAxes)(
+                windows_core::Interface::as_raw(self),
+                automaticfontaxes,
+            )
+            .ok()
+        }
+    }
 }
 #[repr(C)]
 pub struct IDWriteTextFormat3_Vtbl {
@@ -3766,7 +3893,10 @@ pub struct IDWriteTextFormat3_Vtbl {
     GetFontAxisValueCount: usize,
     GetFontAxisValues: usize,
     GetAutomaticFontAxes: usize,
-    SetAutomaticFontAxes: usize,
+    pub SetAutomaticFontAxes: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DWRITE_AUTOMATIC_FONT_AXES,
+    ) -> windows_core::HRESULT,
 }
 unsafe impl Send for IDWriteTextFormat3 {}
 unsafe impl Sync for IDWriteTextFormat3 {}
