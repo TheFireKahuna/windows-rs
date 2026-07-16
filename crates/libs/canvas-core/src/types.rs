@@ -196,6 +196,19 @@ impl Paint for RadialGradient {
     }
 }
 
+/// A tiling bitmap brush (wrap-extended, nearest-sampled): one fill repeats its
+/// bitmap across the target at a 1:1 texel-to-pixel mapping. The primitive for
+/// tiled dither / noise overlays — see
+/// [`DrawingSession::create_tiling_brush`](crate::DrawingSession::create_tiling_brush).
+pub struct TilingBrush(pub(crate) ID2D1BitmapBrush1);
+
+impl sealed::Sealed for TilingBrush {}
+impl Paint for TilingBrush {
+    fn as_raw_brush(&self) -> &ID2D1Brush {
+        &self.0
+    }
+}
+
 /// A gradient stop (position 0.0–1.0 along the gradient axis).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct GradientStop {

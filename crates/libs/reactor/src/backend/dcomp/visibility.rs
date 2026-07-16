@@ -2,7 +2,7 @@
 //!
 //! The dcomp host does not hand the app a per-window event object — the app only
 //! gives [`crate::DCompHost::render`] a render fn — so, mirroring
-//! [`crate::set_hdr_reference_white_nits`], the app registers a **process-global**
+//! [`crate::set_output_color_transform`], the app registers a **process-global**
 //! callback BEFORE the window is created and the host invokes it from its `wnd_proc`
 //! whenever the window's visibility changes (minimize ↔ restore). The app uses it to
 //! pause expensive off-screen work — e.g. a live analyzer's IPC demand, so a hidden
@@ -30,7 +30,7 @@ static LAST: AtomicU8 = AtomicU8::new(0);
 /// Register a process-global window-visibility callback: invoked with `true` when the
 /// window becomes visible (restored / shown) and `false` when it becomes hidden
 /// (minimized). Call **before** the window is created (like
-/// [`crate::set_hdr_reference_white_nits`]); only the first registration is kept.
+/// [`crate::set_output_color_transform`]); only the first registration is kept.
 ///
 /// The callback runs on the UI thread inside the window procedure — keep it cheap and
 /// non-blocking (post to another thread for real work).

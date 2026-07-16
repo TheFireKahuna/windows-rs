@@ -68,19 +68,42 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
             width: AvailableSpace::Definite(width),
             height: AvailableSpace::Definite(height),
         },
-        |known, _available, _node_id, ctx, _style| {
+        |known, available, _node_id, ctx, _style| {
             if let (Some(w), Some(h)) = (known.width, known.height) {
                 return Size { width: w, height: h };
             }
             if let Some(id) = ctx
                 && let Some(node) = arena.get(*id)
                 && let Some(layout) = &node.text_layout
-                && let Ok((tw, th)) = layout.measure()
             {
-                return Size {
-                    width: known.width.unwrap_or(tw),
-                    height: known.height.unwrap_or(th),
-                };
+                // A wrapping run reflows against whatever width Taffy is asking
+                // about, so `measure()` below reports the WRAPPED height instead of
+                // the one-line height of the layout's construction box. Without
+                // this the box stays as `build_text_layout` made it and
+                // `set_word_wrap` is inert — a `.wrap()` paragraph measures (and so
+                // paints) as one long line and overflows its parent.
+                //
+                // The min-content mapping is exact rather than approximate: wrapping
+                // into a zero-width box breaks at every opportunity, so the reported
+                // width is the longest single word — which is min-content's
+                // definition. Max-content is the unconstrained single line.
+                //
+                // Non-wrapping runs keep the construction box untouched: their
+                // intrinsic width IS the measurement, and pills/labels size to it.
+                if node.paint.wrap {
+                    let constraint = known.width.or(match available.width {
+                        AvailableSpace::Definite(w) => Some(w),
+                        AvailableSpace::MinContent => Some(0.0),
+                        AvailableSpace::MaxContent => None,
+                    });
+                    let _ = layout.set_max_width(constraint.unwrap_or(f32::INFINITY));
+                }
+                if let Ok((tw, th)) = layout.measure() {
+                    return Size {
+                        width: known.width.unwrap_or(tw),
+                        height: known.height.unwrap_or(th),
+                    };
+                }
             }
             Size {
                 width: known.width.unwrap_or(0.0),
@@ -194,7 +217,11 @@ fn build_text_layout(
 ) -> Option<TextLayout> {
     let fmt = TextFormat::with_weight(family, size, windows_canvas_core::FontWeight(weight as i32))
         .ok()?;
-    // Single line, generous box; intrinsic width comes from `measure()`.
+    // A generous construction box, i.e. the run's max-content state: unconstrained,
+    // so `measure()` reports the intrinsic single-line size. A non-wrapping run is
+    // measured and painted in exactly this state. A wrapping one is re-flowed
+    // against a real width by the measure callback, and pinned to its final laid
+    // width by `assign` — see both for why the box does not start at the constraint.
     let layout = TextLayout::new(text, &fmt, 100_000.0, 100_000.0).ok()?;
     let _ = layout.set_word_wrap(wrap);
     Some(layout)
@@ -310,6 +337,21 @@ fn assign(
         let _ = n.vis.SetOffset(Vector3::new(sx - sox, sy - soy, 0.0));
         let _ = n.vis.SetSize(Vector2::new(w, h));
         if resized {
+            n.mark_dirty();
+        }
+        // Pin a wrapping run's reflow box to the width it was actually given. This
+        // is the single authoritative writer of that width: the measure callback
+        // probes a node several times per pass (min-content, max-content, then the
+        // definite size), and since the `TextLayout` is shared mutable COM state,
+        // whichever probe ran last would otherwise decide how paint reflows. Here
+        // the final answer is known, so paint needs no constraint logic of its own.
+        // Re-flowing changes which glyphs land where without necessarily changing
+        // the node's box, so this repaints on a width change that `resized` misses.
+        if n.paint.wrap
+            && let Some(layout) = &n.text_layout
+            && layout.metrics().is_ok_and(|m| m.layout_width != w)
+        {
+            let _ = layout.set_max_width(w);
             n.mark_dirty();
         }
         // Notify any viz host (SurfacePainter / composition surface) bound to

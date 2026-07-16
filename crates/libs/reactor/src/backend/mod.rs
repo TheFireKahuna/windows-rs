@@ -16,8 +16,8 @@ pub(crate) mod dcomp;
 
 #[cfg(feature = "dcomp-backend")]
 pub use dcomp::{
-    set_hdr_reference_white_nits, set_host_tokens, set_window_visibility_callback, DCompBackend,
-    DCompHost, HostTokens, Win32Dispatcher,
+    set_display_change_callback, set_host_tokens, set_output_color_transform,
+    set_window_visibility_callback, DCompBackend, DCompHost, HostTokens, Win32Dispatcher,
 };
 
 /// Opaque, non-zero handle the backend assigns to every live control.

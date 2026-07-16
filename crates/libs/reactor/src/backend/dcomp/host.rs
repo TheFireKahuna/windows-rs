@@ -179,12 +179,6 @@ impl DCompHost {
         let scale = (dpi as f32 / 96.0).max(0.01);
         let dip = (pw as f32 / scale, ph as f32 / scale);
 
-        // Seed the display white-level scale from the window's monitor before
-        // any brush exists, so the first paint already carries it (no-op unless
-        // the app opted in via `set_hdr_reference_white_nits`). Also primes the
-        // monitor cache the WM_WINDOWPOSCHANGED handler diffs against.
-        white::refresh_if_monitor_changed(hwnd);
-
         let comp = Compositing::new(hwnd, pw, ph, dpi as f32)?;
         let mut backend = DCompBackend::new(comp, dip, dpi as f32, hwnd as isize);
         // Honour the OS light/dark app theme for the window backdrop at startup
@@ -890,24 +884,32 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             0
         }
 
-        // The display mode / topology changed — the SDR white level may have too.
+        // The display mode / topology changed — HDR toggled, the SDR white level or
+        // panel changed. Let the app re-fit its colour map (it owns colour policy via
+        // the callback), then repaint all chrome so already-painted surfaces pick up
+        // the new draw-time map. Viz surfaces repaint every frame, so only static
+        // chrome needs the nudge.
         WM_DISPLAYCHANGE => {
-            white::refresh_from_display(hwnd);
+            display_change::note_display_change(hwnd);
+            if let Some(s) = shared() {
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.mark_all_dirty_and_repaint());
+            }
             0
         }
 
-        // The window moved/resized: re-query the white level only when it landed
-        // on a different monitor, then fall through to DefWindowProc (which
-        // synthesizes WM_SIZE / WM_MOVE from WM_WINDOWPOSCHANGED).
+        // The window moved/resized: re-fit only when it landed on a different
+        // monitor, then fall through to DefWindowProc (which synthesizes WM_SIZE /
+        // WM_MOVE from WM_WINDOWPOSCHANGED).
         WM_WINDOWPOSCHANGED => {
-            white::refresh_if_monitor_changed(hwnd);
+            display_change::note_possible_monitor_change(hwnd);
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
         WM_SETTINGCHANGE => {
-            // The OS "SDR content brightness" slider broadcasts a plain
-            // WM_SETTINGCHANGE; the refresh is cheap and no-ops on no change.
-            white::refresh_from_display(hwnd);
+            // The OS "SDR content brightness" slider and auto-colour / HDR-mode
+            // toggles broadcast a plain WM_SETTINGCHANGE, so re-fit the colour map.
+            display_change::note_display_change(hwnd);
             // An "ImmersiveColorSet" change flips the system light/dark theme.
             if is_immersive_color_set(lparam)
                 && let Some(s) = shared()

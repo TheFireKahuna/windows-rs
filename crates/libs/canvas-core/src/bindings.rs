@@ -23,6 +23,7 @@ pub struct D2D1_BEZIER_SEGMENT {
 }
 pub type D2D1_BITMAP_OPTIONS = i32;
 pub const D2D1_BITMAP_OPTIONS_CANNOT_DRAW: D2D1_BITMAP_OPTIONS = 2;
+pub const D2D1_BITMAP_OPTIONS_CPU_READ: D2D1_BITMAP_OPTIONS = 4;
 pub const D2D1_BITMAP_OPTIONS_NONE: D2D1_BITMAP_OPTIONS = 0;
 pub const D2D1_BITMAP_OPTIONS_TARGET: D2D1_BITMAP_OPTIONS = 1;
 #[repr(C)]
@@ -36,11 +37,22 @@ pub struct D2D1_BITMAP_PROPERTIES1 {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct D2D1_BITMAP_BRUSH_PROPERTIES1 {
+    pub extendModeX: D2D1_EXTEND_MODE,
+    pub extendModeY: D2D1_EXTEND_MODE,
+    pub interpolationMode: D2D1_INTERPOLATION_MODE,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct D2D1_BRUSH_PROPERTIES {
     pub opacity: f32,
     pub transform: windows_numerics::Matrix3x2,
 }
+pub type D2D1_PRIMITIVE_BLEND = i32;
+pub const D2D1_PRIMITIVE_BLEND_SOURCE_OVER: D2D1_PRIMITIVE_BLEND = 0;
+pub const D2D1_PRIMITIVE_BLEND_ADD: D2D1_PRIMITIVE_BLEND = 3;
 pub type D2D1_BUFFER_PRECISION = i32;
+pub const D2D1_BUFFER_PRECISION_16BPC_FLOAT: D2D1_BUFFER_PRECISION = 4;
 pub type D2D1_CAP_STYLE = i32;
 pub const D2D1_CAP_STYLE_FLAT: D2D1_CAP_STYLE = 0;
 pub const D2D1_CAP_STYLE_ROUND: D2D1_CAP_STYLE = 2;
@@ -54,7 +66,11 @@ pub struct D2D1_COLOR_F {
     pub b: f32,
     pub a: f32,
 }
+pub type D2D1_COLOR_INTERPOLATION_MODE = i32;
+pub const D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT: D2D1_COLOR_INTERPOLATION_MODE = 0;
 pub type D2D1_COLOR_SPACE = i32;
+pub const D2D1_COLOR_SPACE_SRGB: D2D1_COLOR_SPACE = 1;
+pub const D2D1_COLOR_SPACE_SCRGB: D2D1_COLOR_SPACE = 2;
 pub type D2D1_COMPOSITE_MODE = i32;
 pub type D2D1_DASH_STYLE = i32;
 pub const D2D1_DASH_STYLE_DASH: D2D1_DASH_STYLE = 1;
@@ -78,6 +94,7 @@ pub struct D2D1_ELLIPSE {
 }
 pub type D2D1_EXTEND_MODE = i32;
 pub const D2D1_EXTEND_MODE_CLAMP: D2D1_EXTEND_MODE = 0;
+pub const D2D1_EXTEND_MODE_WRAP: D2D1_EXTEND_MODE = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct D2D1_FACTORY_OPTIONS {
@@ -102,6 +119,7 @@ pub struct D2D1_GRADIENT_STOP {
     pub color: D2D1_COLOR_F,
 }
 pub type D2D1_INTERPOLATION_MODE = i32;
+pub const D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR: D2D1_INTERPOLATION_MODE = 0;
 pub const D2D1_INTERPOLATION_MODE_LINEAR: D2D1_INTERPOLATION_MODE = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -114,12 +132,28 @@ pub const D2D1_LINE_JOIN_BEVEL: D2D1_LINE_JOIN = 1;
 pub const D2D1_LINE_JOIN_MITER: D2D1_LINE_JOIN = 0;
 pub const D2D1_LINE_JOIN_ROUND: D2D1_LINE_JOIN = 2;
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct D2D1_MAPPED_RECT {
+    pub pitch: u32,
+    pub bits: *mut u8,
+}
+impl Default for D2D1_MAPPED_RECT {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+pub type D2D1_MAP_OPTIONS = i32;
+pub const D2D1_MAP_OPTIONS_READ: D2D1_MAP_OPTIONS = 1;
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct D2D1_PIXEL_FORMAT {
     pub format: DXGI_FORMAT,
     pub alphaMode: D2D1_ALPHA_MODE,
 }
+pub type D2D1_PROPERTY = i32;
+pub const D2D1_PROPERTY_PRECISION: D2D1_PROPERTY = -2147483641;
 pub type D2D1_PROPERTY_TYPE = i32;
+pub const D2D1_PROPERTY_TYPE_ENUM: D2D1_PROPERTY_TYPE = 11;
 pub const D2D1_PROPERTY_TYPE_FLOAT: D2D1_PROPERTY_TYPE = 5;
 pub const D2D1_PROPERTY_TYPE_VECTOR4: D2D1_PROPERTY_TYPE = 8;
 #[repr(C)]
@@ -164,6 +198,20 @@ pub struct D2D_RECT_F {
     pub top: f32,
     pub right: f32,
     pub bottom: f32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct D2D_POINT_2U {
+    pub x: u32,
+    pub y: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct D2D_RECT_U {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -461,6 +509,25 @@ impl ID2D1Bitmap {
             result__
         }
     }
+    pub(crate) unsafe fn CopyFromBitmap<P1>(
+        &self,
+        destpoint: Option<*const D2D_POINT_2U>,
+        bitmap: P1,
+        srcrect: Option<*const D2D_RECT_U>,
+    ) -> windows_core::Result<()>
+    where
+        P1: windows_core::Param<ID2D1Bitmap>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).CopyFromBitmap)(
+                windows_core::Interface::as_raw(self),
+                destpoint.unwrap_or(core::mem::zeroed()),
+                bitmap.param().abi(),
+                srcrect.unwrap_or(core::mem::zeroed()),
+            )
+            .ok()
+        }
+    }
 }
 #[repr(C)]
 pub struct ID2D1Bitmap_Vtbl {
@@ -469,7 +536,12 @@ pub struct ID2D1Bitmap_Vtbl {
     GetPixelSize: usize,
     GetPixelFormat: usize,
     GetDpi: usize,
-    CopyFromBitmap: usize,
+    pub CopyFromBitmap: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const D2D_POINT_2U,
+        *mut core::ffi::c_void,
+        *const D2D_RECT_U,
+    ) -> windows_core::HRESULT,
     CopyFromRenderTarget: usize,
     CopyFromMemory: usize,
 }
@@ -500,12 +572,68 @@ pub struct ID2D1Bitmap1_Vtbl {
     GetColorContext: usize,
     GetOptions: usize,
     GetSurface: usize,
-    Map: usize,
-    Unmap: usize,
+    pub Map: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        D2D1_MAP_OPTIONS,
+        *mut D2D1_MAPPED_RECT,
+    ) -> windows_core::HRESULT,
+    pub Unmap: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+}
+impl ID2D1Bitmap1 {
+    pub(crate) unsafe fn Map(&self, options: D2D1_MAP_OPTIONS) -> windows_core::Result<D2D1_MAPPED_RECT> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Map)(
+                windows_core::Interface::as_raw(self),
+                options,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn Unmap(&self) -> windows_core::Result<()> {
+        unsafe { (windows_core::Interface::vtable(self).Unmap)(windows_core::Interface::as_raw(self)).ok() }
+    }
 }
 unsafe impl Send for ID2D1Bitmap1 {}
 unsafe impl Sync for ID2D1Bitmap1 {}
 impl windows_core::RuntimeName for ID2D1Bitmap1 {}
+windows_core::imp::define_interface!(
+    ID2D1BitmapBrush1,
+    ID2D1BitmapBrush1_Vtbl,
+    0x41343a53_e41a_49a2_91cd_21793bbb62e5
+);
+impl core::ops::Deref for ID2D1BitmapBrush1 {
+    type Target = ID2D1Brush;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1BitmapBrush1,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Brush
+);
+#[repr(C)]
+pub struct ID2D1BitmapBrush1_Vtbl {
+    pub base__: ID2D1Brush_Vtbl,
+    // ID2D1BitmapBrush
+    SetExtendModeX: usize,
+    SetExtendModeY: usize,
+    SetInterpolationMode: usize,
+    SetBitmap: usize,
+    GetExtendModeX: usize,
+    GetExtendModeY: usize,
+    GetInterpolationMode: usize,
+    GetBitmap: usize,
+    // ID2D1BitmapBrush1
+    SetInterpolationMode1: usize,
+    GetInterpolationMode1: usize,
+}
+unsafe impl Send for ID2D1BitmapBrush1 {}
+unsafe impl Sync for ID2D1BitmapBrush1 {}
+impl windows_core::RuntimeName for ID2D1BitmapBrush1 {}
 windows_core::imp::define_interface!(
     ID2D1Brush,
     ID2D1Brush_Vtbl,
@@ -895,6 +1023,64 @@ impl ID2D1DeviceContext {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) unsafe fn CreateBitmapBrush<P0>(
+        &self,
+        bitmap: P0,
+        bitmapbrushproperties: Option<*const D2D1_BITMAP_BRUSH_PROPERTIES1>,
+        brushproperties: Option<*const D2D1_BRUSH_PROPERTIES>,
+    ) -> windows_core::Result<ID2D1BitmapBrush1>
+    where
+        P0: windows_core::Param<ID2D1Bitmap>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateBitmapBrush)(
+                windows_core::Interface::as_raw(self),
+                bitmap.param().abi(),
+                bitmapbrushproperties.unwrap_or(core::mem::zeroed()) as _,
+                brushproperties.unwrap_or(core::mem::zeroed()) as _,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn SetPrimitiveBlend(&self, blend: D2D1_PRIMITIVE_BLEND) {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetPrimitiveBlend)(
+                windows_core::Interface::as_raw(self),
+                blend,
+            );
+        }
+    }
+    /// The D2D1.1 overload: unlike the base render-target one, it takes the
+    /// gradient-texture `bufferPrecision` — the ONLY way to get a non-8-bit
+    /// gradient realization (8-bit textures posterize subtle gradients on FP16
+    /// linear targets).
+    pub(crate) unsafe fn CreateGradientStopCollection1(
+        &self,
+        straightalphagradientstops: &[D2D1_GRADIENT_STOP],
+        preinterpolationspace: D2D1_COLOR_SPACE,
+        postinterpolationspace: D2D1_COLOR_SPACE,
+        bufferprecision: D2D1_BUFFER_PRECISION,
+        extendmode: D2D1_EXTEND_MODE,
+        colorinterpolationmode: D2D1_COLOR_INTERPOLATION_MODE,
+    ) -> windows_core::Result<ID2D1GradientStopCollection1> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateGradientStopCollection)(
+                windows_core::Interface::as_raw(self),
+                straightalphagradientstops.as_ptr(),
+                straightalphagradientstops.len() as u32,
+                preinterpolationspace,
+                postinterpolationspace,
+                bufferprecision,
+                extendmode,
+                colorinterpolationmode,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) unsafe fn CreateEffect(
         &self,
         effectid: *const windows_core::GUID,
@@ -1016,9 +1202,25 @@ pub struct ID2D1DeviceContext_Vtbl {
         *const windows_core::GUID,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    CreateGradientStopCollection: usize,
+    pub CreateGradientStopCollection: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const D2D1_GRADIENT_STOP,
+        u32,
+        D2D1_COLOR_SPACE,
+        D2D1_COLOR_SPACE,
+        D2D1_BUFFER_PRECISION,
+        D2D1_EXTEND_MODE,
+        D2D1_COLOR_INTERPOLATION_MODE,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CreateImageBrush: usize,
-    CreateBitmapBrush: usize,
+    pub CreateBitmapBrush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *const D2D1_BITMAP_BRUSH_PROPERTIES1,
+        *const D2D1_BRUSH_PROPERTIES,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub CreateCommandList: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
@@ -1033,7 +1235,8 @@ pub struct ID2D1DeviceContext_Vtbl {
     pub GetTarget: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void),
     SetRenderingControls: usize,
     GetRenderingControls: usize,
-    SetPrimitiveBlend: usize,
+    pub SetPrimitiveBlend:
+        unsafe extern "system" fn(*mut core::ffi::c_void, D2D1_PRIMITIVE_BLEND),
     GetPrimitiveBlend: usize,
     SetUnitMode: usize,
     GetUnitMode: usize,
@@ -1893,6 +2096,35 @@ pub struct ID2D1GradientStopCollection_Vtbl {
 unsafe impl Send for ID2D1GradientStopCollection {}
 unsafe impl Sync for ID2D1GradientStopCollection {}
 impl windows_core::RuntimeName for ID2D1GradientStopCollection {}
+windows_core::imp::define_interface!(
+    ID2D1GradientStopCollection1,
+    ID2D1GradientStopCollection1_Vtbl,
+    0xae1572f4_5dd0_4777_998b_9279472ae63b
+);
+impl core::ops::Deref for ID2D1GradientStopCollection1 {
+    type Target = ID2D1GradientStopCollection;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1GradientStopCollection1,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1GradientStopCollection
+);
+#[repr(C)]
+pub struct ID2D1GradientStopCollection1_Vtbl {
+    pub base__: ID2D1GradientStopCollection_Vtbl,
+    GetGradientStops1: usize,
+    GetPreInterpolationSpace: usize,
+    GetPostInterpolationSpace: usize,
+    GetBufferPrecision: usize,
+    GetColorInterpolationMode: usize,
+}
+unsafe impl Send for ID2D1GradientStopCollection1 {}
+unsafe impl Sync for ID2D1GradientStopCollection1 {}
+impl windows_core::RuntimeName for ID2D1GradientStopCollection1 {}
 windows_core::imp::define_interface!(
     ID2D1Image,
     ID2D1Image_Vtbl,

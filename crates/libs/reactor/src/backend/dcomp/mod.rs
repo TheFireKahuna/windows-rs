@@ -16,8 +16,10 @@ use crate::backend::ControlId;
 
 mod bootstrap;
 mod caption;
+mod color_out;
 mod controls;
 mod dispatch;
+mod display_change;
 mod editor;
 mod host;
 mod input;
@@ -32,12 +34,12 @@ mod theme;
 pub use theme::{set_host_tokens, HostTokens};
 mod uia;
 pub(crate) mod visibility;
-pub(crate) mod white;
 
+pub use color_out::set_output_color_transform;
 pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;
+pub use display_change::set_display_change_callback;
 pub use visibility::set_window_visibility_callback;
-pub use white::set_hdr_reference_white_nits;
 pub(crate) use pointer::{register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
 
@@ -420,9 +422,17 @@ impl Backend for DCompBackend {
                 node.mark_dirty();
             }
             (Prop::TextWrapping | Prop::TextWrappingWrap, _) => {
-                // WinRT TextWrapping: NoWrap = 1, Wrap = 2, WrapWholeWords = 3.
+                // WinRT TextWrapping: NoWrap = 1, Wrap = 2, WrapWholeWords = 3 — and
+                // 0 for a widget that never set one, since the generated TextBlock
+                // bindings push this prop unconditionally and the field's Rust default
+                // is `TextWrapping(0)`. Only a real Wrap value wraps: 0 is "unset",
+                // which must mean NoWrap to match XAML's own TextBlock default.
+                // Reading it as `!= 1` instead marked virtually every text node in the
+                // tree as wrapping — inert only for as long as the DWrite box stayed
+                // unconstrained (see `layout::build_text_layout`), and silently
+                // wrapping every label the moment it did not.
                 let wrap = match value {
-                    PropValue::I32(v) => *v != 1,
+                    PropValue::I32(v) => *v > 1,
                     PropValue::Bool(b) => *b,
                     _ => true,
                 };

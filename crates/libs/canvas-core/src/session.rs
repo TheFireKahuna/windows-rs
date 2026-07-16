@@ -213,25 +213,54 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
-    /// Resolve a stop list for this session's target and pick the interpolation
-    /// gamma. Stops enter linear. On a linear (FP16) target the colors pass through
-    /// raw and interpolation runs in linear space (`GAMMA_1_0`) to match them; on an
-    /// 8-bit sRGB target the colors are linear→sRGB encoded and interpolation stays
-    /// in the perceptual `GAMMA_2_2` space (matching the encoded endpoints).
-    fn resolve_stops(&self, stops: &[GradientStop]) -> (Vec<D2D1_GRADIENT_STOP>, D2D1_GAMMA) {
-        let abi: Vec<D2D1_GRADIENT_STOP> = stops
+    /// Resolve a stop list into ABI stops for this session's target: linear→sRGB
+    /// encoded on an 8-bit sRGB target, raw linear on an FP16 one.
+    fn resolve_stops(&self, stops: &[GradientStop]) -> Vec<D2D1_GRADIENT_STOP> {
+        stops
             .iter()
             .map(|s| D2D1_GRADIENT_STOP {
                 position: s.position,
                 color: self.resolve(s.color).into(),
             })
-            .collect();
-        let gamma = if self.encode_srgb {
-            D2D1_GAMMA_2_2
-        } else {
-            D2D1_GAMMA_1_0
-        };
-        (abi, gamma)
+            .collect()
+    }
+
+    /// Build the stop collection matched to the target.
+    ///
+    /// Direct2D realizes every gradient brush by baking its stops into a small
+    /// lookup texture, and the D2D1.0 `CreateGradientStopCollection` bakes an
+    /// **8-bit** texture unconditionally — on a linear FP16 target a subtle
+    /// near-black gradient then posterizes into a handful of flat rings *at the
+    /// brush*, before compositing, no matter how smooth the authored stops are.
+    /// So on a linear target this uses the D2D1.1 overload with a
+    /// **`FLOAT16` gradient texture** (scRGB in/out, straight-alpha
+    /// interpolation in linear light); the 8-bit sRGB target keeps the classic
+    /// gamma-2.2 collection, whose 8-bit texture matches its own surface depth.
+    fn create_stop_collection(
+        &self,
+        abi_stops: &[D2D1_GRADIENT_STOP],
+    ) -> Result<ID2D1GradientStopCollection> {
+        unsafe {
+            if self.encode_srgb {
+                self.context.CreateGradientStopCollection(
+                    abi_stops,
+                    D2D1_GAMMA_2_2,
+                    D2D1_EXTEND_MODE_CLAMP,
+                )
+            } else {
+                self.context
+                    .CreateGradientStopCollection1(
+                        abi_stops,
+                        D2D1_COLOR_SPACE_SCRGB,
+                        D2D1_COLOR_SPACE_SCRGB,
+                        D2D1_BUFFER_PRECISION_16BPC_FLOAT,
+                        D2D1_EXTEND_MODE_CLAMP,
+                        D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT,
+                    )
+                    .map(|c| c.cast())
+                    .and_then(|c| c)
+            }
+        }
     }
 
     /// Stops define colors at positions 0.0–1.0 along the axis from `start` to `end`.
@@ -241,13 +270,9 @@ impl<'a> DrawingSession<'a> {
         end: Vector2,
         stops: &[GradientStop],
     ) -> Result<LinearGradient> {
-        let (abi_stops, gamma) = self.resolve_stops(stops);
+        let abi_stops = self.resolve_stops(stops);
+        let collection = self.create_stop_collection(&abi_stops)?;
         unsafe {
-            let collection = self.context.CreateGradientStopCollection(
-                &abi_stops,
-                gamma,
-                D2D1_EXTEND_MODE_CLAMP,
-            )?;
             let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
                 startPoint: start,
                 endPoint: end,
@@ -266,13 +291,9 @@ impl<'a> DrawingSession<'a> {
         radius_y: f32,
         stops: &[GradientStop],
     ) -> Result<RadialGradient> {
-        let (abi_stops, gamma) = self.resolve_stops(stops);
+        let abi_stops = self.resolve_stops(stops);
+        let collection = self.create_stop_collection(&abi_stops)?;
         unsafe {
-            let collection = self.context.CreateGradientStopCollection(
-                &abi_stops,
-                gamma,
-                D2D1_EXTEND_MODE_CLAMP,
-            )?;
             let props = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
                 center,
                 gradientOriginOffset: Vector2::new(0.0, 0.0),
@@ -459,6 +480,88 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
+    /// Upload an FP16 (`R16G16B16A16_FLOAT`) bitmap from RGBA `f32` texels
+    /// (`width_px × height_px × 4` values, row-major, premultiplied alpha, linear
+    /// extended-range — negatives and `> 1.0` are preserved). The bitmap's DPI is
+    /// stamped from the session, so through a [`create_tiling_brush`]
+    /// (Self::create_tiling_brush) one texel lands on exactly one physical pixel.
+    ///
+    /// The signed-texel upload primitive for dither / noise tiles (a zero-mean
+    /// tile needs negative values, which only a FLOAT format carries).
+    pub fn create_bitmap_fp16(
+        &self,
+        width_px: u32,
+        height_px: u32,
+        rgba: &[f32],
+    ) -> Result<Bitmap> {
+        assert_eq!(
+            rgba.len(),
+            (width_px * height_px * 4) as usize,
+            "texel buffer must be width*height*4 f32s"
+        );
+        let half: Vec<u16> = rgba.iter().map(|&v| f32_to_f16(v)).collect();
+        unsafe {
+            let mut dpi_x = 0.0f32;
+            let mut dpi_y = 0.0f32;
+            self.context.GetDpi(&mut dpi_x, &mut dpi_y);
+            let properties = D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: dpi_x,
+                dpiY: dpi_y,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+                ..Default::default()
+            };
+            self.context
+                .CreateBitmap(
+                    D2D_SIZE_U {
+                        width: width_px,
+                        height: height_px,
+                    },
+                    Some(half.as_ptr().cast()),
+                    width_px * 8,
+                    &properties,
+                )
+                .map(Bitmap)
+        }
+    }
+
+    /// A wrap-extended, nearest-sampled bitmap brush: one
+    /// [`fill_rect`](Self::fill_rect) /
+    /// [`fill_rect_additive`](Self::fill_rect_additive) repeats `bitmap` across the
+    /// filled area, each texel on one physical pixel (the bitmap carries the
+    /// session DPI). The tiled-texture primitive the backdrop's blue-noise dither
+    /// composite uses.
+    pub fn create_tiling_brush(&self, bitmap: &Bitmap) -> Result<TilingBrush> {
+        let props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+            extendModeX: D2D1_EXTEND_MODE_WRAP,
+            extendModeY: D2D1_EXTEND_MODE_WRAP,
+            interpolationMode: D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+        };
+        unsafe {
+            self.context
+                .CreateBitmapBrush(&bitmap.0, Some(&props), None)
+                .map(TilingBrush)
+        }
+    }
+
+    /// Fill a rectangle with **additive** blending (`out = dst + src`), restoring
+    /// the default source-over blend afterwards. With a zero-mean signed tile
+    /// (see [`create_bitmap_fp16`](Self::create_bitmap_fp16)) this is the standard
+    /// GPU ordered-dither composite: it perturbs what is already painted without
+    /// shifting its mean.
+    pub fn fill_rect_additive(&self, rect: &Rect, brush: &impl Paint) {
+        unsafe {
+            self.context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD);
+            self.context
+                .FillRectangle(&rect.to_abi(), brush.as_raw_brush());
+            self.context
+                .SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+        }
+    }
+
     /// Creates a Gaussian shadow/glow effect from `source`: the source's alpha channel
     /// is blurred by `blur_standard_deviation` (DIPs) and tinted with `color`. Draw its
     /// output with [`draw_effect`](Self::draw_effect) — at the identity transform it
@@ -605,3 +708,36 @@ impl Drop for DrawingSession<'_> {
     }
 }
 
+
+/// Convert an `f32` to IEEE 754 binary16 bits, round-to-nearest (ties away from
+/// zero) — the upload conversion for [`DrawingSession::create_bitmap_fp16`].
+/// Handles signs, subnormals, overflow-to-infinity, and NaN; precision loss at
+/// these magnitudes is far below any visible threshold.
+fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let man = bits & 0x007f_ffff;
+    if exp == 0xff {
+        // Infinity / NaN (keep NaN signalling-agnostic with a set payload bit).
+        return sign | 0x7c00 | if man != 0 { 0x0200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // overflow -> infinity
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // underflow -> signed zero
+        }
+        // Subnormal half: shift the (restored-implicit-bit) mantissa into place.
+        let man = man | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half_man = (man >> shift) as u16;
+        let round = ((man >> (shift - 1)) & 1) as u16;
+        return sign | (half_man + round);
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let round = (man >> 12) & 1;
+    sign | (half + round) as u16
+}

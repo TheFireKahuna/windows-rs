@@ -81,12 +81,11 @@ impl Compositing {
         root.cast::<IVisual>()?
             .SetScale(Vector3::new(scale, scale, 1.0))?;
 
-        // Opaque window background (bottom-most visual), sized in DIPs. A color
-        // brush can't be an effect input, so the white-level module rescales its
-        // registered base color directly on display refreshes.
+        // Opaque window background (bottom-most visual), sized in DIPs. It sits
+        // behind the app's own opaque full-window backdrop, so it needs no display
+        // colour mapping — a plain colour brush.
         let bg = compositor.CreateSpriteVisual()?;
         let bg_brush = compositor.CreateColorBrushWithColor(WINDOW_BG)?;
-        super::white::register_color_brush(&bg_brush, WINDOW_BG);
         bg.SetBrush(&bg_brush.cast::<crate::system_bindings::CompositionBrush>()?)?;
         bg.cast::<IVisual>()?
             .SetSize(Vector2::new(dip_size.0, dip_size.1))?;
@@ -135,11 +134,10 @@ impl Compositing {
         }
     }
 
-    /// Recolor the window background (theme change). Routed through the
-    /// white-level module so the stored base color is re-based and the applied
-    /// color carries the current display white-level scale.
+    /// Recolor the window background (theme change). The backdrop sits behind the
+    /// app's own opaque backdrop, so it takes the colour verbatim — no display map.
     pub fn set_background(&self, color: Color) {
-        super::white::register_color_brush(&self.bg_brush, color);
+        let _ = self.bg_brush.SetColor(color);
     }
 
     /// Attach a reactor root node's container directly above the background.
@@ -229,10 +227,9 @@ impl Compositing {
             .compositor
             .CreateSurfaceBrushWithSurface(&surface.cast::<ICompositionSurface>()?)?;
         let _ = brush.SetStretch(CompositionStretch::Fill);
-        // Compositor-side display white-level adjust: wraps the surface brush in
-        // the shared Exposure effect (pure passthrough unless the app opted in
-        // via `set_hdr_reference_white_nits`).
-        let content = super::white::wrap_surface_brush(&self.compositor, &brush)?;
+        // Node-chrome surfaces paint through the app's draw-time colour map (see
+        // `node::linear`), so the surface brush is used raw — no compositor effect.
+        let content = brush.cast::<crate::system_bindings::CompositionBrush>()?;
 
         let sprite = self.compositor.CreateSpriteVisual()?;
         sprite.SetBrush(&content)?;

@@ -21,12 +21,14 @@ use crate::LineEndpoints;
 use windows_canvas_core::{ColorF, TextLayout};
 use windows_core::Interface;
 
-/// Convert a reactor [`Color`] to a [`ColorF`] for D2D. Both are linear scRGB now,
-/// so this is a straight passthrough — the node-chrome surfaces are FP16 scRGB
-/// (linear) and consume the value raw (no gamma transform). The name is kept for its
-/// many call sites; an 8-bit target would re-encode at its own boundary instead.
+/// Convert a reactor [`Color`] to a [`ColorF`] for D2D, applying the app's output
+/// colour transform ([`color_out`](super::color_out)) on the way. Both currencies
+/// are linear scRGB and the node-chrome surfaces are FP16 scRGB (linear), so the
+/// transform — an app's tonemap to the current display — runs here in genuine
+/// linear light, hue-safe, on every painted colour. Identity when no app opted in.
 pub(crate) fn linear(c: Color) -> ColorF {
-    ColorF::new(c.r, c.g, c.b, c.a)
+    let [r, g, b, a] = super::color_out::apply([c.r, c.g, c.b, c.a]);
+    ColorF::new(r, g, b, a)
 }
 
 /// Linearly interpolate two scRGB colors.
