@@ -190,12 +190,6 @@ enum SidePayload {
 /// coalescing corrupts the tree.
 #[derive(Debug)]
 pub(crate) enum Cmd {
-    /// Not currently recorded — `create` is applied eagerly so that
-    /// `get_native_element` stays exact (see [`Backend::create`] on
-    /// [`RecordingBackend`]). The variant is the encoding this call takes once
-    /// the id-token protocol removes that read-back and creation joins the
-    /// buffer like everything else.
-    #[allow(dead_code, reason = "recorded once create stops being eager")]
     Create {
         id: ControlId,
         kind: ControlKind,
@@ -423,24 +417,17 @@ impl<B: Backend> std::ops::DerefMut for RecordingBackend<B> {
 }
 
 impl<B: CreateWithId> Backend for RecordingBackend<B> {
-    /// Mint the id here and create eagerly.
+    /// Mint the id here and buffer the creation.
     ///
-    /// `create` is the one call whose effect is synchronously observable
-    /// through the trait: [`get_native_element`](Backend::get_native_element)
-    /// takes `&self` and is invoked mid-reconcile by `on_mounted`, so a control
-    /// whose creation was still buffered would report `None` and silently break
-    /// every host that parents a composition surface under a node. Creating
-    /// eagerly keeps that observation exact while the id — the part the
-    /// reconciler actually needs back — is still minted on this side, which is
-    /// what dissolves the read-back. Everything else defers.
-    ///
-    /// This eager path disappears with the id-token protocol that replaces
-    /// `get_native_element`, at which point `Cmd::Create` rides the buffer like
-    /// every other command.
+    /// The returned id is the reconciler's addressing scheme, so it must be
+    /// answered now — but it is a monotonic counter, not anything the backend
+    /// knows, so answering it locally costs nothing and leaves no read-back.
+    /// The control itself is created when the buffer is replayed, like every
+    /// other command.
     fn create(&mut self, kind: ControlKind) -> ControlId {
         self.next_id += 1;
         let id = ControlId::new(self.next_id);
-        self.inner.create_with_id(id, kind);
+        self.push(Cmd::Create { id, kind });
         id
     }
 
@@ -621,9 +608,10 @@ impl<B: CreateWithId> Backend for RecordingBackend<B> {
         self.push(Cmd::SetDragHandlers { id, side });
     }
 
-    /// Reads straight through: `create` is eager, so every live control exists
-    /// in the wrapped backend even with a non-empty buffer. This is the one
-    /// remaining synchronous read-back on the seam.
+    /// Reads straight through. The DirectComposition backend exposes no native
+    /// element — its controls are addressed by id — so this answers `None`
+    /// there regardless of what the buffer still holds, and nothing on that
+    /// path observes a control before its creation is replayed.
     fn get_native_element(&self, id: ControlId) -> Option<windows_core::IInspectable> {
         self.inner.get_native_element(id)
     }

@@ -82,9 +82,9 @@ pub(crate) enum PaintSurface {
 /// [`CompositionSurfaceFactory::create_under_node`].
 pub(crate) struct CompSurface {
     target: CompositionDrawTarget,
-    // Keeps the sprite parented under the host element's `ContainerVisual`; dropping
-    // it removes the sprite (so replacing the surface on resize detaches the old one).
-    _visual: CompositionChildVisual,
+    // Keeps the backend hosting the sprite under the host control; dropping it
+    // releases the surface (so replacing it on resize detaches the old one).
+    _hosted: PendingSurface,
     device: GpuDevice,
     width: f32,
     height: f32,
@@ -98,37 +98,54 @@ impl PaintSurface {
     /// `ContainerVisual` (the WinUI backend) or no host is available yet.
     pub(crate) fn build(
         host: Option<&ElementHandle>,
+        pending: &RefCell<Option<PendingSurface>>,
         device: &GpuDevice,
+        device_gen: u64,
         width: f32,
         height: f32,
         dpi: f32,
         opaque: bool,
-    ) -> Result<Self> {
-        // dcomp backend: host a composition child-visual surface under the node.
-        // `from_node` only succeeds when the native object is a system
-        // `ContainerVisual`, so this cleanly no-ops on WinUI.
+        ready: impl Fn() + Send + 'static,
+    ) -> Result<Option<Self>> {
+        // dcomp backend: ask the backend to host a composition surface under the
+        // control. It owns the visual — parenting one is COM work on the thread
+        // that owns the compositor — and hands back only the `Send` drawing side.
         //
-        // This is the last place that still needs the node's live visual rather
-        // than its id: parenting a child visual is COM work that only the
-        // thread owning the compositor may do. It becomes a backend command
-        // addressed by `host.id()` when surface creation moves front-side.
+        // A backend that exposes no native element is the self-hosted one; the
+        // WinUI backend always has a XAML element and takes the path below.
         if let Some(host) = host
-            && let Some(native) = host.native()
-            && let Ok(factory) = CompositionSurfaceFactory::from_node(native, device.d2d_device())
+            && host.native().is_none()
         {
-            let scale = dpi / 96.0;
-            let pw = ((width * scale).round() as i32).max(1);
-            let ph = ((height * scale).round() as i32).max(1);
-            let (visual, draw) =
-                factory.create_under_node(native, (pw, ph), (width, height), opaque)?;
-            return Ok(Self::Comp(CompSurface {
-                target: CompositionDrawTarget::new(draw),
-                _visual: visual,
-                device: device.clone(),
-                width,
-                height,
-                dpi,
-            }));
+            // Already asked: either it has been hosted since (take the drawing
+            // side and keep the handle, which owns the release) or it has not,
+            // and `ready` will bring us back.
+            let hosted = pending.borrow().as_ref().and_then(|p| p.take());
+            if let Some(draw) = hosted {
+                let held = pending.borrow_mut().take().expect("pending was just read");
+                return Ok(Some(Self::Comp(CompSurface {
+                    target: CompositionDrawTarget::new(draw),
+                    _hosted: held,
+                    device: device.clone(),
+                    width,
+                    height,
+                    dpi,
+                })));
+            }
+            if pending.borrow().is_none() {
+                let scale = dpi / 96.0;
+                let pw = ((width * scale).round() as i32).max(1);
+                let ph = ((height * scale).round() as i32).max(1);
+                let dev = SurfaceDevice::new(device.d2d_device(), device_gen)?;
+                *pending.borrow_mut() = Some(request_surface(
+                    host.id(),
+                    dev,
+                    (pw, ph),
+                    (width, height),
+                    opaque,
+                    ready,
+                ));
+            }
+            return Ok(None);
         }
 
         // WinUI backend: a XAML `SurfaceImageSource`.
@@ -137,7 +154,7 @@ impl PaintSurface {
         } else {
             SurfaceImage::new(device, width, height, dpi)?
         };
-        Ok(Self::Image(img))
+        Ok(Some(Self::Image(img)))
     }
 
     fn width(&self) -> f32 {
@@ -196,6 +213,9 @@ pub(crate) struct PainterInner {
     pub(crate) source: RefCell<Option<SurfaceImageSource>>,
     pub(crate) set_size: RefCell<Option<SetState<(u32, u32)>>>,
     size_revoker: RefCell<Option<Subscription>>,
+    // An outstanding backend surface request, kept across renders: it carries the
+    // release token, so dropping it detaches the hosted surface.
+    pub(crate) pending_surface: RefCell<Option<PendingSurface>>,
     // Optional user mount hook, run once with the hosting `Image`'s
     // `ElementHandle` (e.g. to open a capture-capable `PointerSurface`). A `Cell`
     // like `stepper`: it is taken out and run, and the hook may re-enter the
@@ -308,6 +328,7 @@ impl SurfacePainter {
                 source: RefCell::new(None),
                 set_size: RefCell::new(None),
                 size_revoker: RefCell::new(None),
+                pending_surface: RefCell::new(None),
                 mounted: Cell::new(None),
                 request_rebuild: RefCell::new(Box::new(|| {})),
                 dirty: Cell::new(Dirty::Clean),

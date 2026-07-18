@@ -43,6 +43,7 @@ mod popup;
 mod record;
 mod scroll;
 mod size;
+mod surface;
 mod theme;
 pub use theme::{set_host_tokens, HostTokens};
 mod uia;
@@ -138,6 +139,9 @@ pub struct DCompBackend {
     ghosts: Vec<Ghost>,
     /// Monotonic id source for [`Ghost`]s (keys the batch-completed callback).
     next_ghost: u64,
+    /// Composition surfaces hosted under controls on behalf of viz hosts
+    /// (see [`surface`]).
+    surfaces: surface::SurfaceHost,
     /// The host window handle (as `isize`) — used for clipboard ownership.
     hwnd: isize,
 }
@@ -165,6 +169,7 @@ impl DCompBackend {
             popup: None,
             ghosts: Vec::new(),
             next_ghost: 0,
+            surfaces: surface::SurfaceHost::default(),
             hwnd,
         }
     }
@@ -968,6 +973,7 @@ impl Backend for DCompBackend {
         // bounded when a subscriber leaks its `Subscription`.
         size::forget(id);
         pointer::forget(id);
+        self.surfaces.forget(id);
         if self.attached_root == Some(id) {
             if let Some(n) = self.arena.get(id) {
                 self.comp.detach_root(&n.container);
@@ -1023,12 +1029,6 @@ impl Backend for DCompBackend {
         }
     }
 
-    fn get_native_element(&self, id: ControlId) -> Option<windows_core::IInspectable> {
-        use windows_core::Interface;
-        // The node's container visual — what a viz host element (SurfacePainter /
-        // composition-surface) attaches its child visual under via `on_mounted`.
-        self.node(id).and_then(|n| n.container.cast().ok())
-    }
 
     // ── Compositor animations (DWM-evaluated; no app ticks, no repaints) ──
 

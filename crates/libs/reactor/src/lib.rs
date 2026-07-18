@@ -45,12 +45,14 @@ mod host;
 mod interaction;
 mod reconciler;
 mod style;
+mod surface;
 mod widget;
 mod widgets;
 
 #[cfg(feature = "winui-backend")]
 pub use app::*;
 pub use backend::*;
+pub use surface::{request_surface, PendingSurface, SurfaceDevice, SurfaceToken};
 pub use color::Color;
 pub use bindings::AutomationHeadingLevel;
 pub use bindings::AutomationLiveSetting;

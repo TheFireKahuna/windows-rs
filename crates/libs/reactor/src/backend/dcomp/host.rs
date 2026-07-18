@@ -233,6 +233,10 @@ impl DCompHost {
                     0,
                     "layout must never read the arena behind a partial buffer"
                 );
+                // After the buffer, so a surface requested in the same frame its
+                // host mounts finds the control already in the arena; before
+                // layout, so the sprite is parented when sizes are pushed.
+                r.backend.service_surface_ops();
                 r.backend.set_root(root_id);
                 r.backend.relayout_and_paint();
             });

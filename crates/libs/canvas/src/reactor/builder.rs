@@ -229,7 +229,7 @@ fn build_painter<R: 'static>(
 ) -> SurfacePainter {
     let dpi = cx.use_dpi() as f32;
     let (size, set_size) = cx.use_state::<(u32, u32)>((0, 0));
-    let (generation, set_generation) = cx.use_state::<u32>(0);
+    let (generation, set_generation) = cx.use_async_state::<u32>(0);
     let (source, set_source) = cx.use_state::<Option<SurfaceImageSource>>(None);
     let owned_device = cx.use_ref::<Option<GpuDevice>>(None);
     let owned_gen = cx.use_ref::<u64>(0);
@@ -324,9 +324,29 @@ fn build_painter<R: 'static>(
             // `SurfaceImageSource`. A device-lost failure here triggers the same
             // recovery as a lost repaint.
             let host = painter.inner.host.borrow().clone();
-            let built = PaintSurface::build(host.as_ref(), &device, w as f32, h as f32, dpi, opaque);
+            let built = {
+                let set_generation = set_generation.clone();
+                PaintSurface::build(
+                    host.as_ref(),
+                    &painter.inner.pending_surface,
+                    &device,
+                    device_gen,
+                    w as f32,
+                    h as f32,
+                    dpi,
+                    opaque,
+                    move || set_generation.call(generation.wrapping_add(1)),
+                )
+            };
             let surface = match built {
-                Ok(surface) => surface,
+                // The backend is hosting the surface; `ready` re-runs this effect
+                // once it exists. Same standing-by state as a lost device.
+                Ok(None) => {
+                    *painter.inner.surface.borrow_mut() = None;
+                    painter.inner.ready.set(false);
+                    return;
+                }
+                Ok(Some(surface)) => surface,
                 Err(e) => {
                     if is_device_lost(e.code()) {
                         reset_device(&device_source, force_software, &owned_device);
