@@ -40,7 +40,8 @@ use crate::system_bindings::{
     AnimationIterationBehavior, CompositionAnimation, CompositionBrush, CompositionClip,
     CompositionDrawingSurface, CompositionEasingFunction, CompositionNineGridBrush,
     CompositionObject, CompositionSurfaceBrush, ICompositionAnimation, ICompositionObject,
-    ICompositor2, ICompositor4, IKeyFrameAnimation, ISpringVector2NaturalMotionAnimation,
+    ICompositor2, ICompositor4, IKeyFrameAnimation, IScalarNaturalMotionAnimation,
+    CompositionBatchTypes, CompositionScopedBatch, ISpringVector2NaturalMotionAnimation,
     ISpringVector3NaturalMotionAnimation, IVector2NaturalMotionAnimation,
     IVector3NaturalMotionAnimation, IVisual, InsetClip, SpringVector2NaturalMotionAnimation,
     SpringVector3NaturalMotionAnimation, SpriteVisual, TimeSpan, Visual,
@@ -473,20 +474,32 @@ impl Part {
     }
 
     /// Snap position + size (stopping any in-flight glide first).
+    ///
+    /// A snap is AUTHORITATIVE: when a spring may still hold the property it is
+    /// stopped and the value rewritten even if the target equals what we last
+    /// asked for. `off`/`size` record the last target *requested*, not where the
+    /// visual actually is, so while a glide is in flight they are not evidence
+    /// of anything. Skipping on a matching target alone would leave that glide
+    /// owning the property while the caller believes it snapped — interrupt it
+    /// and the visual strands, and since the cache still reads "already at T"
+    /// every later request for T is dropped as redundant, wedging the part
+    /// until some different target happens to arrive.
     fn place(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        if self.off != Some((x, y)) {
-            if self.off_gliding {
-                let _ = self.obj.StopAnimation("Offset");
-                self.off_gliding = false;
-            }
+        let off_stale = self.off_gliding;
+        if off_stale {
+            let _ = self.obj.StopAnimation("Offset");
+            self.off_gliding = false;
+        }
+        if off_stale || self.off != Some((x, y)) {
             let _ = self.vis.SetOffset(Vector3::new(x, y, 0.0));
             self.off = Some((x, y));
         }
-        if self.size != Some((w, h)) {
-            if self.size_gliding {
-                let _ = self.obj.StopAnimation("Size");
-                self.size_gliding = false;
-            }
+        let size_stale = self.size_gliding;
+        if size_stale {
+            let _ = self.obj.StopAnimation("Size");
+            self.size_gliding = false;
+        }
+        if size_stale || self.size != Some((w, h)) {
             let _ = self.vis.SetSize(Vector2::new(w, h));
             self.size = Some((w, h));
         }
@@ -671,9 +684,34 @@ pub(crate) struct Parts {
     looping: bool,
     /// Meter: the fill sprite's reveal clip (its `RightInset` follows the
     /// needle via an `ExpressionAnimation`).
+    ///
     clip: Option<InsetClip>,
     /// Track width the reveal expression was last built for.
     clip_w: f32,
+    /// Slider: whether expressions currently DERIVE the fill'''s rect from the
+    /// thumb'''s offset.
+    ///
+    /// The fill'''s left edge and width cannot simply be sprung alongside the
+    /// thumb: the fill spans `origin -> thumb`, so both are `Min`/`Abs` of the
+    /// thumb position -- affine only within one side of the origin. Springing
+    /// them in parallel across a sign change leaves the left edge still short of
+    /// the origin while the right is already past it, so the bar straddles 0 as
+    /// a wide band instead of collapsing to nothing as the thumb crosses.
+    /// Deriving both from the one thumb spring reproduces the kink exactly.
+    ///
+    /// Expressions evaluate every composition frame, so they are armed only for
+    /// the duration of a glide and torn down to plain values on settle -- at
+    /// rest the fill is a plain rect and the compositor has nothing to evaluate.
+    ///
+    /// Shared with the settle callback, which clears it when it tears the
+    /// expressions down -- otherwise this side would still believe it was
+    /// following and would skip re-arming, freezing the fill.
+    fill_live: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Bumped per glide; a settle callback only applies if it still matches, so
+    /// a stale completion cannot tear down a newer flight.
+    fill_gen: std::rc::Rc<std::cell::Cell<u32>>,
+    /// Keeps the settle subscription alive.
+    _fill_settle: Option<windows_core::EventRevoker>,
 }
 
 impl Parts {
@@ -690,6 +728,9 @@ impl Parts {
             looping: false,
             clip: None,
             clip_w: 0.0,
+            fill_live: std::rc::Rc::new(std::cell::Cell::new(false)),
+            fill_gen: std::rc::Rc::new(std::cell::Cell::new(0)),
+            _fill_settle: None,
         }
     }
 
@@ -783,12 +824,18 @@ fn dim_of(node: &Node) -> f32 {
 /// the paint pass after the node's surface exists (dirty nodes only — every
 /// state change that matters marks the node dirty; pure hover/drag updates go
 /// through the direct event entry points below instead).
-pub(crate) fn sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+pub(crate) fn sync(
+    comp: &Compositing,
+    atlas: &mut Atlas,
+    node: &mut Node,
+    scale: f32,
+    scrubbing: bool,
+) {
     match node.kind {
         ControlKind::ToggleSwitch => toggle_sync(comp, atlas, node, scale),
         ControlKind::CheckBox => check_sync(comp, atlas, node, scale),
-        ControlKind::Slider => slider_sync(comp, atlas, node, scale),
-        ControlKind::Meter => meter_sync(comp, atlas, node, scale),
+        ControlKind::Slider => slider_sync(comp, atlas, node, scale, scrubbing),
+        ControlKind::Meter => meter_sync(comp, atlas, node, scale, scrubbing),
         ControlKind::SelectorBar => segmented_sync(comp, atlas, node, scale),
         ControlKind::NavigationView => nav_sync(comp, atlas, node, scale),
         ControlKind::Expander => expander_sync(comp, atlas, node, scale),
@@ -1038,7 +1085,13 @@ fn slider_fill_color(node: &Node, vfrac: f32, ofrac: f32) -> crate::Color {
 }
 
 /// Above-band roles: `[fill, halo, thumb]`.
-fn slider_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+fn slider_sync(
+    comp: &Compositing,
+    atlas: &mut Atlas,
+    node: &mut Node,
+    scale: f32,
+    scrubbing: bool,
+) {
     if !ensure(comp, node, 0, 3) {
         return;
     }
@@ -1054,7 +1107,11 @@ fn slider_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
     let g = slider_geom(node.rect.w, node.rect.h, frac, ofrac);
     let geom = (node.rect.w, node.rect.h);
     let Some(parts) = node.parts.as_mut() else { return };
-    let snap = !parts.init || parts.geom != geom || node.pressed;
+    // Snap while this slider is the one under the pointer (direct manipulation
+    // goes exactly where you put it) and while ANY drag is streaming updates
+    // (following the dial 1:1 — a spring retargeted per move would pin it).
+    // A discrete change still glides.
+    let snap = !parts.init || parts.geom != geom || node.pressed || scrubbing;
 
     parts.above[0].bind(comp, atlas, k_fill);
     parts.above[1].bind(comp, atlas, k_halo);
@@ -1070,7 +1127,11 @@ fn slider_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
 }
 
 struct SliderGeom {
+    /// The static full-track fill sprite.
     fill: (f32, f32, f32, f32),
+    /// `(x0, x1, origin_x)` in node coords — the constants the fill
+    /// derivation is written against.
+    anchor: (f32, f32, f32),
     halo: (f32, f32, f32, f32),
     thumb: (f32, f32, f32, f32),
 }
@@ -1090,7 +1151,11 @@ fn slider_geom(w: f32, h: f32, frac: f32, ofrac: f32) -> SliderGeom {
     let tr = theme::SLIDER_TRACK;
     let halo_d = theme::SLIDER_THUMB + 6.0;
     SliderGeom {
+        // The fill sprite IS the coloured span, so its nine-grid rounds both
+        // ends. Its left edge and width are derived from the thumb while it
+        // glides (see `slider_fill_follow`) rather than sprung independently.
         fill: (fill_lo, cy - tr / 2.0, fill_hi - fill_lo, tr),
+        anchor: (x0, x1, origin_x),
         halo: (thumb_x - halo_d / 2.0, cy - halo_d / 2.0, halo_d, halo_d),
         thumb: (
             thumb_x - theme::SLIDER_THUMB / 2.0,
@@ -1109,9 +1174,139 @@ fn slider_apply(parts: &mut Parts, g: &SliderGeom, snap: bool) {
             p.glide(r.0, r.1, r.2, r.3);
         }
     };
-    put(&mut parts.above[0], g.fill, snap);
-    put(&mut parts.above[1], g.halo, snap);
-    put(&mut parts.above[2], g.thumb, snap);
+    // First write snaps, matching `Part::glide` — mounting must not fly in.
+    let snap = snap || (parts.above[0].off.is_none() && !parts.fill_live.get());
+    if snap {
+        slider_fill_static(parts, g.fill);
+        put(&mut parts.above[1], g.halo, true);
+        put(&mut parts.above[2], g.thumb, true);
+        return;
+    }
+    // Arm the derivation BEFORE opening the batch: an expression never
+    // completes, so one started inside would keep the batch — and therefore the
+    // follow — alive forever.
+    if !slider_fill_follow(parts, g.anchor) {
+        slider_fill_static(parts, g.fill);
+        put(&mut parts.above[1], g.halo, true);
+        put(&mut parts.above[2], g.thumb, true);
+        return;
+    }
+    // The thumb's glide is the only animation in the batch, so its completion
+    // is exactly when the derived fill has reached its final rect.
+    let batch = parts
+        .above[2]
+        .obj
+        .Compositor()
+        .ok()
+        .and_then(|c| c.CreateScopedBatch(CompositionBatchTypes::Animation).ok());
+    put(&mut parts.above[1], g.halo, false);
+    put(&mut parts.above[2], g.thumb, false);
+    slider_fill_settle(parts, batch, g.fill);
+}
+
+/// Put the fill at a plain rect NOW, releasing any derivation driving it.
+/// Authoritative, like [`Part::place`]: a live derivation is torn down and the
+/// rect rewritten even when the target is unchanged.
+fn slider_fill_static(parts: &mut Parts, r: (f32, f32, f32, f32)) {
+    // Invalidate any in-flight settle: this write supersedes it.
+    parts.fill_gen.set(parts.fill_gen.get().wrapping_add(1));
+    let fill = &mut parts.above[0];
+    if parts.fill_live.replace(false) {
+        let _ = fill.obj.StopAnimation("Offset.X");
+        let _ = fill.obj.StopAnimation("Size.X");
+        // The derivation wrote X behind `Part`'s back — its cache is stale.
+        fill.off = None;
+        fill.size = None;
+    }
+    fill.place(r.0, r.1, r.2, r.3);
+}
+
+/// Derive the fill's own rect from the THUMB's live offset for the duration of
+/// its glide, then settle to plain values.
+///
+/// The fill spans `origin → thumb`, so its left edge and width are `Min`/`Abs`
+/// of the thumb position — affine only within one side of the origin. Springing
+/// them alongside the thumb is exact while the sign holds but wrong across a
+/// crossing: the left edge is still short of the origin while the right is
+/// already past it, so the bar straddles zero as a wide band instead of
+/// collapsing to nothing. Deriving both from the one thumb spring reproduces
+/// that kink exactly, and keeps the sprite sized to the visible span so its
+/// nine-grid rounds both ends the way a plain placed fill does.
+///
+/// `anchor` is `(x0, x1, origin_x)` in node coordinates.
+fn slider_fill_follow(parts: &mut Parts, anchor: (f32, f32, f32)) -> bool {
+    let (_x0, _x1, origin_x) = anchor;
+    let armed = parts.fill_live.get()
+        || (|| -> Option<()> {
+            let comp = parts.above[0].obj.Compositor().ok()?;
+            let thumb: CompositionObject =
+                windows_core::Interface::cast(&parts.above[2].sprite).ok()?;
+            let half = theme::SLIDER_THUMB / 2.0;
+            // Thumb sprite sits at `thumb_x - half`, so its centre is X + half.
+            for (prop, text) in [
+                ("Offset.X", format!("Min(t.Offset.X + {half:.3}, {origin_x:.3})")),
+                ("Size.X", format!("Abs(t.Offset.X + {half:.3} - {origin_x:.3})")),
+            ] {
+                let expr = comp.CreateExpressionAnimationWithExpression(&text).ok()?;
+                windows_core::Interface::cast::<ICompositionAnimation>(&expr)
+                    .ok()?
+                    .SetReferenceParameter("t", &thumb)
+                    .ok()?;
+                parts.above[0]
+                    .obj
+                    .StartAnimation(
+                        prop,
+                        &windows_core::Interface::cast::<CompositionAnimation>(&expr).ok()?,
+                    )
+                    .ok()?;
+            }
+            Some(())
+        })()
+        .is_some();
+    if armed {
+        parts.fill_live.set(true);
+        // X is owned by the derivation now; the cached rect no longer describes
+        // the visual, so it must not suppress a later write.
+        parts.above[0].off = None;
+        parts.above[0].size = None;
+    }
+    armed
+}
+
+/// Settle: when the thumb's glide completes, drop the derivation and write the
+/// final rect, so an idle slider leaves nothing evaluating per frame.
+fn slider_fill_settle(
+    parts: &mut Parts,
+    batch: Option<CompositionScopedBatch>,
+    r: (f32, f32, f32, f32),
+) {
+    let generation = parts.fill_gen.get().wrapping_add(1);
+    parts.fill_gen.set(generation);
+    let settled = batch.and_then(|b| {
+        let vis = parts.above[0].vis.clone();
+        let obj = parts.above[0].obj.clone();
+        let cell = parts.fill_gen.clone();
+        let live = parts.fill_live.clone();
+        let revoker = b
+            .Completed(move |_, _| {
+                if cell.get() == generation {
+                    let _ = obj.StopAnimation("Offset.X");
+                    let _ = obj.StopAnimation("Size.X");
+                    let _ = vis.SetOffset(Vector3::new(r.0, r.1, 0.0));
+                    let _ = vis.SetSize(Vector2::new(r.2, r.3));
+                    live.set(false);
+                }
+            })
+            .ok()
+            .filter(|_| b.End().is_ok())?;
+        Some(revoker)
+    });
+    match settled {
+        Some(rev) => parts._fill_settle = Some(rev),
+        // No completion signal will arrive — settle now rather than leave the
+        // derivation evaluating forever.
+        None => slider_fill_static(parts, r),
+    }
 }
 
 /// Direct event entry: a pointer drag scrubs the slider 1:1 — snap the fill /
@@ -1139,7 +1334,13 @@ pub(crate) fn slider_drag(node: &mut Node, frac: f32) -> bool {
 /// `ExpressionAnimation` — the one needle glide (a compositor Vector3 spring)
 /// drives both, so the fill edge and the needle never separate and a level
 /// change never repaints or ticks.
-fn meter_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+fn meter_sync(
+    comp: &Compositing,
+    atlas: &mut Atlas,
+    node: &mut Node,
+    scale: f32,
+    scrubbing: bool,
+) {
     if !ensure(comp, node, 0, 4) {
         return;
     }
@@ -1164,7 +1365,10 @@ fn meter_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32
     let geom = (w, h);
     let stops = &node.ctrl.stops;
     let Some(parts) = node.parts.as_mut() else { return };
-    let snap = !parts.init || parts.geom != geom;
+    // A meter is a pure follower: it glides to a discrete change, but tracks a
+    // drag 1:1. Springing a stream of per-move updates would restart the needle
+    // spring every frame and leave the level pinned until the pointer stopped.
+    let snap = !parts.init || parts.geom != geom || scrubbing;
 
     parts.above[0].bind_grad(comp, atlas, k_fill, stops);
     parts.above[1].bind(comp, atlas, k_marker);

@@ -1,5 +1,7 @@
 //! `DCompHost`: the Win32 + system-compositor host that drives a root
-//! [`Component`] through `RenderHost<DCompBackend, Win32Dispatcher>`. It owns the
+//! [`Component`] through `RenderHost<RecordingBackend<DCompBackend>, Win32Dispatcher>`
+//! — the reconciler records a `Send` command buffer that `post_render` replays
+//! into the backend (see [`record`](super::record)). It owns the
 //! bare HWND and the blocking `GetMessageW` pump (true idle — zero CPU at rest),
 //! routes input/resize messages to the backend, and wakes/parks the vsync
 //! [`FramePacer`] that paces canvas/viz frame ticks.
@@ -11,6 +13,7 @@ use std::sync::{Arc, Condvar, Mutex, Once};
 
 use super::dispatch::{drain, LocalQueue, SendInner, WM_APP_DISPATCH};
 use super::pacer::{FramePacer, WM_APP_FRAME};
+use super::record::RecordingBackend;
 use super::uia;
 use super::*;
 use crate::engine::RenderHost;
@@ -56,7 +59,16 @@ pub(crate) fn with_backend<R>(f: impl FnOnce(&mut DCompBackend) -> R) -> Option<
         return None;
     }
     IN_BACKEND.with(|c| c.set(true));
-    let r = shared().map(|s| s.render_host.with_reconciler_mut(|r| f(&mut r.backend)));
+    let r = shared().map(|s| {
+        s.render_host.with_reconciler_mut(|r| {
+            // Input, UIA and caption reads all hit-test against laid-out
+            // geometry, so the buffer must be drained first. It is normally
+            // already empty here (`post_render` drains every reconcile); this
+            // is the guarantee, not the common path.
+            r.backend.flush();
+            f(&mut r.backend)
+        })
+    });
     IN_BACKEND.with(|c| c.set(false));
     r
 }
@@ -116,7 +128,7 @@ pub(crate) fn post_ui(hwnd: isize, f: impl FnOnce() + Send + 'static) {
 /// Per-thread state the WndProc reaches into. `render_host` is a clone (an `Rc`
 /// bump) of the host's render host; `local`/`send` are the dispatcher's queues.
 struct HostShared {
-    render_host: RenderHost<DCompBackend, Win32Dispatcher>,
+    render_host: RenderHost<RecordingBackend<DCompBackend>, Win32Dispatcher>,
     local: Rc<LocalQueue>,
     send: Arc<SendInner>,
     /// Vsync pacer for the canvas/viz frame ticks; dropping `HostShared` (end of
@@ -194,7 +206,12 @@ impl DCompHost {
         let marshaller = dispatcher.marshaller();
         let (local, send) = dispatcher.queues();
 
-        let render_host = RenderHost::new(backend, root, dispatcher);
+        // The reconciler drives a recording wrapper, not the backend directly:
+        // its calls become a `Send` command buffer that `post_render` replays
+        // below. Replay is synchronous and on this thread, so behaviour is
+        // unchanged — the seam exists so the reconciler can later run off the
+        // thread that owns the HWND, the pump and the compositor.
+        let render_host = RenderHost::new(RecordingBackend::new(backend), root, dispatcher);
         render_host.set_marshaller(Some(marshaller));
         render_host.set_inner_size(WindowSize {
             width: dip.0 as f64,
@@ -207,6 +224,15 @@ impl DCompHost {
         let pr_host = render_host.clone_inner();
         render_host.set_post_render(move |root_id| {
             pr_host.with_reconciler_mut(|r| {
+                // Drain the reconcile's command buffer before anything reads
+                // the arena: `set_root` looks the new root up and silently
+                // no-ops if it is absent, and layout walks the whole tree.
+                r.backend.flush();
+                debug_assert_eq!(
+                    r.backend.pending(),
+                    0,
+                    "layout must never read the arena behind a partial buffer"
+                );
                 r.backend.set_root(root_id);
                 r.backend.relayout_and_paint();
             });

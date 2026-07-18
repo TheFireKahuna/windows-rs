@@ -40,6 +40,7 @@ mod paint;
 mod parts;
 mod pointer;
 mod popup;
+mod record;
 mod scroll;
 mod size;
 mod theme;
@@ -107,6 +108,17 @@ pub struct DCompBackend {
     /// scrubs on a RELATIVE vertical drag (up = increase) rather than the
     /// slider's absolute positional map, so the gesture origin is latched here.
     knob_drag: Option<(ControlId, f64, f32)>,
+    /// Whether a pointer drag is actively streaming value updates — set on the
+    /// first MOVE of a slider/knob press, cleared on release.
+    ///
+    /// This is the difference between a discrete change and a continuous
+    /// gesture, and every value chrome keys its motion on it. A natural-motion
+    /// spring restarted on each update never leaves rest, so a stream of
+    /// updates must move chrome 1:1; only a discrete change (a click, a preset,
+    /// the wheel, an external set) may spring. It is global, not per-node,
+    /// because a drag on ONE control streams updates to its followers too — the
+    /// dial trailing the slider, the output meter trailing both.
+    scrubbing: bool,
     /// The node holding keyboard focus (drives the focus ring + Space/Enter).
     focused_id: Option<ControlId>,
     /// A registered viz pointer surface (knob/slider/EQ canvas) being dragged:
@@ -146,6 +158,7 @@ impl DCompBackend {
             hovered_scroll: None,
             dragging_thumb: None,
             knob_drag: None,
+            scrubbing: false,
             focused_id: None,
             pressed_surface: None,
             hovered_surface: None,
@@ -200,6 +213,7 @@ impl DCompBackend {
                 &mut self.arena,
                 root,
                 scale,
+                self.scrubbing,
             )
             .is_err()
             {
@@ -485,8 +499,13 @@ impl DCompBackend {
     }
 }
 
-impl Backend for DCompBackend {
-    fn create(&mut self, kind: ControlKind) -> ControlId {
+impl DCompBackend {
+    /// Build a control's retained node and its composition visuals.
+    ///
+    /// Shared by both minting paths: [`Backend::create`], which assigns the id
+    /// from the arena, and [`CreateWithId::create_with_id`], which takes one
+    /// minted by the command-buffer seam.
+    fn build_node(&mut self, kind: ControlKind) -> Node {
         let container = self
             .comp
             .new_container()
@@ -511,6 +530,20 @@ impl Backend for DCompBackend {
         if node.is_scroll() {
             node.scroll_content = self.comp.new_container().ok();
         }
+        node
+    }
+}
+
+impl record::CreateWithId for DCompBackend {
+    fn create_with_id(&mut self, id: ControlId, kind: ControlKind) {
+        let node = self.build_node(kind);
+        self.arena.insert_with_id(id, node);
+    }
+}
+
+impl Backend for DCompBackend {
+    fn create(&mut self, kind: ControlKind) -> ControlId {
+        let node = self.build_node(kind);
         self.arena.insert(node)
     }
 

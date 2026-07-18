@@ -73,7 +73,6 @@ use windows_core::{
 windows_core::link!("oleaut32.dll" "system" fn SafeArrayCreateVector(vt: u16, llbound: i32, celements: u32) -> *mut SAFEARRAY);
 windows_core::link!("oleaut32.dll" "system" fn SafeArrayPutElement(psa: *mut SAFEARRAY, rgindices: *const i32, pv: *const core::ffi::c_void) -> HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaClientsAreListening() -> BOOL);
-windows_core::link!("ole32.dll" "system" fn CoInitializeEx(pvreserved: *const core::ffi::c_void, dwcoinit: u32) -> HRESULT);
 
 // `ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading` — the
 // options the canonical Microsoft server-side provider sample advertises.
@@ -91,15 +90,6 @@ const CAPTION_ITEM_BASE: i32 = 1 << 20;
 
 fn is_caption(item: i32) -> bool {
     item >= CAPTION_ITEM_BASE
-}
-
-// TEMP: env-gated entry-point trace for the event-delivery investigation.
-macro_rules! uia_trace {
-    ($($t:tt)*) => {
-        if std::env::var_os("REACTOR_UIA_TRACE").is_some() {
-            eprintln!("[uia t{:?}] {}", std::thread::current().id(), format!($($t)*));
-        }
-    };
 }
 
 // `ScrollAmount` values + the Scroll pattern's "no scroll" percent sentinel
@@ -875,7 +865,6 @@ impl DCompBackend {
     // deferred through the pump so raising never re-enters the input borrow.
 
     pub(crate) fn uia_notify_bool(&self, id: ControlId, event: Event, v: bool) {
-        uia_trace!("notify_bool id={} ev={event:?} v={v} listening={}", id.0, clients_listening());
         if !clients_listening() {
             return;
         }
@@ -953,7 +942,7 @@ enum PropVal {
 /// Raise `AutomationPropertyChanged` for node `id` — deferred onto the pump.
 /// The old value is reported empty (permitted by the pattern contracts).
 fn raise_property_changed(hwnd: isize, id: ControlId, pid: UIA_PROPERTY_ID, val: PropVal) {
-    dispatch_raise(hwnd, move || {
+    host::post_ui(hwnd, move || {
         let provider = stable_provider(ElementProvider::element(hwnd, id));
         // For a BSTR value the VARIANT holds a non-owning alias; `_owner` keeps
         // the string alive across the synchronous raise (UIA deep-copies it),
@@ -975,40 +964,14 @@ fn raise_property_changed(hwnd: isize, id: ControlId, pid: UIA_PROPERTY_ID, val:
             }
         };
         unsafe {
-            let hr = UiaRaiseAutomationPropertyChangedEvent(
+            let _ = UiaRaiseAutomationPropertyChangedEvent(
                 provider.as_raw(),
                 pid,
                 VARIANT::default(),
                 newv,
             );
-            uia_trace!("RAISE prop pid={pid} id={} -> {hr:?}", id.0);
-        }
-        // TEMP experiment: keep the raised provider alive past the (async)
-        // delivery to test whether UIA retains its pointer.
-        if std::env::var_os("REACTOR_UIA_LEAK_RAISED").is_some() {
-            core::mem::forget(provider);
         }
     });
-}
-
-// TEMP experiment: run a raise closure either on the ASTA UI thread (post_ui,
-// default) or on a fresh unattached thread (REACTOR_UIA_RAISE_OFFTHREAD set), to
-// tell whether the ASTA apartment blocks cross-process event marshaling.
-fn dispatch_raise(hwnd: isize, f: impl FnOnce() + Send + 'static) {
-    if std::env::var_os("REACTOR_UIA_RAISE_OFFTHREAD").is_some() {
-        std::thread::spawn(move || {
-            // COINIT_MULTITHREADED — a proper COM apartment for the native
-            // outgoing event-delivery call (an uninitialized thread cannot make
-            // it; the ASTA UI thread may block it).
-            unsafe {
-                let _ = CoInitializeEx(core::ptr::null(), 0x0);
-            }
-            f();
-            std::thread::sleep(std::time::Duration::from_secs(3));
-        });
-    } else {
-        host::post_ui(hwnd, f);
-    }
 }
 
 // ── Marshal helpers ──────────────────────────────────────────────────────────
@@ -1108,7 +1071,16 @@ fn provider_cache() -> &'static Mutex<HashMap<ProviderKey, SendProvider>> {
 fn stable_provider(p: ElementProvider) -> IRawElementProviderSimple {
     let key = (p.hwnd, p.id.get(), p.item, p.is_root);
     let mut cache = provider_cache().lock().unwrap();
-    cache.entry(key).or_insert_with(|| SendProvider(p.into())).0.clone()
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            // Only the true root is a fragment root (see the type split above).
+            let obj: IRawElementProviderSimple =
+                if p.is_root { RootProvider(p).into() } else { p.into() };
+            SendProvider(obj)
+        })
+        .0
+        .clone()
 }
 
 /// The stable provider for `p`, viewed as a fragment (same object).
@@ -1182,8 +1154,37 @@ impl ElementProvider {
     }
 }
 
+// Two COM object types share one data struct and one body of logic:
+//
+// * `ElementProvider` — a NON-root fragment element. Implements `…Fragment` +
+//   the control patterns.
+// * `RootProvider` — the window's fragment ROOT. Additionally implements
+//   `…FragmentRoot` and `…AdviseEvents`.
+//
+// The split matters for events: a fragment root is an event-scope boundary. If
+// every element answered `QueryInterface` for `IRawElementProviderFragmentRoot`
+// (as a single all-interfaces object would), UIA treats each as its own
+// fragment, and a subtree subscription rooted at the window never matches an
+// event raised inside — so nothing is delivered. Only the true root is a
+// fragment root, mirroring the canonical server-side provider sample.
 implement_decl! {
     impl ElementProvider as ElementProvider_Impl: [
+        IRawElementProviderSimple,
+        IRawElementProviderFragment,
+        IInvokeProvider,
+        IToggleProvider,
+        IValueProvider,
+        IRangeValueProvider,
+        ISelectionProvider,
+        ISelectionItemProvider,
+        IExpandCollapseProvider,
+        IScrollProvider,
+        IScrollItemProvider
+    ]
+}
+
+implement_decl! {
+    impl RootProvider as RootProvider_Impl: [
         IRawElementProviderSimple,
         IRawElementProviderFragment,
         IRawElementProviderFragmentRoot,
@@ -1200,33 +1201,225 @@ implement_decl! {
     ]
 }
 
-impl IRawElementProviderAdviseEvents_Impl for ElementProvider_Impl {
+/// The window's fragment root: an [`ElementProvider`] that additionally exposes
+/// fragment-root and event-advise interfaces.
+struct RootProvider(ElementProvider);
+
+impl ElementProvider {
+    /// The shared element data (identity for the forwarding impls).
+    fn inner(&self) -> &ElementProvider {
+        self
+    }
+}
+
+impl RootProvider {
+    fn inner(&self) -> &ElementProvider {
+        &self.0
+    }
+}
+
+// Emit the shared provider interfaces (everything except the root-only ones) for
+// a given `_Impl` type; every method forwards to the shared logic on the inner
+// `ElementProvider`.
+macro_rules! forward_provider {
+    ($imp:ty) => {
+        impl IRawElementProviderSimple_Impl for $imp {
+            fn ProviderOptions(&self) -> Result<ProviderOptions> {
+                self.inner().provider_options()
+            }
+            fn GetPatternProvider(&self, patternid: UIA_PATTERN_ID) -> Result<IUnknown> {
+                self.inner().pattern_provider(patternid)
+            }
+            fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> Result<VARIANT> {
+                Ok(self.inner().property(propertyid))
+            }
+            fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
+                self.inner().host_element_provider()
+            }
+        }
+        impl IRawElementProviderFragment_Impl for $imp {
+            fn Navigate(
+                &self,
+                direction: NavigateDirection,
+            ) -> Result<IRawElementProviderFragment> {
+                self.inner().navigate(direction)
+            }
+            fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
+                self.inner().runtime_id()
+            }
+            fn BoundingRectangle(&self) -> Result<UiaRect> {
+                self.inner().bounding_rect()
+            }
+            fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
+                Ok(core::ptr::null_mut())
+            }
+            fn SetFocus(&self) -> Result<()> {
+                self.inner().set_focus_node()
+            }
+            fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
+                self.inner().fragment_root_provider()
+            }
+        }
+        impl IInvokeProvider_Impl for $imp {
+            fn Invoke(&self) -> Result<()> {
+                self.inner().invoke()
+            }
+        }
+        impl IToggleProvider_Impl for $imp {
+            fn Toggle(&self) -> Result<()> {
+                self.inner().toggle()
+            }
+            fn ToggleState(&self) -> Result<ToggleState> {
+                self.inner().toggle_state()
+            }
+        }
+        impl IValueProvider_Impl for $imp {
+            fn SetValue(&self, val: &PCWSTR) -> Result<()> {
+                self.inner().value_set(val)
+            }
+            fn Value(&self) -> Result<BSTR> {
+                self.inner().value_get()
+            }
+            fn IsReadOnly(&self) -> Result<BOOL> {
+                Ok(false.into())
+            }
+        }
+        impl IRangeValueProvider_Impl for $imp {
+            fn SetValue(&self, val: f64) -> Result<()> {
+                self.inner().range_set(val)
+            }
+            fn Value(&self) -> Result<f64> {
+                self.inner().range_get()
+            }
+            fn IsReadOnly(&self) -> Result<BOOL> {
+                self.inner().range_readonly()
+            }
+            fn Maximum(&self) -> Result<f64> {
+                self.inner().range_max()
+            }
+            fn Minimum(&self) -> Result<f64> {
+                self.inner().range_min()
+            }
+            fn LargeChange(&self) -> Result<f64> {
+                self.inner().range_large()
+            }
+            fn SmallChange(&self) -> Result<f64> {
+                self.inner().range_small()
+            }
+        }
+        impl ISelectionProvider_Impl for $imp {
+            fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+                self.inner().selection_get()
+            }
+            fn CanSelectMultiple(&self) -> Result<BOOL> {
+                Ok(false.into())
+            }
+            fn IsSelectionRequired(&self) -> Result<BOOL> {
+                Ok(true.into())
+            }
+        }
+        impl ISelectionItemProvider_Impl for $imp {
+            fn Select(&self) -> Result<()> {
+                self.inner().select_item()
+            }
+            fn AddToSelection(&self) -> Result<()> {
+                self.inner().select_item()
+            }
+            fn RemoveFromSelection(&self) -> Result<()> {
+                Ok(())
+            }
+            fn IsSelected(&self) -> Result<BOOL> {
+                self.inner().is_selected()
+            }
+            fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
+                self.inner().selection_container()
+            }
+        }
+        impl IExpandCollapseProvider_Impl for $imp {
+            fn Expand(&self) -> Result<()> {
+                self.inner().expand()
+            }
+            fn Collapse(&self) -> Result<()> {
+                self.inner().collapse()
+            }
+            fn ExpandCollapseState(&self) -> Result<ExpandCollapseState> {
+                self.inner().expand_state()
+            }
+        }
+        impl IScrollProvider_Impl for $imp {
+            fn Scroll(&self, _h: ScrollAmount, v: ScrollAmount) -> Result<()> {
+                self.inner().scroll(v)
+            }
+            fn SetScrollPercent(&self, _h: f64, v: f64) -> Result<()> {
+                self.inner().scroll_set_percent(v)
+            }
+            fn HorizontalScrollPercent(&self) -> Result<f64> {
+                Ok(UIA_SCROLL_NO_SCROLL)
+            }
+            fn VerticalScrollPercent(&self) -> Result<f64> {
+                self.inner().scroll_v_percent()
+            }
+            fn HorizontalViewSize(&self) -> Result<f64> {
+                Ok(100.0)
+            }
+            fn VerticalViewSize(&self) -> Result<f64> {
+                self.inner().scroll_v_view()
+            }
+            fn HorizontallyScrollable(&self) -> Result<BOOL> {
+                Ok(false.into())
+            }
+            fn VerticallyScrollable(&self) -> Result<BOOL> {
+                self.inner().scroll_v_able()
+            }
+        }
+        impl IScrollItemProvider_Impl for $imp {
+            fn ScrollIntoView(&self) -> Result<()> {
+                self.inner().scroll_into_view()
+            }
+        }
+    };
+}
+
+forward_provider!(ElementProvider_Impl);
+forward_provider!(RootProvider_Impl);
+
+// Root-only interfaces.
+impl IRawElementProviderFragmentRoot_Impl for RootProvider_Impl {
+    fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
+        self.inner().provider_from_point(x, y)
+    }
+    fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
+        self.inner().focus_provider()
+    }
+}
+
+impl IRawElementProviderAdviseEvents_Impl for RootProvider_Impl {
     fn AdviseEventAdded(
         &self,
-        eventid: crate::system_bindings::UIA_EVENT_ID,
+        _eventid: crate::system_bindings::UIA_EVENT_ID,
         _propertyids: *const SAFEARRAY,
     ) -> Result<()> {
-        uia_trace!("AdviseEventAdded ev={eventid} id={} root={}", self.id.0, self.is_root);
+        // We use `UiaClientsAreListening` to gate raises, so no bookkeeping is
+        // needed here; implementing the interface tells UIA the root wants events.
         Ok(())
     }
     fn AdviseEventRemoved(
         &self,
-        eventid: crate::system_bindings::UIA_EVENT_ID,
+        _eventid: crate::system_bindings::UIA_EVENT_ID,
         _propertyids: *const SAFEARRAY,
     ) -> Result<()> {
-        uia_trace!("AdviseEventRemoved ev={eventid} id={}", self.id.0);
         Ok(())
     }
 }
 
-impl IRawElementProviderSimple_Impl for ElementProvider_Impl {
-    fn ProviderOptions(&self) -> Result<ProviderOptions> {
-        uia_trace!("ProviderOptions id={} item={} root={}", self.id.0, self.item, self.is_root);
+// Shared provider logic (identity + patterns), called by both `ElementProvider`
+// and `RootProvider` through the `forward_provider!` impls.
+impl ElementProvider {
+    fn provider_options(&self) -> Result<ProviderOptions> {
         Ok(PROVIDER_OPTIONS_SERVER)
     }
 
-    fn GetPatternProvider(&self, patternid: UIA_PATTERN_ID) -> Result<IUnknown> {
-        uia_trace!("GetPatternProvider id={} item={} pat={patternid}", self.id.0, self.item);
+    fn pattern_provider(&self, patternid: UIA_PATTERN_ID) -> Result<IUnknown> {
         let (id, item) = (self.id, self.item);
         let supported = get(self.hwnd, move |b| Some(b.uia_pattern_supported(id, item, patternid)))?;
         if supported {
@@ -1237,31 +1430,21 @@ impl IRawElementProviderSimple_Impl for ElementProvider_Impl {
         }
     }
 
-    fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> Result<VARIANT> {
-        uia_trace!("GetPropertyValue id={} item={} pid={propertyid}", self.id.0, self.item);
-        Ok(self.property(propertyid))
-    }
-
-    fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
-        uia_trace!("HostRawElementProvider id={} root={}", self.id.0, self.is_root);
+    fn host_element_provider(&self) -> Result<IRawElementProviderSimple> {
         if self.is_root {
             host_provider(self.hwnd)
         } else {
             Err(Error::empty()) // S_OK + null: only the root merges with the host
         }
     }
-}
 
-impl IRawElementProviderFragment_Impl for ElementProvider_Impl {
-    fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
-        uia_trace!("Navigate id={} item={} dir={direction}", self.id.0, self.item);
+    fn navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
         let (id, item) = (self.id, self.item);
         let nav = get(self.hwnd, move |b| Some(b.uia_navigate(id, item, direction)))?;
         nav_provider(self.hwnd, nav)
     }
 
-    fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
-        uia_trace!("GetRuntimeId id={} item={} root={}", self.id.0, self.item, self.is_root);
+    fn runtime_id(&self) -> Result<*mut SAFEARRAY> {
         if self.is_root {
             // A fragment ROOT must return null: UIA derives its identity from
             // the host HWND, which lets client subscriptions taken on the
@@ -1272,43 +1455,34 @@ impl IRawElementProviderFragment_Impl for ElementProvider_Impl {
         Ok(make_runtime_id(self.id, self.item))
     }
 
-    fn BoundingRectangle(&self) -> Result<UiaRect> {
+    fn bounding_rect(&self) -> Result<UiaRect> {
         let (id, item) = (self.id, self.item);
         let (left, top, width, height) = get(self.hwnd, move |b| b.uia_bounding_rect(id, item))?;
         Ok(UiaRect { left, top, width, height })
     }
 
-    fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
-        Ok(core::ptr::null_mut())
-    }
-
-    fn SetFocus(&self) -> Result<()> {
+    fn set_focus_node(&self) -> Result<()> {
         let id = self.id;
         act(self.hwnd, move |b| b.uia_focus_node(id));
         Ok(())
     }
 
-    fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
-        uia_trace!("FragmentRoot id={} item={}", self.id.0, self.item);
+    fn fragment_root_provider(&self) -> Result<IRawElementProviderFragmentRoot> {
         let rid = root_id(self.hwnd).ok_or_else(not_available)?;
         stable_provider(ElementProvider::root(self.hwnd, rid)).cast()
     }
-}
 
-impl IRawElementProviderFragmentRoot_Impl for ElementProvider_Impl {
-    fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
+    fn provider_from_point(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
         let nav = get(self.hwnd, move |b| Some(b.uia_element_from_point(x, y)))?;
         nav_provider(self.hwnd, nav)
     }
 
-    fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
+    fn focus_provider(&self) -> Result<IRawElementProviderFragment> {
         let nav = get(self.hwnd, |b| Some(b.uia_focus()))?;
         nav_provider(self.hwnd, nav)
     }
-}
 
-impl IInvokeProvider_Impl for ElementProvider_Impl {
-    fn Invoke(&self) -> Result<()> {
+    fn invoke(&self) -> Result<()> {
         let (id, item) = (self.id, self.item);
         if is_caption(item) {
             // Caption button: post the matching system command. `IsZoomed` is
@@ -1343,79 +1517,71 @@ impl IInvokeProvider_Impl for ElementProvider_Impl {
     }
 }
 
-impl IToggleProvider_Impl for ElementProvider_Impl {
-    fn Toggle(&self) -> Result<()> {
+impl ElementProvider {
+    fn toggle(&self) -> Result<()> {
         let id = self.id;
         act(self.hwnd, move |b| b.uia_activate(id));
         Ok(())
     }
 
-    fn ToggleState(&self) -> Result<ToggleState> {
+    fn toggle_state(&self) -> Result<ToggleState> {
         let id = self.id;
         get(self.hwnd, move |b| Some(b.uia_toggle_state(id)))
     }
-}
 
-impl IValueProvider_Impl for ElementProvider_Impl {
-    fn SetValue(&self, val: &PCWSTR) -> Result<()> {
+    fn value_set(&self, val: &PCWSTR) -> Result<()> {
         let s = unsafe { val.to_string() }.unwrap_or_default();
         let id = self.id;
         act(self.hwnd, move |b| b.uia_set_text(id, &s));
         Ok(())
     }
 
-    fn Value(&self) -> Result<BSTR> {
+    fn value_get(&self) -> Result<BSTR> {
         let id = self.id;
         Ok(BSTR::from(get(self.hwnd, move |b| Some(b.uia_value_string(id)))?))
     }
 
-    fn IsReadOnly(&self) -> Result<BOOL> {
-        Ok(false.into())
-    }
-}
-
-impl IRangeValueProvider_Impl for ElementProvider_Impl {
-    fn SetValue(&self, val: f64) -> Result<()> {
+    fn range_set(&self, val: f64) -> Result<()> {
         let id = self.id;
         act(self.hwnd, move |b| b.uia_set_range(id, val));
         Ok(())
     }
 
-    fn Value(&self) -> Result<f64> {
+    fn range_get(&self) -> Result<f64> {
         let id = self.id;
         Ok(get(self.hwnd, move |b| b.uia_range(id))?.0)
     }
 
-    fn IsReadOnly(&self) -> Result<BOOL> {
+    fn range_readonly(&self) -> Result<BOOL> {
         let id = self.id;
         Ok(get(self.hwnd, move |b| b.uia_range(id))?.3.into())
     }
 
-    fn Maximum(&self) -> Result<f64> {
+    fn range_max(&self) -> Result<f64> {
         let id = self.id;
         Ok(get(self.hwnd, move |b| b.uia_range(id))?.2)
     }
 
-    fn Minimum(&self) -> Result<f64> {
+    fn range_min(&self) -> Result<f64> {
         let id = self.id;
         Ok(get(self.hwnd, move |b| b.uia_range(id))?.1)
     }
 
-    fn LargeChange(&self) -> Result<f64> {
+    fn range_large(&self) -> Result<f64> {
         let id = self.id;
         Ok(get(self.hwnd, move |b| b.uia_range(id))?.4 * 10.0)
     }
 
-    fn SmallChange(&self) -> Result<f64> {
+    fn range_small(&self) -> Result<f64> {
         let id = self.id;
         Ok(get(self.hwnd, move |b| b.uia_range(id))?.4)
     }
 }
 
-impl ISelectionProvider_Impl for ElementProvider_Impl {
+impl ElementProvider {
     /// The selected item, as a one-element `VT_UNKNOWN` array of its provider
     /// (`S_OK` + null for an empty selection, per the pattern contract).
-    fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+    fn selection_get(&self) -> Result<*mut SAFEARRAY> {
         let id = self.id;
         let Some(i) = on_backend(self.hwnd, move |b| b.uia_selected_item(id)).flatten() else {
             return Ok(core::ptr::null_mut());
@@ -1432,46 +1598,24 @@ impl ISelectionProvider_Impl for ElementProvider_Impl {
         }
     }
 
-    fn CanSelectMultiple(&self) -> Result<BOOL> {
-        Ok(false.into())
-    }
-
-    fn IsSelectionRequired(&self) -> Result<BOOL> {
-        // Single-select containers: selection moves but is never cleared.
-        Ok(true.into())
-    }
-}
-
-impl ISelectionItemProvider_Impl for ElementProvider_Impl {
-    fn Select(&self) -> Result<()> {
+    fn select_item(&self) -> Result<()> {
         let (id, item) = (self.id, self.item);
         act(self.hwnd, move |b| b.uia_select_item(id, item));
         Ok(())
     }
 
-    fn AddToSelection(&self) -> Result<()> {
-        // Single-selection containers: identical to Select.
-        let (id, item) = (self.id, self.item);
-        act(self.hwnd, move |b| b.uia_select_item(id, item));
-        Ok(())
-    }
-
-    fn RemoveFromSelection(&self) -> Result<()> {
-        Ok(()) // single-select: nothing to remove
-    }
-
-    fn IsSelected(&self) -> Result<BOOL> {
+    fn is_selected(&self) -> Result<BOOL> {
         let (id, item) = (self.id, self.item);
         Ok(get(self.hwnd, move |b| Some(b.uia_item_selected(id, item)))?.into())
     }
 
-    fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
+    fn selection_container(&self) -> Result<IRawElementProviderSimple> {
         Ok(stable_provider(ElementProvider::element(self.hwnd, self.id)))
     }
 }
 
-impl IScrollProvider_Impl for ElementProvider_Impl {
-    fn Scroll(&self, _h: ScrollAmount, v: ScrollAmount) -> Result<()> {
+impl ElementProvider {
+    fn scroll(&self, v: ScrollAmount) -> Result<()> {
         let id = self.id;
         let (off, viewport, _) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
         let delta = match v {
@@ -1485,7 +1629,7 @@ impl IScrollProvider_Impl for ElementProvider_Impl {
         Ok(())
     }
 
-    fn SetScrollPercent(&self, _h: f64, v: f64) -> Result<()> {
+    fn scroll_set_percent(&self, v: f64) -> Result<()> {
         if v == UIA_SCROLL_NO_SCROLL {
             return Ok(());
         }
@@ -1497,22 +1641,14 @@ impl IScrollProvider_Impl for ElementProvider_Impl {
         Ok(())
     }
 
-    fn HorizontalScrollPercent(&self) -> Result<f64> {
-        Ok(UIA_SCROLL_NO_SCROLL) // vertical-only scrolling
-    }
-
-    fn VerticalScrollPercent(&self) -> Result<f64> {
+    fn scroll_v_percent(&self) -> Result<f64> {
         let id = self.id;
         let (off, viewport, content) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
         let max = (content - viewport).max(0.0);
         Ok(if max > 0.0 { (off / max) as f64 * 100.0 } else { UIA_SCROLL_NO_SCROLL })
     }
 
-    fn HorizontalViewSize(&self) -> Result<f64> {
-        Ok(100.0)
-    }
-
-    fn VerticalViewSize(&self) -> Result<f64> {
+    fn scroll_v_view(&self) -> Result<f64> {
         let id = self.id;
         let (_, viewport, content) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
         Ok(if content > viewport && content > 0.0 {
@@ -1522,39 +1658,31 @@ impl IScrollProvider_Impl for ElementProvider_Impl {
         })
     }
 
-    fn HorizontallyScrollable(&self) -> Result<BOOL> {
-        Ok(false.into())
-    }
-
-    fn VerticallyScrollable(&self) -> Result<BOOL> {
+    fn scroll_v_able(&self) -> Result<BOOL> {
         let id = self.id;
         let (_, viewport, content) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
         Ok((content > viewport).into())
     }
-}
 
-impl IScrollItemProvider_Impl for ElementProvider_Impl {
-    fn ScrollIntoView(&self) -> Result<()> {
+    fn scroll_into_view(&self) -> Result<()> {
         let (id, item) = (self.id, self.item);
         act(self.hwnd, move |b| b.uia_scroll_into_view(id, item));
         Ok(())
     }
-}
 
-impl IExpandCollapseProvider_Impl for ElementProvider_Impl {
-    fn Expand(&self) -> Result<()> {
+    fn expand(&self) -> Result<()> {
         let id = self.id;
         act(self.hwnd, move |b| b.uia_set_expanded(id, true));
         Ok(())
     }
 
-    fn Collapse(&self) -> Result<()> {
+    fn collapse(&self) -> Result<()> {
         let id = self.id;
         act(self.hwnd, move |b| b.uia_set_expanded(id, false));
         Ok(())
     }
 
-    fn ExpandCollapseState(&self) -> Result<ExpandCollapseState> {
+    fn expand_state(&self) -> Result<ExpandCollapseState> {
         let id = self.id;
         get(self.hwnd, move |b| Some(b.uia_expand_state(id)))
     }

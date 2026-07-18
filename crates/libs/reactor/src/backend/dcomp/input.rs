@@ -245,12 +245,17 @@ impl DCompBackend {
         if let Some(pid) = self.pressed_id
             && self.node(pid).map(|n| n.kind) == Some(ControlKind::Slider)
         {
+            // The gesture is now streaming updates, so every value chrome —
+            // this slider, the dial trailing it, the output meter — tracks 1:1
+            // instead of springing (see `mod::scrubbing`).
+            self.scrubbing = true;
             self.slider_to(pid, x);
             return;
         }
 
         // A pressed knob scrubs on a relative vertical drag (up = increase).
         if let Some((id, origin, y0)) = self.knob_drag {
+            self.scrubbing = true;
             self.knob_drag_to(id, origin, y0, y);
             return;
         }
@@ -479,6 +484,9 @@ impl DCompBackend {
         }
 
         if let Some(id) = target {
+            // A press starts as a CLICK — a discrete change that may spring. It
+            // only becomes a scrub once the pointer actually moves.
+            self.scrubbing = false;
             if let Some(n) = self.node_mut(id) {
                 n.pressed = true;
                 if parts::converted(n.kind) {
@@ -493,13 +501,19 @@ impl DCompBackend {
                 self.fire_bool(id, Event::DragStateChanged, true);
                 self.slider_to(id, x);
             }
-            // Knobs latch a RELATIVE vertical-drag origin (no immediate value
-            // change on press — only motion moves it).
+            // Knobs jump to the angle under the pointer (click-to-position),
+            // then scrub on a relative VERTICAL drag from there — precise, and
+            // the pointer never has to orbit the dial. The jump lands 1:1 (the
+            // node is pressed, so the arc does not ease into it); the drag
+            // origin is latched from the post-jump value so the scrub continues
+            // from where the click landed. A press on the centre hub does not
+            // jump, so grabbing the middle never throws the setting.
             if self.node(id).map(|n| n.kind) == Some(ControlKind::Knob) {
+                self.fire_bool(id, Event::DragStateChanged, true);
+                self.knob_press_to(id, x, y);
                 if let Some(n) = self.node(id) {
                     self.knob_drag = Some((id, n.ctrl.value, y));
                 }
-                self.fire_bool(id, Event::DragStateChanged, true);
             }
             self.fire_pointer(id, x, y, |p| p.on_pointer_pressed.as_ref());
             true
@@ -510,6 +524,8 @@ impl DCompBackend {
 
     /// Left button up.
     pub(crate) fn on_pointer_up(&mut self, x: f32, y: f32) {
+        // The gesture is over: value chrome may spring again.
+        self.scrubbing = false;
         // End a viz pointer-surface drag: the surface always sees the release
         // (capture semantics), wherever the pointer is.
         if let Some((sid, sinks, dy)) = self.pressed_surface.take() {
@@ -785,6 +801,31 @@ impl DCompBackend {
         if recolor {
             self.repaint();
         }
+        self.fire_f64(id, Event::ValueChanged, value);
+    }
+
+    /// Click-to-position: jump the knob to the angle under `(x, y)` and report
+    /// it. A press on the centre readout hub changes nothing (the relative drag
+    /// still starts from there). The node is `pressed` here, so the paint pass
+    /// moves the arc 1:1 — a click puts it exactly where you clicked.
+    fn knob_press_to(&mut self, id: ControlId, x: f32, y: f32) {
+        let value = {
+            let Some(n) = self.node_mut(id) else { return };
+            let Some(raw) = knob::value_at_point(n, x, y) else { return };
+            let mut v = raw.clamp(n.ctrl.min, n.ctrl.max);
+            if let Some(step) = n.ctrl.step
+                && step > 0.0
+            {
+                v = ((v / step).round() * step).clamp(n.ctrl.min, n.ctrl.max);
+            }
+            if (v - n.ctrl.value).abs() < f64::EPSILON {
+                return;
+            }
+            n.ctrl.value = v;
+            n.mark_dirty();
+            v
+        };
+        self.repaint();
         self.fire_f64(id, Event::ValueChanged, value);
     }
 

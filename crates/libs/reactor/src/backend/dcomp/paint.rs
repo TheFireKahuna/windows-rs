@@ -43,8 +43,9 @@ pub(crate) fn paint(
     arena: &mut Arena,
     root: ControlId,
     scale: f32,
+    scrubbing: bool,
 ) -> windows_core::Result<()> {
-    paint_node(comp, cache, atlas, arena, root, scale)
+    paint_node(comp, cache, atlas, arena, root, scale, scrubbing)
 }
 
 fn paint_node(
@@ -54,6 +55,7 @@ fn paint_node(
     arena: &mut Arena,
     id: ControlId,
     scale: f32,
+    scrubbing: bool,
 ) -> windows_core::Result<()> {
     let needs = arena
         .get(id)
@@ -93,7 +95,7 @@ fn paint_node(
                 // knob / fill / ink) against the state just painted: state
                 // changes glide on the compositor, first placement snaps.
                 if parts::converted(n.kind) {
-                    parts::sync(comp, atlas, n, scale);
+                    parts::sync(comp, atlas, n, scale, scrubbing);
                 }
                 // Editors: reconcile the caret sprite (position + compositor
                 // blink) against the text metrics just painted.
@@ -103,7 +105,7 @@ fn paint_node(
                 // Knob: reconcile the value-arc shape + needle (its own retained
                 // vector chrome, outside the flat `Part` model).
                 if n.kind == crate::backend::ControlKind::Knob {
-                    super::knob::sync_knob(comp, n, atlas.epoch(), scale);
+                    super::knob::sync_knob(comp, n, atlas.epoch(), scale, scrubbing);
                 }
             }
         }
@@ -111,7 +113,7 @@ fn paint_node(
 
     let children = arena.get(id).map(|n| n.children.clone()).unwrap_or_default();
     for c in children {
-        paint_node(comp, cache, atlas, arena, c, scale)?;
+        paint_node(comp, cache, atlas, arena, c, scale, scrubbing)?;
     }
 
     // Overlay scrollbar thumb (above the scrolled children) for scroll containers.

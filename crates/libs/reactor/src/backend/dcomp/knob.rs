@@ -47,6 +47,13 @@ const KNOB_DAMPING: f32 = 0.806;
 /// `draw_knob` (8-DIP arc, 2-DIP needle).
 const ARC_WIDTH: f32 = 8.0;
 const NEEDLE_W: f32 = 2.0;
+/// The value thumb's diameter (DIPs) — the grab handle riding the arc's end.
+/// Wider than the arc so it reads as a control rather than a cap.
+const THUMB_D: f32 = 15.0;
+/// The thumb's trim window as a fraction of the sweep. A round-capped stroke
+/// over a near-degenerate span renders as a filled circle (two semicircle caps
+/// meeting); a small non-zero span keeps the segment from being culled.
+const THUMB_EPS: f32 = 0.004;
 /// Needle length as a fraction of the track radius (atom `radius * 0.7`).
 const NEEDLE_FRAC: f32 = 0.7;
 /// Arc tessellation chord count over the full sweep.
@@ -84,6 +91,45 @@ pub(crate) fn dial_geom(node: &Node) -> (f32, f32, f32) {
         }
     }
     (cx, cy, radius)
+}
+
+/// Fraction of the track radius reserved for the centre readout hub. A press
+/// inside it starts a relative drag WITHOUT jumping the value, so grabbing the
+/// middle of the dial never throws the setting.
+const HUB_FRAC: f32 = 0.55;
+
+/// Map a pointer position (window DIPs) to a knob value — the inverse of
+/// [`value_to_angle`]. The angle is unwrapped into the sweep; a point in the
+/// gap below the dial clamps to whichever end is angularly nearer, so a press
+/// near the bottom can never wrap min↔max.
+///
+/// Returns `None` inside the readout hub, where a press must not jump.
+pub(crate) fn value_at_point(node: &Node, x: f32, y: f32) -> Option<f64> {
+    let (cx, cy, radius) = dial_geom(node);
+    let dx = x - node.rect.x - cx;
+    let dy = y - node.rect.y - cy;
+    if (dx * dx + dy * dy).sqrt() < radius * HUB_FRAC {
+        return None;
+    }
+    let (start, end) = (node.ctrl.start_angle, node.ctrl.end_angle);
+    // Canvas convention: 0 = east, clockwise — matching `value_to_angle`.
+    let tau = std::f32::consts::TAU;
+    let mut a = dy.atan2(dx);
+    while a < start {
+        a += tau;
+    }
+    while a >= start + tau {
+        a -= tau;
+    }
+    let sweep = end - start;
+    let t = if a <= end {
+        (a - start) / sweep
+    } else if (a - end) <= (start + tau - a) {
+        1.0
+    } else {
+        0.0
+    };
+    Some(node.ctrl.min + f64::from(t.clamp(0.0, 1.0)) * (node.ctrl.max - node.ctrl.min))
 }
 
 /// Map a value to its needle/sweep angle (radians), clamped to `[min, max]`.
@@ -139,17 +185,71 @@ fn build_arc_path(
     CompositionPath::Create(&source).ok()
 }
 
+/// Build the thumb's geometry + thick round-capped stroke over `path`. The
+/// trims are driven by expressions bound to the arc's `TrimEnd`
+/// ([`KnobParts::bind_thumb`]); this only establishes the stroke.
+fn build_thumb(
+    c5: &ICompositor5,
+    path: &CompositionPath,
+    white: &CompositionBrush,
+) -> Option<(
+    CompositionPathGeometry,
+    CompositionObject,
+    ICompositionSpriteShape,
+    CompositionShape,
+)> {
+    let geo = c5.CreatePathGeometryWithPath(path).ok()?;
+    let obj: CompositionObject = geo.cast().ok()?;
+    let ig = geo.cast::<ICompositionGeometry>().ok()?;
+    ig.SetTrimStart(0.0).ok()?;
+    ig.SetTrimEnd(0.0).ok()?;
+    let shape_c = c5.CreateSpriteShapeWithGeometry(&geo).ok()?;
+    let shape: ICompositionSpriteShape = shape_c.cast().ok()?;
+    shape.SetStrokeThickness(THUMB_D).ok()?;
+    shape.SetStrokeStartCap(CompositionStrokeCap::Round).ok()?;
+    shape.SetStrokeEndCap(CompositionStrokeCap::Round).ok()?;
+    shape.SetStrokeBrush(white).ok()?;
+    Some((geo, obj, shape, shape_c.cast().ok()?))
+}
+
 // ── Retained knob parts ──────────────────────────────────────────────────────
 
 /// The knob's retained compositor pieces. The arc is a `MaskBrush` (FP16 gradient
-/// source × white-`TrimEnd`-shape mask); the needle rides the same `TrimEnd`.
+/// source × white-`TrimEnd`-shape mask).
+///
+/// The arc and the thumb are the BAR — the thing the pointer manipulates — so
+/// they move as one: both geometries' `TrimEnd` are driven by the SAME spring
+/// instance, with identical parameters and identical current values, so they
+/// are in lockstep by construction and the circle can never trail the line.
+///
+/// The needle is a readout, not a handle, and runs on its OWN spring: a click
+/// puts the bar exactly where you clicked while the needle sweeps over to it.
 pub(crate) struct KnobParts {
     /// The white `TrimEnd` arc shape (off-tree) whose alpha the mask reads.
     mask_shape: ShapeVisual,
     geo: CompositionPathGeometry,
     geo_obj: CompositionObject,
     sprite_shape: ICompositionSpriteShape,
+    /// The value thumb: a SECOND stroke over the same arc path, trimmed to a
+    /// tiny window at the arc's end and stroked thick with round caps, so it
+    /// renders as a filled circle there. It lives in the same mask shape as the
+    /// arc, so the one gradient `MaskBrush` colours it with the arc's own colour
+    /// at that point — the thumb continues the bar's gradient by construction.
+    thumb_geo: CompositionPathGeometry,
+    thumb_geo_obj: CompositionObject,
+    thumb_shape: ICompositionSpriteShape,
+    thumb_bound: bool,
+    /// Drives BOTH `geo.TrimEnd` and `thumb_geo.TrimEnd` — one object started on
+    /// two targets, so the arc and thumb settle identically.
     trim_spring: Option<SpringScalarNaturalMotionAnimation>,
+    /// The needle's own retargetable spring on `RotationAngle`.
+    needle_spring: Option<SpringScalarNaturalMotionAnimation>,
+    /// Whether a spring may currently hold the bar's / the needle's property.
+    /// `frac` and `angle` record the last target REQUESTED, so while one of
+    /// these is set they say nothing about where the chrome actually is, and a
+    /// snap must run even when the target is unchanged (see `Part::place`).
+    trim_gliding: bool,
+    needle_gliding: bool,
     /// The visible arc sprite (its brush is the `MaskBrush`).
     display: SpriteVisual,
     display_vis: IVisual,
@@ -163,7 +263,8 @@ pub(crate) struct KnobParts {
     geom: (f32, f32, f32),
     init: bool,
     frac: f32,
-    needle_bound: bool,
+    /// Last needle angle written (radians), so an unchanged value costs nothing.
+    angle: f32,
 }
 
 fn stops_signature(stops: &[(f64, crate::Color)]) -> u64 {
@@ -204,10 +305,19 @@ impl KnobParts {
         let white = compositor
             .CreateColorBrushWithColor(UiColor { a: 255, r: 255, g: 255, b: 255 })
             .ok()?;
-        sprite_shape.SetStrokeBrush(&white.cast::<CompositionBrush>().ok()?).ok()?;
+        let white_cb: CompositionBrush = white.cast().ok()?;
+        sprite_shape.SetStrokeBrush(&white_cb).ok()?;
+
+        // The thumb, in the SAME mask shape so the gradient brush colours it
+        // with the arc's colour where it sits.
+        let (thumb_geo, thumb_geo_obj, thumb_shape, thumb_shape_c) =
+            build_thumb(&c5, &path, &white_cb)?;
+
         let mask_shape = c5.CreateShapeVisual().ok()?;
         mask_shape.cast::<IVisual>().ok()?.SetSize(Vector2::new(w, h)).ok()?;
-        mask_shape.Shapes().ok()?.Append(&sprite_shape_c.cast::<CompositionShape>().ok()?).ok()?;
+        let shapes = mask_shape.Shapes().ok()?;
+        shapes.Append(&sprite_shape_c.cast::<CompositionShape>().ok()?).ok()?;
+        shapes.Append(&thumb_shape_c).ok()?;
 
         // ── Live snapshot of the mask shape → a surface brush ──
         let visual_surface = cvs.CreateVisualSurface().ok()?;
@@ -237,7 +347,14 @@ impl KnobParts {
             geo,
             geo_obj,
             sprite_shape,
+            thumb_geo,
+            thumb_geo_obj,
+            thumb_shape,
+            thumb_bound: false,
             trim_spring: None,
+            needle_spring: None,
+            trim_gliding: false,
+            needle_gliding: false,
             display,
             display_vis,
             mask_brush,
@@ -249,11 +366,18 @@ impl KnobParts {
             geom: (0.0, 0.0, 0.0),
             init: false,
             frac: -1.0,
-            needle_bound: false,
+            angle: f32::NAN,
         })
     }
 
-    pub(crate) fn sync(&mut self, comp: &Compositing, node: &Node, atlas_epoch: u32, scale: f32) {
+    pub(crate) fn sync(
+        &mut self,
+        comp: &Compositing,
+        node: &Node,
+        atlas_epoch: u32,
+        scale: f32,
+        scrubbing: bool,
+    ) {
         let (w, h) = (node.rect.w, node.rect.h);
         let (cx, cy, radius) = dial_geom(node);
         let start = node.ctrl.start_angle;
@@ -278,7 +402,16 @@ impl KnobParts {
                     }
                     self.geo = geo;
                     self.trim_spring = None;
-                    self.needle_bound = false;
+                    // The thumb rides the same path — rebuild it too, then let
+                    // both re-bind against the new geometry below.
+                    if let Ok(tgeo) = c5.CreatePathGeometryWithPath(&path) {
+                        let _ = self.thumb_shape.SetGeometry(&tgeo);
+                        if let Ok(obj) = tgeo.cast::<CompositionObject>() {
+                            self.thumb_geo_obj = obj;
+                        }
+                        self.thumb_geo = tgeo;
+                    }
+                    self.thumb_bound = false;
                 }
             }
             let _ = self.mask_shape.cast::<IVisual>().map(|v| v.SetSize(Vector2::new(w, h)));
@@ -311,21 +444,54 @@ impl KnobParts {
             self.stops_sig = sig;
         }
 
-        if !self.needle_bound {
-            self.bind_needle(start, end);
+        if !self.thumb_bound {
+            self.bind_thumb();
         }
 
+        // ── The BAR (arc + thumb) ────────────────────────────────────────────
+        // Direct manipulation lands 1:1: while this knob is the one under the
+        // pointer, snap with plain property sets (stopping any in-flight
+        // spring). That covers both a click-to-position jump and the drag that
+        // may follow it — the bar goes exactly where you put it.
+        //
+        // It also tracks 1:1 while ANY drag is streaming updates: a
+        // natural-motion spring restarted on every update never leaves rest, so
+        // springing here left the arc pinned until the pointer stopped and only
+        // then sprang to the final value.
+        //
+        // A discrete change — a preset, the wheel, an external set — eases in.
         let frac = ctrl_frac(node) as f32;
-        if (self.frac - frac).abs() > f32::EPSILON || resized {
-            if self.init && !resized {
+        let spring_bar = self.init && !resized && !node.pressed && !scrubbing;
+        // Run when the target moved, and ALSO whenever a snap is wanted while a
+        // spring may still hold the property — otherwise an interrupted glide
+        // strands the bar and the unchanged target suppresses every later fix.
+        if (self.frac - frac).abs() > f32::EPSILON || resized || (!spring_bar && self.trim_gliding) {
+            if spring_bar {
                 self.spring_trim(frac);
             } else {
-                if let Ok(ig) = self.geo.cast::<ICompositionGeometry>() {
-                    let _ = ig.SetTrimEnd(frac);
-                }
-                self.init = true;
+                self.snap_trim(frac);
             }
             self.frac = frac;
+        }
+
+        // ── The NEEDLE ───────────────────────────────────────────────────────
+        // A readout, not a handle, so it keeps its own motion: it SWEEPS to a
+        // discrete change (including a click-to-position jump the bar took
+        // instantly) on its own spring. It still tracks 1:1 during a live drag,
+        // for the same restart-pinning reason as the bar.
+        let angle = value_to_angle(node.ctrl.value, node.ctrl.min, node.ctrl.max, start, end);
+        let spring_needle = self.angle.is_finite() && !resized && !scrubbing;
+        if !self.angle.is_finite()
+            || (self.angle - angle).abs() > f32::EPSILON
+            || resized
+            || (!spring_needle && self.needle_gliding)
+        {
+            if spring_needle {
+                self.spring_needle(angle);
+            } else {
+                self.snap_needle(angle);
+            }
+            self.angle = angle;
         }
 
         let dim = if node.paint.is_enabled { 1.0 } else { theme::disabled_opacity() };
@@ -340,27 +506,30 @@ impl KnobParts {
         let _ = self.needle_vis.SetCenterPoint(Vector3::new(0.0, NEEDLE_W / 2.0, 0.0));
     }
 
-    /// Bind the needle's `RotationAngle` to the arc's animated `TrimEnd`:
-    /// `angle = start + TrimEnd·(end − start)` — one spring drives both.
-    fn bind_needle(&mut self, start: f32, end: f32) {
+    /// Bind the thumb's trim WINDOW: `TrimStart = Max(0, TrimEnd − ε)` against
+    /// the thumb geometry's OWN `TrimEnd`. Referencing itself (rather than the
+    /// arc) keeps the window a same-object read, so the circle's two edges can
+    /// never disagree about where the end is; `TrimEnd` itself is driven by the
+    /// arc's spring in [`spring_trim`] / [`snap_trim`].
+    fn bind_thumb(&mut self) {
         let run = || -> Option<()> {
             let compositor = self.needle.cast::<ICompositionObject>().ok()?.Compositor().ok()?;
             let expr: ExpressionAnimation = compositor
-                .CreateExpressionAnimationWithExpression(&format!(
-                    "{start} + geo.TrimEnd * {sweep}",
-                    sweep = end - start
-                ))
+                .CreateExpressionAnimationWithExpression(&format!("Max(0.0, tg.TrimEnd - {THUMB_EPS})"))
                 .ok()?;
             let ianim: ICompositionAnimation = expr.cast().ok()?;
-            ianim.SetReferenceParameter("geo", &self.geo_obj).ok()?;
-            let needle_obj: ICompositionObject = self.needle.cast().ok()?;
-            needle_obj
-                .StartAnimation("RotationAngle", &expr.cast::<CompositionAnimation>().ok()?)
+            ianim.SetReferenceParameter("tg", &self.thumb_geo_obj).ok()?;
+            self.thumb_geo_obj
+                .StartAnimation("TrimStart", &expr.cast::<CompositionAnimation>().ok()?)
                 .ok()
         };
-        self.needle_bound = run().is_some();
+        self.thumb_bound = run().is_some();
     }
 
+    /// Ease the bar to `target`. ONE spring object is started on both the arc's
+    /// and the thumb's `TrimEnd`: same parameters, same current value, so the
+    /// two instances trace the same curve and the circle rides the line's end
+    /// exactly rather than trailing it.
     fn spring_trim(&mut self, target: f32) {
         let started = (|| -> Option<()> {
             if self.trim_spring.is_none() {
@@ -373,16 +542,69 @@ impl KnobParts {
             }
             let a = self.trim_spring.as_ref()?;
             a.cast::<IScalarNaturalMotionAnimation>().ok()?.SetFinalValue(Some(target)).ok()?;
-            self.geo_obj
-                .StartAnimation("TrimEnd", &a.cast::<CompositionAnimation>().ok()?)
+            let anim: CompositionAnimation = a.cast().ok()?;
+            self.geo_obj.StartAnimation("TrimEnd", &anim).ok()?;
+            self.thumb_geo_obj.StartAnimation("TrimEnd", &anim).ok()
+        })()
+        .is_some();
+        if started {
+            self.trim_gliding = true;
+        } else {
+            self.snap_trim(target);
+        }
+    }
+
+    /// Put the bar at `target` NOW — stop any in-flight spring on both the arc
+    /// and the thumb and write the value directly.
+    fn snap_trim(&mut self, target: f32) {
+        if self.trim_gliding {
+            let _ = self.geo_obj.StopAnimation("TrimEnd");
+            let _ = self.thumb_geo_obj.StopAnimation("TrimEnd");
+            self.trim_gliding = false;
+        }
+        for g in [&self.geo, &self.thumb_geo] {
+            if let Ok(ig) = g.cast::<ICompositionGeometry>() {
+                let _ = ig.SetTrimEnd(target);
+            }
+        }
+        self.init = true;
+    }
+
+    /// Sweep the needle to `angle` (radians) on its own spring.
+    fn spring_needle(&mut self, angle: f32) {
+        let started = (|| -> Option<()> {
+            let needle_obj: ICompositionObject = self.needle.cast().ok()?;
+            if self.needle_spring.is_none() {
+                let compositor = needle_obj.Compositor().ok()?;
+                let a = compositor.cast::<ICompositor4>().ok()?.CreateSpringScalarAnimation().ok()?;
+                let sa: ISpringScalarNaturalMotionAnimation = a.cast().ok()?;
+                sa.SetDampingRatio(KNOB_DAMPING).ok()?;
+                sa.SetPeriod(ts_secs(KNOB_PERIOD)).ok()?;
+                self.needle_spring = Some(a);
+            }
+            let a = self.needle_spring.as_ref()?;
+            a.cast::<IScalarNaturalMotionAnimation>().ok()?.SetFinalValue(Some(angle)).ok()?;
+            needle_obj
+                .StartAnimation("RotationAngle", &a.cast::<CompositionAnimation>().ok()?)
                 .ok()
         })()
         .is_some();
-        if !started
-            && let Ok(ig) = self.geo.cast::<ICompositionGeometry>()
-        {
-            let _ = ig.SetTrimEnd(target);
+        if started {
+            self.needle_gliding = true;
+        } else {
+            self.snap_needle(angle);
         }
+    }
+
+    /// Put the needle at `angle` NOW (stopping any in-flight sweep).
+    fn snap_needle(&mut self, angle: f32) {
+        if self.needle_gliding
+            && let Ok(o) = self.needle.cast::<ICompositionObject>()
+        {
+            let _ = o.StopAnimation("RotationAngle");
+            self.needle_gliding = false;
+        }
+        let _ = self.needle_vis.SetRotationAngle(angle);
     }
 
     /// Detach the visible arc + needle from the node container (node teardown).
@@ -410,12 +632,18 @@ fn ctrl_frac(node: &Node) -> f64 {
 }
 
 /// Ensure the node has its knob parts and reconcile them (the paint-pass entry).
-pub(crate) fn sync_knob(comp: &Compositing, node: &mut Node, atlas_epoch: u32, scale: f32) {
+pub(crate) fn sync_knob(
+    comp: &Compositing,
+    node: &mut Node,
+    atlas_epoch: u32,
+    scale: f32,
+    scrubbing: bool,
+) {
     if node.knob.is_none() {
         node.knob = KnobParts::new(comp, node).map(Box::new);
     }
     if let Some(mut kp) = node.knob.take() {
-        kp.sync(comp, node, atlas_epoch, scale);
+        kp.sync(comp, node, atlas_epoch, scale, scrubbing);
         node.knob = Some(kp);
     }
 }

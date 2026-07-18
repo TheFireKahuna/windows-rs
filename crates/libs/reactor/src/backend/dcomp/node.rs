@@ -886,6 +886,19 @@ impl Arena {
         ControlId::new(self.next)
     }
 
+    /// Insert at an id minted by the caller (the command-buffer seam mints
+    /// reconciler-side so `create` needs no synchronous answer — see
+    /// [`record`](super::record)).
+    ///
+    /// `next` is advanced past the supplied id so a later [`insert`](Self::insert)
+    /// can never mint a colliding one: the two minting paths share one id space
+    /// and the never-reuse contract above spans both.
+    pub fn insert_with_id(&mut self, id: ControlId, node: Node) {
+        let raw = id.get();
+        self.nodes.insert(raw, node);
+        self.next = self.next.max(raw);
+    }
+
     pub fn get(&self, id: ControlId) -> Option<&Node> {
         self.nodes.get(&id.get())
     }
