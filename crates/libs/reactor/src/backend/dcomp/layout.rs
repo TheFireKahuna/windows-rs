@@ -127,8 +127,35 @@ fn lay_out(
                             height: known.height.unwrap_or(th + 2.0 * (m.pad_y + m.tray)),
                         };
                     }
+                    // A ToggleSwitch's label sits AFTER the track, so its
+                    // intrinsic width is the track plus the gap plus the
+                    // (wider) label — without this the row clips the text.
+                    if node.kind == ControlKind::ToggleSwitch {
+                        return Size {
+                            width: known.width.unwrap_or(
+                                parts::TRACK_W + controls::TOGGLE_LABEL_GAP + tw,
+                            ),
+                            // Taffy clamps to the birth `min_size` (the 40x20
+                            // track), so the label's line height alone is the
+                            // right answer here.
+                            height: known.height.unwrap_or(th),
+                        };
+                    }
+                    // A leading icon widens the button by its box plus the gap
+                    // — without this an icon button sizes to its label alone
+                    // and the glyph overlaps the text.
+                    let icon_w = if node.extras().icon != 0 {
+                        controls::ICON_SIZE
+                            + if node.paint.text.is_empty() {
+                                0.0
+                            } else {
+                                controls::ICON_GAP
+                            }
+                    } else {
+                        0.0
+                    };
                     return Size {
-                        width: known.width.unwrap_or(tw),
+                        width: known.width.unwrap_or(tw + icon_w),
                         height: known.height.unwrap_or(th),
                     };
                 }
@@ -265,6 +292,59 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
             n.measure_dirty = true;
         }
     }
+    // A ToggleSwitch sizes to its track PLUS the wider of its two state
+    // labels. The *wider*, not the current one, so flipping the switch never
+    // reflows the row around it — and so one cached layout is enough.
+    let needs_toggle = arena.get(id).is_some_and(|n| {
+        n.text_dirty
+            && n.kind == ControlKind::ToggleSwitch
+            && !(n.extras().on_content.is_empty() && n.extras().off_content.is_empty())
+    });
+    if needs_toggle {
+        let (on, off, size, family) = {
+            let n = arena.get(id).unwrap();
+            (
+                n.extras().on_content.clone(),
+                n.extras().off_content.clone(),
+                n.paint.font_size.max(theme::FONT_SIZE_MD),
+                n.paint.font_family.clone().unwrap_or_else(|| "Segoe UI".to_string()),
+            )
+        };
+        let mut widest: Option<TextLayout> = None;
+        let mut widest_w = -1.0f32;
+        for s in [&on, &off] {
+            if s.is_empty() {
+                continue;
+            }
+            if let Some(l) = build_text_layout(s, size, 400, &family, false)
+                && let Ok((w, _)) = l.measure()
+                && w > widest_w
+            {
+                widest_w = w;
+                widest = Some(l);
+            }
+        }
+        if let Some(n) = arena.get_mut(id) {
+            n.text_layout = widest;
+            n.text_dirty = false;
+            n.measure_dirty = true;
+        }
+    }
+    // The caption band draws its own title/subtitle, so it lays them out here
+    // too — and then re-derives the geometry that depends on their measured
+    // width. See `apply_caption_metrics`.
+    let needs_caption = arena
+        .get(id)
+        .is_some_and(|n| n.text_dirty && n.kind == ControlKind::TitleBar);
+    if needs_caption {
+        let built = arena.get(id).map(|n| caption::build_text(n.extras()));
+        if let Some(n) = arena.get_mut(id) {
+            n.caption_text = built.flatten();
+            n.text_dirty = false;
+            n.measure_dirty = true;
+            apply_caption_metrics(n);
+        }
+    }
     let mut i = 0;
     while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
         rebuild_text(arena, c);
@@ -272,8 +352,41 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
     }
 }
 
+/// Re-derive the TitleBar band's layout metrics from the caption state it now
+/// holds: the `tall` band height, and the left padding that reserves the drawn
+/// back button + title block.
+///
+/// Both are chrome geometry, not app style — the band's *right* padding has
+/// always reserved the drawn window-button cluster the same way (see
+/// `birth_style`), and this is the leading half of that same rule. A `Padding`
+/// write from the app is therefore combined with, not replaced by, the inset:
+/// the base comes from `birth_style()` so this stays idempotent no matter how
+/// many times a title changes.
+pub(crate) fn apply_caption_metrics(n: &mut Node) {
+    if n.kind != ControlKind::TitleBar {
+        return;
+    }
+    // Both come straight from `caption`, which is also what `birth_style`
+    // builds a virgin TitleBar from — so a node whose caption state is back at
+    // its defaults re-derives exactly the style it was born with.
+    let pad = caption::pad_left(n.extras())
+        + caption::title_block(n.caption_text.as_deref(), n.rect.w);
+    n.style.min_size.height = length(caption::band_height(n.extras()));
+    n.style.padding.left = length(pad);
+    n.mark_dirty();
+}
+
 fn is_text(n: &Node) -> bool {
-    matches!(n.kind, ControlKind::TextBlock | ControlKind::Button) && !n.paint.text.is_empty()
+    match n.kind {
+        // A Button with only an icon and no label still needs a layout: it is
+        // what carries the line height, and without one the measure callback
+        // has nothing to key on and the button collapses to 0x0. The empty
+        // run measures zero wide, so the icon width is the whole intrinsic
+        // size — which is the right answer.
+        ControlKind::Button => !n.paint.text.is_empty() || n.extras().icon != 0,
+        ControlKind::TextBlock => !n.paint.text.is_empty(),
+        _ => false,
+    }
 }
 
 fn build_text_layout(

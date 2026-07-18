@@ -164,6 +164,35 @@ fn update_scroll_thumb(
         return Ok(());
     }
 
+    // An always-visible bar has no hover edge to ride, so overflow itself is
+    // its reveal: the moment the content outgrows the viewport, show it. A
+    // never-visible one is concealed here for the same reason — the policy may
+    // have changed while the pointer was nowhere near.
+    let shown = match arena
+        .get(id)
+        .map(|n| scroll::reveal_policy(n.extras().v_scrollbar))
+    {
+        Some(scroll::Reveal::Always) if !shown => {
+            if let Some(n) = arena.get_mut(id) {
+                n.thumb_shown = true;
+                if let Some(t) = &n.scroll_thumb {
+                    animate::fade_thumb(comp.compositor(), t, true);
+                }
+            }
+            true
+        }
+        Some(scroll::Reveal::Never) if shown => {
+            if let Some(n) = arena.get_mut(id) {
+                n.thumb_shown = false;
+                if let Some(t) = &n.scroll_thumb {
+                    animate::fade_thumb(comp.compositor(), t, false);
+                }
+            }
+            false
+        }
+        _ => shown,
+    };
+
     let pw = (THUMB_W * scale).ceil() as i32;
     let ph = (g.thumb_h * scale).ceil() as i32;
     if arena.get(id).is_some_and(|n| n.scroll_thumb.is_none()) {

@@ -306,18 +306,31 @@ impl DCompBackend {
 
     /// Drawn caption buttons under the fragment root (0 when the window has no
     /// custom caption).
+    ///
+    /// Four when the band also draws a back button. It takes the LAST index
+    /// ([`caption::BACK_INDEX`]) rather than the first, because that index is
+    /// shared with the hover/press cells and the non-client hit mapping — one
+    /// numbering for all three, so a screen reader and the mouse can never
+    /// disagree about which element is which. The cost is that the back button
+    /// reads after the window buttons rather than before them.
     fn uia_caption_count(&self) -> i32 {
-        if self.caption_rect().is_some() {
-            3
+        if self.caption_rect().is_none() {
+            return 0;
+        }
+        if self.back_button_rect().is_some() {
+            caption::BACK_INDEX + 1
         } else {
-            0
+            3
         }
     }
 
-    /// Caption button `i` (0=min, 1=max, 2=close)'s rect in window DIPs — the
-    /// buttons fill the right end of the caption strip, each [`caption::BTN_W`]
-    /// wide.
+    /// Caption button `i` (0=min, 1=max, 2=close, 3=back)'s rect in window
+    /// DIPs. The window buttons fill the right end of the caption strip, each
+    /// [`caption::BTN_W`] wide; the back button sits at the leading edge.
     fn uia_caption_button(&self, i: i32) -> Option<(f32, f32, f32, f32)> {
+        if i == caption::BACK_INDEX {
+            return self.back_button_rect();
+        }
         if !(0..3).contains(&i) {
             return None;
         }
@@ -459,7 +472,8 @@ impl DCompBackend {
                 0 => "Minimize",
                 1 if caption::maximized() => "Restore",
                 1 => "Maximize",
-                _ => "Close",
+                2 => "Close",
+                _ => "Back",
             }
             .to_string();
         }
@@ -1819,6 +1833,13 @@ impl ElementProvider {
     fn invoke(&self) -> Result<()> {
         let (id, item) = (self.id, self.item);
         if is_caption(item) {
+            // The back button is an app command, not a system one — it has to
+            // go back through the backend on the UI thread, like any other
+            // invoke, rather than posting a `WM_SYSCOMMAND`.
+            if item - CAPTION_ITEM_BASE == caption::BACK_INDEX {
+                act(self.hwnd, move |b| b.raise_back_requested());
+                return Ok(());
+            }
             // Caption button: post the matching system command. `IsZoomed` is
             // callable from this (UIA worker) thread, unlike the caption's
             // UI-thread hover state.

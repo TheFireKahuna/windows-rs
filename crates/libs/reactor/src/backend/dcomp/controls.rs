@@ -40,8 +40,9 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         | ControlKind::SplitButton => paint_button(session, brush, node, rect, dim),
         ControlKind::HyperlinkButton => paint_hyperlink(session, brush, node, rect, dim),
         // Track, outline, and knob are retained chrome parts (compositor
-        // sprites — see `super::parts`); only the focus-ring tail below paints.
-        ControlKind::ToggleSwitch => {}
+        // sprites — see `super::parts`); the state label beside them is static
+        // text, so it paints here on the node's own surface.
+        ControlKind::ToggleSwitch => paint_toggle_label(session, brush, node, rect, dim),
         ControlKind::CheckBox => paint_check_box(session, brush, node, rect, dim),
         ControlKind::SelectorBar => paint_segmented(session, brush, node, rect, dim),
         ControlKind::ComboBox | ControlKind::DropDownButton => {
@@ -145,6 +146,17 @@ fn glyph_str(cp: u32) -> Option<String> {
     char::from_u32(cp).map(|c| c.to_string())
 }
 
+/// Encode a glyph codepoint into a caller-owned stack buffer — the alloc-free
+/// counterpart to [`glyph_str`], for paths that hand the glyph straight to
+/// `draw_text` and never need to own it.
+fn glyph_into(cp: u32, buf: &mut [u8; 4]) -> Option<&str> {
+    char::from_u32(cp).map(|c| &*c.encode_utf8(buf))
+}
+
+/// A button's leading icon: box size, and the gap before the label.
+pub(crate) const ICON_SIZE: f32 = 16.0;
+pub(crate) const ICON_GAP: f32 = theme::SPACE_8;
+
 /// A focus ring: a 2px `STROKE_STRONG` rounded outline inset 1px from the edge.
 pub(crate) fn draw_focus_ring(session: &DrawingSession, brush: &Brush, rect: Rect, radius: f32) {
     let r = Rect::new(rect.left + 1.0, rect.top + 1.0, rect.right - 1.0, rect.bottom - 1.0);
@@ -200,16 +212,84 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
             theme::text()
         },
     );
+    // A leading icon glyph, when the app set one. It takes the leading inset
+    // and the label centres in what is left, so an icon-only button (no label)
+    // still reads as centred chrome.
+    let mut label_box = rect;
+    let mut gbuf = [0u8; 4];
+    if let Some(g) = glyph_into(node.extras().icon, &mut gbuf) {
+        let ix = rect.left + theme::SPACE_12;
+        text(
+            session,
+            brush,
+            g,
+            Rect::new(ix, rect.top, ix + ICON_SIZE, rect.bottom),
+            theme::FONT_ICON,
+            ICON_SIZE,
+            400,
+            fg,
+            TextAlignment::Center,
+            ParagraphAlignment::Center,
+            dim,
+        );
+        if !node.paint.text.is_empty() {
+            label_box = Rect::new(ix + ICON_SIZE + ICON_GAP, rect.top, rect.right, rect.bottom);
+        }
+    }
     text(
         session,
         brush,
         &node.paint.text,
-        rect,
+        label_box,
         "Segoe UI",
         node.paint.font_size.max(theme::FONT_SIZE_MD),
         if accent { 600 } else { 400 },
         fg,
         TextAlignment::Center,
+        ParagraphAlignment::Center,
+        dim,
+    );
+}
+
+// ── ToggleSwitch ─────────────────────────────────────────────────────────────
+
+/// Gap between the switch track and its state label (the WinUI metric).
+pub(crate) const TOGGLE_LABEL_GAP: f32 = theme::SPACE_12;
+
+/// The label for the state the switch is currently in. Empty when the app set
+/// neither `OnContent` nor `OffContent`, which is the bare-switch default.
+pub(crate) fn toggle_label(node: &Node) -> &str {
+    let x = node.extras();
+    if node.ctrl().is_on {
+        &x.on_content
+    } else {
+        &x.off_content
+    }
+}
+
+/// The state label beside the track — left-aligned after it, vertically
+/// centred on the track, in the body text style.
+///
+/// Intentionally NOT a retained part: it does not move or fade, it only
+/// changes at the moment the switch flips, which already forces exactly one
+/// repaint of this surface.
+fn paint_toggle_label(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
+    let label = toggle_label(node);
+    if label.is_empty() {
+        return;
+    }
+    let x0 = rect.left + super::parts::TRACK_W + TOGGLE_LABEL_GAP;
+    let box_ = Rect::new(x0, rect.top, rect.right, rect.bottom);
+    text(
+        session,
+        brush,
+        label,
+        box_,
+        "Segoe UI",
+        node.paint.font_size.max(theme::FONT_SIZE_MD),
+        400,
+        node.paint.foreground.unwrap_or(theme::text()),
+        TextAlignment::Leading,
         ParagraphAlignment::Center,
         dim,
     );

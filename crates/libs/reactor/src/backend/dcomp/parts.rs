@@ -1221,7 +1221,7 @@ pub(crate) fn ink_state_changed(node: &mut Node) {
 // ── ToggleSwitch ─────────────────────────────────────────────────────────────
 
 /// Track geometry mirrors the retired `paint_toggle_switch`.
-const TRACK_W: f32 = 40.0;
+pub(crate) const TRACK_W: f32 = 40.0;
 const TRACK_H: f32 = 20.0;
 const KNOB_D: f32 = 12.0;
 

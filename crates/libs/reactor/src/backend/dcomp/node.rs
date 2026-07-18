@@ -636,6 +636,11 @@ pub(crate) struct Node {
     pub title_content: Option<ControlId>,
     /// TitleBar only: the mounted `RightHeader`/footer (trailing) slot child.
     pub title_footer: Option<ControlId>,
+    /// TitleBar only: the band's own cached title/subtitle layouts. Boxed and
+    /// lazy for the same reason [`Extras`] is — a tree holds at most one or two
+    /// TitleBars, and every other node would carry the dead weight. Rebuilt by
+    /// the layout pass on `text_dirty`; `None` when the band has no titles.
+    pub caption_text: Option<Box<caption::CaptionText>>,
 }
 
 impl Node {
@@ -700,6 +705,7 @@ impl Node {
             editor: is_text_editable(kind).then(|| Editor::new(kind)),
             title_content: None,
             title_footer: None,
+            caption_text: None,
         }
     }
 
@@ -1236,12 +1242,17 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
             s.grid_template_columns =
                 vec![GridTemplateComponent::Single(flex(1.0)), GridTemplateComponent::Single(auto())];
             s.grid_template_rows = vec![GridTemplateComponent::Single(auto())];
-            // Standard 48px caption height with the token side padding. The
-            // right padding additionally reserves the drawn min/max/close
-            // cluster (the frame is extended; the buttons are ours).
-            s.min_size.height = length(theme::ROW_H + theme::SPACE_16);
-            s.padding.left = length(theme::SPACE_16);
-            s.padding.right = length(theme::SPACE_16 + super::caption::CLUSTER_W);
+            // Caption height and side padding, both reserving the band's own
+            // drawn chrome: the trailing min/max/close cluster (the frame is
+            // extended; the buttons are ours) and the leading back button.
+            //
+            // The leading pair is derived from `caption` rather than spelled
+            // out here, because the layout pass re-derives it whenever the
+            // caption state changes and the two must agree exactly — see
+            // `caption::pad_left`.
+            s.min_size.height = length(caption::band_height(&Extras::DEFAULT));
+            s.padding.left = length(caption::pad_left(&Extras::DEFAULT));
+            s.padding.right = length(theme::SPACE_16 + caption::CLUSTER_W);
         }
         _ => {
             s.display = Display::Flex;

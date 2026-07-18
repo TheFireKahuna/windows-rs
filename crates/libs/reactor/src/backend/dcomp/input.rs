@@ -314,7 +314,16 @@ impl DCompBackend {
         let compositor = self.comp.compositor().clone();
         if let Some(n) = self.node_mut(id) {
             let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, n.scroll_off);
-            let show = shown && g.overflow;
+            // The app's visibility policy overrides the hover edge — an
+            // always-visible bar ignores the conceal, a hidden one ignores the
+            // reveal. Overflow still gates both: there is nothing to indicate
+            // when the content fits.
+            let show = g.overflow
+                && match scroll::reveal_policy(n.extras().v_scrollbar) {
+                    scroll::Reveal::Always => true,
+                    scroll::Reveal::Never => false,
+                    scroll::Reveal::OnDemand => shown,
+                };
             if show != n.thumb_shown {
                 n.thumb_shown = show;
                 if let Some(t) = &n.scroll_thumb {

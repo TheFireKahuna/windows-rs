@@ -651,6 +651,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 && y >= cy
                 && y < cy + ch
             {
+                // The drawn back button sits at the LEADING edge, so it is
+                // tested before the trailing cluster. `HTSYSMENU` is the
+                // non-client code for that corner, which buys the whole
+                // hover/press pipeline the window buttons already use — see
+                // `caption::index_for_hit` for the double-click hazard it
+                // brings and the `WM_NCLBUTTONDBLCLK` arm that defuses it.
+                if s.render_host.with_reconciler_mut(|r| r.backend.back_button_active())
+                    && let Some((bx, by, bw, bh)) =
+                        s.render_host.with_reconciler_mut(|r| r.backend.back_button_rect())
+                    && x >= bx
+                    && x < bx + bw
+                    && y >= by
+                    && y < by + bh
+                {
+                    return caption::HTSYSMENU as LRESULT;
+                }
                 let from_right = (cx + cw) - x;
                 if from_right <= caption::BTN_W {
                     return HTCLOSE as LRESULT;
@@ -701,6 +717,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let idx = caption::index_for_hit(wparam as u32);
             if idx >= 0 {
                 caption::set_pressed(idx);
+                // Only the back button draws a distinct pressed state, so it
+                // is the only one whose arming needs a repaint.
+                if idx == caption::BACK_INDEX {
+                    repaint_caption();
+                }
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        // `DefWindowProc` closes the window on a double-click over `HTSYSMENU`
+        // — the classic system-menu gesture. The back button borrows that hit
+        // code (see `caption::index_for_hit`), so a fast double tap on it must
+        // be swallowed here or it would close the app. Each click has already
+        // been dispatched as its own press/release pair.
+        caption::WM_NCLBUTTONDBLCLK => {
+            if caption::index_for_hit(wparam as u32) == caption::BACK_INDEX {
                 return 0;
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -711,6 +744,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let pressed = caption::pressed();
             caption::set_pressed(-1);
             if idx >= 0 && idx == pressed {
+                // The back button is an APP command, not a system one: it
+                // raises the TitleBar's `BackRequested` rather than posting a
+                // `WM_SYSCOMMAND`.
+                if idx == caption::BACK_INDEX {
+                    if let Some(s) = shared() {
+                        s.render_host
+                            .with_reconciler_mut(|r| r.backend.raise_back_requested());
+                    }
+                    repaint_caption();
+                    return 0;
+                }
                 let cmd = match idx {
                     0 => SC_MINIMIZE,
                     1 if unsafe { IsZoomed(hwnd) }.as_bool() => SC_RESTORE,

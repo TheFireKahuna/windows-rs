@@ -413,6 +413,38 @@ impl DCompBackend {
         Some((n.rect.x, n.rect.y, n.rect.w, n.rect.h))
     }
 
+    /// The drawn back button's box in window DIPs, if the mounted TitleBar
+    /// shows one. `None` when there is no TitleBar or its back button is
+    /// hidden — the host then never reports `HTSYSMENU` for that band.
+    pub(crate) fn back_button_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let n = self.arena.get(self.titlebar_id()?)?;
+        let r = caption::back_rect(
+            n.extras(),
+            windows_canvas_core::Rect::from_xywh(n.rect.x, n.rect.y, n.rect.w, n.rect.h),
+        )?;
+        Some((r.left, r.top, r.width(), r.height()))
+    }
+
+    /// Whether the back button is currently clickable — drawn AND enabled. A
+    /// visible-but-disabled button still paints (greyed) but must not take the
+    /// hit, so the band under it stays draggable.
+    pub(crate) fn back_button_active(&self) -> bool {
+        self.titlebar_id()
+            .and_then(|id| self.arena.get(id))
+            .is_some_and(|n| n.extras().back_button_visible && n.extras().back_button_enabled)
+    }
+
+    /// Fire the mounted TitleBar's `BackRequested` handler, if it has one.
+    pub(crate) fn raise_back_requested(&mut self) {
+        if let Some(h) = self
+            .titlebar_id()
+            .and_then(|id| self.arena.get(id))
+            .and_then(|n| n.handler(Event::BackRequested))
+        {
+            h.invoke();
+        }
+    }
+
     /// Whether the point sits over content that must stay client (an
     /// interactive control or a registered viz pointer surface) — keeps the
     /// caption drag region from swallowing the titlebar's own controls.
@@ -1252,13 +1284,17 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.text_dirty = true;
             node.mark_dirty();
         }
+        // These three change the band's drawn geometry (its height, and the
+        // leading inset its back button occupies), so each re-derives the
+        // caption metrics rather than waiting on a text rebuild it does not
+        // need — `tall` and back-button visibility do not touch the titles.
         (Prop::Tall, PropValue::Bool(v)) => {
             node.extras_mut().tall = *v;
-            node.mark_dirty();
+            layout::apply_caption_metrics(node);
         }
         (Prop::IsBackButtonVisible, PropValue::Bool(v)) => {
             node.extras_mut().back_button_visible = *v;
-            node.mark_dirty();
+            layout::apply_caption_metrics(node);
         }
         (Prop::IsBackButtonEnabled, PropValue::Bool(v)) => {
             node.extras_mut().back_button_enabled = *v;
@@ -1332,6 +1368,10 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
         // `MenuRow::icon` already carry glyph icons in.
         (Prop::Icon, PropValue::I32(v)) => {
             node.extras_mut().icon = *v as u32;
+            // The icon widens the button, and gaining/losing one is also what
+            // decides whether a label-less button has a layout at all — so
+            // this has to re-measure, not just repaint.
+            node.text_dirty = true;
             node.mark_dirty();
         }
         (Prop::NavigateUri, PropValue::Str(s)) => {
@@ -1676,6 +1716,63 @@ prop_contract! {
             n.text_dirty = true;
         }
         MenuFlyoutItems => |n| { n.ctrl_reset(|c| c.menu = Ctrl::DEFAULT.menu); }
+
+        // ── Overlay scrollbar policy ─────────────────────────────────────
+        // Reverting to `Auto` restores the hover-driven reveal; the next
+        // paint of the container re-resolves the policy either way, so no
+        // explicit re-derive is needed here.
+        VerticalScrollBarVisibility => |n| {
+            n.extras_reset(|x| x.v_scrollbar = Extras::DEFAULT.v_scrollbar);
+            n.mark_dirty();
+        }
+
+        // ── Button leading icon ──────────────────────────────────────────
+        // Re-measures as well as repaints: losing the icon narrows the button,
+        // and on a label-less one it also removes the only reason it has a
+        // text layout at all.
+        Icon => |n| {
+            n.extras_reset(|x| x.icon = Extras::DEFAULT.icon);
+            n.text_dirty = true;
+        }
+
+        // ── ToggleSwitch state labels ────────────────────────────────────
+        // The switch measures to the WIDER of the two, so dropping either one
+        // re-measures — hence `text_dirty` on both.
+        OnContent => |n| {
+            n.extras_reset(|x| x.on_content = Extras::DEFAULT.on_content);
+            n.text_dirty = true;
+        }
+        OffContent => |n| {
+            n.extras_reset(|x| x.off_content = Extras::DEFAULT.off_content);
+            n.text_dirty = true;
+        }
+
+        // ── TitleBar caption band ────────────────────────────────────────
+        // The titles are drawn from cached layouts the text pass owns, so a
+        // reset drops the state and re-flags it; the pass then rebuilds (to
+        // `None`, here) and re-derives the band's leading inset with it.
+        Title => |n| { n.extras_reset(|x| x.title = Extras::DEFAULT.title); n.text_dirty = true; }
+        Subtitle => |n| {
+            n.extras_reset(|x| x.subtitle = Extras::DEFAULT.subtitle);
+            n.text_dirty = true;
+        }
+        // Band height and back-button inset are derived geometry, so each of
+        // these restores the state and immediately re-derives — the same call
+        // `apply_prop` makes, so set and unset cannot fall out of step.
+        Tall => |n| {
+            n.extras_reset(|x| x.tall = Extras::DEFAULT.tall);
+            layout::apply_caption_metrics(n);
+        }
+        IsBackButtonEnabled => |n| {
+            n.extras_reset(|x| x.back_button_enabled = Extras::DEFAULT.back_button_enabled);
+            n.mark_dirty();
+        }
+        // Born VISIBLE: a NavigationView only emits this prop to say `false`,
+        // so its removal means "show it again".
+        IsBackButtonVisible => |n| {
+            n.extras_reset(|x| x.back_button_visible = Extras::DEFAULT.back_button_visible);
+            layout::apply_caption_metrics(n);
+        }
     }
 
     /// Stored in [`Extras`] but not yet drawn — the state is exact, the paint
@@ -1683,21 +1780,6 @@ prop_contract! {
     /// `Extras` reads as, and its non-empty entries mirror the widget default
     /// whose absence sends the `Unset` (see the constant for which, and why).
     stored {
-        // ── TitleBar ─────────────────────────────────────────────────────
-        Title => |n| { n.extras_reset(|x| x.title = Extras::DEFAULT.title); n.text_dirty = true; }
-        Subtitle => |n| {
-            n.extras_reset(|x| x.subtitle = Extras::DEFAULT.subtitle);
-            n.text_dirty = true;
-        }
-        Tall => |n| { n.extras_reset(|x| x.tall = Extras::DEFAULT.tall); }
-        IsBackButtonEnabled => |n| {
-            n.extras_reset(|x| x.back_button_enabled = Extras::DEFAULT.back_button_enabled);
-        }
-        // Born VISIBLE: a NavigationView only emits this prop to say `false`,
-        // so its removal means "show it again".
-        IsBackButtonVisible => |n| {
-            n.extras_reset(|x| x.back_button_visible = Extras::DEFAULT.back_button_visible);
-        }
         IsPaneToggleButtonVisible => |n| {
             n.extras_reset(|x| x.pane_toggle_visible = Extras::DEFAULT.pane_toggle_visible);
         }
@@ -1727,11 +1809,13 @@ prop_contract! {
         }
 
         // ── Scroll containers ────────────────────────────────────────────
+        // Still stored: this backend scrolls and indicates on ONE axis. There
+        // is no horizontal overlay thumb for this policy to govern, so
+        // consuming it would mean inventing the scrollbar first — see
+        // `scroll::Reveal`, and `VerticalScrollBarVisibility` for the axis
+        // that is wired.
         HorizontalScrollBarVisibility => |n| {
             n.extras_reset(|x| x.h_scrollbar = Extras::DEFAULT.h_scrollbar);
-        }
-        VerticalScrollBarVisibility => |n| {
-            n.extras_reset(|x| x.v_scrollbar = Extras::DEFAULT.v_scrollbar);
         }
 
         // ── Button / HyperlinkButton ─────────────────────────────────────
@@ -1739,18 +1823,19 @@ prop_contract! {
         FlyoutPlacement => |n| {
             n.extras_reset(|x| x.flyout_placement = Extras::DEFAULT.flyout_placement);
         }
-        Icon => |n| { n.extras_reset(|x| x.icon = Extras::DEFAULT.icon); }
+        // Deliberately still stored, not consumed. Drawing a hyperlink is a
+        // rendering problem; *following* one is not. The seam hands over an
+        // arbitrary app-supplied string, and the only way this backend could
+        // act on it is to hand that string to the shell — the first
+        // process-level URI launch anywhere in this crate. Which schemes a
+        // self-hosted window may hand to a registered protocol handler is a
+        // policy decision for the host application, not something a paint pass
+        // should decide on its behalf. The WinUI backend does not face this:
+        // it passes the URI to `HyperlinkButton.SetNavigateUri` and XAML
+        // mediates the navigation inside its own trust context. Consuming this
+        // needs a seam that carries the app's intent (a navigation callback,
+        // or an explicit opt-in), not a `ShellExecute` bolted on here.
         NavigateUri => |n| { n.extras_reset(|x| x.navigate_uri = Extras::DEFAULT.navigate_uri); }
-
-        // ── ToggleSwitch ─────────────────────────────────────────────────
-        OnContent => |n| {
-            n.extras_reset(|x| x.on_content = Extras::DEFAULT.on_content);
-            n.text_dirty = true;
-        }
-        OffContent => |n| {
-            n.extras_reset(|x| x.off_content = Extras::DEFAULT.off_content);
-            n.text_dirty = true;
-        }
 
         // ── Editors / text ───────────────────────────────────────────────
         IsEditable => |n| { n.extras_reset(|x| x.is_editable = Extras::DEFAULT.is_editable); }
