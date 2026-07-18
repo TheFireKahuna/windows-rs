@@ -1893,7 +1893,17 @@ fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) 
     let n = nav::visible_items(&m, h, count);
     let sel = node.ctrl().selected_index;
     let enabled = node.paint.is_enabled;
-    let visible = sel >= 0 && (sel as usize) < n;
+    // The selected row's box: a visible menu row, or the settings row when the
+    // selection sits at its sentinel slot. `None` (no selection, or a selected
+    // row that no longer fits) fades the tile and bar out.
+    let sel_row = if sel == nav::SETTINGS_INDEX {
+        nav::settings_rect(&m, h)
+    } else if sel >= 0 && (sel as usize) < n {
+        Some(nav::item_rect(&m, sel))
+    } else {
+        None
+    };
+    let visible = sel_row.is_some();
 
     let k_bg = AtlasKey::solid(theme::surface_sunken(), scale);
     let k_tile = AtlasKey::hbar(
@@ -1913,7 +1923,7 @@ fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) 
         scale,
     );
 
-    let row = nav::item_rect(&m, sel.max(0));
+    let row = sel_row.unwrap_or_else(|| nav::item_rect(&m, 0));
     let tile = (
         theme::SPACE_4,
         row.top + theme::SPACE_4,
@@ -1999,7 +2009,7 @@ fn nav_ink_rect(node: &Node) -> Option<(f32, f32, f32, f32)> {
     let n = nav::visible_items(&m, node.rect.h, node.ctrl().items.len()) as i32;
     let row = if (0..n).contains(&hot) {
         nav::item_rect(&m, hot)
-    } else if hot == nav::HOT_SETTINGS_BASE {
+    } else if hot == nav::SETTINGS_INDEX {
         nav::settings_rect(&m, node.rect.h)?
     } else {
         // The two chrome buttons wash on the node's own surface (a flat state

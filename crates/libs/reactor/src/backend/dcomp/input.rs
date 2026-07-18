@@ -492,7 +492,7 @@ impl DCompBackend {
                 Some(nav::Hit::Item(i)) => i,
                 Some(nav::Hit::Back) => nav::HOT_BACK,
                 Some(nav::Hit::Toggle) => nav::HOT_TOGGLE,
-                Some(nav::Hit::Settings) => nav::HOT_SETTINGS_BASE,
+                Some(nav::Hit::Settings) => nav::SETTINGS_INDEX,
                 None => -1,
             };
             if self.node(id).is_some_and(|n| n.ctrl().hot_index != hot) {
@@ -1128,13 +1128,24 @@ impl DCompBackend {
         self.relayout_and_paint();
     }
 
-    /// The settings row: reported as a selection carrying the settings tag, and
-    /// it clears the item selection — you are no longer on any of the pages, so
-    /// no row should read as selected (and `ISelectionProvider` must agree).
+    /// The settings row: reported as a selection carrying the settings tag.
+    /// The row is a selectable page like any menu item — the selection moves to
+    /// its sentinel slot ([`nav::SETTINGS_INDEX`]), the tile/bar sprites glide
+    /// to the foot of the pane, and `ISelectionProvider` reports the settings
+    /// element as the selection.
     fn select_nav_settings(&mut self, id: ControlId) {
-        if let Some(n) = self.node_mut(id) {
-            n.ctrl_mut().selected_index = -1;
-            n.mark_dirty();
+        let already = {
+            let Some(n) = self.node_mut(id) else { return };
+            if n.ctrl().selected_index == nav::SETTINGS_INDEX {
+                true
+            } else {
+                n.ctrl_mut().selected_index = nav::SETTINGS_INDEX;
+                n.mark_dirty();
+                false
+            }
+        };
+        if already {
+            return;
         }
         self.repaint();
         self.fire_string(id, Event::SelectionChanged, nav::SETTINGS_TAG.to_string());

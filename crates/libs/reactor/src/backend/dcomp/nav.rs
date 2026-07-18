@@ -489,9 +489,14 @@ fn wash(session: &DrawingSession, brush: &Brush, r: Rect, dim: f32) {
 /// the SelectorBar already uses, and -1 keeps its "nothing hovered" meaning.
 pub(crate) const HOT_BACK: i32 = -2;
 pub(crate) const HOT_TOGGLE: i32 = -3;
-/// The settings row hovers at one past the last item, so the row ink can place
-/// itself from the same index space the item rows use.
-pub(crate) const HOT_SETTINGS_BASE: i32 = 1 << 16;
+/// The settings row's slot in the shared item-index space — far above any real
+/// item index, so it can never collide with one. It serves BOTH per-row index
+/// fields: `Ctrl::hot_index` when the pointer rests on the row, and
+/// `Ctrl::selected_index` when the settings page is the selection (the row is a
+/// selectable page like any menu item; `sync_selected_tag` resolves the
+/// [`SETTINGS_TAG`] echo to this value, and the tile/bar sprites place
+/// themselves on [`settings_rect`] from it).
+pub(crate) const SETTINGS_INDEX: i32 = 1 << 16;
 
 /// The pane header. Drawn only in an expanded pane — a rail has no room for it,
 /// and [`metrics`] has already reserved no header row in that case.
@@ -638,7 +643,10 @@ fn paint_row_label(
 }
 
 /// The settings row at the foot of the pane — the same icon-plus-label shape as
-/// a menu item, so it reads as one, but it is not part of the selection.
+/// a menu item, and it selects like one: when the settings page is current
+/// (`selected_index == `[`SETTINGS_INDEX`]) the row takes the same active
+/// colors a selected menu item does, and the selection tile/bar sprites sit
+/// under it.
 fn paint_settings(
     session: &DrawingSession,
     brush: &Brush,
@@ -651,9 +659,10 @@ fn paint_settings(
     let Some(row) = settings_rect(m, rect.height()) else {
         return;
     };
-    if node.ctrl().hot_index == HOT_SETTINGS_BASE {
+    if node.ctrl().hot_index == SETTINGS_INDEX {
         wash(session, brush, row, dim);
     }
+    let active = node.ctrl().selected_index == SETTINGS_INDEX;
     let cell = Rect::from_xywh(row.left, row.top, theme::NAV_RAIL_W, row.height());
     super::controls::text(
         session,
@@ -663,7 +672,11 @@ fn paint_settings(
         theme::FONT_ICON,
         theme::FONT_SIZE_MD,
         400,
-        theme::text_tertiary(),
+        if active {
+            theme::accent()
+        } else {
+            theme::text_tertiary()
+        },
         TextAlignment::Center,
         ParagraphAlignment::Center,
         dim,
@@ -676,7 +689,7 @@ fn paint_settings(
             text.map(|t| t.line_h).unwrap_or(0.0),
             row,
             m.width,
-            theme::text_secondary(),
+            if active { theme::text() } else { theme::text_secondary() },
             dim,
         );
     }

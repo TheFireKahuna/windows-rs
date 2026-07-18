@@ -1207,7 +1207,12 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
             // the pane state changes and the two must agree exactly — see
             // `nav::pane_width`. A virgin NavigationView resolves to WinUI's own
             // default: `is_pane_open` true at `open_pane_length` 320.
-            s.display = Display::Flex;
+            //
+            // Grid, not Flex: the content must FILL the space beside the pane
+            // (WinUI's content frame does), and grid items default to
+            // align/justify-self Stretch. A flex child has no grow, so content
+            // would size to its own width and hug the pane.
+            s.display = Display::Grid;
             s.padding.left = length(nav::pane_width(&Extras::DEFAULT, 0.0));
         }
         ControlKind::Expander => {

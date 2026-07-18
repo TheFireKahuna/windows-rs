@@ -2242,11 +2242,18 @@ pub(crate) fn ctrl_value_frac(node: &Node) -> f64 {
 /// Resolve a pending `selected_tag` against the loaded `tags` into a
 /// `selected_index` (NavigationView). The rail indicator is a chrome part —
 /// the paint pass glides/snaps it from `selected_index` directly.
+///
+/// The built-in settings row is selectable but lives in no app item list, so
+/// its tag resolves to the sentinel [`nav::SETTINGS_INDEX`] instead of a list
+/// position. An app item tagged "settings" wins over the built-in row — the
+/// list is the app's own naming, matched first.
 fn sync_selected_tag(node: &mut Node) {
-    if let Some(tag) = &node.ctrl().selected_tag
-        && let Some(i) = node.ctrl().tags.iter().position(|t| t == tag)
-    {
-        node.ctrl_mut().selected_index = i as i32;
+    if let Some(tag) = &node.ctrl().selected_tag {
+        if let Some(i) = node.ctrl().tags.iter().position(|t| t == tag) {
+            node.ctrl_mut().selected_index = i as i32;
+        } else if node.kind == ControlKind::NavigationView && tag == nav::SETTINGS_TAG {
+            node.ctrl_mut().selected_index = nav::SETTINGS_INDEX;
+        }
     }
 }
 

@@ -288,8 +288,12 @@ fn is_item_container(kind: ControlKind) -> bool {
 fn pattern_supported(kind: ControlKind, item: i32, pid: PATTERNID) -> bool {
     use ControlKind::*;
     if is_nav_chrome(item) {
-        // Pane chrome invokes; it is not part of any selection.
-        return pid == UIA_InvokePatternId;
+        // Pane chrome invokes. The settings row is also a selectable page, so
+        // it carries SelectionItem alongside Invoke; the back arrow and the
+        // hamburger are not part of any selection.
+        return pid == UIA_InvokePatternId
+            || (pid == UIA_SelectionItemPatternId
+                && nav_chrome_hit(item) == Some(nav::Hit::Settings));
     }
     if item >= 0 {
         // Synthetic items select — and also invoke, so `uia:invoke;name=<label>`
@@ -783,7 +787,18 @@ impl DCompBackend {
     }
 
     fn uia_item_selected(&self, id: ControlId, item: i32) -> bool {
-        self.arena.get(id).is_some_and(|n| n.ctrl().selected_index == item)
+        let Some(n) = self.arena.get(id) else {
+            return false;
+        };
+        let sel = n.ctrl().selected_index;
+        // The settings element selects at its sentinel slot; the other chrome
+        // items are never part of a selection (and their ids must not compare
+        // against the sentinel, which shares the chrome index space).
+        match nav_chrome_of(item) {
+            Some(nav::Hit::Settings) => sel == nav::SETTINGS_INDEX,
+            Some(_) => false,
+            None => sel == item,
+        }
     }
 
     /// The selected item index of container `id`, or `None` when the index is
@@ -799,6 +814,13 @@ impl DCompBackend {
             return None;
         }
         let i = n.ctrl().selected_index;
+        // A nav pane whose selection sits at the settings sentinel reports the
+        // settings element — bounded the same way the items are: only when the
+        // pane is tall enough to actually show the row.
+        if n.kind == ControlKind::NavigationView && i == nav::SETTINGS_INDEX {
+            let (_, _, st) = self.nav_chrome_present(id);
+            return st.then(|| nav_chrome_item(nav::Hit::Settings)).flatten();
+        }
         (0..self.uia_item_count(id)).contains(&i).then_some(i)
     }
 
