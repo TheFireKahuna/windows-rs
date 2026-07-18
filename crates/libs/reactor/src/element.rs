@@ -32,8 +32,12 @@ pub trait CustomElement: 'static {
     /// Boxed clone so [`Element`] stays `Clone`.
     fn clone_dyn(&self) -> Box<dyn CustomElement>;
 
-    /// Create the underlying control via `backend` and return its id.
-    fn mount(&self, backend: &mut dyn Backend) -> ControlId;
+    /// Create the underlying control at `id` via `backend`.
+    ///
+    /// The id is minted by the reconciler — implementations pass it straight to
+    /// [`Backend::create`] rather than assigning their own, so every control in
+    /// the tree comes from one monotonic, never-reused source.
+    fn mount(&self, id: ControlId, backend: &mut dyn Backend);
 
     /// Apply the diff from `prev` (same `type_id`) to the live control `id`.
     fn update(&self, prev: &dyn CustomElement, id: ControlId, backend: &mut dyn Backend);

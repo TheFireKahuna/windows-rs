@@ -65,10 +65,7 @@ struct NoNativeBackend {
 }
 
 impl Backend for NoNativeBackend {
-    fn create(&mut self, _kind: ControlKind) -> ControlId {
-        self.next_id += 1;
-        ControlId::new(self.next_id)
-    }
+    fn create(&mut self, _id: ControlId, _kind: ControlKind) {}
 
     fn set_prop(&mut self, _id: ControlId, _prop: Prop, _value: &PropValue) {}
 

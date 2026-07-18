@@ -20,14 +20,10 @@
 //!   `PropValue` variant upstream breaks this build instead of being silently
 //!   dropped from the wire, forcing a deliberate send-or-side-table decision.
 //!
-//! Control ids are minted here rather than by the wrapped backend. They are a
-//! monotonic counter that is never reused (see the `Arena` docs in [`node`] for
-//! why reuse would corrupt the reconciler's graft check), so the reconciler can
-//! mint them itself and `create`'s synchronous read-back dissolves. The replay
-//! side inserts at the recorded id via `DCompBackend::create_with_id`; this
-//! recorder therefore owns the *sole* id counter for the process.
-//!
-//! [`node`]: super::node
+//! The reconciler mints control ids, so `create` takes one rather than
+//! returning one and the trait has no call that must be answered synchronously.
+//! That is what makes the buffer a complete encoding: every method is a pure
+//! command, and replaying the stream reproduces the tree exactly.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -350,17 +346,15 @@ pub(crate) struct RecordingBackend<B: Backend> {
     cmds: Vec<Cmd>,
     side: FxHashMap<SideId, SidePayload>,
     next_side: u32,
-    next_id: u32,
 }
 
-impl<B: CreateWithId> RecordingBackend<B> {
+impl<B: Backend> RecordingBackend<B> {
     pub(crate) fn new(inner: B) -> Self {
         Self {
             inner,
             cmds: Vec::new(),
             side: FxHashMap::default(),
             next_side: 0,
-            next_id: 0,
         }
     }
 
@@ -416,19 +410,9 @@ impl<B: Backend> std::ops::DerefMut for RecordingBackend<B> {
     }
 }
 
-impl<B: CreateWithId> Backend for RecordingBackend<B> {
-    /// Mint the id here and buffer the creation.
-    ///
-    /// The returned id is the reconciler's addressing scheme, so it must be
-    /// answered now — but it is a monotonic counter, not anything the backend
-    /// knows, so answering it locally costs nothing and leaves no read-back.
-    /// The control itself is created when the buffer is replayed, like every
-    /// other command.
-    fn create(&mut self, kind: ControlKind) -> ControlId {
-        self.next_id += 1;
-        let id = ControlId::new(self.next_id);
+impl<B: Backend> Backend for RecordingBackend<B> {
+    fn create(&mut self, id: ControlId, kind: ControlKind) {
         self.push(Cmd::Create { id, kind });
-        id
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
@@ -617,7 +601,7 @@ impl<B: CreateWithId> Backend for RecordingBackend<B> {
     }
 }
 
-impl<B: CreateWithId> RecordingBackend<B> {
+impl<B: Backend> RecordingBackend<B> {
     /// Apply one recorded command to the wrapped backend.
     ///
     /// Side-table payloads are *taken*, not cloned: a command is replayed once,
@@ -627,7 +611,7 @@ impl<B: CreateWithId> RecordingBackend<B> {
     /// state, so it is asserted in debug and skipped in release.
     fn apply(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Create { id, kind } => self.inner.create_with_id(id, kind),
+            Cmd::Create { id, kind } => self.inner.create(id, kind),
             Cmd::SetProp { id, prop, value } => self.inner.set_prop(id, prop, &value.into_prop()),
             Cmd::SetPropSide { id, prop, side } => {
                 if let Some(SidePayload::Prop(value)) = self.take_side(side) {
@@ -745,19 +729,6 @@ impl<B: CreateWithId> RecordingBackend<B> {
         );
         payload
     }
-}
-
-/// Accepts a control id minted by the caller instead of minting its own.
-///
-/// Splitting the id out of `create` is what lets the reconciler address
-/// controls without waiting on the backend. The contract the implementor must
-/// uphold is the arena's: ids arrive monotonically and are never reused, so a
-/// destroyed control's id can never alias a live one (see the `Arena` docs in
-/// [`node`] for what breaks otherwise).
-///
-/// [`node`]: super::node
-pub(crate) trait CreateWithId: Backend {
-    fn create_with_id(&mut self, id: ControlId, kind: ControlKind);
 }
 
 /// The buffer must stay `Send`: it is the payload that will cross to the app

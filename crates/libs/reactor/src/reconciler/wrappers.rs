@@ -223,7 +223,8 @@ impl<B: Backend + 'static> Reconciler<B> {
 
     pub fn mount_custom(&mut self, c: &CustomElementHandle) -> ControlId {
         self.debug_ui_elements_created += 1;
-        let id = c.0.mount(&mut self.backend);
+        let id = self.mint_control_id();
+        c.0.mount(id, &mut self.backend);
         self.custom_handles.insert(id, c.0.clone_dyn());
         id
     }

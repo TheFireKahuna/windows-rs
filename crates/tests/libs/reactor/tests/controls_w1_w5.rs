@@ -300,7 +300,7 @@ fn list_view_produces_templated_list() {
 #[test]
 fn scroll_templated_to_index_records_op_on_recording_backend() {
     let mut rb = RecordingBackend::new();
-    let id = rb.create(ControlKind::ListView);
+    let id = rb.create_id(ControlKind::ListView);
     rb.scroll_templated_to_index(id, 7);
     let saw = rb
         .ops

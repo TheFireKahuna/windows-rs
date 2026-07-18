@@ -21,6 +21,10 @@ pub use self::templated::{RealizationQueue, RealizationRequest, new_realization_
 /// handles, templated-list state, …).
 pub struct Reconciler<B: Backend> {
     pub backend: B,
+    /// Source of control ids. Monotonic and never reused: the graft check at
+    /// `child.rs` compares raw ids, so recycling one would alias a destroyed
+    /// node onto a live one and silently skip grafting the remount.
+    next_control_id: u32,
     pub debug_elements_skipped: u64,
     pub debug_elements_diffed: u64,
     pub debug_ui_elements_created: u64,
@@ -69,6 +73,7 @@ impl<B: Backend + 'static> Reconciler<B> {
     pub fn new(backend: B) -> Self {
         Self {
             backend,
+            next_control_id: 0,
             debug_elements_skipped: 0,
             debug_elements_diffed: 0,
             debug_ui_elements_created: 0,
@@ -137,9 +142,17 @@ impl<B: Backend + 'static> Reconciler<B> {
         self.forced_components.len()
     }
 
+    /// Next control id. The sole source for the whole tree — see
+    /// [`next_control_id`](Self::next_control_id) for why it must never be reused.
+    pub(crate) fn mint_control_id(&mut self) -> ControlId {
+        self.next_control_id += 1;
+        ControlId::new(self.next_control_id)
+    }
+
     pub fn acquire_control(&mut self, kind: ControlKind) -> ControlId {
         self.debug_ui_elements_created += 1;
-        let id = self.backend.create(kind);
+        let id = self.mint_control_id();
+        self.backend.create(id, kind);
 
         if let Some(stale) = self.component_instances.remove(&id) {
             self.unregister_component_listeners(&stale);

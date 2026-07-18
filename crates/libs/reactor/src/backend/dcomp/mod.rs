@@ -671,20 +671,11 @@ impl DCompBackend {
     }
 }
 
-impl record::CreateWithId for DCompBackend {
-    fn create_with_id(&mut self, id: ControlId, kind: ControlKind) {
+impl Backend for DCompBackend {
+    fn create(&mut self, id: ControlId, kind: ControlKind) {
         let node = self.build_node(kind);
         self.arena.insert_with_id(id, node);
         self.note_inserted(id, kind);
-    }
-}
-
-impl Backend for DCompBackend {
-    fn create(&mut self, kind: ControlKind) -> ControlId {
-        let node = self.build_node(kind);
-        let id = self.arena.insert(node);
-        self.note_inserted(id, kind);
-        id
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {

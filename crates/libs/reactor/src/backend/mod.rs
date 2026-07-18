@@ -468,7 +468,14 @@ impl EventHandler {
 /// for tests and by `WinUIBackend` for production. New methods must have
 /// default implementations so existing backends keep compiling.
 pub trait Backend {
-    fn create(&mut self, kind: ControlKind) -> ControlId;
+    /// Create a control at `id`, which the reconciler has minted.
+    ///
+    /// Ids arrive monotonically and are never reused, so a destroyed control's
+    /// id can never alias a live one — the reconciler's graft check compares
+    /// raw ids, and a recycled one would silently fail to graft a remounted
+    /// subtree. Implementations must accept the id as given rather than
+    /// assigning their own.
+    fn create(&mut self, id: ControlId, kind: ControlKind);
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue);
 

@@ -186,6 +186,15 @@ impl RecordingBackend {
         Self::default()
     }
 
+    /// Mint an id and create a control with it. The reconciler does this in
+    /// production; tests that drive the backend directly do it here.
+    pub fn create_id(&mut self, kind: ControlKind) -> ControlId {
+        self.next_id += 1;
+        let id = ControlId::new(self.next_id);
+        self.create(id, kind);
+        id
+    }
+
     pub fn op_count(&self) -> usize {
         self.ops.len()
     }
@@ -325,12 +334,9 @@ impl RecordingBackend {
 }
 
 impl Backend for RecordingBackend {
-    fn create(&mut self, kind: ControlKind) -> ControlId {
-        self.next_id += 1;
-        let id = ControlId::new(self.next_id);
+    fn create(&mut self, id: ControlId, kind: ControlKind) {
         self.ops.push(Op::Create { id, kind });
         self.native_elements.insert(id, stub_native_element());
-        id
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {

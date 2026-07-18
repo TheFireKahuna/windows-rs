@@ -1229,11 +1229,9 @@ fn unbox_index(value: &windows_core::IInspectable) -> Option<usize> {
 const CONTENT_TEMPLATE_XAML: &str = "<DataTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><ContentControl HorizontalContentAlignment='Stretch' VerticalContentAlignment='Stretch'/></DataTemplate>";
 
 impl Backend for WinUIBackend {
-    fn create(&mut self, kind: ControlKind) -> ControlId {
-        let id = self.alloc_id();
+    fn create(&mut self, id: ControlId, kind: ControlKind) {
         let handle = Self::make_handle_for_kind(kind);
         self.controls.borrow_mut().insert(id, handle);
-        id
     }
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
         let map = self.controls.borrow();
