@@ -12,16 +12,33 @@
 //! in `input.rs`).
 //!
 //! ## Architecture
-//! * **Providers are value objects.** [`ElementProvider`] holds only plain data
-//!   (`hwnd`, `ControlId`, item index, root flag) and is recreated per query —
-//!   no per-node COM caching, so idle cost is zero and there is no `!Send` state
-//!   to store. UIA establishes element identity from `GetRuntimeId`, not pointer
-//!   identity.
+//! * **Provider data is plain; provider *objects* are interned.**
+//!   [`ElementProvider`] carries only `Send` data (`hwnd`, `ControlId`, item
+//!   index, root flag) and holds no arena state. The COM object wrapping that
+//!   data is **not** recreated per query: UIA correlates elements — and matches
+//!   raised events to registered listeners — partly by COM object identity, so
+//!   [`stable_provider`] mints one object per element identity and hands the
+//!   same object back on every query. Those objects live in a process-wide cache
+//!   ([`provider_cache`]) keyed by `(hwnd, ControlId)` and then by
+//!   `(item, is_root)`. The cache is **evicted by node lifetime**: `destroy`
+//!   calls [`forget`], which drops the node's providers along with its `size` /
+//!   `pointer` registrations. Idle cost is one small map entry per element a
+//!   client has actually visited, and zero for a session no client ever queries.
 //! * **Threading.** UIA calls arrive on UIA worker threads, but the arena is
 //!   `!Send` and single-threaded. Every provider method that touches the arena
 //!   marshals to the UI thread through [`host::marshal_to_ui`] (a blocking
 //!   request/response the message pump services); calls already on the UI thread
 //!   run inline. There is one action path and one arena owner.
+//! * **Property batching.** A marshal is a cross-thread round trip, and a client
+//!   tree walk asks for ~10 properties per element. `GetPropertyValue` therefore
+//!   fills a whole [`PropSnapshot`] in **one** marshal and serves the rest of the
+//!   burst from a per-UIA-thread cache of a single element. The cache is stamped
+//!   with [`UIA_GEN`], a process-global counter the UI thread bumps on every
+//!   mutation ([`note_tree_change`] / [`note_state_change`]), so a snapshot can
+//!   never survive a change to the thing it describes. Values that move without
+//!   a mutation hook — `IsOffscreen` (ancestor scroll offsets) and
+//!   `BoundingRectangle` (layout) — are deliberately **not** in the snapshot and
+//!   still marshal per call.
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -40,10 +57,13 @@ use crate::system_bindings::{
     IRawElementProviderAdviseEvents, IRawElementProviderAdviseEvents_Impl,
     IRawElementProviderSimple, IRawElementProviderSimple_Impl, IScrollItemProvider,
     IScrollItemProvider_Impl, IScrollProvider,
+    ITextProvider, ITextProvider_Impl, ITextRangeProvider, ITextRangeProvider_Impl,
     IScrollProvider_Impl, ISelectionItemProvider, ISelectionItemProvider_Impl, ISelectionProvider,
     ISelectionProvider_Impl, IToggleProvider, IToggleProvider_Impl, IValueProvider,
     IValueProvider_Impl, IsZoomed, NavigateDirection, PostMessageW, ProviderOptions,
-    ScreenToClient, ScrollAmount, ToggleState, UiaRect,
+    ScreenToClient, ScrollAmount, SupportedTextSelection, SupportedTextSelection_Single,
+    TEXTATTRIBUTEID, TextPatternRangeEndpoint, TextPatternRangeEndpoint_Start, TextUnit,
+    TextUnit_Character, TextUnit_Format, TextUnit_Word, ToggleState, UiaPoint, UiaRect,
     UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent,
     HWND, LPARAM, POINT, SAFEARRAY, VARIANT, VARIANT_0,
     VARIANT_0_0, VARIANT_0_0_0, WM_SYSCOMMAND, WPARAM, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
@@ -61,7 +81,7 @@ use crate::system_bindings::{
     UIA_RangeValuePatternId, UIA_RangeValueValuePropertyId,
     UIA_ScrollItemPatternId, UIA_ScrollPatternId, UIA_SelectionItemPatternId,
     UIA_SelectionItem_ElementSelectedEventId, UIA_SelectionPatternId,
-    UIA_SliderControlTypeId, UIA_TabControlTypeId,
+    UIA_SliderControlTypeId, UIA_TabControlTypeId, UIA_TextPatternId,
     UIA_TabItemControlTypeId, UIA_TextControlTypeId, UIA_TogglePatternId,
     UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
 };
@@ -79,6 +99,8 @@ windows_core::link!("uiautomationcore.dll" "system" fn UiaClientsAreListening() 
 const PROVIDER_OPTIONS_SERVER: ProviderOptions = 0x1 | 0x20;
 // `UIA_E_ELEMENTNOTAVAILABLE` — returned when the node has gone (id reused/freed).
 const UIA_E_ELEMENTNOTAVAILABLE: HRESULT = HRESULT(0x8004_0201u32 as i32);
+// `UIA_E_INVALIDOPERATION` — the operation is not valid for this element.
+const UIA_E_INVALIDOPERATION: HRESULT = HRESULT(0x8004_0200u32 as i32);
 // `UiaAppendRuntimeId` — first element of a fragment's runtime id.
 const UIA_APPEND_RUNTIME_ID: i32 = 3;
 
@@ -91,6 +113,18 @@ const CAPTION_ITEM_BASE: i32 = 1 << 20;
 fn is_caption(item: i32) -> bool {
     item >= CAPTION_ITEM_BASE
 }
+
+/// UTF-16 word separator — the rule [`Editor`](super::editor::Editor)'s private
+/// `is_space` uses, repeated here because the Text pattern needs word units and
+/// that helper is not exported.
+fn is_word_break(u: u16) -> bool {
+    matches!(u, 0x20 | 0x09 | 0x0A | 0x0D | 0xA0)
+}
+
+/// Cycle guard on the parent-link walk. Real UI trees are tens of levels deep;
+/// this only bounds the damage if a future mutator ever introduces a cycle,
+/// since the walk runs on the UI thread inside a blocking UIA marshal.
+const MAX_TREE_DEPTH: usize = 4096;
 
 // `ScrollAmount` values + the Scroll pattern's "no scroll" percent sentinel
 // (uiautomationcore.h).
@@ -290,22 +324,12 @@ impl DCompBackend {
         Some((cx + cw - (3 - i) as f32 * caption::BTN_W, cy, caption::BTN_W, ch))
     }
 
-    /// The parent of `target` by DFS from the root (trees are small; no parent
-    /// pointer is stored on the node).
+    /// The parent of `target`: an O(1) read of the link every structural mutator
+    /// maintains (see [`Node::parent`](super::node::Node::parent)). A parent that
+    /// has since been destroyed fails the arena lookup and reads as no parent.
     fn uia_parent(&self, target: ControlId) -> Option<ControlId> {
-        fn rec(b: &DCompBackend, cur: ControlId, target: ControlId) -> Option<ControlId> {
-            let n = b.arena.get(cur)?;
-            for c in &n.children {
-                if *c == target {
-                    return Some(cur);
-                }
-                if let Some(p) = rec(b, *c, target) {
-                    return Some(p);
-                }
-            }
-            None
-        }
-        rec(self, self.root?, target)
+        let p = self.arena.get(target)?.parent?;
+        self.arena.get(p).is_some().then_some(p)
     }
 
     /// Step through the logical tree. A container's synthetic items form a
@@ -511,6 +535,10 @@ impl DCompBackend {
         if pid == UIA_ScrollItemPatternId {
             return self.uia_scroll_ancestor(id).is_some();
         }
+        if pid == UIA_TextPatternId {
+            // Never on a synthetic item, never on a password field.
+            return item < 0 && self.uia_text_supported(id);
+        }
         self.uia_kind(id)
             .is_some_and(|k| pattern_supported(k, item, pid))
     }
@@ -606,36 +634,25 @@ impl DCompBackend {
     }
 
     /// Ancestors of `target`, nearest-first (root last); empty when `target`
-    /// is the root or unreachable.
+    /// is the root or unparented.
+    ///
+    /// Walks the maintained parent links, so this is O(depth). It used to be a
+    /// DFS from the root per call, which made a client `FindAll` over the tree
+    /// O(n²) through [`uia_is_offscreen`](Self::uia_is_offscreen).
     fn uia_ancestors(&self, target: ControlId) -> Vec<ControlId> {
-        fn rec(
-            b: &DCompBackend,
-            cur: ControlId,
-            target: ControlId,
-            path: &mut Vec<ControlId>,
-        ) -> bool {
-            if cur == target {
-                return true;
-            }
-            path.push(cur);
-            if let Some(n) = b.arena.get(cur) {
-                for c in &n.children {
-                    if rec(b, *c, target, path) {
-                        return true;
-                    }
-                }
-            }
-            path.pop();
-            false
-        }
         let mut path = Vec::new();
-        match self.root {
-            Some(r) if rec(self, r, target, &mut path) => {
-                path.reverse();
-                path
-            }
-            _ => Vec::new(),
+        let mut cur = target;
+        // The links form a tree, so this terminates; the bound is belt-and-braces
+        // against a cycle introduced by a future mutator, which would otherwise
+        // hang the UI thread inside a blocking UIA marshal.
+        for _ in 0..MAX_TREE_DEPTH {
+            let Some(p) = self.uia_parent(cur) else {
+                break;
+            };
+            path.push(p);
+            cur = p;
         }
+        path
     }
 
     /// Total DIPs `id` is shifted up by ancestor scroll offsets. Layout rects
@@ -841,10 +858,158 @@ impl DCompBackend {
         }
     }
 
+    // ── Text pattern (single-line editors) ───────────────────────────────────
+    //
+    // The Text pattern is served straight off the [`Editor`](super::editor::Editor)
+    // document: `buf` is already UTF-16, so a UIA text position IS a buffer
+    // index — no transcoding, no second copy of the document.
+    //
+    // A `PasswordBox` supports the pattern NOWHERE: `uia_text_supported` returns
+    // false for it, so `GetPatternProvider(TextPatternId)` answers null and no
+    // range over its contents can be minted at all. That is stronger than
+    // masking inside `GetText`, and matches the `IsPassword` contract the Value
+    // pattern already honours here.
+
+    /// Whether `id` exposes the Text pattern: an editor-backed node that is not
+    /// a password field.
+    fn uia_text_supported(&self, id: ControlId) -> bool {
+        self.arena.get(id).is_some_and(|n| {
+            n.editor.is_some() && n.kind != ControlKind::PasswordBox
+        })
+    }
+
+    /// The editor of `id`, only when the Text pattern is exposed for it.
+    fn uia_editor(&self, id: ControlId) -> Option<&super::editor::Editor> {
+        let n = self.arena.get(id)?;
+        (n.kind != ControlKind::PasswordBox).then_some(())?;
+        n.editor.as_ref()
+    }
+
+    /// Document length in UTF-16 code units.
+    fn uia_text_len(&self, id: ControlId) -> Option<usize> {
+        Some(self.uia_editor(id)?.buf.len())
+    }
+
+    /// `[a, b)` of the document as a `String` (clamped to the buffer).
+    fn uia_text_slice(&self, id: ControlId, a: usize, b: usize) -> Option<String> {
+        let ed = self.uia_editor(id)?;
+        let n = ed.buf.len();
+        let (a, b) = (a.min(n), b.min(n));
+        Some(String::from_utf16_lossy(&ed.buf[a.min(b)..b]))
+    }
+
+    /// The caret/anchor selection as an ordered `[start, end)`.
+    fn uia_text_selection(&self, id: ControlId) -> Option<(usize, usize)> {
+        Some(self.uia_editor(id)?.sel())
+    }
+
+    /// Point the editor's selection at `[a, b)` (caret at `b`), as UIA `Select`.
+    fn uia_text_select(&mut self, id: ControlId, a: usize, b: usize) {
+        let Some(n) = self.arena.get_mut(id) else {
+            return;
+        };
+        if n.kind == ControlKind::PasswordBox {
+            return;
+        }
+        let Some(ed) = n.editor.as_mut() else {
+            return;
+        };
+        let len = ed.buf.len();
+        ed.anchor = a.min(len);
+        ed.caret = b.min(len);
+        // Restart the compositor caret blink solid-first, exactly as a keyboard
+        // caret move does.
+        ed.caret_moved = true;
+        n.mark_dirty();
+    }
+
+    /// Word boundaries around `i`: `[start, end)` of the word `i` sits in.
+    ///
+    /// `Editor`'s own `word_left` / `word_right` are private, so this repeats
+    /// their rule (skip whitespace, then the run of non-whitespace) against the
+    /// same buffer.
+    fn uia_text_word(&self, id: ControlId, i: usize) -> Option<(usize, usize)> {
+        let ed = self.uia_editor(id)?;
+        let buf = &ed.buf;
+        let n = buf.len();
+        let i = i.min(n);
+        let mut start = i;
+        while start > 0 && !is_word_break(buf[start - 1]) {
+            start -= 1;
+        }
+        let mut end = i;
+        // A word run plus the whitespace that trails it — the unit UIA expects,
+        // so `Move(Word, 1)` lands on the next word rather than on the gap.
+        while end < n && !is_word_break(buf[end]) {
+            end += 1;
+        }
+        while end < n && is_word_break(buf[end]) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// Node-local text-draw origin `(origin_x, origin_y)` in DIPs, matching the
+    /// geometry `controls::draw_editor` paints the run at.
+    fn uia_text_origin(&self, id: ControlId) -> Option<(f32, f32)> {
+        let n = self.arena.get(id)?;
+        let ed = n.editor.as_ref()?;
+        let (pad_left, _) = super::editor::editor_content(n.kind, n.rect.w);
+        let text_h = ed
+            .layout
+            .as_ref()
+            .and_then(|l| l.measure().ok())
+            .map(|(_, h)| h)
+            .filter(|h| *h > 0.0)
+            .unwrap_or(n.paint.font_size * 1.4);
+        Some((pad_left - ed.scroll_x, (n.rect.h - text_h) / 2.0))
+    }
+
+    /// Screen-pixel rectangles covering `[a, b)` — one per line the range spans
+    /// (single-line editors yield at most one). Empty for a degenerate range.
+    fn uia_text_rects(&self, id: ControlId, a: usize, b: usize) -> Vec<(f64, f64, f64, f64)> {
+        let Some(ed) = self.uia_editor(id) else {
+            return Vec::new();
+        };
+        let (Some(layout), Some((ox, oy)), Some(n)) =
+            (ed.layout.as_ref(), self.uia_text_origin(id), self.arena.get(id))
+        else {
+            return Vec::new();
+        };
+        let len = ed.buf.len();
+        let (a, b) = (a.min(len), b.min(len));
+        if a >= b {
+            return Vec::new();
+        }
+        let scroll = self.uia_scroll_adjust(id);
+        layout
+            .hit_test_range(a as u32, (b - a) as u32, n.rect.x + ox, n.rect.y + oy - scroll)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(x, y, w, h)| self.uia_screen_rect(x, y, w, h))
+            .collect()
+    }
+
+    /// The document index under screen point `(sx, sy)` for editor `id`.
+    fn uia_text_index_at(&self, id: ControlId, sx: f64, sy: f64) -> Option<usize> {
+        let ed = self.uia_editor(id)?;
+        let n = self.arena.get(id)?;
+        let scale = self.scale();
+        let mut pt = POINT { x: sx as i32, y: sy as i32 };
+        unsafe {
+            let _ = ScreenToClient(self.hwnd as HWND, &mut pt);
+        }
+        let (ox, _) = self.uia_text_origin(id)?;
+        Some(ed.index_at_x(pt.x as f32 / scale - n.rect.x, ox))
+    }
+
     /// Raise an `AutomationFocusChanged` event for `id` — deferred onto the pump
     /// so it never runs inside an input borrow, and a no-op when no client is
     /// listening (idle cost stays zero). Called on the UI thread from `set_focus`.
     pub(crate) fn uia_raise_focus(&self, id: ControlId) {
+        // The state this describes just changed — retire the property snapshots
+        // before the (client-gated) event raise.
+        note_state_change();
         if !clients_listening() {
             return;
         }
@@ -865,6 +1030,9 @@ impl DCompBackend {
     // deferred through the pump so raising never re-enters the input borrow.
 
     pub(crate) fn uia_notify_bool(&self, id: ControlId, event: Event, v: bool) {
+        // The state this describes just changed — retire the property snapshots
+        // before the (client-gated) event raise.
+        note_state_change();
         if !clients_listening() {
             return;
         }
@@ -887,6 +1055,9 @@ impl DCompBackend {
     }
 
     pub(crate) fn uia_notify_f64(&self, id: ControlId, event: Event, v: f64) {
+        // The state this describes just changed — retire the property snapshots
+        // before the (client-gated) event raise.
+        note_state_change();
         if !clients_listening() {
             return;
         }
@@ -896,6 +1067,9 @@ impl DCompBackend {
     }
 
     pub(crate) fn uia_notify_string(&self, id: ControlId, event: Event, v: &str) {
+        // The state this describes just changed — retire the property snapshots
+        // before the (client-gated) event raise.
+        note_state_change();
         if !clients_listening() {
             return;
         }
@@ -929,6 +1103,121 @@ impl DCompBackend {
 
 fn clients_listening() -> bool {
     unsafe { UiaClientsAreListening() }.as_bool()
+}
+
+// ── Property batching ────────────────────────────────────────────────────────
+//
+// Every marshal is a `PostMessageW` + condvar wait against the UI thread, and
+// each one drains the command buffer (`with_backend` → `flush`). A client tree
+// walk reads ~10 properties per element, so one marshal per property made a
+// 104-element walk ~1000 blocking round trips. Instead the FIRST property read
+// of an element fills a whole `PropSnapshot` in one marshal and the rest of the
+// burst is served from it.
+//
+// **Invalidation rule.** A snapshot is valid only while `UIA_GEN` still holds
+// the value it was stamped with. The UI thread bumps `UIA_GEN` on every arena
+// mutation — `set_prop` and the structural mutators call `note_state_change` /
+// `note_tree_change`, and the interactive state changes funnel through the
+// `uia_notify_*` / `uia_raise_focus` / `act` paths below, which bump too. The
+// counter is a plain atomic, so the UIA worker validates without marshalling;
+// a mismatch simply refills. The cache holds ONE element per UIA thread, so it
+// is bounded by construction and cannot outlive the thread.
+//
+// Two properties are deliberately excluded because they move without passing a
+// mutation hook: `IsOffscreen` (an ancestor's scroll offset glides from the
+// wheel path) and `BoundingRectangle` (a layout pass). Both still marshal per
+// call — cheap now that the ancestor walk is O(depth).
+
+/// Monotonic stamp of "the arena as the UIA layer may describe it". Bumped by
+/// the UI thread on mutation; read lock-free by UIA worker threads.
+static UIA_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn uia_gen() -> u64 {
+    UIA_GEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn bump_gen() {
+    UIA_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// The logical tree changed (a child was linked or unlinked). Called from the
+/// structural mutators in [`mod`](super).
+pub(crate) fn note_tree_change() {
+    bump_gen();
+}
+
+/// A node's observable state changed (a prop write, an interactive edit).
+pub(crate) fn note_state_change() {
+    bump_gen();
+}
+
+/// The properties one marshal collects for an element. Plain `Send` data.
+#[derive(Clone, Default)]
+struct PropSnapshot {
+    name: String,
+    automation_id: String,
+    help_text: String,
+    control_type: i32,
+    value: String,
+    toggle_state: i32,
+    range_value: f64,
+    is_enabled: bool,
+    focusable: bool,
+    has_focus: bool,
+    is_password: bool,
+}
+
+impl DCompBackend {
+    /// Collect every cacheable property of `(id, item)` in one pass.
+    fn uia_snapshot(&self, id: ControlId, item: i32) -> PropSnapshot {
+        PropSnapshot {
+            name: self.uia_name(id, item),
+            automation_id: self.uia_automation_id(id),
+            help_text: self.uia_help_text(id),
+            control_type: self.uia_control_type(id, item),
+            value: self.uia_value_string(id),
+            toggle_state: self.uia_toggle_state(id),
+            range_value: self.uia_range(id).map_or(0.0, |r| r.0),
+            is_enabled: self.uia_is_enabled(id),
+            focusable: self.uia_focusable(id, item),
+            has_focus: self.uia_has_focus(id, item),
+            is_password: self.uia_kind(id) == Some(ControlKind::PasswordBox),
+        }
+    }
+}
+
+thread_local! {
+    /// One cached element per UIA worker thread: `(key, generation, snapshot)`.
+    static SNAPSHOT: std::cell::RefCell<Option<((isize, u32, i32), u64, PropSnapshot)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The snapshot for `(hwnd, id, item)`, from this thread's cache when it is
+/// still current, else refilled with a single marshal.
+fn snapshot(hwnd: isize, id: ControlId, item: i32) -> Option<PropSnapshot> {
+    let key = (hwnd, id.get(), item);
+    let hit = SNAPSHOT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(k, g, _)| *k == key && *g == uia_gen())
+            .map(|(_, _, s)| s.clone())
+    });
+    if let Some(s) = hit {
+        return Some(s);
+    }
+    // Stamp on the UI thread: bumps happen there too, so reading the counter
+    // inside the same borrow pairs the snapshot with the exact generation it
+    // describes. A mutation that lands while we are blocked bumps past this
+    // stamp and the entry is dead on arrival — never stale, only refilled.
+    let (stamp, s) = on_backend(hwnd, move |b| {
+        b.arena
+            .get(id)
+            .is_some()
+            .then(|| (uia_gen(), b.uia_snapshot(id, item)))
+    })
+    .flatten()?;
+    SNAPSHOT.with(|c| *c.borrow_mut() = Some((key, stamp, s.clone())));
+    Some(s)
 }
 
 /// A property's new value as plain `Send` data; the VARIANT is built on the UI
@@ -1000,11 +1289,16 @@ where
 }
 
 /// Fire-and-forget an action onto the backend (Invoke/Toggle/SetValue/…).
+///
+/// Every action mutates, so this is also a generation bump: a client that sets a
+/// value and immediately reads it back must not be answered from the snapshot
+/// taken before its own write.
 fn act<F>(hwnd: isize, f: F)
 where
     F: FnOnce(&mut DCompBackend) + Send + 'static,
 {
     let _ = on_backend(hwnd, f);
+    note_state_change();
 }
 
 fn root_id(hwnd: isize) -> Option<ControlId> {
@@ -1049,9 +1343,17 @@ pub(crate) fn root_provider(hwnd: isize, root: ControlId) -> IRawElementProvider
 //
 // The objects carry only plain data and marshal all real work to the UI thread,
 // and `implement_decl!` makes them agile (they answer `IAgileObject`/`IMarshal`),
-// so a single instance is safely shared across UIA's worker threads. The cache
-// is grow-only for the process; each entry is a few words and UIA holds its own
-// references besides.
+// so a single instance is safely shared across UIA's worker threads.
+//
+// Lifetime: the cache is keyed by NODE first, then by the synthetic-item/root
+// variants of that node, so `destroy` can drop every provider for a node in one
+// O(1) map removal ([`forget`], called from `DCompBackend::destroy` beside the
+// existing `size::forget` / `pointer::forget`). Without that, a long session of
+// mounts and unmounts grew the map forever. Dropping our reference does not
+// yank the object out from under UIA — COM refcounting keeps any provider UIA
+// still holds alive; we only stop *handing out* a dead node's provider, and
+// every method on it already answers `UIA_E_ELEMENTNOTAVAILABLE` once the arena
+// entry is gone.
 
 /// An agile provider object, sendable because it is callable from any apartment.
 struct SendProvider(IRawElementProviderSimple);
@@ -1059,20 +1361,38 @@ struct SendProvider(IRawElementProviderSimple);
 // wrapped object may be AddRef'd/called from any thread.
 unsafe impl Send for SendProvider {}
 
-type ProviderKey = (isize, u32, i32, bool);
+/// Which provider of one node: `(synthetic item index, is fragment root)`.
+type VariantKey = (i32, bool);
+/// Which node: `(hwnd, ControlId)`.
+type NodeKey = (isize, u32);
 
-fn provider_cache() -> &'static Mutex<HashMap<ProviderKey, SendProvider>> {
-    static CACHE: OnceLock<Mutex<HashMap<ProviderKey, SendProvider>>> = OnceLock::new();
+type ProviderCache = HashMap<NodeKey, HashMap<VariantKey, SendProvider>>;
+
+fn provider_cache() -> &'static Mutex<ProviderCache> {
+    static CACHE: OnceLock<Mutex<ProviderCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop every cached provider object (element, items, root) for node `id` of
+/// window `hwnd` — one map removal, whatever the node's item count.
+///
+/// Called from `DCompBackend::destroy`. Ids are minted monotonically and never
+/// reused, so an entry for a destroyed node could never be re-addressed — this
+/// is purely about keeping the map bounded across mount/unmount churn.
+pub(crate) fn forget(hwnd: isize, id: ControlId) {
+    if let Ok(mut cache) = provider_cache().lock() {
+        cache.remove(&(hwnd, id.get()));
+    }
 }
 
 /// The one stable provider object for `p`'s element identity, created on first
 /// use and reused thereafter.
 fn stable_provider(p: ElementProvider) -> IRawElementProviderSimple {
-    let key = (p.hwnd, p.id.get(), p.item, p.is_root);
     let mut cache = provider_cache().lock().unwrap();
     cache
-        .entry(key)
+        .entry((p.hwnd, p.id.get()))
+        .or_default()
+        .entry((p.item, p.is_root))
         .or_insert_with(|| {
             // Only the true root is a fragment root (see the type split above).
             let obj: IRawElementProviderSimple =
@@ -1119,35 +1439,45 @@ impl ElementProvider {
     }
 
     /// A property VARIANT for `pid` (`VT_EMPTY` for anything we don't report).
+    ///
+    /// Constants first (no marshal at all), then the two properties that must be
+    /// read live, then everything else off ONE batched [`PropSnapshot`] — see the
+    /// property-batching notes above.
     fn property(&self, pid: PROPERTYID) -> VARIANT {
         let (hwnd, id, item) = (self.hwnd, self.id, self.item);
+        if pid == UIA_IsControlElementPropertyId || pid == UIA_IsContentElementPropertyId {
+            return v_bool(true);
+        }
+        // Excluded from the snapshot: moves with scroll glide / layout, neither
+        // of which passes a generation bump.
+        if pid == UIA_IsOffscreenPropertyId {
+            return v_bool(on_backend(hwnd, move |b| b.uia_is_offscreen(id, item)).unwrap_or(false));
+        }
+        let Some(s) = snapshot(hwnd, id, item) else {
+            return VARIANT::default();
+        };
         if pid == UIA_NamePropertyId {
-            v_bstr(on_backend(hwnd, move |b| b.uia_name(id, item)).unwrap_or_default())
+            v_bstr(s.name)
         } else if pid == UIA_AutomationIdPropertyId {
-            v_bstr(on_backend(hwnd, move |b| b.uia_automation_id(id)).unwrap_or_default())
+            v_bstr(s.automation_id)
         } else if pid == UIA_HelpTextPropertyId {
-            v_bstr(on_backend(hwnd, move |b| b.uia_help_text(id)).unwrap_or_default())
+            v_bstr(s.help_text)
         } else if pid == UIA_ControlTypePropertyId {
-            v_i4(on_backend(hwnd, move |b| b.uia_control_type(id, item)).unwrap_or(UIA_GroupControlTypeId))
+            v_i4(s.control_type)
         } else if pid == UIA_IsEnabledPropertyId {
-            v_bool(on_backend(hwnd, move |b| b.uia_is_enabled(id)).unwrap_or(true))
+            v_bool(s.is_enabled)
         } else if pid == UIA_IsKeyboardFocusablePropertyId {
-            v_bool(on_backend(hwnd, move |b| b.uia_focusable(id, item)).unwrap_or(false))
+            v_bool(s.focusable)
         } else if pid == UIA_HasKeyboardFocusPropertyId {
-            v_bool(on_backend(hwnd, move |b| b.uia_has_focus(id, item)).unwrap_or(false))
-        } else if pid == UIA_IsControlElementPropertyId || pid == UIA_IsContentElementPropertyId {
-            v_bool(true)
-        } else if pid == UIA_IsOffscreenPropertyId {
-            v_bool(on_backend(hwnd, move |b| b.uia_is_offscreen(id, item)).unwrap_or(false))
+            v_bool(s.has_focus)
         } else if pid == UIA_IsPasswordPropertyId {
-            let kind = on_backend(hwnd, move |b| b.uia_kind(id)).flatten();
-            v_bool(kind == Some(ControlKind::PasswordBox))
+            v_bool(s.is_password)
         } else if pid == UIA_ToggleToggleStatePropertyId {
-            v_i4(on_backend(hwnd, move |b| b.uia_toggle_state(id)).unwrap_or(0))
+            v_i4(s.toggle_state)
         } else if pid == UIA_RangeValueValuePropertyId {
-            v_r8(on_backend(hwnd, move |b| b.uia_range(id)).flatten().map_or(0.0, |r| r.0))
+            v_r8(s.range_value)
         } else if pid == UIA_ValueValuePropertyId {
-            v_bstr(on_backend(hwnd, move |b| b.uia_value_string(id)).unwrap_or_default())
+            v_bstr(s.value)
         } else {
             VARIANT::default()
         }
@@ -1179,7 +1509,8 @@ implement_decl! {
         ISelectionItemProvider,
         IExpandCollapseProvider,
         IScrollProvider,
-        IScrollItemProvider
+        IScrollItemProvider,
+        ITextProvider
     ]
 }
 
@@ -1197,6 +1528,7 @@ implement_decl! {
         IExpandCollapseProvider,
         IScrollProvider,
         IScrollItemProvider,
+        ITextProvider,
         IRawElementProviderAdviseEvents
     ]
 }
@@ -1685,5 +2017,463 @@ impl ElementProvider {
     fn expand_state(&self) -> Result<ExpandCollapseState> {
         let id = self.id;
         get(self.hwnd, move |b| Some(b.uia_expand_state(id)))
+    }
+}
+
+// ── Text pattern ─────────────────────────────────────────────────────────────
+//
+// `ITextProvider` on the editor element, `ITextRangeProvider` on a range over
+// its UTF-16 document. A text position is a code-unit index into
+// `Editor::buf` — the same index space the caret, the selection and DWrite's
+// hit-testing already use, so nothing is transcoded on this path.
+//
+// The editor is single-line by construction (it has `scroll_x` and no
+// `scroll_y`), so Line / Paragraph / Page / Document are all ONE unit spanning
+// the whole document, and `GetVisibleRanges` is the document range.
+//
+// PASSWORDS: `uia_text_supported` is false for a `PasswordBox`, so
+// `GetPatternProvider` answers null and no range can ever be minted over a
+// masked buffer. Every accessor additionally re-checks the kind, so a field that
+// becomes a password after a range was handed out starts answering empty rather
+// than leaking.
+
+/// A range's element identity plus its `[start, end)` in code units, shared with
+/// the registry below so a range handed back to us can be recognised by object
+/// identity — and so a comparison can tell two ranges over DIFFERENT elements
+/// apart even when their offsets coincide.
+type RangeState = (isize, ControlId, usize, usize);
+type SpanCell = std::sync::Arc<Mutex<RangeState>>;
+
+type RangeRegistry = Mutex<HashMap<usize, std::sync::Weak<Mutex<RangeState>>>>;
+
+/// Live ranges, keyed by their COM object address.
+///
+/// `Compare` / `CompareEndpoints` / `MoveEndpointByRange` are handed an
+/// `ITextRangeProvider` and need its absolute offsets, which no standard method
+/// exposes. Rather than an unchecked downcast, each range we mint registers a
+/// `Weak` handle on its span under its own pointer: a hit that still upgrades is
+/// provably one of ours (the `Arc` lives only inside that object), and anything
+/// else — a foreign implementation, a marshalling proxy, a freed address — fails
+/// the upgrade and is treated as foreign. Dead entries are pruned on insert, so
+/// the map stays bounded without a `Drop` impl.
+fn range_registry() -> &'static RangeRegistry {
+    static REG: OnceLock<RangeRegistry> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Mint a range over `[a, b)` of editor `id` and register it.
+fn new_range(hwnd: isize, id: ControlId, a: usize, b: usize) -> ITextRangeProvider {
+    let span: SpanCell = std::sync::Arc::new(Mutex::new((hwnd, id, a.min(b), a.max(b))));
+    let obj: ITextRangeProvider = TextRange { hwnd, id, span: span.clone() }.into();
+    if let Ok(mut reg) = range_registry().lock() {
+        if reg.len() > 256 {
+            reg.retain(|_, w| w.strong_count() > 0);
+        }
+        reg.insert(obj.as_raw() as usize, std::sync::Arc::downgrade(&span));
+    }
+    obj
+}
+
+/// The element + span of `r`, if `r` is one of our live ranges.
+fn foreign_state(r: Option<&ITextRangeProvider>) -> Option<RangeState> {
+    let cell = range_registry()
+        .lock()
+        .ok()?
+        .get(&(r?.as_raw() as usize))?
+        .upgrade()?;
+    let state = *cell.lock().ok()?;
+    Some(state)
+}
+
+/// The span of `r` when it is a live range over the SAME element as `owner`.
+/// Endpoint arithmetic against a range on another element is meaningless, so it
+/// is rejected rather than silently answered.
+fn sibling_span(owner: (isize, ControlId), r: Option<&ITextRangeProvider>) -> Option<(usize, usize)> {
+    let (hwnd, id, a, b) = foreign_state(r)?;
+    ((hwnd, id) == owner).then_some((a, b))
+}
+
+/// One UI Automation text range: an element identity plus a mutable
+/// `[start, end)` over that element's document.
+struct TextRange {
+    hwnd: isize,
+    id: ControlId,
+    span: SpanCell,
+}
+
+implement_decl! {
+    impl TextRange as TextRange_Impl: [ITextRangeProvider]
+}
+
+// `ITextProvider` is answered by the same stable element object every other
+// pattern is answered by (see `pattern_provider`).
+impl ElementProvider {
+    fn text_document_range(&self) -> Result<ITextRangeProvider> {
+        let id = self.id;
+        let len = get(self.hwnd, move |b| b.uia_text_len(id))?;
+        Ok(new_range(self.hwnd, self.id, 0, len))
+    }
+
+    /// A one-element `VT_UNKNOWN` array holding the selection range.
+    fn text_selection(&self) -> Result<*mut SAFEARRAY> {
+        let id = self.id;
+        let (a, b) = get(self.hwnd, move |b| b.uia_text_selection(id))?;
+        Ok(range_array(&[new_range(self.hwnd, self.id, a, b)]))
+    }
+
+    /// The whole document — a single-line field scrolls horizontally but never
+    /// hides a line, and reporting the exact visible substring would make a
+    /// screen reader announce a clipped fragment.
+    fn text_visible_ranges(&self) -> Result<*mut SAFEARRAY> {
+        Ok(range_array(&[self.text_document_range()?]))
+    }
+
+    /// The editor has no child elements, so any child maps to the whole document.
+    fn text_range_from_child(&self) -> Result<ITextRangeProvider> {
+        self.text_document_range()
+    }
+
+    fn text_range_from_point(&self, pt: &UiaPoint) -> Result<ITextRangeProvider> {
+        let (id, x, y) = (self.id, pt.x, pt.y);
+        let i = get(self.hwnd, move |b| b.uia_text_index_at(id, x, y))?;
+        // A degenerate range at the hit position, as the pattern specifies.
+        Ok(new_range(self.hwnd, self.id, i, i))
+    }
+}
+
+/// Pack `ranges` into a `VT_UNKNOWN` SAFEARRAY (UIA takes ownership).
+fn range_array(ranges: &[ITextRangeProvider]) -> *mut SAFEARRAY {
+    unsafe {
+        let psa = SafeArrayCreateVector(VT_UNKNOWN, 0, ranges.len() as u32);
+        if psa.is_null() {
+            return psa;
+        }
+        for (i, r) in ranges.iter().enumerate() {
+            let idx = i as i32;
+            // SafeArrayPutElement AddRefs the interface pointer.
+            let _ = SafeArrayPutElement(psa, &idx, r.as_raw());
+        }
+        psa
+    }
+}
+
+macro_rules! forward_text_provider {
+    ($imp:ty) => {
+        impl ITextProvider_Impl for $imp {
+            fn DocumentRange(&self) -> Result<ITextRangeProvider> {
+                self.inner().text_document_range()
+            }
+            fn SupportedTextSelection(&self) -> Result<SupportedTextSelection> {
+                Ok(SupportedTextSelection_Single)
+            }
+            fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+                self.inner().text_selection()
+            }
+            fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> {
+                self.inner().text_visible_ranges()
+            }
+            fn RangeFromChild(
+                &self,
+                _childelement: windows_core::Ref<IRawElementProviderSimple>,
+            ) -> Result<ITextRangeProvider> {
+                self.inner().text_range_from_child()
+            }
+            fn RangeFromPoint(&self, point: &UiaPoint) -> Result<ITextRangeProvider> {
+                self.inner().text_range_from_point(point)
+            }
+        }
+    };
+}
+
+forward_text_provider!(ElementProvider_Impl);
+forward_text_provider!(RootProvider_Impl);
+
+// ── The range object ─────────────────────────────────────────────────────────
+
+impl TextRange {
+    fn span(&self) -> (usize, usize) {
+        let (_, _, a, b) = *self.span.lock().unwrap();
+        (a, b)
+    }
+
+    fn set_span(&self, a: usize, b: usize) {
+        let mut g = self.span.lock().unwrap();
+        *g = (g.0, g.1, a.min(b), a.max(b));
+    }
+
+    /// This range's element identity, for comparisons against another range.
+    fn owner(&self) -> (isize, ControlId) {
+        (self.hwnd, self.id)
+    }
+
+    fn len(&self) -> usize {
+        let id = self.id;
+        on_backend(self.hwnd, move |b| b.uia_text_len(id))
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// The unit boundaries enclosing `i`. Line / Paragraph / Page / Document all
+    /// resolve to the whole document — the editor is single-line.
+    fn unit_bounds(&self, unit: TextUnit, i: usize) -> (usize, usize) {
+        let len = self.len();
+        let i = i.min(len);
+        // Compared, not matched: the generated `TextUnit_*` constants are not
+        // upper-case, and a constant pattern would trip `non_upper_case_globals`.
+        if unit == TextUnit_Character {
+            (i, (i + 1).min(len))
+        } else if unit == TextUnit_Word || unit == TextUnit_Format {
+            let id = self.id;
+            on_backend(self.hwnd, move |b| b.uia_text_word(id, i))
+                .flatten()
+                .unwrap_or((i, len))
+        } else {
+            (0, len)
+        }
+    }
+
+    /// Step `i` by `count` units, returning `(new index, units actually moved)`.
+    fn step(&self, unit: TextUnit, i: usize, count: i32) -> (usize, i32) {
+        let len = self.len();
+        let mut at = i.min(len);
+        let mut moved = 0i32;
+        let back = count < 0;
+        for _ in 0..count.unsigned_abs() {
+            let next = if unit == TextUnit_Character {
+                if back {
+                    at.checked_sub(1)
+                } else {
+                    (at < len).then_some(at + 1)
+                }
+            } else if unit == TextUnit_Word || unit == TextUnit_Format {
+                if back {
+                    // Start of this word if we are inside one, else the start of
+                    // the word before it.
+                    let (s, _) = self.unit_bounds(unit, at);
+                    let prev = if s < at {
+                        s
+                    } else {
+                        self.unit_bounds(unit, at.saturating_sub(1)).0
+                    };
+                    (prev < at).then_some(prev)
+                } else {
+                    let (_, e) = self.unit_bounds(unit, at);
+                    (e > at).then_some(e)
+                }
+            } else if back {
+                // One document unit: at most one step, to either edge.
+                (at > 0).then_some(0)
+            } else {
+                (at < len).then_some(len)
+            };
+            match next {
+                Some(n) => {
+                    at = n;
+                    moved += if back { -1 } else { 1 };
+                }
+                None => break,
+            }
+        }
+        (at, moved)
+    }
+}
+
+impl ITextRangeProvider_Impl for TextRange_Impl {
+    fn Clone(&self) -> Result<ITextRangeProvider> {
+        let (a, b) = self.span();
+        Ok(new_range(self.hwnd, self.id, a, b))
+    }
+
+    fn Compare(&self, range: windows_core::Ref<ITextRangeProvider>) -> Result<BOOL> {
+        // Equal only when it is one of our ranges, over the same element, with
+        // the same endpoints. Identical offsets on a different field are a
+        // different range.
+        let (a, b) = self.span();
+        let same = foreign_state(range.as_ref()) == Some((self.hwnd, self.id, a, b));
+        Ok(same.into())
+    }
+
+    fn CompareEndpoints(
+        &self,
+        endpoint: TextPatternRangeEndpoint,
+        targetrange: windows_core::Ref<ITextRangeProvider>,
+        targetendpoint: TextPatternRangeEndpoint,
+    ) -> Result<i32> {
+        let (a, b) = self.span();
+        let (ta, tb) =
+            sibling_span(self.owner(), targetrange.as_ref()).ok_or_else(not_available)?;
+        let mine = if endpoint == TextPatternRangeEndpoint_Start { a } else { b };
+        let theirs = if targetendpoint == TextPatternRangeEndpoint_Start { ta } else { tb };
+        Ok(match mine.cmp(&theirs) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        })
+    }
+
+    fn ExpandToEnclosingUnit(&self, unit: TextUnit) -> Result<()> {
+        let (a, _) = self.span();
+        let (s, e) = self.unit_bounds(unit, a);
+        self.set_span(s, e);
+        Ok(())
+    }
+
+    fn GetText(&self, maxlength: i32) -> Result<BSTR> {
+        let (a, mut b) = self.span();
+        if maxlength >= 0 {
+            b = b.min(a + maxlength as usize);
+        }
+        let id = self.id;
+        // `uia_text_slice` re-checks the password kind, so a field that turned
+        // into a `PasswordBox` after this range was minted yields nothing.
+        let s = on_backend(self.hwnd, move |bk| bk.uia_text_slice(id, a, b))
+            .flatten()
+            .ok_or_else(not_available)?;
+        Ok(BSTR::from(s))
+    }
+
+    fn Move(&self, unit: TextUnit, count: i32) -> Result<i32> {
+        let (a, b) = self.span();
+        let degenerate = a == b;
+        let (at, moved) = self.step(unit, a, count);
+        if degenerate {
+            self.set_span(at, at);
+        } else {
+            // A non-degenerate range lands on a whole unit, per the pattern.
+            let (s, e) = self.unit_bounds(unit, at);
+            self.set_span(s, e);
+        }
+        Ok(moved)
+    }
+
+    fn MoveEndpointByUnit(
+        &self,
+        endpoint: TextPatternRangeEndpoint,
+        unit: TextUnit,
+        count: i32,
+    ) -> Result<i32> {
+        let (a, b) = self.span();
+        let start = endpoint == TextPatternRangeEndpoint_Start;
+        let (at, moved) = self.step(unit, if start { a } else { b }, count);
+        // Crossing the other endpoint collapses the range onto the moved one.
+        if start {
+            self.set_span(at, b.max(at));
+        } else {
+            self.set_span(a.min(at), at);
+        }
+        Ok(moved)
+    }
+
+    fn MoveEndpointByRange(
+        &self,
+        endpoint: TextPatternRangeEndpoint,
+        targetrange: windows_core::Ref<ITextRangeProvider>,
+        targetendpoint: TextPatternRangeEndpoint,
+    ) -> Result<()> {
+        let (a, b) = self.span();
+        let (ta, tb) =
+            sibling_span(self.owner(), targetrange.as_ref()).ok_or_else(not_available)?;
+        let to = if targetendpoint == TextPatternRangeEndpoint_Start { ta } else { tb };
+        if endpoint == TextPatternRangeEndpoint_Start {
+            self.set_span(to, b.max(to));
+        } else {
+            self.set_span(a.min(to), to);
+        }
+        Ok(())
+    }
+
+    fn Select(&self) -> Result<()> {
+        let (a, b) = self.span();
+        let id = self.id;
+        act(self.hwnd, move |bk| bk.uia_text_select(id, a, b));
+        Ok(())
+    }
+
+    fn GetBoundingRectangles(&self) -> Result<*mut SAFEARRAY> {
+        let (a, b) = self.span();
+        let id = self.id;
+        let rects = on_backend(self.hwnd, move |bk| bk.uia_text_rects(id, a, b)).unwrap_or_default();
+        // The pattern's array is a flat run of doubles: left, top, width, height.
+        unsafe {
+            let psa = SafeArrayCreateVector(VT_R8, 0, (rects.len() * 4) as u32);
+            if psa.is_null() {
+                return Ok(psa);
+            }
+            for (i, r) in rects.iter().enumerate() {
+                for (j, v) in [r.0, r.1, r.2, r.3].iter().enumerate() {
+                    let idx = (i * 4 + j) as i32;
+                    let _ = SafeArrayPutElement(psa, &idx, v as *const f64 as *const _);
+                }
+            }
+            Ok(psa)
+        }
+    }
+
+    fn GetEnclosingElement(&self) -> Result<IRawElementProviderSimple> {
+        Ok(stable_provider(ElementProvider::element(self.hwnd, self.id)))
+    }
+
+    fn GetChildren(&self) -> Result<*mut SAFEARRAY> {
+        // A drawn text field has no child elements.
+        Ok(unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, 0) })
+    }
+
+    fn ScrollIntoView(&self, _aligntotop: BOOL) -> Result<()> {
+        let id = self.id;
+        act(self.hwnd, move |bk| bk.uia_scroll_into_view(id, -1));
+        Ok(())
+    }
+
+    fn FindText(&self, text: &BSTR, backward: BOOL, ignorecase: BOOL) -> Result<ITextRangeProvider> {
+        let (a, b) = self.span();
+        let id = self.id;
+        let hay = on_backend(self.hwnd, move |bk| bk.uia_text_slice(id, a, b))
+            .flatten()
+            .ok_or_else(not_available)?;
+        let needle = text.display().to_string();
+        // Search in UTF-16 units so a hit offset lands in the document's own
+        // index space (a `str` byte offset would not).
+        let (hay, needle) = if ignorecase.as_bool() {
+            (hay.to_lowercase(), needle.to_lowercase())
+        } else {
+            (hay, needle)
+        };
+        let hay: Vec<u16> = hay.encode_utf16().collect();
+        let pat: Vec<u16> = needle.encode_utf16().collect();
+        if pat.is_empty() || pat.len() > hay.len() {
+            return Err(Error::empty()); // S_OK + null: not found
+        }
+        let mut hits =
+            (0..=hay.len() - pat.len()).filter(|i| hay[*i..*i + pat.len()] == pat[..]);
+        let found = if backward.as_bool() { hits.next_back() } else { hits.next() };
+        match found {
+            Some(i) => Ok(new_range(self.hwnd, self.id, a + i, a + i + pat.len())),
+            None => Err(Error::empty()),
+        }
+    }
+
+    fn FindAttribute(
+        &self,
+        _attributeid: TEXTATTRIBUTEID,
+        _val: &VARIANT,
+        _backward: BOOL,
+    ) -> Result<ITextRangeProvider> {
+        // No text attributes are reported, so nothing can match.
+        Err(Error::empty()) // S_OK + null
+    }
+
+    fn GetAttributeValue(&self, _attributeid: TEXTATTRIBUTEID) -> Result<VARIANT> {
+        // The field is uniformly formatted and we report no attributes; an empty
+        // VARIANT is the "not supported" answer clients tolerate.
+        Ok(VARIANT::default())
+    }
+
+    fn AddToSelection(&self) -> Result<()> {
+        // `SupportedTextSelection_Single` — there is only ever one selection.
+        Err(Error::from_hresult(UIA_E_INVALIDOPERATION))
+    }
+
+    fn RemoveFromSelection(&self) -> Result<()> {
+        Err(Error::from_hresult(UIA_E_INVALIDOPERATION))
     }
 }

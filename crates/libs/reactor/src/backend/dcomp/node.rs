@@ -213,6 +213,20 @@ pub(crate) struct Node {
     /// Taffy layout inputs, mutated in place by `set_prop`.
     pub style: taffy::Style,
     pub children: Vec<ControlId>,
+    /// The node currently listing this one in its `children`, or `None` for the
+    /// root and for a node that is momentarily unparented (the reconciler
+    /// legitimately produces such states mid-diff — see `RecordingBackend::flush`).
+    ///
+    /// Maintained as the exact inverse of `children` by every mutator in
+    /// [`mod`](super) that changes WHICH list a node is in — `append_child`,
+    /// `insert_child`, `remove_child`, `replace_child`, `set_title_slot`, and
+    /// `destroy`. (`move_child` only reorders one list, so every node keeps its
+    /// parent.) It exists so the UIA provider can answer parent/ancestor queries
+    /// in O(depth) instead of a DFS from the root per call; a client `FindAll`
+    /// walk was O(n²) without it. Ids are never reused (see [`Arena`]), so a
+    /// stored id can never alias a different node — a parent that has since been
+    /// destroyed simply fails the arena lookup.
+    pub parent: Option<ControlId>,
     pub paint: Paint,
     /// StackPanel spacing (DIPs); applied to the Taffy gap on the main axis.
     pub spacing: f32,
@@ -362,6 +376,7 @@ impl Node {
             kind,
             style: default_style(kind),
             children: Vec::new(),
+            parent: None,
             paint,
             spacing: 0.0,
             grid_rows: Vec::new(),

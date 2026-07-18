@@ -33,17 +33,17 @@ mod editor;
 mod host;
 mod input;
 mod knob;
-mod layout;
-mod node;
+pub(crate) mod layout;
+pub(crate) mod node;
 mod pacer;
 mod paint;
 mod parts;
 mod pointer;
 mod popup;
-mod record;
+pub(crate) mod record;
 mod scroll;
 mod size;
-mod theme;
+pub(crate) mod theme;
 pub use theme::{set_host_tokens, HostTokens};
 mod uia;
 pub(crate) mod visibility;
@@ -255,6 +255,28 @@ impl DCompBackend {
         self.arena.get_mut(id)
     }
 
+    /// Point `child`'s parent link at `parent` (it just entered that child list).
+    fn link_parent(&mut self, child: ControlId, parent: ControlId) {
+        if let Some(c) = self.node_mut(child) {
+            c.parent = Some(parent);
+        }
+        uia::note_tree_change();
+    }
+
+    /// Clear `child`'s parent link, but only if it still names `parent`.
+    ///
+    /// The guard is what keeps the link exact through a reparent: the buffer
+    /// legitimately replays "attach to B" before "detach from A", and an
+    /// unconditional clear there would erase the newer, correct link.
+    fn unlink_parent(&mut self, child: ControlId, parent: ControlId) {
+        if let Some(c) = self.node_mut(child)
+            && c.parent == Some(parent)
+        {
+            c.parent = None;
+        }
+        uia::note_tree_change();
+    }
+
     /// Attach (or clear) one of a `TitleBar`'s caption slot children.
     ///
     /// `footer == false` is the centered `Content` slot: it spans both caption
@@ -268,6 +290,7 @@ impl DCompBackend {
         use taffy::prelude::*;
         // Swap the tracked child out of (and the new one into) the TitleBar's
         // composition children, marking the child order for re-sync.
+        let mut detached = None;
         if let Some(tb) = self.node_mut(id) {
             let prev = if footer {
                 tb.title_footer.take()
@@ -277,6 +300,7 @@ impl DCompBackend {
             if let Some(prev) = prev {
                 tb.children.retain(|c| *c != prev);
                 tb.children_dirty = true;
+                detached = Some(prev);
             }
             if let Some(new) = slot {
                 tb.children.push(new);
@@ -287,6 +311,13 @@ impl DCompBackend {
                     tb.title_content = Some(new);
                 }
             }
+        }
+        // Keep the parent links the exact inverse of the edited child list.
+        if let Some(prev) = detached {
+            self.unlink_parent(prev, id);
+        }
+        if let Some(new) = slot {
+            self.link_parent(new, id);
         }
         // Place the freshly attached slot inside the caption grid. Alignment is
         // driven through the child's `h_align`/`v_align` so the per-layout
@@ -549,6 +580,9 @@ impl Backend for DCompBackend {
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
         use taffy::prelude::*;
+        // Any prop write can move a value the UIA property snapshot caches
+        // (Name, IsEnabled, ToggleState, …), so retire the snapshots first.
+        uia::note_state_change();
         let mut refresh_suggest = false;
         {
             let Some(node) = self.node_mut(id) else { return };
@@ -923,6 +957,7 @@ impl Backend for DCompBackend {
             p.children.push(child);
             p.children_dirty = true;
         }
+        self.link_parent(child, parent);
     }
 
     fn insert_child(&mut self, parent: ControlId, index: usize, child: ControlId) {
@@ -931,26 +966,38 @@ impl Backend for DCompBackend {
             p.children.insert(i, child);
             p.children_dirty = true;
         }
+        self.link_parent(child, parent);
     }
 
     fn remove_child(&mut self, parent: ControlId, index: usize) {
+        let mut gone = None;
         if let Some(p) = self.node_mut(parent)
             && index < p.children.len()
         {
-            p.children.remove(index);
+            gone = Some(p.children.remove(index));
             p.children_dirty = true;
+        }
+        if let Some(c) = gone {
+            self.unlink_parent(c, parent);
         }
     }
 
     fn replace_child(&mut self, parent: ControlId, index: usize, new: ControlId) {
+        let mut gone = None;
         if let Some(p) = self.node_mut(parent)
             && index < p.children.len()
         {
-            p.children[index] = new;
+            gone = Some(std::mem::replace(&mut p.children[index], new));
             p.children_dirty = true;
+        }
+        if let Some(c) = gone {
+            self.unlink_parent(c, parent);
+            self.link_parent(new, parent);
         }
     }
 
+    /// A pure reorder inside one child list — every moved node keeps the same
+    /// parent, so no parent link changes.
     fn move_child(&mut self, parent: ControlId, from: usize, to: usize) {
         if let Some(p) = self.node_mut(parent)
             && from < p.children.len()
@@ -968,6 +1015,15 @@ impl Backend for DCompBackend {
         // bounded when a subscriber leaks its `Subscription`.
         size::forget(id);
         pointer::forget(id);
+        uia::forget(self.hwnd, id);
+        // This node's parent link dies with the entry, but its children would be
+        // left naming a parent that is no longer in the arena. Cut those links so
+        // the inverse of `children` stays exact for every node that survives.
+        if let Some(kids) = self.arena.get(id).map(|n| n.children.clone()) {
+            for k in kids {
+                self.unlink_parent(k, id);
+            }
+        }
         if self.attached_root == Some(id) {
             if let Some(n) = self.arena.get(id) {
                 self.comp.detach_root(&n.container);

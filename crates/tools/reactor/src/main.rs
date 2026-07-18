@@ -153,6 +153,8 @@ fn generate_reactor_bindings() {
         "Windows.Win32.IExpandCollapseProvider",
         "Windows.Win32.IScrollProvider",
         "Windows.Win32.IScrollItemProvider",
+        "Windows.Win32.ITextProvider",
+        "Windows.Win32.ITextRangeProvider",
         "Windows.Win32.IRawElementProviderAdviseEvents",
         "Windows.Win32.ITextStoreACP",
         // The backend implements these to hand a D2D path geometry to the

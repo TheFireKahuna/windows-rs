@@ -5708,6 +5708,712 @@ pub struct IStepEasingFunction_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
+    ITextProvider,
+    ITextProvider_Vtbl,
+    0x3589c92c_63f3_4367_99bb_ada653b77cf2
+);
+windows_core::imp::interface_hierarchy!(ITextProvider, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITextProvider_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub GetSelection: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut SAFEARRAY,
+    ) -> windows_core::HRESULT,
+    pub GetVisibleRanges: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut SAFEARRAY,
+    ) -> windows_core::HRESULT,
+    pub RangeFromChild: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub RangeFromPoint: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        UiaPoint,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub DocumentRange: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub SupportedTextSelection: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut SupportedTextSelection,
+    ) -> windows_core::HRESULT,
+}
+pub trait ITextProvider_Impl: windows_core::IUnknownImpl {
+    fn GetSelection(&self) -> windows_core::Result<*mut SAFEARRAY>;
+    fn GetVisibleRanges(&self) -> windows_core::Result<*mut SAFEARRAY>;
+    fn RangeFromChild(
+        &self,
+        childelement: windows_core::Ref<IRawElementProviderSimple>,
+    ) -> windows_core::Result<ITextRangeProvider>;
+    fn RangeFromPoint(&self, point: &UiaPoint) -> windows_core::Result<ITextRangeProvider>;
+    fn DocumentRange(&self) -> windows_core::Result<ITextRangeProvider>;
+    fn SupportedTextSelection(&self) -> windows_core::Result<SupportedTextSelection>;
+}
+impl ITextProvider_Vtbl {
+    pub const fn new<Identity: ITextProvider_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn GetSelection<
+            Identity: ITextProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut *mut SAFEARRAY,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextProvider_Impl::GetSelection(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetVisibleRanges<
+            Identity: ITextProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut *mut SAFEARRAY,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextProvider_Impl::GetVisibleRanges(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn RangeFromChild<
+            Identity: ITextProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            childelement: *mut core::ffi::c_void,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextProvider_Impl::RangeFromChild(
+                    this,
+                    core::mem::transmute_copy(&childelement),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn RangeFromPoint<
+            Identity: ITextProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            point: UiaPoint,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextProvider_Impl::RangeFromPoint(this, core::mem::transmute(&point)) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn DocumentRange<
+            Identity: ITextProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextProvider_Impl::DocumentRange(this) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn SupportedTextSelection<
+            Identity: ITextProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut SupportedTextSelection,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextProvider_Impl::SupportedTextSelection(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            GetSelection: GetSelection::<Identity, OFFSET>,
+            GetVisibleRanges: GetVisibleRanges::<Identity, OFFSET>,
+            RangeFromChild: RangeFromChild::<Identity, OFFSET>,
+            RangeFromPoint: RangeFromPoint::<Identity, OFFSET>,
+            DocumentRange: DocumentRange::<Identity, OFFSET>,
+            SupportedTextSelection: SupportedTextSelection::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<ITextProvider as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for ITextProvider {}
+windows_core::imp::define_interface!(
+    ITextRangeProvider,
+    ITextRangeProvider_Vtbl,
+    0x5347ad7b_c355_46f8_aff5_909033582f63
+);
+windows_core::imp::interface_hierarchy!(ITextRangeProvider, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITextRangeProvider_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub Clone: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub Compare: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub CompareEndpoints: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TextPatternRangeEndpoint,
+        *mut core::ffi::c_void,
+        TextPatternRangeEndpoint,
+        *mut i32,
+    ) -> windows_core::HRESULT,
+    pub ExpandToEnclosingUnit:
+        unsafe extern "system" fn(*mut core::ffi::c_void, TextUnit) -> windows_core::HRESULT,
+    pub FindAttribute: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TEXTATTRIBUTEID,
+        VARIANT,
+        windows_core::BOOL,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub FindText: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        windows_core::BOOL,
+        windows_core::BOOL,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetAttributeValue: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TEXTATTRIBUTEID,
+        *mut VARIANT,
+    ) -> windows_core::HRESULT,
+    pub GetBoundingRectangles: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut SAFEARRAY,
+    ) -> windows_core::HRESULT,
+    pub GetEnclosingElement: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetText: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub Move: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TextUnit,
+        i32,
+        *mut i32,
+    ) -> windows_core::HRESULT,
+    pub MoveEndpointByUnit: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TextPatternRangeEndpoint,
+        TextUnit,
+        i32,
+        *mut i32,
+    ) -> windows_core::HRESULT,
+    pub MoveEndpointByRange: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TextPatternRangeEndpoint,
+        *mut core::ffi::c_void,
+        TextPatternRangeEndpoint,
+    ) -> windows_core::HRESULT,
+    pub Select: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+    pub AddToSelection: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+    pub RemoveFromSelection:
+        unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+    pub ScrollIntoView: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub GetChildren: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut SAFEARRAY,
+    ) -> windows_core::HRESULT,
+}
+pub trait ITextRangeProvider_Impl: windows_core::IUnknownImpl {
+    fn Clone(&self) -> windows_core::Result<ITextRangeProvider>;
+    fn Compare(
+        &self,
+        range: windows_core::Ref<ITextRangeProvider>,
+    ) -> windows_core::Result<windows_core::BOOL>;
+    fn CompareEndpoints(
+        &self,
+        endpoint: TextPatternRangeEndpoint,
+        targetrange: windows_core::Ref<ITextRangeProvider>,
+        targetendpoint: TextPatternRangeEndpoint,
+    ) -> windows_core::Result<i32>;
+    fn ExpandToEnclosingUnit(&self, unit: TextUnit) -> windows_core::Result<()>;
+    fn FindAttribute(
+        &self,
+        attributeid: TEXTATTRIBUTEID,
+        val: &VARIANT,
+        backward: windows_core::BOOL,
+    ) -> windows_core::Result<ITextRangeProvider>;
+    fn FindText(
+        &self,
+        text: &windows_core::BSTR,
+        backward: windows_core::BOOL,
+        ignorecase: windows_core::BOOL,
+    ) -> windows_core::Result<ITextRangeProvider>;
+    fn GetAttributeValue(&self, attributeid: TEXTATTRIBUTEID) -> windows_core::Result<VARIANT>;
+    fn GetBoundingRectangles(&self) -> windows_core::Result<*mut SAFEARRAY>;
+    fn GetEnclosingElement(&self) -> windows_core::Result<IRawElementProviderSimple>;
+    fn GetText(&self, maxlength: i32) -> windows_core::Result<windows_core::BSTR>;
+    fn Move(&self, unit: TextUnit, count: i32) -> windows_core::Result<i32>;
+    fn MoveEndpointByUnit(
+        &self,
+        endpoint: TextPatternRangeEndpoint,
+        unit: TextUnit,
+        count: i32,
+    ) -> windows_core::Result<i32>;
+    fn MoveEndpointByRange(
+        &self,
+        endpoint: TextPatternRangeEndpoint,
+        targetrange: windows_core::Ref<ITextRangeProvider>,
+        targetendpoint: TextPatternRangeEndpoint,
+    ) -> windows_core::Result<()>;
+    fn Select(&self) -> windows_core::Result<()>;
+    fn AddToSelection(&self) -> windows_core::Result<()>;
+    fn RemoveFromSelection(&self) -> windows_core::Result<()>;
+    fn ScrollIntoView(&self, aligntotop: windows_core::BOOL) -> windows_core::Result<()>;
+    fn GetChildren(&self) -> windows_core::Result<*mut SAFEARRAY>;
+}
+impl ITextRangeProvider_Vtbl {
+    pub const fn new<Identity: ITextRangeProvider_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn Clone<Identity: ITextRangeProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::Clone(this) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn Compare<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            range: *mut core::ffi::c_void,
+            pretval: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::Compare(this, core::mem::transmute_copy(&range)) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn CompareEndpoints<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            endpoint: TextPatternRangeEndpoint,
+            targetrange: *mut core::ffi::c_void,
+            targetendpoint: TextPatternRangeEndpoint,
+            pretval: *mut i32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::CompareEndpoints(
+                    this,
+                    core::mem::transmute_copy(&endpoint),
+                    core::mem::transmute_copy(&targetrange),
+                    core::mem::transmute_copy(&targetendpoint),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn ExpandToEnclosingUnit<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            unit: TextUnit,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextRangeProvider_Impl::ExpandToEnclosingUnit(
+                    this,
+                    core::mem::transmute_copy(&unit),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn FindAttribute<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            attributeid: TEXTATTRIBUTEID,
+            val: VARIANT,
+            backward: windows_core::BOOL,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::FindAttribute(
+                    this,
+                    core::mem::transmute_copy(&attributeid),
+                    core::mem::transmute(&val),
+                    core::mem::transmute_copy(&backward),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn FindText<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            text: *mut core::ffi::c_void,
+            backward: windows_core::BOOL,
+            ignorecase: windows_core::BOOL,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::FindText(
+                    this,
+                    core::mem::transmute(&text),
+                    core::mem::transmute_copy(&backward),
+                    core::mem::transmute_copy(&ignorecase),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetAttributeValue<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            attributeid: TEXTATTRIBUTEID,
+            pretval: *mut VARIANT,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::GetAttributeValue(
+                    this,
+                    core::mem::transmute_copy(&attributeid),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetBoundingRectangles<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut *mut SAFEARRAY,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::GetBoundingRectangles(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetEnclosingElement<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::GetEnclosingElement(this) {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetText<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            maxlength: i32,
+            pretval: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::GetText(this, core::mem::transmute_copy(&maxlength))
+                {
+                    Ok(ok__) => {
+                        pretval.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn Move<Identity: ITextRangeProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            unit: TextUnit,
+            count: i32,
+            pretval: *mut i32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::Move(
+                    this,
+                    core::mem::transmute_copy(&unit),
+                    core::mem::transmute_copy(&count),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn MoveEndpointByUnit<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            endpoint: TextPatternRangeEndpoint,
+            unit: TextUnit,
+            count: i32,
+            pretval: *mut i32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::MoveEndpointByUnit(
+                    this,
+                    core::mem::transmute_copy(&endpoint),
+                    core::mem::transmute_copy(&unit),
+                    core::mem::transmute_copy(&count),
+                ) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn MoveEndpointByRange<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            endpoint: TextPatternRangeEndpoint,
+            targetrange: *mut core::ffi::c_void,
+            targetendpoint: TextPatternRangeEndpoint,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextRangeProvider_Impl::MoveEndpointByRange(
+                    this,
+                    core::mem::transmute_copy(&endpoint),
+                    core::mem::transmute_copy(&targetrange),
+                    core::mem::transmute_copy(&targetendpoint),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn Select<Identity: ITextRangeProvider_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextRangeProvider_Impl::Select(this).into()
+            }
+        }
+        unsafe extern "system" fn AddToSelection<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextRangeProvider_Impl::AddToSelection(this).into()
+            }
+        }
+        unsafe extern "system" fn RemoveFromSelection<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextRangeProvider_Impl::RemoveFromSelection(this).into()
+            }
+        }
+        unsafe extern "system" fn ScrollIntoView<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            aligntotop: windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextRangeProvider_Impl::ScrollIntoView(
+                    this,
+                    core::mem::transmute_copy(&aligntotop),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn GetChildren<
+            Identity: ITextRangeProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pretval: *mut *mut SAFEARRAY,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITextRangeProvider_Impl::GetChildren(this) {
+                    Ok(ok__) => {
+                        pretval.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            Clone: Clone::<Identity, OFFSET>,
+            Compare: Compare::<Identity, OFFSET>,
+            CompareEndpoints: CompareEndpoints::<Identity, OFFSET>,
+            ExpandToEnclosingUnit: ExpandToEnclosingUnit::<Identity, OFFSET>,
+            FindAttribute: FindAttribute::<Identity, OFFSET>,
+            FindText: FindText::<Identity, OFFSET>,
+            GetAttributeValue: GetAttributeValue::<Identity, OFFSET>,
+            GetBoundingRectangles: GetBoundingRectangles::<Identity, OFFSET>,
+            GetEnclosingElement: GetEnclosingElement::<Identity, OFFSET>,
+            GetText: GetText::<Identity, OFFSET>,
+            Move: Move::<Identity, OFFSET>,
+            MoveEndpointByUnit: MoveEndpointByUnit::<Identity, OFFSET>,
+            MoveEndpointByRange: MoveEndpointByRange::<Identity, OFFSET>,
+            Select: Select::<Identity, OFFSET>,
+            AddToSelection: AddToSelection::<Identity, OFFSET>,
+            RemoveFromSelection: RemoveFromSelection::<Identity, OFFSET>,
+            ScrollIntoView: ScrollIntoView::<Identity, OFFSET>,
+            GetChildren: GetChildren::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<ITextRangeProvider as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for ITextRangeProvider {}
+windows_core::imp::define_interface!(
     ITextStoreACP,
     ITextStoreACP_Vtbl,
     0x28888fe3_c2a0_483a_a3ea_8cb1ce51ff3d
@@ -9125,6 +9831,7 @@ pub type SupportedTextSelection = i32;
 pub const SupportedTextSelection_Multiple: SupportedTextSelection = 2;
 pub const SupportedTextSelection_None: SupportedTextSelection = 0;
 pub const SupportedTextSelection_Single: SupportedTextSelection = 1;
+pub type TEXTATTRIBUTEID = i32;
 pub const TF_ES_ASYNCDONTCARE: u32 = 0;
 pub const TF_ES_READ: u32 = 2;
 pub const TF_ES_READWRITE: u32 = 6;
@@ -9208,6 +9915,17 @@ pub struct TS_TEXTCHANGE {
     pub acpOldEnd: i32,
     pub acpNewEnd: i32,
 }
+pub type TextPatternRangeEndpoint = i32;
+pub const TextPatternRangeEndpoint_End: TextPatternRangeEndpoint = 1;
+pub const TextPatternRangeEndpoint_Start: TextPatternRangeEndpoint = 0;
+pub type TextUnit = i32;
+pub const TextUnit_Character: TextUnit = 0;
+pub const TextUnit_Document: TextUnit = 6;
+pub const TextUnit_Format: TextUnit = 1;
+pub const TextUnit_Line: TextUnit = 3;
+pub const TextUnit_Page: TextUnit = 5;
+pub const TextUnit_Paragraph: TextUnit = 4;
+pub const TextUnit_Word: TextUnit = 2;
 pub type TfActiveSelEnd = i32;
 pub type TfClientId = u32;
 pub type TfEditCookie = u32;
@@ -9332,6 +10050,7 @@ pub const UIA_IsEnabledPropertyId: i32 = 30010;
 pub const UIA_IsKeyboardFocusablePropertyId: i32 = 30009;
 pub const UIA_IsOffscreenPropertyId: i32 = 30022;
 pub const UIA_IsPasswordPropertyId: i32 = 30019;
+pub const UIA_IsTextPatternAvailablePropertyId: i32 = 30040;
 pub const UIA_ListControlTypeId: i32 = 50008;
 pub const UIA_ListItemControlTypeId: i32 = 50007;
 pub const UIA_LiveRegionChangedEventId: i32 = 20024;
@@ -9355,12 +10074,19 @@ pub const UIA_StructureChangedEventId: i32 = 20002;
 pub const UIA_TabControlTypeId: i32 = 50018;
 pub const UIA_TabItemControlTypeId: i32 = 50019;
 pub const UIA_TextControlTypeId: i32 = 50020;
+pub const UIA_TextPatternId: i32 = 10014;
 pub const UIA_TitleBarControlTypeId: i32 = 50037;
 pub const UIA_TogglePatternId: i32 = 10015;
 pub const UIA_ToggleToggleStatePropertyId: i32 = 30086;
 pub const UIA_ValuePatternId: i32 = 10002;
 pub const UIA_ValueValuePropertyId: i32 = 30045;
 pub const UIA_WindowControlTypeId: i32 = 50032;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UiaPoint {
+    pub x: f64,
+    pub y: f64,
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UiaRect {
