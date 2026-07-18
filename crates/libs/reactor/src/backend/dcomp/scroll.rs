@@ -9,6 +9,35 @@ pub(crate) const THUMB_MARGIN: f32 = 2.0;
 /// Smallest the thumb is allowed to shrink to, however long the content (DIP).
 pub(crate) const THUMB_MIN_H: f32 = 24.0;
 
+/// What the app's `ScrollBarVisibility` asks of the overlay thumb.
+///
+/// This backend draws ONE overlay scrollbar — the vertical thumb — so it is
+/// `VerticalScrollBarVisibility` that resolves here. There is no horizontal
+/// thumb for the horizontal prop to govern (see `thumb_geom`: the geometry is
+/// vertical throughout, and a container carries a single `scroll_off`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reveal {
+    /// Shown whenever the content overflows, with no pointer nearby.
+    Always,
+    /// Never shown, however the pointer moves.
+    Never,
+    /// The default: revealed on hover / active scroll, concealed on exit.
+    OnDemand,
+}
+
+/// Resolve a `ScrollBarVisibility` discriminant to a reveal policy.
+///
+/// `Disabled` maps to `Never` rather than to "no scrolling": this is the
+/// overlay indicator's policy only, and suppressing the indicator is the part
+/// of `Disabled` that belongs to the thumb.
+pub(crate) fn reveal_policy(v: i32) -> Reveal {
+    match crate::ScrollBarVisibility(v) {
+        crate::ScrollBarVisibility::Visible => Reveal::Always,
+        crate::ScrollBarVisibility::Hidden | crate::ScrollBarVisibility::Disabled => Reveal::Never,
+        _ => Reveal::OnDemand,
+    }
+}
+
 /// The resolved scrollbar geometry for one scroll container.
 #[derive(Clone, Copy)]
 pub(crate) struct ThumbGeom {

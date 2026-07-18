@@ -33,18 +33,19 @@ mod editor;
 mod host;
 mod input;
 mod knob;
-mod layout;
-mod node;
+pub(crate) mod layout;
+pub(crate) mod nav;
+pub(crate) mod node;
 mod pacer;
 mod paint;
 mod parts;
 mod pointer;
 mod popup;
-mod record;
+pub(crate) mod record;
 mod scroll;
 mod size;
 mod surface;
-mod theme;
+pub(crate) mod theme;
 pub use theme::{set_host_tokens, HostTokens};
 mod uia;
 pub(crate) mod visibility;
@@ -58,7 +59,7 @@ pub(crate) use pointer::{register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
 
 use bootstrap::Compositing;
-use node::{Arena, MenuRow, Node};
+use node::{Arena, Ctrl, Extras, MenuRow, Node};
 use paint::PaintCache;
 
 use crate::backend::{Backend, ControlKind, Event, EventHandler, Prop, PropValue};
@@ -142,6 +143,25 @@ pub struct DCompBackend {
     /// Composition surfaces hosted under controls on behalf of viz hosts
     /// (see [`surface`]).
     surfaces: surface::SurfaceHost,
+    /// Live `TitleBar` node ids in mount order — the caption-geometry cache.
+    ///
+    /// `WM_NCHITTEST` asks for [`Self::caption_rect`] on every non-client mouse
+    /// move, so finding the caption may not scan the arena (an unordered map).
+    /// Maintained structurally instead: every arena insert flows through
+    /// `create` / `create_with_id` and every removal through `destroy`, all of
+    /// which know the kind, so this list is exact by construction and can never
+    /// name a node that is no longer in the arena. Ids are never reused, so
+    /// even a leaked entry could not alias a later node — but none can leak.
+    ///
+    /// A `Vec` rather than an `Option` because a tree with two TitleBars is
+    /// structurally reachable (nothing in the seam forbids it) and a remount
+    /// legitimately mounts the replacement *before* destroying the original —
+    /// which an `Option` would resolve by clearing the cache on the destroy,
+    /// leaving the live TitleBar unfindable. Order gives a defined policy:
+    /// **the first-mounted TitleBar owns the caption**; a second is laid out
+    /// and painted as an ordinary node but contributes no non-client region.
+    /// (The scan this replaced picked an arbitrary one — map order.)
+    titlebars: Vec<ControlId>,
     /// The host window handle (as `isize`) — used for clipboard ownership.
     hwnd: isize,
 }
@@ -170,6 +190,7 @@ impl DCompBackend {
             ghosts: Vec::new(),
             next_ghost: 0,
             surfaces: surface::SurfaceHost::default(),
+            titlebars: Vec::new(),
             hwnd,
         }
     }
@@ -199,6 +220,13 @@ impl DCompBackend {
 
     /// Full layout + surface paint. Run after each reconcile and on resize.
     pub(crate) fn relayout_and_paint(&mut self) {
+        // The tree just settled — audit the caption cache while the structural
+        // edits that could have drifted it are still fresh. `cfg!` rather than
+        // `#[cfg]` so the audit type-checks in every configuration; `if false`
+        // costs a release build nothing.
+        if cfg!(debug_assertions) {
+            self.audit_titlebars();
+        }
         if let Some(root) = self.root {
             let (w, h) = self.dip_size;
             let scale = self.scale();
@@ -260,6 +288,28 @@ impl DCompBackend {
         self.arena.get_mut(id)
     }
 
+    /// Point `child`'s parent link at `parent` (it just entered that child list).
+    fn link_parent(&mut self, child: ControlId, parent: ControlId) {
+        if let Some(c) = self.node_mut(child) {
+            c.parent = Some(parent);
+        }
+        uia::note_tree_change();
+    }
+
+    /// Clear `child`'s parent link, but only if it still names `parent`.
+    ///
+    /// The guard is what keeps the link exact through a reparent: the buffer
+    /// legitimately replays "attach to B" before "detach from A", and an
+    /// unconditional clear there would erase the newer, correct link.
+    fn unlink_parent(&mut self, child: ControlId, parent: ControlId) {
+        if let Some(c) = self.node_mut(child)
+            && c.parent == Some(parent)
+        {
+            c.parent = None;
+        }
+        uia::note_tree_change();
+    }
+
     /// Attach (or clear) one of a `TitleBar`'s caption slot children.
     ///
     /// `footer == false` is the centered `Content` slot: it spans both caption
@@ -273,6 +323,7 @@ impl DCompBackend {
         use taffy::prelude::*;
         // Swap the tracked child out of (and the new one into) the TitleBar's
         // composition children, marking the child order for re-sync.
+        let mut detached = None;
         if let Some(tb) = self.node_mut(id) {
             let prev = if footer {
                 tb.title_footer.take()
@@ -282,6 +333,7 @@ impl DCompBackend {
             if let Some(prev) = prev {
                 tb.children.retain(|c| *c != prev);
                 tb.children_dirty = true;
+                detached = Some(prev);
             }
             if let Some(new) = slot {
                 tb.children.push(new);
@@ -292,6 +344,13 @@ impl DCompBackend {
                     tb.title_content = Some(new);
                 }
             }
+        }
+        // Keep the parent links the exact inverse of the edited child list.
+        if let Some(prev) = detached {
+            self.unlink_parent(prev, id);
+        }
+        if let Some(new) = slot {
+            self.link_parent(new, id);
         }
         // Place the freshly attached slot inside the caption grid. Alignment is
         // driven through the child's `h_align`/`v_align` so the per-layout
@@ -319,12 +378,38 @@ impl DCompBackend {
         }
     }
 
-    /// The TitleBar node (the custom caption band), if the tree has one.
+    /// The TitleBar node that owns the caption (the custom caption band), if
+    /// the tree has one. O(1) — see [`Self::titlebars`].
     fn titlebar_id(&self) -> Option<ControlId> {
-        self.arena
+        self.titlebars.first().copied()
+    }
+
+    /// Debug-only: prove [`Self::titlebars`] still names exactly the live
+    /// TitleBar nodes. The list is maintained structurally at create/destroy,
+    /// so drift here would mean a mint or teardown path that bypassed them —
+    /// and a cached id naming a destroyed node would hand `WM_NCHITTEST` a
+    /// stale caption region for the rest of the window's life, which is worse
+    /// than the arena scan this cache replaced.
+    fn audit_titlebars(&self) {
+        // Arena order is unspecified, so compare membership, not sequence.
+        let live = self
+            .arena
             .iter()
-            .find(|(_, n)| n.kind == ControlKind::TitleBar)
-            .map(|(id, _)| id)
+            .filter(|(_, n)| n.kind == ControlKind::TitleBar)
+            .count();
+        debug_assert_eq!(
+            live,
+            self.titlebars.len(),
+            "TitleBar cache drifted: {live} live, {} cached",
+            self.titlebars.len()
+        );
+        debug_assert!(
+            self.titlebars.iter().all(|id| self
+                .arena
+                .get(*id)
+                .is_some_and(|n| n.kind == ControlKind::TitleBar)),
+            "TitleBar cache names a node that is gone or is no longer a TitleBar"
+        );
     }
 
     /// The caption band's layout box in window DIPs (`(x, y, w, h)`), if a
@@ -332,6 +417,38 @@ impl DCompBackend {
     pub(crate) fn caption_rect(&self) -> Option<(f32, f32, f32, f32)> {
         let n = self.arena.get(self.titlebar_id()?)?;
         Some((n.rect.x, n.rect.y, n.rect.w, n.rect.h))
+    }
+
+    /// The drawn back button's box in window DIPs, if the mounted TitleBar
+    /// shows one. `None` when there is no TitleBar or its back button is
+    /// hidden — the host then never reports `HTSYSMENU` for that band.
+    pub(crate) fn back_button_rect(&self) -> Option<(f32, f32, f32, f32)> {
+        let n = self.arena.get(self.titlebar_id()?)?;
+        let r = caption::back_rect(
+            n.extras(),
+            windows_canvas_core::Rect::from_xywh(n.rect.x, n.rect.y, n.rect.w, n.rect.h),
+        )?;
+        Some((r.left, r.top, r.width(), r.height()))
+    }
+
+    /// Whether the back button is currently clickable — drawn AND enabled. A
+    /// visible-but-disabled button still paints (greyed) but must not take the
+    /// hit, so the band under it stays draggable.
+    pub(crate) fn back_button_active(&self) -> bool {
+        self.titlebar_id()
+            .and_then(|id| self.arena.get(id))
+            .is_some_and(|n| n.extras().back_button_visible && n.extras().back_button_enabled)
+    }
+
+    /// Fire the mounted TitleBar's `BackRequested` handler, if it has one.
+    pub(crate) fn raise_back_requested(&mut self) {
+        if let Some(h) = self
+            .titlebar_id()
+            .and_then(|id| self.arena.get(id))
+            .and_then(|n| n.handler(Event::BackRequested))
+        {
+            h.invoke();
+        }
     }
 
     /// Whether the point sits over content that must stay client (an
@@ -537,388 +654,47 @@ impl DCompBackend {
         }
         node
     }
+
+    /// Register a freshly inserted node in the kind-keyed id caches. Called
+    /// from both minting paths, so [`Self::titlebars`] tracks the arena exactly.
+    fn note_inserted(&mut self, id: ControlId, kind: ControlKind) {
+        if kind == ControlKind::TitleBar && !self.titlebars.contains(&id) {
+            if !self.titlebars.is_empty() {
+                animate::warn(format_args!(
+                    "TitleBar {id}: a second TitleBar is mounted — the first \
+                     ({:?}) keeps the caption; this one paints as a plain node",
+                    self.titlebars[0]
+                ));
+            }
+            self.titlebars.push(id);
+        }
+    }
 }
 
 impl record::CreateWithId for DCompBackend {
     fn create_with_id(&mut self, id: ControlId, kind: ControlKind) {
         let node = self.build_node(kind);
         self.arena.insert_with_id(id, node);
+        self.note_inserted(id, kind);
     }
 }
 
 impl Backend for DCompBackend {
     fn create(&mut self, kind: ControlKind) -> ControlId {
         let node = self.build_node(kind);
-        self.arena.insert(node)
+        let id = self.arena.insert(node);
+        self.note_inserted(id, kind);
+        id
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
-        use taffy::prelude::*;
-        let mut refresh_suggest = false;
-        {
-            let Some(node) = self.node_mut(id) else { return };
-            match (prop, value) {
-            // ── Prop removal — a conditional prop diffed away reverts to its
-            // default (e.g. a Segmented pill losing its active accent fill) ──
-            (_, PropValue::Unset) => reset_prop(node, prop),
-            // ── Paint props (mark the node's surface dirty) ──────────────
-            (Prop::Background, PropValue::Color(c)) => {
-                node.paint.background = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::Foreground, PropValue::Color(c)) => {
-                node.paint.foreground = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::BorderBrush, PropValue::Color(c)) => {
-                node.paint.border_brush = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::BorderThickness, PropValue::Thickness(t)) => {
-                node.paint.border_thickness = t.left as f32;
-                // Border thickness also insets content in layout.
-                node.style.border = Rect {
-                    left: length(t.left as f32),
-                    right: length(t.right as f32),
-                    top: length(t.top as f32),
-                    bottom: length(t.bottom as f32),
-                };
-                node.mark_dirty();
-            }
-            (Prop::CornerRadius, PropValue::F64(v)) => {
-                node.paint.corner_radius = *v as f32;
-                node.mark_dirty();
-            }
-            (Prop::Fill, PropValue::Color(c)) => {
-                node.paint.fill = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::Stroke, PropValue::Color(c)) => {
-                node.paint.stroke = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::StrokeThickness, PropValue::F64(v)) => {
-                node.paint.stroke_thickness = *v as f32;
-                node.mark_dirty();
-            }
-            (Prop::LineEndpoints, PropValue::LineEndpoints(l)) => {
-                node.paint.line = *l;
-                node.mark_dirty();
-            }
-            (Prop::StyleVariant, PropValue::I32(v)) => {
-                node.paint.style_variant = *v;
-                node.mark_dirty();
-            }
-            (Prop::IsEnabled, PropValue::Bool(b)) => {
-                node.paint.is_enabled = *b;
-                node.mark_dirty();
-            }
-
-            // An Expander's title arrives as `Prop::Header`; it paints as the
-            // node's label like every other text-bearing control.
-            (Prop::Content | Prop::Text | Prop::Header, PropValue::Str(s)) => {
-                // For an editable kind (AutoSuggestBox carries its text via
-                // `Prop::Text`), seed the editor buffer instead of the label.
-                if node.editor.is_some() {
-                    seed_editor_text(node, s);
-                } else {
-                    node.paint.text = s.clone();
-                    node.text_dirty = true;
-                }
-                node.mark_dirty();
-            }
-            // TextBox / PasswordBox carry their text via `Prop::Value(Str)`.
-            (Prop::Value, PropValue::Str(s)) if node.editor.is_some() => {
-                seed_editor_text(node, s);
-                node.mark_dirty();
-            }
-            (Prop::Precision, PropValue::I32(v)) => {
-                node.ctrl.precision = Some(*v);
-                // Reformat the seeded value to the new precision (the `Value`
-                // prop usually arrives before `Precision`). Never while focused
-                // — the user owns the buffer mid-edit.
-                if node.kind == ControlKind::NumberBox && !node.focused {
-                    let value = node.ctrl.value;
-                    if let Some(ed) = &mut node.editor {
-                        ed.seeded = false;
-                    }
-                    seed_number_text(node, value);
-                    node.mark_dirty();
-                }
-            }
-            (Prop::LargeChange, PropValue::F64(v)) => node.ctrl.large_change = Some(*v),
-            (Prop::HorizontalContentAlignment, PropValue::I32(v)) => {
-                node.ctrl.content_align = *v;
-                if let Some(ed) = &mut node.editor {
-                    ed.layout_dirty = true;
-                }
-                node.mark_dirty();
-            }
-            (Prop::FontSize, PropValue::F64(v)) => {
-                node.paint.font_size = *v as f32;
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-            (Prop::FontWeight, PropValue::U16(w)) => {
-                node.paint.font_weight = *w;
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-            (Prop::FontFamily, PropValue::Str(s)) => {
-                node.paint.font_family = Some(s.clone());
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-            (Prop::TextWrapping | Prop::TextWrappingWrap, _) => {
-                // WinRT TextWrapping: NoWrap = 1, Wrap = 2, WrapWholeWords = 3 — and
-                // 0 for a widget that never set one, since the generated TextBlock
-                // bindings push this prop unconditionally and the field's Rust default
-                // is `TextWrapping(0)`. Only a real Wrap value wraps: 0 is "unset",
-                // which must mean NoWrap to match XAML's own TextBlock default.
-                // Reading it as `!= 1` instead marked virtually every text node in the
-                // tree as wrapping — inert only for as long as the DWrite box stayed
-                // unconstrained (see `layout::build_text_layout`), and silently
-                // wrapping every label the moment it did not.
-                let wrap = match value {
-                    PropValue::I32(v) => *v > 1,
-                    PropValue::Bool(b) => *b,
-                    _ => true,
-                };
-                node.paint.wrap = wrap;
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-
-            // ── Visual prop applied straight onto the container ──────────
-            (Prop::Opacity, PropValue::F64(v)) => {
-                let _ = node.vis.SetOpacity((*v as f32).clamp(0.0, 1.0));
-            }
-
-            // ── Layout props (Taffy inputs; relayout runs each reconcile) ─
-            (Prop::Padding, PropValue::Thickness(t)) => {
-                node.style.padding = Rect {
-                    left: length(t.left as f32),
-                    right: length(t.right as f32),
-                    top: length(t.top as f32),
-                    bottom: length(t.bottom as f32),
-                };
-            }
-            (Prop::Margin, PropValue::Thickness(t)) => {
-                node.style.margin = Rect {
-                    left: length(t.left as f32),
-                    right: length(t.right as f32),
-                    top: length(t.top as f32),
-                    bottom: length(t.bottom as f32),
-                };
-            }
-            (Prop::Width, PropValue::F64(v)) => node.style.size.width = length(*v as f32),
-            (Prop::Height, PropValue::F64(v)) => node.style.size.height = length(*v as f32),
-            (Prop::MinWidth, PropValue::F64(v)) => node.style.min_size.width = length(*v as f32),
-            (Prop::MinHeight, PropValue::F64(v)) => node.style.min_size.height = length(*v as f32),
-            (Prop::MaxWidth, PropValue::F64(v)) => node.style.max_size.width = length(*v as f32),
-            (Prop::MaxHeight, PropValue::F64(v)) => node.style.max_size.height = length(*v as f32),
-
-            (Prop::HorizontalAlignment, PropValue::I32(v)) => node.h_align = *v,
-            (Prop::VerticalAlignment, PropValue::I32(v)) => node.v_align = *v,
-
-            (Prop::Orientation, PropValue::I32(v)) => {
-                // WinRT Orientation: Vertical = 0, Horizontal = 1.
-                node.style.flex_direction = if *v == 1 {
-                    FlexDirection::Row
-                } else {
-                    FlexDirection::Column
-                };
-                apply_stack_gap(node);
-            }
-            (Prop::Spacing, PropValue::F64(v)) => {
-                node.spacing = *v as f32;
-                apply_stack_gap(node);
-            }
-            (Prop::ColumnSpacing, PropValue::F64(v)) => node.style.gap.width = length(*v as f32),
-            (Prop::RowSpacing, PropValue::F64(v)) => node.style.gap.height = length(*v as f32),
-            (Prop::GridRows, PropValue::GridLengths(g)) => node.grid_rows = clone_lengths(g),
-            (Prop::GridColumns, PropValue::GridLengths(g)) => node.grid_cols = clone_lengths(g),
-
-            (Prop::AttachedGridRow, PropValue::I32(v)) => {
-                node.style.grid_row.start = line((*v + 1) as i16);
-            }
-            (Prop::AttachedGridColumn, PropValue::I32(v)) => {
-                node.style.grid_column.start = line((*v + 1) as i16);
-            }
-            (Prop::AttachedGridRowSpan, PropValue::I32(v)) => {
-                node.style.grid_row.end = span((*v).max(1) as u16);
-            }
-            (Prop::AttachedGridColumnSpan, PropValue::I32(v)) => {
-                node.style.grid_column.end = span((*v).max(1) as u16);
-            }
-            (Prop::AttachedCanvasLeft, PropValue::F64(v)) => {
-                node.style.position = Position::Absolute;
-                node.style.inset.left = length(*v as f32);
-            }
-            (Prop::AttachedCanvasTop, PropValue::F64(v)) => {
-                node.style.position = Position::Absolute;
-                node.style.inset.top = length(*v as f32);
-            }
-            (Prop::AttachedCanvasZIndex, PropValue::I32(v)) => {
-                node.z_index = *v;
-                node.z_dirty = true;
-            }
-
-            // ── Control state (stateful drawn controls) ──────────────────
-            // The part-converted kinds (toggle / slider / segmented / nav) need
-            // no spring tick here: marking dirty routes them through the paint
-            // pass, whose parts sync glides the change on the compositor.
-            (Prop::IsOn, PropValue::Bool(v)) => {
-                node.ctrl.is_on = *v;
-                node.mark_dirty();
-            }
-            (Prop::IsChecked, PropValue::Bool(v)) => {
-                // The CheckBox reveal fades via its chrome parts on repaint; a
-                // ToggleButton's checked state is plain painted chrome.
-                node.ctrl.is_checked = *v;
-                node.mark_dirty();
-            }
-            (Prop::Value, PropValue::F64(v)) => {
-                node.ctrl.value = *v;
-                // NumberBox: reflect the programmatic value as formatted text
-                // (unless the user is mid-edit — the editor owns the buffer
-                // while focused).
-                if node.kind == ControlKind::NumberBox {
-                    seed_number_text(node, *v);
-                }
-                node.mark_dirty();
-            }
-            (Prop::Minimum, PropValue::F64(v)) => {
-                node.ctrl.min = *v;
-                node.mark_dirty();
-            }
-            (Prop::Maximum, PropValue::F64(v)) => {
-                node.ctrl.max = *v;
-                node.mark_dirty();
-            }
-            (Prop::Step, PropValue::F64(v)) => node.ctrl.step = Some(*v),
-            (Prop::FillOrigin, PropValue::F64(v)) => {
-                node.ctrl.fill_origin = Some(*v);
-                node.mark_dirty();
-            }
-            (Prop::FillColor, PropValue::Color(c)) => {
-                node.ctrl.fill_color = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::FillColorAlt, PropValue::Color(c)) => {
-                node.ctrl.fill_color_alt = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::Marker, PropValue::F64(v)) => {
-                node.ctrl.marker = Some(*v);
-                node.mark_dirty();
-            }
-            (Prop::MarkerColor, PropValue::Color(c)) => {
-                node.ctrl.marker_color = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::GradientStops, PropValue::GradientStops(stops)) => {
-                node.ctrl.stops = stops.clone();
-                node.mark_dirty();
-            }
-            (Prop::StartAngle, PropValue::F64(v)) => {
-                node.ctrl.start_angle = *v as f32;
-                node.mark_dirty();
-            }
-            (Prop::EndAngle, PropValue::F64(v)) => {
-                node.ctrl.end_angle = *v as f32;
-                node.mark_dirty();
-            }
-            (Prop::Ticks, PropValue::F64List(list)) => {
-                node.ctrl.ticks = list.clone();
-                node.mark_dirty();
-            }
-            (Prop::TickLabels, PropValue::ValueLabels(list)) => {
-                node.ctrl.tick_labels = list.clone();
-                node.mark_dirty();
-            }
-            (Prop::MajorEvery, PropValue::F64(v)) => {
-                node.ctrl.major_every = Some(*v);
-                node.mark_dirty();
-            }
-            (Prop::Accent, PropValue::Color(c)) => {
-                node.ctrl.accent = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::Unit, PropValue::Str(s)) => {
-                node.ctrl.unit = s.clone();
-                node.mark_dirty();
-            }
-            (Prop::SubText, PropValue::Str(s)) => {
-                node.ctrl.sub_text = s.clone();
-                node.mark_dirty();
-            }
-            (Prop::IsIndeterminate, PropValue::Bool(v)) => {
-                node.ctrl.indeterminate = *v;
-                node.mark_dirty();
-            }
-            (Prop::IsActive, PropValue::Bool(v)) => {
-                node.ctrl.is_active = *v;
-                node.mark_dirty();
-            }
-            (Prop::IsExpanded, PropValue::Bool(v)) => {
-                node.ctrl.expanded = *v;
-                node.mark_dirty();
-            }
-            (Prop::SelectedIndex, PropValue::I32(v)) => {
-                node.ctrl.selected_index = *v;
-                node.mark_dirty();
-            }
-            (Prop::SelectedTag, PropValue::Str(s)) => {
-                node.ctrl.selected_tag = Some(s.clone());
-                sync_selected_tag(node);
-                node.mark_dirty();
-            }
-            (Prop::PlaceholderText, PropValue::Str(s)) => {
-                node.ctrl.placeholder = s.clone();
-                node.mark_dirty();
-            }
-            (Prop::Items, PropValue::StrList(list)) => {
-                node.ctrl.items = list.clone();
-                node.mark_dirty();
-                // A focused AutoSuggestBox whose filtered list just changed refreshes
-                // its open dropdown in place (deferred until the node borrow ends).
-                refresh_suggest = node.kind == ControlKind::AutoSuggestBox;
-            }
-            (Prop::Items, PropValue::SelectorBarItems(items)) => {
-                node.ctrl.items = items.iter().map(|i| i.text.clone()).collect();
-                if node.ctrl.selected_index < 0 && !node.ctrl.items.is_empty() {
-                    node.ctrl.selected_index = 0;
-                }
-                // Labels feed the per-item width measure — rebuild it.
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-            (Prop::MenuItems, PropValue::NavMenuItems(items)) => {
-                node.ctrl.items.clear();
-                node.ctrl.tags.clear();
-                node.ctrl.icons.clear();
-                for it in items {
-                    if it.is_header {
-                        continue;
-                    }
-                    node.ctrl.items.push(it.content.clone());
-                    node.ctrl
-                        .tags
-                        .push(it.tag.clone().unwrap_or_else(|| it.content.clone()));
-                    node.ctrl.icons.push(it.icon.map(|s| s.0 as u32).unwrap_or(0));
-                }
-                sync_selected_tag(node);
-                node.mark_dirty();
-            }
-            (Prop::MenuFlyoutItems, PropValue::MenuFlyoutItems(items)) => {
-                node.ctrl.menu = items.iter().map(menu_row).collect();
-                node.mark_dirty();
-            }
-            _ => {}
-            }
-        }
-        if refresh_suggest {
+        // Any prop write can move a value the UIA property snapshot caches
+        // (Name, IsEnabled, ToggleState, …), so retire the snapshots first.
+        uia::note_state_change();
+        let Some(node) = self.node_mut(id) else { return };
+        // A focused AutoSuggestBox whose filtered list just changed refreshes
+        // its open dropdown in place (deferred until the node borrow ends).
+        if apply_prop(node, prop, value) {
             self.refresh_suggest(id);
         }
     }
@@ -928,6 +704,7 @@ impl Backend for DCompBackend {
             p.children.push(child);
             p.children_dirty = true;
         }
+        self.link_parent(child, parent);
     }
 
     fn insert_child(&mut self, parent: ControlId, index: usize, child: ControlId) {
@@ -936,26 +713,38 @@ impl Backend for DCompBackend {
             p.children.insert(i, child);
             p.children_dirty = true;
         }
+        self.link_parent(child, parent);
     }
 
     fn remove_child(&mut self, parent: ControlId, index: usize) {
+        let mut gone = None;
         if let Some(p) = self.node_mut(parent)
             && index < p.children.len()
         {
-            p.children.remove(index);
+            gone = Some(p.children.remove(index));
             p.children_dirty = true;
+        }
+        if let Some(c) = gone {
+            self.unlink_parent(c, parent);
         }
     }
 
     fn replace_child(&mut self, parent: ControlId, index: usize, new: ControlId) {
+        let mut gone = None;
         if let Some(p) = self.node_mut(parent)
             && index < p.children.len()
         {
-            p.children[index] = new;
+            gone = Some(std::mem::replace(&mut p.children[index], new));
             p.children_dirty = true;
+        }
+        if let Some(c) = gone {
+            self.unlink_parent(c, parent);
+            self.link_parent(new, parent);
         }
     }
 
+    /// A pure reorder inside one child list — every moved node keeps the same
+    /// parent, so no parent link changes.
     fn move_child(&mut self, parent: ControlId, from: usize, to: usize) {
         if let Some(p) = self.node_mut(parent)
             && from < p.children.len()
@@ -974,6 +763,19 @@ impl Backend for DCompBackend {
         size::forget(id);
         pointer::forget(id);
         self.surfaces.forget(id);
+        uia::forget(self.hwnd, id);
+        // Drop the caption cache entry in lock-step with the arena entry: a
+        // cached id naming a destroyed node would hand the host a stale (or
+        // absent) non-client region for the rest of the window's life.
+        self.titlebars.retain(|t| *t != id);
+        // This node's parent link dies with the entry, but its children would be
+        // left naming a parent that is no longer in the arena. Cut those links so
+        // the inverse of `children` stays exact for every node that survives.
+        if let Some(kids) = self.arena.get(id).map(|n| n.children.clone()) {
+            for k in kids {
+                self.unlink_parent(k, id);
+            }
+        }
         if self.attached_root == Some(id) {
             if let Some(n) = self.arena.get(id) {
                 self.comp.detach_root(&n.container);
@@ -1095,83 +897,1299 @@ impl Backend for DCompBackend {
     }
 }
 
-/// Revert a prop to its default when the reconciler diffs it away
-/// (`PropValue::Unset`). Covers the props elements set conditionally; anything
-/// else keeps its last value (matching WinUI's ClearValue granularity).
-fn reset_prop(node: &mut Node, prop: Prop) {
+/// Apply one reconciler prop write to a node, and report whether the caller
+/// must refresh an open suggestion dropdown afterwards (it needs the backend,
+/// which this deliberately does not take — everything else a prop write does is
+/// a mutation of the node itself).
+///
+/// Split out of [`Backend::set_prop`] so the whole prop vocabulary can be
+/// driven against a real [`Node`] without a window: the set and the reset of a
+/// prop are one contract, and a test that can only exercise half of it cannot
+/// see the two disagree.
+pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool {
     use taffy::prelude::*;
-    match prop {
-        Prop::Background => {
-            node.paint.background = None;
+    let mut refresh_suggest = false;
+    match (prop, value) {
+        // ── Prop removal — a conditional prop diffed away reverts to its
+        // default (e.g. a Segmented pill losing its active accent fill) ──
+        (_, PropValue::Unset) => reset_prop(node, prop),
+        // ── Paint props (mark the node's surface dirty) ──────────────
+        (Prop::Background, PropValue::Color(c)) => {
+            node.paint.background = Some(*c);
             node.mark_dirty();
         }
-        Prop::Foreground => {
-            node.paint.foreground = None;
+        (Prop::Foreground, PropValue::Color(c)) => {
+            node.paint.foreground = Some(*c);
             node.mark_dirty();
         }
-        Prop::BorderBrush => {
-            node.paint.border_brush = None;
+        (Prop::BorderBrush, PropValue::Color(c)) => {
+            node.paint.border_brush = Some(*c);
             node.mark_dirty();
         }
-        Prop::BorderThickness => {
-            node.paint.border_thickness = 0.0;
-            node.style.border = Rect::zero();
+        (Prop::BorderThickness, PropValue::Thickness(t)) => {
+            node.paint.border_thickness = t.left as f32;
+            // Border thickness also insets content in layout.
+            node.style.border = Rect {
+                left: length(t.left as f32),
+                right: length(t.right as f32),
+                top: length(t.top as f32),
+                bottom: length(t.bottom as f32),
+            };
             node.mark_dirty();
         }
-        Prop::CornerRadius => {
-            node.paint.corner_radius = 0.0;
+        (Prop::CornerRadius, PropValue::F64(v)) => {
+            node.paint.corner_radius = *v as f32;
             node.mark_dirty();
         }
-        Prop::Fill => {
-            node.paint.fill = None;
+        (Prop::Fill, PropValue::Color(c)) => {
+            node.paint.fill = Some(*c);
             node.mark_dirty();
         }
-        Prop::FillOrigin => {
-            node.ctrl.fill_origin = None;
+        (Prop::Stroke, PropValue::Color(c)) => {
+            node.paint.stroke = Some(*c);
             node.mark_dirty();
         }
-        Prop::FillColor => {
-            node.ctrl.fill_color = None;
+        (Prop::StrokeThickness, PropValue::F64(v)) => {
+            node.paint.stroke_thickness = *v as f32;
             node.mark_dirty();
         }
-        Prop::FillColorAlt => {
-            node.ctrl.fill_color_alt = None;
+        (Prop::LineEndpoints, PropValue::LineEndpoints(l)) => {
+            node.paint.line = *l;
             node.mark_dirty();
         }
-        Prop::Marker => {
-            node.ctrl.marker = None;
+        (Prop::StyleVariant, PropValue::I32(v)) => {
+            node.paint.style_variant = *v;
             node.mark_dirty();
         }
-        Prop::MarkerColor => {
-            node.ctrl.marker_color = None;
+        (Prop::IsEnabled, PropValue::Bool(b)) => {
+            node.paint.is_enabled = *b;
             node.mark_dirty();
         }
-        Prop::GradientStops => {
-            node.ctrl.stops.clear();
+
+        // An Expander's title arrives as `Prop::Header`; it paints as the
+        // node's label like every other text-bearing control.
+        (Prop::Content | Prop::Text | Prop::Header, PropValue::Str(s)) => {
+            // For an editable kind (AutoSuggestBox carries its text via
+            // `Prop::Text`), seed the editor buffer instead of the label.
+            if node.editor.is_some() {
+                seed_editor_text(node, s);
+            } else {
+                node.paint.text = s.clone();
+                node.text_dirty = true;
+            }
             node.mark_dirty();
         }
-        Prop::Stroke => {
-            node.paint.stroke = None;
+        // TextBox / PasswordBox carry their text via `Prop::Value(Str)`.
+        (Prop::Value, PropValue::Str(s)) if node.editor.is_some() => {
+            seed_editor_text(node, s);
             node.mark_dirty();
         }
-        Prop::StrokeThickness => {
-            node.paint.stroke_thickness = 0.0;
+        (Prop::Precision, PropValue::I32(v)) => {
+            node.ctrl_mut().precision = Some(*v);
+            // Reformat the seeded value to the new precision (the `Value`
+            // prop usually arrives before `Precision`). Never while focused
+            // — the user owns the buffer mid-edit.
+            if node.kind == ControlKind::NumberBox && !node.focused {
+                let value = node.ctrl().value;
+                if let Some(ed) = &mut node.editor {
+                    ed.seeded = false;
+                }
+                seed_number_text(node, value);
+                node.mark_dirty();
+            }
+        }
+        (Prop::LargeChange, PropValue::F64(v)) => node.ctrl_mut().large_change = Some(*v),
+        (Prop::HorizontalContentAlignment, PropValue::I32(v)) => {
+            node.ctrl_mut().content_align = *v;
+            if let Some(ed) = &mut node.editor {
+                ed.layout_dirty = true;
+            }
             node.mark_dirty();
         }
-        Prop::Opacity => {
-            let _ = node.vis.SetOpacity(1.0);
+        (Prop::FontSize, PropValue::F64(v)) => {
+            node.paint.font_size = *v as f32;
+            node.text_dirty = true;
+            node.mark_dirty();
         }
-        Prop::Padding => node.style.padding = Rect::zero(),
-        Prop::Margin => node.style.margin = Rect::zero(),
-        Prop::Width => node.style.size.width = auto(),
-        Prop::Height => node.style.size.height = auto(),
-        Prop::MinWidth => node.style.min_size.width = auto(),
-        Prop::MinHeight => node.style.min_size.height = auto(),
-        Prop::MaxWidth => node.style.max_size.width = auto(),
-        Prop::MaxHeight => node.style.max_size.height = auto(),
-        Prop::HorizontalAlignment => node.h_align = -1,
-        Prop::VerticalAlignment => node.v_align = -1,
-        _ => {}
+        (Prop::FontWeight, PropValue::U16(w)) => {
+            node.paint.font_weight = *w;
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::FontFamily, PropValue::Str(s)) => {
+            node.paint.font_family = Some(s.clone());
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::TextWrapping | Prop::TextWrappingWrap, _) => {
+            // WinRT TextWrapping: NoWrap = 1, Wrap = 2, WrapWholeWords = 3 — and
+            // 0 for a widget that never set one, since the generated TextBlock
+            // bindings push this prop unconditionally and the field's Rust default
+            // is `TextWrapping(0)`. Only a real Wrap value wraps: 0 is "unset",
+            // which must mean NoWrap to match XAML's own TextBlock default.
+            // Reading it as `!= 1` instead marked virtually every text node in the
+            // tree as wrapping — inert only for as long as the DWrite box stayed
+            // unconstrained (see `layout::build_text_layout`), and silently
+            // wrapping every label the moment it did not.
+            let wrap = match value {
+                PropValue::I32(v) => *v > 1,
+                PropValue::Bool(b) => *b,
+                _ => true,
+            };
+            node.paint.wrap = wrap;
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+
+        // ── Visual prop applied straight onto the container ──────────
+        (Prop::Opacity, PropValue::F64(v)) => {
+            let _ = node.vis.SetOpacity((*v as f32).clamp(0.0, 1.0));
+        }
+
+        // ── Layout props (Taffy inputs; relayout runs each reconcile) ─
+        (Prop::Padding, PropValue::Thickness(t)) => {
+            node.style.padding = Rect {
+                left: length(t.left as f32),
+                right: length(t.right as f32),
+                top: length(t.top as f32),
+                bottom: length(t.bottom as f32),
+            };
+        }
+        (Prop::Margin, PropValue::Thickness(t)) => {
+            node.style.margin = Rect {
+                left: length(t.left as f32),
+                right: length(t.right as f32),
+                top: length(t.top as f32),
+                bottom: length(t.bottom as f32),
+            };
+        }
+        (Prop::Width, PropValue::F64(v)) => node.style.size.width = length(*v as f32),
+        (Prop::Height, PropValue::F64(v)) => node.style.size.height = length(*v as f32),
+        (Prop::MinWidth, PropValue::F64(v)) => node.style.min_size.width = length(*v as f32),
+        (Prop::MinHeight, PropValue::F64(v)) => node.style.min_size.height = length(*v as f32),
+        (Prop::MaxWidth, PropValue::F64(v)) => node.style.max_size.width = length(*v as f32),
+        (Prop::MaxHeight, PropValue::F64(v)) => node.style.max_size.height = length(*v as f32),
+
+        (Prop::HorizontalAlignment, PropValue::I32(v)) => node.h_align = *v,
+        (Prop::VerticalAlignment, PropValue::I32(v)) => node.v_align = *v,
+
+        (Prop::Orientation, PropValue::I32(v)) => {
+            // WinRT Orientation: Vertical = 0, Horizontal = 1.
+            node.style.flex_direction = if *v == 1 {
+                FlexDirection::Row
+            } else {
+                FlexDirection::Column
+            };
+            apply_stack_gap(node);
+        }
+        (Prop::Spacing, PropValue::F64(v)) => {
+            node.spacing = *v as f32;
+            apply_stack_gap(node);
+        }
+        (Prop::ColumnSpacing, PropValue::F64(v)) => node.style.gap.width = length(*v as f32),
+        (Prop::RowSpacing, PropValue::F64(v)) => node.style.gap.height = length(*v as f32),
+        (Prop::GridRows, PropValue::GridLengths(g)) => node.grid_rows = clone_lengths(g),
+        (Prop::GridColumns, PropValue::GridLengths(g)) => node.grid_cols = clone_lengths(g),
+
+        (Prop::AttachedGridRow, PropValue::I32(v)) => {
+            node.style.grid_row.start = line((*v + 1) as i16);
+        }
+        (Prop::AttachedGridColumn, PropValue::I32(v)) => {
+            node.style.grid_column.start = line((*v + 1) as i16);
+        }
+        (Prop::AttachedGridRowSpan, PropValue::I32(v)) => {
+            node.style.grid_row.end = span((*v).max(1) as u16);
+        }
+        (Prop::AttachedGridColumnSpan, PropValue::I32(v)) => {
+            node.style.grid_column.end = span((*v).max(1) as u16);
+        }
+        (Prop::AttachedCanvasLeft, PropValue::F64(v)) => {
+            node.style.position = Position::Absolute;
+            node.style.inset.left = length(*v as f32);
+        }
+        (Prop::AttachedCanvasTop, PropValue::F64(v)) => {
+            node.style.position = Position::Absolute;
+            node.style.inset.top = length(*v as f32);
+        }
+        (Prop::AttachedCanvasZIndex, PropValue::I32(v)) => {
+            node.z_index = *v;
+            node.z_dirty = true;
+        }
+
+        // ── Control state (stateful drawn controls) ──────────────────
+        // The part-converted kinds (toggle / slider / segmented / nav) need
+        // no spring tick here: marking dirty routes them through the paint
+        // pass, whose parts sync glides the change on the compositor.
+        (Prop::IsOn, PropValue::Bool(v)) => {
+            node.ctrl_mut().is_on = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsChecked, PropValue::Bool(v)) => {
+            // The CheckBox reveal fades via its chrome parts on repaint; a
+            // ToggleButton's checked state is plain painted chrome.
+            node.ctrl_mut().is_checked = *v;
+            node.mark_dirty();
+        }
+        (Prop::Value, PropValue::F64(v)) => {
+            node.ctrl_mut().value = *v;
+            // NumberBox: reflect the programmatic value as formatted text
+            // (unless the user is mid-edit — the editor owns the buffer
+            // while focused).
+            if node.kind == ControlKind::NumberBox {
+                seed_number_text(node, *v);
+            }
+            node.mark_dirty();
+        }
+        (Prop::Minimum, PropValue::F64(v)) => {
+            node.ctrl_mut().min = *v;
+            node.mark_dirty();
+        }
+        (Prop::Maximum, PropValue::F64(v)) => {
+            node.ctrl_mut().max = *v;
+            node.mark_dirty();
+        }
+        (Prop::Step, PropValue::F64(v)) => node.ctrl_mut().step = Some(*v),
+        (Prop::FillOrigin, PropValue::F64(v)) => {
+            node.ctrl_mut().fill_origin = Some(*v);
+            node.mark_dirty();
+        }
+        (Prop::FillColor, PropValue::Color(c)) => {
+            node.ctrl_mut().fill_color = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::FillColorAlt, PropValue::Color(c)) => {
+            node.ctrl_mut().fill_color_alt = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::Marker, PropValue::F64(v)) => {
+            node.ctrl_mut().marker = Some(*v);
+            node.mark_dirty();
+        }
+        (Prop::MarkerColor, PropValue::Color(c)) => {
+            node.ctrl_mut().marker_color = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::GradientStops, PropValue::GradientStops(stops)) => {
+            node.ctrl_mut().stops = stops.clone();
+            node.mark_dirty();
+        }
+        (Prop::StartAngle, PropValue::F64(v)) => {
+            node.ctrl_mut().start_angle = *v as f32;
+            node.mark_dirty();
+        }
+        (Prop::EndAngle, PropValue::F64(v)) => {
+            node.ctrl_mut().end_angle = *v as f32;
+            node.mark_dirty();
+        }
+        (Prop::Ticks, PropValue::F64List(list)) => {
+            node.ctrl_mut().ticks = list.clone();
+            node.mark_dirty();
+        }
+        (Prop::TickLabels, PropValue::ValueLabels(list)) => {
+            node.ctrl_mut().tick_labels = list.clone();
+            node.mark_dirty();
+        }
+        (Prop::MajorEvery, PropValue::F64(v)) => {
+            node.ctrl_mut().major_every = Some(*v);
+            node.mark_dirty();
+        }
+        (Prop::Accent, PropValue::Color(c)) => {
+            node.ctrl_mut().accent = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::Unit, PropValue::Str(s)) => {
+            node.ctrl_mut().unit = s.clone();
+            node.mark_dirty();
+        }
+        (Prop::SubText, PropValue::Str(s)) => {
+            node.ctrl_mut().sub_text = s.clone();
+            node.mark_dirty();
+        }
+        (Prop::IsIndeterminate, PropValue::Bool(v)) => {
+            node.ctrl_mut().indeterminate = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsActive, PropValue::Bool(v)) => {
+            node.ctrl_mut().is_active = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsExpanded, PropValue::Bool(v)) => {
+            node.ctrl_mut().expanded = *v;
+            node.mark_dirty();
+        }
+        (Prop::SelectedIndex, PropValue::I32(v)) => {
+            node.ctrl_mut().selected_index = *v;
+            node.mark_dirty();
+        }
+        (Prop::SelectedTag, PropValue::Str(s)) => {
+            node.ctrl_mut().selected_tag = Some(s.clone());
+            sync_selected_tag(node);
+            node.mark_dirty();
+        }
+        (Prop::PlaceholderText, PropValue::Str(s)) => {
+            node.ctrl_mut().placeholder = s.clone();
+            node.mark_dirty();
+        }
+        (Prop::Items, PropValue::StrList(list)) => {
+            node.ctrl_mut().items = list.clone();
+            node.mark_dirty();
+            // A focused AutoSuggestBox whose filtered list just changed refreshes
+            // its open dropdown in place — reported back to the caller, which
+            // holds the backend this needs and no longer holds the node borrow.
+            refresh_suggest = node.kind == ControlKind::AutoSuggestBox;
+        }
+        (Prop::Items, PropValue::SelectorBarItems(items)) => {
+            node.ctrl_mut().items = items.iter().map(|i| i.text.clone()).collect();
+            if node.ctrl().selected_index < 0 && !node.ctrl().items.is_empty() {
+                node.ctrl_mut().selected_index = 0;
+            }
+            // Labels feed the per-item width measure — rebuild it.
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::MenuItems, PropValue::NavMenuItems(items)) => {
+            let ctrl = node.ctrl_mut();
+            ctrl.items.clear();
+            ctrl.tags.clear();
+            ctrl.icons.clear();
+            for it in items {
+                if it.is_header {
+                    continue;
+                }
+                ctrl.items.push(it.content.clone());
+                ctrl.tags
+                    .push(it.tag.clone().unwrap_or_else(|| it.content.clone()));
+                ctrl.icons.push(it.icon.map(|s| s.0 as u32).unwrap_or(0));
+            }
+            sync_selected_tag(node);
+            node.mark_dirty();
+        }
+        (Prop::MenuFlyoutItems, PropValue::MenuFlyoutItems(items)) => {
+            node.ctrl_mut().menu = items.iter().map(menu_row).collect();
+            node.mark_dirty();
+        }
+
+        // ── Chrome state: stored, not yet drawn ──────────────────────
+        // Everything below lands in `Extras` and nothing reads it yet. It is
+        // stored anyway because the alternative is what this arm block
+        // replaced: a silent drop at the consumer, where the value is gone by
+        // the time anyone writes the drawing. The state is now exact and the
+        // gap is purely the paint — see [`Status::Stored`].
+        (Prop::Title, PropValue::Str(s)) => {
+            node.extras_mut().title = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::Subtitle, PropValue::Str(s)) => {
+            node.extras_mut().subtitle = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        // These three change the band's drawn geometry (its height, and the
+        // leading inset its back button occupies), so each re-derives the
+        // caption metrics rather than waiting on a text rebuild it does not
+        // need — `tall` and back-button visibility do not touch the titles.
+        (Prop::Tall, PropValue::Bool(v)) => {
+            node.extras_mut().tall = *v;
+            layout::apply_caption_metrics(node);
+        }
+        (Prop::IsBackButtonVisible, PropValue::Bool(v)) => {
+            node.extras_mut().back_button_visible = *v;
+            layout::apply_caption_metrics(node);
+        }
+        (Prop::IsBackButtonEnabled, PropValue::Bool(v)) => {
+            node.extras_mut().back_button_enabled = *v;
+            node.mark_dirty();
+        }
+        // The nav pane's toggle and back arrow occupy its chrome row, and
+        // whether that row exists at all shifts every item below it — so these
+        // move geometry, not just pixels.
+        (Prop::IsPaneToggleButtonVisible, PropValue::Bool(v)) => {
+            node.extras_mut().pane_toggle_visible = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsBackEnabled, PropValue::Bool(v)) => {
+            node.extras_mut().back_enabled = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsSettingsVisible, PropValue::Bool(v)) => {
+            node.extras_mut().settings_visible = *v;
+            node.mark_dirty();
+        }
+        // The three that change the pane's WIDTH re-derive the layout inset the
+        // content child sits behind — the same call the layout pass makes, so a
+        // set and an unset cannot fall out of step (see `apply_nav_metrics`).
+        (Prop::IsPaneOpen, PropValue::Bool(v)) => {
+            node.extras_mut().pane_open = *v;
+            layout::apply_nav_metrics(node);
+        }
+        (Prop::PaneTitle, PropValue::Str(s)) => {
+            node.extras_mut().pane_title = s.clone();
+            // A header row appears/disappears with the string, so this
+            // re-measures as well as repaints; the text pass re-derives the
+            // metrics once it knows whether there is a title to lay out.
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::PaneDisplayMode, PropValue::I32(v)) => {
+            node.extras_mut().pane_display_mode = *v;
+            layout::apply_nav_metrics(node);
+        }
+        (Prop::OpenPaneLength, PropValue::F64(v)) => {
+            node.extras_mut().open_pane_length = *v;
+            layout::apply_nav_metrics(node);
+        }
+        (Prop::AutoSuggestBox, PropValue::Bool(v)) => {
+            node.extras_mut().search_box = *v;
+            node.mark_dirty();
+        }
+        (Prop::AutoSuggestItems, PropValue::StrList(list)) => {
+            node.extras_mut().suggest_items = list.clone();
+            node.mark_dirty();
+        }
+        (Prop::AutoSuggestPlaceholder, PropValue::Str(s)) => {
+            node.extras_mut().suggest_placeholder = s.clone();
+            node.mark_dirty();
+        }
+        (Prop::HorizontalScrollBarVisibility, PropValue::I32(v)) => {
+            node.extras_mut().h_scrollbar = *v;
+            node.mark_dirty();
+        }
+        (Prop::VerticalScrollBarVisibility, PropValue::I32(v)) => {
+            node.extras_mut().v_scrollbar = *v;
+            node.mark_dirty();
+        }
+        // A plain-text flyout is a `FlyoutDef` with only its text set — the
+        // seam's own constructor for that case, so the two shapes converge
+        // with nothing dropped and no second field to keep in step.
+        (Prop::FlyoutContent, PropValue::Str(s)) => {
+            node.extras_mut().flyout = Some(Box::new(crate::FlyoutDef::text(s.clone())));
+            node.mark_dirty();
+        }
+        (Prop::FlyoutContent, PropValue::FlyoutDef(def)) => {
+            node.extras_mut().flyout = Some(Box::new(def.clone()));
+            node.mark_dirty();
+        }
+        (Prop::FlyoutPlacement, PropValue::I32(v)) => {
+            node.extras_mut().flyout_placement = *v;
+            node.mark_dirty();
+        }
+        // A `Symbol`'s codepoint, 0 = none — the encoding `Ctrl::icons` and
+        // `MenuRow::icon` already carry glyph icons in.
+        (Prop::Icon, PropValue::I32(v)) => {
+            node.extras_mut().icon = *v as u32;
+            // The icon widens the button, and gaining/losing one is also what
+            // decides whether a label-less button has a layout at all — so
+            // this has to re-measure, not just repaint.
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::NavigateUri, PropValue::Str(s)) => {
+            node.extras_mut().navigate_uri = s.clone();
+        }
+        (Prop::OnContent, PropValue::Str(s)) => {
+            node.extras_mut().on_content = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::OffContent, PropValue::Str(s)) => {
+            node.extras_mut().off_content = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::IsEditable, PropValue::Bool(v)) => {
+            node.extras_mut().is_editable = *v;
+            node.mark_dirty();
+        }
+        (Prop::AcceptsReturn, PropValue::Bool(v)) => {
+            node.extras_mut().accepts_return = *v;
+        }
+        (Prop::PasswordRevealMode, PropValue::I32(v)) => {
+            node.extras_mut().password_reveal_mode = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsPasswordRevealButtonEnabled, PropValue::Bool(v)) => {
+            node.extras_mut().password_reveal_button = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsTextSelectionEnabled, PropValue::Bool(v)) => {
+            node.extras_mut().text_selectable = *v;
+        }
+        (Prop::Delay, PropValue::I32(v)) => node.extras_mut().repeat_delay = *v,
+        (Prop::Interval, PropValue::I32(v)) => node.extras_mut().repeat_interval = *v,
+
+        // Every pair this backend does not consume lands here and is
+        // dropped. In a debug build say so — but only when the drop is a
+        // defect (see [`unhandled`]); in release this compiles to nothing.
+        _ => unhandled::note(node.kind, prop, value),
+    }
+    refresh_suggest
+}
+
+/// What this backend does with a [`Prop`] — the classification behind both the
+/// dropped-prop diagnostic ([`unhandled`]) and the reset table below.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub(crate) enum Status {
+    /// Implemented end to end: [`apply_prop`] stores it and something reads
+    /// what it stored. Reaching the terminal `_` arm with one of these means
+    /// the value arrived in a shape no arm accepts (`Width` as an `I32`, a
+    /// `Value(Str)` on a node with no editor) — always a defect, because the
+    /// write was addressed to a feature that exists here and was dropped
+    /// anyway.
+    Consumed,
+    /// Stored in node state, correctly and completely — but nothing draws or
+    /// acts on it yet. Distinct from [`Self::Consumed`] because the gap is
+    /// real (the app sees nothing) and distinct from the old "unimplemented"
+    /// because the value is no longer LOST: whoever writes the drawing finds
+    /// the state already there and already reset correctly.
+    Stored,
+    /// Every control kind that can carry this prop is one this backend does
+    /// not render. Ignoring it is the design, not a gap — reported never.
+    NotApplicable,
+}
+
+/// The per-prop contract, stated once: how this backend classifies a [`Prop`],
+/// and — for every prop it stores — how an [`Unset`](PropValue::Unset) undoes
+/// it.
+///
+/// The two used to be separate matches, and they disagreed. `set_prop` grew a
+/// classifier covering all 165 props while `reset_prop` kept a terminal `_` and
+/// covered 24 of the 75 it claimed to consume, so an `Unset` for any of the
+/// other 51 was silently ignored and the node kept a stale value — the exact
+/// defect that had already been found and fixed once on the `set_prop` side.
+/// Nothing structural stopped it recurring, because nothing tied a
+/// classification to the existence of a reset.
+///
+/// This macro is that tie. A prop's status and its reset are ONE entry, so
+/// classifying a prop as stored-here without saying how to unstore it is not
+/// an omission anyone can make — it is a syntax error. Both generated matches
+/// are exhaustive with no `_` arm, so a [`Prop`] added to the seam must be
+/// placed in one of the three sections before this compiles at all, and a prop
+/// named twice trips `unreachable_patterns`.
+///
+/// Reset targets are DERIVED, never remembered: [`Node::birth_paint`] and
+/// [`Node::birth_style`] are the same functions [`Node::new`] builds a node
+/// with, and `Ctrl::DEFAULT` / `Extras::DEFAULT` are the same constants the
+/// absent-read path returns. Several of those birth values are deliberately
+/// not zero — `max` is 100, `is_active` is true, `selected_index` and
+/// `content_align` are -1, a Button is born with a 6 DIP corner radius, 12/6
+/// padding and a 30 DIP minimum height — so a reset written from memory as
+/// "set it to zero" is a new bug, not a fix. Writing `Ctrl::DEFAULT.max`
+/// cannot be that bug.
+macro_rules! prop_contract {
+    (
+        $(#[$cm:meta])*
+        consumed { $($($cp:ident)|+ => |$cn:ident| $cb:block)* }
+        $(#[$sm:meta])*
+        stored { $($($sp:ident)|+ => |$sn:ident| $sb:block)* }
+        $(#[$nm:meta])*
+        not_applicable { $($($np:ident),+ ;)* }
+    ) => {
+        /// Classify a prop — see [`prop_contract`].
+        #[cfg_attr(not(debug_assertions), allow(dead_code))]
+        pub(crate) fn prop_status(prop: Prop) -> Status {
+            match prop {
+                $($(Prop::$cp)|+ => Status::Consumed,)*
+                $($(Prop::$sp)|+ => Status::Stored,)*
+                $($(Prop::$np)|+ => Status::NotApplicable,)*
+            }
+        }
+
+        /// Revert a prop to the value a node that never received it holds,
+        /// when the reconciler diffs it away (`PropValue::Unset`).
+        ///
+        /// Every prop this backend stores has an arm here — see
+        /// [`prop_contract`], which generates both this and [`prop_status`]
+        /// from one list so the two cannot drift apart again.
+        fn reset_prop(node: &mut Node, prop: Prop) {
+            #[allow(unused_imports)]
+            use taffy::prelude::*;
+            match prop {
+                $($(Prop::$cp)|+ => { let $cn = &mut *node; $cb })*
+                $($(Prop::$sp)|+ => { let $sn = &mut *node; $sb })*
+                // Nothing was stored, so there is nothing to restore.
+                $($(Prop::$np)|+ => {})*
+            }
+        }
+    };
+}
+
+prop_contract! {
+    /// Implemented end to end by [`apply_prop`].
+    consumed {
+        // ── Paint ────────────────────────────────────────────────────────
+        Background => |n| { n.paint.background = None; n.mark_dirty(); }
+        Foreground => |n| { n.paint.foreground = None; n.mark_dirty(); }
+        BorderBrush => |n| { n.paint.border_brush = None; n.mark_dirty(); }
+        BorderThickness => |n| {
+            n.paint.border_thickness = n.birth_paint().border_thickness;
+            n.style.border = n.birth_style().border;
+            n.mark_dirty();
+        }
+        // NOT zero for a Button, which is born with a 6 DIP radius.
+        CornerRadius => |n| {
+            n.paint.corner_radius = n.birth_paint().corner_radius;
+            n.mark_dirty();
+        }
+        Fill => |n| { n.paint.fill = None; n.mark_dirty(); }
+        Stroke => |n| { n.paint.stroke = None; n.mark_dirty(); }
+        StrokeThickness => |n| {
+            n.paint.stroke_thickness = n.birth_paint().stroke_thickness;
+            n.mark_dirty();
+        }
+        LineEndpoints => |n| { n.paint.line = n.birth_paint().line; n.mark_dirty(); }
+        StyleVariant => |n| {
+            n.paint.style_variant = n.birth_paint().style_variant;
+            n.mark_dirty();
+        }
+        // Born ENABLED — resetting this to `false` greys the control out.
+        IsEnabled => |n| { n.paint.is_enabled = n.birth_paint().is_enabled; n.mark_dirty(); }
+        Opacity => |n| { let _ = n.vis.SetOpacity(1.0); }
+
+        // ── Text ─────────────────────────────────────────────────────────
+        // Mirrors the set: an editable kind carries its text in the editor
+        // buffer, everything else in the paint label.
+        Content | Text | Header => |n| {
+            if n.editor.is_some() {
+                clear_editor_text(n);
+            } else {
+                n.paint.text = n.birth_paint().text;
+            }
+            n.text_dirty = true;
+            n.mark_dirty();
+        }
+        // Born at a real size and weight: zeroing either makes the text
+        // invisible rather than default.
+        FontSize => |n| {
+            n.paint.font_size = n.birth_paint().font_size;
+            n.text_dirty = true;
+            n.mark_dirty();
+        }
+        FontWeight => |n| {
+            n.paint.font_weight = n.birth_paint().font_weight;
+            n.text_dirty = true;
+            n.mark_dirty();
+        }
+        FontFamily => |n| { n.paint.font_family = None; n.text_dirty = true; n.mark_dirty(); }
+        TextWrapping | TextWrappingWrap => |n| {
+            n.paint.wrap = n.birth_paint().wrap;
+            n.text_dirty = true;
+            n.mark_dirty();
+        }
+
+        // ── Layout ───────────────────────────────────────────────────────
+        // Not `Rect::zero()`: a Button is born with 12/6 padding, an Expander
+        // and a TitleBar with the inset their drawn header occupies, and a
+        // NavigationView with the icon rail's width on the left. Zeroing that
+        // paints the chrome over the content.
+        Padding => |n| { n.style.padding = n.birth_style().padding; }
+        Margin => |n| { n.style.margin = n.birth_style().margin; }
+        Width => |n| { n.style.size.width = n.birth_style().size.width; }
+        Height => |n| { n.style.size.height = n.birth_style().size.height; }
+        // Likewise not `auto()`: the intrinsic minimum is the only thing
+        // keeping a childless drawn control (ToggleSwitch, Slider, Knob,
+        // Meter, CheckBox) from measuring 0 and vanishing in a flex row.
+        MinWidth => |n| { n.style.min_size.width = n.birth_style().min_size.width; }
+        MinHeight => |n| { n.style.min_size.height = n.birth_style().min_size.height; }
+        MaxWidth => |n| { n.style.max_size.width = n.birth_style().max_size.width; }
+        MaxHeight => |n| { n.style.max_size.height = n.birth_style().max_size.height; }
+        HorizontalAlignment => |n| { n.h_align = node::ALIGN_UNSET; }
+        VerticalAlignment => |n| { n.v_align = node::ALIGN_UNSET; }
+        Orientation => |n| {
+            n.style.flex_direction = n.birth_style().flex_direction;
+            apply_stack_gap(n);
+        }
+        Spacing => |n| { n.spacing = 0.0; apply_stack_gap(n); }
+        ColumnSpacing => |n| { n.style.gap.width = n.birth_style().gap.width; }
+        RowSpacing => |n| { n.style.gap.height = n.birth_style().gap.height; }
+        GridRows => |n| { n.grid_rows.clear(); }
+        GridColumns => |n| { n.grid_cols.clear(); }
+        // XAML Grid parity: an unplaced child belongs to cell (0, 0), which is
+        // Taffy line 1 — not `auto`, which would auto-flow it into the next
+        // free cell and un-overlap a deliberately overlapping pair.
+        AttachedGridRow => |n| { n.style.grid_row.start = n.birth_style().grid_row.start; }
+        AttachedGridColumn => |n| {
+            n.style.grid_column.start = n.birth_style().grid_column.start;
+        }
+        AttachedGridRowSpan => |n| { n.style.grid_row.end = n.birth_style().grid_row.end; }
+        AttachedGridColumnSpan => |n| {
+            n.style.grid_column.end = n.birth_style().grid_column.end;
+        }
+        // Setting either inset made the node absolute, so clearing one only
+        // returns it to flow once the other is gone too.
+        AttachedCanvasLeft => |n| {
+            let birth = n.birth_style();
+            n.style.inset.left = birth.inset.left;
+            if n.style.inset.top == birth.inset.top {
+                n.style.position = birth.position;
+            }
+        }
+        AttachedCanvasTop => |n| {
+            let birth = n.birth_style();
+            n.style.inset.top = birth.inset.top;
+            if n.style.inset.left == birth.inset.left {
+                n.style.position = birth.position;
+            }
+        }
+        AttachedCanvasZIndex => |n| { n.z_index = 0; n.z_dirty = true; }
+
+        // ── Control state ────────────────────────────────────────────────
+        // `Ctrl::DEFAULT` is the same constant an unallocated `Ctrl` reads as,
+        // and several of its fields are pointedly not zero.
+        IsOn => |n| { n.ctrl_reset(|c| c.is_on = Ctrl::DEFAULT.is_on); }
+        IsChecked => |n| { n.ctrl_reset(|c| c.is_checked = Ctrl::DEFAULT.is_checked); }
+        Value => |n| {
+            n.ctrl_reset(|c| c.value = Ctrl::DEFAULT.value);
+            // An editor's buffer is the value for the text kinds; a node born
+            // without one shows an empty, UNSEEDED field.
+            clear_editor_text(n);
+            n.mark_dirty();
+        }
+        Minimum => |n| { n.ctrl_reset(|c| c.min = Ctrl::DEFAULT.min); }
+        // 100, not 0 — a zero-span range makes every fill and thumb NaN.
+        Maximum => |n| { n.ctrl_reset(|c| c.max = Ctrl::DEFAULT.max); }
+        Step => |n| { n.ctrl_reset(|c| c.step = Ctrl::DEFAULT.step); }
+        LargeChange => |n| { n.ctrl_reset(|c| c.large_change = Ctrl::DEFAULT.large_change); }
+        // Mirrors the set arm: the seeded text is re-formatted at the restored
+        // precision, and never while focused (the user owns the buffer).
+        //
+        // Only text that was ACTUALLY seeded from a value prop is re-formatted.
+        // The set arm can reformat unconditionally because a `Precision` write
+        // implies a value; a reset carries no such implication, and a field
+        // that never received one must stay empty rather than acquire a "0.00"
+        // from nowhere.
+        Precision => |n| {
+            n.ctrl_reset(|c| c.precision = Ctrl::DEFAULT.precision);
+            if n.kind == ControlKind::NumberBox
+                && !n.focused
+                && n.editor.as_ref().is_some_and(|ed| ed.seeded)
+            {
+                let value = n.ctrl().value;
+                if let Some(ed) = &mut n.editor {
+                    ed.seeded = false;
+                }
+                seed_number_text(n, value);
+                n.mark_dirty();
+            }
+        }
+        // -1 (unset), not 0 — 0 is a real WinRT `Left`.
+        HorizontalContentAlignment => |n| {
+            n.ctrl_reset(|c| c.content_align = Ctrl::DEFAULT.content_align);
+            if let Some(ed) = &mut n.editor {
+                ed.layout_dirty = true;
+            }
+            n.mark_dirty();
+        }
+        FillOrigin => |n| { n.ctrl_reset(|c| c.fill_origin = Ctrl::DEFAULT.fill_origin); }
+        FillColor => |n| { n.ctrl_reset(|c| c.fill_color = Ctrl::DEFAULT.fill_color); }
+        FillColorAlt => |n| {
+            n.ctrl_reset(|c| c.fill_color_alt = Ctrl::DEFAULT.fill_color_alt);
+        }
+        Marker => |n| { n.ctrl_reset(|c| c.marker = Ctrl::DEFAULT.marker); }
+        MarkerColor => |n| { n.ctrl_reset(|c| c.marker_color = Ctrl::DEFAULT.marker_color); }
+        GradientStops => |n| { n.ctrl_reset(|c| c.stops = Ctrl::DEFAULT.stops); }
+        StartAngle => |n| { n.ctrl_reset(|c| c.start_angle = Ctrl::DEFAULT.start_angle); }
+        EndAngle => |n| { n.ctrl_reset(|c| c.end_angle = Ctrl::DEFAULT.end_angle); }
+        Ticks => |n| { n.ctrl_reset(|c| c.ticks = Ctrl::DEFAULT.ticks); }
+        TickLabels => |n| { n.ctrl_reset(|c| c.tick_labels = Ctrl::DEFAULT.tick_labels); }
+        MajorEvery => |n| { n.ctrl_reset(|c| c.major_every = Ctrl::DEFAULT.major_every); }
+        Accent => |n| { n.ctrl_reset(|c| c.accent = Ctrl::DEFAULT.accent); }
+        Unit => |n| { n.ctrl_reset(|c| c.unit = Ctrl::DEFAULT.unit); }
+        SubText => |n| { n.ctrl_reset(|c| c.sub_text = Ctrl::DEFAULT.sub_text); }
+        IsIndeterminate => |n| {
+            n.ctrl_reset(|c| c.indeterminate = Ctrl::DEFAULT.indeterminate);
+        }
+        // Born ACTIVE — a false here dims every meter that loses the prop.
+        IsActive => |n| { n.ctrl_reset(|c| c.is_active = Ctrl::DEFAULT.is_active); }
+        IsExpanded => |n| { n.ctrl_reset(|c| c.expanded = Ctrl::DEFAULT.expanded); }
+        // -1 ("nothing selected"), not 0 ("the first item").
+        SelectedIndex => |n| {
+            n.ctrl_reset(|c| c.selected_index = Ctrl::DEFAULT.selected_index);
+        }
+        SelectedTag => |n| { n.ctrl_reset(|c| c.selected_tag = Ctrl::DEFAULT.selected_tag); }
+        PlaceholderText => |n| { n.ctrl_reset(|c| c.placeholder = Ctrl::DEFAULT.placeholder); }
+        // The measured per-segment label widths are derived from `items`, so
+        // they go with them and the text pass re-measures.
+        Items => |n| {
+            n.ctrl_reset(|c| {
+                c.items = Ctrl::DEFAULT.items;
+                c.seg_label_w = Ctrl::DEFAULT.seg_label_w;
+            });
+            n.text_dirty = true;
+        }
+        MenuItems => |n| {
+            n.ctrl_reset(|c| {
+                c.items = Ctrl::DEFAULT.items;
+                c.tags = Ctrl::DEFAULT.tags;
+                c.icons = Ctrl::DEFAULT.icons;
+            });
+            n.text_dirty = true;
+        }
+        MenuFlyoutItems => |n| { n.ctrl_reset(|c| c.menu = Ctrl::DEFAULT.menu); }
+
+        // ── Overlay scrollbar policy ─────────────────────────────────────
+        // Reverting to `Auto` restores the hover-driven reveal; the next
+        // paint of the container re-resolves the policy either way, so no
+        // explicit re-derive is needed here.
+        VerticalScrollBarVisibility => |n| {
+            n.extras_reset(|x| x.v_scrollbar = Extras::DEFAULT.v_scrollbar);
+            n.mark_dirty();
+        }
+
+        // ── Button leading icon ──────────────────────────────────────────
+        // Re-measures as well as repaints: losing the icon narrows the button,
+        // and on a label-less one it also removes the only reason it has a
+        // text layout at all.
+        Icon => |n| {
+            n.extras_reset(|x| x.icon = Extras::DEFAULT.icon);
+            n.text_dirty = true;
+        }
+
+        // ── HyperlinkButton target ───────────────────────────────────────
+        // Consumed at activation, not at paint: `input::activate` offers it to
+        // the app's [`crate::set_uri_launcher`] hook — the one path a pointer
+        // release, a Space/Enter press and a UIA `Invoke` all share. This
+        // backend still makes no policy decision about the string; with no
+        // launcher installed the link is inert, which is the default. Purely a
+        // stored value as far as rendering is concerned, so the reset neither
+        // re-measures nor repaints.
+        NavigateUri => |n| { n.extras_reset(|x| x.navigate_uri = Extras::DEFAULT.navigate_uri); }
+
+        // ── ToggleSwitch state labels ────────────────────────────────────
+        // The switch measures to the WIDER of the two, so dropping either one
+        // re-measures — hence `text_dirty` on both.
+        OnContent => |n| {
+            n.extras_reset(|x| x.on_content = Extras::DEFAULT.on_content);
+            n.text_dirty = true;
+        }
+        OffContent => |n| {
+            n.extras_reset(|x| x.off_content = Extras::DEFAULT.off_content);
+            n.text_dirty = true;
+        }
+
+        // ── TitleBar caption band ────────────────────────────────────────
+        // The titles are drawn from cached layouts the text pass owns, so a
+        // reset drops the state and re-flags it; the pass then rebuilds (to
+        // `None`, here) and re-derives the band's leading inset with it.
+        Title => |n| { n.extras_reset(|x| x.title = Extras::DEFAULT.title); n.text_dirty = true; }
+        Subtitle => |n| {
+            n.extras_reset(|x| x.subtitle = Extras::DEFAULT.subtitle);
+            n.text_dirty = true;
+        }
+        // Band height and back-button inset are derived geometry, so each of
+        // these restores the state and immediately re-derives — the same call
+        // `apply_prop` makes, so set and unset cannot fall out of step.
+        Tall => |n| {
+            n.extras_reset(|x| x.tall = Extras::DEFAULT.tall);
+            layout::apply_caption_metrics(n);
+        }
+        IsBackButtonEnabled => |n| {
+            n.extras_reset(|x| x.back_button_enabled = Extras::DEFAULT.back_button_enabled);
+            n.mark_dirty();
+        }
+        // Born VISIBLE: a NavigationView only emits this prop to say `false`,
+        // so its removal means "show it again".
+        //
+        // Carried by BOTH drawn bands — it is the caption's back button and the
+        // nav pane's alike — so the reset re-derives both geometries. Each is a
+        // no-op on the kind it does not belong to.
+        IsBackButtonVisible => |n| {
+            n.extras_reset(|x| x.back_button_visible = Extras::DEFAULT.back_button_visible);
+            layout::apply_caption_metrics(n);
+            layout::apply_nav_metrics(n);
+        }
+
+        // ── NavigationView pane ──────────────────────────────────────────
+        // Pane width, and everything that follows from it, is DERIVED — see
+        // `nav::pane_width`, which `birth_style` also builds a virgin
+        // NavigationView from. So each of these restores the state and then
+        // re-derives with the same call `apply_prop` makes, and a node whose
+        // pane state is back at its defaults is indistinguishable from one that
+        // never received the prop, style included.
+        //
+        // Born TOGGLE-VISIBLE and SETTINGS-VISIBLE: like the back button, a
+        // NavigationView only emits these to say `false`, so losing the binding
+        // means "show it again".
+        IsPaneToggleButtonVisible => |n| {
+            n.extras_reset(|x| x.pane_toggle_visible = Extras::DEFAULT.pane_toggle_visible);
+            layout::apply_nav_metrics(n);
+        }
+        IsBackEnabled => |n| { n.extras_reset(|x| x.back_enabled = Extras::DEFAULT.back_enabled); }
+        IsSettingsVisible => |n| {
+            n.extras_reset(|x| x.settings_visible = Extras::DEFAULT.settings_visible);
+        }
+        // Born OPEN, matching `NavigationView::default()` — so an app that
+        // never binds this gets WinUI's own expanded pane, not a rail.
+        IsPaneOpen => |n| {
+            n.extras_reset(|x| x.pane_open = Extras::DEFAULT.pane_open);
+            layout::apply_nav_metrics(n);
+        }
+        // The header is drawn from a cached layout the text pass owns, so a
+        // reset drops the state and re-flags it; the pass then rebuilds (to
+        // `None`, here) and re-derives the pane metrics with it.
+        PaneTitle => |n| {
+            n.extras_reset(|x| x.pane_title = Extras::DEFAULT.pane_title);
+            n.text_dirty = true;
+        }
+        // `Auto`, not `Left`: the unset state is the ADAPTIVE mode, which is
+        // what a NavigationView with no `pane_display_mode` binding means.
+        PaneDisplayMode => |n| {
+            n.extras_reset(|x| x.pane_display_mode = Extras::DEFAULT.pane_display_mode);
+            layout::apply_nav_metrics(n);
+        }
+        // 320, not 0 — a zero-length pane is not a default, it is an invisible
+        // control.
+        OpenPaneLength => |n| {
+            n.extras_reset(|x| x.open_pane_length = Extras::DEFAULT.open_pane_length);
+            layout::apply_nav_metrics(n);
+        }
+    }
+
+    /// Stored in [`Extras`] but not yet drawn — the state is exact, the paint
+    /// is the gap. `Extras::DEFAULT` is the same constant an unallocated
+    /// `Extras` reads as, and its non-empty entries mirror the widget default
+    /// whose absence sends the `Unset` (see the constant for which, and why).
+    stored {
+        // ── NavigationView's embedded search box ─────────────────────────
+        // Deliberately still stored: this one is blocked on the shape of
+        // [`Node`], not on the drawing.
+        //
+        // Every other pane element is a rectangle plus glyphs — the pane draws
+        // them and `nav::hit` resolves them, all inside one node. An editor is
+        // not. The editing machinery this backend already has is keyed to a
+        // NODE, and in three ways that a sub-element of a non-editor node
+        // cannot satisfy:
+        //
+        // * **Geometry.** `Editor` has no box of its own. `caret_index_at`,
+        //   `editor_caret_box` and `paint_editor` all take the field's box to
+        //   BE `node.rect` (see `editor::editor_content(kind, rect.w)`). An
+        //   editor hosted at some sub-rect of a nav pane would map pointer x to
+        //   a caret index across the whole pane and hang its caret sprite off
+        //   the pane's top-left corner.
+        // * **Focus.** Focus is `Option<ControlId>` — one focusable per node —
+        //   and `editor_key` routes EVERY editing key to the focused node's
+        //   editor before the generic ring sees it. A nav pane with a search
+        //   field needs two focus targets in one node (the field, and the row
+        //   ring the arrow keys drive), and the Tab order needs to contain
+        //   both. Neither is representable.
+        // * **Accessibility.** A synthetic item can be an invokable button or a
+        //   selectable row; `pattern_supported` gives `IValueProvider` and the
+        //   Text pattern to real editor NODES only, and both read
+        //   `node.editor`. A search box exposed as an item would answer
+        //   `SetValue` for the whole pane.
+        //
+        // Making this work needs `Node` to carry editor state as a placed
+        // sub-element — an editor with its own rect and its own focus identity,
+        // with the ~30 `ControlId`-keyed editor call sites taught to address
+        // it. That is a seam change, and forcing it from the paint side would
+        // mean a second, parallel editor that looks right and mishandles every
+        // caret, IME composition and screen reader that meets it.
+        //
+        // The state below stays exact, so that change lands as plumbing and
+        // nothing else. Note the seam is otherwise ready: the NavigationView
+        // handle already carries `QuerySubmitted` / `TextChanged` /
+        // `SuggestionChosen`, so only the hosting is missing.
+        AutoSuggestBox => |n| { n.extras_reset(|x| x.search_box = Extras::DEFAULT.search_box); }
+        AutoSuggestItems => |n| {
+            n.extras_reset(|x| x.suggest_items = Extras::DEFAULT.suggest_items);
+        }
+        AutoSuggestPlaceholder => |n| {
+            n.extras_reset(|x| x.suggest_placeholder = Extras::DEFAULT.suggest_placeholder);
+        }
+
+        // ── Scroll containers ────────────────────────────────────────────
+        // Still stored: this backend scrolls and indicates on ONE axis. There
+        // is no horizontal overlay thumb for this policy to govern, so
+        // consuming it would mean inventing the scrollbar first — see
+        // `scroll::Reveal`, and `VerticalScrollBarVisibility` for the axis
+        // that is wired.
+        HorizontalScrollBarVisibility => |n| {
+            n.extras_reset(|x| x.h_scrollbar = Extras::DEFAULT.h_scrollbar);
+        }
+
+        // ── Button / HyperlinkButton ─────────────────────────────────────
+        FlyoutContent => |n| { n.extras_reset(|x| x.flyout = Extras::DEFAULT.flyout); }
+        FlyoutPlacement => |n| {
+            n.extras_reset(|x| x.flyout_placement = Extras::DEFAULT.flyout_placement);
+        }
+        // ── Editors / text ───────────────────────────────────────────────
+        IsEditable => |n| { n.extras_reset(|x| x.is_editable = Extras::DEFAULT.is_editable); }
+        AcceptsReturn => |n| {
+            n.extras_reset(|x| x.accepts_return = Extras::DEFAULT.accepts_return);
+        }
+        PasswordRevealMode => |n| {
+            n.extras_reset(|x| x.password_reveal_mode = Extras::DEFAULT.password_reveal_mode);
+        }
+        // Born OFFERED, matching `PasswordBox::default()`.
+        IsPasswordRevealButtonEnabled => |n| {
+            n.extras_reset(|x| x.password_reveal_button = Extras::DEFAULT.password_reveal_button);
+        }
+        IsTextSelectionEnabled => |n| {
+            n.extras_reset(|x| x.text_selectable = Extras::DEFAULT.text_selectable);
+        }
+
+        // ── RepeatButton ─────────────────────────────────────────────────
+        // Born at the WinUI repeat timing (500 ms then 33 ms), not 0 — a zero
+        // interval is an unbounded repeat, not a default.
+        Delay => |n| { n.extras_reset(|x| x.repeat_delay = Extras::DEFAULT.repeat_delay); }
+        Interval => |n| {
+            n.extras_reset(|x| x.repeat_interval = Extras::DEFAULT.repeat_interval);
+        }
+    }
+
+    /// Never stored, so never reset: every kind that can carry these is one
+    /// this backend does not render (or, for the last group, nothing emits
+    /// them at all).
+    not_applicable {
+        // XAML framework machinery with no counterpart in a self-rendering
+        // backend: there is no resource dictionary, no style system, and no
+        // XAML drag-drop here.
+        Style, Resources, AllowDrop;
+        // RelativePanel attached props — this backend has no RelativePanel.
+        AlignBottomWithPanel, AlignHCenterWithPanel, AlignLeftWithPanel,
+        AlignRightWithPanel, AlignTopWithPanel, AlignVCenterWithPanel;
+        // TabView / TabViewItem / Pivot.
+        CanReorderTabs, IsAddTabButtonVisible, IsClosable, ItemKey, ItemHeader;
+        // ColorPicker.
+        ColorValue, IsAlphaEnabled, IsColorChannelTextInputVisible,
+        IsColorSliderVisible, IsHexInputVisible;
+        // Date / time / calendar pickers.
+        ClockIdentifier, MinuteIncrement, DayVisible, MonthVisible, YearVisible,
+        IsCalendarOpen, IsTodayHighlighted, IsGroupLabelVisible;
+        // ContentDialog.
+        PrimaryButtonText, SecondaryButtonText, CloseButtonText,
+        IsPrimaryButtonEnabled, IsSecondaryButtonEnabled;
+        // InfoBar / TeachingTip (`IsOpen` is carried only by these two and
+        // ContentDialog — all three unrendered).
+        Message, Severity, ActionButton, ActionButtonText, CloseButton,
+        PreferredPlacement, IsLightDismissEnabled, IsOpen;
+        // CommandBar / TreeView / SplitView-only / PersonPicture / Image /
+        // Viewbox / RatingControl / RadioButton(s). `CompactPaneLength` is
+        // SplitView's alone — the NavigationView bindings never emit it, so
+        // it is not part of this backend's nav-pane gap.
+        PrimaryCommands, SecondaryCommands, CommandBarFlyoutCommands,
+        DefaultLabelPosition, Nodes, SelectionMode, DisplayMode, DisplayName,
+        Initials, ImageSource, Stretch, MaxRating, Caption, PlaceholderValue,
+        IsReadOnly, GroupName, MaxColumns, CompactPaneLength;
+        // Seam vocabulary no widget emits.
+        Columns, Rows;
+    }
+}
+
+/// Return an editor to the empty, unseeded buffer a node is born with. Skipped
+/// while the field is focused, for the same reason the seed is: the user owns
+/// the buffer mid-edit. No-op for a kind that has no editor.
+fn clear_editor_text(node: &mut Node) {
+    let focused = node.focused;
+    if let Some(ed) = &mut node.editor
+        && (!focused || !ed.seeded)
+    {
+        ed.set_text("");
+        ed.seeded = false;
+    }
+}
+
+/// Debug-only diagnostics for the terminal `_` arm of [`Backend::set_prop`].
+///
+/// The reconciler seam is one shared vocabulary — ~165 [`Prop`]s × ~24
+/// [`PropValue`] shapes — and any single backend implements a slice of it, so
+/// most pairs legitimately reach that arm. The recorder already refuses a `_`
+/// arm in `SendValue::from_prop` precisely so a new value shape cannot vanish
+/// from the wire; before this module the same value could still vanish one
+/// layer later, at the actual consumer, with no warning and no counter.
+///
+/// A blanket warning would be useless: the large majority of fallthroughs are
+/// props whose only carriers are controls this backend does not render, and
+/// those would drown the handful that are real gaps. So each fallthrough is
+/// classified first (see [`Status`], whose table lives in
+/// [`prop_contract`](super::prop_contract)) and only defects are reported,
+/// once each.
+///
+/// [`prop_status`](super::prop_status) and [`shape`] are **exhaustive matches
+/// with no `_` arm** — the same discipline as the recorder, and for the same
+/// reason: a `Prop` or `PropValue` variant added to the seam must not be able
+/// to slip in already silently dropped. They stay compiled in release (dead,
+/// so no codegen) so that check holds in every configuration; only the
+/// reporting is cfg'd out.
+mod unhandled {
+    // In release nothing calls into here; the matches are kept for their
+    // compile-time exhaustiveness check alone.
+    #![cfg_attr(not(debug_assertions), allow(dead_code))]
+
+    use super::{prop_status, ControlKind, Prop, PropValue, Status};
+    use std::cell::RefCell;
+    use std::mem::Discriminant;
+
+    thread_local! {
+        /// Pairs already reported. A dropped prop repeats on every reconcile,
+        /// so without this one gap would scroll the console. The backend is
+        /// single-threaded (UI thread), hence a plain thread-local.
+        static SEEN: RefCell<rustc_hash::FxHashSet<(ControlKind, Prop, Discriminant<PropValue>)>> =
+            RefCell::new(rustc_hash::FxHashSet::default());
+        /// Unrendered kinds already reported (one line per kind, not per prop).
+        static SEEN_KINDS: RefCell<rustc_hash::FxHashSet<ControlKind>> =
+            RefCell::new(rustc_hash::FxHashSet::default());
+    }
+
+    /// Report one dropped `(kind, prop, value)` — if it is worth reporting.
+    #[cfg(debug_assertions)]
+    pub(super) fn note(kind: ControlKind, prop: Prop, value: &PropValue) {
+        // Scoped to the reporting path so the release stub leaves no import
+        // behind for either to be unused in.
+        use super::animate::warn;
+        use std::mem::discriminant;
+
+        // A prop dropped on a kind this backend never renders is not a fact
+        // about the prop; the one actionable fact is the kind itself, and it is
+        // worth saying exactly once rather than once per prop it carries.
+        if !renders(kind) {
+            if SEEN_KINDS.with(|s| s.borrow_mut().insert(kind)) {
+                warn(format_args!(
+                    "{kind:?} is not rendered by the DirectComposition backend — \
+                     it lays out as a plain container and its own props are inert"
+                ));
+            }
+            return;
+        }
+        let status = prop_status(prop);
+        if matches!(status, Status::NotApplicable) {
+            return;
+        }
+        if !SEEN.with(|s| s.borrow_mut().insert((kind, prop, discriminant(value)))) {
+            return;
+        }
+        match status {
+            Status::Consumed => warn(format_args!(
+                "set_prop({kind:?}, {prop:?}, {}): DROPPED — this backend \
+                 implements {prop:?}, but no arm accepts that value shape",
+                shape(value)
+            )),
+            // The value SHAPE is still the defect — an arm exists, it just
+            // did not match. Worth its own wording because the state it
+            // would have written is not drawn yet either, so this one goes
+            // unnoticed twice over.
+            Status::Stored => warn(format_args!(
+                "set_prop({kind:?}, {prop:?}, {}): DROPPED — this backend \
+                 stores {prop:?} (though nothing draws it yet), but no arm \
+                 accepts that value shape",
+                shape(value)
+            )),
+            Status::NotApplicable => {}
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    pub(super) fn note(_kind: ControlKind, _prop: Prop, _value: &PropValue) {}
+
+    /// Whether this backend gives `kind` its own behaviour — drawn chrome, or
+    /// (for the panels and host surfaces) a real layout/attachment role. `false`
+    /// means the node exists only as a laid-out, unpainted container.
+    fn renders(kind: ControlKind) -> bool {
+        use ControlKind as K;
+        match kind {
+            // Panels, host surfaces and shapes.
+            K::StackPanel
+            | K::Grid
+            | K::Canvas
+            | K::Border
+            | K::ScrollViewer
+            | K::ScrollView
+            | K::SwapChainPanel
+            | K::Rectangle
+            | K::Ellipse
+            | K::Line
+            // Drawn controls.
+            | K::TextBlock
+            | K::Button
+            | K::RepeatButton
+            | K::HyperlinkButton
+            | K::DropDownButton
+            | K::SplitButton
+            | K::ToggleButton
+            | K::CheckBox
+            | K::ToggleSwitch
+            | K::Slider
+            | K::Knob
+            | K::Meter
+            | K::ProgressBar
+            | K::ProgressRing
+            | K::Expander
+            | K::TextBox
+            | K::PasswordBox
+            | K::NumberBox
+            | K::AutoSuggestBox
+            | K::ComboBox
+            | K::SelectorBar
+            | K::NavigationView
+            | K::TitleBar => true,
+
+            // Not rendered: no drawn chrome and no behaviour of their own.
+            K::RadioButton
+            | K::RadioButtons
+            | K::InfoBar
+            | K::InfoBadge
+            | K::PersonPicture
+            | K::Image
+            | K::TabView
+            | K::TabViewItem
+            | K::Pivot
+            | K::PivotItem
+            | K::BreadcrumbBar
+            | K::RichTextBlock
+            | K::RichEditBox
+            | K::ListView
+            | K::GridView
+            | K::ListBox
+            | K::FlipView
+            | K::TreeView
+            | K::ContentDialog
+            | K::TeachingTip
+            | K::Viewbox
+            | K::RatingControl
+            | K::ColorPicker
+            | K::DatePicker
+            | K::TimePicker
+            | K::CalendarDatePicker
+            | K::CalendarView
+            | K::SplitView
+            | K::MenuBar
+            | K::CommandBar
+            | K::RelativePanel
+            | K::WebView2 => false,
+        }
+    }
+
+    /// Short name of a value's shape — `Debug` on the value itself would dump
+    /// whole item lists into the log.
+    fn shape(value: &PropValue) -> &'static str {
+        match value {
+            PropValue::Str(_) => "Str",
+            PropValue::F64(_) => "F64",
+            PropValue::U16(_) => "U16",
+            PropValue::Bool(_) => "Bool",
+            PropValue::I32(_) => "I32",
+            PropValue::Thickness(_) => "Thickness",
+            PropValue::Color(_) => "Color",
+            PropValue::Unset => "Unset",
+            PropValue::GridLengths(_) => "GridLengths",
+            PropValue::SurfaceImageSource(_) => "SurfaceImageSource",
+            PropValue::VirtualSurfaceImageSource(_) => "VirtualSurfaceImageSource",
+            PropValue::LineEndpoints(_) => "LineEndpoints",
+            PropValue::NavMenuItems(_) => "NavMenuItems",
+            PropValue::StrList(_) => "StrList",
+            PropValue::MenuBarItems(_) => "MenuBarItems",
+            PropValue::MenuFlyoutItems(_) => "MenuFlyoutItems",
+            PropValue::FlyoutDef(_) => "FlyoutDef",
+            PropValue::TreeViewNodes(_) => "TreeViewNodes",
+            PropValue::CommandBarCommands(_) => "CommandBarCommands",
+            PropValue::CommandBarFlyoutDef { .. } => "CommandBarFlyoutDef",
+            PropValue::SelectorBarItems(_) => "SelectorBarItems",
+            PropValue::Resources(_) => "Resources",
+            PropValue::GradientStops(_) => "GradientStops",
+            PropValue::F64List(_) => "F64List",
+            PropValue::ValueLabels(_) => "ValueLabels",
+        }
     }
 }
 
@@ -1195,7 +2213,7 @@ fn seed_editor_text(node: &mut Node, s: &str) {
 /// configured precision. Skipped while focused (the user owns the buffer).
 fn seed_number_text(node: &mut Node, v: f64) {
     let focused = node.focused;
-    let precision = node.ctrl.precision;
+    let precision = node.ctrl().precision;
     if let Some(ed) = &mut node.editor
         && (!focused || !ed.seeded)
     {
@@ -1207,11 +2225,11 @@ fn seed_number_text(node: &mut Node, v: f64) {
 
 /// The control's value as a 0..1 fraction of its `[min, max]` range.
 pub(crate) fn ctrl_value_frac(node: &Node) -> f64 {
-    let span = node.ctrl.max - node.ctrl.min;
+    let span = node.ctrl().max - node.ctrl().min;
     if span.abs() < f64::EPSILON {
         0.0
     } else {
-        ((node.ctrl.value - node.ctrl.min) / span).clamp(0.0, 1.0)
+        ((node.ctrl().value - node.ctrl().min) / span).clamp(0.0, 1.0)
     }
 }
 
@@ -1219,10 +2237,10 @@ pub(crate) fn ctrl_value_frac(node: &Node) -> f64 {
 /// `selected_index` (NavigationView). The rail indicator is a chrome part —
 /// the paint pass glides/snaps it from `selected_index` directly.
 fn sync_selected_tag(node: &mut Node) {
-    if let Some(tag) = &node.ctrl.selected_tag
-        && let Some(i) = node.ctrl.tags.iter().position(|t| t == tag)
+    if let Some(tag) = &node.ctrl().selected_tag
+        && let Some(i) = node.ctrl().tags.iter().position(|t| t == tag)
     {
-        node.ctrl.selected_index = i as i32;
+        node.ctrl_mut().selected_index = i as i32;
     }
 }
 

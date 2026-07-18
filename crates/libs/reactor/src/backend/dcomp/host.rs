@@ -145,6 +145,25 @@ struct HostShared {
 
 thread_local! {
     static DCOMP: RefCell<Option<Rc<HostShared>>> = const { RefCell::new(None) };
+
+    /// Set for the duration of our own [`release_capture_self`] call.
+    ///
+    /// `ReleaseCapture` delivers `WM_CAPTURECHANGED` **synchronously**, and a
+    /// normal button-up releases capture before dispatching the release. Without
+    /// this flag the capture-lost handler would tear the press down a moment
+    /// before `on_pointer_up` went looking for it, and no click would ever
+    /// activate. Only a capture change we did NOT initiate is a steal.
+    static RELEASING_CAPTURE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Release pointer capture without the resulting synchronous
+/// `WM_CAPTURECHANGED` being mistaken for the OS stealing it.
+fn release_capture_self() {
+    RELEASING_CAPTURE.with(|c| c.set(true));
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+    RELEASING_CAPTURE.with(|c| c.set(false));
 }
 
 /// A self-hosted DirectComposition window hosting one reactor component tree.
@@ -636,6 +655,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 && y >= cy
                 && y < cy + ch
             {
+                // The drawn back button sits at the LEADING edge, so it is
+                // tested before the trailing cluster. `HTSYSMENU` is the
+                // non-client code for that corner, which buys the whole
+                // hover/press pipeline the window buttons already use — see
+                // `caption::index_for_hit` for the double-click hazard it
+                // brings and the `WM_NCLBUTTONDBLCLK` arm that defuses it.
+                if s.render_host.with_reconciler_mut(|r| r.backend.back_button_active())
+                    && let Some((bx, by, bw, bh)) =
+                        s.render_host.with_reconciler_mut(|r| r.backend.back_button_rect())
+                    && x >= bx
+                    && x < bx + bw
+                    && y >= by
+                    && y < by + bh
+                {
+                    return caption::HTSYSMENU as LRESULT;
+                }
                 let from_right = (cx + cw) - x;
                 if from_right <= caption::BTN_W {
                     return HTCLOSE as LRESULT;
@@ -686,6 +721,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let idx = caption::index_for_hit(wparam as u32);
             if idx >= 0 {
                 caption::set_pressed(idx);
+                // Only the back button draws a distinct pressed state, so it
+                // is the only one whose arming needs a repaint.
+                if idx == caption::BACK_INDEX {
+                    repaint_caption();
+                }
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        // `DefWindowProc` closes the window on a double-click over `HTSYSMENU`
+        // — the classic system-menu gesture. The back button borrows that hit
+        // code (see `caption::index_for_hit`), so a fast double tap on it must
+        // be swallowed here or it would close the app. Each click has already
+        // been dispatched as its own press/release pair.
+        caption::WM_NCLBUTTONDBLCLK => {
+            if caption::index_for_hit(wparam as u32) == caption::BACK_INDEX {
                 return 0;
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -696,6 +748,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let pressed = caption::pressed();
             caption::set_pressed(-1);
             if idx >= 0 && idx == pressed {
+                // The back button is an APP command, not a system one: it
+                // raises the TitleBar's `BackRequested` rather than posting a
+                // `WM_SYSCOMMAND`.
+                if idx == caption::BACK_INDEX {
+                    if let Some(s) = shared() {
+                        s.render_host
+                            .with_reconciler_mut(|r| r.backend.raise_back_requested());
+                    }
+                    repaint_caption();
+                    return 0;
+                }
                 let cmd = match idx {
                     0 => SC_MINIMIZE,
                     1 if unsafe { IsZoomed(hwnd) }.as_bool() => SC_RESTORE,
@@ -793,15 +856,63 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONUP => {
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
-                unsafe {
-                    let _ = ReleaseCapture();
-                }
+                release_capture_self();
                 s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_up(x, y));
             }
             0
         }
 
-        WM_MOUSEWHEEL => {
+        // Capture was taken from us: a system modal dialog, Alt+Tab, Win+D, a
+        // debugger break. No WM_LBUTTONUP will follow, so the gesture has to be
+        // cancelled here or its state stays live forever — a stuck global
+        // `scrubbing` flag leaves every slider, knob and meter in the window
+        // snapping instead of springing until the next clean press/release.
+        //
+        // Our own ReleaseCapture also lands here (synchronously, from the
+        // button-up arm above); `release_capture_self` marks those so a normal
+        // click is not cancelled out from under itself.
+        WM_CAPTURECHANGED => {
+            if !RELEASING_CAPTURE.with(|c| c.get())
+                && let Some(s) = shared()
+            {
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.on_pointer_cancel());
+            }
+            0
+        }
+
+        // Right button: no capture and no press ink (see
+        // `on_right_pointer_down`) — it only reports a right-tap, which is what
+        // a context menu hangs off. Unhandled presses fall through to
+        // DefWindowProc so the system context-menu path still works.
+        WM_RBUTTONDOWN => {
+            let (x, y) = dip_xy(hwnd, lparam);
+            let consumed = shared().is_some_and(|s| {
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.on_right_pointer_down(x, y))
+            });
+            if consumed {
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_RBUTTONUP => {
+            if let Some(s) = shared() {
+                let (x, y) = dip_xy(hwnd, lparam);
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.on_right_pointer_up(x, y));
+            }
+            0
+        }
+
+        // Both wheel axes decode identically: SCREEN coords in lParam, a signed
+        // 120-per-detent delta in the high word of wParam. They differ only in
+        // what the sign MEANS — WM_MOUSEWHEEL is positive away from the user,
+        // WM_MOUSEHWHEEL is positive to the RIGHT. Neither is remapped here;
+        // the delta goes through raw and the backend tags it with its axis, so
+        // a sink reads each with the convention Windows documents for it.
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             if let Some(s) = shared() {
                 // wheel lParam carries SCREEN coords; convert to client DIPs.
                 let mut pt = POINT {
@@ -814,7 +925,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let scale = dpi_scale(hwnd);
                 let delta = ((wparam >> 16) & 0xFFFF) as i16 as i32;
                 let (x, y) = (pt.x as f32 / scale, pt.y as f32 / scale);
-                s.render_host.with_reconciler_mut(|r| r.backend.on_wheel(x, y, delta));
+                let horizontal = msg == WM_MOUSEHWHEEL;
+                s.render_host.with_reconciler_mut(|r| {
+                    if horizontal {
+                        r.backend.on_wheel_h(x, y, delta)
+                    } else {
+                        r.backend.on_wheel(x, y, delta)
+                    }
+                });
             }
             0
         }
@@ -826,6 +944,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
                 s.render_host
                     .with_reconciler_mut(|r| r.backend.on_key(vk, shift, ctrl));
+            }
+            0
+        }
+
+        // Ends the held/auto-repeat state started by the matching key-down.
+        WM_KEYUP | WM_SYSKEYUP => {
+            if let Some(s) = shared() {
+                let vk = (wparam & 0xFFFF) as u32;
+                s.render_host.with_reconciler_mut(|r| r.backend.on_key_up(vk));
             }
             0
         }

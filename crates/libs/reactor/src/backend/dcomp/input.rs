@@ -7,10 +7,11 @@
 
 use super::controls;
 use super::editor;
+use super::host;
 use super::popup::Popup;
 use super::*;
 use crate::backend::Event;
-use crate::style::PointerEventInfo;
+use crate::style::{PointerEventInfo, WheelAxis};
 use crate::system_bindings::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GlobalAlloc, GlobalLock, GlobalUnlock,
     OpenClipboard, SetClipboardData, CF_UNICODETEXT, GMEM_MOVEABLE, HWND,
@@ -37,24 +38,152 @@ const VK_C: u32 = 0x43;
 const VK_V: u32 = 0x56;
 const VK_X: u32 = 0x58;
 
+// ── Host-thread input state ─────────────────────────────────────────────────
+//
+// Both cells below are per-host-thread rather than `DCompBackend` fields: one
+// `DCompHost` (and therefore one backend) exists per thread — see the `DCOMP`
+// thread-local in `host` — so thread-local and per-backend are the same scope
+// here.
+
+thread_local! {
+    /// The last pointer position this backend actually processed, in absolute
+    /// client DIPs. Read by [`DCompBackend::on_pointer_cancel`], which is
+    /// driven by `WM_CAPTURECHANGED` — a message that carries no coordinates
+    /// and may arrive with the cursor already off over some other window.
+    static LAST_POINTER: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((0.0, 0.0)) };
+
+    /// Bitmap of currently-held virtual keys (VK 0..256, one bit each).
+    /// Maintained by `on_key` / `on_key_up` and cleared wholesale when the
+    /// window loses activation.
+    ///
+    /// Its job is to tell a fresh press from an auto-repeat: a key that is
+    /// already down when its `WM_KEYDOWN` arrives is the keyboard repeating.
+    static KEYS_DOWN: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+
+    /// The node a right-button press landed on, so the release can require
+    /// down and up on the *same* element before reporting a right-tap.
+    static RIGHT_PRESSED: std::cell::Cell<Option<ControlId>> = const { std::cell::Cell::new(None) };
+}
+
+fn set_last_pointer(x: f32, y: f32) {
+    LAST_POINTER.with(|c| c.set((x, y)));
+}
+
+fn last_pointer() -> (f32, f32) {
+    LAST_POINTER.with(|c| c.get())
+}
+
+/// Mark `vk` held; returns whether it was **already** held — i.e. whether this
+/// key-down is an auto-repeat rather than a fresh press.
+fn key_press(vk: u32) -> bool {
+    if vk >= 256 {
+        return false;
+    }
+    let (word, bit) = ((vk / 64) as usize, 1u64 << (vk % 64));
+    KEYS_DOWN.with(|c| {
+        let mut m = c.get();
+        let was = m[word] & bit != 0;
+        m[word] |= bit;
+        c.set(m);
+        was
+    })
+}
+
+/// Mark `vk` released.
+fn key_release(vk: u32) {
+    if vk >= 256 {
+        return;
+    }
+    let (word, bit) = ((vk / 64) as usize, 1u64 << (vk % 64));
+    KEYS_DOWN.with(|c| {
+        let mut m = c.get();
+        m[word] &= !bit;
+        c.set(m);
+    });
+}
+
+/// Forget every held key. Keys released while another window has focus never
+/// deliver a `WM_KEYUP` to us, so without this the next genuine press of such a
+/// key would look like an auto-repeat and be suppressed.
+fn keys_clear() {
+    KEYS_DOWN.with(|c| c.set([0; 4]));
+}
+
+/// What a [`DCompBackend::hit_test`] walk is looking for.
+///
+/// The variants differ only in which nodes are eligible to *win* the hit —
+/// traversal, coordinate mapping and clipping are identical for all of them, so
+/// every consumer resolves the same point to the same place in the tree.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum HitKind {
+    /// Nodes that respond to a press ([`Node::is_clickable`]) — pointer routing.
+    Interactive,
+    /// Scroll containers ([`Node::is_scroll`]) — wheel and thumb routing.
+    Scroll,
+    /// Every node, whatever its kind. This is the arm UI Automation's
+    /// `ElementProviderFromPoint` wants: it must resolve to the topmost element
+    /// at the point, interactive or not.
+    Any,
+}
+
+impl HitKind {
+    /// Whether `n` is eligible to win a hit for this kind.
+    fn eligible(self, n: &Node) -> bool {
+        match self {
+            Self::Interactive => n.is_clickable(),
+            Self::Scroll => n.is_scroll(),
+            Self::Any => true,
+        }
+    }
+}
+
 impl DCompBackend {
     // ── Hit-testing ──────────────────────────────────────────────────────────
+
+    /// Resolve absolute client-DIP `(x, y)` to the node that owns that point,
+    /// for the given [`HitKind`]. This is the single hit-test authority — every
+    /// consumer (pointer routing, wheel routing, UI Automation) must go through
+    /// it so a click and an `ElementProviderFromPoint` can never disagree about
+    /// what is under the cursor.
+    ///
+    /// Contract:
+    ///
+    /// * **Coordinates** are absolute, in client DIPs, as delivered by the host
+    ///   wndproc. The walk maps them into each node's own layout space as it
+    ///   descends, adding the `scroll_off` of every ancestor scroll container
+    ///   (whose children are laid out unscrolled).
+    /// * **Z-order is paint order.** Children paint over their parent and later
+    ///   siblings paint over earlier ones, so the *last* eligible node in the
+    ///   DFS wins — i.e. the visually topmost one. Two overlapping siblings
+    ///   resolve to the one drawn on top.
+    /// * **A plain miss prunes nothing.** A child may legitimately extend past
+    ///   its parent's box (a knob's overhanging halo, an absolutely-positioned
+    ///   overlay), so a subtree is still searched when the point is outside the
+    ///   parent's rect.
+    /// * **A clipped miss prunes the whole subtree.** A node that clips its
+    ///   children to its own bounds (a scroll viewport, a progress track — the
+    ///   nodes carrying a composition `InsetClip`) does not *draw* content
+    ///   outside those bounds, so that content must not hit-test either.
+    ///   Without this, rows scrolled out of a `ScrollViewer` stay clickable.
+    ///
+    /// Returns `None` when the point lands on nothing eligible, or when no tree
+    /// is mounted.
+    pub(crate) fn hit_test(&self, x: f32, y: f32, kind: HitKind) -> Option<ControlId> {
+        let root = self.root?;
+        let mut best = None;
+        self.hit_walk(root, x, y, &mut best, kind);
+        best
+    }
 
     /// The deepest interactive node containing the point, accounting for the
     /// scroll offset of any ancestor scroll container.
     pub(super) fn interactive_at(&self, x: f32, y: f32) -> Option<ControlId> {
-        let root = self.root?;
-        let mut best = None;
-        self.hit_walk(root, x, y, &mut best, true);
-        best
+        self.hit_test(x, y, HitKind::Interactive)
     }
 
     /// The deepest scroll container containing the point.
     fn scroll_at(&self, x: f32, y: f32) -> Option<ControlId> {
-        let root = self.root?;
-        let mut best = None;
-        self.hit_walk(root, x, y, &mut best, false);
-        best
+        self.hit_test(x, y, HitKind::Scroll)
     }
 
     /// The deepest registered viz pointer surface (knob/slider/EQ canvas — see
@@ -83,10 +212,14 @@ impl DCompBackend {
         out: &mut Option<(ControlId, std::rc::Rc<super::PointerSinks>, f32, f32)>,
     ) {
         let Some(node) = self.node(id) else { return };
-        if node.rect.contains(x, y)
-            && let Some(sinks) = super::pointer::sinks_for(id)
-        {
+        let inside = node.rect.contains(x, y);
+        if inside && let Some(sinks) = super::pointer::sinks_for(id) {
             *out = Some((id, sinks, x, y));
+        }
+        // Same clip rule as `hit_walk`: a surface scrolled out of an ancestor
+        // viewport is not drawn, so it must not take the pointer either.
+        if !inside && node.clip.is_some() {
+            return;
         }
         let child_y = if node.is_scroll() { y + node.scroll_off } else { y };
         for c in &node.children {
@@ -97,6 +230,10 @@ impl DCompBackend {
     /// Deliver a pointer transition to a viz surface's sink with element-relative
     /// DIP coordinates. `(x, y)` must be in the node's layout space (scroll-
     /// adjusted, as returned by [`surface_at`](Self::surface_at)).
+    ///
+    /// Reports the vertical wheel axis — correct for every pointer transition
+    /// (which carries `wheel_delta` 0) and for the classic wheel. The
+    /// horizontal tilt goes through [`fire_surface_wheel`](Self::fire_surface_wheel).
     fn fire_surface(
         &self,
         id: ControlId,
@@ -106,12 +243,30 @@ impl DCompBackend {
         left: bool,
         wheel_delta: i32,
     ) {
+        self.fire_surface_wheel(id, cell, x, y, left, wheel_delta, WheelAxis::Vertical);
+    }
+
+    /// [`fire_surface`](Self::fire_surface) with an explicit wheel axis, so a
+    /// surface sink can tell a sideways tilt from a wheel turn and opt in to
+    /// (or ignore) each independently.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_surface_wheel(
+        &self,
+        id: ControlId,
+        cell: &std::cell::RefCell<Option<Box<dyn Fn(PointerEventInfo)>>>,
+        x: f32,
+        y: f32,
+        left: bool,
+        wheel_delta: i32,
+        wheel_axis: WheelAxis,
+    ) {
         let Some(node) = self.node(id) else { return };
         let info = PointerEventInfo {
             x: (x - node.rect.x) as f64,
             y: (y - node.rect.y) as f64,
             is_left_button_pressed: left,
             wheel_delta,
+            wheel_axis,
             ..PointerEventInfo::default()
         };
         if let Some(cb) = cell.borrow().as_ref() {
@@ -123,7 +278,7 @@ impl DCompBackend {
     /// Returns the pointer→thumb-top offset (for drag tracking) when it does.
     fn thumb_at(&self, id: ControlId, x: f32, y: f32) -> Option<f32> {
         let n = self.node(id)?;
-        let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, n.scroll_off);
+        let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, n.scroll_off);
         if !g.overflow {
             return None;
         }
@@ -159,8 +314,17 @@ impl DCompBackend {
     fn set_thumb_shown(&mut self, id: ControlId, shown: bool) {
         let compositor = self.comp.compositor().clone();
         if let Some(n) = self.node_mut(id) {
-            let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, n.scroll_off);
-            let show = shown && g.overflow;
+            let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, n.scroll_off);
+            // The app's visibility policy overrides the hover edge — an
+            // always-visible bar ignores the conceal, a hidden one ignores the
+            // reveal. Overflow still gates both: there is nothing to indicate
+            // when the content fits.
+            let show = g.overflow
+                && match scroll::reveal_policy(n.extras().v_scrollbar) {
+                    scroll::Reveal::Always => true,
+                    scroll::Reveal::Never => false,
+                    scroll::Reveal::OnDemand => shown,
+                };
             if show != n.thumb_shown {
                 n.thumb_shown = show;
                 if let Some(t) = &n.scroll_thumb {
@@ -174,7 +338,7 @@ impl DCompBackend {
     /// 1:1 — carrier and thumb move by plain property snaps (no repaint).
     fn drag_thumb_to(&mut self, id: ControlId, y: f32) {
         let (ny, vh, content_h, grab) = match self.node(id) {
-            Some(n) => (n.rect.y, n.rect.h, n.ctrl.content_h, n.thumb_drag.unwrap_or(0.0)),
+            Some(n) => (n.rect.y, n.rect.h, n.ctrl().content_h, n.thumb_drag.unwrap_or(0.0)),
             None => return,
         };
         let thumb_y = (y - ny) - grab;
@@ -188,20 +352,27 @@ impl DCompBackend {
         }
     }
 
-    /// Walk the tree; `y` is pre-adjusted for ancestor scroll. When
-    /// `want_interactive` collect clickable nodes, else collect scroll nodes.
-    fn hit_walk(&self, id: ControlId, x: f32, y: f32, out: &mut Option<ControlId>, want_interactive: bool) {
+    /// The recursive body of [`hit_test`](Self::hit_test) — see that method for
+    /// the full contract. `y` arrives pre-adjusted for ancestor scroll, and
+    /// `out` accumulates the last (topmost) eligible node seen.
+    fn hit_walk(&self, id: ControlId, x: f32, y: f32, out: &mut Option<ControlId>, kind: HitKind) {
         let Some(node) = self.node(id) else { return };
-        if node.rect.contains(x, y) {
-            if want_interactive && node.is_clickable() {
-                *out = Some(id);
-            } else if !want_interactive && node.is_scroll() {
-                *out = Some(id);
-            }
+        let inside = node.rect.contains(x, y);
+        if inside && kind.eligible(node) {
+            // Later in the DFS == painted later == on top: overwrite freely.
+            *out = Some(id);
+        }
+        // A node that clips its children to its own bounds (the composition
+        // `InsetClip` minted for scroll viewports and progress tracks) hides
+        // everything below it that falls outside those bounds — so a miss here
+        // ends the subtree. A miss on a NON-clipping node prunes nothing: its
+        // children may legitimately overhang it.
+        if !inside && node.clip.is_some() {
+            return;
         }
         let child_y = if node.is_scroll() { y + node.scroll_off } else { y };
         for c in &node.children {
-            self.hit_walk(*c, x, child_y, out, want_interactive);
+            self.hit_walk(*c, x, child_y, out, kind);
         }
     }
 
@@ -209,20 +380,7 @@ impl DCompBackend {
 
     /// Pointer moved to (x, y) DIPs.
     pub(crate) fn on_pointer_move(&mut self, x: f32, y: f32) {
-        #[cfg(debug_assertions)]
-        {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static SEEN_TOP: AtomicU32 = AtomicU32::new(0);
-            let n = SEEN_TOP.fetch_add(1, Ordering::Relaxed);
-            if n < 8 {
-                eprintln!(
-                    "reactor: [dev] move#{n} ({x:.0},{y:.0}) popup={} pressed={:?} psurf={}",
-                    self.popup.is_some(),
-                    self.pressed_id,
-                    self.pressed_surface.is_some(),
-                );
-            }
-        }
+        set_last_pointer(x, y);
         // While a popup is open, the move only re-highlights its rows.
         if self.popup.is_some() {
             let hit = self.popup.as_ref().and_then(|p| p.hit(x, y));
@@ -308,13 +466,42 @@ impl DCompBackend {
                 .node(id)
                 .is_some_and(|n| n.kind == ControlKind::SelectorBar && n.paint.is_enabled)
             && let Some(hot) = self.segment_at(id, x)
-            && self.node(id).is_some_and(|n| n.ctrl.hot_index != hot)
+            && self.node(id).is_some_and(|n| n.ctrl().hot_index != hot)
         {
             if let Some(n) = self.node_mut(id) {
-                n.ctrl.hot_index = hot;
+                n.ctrl_mut().hot_index = hot;
                 n.mark_dirty();
             }
             seg_hot_moved = true;
+        }
+
+        // Per-row hover in a nav pane, tracked for the same reason and before
+        // the same early-out: the hot row changes while the pointer stays on the
+        // one NavigationView node, so the node-level hover flip below never sees
+        // it. The row ink is a compositor sprite placed by the parts sync, and
+        // the two chrome buttons repaint their flat wash — both keyed on this
+        // one index (see `nav::HOT_BACK` and friends for why chrome sits at
+        // sentinel values rather than in the item range).
+        let mut nav_hot_moved = false;
+        if let Some(id) = now
+            && self
+                .node(id)
+                .is_some_and(|n| n.kind == ControlKind::NavigationView && n.paint.is_enabled)
+        {
+            let hot = match self.nav_hit_at(id, x, y) {
+                Some(nav::Hit::Item(i)) => i,
+                Some(nav::Hit::Back) => nav::HOT_BACK,
+                Some(nav::Hit::Toggle) => nav::HOT_TOGGLE,
+                Some(nav::Hit::Settings) => nav::HOT_SETTINGS_BASE,
+                None => -1,
+            };
+            if self.node(id).is_some_and(|n| n.ctrl().hot_index != hot) {
+                if let Some(n) = self.node_mut(id) {
+                    n.ctrl_mut().hot_index = hot;
+                    n.mark_dirty();
+                }
+                nav_hot_moved = true;
+            }
         }
 
         // Hover moves over a viz pointer surface (EQ node highlight etc.) —
@@ -345,6 +532,16 @@ impl DCompBackend {
                 }
                 self.repaint();
             }
+            // Same node, new pane row: snap the ink onto it (the chrome wash
+            // and the row labels repaint from the dirty flag the caller set).
+            if nav_hot_moved
+                && let Some(id) = now
+            {
+                if let Some(n) = self.node_mut(id) {
+                    parts::nav_hot_changed(n);
+                }
+                self.repaint();
+            }
             return;
         }
         let mut redraw = false;
@@ -370,11 +567,12 @@ impl DCompBackend {
         if let Some(n) = self.node_mut(id) {
             n.hovered = hovered;
             match n.kind {
-                ControlKind::SelectorBar => {
-                    // Label brightening is painted; entering keeps the hot
-                    // segment recorded by the caller, leaving clears it.
+                // Both track a hot child index the node-level hover does not
+                // capture: leaving the node clears it, entering keeps whatever
+                // the caller just recorded.
+                ControlKind::SelectorBar | ControlKind::NavigationView => {
                     if !hovered {
-                        n.ctrl.hot_index = -1;
+                        n.ctrl_mut().hot_index = -1;
                     }
                     n.mark_dirty();
                     redraw = true;
@@ -426,6 +624,7 @@ impl DCompBackend {
 
     /// Left button down. Returns whether the pointer should be captured.
     pub(crate) fn on_pointer_down(&mut self, x: f32, y: f32) -> bool {
+        set_last_pointer(x, y);
         // Popup open: outside-click light-dismisses; inside is handled on up.
         if self.popup.is_some() {
             let inside = self.popup.as_ref().is_some_and(|p| p.contains(x, y));
@@ -510,7 +709,7 @@ impl DCompBackend {
                 self.fire_bool(id, Event::DragStateChanged, true);
                 self.knob_press_to(id, x, y);
                 if let Some(n) = self.node(id) {
-                    self.knob_drag = Some((id, n.ctrl.value, y));
+                    self.knob_drag = Some((id, n.ctrl().value, y));
                 }
             }
             self.fire_pointer(id, x, y, |p| p.on_pointer_pressed.as_ref());
@@ -520,8 +719,90 @@ impl DCompBackend {
         }
     }
 
+    /// Pointer capture was taken away from us — a system modal dialog, Alt+Tab,
+    /// Win+D, a debugger break. No `WM_LBUTTONUP` will ever follow, so this is
+    /// the only chance to tear the gesture down.
+    ///
+    /// A stolen capture is a **cancel, not a click**. The distinction this draws
+    /// through [`on_pointer_up`](Self::on_pointer_up) is:
+    ///
+    /// * *Release state* — the pressed flag and its ink, `pressed_id`,
+    ///   `knob_drag`, `pressed_surface`, `dragging_thumb`, and above all the
+    ///   global `scrubbing` flag — is cleared, exactly as a real release clears
+    ///   it. Leaving `scrubbing` stuck true is the worst of these: it is global,
+    ///   so every slider, knob and meter in the window would snap instead of
+    ///   spring, permanently, until the next clean press/release.
+    /// * *End-of-gesture notifications* that pair with something already fired
+    ///   at press time — `DragStateChanged(false)`, `on_pointer_released`, a viz
+    ///   surface's `up` sink — DO still fire. These report that the gesture
+    ///   stopped, not what it produced; withholding them would strand the app's
+    ///   own drag state in exactly the way this method exists to prevent.
+    /// * *Committing the action* — `activate_pointer`, i.e. the toggle, the
+    ///   click handler, the selection change, the popup open — does **not** run.
+    ///   Nothing is committed by a gesture the user never finished.
+    ///
+    /// Unlike `on_pointer_up` this clears every kind of press state rather than
+    /// returning after the first match: the point is to leave nothing live.
+    pub(crate) fn on_pointer_cancel(&mut self) {
+        let (x, y) = last_pointer();
+
+        // The gesture is over however it ended: value chrome may spring again.
+        self.scrubbing = false;
+
+        // Drop any pending right-press too: its release will never arrive
+        // either, and a stale record could otherwise pair with a stray later
+        // button-up and report a right-tap the user never made.
+        RIGHT_PRESSED.with(|c| c.set(None));
+
+        // A viz pointer-surface drag: the surface hears its release wherever the
+        // pointer was (capture semantics). No value is committed — every value
+        // was already streamed by the `moved` sink.
+        if let Some((sid, sinks, dy)) = self.pressed_surface.take() {
+            self.fire_surface(sid, &sinks.up, x, y + dy, false, 0);
+        }
+
+        // A scrollbar-thumb drag: `scroll_off` is applied live as the thumb
+        // moves, so dropping the drag IS the whole cancellation.
+        if let Some(sid) = self.dragging_thumb.take() {
+            if let Some(n) = self.node_mut(sid) {
+                n.thumb_drag = None;
+            }
+            if self.hovered_scroll != Some(sid) {
+                self.set_thumb_shown(sid, false);
+            }
+        }
+
+        let was_knob_drag = self.knob_drag.take().is_some();
+
+        let Some(id) = self.pressed_id.take() else { return };
+
+        // A text field's press carries no ink and no activation (mirroring the
+        // text-field arm of `on_pointer_up`) — dropping the press is enough.
+        if self.node(id).is_some_and(|n| n.editor.is_some()) {
+            return;
+        }
+
+        if let Some(n) = self.node_mut(id) {
+            n.pressed = false;
+            if parts::converted(n.kind) {
+                parts::ink_state_changed(n);
+            }
+        }
+
+        // Mirror of the press-time `DragStateChanged(true)` for the scrubbing
+        // kinds: a state edge the app must see, not a value.
+        if was_knob_drag || self.node(id).map(|n| n.kind) == Some(ControlKind::Slider) {
+            self.fire_bool(id, Event::DragStateChanged, false);
+        }
+
+        // The press is over for anyone tracking it — but deliberately WITHOUT
+        // the `activate_pointer` call `on_pointer_up` makes here.
+        self.fire_pointer(id, x, y, |p| p.on_pointer_released.as_ref());
+    }
+
     /// Left button up.
     pub(crate) fn on_pointer_up(&mut self, x: f32, y: f32) {
+        set_last_pointer(x, y);
         // The gesture is over: value chrome may spring again.
         self.scrubbing = false;
         // End a viz pointer-surface drag: the surface always sees the release
@@ -590,6 +871,46 @@ impl DCompBackend {
         }
     }
 
+    /// Right button down. Returns whether the message was consumed.
+    ///
+    /// The right button never presses a control: there is no press ink, no
+    /// scrub, no focus move, and no pointer capture (a right-drag is not a
+    /// gesture this backend has). It only records where the press landed so
+    /// [`on_right_pointer_up`](Self::on_right_pointer_up) can require down and
+    /// up on the same element, the way `RightTapped` is defined.
+    pub(crate) fn on_right_pointer_down(&mut self, x: f32, y: f32) -> bool {
+        set_last_pointer(x, y);
+        RIGHT_PRESSED.with(|c| c.set(None));
+
+        // An open popup light-dismisses on a right-click anywhere, inside or
+        // out — the same as clicking away from it — and swallows the press.
+        if self.popup.is_some() {
+            self.close_popup();
+            return true;
+        }
+
+        let target = self.interactive_at(x, y);
+        RIGHT_PRESSED.with(|c| c.set(target));
+        target.is_some()
+    }
+
+    /// Right button up: report a right-tap when the release lands on the same
+    /// node the press did. This is what a context menu would hang off.
+    pub(crate) fn on_right_pointer_up(&mut self, x: f32, y: f32) {
+        set_last_pointer(x, y);
+        let Some(id) = RIGHT_PRESSED.with(|c| c.take()) else {
+            return;
+        };
+        if !self.is_over(id, x, y) {
+            return;
+        }
+        if let Some(p) = self.node(id).and_then(|n| n.pointer.as_ref())
+            && let Some(cb) = &p.on_right_tapped
+        {
+            cb.invoke(());
+        }
+    }
+
     /// Whether `(x, y)` still lies over node `id` (scroll-adjusted).
     fn is_over(&self, id: ControlId, x: f32, y: f32) -> bool {
         // Re-walk to find the topmost interactive node and compare.
@@ -605,7 +926,11 @@ impl DCompBackend {
         let kind = self.node(id).map(|n| n.kind);
         match kind {
             Some(ControlKind::SelectorBar) => self.select_segment(id, x),
-            Some(ControlKind::NavigationView) => self.select_nav(id, y),
+            Some(ControlKind::NavigationView) => {
+                if let Some(hit) = self.nav_hit_at(id, x, y) {
+                    self.nav_act(id, hit);
+                }
+            }
             _ => self.activate(id),
         }
     }
@@ -615,9 +940,9 @@ impl DCompBackend {
         let Some(kind) = self.node(id).map(|n| n.kind) else { return };
         match kind {
             ControlKind::ToggleSwitch => {
-                let on = !self.node(id).map(|n| n.ctrl.is_on).unwrap_or(false);
+                let on = !self.node(id).map(|n| n.ctrl().is_on).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
-                    n.ctrl.is_on = on;
+                    n.ctrl_mut().is_on = on;
                     n.mark_dirty();
                 }
                 // The knob/track glide runs on the compositor: the repaint's
@@ -626,9 +951,9 @@ impl DCompBackend {
                 self.fire_bool(id, Event::Toggled, on);
             }
             ControlKind::CheckBox | ControlKind::ToggleButton => {
-                let on = !self.node(id).map(|n| n.ctrl.is_checked).unwrap_or(false);
+                let on = !self.node(id).map(|n| n.ctrl().is_checked).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
-                    n.ctrl.is_checked = on;
+                    n.ctrl_mut().is_checked = on;
                     n.mark_dirty();
                 }
                 // The CheckBox reveal fades on the compositor (the repaint's
@@ -637,9 +962,9 @@ impl DCompBackend {
                 self.fire_bool(id, Event::Checked, on);
             }
             ControlKind::Expander => {
-                let ex = !self.node(id).map(|n| n.ctrl.expanded).unwrap_or(false);
+                let ex = !self.node(id).map(|n| n.ctrl().expanded).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
-                    n.ctrl.expanded = ex;
+                    n.ctrl_mut().expanded = ex;
                     n.mark_dirty();
                 }
                 self.fire_bool(id, Event::Expanding, ex);
@@ -654,7 +979,7 @@ impl DCompBackend {
             ControlKind::Button | ControlKind::RepeatButton | ControlKind::HyperlinkButton => {
                 // A Button carrying a MenuFlyout (e.g. "+ Add Processor") opens its
                 // menu in the popup overlay, mirroring the native WinUI button-flyout.
-                if self.node(id).is_some_and(|n| !n.ctrl.menu.is_empty()) {
+                if self.node(id).is_some_and(|n| !n.ctrl().menu.is_empty()) {
                     self.open_popup(id);
                     return;
                 }
@@ -665,6 +990,31 @@ impl DCompBackend {
                     && let Some(cb) = &p.on_tapped
                 {
                     cb.invoke(());
+                }
+                // A HyperlinkButton also follows its `NavigateUri` — through the
+                // app's installed launcher, or not at all. This sits in
+                // `activate`, the ONE path a pointer release, a Space/Enter
+                // press and a UIA `Invoke` all converge on, so a screen reader
+                // invoking a link launches exactly as a click does; there is no
+                // second route to keep in step.
+                //
+                // Deferred, not called here: we are inside the backend's own
+                // `RefCell` borrow, and the launcher is app code that may pump
+                // messages (`ShellExecuteW` does) — a synchronous call could
+                // re-enter the window procedure and find the backend already
+                // borrowed. `post_ui` runs it from the pump with the borrow
+                // released, which is also where the contract on
+                // `set_uri_launcher` promises it runs.
+                if kind == ControlKind::HyperlinkButton
+                    && crate::uri_launcher_installed()
+                    && let Some(uri) = self
+                        .node(id)
+                        .map(|n| n.extras().navigate_uri.clone())
+                        .filter(|u| !u.is_empty())
+                {
+                    host::post_ui(self.hwnd, move || {
+                        crate::launch_uri(&uri);
+                    });
                 }
             }
             // Any other node that hit-tested as clickable (a Border/panel made
@@ -687,7 +1037,7 @@ impl DCompBackend {
     /// The segment index under window-relative `x`, or `None` for an empty bar.
     fn segment_at(&self, id: ControlId, x: f32) -> Option<i32> {
         let node = self.node(id)?;
-        let n = node.ctrl.items.len();
+        let n = node.ctrl().items.len();
         if n == 0 {
             return None;
         }
@@ -706,26 +1056,88 @@ impl DCompBackend {
     fn set_segment(&mut self, id: ControlId, i: i32) {
         let label = {
             let Some(n) = self.node_mut(id) else { return };
-            if n.ctrl.selected_index == i || !n.paint.is_enabled {
+            if n.ctrl().selected_index == i || !n.paint.is_enabled {
                 return;
             }
-            n.ctrl.selected_index = i;
+            n.ctrl_mut().selected_index = i;
             n.mark_dirty();
-            n.ctrl.items.get(i as usize).cloned().unwrap_or_default()
+            n.ctrl().items.get(i as usize).cloned().unwrap_or_default()
         };
         self.repaint();
         self.fire_string(id, Event::SelectionChanged, label);
     }
 
-    fn select_nav(&mut self, id: ControlId, y: f32) {
-        let Some(node) = self.node(id) else { return };
-        let n = node.ctrl.items.len();
-        if n == 0 {
-            return;
+    /// The pane geometry for a NavigationView node: the resolved metrics, the
+    /// node height they were resolved against, and the item count. `None` for
+    /// any other kind.
+    ///
+    /// Every pane question in this module goes through here so the hit test can
+    /// never resolve against different geometry than the paint did — they call
+    /// the same `nav::metrics` with the same inputs.
+    pub(crate) fn nav_metrics(&self, id: ControlId) -> Option<(nav::Metrics, f32, usize)> {
+        let n = self.node(id)?;
+        if n.kind != ControlKind::NavigationView {
+            return None;
         }
-        let rel = y - node.rect.y;
-        let i = ((rel / controls::NAV_ITEM_H).floor() as i32).clamp(0, n as i32 - 1);
-        self.set_nav_index(id, i);
+        let has_title = n.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+        Some((
+            nav::metrics(n.extras(), n.rect.w, has_title),
+            n.rect.h,
+            n.ctrl().items.len(),
+        ))
+    }
+
+    /// What a window-relative point lands on inside a nav pane.
+    pub(crate) fn nav_hit_at(&self, id: ControlId, x: f32, y: f32) -> Option<nav::Hit> {
+        let (m, h, count) = self.nav_metrics(id)?;
+        let n = self.node(id)?;
+        nav::hit(&m, h, count, x - n.rect.x, y - n.rect.y)
+    }
+
+    /// A press landed in the pane: route it to whatever it hit. The pointer and
+    /// the accessibility tree share this one entry point, so an invoke from a
+    /// screen reader takes exactly the path a click takes.
+    pub(crate) fn nav_act(&mut self, id: ControlId, hit: nav::Hit) {
+        match hit {
+            nav::Hit::Item(i) => self.set_nav_index(id, i),
+            nav::Hit::Back => {
+                // A disabled back arrow is drawn but inert, mirroring the drawn
+                // caption back button.
+                if self.node(id).is_some_and(|n| n.extras().back_enabled)
+                    && let Some(h) = self.node(id).and_then(|n| n.handler(Event::BackRequested))
+                {
+                    h.invoke();
+                }
+            }
+            nav::Hit::Toggle => self.toggle_nav_pane(id),
+            nav::Hit::Settings => self.select_nav_settings(id),
+        }
+    }
+
+    /// Flip the pane open/closed. This is the hamburger's whole behaviour: the
+    /// seam carries no event for it (the NavigationView widget exposes only
+    /// `on_selection_changed` and `on_back_requested`), and WinUI's own toggle
+    /// likewise just drives `IsPaneOpen`. The pane's new width is derived
+    /// geometry, so the flip has to re-derive and re-lay-out — the content pane
+    /// beside it must resize with it.
+    fn toggle_nav_pane(&mut self, id: ControlId) {
+        let Some(n) = self.node_mut(id) else { return };
+        let open = !n.extras().pane_open;
+        n.extras_mut().pane_open = open;
+        layout::apply_nav_metrics(n);
+        self.relayout_and_paint();
+    }
+
+    /// The settings row: reported as a selection carrying the settings tag, and
+    /// it clears the item selection — you are no longer on any of the pages, so
+    /// no row should read as selected (and `ISelectionProvider` must agree).
+    fn select_nav_settings(&mut self, id: ControlId) {
+        if let Some(n) = self.node_mut(id) {
+            n.ctrl_mut().selected_index = -1;
+            n.mark_dirty();
+        }
+        self.repaint();
+        self.fire_string(id, Event::SelectionChanged, nav::SETTINGS_TAG.to_string());
     }
 
     /// Select NavigationView item `i` (the by-index core `select_nav` and UIA
@@ -733,12 +1145,12 @@ impl DCompBackend {
     fn set_nav_index(&mut self, id: ControlId, i: i32) {
         let tag = {
             let Some(nd) = self.node_mut(id) else { return };
-            if nd.ctrl.selected_index == i {
+            if nd.ctrl().selected_index == i {
                 return;
             }
-            nd.ctrl.selected_index = i;
+            nd.ctrl_mut().selected_index = i;
             nd.mark_dirty();
-            nd.ctrl.tags.get(i as usize).cloned().unwrap_or_default()
+            nd.ctrl().tags.get(i as usize).cloned().unwrap_or_default()
         };
         // Indicator glide + glyph recolor both flow from the repaint (the
         // parts sync glides the tile/bar on the compositor).
@@ -751,10 +1163,10 @@ impl DCompBackend {
     fn set_combo_index(&mut self, id: ControlId, i: i32) {
         {
             let Some(n) = self.node_mut(id) else { return };
-            if n.ctrl.selected_index == i {
+            if n.ctrl().selected_index == i {
                 return;
             }
-            n.ctrl.selected_index = i;
+            n.ctrl_mut().selected_index = i;
             n.mark_dirty();
         }
         self.repaint();
@@ -770,25 +1182,25 @@ impl DCompBackend {
             let inset = theme::SLIDER_THUMB / 2.0;
             let w = (n.rect.w - 2.0 * inset).max(1.0);
             let mut frac = ((x - n.rect.x - inset) / w).clamp(0.0, 1.0);
-            let mut v = n.ctrl.min + frac as f64 * (n.ctrl.max - n.ctrl.min);
-            if let Some(step) = n.ctrl.step
+            let mut v = n.ctrl().min + frac as f64 * (n.ctrl().max - n.ctrl().min);
+            if let Some(step) = n.ctrl().step
                 && step > 0.0
             {
                 v = (v / step).round() * step;
-                v = v.clamp(n.ctrl.min, n.ctrl.max);
-                let span = n.ctrl.max - n.ctrl.min;
-                frac = if span.abs() < f64::EPSILON { 0.0 } else { ((v - n.ctrl.min) / span) as f32 };
+                v = v.clamp(n.ctrl().min, n.ctrl().max);
+                let span = n.ctrl().max - n.ctrl().min;
+                frac = if span.abs() < f64::EPSILON { 0.0 } else { ((v - n.ctrl().min) / span) as f32 };
             }
             // Crossing the fill origin flips the two-tone fill color — a
             // discrete edge, handled by one dirty repaint whose parts sync
             // rebinds the fill's atlas source. Scrub motion stays pure
             // property snaps.
-            let old = n.ctrl.value;
+            let old = n.ctrl().value;
             let recolor = n
-                .ctrl
+                .ctrl()
                 .fill_origin
                 .is_some_and(|o| (old <= o) != (v <= o));
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             if !parts::slider_drag(n, frac) || recolor {
                 // Also the parts-not-built-yet fallback (first interaction
                 // before first paint): the repaint's sync snaps them.
@@ -810,16 +1222,16 @@ impl DCompBackend {
         let value = {
             let Some(n) = self.node_mut(id) else { return };
             let Some(raw) = knob::value_at_point(n, x, y) else { return };
-            let mut v = raw.clamp(n.ctrl.min, n.ctrl.max);
-            if let Some(step) = n.ctrl.step
+            let mut v = raw.clamp(n.ctrl().min, n.ctrl().max);
+            if let Some(step) = n.ctrl().step
                 && step > 0.0
             {
-                v = ((v / step).round() * step).clamp(n.ctrl.min, n.ctrl.max);
+                v = ((v / step).round() * step).clamp(n.ctrl().min, n.ctrl().max);
             }
-            if (v - n.ctrl.value).abs() < f64::EPSILON {
+            if (v - n.ctrl().value).abs() < f64::EPSILON {
                 return;
             }
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             n.mark_dirty();
             v
         };
@@ -837,19 +1249,19 @@ impl DCompBackend {
         const KNOB_DRAG_RANGE: f32 = 200.0;
         let value = {
             let Some(n) = self.node_mut(id) else { return };
-            let span = n.ctrl.max - n.ctrl.min;
+            let span = n.ctrl().max - n.ctrl().min;
             if span == 0.0 {
                 return;
             }
             let dy = (y0 - y) as f64; // up (decreasing y) increases
-            let mut v = (origin + (dy / KNOB_DRAG_RANGE as f64) * span).clamp(n.ctrl.min, n.ctrl.max);
-            if let Some(step) = n.ctrl.step
+            let mut v = (origin + (dy / KNOB_DRAG_RANGE as f64) * span).clamp(n.ctrl().min, n.ctrl().max);
+            if let Some(step) = n.ctrl().step
                 && step > 0.0
             {
                 v = (v / step).round() * step;
-                v = v.clamp(n.ctrl.min, n.ctrl.max);
+                v = v.clamp(n.ctrl().min, n.ctrl().max);
             }
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             n.mark_dirty();
             v
         };
@@ -864,18 +1276,18 @@ impl DCompBackend {
         const KNOB_WHEEL_FRAC: f64 = 0.05;
         let value = {
             let Some(n) = self.node_mut(id) else { return };
-            let span = n.ctrl.max - n.ctrl.min;
+            let span = n.ctrl().max - n.ctrl().min;
             if span == 0.0 {
                 return;
             }
-            let mut v = (n.ctrl.value + detents * KNOB_WHEEL_FRAC * span).clamp(n.ctrl.min, n.ctrl.max);
-            if let Some(step) = n.ctrl.step
+            let mut v = (n.ctrl().value + detents * KNOB_WHEEL_FRAC * span).clamp(n.ctrl().min, n.ctrl().max);
+            if let Some(step) = n.ctrl().step
                 && step > 0.0
             {
                 v = (v / step).round() * step;
-                v = v.clamp(n.ctrl.min, n.ctrl.max);
+                v = v.clamp(n.ctrl().min, n.ctrl().max);
             }
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             n.mark_dirty();
             v
         };
@@ -890,7 +1302,7 @@ impl DCompBackend {
         let combo = node.kind == ControlKind::ComboBox;
         let rect = CanvasRect::from_xywh(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
         let rows: Vec<MenuRow> = if combo {
-            node.ctrl
+            node.ctrl()
                 .items
                 .iter()
                 .map(|s| MenuRow {
@@ -901,12 +1313,12 @@ impl DCompBackend {
                 })
                 .collect()
         } else {
-            node.ctrl.menu.clone()
+            node.ctrl().menu.clone()
         };
         if rows.is_empty() {
             return;
         }
-        let selected = node.ctrl.selected_index;
+        let selected = node.ctrl().selected_index;
         match Popup::open(&self.comp, owner, rows, rect, self.dip_size, combo, selected, false) {
             Ok(p) => {
                 self.close_popup();
@@ -928,7 +1340,7 @@ impl DCompBackend {
         let rows: Vec<MenuRow> = if focused {
             self.node(owner)
                 .map(|n| {
-                    n.ctrl
+                    n.ctrl()
                         .items
                         .iter()
                         .map(|s| MenuRow {
@@ -1038,7 +1450,7 @@ impl DCompBackend {
         self.close_popup();
         if combo {
             if let Some(n) = self.node_mut(owner) {
-                n.ctrl.selected_index = idx as i32;
+                n.ctrl_mut().selected_index = idx as i32;
                 n.mark_dirty();
             }
             self.fire_i32(owner, Event::SelectionChanged, idx as i32);
@@ -1049,8 +1461,9 @@ impl DCompBackend {
 
     // ── Wheel ────────────────────────────────────────────────────────────────
 
-    /// Mouse wheel at (x, y) DIPs, `delta` in WHEEL_DELTA (120) units. The
-    /// scroll glide plays on the compositor — nothing here needs the timer.
+    /// Vertical mouse wheel at (x, y) DIPs, `delta` in WHEEL_DELTA (120) units,
+    /// positive away from the user. The scroll glide plays on the compositor —
+    /// nothing here needs the timer.
     pub(crate) fn on_wheel(&mut self, x: f32, y: f32, delta: i32) {
         // A viz pointer surface that subscribed the wheel (EQ Q-adjust) consumes
         // it; surfaces without a wheel sink fall through to scrolling.
@@ -1088,12 +1501,12 @@ impl DCompBackend {
             // content is about to settle.
             let step = -(delta as f32 / 120.0) * 48.0;
             let scale = self.scale();
-            let max = self.node(id).map(|n| (n.ctrl.content_h - n.rect.h).max(0.0)).unwrap_or(0.0);
+            let max = self.node(id).map(|n| (n.ctrl().content_h - n.rect.h).max(0.0)).unwrap_or(0.0);
             if let Some(n) = self.node_mut(id) {
                 let target = layout::snap((n.scroll_off + step).clamp(0.0, max), scale);
                 n.scroll_off = target;
                 n.scroll_glide(target);
-                let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, target);
+                let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, target);
                 let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
                 n.thumb_glide(tx, g.thumb_y);
             }
@@ -1103,11 +1516,88 @@ impl DCompBackend {
         }
     }
 
+    /// Horizontal wheel — a tilt-wheel click or a touchpad sideways pan — at
+    /// (x, y) DIPs, `delta` in WHEEL_DELTA (120) units.
+    ///
+    /// **Sign:** `WM_MOUSEHWHEEL` does not share `WM_MOUSEWHEEL`'s convention.
+    /// A positive vertical delta means *away from the user*; a positive
+    /// horizontal delta means *to the right*. `delta` is forwarded raw, with
+    /// [`WheelAxis::Horizontal`] attached, so a sink reads it with the
+    /// right-is-positive convention its users expect rather than an invented
+    /// mapping onto "forward".
+    ///
+    /// Only one link of the vertical chain has a horizontal analogue:
+    ///
+    /// * **Viz surface wheel sink** — receives it, tagged `Horizontal`. The
+    ///   surface is the one consumer that can meaningfully distinguish the
+    ///   axes, so it decides (an EQ that adjusts Q on the wheel reads
+    ///   [`PointerEventInfo::wheel_delta_on`] and stays inert under a tilt).
+    /// * **Focused NumberBox** — deliberately nothing. Stepping a numeric value
+    ///   is a vertical-wheel gesture; a sideways pan across a form would drift
+    ///   every field it crossed.
+    /// * **Knob** — deliberately nothing, for the same reason. A knob's domain
+    ///   has one axis and the vertical wheel already owns it; an audio control
+    ///   must not move because the user panned sideways.
+    /// * **Nearest scroll ancestor** — deliberately nothing. `Node::scroll_off`
+    ///   is a single *vertical* scalar and the carrier/thumb machinery
+    ///   (`scroll::thumb_geom`, `scroll_for_thumb_y`, the content-carrier
+    ///   spring) is vertical-only, so there is nothing to move on this axis.
+    ///   Falling through to the vertical path would scroll the wrong way, which
+    ///   is worse than not scrolling: a container that only scrolls vertically
+    ///   must ignore a horizontal tilt. Real horizontal content scrolling needs
+    ///   a second scroll scalar plus horizontal thumb geometry and carrier
+    ///   springs — not plumbing, and out of scope here.
+    ///
+    /// So this returns without touching layout unless a surface takes it, and
+    /// never falls through to [`on_wheel`](Self::on_wheel).
+    pub(crate) fn on_wheel_h(&mut self, x: f32, y: f32, delta: i32) {
+        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y)
+            && sinks.wheel.borrow().is_some()
+        {
+            self.fire_surface_wheel(
+                sid,
+                &sinks.wheel,
+                ax,
+                ay,
+                false,
+                delta,
+                WheelAxis::Horizontal,
+            );
+        }
+    }
+
     // ── Keyboard ─────────────────────────────────────────────────────────────
+
+    /// A key was released. Ends the held/auto-repeat state started by the
+    /// matching [`on_key`](Self::on_key); nothing else keys off a key-up.
+    pub(crate) fn on_key_up(&mut self, vk: u32) {
+        key_release(vk);
+    }
 
     /// A key was pressed (`shift` / `ctrl` held?). Returns `true` if a
     /// spring/timer should run.
     pub(crate) fn on_key(&mut self, vk: u32, shift: bool, ctrl: bool) {
+        // The keyboard repeats a held key at the system rate. Record the press
+        // and find out whether this is a fresh one or the repeat.
+        let repeat = key_press(vk);
+
+        // A held Space/Enter must not re-activate on every repeat: that fires a
+        // Button's click handler dozens of times a second, and flickers a
+        // ToggleSwitch / CheckBox on and off. A RepeatButton is the one kind
+        // whose whole purpose is to repeat, so it opts back in. Text editing,
+        // arrow-key nudges and Tab all repeat normally and fall through.
+        if repeat
+            && matches!(vk, VK_SPACE | VK_RETURN)
+            && self.focused_editable().is_none()
+            && self.popup.is_none()
+            && self
+                .focused_id
+                .and_then(|id| self.node(id).map(|n| n.kind))
+                != Some(ControlKind::RepeatButton)
+        {
+            return;
+        }
+
         // A focused text editor consumes editing keys before the generic ring.
         if let Some(id) = self.focused_editable()
             && self.editor_key(id, vk, shift, ctrl).is_some()
@@ -1185,6 +1675,12 @@ impl DCompBackend {
     /// loses activation (keyboard focus is retained either way). Re-activating
     /// restarts the blink solid-first.
     pub(crate) fn window_focus_changed(&mut self, focused: bool) {
+        if !focused {
+            // Keys released while another window has focus never send us a
+            // `WM_KEYUP`, so the held set would keep them down forever and the
+            // next genuine press would be mistaken for an auto-repeat.
+            keys_clear();
+        }
         if let Some(id) = self.focused_editable() {
             if let Some(n) = self.node_mut(id) {
                 if let Some(e) = &mut n.editor {
@@ -1436,7 +1932,7 @@ impl DCompBackend {
         let (text, fallback) = match self.node(id) {
             Some(n) => (
                 n.editor.as_ref().map(|e| e.text()).unwrap_or_default(),
-                n.ctrl.value,
+                n.ctrl().value,
             ),
             None => return,
         };
@@ -1450,10 +1946,10 @@ impl DCompBackend {
         let value = match self.node(id) {
             Some(n) => {
                 let text = n.editor.as_ref().map(|e| e.text()).unwrap_or_default();
-                let cur = editor::eval_numeric(&text).unwrap_or(n.ctrl.value);
-                let step = n.ctrl.step.unwrap_or(1.0);
+                let cur = editor::eval_numeric(&text).unwrap_or(n.ctrl().value);
+                let step = n.ctrl().step.unwrap_or(1.0);
                 let inc = if large {
-                    n.ctrl.large_change.unwrap_or(step * 10.0)
+                    n.ctrl().large_change.unwrap_or(step * 10.0)
                 } else {
                     step
                 };
@@ -1468,12 +1964,12 @@ impl DCompBackend {
     /// fire `ValueChanged`.
     fn apply_number(&mut self, id: ControlId, value: f64) {
         let (min, max, precision) = match self.node(id) {
-            Some(n) => (n.ctrl.min, n.ctrl.max, n.ctrl.precision),
+            Some(n) => (n.ctrl().min, n.ctrl().max, n.ctrl().precision),
             None => return,
         };
         let (v, s) = editor::commit_format(value, min, max, precision);
         if let Some(n) = self.node_mut(id) {
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             if let Some(e) = &mut n.editor {
                 e.set_text(&s);
                 e.seeded = true;
@@ -1599,9 +2095,9 @@ impl DCompBackend {
             Some(ControlKind::Slider | ControlKind::Knob) => {
                 let value = {
                     let Some(n) = self.node_mut(id) else { return };
-                    let step = n.ctrl.step.unwrap_or((n.ctrl.max - n.ctrl.min) / 20.0);
-                    let v = (n.ctrl.value + dir as f64 * step).clamp(n.ctrl.min, n.ctrl.max);
-                    n.ctrl.value = v;
+                    let step = n.ctrl().step.unwrap_or((n.ctrl().max - n.ctrl().min) / 20.0);
+                    let v = (n.ctrl().value + dir as f64 * step).clamp(n.ctrl().min, n.ctrl().max);
+                    n.ctrl_mut().value = v;
                     n.mark_dirty();
                     v
                 };
@@ -1613,7 +2109,7 @@ impl DCompBackend {
             Some(ControlKind::SelectorBar) => {
                 let (cur, n) = self
                     .node(id)
-                    .map(|nd| (nd.ctrl.selected_index, nd.ctrl.items.len() as i32))
+                    .map(|nd| (nd.ctrl().selected_index, nd.ctrl().items.len() as i32))
                     .unwrap_or((0, 0));
                 if n > 0 {
                     self.set_segment(id, (cur + dir).clamp(0, n - 1));
@@ -1760,8 +2256,8 @@ impl DCompBackend {
         }
         let value = {
             let Some(n) = self.node_mut(id) else { return };
-            let v = v.clamp(n.ctrl.min, n.ctrl.max);
-            n.ctrl.value = v;
+            let v = v.clamp(n.ctrl().min, n.ctrl().max);
+            n.ctrl_mut().value = v;
             n.mark_dirty();
             v
         };
@@ -1770,12 +2266,22 @@ impl DCompBackend {
         self.fire_f64(id, Event::ValueChanged, value);
     }
 
-    /// `SelectionItem::Select` on item `i` of a SelectorBar / ComboBox /
-    /// NavigationView, routed through the existing per-kind selection path.
+    /// `SelectionItem::Select` (and `Invoke`) on synthetic item `i` of a
+    /// SelectorBar / ComboBox / NavigationView, routed through the existing
+    /// per-kind selection path.
+    ///
+    /// A nav pane's chrome arrives here too — `Invoke` on any synthetic item
+    /// lands on this one entry point — and is handed to [`Self::nav_act`], the
+    /// same function a pointer press calls. That is deliberate: an accessibility
+    /// client invoking the hamburger must toggle the pane by exactly the path a
+    /// click toggles it, not by a parallel implementation that can drift.
     pub(crate) fn uia_select_item(&mut self, id: ControlId, i: i32) {
         match self.node(id).map(|n| n.kind) {
             Some(ControlKind::SelectorBar) => self.set_segment(id, i),
-            Some(ControlKind::NavigationView) => self.set_nav_index(id, i),
+            Some(ControlKind::NavigationView) => match uia::nav_chrome_of(i) {
+                Some(hit) => self.nav_act(id, hit),
+                None => self.set_nav_index(id, i),
+            },
             Some(ControlKind::ComboBox) => self.set_combo_index(id, i),
             _ => {}
         }
@@ -1786,7 +2292,7 @@ impl DCompBackend {
     pub(crate) fn uia_set_expanded(&mut self, id: ControlId, want: bool) {
         match self.node(id).map(|n| n.kind) {
             Some(ControlKind::Expander) => {
-                let cur = self.node(id).map(|n| n.ctrl.expanded).unwrap_or(false);
+                let cur = self.node(id).map(|n| n.ctrl().expanded).unwrap_or(false);
                 if cur != want {
                     self.activate(id);
                 }

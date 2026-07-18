@@ -111,9 +111,15 @@ fn paint_node(
         }
     }
 
-    let children = arena.get(id).map(|n| n.children.clone()).unwrap_or_default();
-    for c in children {
+    // Indexed rather than over a cloned child list — the clone was a heap
+    // allocation per node per frame bought purely to dodge `&mut Arena`. An
+    // index is also the only shape that stays correct here: this walk can
+    // propagate `?` mid-iteration on device loss, so a `mem::take` of the
+    // children would leave the node permanently childless on the way out.
+    let mut i = 0;
+    while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
         paint_node(comp, cache, atlas, arena, c, scale, scrubbing)?;
+        i += 1;
     }
 
     // Overlay scrollbar thumb (above the scrolled children) for scroll containers.
@@ -138,7 +144,7 @@ fn update_scroll_thumb(
 ) -> windows_core::Result<()> {
     use scroll::{thumb_geom, THUMB_MARGIN, THUMB_W};
     let (vh, content_h, sc, shown) = match arena.get(id) {
-        Some(n) => (n.rect.h, n.ctrl.content_h, n.scroll_off, n.thumb_shown),
+        Some(n) => (n.rect.h, n.ctrl().content_h, n.scroll_off, n.thumb_shown),
         None => return Ok(()),
     };
     let g = thumb_geom(vh, content_h, sc);
@@ -157,6 +163,35 @@ fn update_scroll_thumb(
         }
         return Ok(());
     }
+
+    // An always-visible bar has no hover edge to ride, so overflow itself is
+    // its reveal: the moment the content outgrows the viewport, show it. A
+    // never-visible one is concealed here for the same reason — the policy may
+    // have changed while the pointer was nowhere near.
+    let shown = match arena
+        .get(id)
+        .map(|n| scroll::reveal_policy(n.extras().v_scrollbar))
+    {
+        Some(scroll::Reveal::Always) if !shown => {
+            if let Some(n) = arena.get_mut(id) {
+                n.thumb_shown = true;
+                if let Some(t) = &n.scroll_thumb {
+                    animate::fade_thumb(comp.compositor(), t, true);
+                }
+            }
+            true
+        }
+        Some(scroll::Reveal::Never) if shown => {
+            if let Some(n) = arena.get_mut(id) {
+                n.thumb_shown = false;
+                if let Some(t) = &n.scroll_thumb {
+                    animate::fade_thumb(comp.compositor(), t, false);
+                }
+            }
+            false
+        }
+        _ => shown,
+    };
 
     let pw = (THUMB_W * scale).ceil() as i32;
     let ph = (g.thumb_h * scale).ceil() as i32;
@@ -250,7 +285,7 @@ fn draw_surface(
     if arena.get(id).is_some_and(|n| n.editor.is_some()) {
         let (kind, w, fs, weight, align) = {
             let n = arena.get(id).unwrap();
-            (n.kind, n.rect.w, n.paint.font_size, n.paint.font_weight, n.ctrl.content_align)
+            (n.kind, n.rect.w, n.paint.font_size, n.paint.font_weight, n.ctrl().content_align)
         };
         let (_, content_w) = editor::editor_content(kind, w);
         if let Some(n) = arena.get_mut(id)

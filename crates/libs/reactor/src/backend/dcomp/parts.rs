@@ -12,6 +12,15 @@
 //!   (9-slice), so one source serves any width with pristine corners. Cleared
 //!   whenever the mapped colours may have changed (display change, DPI change,
 //!   device loss) — parts re-bind by epoch.
+//!
+//!   **Bounding.** Two of the key's dimensions are LAYOUT-derived, not
+//!   token-derived — a bar's height comes from `node.rect.h`, and a slider's
+//!   fill colour is whatever the app authored — so the raw key is unbounded: a
+//!   drag-resize or an animated fill colour would mint one FP16 surface per
+//!   frame. The key is therefore QUANTIZED at construction ([`snap_extent`],
+//!   [`snap_len`], [`quant_channel`]) onto the granularity the raster itself
+//!   already has, and [`ATLAS_CAP`] caps the map with LRU eviction as a
+//!   backstop. See those items for the exact grids and why each is lossless.
 //! - [`Part`] — one `SpriteVisual` plus cached **retargetable compositor
 //!   springs** for Offset / Size / Opacity. A state change is `SetFinalValue`
 //!   + `StartAnimation` on the cached object (no per-event allocation); a drag
@@ -33,6 +42,7 @@
 use rustc_hash::FxHashMap;
 
 use super::bootstrap::Compositing;
+use super::nav;
 use super::node::{linear, Node};
 use super::theme;
 use crate::backend::ControlKind;
@@ -40,7 +50,7 @@ use crate::system_bindings::{
     AnimationIterationBehavior, CompositionAnimation, CompositionBrush, CompositionClip,
     CompositionDrawingSurface, CompositionEasingFunction, CompositionNineGridBrush,
     CompositionObject, CompositionSurfaceBrush, ICompositionAnimation, ICompositionObject,
-    ICompositor2, ICompositor4, IKeyFrameAnimation, IScalarNaturalMotionAnimation,
+    ICompositor2, ICompositor4, IKeyFrameAnimation,
     CompositionBatchTypes, CompositionScopedBatch, ISpringVector2NaturalMotionAnimation,
     ISpringVector3NaturalMotionAnimation, IVector2NaturalMotionAnimation,
     IVector3NaturalMotionAnimation, IVisual, InsetClip, SpringVector2NaturalMotionAnimation,
@@ -70,9 +80,135 @@ fn ts_secs(s: f32) -> TimeSpan {
 // Atlas — shared rasterized part sources
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The rasterized shape of an atlas source. Dimensions are DIP `f32` bit
-/// patterns so the key is `Eq + Hash` without float caveats.
+// ── Key quantization ─────────────────────────────────────────────────────────
+//
+// Everything that reaches an `AtlasKey` passes through one of these first. They
+// exist to make the key space FINITE: without them the key carries raw layout
+// floats and raw app-authored colours, and the cache grows without limit.
+
+/// Physical-pixel granularity for a source's EXTENTS (bar height, circle
+/// diameter, checkbox side). Whole physical pixels — and that is exactly
+/// lossless, not merely close: [`rasterize`] already sizes the surface
+/// `round(dip · scale)` px, so two DIP extents that land on the same pixel count
+/// produce byte-identical pixels today. Snapping here just stops a drag-resize
+/// from minting one FP16 surface per distinct sub-pixel height.
+const EXTENT_STEPS_PER_PX: f32 = 1.0;
+
+/// Granularity for RADII and STROKE WIDTHS — a quarter physical pixel. These are
+/// token constants or derived from an already-snapped extent (`h / 2`), so they
+/// are bounded regardless; the finer grid costs nothing and keeps a 1.5-DIP
+/// hairline from rounding up to 2. As a bonus a nine-grid inset (`r · scale`)
+/// now lands on a quarter-pixel instead of an arbitrary fraction.
+const DETAIL_STEPS_PER_PX: f32 = 4.0;
+
+/// Snap a DIP length onto a physical-pixel grid, returning the canonical `f32`
+/// to key on. Deterministic (equal inputs give bit-identical output) and
+/// non-negative; a non-finite input collapses to `0.0` so a stray NaN cannot
+/// mint one entry per distinct NaN payload.
+fn snap_len(dip: f32, scale: f32, steps_per_px: f32) -> f32 {
+    if !dip.is_finite() || dip <= 0.0 {
+        return 0.0;
+    }
+    let grid = (scale * steps_per_px).max(1.0e-3);
+    (dip * grid).round() / grid
+}
+
+/// [`snap_len`] for an extent: whole physical pixels, and a positive extent
+/// never collapses to zero (a sub-pixel bar still rasterizes one pixel tall,
+/// which is what `rasterize`'s own `.max(1)` would have produced anyway).
+fn snap_extent(dip: f32, scale: f32) -> f32 {
+    if !dip.is_finite() || dip <= 0.0 {
+        return 0.0;
+    }
+    let grid = (scale * EXTENT_STEPS_PER_PX).max(1.0e-3);
+    (dip * grid).round().max(1.0) / grid
+}
+
+/// Canonical DIP→px scale. Display scales are a short list (1.0, 1.25, 1.5, …);
+/// rounding to 1/1000 keeps any float noise in the DPI computation from forking
+/// the whole atlas, and every dimension above is snapped against THIS value so
+/// the key is self-consistent.
+fn snap_scale(scale: f32) -> f32 {
+    if !scale.is_finite() || scale <= 0.0 {
+        return 1.0;
+    }
+    (scale * 1000.0).round() / 1000.0
+}
+
+/// Colour-channel quantization steps per unit of the signed-sqrt encoding.
+const COLOR_STEPS: f32 = 4096.0;
+
+/// Quantize one scRGB channel to a bounded integer code.
+///
+/// This is an FP16 **extended-range** pipeline: a channel may be negative (an
+/// out-of-gamut primary) or far above 1.0 (an above-paper-white highlight), so
+/// the quantizer must NOT clamp to `[0, 1]` — doing so would crush exactly the
+/// HDR values the FP16 surfaces exist to carry. Instead the channel is encoded
+/// through a SIGNED square root before the uniform step, which is sign-symmetric
+/// and exact at zero, and spends resolution where the eye is: the resulting step
+/// in linear light is `≈ 2·√|v| / COLOR_STEPS`, i.e. ~1/2048 at paper white
+/// (finer than 16-bit), quadratically finer approaching black, and ~1.7e-3 at
+/// 12× paper white — a relative error of 1.4e-4 up in the highlights. Magnitudes
+/// are preserved; nothing is clipped.
+///
+/// Bounded by construction: |code| ≤ `√|v| · COLOR_STEPS`, so even a 16.0
+/// channel (≈3200 nits at 203-nit paper white) codes to ±16384.
+fn quant_channel(v: f32) -> i32 {
+    if !v.is_finite() {
+        return 0;
+    }
+    let e = v.abs().sqrt().copysign(v);
+    (e * COLOR_STEPS).round() as i32
+}
+
+/// Inverse of [`quant_channel`] — the colour the raster is actually painted in.
+fn dequant_channel(q: i32) -> f32 {
+    let e = q as f32 / COLOR_STEPS;
+    (e * e).copysign(e)
+}
+
+fn color_bits(c: crate::Color) -> [i32; 4] {
+    [
+        quant_channel(c.r),
+        quant_channel(c.g),
+        quant_channel(c.b),
+        quant_channel(c.a),
+    ]
+}
+
+fn color_of(bits: [i32; 4]) -> crate::Color {
+    crate::Color {
+        r: dequant_channel(bits[0]),
+        g: dequant_channel(bits[1]),
+        b: dequant_channel(bits[2]),
+        a: dequant_channel(bits[3]),
+    }
+}
+
+/// One quantized gradient stop — position and colour, both on the grids above.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct QStop {
+    /// Position in 1/65536ths of the ramp (positions are a `0..=1` fraction).
+    pos: i32,
+    color: [i32; 4],
+}
+
+impl QStop {
+    fn of((p, c): &(f64, crate::Color)) -> Self {
+        let pos = if p.is_finite() { (*p * 65536.0).round() as i32 } else { 0 };
+        Self { pos, color: color_bits(*c) }
+    }
+    fn position(self) -> f32 {
+        self.pos as f32 / 65536.0
+    }
+    fn color(self) -> crate::Color {
+        color_of(self.color)
+    }
+}
+
+/// The rasterized shape of an atlas source. Dimensions are quantized DIP `f32`
+/// bit patterns so the key is `Eq + Hash` without float caveats.
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum ShapeKey {
     /// A solid fill; stretches to any size (4×4 px source).
     Solid,
@@ -90,90 +226,171 @@ enum ShapeKey {
     /// gradient's own math). When `r > 0` it is served through a per-part
     /// nine-grid brush so the rounded ends stay crisp while the middle stretches
     /// (the meter fill); `r == 0` is a plain full-bleed stretch (the knob arc
-    /// stroke brush). `sig` hashes the stop list; the stops are supplied at bind
-    /// time.
-    GradBar { sig: u64, r: u32, h: u32 },
+    /// stroke brush).
+    ///
+    /// The key carries the QUANTIZED STOP LIST ITSELF, not a digest of it. A
+    /// digest is not injective: `FxHash` is a fast, non-cryptographic mixer, so
+    /// two different ramps can collide, and a collision on a cache key means the
+    /// meter silently renders the WRONG colour ramp with no error anywhere.
+    /// Hashing may still collide here — that is fine and expected, because the
+    /// map resolves a bucket collision with `Eq`, and `Eq` now compares the
+    /// stops. The list is `Rc`-shared, so the common case is a pointer compare
+    /// and the worst case a walk of a handful of stops.
+    GradBar { stops: std::rc::Rc<[QStop]>, r: u32, h: u32 },
 }
 
 /// Atlas cache key: shape + the *authored* token colour (the display colour
 /// map is applied at rasterize time) + the DIP→px scale it was drawn at.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Every field is quantized at construction — see the module header. Not `Copy`:
+/// a gradient bar owns its stop list.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AtlasKey {
     shape: ShapeKey,
-    color: [u32; 4],
+    color: [i32; 4],
     scale: u32,
 }
 
 impl AtlasKey {
     fn solid(c: crate::Color, scale: f32) -> Self {
+        let scale = snap_scale(scale);
         Self { shape: ShapeKey::Solid, color: color_bits(c), scale: scale.to_bits() }
     }
     fn hbar(h: f32, r: f32, stroke_w: f32, c: crate::Color, scale: f32) -> Self {
+        let scale = snap_scale(scale);
         Self {
-            shape: ShapeKey::HBar { h: h.to_bits(), r: r.to_bits(), stroke_w: stroke_w.to_bits() },
+            shape: ShapeKey::HBar {
+                h: snap_extent(h, scale).to_bits(),
+                r: snap_len(r, scale, DETAIL_STEPS_PER_PX).to_bits(),
+                stroke_w: snap_len(stroke_w, scale, DETAIL_STEPS_PER_PX).to_bits(),
+            },
             color: color_bits(c),
             scale: scale.to_bits(),
         }
     }
     fn circle(d: f32, c: crate::Color, scale: f32) -> Self {
-        Self { shape: ShapeKey::Circle { d: d.to_bits() }, color: color_bits(c), scale: scale.to_bits() }
+        let scale = snap_scale(scale);
+        Self {
+            shape: ShapeKey::Circle { d: snap_extent(d, scale).to_bits() },
+            color: color_bits(c),
+            scale: scale.to_bits(),
+        }
     }
     fn check(d: f32, c: crate::Color, scale: f32) -> Self {
-        Self { shape: ShapeKey::Check { d: d.to_bits() }, color: color_bits(c), scale: scale.to_bits() }
+        let scale = snap_scale(scale);
+        Self {
+            shape: ShapeKey::Check { d: snap_extent(d, scale).to_bits() },
+            color: color_bits(c),
+            scale: scale.to_bits(),
+        }
     }
     fn grad_bar(stops: &[(f64, crate::Color)], r: f32, h: f32, scale: f32) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hh = rustc_hash::FxHasher::default();
-        for (p, c) in stops {
-            p.to_bits().hash(&mut hh);
-            color_bits(*c).hash(&mut hh);
-        }
+        let scale = snap_scale(scale);
         Self {
-            shape: ShapeKey::GradBar { sig: hh.finish(), r: r.to_bits(), h: h.to_bits() },
+            shape: ShapeKey::GradBar {
+                stops: stops.iter().map(QStop::of).collect(),
+                r: snap_len(r, scale, DETAIL_STEPS_PER_PX).to_bits(),
+                h: snap_extent(h, scale).to_bits(),
+            },
             color: [0; 4],
             scale: scale.to_bits(),
         }
     }
+
+    /// Whether this key is exactly the gradient bar `stops` / `r` / `h` / `scale`
+    /// describe. Allocation-free, so a steady repaint can reuse a cached key
+    /// (see [`grad_bar_key`]) instead of building a fresh stop list each frame.
+    fn is_grad_bar(&self, stops: &[(f64, crate::Color)], r: f32, h: f32, scale: f32) -> bool {
+        let scale = snap_scale(scale);
+        let ShapeKey::GradBar { stops: have, r: kr, h: kh } = &self.shape else {
+            return false;
+        };
+        self.scale == scale.to_bits()
+            && *kr == snap_len(r, scale, DETAIL_STEPS_PER_PX).to_bits()
+            && *kh == snap_extent(h, scale).to_bits()
+            && have.len() == stops.len()
+            && have.iter().zip(stops).all(|(q, s)| *q == QStop::of(s))
+    }
+
     /// The nine-grid corner inset in source pixels (`r * scale`), 0 for the
     /// shapes that stretch uniformly.
     fn inset_px(&self) -> f32 {
         let scale = f32::from_bits(self.scale);
-        match self.shape {
-            ShapeKey::HBar { r, .. } => f32::from_bits(r) * scale,
-            ShapeKey::GradBar { r, .. } => f32::from_bits(r) * scale,
+        match &self.shape {
+            ShapeKey::HBar { r, .. } | ShapeKey::GradBar { r, .. } => f32::from_bits(*r) * scale,
             _ => 0.0,
         }
     }
     /// Whether this source is served through a horizontal nine-grid brush
     /// (rounded ends preserved, middle stretched) rather than a plain stretch.
     fn uses_nine_grid(&self) -> bool {
-        match self.shape {
+        match &self.shape {
             ShapeKey::HBar { .. } => true,
-            ShapeKey::GradBar { r, .. } => f32::from_bits(r) > 0.0,
+            ShapeKey::GradBar { r, .. } => f32::from_bits(*r) > 0.0,
             _ => false,
         }
     }
 }
 
-fn color_bits(c: crate::Color) -> [u32; 4] {
-    [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()]
+/// The gradient-bar key for these stops, reusing `cache` when nothing about the
+/// ramp changed — the reuse path clones an `Rc` (a refcount bump), so a meter
+/// repaint allocates nothing.
+fn grad_bar_key(
+    cache: &mut Option<AtlasKey>,
+    stops: &[(f64, crate::Color)],
+    r: f32,
+    h: f32,
+    scale: f32,
+) -> AtlasKey {
+    if let Some(k) = cache.as_ref()
+        && k.is_grad_bar(stops, r, h, scale)
+    {
+        return k.clone();
+    }
+    let k = AtlasKey::grad_bar(stops, r, h, scale);
+    *cache = Some(k.clone());
+    k
 }
 
 struct AtlasEntry {
     brush: CompositionSurfaceBrush,
     // Keeps the pixels alive behind the brush.
     _surface: CompositionDrawingSurface,
+    /// Logical clock reading of the last bind — the LRU ordering.
+    used: u64,
 }
 
-/// Rasterized part sources, shared across every control. Bounded: a handful of
-/// shapes × the token palette; cleared wholesale on any edge that can change
-/// the mapped colours or the pixel scale.
+/// Hard cap on live atlas sources, enforced by LRU eviction.
+///
+/// Sized to hold the entire legitimate working set with headroom: ~16 converted
+/// control kinds bind 1–4 sources each, times the handful of distinct pixel
+/// heights and token colours live at one scale — a rich window sits well under a
+/// hundred. 256 therefore never evicts in steady state, while capping the
+/// worst case: sources are tiny (a solid is 4×4 px; the widest, a gradient bar,
+/// is 256 px × the bar height in FP16), so a full atlas is single-digit MB
+/// rather than unbounded. Eviction is an O(n) scan of at most 256 entries, and
+/// only on a miss at capacity.
+///
+/// Evicting a source a sprite is still using is safe: the sprite's
+/// `CompositionSurfaceBrush` holds its own reference to the surface, so it keeps
+/// rendering the pixels it bound. The part simply re-rasterizes if it ever
+/// re-binds that key.
+const ATLAS_CAP: usize = 256;
+
+/// Rasterized part sources, shared across every control.
+///
+/// Bounded two ways: the key is quantized so layout floats and app-authored
+/// colours cannot fork it without limit (module header), and [`ATLAS_CAP`] caps
+/// the live count with LRU eviction as a backstop. Cleared wholesale on any edge
+/// that can change the mapped colours or the pixel scale.
 #[derive(Default)]
 pub(crate) struct Atlas {
     map: FxHashMap<AtlasKey, AtlasEntry>,
     /// Bumped on [`clear`](Self::clear); parts re-bind when their bound epoch
     /// no longer matches.
     epoch: u32,
+    /// Monotonic bind counter driving the LRU ordering.
+    clock: u64,
 }
 
 impl Atlas {
@@ -191,19 +408,30 @@ impl Atlas {
         self.epoch
     }
 
-    fn entry(
-        &mut self,
-        comp: &Compositing,
-        key: AtlasKey,
-        stops: &[(f64, crate::Color)],
-    ) -> Option<&AtlasEntry> {
-        use std::collections::hash_map::Entry;
-        match self.map.entry(key) {
-            Entry::Occupied(e) => Some(e.into_mut()),
-            Entry::Vacant(v) => {
-                let entry = rasterize(comp, &key, stops)?;
-                Some(v.insert(entry))
+    fn entry(&mut self, comp: &Compositing, key: &AtlasKey) -> Option<&AtlasEntry> {
+        self.clock += 1;
+        let now = self.clock;
+        if !self.map.contains_key(key) {
+            let entry = rasterize(comp, key)?;
+            if self.map.len() >= ATLAS_CAP {
+                self.evict_lru();
             }
+            self.map.insert(key.clone(), AtlasEntry { used: now, ..entry });
+        }
+        let e = self.map.get_mut(key)?;
+        e.used = now;
+        Some(e)
+    }
+
+    /// Drop the least recently bound source. Called only on a miss at capacity.
+    fn evict_lru(&mut self) {
+        if let Some(k) = self
+            .map
+            .iter()
+            .min_by_key(|(_, e)| e.used)
+            .map(|(k, _)| k.clone())
+        {
+            self.map.remove(&k);
         }
     }
 }
@@ -217,25 +445,25 @@ const GRAD_SRC_H: f32 = 16.0;
 
 /// Draw one atlas source: an FP16 surface of the shape's exact pixel size,
 /// painted through the app's output colour map ([`linear`]).
-fn rasterize(comp: &Compositing, key: &AtlasKey, stops: &[(f64, crate::Color)]) -> Option<AtlasEntry> {
+///
+/// The gradient stops come out of the KEY, so the pixels cannot disagree with
+/// the thing they are cached under.
+fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
     let scale = f32::from_bits(key.scale).max(0.01);
-    let color = crate::Color {
-        r: f32::from_bits(key.color[0]),
-        g: f32::from_bits(key.color[1]),
-        b: f32::from_bits(key.color[2]),
-        a: f32::from_bits(key.color[3]),
-    };
+    let color = color_of(key.color);
     // DIP geometry of the source.
-    let (dip_w, dip_h) = match key.shape {
+    let (dip_w, dip_h) = match &key.shape {
         ShapeKey::Solid => (4.0 / scale, 4.0 / scale),
         // Corners plus a 2-DIP stretchable centre column.
-        ShapeKey::HBar { h, r, .. } => (2.0 * f32::from_bits(r) + 2.0, f32::from_bits(h)),
-        ShapeKey::Circle { d } | ShapeKey::Check { d } => (f32::from_bits(d), f32::from_bits(d)),
+        ShapeKey::HBar { h, r, .. } => (2.0 * f32::from_bits(*r) + 2.0, f32::from_bits(*h)),
+        ShapeKey::Circle { d } | ShapeKey::Check { d } => {
+            (f32::from_bits(*d), f32::from_bits(*d))
+        }
         // Wide source for gradient resolution; rasterized at the bar's actual
         // DIP height so a rounded end's corner is circular (never vertically
         // stretched by the nine-grid, whose insets are horizontal only).
         ShapeKey::GradBar { h, .. } => {
-            let hh = f32::from_bits(h);
+            let hh = f32::from_bits(*h);
             (GRAD_SRC_W / scale, if hh > 0.0 { hh } else { GRAD_SRC_H / scale })
         }
     };
@@ -256,12 +484,12 @@ fn rasterize(comp: &Compositing, key: &AtlasKey, stops: &[(f64, crate::Color)]) 
         m32: origin.y as f32,
     });
     session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
-    if let ShapeKey::GradBar { r, .. } = key.shape {
+    if let ShapeKey::GradBar { r, stops, .. } = &key.shape {
         // Each stop rides the same output colour map as every solid; the
         // FP16 stop collection keeps subtle ramps from posterizing.
         let mapped: Vec<GradientStop> = stops
             .iter()
-            .map(|(p, c)| GradientStop::new(*p as f32, linear(*c)))
+            .map(|s| GradientStop::new(s.position(), linear(s.color())))
             .collect();
         if let Ok(g) = session.create_linear_gradient(
             CVec2::new(0.0, 0.0),
@@ -269,7 +497,7 @@ fn rasterize(comp: &Compositing, key: &AtlasKey, stops: &[(f64, crate::Color)]) 
             &mapped,
         ) {
             let rect = Rect::from_xywh(0.0, 0.0, dip_w, dip_h);
-            let radius = f32::from_bits(r);
+            let radius = f32::from_bits(*r);
             if radius > 0.0 {
                 session.fill_rounded_rect(&RoundedRect::uniform(rect, radius), &g);
             } else {
@@ -277,10 +505,10 @@ fn rasterize(comp: &Compositing, key: &AtlasKey, stops: &[(f64, crate::Color)]) 
             }
         }
     } else if let Ok(b) = session.create_solid_brush(linear(color)) {
-        draw_shape(&session, &b, key.shape, dip_w, dip_h);
+        draw_shape(&session, &b, &key.shape, dip_w, dip_h);
     }
     unsafe { interop.EndDraw() }.ok().ok()?;
-    Some(AtlasEntry { brush, _surface: surface })
+    Some(AtlasEntry { brush, _surface: surface, used: 0 })
 }
 
 /// A standalone FP16 gradient-bar surface brush (the same display-mapped raster
@@ -294,7 +522,7 @@ pub(crate) fn build_gradient_surface(
 ) -> Option<CompositionSurfaceBrush> {
     // Plain full-bleed stretch (r = 0): the knob strokes an arc SHAPE with this
     // as a Fill surface brush, so it must have no rounded (transparent) ends.
-    rasterize(comp, &AtlasKey::grad_bar(stops, 0.0, GRAD_SRC_H, scale), stops).map(|e| e.brush)
+    rasterize(comp, &AtlasKey::grad_bar(stops, 0.0, GRAD_SRC_H, scale)).map(|e| e.brush)
 }
 
 /// A standalone FP16 solid-color surface brush (display-mapped), for the Knob's
@@ -304,15 +532,15 @@ pub(crate) fn build_solid_surface(
     color: crate::Color,
     scale: f32,
 ) -> Option<CompositionSurfaceBrush> {
-    rasterize(comp, &AtlasKey::solid(color, scale), &[]).map(|e| e.brush)
+    rasterize(comp, &AtlasKey::solid(color, scale)).map(|e| e.brush)
 }
 
-fn draw_shape(session: &DrawingSession, brush: &Brush, shape: ShapeKey, w: f32, h: f32) {
+fn draw_shape(session: &DrawingSession, brush: &Brush, shape: &ShapeKey, w: f32, h: f32) {
     match shape {
         ShapeKey::Solid => session.fill_rect(&Rect::from_xywh(0.0, 0.0, w, h), brush),
         ShapeKey::HBar { r, stroke_w, .. } => {
-            let radius = f32::from_bits(r);
-            let sw = f32::from_bits(stroke_w);
+            let radius = f32::from_bits(*r);
+            let sw = f32::from_bits(*stroke_w);
             let rect = Rect::from_xywh(0.0, 0.0, w, h);
             if sw <= 0.0 {
                 session.fill_rounded_rect(&RoundedRect::uniform(rect, radius), brush);
@@ -324,7 +552,7 @@ fn draw_shape(session: &DrawingSession, brush: &Brush, shape: ShapeKey, w: f32, 
             }
         }
         ShapeKey::Circle { d } => {
-            let radius = f32::from_bits(d) / 2.0;
+            let radius = f32::from_bits(*d) / 2.0;
             session.fill_ellipse(
                 &Ellipse::new(CVec2::new(radius, radius), radius, radius),
                 brush,
@@ -335,7 +563,7 @@ fn draw_shape(session: &DrawingSession, brush: &Brush, shape: ShapeKey, w: f32, 
         // Stroke coordinates mirror the retired painted checkmark (authored in
         // an 18-DIP box), scaled to `d`.
         ShapeKey::Check { d } => {
-            let s = f32::from_bits(d) / 18.0;
+            let s = f32::from_bits(*d) / 18.0;
             session.draw_line(
                 CVec2::new(4.0 * s, 9.0 * s),
                 CVec2::new(7.5 * s, 12.5 * s),
@@ -356,6 +584,87 @@ fn draw_shape(session: &DrawingSession, brush: &Brush, shape: ShapeKey, w: f32, 
 // Part — one retained sprite with retargetable compositor springs
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The two facts about one animatable property that must never drift apart:
+/// the last target we ASKED for, and which animation (if any) may currently own
+/// the property.
+///
+/// They live in a module of their own with PRIVATE fields so that no site can
+/// update one without the other. Before, both were plain fields on `Part` and
+/// the pairing was a convention — one an out-of-band site (`loop_x`, the slider
+/// fill derivation) could satisfy halfway by nulling the cached target and
+/// forgetting the flag, leaving `Part::place` unable to reclaim the property it
+/// believed it owned. There is now no way to express that halfway state: every
+/// transition is one call, named for what actually happened to the property.
+mod channel {
+    /// The property token an animation was started on (`"Offset"`, `"Offset.X"`,
+    /// …) — the exact token a snap has to `StopAnimation`.
+    pub(super) type Prop = &'static str;
+
+    pub(super) struct Channel {
+        /// The last target REQUESTED, not where the visual is: while `animated`
+        /// is set this is not evidence of anything (see [`super::Part::place`]).
+        target: Option<(f32, f32)>,
+        /// The property an animation may currently hold.
+        animated: Option<Prop>,
+    }
+
+    impl Channel {
+        pub(super) const fn new() -> Self {
+            Self { target: None, animated: None }
+        }
+
+        /// Has this channel ever been written? A first write must snap —
+        /// mounting must never fly in from the visual's zeroed defaults.
+        pub(super) fn placed(&self) -> bool {
+            self.target.is_some()
+        }
+
+        /// The last requested target, if one is still meaningful.
+        pub(super) fn target(&self) -> Option<(f32, f32)> {
+            self.target
+        }
+
+        /// Begin an authoritative snap: yields the property token the caller
+        /// MUST stop (if any) and leaves the channel un-animated. A `Some`
+        /// result also means the cached target is stale, so the caller must
+        /// write unconditionally.
+        #[must_use]
+        pub(super) fn begin_snap(&mut self) -> Option<Prop> {
+            self.animated.take()
+        }
+
+        /// Record a plain property write of `t` (a snap).
+        pub(super) fn wrote(&mut self, t: (f32, f32)) {
+            self.target = Some(t);
+        }
+
+        /// A spring this `Part` owns now drives `prop` toward `t`.
+        pub(super) fn animating(&mut self, prop: Prop, t: (f32, f32)) {
+            self.target = Some(t);
+            self.animated = Some(prop);
+        }
+
+        /// Hand `prop` to an OUT-OF-BAND animation whose value this part does
+        /// not track — a forever-looping sweep, an expression derivation. Both
+        /// consequences follow from this single call, which is the whole point:
+        /// the cached target no longer describes the visual (so it must not
+        /// suppress a later write) AND a snap must stop `prop`.
+        pub(super) fn ceded(&mut self, prop: Prop) {
+            self.target = None;
+            self.animated = Some(prop);
+        }
+
+        /// The caller has ALREADY stopped whatever held the property. Nothing
+        /// animates it now, but the value it left behind is unknown, so the next
+        /// write must be unconditional.
+        pub(super) fn reclaimed(&mut self) {
+            self.target = None;
+            self.animated = None;
+        }
+    }
+}
+use channel::Channel;
+
 /// One chrome-part sprite. All mutation is change-gated against the last
 /// written *target* so an unchanged sync costs nothing, and all motion is a
 /// retarget of a cached compositor spring — zero allocation per event.
@@ -368,13 +677,12 @@ pub(crate) struct Part {
     /// The atlas source currently bound + the epoch it came from.
     key: Option<AtlasKey>,
     epoch: u32,
-    /// Last written targets (`None` = never placed → the next write snaps).
-    off: Option<(f32, f32)>,
-    size: Option<(f32, f32)>,
+    /// Offset / Size: last requested target + who owns the property.
+    off: Channel,
+    size: Channel,
     opacity: Option<f32>,
-    /// Whether a spring may currently hold the property (snap must stop it).
-    off_gliding: bool,
-    size_gliding: bool,
+    /// Whether a fade may currently hold Opacity (snap must stop it). Opacity
+    /// has no out-of-band writer, so it stays a plain flag.
     op_gliding: bool,
     // Cached retargetable motion springs, built on first glide.
     s_off: Option<SpringVector3NaturalMotionAnimation>,
@@ -393,11 +701,9 @@ impl Part {
             nine: None,
             key: None,
             epoch: 0,
-            off: None,
-            size: None,
+            off: Channel::new(),
+            size: Channel::new(),
             opacity: None,
-            off_gliding: false,
-            size_gliding: false,
             op_gliding: false,
             s_off: None,
             s_size: None,
@@ -410,35 +716,14 @@ impl Part {
     }
 
     /// Bind (or re-bind) this part's brush to the atlas source for `key`.
-    /// No-op while the key and atlas epoch are unchanged.
+    /// No-op while the key and atlas epoch are unchanged. A gradient bar's key
+    /// carries its own stop list, so there is nothing to supply alongside it.
     fn bind(&mut self, comp: &Compositing, atlas: &mut Atlas, key: AtlasKey) {
-        self.bind_with(comp, atlas, key, &[]);
-    }
-
-    /// [`bind`](Self::bind) for a gradient-bar key, supplying the stop list
-    /// the raster needs on a cache miss (the key carries only their hash).
-    fn bind_grad(
-        &mut self,
-        comp: &Compositing,
-        atlas: &mut Atlas,
-        key: AtlasKey,
-        stops: &[(f64, crate::Color)],
-    ) {
-        self.bind_with(comp, atlas, key, stops);
-    }
-
-    fn bind_with(
-        &mut self,
-        comp: &Compositing,
-        atlas: &mut Atlas,
-        key: AtlasKey,
-        stops: &[(f64, crate::Color)],
-    ) {
-        if self.key == Some(key) && self.epoch == atlas.epoch {
+        if self.key.as_ref() == Some(&key) && self.epoch == atlas.epoch {
             return;
         }
         let epoch = atlas.epoch;
-        let Some(entry) = atlas.entry(comp, key, stops) else { return };
+        let Some(entry) = atlas.entry(comp, &key) else { return };
         let brush: Option<CompositionBrush> = if key.uses_nine_grid() {
             // Corners map 1:1 back to DIPs: source insets are `r * scale` px,
             // scaled down by `1 / scale` on the destination.
@@ -485,46 +770,42 @@ impl Part {
     /// every later request for T is dropped as redundant, wedging the part
     /// until some different target happens to arrive.
     fn place(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        let off_stale = self.off_gliding;
-        if off_stale {
-            let _ = self.obj.StopAnimation("Offset");
-            self.off_gliding = false;
+        let off_held = self.off.begin_snap();
+        if let Some(prop) = off_held {
+            let _ = self.obj.StopAnimation(prop);
         }
-        if off_stale || self.off != Some((x, y)) {
+        if off_held.is_some() || self.off.target() != Some((x, y)) {
             let _ = self.vis.SetOffset(Vector3::new(x, y, 0.0));
-            self.off = Some((x, y));
+            self.off.wrote((x, y));
         }
-        let size_stale = self.size_gliding;
-        if size_stale {
-            let _ = self.obj.StopAnimation("Size");
-            self.size_gliding = false;
+        let size_held = self.size.begin_snap();
+        if let Some(prop) = size_held {
+            let _ = self.obj.StopAnimation(prop);
         }
-        if size_stale || self.size != Some((w, h)) {
+        if size_held.is_some() || self.size.target() != Some((w, h)) {
             let _ = self.vis.SetSize(Vector2::new(w, h));
-            self.size = Some((w, h));
+            self.size.wrote((w, h));
         }
     }
 
     /// Spring-glide position + size to a new target. First placement snaps
     /// (mounting must never fly in from the visual's zeroed defaults).
     fn glide(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        if self.off.is_none() || self.size.is_none() {
+        if !self.off.placed() || !self.size.placed() {
             self.place(x, y, w, h);
             return;
         }
-        if self.off != Some((x, y)) {
+        if self.off.target() != Some((x, y)) {
             if self.glide_offset(x, y).is_some() {
-                self.off = Some((x, y));
-                self.off_gliding = true;
+                self.off.animating("Offset", (x, y));
             } else {
                 self.place(x, y, w, h);
                 return;
             }
         }
-        if self.size != Some((w, h)) {
+        if self.size.target() != Some((w, h)) {
             if self.glide_size(w, h).is_some() {
-                self.size = Some((w, h));
-                self.size_gliding = true;
+                self.size.animating("Size", (w, h));
             } else {
                 self.place(x, y, w, h);
             }
@@ -637,9 +918,10 @@ impl Part {
                 .StartAnimation("Offset.X", &a.cast::<CompositionAnimation>().ok()?)
                 .ok()
         };
-        // The loop owns Offset.X from here; drop the offset gate so a later
-        // place() rewrites the full offset unconditionally.
-        self.off = None;
+        // The loop owns Offset.X from here. Ceding says BOTH halves at once:
+        // the cached target no longer describes the visual, and a later
+        // `place` must stop `Offset.X` before it can reclaim the property.
+        self.off.ceded("Offset.X");
         run().is_some()
     }
 
@@ -647,7 +929,9 @@ impl Part {
     /// re-anchors the offset.
     fn stop_loop_x(&mut self) {
         let _ = self.obj.StopAnimation("Offset.X");
-        self.off = None;
+        // Stopped here, so nothing animates Offset — but the loop left the
+        // visual at an unknown X, so the next write must be unconditional.
+        self.off.reclaimed();
     }
 }
 
@@ -688,6 +972,10 @@ pub(crate) struct Parts {
     clip: Option<InsetClip>,
     /// Track width the reveal expression was last built for.
     clip_w: f32,
+    /// Meter: the gradient-bar atlas key last built. Reused while the ramp,
+    /// bar height and scale are unchanged, so a steady repaint clones an `Rc`
+    /// instead of allocating a fresh stop list (see [`grad_bar_key`]).
+    grad_key: Option<AtlasKey>,
     /// Slider: whether expressions currently DERIVE the fill'''s rect from the
     /// thumb'''s offset.
     ///
@@ -728,6 +1016,7 @@ impl Parts {
             looping: false,
             clip: None,
             clip_w: 0.0,
+            grad_key: None,
             fill_live: std::rc::Rc::new(std::cell::Cell::new(false)),
             fill_gen: std::rc::Rc::new(std::cell::Cell::new(0)),
             _fill_settle: None,
@@ -911,6 +1200,11 @@ pub(crate) fn ink_state_changed(node: &mut Node) {
         // before this flip, so the ink must land on it, not fade in wherever
         // it last sat.
         ControlKind::SelectorBar => seg_hot_changed(node),
+        // Same reason as the SelectorBar, and the same hazard the default arm
+        // below would cause: a nav pane's `above[0]` is the ROW ink, placed on
+        // the hot row. Fading it to a node-level hover target would light it up
+        // wherever it last sat, on whichever row the pointer left.
+        ControlKind::NavigationView => nav_hot_changed(node),
         // No ink: the CheckBox / hyperlink hover feedback is painted (the
         // caller repaints once, event-driven); progress is not interactive.
         // Careful: the CheckBox's above[0] is its CHECKMARK — the default arm
@@ -933,7 +1227,7 @@ pub(crate) fn ink_state_changed(node: &mut Node) {
 // ── ToggleSwitch ─────────────────────────────────────────────────────────────
 
 /// Track geometry mirrors the retired `paint_toggle_switch`.
-const TRACK_W: f32 = 40.0;
+pub(crate) const TRACK_W: f32 = 40.0;
 const TRACK_H: f32 = 20.0;
 const KNOB_D: f32 = 12.0;
 
@@ -951,7 +1245,7 @@ fn toggle_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
         return;
     }
     let cy = node.rect.h / 2.0;
-    let on = node.ctrl.is_on;
+    let on = node.ctrl().is_on;
     let dim = dim_of(node);
     let (kx_off, kx_on) = knob_xs();
     let kx = if on { kx_on } else { kx_off };
@@ -1004,7 +1298,7 @@ fn track_targets(on: bool, hovered: bool, dim: f32) -> (f32, f32) {
 
 /// Hover flipped on the toggle: refade the off-track outline.
 fn toggle_fades(node: &mut Node) {
-    let (_, off_t) = track_targets(node.ctrl.is_on, node.hovered, dim_of(node));
+    let (_, off_t) = track_targets(node.ctrl().is_on, node.hovered, dim_of(node));
     if let Some(parts) = node.parts.as_mut()
         && parts.below.len() == 3
     {
@@ -1025,7 +1319,7 @@ fn check_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32
     if !ensure(comp, node, 1, 1) {
         return;
     }
-    let on = node.ctrl.is_checked;
+    let on = node.ctrl().is_checked;
     let t = if on { dim_of(node) } else { 0.0 };
     let y = node.rect.h / 2.0 - CHECK_BOX_D / 2.0;
     let k_fill = AtlasKey::hbar(CHECK_BOX_D, theme::RADIUS_SM, 0.0, theme::accent(), scale);
@@ -1063,12 +1357,12 @@ fn halo_target(node: &Node) -> f32 {
 /// The slider's fill-origin as a 0..1 track fraction (`fill_origin` clamped
 /// into `[min, max]`; unset = 0.0, i.e. fill from the `min` end).
 pub(crate) fn slider_origin_frac(node: &Node) -> f32 {
-    let Some(o) = node.ctrl.fill_origin else { return 0.0 };
-    let span = node.ctrl.max - node.ctrl.min;
+    let Some(o) = node.ctrl().fill_origin else { return 0.0 };
+    let span = node.ctrl().max - node.ctrl().min;
     if span.abs() < f64::EPSILON {
         0.0
     } else {
-        ((o - node.ctrl.min) / span).clamp(0.0, 1.0) as f32
+        ((o - node.ctrl().min) / span).clamp(0.0, 1.0) as f32
     }
 }
 
@@ -1076,11 +1370,11 @@ pub(crate) fn slider_origin_frac(node: &Node) -> f32 {
 /// below → `fill_color`, above → `fill_color_alt` (each falling back toward
 /// the theme accent). Authored colors — the atlas raster display-maps them.
 fn slider_fill_color(node: &Node, vfrac: f32, ofrac: f32) -> crate::Color {
-    let below = node.ctrl.fill_color.unwrap_or_else(theme::accent);
+    let below = node.ctrl().fill_color.unwrap_or_else(theme::accent);
     if vfrac <= ofrac {
         below
     } else {
-        node.ctrl.fill_color_alt.unwrap_or(below)
+        node.ctrl().fill_color_alt.unwrap_or(below)
     }
 }
 
@@ -1167,6 +1461,9 @@ fn slider_geom(w: f32, h: f32, frac: f32, ofrac: f32) -> SliderGeom {
 }
 
 fn slider_apply(parts: &mut Parts, g: &SliderGeom, snap: bool) {
+    // The ONE way a part moves here. Everything that animates therefore goes
+    // through `Part::glide` and so shares `SPRING_PERIOD` / `SPRING_DAMPING` —
+    // the coupling the settle batch below depends on.
     let put = |p: &mut Part, r: (f32, f32, f32, f32), snap: bool| {
         if snap {
             p.place(r.0, r.1, r.2, r.3);
@@ -1175,7 +1472,7 @@ fn slider_apply(parts: &mut Parts, g: &SliderGeom, snap: bool) {
         }
     };
     // First write snaps, matching `Part::glide` — mounting must not fly in.
-    let snap = snap || (parts.above[0].off.is_none() && !parts.fill_live.get());
+    let snap = snap || (!parts.above[0].off.placed() && !parts.fill_live.get());
     if snap {
         slider_fill_static(parts, g.fill);
         put(&mut parts.above[1], g.halo, true);
@@ -1191,8 +1488,21 @@ fn slider_apply(parts: &mut Parts, g: &SliderGeom, snap: bool) {
         put(&mut parts.above[2], g.thumb, true);
         return;
     }
-    // The thumb's glide is the only animation in the batch, so its completion
-    // is exactly when the derived fill has reached its final rect.
+    // The halo and the thumb BOTH glide inside this batch, so the batch does
+    // not complete when the thumb does — it completes when the last of them
+    // does. Reading that completion as "the derived fill has arrived" is sound
+    // only because every animation in the batch is a `Part::glide`, and every
+    // `Part::glide` is a spring built with the one shared `SPRING_PERIOD` /
+    // `SPRING_DAMPING` pair: same tuning, both retargeted in the same tick, so
+    // they settle together and the thumb-derived fill is at its final rect
+    // whichever one reports last.
+    //
+    // That is the invariant to preserve: anything added to this batch must go
+    // through `Part::glide` (hence the shared tuning). An animation with its own
+    // timing — a keyframe fade, a differently tuned spring — would push the
+    // completion past the thumb's arrival and leave the derivation evaluating
+    // every frame until it finished, or (if shorter) tear the derivation down
+    // while the fill was still mid-flight.
     let batch = parts
         .above[2]
         .obj
@@ -1214,9 +1524,11 @@ fn slider_fill_static(parts: &mut Parts, r: (f32, f32, f32, f32)) {
     if parts.fill_live.replace(false) {
         let _ = fill.obj.StopAnimation("Offset.X");
         let _ = fill.obj.StopAnimation("Size.X");
-        // The derivation wrote X behind `Part`'s back — its cache is stale.
-        fill.off = None;
-        fill.size = None;
+        // The derivation wrote X behind `Part`'s back and is now stopped: no
+        // animation holds either property, but where it left them is unknown,
+        // so the `place` below must write unconditionally.
+        fill.off.reclaimed();
+        fill.size.reclaimed();
     }
     fill.place(r.0, r.1, r.2, r.3);
 }
@@ -1265,10 +1577,12 @@ fn slider_fill_follow(parts: &mut Parts, anchor: (f32, f32, f32)) -> bool {
         .is_some();
     if armed {
         parts.fill_live.set(true);
-        // X is owned by the derivation now; the cached rect no longer describes
-        // the visual, so it must not suppress a later write.
-        parts.above[0].off = None;
-        parts.above[0].size = None;
+        // The expressions own X now. Ceding is the one call that says both
+        // halves: the cached rect no longer describes the visual (so it must
+        // not suppress a later write) AND a `Part::place` must stop these
+        // subchannel animations before it can reclaim the properties.
+        parts.above[0].off.ceded("Offset.X");
+        parts.above[0].size.ceded("Size.X");
     }
     armed
 }
@@ -1350,29 +1664,30 @@ fn meter_sync(
     let top = theme::METER_INSET;
     let bar_h = (h - 2.0 * top).max(1.0);
     let marker_x = super::controls::meter_marker_frac(node).map(|f| f * w);
-    let marker_c = node.ctrl.marker_color.unwrap_or_else(|| theme::w(0.15));
+    let marker_c = node.ctrl().marker_color.unwrap_or_else(|| theme::w(0.15));
 
-    let k_fill = if node.ctrl.stops.is_empty() {
-        AtlasKey::hbar(bar_h, theme::METER_RADIUS, 0.0, theme::accent(), scale)
-    } else {
-        // Rounded ends (nine-grid) so the coloured fill matches the groove's
-        // rounded corners; the reveal clip trims the straight leading edge.
-        AtlasKey::grad_bar(&node.ctrl.stops, theme::METER_RADIUS, bar_h, scale)
-    };
     let k_marker = AtlasKey::solid(marker_c, scale);
     let k_white = AtlasKey::solid(theme::w(1.0), scale);
 
     let geom = (w, h);
-    let stops = &node.ctrl.stops;
-    let Some(parts) = node.parts.as_mut() else { return };
+    let gradient = !node.ctrl().stops.is_empty();
+    let (ctrl, parts) = node.ctrl_and_parts();
+    let Some(parts) = parts else { return };
+    let k_fill = if gradient {
+        // Rounded ends (nine-grid) so the coloured fill matches the groove's
+        // rounded corners; the reveal clip trims the straight leading edge.
+        grad_bar_key(&mut parts.grad_key, &ctrl.stops, theme::METER_RADIUS, bar_h, scale)
+    } else {
+        AtlasKey::hbar(bar_h, theme::METER_RADIUS, 0.0, theme::accent(), scale)
+    };
     // A meter is a pure follower: it glides to a discrete change, but tracks a
     // drag 1:1. Springing a stream of per-move updates would restart the needle
     // spring every frame and leave the level pinned until the pointer stopped.
     let snap = !parts.init || parts.geom != geom || scrubbing;
 
-    parts.above[0].bind_grad(comp, atlas, k_fill, stops);
+    parts.above[0].bind(comp, atlas, k_fill);
     parts.above[1].bind(comp, atlas, k_marker);
-    parts.above[2].bind(comp, atlas, k_white);
+    parts.above[2].bind(comp, atlas, k_white.clone());
     parts.above[3].bind(comp, atlas, k_white);
 
     parts.above[0].place(0.0, top, w, bar_h);
@@ -1455,7 +1770,7 @@ fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale:
     if !ensure(comp, node, 4, 0) {
         return;
     }
-    let n = node.ctrl.items.len();
+    let n = node.ctrl().items.len();
     let (w, h) = (node.rect.w, node.rect.h);
     let accent = node.paint.style_variant == 1;
     let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
@@ -1474,14 +1789,14 @@ fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale:
     let k_pill = AtlasKey::hbar(pill_h, seg_radius, 0.0, pill_fill, scale);
     let k_ink = AtlasKey::hbar(pill_h, seg_radius, 0.0, theme::w(1.0), scale);
 
-    let sel = if n == 0 { -1 } else { (node.ctrl.selected_index.max(0)).min(n as i32 - 1) };
+    let sel = if n == 0 { -1 } else { (node.ctrl().selected_index.max(0)).min(n as i32 - 1) };
     let seg_rect = |i: i32| -> Option<(f32, f32, f32, f32)> {
         let i = usize::try_from(i).ok()?;
         let (a, b) = (*edges.get(i)?, *edges.get(i + 1)?);
         Some((a, m.tray, b - a, pill_h))
     };
     let pill = seg_rect(sel);
-    let hot = node.ctrl.hot_index;
+    let hot = node.ctrl().hot_index;
     let ink = seg_rect(hot);
     let ink_t = seg_ink_target(node);
 
@@ -1525,7 +1840,7 @@ fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale:
 }
 
 fn seg_ink_target(node: &Node) -> f32 {
-    if node.paint.is_enabled && node.hovered && node.ctrl.hot_index >= 0 {
+    if node.paint.is_enabled && node.hovered && node.ctrl().hot_index >= 0 {
         wash(0.05)
     } else {
         0.0
@@ -1539,7 +1854,7 @@ pub(crate) fn seg_hot_changed(node: &mut Node) {
     let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
     let edges = super::controls::segment_edges(node);
     let pill_h = (node.rect.h - 2.0 * m.tray).max(0.0);
-    let hot = node.ctrl.hot_index;
+    let hot = node.ctrl().hot_index;
     let rect = usize::try_from(hot).ok().and_then(|i| {
         let (a, b) = (*edges.get(i)?, *edges.get(i + 1)?);
         Some((a, m.tray, b - a, pill_h))
@@ -1555,40 +1870,80 @@ pub(crate) fn seg_hot_changed(node: &mut Node) {
     }
 }
 
-// ── NavigationView (icon rail) ───────────────────────────────────────────────
+// ── NavigationView pane ──────────────────────────────────────────
 
-/// Below-band roles: `[rail background, active tile, accent bar]`.
+/// Below-band roles: `[pane background, active tile, accent bar]`; above:
+/// `[row hover ink]`.
+///
+/// Three things move here and all three move on the compositor: the pane's
+/// WIDTH when it opens or closes, the selection tile and its accent bar when
+/// the selected page changes, and the hover ink as the pointer crosses rows.
+/// The pane's painted layer (glyphs, labels, divider) snaps to the new width in
+/// the same repaint that starts the glide — the geometry is retained chrome,
+/// the text is not, and a text layout cannot be interpolated.
 fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 3, 0) {
+    if !ensure(comp, node, 3, 1) {
         return;
     }
-    let h = node.rect.h;
+    let (w, h) = (node.rect.w, node.rect.h);
     let dim = dim_of(node);
-    let item_h = super::controls::NAV_ITEM_H;
-    let sel = node.ctrl.selected_index;
-    let visible = sel >= 0 && !node.ctrl.items.is_empty();
-    let iy = sel.max(0) as f32 * item_h;
+    let count = node.ctrl().items.len();
+    let has_title = node.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+    let m = nav::metrics(node.extras(), w, has_title);
+    let n = nav::visible_items(&m, h, count);
+    let sel = node.ctrl().selected_index;
+    let enabled = node.paint.is_enabled;
+    let visible = sel >= 0 && (sel as usize) < n;
 
     let k_bg = AtlasKey::solid(theme::surface_sunken(), scale);
-    let k_tile = AtlasKey::hbar(item_h - theme::SPACE_8, theme::RADIUS_SM, 0.0, theme::accent_fill(), scale);
+    let k_tile = AtlasKey::hbar(
+        nav::ITEM_H - theme::SPACE_8,
+        theme::RADIUS_SM,
+        0.0,
+        theme::accent_fill(),
+        scale,
+    );
     let bar_h = theme::SPACE_16;
     let k_bar = AtlasKey::hbar(bar_h, theme::BORDER_W, 0.0, theme::accent(), scale);
+    let k_ink = AtlasKey::hbar(
+        nav::ITEM_H - theme::SPACE_8,
+        theme::RADIUS_SM,
+        0.0,
+        theme::w(1.0),
+        scale,
+    );
 
+    let row = nav::item_rect(&m, sel.max(0));
     let tile = (
         theme::SPACE_4,
-        iy + theme::SPACE_4,
-        theme::NAV_RAIL_W - theme::SPACE_8,
-        item_h - theme::SPACE_8,
+        row.top + theme::SPACE_4,
+        (m.width - theme::SPACE_8).max(0.0),
+        nav::ITEM_H - theme::SPACE_8,
     );
-    let bar = (0.0, iy + (item_h - bar_h) / 2.0, theme::BORDER_W * 3.0, bar_h);
+    let bar = (
+        0.0,
+        row.top + (nav::ITEM_H - bar_h) / 2.0,
+        theme::BORDER_W * 3.0,
+        bar_h,
+    );
+
+    let ink_row = nav_ink_rect(node);
 
     let Some(parts) = node.parts.as_mut() else { return };
-    let snap = !parts.init || parts.geom != (theme::NAV_RAIL_W, h);
+    // A HEIGHT change snaps (a resize must not play as motion); a WIDTH change
+    // is exactly the pane opening or closing, so it glides.
+    let snap = !parts.init || parts.geom.1 != h;
 
     parts.below[0].bind(comp, atlas, k_bg);
     parts.below[1].bind(comp, atlas, k_tile);
     parts.below[2].bind(comp, atlas, k_bar);
-    parts.below[0].place(0.0, 0.0, theme::NAV_RAIL_W, h);
+    parts.above[0].bind(comp, atlas, k_ink);
+
+    if snap {
+        parts.below[0].place(0.0, 0.0, m.width, h);
+    } else {
+        parts.below[0].glide(0.0, 0.0, m.width, h);
+    }
     parts.below[0].set_opacity(dim);
 
     if visible {
@@ -1605,9 +1960,79 @@ fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) 
         parts.below[1].set_opacity(0.0);
         parts.below[2].set_opacity(0.0);
     }
+
+    match ink_row.filter(|_| enabled) {
+        Some(r) => {
+            // Snap the ink to the newly hovered row, then fade it in: a glide
+            // would draw a wash sliding down the pane between two rows the
+            // pointer never paused on.
+            parts.above[0].place(r.0, r.1, r.2, r.3);
+            if parts.init {
+                parts.above[0].fade_to(wash(0.06) * dim);
+            } else {
+                parts.above[0].set_opacity(wash(0.06) * dim);
+            }
+        }
+        None if parts.init => parts.above[0].fade_to(0.0),
+        None => parts.above[0].set_opacity(0.0),
+    }
+
     parts.sel = sel;
-    parts.geom = (theme::NAV_RAIL_W, h);
+    parts.geom = (m.width, h);
     parts.init = true;
+}
+
+/// The hover ink's box for whatever row a nav pane currently calls hot, in
+/// node-local DIPs. `None` when nothing is hovered.
+///
+/// The one definition the full sync and the hover edge below both read, so an
+/// ink placed by a hover and an ink placed by a repaint cannot land differently.
+/// A settings row hovers at its own sentinel index, so one sprite serves both it
+/// and the menu rows without a second part.
+fn nav_ink_rect(node: &Node) -> Option<(f32, f32, f32, f32)> {
+    let hot = node.ctrl().hot_index;
+    if hot == -1 {
+        return None;
+    }
+    let has_title = node.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+    let m = nav::metrics(node.extras(), node.rect.w, has_title);
+    let n = nav::visible_items(&m, node.rect.h, node.ctrl().items.len()) as i32;
+    let row = if (0..n).contains(&hot) {
+        nav::item_rect(&m, hot)
+    } else if hot == nav::HOT_SETTINGS_BASE {
+        nav::settings_rect(&m, node.rect.h)?
+    } else {
+        // The two chrome buttons wash on the node's own surface (a flat state
+        // fill, like the caption band's back button), not through this sprite.
+        return None;
+    };
+    Some((
+        theme::SPACE_4,
+        row.top + theme::SPACE_4,
+        (m.width - theme::SPACE_8).max(0.0),
+        nav::ITEM_H - theme::SPACE_8,
+    ))
+}
+
+/// The hot row moved while the pointer stayed on the pane: place the ink on the
+/// new row, then fade to the target. Place *and* fade, for the reason
+/// [`seg_hot_changed`] does both — on hover entry the hot row was recorded
+/// before this call, so the ink must land on it rather than fade in wherever it
+/// last sat.
+pub(crate) fn nav_hot_changed(node: &mut Node) {
+    let rect = nav_ink_rect(node).filter(|_| node.paint.is_enabled && node.hovered);
+    let dim = dim_of(node);
+    let Some(parts) = node.parts.as_mut() else { return };
+    if parts.above.is_empty() {
+        return;
+    }
+    match rect {
+        Some((x, y, w, h)) => {
+            parts.above[0].place(x, y, w, h);
+            parts.above[0].fade_to(wash(0.06) * dim);
+        }
+        None => parts.above[0].fade_to(0.0),
+    }
 }
 
 // ── Expander ─────────────────────────────────────────────────────────────────
@@ -1661,7 +2086,7 @@ fn progress_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: 
     let y = h / 2.0 - bar_h / 2.0;
     let dim = dim_of(node);
     let frac = (super::ctrl_value_frac(node) as f32).clamp(0.0, 1.0);
-    let ind = node.ctrl.indeterminate;
+    let ind = node.ctrl().indeterminate;
     let k_track = AtlasKey::hbar(bar_h, bar_h / 2.0, 0.0, theme::w(0.08), scale);
     let k_fill = AtlasKey::hbar(bar_h, bar_h / 2.0, 0.0, theme::accent(), scale);
 
@@ -1669,7 +2094,7 @@ fn progress_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: 
     let snap = !parts.init || parts.geom != (w, h);
 
     parts.below[0].bind(comp, atlas, k_track);
-    parts.below[1].bind(comp, atlas, k_fill);
+    parts.below[1].bind(comp, atlas, k_fill.clone());
     parts.below[2].bind(comp, atlas, k_fill);
     parts.below[0].place(0.0, y, w, bar_h);
     parts.below[0].set_opacity(dim);
@@ -1713,7 +2138,7 @@ fn ring_sync(comp: &Compositing, node: &mut Node) {
         return;
     }
     let (w, h) = (node.rect.w, node.rect.h);
-    let ind = node.ctrl.indeterminate;
+    let ind = node.ctrl().indeterminate;
     let Some(surf) = node.surf.as_ref() else { return };
     let (Ok(vis), Ok(obj)) = (
         surf.sprite.cast::<IVisual>(),
@@ -1788,11 +2213,11 @@ impl Caret {
     /// Bind (or re-bind) the solid atlas source for `key` (same epoch contract
     /// as [`Part::bind`]).
     fn bind(&mut self, comp: &Compositing, atlas: &mut Atlas, key: AtlasKey) {
-        if self.key == Some(key) && self.epoch == atlas.epoch {
+        if self.key.as_ref() == Some(&key) && self.epoch == atlas.epoch {
             return;
         }
         let epoch = atlas.epoch;
-        let Some(entry) = atlas.entry(comp, key, &[]) else { return };
+        let Some(entry) = atlas.entry(comp, &key) else { return };
         if let Ok(b) = entry.brush.cast::<CompositionBrush>()
             && self.sprite.SetBrush(&b).is_ok()
         {

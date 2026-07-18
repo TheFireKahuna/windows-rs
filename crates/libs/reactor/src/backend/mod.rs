@@ -16,6 +16,12 @@ pub use winui::WinUIBackend;
 #[cfg(feature = "dcomp-backend")]
 pub(crate) mod dcomp;
 
+/// Narrow, purpose-built test surface over the DComp backend's `pub(crate)`
+/// internals. Compiled only for `dcomp-backend` + `test`; never in a shipping
+/// build.
+#[cfg(all(feature = "dcomp-backend", feature = "test"))]
+pub mod dcomp_test_api;
+
 #[cfg(feature = "dcomp-backend")]
 pub use dcomp::{
     set_display_change_callback, set_host_tokens, set_output_color_transform,

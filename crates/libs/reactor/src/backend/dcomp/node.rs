@@ -20,10 +20,14 @@ use crate::style::{
 };
 use crate::system_bindings::{
     ContainerVisual, ICompositionObject, ICompositionObject2, IVisual, ImplicitAnimationCollection,
-    InsetClip,
+    InsetClip, Visual,
 };
 use crate::Color;
 use crate::LineEndpoints;
+use crate::{
+    FlyoutDef, FlyoutPlacementMode, NavigationViewPaneDisplayMode, PasswordRevealMode,
+    ScrollBarVisibility,
+};
 use windows_canvas_core::{ColorF, TextLayout};
 use windows_core::Interface;
 use windows_numerics::{Vector2, Vector3};
@@ -56,7 +60,7 @@ impl LaidRect {
 
 /// The painted content of a node, separate from layout. All optional — a bare
 /// `StackPanel`/`Grid`/`Canvas` paints nothing itself.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct Paint {
     pub background: Option<Color>,
     pub corner_radius: f32,
@@ -79,7 +83,7 @@ pub(crate) struct Paint {
 }
 
 /// A single command row in a popup menu / dropdown list.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub(crate) struct MenuRow {
     pub text: String,
     pub tag: String,
@@ -91,9 +95,203 @@ pub(crate) struct MenuRow {
     pub separator: bool,
 }
 
+/// The chrome-heavy control state only a handful of kinds ever carry: the
+/// caption strip's titles, the NavigationView pane and its embedded search box,
+/// the scrollbar visibility policy, a button's flyout/icon, the ToggleSwitch
+/// on/off labels, and the editor / repeat-button policy flags.
+///
+/// Boxed inside [`Ctrl`] and allocated on first write, for the same reason
+/// `Ctrl` is boxed inside [`Node`]: a `Ctrl` already exists on every Slider,
+/// Knob, ToggleSwitch and ComboBox, and none of those carry ANY of this. Inline
+/// it would be ~250 bytes of `String`/`Vec` headers on each of them; behind the
+/// box it is one pointer, and a real tree holds at most one TitleBar and one
+/// NavigationView.
+///
+/// Every field here is currently **written and reset but not yet drawn** — see
+/// [`Status::Stored`](super::Status::Stored). The state lands so the drawing
+/// side can be written against a node that already holds the right value.
+#[derive(Clone, Debug)]
+pub(crate) struct Extras {
+    // ── TitleBar ─────────────────────────────────────────────────────────
+    /// Caption title text (`Prop::Title`).
+    pub title: String,
+    /// Caption subtitle, drawn after the title in a dimmer style.
+    pub subtitle: String,
+    /// Tall (double-height) caption band.
+    pub tall: bool,
+    /// TitleBar back button: shown / clickable.
+    pub back_button_visible: bool,
+    pub back_button_enabled: bool,
+    /// TitleBar + NavigationView: the pane (hamburger) toggle is shown.
+    pub pane_toggle_visible: bool,
+
+    // ── NavigationView ───────────────────────────────────────────────────
+    /// The nav pane's own back arrow is enabled (`Prop::IsBackEnabled` — a
+    /// different seam prop from the TitleBar's `IsBackButtonEnabled`).
+    pub back_enabled: bool,
+    /// The settings row is present at the foot of the pane.
+    pub settings_visible: bool,
+    /// The pane is expanded rather than collapsed to the icon rail.
+    pub pane_open: bool,
+    /// Header text drawn above the menu items.
+    pub pane_title: String,
+    /// `NavigationViewPaneDisplayMode` as delivered (WinRT discriminant).
+    pub pane_display_mode: i32,
+    /// Expanded pane width (DIP).
+    pub open_pane_length: f64,
+    /// The pane hosts an embedded search box.
+    pub search_box: bool,
+    /// Suggestions offered by that search box.
+    pub suggest_items: Vec<String>,
+    pub suggest_placeholder: String,
+
+    // ── Scroll containers ────────────────────────────────────────────────
+    /// `ScrollBarVisibility` per axis as delivered (WinRT discriminant).
+    pub h_scrollbar: i32,
+    pub v_scrollbar: i32,
+
+    // ── Button ───────────────────────────────────────────────────────────
+    /// Attached flyout. A `Str` value arrives as [`FlyoutDef::text`], so both
+    /// shapes the seam sends land in the same field with nothing dropped.
+    pub flyout: Option<Box<FlyoutDef>>,
+    /// `FlyoutPlacementMode` as delivered (WinRT discriminant).
+    pub flyout_placement: i32,
+    /// Leading icon glyph codepoint (a `Symbol`'s value), 0 = none — the same
+    /// encoding [`Ctrl::icons`] and [`MenuRow::icon`] already use.
+    pub icon: u32,
+
+    // ── HyperlinkButton ──────────────────────────────────────────────────
+    /// Target URI (empty = none).
+    pub navigate_uri: String,
+
+    // ── ToggleSwitch ─────────────────────────────────────────────────────
+    /// Labels drawn beside the track per state (empty = none).
+    pub on_content: String,
+    pub off_content: String,
+
+    // ── Editors / text ───────────────────────────────────────────────────
+    /// ComboBox: the closed box is a text field, not just a display.
+    pub is_editable: bool,
+    /// TextBox: Enter inserts a newline instead of committing.
+    pub accepts_return: bool,
+    /// `PasswordRevealMode` as delivered (WinRT discriminant).
+    pub password_reveal_mode: i32,
+    /// PasswordBox: the reveal ("eye") button is offered.
+    pub password_reveal_button: bool,
+    /// TextBlock: its text can be selected with the pointer.
+    pub text_selectable: bool,
+
+    // ── RepeatButton ─────────────────────────────────────────────────────
+    /// Milliseconds before the first repeat, then between repeats.
+    pub repeat_delay: i32,
+    pub repeat_interval: i32,
+}
+
+impl Extras {
+    /// The state every node starts in, as a `const` so it can also back
+    /// [`EMPTY_EXTRAS`] — the value a node with no allocated `Extras` reads as.
+    /// Same single-definition discipline as [`Ctrl::DEFAULT`], and for the same
+    /// reason: the absent and the untouched read must be indistinguishable.
+    ///
+    /// The non-empty entries are the ones a node can actually be observed at,
+    /// because their widget binding is CONDITIONAL — it disappears (arriving
+    /// here as `PropValue::Unset`) exactly when the widget field holds its own
+    /// default. Each therefore mirrors that widget default rather than a zero:
+    /// `NavigationView::default()` has `is_back_button_visible: true`,
+    /// `is_pane_toggle_button_visible: true`, `is_settings_visible: true`,
+    /// `is_pane_open: true` and `open_pane_length: 320.0`;
+    /// `PasswordBox::default()` has `is_password_reveal_button_enabled: true`;
+    /// `RepeatButton::default()` has `delay: 500, interval: 33`. The enum
+    /// fields take the WinRT enumerator the unset state means, by name.
+    pub const DEFAULT: Extras = Extras {
+        title: String::new(),
+        subtitle: String::new(),
+        tall: false,
+        back_button_visible: true,
+        back_button_enabled: false,
+        pane_toggle_visible: true,
+        back_enabled: false,
+        settings_visible: true,
+        pane_open: true,
+        pane_title: String::new(),
+        pane_display_mode: NavigationViewPaneDisplayMode::Auto.0,
+        open_pane_length: 320.0,
+        search_box: false,
+        suggest_items: Vec::new(),
+        suggest_placeholder: String::new(),
+        h_scrollbar: ScrollBarVisibility::Auto.0,
+        v_scrollbar: ScrollBarVisibility::Auto.0,
+        flyout: None,
+        flyout_placement: FlyoutPlacementMode::Top.0,
+        icon: 0,
+        navigate_uri: String::new(),
+        on_content: String::new(),
+        off_content: String::new(),
+        is_editable: false,
+        accepts_return: false,
+        password_reveal_mode: PasswordRevealMode::Peek.0,
+        password_reveal_button: true,
+        text_selectable: false,
+        repeat_delay: 500,
+        repeat_interval: 33,
+    };
+}
+
+impl Default for Extras {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The lazily-boxed [`Extras`] inside a [`Ctrl`].
+///
+/// A newtype purely so `Debug` can tell the truth about the invariant: an
+/// absent `Extras` READS as [`Extras::DEFAULT`], so it must also PRINT as it.
+/// Derived on the `Option` it would print `None` where a materialised-but-
+/// untouched one prints its fields, making two states that are equivalent by
+/// construction look different to anything that compares node state.
+#[derive(Clone, Default)]
+pub(crate) struct LazyExtras(Option<Box<Extras>>);
+
+impl std::fmt::Debug for LazyExtras {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+impl LazyExtras {
+    /// The effective value — the box's contents, or the shared default.
+    fn get(&self) -> &Extras {
+        self.0.as_deref().unwrap_or(EMPTY_EXTRAS)
+    }
+
+    fn get_mut(&mut self) -> &mut Extras {
+        self.0.get_or_insert_with(|| Box::new(Extras::DEFAULT))
+    }
+
+    /// The allocated value, or `None` — the reset path's view.
+    fn get_opt_mut(&mut self) -> Option<&mut Extras> {
+        self.0.as_deref_mut()
+    }
+
+    #[cfg(feature = "test")]
+    fn allocated(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+/// The [`Extras`] a node that has never had any written reads as.
+///
+/// An inline `const` block rather than a `static` like [`EMPTY_CTRL`]: a
+/// `static` must be `Sync`, and [`FlyoutDef`] carries the app's `Rc` callbacks
+/// and element tree, which are not. The block still yields one `&'static` the
+/// whole process shares, and every heap field in [`Extras::DEFAULT`] is an
+/// empty `Vec`/`String`/`None`, so it owns no allocation.
+pub(crate) const EMPTY_EXTRAS: &Extras = &Extras::DEFAULT;
+
 /// Control-specific state, distinct from generic layout/paint. Populated by
 /// `set_prop` for the stateful drawn controls (toggle, slider, segmented, …).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Ctrl {
     pub is_on: bool,
     pub is_checked: bool,
@@ -162,50 +360,108 @@ pub(crate) struct Ctrl {
     pub unit: String,
     /// Knob: optional sub-line under the unit (e.g. a linear multiplier).
     pub sub_text: String,
+    /// The chrome-heavy state of the caption / nav-pane / flyout / editor-policy
+    /// props, allocated on the first write of any of them. Absent on every node
+    /// that carries none — which is nearly every node that carries a `Ctrl` at
+    /// all. Read it through [`Node::extras`], write it through
+    /// [`Node::extras_mut`]; like `Ctrl` itself the field is deliberately not
+    /// reachable directly, so an absent `Extras` cannot be mistaken for a
+    /// present one.
+    extras: LazyExtras,
+}
+
+impl Ctrl {
+    /// The state every control starts in, as a `const` so it can also back
+    /// [`EMPTY_CTRL`] — the value a node with no allocated [`Ctrl`] reads as.
+    ///
+    /// This constant is the SINGLE definition: [`Default`] returns it and the
+    /// absent-read path returns a reference to it. A node that has never been
+    /// written therefore reads exactly what an eagerly-constructed `Ctrl` would
+    /// have held, and the two cannot drift apart because there is only one.
+    pub const DEFAULT: Ctrl = Ctrl {
+        is_on: false,
+        is_checked: false,
+        value: 0.0,
+        min: 0.0,
+        max: 100.0,
+        step: None,
+        indeterminate: false,
+        is_active: true,
+        selected_index: -1,
+        hot_index: -1,
+        seg_label_w: Vec::new(),
+        items: Vec::new(),
+        tags: Vec::new(),
+        icons: Vec::new(),
+        expanded: false,
+        selected_tag: None,
+        menu: Vec::new(),
+        placeholder: String::new(),
+        content_h: 0.0,
+        precision: None,
+        large_change: None,
+        content_align: -1,
+        fill_origin: None,
+        fill_color: None,
+        fill_color_alt: None,
+        marker: None,
+        marker_color: None,
+        stops: Vec::new(),
+        start_angle: 0.0,
+        end_angle: 0.0,
+        ticks: Vec::new(),
+        tick_labels: Vec::new(),
+        major_every: None,
+        accent: None,
+        unit: String::new(),
+        sub_text: String::new(),
+        extras: LazyExtras(None),
+    };
+
+    /// This node's [`Extras`] for reading — [`EMPTY_EXTRAS`] when none has been
+    /// allocated, which IS [`Extras::DEFAULT`], so absent and untouched read
+    /// identically.
+    ///
+    /// Unused until the caption / nav-pane / flyout chrome is actually drawn —
+    /// that is what "stored, not yet drawn" means, and the read path is here
+    /// so the drawing lands as a paint change and nothing else.
+    #[allow(dead_code)]
+    pub fn extras(&self) -> &Extras {
+        self.extras.get()
+    }
+
+    /// This node's [`Extras`] for writing, allocated on first use.
+    pub fn extras_mut(&mut self) -> &mut Extras {
+        self.extras.get_mut()
+    }
+
+    /// The allocated [`Extras`], or `None` — the reset path's view, which must
+    /// never materialise one (see [`Node::extras_reset`]).
+    fn extras_opt_mut(&mut self) -> Option<&mut Extras> {
+        self.extras.get_opt_mut()
+    }
+
+    /// Whether the [`Extras`] box has actually been allocated (test seam only).
+    #[cfg(feature = "test")]
+    fn extras_allocated(&self) -> bool {
+        self.extras.allocated()
+    }
 }
 
 impl Default for Ctrl {
     fn default() -> Self {
-        Self {
-            is_on: false,
-            is_checked: false,
-            value: 0.0,
-            min: 0.0,
-            max: 100.0,
-            step: None,
-            indeterminate: false,
-            is_active: true,
-            selected_index: -1,
-            hot_index: -1,
-            seg_label_w: Vec::new(),
-            items: Vec::new(),
-            tags: Vec::new(),
-            icons: Vec::new(),
-            expanded: false,
-            selected_tag: None,
-            menu: Vec::new(),
-            placeholder: String::new(),
-            content_h: 0.0,
-            precision: None,
-            large_change: None,
-            content_align: -1,
-            fill_origin: None,
-            fill_color: None,
-            fill_color_alt: None,
-            marker: None,
-            marker_color: None,
-            stops: Vec::new(),
-            start_angle: 0.0,
-            end_angle: 0.0,
-            ticks: Vec::new(),
-            tick_labels: Vec::new(),
-            major_every: None,
-            accent: None,
-            unit: String::new(),
-            sub_text: String::new(),
-        }
+        Self::DEFAULT
     }
 }
+
+/// The [`Ctrl`] a node that has never had control state written reads as.
+///
+/// An inline `const` rather than a `static` for the reason given on
+/// [`EMPTY_EXTRAS`]: `Ctrl` reaches a [`FlyoutDef`] through its `Extras`, and
+/// that is not `Sync`. Every heap field in [`Ctrl::DEFAULT`] is an empty
+/// `Vec`/`String`/`None`, so this owns no allocation either way, and no caller
+/// depends on it having one address — it is only ever read through.
+pub(crate) const EMPTY_CTRL: &Ctrl = &Ctrl::DEFAULT;
 
 /// One live control.
 pub(crate) struct Node {
@@ -213,6 +469,20 @@ pub(crate) struct Node {
     /// Taffy layout inputs, mutated in place by `set_prop`.
     pub style: taffy::Style,
     pub children: Vec<ControlId>,
+    /// The node currently listing this one in its `children`, or `None` for the
+    /// root and for a node that is momentarily unparented (the reconciler
+    /// legitimately produces such states mid-diff — see `RecordingBackend::flush`).
+    ///
+    /// Maintained as the exact inverse of `children` by every mutator in
+    /// [`mod`](super) that changes WHICH list a node is in — `append_child`,
+    /// `insert_child`, `remove_child`, `replace_child`, `set_title_slot`, and
+    /// `destroy`. (`move_child` only reorders one list, so every node keeps its
+    /// parent.) It exists so the UIA provider can answer parent/ancestor queries
+    /// in O(depth) instead of a DFS from the root per call; a client `FindAll`
+    /// walk was O(n²) without it. Ids are never reused (see [`Arena`]), so a
+    /// stored id can never alias a different node — a parent that has since been
+    /// destroyed simply fails the arena lookup.
+    pub parent: Option<ControlId>,
     pub paint: Paint,
     /// StackPanel spacing (DIPs); applied to the Taffy gap on the main axis.
     pub spacing: f32,
@@ -313,15 +583,39 @@ pub(crate) struct Node {
     /// This node's surface needs a repaint (content/size/state changed).
     pub dirty: bool,
 
-    /// Transient: the Taffy node this maps to in the current layout pass.
-    pub taffy_id: Option<taffy::NodeId>,
+    /// The Taffy node this maps to, PERSISTENT across layout passes, stamped
+    /// with the generation of the [`LayoutTree`](super::layout::LayoutTree)
+    /// that minted it. Taffy indexes its slotmap unchecked, so an id from a
+    /// tree that no longer exists must never be dereferenced — the stamp makes
+    /// that unrepresentable rather than merely unlikely: a mismatch reads as
+    /// "no Taffy node yet" and the node is re-created.
+    pub taffy_id: Option<(u32, taffy::NodeId)>,
+    /// Something Taffy cannot see (a rebuilt DirectWrite layout) invalidated
+    /// this node's cached intrinsic measurement. Taffy keys its measure cache
+    /// on constraints alone, so without this a relabelled text node keeps its
+    /// old size forever. Cleared by the layout tree sync that marks it dirty.
+    pub measure_dirty: bool,
+    /// The visuals the composition child-order sync last parented under this
+    /// node, with the collection each went into — see
+    /// [`layout::sync`](super::layout). A re-stack detaches exactly this set
+    /// and nothing else, so a sprite parented in elsewhere (a Knob's arc and
+    /// needle, an editor's caret) is never torn out from under its owner.
+    pub stacked: Vec<(layout::Slot, Visual)>,
     pub rect: LaidRect,
     pub hovered: bool,
     pub pressed: bool,
 
     // ── Control library state ────────────────────────────────────────────
-    /// Stateful drawn-control data (toggle/slider/segmented/select/nav/…).
-    pub ctrl: Ctrl,
+    /// Stateful drawn-control data (toggle/slider/segmented/select/nav/…),
+    /// allocated on the first write and absent until then.
+    ///
+    /// [`Ctrl`] is the largest per-node payload after the Taffy style, yet a
+    /// real tree is mostly `TextBlock`/`Border`/`Grid`/`StackPanel` — kinds that
+    /// never hold any of it. Boxing it keeps that majority out of the arena's
+    /// working set entirely. Read it through [`Node::ctrl`] and write it through
+    /// [`Node::ctrl_mut`]; the field is deliberately not accessed directly so an
+    /// absent `Ctrl` cannot be mistaken for a present one.
+    ctrl: Option<Box<Ctrl>>,
     /// ScrollViewer only: the LOGICAL scroll offset (DIPs of content above the
     /// viewport). Hit-testing and thumb geometry read this; the VISUAL glide
     /// toward it plays on the compositor (`scroll_glide`), so during a wheel
@@ -342,26 +636,31 @@ pub(crate) struct Node {
     pub title_content: Option<ControlId>,
     /// TitleBar only: the mounted `RightHeader`/footer (trailing) slot child.
     pub title_footer: Option<ControlId>,
+    /// TitleBar only: the band's own cached title/subtitle layouts. Boxed and
+    /// lazy for the same reason [`Extras`] is — a tree holds at most one or two
+    /// TitleBars, and every other node would carry the dead weight. Rebuilt by
+    /// the layout pass on `text_dirty`; `None` when the band has no titles.
+    pub caption_text: Option<Box<caption::CaptionText>>,
+
+    // ── NavigationView pane ────────────────────────────────────────
+    /// NavigationView only: the pane's cached header / item / settings label
+    /// layouts. Boxed and lazy for the reason [`Extras`] is — a tree holds at
+    /// most one or two nav shells, and every other node would carry the dead
+    /// weight. Rebuilt by the layout pass on `text_dirty`; `None` when the pane
+    /// has no text at all (a glyph-only rail).
+    pub nav_text: Option<Box<nav::NavPaneText>>,
 }
 
 impl Node {
     pub fn new(kind: ControlKind, container: ContainerVisual) -> Self {
         let vis: IVisual = container.cast().expect("ContainerVisual is an IVisual");
-        let mut paint = Paint {
-            font_size: default_font_size(kind),
-            font_weight: 400,
-            is_enabled: true,
-            ..Paint::default()
-        };
-        // Buttons draw their own chrome (the WinUI default style is gone here).
-        if kind == ControlKind::Button {
-            paint.corner_radius = 6.0;
-        }
+        let paint = birth_paint(kind);
         let focusable = is_focusable_kind(kind);
         Self {
             kind,
             style: default_style(kind),
             children: Vec::new(),
+            parent: None,
             paint,
             spacing: 0.0,
             grid_rows: Vec::new(),
@@ -395,24 +694,121 @@ impl Node {
             wants_center: false,
             last_off: None,
             last_size: None,
-            h_align: -1,
-            v_align: -1,
+            h_align: ALIGN_UNSET,
+            v_align: ALIGN_UNSET,
             z_index: 0,
             z_dirty: false,
             children_dirty: false,
             dirty: true,
             taffy_id: None,
+            measure_dirty: true,
+            stacked: Vec::new(),
             rect: LaidRect::default(),
             hovered: false,
             pressed: false,
-            ctrl: Ctrl::default(),
+            ctrl: None,
             scroll_off: 0.0,
             focusable,
             focused: false,
             editor: is_text_editable(kind).then(|| Editor::new(kind)),
             title_content: None,
             title_footer: None,
+            caption_text: None,
+            nav_text: None,
         }
+    }
+
+    /// This node's control state for reading. A node that has never had any
+    /// written reads [`EMPTY_CTRL`] — which IS [`Ctrl::DEFAULT`], the same value
+    /// an eagerly-allocated `Ctrl` was constructed with, so an absent `Ctrl` and
+    /// an untouched one are indistinguishable to every reader.
+    pub fn ctrl(&self) -> &Ctrl {
+        self.ctrl.as_deref().unwrap_or(EMPTY_CTRL)
+    }
+
+    /// This node's control state for writing, allocated on first use.
+    pub fn ctrl_mut(&mut self) -> &mut Ctrl {
+        self.ctrl.get_or_insert_with(|| Box::new(Ctrl::DEFAULT))
+    }
+
+    /// Restore part of the control state to its birth value — but only if a
+    /// [`Ctrl`] was ever allocated.
+    ///
+    /// A reset writes the value a never-written node holds, and a node with no
+    /// `Ctrl` already READS exactly that ([`EMPTY_CTRL`]). Going through
+    /// [`Self::ctrl_mut`] here would allocate several hundred bytes to store a
+    /// value that is already in effect — undoing the lazy box for any node the
+    /// reconciler happens to diff a prop away from. The repaint is marked only
+    /// when there was something to change.
+    pub fn ctrl_reset(&mut self, f: impl FnOnce(&mut Ctrl)) {
+        if let Some(c) = self.ctrl.as_deref_mut() {
+            f(c);
+            self.dirty = true;
+        }
+    }
+
+    /// This node's [`Extras`] for reading (see [`Ctrl::extras`]) — the entry
+    /// point the drawing side will use. Dead until then, by construction.
+    #[allow(dead_code)]
+    pub fn extras(&self) -> &Extras {
+        self.ctrl().extras()
+    }
+
+    /// This node's [`Extras`] for writing, allocating both boxes on first use.
+    pub fn extras_mut(&mut self) -> &mut Extras {
+        self.ctrl_mut().extras_mut()
+    }
+
+    /// [`Self::ctrl_reset`] for the [`Extras`] tier — same rule, same reason:
+    /// an absent `Extras` already reads its birth value, so a reset that
+    /// materialises one has only spent memory.
+    pub fn extras_reset(&mut self, f: impl FnOnce(&mut Extras)) {
+        if let Some(x) = self.ctrl.as_deref_mut().and_then(Ctrl::extras_opt_mut) {
+            f(x);
+            self.dirty = true;
+        }
+    }
+
+    /// The [`Paint`] this node was born with — what a prop reset must restore.
+    /// Built by the same function [`Node::new`] builds it with, so the two
+    /// cannot disagree about a per-kind default (a Button's 6 DIP corner
+    /// radius, a compact kind's smaller font).
+    pub fn birth_paint(&self) -> Paint {
+        birth_paint(self.kind)
+    }
+
+    /// The Taffy style this node was born with — likewise the reset target for
+    /// every layout prop. Not all-zero: a Button is born with padding and a
+    /// minimum height, an editor and a TitleBar with a minimum height, a
+    /// NavigationView with the icon rail's left padding.
+    pub fn birth_style(&self) -> taffy::Style {
+        default_style(self.kind)
+    }
+
+    /// Whether the boxed [`Ctrl`] has actually been allocated. Only the test
+    /// seam asks — the backend proper never distinguishes the two states.
+    #[cfg(feature = "test")]
+    pub fn ctrl_allocated(&self) -> bool {
+        self.ctrl.is_some()
+    }
+
+    /// Whether the [`Extras`] tier inside the boxed [`Ctrl`] has been
+    /// allocated. Only the test seam asks — see [`Self::ctrl_allocated`].
+    #[cfg(feature = "test")]
+    pub fn extras_allocated(&self) -> bool {
+        self.ctrl.as_deref().is_some_and(Ctrl::extras_allocated)
+    }
+
+    /// The control state and the retained chrome parts as two disjoint borrows.
+    ///
+    /// Two field accesses can be split by the borrow checker; a method call
+    /// borrowing the whole `Node` cannot. A parts sync that reads `ctrl` while
+    /// mutating `parts` goes through here instead of cloning either.
+    pub fn ctrl_and_parts(&mut self) -> (&Ctrl, Option<&mut parts::Parts>) {
+        (
+            self.ctrl.as_deref().unwrap_or(EMPTY_CTRL),
+            self.parts.as_deref_mut(),
+        )
     }
 
     pub fn handler(&self, event: Event) -> Option<&EventHandler> {
@@ -628,6 +1024,30 @@ impl Node {
     }
 }
 
+/// No alignment requested — the value [`Node::h_align`] / [`Node::v_align`] are
+/// born with and the one a reset restores. Not zero: 0 is a real WinRT
+/// `HorizontalAlignment::Left`.
+pub(crate) const ALIGN_UNSET: i32 = -1;
+
+/// The [`Paint`] a node of `kind` is born with.
+///
+/// The single definition of those defaults: [`Node::new`] builds the node's
+/// paint with it and [`Node::birth_paint`] hands it to the prop-reset path, so
+/// "what an unset value means" is one fact stated once. Deliberately not all
+/// default: text is laid out at a real size, drawn at a real weight, and
+/// controls are enabled — resetting any of those to zero would render a node
+/// invisible, hairline-thin, or greyed out.
+pub(crate) fn birth_paint(kind: ControlKind) -> Paint {
+    Paint {
+        font_size: default_font_size(kind),
+        font_weight: 400,
+        is_enabled: true,
+        // Buttons draw their own chrome (the WinUI default style is gone here).
+        corner_radius: if kind == ControlKind::Button { 6.0 } else { 0.0 },
+        ..Paint::default()
+    }
+}
+
 fn default_font_size(kind: ControlKind) -> f32 {
     match kind {
         ControlKind::ToggleSwitch
@@ -712,7 +1132,9 @@ fn is_focusable_kind(kind: ControlKind) -> bool {
 
 /// Per-kind default Taffy style (display mode + the small intrinsic defaults a
 /// drawn control needs, e.g. button padding so its label isn't cramped).
-fn default_style(kind: ControlKind) -> taffy::Style {
+///
+/// Also the reset target for every layout prop, via [`Node::birth_style`].
+pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
     use taffy::prelude::*;
     let mut s = Style::default();
     match kind {
@@ -742,10 +1164,14 @@ fn default_style(kind: ControlKind) -> taffy::Style {
             s.display = Display::Block;
         }
         ControlKind::NavigationView => {
-            // The icon rail is drawn on the node's own surface; the single
-            // content child is inset to the right of it.
+            // The pane is drawn on the node's own surface; the content child is
+            // inset past it. The inset is derived from `nav` rather than
+            // spelled out here, because the layout pass re-derives it whenever
+            // the pane state changes and the two must agree exactly — see
+            // `nav::pane_width`. A virgin NavigationView resolves to WinUI's own
+            // default: `is_pane_open` true at `open_pane_length` 320.
             s.display = Display::Flex;
-            s.padding.left = length(theme::NAV_RAIL_W);
+            s.padding.left = length(nav::pane_width(&Extras::DEFAULT, 0.0));
         }
         ControlKind::Expander => {
             // A header band is drawn on the node's surface; content sits below.
@@ -829,12 +1255,17 @@ fn default_style(kind: ControlKind) -> taffy::Style {
             s.grid_template_columns =
                 vec![GridTemplateComponent::Single(flex(1.0)), GridTemplateComponent::Single(auto())];
             s.grid_template_rows = vec![GridTemplateComponent::Single(auto())];
-            // Standard 48px caption height with the token side padding. The
-            // right padding additionally reserves the drawn min/max/close
-            // cluster (the frame is extended; the buttons are ours).
-            s.min_size.height = length(theme::ROW_H + theme::SPACE_16);
-            s.padding.left = length(theme::SPACE_16);
-            s.padding.right = length(theme::SPACE_16 + super::caption::CLUSTER_W);
+            // Caption height and side padding, both reserving the band's own
+            // drawn chrome: the trailing min/max/close cluster (the frame is
+            // extended; the buttons are ours) and the leading back button.
+            //
+            // The leading pair is derived from `caption` rather than spelled
+            // out here, because the layout pass re-derives it whenever the
+            // caption state changes and the two must agree exactly — see
+            // `caption::pad_left`.
+            s.min_size.height = length(caption::band_height(&Extras::DEFAULT));
+            s.padding.left = length(caption::pad_left(&Extras::DEFAULT));
+            s.padding.right = length(theme::SPACE_16 + caption::CLUSTER_W);
         }
         _ => {
             s.display = Display::Flex;
@@ -853,6 +1284,20 @@ fn default_style(kind: ControlKind) -> taffy::Style {
     s
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /// Node arena keyed by [`ControlId`] (a `NonZeroU32`).
 ///
 /// Ids are minted monotonically and NEVER reused. The reconciler tracks nodes
@@ -867,6 +1312,13 @@ fn default_style(kind: ControlKind) -> taffy::Style {
 pub(crate) struct Arena {
     nodes: rustc_hash::FxHashMap<u32, Node>,
     next: u32,
+    /// Persistent layout state — the Taffy tree, kept in lock-step with these
+    /// nodes across passes instead of rebuilt per pass. Lives with the arena
+    /// because its lifetime is exactly the arena's; see
+    /// [`layout::compute`](super::layout::compute), which takes it out for the
+    /// duration of a pass (the measure callback needs `&Arena` while Taffy
+    /// holds `&mut TaffyTree`) and puts it back at the end.
+    pub(crate) layout: Option<layout::LayoutTree>,
 }
 
 impl Arena {

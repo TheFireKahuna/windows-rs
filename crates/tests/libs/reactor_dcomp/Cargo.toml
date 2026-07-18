@@ -1,0 +1,22 @@
+[package]
+name = "test_reactor_dcomp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Tests for the self-hosted DirectComposition backend. Unlike `test_reactor`
+# (which takes windows-reactor with default features and therefore exercises the
+# WinUI backend), this crate turns the default off and compiles the DComp
+# backend, plus the `test` feature that publishes `backend::dcomp_test_api`.
+#
+#   cargo test -p test_reactor_dcomp
+
+[dependencies]
+windows-core = { workspace = true }
+windows-reactor = { workspace = true, default-features = false, features = [
+    "dcomp-backend",
+    "test",
+] }
+
+[lints]
+workspace = true
