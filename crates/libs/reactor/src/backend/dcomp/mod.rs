@@ -34,6 +34,7 @@ mod host;
 mod input;
 mod knob;
 pub(crate) mod layout;
+pub(crate) mod nav;
 pub(crate) mod node;
 mod pacer;
 mod paint;
@@ -1300,6 +1301,9 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.extras_mut().back_button_enabled = *v;
             node.mark_dirty();
         }
+        // The nav pane's toggle and back arrow occupy its chrome row, and
+        // whether that row exists at all shifts every item below it — so these
+        // move geometry, not just pixels.
         (Prop::IsPaneToggleButtonVisible, PropValue::Bool(v)) => {
             node.extras_mut().pane_toggle_visible = *v;
             node.mark_dirty();
@@ -1312,22 +1316,28 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.extras_mut().settings_visible = *v;
             node.mark_dirty();
         }
+        // The three that change the pane's WIDTH re-derive the layout inset the
+        // content child sits behind — the same call the layout pass makes, so a
+        // set and an unset cannot fall out of step (see `apply_nav_metrics`).
         (Prop::IsPaneOpen, PropValue::Bool(v)) => {
             node.extras_mut().pane_open = *v;
-            node.mark_dirty();
+            layout::apply_nav_metrics(node);
         }
         (Prop::PaneTitle, PropValue::Str(s)) => {
             node.extras_mut().pane_title = s.clone();
+            // A header row appears/disappears with the string, so this
+            // re-measures as well as repaints; the text pass re-derives the
+            // metrics once it knows whether there is a title to lay out.
             node.text_dirty = true;
             node.mark_dirty();
         }
         (Prop::PaneDisplayMode, PropValue::I32(v)) => {
             node.extras_mut().pane_display_mode = *v;
-            node.mark_dirty();
+            layout::apply_nav_metrics(node);
         }
         (Prop::OpenPaneLength, PropValue::F64(v)) => {
             node.extras_mut().open_pane_length = *v;
-            node.mark_dirty();
+            layout::apply_nav_metrics(node);
         }
         (Prop::AutoSuggestBox, PropValue::Bool(v)) => {
             node.extras_mut().search_box = *v;
@@ -1769,9 +1779,59 @@ prop_contract! {
         }
         // Born VISIBLE: a NavigationView only emits this prop to say `false`,
         // so its removal means "show it again".
+        //
+        // Carried by BOTH drawn bands — it is the caption's back button and the
+        // nav pane's alike — so the reset re-derives both geometries. Each is a
+        // no-op on the kind it does not belong to.
         IsBackButtonVisible => |n| {
             n.extras_reset(|x| x.back_button_visible = Extras::DEFAULT.back_button_visible);
             layout::apply_caption_metrics(n);
+            layout::apply_nav_metrics(n);
+        }
+
+        // ── NavigationView pane ──────────────────────────────────────────
+        // Pane width, and everything that follows from it, is DERIVED — see
+        // `nav::pane_width`, which `birth_style` also builds a virgin
+        // NavigationView from. So each of these restores the state and then
+        // re-derives with the same call `apply_prop` makes, and a node whose
+        // pane state is back at its defaults is indistinguishable from one that
+        // never received the prop, style included.
+        //
+        // Born TOGGLE-VISIBLE and SETTINGS-VISIBLE: like the back button, a
+        // NavigationView only emits these to say `false`, so losing the binding
+        // means "show it again".
+        IsPaneToggleButtonVisible => |n| {
+            n.extras_reset(|x| x.pane_toggle_visible = Extras::DEFAULT.pane_toggle_visible);
+            layout::apply_nav_metrics(n);
+        }
+        IsBackEnabled => |n| { n.extras_reset(|x| x.back_enabled = Extras::DEFAULT.back_enabled); }
+        IsSettingsVisible => |n| {
+            n.extras_reset(|x| x.settings_visible = Extras::DEFAULT.settings_visible);
+        }
+        // Born OPEN, matching `NavigationView::default()` — so an app that
+        // never binds this gets WinUI's own expanded pane, not a rail.
+        IsPaneOpen => |n| {
+            n.extras_reset(|x| x.pane_open = Extras::DEFAULT.pane_open);
+            layout::apply_nav_metrics(n);
+        }
+        // The header is drawn from a cached layout the text pass owns, so a
+        // reset drops the state and re-flags it; the pass then rebuilds (to
+        // `None`, here) and re-derives the pane metrics with it.
+        PaneTitle => |n| {
+            n.extras_reset(|x| x.pane_title = Extras::DEFAULT.pane_title);
+            n.text_dirty = true;
+        }
+        // `Auto`, not `Left`: the unset state is the ADAPTIVE mode, which is
+        // what a NavigationView with no `pane_display_mode` binding means.
+        PaneDisplayMode => |n| {
+            n.extras_reset(|x| x.pane_display_mode = Extras::DEFAULT.pane_display_mode);
+            layout::apply_nav_metrics(n);
+        }
+        // 320, not 0 — a zero-length pane is not a default, it is an invisible
+        // control.
+        OpenPaneLength => |n| {
+            n.extras_reset(|x| x.open_pane_length = Extras::DEFAULT.open_pane_length);
+            layout::apply_nav_metrics(n);
         }
     }
 
@@ -1780,26 +1840,45 @@ prop_contract! {
     /// `Extras` reads as, and its non-empty entries mirror the widget default
     /// whose absence sends the `Unset` (see the constant for which, and why).
     stored {
-        IsPaneToggleButtonVisible => |n| {
-            n.extras_reset(|x| x.pane_toggle_visible = Extras::DEFAULT.pane_toggle_visible);
-        }
-
-        // ── NavigationView ───────────────────────────────────────────────
-        IsBackEnabled => |n| { n.extras_reset(|x| x.back_enabled = Extras::DEFAULT.back_enabled); }
-        IsSettingsVisible => |n| {
-            n.extras_reset(|x| x.settings_visible = Extras::DEFAULT.settings_visible);
-        }
-        IsPaneOpen => |n| { n.extras_reset(|x| x.pane_open = Extras::DEFAULT.pane_open); }
-        PaneTitle => |n| {
-            n.extras_reset(|x| x.pane_title = Extras::DEFAULT.pane_title);
-            n.text_dirty = true;
-        }
-        PaneDisplayMode => |n| {
-            n.extras_reset(|x| x.pane_display_mode = Extras::DEFAULT.pane_display_mode);
-        }
-        OpenPaneLength => |n| {
-            n.extras_reset(|x| x.open_pane_length = Extras::DEFAULT.open_pane_length);
-        }
+        // ── NavigationView's embedded search box ─────────────────────────
+        // Deliberately still stored: this one is blocked on the shape of
+        // [`Node`], not on the drawing.
+        //
+        // Every other pane element is a rectangle plus glyphs — the pane draws
+        // them and `nav::hit` resolves them, all inside one node. An editor is
+        // not. The editing machinery this backend already has is keyed to a
+        // NODE, and in three ways that a sub-element of a non-editor node
+        // cannot satisfy:
+        //
+        // * **Geometry.** `Editor` has no box of its own. `caret_index_at`,
+        //   `editor_caret_box` and `paint_editor` all take the field's box to
+        //   BE `node.rect` (see `editor::editor_content(kind, rect.w)`). An
+        //   editor hosted at some sub-rect of a nav pane would map pointer x to
+        //   a caret index across the whole pane and hang its caret sprite off
+        //   the pane's top-left corner.
+        // * **Focus.** Focus is `Option<ControlId>` — one focusable per node —
+        //   and `editor_key` routes EVERY editing key to the focused node's
+        //   editor before the generic ring sees it. A nav pane with a search
+        //   field needs two focus targets in one node (the field, and the row
+        //   ring the arrow keys drive), and the Tab order needs to contain
+        //   both. Neither is representable.
+        // * **Accessibility.** A synthetic item can be an invokable button or a
+        //   selectable row; `pattern_supported` gives `IValueProvider` and the
+        //   Text pattern to real editor NODES only, and both read
+        //   `node.editor`. A search box exposed as an item would answer
+        //   `SetValue` for the whole pane.
+        //
+        // Making this work needs `Node` to carry editor state as a placed
+        // sub-element — an editor with its own rect and its own focus identity,
+        // with the ~30 `ControlId`-keyed editor call sites taught to address
+        // it. That is a seam change, and forcing it from the paint side would
+        // mean a second, parallel editor that looks right and mishandles every
+        // caret, IME composition and screen reader that meets it.
+        //
+        // The state below stays exact, so that change lands as plumbing and
+        // nothing else. Note the seam is otherwise ready: the NavigationView
+        // handle already carries `QuerySubmitted` / `TextChanged` /
+        // `SuggestionChosen`, so only the hosting is missing.
         AutoSuggestBox => |n| { n.extras_reset(|x| x.search_box = Extras::DEFAULT.search_box); }
         AutoSuggestItems => |n| {
             n.extras_reset(|x| x.suggest_items = Extras::DEFAULT.suggest_items);

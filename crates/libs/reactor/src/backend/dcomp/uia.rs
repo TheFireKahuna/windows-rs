@@ -115,6 +115,52 @@ fn is_caption(item: i32) -> bool {
     item >= CAPTION_ITEM_BASE
 }
 
+/// A NavigationView pane's own chrome — the back arrow, the hamburger and the
+/// settings row — as synthetic items at `NAV_CHROME_BASE + i`.
+///
+/// They need an index space of their own for the same reason the caption
+/// buttons do: the natural `0..count` range belongs to the menu items, and that
+/// range is load-bearing. `ISelectionProvider` is defined over it, the
+/// `uia:invoke;name=<label>` scripts the visual-parity rig runs address it, and
+/// `Ctrl::selected_index` indexes straight into it. Renumbering the items to
+/// make room at the front would have silently changed every one of those; a
+/// disjoint base changes none of them, and a chrome item can never be mistaken
+/// for a selectable page.
+const NAV_CHROME_BASE: i32 = 1 << 16;
+
+fn is_nav_chrome(item: i32) -> bool {
+    (NAV_CHROME_BASE..CAPTION_ITEM_BASE).contains(&item)
+}
+
+/// The pane element a chrome item names, and the inverse. Both directions are
+/// needed and a wrong pairing would put a screen reader's invoke on the wrong
+/// button, so neither is derived from the other by arithmetic at a call site.
+fn nav_chrome_hit(item: i32) -> Option<nav::Hit> {
+    match item - NAV_CHROME_BASE {
+        0 => Some(nav::Hit::Back),
+        1 => Some(nav::Hit::Toggle),
+        2 => Some(nav::Hit::Settings),
+        _ => None,
+    }
+}
+
+/// The pane element a synthetic item names, or `None` when the item is a menu
+/// row rather than chrome. The one classifier the action path outside this
+/// module asks (see `input::uia_select_item`), so the chrome index space is
+/// interpreted in exactly one place.
+pub(crate) fn nav_chrome_of(item: i32) -> Option<nav::Hit> {
+    is_nav_chrome(item).then(|| nav_chrome_hit(item)).flatten()
+}
+
+fn nav_chrome_item(hit: nav::Hit) -> Option<i32> {
+    match hit {
+        nav::Hit::Back => Some(NAV_CHROME_BASE),
+        nav::Hit::Toggle => Some(NAV_CHROME_BASE + 1),
+        nav::Hit::Settings => Some(NAV_CHROME_BASE + 2),
+        nav::Hit::Item(_) => None,
+    }
+}
+
 /// UTF-16 word separator — the rule [`Editor`](super::editor::Editor)'s private
 /// `is_space` uses, repeated here because the Text pattern needs word units and
 /// that helper is not exported.
@@ -241,6 +287,10 @@ fn is_item_container(kind: ControlKind) -> bool {
 
 fn pattern_supported(kind: ControlKind, item: i32, pid: PATTERNID) -> bool {
     use ControlKind::*;
+    if is_nav_chrome(item) {
+        // Pane chrome invokes; it is not part of any selection.
+        return pid == UIA_InvokePatternId;
+    }
     if item >= 0 {
         // Synthetic items select — and also invoke, so `uia:invoke;name=<label>`
         // scripts written against the old per-segment Buttons keep working.
@@ -297,11 +347,114 @@ impl DCompBackend {
         self.arena.get(id).map(|n| n.kind)
     }
 
+    /// The container's selectable items.
+    ///
+    /// For a nav pane this is the rows that FIT, not the rows that exist: a
+    /// pane too short for its whole menu draws a prefix of it, and the same
+    /// `nav::visible_items` bound governs the paint, the hit test and this — so
+    /// nothing is announced that is not on screen and cannot be clicked.
     fn uia_item_count(&self, id: ControlId) -> i32 {
         match self.arena.get(id) {
+            Some(n) if n.kind == ControlKind::NavigationView => self
+                .nav_metrics(id)
+                .map(|(m, h, count)| nav::visible_items(&m, h, count) as i32)
+                .unwrap_or(0),
             Some(n) if is_item_container(n.kind) => n.ctrl().items.len() as i32,
             _ => 0,
         }
+    }
+
+    /// Which of the pane's chrome elements are present: `(back, toggle,
+    /// settings)`.
+    fn nav_chrome_present(&self, id: ControlId) -> (bool, bool, bool) {
+        match self.nav_metrics(id) {
+            Some((m, h, _)) => (m.back, m.toggle, nav::settings_rect(&m, h).is_some()),
+            None => (false, false, false),
+        }
+    }
+
+    /// Total synthetic children of a nav pane — its chrome plus its items.
+    fn nav_seq_len(&self, id: ControlId) -> i32 {
+        let (b, t, st) = self.nav_chrome_present(id);
+        i32::from(b) + i32::from(t) + self.uia_item_count(id) + i32::from(st)
+    }
+
+    /// The synthetic item at reading position `pos`. The pane reads top to
+    /// bottom exactly as it is drawn: back, hamburger, the menu rows, settings.
+    fn nav_seq_at(&self, id: ControlId, pos: i32) -> Option<i32> {
+        let (b, t, st) = self.nav_chrome_present(id);
+        if pos < 0 {
+            return None;
+        }
+        let mut p = pos;
+        for (present, hit) in [(b, nav::Hit::Back), (t, nav::Hit::Toggle)] {
+            if present {
+                if p == 0 {
+                    return nav_chrome_item(hit);
+                }
+                p -= 1;
+            }
+        }
+        let n = self.uia_item_count(id);
+        if p < n {
+            return Some(p);
+        }
+        p -= n;
+        if st && p == 0 {
+            return nav_chrome_item(nav::Hit::Settings);
+        }
+        None
+    }
+
+    /// How many synthetic children a container exposes.
+    ///
+    /// For every container but the nav pane this is simply the item count: the
+    /// items ARE the whole synthetic sequence, and item `i` sits at position
+    /// `i`. A nav pane interleaves chrome around its rows, so the two stop
+    /// being the same number and the three `syn_*` helpers become the only
+    /// thing the tree walk below may reason about.
+    fn syn_len(&self, id: ControlId) -> i32 {
+        if self.uia_kind(id) == Some(ControlKind::NavigationView) {
+            self.nav_seq_len(id)
+        } else {
+            self.uia_item_count(id)
+        }
+    }
+
+    /// The synthetic item at reading position `pos`.
+    fn syn_at(&self, id: ControlId, pos: i32) -> Option<i32> {
+        if self.uia_kind(id) == Some(ControlKind::NavigationView) {
+            self.nav_seq_at(id, pos)
+        } else {
+            (0..self.uia_item_count(id)).contains(&pos).then_some(pos)
+        }
+    }
+
+    /// The reading position of synthetic item `item`.
+    fn syn_pos(&self, id: ControlId, item: i32) -> Option<i32> {
+        if self.uia_kind(id) == Some(ControlKind::NavigationView) {
+            self.nav_seq_pos(id, item)
+        } else {
+            (0..self.uia_item_count(id)).contains(&item).then_some(item)
+        }
+    }
+
+    /// Reading position of a synthetic item — the inverse of
+    /// [`nav_seq_at`](Self::nav_seq_at).
+    fn nav_seq_pos(&self, id: ControlId, item: i32) -> Option<i32> {
+        let (b, t, st) = self.nav_chrome_present(id);
+        let lead = i32::from(b) + i32::from(t);
+        if is_nav_chrome(item) {
+            return match nav_chrome_hit(item) {
+                Some(nav::Hit::Back) if b => Some(0),
+                Some(nav::Hit::Toggle) if t => Some(i32::from(b)),
+                Some(nav::Hit::Settings) if st => Some(lead + self.uia_item_count(id)),
+                _ => None,
+            };
+        }
+        (0..self.uia_item_count(id))
+            .contains(&item)
+            .then_some(lead + item)
     }
 
     /// Drawn caption buttons under the fragment root (0 when the window has no
@@ -369,9 +522,9 @@ impl DCompBackend {
                 NAV_PREV if i > 0 => UiaNav::Item(id, CAPTION_ITEM_BASE + i - 1),
                 NAV_PREV => match node.children.last() {
                     Some(c) => UiaNav::Node(*c),
-                    None => match self.uia_item_count(id) {
-                        0 => UiaNav::None,
-                        n => UiaNav::Item(id, n - 1),
+                    None => match self.syn_at(id, self.syn_len(id) - 1) {
+                        Some(last) => UiaNav::Item(id, last),
+                        None => UiaNav::None,
                     },
                 },
                 _ => UiaNav::None,
@@ -379,29 +532,42 @@ impl DCompBackend {
         }
 
         if item >= 0 {
-            let count = self.uia_item_count(id);
+            // Siblings are the container's synthetic sequence, walked by
+            // POSITION. For every kind but the nav pane position == index, so
+            // this is the same walk it always was; for a nav pane it is what
+            // threads the back arrow, the hamburger and the settings row into
+            // the reading order between the menu rows.
+            let pos = self.syn_pos(id, item);
             return match dir {
                 NAV_PARENT if self.root == Some(id) => UiaNav::Root,
                 NAV_PARENT => UiaNav::Node(id),
-                NAV_NEXT if item + 1 < count => UiaNav::Item(id, item + 1),
-                NAV_NEXT => match node.children.first() {
-                    Some(c) => UiaNav::Node(*c),
-                    None if self.root == Some(id) && self.uia_caption_count() > 0 => {
-                        UiaNav::Item(id, CAPTION_ITEM_BASE)
-                    }
+                NAV_NEXT => match pos.and_then(|p| self.syn_at(id, p + 1)) {
+                    Some(next) => UiaNav::Item(id, next),
+                    None => match node.children.first() {
+                        Some(c) => UiaNav::Node(*c),
+                        None if self.root == Some(id) && self.uia_caption_count() > 0 => {
+                            UiaNav::Item(id, CAPTION_ITEM_BASE)
+                        }
+                        None => UiaNav::None,
+                    },
+                },
+                NAV_PREV => match pos
+                    .filter(|p| *p > 0)
+                    .and_then(|p| self.syn_at(id, p - 1))
+                {
+                    Some(prev) => UiaNav::Item(id, prev),
                     None => UiaNav::None,
                 },
-                NAV_PREV if item > 0 => UiaNav::Item(id, item - 1),
                 _ => UiaNav::None,
             };
         }
 
-        let item_count = self.uia_item_count(id);
+        let syn_count = self.syn_len(id);
         let caption_count = if self.root == Some(id) { self.uia_caption_count() } else { 0 };
         match dir {
             NAV_FIRST => {
-                if item_count > 0 {
-                    UiaNav::Item(id, 0)
+                if let Some(first) = (syn_count > 0).then(|| self.syn_at(id, 0)).flatten() {
+                    UiaNav::Item(id, first)
                 } else if let Some(c) = node.children.first() {
                     UiaNav::Node(*c)
                 } else if caption_count > 0 {
@@ -416,8 +582,10 @@ impl DCompBackend {
                 } else {
                     match node.children.last() {
                         Some(c) => UiaNav::Node(*c),
-                        None if item_count > 0 => UiaNav::Item(id, item_count - 1),
-                        None => UiaNav::None,
+                        None => match self.syn_at(id, syn_count - 1) {
+                            Some(last) => UiaNav::Item(id, last),
+                            None => UiaNav::None,
+                        },
                     }
                 }
             }
@@ -477,6 +645,11 @@ impl DCompBackend {
             }
             .to_string();
         }
+        if is_nav_chrome(item)
+            && let Some(hit) = nav_chrome_hit(item)
+        {
+            return nav::chrome_label(hit).to_string();
+        }
         let Some(n) = self.arena.get(id) else {
             return String::new();
         };
@@ -512,7 +685,10 @@ impl DCompBackend {
     }
 
     fn uia_control_type(&self, id: ControlId, item: i32) -> i32 {
-        if is_caption(item) {
+        // The pane's own chrome are buttons, not list items: a screen reader
+        // must not offer "select" on the hamburger, nor count it among the
+        // pages.
+        if is_caption(item) || is_nav_chrome(item) {
             return UIA_ButtonControlTypeId;
         }
         match self.arena.get(id) {
@@ -612,13 +788,18 @@ impl DCompBackend {
 
     /// The selected item index of container `id`, or `None` when the index is
     /// out of range (or the node is not an item container).
+    ///
+    /// Bounded by the EXPOSED item count, not the stored one. They differ only
+    /// for a nav pane too short to draw its whole menu, and there the
+    /// distinction matters: reporting a selection a client cannot then navigate
+    /// to hands it an index into an element that does not exist.
     fn uia_selected_item(&self, id: ControlId) -> Option<i32> {
         let n = self.arena.get(id)?;
         if !is_item_container(n.kind) {
             return None;
         }
         let i = n.ctrl().selected_index;
-        (0..n.ctrl().items.len() as i32).contains(&i).then_some(i)
+        (0..self.uia_item_count(id)).contains(&i).then_some(i)
     }
 
     /// `(offset, viewport height, content height)` in DIPs for a scroll
@@ -727,11 +908,16 @@ impl DCompBackend {
             return;
         };
         if item >= 0
-            && let Some(n) = self.arena.get(id)
-            && n.kind == ControlKind::NavigationView
+            && !is_nav_chrome(item)
+            && self
+                .arena
+                .get(id)
+                .is_some_and(|n| n.kind == ControlKind::NavigationView)
+            && let Some((m, _, _)) = self.nav_metrics(id)
         {
-            ny += controls::NAV_ITEM_H * item as f32;
-            nh = controls::NAV_ITEM_H;
+            let r = nav::item_rect(&m, item);
+            ny += r.top;
+            nh = r.height();
         }
         let Some((vy, vh, off)) = self.arena.get(sv).map(|n| (n.rect.y, n.rect.h, n.scroll_off))
         else {
@@ -776,8 +962,22 @@ impl DCompBackend {
                     }
                 }
                 ControlKind::NavigationView => {
-                    y = n.rect.y + controls::NAV_ITEM_H * item as f32;
-                    h = controls::NAV_ITEM_H;
+                    // Every pane box — rows and chrome alike — comes from the
+                    // one geometry the paint used.
+                    if let Some((m, nh, _)) = self.nav_metrics(id) {
+                        let r = match nav_chrome_hit(item).filter(|_| is_nav_chrome(item)) {
+                            Some(nav::Hit::Back) => nav::back_rect(&m),
+                            Some(nav::Hit::Toggle) => nav::toggle_rect(&m),
+                            Some(nav::Hit::Settings) => nav::settings_rect(&m, nh),
+                            _ => Some(nav::item_rect(&m, item)),
+                        };
+                        if let Some(r) = r {
+                            x = n.rect.x + r.left;
+                            y = n.rect.y + r.top;
+                            w = r.width();
+                            h = r.height();
+                        }
+                    }
                 }
                 _ => {} // ComboBox items live in a popup; report the field's box.
             }
@@ -863,12 +1063,16 @@ impl DCompBackend {
                 Some(edges[1..count].iter().take_while(|&&e| rel >= e).count() as i32)
             }
             ControlKind::NavigationView => {
-                // Items occupy only the top of the rail column; elsewhere the
-                // point belongs to the container (the body pane is a real child
-                // and was already tried by the recursion above).
-                let (rx, ry) = (px - n.rect.x, py - n.rect.y);
-                let i = (ry / controls::NAV_ITEM_H).floor() as i32;
-                (rx < theme::NAV_RAIL_W && (0..count as i32).contains(&i)).then_some(i)
+                // Delegated to the pane's own hit test — the same call the
+                // pointer path makes, so a click and an
+                // `ElementProviderFromPoint` can never name different elements.
+                // Outside the pane the point belongs to the container (the body
+                // is a real child and the walk already tried it).
+                let (m, h, count) = self.nav_metrics(id)?;
+                match nav::hit(&m, h, count, px - n.rect.x, py - n.rect.y)? {
+                    nav::Hit::Item(i) => Some(i),
+                    hit => nav_chrome_item(hit),
+                }
             }
             _ => None,
         }

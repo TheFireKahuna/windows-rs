@@ -641,6 +641,14 @@ pub(crate) struct Node {
     /// TitleBars, and every other node would carry the dead weight. Rebuilt by
     /// the layout pass on `text_dirty`; `None` when the band has no titles.
     pub caption_text: Option<Box<caption::CaptionText>>,
+
+    // ── NavigationView pane ────────────────────────────────────────
+    /// NavigationView only: the pane's cached header / item / settings label
+    /// layouts. Boxed and lazy for the reason [`Extras`] is — a tree holds at
+    /// most one or two nav shells, and every other node would carry the dead
+    /// weight. Rebuilt by the layout pass on `text_dirty`; `None` when the pane
+    /// has no text at all (a glyph-only rail).
+    pub nav_text: Option<Box<nav::NavPaneText>>,
 }
 
 impl Node {
@@ -706,6 +714,7 @@ impl Node {
             title_content: None,
             title_footer: None,
             caption_text: None,
+            nav_text: None,
         }
     }
 
@@ -1155,10 +1164,14 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
             s.display = Display::Block;
         }
         ControlKind::NavigationView => {
-            // The icon rail is drawn on the node's own surface; the single
-            // content child is inset to the right of it.
+            // The pane is drawn on the node's own surface; the content child is
+            // inset past it. The inset is derived from `nav` rather than
+            // spelled out here, because the layout pass re-derives it whenever
+            // the pane state changes and the two must agree exactly — see
+            // `nav::pane_width`. A virgin NavigationView resolves to WinUI's own
+            // default: `is_pane_open` true at `open_pane_length` 320.
             s.display = Display::Flex;
-            s.padding.left = length(theme::NAV_RAIL_W);
+            s.padding.left = length(nav::pane_width(&Extras::DEFAULT, 0.0));
         }
         ControlKind::Expander => {
             // A header band is drawn on the node's surface; content sits below.

@@ -345,11 +345,49 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
             apply_caption_metrics(n);
         }
     }
+    // The nav pane draws a header, a label per item and a settings row, so it
+    // lays them out here too — and then re-derives the width that depends on
+    // whether there is a header at all. See `apply_nav_metrics`.
+    let needs_nav = arena
+        .get(id)
+        .is_some_and(|n| n.text_dirty && n.kind == ControlKind::NavigationView);
+    if needs_nav {
+        let built = arena
+            .get(id)
+            .map(|n| nav::build_text(n.extras(), &n.ctrl().items));
+        if let Some(n) = arena.get_mut(id) {
+            n.nav_text = built.flatten();
+            n.text_dirty = false;
+            n.measure_dirty = true;
+            apply_nav_metrics(n);
+        }
+    }
     let mut i = 0;
     while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
         rebuild_text(arena, c);
         i += 1;
     }
+}
+
+/// Re-derive the NavigationView's layout inset from the pane state it now
+/// holds: the content child is inset by exactly the width the pane draws
+/// across.
+///
+/// The same rule, and the same single-definition discipline, as
+/// [`apply_caption_metrics`]: the width comes straight from `nav`, which is
+/// also what `birth_style` builds a virgin NavigationView from — so a node
+/// whose pane state is back at its defaults re-derives exactly the style it was
+/// born with, and the reset invariant holds without anything remembering a
+/// number.
+///
+/// Reading `rect.w` (last pass's width) is what makes `PaneDisplayMode::Auto`
+/// adaptive; see [`nav::resolve`].
+pub(crate) fn apply_nav_metrics(n: &mut Node) {
+    if n.kind != ControlKind::NavigationView {
+        return;
+    }
+    n.style.padding.left = length(nav::pane_width(n.extras(), n.rect.w));
+    n.mark_dirty();
 }
 
 /// Re-derive the TitleBar band's layout metrics from the caption state it now

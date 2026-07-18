@@ -511,6 +511,123 @@ impl ArenaHarness {
     }
 }
 
+// ── nav.rs — the NavigationView pane ─────────────────────────────────────────
+
+/// What a point in a nav pane lands on — [`dcomp::nav::Hit`] re-published so
+/// the test crate can name the elements the backend resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavHit {
+    Back,
+    Toggle,
+    Item(i32),
+    Settings,
+}
+
+impl From<dcomp::nav::Hit> for NavHit {
+    fn from(h: dcomp::nav::Hit) -> Self {
+        match h {
+            dcomp::nav::Hit::Back => Self::Back,
+            dcomp::nav::Hit::Toggle => Self::Toggle,
+            dcomp::nav::Hit::Item(i) => Self::Item(i),
+            dcomp::nav::Hit::Settings => Self::Settings,
+        }
+    }
+}
+
+/// The pane geometry a NavigationView resolves to at a given laid-out size —
+/// [`dcomp::nav::Metrics`] plus the two derived quantities that depend on the
+/// node's height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NavProbe {
+    pub width: f32,
+    pub expanded: bool,
+    pub items_y: f32,
+    pub back: bool,
+    pub toggle: bool,
+    pub settings: bool,
+    pub visible_items: usize,
+    /// Top of the settings row, when there is room for one.
+    pub settings_y: Option<f32>,
+}
+
+impl ArenaHarness {
+    /// Stamp the laid-out rect a real layout pass would have written. The pane
+    /// is adaptive — its display mode and how many rows fit both depend on the
+    /// node's own size — so a test that never lays out is testing the pane at
+    /// 0x0 and nothing else.
+    pub fn set_rect(&mut self, id: ControlId, w: f32, h: f32) {
+        if let Some(n) = self.arena.get_mut(id) {
+            n.rect.w = w;
+            n.rect.h = h;
+        }
+    }
+
+    /// Resolve the pane geometry, through the real
+    /// [`dcomp::nav::metrics`] the paint and hit test both call.
+    pub fn nav_probe(&self, id: ControlId) -> Option<NavProbe> {
+        let n = self.arena.get(id)?;
+        if n.kind != ControlKind::NavigationView {
+            return None;
+        }
+        let has_title = n.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+        let m = dcomp::nav::metrics(n.extras(), n.rect.w, has_title);
+        let count = n.ctrl().items.len();
+        Some(NavProbe {
+            width: m.width,
+            expanded: m.kind.expanded(),
+            items_y: m.items_y,
+            back: m.back,
+            toggle: m.toggle,
+            settings: m.settings,
+            visible_items: dcomp::nav::visible_items(&m, n.rect.h, count),
+            settings_y: dcomp::nav::settings_rect(&m, n.rect.h).map(|r| r.top),
+        })
+    }
+
+    /// Whether the pane's layout inset — what the content child is pushed behind
+    /// — currently equals `dips`.
+    ///
+    /// Compared by VALUE against `taffy::length(..)` rather than destructured:
+    /// `LengthPercentage` is a packed calc representation in taffy 0.11 with no
+    /// public variant to match on, and equality is the only thing the assertion
+    /// needs anyway.
+    pub fn nav_pad_left_is(&self, id: ControlId, dips: f32) -> bool {
+        self.arena
+            .get(id)
+            .is_some_and(|n| n.style.padding.left == taffy::style_helpers::length(dips))
+    }
+
+    /// Re-derive the pane's layout inset — [`dcomp::layout::apply_nav_metrics`],
+    /// the same call `apply_prop` and the layout pass make.
+    pub fn nav_apply_metrics(&mut self, id: ControlId) {
+        if let Some(n) = self.arena.get_mut(id) {
+            dcomp::layout::apply_nav_metrics(n);
+        }
+    }
+
+    /// Resolve a node-local point against the pane, through the real
+    /// [`dcomp::nav::hit`] the pointer path and the accessibility tree share.
+    pub fn nav_hit(&self, id: ControlId, x: f32, y: f32) -> Option<NavHit> {
+        let n = self.arena.get(id)?;
+        if n.kind != ControlKind::NavigationView {
+            return None;
+        }
+        let has_title = n.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+        let m = dcomp::nav::metrics(n.extras(), n.rect.w, has_title);
+        dcomp::nav::hit(&m, n.rect.h, n.ctrl().items.len(), x, y).map(NavHit::from)
+    }
+
+    /// The node-local box the pane draws item `i` in — the geometry the hit test
+    /// must agree with.
+    pub fn nav_item_box(&self, id: ControlId, i: i32) -> Option<(f32, f32, f32, f32)> {
+        let n = self.arena.get(id)?;
+        let has_title = n.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+        let m = dcomp::nav::metrics(n.extras(), n.rect.w, has_title);
+        let r = dcomp::nav::item_rect(&m, i);
+        Some((r.left, r.top, r.width(), r.height()))
+    }
+}
+
 /// A snapshot of the [`Ctrl`](dcomp::node::Ctrl) fields whose defaults are not
 /// all-zero — see [`ArenaHarness::ctrl_probe`].
 #[derive(Debug, Clone, PartialEq)]

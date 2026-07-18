@@ -42,6 +42,7 @@
 use rustc_hash::FxHashMap;
 
 use super::bootstrap::Compositing;
+use super::nav;
 use super::node::{linear, Node};
 use super::theme;
 use crate::backend::ControlKind;
@@ -1199,6 +1200,11 @@ pub(crate) fn ink_state_changed(node: &mut Node) {
         // before this flip, so the ink must land on it, not fade in wherever
         // it last sat.
         ControlKind::SelectorBar => seg_hot_changed(node),
+        // Same reason as the SelectorBar, and the same hazard the default arm
+        // below would cause: a nav pane's `above[0]` is the ROW ink, placed on
+        // the hot row. Fading it to a node-level hover target would light it up
+        // wherever it last sat, on whichever row the pointer left.
+        ControlKind::NavigationView => nav_hot_changed(node),
         // No ink: the CheckBox / hyperlink hover feedback is painted (the
         // caller repaints once, event-driven); progress is not interactive.
         // Careful: the CheckBox's above[0] is its CHECKMARK — the default arm
@@ -1864,40 +1870,80 @@ pub(crate) fn seg_hot_changed(node: &mut Node) {
     }
 }
 
-// ── NavigationView (icon rail) ───────────────────────────────────────────────
+// ── NavigationView pane ──────────────────────────────────────────
 
-/// Below-band roles: `[rail background, active tile, accent bar]`.
+/// Below-band roles: `[pane background, active tile, accent bar]`; above:
+/// `[row hover ink]`.
+///
+/// Three things move here and all three move on the compositor: the pane's
+/// WIDTH when it opens or closes, the selection tile and its accent bar when
+/// the selected page changes, and the hover ink as the pointer crosses rows.
+/// The pane's painted layer (glyphs, labels, divider) snaps to the new width in
+/// the same repaint that starts the glide — the geometry is retained chrome,
+/// the text is not, and a text layout cannot be interpolated.
 fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 3, 0) {
+    if !ensure(comp, node, 3, 1) {
         return;
     }
-    let h = node.rect.h;
+    let (w, h) = (node.rect.w, node.rect.h);
     let dim = dim_of(node);
-    let item_h = super::controls::NAV_ITEM_H;
+    let count = node.ctrl().items.len();
+    let has_title = node.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+    let m = nav::metrics(node.extras(), w, has_title);
+    let n = nav::visible_items(&m, h, count);
     let sel = node.ctrl().selected_index;
-    let visible = sel >= 0 && !node.ctrl().items.is_empty();
-    let iy = sel.max(0) as f32 * item_h;
+    let enabled = node.paint.is_enabled;
+    let visible = sel >= 0 && (sel as usize) < n;
 
     let k_bg = AtlasKey::solid(theme::surface_sunken(), scale);
-    let k_tile = AtlasKey::hbar(item_h - theme::SPACE_8, theme::RADIUS_SM, 0.0, theme::accent_fill(), scale);
+    let k_tile = AtlasKey::hbar(
+        nav::ITEM_H - theme::SPACE_8,
+        theme::RADIUS_SM,
+        0.0,
+        theme::accent_fill(),
+        scale,
+    );
     let bar_h = theme::SPACE_16;
     let k_bar = AtlasKey::hbar(bar_h, theme::BORDER_W, 0.0, theme::accent(), scale);
+    let k_ink = AtlasKey::hbar(
+        nav::ITEM_H - theme::SPACE_8,
+        theme::RADIUS_SM,
+        0.0,
+        theme::w(1.0),
+        scale,
+    );
 
+    let row = nav::item_rect(&m, sel.max(0));
     let tile = (
         theme::SPACE_4,
-        iy + theme::SPACE_4,
-        theme::NAV_RAIL_W - theme::SPACE_8,
-        item_h - theme::SPACE_8,
+        row.top + theme::SPACE_4,
+        (m.width - theme::SPACE_8).max(0.0),
+        nav::ITEM_H - theme::SPACE_8,
     );
-    let bar = (0.0, iy + (item_h - bar_h) / 2.0, theme::BORDER_W * 3.0, bar_h);
+    let bar = (
+        0.0,
+        row.top + (nav::ITEM_H - bar_h) / 2.0,
+        theme::BORDER_W * 3.0,
+        bar_h,
+    );
+
+    let ink_row = nav_ink_rect(node);
 
     let Some(parts) = node.parts.as_mut() else { return };
-    let snap = !parts.init || parts.geom != (theme::NAV_RAIL_W, h);
+    // A HEIGHT change snaps (a resize must not play as motion); a WIDTH change
+    // is exactly the pane opening or closing, so it glides.
+    let snap = !parts.init || parts.geom.1 != h;
 
     parts.below[0].bind(comp, atlas, k_bg);
     parts.below[1].bind(comp, atlas, k_tile);
     parts.below[2].bind(comp, atlas, k_bar);
-    parts.below[0].place(0.0, 0.0, theme::NAV_RAIL_W, h);
+    parts.above[0].bind(comp, atlas, k_ink);
+
+    if snap {
+        parts.below[0].place(0.0, 0.0, m.width, h);
+    } else {
+        parts.below[0].glide(0.0, 0.0, m.width, h);
+    }
     parts.below[0].set_opacity(dim);
 
     if visible {
@@ -1914,9 +1960,79 @@ fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) 
         parts.below[1].set_opacity(0.0);
         parts.below[2].set_opacity(0.0);
     }
+
+    match ink_row.filter(|_| enabled) {
+        Some(r) => {
+            // Snap the ink to the newly hovered row, then fade it in: a glide
+            // would draw a wash sliding down the pane between two rows the
+            // pointer never paused on.
+            parts.above[0].place(r.0, r.1, r.2, r.3);
+            if parts.init {
+                parts.above[0].fade_to(wash(0.06) * dim);
+            } else {
+                parts.above[0].set_opacity(wash(0.06) * dim);
+            }
+        }
+        None if parts.init => parts.above[0].fade_to(0.0),
+        None => parts.above[0].set_opacity(0.0),
+    }
+
     parts.sel = sel;
-    parts.geom = (theme::NAV_RAIL_W, h);
+    parts.geom = (m.width, h);
     parts.init = true;
+}
+
+/// The hover ink's box for whatever row a nav pane currently calls hot, in
+/// node-local DIPs. `None` when nothing is hovered.
+///
+/// The one definition the full sync and the hover edge below both read, so an
+/// ink placed by a hover and an ink placed by a repaint cannot land differently.
+/// A settings row hovers at its own sentinel index, so one sprite serves both it
+/// and the menu rows without a second part.
+fn nav_ink_rect(node: &Node) -> Option<(f32, f32, f32, f32)> {
+    let hot = node.ctrl().hot_index;
+    if hot == -1 {
+        return None;
+    }
+    let has_title = node.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+    let m = nav::metrics(node.extras(), node.rect.w, has_title);
+    let n = nav::visible_items(&m, node.rect.h, node.ctrl().items.len()) as i32;
+    let row = if (0..n).contains(&hot) {
+        nav::item_rect(&m, hot)
+    } else if hot == nav::HOT_SETTINGS_BASE {
+        nav::settings_rect(&m, node.rect.h)?
+    } else {
+        // The two chrome buttons wash on the node's own surface (a flat state
+        // fill, like the caption band's back button), not through this sprite.
+        return None;
+    };
+    Some((
+        theme::SPACE_4,
+        row.top + theme::SPACE_4,
+        (m.width - theme::SPACE_8).max(0.0),
+        nav::ITEM_H - theme::SPACE_8,
+    ))
+}
+
+/// The hot row moved while the pointer stayed on the pane: place the ink on the
+/// new row, then fade to the target. Place *and* fade, for the reason
+/// [`seg_hot_changed`] does both — on hover entry the hot row was recorded
+/// before this call, so the ink must land on it rather than fade in wherever it
+/// last sat.
+pub(crate) fn nav_hot_changed(node: &mut Node) {
+    let rect = nav_ink_rect(node).filter(|_| node.paint.is_enabled && node.hovered);
+    let dim = dim_of(node);
+    let Some(parts) = node.parts.as_mut() else { return };
+    if parts.above.is_empty() {
+        return;
+    }
+    match rect {
+        Some((x, y, w, h)) => {
+            parts.above[0].place(x, y, w, h);
+            parts.above[0].fade_to(wash(0.06) * dim);
+        }
+        None => parts.above[0].fade_to(0.0),
+    }
 }
 
 // ── Expander ─────────────────────────────────────────────────────────────────

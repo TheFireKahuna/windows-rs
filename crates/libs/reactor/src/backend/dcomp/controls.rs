@@ -55,7 +55,7 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         // (`super::parts::progress_sync`) — the sweep loops on the compositor.
         ControlKind::ProgressBar => {}
         ControlKind::ProgressRing => paint_progress_ring(session, brush, node, rect, dim),
-        ControlKind::NavigationView => paint_nav(session, brush, node, rect, dim),
+        ControlKind::NavigationView => super::nav::paint(session, brush, node, rect, dim),
         ControlKind::Expander => paint_expander(session, brush, node, rect, dim),
         // The custom caption band: only the min/max/close cluster is drawn
         // here (the band itself is transparent; slot children are real nodes).
@@ -77,13 +77,20 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
 /// Set the recolorable brush to a token colour, scaled by `dim` (disabled fade).
-fn put(brush: &Brush, c: Color, dim: f32) {
+pub(crate) fn put(brush: &Brush, c: Color, dim: f32) {
     let mut l = linear(c);
     l.a *= dim;
     brush.set_color(l);
 }
 
-fn fill_rr(session: &DrawingSession, brush: &Brush, r: Rect, radius: f32, c: Color, dim: f32) {
+pub(crate) fn fill_rr(
+    session: &DrawingSession,
+    brush: &Brush,
+    r: Rect,
+    radius: f32,
+    c: Color,
+    dim: f32,
+) {
     put(brush, c, dim);
     if radius > 0.0 {
         session.fill_rounded_rect(&RoundedRect::uniform(r, radius), brush);
@@ -149,7 +156,7 @@ fn glyph_str(cp: u32) -> Option<String> {
 /// Encode a glyph codepoint into a caller-owned stack buffer — the alloc-free
 /// counterpart to [`glyph_str`], for paths that hand the glyph straight to
 /// `draw_text` and never need to own it.
-fn glyph_into(cp: u32, buf: &mut [u8; 4]) -> Option<&str> {
+pub(crate) fn glyph_into(cp: u32, buf: &mut [u8; 4]) -> Option<&str> {
     char::from_u32(cp).map(|c| &*c.encode_utf8(buf))
 }
 
@@ -704,64 +711,6 @@ fn arc(
         let p = Vector2::new(cx + r * a.cos(), cy + r * a.sin());
         session.draw_line(prev, p, brush, width);
         prev = p;
-    }
-}
-
-// ── NavigationView (icon rail) ───────────────────────────────────────────────
-
-/// Per-item square side in the rail (height of one nav row).
-pub(crate) const NAV_ITEM_H: f32 = theme::NAV_RAIL_W;
-
-fn paint_nav(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    // The rail background, active tile wash, and accent indicator bar are
-    // retained chrome parts UNDER this surface (`super::parts`) — a selection
-    // change glides them on the compositor. The divider and per-item glyphs
-    // paint here, above them.
-    put(brush, theme::stroke_divider(), dim);
-    session.draw_line(
-        Vector2::new(theme::NAV_RAIL_W, 0.0),
-        Vector2::new(theme::NAV_RAIL_W, rect.height()),
-        brush,
-        theme::BORDER_W,
-    );
-
-    let n = node.ctrl().items.len();
-    if n == 0 {
-        return;
-    }
-    let sel = node.ctrl().selected_index;
-
-    for (i, label) in node.ctrl().items.iter().enumerate() {
-        let iy = i as f32 * NAV_ITEM_H;
-        let active = i as i32 == sel;
-        let color = if active { theme::accent() } else { theme::text_tertiary() };
-        let cell = Rect::from_xywh(0.0, iy, theme::NAV_RAIL_W, NAV_ITEM_H);
-        let glyph = node
-            .ctrl()
-            .icons
-            .get(i)
-            .copied()
-            .filter(|g| *g != 0)
-            .and_then(glyph_str)
-            .unwrap_or_else(|| label.chars().next().map(|c| c.to_string()).unwrap_or_default());
-        let family = if node.ctrl().icons.get(i).copied().unwrap_or(0) != 0 {
-            theme::FONT_ICON
-        } else {
-            "Segoe UI"
-        };
-        text(
-            session,
-            brush,
-            &glyph,
-            cell,
-            family,
-            theme::FONT_SIZE_LG,
-            400,
-            color,
-            TextAlignment::Center,
-            ParagraphAlignment::Center,
-            dim,
-        );
     }
 }
 
