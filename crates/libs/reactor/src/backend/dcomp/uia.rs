@@ -45,6 +45,7 @@ use std::mem::ManuallyDrop;
 use std::sync::{Mutex, OnceLock};
 
 use super::host;
+use super::input::HitKind;
 use super::{caption, controls};
 use super::{layout, scroll};
 use super::*;
@@ -784,7 +785,23 @@ impl DCompBackend {
         (pt.x as f64, pt.y as f64, (w * scale) as f64, (h * scale) as f64)
     }
 
-    /// Deepest node containing screen point `(sx, sy)` (for `ElementProviderFromPoint`).
+    /// The element at screen point `(sx, sy)` (for `ElementProviderFromPoint`).
+    ///
+    /// Hit-testing is delegated to [`DCompBackend::hit_test`], the single
+    /// hit-test authority shared with pointer and wheel routing, so a click and
+    /// an `ElementProviderFromPoint` can never resolve to different elements.
+    /// [`HitKind::Any`] is the arm UIA needs: the topmost element at the point,
+    /// interactive or not.
+    ///
+    /// Two things live outside the arena walk and are handled here:
+    ///
+    /// * **Caption buttons** are synthetic items in the `CAPTION_ITEM_BASE`
+    ///   sentinel space, not arena nodes, so `hit_test` cannot return them. The
+    ///   cluster overlays the content, so it is tested *before* delegating.
+    /// * **Container items** (SelectorBar segments, NavigationView rows) are
+    ///   likewise synthetic; once the walk names their container,
+    ///   [`uia_item_at`](Self::uia_item_at) subdivides it — it takes the same
+    ///   window-space point and applies its own scroll adjustment.
     fn uia_element_from_point(&self, sx: f64, sy: f64) -> UiaNav {
         let scale = self.scale();
         let mut pt = POINT { x: sx as i32, y: sy as i32 };
@@ -803,22 +820,7 @@ impl DCompBackend {
                 return UiaNav::Item(root, CAPTION_ITEM_BASE + i);
             }
         }
-        fn rec(b: &DCompBackend, id: ControlId, px: f32, py: f32) -> Option<ControlId> {
-            let n = b.arena.get(id)?;
-            if !n.rect.contains(px, py) {
-                return None;
-            }
-            // Descend in content space: a scroll container's children are laid
-            // out unscrolled (mirrors the pointer path's `surface_walk`).
-            let cy = if n.is_scroll() { py + n.scroll_off } else { py };
-            for c in &n.children {
-                if let Some(found) = rec(b, *c, px, cy) {
-                    return Some(found);
-                }
-            }
-            Some(id)
-        }
-        match self.root.and_then(|r| rec(self, r, px, py)) {
+        match self.hit_test(px, py, HitKind::Any) {
             Some(id) if self.root == Some(id) => UiaNav::Root,
             Some(id) => match self.uia_item_at(id, px, py) {
                 Some(i) => UiaNav::Item(id, i),
