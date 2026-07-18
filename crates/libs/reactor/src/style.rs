@@ -420,10 +420,45 @@ static URI_LAUNCHER: OnceLock<UriLauncher> = OnceLock::new();
 /// is not optional: handing this straight to `ShellExecuteW` executes whatever
 /// protocol handler the machine has registered.
 ///
+/// Three things the structural gate specifically does **not** cover, because
+/// each is a judgement only the app can make:
+///
+/// - **Percent-encoding is not decoded.** `%00`, `%0A` and `%2E%2E%2F` reach the
+///   launcher as those literal characters. The gate rejects a literal control
+///   character; it cannot reject one that does not exist until something
+///   decodes. If your launcher percent-decodes — or hands the string to
+///   something that does — apply the same structural check again on the decoded
+///   form, and expect an embedded NUL there.
+/// - **The authority is not judged.** IDN, punycode and homoglyphs pass through:
+///   `https://xn--80ak6aa92e.com/` is a well-formed URI reference and this crate
+///   has no basis for deciding it is not the host you meant. An app that shows
+///   the target to a user should render the decoded form, or the ASCII form,
+///   deliberately — not whichever one it happened to get.
+/// - **Nothing is canonicalised.** Dot segments, case, and duplicate slashes
+///   arrive as authored. Screen the string you will actually launch, not a
+///   normalisation of it that you then discard.
+///
+/// # Being called is not evidence of a user gesture
+///
+/// Activation converges on one path, which a pointer release, a Space/Enter
+/// press and a UI-Automation `Invoke` all share — deliberately, so a screen
+/// reader follows a link exactly as a click does. UIA is cross-process: any
+/// process able to automate this window can drive that `Invoke` with no user
+/// present. That is not a new capability (a process that can automate your UI
+/// can already press the button), and the URI is still one your own tree
+/// supplied, so the launcher is not being handed anything an attacker authored.
+/// But it does mean a launcher must not treat the call itself as proof a human
+/// asked. If a scheme needs consent, prompt for it; do not infer it.
+///
 /// # Contract
 ///
-/// The launcher runs **on the UI thread**, from the message pump, outside any
-/// backend borrow — never during layout, paint, or event dispatch.
+/// When *this crate* routes a `HyperlinkButton` activation, the launcher runs
+/// **on the UI thread**, from the message pump, outside any backend borrow —
+/// never during layout, paint, or event dispatch. That is a property of the
+/// routing, not of the seam: [`launch_uri`] is public and the `Send + Sync`
+/// bound is real, so an app calling it directly can reach the launcher from any
+/// thread, concurrently with itself, and re-entrantly from inside it. Nothing
+/// here serialises those; write the launcher to tolerate them.
 ///
 /// - It must not block. A synchronous `ShellExecuteW` on a cold handler can
 ///   stall for seconds; the window is frozen for exactly that long. Post the
@@ -434,9 +469,23 @@ static URI_LAUNCHER: OnceLock<UriLauncher> = OnceLock::new();
 ///   same fault boundary as an event handler, and the fault is reported under
 ///   the `"uri launcher"` context. The URI is **not** part of that report — a
 ///   fault handler that logs, and a hyperlink carrying a capability URL, must
-///   not combine into a leak.
-pub fn set_uri_launcher(launcher: impl Fn(&str) -> bool + Send + Sync + 'static) {
-    let _ = URI_LAUNCHER.set(Box::new(launcher));
+///   not combine into a leak. Two limits on that, both inherited from the fault
+///   module rather than chosen here: the boundary deliberately does not catch
+///   during a render pass (so a launcher reached by calling [`launch_uri`] from
+///   inside a component body is not covered), and the fault handler is a
+///   `winui-backend` facility — under `dcomp-backend` a caught panic goes to
+///   stderr. The context string is still URI-free either way, but the panic
+///   *message* is yours: do not put the URI in it.
+/// Returns whether THIS registration is the one now installed. `false` means a
+/// launcher was already present and yours was discarded — check it. First-wins
+/// is the fail-safe direction (a component loaded later cannot silently swap out
+/// the policy the app installed at startup), but it means losing the race is
+/// indistinguishable from winning it unless you look: [`uri_launcher_installed`]
+/// would answer `true` either way, and an app that assumed its own allow-list
+/// was in force would render links as followable while someone else's policy
+/// decided where they go.
+pub fn set_uri_launcher(launcher: impl Fn(&str) -> bool + Send + Sync + 'static) -> bool {
+    URI_LAUNCHER.set(Box::new(launcher)).is_ok()
 }
 
 /// Whether a launcher has been installed with [`set_uri_launcher`].
@@ -457,18 +506,36 @@ pub fn uri_launcher_installed() -> bool {
 ///
 /// The structural gate is deliberately the *only* filtering done here, and it
 /// is not a security judgement — it rejects strings that cannot be a URI
-/// reference under RFC 3986 no matter whose policy applies: empty or
-/// whitespace-only, and anything containing a C0/C1 control character (which
-/// includes NUL, CR and LF, the bytes that would let one "URI" become two
-/// arguments or two log lines further down). Everything a policy could
-/// reasonably differ on — the scheme, the authority, the path, the encoding —
-/// is passed through untouched for the launcher to judge.
+/// reference under RFC 3986 no matter whose policy applies: the empty string,
+/// anything with leading or trailing whitespace, and anything containing a
+/// character RFC 3986 §2 does not admit literally — see
+/// [`not_a_uri_character`]. That is the class of byte that would let one "URI"
+/// become two arguments or two log lines further down, or render as one host
+/// and parse as another. Everything a policy could reasonably differ on — the
+/// scheme, the authority, the path, the encoding — is passed through untouched
+/// for the launcher to judge.
+///
+/// The string handed to the launcher is the string that cleared the gate,
+/// byte-for-byte. Nothing is trimmed, decoded or normalised on the way through,
+/// so the launcher's allow-list and whatever eventually parses the URI are
+/// looking at the same characters.
 ///
 /// Public because it is the one chokepoint: an app rendering its own link-like
 /// affordance should route through here rather than reaching for the shell
 /// separately, so a single installed policy governs every launch.
 pub fn launch_uri(uri: &str) -> bool {
-    if uri.trim().is_empty() || uri.chars().any(|c| c.is_control()) {
+    if uri.is_empty()
+        // Rejected, NOT trimmed. Trimming and passing the trimmed string would
+        // be a policy edit; passing the untrimmed one after testing `trim()` for
+        // emptiness — which is what this used to do — is worse than either: the
+        // app's allow-list reads a different string from the one the shell
+        // eventually parses. `" file:///C:/Windows/System32/cmd.exe"` cleared
+        // the old gate, and a launcher screening with `!uri.starts_with("file:")`
+        // — the exact shape this module documents — called it handled.
+        || uri.starts_with(char::is_whitespace)
+        || uri.ends_with(char::is_whitespace)
+        || uri.chars().any(not_a_uri_character)
+    {
         return false;
     }
     let Some(launcher) = URI_LAUNCHER.get() else {
@@ -480,6 +547,50 @@ pub fn launch_uri(uri: &str) -> bool {
     let handled = Cell::new(false);
     fault::catch("uri launcher", || handled.set(launcher(uri)));
     handled.get()
+}
+
+/// A character that cannot appear literally in a URI reference, so rejecting it
+/// is the same structural call the control-character test already makes rather
+/// than a new policy one.
+///
+/// RFC 3986 §2 fixes the whole repertoire — ALPHA / DIGIT / the unreserved
+/// marks / the reserved set / `%` — and nothing below is in it. To carry any of
+/// these a URI must percent-encode them, and the encoded form passes through
+/// here untouched, which is the point: this rejects the *literal* character, it
+/// does not decode or judge what the URI is trying to say.
+///
+/// Why these and not merely `is_control`: `char::is_control` is Unicode category
+/// Cc alone, so the old gate stopped CR and LF and NUL and U+0085 while letting
+/// through the characters that do the same damage from outside Cc.
+///
+/// - **U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR** — line terminators to
+///   JavaScript and to several log formats. One URI, two log lines: precisely
+///   what this gate exists to stop, and it did not stop it.
+/// - **Other non-space whitespace** (U+00A0 NBSP, U+3000 IDEOGRAPHIC SPACE, …) —
+///   a separator to anything tokenising on Unicode whitespace, and invisible or
+///   near-invisible in the string the reviewer read.
+/// - **Bidi controls and invisibles** (U+202E RIGHT-TO-LEFT OVERRIDE, the
+///   isolates, U+200B ZWSP, U+FEFF, U+00AD SOFT HYPHEN) — these make the
+///   rendered string and the parsed string differ, so the host a user sees is
+///   not the host that is launched, and two different URIs can render
+///   identically.
+///
+/// A plain U+0020 in the interior is deliberately still allowed: it is visible,
+/// an app can see it and decide, and `file:///C:/Program Files/…` is a real
+/// thing apps launch. Leading and trailing whitespace is rejected outright by
+/// the caller — no URI has it, and it is what makes the app's reading of the
+/// scheme diverge from the shell's.
+fn not_a_uri_character(c: char) -> bool {
+    c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c,
+            '\u{00AD}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}')
 }
 
 /// Symbolic reference to a WinUI XAML theme resource (resolved at apply

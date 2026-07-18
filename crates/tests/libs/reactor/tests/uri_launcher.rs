@@ -64,11 +64,14 @@ fn the_uri_launch_seam_is_inert_until_the_app_installs_a_launcher() {
     );
 
     // ── Install ──────────────────────────────────────────────────────────
-    set_uri_launcher(|uri| {
-        SEEN.lock().unwrap().push(uri.to_string());
-        // Decide as well as act: the seam must carry a decline back.
-        !uri.starts_with("file:")
-    });
+    assert!(
+        set_uri_launcher(|uri| {
+            SEEN.lock().unwrap().push(uri.to_string());
+            // Decide as well as act: the seam must carry a decline back.
+            !uri.starts_with("file:")
+        }),
+        "the first registration must report that it won the slot"
+    );
     assert!(
         uri_launcher_installed(),
         "installing a launcher is not observable"
@@ -105,7 +108,17 @@ fn the_uri_launch_seam_is_inert_until_the_app_installs_a_launcher() {
         "vscode://file/C:/x",
         "HTTPS://EXAMPLE.COM/../../%2e%2e/etc",
         "unregistered-scheme:whatever",
+        // Interior U+0020 stays legal. It is visible, so the app can see it and
+        // decide, and `file:///C:/Program Files/…` is a real thing apps launch.
         "not a uri at all, just words",
+        // Percent-encoding is NOT decoded here, so these are not control
+        // characters yet and the gate has no basis to reject them. An app that
+        // decodes owns re-checking the decoded form.
+        "https://newapo.dev/%00",
+        "https://newapo.dev/%0Ainjected",
+        // Punycode/homoglyph authorities are well-formed URI references. Which
+        // host you meant is not a structural question.
+        "https://xn--80ak6aa92e.com/",
     ];
     for uri in passed_through {
         launch_uri(uri);
@@ -131,6 +144,28 @@ fn the_uri_launch_seam_is_inert_until_the_app_installs_a_launcher() {
         "https://newapo.dev\0",
         "https://newapo.dev\r\nHost: elsewhere",
         "https://newapo.dev\u{85}",
+        // Leading/trailing whitespace is REJECTED, not trimmed. Testing
+        // `trim()` for emptiness and then handing over the untrimmed string
+        // let the app's allow-list read a different string from the one the
+        // shell would parse: this exact URI cleared the old gate, and the
+        // launcher installed above — screening with `!uri.starts_with("file:")`
+        // — reported it handled.
+        "  file:///C:/Windows/System32/cmd.exe",
+        "https://newapo.dev ",
+        "\u{feff}file:///C:/Windows/System32/cmd.exe",
+        // Line terminators from outside category Cc. `char::is_control` is Cc
+        // ONLY, so these cleared a gate whose whole stated purpose was to stop
+        // one URI becoming two log lines.
+        "https://newapo.dev/\u{2028}console.log(1)",
+        "https://newapo.dev/\u{2029}next",
+        // Separators to anything tokenising on Unicode whitespace, and all but
+        // invisible in the string a reviewer read.
+        "https://newapo.dev/\u{a0}--flag",
+        "https://newapo.dev/\u{3000}arg",
+        // Render-vs-parse divergence: what the user sees is not what launches.
+        "https://newapo.dev/\u{202e}kcatta",
+        "https://newapo.dev\u{200b}.evil.test/",
+        "https://newapo.dev/\u{ad}soft",
     ] {
         assert!(
             !launch_uri(bad),
@@ -147,8 +182,18 @@ fn the_uri_launch_seam_is_inert_until_the_app_installs_a_launcher() {
     // Matches `set_window_visibility_callback` / `set_display_change_callback`:
     // a later call cannot silently swap out the policy an app installed at
     // startup.
+    // First-wins is the fail-safe direction: a component loaded later cannot
+    // silently swap out the policy the app installed at startup. But losing is
+    // only safe if the loser can TELL — `uri_launcher_installed` answers `true`
+    // either way, so without a return value an app would render links as
+    // followable believing its own allow-list was in force while someone else's
+    // decided where they went.
     SEEN.lock().unwrap().clear();
-    set_uri_launcher(|_| panic!("the second registration replaced the first"));
+    assert!(
+        !set_uri_launcher(|_| panic!("the second registration replaced the first")),
+        "a discarded registration reported success — losing the slot must be \
+         observable, or an app cannot tell whose policy is in force"
+    );
     assert!(launch_uri("https://newapo.dev"));
     assert_eq!(seen(), vec!["https://newapo.dev"]);
 }
