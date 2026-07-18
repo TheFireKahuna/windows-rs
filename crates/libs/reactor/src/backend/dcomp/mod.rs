@@ -57,7 +57,7 @@ pub(crate) use pointer::{register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
 
 use bootstrap::Compositing;
-use node::{Arena, MenuRow, Node};
+use node::{Arena, Ctrl, Extras, MenuRow, Node};
 use paint::PaintCache;
 
 use crate::backend::{Backend, ControlKind, Event, EventHandler, Prop, PropValue};
@@ -650,378 +650,13 @@ impl Backend for DCompBackend {
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
-        use taffy::prelude::*;
         // Any prop write can move a value the UIA property snapshot caches
         // (Name, IsEnabled, ToggleState, …), so retire the snapshots first.
         uia::note_state_change();
-        let mut refresh_suggest = false;
-        {
-            let Some(node) = self.node_mut(id) else { return };
-            match (prop, value) {
-            // ── Prop removal — a conditional prop diffed away reverts to its
-            // default (e.g. a Segmented pill losing its active accent fill) ──
-            (_, PropValue::Unset) => reset_prop(node, prop),
-            // ── Paint props (mark the node's surface dirty) ──────────────
-            (Prop::Background, PropValue::Color(c)) => {
-                node.paint.background = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::Foreground, PropValue::Color(c)) => {
-                node.paint.foreground = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::BorderBrush, PropValue::Color(c)) => {
-                node.paint.border_brush = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::BorderThickness, PropValue::Thickness(t)) => {
-                node.paint.border_thickness = t.left as f32;
-                // Border thickness also insets content in layout.
-                node.style.border = Rect {
-                    left: length(t.left as f32),
-                    right: length(t.right as f32),
-                    top: length(t.top as f32),
-                    bottom: length(t.bottom as f32),
-                };
-                node.mark_dirty();
-            }
-            (Prop::CornerRadius, PropValue::F64(v)) => {
-                node.paint.corner_radius = *v as f32;
-                node.mark_dirty();
-            }
-            (Prop::Fill, PropValue::Color(c)) => {
-                node.paint.fill = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::Stroke, PropValue::Color(c)) => {
-                node.paint.stroke = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::StrokeThickness, PropValue::F64(v)) => {
-                node.paint.stroke_thickness = *v as f32;
-                node.mark_dirty();
-            }
-            (Prop::LineEndpoints, PropValue::LineEndpoints(l)) => {
-                node.paint.line = *l;
-                node.mark_dirty();
-            }
-            (Prop::StyleVariant, PropValue::I32(v)) => {
-                node.paint.style_variant = *v;
-                node.mark_dirty();
-            }
-            (Prop::IsEnabled, PropValue::Bool(b)) => {
-                node.paint.is_enabled = *b;
-                node.mark_dirty();
-            }
-
-            // An Expander's title arrives as `Prop::Header`; it paints as the
-            // node's label like every other text-bearing control.
-            (Prop::Content | Prop::Text | Prop::Header, PropValue::Str(s)) => {
-                // For an editable kind (AutoSuggestBox carries its text via
-                // `Prop::Text`), seed the editor buffer instead of the label.
-                if node.editor.is_some() {
-                    seed_editor_text(node, s);
-                } else {
-                    node.paint.text = s.clone();
-                    node.text_dirty = true;
-                }
-                node.mark_dirty();
-            }
-            // TextBox / PasswordBox carry their text via `Prop::Value(Str)`.
-            (Prop::Value, PropValue::Str(s)) if node.editor.is_some() => {
-                seed_editor_text(node, s);
-                node.mark_dirty();
-            }
-            (Prop::Precision, PropValue::I32(v)) => {
-                node.ctrl_mut().precision = Some(*v);
-                // Reformat the seeded value to the new precision (the `Value`
-                // prop usually arrives before `Precision`). Never while focused
-                // — the user owns the buffer mid-edit.
-                if node.kind == ControlKind::NumberBox && !node.focused {
-                    let value = node.ctrl().value;
-                    if let Some(ed) = &mut node.editor {
-                        ed.seeded = false;
-                    }
-                    seed_number_text(node, value);
-                    node.mark_dirty();
-                }
-            }
-            (Prop::LargeChange, PropValue::F64(v)) => node.ctrl_mut().large_change = Some(*v),
-            (Prop::HorizontalContentAlignment, PropValue::I32(v)) => {
-                node.ctrl_mut().content_align = *v;
-                if let Some(ed) = &mut node.editor {
-                    ed.layout_dirty = true;
-                }
-                node.mark_dirty();
-            }
-            (Prop::FontSize, PropValue::F64(v)) => {
-                node.paint.font_size = *v as f32;
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-            (Prop::FontWeight, PropValue::U16(w)) => {
-                node.paint.font_weight = *w;
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-            (Prop::FontFamily, PropValue::Str(s)) => {
-                node.paint.font_family = Some(s.clone());
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-            (Prop::TextWrapping | Prop::TextWrappingWrap, _) => {
-                // WinRT TextWrapping: NoWrap = 1, Wrap = 2, WrapWholeWords = 3 — and
-                // 0 for a widget that never set one, since the generated TextBlock
-                // bindings push this prop unconditionally and the field's Rust default
-                // is `TextWrapping(0)`. Only a real Wrap value wraps: 0 is "unset",
-                // which must mean NoWrap to match XAML's own TextBlock default.
-                // Reading it as `!= 1` instead marked virtually every text node in the
-                // tree as wrapping — inert only for as long as the DWrite box stayed
-                // unconstrained (see `layout::build_text_layout`), and silently
-                // wrapping every label the moment it did not.
-                let wrap = match value {
-                    PropValue::I32(v) => *v > 1,
-                    PropValue::Bool(b) => *b,
-                    _ => true,
-                };
-                node.paint.wrap = wrap;
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-
-            // ── Visual prop applied straight onto the container ──────────
-            (Prop::Opacity, PropValue::F64(v)) => {
-                let _ = node.vis.SetOpacity((*v as f32).clamp(0.0, 1.0));
-            }
-
-            // ── Layout props (Taffy inputs; relayout runs each reconcile) ─
-            (Prop::Padding, PropValue::Thickness(t)) => {
-                node.style.padding = Rect {
-                    left: length(t.left as f32),
-                    right: length(t.right as f32),
-                    top: length(t.top as f32),
-                    bottom: length(t.bottom as f32),
-                };
-            }
-            (Prop::Margin, PropValue::Thickness(t)) => {
-                node.style.margin = Rect {
-                    left: length(t.left as f32),
-                    right: length(t.right as f32),
-                    top: length(t.top as f32),
-                    bottom: length(t.bottom as f32),
-                };
-            }
-            (Prop::Width, PropValue::F64(v)) => node.style.size.width = length(*v as f32),
-            (Prop::Height, PropValue::F64(v)) => node.style.size.height = length(*v as f32),
-            (Prop::MinWidth, PropValue::F64(v)) => node.style.min_size.width = length(*v as f32),
-            (Prop::MinHeight, PropValue::F64(v)) => node.style.min_size.height = length(*v as f32),
-            (Prop::MaxWidth, PropValue::F64(v)) => node.style.max_size.width = length(*v as f32),
-            (Prop::MaxHeight, PropValue::F64(v)) => node.style.max_size.height = length(*v as f32),
-
-            (Prop::HorizontalAlignment, PropValue::I32(v)) => node.h_align = *v,
-            (Prop::VerticalAlignment, PropValue::I32(v)) => node.v_align = *v,
-
-            (Prop::Orientation, PropValue::I32(v)) => {
-                // WinRT Orientation: Vertical = 0, Horizontal = 1.
-                node.style.flex_direction = if *v == 1 {
-                    FlexDirection::Row
-                } else {
-                    FlexDirection::Column
-                };
-                apply_stack_gap(node);
-            }
-            (Prop::Spacing, PropValue::F64(v)) => {
-                node.spacing = *v as f32;
-                apply_stack_gap(node);
-            }
-            (Prop::ColumnSpacing, PropValue::F64(v)) => node.style.gap.width = length(*v as f32),
-            (Prop::RowSpacing, PropValue::F64(v)) => node.style.gap.height = length(*v as f32),
-            (Prop::GridRows, PropValue::GridLengths(g)) => node.grid_rows = clone_lengths(g),
-            (Prop::GridColumns, PropValue::GridLengths(g)) => node.grid_cols = clone_lengths(g),
-
-            (Prop::AttachedGridRow, PropValue::I32(v)) => {
-                node.style.grid_row.start = line((*v + 1) as i16);
-            }
-            (Prop::AttachedGridColumn, PropValue::I32(v)) => {
-                node.style.grid_column.start = line((*v + 1) as i16);
-            }
-            (Prop::AttachedGridRowSpan, PropValue::I32(v)) => {
-                node.style.grid_row.end = span((*v).max(1) as u16);
-            }
-            (Prop::AttachedGridColumnSpan, PropValue::I32(v)) => {
-                node.style.grid_column.end = span((*v).max(1) as u16);
-            }
-            (Prop::AttachedCanvasLeft, PropValue::F64(v)) => {
-                node.style.position = Position::Absolute;
-                node.style.inset.left = length(*v as f32);
-            }
-            (Prop::AttachedCanvasTop, PropValue::F64(v)) => {
-                node.style.position = Position::Absolute;
-                node.style.inset.top = length(*v as f32);
-            }
-            (Prop::AttachedCanvasZIndex, PropValue::I32(v)) => {
-                node.z_index = *v;
-                node.z_dirty = true;
-            }
-
-            // ── Control state (stateful drawn controls) ──────────────────
-            // The part-converted kinds (toggle / slider / segmented / nav) need
-            // no spring tick here: marking dirty routes them through the paint
-            // pass, whose parts sync glides the change on the compositor.
-            (Prop::IsOn, PropValue::Bool(v)) => {
-                node.ctrl_mut().is_on = *v;
-                node.mark_dirty();
-            }
-            (Prop::IsChecked, PropValue::Bool(v)) => {
-                // The CheckBox reveal fades via its chrome parts on repaint; a
-                // ToggleButton's checked state is plain painted chrome.
-                node.ctrl_mut().is_checked = *v;
-                node.mark_dirty();
-            }
-            (Prop::Value, PropValue::F64(v)) => {
-                node.ctrl_mut().value = *v;
-                // NumberBox: reflect the programmatic value as formatted text
-                // (unless the user is mid-edit — the editor owns the buffer
-                // while focused).
-                if node.kind == ControlKind::NumberBox {
-                    seed_number_text(node, *v);
-                }
-                node.mark_dirty();
-            }
-            (Prop::Minimum, PropValue::F64(v)) => {
-                node.ctrl_mut().min = *v;
-                node.mark_dirty();
-            }
-            (Prop::Maximum, PropValue::F64(v)) => {
-                node.ctrl_mut().max = *v;
-                node.mark_dirty();
-            }
-            (Prop::Step, PropValue::F64(v)) => node.ctrl_mut().step = Some(*v),
-            (Prop::FillOrigin, PropValue::F64(v)) => {
-                node.ctrl_mut().fill_origin = Some(*v);
-                node.mark_dirty();
-            }
-            (Prop::FillColor, PropValue::Color(c)) => {
-                node.ctrl_mut().fill_color = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::FillColorAlt, PropValue::Color(c)) => {
-                node.ctrl_mut().fill_color_alt = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::Marker, PropValue::F64(v)) => {
-                node.ctrl_mut().marker = Some(*v);
-                node.mark_dirty();
-            }
-            (Prop::MarkerColor, PropValue::Color(c)) => {
-                node.ctrl_mut().marker_color = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::GradientStops, PropValue::GradientStops(stops)) => {
-                node.ctrl_mut().stops = stops.clone();
-                node.mark_dirty();
-            }
-            (Prop::StartAngle, PropValue::F64(v)) => {
-                node.ctrl_mut().start_angle = *v as f32;
-                node.mark_dirty();
-            }
-            (Prop::EndAngle, PropValue::F64(v)) => {
-                node.ctrl_mut().end_angle = *v as f32;
-                node.mark_dirty();
-            }
-            (Prop::Ticks, PropValue::F64List(list)) => {
-                node.ctrl_mut().ticks = list.clone();
-                node.mark_dirty();
-            }
-            (Prop::TickLabels, PropValue::ValueLabels(list)) => {
-                node.ctrl_mut().tick_labels = list.clone();
-                node.mark_dirty();
-            }
-            (Prop::MajorEvery, PropValue::F64(v)) => {
-                node.ctrl_mut().major_every = Some(*v);
-                node.mark_dirty();
-            }
-            (Prop::Accent, PropValue::Color(c)) => {
-                node.ctrl_mut().accent = Some(*c);
-                node.mark_dirty();
-            }
-            (Prop::Unit, PropValue::Str(s)) => {
-                node.ctrl_mut().unit = s.clone();
-                node.mark_dirty();
-            }
-            (Prop::SubText, PropValue::Str(s)) => {
-                node.ctrl_mut().sub_text = s.clone();
-                node.mark_dirty();
-            }
-            (Prop::IsIndeterminate, PropValue::Bool(v)) => {
-                node.ctrl_mut().indeterminate = *v;
-                node.mark_dirty();
-            }
-            (Prop::IsActive, PropValue::Bool(v)) => {
-                node.ctrl_mut().is_active = *v;
-                node.mark_dirty();
-            }
-            (Prop::IsExpanded, PropValue::Bool(v)) => {
-                node.ctrl_mut().expanded = *v;
-                node.mark_dirty();
-            }
-            (Prop::SelectedIndex, PropValue::I32(v)) => {
-                node.ctrl_mut().selected_index = *v;
-                node.mark_dirty();
-            }
-            (Prop::SelectedTag, PropValue::Str(s)) => {
-                node.ctrl_mut().selected_tag = Some(s.clone());
-                sync_selected_tag(node);
-                node.mark_dirty();
-            }
-            (Prop::PlaceholderText, PropValue::Str(s)) => {
-                node.ctrl_mut().placeholder = s.clone();
-                node.mark_dirty();
-            }
-            (Prop::Items, PropValue::StrList(list)) => {
-                node.ctrl_mut().items = list.clone();
-                node.mark_dirty();
-                // A focused AutoSuggestBox whose filtered list just changed refreshes
-                // its open dropdown in place (deferred until the node borrow ends).
-                refresh_suggest = node.kind == ControlKind::AutoSuggestBox;
-            }
-            (Prop::Items, PropValue::SelectorBarItems(items)) => {
-                node.ctrl_mut().items = items.iter().map(|i| i.text.clone()).collect();
-                if node.ctrl().selected_index < 0 && !node.ctrl().items.is_empty() {
-                    node.ctrl_mut().selected_index = 0;
-                }
-                // Labels feed the per-item width measure — rebuild it.
-                node.text_dirty = true;
-                node.mark_dirty();
-            }
-            (Prop::MenuItems, PropValue::NavMenuItems(items)) => {
-                let ctrl = node.ctrl_mut();
-                ctrl.items.clear();
-                ctrl.tags.clear();
-                ctrl.icons.clear();
-                for it in items {
-                    if it.is_header {
-                        continue;
-                    }
-                    ctrl.items.push(it.content.clone());
-                    ctrl.tags
-                        .push(it.tag.clone().unwrap_or_else(|| it.content.clone()));
-                    ctrl.icons.push(it.icon.map(|s| s.0 as u32).unwrap_or(0));
-                }
-                sync_selected_tag(node);
-                node.mark_dirty();
-            }
-            (Prop::MenuFlyoutItems, PropValue::MenuFlyoutItems(items)) => {
-                node.ctrl_mut().menu = items.iter().map(menu_row).collect();
-                node.mark_dirty();
-            }
-            // Every pair this backend does not consume lands here and is
-            // dropped. In a debug build say so — but only when the drop is a
-            // defect (see [`unhandled`]); in release this compiles to nothing.
-            _ => unhandled::note(node.kind, prop, value),
-            }
-        }
-        if refresh_suggest {
+        let Some(node) = self.node_mut(id) else { return };
+        // A focused AutoSuggestBox whose filtered list just changed refreshes
+        // its open dropdown in place (deferred until the node borrow ends).
+        if apply_prop(node, prop, value) {
             self.refresh_suggest(id);
         }
     }
@@ -1229,6 +864,971 @@ impl Backend for DCompBackend {
     }
 }
 
+/// Apply one reconciler prop write to a node, and report whether the caller
+/// must refresh an open suggestion dropdown afterwards (it needs the backend,
+/// which this deliberately does not take — everything else a prop write does is
+/// a mutation of the node itself).
+///
+/// Split out of [`Backend::set_prop`] so the whole prop vocabulary can be
+/// driven against a real [`Node`] without a window: the set and the reset of a
+/// prop are one contract, and a test that can only exercise half of it cannot
+/// see the two disagree.
+pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool {
+    use taffy::prelude::*;
+    let mut refresh_suggest = false;
+    match (prop, value) {
+        // ── Prop removal — a conditional prop diffed away reverts to its
+        // default (e.g. a Segmented pill losing its active accent fill) ──
+        (_, PropValue::Unset) => reset_prop(node, prop),
+        // ── Paint props (mark the node's surface dirty) ──────────────
+        (Prop::Background, PropValue::Color(c)) => {
+            node.paint.background = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::Foreground, PropValue::Color(c)) => {
+            node.paint.foreground = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::BorderBrush, PropValue::Color(c)) => {
+            node.paint.border_brush = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::BorderThickness, PropValue::Thickness(t)) => {
+            node.paint.border_thickness = t.left as f32;
+            // Border thickness also insets content in layout.
+            node.style.border = Rect {
+                left: length(t.left as f32),
+                right: length(t.right as f32),
+                top: length(t.top as f32),
+                bottom: length(t.bottom as f32),
+            };
+            node.mark_dirty();
+        }
+        (Prop::CornerRadius, PropValue::F64(v)) => {
+            node.paint.corner_radius = *v as f32;
+            node.mark_dirty();
+        }
+        (Prop::Fill, PropValue::Color(c)) => {
+            node.paint.fill = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::Stroke, PropValue::Color(c)) => {
+            node.paint.stroke = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::StrokeThickness, PropValue::F64(v)) => {
+            node.paint.stroke_thickness = *v as f32;
+            node.mark_dirty();
+        }
+        (Prop::LineEndpoints, PropValue::LineEndpoints(l)) => {
+            node.paint.line = *l;
+            node.mark_dirty();
+        }
+        (Prop::StyleVariant, PropValue::I32(v)) => {
+            node.paint.style_variant = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsEnabled, PropValue::Bool(b)) => {
+            node.paint.is_enabled = *b;
+            node.mark_dirty();
+        }
+
+        // An Expander's title arrives as `Prop::Header`; it paints as the
+        // node's label like every other text-bearing control.
+        (Prop::Content | Prop::Text | Prop::Header, PropValue::Str(s)) => {
+            // For an editable kind (AutoSuggestBox carries its text via
+            // `Prop::Text`), seed the editor buffer instead of the label.
+            if node.editor.is_some() {
+                seed_editor_text(node, s);
+            } else {
+                node.paint.text = s.clone();
+                node.text_dirty = true;
+            }
+            node.mark_dirty();
+        }
+        // TextBox / PasswordBox carry their text via `Prop::Value(Str)`.
+        (Prop::Value, PropValue::Str(s)) if node.editor.is_some() => {
+            seed_editor_text(node, s);
+            node.mark_dirty();
+        }
+        (Prop::Precision, PropValue::I32(v)) => {
+            node.ctrl_mut().precision = Some(*v);
+            // Reformat the seeded value to the new precision (the `Value`
+            // prop usually arrives before `Precision`). Never while focused
+            // — the user owns the buffer mid-edit.
+            if node.kind == ControlKind::NumberBox && !node.focused {
+                let value = node.ctrl().value;
+                if let Some(ed) = &mut node.editor {
+                    ed.seeded = false;
+                }
+                seed_number_text(node, value);
+                node.mark_dirty();
+            }
+        }
+        (Prop::LargeChange, PropValue::F64(v)) => node.ctrl_mut().large_change = Some(*v),
+        (Prop::HorizontalContentAlignment, PropValue::I32(v)) => {
+            node.ctrl_mut().content_align = *v;
+            if let Some(ed) = &mut node.editor {
+                ed.layout_dirty = true;
+            }
+            node.mark_dirty();
+        }
+        (Prop::FontSize, PropValue::F64(v)) => {
+            node.paint.font_size = *v as f32;
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::FontWeight, PropValue::U16(w)) => {
+            node.paint.font_weight = *w;
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::FontFamily, PropValue::Str(s)) => {
+            node.paint.font_family = Some(s.clone());
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::TextWrapping | Prop::TextWrappingWrap, _) => {
+            // WinRT TextWrapping: NoWrap = 1, Wrap = 2, WrapWholeWords = 3 — and
+            // 0 for a widget that never set one, since the generated TextBlock
+            // bindings push this prop unconditionally and the field's Rust default
+            // is `TextWrapping(0)`. Only a real Wrap value wraps: 0 is "unset",
+            // which must mean NoWrap to match XAML's own TextBlock default.
+            // Reading it as `!= 1` instead marked virtually every text node in the
+            // tree as wrapping — inert only for as long as the DWrite box stayed
+            // unconstrained (see `layout::build_text_layout`), and silently
+            // wrapping every label the moment it did not.
+            let wrap = match value {
+                PropValue::I32(v) => *v > 1,
+                PropValue::Bool(b) => *b,
+                _ => true,
+            };
+            node.paint.wrap = wrap;
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+
+        // ── Visual prop applied straight onto the container ──────────
+        (Prop::Opacity, PropValue::F64(v)) => {
+            let _ = node.vis.SetOpacity((*v as f32).clamp(0.0, 1.0));
+        }
+
+        // ── Layout props (Taffy inputs; relayout runs each reconcile) ─
+        (Prop::Padding, PropValue::Thickness(t)) => {
+            node.style.padding = Rect {
+                left: length(t.left as f32),
+                right: length(t.right as f32),
+                top: length(t.top as f32),
+                bottom: length(t.bottom as f32),
+            };
+        }
+        (Prop::Margin, PropValue::Thickness(t)) => {
+            node.style.margin = Rect {
+                left: length(t.left as f32),
+                right: length(t.right as f32),
+                top: length(t.top as f32),
+                bottom: length(t.bottom as f32),
+            };
+        }
+        (Prop::Width, PropValue::F64(v)) => node.style.size.width = length(*v as f32),
+        (Prop::Height, PropValue::F64(v)) => node.style.size.height = length(*v as f32),
+        (Prop::MinWidth, PropValue::F64(v)) => node.style.min_size.width = length(*v as f32),
+        (Prop::MinHeight, PropValue::F64(v)) => node.style.min_size.height = length(*v as f32),
+        (Prop::MaxWidth, PropValue::F64(v)) => node.style.max_size.width = length(*v as f32),
+        (Prop::MaxHeight, PropValue::F64(v)) => node.style.max_size.height = length(*v as f32),
+
+        (Prop::HorizontalAlignment, PropValue::I32(v)) => node.h_align = *v,
+        (Prop::VerticalAlignment, PropValue::I32(v)) => node.v_align = *v,
+
+        (Prop::Orientation, PropValue::I32(v)) => {
+            // WinRT Orientation: Vertical = 0, Horizontal = 1.
+            node.style.flex_direction = if *v == 1 {
+                FlexDirection::Row
+            } else {
+                FlexDirection::Column
+            };
+            apply_stack_gap(node);
+        }
+        (Prop::Spacing, PropValue::F64(v)) => {
+            node.spacing = *v as f32;
+            apply_stack_gap(node);
+        }
+        (Prop::ColumnSpacing, PropValue::F64(v)) => node.style.gap.width = length(*v as f32),
+        (Prop::RowSpacing, PropValue::F64(v)) => node.style.gap.height = length(*v as f32),
+        (Prop::GridRows, PropValue::GridLengths(g)) => node.grid_rows = clone_lengths(g),
+        (Prop::GridColumns, PropValue::GridLengths(g)) => node.grid_cols = clone_lengths(g),
+
+        (Prop::AttachedGridRow, PropValue::I32(v)) => {
+            node.style.grid_row.start = line((*v + 1) as i16);
+        }
+        (Prop::AttachedGridColumn, PropValue::I32(v)) => {
+            node.style.grid_column.start = line((*v + 1) as i16);
+        }
+        (Prop::AttachedGridRowSpan, PropValue::I32(v)) => {
+            node.style.grid_row.end = span((*v).max(1) as u16);
+        }
+        (Prop::AttachedGridColumnSpan, PropValue::I32(v)) => {
+            node.style.grid_column.end = span((*v).max(1) as u16);
+        }
+        (Prop::AttachedCanvasLeft, PropValue::F64(v)) => {
+            node.style.position = Position::Absolute;
+            node.style.inset.left = length(*v as f32);
+        }
+        (Prop::AttachedCanvasTop, PropValue::F64(v)) => {
+            node.style.position = Position::Absolute;
+            node.style.inset.top = length(*v as f32);
+        }
+        (Prop::AttachedCanvasZIndex, PropValue::I32(v)) => {
+            node.z_index = *v;
+            node.z_dirty = true;
+        }
+
+        // ── Control state (stateful drawn controls) ──────────────────
+        // The part-converted kinds (toggle / slider / segmented / nav) need
+        // no spring tick here: marking dirty routes them through the paint
+        // pass, whose parts sync glides the change on the compositor.
+        (Prop::IsOn, PropValue::Bool(v)) => {
+            node.ctrl_mut().is_on = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsChecked, PropValue::Bool(v)) => {
+            // The CheckBox reveal fades via its chrome parts on repaint; a
+            // ToggleButton's checked state is plain painted chrome.
+            node.ctrl_mut().is_checked = *v;
+            node.mark_dirty();
+        }
+        (Prop::Value, PropValue::F64(v)) => {
+            node.ctrl_mut().value = *v;
+            // NumberBox: reflect the programmatic value as formatted text
+            // (unless the user is mid-edit — the editor owns the buffer
+            // while focused).
+            if node.kind == ControlKind::NumberBox {
+                seed_number_text(node, *v);
+            }
+            node.mark_dirty();
+        }
+        (Prop::Minimum, PropValue::F64(v)) => {
+            node.ctrl_mut().min = *v;
+            node.mark_dirty();
+        }
+        (Prop::Maximum, PropValue::F64(v)) => {
+            node.ctrl_mut().max = *v;
+            node.mark_dirty();
+        }
+        (Prop::Step, PropValue::F64(v)) => node.ctrl_mut().step = Some(*v),
+        (Prop::FillOrigin, PropValue::F64(v)) => {
+            node.ctrl_mut().fill_origin = Some(*v);
+            node.mark_dirty();
+        }
+        (Prop::FillColor, PropValue::Color(c)) => {
+            node.ctrl_mut().fill_color = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::FillColorAlt, PropValue::Color(c)) => {
+            node.ctrl_mut().fill_color_alt = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::Marker, PropValue::F64(v)) => {
+            node.ctrl_mut().marker = Some(*v);
+            node.mark_dirty();
+        }
+        (Prop::MarkerColor, PropValue::Color(c)) => {
+            node.ctrl_mut().marker_color = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::GradientStops, PropValue::GradientStops(stops)) => {
+            node.ctrl_mut().stops = stops.clone();
+            node.mark_dirty();
+        }
+        (Prop::StartAngle, PropValue::F64(v)) => {
+            node.ctrl_mut().start_angle = *v as f32;
+            node.mark_dirty();
+        }
+        (Prop::EndAngle, PropValue::F64(v)) => {
+            node.ctrl_mut().end_angle = *v as f32;
+            node.mark_dirty();
+        }
+        (Prop::Ticks, PropValue::F64List(list)) => {
+            node.ctrl_mut().ticks = list.clone();
+            node.mark_dirty();
+        }
+        (Prop::TickLabels, PropValue::ValueLabels(list)) => {
+            node.ctrl_mut().tick_labels = list.clone();
+            node.mark_dirty();
+        }
+        (Prop::MajorEvery, PropValue::F64(v)) => {
+            node.ctrl_mut().major_every = Some(*v);
+            node.mark_dirty();
+        }
+        (Prop::Accent, PropValue::Color(c)) => {
+            node.ctrl_mut().accent = Some(*c);
+            node.mark_dirty();
+        }
+        (Prop::Unit, PropValue::Str(s)) => {
+            node.ctrl_mut().unit = s.clone();
+            node.mark_dirty();
+        }
+        (Prop::SubText, PropValue::Str(s)) => {
+            node.ctrl_mut().sub_text = s.clone();
+            node.mark_dirty();
+        }
+        (Prop::IsIndeterminate, PropValue::Bool(v)) => {
+            node.ctrl_mut().indeterminate = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsActive, PropValue::Bool(v)) => {
+            node.ctrl_mut().is_active = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsExpanded, PropValue::Bool(v)) => {
+            node.ctrl_mut().expanded = *v;
+            node.mark_dirty();
+        }
+        (Prop::SelectedIndex, PropValue::I32(v)) => {
+            node.ctrl_mut().selected_index = *v;
+            node.mark_dirty();
+        }
+        (Prop::SelectedTag, PropValue::Str(s)) => {
+            node.ctrl_mut().selected_tag = Some(s.clone());
+            sync_selected_tag(node);
+            node.mark_dirty();
+        }
+        (Prop::PlaceholderText, PropValue::Str(s)) => {
+            node.ctrl_mut().placeholder = s.clone();
+            node.mark_dirty();
+        }
+        (Prop::Items, PropValue::StrList(list)) => {
+            node.ctrl_mut().items = list.clone();
+            node.mark_dirty();
+            // A focused AutoSuggestBox whose filtered list just changed refreshes
+            // its open dropdown in place — reported back to the caller, which
+            // holds the backend this needs and no longer holds the node borrow.
+            refresh_suggest = node.kind == ControlKind::AutoSuggestBox;
+        }
+        (Prop::Items, PropValue::SelectorBarItems(items)) => {
+            node.ctrl_mut().items = items.iter().map(|i| i.text.clone()).collect();
+            if node.ctrl().selected_index < 0 && !node.ctrl().items.is_empty() {
+                node.ctrl_mut().selected_index = 0;
+            }
+            // Labels feed the per-item width measure — rebuild it.
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::MenuItems, PropValue::NavMenuItems(items)) => {
+            let ctrl = node.ctrl_mut();
+            ctrl.items.clear();
+            ctrl.tags.clear();
+            ctrl.icons.clear();
+            for it in items {
+                if it.is_header {
+                    continue;
+                }
+                ctrl.items.push(it.content.clone());
+                ctrl.tags
+                    .push(it.tag.clone().unwrap_or_else(|| it.content.clone()));
+                ctrl.icons.push(it.icon.map(|s| s.0 as u32).unwrap_or(0));
+            }
+            sync_selected_tag(node);
+            node.mark_dirty();
+        }
+        (Prop::MenuFlyoutItems, PropValue::MenuFlyoutItems(items)) => {
+            node.ctrl_mut().menu = items.iter().map(menu_row).collect();
+            node.mark_dirty();
+        }
+
+        // ── Chrome state: stored, not yet drawn ──────────────────────
+        // Everything below lands in `Extras` and nothing reads it yet. It is
+        // stored anyway because the alternative is what this arm block
+        // replaced: a silent drop at the consumer, where the value is gone by
+        // the time anyone writes the drawing. The state is now exact and the
+        // gap is purely the paint — see [`Status::Stored`].
+        (Prop::Title, PropValue::Str(s)) => {
+            node.extras_mut().title = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::Subtitle, PropValue::Str(s)) => {
+            node.extras_mut().subtitle = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::Tall, PropValue::Bool(v)) => {
+            node.extras_mut().tall = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsBackButtonVisible, PropValue::Bool(v)) => {
+            node.extras_mut().back_button_visible = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsBackButtonEnabled, PropValue::Bool(v)) => {
+            node.extras_mut().back_button_enabled = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsPaneToggleButtonVisible, PropValue::Bool(v)) => {
+            node.extras_mut().pane_toggle_visible = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsBackEnabled, PropValue::Bool(v)) => {
+            node.extras_mut().back_enabled = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsSettingsVisible, PropValue::Bool(v)) => {
+            node.extras_mut().settings_visible = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsPaneOpen, PropValue::Bool(v)) => {
+            node.extras_mut().pane_open = *v;
+            node.mark_dirty();
+        }
+        (Prop::PaneTitle, PropValue::Str(s)) => {
+            node.extras_mut().pane_title = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::PaneDisplayMode, PropValue::I32(v)) => {
+            node.extras_mut().pane_display_mode = *v;
+            node.mark_dirty();
+        }
+        (Prop::OpenPaneLength, PropValue::F64(v)) => {
+            node.extras_mut().open_pane_length = *v;
+            node.mark_dirty();
+        }
+        (Prop::AutoSuggestBox, PropValue::Bool(v)) => {
+            node.extras_mut().search_box = *v;
+            node.mark_dirty();
+        }
+        (Prop::AutoSuggestItems, PropValue::StrList(list)) => {
+            node.extras_mut().suggest_items = list.clone();
+            node.mark_dirty();
+        }
+        (Prop::AutoSuggestPlaceholder, PropValue::Str(s)) => {
+            node.extras_mut().suggest_placeholder = s.clone();
+            node.mark_dirty();
+        }
+        (Prop::HorizontalScrollBarVisibility, PropValue::I32(v)) => {
+            node.extras_mut().h_scrollbar = *v;
+            node.mark_dirty();
+        }
+        (Prop::VerticalScrollBarVisibility, PropValue::I32(v)) => {
+            node.extras_mut().v_scrollbar = *v;
+            node.mark_dirty();
+        }
+        // A plain-text flyout is a `FlyoutDef` with only its text set — the
+        // seam's own constructor for that case, so the two shapes converge
+        // with nothing dropped and no second field to keep in step.
+        (Prop::FlyoutContent, PropValue::Str(s)) => {
+            node.extras_mut().flyout = Some(Box::new(crate::FlyoutDef::text(s.clone())));
+            node.mark_dirty();
+        }
+        (Prop::FlyoutContent, PropValue::FlyoutDef(def)) => {
+            node.extras_mut().flyout = Some(Box::new(def.clone()));
+            node.mark_dirty();
+        }
+        (Prop::FlyoutPlacement, PropValue::I32(v)) => {
+            node.extras_mut().flyout_placement = *v;
+            node.mark_dirty();
+        }
+        // A `Symbol`'s codepoint, 0 = none — the encoding `Ctrl::icons` and
+        // `MenuRow::icon` already carry glyph icons in.
+        (Prop::Icon, PropValue::I32(v)) => {
+            node.extras_mut().icon = *v as u32;
+            node.mark_dirty();
+        }
+        (Prop::NavigateUri, PropValue::Str(s)) => {
+            node.extras_mut().navigate_uri = s.clone();
+        }
+        (Prop::OnContent, PropValue::Str(s)) => {
+            node.extras_mut().on_content = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::OffContent, PropValue::Str(s)) => {
+            node.extras_mut().off_content = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::IsEditable, PropValue::Bool(v)) => {
+            node.extras_mut().is_editable = *v;
+            node.mark_dirty();
+        }
+        (Prop::AcceptsReturn, PropValue::Bool(v)) => {
+            node.extras_mut().accepts_return = *v;
+        }
+        (Prop::PasswordRevealMode, PropValue::I32(v)) => {
+            node.extras_mut().password_reveal_mode = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsPasswordRevealButtonEnabled, PropValue::Bool(v)) => {
+            node.extras_mut().password_reveal_button = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsTextSelectionEnabled, PropValue::Bool(v)) => {
+            node.extras_mut().text_selectable = *v;
+        }
+        (Prop::Delay, PropValue::I32(v)) => node.extras_mut().repeat_delay = *v,
+        (Prop::Interval, PropValue::I32(v)) => node.extras_mut().repeat_interval = *v,
+
+        // Every pair this backend does not consume lands here and is
+        // dropped. In a debug build say so — but only when the drop is a
+        // defect (see [`unhandled`]); in release this compiles to nothing.
+        _ => unhandled::note(node.kind, prop, value),
+    }
+    refresh_suggest
+}
+
+/// What this backend does with a [`Prop`] — the classification behind both the
+/// dropped-prop diagnostic ([`unhandled`]) and the reset table below.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub(crate) enum Status {
+    /// Implemented end to end: [`apply_prop`] stores it and something reads
+    /// what it stored. Reaching the terminal `_` arm with one of these means
+    /// the value arrived in a shape no arm accepts (`Width` as an `I32`, a
+    /// `Value(Str)` on a node with no editor) — always a defect, because the
+    /// write was addressed to a feature that exists here and was dropped
+    /// anyway.
+    Consumed,
+    /// Stored in node state, correctly and completely — but nothing draws or
+    /// acts on it yet. Distinct from [`Self::Consumed`] because the gap is
+    /// real (the app sees nothing) and distinct from the old "unimplemented"
+    /// because the value is no longer LOST: whoever writes the drawing finds
+    /// the state already there and already reset correctly.
+    Stored,
+    /// Every control kind that can carry this prop is one this backend does
+    /// not render. Ignoring it is the design, not a gap — reported never.
+    NotApplicable,
+}
+
+/// The per-prop contract, stated once: how this backend classifies a [`Prop`],
+/// and — for every prop it stores — how an [`Unset`](PropValue::Unset) undoes
+/// it.
+///
+/// The two used to be separate matches, and they disagreed. `set_prop` grew a
+/// classifier covering all 165 props while `reset_prop` kept a terminal `_` and
+/// covered 24 of the 75 it claimed to consume, so an `Unset` for any of the
+/// other 51 was silently ignored and the node kept a stale value — the exact
+/// defect that had already been found and fixed once on the `set_prop` side.
+/// Nothing structural stopped it recurring, because nothing tied a
+/// classification to the existence of a reset.
+///
+/// This macro is that tie. A prop's status and its reset are ONE entry, so
+/// classifying a prop as stored-here without saying how to unstore it is not
+/// an omission anyone can make — it is a syntax error. Both generated matches
+/// are exhaustive with no `_` arm, so a [`Prop`] added to the seam must be
+/// placed in one of the three sections before this compiles at all, and a prop
+/// named twice trips `unreachable_patterns`.
+///
+/// Reset targets are DERIVED, never remembered: [`Node::birth_paint`] and
+/// [`Node::birth_style`] are the same functions [`Node::new`] builds a node
+/// with, and `Ctrl::DEFAULT` / `Extras::DEFAULT` are the same constants the
+/// absent-read path returns. Several of those birth values are deliberately
+/// not zero — `max` is 100, `is_active` is true, `selected_index` and
+/// `content_align` are -1, a Button is born with a 6 DIP corner radius, 12/6
+/// padding and a 30 DIP minimum height — so a reset written from memory as
+/// "set it to zero" is a new bug, not a fix. Writing `Ctrl::DEFAULT.max`
+/// cannot be that bug.
+macro_rules! prop_contract {
+    (
+        $(#[$cm:meta])*
+        consumed { $($($cp:ident)|+ => |$cn:ident| $cb:block)* }
+        $(#[$sm:meta])*
+        stored { $($($sp:ident)|+ => |$sn:ident| $sb:block)* }
+        $(#[$nm:meta])*
+        not_applicable { $($($np:ident),+ ;)* }
+    ) => {
+        /// Classify a prop — see [`prop_contract`].
+        #[cfg_attr(not(debug_assertions), allow(dead_code))]
+        pub(crate) fn prop_status(prop: Prop) -> Status {
+            match prop {
+                $($(Prop::$cp)|+ => Status::Consumed,)*
+                $($(Prop::$sp)|+ => Status::Stored,)*
+                $($(Prop::$np)|+ => Status::NotApplicable,)*
+            }
+        }
+
+        /// Revert a prop to the value a node that never received it holds,
+        /// when the reconciler diffs it away (`PropValue::Unset`).
+        ///
+        /// Every prop this backend stores has an arm here — see
+        /// [`prop_contract`], which generates both this and [`prop_status`]
+        /// from one list so the two cannot drift apart again.
+        fn reset_prop(node: &mut Node, prop: Prop) {
+            #[allow(unused_imports)]
+            use taffy::prelude::*;
+            match prop {
+                $($(Prop::$cp)|+ => { let $cn = &mut *node; $cb })*
+                $($(Prop::$sp)|+ => { let $sn = &mut *node; $sb })*
+                // Nothing was stored, so there is nothing to restore.
+                $($(Prop::$np)|+ => {})*
+            }
+        }
+    };
+}
+
+prop_contract! {
+    /// Implemented end to end by [`apply_prop`].
+    consumed {
+        // ── Paint ────────────────────────────────────────────────────────
+        Background => |n| { n.paint.background = None; n.mark_dirty(); }
+        Foreground => |n| { n.paint.foreground = None; n.mark_dirty(); }
+        BorderBrush => |n| { n.paint.border_brush = None; n.mark_dirty(); }
+        BorderThickness => |n| {
+            n.paint.border_thickness = n.birth_paint().border_thickness;
+            n.style.border = n.birth_style().border;
+            n.mark_dirty();
+        }
+        // NOT zero for a Button, which is born with a 6 DIP radius.
+        CornerRadius => |n| {
+            n.paint.corner_radius = n.birth_paint().corner_radius;
+            n.mark_dirty();
+        }
+        Fill => |n| { n.paint.fill = None; n.mark_dirty(); }
+        Stroke => |n| { n.paint.stroke = None; n.mark_dirty(); }
+        StrokeThickness => |n| {
+            n.paint.stroke_thickness = n.birth_paint().stroke_thickness;
+            n.mark_dirty();
+        }
+        LineEndpoints => |n| { n.paint.line = n.birth_paint().line; n.mark_dirty(); }
+        StyleVariant => |n| {
+            n.paint.style_variant = n.birth_paint().style_variant;
+            n.mark_dirty();
+        }
+        // Born ENABLED — resetting this to `false` greys the control out.
+        IsEnabled => |n| { n.paint.is_enabled = n.birth_paint().is_enabled; n.mark_dirty(); }
+        Opacity => |n| { let _ = n.vis.SetOpacity(1.0); }
+
+        // ── Text ─────────────────────────────────────────────────────────
+        // Mirrors the set: an editable kind carries its text in the editor
+        // buffer, everything else in the paint label.
+        Content | Text | Header => |n| {
+            if n.editor.is_some() {
+                clear_editor_text(n);
+            } else {
+                n.paint.text = n.birth_paint().text;
+            }
+            n.text_dirty = true;
+            n.mark_dirty();
+        }
+        // Born at a real size and weight: zeroing either makes the text
+        // invisible rather than default.
+        FontSize => |n| {
+            n.paint.font_size = n.birth_paint().font_size;
+            n.text_dirty = true;
+            n.mark_dirty();
+        }
+        FontWeight => |n| {
+            n.paint.font_weight = n.birth_paint().font_weight;
+            n.text_dirty = true;
+            n.mark_dirty();
+        }
+        FontFamily => |n| { n.paint.font_family = None; n.text_dirty = true; n.mark_dirty(); }
+        TextWrapping | TextWrappingWrap => |n| {
+            n.paint.wrap = n.birth_paint().wrap;
+            n.text_dirty = true;
+            n.mark_dirty();
+        }
+
+        // ── Layout ───────────────────────────────────────────────────────
+        // Not `Rect::zero()`: a Button is born with 12/6 padding, an Expander
+        // and a TitleBar with the inset their drawn header occupies, and a
+        // NavigationView with the icon rail's width on the left. Zeroing that
+        // paints the chrome over the content.
+        Padding => |n| { n.style.padding = n.birth_style().padding; }
+        Margin => |n| { n.style.margin = n.birth_style().margin; }
+        Width => |n| { n.style.size.width = n.birth_style().size.width; }
+        Height => |n| { n.style.size.height = n.birth_style().size.height; }
+        // Likewise not `auto()`: the intrinsic minimum is the only thing
+        // keeping a childless drawn control (ToggleSwitch, Slider, Knob,
+        // Meter, CheckBox) from measuring 0 and vanishing in a flex row.
+        MinWidth => |n| { n.style.min_size.width = n.birth_style().min_size.width; }
+        MinHeight => |n| { n.style.min_size.height = n.birth_style().min_size.height; }
+        MaxWidth => |n| { n.style.max_size.width = n.birth_style().max_size.width; }
+        MaxHeight => |n| { n.style.max_size.height = n.birth_style().max_size.height; }
+        HorizontalAlignment => |n| { n.h_align = node::ALIGN_UNSET; }
+        VerticalAlignment => |n| { n.v_align = node::ALIGN_UNSET; }
+        Orientation => |n| {
+            n.style.flex_direction = n.birth_style().flex_direction;
+            apply_stack_gap(n);
+        }
+        Spacing => |n| { n.spacing = 0.0; apply_stack_gap(n); }
+        ColumnSpacing => |n| { n.style.gap.width = n.birth_style().gap.width; }
+        RowSpacing => |n| { n.style.gap.height = n.birth_style().gap.height; }
+        GridRows => |n| { n.grid_rows.clear(); }
+        GridColumns => |n| { n.grid_cols.clear(); }
+        // XAML Grid parity: an unplaced child belongs to cell (0, 0), which is
+        // Taffy line 1 — not `auto`, which would auto-flow it into the next
+        // free cell and un-overlap a deliberately overlapping pair.
+        AttachedGridRow => |n| { n.style.grid_row.start = n.birth_style().grid_row.start; }
+        AttachedGridColumn => |n| {
+            n.style.grid_column.start = n.birth_style().grid_column.start;
+        }
+        AttachedGridRowSpan => |n| { n.style.grid_row.end = n.birth_style().grid_row.end; }
+        AttachedGridColumnSpan => |n| {
+            n.style.grid_column.end = n.birth_style().grid_column.end;
+        }
+        // Setting either inset made the node absolute, so clearing one only
+        // returns it to flow once the other is gone too.
+        AttachedCanvasLeft => |n| {
+            let birth = n.birth_style();
+            n.style.inset.left = birth.inset.left;
+            if n.style.inset.top == birth.inset.top {
+                n.style.position = birth.position;
+            }
+        }
+        AttachedCanvasTop => |n| {
+            let birth = n.birth_style();
+            n.style.inset.top = birth.inset.top;
+            if n.style.inset.left == birth.inset.left {
+                n.style.position = birth.position;
+            }
+        }
+        AttachedCanvasZIndex => |n| { n.z_index = 0; n.z_dirty = true; }
+
+        // ── Control state ────────────────────────────────────────────────
+        // `Ctrl::DEFAULT` is the same constant an unallocated `Ctrl` reads as,
+        // and several of its fields are pointedly not zero.
+        IsOn => |n| { n.ctrl_reset(|c| c.is_on = Ctrl::DEFAULT.is_on); }
+        IsChecked => |n| { n.ctrl_reset(|c| c.is_checked = Ctrl::DEFAULT.is_checked); }
+        Value => |n| {
+            n.ctrl_reset(|c| c.value = Ctrl::DEFAULT.value);
+            // An editor's buffer is the value for the text kinds; a node born
+            // without one shows an empty, UNSEEDED field.
+            clear_editor_text(n);
+            n.mark_dirty();
+        }
+        Minimum => |n| { n.ctrl_reset(|c| c.min = Ctrl::DEFAULT.min); }
+        // 100, not 0 — a zero-span range makes every fill and thumb NaN.
+        Maximum => |n| { n.ctrl_reset(|c| c.max = Ctrl::DEFAULT.max); }
+        Step => |n| { n.ctrl_reset(|c| c.step = Ctrl::DEFAULT.step); }
+        LargeChange => |n| { n.ctrl_reset(|c| c.large_change = Ctrl::DEFAULT.large_change); }
+        // Mirrors the set arm: the seeded text is re-formatted at the restored
+        // precision, and never while focused (the user owns the buffer).
+        //
+        // Only text that was ACTUALLY seeded from a value prop is re-formatted.
+        // The set arm can reformat unconditionally because a `Precision` write
+        // implies a value; a reset carries no such implication, and a field
+        // that never received one must stay empty rather than acquire a "0.00"
+        // from nowhere.
+        Precision => |n| {
+            n.ctrl_reset(|c| c.precision = Ctrl::DEFAULT.precision);
+            if n.kind == ControlKind::NumberBox
+                && !n.focused
+                && n.editor.as_ref().is_some_and(|ed| ed.seeded)
+            {
+                let value = n.ctrl().value;
+                if let Some(ed) = &mut n.editor {
+                    ed.seeded = false;
+                }
+                seed_number_text(n, value);
+                n.mark_dirty();
+            }
+        }
+        // -1 (unset), not 0 — 0 is a real WinRT `Left`.
+        HorizontalContentAlignment => |n| {
+            n.ctrl_reset(|c| c.content_align = Ctrl::DEFAULT.content_align);
+            if let Some(ed) = &mut n.editor {
+                ed.layout_dirty = true;
+            }
+            n.mark_dirty();
+        }
+        FillOrigin => |n| { n.ctrl_reset(|c| c.fill_origin = Ctrl::DEFAULT.fill_origin); }
+        FillColor => |n| { n.ctrl_reset(|c| c.fill_color = Ctrl::DEFAULT.fill_color); }
+        FillColorAlt => |n| {
+            n.ctrl_reset(|c| c.fill_color_alt = Ctrl::DEFAULT.fill_color_alt);
+        }
+        Marker => |n| { n.ctrl_reset(|c| c.marker = Ctrl::DEFAULT.marker); }
+        MarkerColor => |n| { n.ctrl_reset(|c| c.marker_color = Ctrl::DEFAULT.marker_color); }
+        GradientStops => |n| { n.ctrl_reset(|c| c.stops = Ctrl::DEFAULT.stops); }
+        StartAngle => |n| { n.ctrl_reset(|c| c.start_angle = Ctrl::DEFAULT.start_angle); }
+        EndAngle => |n| { n.ctrl_reset(|c| c.end_angle = Ctrl::DEFAULT.end_angle); }
+        Ticks => |n| { n.ctrl_reset(|c| c.ticks = Ctrl::DEFAULT.ticks); }
+        TickLabels => |n| { n.ctrl_reset(|c| c.tick_labels = Ctrl::DEFAULT.tick_labels); }
+        MajorEvery => |n| { n.ctrl_reset(|c| c.major_every = Ctrl::DEFAULT.major_every); }
+        Accent => |n| { n.ctrl_reset(|c| c.accent = Ctrl::DEFAULT.accent); }
+        Unit => |n| { n.ctrl_reset(|c| c.unit = Ctrl::DEFAULT.unit); }
+        SubText => |n| { n.ctrl_reset(|c| c.sub_text = Ctrl::DEFAULT.sub_text); }
+        IsIndeterminate => |n| {
+            n.ctrl_reset(|c| c.indeterminate = Ctrl::DEFAULT.indeterminate);
+        }
+        // Born ACTIVE — a false here dims every meter that loses the prop.
+        IsActive => |n| { n.ctrl_reset(|c| c.is_active = Ctrl::DEFAULT.is_active); }
+        IsExpanded => |n| { n.ctrl_reset(|c| c.expanded = Ctrl::DEFAULT.expanded); }
+        // -1 ("nothing selected"), not 0 ("the first item").
+        SelectedIndex => |n| {
+            n.ctrl_reset(|c| c.selected_index = Ctrl::DEFAULT.selected_index);
+        }
+        SelectedTag => |n| { n.ctrl_reset(|c| c.selected_tag = Ctrl::DEFAULT.selected_tag); }
+        PlaceholderText => |n| { n.ctrl_reset(|c| c.placeholder = Ctrl::DEFAULT.placeholder); }
+        // The measured per-segment label widths are derived from `items`, so
+        // they go with them and the text pass re-measures.
+        Items => |n| {
+            n.ctrl_reset(|c| {
+                c.items = Ctrl::DEFAULT.items;
+                c.seg_label_w = Ctrl::DEFAULT.seg_label_w;
+            });
+            n.text_dirty = true;
+        }
+        MenuItems => |n| {
+            n.ctrl_reset(|c| {
+                c.items = Ctrl::DEFAULT.items;
+                c.tags = Ctrl::DEFAULT.tags;
+                c.icons = Ctrl::DEFAULT.icons;
+            });
+            n.text_dirty = true;
+        }
+        MenuFlyoutItems => |n| { n.ctrl_reset(|c| c.menu = Ctrl::DEFAULT.menu); }
+    }
+
+    /// Stored in [`Extras`] but not yet drawn — the state is exact, the paint
+    /// is the gap. `Extras::DEFAULT` is the same constant an unallocated
+    /// `Extras` reads as, and its non-empty entries mirror the widget default
+    /// whose absence sends the `Unset` (see the constant for which, and why).
+    stored {
+        // ── TitleBar ─────────────────────────────────────────────────────
+        Title => |n| { n.extras_reset(|x| x.title = Extras::DEFAULT.title); n.text_dirty = true; }
+        Subtitle => |n| {
+            n.extras_reset(|x| x.subtitle = Extras::DEFAULT.subtitle);
+            n.text_dirty = true;
+        }
+        Tall => |n| { n.extras_reset(|x| x.tall = Extras::DEFAULT.tall); }
+        IsBackButtonEnabled => |n| {
+            n.extras_reset(|x| x.back_button_enabled = Extras::DEFAULT.back_button_enabled);
+        }
+        // Born VISIBLE: a NavigationView only emits this prop to say `false`,
+        // so its removal means "show it again".
+        IsBackButtonVisible => |n| {
+            n.extras_reset(|x| x.back_button_visible = Extras::DEFAULT.back_button_visible);
+        }
+        IsPaneToggleButtonVisible => |n| {
+            n.extras_reset(|x| x.pane_toggle_visible = Extras::DEFAULT.pane_toggle_visible);
+        }
+
+        // ── NavigationView ───────────────────────────────────────────────
+        IsBackEnabled => |n| { n.extras_reset(|x| x.back_enabled = Extras::DEFAULT.back_enabled); }
+        IsSettingsVisible => |n| {
+            n.extras_reset(|x| x.settings_visible = Extras::DEFAULT.settings_visible);
+        }
+        IsPaneOpen => |n| { n.extras_reset(|x| x.pane_open = Extras::DEFAULT.pane_open); }
+        PaneTitle => |n| {
+            n.extras_reset(|x| x.pane_title = Extras::DEFAULT.pane_title);
+            n.text_dirty = true;
+        }
+        PaneDisplayMode => |n| {
+            n.extras_reset(|x| x.pane_display_mode = Extras::DEFAULT.pane_display_mode);
+        }
+        OpenPaneLength => |n| {
+            n.extras_reset(|x| x.open_pane_length = Extras::DEFAULT.open_pane_length);
+        }
+        AutoSuggestBox => |n| { n.extras_reset(|x| x.search_box = Extras::DEFAULT.search_box); }
+        AutoSuggestItems => |n| {
+            n.extras_reset(|x| x.suggest_items = Extras::DEFAULT.suggest_items);
+        }
+        AutoSuggestPlaceholder => |n| {
+            n.extras_reset(|x| x.suggest_placeholder = Extras::DEFAULT.suggest_placeholder);
+        }
+
+        // ── Scroll containers ────────────────────────────────────────────
+        HorizontalScrollBarVisibility => |n| {
+            n.extras_reset(|x| x.h_scrollbar = Extras::DEFAULT.h_scrollbar);
+        }
+        VerticalScrollBarVisibility => |n| {
+            n.extras_reset(|x| x.v_scrollbar = Extras::DEFAULT.v_scrollbar);
+        }
+
+        // ── Button / HyperlinkButton ─────────────────────────────────────
+        FlyoutContent => |n| { n.extras_reset(|x| x.flyout = Extras::DEFAULT.flyout); }
+        FlyoutPlacement => |n| {
+            n.extras_reset(|x| x.flyout_placement = Extras::DEFAULT.flyout_placement);
+        }
+        Icon => |n| { n.extras_reset(|x| x.icon = Extras::DEFAULT.icon); }
+        NavigateUri => |n| { n.extras_reset(|x| x.navigate_uri = Extras::DEFAULT.navigate_uri); }
+
+        // ── ToggleSwitch ─────────────────────────────────────────────────
+        OnContent => |n| {
+            n.extras_reset(|x| x.on_content = Extras::DEFAULT.on_content);
+            n.text_dirty = true;
+        }
+        OffContent => |n| {
+            n.extras_reset(|x| x.off_content = Extras::DEFAULT.off_content);
+            n.text_dirty = true;
+        }
+
+        // ── Editors / text ───────────────────────────────────────────────
+        IsEditable => |n| { n.extras_reset(|x| x.is_editable = Extras::DEFAULT.is_editable); }
+        AcceptsReturn => |n| {
+            n.extras_reset(|x| x.accepts_return = Extras::DEFAULT.accepts_return);
+        }
+        PasswordRevealMode => |n| {
+            n.extras_reset(|x| x.password_reveal_mode = Extras::DEFAULT.password_reveal_mode);
+        }
+        // Born OFFERED, matching `PasswordBox::default()`.
+        IsPasswordRevealButtonEnabled => |n| {
+            n.extras_reset(|x| x.password_reveal_button = Extras::DEFAULT.password_reveal_button);
+        }
+        IsTextSelectionEnabled => |n| {
+            n.extras_reset(|x| x.text_selectable = Extras::DEFAULT.text_selectable);
+        }
+
+        // ── RepeatButton ─────────────────────────────────────────────────
+        // Born at the WinUI repeat timing (500 ms then 33 ms), not 0 — a zero
+        // interval is an unbounded repeat, not a default.
+        Delay => |n| { n.extras_reset(|x| x.repeat_delay = Extras::DEFAULT.repeat_delay); }
+        Interval => |n| {
+            n.extras_reset(|x| x.repeat_interval = Extras::DEFAULT.repeat_interval);
+        }
+    }
+
+    /// Never stored, so never reset: every kind that can carry these is one
+    /// this backend does not render (or, for the last group, nothing emits
+    /// them at all).
+    not_applicable {
+        // XAML framework machinery with no counterpart in a self-rendering
+        // backend: there is no resource dictionary, no style system, and no
+        // XAML drag-drop here.
+        Style, Resources, AllowDrop;
+        // RelativePanel attached props — this backend has no RelativePanel.
+        AlignBottomWithPanel, AlignHCenterWithPanel, AlignLeftWithPanel,
+        AlignRightWithPanel, AlignTopWithPanel, AlignVCenterWithPanel;
+        // TabView / TabViewItem / Pivot.
+        CanReorderTabs, IsAddTabButtonVisible, IsClosable, ItemKey, ItemHeader;
+        // ColorPicker.
+        ColorValue, IsAlphaEnabled, IsColorChannelTextInputVisible,
+        IsColorSliderVisible, IsHexInputVisible;
+        // Date / time / calendar pickers.
+        ClockIdentifier, MinuteIncrement, DayVisible, MonthVisible, YearVisible,
+        IsCalendarOpen, IsTodayHighlighted, IsGroupLabelVisible;
+        // ContentDialog.
+        PrimaryButtonText, SecondaryButtonText, CloseButtonText,
+        IsPrimaryButtonEnabled, IsSecondaryButtonEnabled;
+        // InfoBar / TeachingTip (`IsOpen` is carried only by these two and
+        // ContentDialog — all three unrendered).
+        Message, Severity, ActionButton, ActionButtonText, CloseButton,
+        PreferredPlacement, IsLightDismissEnabled, IsOpen;
+        // CommandBar / TreeView / SplitView-only / PersonPicture / Image /
+        // Viewbox / RatingControl / RadioButton(s). `CompactPaneLength` is
+        // SplitView's alone — the NavigationView bindings never emit it, so
+        // it is not part of this backend's nav-pane gap.
+        PrimaryCommands, SecondaryCommands, CommandBarFlyoutCommands,
+        DefaultLabelPosition, Nodes, SelectionMode, DisplayMode, DisplayName,
+        Initials, ImageSource, Stretch, MaxRating, Caption, PlaceholderValue,
+        IsReadOnly, GroupName, MaxColumns, CompactPaneLength;
+        // Seam vocabulary no widget emits.
+        Columns, Rows;
+    }
+}
+
+/// Return an editor to the empty, unseeded buffer a node is born with. Skipped
+/// while the field is focused, for the same reason the seed is: the user owns
+/// the buffer mid-edit. No-op for a kind that has no editor.
+fn clear_editor_text(node: &mut Node) {
+    let focused = node.focused;
+    if let Some(ed) = &mut node.editor
+        && (!focused || !ed.seeded)
+    {
+        ed.set_text("");
+        ed.seeded = false;
+    }
+}
+
 /// Debug-only diagnostics for the terminal `_` arm of [`Backend::set_prop`].
 ///
 /// The reconciler seam is one shared vocabulary — ~165 [`Prop`]s × ~24
@@ -1241,37 +1841,24 @@ impl Backend for DCompBackend {
 /// A blanket warning would be useless: the large majority of fallthroughs are
 /// props whose only carriers are controls this backend does not render, and
 /// those would drown the handful that are real gaps. So each fallthrough is
-/// classified first (see [`Status`]) and only defects are reported, once each.
+/// classified first (see [`Status`], whose table lives in
+/// [`prop_contract`](super::prop_contract)) and only defects are reported,
+/// once each.
 ///
-/// [`status`] and [`shape`] are **exhaustive matches with no `_` arm** — the
-/// same discipline as the recorder, and for the same reason: a `Prop` or
-/// `PropValue` variant added to the seam must not be able to slip in already
-/// silently dropped. They stay compiled in release (dead, so no codegen) so
-/// that check holds in every configuration; only the reporting is cfg'd out.
+/// [`prop_status`](super::prop_status) and [`shape`] are **exhaustive matches
+/// with no `_` arm** — the same discipline as the recorder, and for the same
+/// reason: a `Prop` or `PropValue` variant added to the seam must not be able
+/// to slip in already silently dropped. They stay compiled in release (dead,
+/// so no codegen) so that check holds in every configuration; only the
+/// reporting is cfg'd out.
 mod unhandled {
     // In release nothing calls into here; the matches are kept for their
     // compile-time exhaustiveness check alone.
     #![cfg_attr(not(debug_assertions), allow(dead_code))]
 
-    use super::{ControlKind, Prop, PropValue};
+    use super::{prop_status, ControlKind, Prop, PropValue, Status};
     use std::cell::RefCell;
     use std::mem::Discriminant;
-
-    /// What a `set_prop` fallthrough means for this backend.
-    enum Status {
-        /// This backend *does* implement the prop — so reaching the `_` arm
-        /// means the value arrived in a shape no arm accepts (`Width` as an
-        /// `I32`, a `Value(Str)` on a node with no editor). Always a defect:
-        /// the write was addressed to a feature that exists here, and was
-        /// dropped anyway.
-        Consumed,
-        /// Every control kind that can carry this prop is one this backend does
-        /// not render. Ignoring it is the design, not a gap — reported never.
-        NotApplicable,
-        /// The prop belongs to a kind this backend renders and is simply not
-        /// wired up yet. The actionable bucket.
-        Unimplemented,
-    }
 
     thread_local! {
         /// Pairs already reported. A dropped prop repeats on every reconcile,
@@ -1304,25 +1891,30 @@ mod unhandled {
             }
             return;
         }
-        let status = status(prop);
+        let status = prop_status(prop);
         if matches!(status, Status::NotApplicable) {
             return;
         }
         if !SEEN.with(|s| s.borrow_mut().insert((kind, prop, discriminant(value)))) {
             return;
         }
-        if matches!(status, Status::Consumed) {
-            warn(format_args!(
+        match status {
+            Status::Consumed => warn(format_args!(
                 "set_prop({kind:?}, {prop:?}, {}): DROPPED — this backend \
                  implements {prop:?}, but no arm accepts that value shape",
                 shape(value)
-            ));
-        } else {
-            warn(format_args!(
-                "set_prop({kind:?}, {prop:?}, {}): dropped — not implemented by \
-                 the DirectComposition backend",
+            )),
+            // The value SHAPE is still the defect — an arm exists, it just
+            // did not match. Worth its own wording because the state it
+            // would have written is not drawn yet either, so this one goes
+            // unnoticed twice over.
+            Status::Stored => warn(format_args!(
+                "set_prop({kind:?}, {prop:?}, {}): DROPPED — this backend \
+                 stores {prop:?} (though nothing draws it yet), but no arm \
+                 accepts that value shape",
                 shape(value)
-            ));
+            )),
+            Status::NotApplicable => {}
         }
     }
 
@@ -1408,198 +2000,6 @@ mod unhandled {
         }
     }
 
-    /// Classify a prop that reached the `_` arm. Exhaustive by design.
-    fn status(prop: Prop) -> Status {
-        use Prop as P;
-        use Status::{Consumed, NotApplicable as NA, Unimplemented as TODO};
-        match prop {
-            // ── Implemented by `set_prop` ────────────────────────────────
-            // Reaching the `_` arm with one of these is a value-shape defect.
-            P::Background
-            | P::Foreground
-            | P::BorderBrush
-            | P::BorderThickness
-            | P::CornerRadius
-            | P::Fill
-            | P::Stroke
-            | P::StrokeThickness
-            | P::LineEndpoints
-            | P::StyleVariant
-            | P::IsEnabled
-            | P::Opacity
-            | P::Content
-            | P::Text
-            | P::Header
-            | P::Value
-            | P::Precision
-            | P::LargeChange
-            | P::HorizontalContentAlignment
-            | P::FontSize
-            | P::FontWeight
-            | P::FontFamily
-            | P::TextWrapping
-            | P::TextWrappingWrap
-            | P::Padding
-            | P::Margin
-            | P::Width
-            | P::Height
-            | P::MinWidth
-            | P::MinHeight
-            | P::MaxWidth
-            | P::MaxHeight
-            | P::HorizontalAlignment
-            | P::VerticalAlignment
-            | P::Orientation
-            | P::Spacing
-            | P::ColumnSpacing
-            | P::RowSpacing
-            | P::GridRows
-            | P::GridColumns
-            | P::AttachedGridRow
-            | P::AttachedGridColumn
-            | P::AttachedGridRowSpan
-            | P::AttachedGridColumnSpan
-            | P::AttachedCanvasLeft
-            | P::AttachedCanvasTop
-            | P::AttachedCanvasZIndex
-            | P::IsOn
-            | P::IsChecked
-            | P::Minimum
-            | P::Maximum
-            | P::Step
-            | P::FillOrigin
-            | P::FillColor
-            | P::FillColorAlt
-            | P::Marker
-            | P::MarkerColor
-            | P::GradientStops
-            | P::StartAngle
-            | P::EndAngle
-            | P::Ticks
-            | P::TickLabels
-            | P::MajorEvery
-            | P::Accent
-            | P::Unit
-            | P::SubText
-            | P::IsIndeterminate
-            | P::IsActive
-            | P::IsExpanded
-            | P::SelectedIndex
-            | P::SelectedTag
-            | P::PlaceholderText
-            | P::Items
-            | P::MenuItems
-            | P::MenuFlyoutItems => Consumed,
-
-            // ── Deliberately not applicable ──────────────────────────────
-            // XAML framework machinery with no counterpart in a self-rendering
-            // backend: there is no resource dictionary, no style system, and no
-            // XAML drag-drop here.
-            P::Style | P::Resources | P::AllowDrop => NA,
-            // RelativePanel attached props — this backend has no RelativePanel.
-            P::AlignBottomWithPanel
-            | P::AlignHCenterWithPanel
-            | P::AlignLeftWithPanel
-            | P::AlignRightWithPanel
-            | P::AlignTopWithPanel
-            | P::AlignVCenterWithPanel => NA,
-            // TabView / TabViewItem / Pivot.
-            P::CanReorderTabs | P::IsAddTabButtonVisible | P::IsClosable | P::ItemKey
-            | P::ItemHeader => NA,
-            // ColorPicker.
-            P::ColorValue
-            | P::IsAlphaEnabled
-            | P::IsColorChannelTextInputVisible
-            | P::IsColorSliderVisible
-            | P::IsHexInputVisible => NA,
-            // Date / time / calendar pickers.
-            P::ClockIdentifier
-            | P::MinuteIncrement
-            | P::DayVisible
-            | P::MonthVisible
-            | P::YearVisible
-            | P::IsCalendarOpen
-            | P::IsTodayHighlighted
-            | P::IsGroupLabelVisible => NA,
-            // ContentDialog.
-            P::PrimaryButtonText
-            | P::SecondaryButtonText
-            | P::CloseButtonText
-            | P::IsPrimaryButtonEnabled
-            | P::IsSecondaryButtonEnabled => NA,
-            // InfoBar / TeachingTip (`IsOpen` is carried only by these two and
-            // ContentDialog — all three unrendered).
-            P::Message
-            | P::Severity
-            | P::ActionButton
-            | P::ActionButtonText
-            | P::CloseButton
-            | P::PreferredPlacement
-            | P::IsLightDismissEnabled
-            | P::IsOpen => NA,
-            // CommandBar / TreeView / SplitView-only / PersonPicture / Image /
-            // Viewbox / RatingControl / RadioButton(s).
-            P::PrimaryCommands
-            | P::SecondaryCommands
-            | P::CommandBarFlyoutCommands
-            | P::DefaultLabelPosition
-            | P::Nodes
-            | P::SelectionMode
-            | P::DisplayMode
-            | P::DisplayName
-            | P::Initials
-            | P::ImageSource
-            | P::Stretch
-            | P::MaxRating
-            | P::Caption
-            | P::PlaceholderValue
-            | P::IsReadOnly
-            | P::GroupName
-            | P::MaxColumns => NA,
-            // Seam vocabulary no widget emits.
-            P::Columns | P::Rows => NA,
-
-            // ── Not implemented yet (the kind IS rendered here) ──────────
-            // TitleBar: this backend draws the caption band and its three
-            // window buttons, but no title/subtitle text and no back button —
-            // an app setting these gets nothing.
-            P::Title
-            | P::Subtitle
-            | P::Tall
-            | P::IsBackButtonEnabled
-            | P::IsBackButtonVisible
-            | P::IsPaneToggleButtonVisible => TODO,
-            // NavigationView: pane chrome and the embedded search box.
-            P::IsBackEnabled
-            | P::IsSettingsVisible
-            | P::PaneTitle
-            | P::PaneDisplayMode
-            | P::IsPaneOpen
-            | P::CompactPaneLength
-            | P::OpenPaneLength
-            | P::AutoSuggestBox
-            | P::AutoSuggestItems
-            | P::AutoSuggestPlaceholder => TODO,
-            // Scroll containers: the thumbs are drawn, but their visibility
-            // policy is not honoured.
-            P::HorizontalScrollBarVisibility | P::VerticalScrollBarVisibility => TODO,
-            // Buttons: no attached flyout, no icon glyph.
-            P::FlyoutContent | P::FlyoutPlacement | P::Icon => TODO,
-            // HyperlinkButton navigation.
-            P::NavigateUri => TODO,
-            // ToggleSwitch on/off labels.
-            P::OnContent | P::OffContent => TODO,
-            // Editors and the repeat-button timing.
-            P::IsEditable
-            | P::AcceptsReturn
-            | P::PasswordRevealMode
-            | P::IsPasswordRevealButtonEnabled
-            | P::IsTextSelectionEnabled
-            | P::Delay
-            | P::Interval => TODO,
-        }
-    }
-
     /// Short name of a value's shape — `Debug` on the value itself would dump
     /// whole item lists into the log.
     fn shape(value: &PropValue) -> &'static str {
@@ -1630,86 +2030,6 @@ mod unhandled {
             PropValue::F64List(_) => "F64List",
             PropValue::ValueLabels(_) => "ValueLabels",
         }
-    }
-}
-
-/// Revert a prop to its default when the reconciler diffs it away
-/// (`PropValue::Unset`). Covers the props elements set conditionally; anything
-/// else keeps its last value (matching WinUI's ClearValue granularity).
-fn reset_prop(node: &mut Node, prop: Prop) {
-    use taffy::prelude::*;
-    match prop {
-        Prop::Background => {
-            node.paint.background = None;
-            node.mark_dirty();
-        }
-        Prop::Foreground => {
-            node.paint.foreground = None;
-            node.mark_dirty();
-        }
-        Prop::BorderBrush => {
-            node.paint.border_brush = None;
-            node.mark_dirty();
-        }
-        Prop::BorderThickness => {
-            node.paint.border_thickness = 0.0;
-            node.style.border = Rect::zero();
-            node.mark_dirty();
-        }
-        Prop::CornerRadius => {
-            node.paint.corner_radius = 0.0;
-            node.mark_dirty();
-        }
-        Prop::Fill => {
-            node.paint.fill = None;
-            node.mark_dirty();
-        }
-        Prop::FillOrigin => {
-            node.ctrl_mut().fill_origin = None;
-            node.mark_dirty();
-        }
-        Prop::FillColor => {
-            node.ctrl_mut().fill_color = None;
-            node.mark_dirty();
-        }
-        Prop::FillColorAlt => {
-            node.ctrl_mut().fill_color_alt = None;
-            node.mark_dirty();
-        }
-        Prop::Marker => {
-            node.ctrl_mut().marker = None;
-            node.mark_dirty();
-        }
-        Prop::MarkerColor => {
-            node.ctrl_mut().marker_color = None;
-            node.mark_dirty();
-        }
-        Prop::GradientStops => {
-            node.ctrl_mut().stops.clear();
-            node.mark_dirty();
-        }
-        Prop::Stroke => {
-            node.paint.stroke = None;
-            node.mark_dirty();
-        }
-        Prop::StrokeThickness => {
-            node.paint.stroke_thickness = 0.0;
-            node.mark_dirty();
-        }
-        Prop::Opacity => {
-            let _ = node.vis.SetOpacity(1.0);
-        }
-        Prop::Padding => node.style.padding = Rect::zero(),
-        Prop::Margin => node.style.margin = Rect::zero(),
-        Prop::Width => node.style.size.width = auto(),
-        Prop::Height => node.style.size.height = auto(),
-        Prop::MinWidth => node.style.min_size.width = auto(),
-        Prop::MinHeight => node.style.min_size.height = auto(),
-        Prop::MaxWidth => node.style.max_size.width = auto(),
-        Prop::MaxHeight => node.style.max_size.height = auto(),
-        Prop::HorizontalAlignment => node.h_align = -1,
-        Prop::VerticalAlignment => node.v_align = -1,
-        _ => {}
     }
 }
 

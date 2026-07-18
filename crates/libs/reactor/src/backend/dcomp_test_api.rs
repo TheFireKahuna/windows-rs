@@ -460,6 +460,55 @@ impl ArenaHarness {
             n.ctrl_mut().is_on = v;
         }
     }
+
+    /// Whether this node has allocated its `Extras` — the second lazily-boxed
+    /// tier, holding the caption / nav-pane / flyout / editor-policy state.
+    pub fn extras_allocated(&self, id: ControlId) -> Option<bool> {
+        self.arena.get(id).map(|n| n.extras_allocated())
+    }
+
+    /// `dcomp::apply_prop` — the REAL body of `Backend::set_prop`, including
+    /// its `PropValue::Unset` arm, which is the reset path.
+    ///
+    /// Driving the shipping function is the whole point: a test that reset a
+    /// node through its own copy of the rules would agree with itself no
+    /// matter how far the backend drifted.
+    pub fn apply_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
+        if let Some(n) = self.arena.get_mut(id) {
+            dcomp::apply_prop(n, prop, value);
+        }
+    }
+
+    /// A node's whole value state as a string: paint, Taffy style, control
+    /// state (which contains `Extras`), and the loose per-node layout fields.
+    ///
+    /// Deliberately a broad `Debug` dump rather than a field list, so a reset
+    /// that restores the field it was written for but disturbs a neighbour is
+    /// caught by the same comparison. Control state is read through the
+    /// `ctrl()` accessor, so an absent box and a materialised-but-default one
+    /// render identically — which is exactly the equivalence a reset relies on.
+    ///
+    /// The dirty/invalidation flags are excluded: a reset legitimately marks
+    /// the node for repaint, and a fresh node is born already dirty, so they
+    /// describe scheduling rather than value.
+    pub fn node_digest(&self, id: ControlId) -> Option<String> {
+        self.arena.get(id).map(|n| {
+            format!(
+                "paint={:?}\nstyle={:?}\nctrl={:?}\nh_align={} v_align={} z={} spacing={}\n\
+                 rows={:?} cols={:?}\neditor={:?}",
+                n.paint,
+                n.style,
+                n.ctrl(),
+                n.h_align,
+                n.v_align,
+                n.z_index,
+                n.spacing,
+                n.grid_rows,
+                n.grid_cols,
+                n.editor.as_ref().map(|e| (e.text(), e.seeded)),
+            )
+        })
+    }
 }
 
 /// A snapshot of the [`Ctrl`](dcomp::node::Ctrl) fields whose defaults are not
