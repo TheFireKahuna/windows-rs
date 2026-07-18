@@ -11,9 +11,18 @@
 //!   live by a [`CompositionVisualSurface`]; its `TrimEnd` is grown by a scalar
 //!   spring, so the reveal eases on the compositor.
 //!
-//! The needle's `RotationAngle` is bound to that same `TrimEnd` by one
-//! `ExpressionAnimation`, so a single spring drives both — provably locked. The
-//! track ring, ticks, labels, hub, and readout paint on the node surface
+//! Two things move, on two DELIBERATELY separate springs:
+//!
+//! - the **bar** (arc + value thumb) is what the pointer manipulates, so it
+//!   lands 1:1 where you put it. Its two geometries' `TrimEnd` are driven by ONE
+//!   spring instance started on both, so the thumb can never trail the arc;
+//! - the **needle** is a readout, not a handle, so it keeps its own
+//!   `RotationAngle` spring ([`KnobParts::needle_spring`]) and SWEEPS over to a
+//!   value the bar jumped straight to. It is not bound to `TrimEnd` by an
+//!   expression — that would lock it to the bar and destroy exactly the
+//!   click-to-position feel the separation buys. See [`KnobParts`].
+//!
+//! The track ring, ticks, labels, hub, and readout paint on the node surface
 //! (dirty-only) — see `controls::paint_knob`.
 //!
 //! The D2D arc geometry reaches the compositor through a small
@@ -157,6 +166,32 @@ impl IGeometrySource2DInterop_Impl for ArcGeometrySource_Impl {
     fn GetGeometry(&self) -> Result<ID2D1Geometry> {
         Ok(self.geometry.clone())
     }
+
+    /// Returns the one cached geometry, IGNORING `factory`.
+    ///
+    /// D2D resources are factory-affine, so handing back a geometry built on a
+    /// different factory than the caller asked for would be a real contract
+    /// violation — this is sound only because there is exactly ONE D2D factory
+    /// in the process, and the caller cannot be holding another one:
+    ///
+    /// - the geometry is tessellated by [`build_arc_path`] on `comp.gpu`, the
+    ///   single [`GpuDevice`] owned by `Compositing`;
+    /// - the only caller of this interface is the composition graphics device,
+    ///   and `Compositing::new` creates that device *from* `comp.gpu` — see the
+    ///   `CreateGraphicsDevice(gpu.d2d_device())` there. A D2D device's factory
+    ///   is the factory it was created on, so the factory the compositor passes
+    ///   here IS `comp.gpu`'s factory, the one the geometry already belongs to.
+    ///
+    /// Both facts hold by construction, not by luck, but neither is checkable
+    /// from inside this method: `ID2D1Resource::GetFactory` is not scraped into
+    /// `system_bindings`, so the two factories cannot be compared here.
+    ///
+    /// What would break it: a second `GpuDevice`/D2D factory anywhere in the
+    /// backend, or a `CompositionGraphicsDevice` created from a device other
+    /// than `comp.gpu`. Either change must also make this method honour
+    /// `factory` — re-tessellating the arc on the factory it is handed (the
+    /// path parameters are all that is needed) rather than returning a resource
+    /// from a foreign one.
     fn TryGetGeometryUsingFactory(&self, _factory: Ref<ID2D1Factory>) -> Result<ID2D1Geometry> {
         Ok(self.geometry.clone())
     }
@@ -250,8 +285,8 @@ pub(crate) struct KnobParts {
     /// snap must run even when the target is unchanged (see `Part::place`).
     trim_gliding: bool,
     needle_gliding: bool,
-    /// The visible arc sprite (its brush is the `MaskBrush`).
-    display: SpriteVisual,
+    /// The visible arc sprite (its brush is the `MaskBrush`), held as its
+    /// `IVisual` — the same COM object, and the only face of it anything needs.
     display_vis: IVisual,
     mask_brush: CompositionMaskBrush,
     /// Live snapshot of `mask_shape` feeding the mask alpha.
@@ -259,7 +294,16 @@ pub(crate) struct KnobParts {
     needle: SpriteVisual,
     needle_vis: IVisual,
     grad_epoch: u32,
-    stops_sig: u64,
+    /// The ramp the gradient source was last built for, stored EXACTLY.
+    ///
+    /// This was a truncated `FxHash` digest. A digest is smaller, but `FxHash`
+    /// is a fast non-cryptographic mixer, not a collision-resistant one, and the
+    /// failure it admits here is the silent kind: two different ramps hashing
+    /// alike reads as "nothing changed", so the arc keeps rendering the previous
+    /// colour ramp with nothing to signal it. Comparing the (handful of) stops
+    /// themselves cannot be wrong, and only reallocates when the ramp really
+    /// changes — a sync that finds them equal allocates nothing.
+    stops_seen: Vec<(f64, crate::Color)>,
     geom: (f32, f32, f32),
     init: bool,
     frac: f32,
@@ -267,14 +311,18 @@ pub(crate) struct KnobParts {
     angle: f32,
 }
 
-fn stops_signature(stops: &[(f64, crate::Color)]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = rustc_hash::FxHasher::default();
-    for (p, c) in stops {
-        p.to_bits().hash(&mut h);
-        [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()].hash(&mut h);
-    }
-    h.finish()
+/// Exact stop-list comparison, on raw bits so a `NaN` position or channel
+/// compares equal to itself (a `NaN` under `PartialEq` would report "changed"
+/// forever and rebuild the gradient surface on every sync).
+fn stops_eq(a: &[(f64, crate::Color)], b: &[(f64, crate::Color)]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|((pa, ca), (pb, cb))| {
+            pa.to_bits() == pb.to_bits()
+                && ca.r.to_bits() == cb.r.to_bits()
+                && ca.g.to_bits() == cb.g.to_bits()
+                && ca.b.to_bits() == cb.b.to_bits()
+                && ca.a.to_bits() == cb.a.to_bits()
+        })
 }
 
 impl KnobParts {
@@ -355,14 +403,13 @@ impl KnobParts {
             needle_spring: None,
             trim_gliding: false,
             needle_gliding: false,
-            display,
             display_vis,
             mask_brush,
             visual_surface,
             needle,
             needle_vis,
             grad_epoch: u32::MAX,
-            stops_sig: 0,
+            stops_seen: Vec::new(),
             geom: (0.0, 0.0, 0.0),
             init: false,
             frac: -1.0,
@@ -423,8 +470,10 @@ impl KnobParts {
 
         // FP16 gradient SOURCE (display-mapped) + needle colour: rebind on a
         // display epoch or a stops-list change.
-        let sig = stops_signature(&node.ctrl.stops);
-        if self.grad_epoch != atlas_epoch || self.stops_sig != sig || resized {
+        if self.grad_epoch != atlas_epoch
+            || !stops_eq(&self.stops_seen, &node.ctrl.stops)
+            || resized
+        {
             let src = if node.ctrl.stops.is_empty() {
                 super::parts::build_solid_surface(comp, node.ctrl.accent.unwrap_or_else(theme::accent), scale)
             } else {
@@ -441,7 +490,8 @@ impl KnobParts {
                 let _ = self.needle.SetBrush(&cb);
             }
             self.grad_epoch = atlas_epoch;
-            self.stops_sig = sig;
+            self.stops_seen.clear();
+            self.stops_seen.extend_from_slice(&node.ctrl.stops);
         }
 
         if !self.thumb_bound {
@@ -607,18 +657,6 @@ impl KnobParts {
         let _ = self.needle_vis.SetRotationAngle(angle);
     }
 
-    /// Detach the visible arc + needle from the node container (node teardown).
-    /// The mask shape is off-tree already (only referenced by the visual surface).
-    pub(crate) fn detach(&self, node: &Node) {
-        if let Ok(children) = node.container.Children() {
-            if let Ok(v) = self.display.cast::<Visual>() {
-                let _ = children.Remove(&v);
-            }
-            if let Ok(v) = self.needle.cast::<Visual>() {
-                let _ = children.Remove(&v);
-            }
-        }
-    }
 }
 
 /// The node's value fraction (0..1) over `[min, max]`.
