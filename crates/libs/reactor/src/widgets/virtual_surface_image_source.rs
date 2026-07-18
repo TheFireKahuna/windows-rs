@@ -228,6 +228,7 @@ impl VirtualSurfaceImageSource {
 
     /// Cast the underlying source to the `ImageSource` the backend assigns to
     /// `Image.Source`.
+    #[cfg(feature = "winui-backend")]
     pub(crate) fn image_source(&self) -> Result<bindings::ImageSource> {
         self.source.cast()
     }

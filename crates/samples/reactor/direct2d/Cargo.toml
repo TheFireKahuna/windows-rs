@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 windows-core = { workspace = true }
-windows-reactor = { workspace = true }
+windows-reactor = { workspace = true, features = ["winui-backend"] }
 windows-numerics = { workspace = true }
 windows-canvas = { workspace = true, features = ["reactor"] }
 

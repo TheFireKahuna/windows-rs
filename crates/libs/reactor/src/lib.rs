@@ -26,9 +26,12 @@ mod bindings;
 )]
 mod system_bindings;
 
+#[cfg(feature = "winui-backend")]
 mod app;
+#[cfg(feature = "winui-backend")]
 mod app_shim;
 mod backend;
+#[cfg(feature = "winui-backend")]
 mod bootstrap;
 mod color;
 mod diagnostics;
@@ -45,6 +48,7 @@ mod style;
 mod widget;
 mod widgets;
 
+#[cfg(feature = "winui-backend")]
 pub use app::*;
 pub use backend::*;
 pub use color::Color;
@@ -69,6 +73,7 @@ pub use bindings::TreeViewSelectionMode;
 pub use bindings::VerticalAlignment;
 pub use bindings::VirtualKey;
 pub use bindings::VirtualKeyModifiers;
+#[cfg(feature = "winui-backend")]
 pub use bootstrap::*;
 pub use drag::*;
 pub use element::*;

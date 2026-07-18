@@ -7,8 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 
+#[cfg(feature = "winui-backend")]
 mod winui;
 
+#[cfg(feature = "winui-backend")]
 pub use winui::WinUIBackend;
 
 #[cfg(feature = "dcomp-backend")]
@@ -408,6 +410,7 @@ impl EventHandler {
         }
     }
 
+    #[cfg(feature = "winui-backend")]
     fn invoke_color(&self, argb: (u8, u8, u8, u8)) {
         match self {
             Self::Color(cb) => cb.invoke(argb),
@@ -783,15 +786,18 @@ impl Dispatcher for RunOnDemandDispatcher {
 
 // -- WinUI Dispatcher -----------------------------------------------------------
 
+#[cfg(feature = "winui-backend")]
 use bindings::{DispatcherQueue, DispatcherQueueHandler};
 
 /// [`Dispatcher`] backed by the WinUI thread's `DispatcherQueue`.
+#[cfg(feature = "winui-backend")]
 pub struct WinUIDispatcher {
     queue: DispatcherQueue,
     /// Agile handle used to satisfy [`SendDispatcher`] from any thread.
     send_handle: Arc<AgileDispatcherQueue>,
 }
 
+#[cfg(feature = "winui-backend")]
 impl WinUIDispatcher {
     pub fn for_current_thread() -> Result<Self> {
         let queue = DispatcherQueue::GetForCurrentThread()?;
@@ -816,6 +822,7 @@ impl WinUIDispatcher {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 impl Dispatcher for WinUIDispatcher {
     fn enqueue(&self, priority: DispatcherQueuePriority, f: Box<dyn FnOnce()>) -> bool {
         let slot = RefCell::new(Some(f));
@@ -833,15 +840,19 @@ impl Dispatcher for WinUIDispatcher {
 /// Wrapper around an agile `DispatcherQueue` so closures can be posted
 /// across threads. `DispatcherQueue` implements `IAgileObject`; its
 /// `TryEnqueue` is callable from any thread.
+#[cfg(feature = "winui-backend")]
 struct AgileDispatcherQueue {
     queue: DispatcherQueue,
 }
 
 // SAFETY: DispatcherQueue is an agile COM object and TryEnqueue is
 // documented as callable from any thread.
+#[cfg(feature = "winui-backend")]
 unsafe impl Send for AgileDispatcherQueue {}
+#[cfg(feature = "winui-backend")]
 unsafe impl Sync for AgileDispatcherQueue {}
 
+#[cfg(feature = "winui-backend")]
 impl SendDispatcher for AgileDispatcherQueue {
     fn enqueue_send(
         &self,

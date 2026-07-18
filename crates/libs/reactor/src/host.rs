@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+#[cfg(feature = "winui-backend")]
 use std::rc::Rc;
 
 use super::*;
@@ -118,6 +119,7 @@ pub enum PresenterKind {
     CompactOverlay,
 }
 
+#[cfg(feature = "winui-backend")]
 impl PresenterKind {
     fn to_native(self) -> Option<AppWindowPresenterKind> {
         match self {
@@ -159,6 +161,7 @@ impl Backdrop {
 
 /// WinUI-bound [`RenderHost`] hosting a single root [`Component`] inside
 /// a `Microsoft.UI.Xaml.Window`.
+#[cfg(feature = "winui-backend")]
 pub struct ReactorHost {
     render_host: RenderHost<WinUIBackend, WinUIDispatcher>,
     window: Window,
@@ -167,6 +170,7 @@ pub struct ReactorHost {
     icon: RefCell<Option<String>>,
 }
 
+#[cfg(feature = "winui-backend")]
 impl ReactorHost {
     pub fn new(title: impl AsRef<str>, root: Box<dyn Component>) -> Result<Self> {
         Self::new_with(title, root, |_| {})
@@ -359,6 +363,7 @@ impl ReactorHost {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 fn get_default_display_size(hwnd: HWND, dpi: u32) -> WindowSize {
     unsafe {
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -384,6 +389,7 @@ fn get_default_display_size(hwnd: HWND, dpi: u32) -> WindowSize {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 fn center_window_on_display(
     hwnd: HWND,
     client_width_px: i32,
@@ -423,6 +429,7 @@ fn center_window_on_display(
     }
 }
 
+#[cfg(feature = "winui-backend")]
 fn subscribe_size_and_dpi(
     fe: &FrameworkElement,
     render_host: RenderHost<WinUIBackend, WinUIDispatcher>,
@@ -451,6 +458,7 @@ fn subscribe_size_and_dpi(
         .map(|r| r.into_token());
 }
 
+#[cfg(feature = "winui-backend")]
 fn create_window(
     title: impl AsRef<str>,
     size: Option<WindowSize>,
@@ -528,6 +536,7 @@ fn create_window(
 
 /// Re-apply DIP `constraints` to the window's `OverlappedPresenter`,
 /// re-measuring the non-client offset at current DPI.
+#[cfg(feature = "winui-backend")]
 fn apply_constraints_for_window(
     window: &Window,
     dpi: u32,
@@ -567,6 +576,7 @@ impl<B: Backend + 'static, D: Dispatcher + 'static> RenderHost<B, D> {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 fn subscribe_actual_theme_changed(
     fe: &FrameworkElement,
     render_host: RenderHost<WinUIBackend, WinUIDispatcher>,
@@ -586,6 +596,7 @@ fn subscribe_actual_theme_changed(
         .map(|r| r.into_token());
 }
 
+#[cfg(feature = "winui-backend")]
 fn update_color_scheme_from(fe: &FrameworkElement) {
     if let Ok(theme) = fe.ActualTheme() {
         let scheme = match theme {
@@ -596,6 +607,7 @@ fn update_color_scheme_from(fe: &FrameworkElement) {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 struct AttachState {
     window: Window,
     render_host: RenderHost<WinUIBackend, WinUIDispatcher>,
