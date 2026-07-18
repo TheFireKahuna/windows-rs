@@ -425,6 +425,7 @@ Windows::Win32::UI::Accessibility::ISelectionProvider::*
 Windows::Win32::UI::Accessibility::ISelectionItemProvider::*
 Windows::Win32::UI::Accessibility::IExpandCollapseProvider::*
 Windows::Win32::UI::Accessibility::IScrollProvider::*
+Windows::Win32::UI::Accessibility::IScrollItemProvider::*
 // ── Host / event functions ──
 Windows::Win32::UI::Accessibility::UiaReturnRawElementProvider
 Windows::Win32::UI::Accessibility::UiaHostProviderFromHwnd
@@ -459,6 +460,9 @@ Windows::Win32::UI::Accessibility::UIA_RuntimeIdPropertyId
 Windows::Win32::UI::Accessibility::UIA_ValueValuePropertyId
 Windows::Win32::UI::Accessibility::UIA_RangeValueValuePropertyId
 Windows::Win32::UI::Accessibility::UIA_ToggleToggleStatePropertyId
+Windows::Win32::UI::Accessibility::UIA_ExpandCollapseExpandCollapseStatePropertyId
+Windows::Win32::UI::Accessibility::UIA_IsOffscreenPropertyId
+Windows::Win32::UI::Accessibility::UIA_IsPasswordPropertyId
 // ── Pattern ids ──
 Windows::Win32::UI::Accessibility::UIA_InvokePatternId
 Windows::Win32::UI::Accessibility::UIA_ValuePatternId
@@ -468,6 +472,7 @@ Windows::Win32::UI::Accessibility::UIA_SelectionPatternId
 Windows::Win32::UI::Accessibility::UIA_SelectionItemPatternId
 Windows::Win32::UI::Accessibility::UIA_ExpandCollapsePatternId
 Windows::Win32::UI::Accessibility::UIA_ScrollPatternId
+Windows::Win32::UI::Accessibility::UIA_ScrollItemPatternId
 // ── Control-type ids ──
 Windows::Win32::UI::Accessibility::UIA_ButtonControlTypeId
 Windows::Win32::UI::Accessibility::UIA_SliderControlTypeId
@@ -487,6 +492,10 @@ Windows::Win32::UI::Accessibility::UIA_MenuItemControlTypeId
 Windows::Win32::UI::Accessibility::UIA_ScrollBarControlTypeId
 Windows::Win32::UI::Accessibility::UIA_ImageControlTypeId
 Windows::Win32::UI::Accessibility::UIA_CustomControlTypeId
+Windows::Win32::UI::Accessibility::UIA_HyperlinkControlTypeId
+Windows::Win32::UI::Accessibility::UIA_ProgressBarControlTypeId
+Windows::Win32::UI::Accessibility::UIA_RadioButtonControlTypeId
+Windows::Win32::UI::Accessibility::UIA_TitleBarControlTypeId
 // ── Event ids ──
 Windows::Win32::UI::Accessibility::UIA_AutomationPropertyChangedEventId
 Windows::Win32::UI::Accessibility::UIA_Invoke_InvokedEventId

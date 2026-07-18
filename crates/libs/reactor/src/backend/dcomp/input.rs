@@ -1661,17 +1661,24 @@ impl DCompBackend {
 
     // ── Event dispatch ───────────────────────────────────────────────────────
 
+    // The `fire_*` dispatchers double as the UIA notification choke point: every
+    // state change (pointer, keyboard, or UIA-initiated) flows through exactly
+    // one of them, so screen readers hear the change even when the app attached
+    // no handler.
     fn fire_bool(&self, id: ControlId, event: Event, v: bool) {
+        self.uia_notify_bool(id, event, v);
         if let Some(h) = self.node(id).and_then(|n| n.handler(event)) {
             h.invoke_bool(v);
         }
     }
     fn fire_string(&self, id: ControlId, event: Event, v: String) {
+        self.uia_notify_string(id, event, &v);
         if let Some(h) = self.node(id).and_then(|n| n.handler(event)) {
             h.invoke_string(v);
         }
     }
     fn fire_f64(&self, id: ControlId, event: Event, v: f64) {
+        self.uia_notify_f64(id, event, v);
         if let Some(h) = self.node(id).and_then(|n| n.handler(event)) {
             h.invoke_f64(v);
         }

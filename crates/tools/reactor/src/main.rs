@@ -145,6 +145,7 @@ fn generate_reactor_bindings() {
         "Windows.Win32.UI.Accessibility.ISelectionItemProvider",
         "Windows.Win32.UI.Accessibility.IExpandCollapseProvider",
         "Windows.Win32.UI.Accessibility.IScrollProvider",
+        "Windows.Win32.UI.Accessibility.IScrollItemProvider",
         "Windows.Win32.UI.TextServices.ITextStoreACP",
         "--minimal",
         "--dead-code",

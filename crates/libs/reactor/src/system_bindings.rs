@@ -3970,6 +3970,44 @@ pub struct IScalarNaturalMotionAnimation_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    IScrollItemProvider,
+    IScrollItemProvider_Vtbl,
+    0x2360c714_4bf1_4b26_ba65_9b21316127eb
+);
+windows_core::imp::interface_hierarchy!(IScrollItemProvider, windows_core::IUnknown);
+#[repr(C)]
+pub struct IScrollItemProvider_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub ScrollIntoView: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+}
+pub trait IScrollItemProvider_Impl: windows_core::IUnknownImpl {
+    fn ScrollIntoView(&self) -> windows_core::Result<()>;
+}
+impl IScrollItemProvider_Vtbl {
+    pub const fn new<Identity: IScrollItemProvider_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn ScrollIntoView<
+            Identity: IScrollItemProvider_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                IScrollItemProvider_Impl::ScrollIntoView(this).into()
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            ScrollIntoView: ScrollIntoView::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<IScrollItemProvider as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for IScrollItemProvider {}
+windows_core::imp::define_interface!(
     IScrollProvider,
     IScrollProvider_Vtbl,
     0xb38b8077_1fc3_42a5_8cae_d40c2215055a
@@ -7454,10 +7492,12 @@ pub const UIA_ControlTypePropertyId: UIA_PROPERTY_ID = 30003;
 pub const UIA_CustomControlTypeId: UIA_CONTROLTYPE_ID = 50025;
 pub type UIA_EVENT_ID = i32;
 pub const UIA_EditControlTypeId: UIA_CONTROLTYPE_ID = 50004;
+pub const UIA_ExpandCollapseExpandCollapseStatePropertyId: UIA_PROPERTY_ID = 30070;
 pub const UIA_ExpandCollapsePatternId: UIA_PATTERN_ID = 10005;
 pub const UIA_GroupControlTypeId: UIA_CONTROLTYPE_ID = 50026;
 pub const UIA_HasKeyboardFocusPropertyId: UIA_PROPERTY_ID = 30008;
 pub const UIA_HelpTextPropertyId: UIA_PROPERTY_ID = 30013;
+pub const UIA_HyperlinkControlTypeId: UIA_CONTROLTYPE_ID = 50005;
 pub const UIA_ImageControlTypeId: UIA_CONTROLTYPE_ID = 50006;
 pub const UIA_InvokePatternId: UIA_PATTERN_ID = 10000;
 pub const UIA_Invoke_InvokedEventId: UIA_EVENT_ID = 20009;
@@ -7465,6 +7505,8 @@ pub const UIA_IsContentElementPropertyId: UIA_PROPERTY_ID = 30017;
 pub const UIA_IsControlElementPropertyId: UIA_PROPERTY_ID = 30016;
 pub const UIA_IsEnabledPropertyId: UIA_PROPERTY_ID = 30010;
 pub const UIA_IsKeyboardFocusablePropertyId: UIA_PROPERTY_ID = 30009;
+pub const UIA_IsOffscreenPropertyId: UIA_PROPERTY_ID = 30022;
+pub const UIA_IsPasswordPropertyId: UIA_PROPERTY_ID = 30019;
 pub const UIA_ListControlTypeId: UIA_CONTROLTYPE_ID = 50008;
 pub const UIA_ListItemControlTypeId: UIA_CONTROLTYPE_ID = 50007;
 pub const UIA_LiveRegionChangedEventId: UIA_EVENT_ID = 20024;
@@ -7474,10 +7516,13 @@ pub const UIA_NamePropertyId: UIA_PROPERTY_ID = 30005;
 pub type UIA_PATTERN_ID = i32;
 pub type UIA_PROPERTY_ID = i32;
 pub const UIA_PaneControlTypeId: UIA_CONTROLTYPE_ID = 50033;
+pub const UIA_ProgressBarControlTypeId: UIA_CONTROLTYPE_ID = 50012;
+pub const UIA_RadioButtonControlTypeId: UIA_CONTROLTYPE_ID = 50013;
 pub const UIA_RangeValuePatternId: UIA_PATTERN_ID = 10003;
 pub const UIA_RangeValueValuePropertyId: UIA_PROPERTY_ID = 30047;
 pub const UIA_RuntimeIdPropertyId: UIA_PROPERTY_ID = 30000;
 pub const UIA_ScrollBarControlTypeId: UIA_CONTROLTYPE_ID = 50014;
+pub const UIA_ScrollItemPatternId: UIA_PATTERN_ID = 10017;
 pub const UIA_ScrollPatternId: UIA_PATTERN_ID = 10004;
 pub const UIA_SelectionItemPatternId: UIA_PATTERN_ID = 10010;
 pub const UIA_SelectionItem_ElementSelectedEventId: UIA_EVENT_ID = 20012;
@@ -7487,6 +7532,7 @@ pub const UIA_StructureChangedEventId: UIA_EVENT_ID = 20002;
 pub const UIA_TabControlTypeId: UIA_CONTROLTYPE_ID = 50018;
 pub const UIA_TabItemControlTypeId: UIA_CONTROLTYPE_ID = 50019;
 pub const UIA_TextControlTypeId: UIA_CONTROLTYPE_ID = 50020;
+pub const UIA_TitleBarControlTypeId: UIA_CONTROLTYPE_ID = 50037;
 pub const UIA_TogglePatternId: UIA_PATTERN_ID = 10015;
 pub const UIA_ToggleToggleStatePropertyId: UIA_PROPERTY_ID = 30086;
 pub const UIA_ValuePatternId: UIA_PATTERN_ID = 10002;

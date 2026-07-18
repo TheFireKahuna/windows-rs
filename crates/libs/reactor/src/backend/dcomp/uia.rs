@@ -6,9 +6,10 @@
 //! arena to UI Automation: one lightweight COM provider per [`ControlId`] (plus a
 //! synthetic provider per item of a SelectorBar / ComboBox / NavigationView),
 //! mirroring the logical tree, reporting Name/AutomationId/ControlType/focus, and
-//! translating Invoke/Toggle/Value/RangeValue/SelectionItem/ExpandCollapse calls
-//! into the **same** typed event dispatch a pointer or keyboard interaction takes
-//! (the [`uia_*` action bridge](super::DCompBackend) in `input.rs`).
+//! translating Invoke/Toggle/Value/RangeValue/Selection/SelectionItem/
+//! ExpandCollapse/Scroll calls into the **same** typed event dispatch a pointer
+//! or keyboard interaction takes (the [`uia_*` action bridge](super::DCompBackend)
+//! in `input.rs`).
 //!
 //! ## Architecture
 //! * **Providers are value objects.** [`ElementProvider`] holds only plain data
@@ -25,27 +26,39 @@
 use std::mem::ManuallyDrop;
 
 use super::host;
-use super::controls;
+use super::{caption, controls};
+use super::{layout, scroll};
 use super::*;
-use crate::backend::ControlKind;
+use crate::backend::{ControlKind, Event};
 use crate::system_bindings::{
     ClientToScreen, ExpandCollapseState, IExpandCollapseProvider, IExpandCollapseProvider_Impl,
     IInvokeProvider, IInvokeProvider_Impl, IRangeValueProvider, IRangeValueProvider_Impl,
     IRawElementProviderFragment, IRawElementProviderFragmentRoot,
     IRawElementProviderFragmentRoot_Impl, IRawElementProviderFragment_Impl,
-    IRawElementProviderSimple, IRawElementProviderSimple_Impl, ISelectionItemProvider,
-    ISelectionItemProvider_Impl, IToggleProvider, IToggleProvider_Impl, IValueProvider,
-    IValueProvider_Impl, NavigateDirection, ProviderOptions, ScreenToClient, ToggleState, UiaRect,
-    UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, HWND, POINT, SAFEARRAY, VARIANT, VARIANT_0,
-    VARIANT_0_0, VARIANT_0_0_0, UIA_AutomationFocusChangedEventId, UIA_AutomationIdPropertyId,
+    IRawElementProviderSimple, IRawElementProviderSimple_Impl, IScrollItemProvider,
+    IScrollItemProvider_Impl, IScrollProvider,
+    IScrollProvider_Impl, ISelectionItemProvider, ISelectionItemProvider_Impl, ISelectionProvider,
+    ISelectionProvider_Impl, IToggleProvider, IToggleProvider_Impl, IValueProvider,
+    IValueProvider_Impl, IsZoomed, NavigateDirection, PostMessageW, ProviderOptions,
+    ScreenToClient, ScrollAmount, ToggleState, UiaRect,
+    UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent,
+    HWND, LPARAM, POINT, SAFEARRAY, VARIANT, VARIANT_0,
+    VARIANT_0_0, VARIANT_0_0_0, WM_SYSCOMMAND, WPARAM, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
+    SC_RESTORE, UIA_AutomationFocusChangedEventId, UIA_AutomationIdPropertyId,
     UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
     UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_ExpandCollapsePatternId,
-    UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId, UIA_HelpTextPropertyId,
-    UIA_ImageControlTypeId, UIA_InvokePatternId, UIA_IsContentElementPropertyId,
+    UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_GroupControlTypeId,
+    UIA_HasKeyboardFocusPropertyId, UIA_HelpTextPropertyId, UIA_HyperlinkControlTypeId,
+    UIA_ImageControlTypeId, UIA_InvokePatternId, UIA_Invoke_InvokedEventId,
+    UIA_IsContentElementPropertyId,
     UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
+    UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
     UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_NamePropertyId, UIA_PaneControlTypeId,
-    UIA_PATTERN_ID, UIA_PROPERTY_ID, UIA_RangeValuePatternId, UIA_RangeValueValuePropertyId,
-    UIA_SelectionItemPatternId, UIA_SliderControlTypeId, UIA_TabControlTypeId,
+    UIA_PATTERN_ID, UIA_PROPERTY_ID, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
+    UIA_RangeValuePatternId, UIA_RangeValueValuePropertyId,
+    UIA_ScrollItemPatternId, UIA_ScrollPatternId, UIA_SelectionItemPatternId,
+    UIA_SelectionItem_ElementSelectedEventId, UIA_SelectionPatternId,
+    UIA_SliderControlTypeId, UIA_TabControlTypeId,
     UIA_TabItemControlTypeId, UIA_TextControlTypeId, UIA_TogglePatternId,
     UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
 };
@@ -58,19 +71,42 @@ windows_core::link!("oleaut32.dll" "system" fn SafeArrayCreateVector(vt: u16, ll
 windows_core::link!("oleaut32.dll" "system" fn SafeArrayPutElement(psa: *mut SAFEARRAY, rgindices: *const i32, pv: *const core::ffi::c_void) -> HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaClientsAreListening() -> BOOL);
 
-// `ProviderOptions_ServerSideProvider` — we are a server-side provider that
-// marshals its own arena access, so we advertise nothing else.
-const PROVIDER_OPTIONS_SERVER: ProviderOptions = 1;
+// `ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading` — a
+// server-side provider whose state lives on the UI thread. `UseComThreading`
+// makes UIA core honor COM threading for callbacks and, critically, for its
+// event-delivery machinery (raised events can be dropped without it).
+const PROVIDER_OPTIONS_SERVER: ProviderOptions = 0x1 | 0x20;
 // `UIA_E_ELEMENTNOTAVAILABLE` — returned when the node has gone (id reused/freed).
 const UIA_E_ELEMENTNOTAVAILABLE: HRESULT = HRESULT(0x8004_0201u32 as i32);
 // `UiaAppendRuntimeId` — first element of a fragment's runtime id.
 const UIA_APPEND_RUNTIME_ID: i32 = 3;
 
-// VARENUM tags used when building property VARIANTs.
+/// Synthetic-item index space: container items use their natural 0-based
+/// index; the fragment root's drawn caption buttons (min/max/close) live at
+/// `CAPTION_ITEM_BASE + i` so they never collide with a root that is itself an
+/// item container (e.g. a NavigationView shell as the app's top element).
+const CAPTION_ITEM_BASE: i32 = 1 << 20;
+
+fn is_caption(item: i32) -> bool {
+    item >= CAPTION_ITEM_BASE
+}
+
+// `ScrollAmount` values + the Scroll pattern's "no scroll" percent sentinel
+// (uiautomationcore.h).
+const SCROLL_LARGE_DECREMENT: ScrollAmount = 0;
+const SCROLL_SMALL_DECREMENT: ScrollAmount = 1;
+const SCROLL_LARGE_INCREMENT: ScrollAmount = 3;
+const SCROLL_SMALL_INCREMENT: ScrollAmount = 4;
+const UIA_SCROLL_NO_SCROLL: f64 = -1.0;
+/// One Scroll-pattern small step — matches the wheel detent in `on_wheel`.
+const SCROLL_LINE: f32 = 48.0;
+
+// VARENUM tags used when building property VARIANTs / provider arrays.
 const VT_I4: u16 = 3;
 const VT_R8: u16 = 5;
 const VT_BSTR: u16 = 8;
 const VT_BOOL: u16 = 11;
+const VT_UNKNOWN: u16 = 13;
 
 // NavigateDirection values (uiautomationcore.h).
 const NAV_PARENT: NavigateDirection = 0;
@@ -132,12 +168,15 @@ fn make_runtime_id(id: ControlId, item: i32) -> *mut SAFEARRAY {
 fn control_type(kind: ControlKind) -> i32 {
     use ControlKind::*;
     match kind {
-        Button | RepeatButton | HyperlinkButton | DropDownButton | SplitButton | ToggleSwitch => {
+        Button | RepeatButton | DropDownButton | SplitButton | ToggleSwitch => {
             UIA_ButtonControlTypeId
         }
-        CheckBox | ToggleButton | RadioButton => UIA_CheckBoxControlTypeId,
+        HyperlinkButton => UIA_HyperlinkControlTypeId,
+        CheckBox | ToggleButton => UIA_CheckBoxControlTypeId,
+        RadioButton => UIA_RadioButtonControlTypeId,
         TextBox | NumberBox | PasswordBox | AutoSuggestBox | RichEditBox => UIA_EditControlTypeId,
         Slider => UIA_SliderControlTypeId,
+        ProgressBar | ProgressRing => UIA_ProgressBarControlTypeId,
         ComboBox => UIA_ComboBoxControlTypeId,
         SelectorBar | TabView | Pivot => UIA_TabControlTypeId,
         NavigationView => UIA_ListControlTypeId,
@@ -181,6 +220,10 @@ fn pattern_supported(kind: ControlKind, item: i32, pid: UIA_PATTERN_ID) -> bool 
         matches!(kind, Slider | NumberBox | ProgressBar | ProgressRing)
     } else if pid == UIA_ExpandCollapsePatternId {
         matches!(kind, Expander | ComboBox | DropDownButton | SplitButton)
+    } else if pid == UIA_SelectionPatternId {
+        is_item_container(kind)
+    } else if pid == UIA_ScrollPatternId {
+        matches!(kind, ScrollViewer | ScrollView)
     } else {
         false
     }
@@ -225,6 +268,27 @@ impl DCompBackend {
         }
     }
 
+    /// Drawn caption buttons under the fragment root (0 when the window has no
+    /// custom caption).
+    fn uia_caption_count(&self) -> i32 {
+        if self.caption_rect().is_some() {
+            3
+        } else {
+            0
+        }
+    }
+
+    /// Caption button `i` (0=min, 1=max, 2=close)'s rect in window DIPs — the
+    /// buttons fill the right end of the caption strip, each [`caption::BTN_W`]
+    /// wide.
+    fn uia_caption_button(&self, i: i32) -> Option<(f32, f32, f32, f32)> {
+        if !(0..3).contains(&i) {
+            return None;
+        }
+        let (cx, cy, cw, ch) = self.caption_rect()?;
+        Some((cx + cw - (3 - i) as f32 * caption::BTN_W, cy, caption::BTN_W, ch))
+    }
+
     /// The parent of `target` by DFS from the root (trees are small; no parent
     /// pointer is stored on the node).
     fn uia_parent(&self, target: ControlId) -> Option<ControlId> {
@@ -243,36 +307,79 @@ impl DCompBackend {
         rec(self, self.root?, target)
     }
 
+    /// Step through the logical tree. A container's synthetic items form a
+    /// *prefix* of one combined child sequence `[item 0 … item n-1, child 0 …
+    /// child m-1]`, so a tree walk (screen reader, client `FindAll`) continues
+    /// from the last item into content hosted inside the container — e.g. a
+    /// NavigationView's body pane — instead of dead-ending on the items.
     pub(crate) fn uia_navigate(&self, id: ControlId, item: i32, dir: NavigateDirection) -> UiaNav {
         let Some(node) = self.arena.get(id) else {
             return UiaNav::None;
         };
 
-        // Synthetic item: siblings within the container, parent is the container.
+        // Synthetic item: parent is the container; the sibling after the last
+        // item is the container's first real child.
+        // Caption buttons: a synthetic suffix after the root's real children.
+        if is_caption(item) {
+            let i = item - CAPTION_ITEM_BASE;
+            return match dir {
+                NAV_PARENT => UiaNav::Root,
+                NAV_NEXT if i + 1 < self.uia_caption_count() => {
+                    UiaNav::Item(id, CAPTION_ITEM_BASE + i + 1)
+                }
+                NAV_PREV if i > 0 => UiaNav::Item(id, CAPTION_ITEM_BASE + i - 1),
+                NAV_PREV => match node.children.last() {
+                    Some(c) => UiaNav::Node(*c),
+                    None => match self.uia_item_count(id) {
+                        0 => UiaNav::None,
+                        n => UiaNav::Item(id, n - 1),
+                    },
+                },
+                _ => UiaNav::None,
+            };
+        }
+
         if item >= 0 {
             let count = self.uia_item_count(id);
             return match dir {
+                NAV_PARENT if self.root == Some(id) => UiaNav::Root,
                 NAV_PARENT => UiaNav::Node(id),
                 NAV_NEXT if item + 1 < count => UiaNav::Item(id, item + 1),
+                NAV_NEXT => match node.children.first() {
+                    Some(c) => UiaNav::Node(*c),
+                    None if self.root == Some(id) && self.uia_caption_count() > 0 => {
+                        UiaNav::Item(id, CAPTION_ITEM_BASE)
+                    }
+                    None => UiaNav::None,
+                },
                 NAV_PREV if item > 0 => UiaNav::Item(id, item - 1),
                 _ => UiaNav::None,
             };
         }
 
         let item_count = self.uia_item_count(id);
+        let caption_count = if self.root == Some(id) { self.uia_caption_count() } else { 0 };
         match dir {
             NAV_FIRST => {
                 if item_count > 0 {
                     UiaNav::Item(id, 0)
+                } else if let Some(c) = node.children.first() {
+                    UiaNav::Node(*c)
+                } else if caption_count > 0 {
+                    UiaNav::Item(id, CAPTION_ITEM_BASE)
                 } else {
-                    node.children.first().map_or(UiaNav::None, |c| UiaNav::Node(*c))
+                    UiaNav::None
                 }
             }
             NAV_LAST => {
-                if item_count > 0 {
-                    UiaNav::Item(id, item_count - 1)
+                if caption_count > 0 {
+                    UiaNav::Item(id, CAPTION_ITEM_BASE + caption_count - 1)
                 } else {
-                    node.children.last().map_or(UiaNav::None, |c| UiaNav::Node(*c))
+                    match node.children.last() {
+                        Some(c) => UiaNav::Node(*c),
+                        None if item_count > 0 => UiaNav::Item(id, item_count - 1),
+                        None => UiaNav::None,
+                    }
                 }
             }
             NAV_PARENT => {
@@ -296,14 +403,24 @@ impl DCompBackend {
                 let Some(idx) = pn.children.iter().position(|c| *c == id) else {
                     return UiaNav::None;
                 };
-                let next = if dir == NAV_NEXT {
-                    pn.children.get(idx + 1)
-                } else if idx == 0 {
-                    None
+                if dir == NAV_NEXT {
+                    match pn.children.get(idx + 1) {
+                        Some(c) => UiaNav::Node(*c),
+                        // Last real child of the root: the caption suffix follows.
+                        None if self.root == Some(p) && self.uia_caption_count() > 0 => {
+                            UiaNav::Item(p, CAPTION_ITEM_BASE)
+                        }
+                        None => UiaNav::None,
+                    }
+                } else if idx > 0 {
+                    UiaNav::Node(pn.children[idx - 1])
                 } else {
-                    pn.children.get(idx - 1)
-                };
-                next.map_or(UiaNav::None, |c| UiaNav::Node(*c))
+                    // First real child: preceded by the parent's last item.
+                    match self.uia_item_count(p) {
+                        0 => UiaNav::None,
+                        n => UiaNav::Item(p, n - 1),
+                    }
+                }
             }
             _ => UiaNav::None,
         }
@@ -311,6 +428,15 @@ impl DCompBackend {
 
     /// Accessible name: explicit AutomationName, else the visible label/text.
     fn uia_name(&self, id: ControlId, item: i32) -> String {
+        if is_caption(item) {
+            return match item - CAPTION_ITEM_BASE {
+                0 => "Minimize",
+                1 if caption::maximized() => "Restore",
+                1 => "Maximize",
+                _ => "Close",
+            }
+            .to_string();
+        }
         let Some(n) = self.arena.get(id) else {
             return String::new();
         };
@@ -346,6 +472,9 @@ impl DCompBackend {
     }
 
     fn uia_control_type(&self, id: ControlId, item: i32) -> i32 {
+        if is_caption(item) {
+            return UIA_ButtonControlTypeId;
+        }
         match self.arena.get(id) {
             Some(n) if item >= 0 => item_control_type(n.kind),
             Some(n) => control_type(n.kind),
@@ -359,7 +488,8 @@ impl DCompBackend {
 
     fn uia_focusable(&self, id: ControlId, item: i32) -> bool {
         if item >= 0 {
-            return true;
+            // Caption buttons are pointer-only (Alt+Space serves the keyboard).
+            return !is_caption(item);
         }
         self.arena.get(id).map_or(false, |n| n.focusable)
     }
@@ -374,6 +504,12 @@ impl DCompBackend {
         item: i32,
         pid: UIA_PATTERN_ID,
     ) -> bool {
+        if is_caption(item) {
+            return pid == UIA_InvokePatternId; // caption buttons only invoke
+        }
+        if pid == UIA_ScrollItemPatternId {
+            return self.uia_scroll_ancestor(id).is_some();
+        }
         self.uia_kind(id)
             .is_some_and(|k| pattern_supported(k, item, pid))
     }
@@ -427,6 +563,154 @@ impl DCompBackend {
         self.arena.get(id).is_some_and(|n| n.ctrl.selected_index == item)
     }
 
+    /// The selected item index of container `id`, or `None` when the index is
+    /// out of range (or the node is not an item container).
+    fn uia_selected_item(&self, id: ControlId) -> Option<i32> {
+        let n = self.arena.get(id)?;
+        if !is_item_container(n.kind) {
+            return None;
+        }
+        let i = n.ctrl.selected_index;
+        (0..n.ctrl.items.len() as i32).contains(&i).then_some(i)
+    }
+
+    /// `(offset, viewport height, content height)` in DIPs for a scroll
+    /// container.
+    fn uia_scroll_info(&self, id: ControlId) -> Option<(f32, f32, f32)> {
+        let n = self.arena.get(id)?;
+        n.is_scroll().then(|| (n.scroll_off, n.rect.h, n.ctrl.content_h))
+    }
+
+    /// UIA `Scroll`/`SetScrollPercent`: glide scroll container `id` to logical
+    /// offset `off` (DIPs of content above the viewport), clamped to range —
+    /// the same compositor glide + thumb sync a wheel detent takes (`on_wheel`).
+    fn uia_scroll_to(&mut self, id: ControlId, off: f32) {
+        let scale = self.scale();
+        let Some(n) = self.arena.get_mut(id) else {
+            return;
+        };
+        if !n.is_scroll() {
+            return;
+        }
+        let max = (n.ctrl.content_h - n.rect.h).max(0.0);
+        let target = layout::snap(off.clamp(0.0, max), scale);
+        n.scroll_off = target;
+        n.scroll_glide(target);
+        let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, target);
+        let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
+        n.thumb_glide(tx, g.thumb_y);
+    }
+
+    /// Ancestors of `target`, nearest-first (root last); empty when `target`
+    /// is the root or unreachable.
+    fn uia_ancestors(&self, target: ControlId) -> Vec<ControlId> {
+        fn rec(
+            b: &DCompBackend,
+            cur: ControlId,
+            target: ControlId,
+            path: &mut Vec<ControlId>,
+        ) -> bool {
+            if cur == target {
+                return true;
+            }
+            path.push(cur);
+            if let Some(n) = b.arena.get(cur) {
+                for c in &n.children {
+                    if rec(b, *c, target, path) {
+                        return true;
+                    }
+                }
+            }
+            path.pop();
+            false
+        }
+        let mut path = Vec::new();
+        match self.root {
+            Some(r) if rec(self, r, target, &mut path) => {
+                path.reverse();
+                path
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Total DIPs `id` is shifted up by ancestor scroll offsets. Layout rects
+    /// are stored unscrolled (the content-carrier visual applies the shift),
+    /// so every screen-space answer must subtract this.
+    fn uia_scroll_adjust(&self, id: ControlId) -> f32 {
+        self.uia_ancestors(id)
+            .iter()
+            .filter_map(|a| self.arena.get(*a))
+            .filter(|n| n.is_scroll())
+            .map(|n| n.scroll_off)
+            .sum()
+    }
+
+    /// The nearest scroll-container ancestor of `id`.
+    fn uia_scroll_ancestor(&self, id: ControlId) -> Option<ControlId> {
+        self.uia_ancestors(id)
+            .into_iter()
+            .find(|a| self.arena.get(*a).is_some_and(|n| n.is_scroll()))
+    }
+
+    /// Whether `id` is currently invisible: zero-area layout (a collapsed
+    /// Expander body is `Display::None`) or scrolled fully outside an ancestor
+    /// scroll container's viewport.
+    fn uia_is_offscreen(&self, id: ControlId, item: i32) -> bool {
+        if item >= 0 {
+            return false; // items and caption buttons track their container
+        }
+        let Some(n) = self.arena.get(id) else {
+            return true;
+        };
+        if n.rect.w <= 0.0 || n.rect.h <= 0.0 {
+            return true;
+        }
+        let (mut top, mut bot) = (n.rect.y, n.rect.y + n.rect.h);
+        for a in self.uia_ancestors(id) {
+            if let Some(an) = self.arena.get(a)
+                && an.is_scroll()
+            {
+                top -= an.scroll_off;
+                bot -= an.scroll_off;
+                if bot <= an.rect.y || top >= an.rect.y + an.rect.h {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// UIA `ScrollIntoView`: scroll the nearest scroll ancestor the minimum
+    /// distance that brings `id` (or its item) fully into the viewport.
+    fn uia_scroll_into_view(&mut self, id: ControlId, item: i32) {
+        let Some(sv) = self.uia_scroll_ancestor(id) else {
+            return;
+        };
+        let Some((mut ny, mut nh)) = self.arena.get(id).map(|n| (n.rect.y, n.rect.h)) else {
+            return;
+        };
+        if item >= 0
+            && let Some(n) = self.arena.get(id)
+            && n.kind == ControlKind::NavigationView
+        {
+            ny += controls::NAV_ITEM_H * item as f32;
+            nh = controls::NAV_ITEM_H;
+        }
+        let Some((vy, vh, off)) = self.arena.get(sv).map(|n| (n.rect.y, n.rect.h, n.scroll_off))
+        else {
+            return;
+        };
+        // Both rects are unscrolled layout coordinates, so their difference is
+        // the target's offset within the scrolled content.
+        let content_y = ny - vy;
+        if content_y >= off && content_y + nh <= off + vh {
+            return; // already fully visible
+        }
+        let target = if content_y < off { content_y } else { content_y + nh - vh };
+        self.uia_scroll_to(sv, target);
+    }
+
     /// The fragment with keyboard focus, for the fragment root's `GetFocus`.
     pub(crate) fn uia_focus(&self) -> UiaNav {
         match self.focused_id {
@@ -438,6 +722,10 @@ impl DCompBackend {
 
     /// `BoundingRectangle` in screen pixels for node `id` (or item `item`).
     fn uia_bounding_rect(&self, id: ControlId, item: i32) -> Option<(f64, f64, f64, f64)> {
+        if is_caption(item) {
+            let (bx, by, bw, bh) = self.uia_caption_button(item - CAPTION_ITEM_BASE)?;
+            return Some(self.uia_screen_rect(bx, by, bw, bh));
+        }
         let n = self.arena.get(id)?;
         let (mut x, mut y, mut w, mut h) = (n.rect.x, n.rect.y, n.rect.w, n.rect.h);
         if item >= 0 {
@@ -458,6 +746,7 @@ impl DCompBackend {
                 _ => {} // ComboBox items live in a popup; report the field's box.
             }
         }
+        y -= self.uia_scroll_adjust(id);
         Some(self.uia_screen_rect(x, y, w, h))
     }
 
@@ -482,13 +771,27 @@ impl DCompBackend {
             let _ = ScreenToClient(self.hwnd as HWND, &mut pt);
         }
         let (px, py) = (pt.x as f32 / scale, pt.y as f32 / scale);
+        // The caption cluster overlays the content; test its buttons first.
+        if let (Some(root), Some((bx0, cy, _, ch))) = (self.root, self.uia_caption_button(0))
+            && py >= cy
+            && py < cy + ch
+            && px >= bx0
+        {
+            let i = ((px - bx0) / caption::BTN_W) as i32;
+            if (0..3).contains(&i) {
+                return UiaNav::Item(root, CAPTION_ITEM_BASE + i);
+            }
+        }
         fn rec(b: &DCompBackend, id: ControlId, px: f32, py: f32) -> Option<ControlId> {
             let n = b.arena.get(id)?;
             if !n.rect.contains(px, py) {
                 return None;
             }
+            // Descend in content space: a scroll container's children are laid
+            // out unscrolled (mirrors the pointer path's `surface_walk`).
+            let cy = if n.is_scroll() { py + n.scroll_off } else { py };
             for c in &n.children {
-                if let Some(found) = rec(b, *c, px, py) {
+                if let Some(found) = rec(b, *c, px, cy) {
                     return Some(found);
                 }
             }
@@ -496,8 +799,41 @@ impl DCompBackend {
         }
         match self.root.and_then(|r| rec(self, r, px, py)) {
             Some(id) if self.root == Some(id) => UiaNav::Root,
-            Some(id) => UiaNav::Node(id),
+            Some(id) => match self.uia_item_at(id, px, py) {
+                Some(i) => UiaNav::Item(id, i),
+                None => UiaNav::Node(id),
+            },
             None => UiaNav::Root,
+        }
+    }
+
+    /// The synthetic item of container `id` under window-relative DIP point
+    /// `(px, py)`, mirroring the pointer hit geometry in `input.rs`. `None` when
+    /// the point misses the item area or the container hosts its items in a
+    /// popup (ComboBox).
+    fn uia_item_at(&self, id: ControlId, px: f32, py: f32) -> Option<i32> {
+        // Window-space → the container's unscrolled layout space.
+        let py = py + self.uia_scroll_adjust(id);
+        let n = self.arena.get(id)?;
+        let count = n.ctrl.items.len();
+        if count == 0 {
+            return None;
+        }
+        match n.kind {
+            ControlKind::SelectorBar => {
+                let edges = controls::segment_edges(n);
+                let rel = px - n.rect.x;
+                Some(edges[1..count].iter().take_while(|&&e| rel >= e).count() as i32)
+            }
+            ControlKind::NavigationView => {
+                // Items occupy only the top of the rail column; elsewhere the
+                // point belongs to the container (the body pane is a real child
+                // and was already tried by the recursion above).
+                let (rx, ry) = (px - n.rect.x, py - n.rect.y);
+                let i = (ry / controls::NAV_ITEM_H).floor() as i32;
+                (rx < theme::NAV_RAIL_W && (0..count as i32).contains(&i)).then_some(i)
+            }
+            _ => None,
         }
     }
 
@@ -505,7 +841,7 @@ impl DCompBackend {
     /// so it never runs inside an input borrow, and a no-op when no client is
     /// listening (idle cost stays zero). Called on the UI thread from `set_focus`.
     pub(crate) fn uia_raise_focus(&self, id: ControlId) {
-        if !unsafe { UiaClientsAreListening() }.as_bool() {
+        if !clients_listening() {
             return;
         }
         let hwnd = self.hwnd;
@@ -516,6 +852,122 @@ impl DCompBackend {
             }
         });
     }
+
+    // ── State-change notifications ───────────────────────────────────────────
+    //
+    // Called from the `fire_*` event-dispatch choke points in `input.rs`, so a
+    // pointer, keyboard, or UIA-initiated change announces identically to
+    // screen readers. Gated on a listening client (zero idle cost) and
+    // deferred through the pump so raising never re-enters the input borrow.
+
+    pub(crate) fn uia_notify_bool(&self, id: ControlId, event: Event, v: bool) {
+        if !clients_listening() {
+            return;
+        }
+        let state = i32::from(v);
+        match event {
+            Event::Toggled | Event::Checked => raise_property_changed(
+                self.hwnd,
+                id,
+                UIA_ToggleToggleStatePropertyId,
+                PropVal::I4(state),
+            ),
+            Event::Expanding => raise_property_changed(
+                self.hwnd,
+                id,
+                UIA_ExpandCollapseExpandCollapseStatePropertyId,
+                PropVal::I4(state),
+            ),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn uia_notify_f64(&self, id: ControlId, event: Event, v: f64) {
+        if !clients_listening() {
+            return;
+        }
+        if matches!(event, Event::ValueChanged) {
+            raise_property_changed(self.hwnd, id, UIA_RangeValueValuePropertyId, PropVal::R8(v));
+        }
+    }
+
+    pub(crate) fn uia_notify_string(&self, id: ControlId, event: Event, v: &str) {
+        if !clients_listening() {
+            return;
+        }
+        match event {
+            Event::SelectionChanged => {
+                let Some(i) = self.uia_selected_item(id) else {
+                    return;
+                };
+                let hwnd = self.hwnd;
+                host::post_ui(hwnd, move || {
+                    let p: IRawElementProviderSimple = ElementProvider::item(hwnd, id, i).into();
+                    unsafe {
+                        let _ = UiaRaiseAutomationEvent(
+                            p.as_raw(),
+                            UIA_SelectionItem_ElementSelectedEventId,
+                        );
+                    }
+                });
+            }
+            // PasswordChanged is deliberately not announced.
+            Event::TextChanged => raise_property_changed(
+                self.hwnd,
+                id,
+                UIA_ValueValuePropertyId,
+                PropVal::Bstr(v.to_string()),
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn clients_listening() -> bool {
+    unsafe { UiaClientsAreListening() }.as_bool()
+}
+
+/// A property's new value as plain `Send` data; the VARIANT is built on the UI
+/// thread inside the deferred raise.
+enum PropVal {
+    I4(i32),
+    R8(f64),
+    Bstr(String),
+}
+
+/// Raise `AutomationPropertyChanged` for node `id` — deferred onto the pump.
+/// The old value is reported empty (permitted by the pattern contracts).
+fn raise_property_changed(hwnd: isize, id: ControlId, pid: UIA_PROPERTY_ID, val: PropVal) {
+    host::post_ui(hwnd, move || {
+        let provider: IRawElementProviderSimple = ElementProvider::element(hwnd, id).into();
+        // For a BSTR value the VARIANT holds a non-owning alias; `_owner` keeps
+        // the string alive across the synchronous raise (UIA deep-copies it),
+        // then frees it — a by-value VARIANT is never dropped by anyone else.
+        let mut _owner: Option<BSTR> = None;
+        let newv = match val {
+            PropVal::I4(v) => v_i4(v),
+            PropVal::R8(v) => v_r8(v),
+            PropVal::Bstr(s) => {
+                let b = BSTR::from(s.as_str());
+                let v = make_variant(
+                    VT_BSTR,
+                    VARIANT_0_0_0 {
+                        bstrVal: ManuallyDrop::new(unsafe { core::mem::transmute_copy(&b) }),
+                    },
+                );
+                _owner = Some(b);
+                v
+            }
+        };
+        unsafe {
+            let _ = UiaRaiseAutomationPropertyChangedEvent(
+                provider.as_raw(),
+                pid,
+                VARIANT::default(),
+                newv,
+            );
+        }
+    });
 }
 
 // ── Marshal helpers ──────────────────────────────────────────────────────────
@@ -629,6 +1081,11 @@ impl ElementProvider {
             v_bool(on_backend(hwnd, move |b| b.uia_has_focus(id, item)).unwrap_or(false))
         } else if pid == UIA_IsControlElementPropertyId || pid == UIA_IsContentElementPropertyId {
             v_bool(true)
+        } else if pid == UIA_IsOffscreenPropertyId {
+            v_bool(on_backend(hwnd, move |b| b.uia_is_offscreen(id, item)).unwrap_or(false))
+        } else if pid == UIA_IsPasswordPropertyId {
+            let kind = on_backend(hwnd, move |b| b.uia_kind(id)).flatten();
+            v_bool(kind == Some(ControlKind::PasswordBox))
         } else if pid == UIA_ToggleToggleStatePropertyId {
             v_i4(on_backend(hwnd, move |b| b.uia_toggle_state(id)).unwrap_or(0))
         } else if pid == UIA_RangeValueValuePropertyId {
@@ -650,8 +1107,11 @@ implement_decl! {
         IToggleProvider,
         IValueProvider,
         IRangeValueProvider,
+        ISelectionProvider,
         ISelectionItemProvider,
-        IExpandCollapseProvider
+        IExpandCollapseProvider,
+        IScrollProvider,
+        IScrollItemProvider
     ]
 }
 
@@ -691,6 +1151,13 @@ impl IRawElementProviderFragment_Impl for ElementProvider_Impl {
     }
 
     fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
+        if self.is_root {
+            // A fragment ROOT must return null: UIA derives its identity from
+            // the host HWND, which lets client subscriptions taken on the
+            // window element scope-match events raised from inside the
+            // fragment.
+            return Ok(core::ptr::null_mut());
+        }
         Ok(make_runtime_id(self.id, self.item))
     }
 
@@ -731,12 +1198,35 @@ impl IRawElementProviderFragmentRoot_Impl for ElementProvider_Impl {
 impl IInvokeProvider_Impl for ElementProvider_Impl {
     fn Invoke(&self) -> Result<()> {
         let (id, item) = (self.id, self.item);
+        if is_caption(item) {
+            // Caption button: post the matching system command. `IsZoomed` is
+            // callable from this (UIA worker) thread, unlike the caption's
+            // UI-thread hover state.
+            let cmd = match item - CAPTION_ITEM_BASE {
+                0 => SC_MINIMIZE,
+                1 if unsafe { IsZoomed(self.hwnd as HWND) }.as_bool() => SC_RESTORE,
+                1 => SC_MAXIMIZE,
+                _ => SC_CLOSE,
+            };
+            unsafe {
+                let _ = PostMessageW(self.hwnd as HWND, WM_SYSCOMMAND, cmd as WPARAM, 0 as LPARAM);
+            }
+            return Ok(());
+        }
         if item >= 0 {
             // Invoking a synthetic container item selects it.
             act(self.hwnd, move |b| b.uia_select_item(id, item));
         } else {
             act(self.hwnd, move |b| b.uia_activate(id));
         }
+        // Clients (e.g. guishot's `uia:invoke`) may wait on the Invoked event.
+        let me = self.dup();
+        host::post_ui(self.hwnd, move || {
+            let p: IRawElementProviderSimple = me.into();
+            unsafe {
+                let _ = UiaRaiseAutomationEvent(p.as_raw(), UIA_Invoke_InvokedEventId);
+            }
+        });
         Ok(())
     }
 }
@@ -810,6 +1300,36 @@ impl IRangeValueProvider_Impl for ElementProvider_Impl {
     }
 }
 
+impl ISelectionProvider_Impl for ElementProvider_Impl {
+    /// The selected item, as a one-element `VT_UNKNOWN` array of its provider
+    /// (`S_OK` + null for an empty selection, per the pattern contract).
+    fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
+        let id = self.id;
+        let Some(i) = on_backend(self.hwnd, move |b| b.uia_selected_item(id)).flatten() else {
+            return Ok(core::ptr::null_mut());
+        };
+        let sel: IRawElementProviderSimple = ElementProvider::item(self.hwnd, id, i).into();
+        unsafe {
+            let psa = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+            if !psa.is_null() {
+                // SafeArrayPutElement AddRefs the interface pointer.
+                let idx = 0i32;
+                let _ = SafeArrayPutElement(psa, &idx, sel.as_raw());
+            }
+            Ok(psa)
+        }
+    }
+
+    fn CanSelectMultiple(&self) -> Result<BOOL> {
+        Ok(false.into())
+    }
+
+    fn IsSelectionRequired(&self) -> Result<BOOL> {
+        // Single-select containers: selection moves but is never cleared.
+        Ok(true.into())
+    }
+}
+
 impl ISelectionItemProvider_Impl for ElementProvider_Impl {
     fn Select(&self) -> Result<()> {
         let (id, item) = (self.id, self.item);
@@ -835,6 +1355,77 @@ impl ISelectionItemProvider_Impl for ElementProvider_Impl {
 
     fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
         Ok(ElementProvider::element(self.hwnd, self.id).into())
+    }
+}
+
+impl IScrollProvider_Impl for ElementProvider_Impl {
+    fn Scroll(&self, _h: ScrollAmount, v: ScrollAmount) -> Result<()> {
+        let id = self.id;
+        let (off, viewport, _) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
+        let delta = match v {
+            SCROLL_SMALL_DECREMENT => -SCROLL_LINE,
+            SCROLL_SMALL_INCREMENT => SCROLL_LINE,
+            SCROLL_LARGE_DECREMENT => -viewport,
+            SCROLL_LARGE_INCREMENT => viewport,
+            _ => return Ok(()),
+        };
+        act(self.hwnd, move |b| b.uia_scroll_to(id, off + delta));
+        Ok(())
+    }
+
+    fn SetScrollPercent(&self, _h: f64, v: f64) -> Result<()> {
+        if v == UIA_SCROLL_NO_SCROLL {
+            return Ok(());
+        }
+        let id = self.id;
+        let (_, viewport, content) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
+        let max = (content - viewport).max(0.0);
+        let off = (v.clamp(0.0, 100.0) as f32 / 100.0) * max;
+        act(self.hwnd, move |b| b.uia_scroll_to(id, off));
+        Ok(())
+    }
+
+    fn HorizontalScrollPercent(&self) -> Result<f64> {
+        Ok(UIA_SCROLL_NO_SCROLL) // vertical-only scrolling
+    }
+
+    fn VerticalScrollPercent(&self) -> Result<f64> {
+        let id = self.id;
+        let (off, viewport, content) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
+        let max = (content - viewport).max(0.0);
+        Ok(if max > 0.0 { (off / max) as f64 * 100.0 } else { UIA_SCROLL_NO_SCROLL })
+    }
+
+    fn HorizontalViewSize(&self) -> Result<f64> {
+        Ok(100.0)
+    }
+
+    fn VerticalViewSize(&self) -> Result<f64> {
+        let id = self.id;
+        let (_, viewport, content) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
+        Ok(if content > viewport && content > 0.0 {
+            (viewport / content) as f64 * 100.0
+        } else {
+            100.0
+        })
+    }
+
+    fn HorizontallyScrollable(&self) -> Result<BOOL> {
+        Ok(false.into())
+    }
+
+    fn VerticallyScrollable(&self) -> Result<BOOL> {
+        let id = self.id;
+        let (_, viewport, content) = get(self.hwnd, move |b| b.uia_scroll_info(id))?;
+        Ok((content > viewport).into())
+    }
+}
+
+impl IScrollItemProvider_Impl for ElementProvider_Impl {
+    fn ScrollIntoView(&self) -> Result<()> {
+        let (id, item) = (self.id, self.item);
+        act(self.hwnd, move |b| b.uia_scroll_into_view(id, item));
+        Ok(())
     }
 }
 
