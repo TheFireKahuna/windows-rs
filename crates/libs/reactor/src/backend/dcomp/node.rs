@@ -58,6 +58,23 @@ impl LaidRect {
     }
 }
 
+/// Which events a control has declared a handler for, for the questions input
+/// answers without dispatching: whether a node is hit-testable at all, and
+/// whether the caption's back button is live.
+///
+/// Only events read as a *guard* need a flag. The rest are dispatch-only —
+/// their presence changes nothing about how input routes.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct Interactivity {
+    /// A `Click` handler makes an otherwise inert node (a `Border`, a panel)
+    /// hit-testable — see [`Node::is_clickable`], which also gates
+    /// `WM_NCHITTEST` through `wants_client_at`.
+    pub click: bool,
+    /// A `BackRequested` handler enables the navigation and caption back
+    /// buttons; without one they are inert rather than merely silent.
+    pub back: bool,
+}
+
 /// The painted content of a node, separate from layout. All optional — a bare
 /// `StackPanel`/`Grid`/`Canvas` paints nothing itself.
 #[derive(Default, Debug)]
@@ -493,6 +510,14 @@ pub(crate) struct Node {
     pub text_layout: Option<TextLayout>,
     pub text_dirty: bool,
     pub handlers: Vec<(Event, EventHandler)>,
+    /// What the app has declared this control responds to.
+    ///
+    /// Kept beside `handlers` rather than derived from it because the two
+    /// answer different questions on different threads: firing needs the
+    /// closure, but hit-testing and `WM_NCHITTEST` only need to know that one
+    /// exists. Once handlers live on the app thread and firing becomes an
+    /// intent, this is what the input side keeps.
+    pub interactivity: Interactivity,
     pub pointer: Option<PointerHandlers>,
     pub accessibility: Option<AccessibilityModifiers>,
 
@@ -668,6 +693,7 @@ impl Node {
             text_layout: None,
             text_dirty: true,
             handlers: Vec::new(),
+            interactivity: Interactivity::default(),
             pointer: None,
             accessibility: None,
             container,
@@ -811,6 +837,17 @@ impl Node {
         )
     }
 
+    /// Record that `event` gained or lost a handler.
+    pub fn note_interactivity(&mut self, event: Event, attached: bool) {
+        match event {
+            Event::Click => self.interactivity.click = attached,
+            Event::BackRequested => self.interactivity.back = attached,
+            // Every other event is dispatch-only: nothing consults its presence
+            // to decide whether the control participates in input.
+            _ => {}
+        }
+    }
+
     pub fn handler(&self, event: Event) -> Option<&EventHandler> {
         self.handlers.iter().find(|(e, _)| *e == event).map(|(_, h)| h)
     }
@@ -819,7 +856,7 @@ impl Node {
     pub fn is_clickable(&self) -> bool {
         is_interactive_kind(self.kind)
             || is_text_editable(self.kind)
-            || self.handler(Event::Click).is_some()
+            || self.interactivity.click
             || self
                 .pointer
                 .as_ref()
@@ -1300,14 +1337,13 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
 
 /// Node arena keyed by [`ControlId`] (a `NonZeroU32`).
 ///
-/// Ids are minted monotonically and NEVER reused. The reconciler tracks nodes
-/// by id across an unmount/mount sequence (`children_mirror`, the
-/// `new_id != old_id` graft check after a component remount), so a recycled id
-/// would alias a destroyed node and silently corrupt the diff — the freshly
-/// mounted subtree is never grafted and the destroyed subtree's visuals stay
-/// on screen. The WinUI backend upholds the same contract with its monotonic
-/// `next_id`. Map storage (vs. slots) releases a removed node's memory under
-/// remount churn.
+/// Ids arrive already minted, from the reconciler's single monotonic counter,
+/// and are NEVER reused. The reconciler tracks nodes by id across an
+/// unmount/mount sequence (`children_mirror`, the `new_id != old_id` graft
+/// check after a component remount), so a recycled id would alias a destroyed
+/// node and silently corrupt the diff — the freshly mounted subtree is never
+/// grafted and the destroyed subtree's visuals stay on screen. Map storage
+/// (vs. slots) releases a removed node's memory under remount churn.
 #[derive(Default)]
 pub(crate) struct Arena {
     nodes: rustc_hash::FxHashMap<u32, Node>,
@@ -1322,23 +1358,10 @@ pub(crate) struct Arena {
 }
 
 impl Arena {
-    pub fn insert(&mut self, node: Node) -> ControlId {
-        self.next += 1;
-        self.nodes.insert(self.next, node);
-        ControlId::new(self.next)
-    }
-
-    /// Insert at an id minted by the caller (the command-buffer seam mints
-    /// reconciler-side so `create` needs no synchronous answer — see
-    /// [`record`](super::record)).
-    ///
-    /// `next` is advanced past the supplied id so a later [`insert`](Self::insert)
-    /// can never mint a colliding one: the two minting paths share one id space
-    /// and the never-reuse contract above spans both.
+    /// Insert at the id the reconciler minted. Ids arrive from one monotonic,
+    /// never-reused source, so the arena assigns none of its own.
     pub fn insert_with_id(&mut self, id: ControlId, node: Node) {
-        let raw = id.get();
-        self.nodes.insert(raw, node);
-        self.next = self.next.max(raw);
+        self.nodes.insert(id.get(), node);
     }
 
     pub fn get(&self, id: ControlId) -> Option<&Node> {

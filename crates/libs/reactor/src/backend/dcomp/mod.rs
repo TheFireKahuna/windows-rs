@@ -784,12 +784,14 @@ impl Backend for DCompBackend {
         if let Some(node) = self.node_mut(id) {
             node.handlers.retain(|(e, _)| *e != event);
             node.handlers.push((event, handler));
+            node.note_interactivity(event, true);
         }
     }
 
     fn detach_event(&mut self, id: ControlId, event: Event) {
         if let Some(node) = self.node_mut(id) {
             node.handlers.retain(|(e, _)| *e != event);
+            node.note_interactivity(event, false);
         }
     }
 
@@ -1120,6 +1122,19 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             // ToggleButton's checked state is plain painted chrome.
             node.ctrl_mut().is_checked = *v;
             node.mark_dirty();
+        }
+        (Prop::Value, PropValue::F64(v)) if node.pressed => {
+            // While the user is driving this control, input owns its value.
+            // A write arriving now is the app echoing a value the gesture has
+            // already moved past, and applying it would drag the chrome
+            // backwards under the user's finger — the same reason the editor
+            // ignores `Prop::Value` while its buffer is focused and seeded.
+            //
+            // This covers the visible window (a continuous drag). Closing it
+            // for a value echoed *after* release needs the revision protocol
+            // in docs/INPUT-OFFTHREAD-DESIGN.md §7.2, which requires intents to
+            // carry the revision out and back.
+            let _ = v;
         }
         (Prop::Value, PropValue::F64(v)) => {
             node.ctrl_mut().value = *v;
