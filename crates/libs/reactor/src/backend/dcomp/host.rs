@@ -367,9 +367,14 @@ fn apply_effective_theme(s: &HostShared) {
     s.render_host.with_reconciler_mut(|r| {
         r.backend.apply_theme(dark);
         r.backend.mark_all_dirty_and_repaint();
+        // Every component re-renders on the next pass: value-color props are
+        // recomputed only inside render functions, so memoised components with
+        // unchanged props would otherwise keep the old palette.
+        r.invalidate_all_components();
     });
-    // Re-run component render functions so `use_color_scheme` readers see the
-    // new scheme (the repaint above only covers backend-drawn chrome).
+    // Re-run component render functions so scheme-derived values (colors,
+    // `use_color_scheme`) are re-read (the repaint above only covers
+    // backend-drawn chrome).
     s.render_host.request_render();
 }
 

@@ -577,7 +577,13 @@ fn subscribe_actual_theme_changed(
                 update_color_scheme_from(fe);
                 update_titlebar_theme();
             }
-            render_host.with_reconciler_mut(|r| r.notify_theme_changed());
+            render_host.with_reconciler_mut(|r| {
+                r.notify_theme_changed();
+                // Memoised components recompute value-color props only inside
+                // their render functions — force a full pass so none keeps the
+                // old scheme's palette.
+                r.invalidate_all_components();
+            });
             render_host.request_render();
         })
         .ok()

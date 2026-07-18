@@ -449,4 +449,4 @@ pub use builder::{
     CreateReason, ResourceCx, ResourcePainterBuilder, SurfacePainterBuilder, surface_painter,
 };
 pub use device::DeviceSource;
-pub use painter::{FrameTiming, PumpHold, Step, SurfacePainter};
+pub use painter::{invalidate_all_painters, FrameTiming, PumpHold, Step, SurfacePainter};

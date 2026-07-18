@@ -267,9 +267,35 @@ pub struct SurfacePainter {
     pub(crate) inner: Rc<PainterInner>,
 }
 
+thread_local! {
+    /// Every live painter on this (UI) thread, weakly — a painter unregisters by
+    /// dropping. Lets the app broadcast a repaint for a global draw-input change
+    /// no individual painter tracks (e.g. a color-scheme flip, where every draw
+    /// closure resolves theme tokens at paint time); see
+    /// [`invalidate_all_painters`].
+    static PAINTERS: RefCell<Vec<std::rc::Weak<PainterInner>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Request a coalesced full redraw of **every** live [`SurfacePainter`] on this
+/// thread (each equivalent to its own [`SurfacePainter::invalidate`]). For
+/// global draw-input changes that no painter's own state tracks — the canonical
+/// case is a light/dark scheme flip, where draw closures resolve theme tokens
+/// at paint time and would otherwise show the old palette until their next
+/// interaction-driven repaint.
+pub fn invalidate_all_painters() {
+    let live: Vec<Rc<PainterInner>> = PAINTERS.with(|p| {
+        let mut v = p.borrow_mut();
+        v.retain(|w| w.strong_count() > 0);
+        v.iter().filter_map(std::rc::Weak::upgrade).collect()
+    });
+    for inner in live {
+        SurfacePainter { inner }.invalidate();
+    }
+}
+
 impl SurfacePainter {
     pub(crate) fn new() -> Self {
-        Self {
+        let painter = Self {
             inner: Rc::new(PainterInner {
                 surface: RefCell::new(None),
                 draw: RefCell::new(Rc::new(|_| {})),
@@ -289,7 +315,9 @@ impl SurfacePainter {
                 dpi: Cell::new(96.0),
                 host: RefCell::new(None),
             }),
-        }
+        };
+        PAINTERS.with(|p| p.borrow_mut().push(Rc::downgrade(&painter.inner)));
+        painter
     }
 
     /// The element to return from your render function. A faithful port of

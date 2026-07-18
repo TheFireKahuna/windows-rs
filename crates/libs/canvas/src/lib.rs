@@ -45,6 +45,7 @@ pub use composition::CompositionDrawTarget;
 pub use reactor::{
     CreateReason, DeviceSource, DpiRounding, DrawContext, FrameTiming, PumpHold, ResourceCx,
     ResourcePainterBuilder, Step, SurfacePainter, SurfacePainterBuilder, animated_canvas,
+    invalidate_all_painters,
     surface_image, surface_painter, virtual_surface_image,
 };
 #[cfg(feature = "reactor")]

@@ -1,25 +1,28 @@
 //! Default design tokens for the self-hosted control library — the **WinUI 3
-//! Fluent dark-theme defaults**, extracted from the `microsoft/microsoft-ui-xaml`
-//! sources (`Common_themeresources_any.xaml` "Default" dictionary,
-//! `CornerRadius_themeresources.xaml`, `TextBlock_themeresources.xaml`, and the
-//! per-control theme resource files).
+//! Fluent theme defaults**, extracted from the `microsoft/microsoft-ui-xaml`
+//! sources (`Common_themeresources_any.xaml` "Default" (dark) and "Light"
+//! dictionaries, `CornerRadius_themeresources.xaml`,
+//! `TextBlock_themeresources.xaml`, and the per-control theme resource files).
 //!
-//! This table is deliberately **application-agnostic**: it carries no product
+//! The tables are deliberately **application-agnostic**: they carry no product
 //! palette and no design decisions beyond what stock WinUI ships. A host
 //! application restyles the drawn controls by supplying its own values —
 //! [`set_host_tokens`] — exactly as a XAML app would override the Fluent
-//! resources. Every color accessor below reads the host table when one was
-//! installed and the Fluent defaults otherwise; non-color metrics (spacing,
-//! radii, control geometry, durations, fonts) are structural and stay `const`.
+//! resources. Every color accessor below resolves **per scheme** at call time:
+//! the host table for the current [`ColorScheme`] when one was installed, the
+//! matching Fluent table otherwise. Non-color metrics (spacing, radii, control
+//! geometry, durations, fonts) are structural and stay `const`.
 //!
-//! Colours are Fluent's own encoding — mostly **white at a low alpha** composited
-//! over the base surface (`#202020`), not opaque greys. Each token cites the
-//! Fluent resource it mirrors; a few metrics keep this library's drawn-control
-//! geometry where it structurally differs from XAML templates (noted inline).
+//! Colours are Fluent's own encoding — mostly **ink at a low alpha** composited
+//! over the base surface (white ink on the dark table, black on the light), not
+//! opaque greys. Each token cites the Fluent resource it mirrors; a few metrics
+//! keep this library's drawn-control geometry where it structurally differs
+//! from XAML templates (noted inline).
 #![allow(dead_code)]
 
 use std::sync::OnceLock;
 
+use crate::style::{current_color_scheme, ColorScheme};
 use crate::Color;
 
 // ── Host token injection ─────────────────────────────────────────────────────
@@ -33,10 +36,11 @@ use crate::Color;
 /// drawn controls simply use them.
 #[derive(Copy, Clone, Debug)]
 pub struct HostTokens {
-    /// The diffuse-white basis every white-alpha wash and stroke derives from
-    /// ([`w`], [`stroke`], …). Fluent's is plain linear `1.0`; an HDR host
-    /// passes its anchored white so hairlines sit on its luminance scale.
-    pub white: Color,
+    /// The ink basis every wash and stroke derives from ([`w`], [`stroke`], …):
+    /// diffuse white on a dark table, black on a light table. Fluent's dark ink
+    /// is plain linear `1.0`; an HDR host passes its anchored white so
+    /// hairlines sit on its luminance scale.
+    pub ink: Color,
     /// `SolidBackgroundFillColorSecondary` — window base.
     pub surface_sunken: Color,
     /// `SolidBackgroundFillColorTertiary` — card / panel surface.
@@ -72,11 +76,11 @@ pub struct HostTokens {
     pub disabled_opacity: f32,
 }
 
-/// The stock WinUI 3 Fluent dark table (the values documented per-accessor
+/// The stock WinUI 3 Fluent **dark** table (the values documented per-accessor
 /// below). `Color::rgb`/`rgba` decode sRGB hex to plain linear — no luminance
 /// anchor, by design.
-const FLUENT: HostTokens = HostTokens {
-    white: Color::scrgb(1.0, 1.0, 1.0, 1.0),
+const FLUENT_DARK: HostTokens = HostTokens {
+    ink: Color::scrgb(1.0, 1.0, 1.0, 1.0),
     surface_sunken: rgb(0x1c, 0x1c, 0x1c),
     surface: rgb(0x28, 0x28, 0x28),
     surface_raised: rgb(0x2c, 0x2c, 0x2c),
@@ -86,8 +90,15 @@ const FLUENT: HostTokens = HostTokens {
     text_tertiary: rgba(0xff, 0xff, 0xff, 0x87),
     text_disabled: rgba(0xff, 0xff, 0xff, 0x5d),
     accent: rgb(0x4c, 0xc2, 0xff),
+    // `with_alpha(accent, 0.8)` through the dark wash fit, precomputed so the
+    // table stays const now that the public helper resolves per scheme.
     accent_light: rgb(0x99, 0xeb, 0xff),
-    accent_dark: with_alpha(rgb(0x4c, 0xc2, 0xff), 0.8),
+    accent_dark: Color::scrgb(
+        rgb(0x4c, 0xc2, 0xff).r,
+        rgb(0x4c, 0xc2, 0xff).g,
+        rgb(0x4c, 0xc2, 0xff).b,
+        dark_wash_alpha(0.8),
+    ),
     ok: rgb(0x6c, 0xcb, 0x5f),
     warn: rgb(0xfc, 0xe1, 0x00),
     bad: rgb(0xff, 0x99, 0xa4),
@@ -95,28 +106,66 @@ const FLUENT: HostTokens = HostTokens {
     disabled_opacity: 0.4,
 };
 
+/// The stock WinUI 3 Fluent **light** table ("Light" resource dictionary; black
+/// ink, near-white surface ladder, the accent's dark shades for control fills).
+const FLUENT_LIGHT: HostTokens = HostTokens {
+    ink: Color::scrgb(0.0, 0.0, 0.0, 1.0),
+    // `SolidBackgroundFillColor{Secondary,Tertiary,Quarternary}` light values;
+    // hover is the nearest solid to the light hover wash.
+    surface_sunken: rgb(0xee, 0xee, 0xee),
+    surface: rgb(0xf9, 0xf9, 0xf9),
+    surface_raised: rgb(0xff, 0xff, 0xff),
+    surface_hover: rgb(0xec, 0xec, 0xec),
+    // `TextFillColor*` light — black at Fluent's authored alphas.
+    text: rgba(0x00, 0x00, 0x00, 0xe4),
+    text_secondary: rgba(0x00, 0x00, 0x00, 0x9e),
+    text_tertiary: rgba(0x00, 0x00, 0x00, 0x72),
+    text_disabled: rgba(0x00, 0x00, 0x00, 0x5c),
+    // Light theme fills with the accent's DARK shades (the mirror of dark
+    // filling with the light shades): Dark1 base, Dark2 text/hover.
+    accent: rgb(0x00, 0x5f, 0xb8),
+    accent_light: rgb(0x00, 0x3e, 0x92),
+    accent_dark: Color::scrgb(
+        rgb(0x00, 0x5f, 0xb8).r,
+        rgb(0x00, 0x5f, 0xb8).g,
+        rgb(0x00, 0x5f, 0xb8).b,
+        0.8,
+    ),
+    // `SystemFillColor{Success,Caution,Critical}` light.
+    ok: rgb(0x0f, 0x7b, 0x0f),
+    warn: rgb(0x9d, 0x5d, 0x00),
+    bad: rgb(0xc4, 0x2b, 0x1c),
+    danger: rgb(0xc4, 0x2b, 0x1c),
+    disabled_opacity: 0.4,
+};
+
 impl Default for HostTokens {
     fn default() -> Self {
-        FLUENT
+        FLUENT_DARK
     }
 }
 
-/// The installed host table, if any. Written once before the window exists,
+/// The installed host tables, if any. Written once before the window exists,
 /// read from the UI thread thereafter.
-static HOST: OnceLock<HostTokens> = OnceLock::new();
+static HOST_DARK: OnceLock<HostTokens> = OnceLock::new();
+static HOST_LIGHT: OnceLock<HostTokens> = OnceLock::new();
 
-/// Install the host application's token table. Call **once, before the app
-/// window is created** — drawn controls resolve tokens at paint time, but a
-/// table swapped mid-run does not repaint existing content. A second call is
-/// ignored (first one wins).
-pub fn set_host_tokens(tokens: HostTokens) {
-    let _ = HOST.set(tokens);
+/// Install the host application's token tables, one per [`ColorScheme`]. Call
+/// **once, before the app window is created** — drawn controls resolve tokens
+/// at paint time (per the current scheme), but tables swapped mid-run do not
+/// repaint existing content. A second call is ignored (first one wins).
+pub fn set_host_tokens(dark: HostTokens, light: HostTokens) {
+    let _ = HOST_DARK.set(dark);
+    let _ = HOST_LIGHT.set(light);
 }
 
-/// The active table: the host's, else Fluent.
+/// The active table for the current scheme: the host's, else Fluent.
 #[inline]
 fn host() -> &'static HostTokens {
-    HOST.get().unwrap_or(&FLUENT)
+    match current_color_scheme() {
+        ColorScheme::Dark => HOST_DARK.get().unwrap_or(&FLUENT_DARK),
+        ColorScheme::Light => HOST_LIGHT.get().unwrap_or(&FLUENT_LIGHT),
+    }
 }
 
 // ── A.1 Surfaces (Fluent SolidBackgroundFill ladder) ─────────────────────────
@@ -156,12 +205,13 @@ pub fn stroke_strong() -> Color {
     w(0x8b as f32 / 255.0)
 }
 
-/// sRGB-authored → linear-blend wash alpha. Fluent's translucent tokens
-/// (`#0AFFFFFF`-style washes) assume gamma-space compositing; this pipeline
-/// blends in linear light, where the same alpha lands ~4× hotter over a dark
-/// surface. The cubic reproduces the authored appearance over the dark base
-/// (fit against `#282828`, within ~1% across `0..=1`).
-pub(crate) const fn wash_alpha(a: f32) -> f32 {
+/// sRGB-authored → linear-blend wash alpha over the **dark** base. Fluent's
+/// translucent tokens (`#0AFFFFFF`-style washes) assume gamma-space
+/// compositing; this pipeline blends in linear light, where the same alpha
+/// lands ~4× hotter over a dark surface. The cubic reproduces the authored
+/// appearance over the dark base (fit against `#282828`, within ~1% across
+/// `0..=1`).
+const fn dark_wash_alpha(a: f32) -> f32 {
     let out = a * (0.2113 + 0.5905 * a + 0.1984 * a * a);
     if out > 1.0 {
         1.0
@@ -170,22 +220,46 @@ pub(crate) const fn wash_alpha(a: f32) -> f32 {
     }
 }
 
-/// The host's diffuse white at `alpha` (the pervasive hairline / wash helper).
-/// Fluent's white is linear `1.0`; an HDR host's carries its anchor. `alpha` is
-/// the sRGB-authored opacity — converted by [`wash_alpha`] for the linear blend.
-pub fn w(alpha: f32) -> Color {
-    let white = host().white;
-    Color::scrgb(white.r, white.g, white.b, wash_alpha(alpha))
+/// The light-base counterpart: a black-ink wash authored in sRGB also lands
+/// hotter in linear over a light surface (a 6% authored scrim reads ~13%).
+/// Cubic fit of the exact gamma-blend conversion against the light card
+/// surface (`#f9f9f9`), within ~1% across `0..=1` — the fit is insensitive to
+/// the exact near-white base, so it matches the app-side light cubic.
+const fn light_wash_alpha(a: f32) -> f32 {
+    let out = a * (2.265 - 1.516 * a + 0.251 * a * a);
+    if out > 1.0 {
+        1.0
+    } else {
+        out
+    }
 }
 
-/// Black at `alpha` (dark insets / scrims / drop shadows). Linear black is `0.0`.
+/// sRGB-authored → linear-blend wash alpha for the current scheme's ink over
+/// its own surface ladder.
+pub(crate) fn wash_alpha(a: f32) -> f32 {
+    match current_color_scheme() {
+        ColorScheme::Dark => dark_wash_alpha(a),
+        ColorScheme::Light => light_wash_alpha(a),
+    }
+}
+
+/// The scheme's ink at `alpha` (the pervasive hairline / wash helper): the host
+/// table's [`HostTokens::ink`] — white on dark, black on light. `alpha` is the
+/// sRGB-authored opacity — converted by [`wash_alpha`] for the linear blend.
+pub fn w(alpha: f32) -> Color {
+    let ink = host().ink;
+    Color::scrgb(ink.r, ink.g, ink.b, wash_alpha(alpha))
+}
+
+/// Black at `alpha` (insets / scrims / drop shadows — shadows stay dark on both
+/// schemes). Linear black is `0.0`.
 pub const fn b(alpha: f32) -> Color {
     Color::scrgb(0.0, 0.0, 0.0, alpha)
 }
 
 /// An arbitrary hue at `alpha` (badge washes, fill tints) — keeps `c`'s linear RGB,
 /// overrides the opacity. `alpha` is sRGB-authored ([`wash_alpha`]).
-pub const fn with_alpha(c: Color, alpha: f32) -> Color {
+pub fn with_alpha(c: Color, alpha: f32) -> Color {
     Color::scrgb(c.r, c.g, c.b, wash_alpha(alpha))
 }
 

@@ -857,6 +857,18 @@ impl<B: Backend + 'static> Reconciler<B> {
         self.force_component_rerender = false;
         self.forced_components.clear();
     }
+
+    /// Seed the next pass to re-render EVERY mounted component and re-diff every
+    /// element, bypassing `can_skip_update` and component memoisation — for a
+    /// global render input no prop or state tracks (the color-scheme flip:
+    /// value-color props are recomputed only inside render functions, so a
+    /// memoised component with unchanged props would otherwise keep its old
+    /// palette). One pass only: the flags clear at the end of the pass as usual.
+    pub fn invalidate_all_components(&mut self) {
+        self.force_component_rerender = true;
+        self.forced_components
+            .extend(self.component_instances.keys().copied());
+    }
 }
 
 /// A cow-like container that avoids allocating a `Vec<&Element>` when the
