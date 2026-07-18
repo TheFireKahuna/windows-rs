@@ -10,7 +10,7 @@ use super::editor;
 use super::popup::Popup;
 use super::*;
 use crate::backend::Event;
-use crate::style::PointerEventInfo;
+use crate::style::{PointerEventInfo, WheelAxis};
 use crate::system_bindings::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GlobalAlloc, GlobalLock, GlobalUnlock,
     OpenClipboard, SetClipboardData, CF_UNICODETEXT, GMEM_MOVEABLE, HWND,
@@ -122,10 +122,6 @@ pub(crate) enum HitKind {
     /// Every node, whatever its kind. This is the arm UI Automation's
     /// `ElementProviderFromPoint` wants: it must resolve to the topmost element
     /// at the point, interactive or not.
-    //
-    // Constructed by the UIA side once `uia_element_from_point` adopts
-    // `hit_test` in place of its own private walk.
-    #[allow(dead_code)]
     Any,
 }
 
@@ -233,6 +229,10 @@ impl DCompBackend {
     /// Deliver a pointer transition to a viz surface's sink with element-relative
     /// DIP coordinates. `(x, y)` must be in the node's layout space (scroll-
     /// adjusted, as returned by [`surface_at`](Self::surface_at)).
+    ///
+    /// Reports the vertical wheel axis — correct for every pointer transition
+    /// (which carries `wheel_delta` 0) and for the classic wheel. The
+    /// horizontal tilt goes through [`fire_surface_wheel`](Self::fire_surface_wheel).
     fn fire_surface(
         &self,
         id: ControlId,
@@ -242,12 +242,30 @@ impl DCompBackend {
         left: bool,
         wheel_delta: i32,
     ) {
+        self.fire_surface_wheel(id, cell, x, y, left, wheel_delta, WheelAxis::Vertical);
+    }
+
+    /// [`fire_surface`](Self::fire_surface) with an explicit wheel axis, so a
+    /// surface sink can tell a sideways tilt from a wheel turn and opt in to
+    /// (or ignore) each independently.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_surface_wheel(
+        &self,
+        id: ControlId,
+        cell: &std::cell::RefCell<Option<Box<dyn Fn(PointerEventInfo)>>>,
+        x: f32,
+        y: f32,
+        left: bool,
+        wheel_delta: i32,
+        wheel_axis: WheelAxis,
+    ) {
         let Some(node) = self.node(id) else { return };
         let info = PointerEventInfo {
             x: (x - node.rect.x) as f64,
             y: (y - node.rect.y) as f64,
             is_left_button_pressed: left,
             wheel_delta,
+            wheel_axis,
             ..PointerEventInfo::default()
         };
         if let Some(cb) = cell.borrow().as_ref() {
@@ -1302,8 +1320,9 @@ impl DCompBackend {
 
     // ── Wheel ────────────────────────────────────────────────────────────────
 
-    /// Mouse wheel at (x, y) DIPs, `delta` in WHEEL_DELTA (120) units. The
-    /// scroll glide plays on the compositor — nothing here needs the timer.
+    /// Vertical mouse wheel at (x, y) DIPs, `delta` in WHEEL_DELTA (120) units,
+    /// positive away from the user. The scroll glide plays on the compositor —
+    /// nothing here needs the timer.
     pub(crate) fn on_wheel(&mut self, x: f32, y: f32, delta: i32) {
         // A viz pointer surface that subscribed the wheel (EQ Q-adjust) consumes
         // it; surfaces without a wheel sink fall through to scrolling.
@@ -1353,6 +1372,56 @@ impl DCompBackend {
             // Reveal the thumb while scrolling (it conceals when the pointer
             // leaves the container).
             self.update_hovered_scroll(Some(id));
+        }
+    }
+
+    /// Horizontal wheel — a tilt-wheel click or a touchpad sideways pan — at
+    /// (x, y) DIPs, `delta` in WHEEL_DELTA (120) units.
+    ///
+    /// **Sign:** `WM_MOUSEHWHEEL` does not share `WM_MOUSEWHEEL`'s convention.
+    /// A positive vertical delta means *away from the user*; a positive
+    /// horizontal delta means *to the right*. `delta` is forwarded raw, with
+    /// [`WheelAxis::Horizontal`] attached, so a sink reads it with the
+    /// right-is-positive convention its users expect rather than an invented
+    /// mapping onto "forward".
+    ///
+    /// Only one link of the vertical chain has a horizontal analogue:
+    ///
+    /// * **Viz surface wheel sink** — receives it, tagged `Horizontal`. The
+    ///   surface is the one consumer that can meaningfully distinguish the
+    ///   axes, so it decides (an EQ that adjusts Q on the wheel reads
+    ///   [`PointerEventInfo::wheel_delta_on`] and stays inert under a tilt).
+    /// * **Focused NumberBox** — deliberately nothing. Stepping a numeric value
+    ///   is a vertical-wheel gesture; a sideways pan across a form would drift
+    ///   every field it crossed.
+    /// * **Knob** — deliberately nothing, for the same reason. A knob's domain
+    ///   has one axis and the vertical wheel already owns it; an audio control
+    ///   must not move because the user panned sideways.
+    /// * **Nearest scroll ancestor** — deliberately nothing. `Node::scroll_off`
+    ///   is a single *vertical* scalar and the carrier/thumb machinery
+    ///   (`scroll::thumb_geom`, `scroll_for_thumb_y`, the content-carrier
+    ///   spring) is vertical-only, so there is nothing to move on this axis.
+    ///   Falling through to the vertical path would scroll the wrong way, which
+    ///   is worse than not scrolling: a container that only scrolls vertically
+    ///   must ignore a horizontal tilt. Real horizontal content scrolling needs
+    ///   a second scroll scalar plus horizontal thumb geometry and carrier
+    ///   springs — not plumbing, and out of scope here.
+    ///
+    /// So this returns without touching layout unless a surface takes it, and
+    /// never falls through to [`on_wheel`](Self::on_wheel).
+    pub(crate) fn on_wheel_h(&mut self, x: f32, y: f32, delta: i32) {
+        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y)
+            && sinks.wheel.borrow().is_some()
+        {
+            self.fire_surface_wheel(
+                sid,
+                &sinks.wheel,
+                ax,
+                ay,
+                false,
+                delta,
+                WheelAxis::Horizontal,
+            );
         }
     }
 

@@ -858,7 +858,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             0
         }
 
-        WM_MOUSEWHEEL => {
+        // Both wheel axes decode identically: SCREEN coords in lParam, a signed
+        // 120-per-detent delta in the high word of wParam. They differ only in
+        // what the sign MEANS — WM_MOUSEWHEEL is positive away from the user,
+        // WM_MOUSEHWHEEL is positive to the RIGHT. Neither is remapped here;
+        // the delta goes through raw and the backend tags it with its axis, so
+        // a sink reads each with the convention Windows documents for it.
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             if let Some(s) = shared() {
                 // wheel lParam carries SCREEN coords; convert to client DIPs.
                 let mut pt = POINT {
@@ -871,7 +877,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let scale = dpi_scale(hwnd);
                 let delta = ((wparam >> 16) & 0xFFFF) as i16 as i32;
                 let (x, y) = (pt.x as f32 / scale, pt.y as f32 / scale);
-                s.render_host.with_reconciler_mut(|r| r.backend.on_wheel(x, y, delta));
+                let horizontal = msg == WM_MOUSEHWHEEL;
+                s.render_host.with_reconciler_mut(|r| {
+                    if horizontal {
+                        r.backend.on_wheel_h(x, y, delta)
+                    } else {
+                        r.backend.on_wheel(x, y, delta)
+                    }
+                });
             }
             0
         }

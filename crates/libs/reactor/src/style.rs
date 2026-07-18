@@ -748,13 +748,41 @@ impl PointerHandlers {
     }
 }
 
+/// Which axis a wheel event travelled on.
+///
+/// [`Vertical`](WheelAxis::Vertical) is the classic wheel (`WM_MOUSEWHEEL` /
+/// WinUI `PointerWheelChanged`); [`Horizontal`](WheelAxis::Horizontal) is the
+/// tilt-wheel or touchpad sideways pan (`WM_MOUSEHWHEEL`).
+///
+/// The two axes do **not** share a sign convention, because the platform's
+/// don't: a positive vertical delta is *up / away from the user*, a positive
+/// horizontal delta is *to the right*. Deltas are passed through raw rather
+/// than normalised to some common "forward", so a sink reads each axis with
+/// the convention its users already expect.
+///
+/// `Vertical` is the [`Default`] deliberately: a sink written before this
+/// enum existed, and every non-wheel pointer callback (which leaves
+/// `wheel_delta` at 0), sees precisely the axis it always implicitly assumed.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WheelAxis {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
 /// Pointer state captured at a pointer callback (`PointerPressed`,
 /// `PointerReleased`, `PointerMoved`, `PointerEntered`, or
 /// `PointerWheelChanged`). `x`/`y` are the pointer position in DIPs, relative
 /// to the top-left of the element the handler is attached to. Non-mouse
 /// pointer kinds report all three button flags as `false`. `wheel_delta` is
 /// the raw `MouseWheelDelta` (120 per detent, signed) and is only meaningful
-/// in a wheel callback.
+/// in a wheel callback; [`wheel_axis`](Self::wheel_axis) says which axis it
+/// travelled on and is [`WheelAxis::Vertical`] everywhere else.
+///
+/// A sink that wants exactly one axis should read it through
+/// [`wheel_delta_on`](Self::wheel_delta_on) rather than `wheel_delta`, so a
+/// sideways tilt cannot drive a control that only ever meant to respond to the
+/// vertical wheel.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct PointerEventInfo {
     pub x: f64,
@@ -763,6 +791,18 @@ pub struct PointerEventInfo {
     pub is_right_button_pressed: bool,
     pub is_middle_button_pressed: bool,
     pub wheel_delta: i32,
+    pub wheel_axis: WheelAxis,
+}
+
+impl PointerEventInfo {
+    /// The wheel delta if it arrived on `axis`, otherwise 0.
+    ///
+    /// This is the opt-in read: a control that adjusts a value on the vertical
+    /// wheel calls `wheel_delta_on(WheelAxis::Vertical)` and is inert under a
+    /// horizontal tilt, without having to match on the axis itself.
+    pub fn wheel_delta_on(&self, axis: WheelAxis) -> i32 {
+        if self.wheel_axis == axis { self.wheel_delta } else { 0 }
+    }
 }
 
 // --- Accessibility ---
