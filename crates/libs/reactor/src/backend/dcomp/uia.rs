@@ -1316,21 +1316,7 @@ impl DCompBackend {
             return;
         }
         match event {
-            Event::SelectionChanged => {
-                let Some(i) = self.uia_selected_item(id) else {
-                    return;
-                };
-                let hwnd = self.hwnd;
-                host::post_ui(hwnd, move || {
-                    let p = stable_provider(ElementProvider::item(hwnd, id, i));
-                    unsafe {
-                        let _ = UiaRaiseAutomationEvent(
-                            p.as_raw(),
-                            UIA_SelectionItem_ElementSelectedEventId,
-                        );
-                    }
-                });
-            }
+            Event::SelectionChanged => self.uia_raise_selection(id),
             // PasswordChanged is deliberately not announced.
             Event::TextChanged => raise_property_changed(
                 self.hwnd,
@@ -1340,6 +1326,40 @@ impl DCompBackend {
             ),
             _ => {}
         }
+    }
+
+    /// The i32-payload arm of the notification choke point — a ComboBox (or
+    /// UIA-driven) `SelectionChanged` carries the index. Announced exactly as
+    /// the string-payload arm announces a bar/nav selection; the index itself
+    /// is re-read from the arena (`uia_selected_item`), which the callers have
+    /// already updated — state mutates first, notification fires last.
+    pub(crate) fn uia_notify_i32(&self, id: ControlId, event: Event, v: i32) {
+        note_state_change();
+        if !clients_listening() {
+            return;
+        }
+        let _ = v;
+        if matches!(event, Event::SelectionChanged) {
+            self.uia_raise_selection(id);
+        }
+    }
+
+    /// Raise `SelectionItem::ElementSelected` for `id`'s currently selected
+    /// synthetic item — deferred onto the pump like every other raise.
+    fn uia_raise_selection(&self, id: ControlId) {
+        let Some(i) = self.uia_selected_item(id) else {
+            return;
+        };
+        let hwnd = self.hwnd;
+        host::post_ui(hwnd, move || {
+            let p = stable_provider(ElementProvider::item(hwnd, id, i));
+            unsafe {
+                let _ = UiaRaiseAutomationEvent(
+                    p.as_raw(),
+                    UIA_SelectionItem_ElementSelectedEventId,
+                );
+            }
+        });
     }
 }
 

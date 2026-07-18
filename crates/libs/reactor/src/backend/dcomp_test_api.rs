@@ -21,7 +21,8 @@ use crate::backend::{
 };
 use crate::drag::DragHandlers;
 use crate::interaction::Callback;
-use dcomp::record::{CreateWithId, RecordingBackend};
+use dcomp::node::PointerInterest;
+use dcomp::record::{FrontBackend, Intent, IntentPayload, RecordingBackend};
 
 // ── layout.rs ────────────────────────────────────────────────────────────────
 
@@ -72,10 +73,11 @@ pub type AppliedLog = Vec<String>;
 #[derive(Default)]
 struct Spy {
     log: Rc<RefCell<AppliedLog>>,
-    /// Event handlers as they arrived at replay, so a test can invoke one and
-    /// prove the side table round-tripped the real closure and not a copy.
-    events: Rc<RefCell<Vec<(ControlId, Event, EventHandler)>>>,
     tooltips: Rc<RefCell<Vec<(ControlId, Option<Tooltip>)>>>,
+    /// Intents a test has staged (via [`Recorder::queue_*`]) for the next
+    /// [`FrontBackend::take_intents`] — the headless stand-in for the input
+    /// paths that queue them in the real backend.
+    intents: Rc<RefCell<Vec<Intent>>>,
 }
 
 impl Spy {
@@ -84,15 +86,27 @@ impl Spy {
     }
 }
 
-impl CreateWithId for Spy {
-    fn create_with_id(&mut self, id: ControlId, kind: ControlKind) {
-        self.note(format!("create {} {kind:?}", id.get()));
+impl FrontBackend for Spy {
+    fn declare_event(&mut self, id: ControlId, event: Event) {
+        self.note(format!("declare_event {} {event:?}", id.get()));
+    }
+
+    fn set_pointer_interest(&mut self, id: ControlId, interest: PointerInterest) {
+        self.note(format!("set_pointer_interest {} {interest:?}", id.get()));
+    }
+
+    fn set_value_stamped(&mut self, id: ControlId, value: f64, based_on: u64) {
+        self.note(format!("set_value {} {value} based_on={based_on}", id.get()));
+    }
+
+    fn take_intents(&mut self) -> Vec<Intent> {
+        std::mem::take(&mut *self.intents.borrow_mut())
     }
 }
 
 impl Backend for Spy {
-    fn create(&mut self, kind: ControlKind) -> ControlId {
-        unreachable!("RecordingBackend mints ids and calls create_with_id ({kind:?})")
+    fn create(&mut self, id: ControlId, kind: ControlKind) {
+        self.note(format!("create {} {kind:?}", id.get()));
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
@@ -123,9 +137,12 @@ impl Backend for Spy {
         self.note(format!("destroy {}", id.get()));
     }
 
+    /// Never reached through the recorder — replay declares via
+    /// [`FrontBackend::declare_event`]; the handler stays app-side. Logged so
+    /// a regression that routes the closure back into the backend is visible.
     fn attach_event(&mut self, id: ControlId, event: Event, handler: EventHandler) {
-        self.note(format!("attach_event {} {event:?}", id.get()));
-        self.events.borrow_mut().push((id, event, handler));
+        let _ = handler;
+        self.note(format!("attach_event {} {event:?} (closure reached backend!)", id.get()));
     }
 
     fn detach_event(&mut self, id: ControlId, event: Event) {
@@ -257,12 +274,15 @@ impl Backend for Spy {
 /// what replay actually applied.
 ///
 /// [`Self::backend`] hands out the full public [`Backend`] surface, so a test
-/// drives the recorder exactly as the reconciler does.
+/// drives the recorder exactly as the reconciler does. The intent half of the
+/// seam is driven from the other side: [`Self::queue_*`] stage intents where
+/// the real backend's input paths would, and [`Self::drain_and_run`] performs
+/// the recorder's app-side resolution + invocation exactly as the host does.
 pub struct Recorder {
     inner: RecordingBackend<Spy>,
     log: Rc<RefCell<AppliedLog>>,
-    events: Rc<RefCell<Vec<(ControlId, Event, EventHandler)>>>,
     tooltips: Rc<RefCell<Vec<(ControlId, Option<Tooltip>)>>>,
+    intents: Rc<RefCell<Vec<Intent>>>,
 }
 
 impl Default for Recorder {
@@ -275,13 +295,13 @@ impl Recorder {
     pub fn new() -> Self {
         let spy = Spy::default();
         let log = Rc::clone(&spy.log);
-        let events = Rc::clone(&spy.events);
         let tooltips = Rc::clone(&spy.tooltips);
+        let intents = Rc::clone(&spy.intents);
         Self {
             inner: RecordingBackend::new(spy),
             log,
-            events,
             tooltips,
+            intents,
         }
     }
 
@@ -305,15 +325,6 @@ impl Recorder {
         self.log.borrow().clone()
     }
 
-    /// Invoke the `n`-th event handler that reached the spy at replay.
-    /// Panics if there is no such handler — a test asserting a round trip
-    /// wants the absence to be loud.
-    pub fn invoke_replayed_event(&self, n: usize) {
-        let events = self.events.borrow();
-        let (_, _, handler) = &events[n];
-        handler.invoke();
-    }
-
     /// Tooltips as they arrived at replay.
     pub fn replayed_tooltips(&self) -> Vec<Option<Tooltip>> {
         self.tooltips
@@ -321,6 +332,38 @@ impl Recorder {
             .iter()
             .map(|(_, t)| t.clone())
             .collect()
+    }
+
+    /// Stage a unit-payload event intent (`Click`, `BackRequested`), as the
+    /// backend's input paths would queue it.
+    pub fn queue_unit_event(&mut self, id: ControlId, event: Event) {
+        self.intents.borrow_mut().push(Intent::Event {
+            id,
+            event,
+            payload: IntentPayload::Unit,
+        });
+    }
+
+    /// Stage a `ValueChanged` intent carrying revision `rev`.
+    pub fn queue_value_changed(&mut self, id: ControlId, value: f64, rev: u64) {
+        self.intents.borrow_mut().push(Intent::ValueChanged { id, value, rev });
+    }
+
+    /// Stage an `on_tapped` intent.
+    pub fn queue_tapped(&mut self, id: ControlId) {
+        self.intents.borrow_mut().push(Intent::Tapped { id });
+    }
+
+    /// Drain the staged intents through the recorder's real app-side
+    /// resolution and run the resulting handler jobs — the exact sequence the
+    /// host performs after an input dispatch. Returns how many handlers ran.
+    pub fn drain_and_run(&mut self) -> usize {
+        let jobs = self.inner.drain_intents();
+        let n = jobs.len();
+        for job in jobs {
+            job.run();
+        }
+        n
     }
 }
 
@@ -331,6 +374,7 @@ pub fn assert_cmd_buffer_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<dcomp::record::Cmd>();
     assert_send::<dcomp::record::SendValue>();
+    assert_send::<Intent>();
 }
 
 // ── node.rs (Arena) ──────────────────────────────────────────────────────────
@@ -345,6 +389,9 @@ pub fn assert_cmd_buffer_is_send() {
 pub struct ArenaHarness {
     compositor: crate::system_bindings::Compositor,
     arena: dcomp::node::Arena,
+    /// Monotonic id mint for [`Self::insert`] (the reconciler's role in the
+    /// shipping pipeline).
+    next_id: u32,
 }
 
 impl ArenaHarness {
@@ -366,6 +413,7 @@ impl ArenaHarness {
         Ok(Self {
             compositor: crate::system_bindings::Compositor::new()?,
             arena: dcomp::node::Arena::default(),
+            next_id: 0,
         })
     }
 
@@ -376,16 +424,25 @@ impl ArenaHarness {
         ))
     }
 
-    /// `Arena::insert` — the arena mints the id.
+    /// Insert a node under a harness-minted id.
+    ///
+    /// The arena no longer mints ids at all — the reconciler is the single
+    /// minter in the shipping pipeline — so the harness plays that role here,
+    /// with the same contract: monotonic, and never reusing any id this arena
+    /// has seen, caller-provided ones included (the watermark below).
     pub fn insert(&mut self, kind: ControlKind) -> windows_core::Result<ControlId> {
-        let node = self.node(kind)?;
-        Ok(self.arena.insert(node))
+        self.next_id += 1;
+        let id = ControlId::new(self.next_id);
+        self.insert_with_id(id, kind)?;
+        Ok(id)
     }
 
-    /// `Arena::insert_with_id` — the caller (the recorder) minted the id.
+    /// `Arena::insert_with_id` — the caller minted the id. Advances the
+    /// harness mint's watermark past it, as any correct single minter must.
     pub fn insert_with_id(&mut self, id: ControlId, kind: ControlKind) -> windows_core::Result<()> {
         let node = self.node(kind)?;
         self.arena.insert_with_id(id, node);
+        self.next_id = self.next_id.max(id.get());
         Ok(())
     }
 
@@ -465,6 +522,25 @@ impl ArenaHarness {
     /// tier, holding the caption / nav-pane / flyout / editor-policy state.
     pub fn extras_allocated(&self, id: ControlId) -> Option<bool> {
         self.arena.get(id).map(|n| n.extras_allocated())
+    }
+
+    /// Bump the node's input value revision, as the backend's
+    /// `fire_value_changed` does on every input-originated value write.
+    /// Returns the new revision.
+    pub fn bump_value_rev(&mut self, id: ControlId) -> u64 {
+        match self.arena.get_mut(id) {
+            Some(n) => {
+                n.value_rev += 1;
+                n.value_rev
+            }
+            None => 0,
+        }
+    }
+
+    /// The §7.2 echo gate for control values — the shipping
+    /// `Node::accepts_value_echo` predicate `set_value_stamped` applies.
+    pub fn accepts_value_echo(&self, id: ControlId, based_on: u64) -> Option<bool> {
+        self.arena.get(id).map(|n| n.accepts_value_echo(based_on))
     }
 
     /// `dcomp::apply_prop` — the REAL body of `Backend::set_prop`, including

@@ -436,15 +436,13 @@ impl DCompBackend {
             return;
         }
 
-        // Pointer capture: a pressed node with pointer handlers (declarative
-        // `on_pointer_*` modifiers) receives every move 1:1 — including outside
-        // its bounds — until release. Hover is frozen for the drag's duration.
+        // Pointer capture: a pressed node with a declared `on_pointer_moved`
+        // receives every move 1:1 — including outside its bounds — until
+        // release. Hover is frozen for the drag's duration.
         if let Some(pid) = self.pressed_id
-            && self.node(pid).is_some_and(|n| {
-                n.pointer.as_ref().is_some_and(|p| p.on_pointer_moved.is_some())
-            })
+            && self.node(pid).is_some_and(|n| n.pointer.moved)
         {
-            self.fire_pointer(pid, x, y, |p| p.on_pointer_moved.as_ref());
+            self.fire_pointer(pid, x, y, record::PointerIntentKind::Moved);
             return;
         }
 
@@ -550,7 +548,7 @@ impl DCompBackend {
         }
         if let Some(new) = now {
             redraw |= self.hover_flip(new, true);
-            self.fire_pointer(new, x, y, |p| p.on_pointer_moved.as_ref());
+            self.fire_pointer(new, x, y, record::PointerIntentKind::Moved);
         }
         self.hovered_id = now;
         if redraw {
@@ -712,7 +710,7 @@ impl DCompBackend {
                     self.knob_drag = Some((id, n.ctrl().value, y));
                 }
             }
-            self.fire_pointer(id, x, y, |p| p.on_pointer_pressed.as_ref());
+            self.fire_pointer(id, x, y, record::PointerIntentKind::Pressed);
             true
         } else {
             false
@@ -797,7 +795,7 @@ impl DCompBackend {
 
         // The press is over for anyone tracking it — but deliberately WITHOUT
         // the `activate_pointer` call `on_pointer_up` makes here.
-        self.fire_pointer(id, x, y, |p| p.on_pointer_released.as_ref());
+        self.fire_pointer(id, x, y, record::PointerIntentKind::Released);
     }
 
     /// Left button up.
@@ -865,7 +863,7 @@ impl DCompBackend {
         // Capture semantics: the pressed node always sees the release (a drag
         // must end even when the pointer strays off the control). Activation
         // still requires releasing over the control.
-        self.fire_pointer(id, x, y, |p| p.on_pointer_released.as_ref());
+        self.fire_pointer(id, x, y, record::PointerIntentKind::Released);
         if self.is_over(id, x, y) {
             self.activate_pointer(id, x, y);
         }
@@ -904,11 +902,7 @@ impl DCompBackend {
         if !self.is_over(id, x, y) {
             return;
         }
-        if let Some(p) = self.node(id).and_then(|n| n.pointer.as_ref())
-            && let Some(cb) = &p.on_right_tapped
-        {
-            cb.invoke(());
-        }
+        self.fire_right_tapped(id);
     }
 
     /// Whether `(x, y)` still lies over node `id` (scroll-adjusted).
@@ -983,14 +977,11 @@ impl DCompBackend {
                     self.open_popup(id);
                     return;
                 }
-                if let Some(h) = self.node(id).and_then(|n| n.handler(Event::Click)) {
-                    h.invoke();
-                }
-                if let Some(p) = self.node(id).and_then(|n| n.pointer.as_ref())
-                    && let Some(cb) = &p.on_tapped
-                {
-                    cb.invoke(());
-                }
+                // `Click` queues before `on_tapped`, and the intent queue is
+                // FIFO — a node carrying both observes them in that order,
+                // exactly as the old synchronous dispatch delivered them.
+                self.fire_unit(id, Event::Click);
+                self.fire_tapped(id);
                 // A HyperlinkButton also follows its `NavigateUri` — through the
                 // app's installed launcher, or not at all. This sits in
                 // `activate`, the ONE path a pointer release, a Space/Enter
@@ -1022,14 +1013,9 @@ impl DCompBackend {
             // items) activates the same way a Button does — the press wouldn't
             // have reached here otherwise.
             _ => {
-                if let Some(h) = self.node(id).and_then(|n| n.handler(Event::Click)) {
-                    h.invoke();
-                }
-                if let Some(p) = self.node(id).and_then(|n| n.pointer.as_ref())
-                    && let Some(cb) = &p.on_tapped
-                {
-                    cb.invoke(());
-                }
+                // Same order contract as the Button arm: Click, then tapped.
+                self.fire_unit(id, Event::Click);
+                self.fire_tapped(id);
             }
         }
     }
@@ -1102,11 +1088,13 @@ impl DCompBackend {
             nav::Hit::Item(i) => self.set_nav_index(id, i),
             nav::Hit::Back => {
                 // A disabled back arrow is drawn but inert, mirroring the drawn
-                // caption back button.
-                if self.node(id).is_some_and(|n| n.extras().back_enabled)
-                    && let Some(h) = self.node(id).and_then(|n| n.handler(Event::BackRequested))
+                // caption back button — and without a declared handler it is
+                // inert too, not merely silent (`Interactivity::back`).
+                if self
+                    .node(id)
+                    .is_some_and(|n| n.extras().back_enabled && n.interactivity.back)
                 {
-                    h.invoke();
+                    self.fire_unit(id, Event::BackRequested);
                 }
             }
             nav::Hit::Toggle => self.toggle_nav_pane(id),
@@ -1222,7 +1210,7 @@ impl DCompBackend {
         if recolor {
             self.repaint();
         }
-        self.fire_f64(id, Event::ValueChanged, value);
+        self.fire_value_changed(id, value);
     }
 
     /// Click-to-position: jump the knob to the angle under `(x, y)` and report
@@ -1247,7 +1235,7 @@ impl DCompBackend {
             v
         };
         self.repaint();
-        self.fire_f64(id, Event::ValueChanged, value);
+        self.fire_value_changed(id, value);
     }
 
     /// Map a relative vertical drag to a knob value: `dy` (up = increase) over
@@ -1277,7 +1265,7 @@ impl DCompBackend {
             v
         };
         self.repaint();
-        self.fire_f64(id, Event::ValueChanged, value);
+        self.fire_value_changed(id, value);
     }
 
     /// Advance a knob value by `detents` mouse-wheel detents (5% of the domain
@@ -1303,7 +1291,7 @@ impl DCompBackend {
             v
         };
         self.repaint();
-        self.fire_f64(id, Event::ValueChanged, value);
+        self.fire_value_changed(id, value);
     }
 
     // ── Popup ────────────────────────────────────────────────────────────────
@@ -1989,7 +1977,7 @@ impl DCompBackend {
             n.mark_dirty();
         }
         self.repaint();
-        self.fire_f64(id, Event::ValueChanged, v);
+        self.fire_value_changed(id, v);
     }
 
     // ── Editor pointer + clipboard ───────────────────────────────────────────
@@ -2115,7 +2103,7 @@ impl DCompBackend {
                 // The fill/thumb (slider) or arc/needle (knob) glide runs on the
                 // compositor via the repaint's sync — a keyboard nudge needs no tick.
                 self.repaint();
-                self.fire_f64(id, Event::ValueChanged, value);
+                self.fire_value_changed(id, value);
             }
             Some(ControlKind::SelectorBar) => {
                 let (cur, n) = self
@@ -2274,7 +2262,7 @@ impl DCompBackend {
         };
         // Compositor glide via the repaint's parts sync (see `focus_arrow`).
         self.repaint();
-        self.fire_f64(id, Event::ValueChanged, value);
+        self.fire_value_changed(id, value);
     }
 
     /// `SelectionItem::Select` (and `Invoke`) on synthetic item `i` of a
@@ -2321,51 +2309,90 @@ impl DCompBackend {
 
     // ── Event dispatch ───────────────────────────────────────────────────────
 
-    // The `fire_*` dispatchers double as the UIA notification choke point: every
+    // The `fire_*` dispatchers are the app-notification choke points: every
     // state change (pointer, keyboard, or UIA-initiated) flows through exactly
-    // one of them, so screen readers hear the change even when the app attached
-    // no handler.
-    fn fire_bool(&self, id: ControlId, event: Event, v: bool) {
+    // one of them. Each notifies UI Automation synchronously — screen readers
+    // hear the change even when the app attached no handler — then queues a
+    // typed, plain-data intent instead of invoking a closure: the backend no
+    // longer holds any app handler. The recorder resolves the queue against
+    // its app-side handler map after this input dispatch returns
+    // (`record::RecordingBackend::drain_intents`), preserving fire order —
+    // notably `Click` before `on_tapped` within one activation.
+    pub(super) fn fire_unit(&mut self, id: ControlId, event: Event) {
+        self.intents.push(record::Intent::Event {
+            id,
+            event,
+            payload: record::IntentPayload::Unit,
+        });
+    }
+    fn fire_bool(&mut self, id: ControlId, event: Event, v: bool) {
         self.uia_notify_bool(id, event, v);
-        if let Some(h) = self.node(id).and_then(|n| n.handler(event)) {
-            h.invoke_bool(v);
-        }
+        self.intents.push(record::Intent::Event {
+            id,
+            event,
+            payload: record::IntentPayload::Bool(v),
+        });
     }
-    fn fire_string(&self, id: ControlId, event: Event, v: String) {
+    fn fire_string(&mut self, id: ControlId, event: Event, v: String) {
         self.uia_notify_string(id, event, &v);
-        if let Some(h) = self.node(id).and_then(|n| n.handler(event)) {
-            h.invoke_string(v);
-        }
+        self.intents.push(record::Intent::Event {
+            id,
+            event,
+            payload: record::IntentPayload::Str(v),
+        });
     }
-    fn fire_f64(&self, id: ControlId, event: Event, v: f64) {
-        self.uia_notify_f64(id, event, v);
-        if let Some(h) = self.node(id).and_then(|n| n.handler(event)) {
-            h.invoke_f64(v);
-        }
-    }
-    fn fire_i32(&self, id: ControlId, event: Event, v: i32) {
-        if let Some(h) = self.node(id).and_then(|n| n.handler(event)) {
-            h.invoke_i32(v);
-        }
+    fn fire_i32(&mut self, id: ControlId, event: Event, v: i32) {
+        self.uia_notify_i32(id, event, v);
+        self.intents.push(record::Intent::Event {
+            id,
+            event,
+            payload: record::IntentPayload::I32(v),
+        });
     }
 
-    fn fire_pointer(
-        &self,
-        id: ControlId,
-        x: f32,
-        y: f32,
-        pick: impl Fn(&PointerHandlers) -> Option<&crate::Callback<PointerEventInfo>>,
-    ) {
+    /// `Event::ValueChanged` — the one event that carries a revision. Every
+    /// input-originated value write bumps the node's `value_rev` here, and the
+    /// intent carries it out so the app's echo can come back stamped against
+    /// it (`Cmd::SetValue`) — the §7.2 revision protocol for control values.
+    fn fire_value_changed(&mut self, id: ControlId, v: f64) {
+        self.uia_notify_f64(id, Event::ValueChanged, v);
+        let Some(node) = self.node_mut(id) else { return };
+        node.value_rev += 1;
+        let rev = node.value_rev;
+        self.intents.push(record::Intent::ValueChanged { id, value: v, rev });
+    }
+
+    /// Queue a positional pointer callback, when the app declared one
+    /// (`Node::pointer` carries presence only — the closure lives app-side).
+    fn fire_pointer(&mut self, id: ControlId, x: f32, y: f32, kind: record::PointerIntentKind) {
         let Some(node) = self.node(id) else { return };
-        let Some(handlers) = &node.pointer else { return };
-        let Some(cb) = pick(handlers) else { return };
+        let declared = match kind {
+            record::PointerIntentKind::Pressed => node.pointer.pressed,
+            record::PointerIntentKind::Released => node.pointer.released,
+            record::PointerIntentKind::Moved => node.pointer.moved,
+        };
+        if !declared {
+            return;
+        }
         let info = PointerEventInfo {
             x: (x - node.rect.x) as f64,
             y: (y - node.rect.y) as f64,
             is_left_button_pressed: node.pressed,
             ..PointerEventInfo::default()
         };
-        cb.invoke(info);
+        self.intents.push(record::Intent::Pointer { id, kind, info });
+    }
+
+    fn fire_tapped(&mut self, id: ControlId) {
+        if self.node(id).is_some_and(|n| n.pointer.tapped) {
+            self.intents.push(record::Intent::Tapped { id });
+        }
+    }
+
+    fn fire_right_tapped(&mut self, id: ControlId) {
+        if self.node(id).is_some_and(|n| n.pointer.right_tapped) {
+            self.intents.push(record::Intent::RightTapped { id });
+        }
     }
 
     fn hwnd(&self) -> HWND {

@@ -13,7 +13,7 @@
 use super::bootstrap::NodeSurface;
 use super::editor::Editor;
 use super::*;
-use crate::backend::{ControlKind, Event, EventHandler};
+use crate::backend::{ControlKind, Event};
 use crate::style::{
     AccessibilityModifiers, AnimationConfig, ImplicitTransitions, LayoutAnimationConfig,
     PointerHandlers,
@@ -73,6 +73,39 @@ pub(crate) struct Interactivity {
     /// A `BackRequested` handler enables the navigation and caption back
     /// buttons; without one they are inert rather than merely silent.
     pub back: bool,
+}
+
+/// Which per-element pointer callbacks the app has declared, by presence.
+///
+/// The closures themselves live app-side in the recorder's handler map
+/// (`record.rs`) and are invoked from queued intents; the retained tree keeps
+/// only these bits, which are what input consults synchronously — a node with
+/// `tapped`/`pressed` is hit-testable ([`Node::is_clickable`]), and a pressed
+/// node with `moved` captures the pointer for the drag's duration.
+///
+/// Only the five callbacks this backend actually fires have a bit;
+/// `on_pointer_entered`/`exited`/`wheel` are WinUI-backend surface and never
+/// dispatch here.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub(crate) struct PointerInterest {
+    pub tapped: bool,
+    pub right_tapped: bool,
+    pub pressed: bool,
+    pub released: bool,
+    pub moved: bool,
+}
+
+impl PointerInterest {
+    /// The declaration for a set of pointer handlers — presence only.
+    pub fn of(h: &PointerHandlers) -> Self {
+        Self {
+            tapped: h.on_tapped.is_some(),
+            right_tapped: h.on_right_tapped.is_some(),
+            pressed: h.on_pointer_pressed.is_some(),
+            released: h.on_pointer_released.is_some(),
+            moved: h.on_pointer_moved.is_some(),
+        }
+    }
 }
 
 /// The painted content of a node, separate from layout. All optional — a bare
@@ -509,16 +542,24 @@ pub(crate) struct Node {
     /// Cached DWrite layout for text-bearing nodes; rebuilt on text/font change.
     pub text_layout: Option<TextLayout>,
     pub text_dirty: bool,
-    pub handlers: Vec<(Event, EventHandler)>,
     /// What the app has declared this control responds to.
     ///
-    /// Kept beside `handlers` rather than derived from it because the two
-    /// answer different questions on different threads: firing needs the
-    /// closure, but hit-testing and `WM_NCHITTEST` only need to know that one
-    /// exists. Once handlers live on the app thread and firing becomes an
-    /// intent, this is what the input side keeps.
+    /// A declaration, not a closure: the `EventHandler`s themselves live
+    /// app-side in the recorder's handler map and are invoked from queued
+    /// intents (`record.rs`). Hit-testing and `WM_NCHITTEST` only need to know
+    /// that one exists, and once replay crosses to the front thread these
+    /// flags are all the input side keeps.
     pub interactivity: Interactivity,
-    pub pointer: Option<PointerHandlers>,
+    /// Which per-element pointer callbacks exist — same declaration-not-closure
+    /// split as `interactivity`; see [`PointerInterest`].
+    pub pointer: PointerInterest,
+    /// Monotonic revision of `ctrl.value`, bumped on every **input-originated**
+    /// write (drag, wheel, keyboard nudge, NumberBox commit, UIA SetValue).
+    /// Rides out on `ValueChanged` intents; the app's echo comes back stamped
+    /// with the revision it was based on, and a stale echo is dropped instead
+    /// of dragging the chrome backwards after the gesture has moved on — the
+    /// §7.2 revision protocol, extended from text to control values.
+    pub value_rev: u64,
     pub accessibility: Option<AccessibilityModifiers>,
 
     // ── Composition ──────────────────────────────────────────────────────
@@ -692,9 +733,9 @@ impl Node {
             grid_cols: Vec::new(),
             text_layout: None,
             text_dirty: true,
-            handlers: Vec::new(),
             interactivity: Interactivity::default(),
-            pointer: None,
+            pointer: PointerInterest::default(),
+            value_rev: 0,
             accessibility: None,
             container,
             vis,
@@ -848,8 +889,14 @@ impl Node {
         }
     }
 
-    pub fn handler(&self, event: Event) -> Option<&EventHandler> {
-        self.handlers.iter().find(|(e, _)| *e == event).map(|(_, h)| h)
+    /// Whether an app value write stamped `based_on` may still apply — the
+    /// revision half of the §7.2 gate for control values. `false` means the
+    /// user drove the value after the app last heard about it
+    /// (`ValueChanged` intents deliver `value_rev`), so the write is a stale
+    /// echo: applying it would snap the chrome backwards, and the app
+    /// converges through the newer intent instead.
+    pub fn accepts_value_echo(&self, based_on: u64) -> bool {
+        based_on >= self.value_rev
     }
 
     /// True for nodes that respond to a press (hover/press ink + activate).
@@ -857,10 +904,8 @@ impl Node {
         is_interactive_kind(self.kind)
             || is_text_editable(self.kind)
             || self.interactivity.click
-            || self
-                .pointer
-                .as_ref()
-                .is_some_and(|p| p.on_tapped.is_some() || p.on_pointer_pressed.is_some())
+            || self.pointer.tapped
+            || self.pointer.pressed
     }
 
     /// Whether this node draws any chrome (and therefore needs a surface).

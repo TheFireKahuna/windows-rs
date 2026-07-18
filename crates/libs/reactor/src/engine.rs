@@ -1399,6 +1399,16 @@ impl<B: Backend + 'static, D: Dispatcher + 'static> RenderHost<B, D> {
         f(&mut self.inner.reconciler.borrow_mut())
     }
 
+    /// Non-panicking [`Self::with_reconciler_mut`]: `None` when the reconciler
+    /// is already borrowed on this thread — a re-entrant call from inside a
+    /// backend mutation, such as a composition scoped batch whose `Completed`
+    /// event fires synchronously from `End()`. Callers own the fallback
+    /// (typically deferring through the message pump).
+    pub fn try_with_reconciler_mut<R>(&self, f: impl FnOnce(&mut Reconciler<B>) -> R) -> Option<R> {
+        let mut r = self.inner.reconciler.try_borrow_mut().ok()?;
+        Some(f(&mut r))
+    }
+
     pub fn clone_inner(&self) -> Self {
         Self {
             inner: Rc::clone(&self.inner),

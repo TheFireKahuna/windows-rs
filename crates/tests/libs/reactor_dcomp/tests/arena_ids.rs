@@ -66,13 +66,13 @@ fn arena_ids_are_monotonic_and_never_reused() {
     }
 }
 
-/// The two minting paths share one id space.
+/// Caller-minted and harness-minted ids share one id space.
 ///
-/// `insert_with_id` takes an id the *recorder* minted (the command-buffer seam
-/// mints reconciler-side so `create` needs no synchronous answer). It must
-/// advance the arena's own counter past that id, or a later `insert` collides
-/// with a live node — the same aliasing failure, arrived at from the other
-/// direction.
+/// The arena itself no longer mints — the reconciler is the single minter and
+/// `insert_with_id` files nodes under ids it chose. The harness mint models
+/// that role, and this asserts its watermark contract: minting after a
+/// caller-provided id must advance past it, or a later mint collides with a
+/// live node — the same aliasing failure, arrived at from the other direction.
 #[test]
 fn caller_minted_ids_advance_the_arenas_own_counter() {
     let mut a = harness();

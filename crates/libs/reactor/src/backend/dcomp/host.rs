@@ -43,34 +43,54 @@ pub(crate) fn on_ui_thread() -> bool {
     UI_THREAD_ID.load(Ordering::Relaxed) == unsafe { GetCurrentThreadId() }
 }
 
-thread_local! {
-    /// Set while a `with_backend` call holds the reconciler borrow, so a
-    /// re-entrant call (e.g. a UIA event raised synchronously from inside a
-    /// backend mutation) refuses rather than double-borrowing the `RefCell`.
-    static IN_BACKEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// Run `f` against the backend on the UI thread, then deliver any app intents
+/// it queued. Returns `None` when there is no live host on this thread, or
+/// when the reconciler is already borrowed — a re-entrant call, e.g. a
+/// composition scoped batch whose `Completed` fires synchronously from inside
+/// a backend mutation (`try_with_reconciler_mut` refuses instead of
+/// panicking on the `RefCell`, and callers defer through the pump). Must be
+/// called on the UI thread (the UIA layer reaches it through
+/// [`marshal_to_ui`]).
+pub(crate) fn with_backend<R>(f: impl FnOnce(&mut DCompBackend) -> R) -> Option<R> {
+    let s = shared()?;
+    let (r, jobs) = s.render_host.try_with_reconciler_mut(|r| {
+        // Input, UIA and caption reads all hit-test against laid-out
+        // geometry, so the buffer must be drained first. It is normally
+        // already empty here (`post_render` drains every reconcile); this
+        // is the guarantee, not the common path.
+        r.backend.flush();
+        let out = f(&mut r.backend);
+        // UIA actions (Invoke/Toggle/SetValue) fire the same intents input
+        // does; resolve them app-side while the borrow is still held...
+        (out, r.backend.drain_intents())
+    })?;
+    // ...and run them here, with the borrow released, so a handler that pumps
+    // messages or re-enters the backend finds nothing held.
+    for job in jobs {
+        job.run();
+    }
+    Some(r)
 }
 
-/// Run `f` against the backend on the UI thread. Returns `None` when there is no
-/// live host on this thread, or when called re-entrantly (the outer borrow is
-/// still active). Must be called on the UI thread (the UIA layer reaches it
-/// through [`marshal_to_ui`]).
-pub(crate) fn with_backend<R>(f: impl FnOnce(&mut DCompBackend) -> R) -> Option<R> {
-    if IN_BACKEND.with(|c| c.get()) {
-        return None;
-    }
-    IN_BACKEND.with(|c| c.set(true));
-    let r = shared().map(|s| {
-        s.render_host.with_reconciler_mut(|r| {
-            // Input, UIA and caption reads all hit-test against laid-out
-            // geometry, so the buffer must be drained first. It is normally
-            // already empty here (`post_render` drains every reconcile); this
-            // is the guarantee, not the common path.
-            r.backend.flush();
-            f(&mut r.backend)
-        })
+/// Route one input entry point into the backend, then deliver the intents it
+/// queued: the recorder resolves them against its app-side handler map inside
+/// the borrow, and the handlers run here after it is released — same thread,
+/// same message, so app-visible behaviour matches the old synchronous fire
+/// while the queue stays the seam. Every wndproc arm that can make the
+/// backend fire an event goes through here.
+fn dispatch_input<R>(
+    s: &HostShared,
+    f: impl FnOnce(&mut RecordingBackend<DCompBackend>) -> R,
+) -> R {
+    let (out, jobs) = s.render_host.with_reconciler_mut(|r| {
+        let out = f(&mut r.backend);
+        let jobs = r.backend.drain_intents();
+        (out, jobs)
     });
-    IN_BACKEND.with(|c| c.set(false));
-    r
+    for job in jobs {
+        job.run();
+    }
+    out
 }
 
 /// Marshal `f` onto the UI thread and block until it completes, returning its
@@ -242,7 +262,7 @@ impl DCompHost {
         // control motion plays on the system compositor — no timer to arm.
         let pr_host = render_host.clone_inner();
         render_host.set_post_render(move |root_id| {
-            pr_host.with_reconciler_mut(|r| {
+            let jobs = pr_host.with_reconciler_mut(|r| {
                 // Drain the reconcile's command buffer before anything reads
                 // the arena: `set_root` looks the new root up and silently
                 // no-ops if it is absent, and layout walks the whole tree.
@@ -258,7 +278,14 @@ impl DCompHost {
                 r.backend.service_surface_ops();
                 r.backend.set_root(root_id);
                 r.backend.relayout_and_paint();
+                // Replay fires no events today, so this is normally empty —
+                // drained anyway so an intent can never sit in the queue until
+                // the next input message if a replayed path ever gains one.
+                r.backend.drain_intents()
             });
+            for job in jobs {
+                job.run();
+            }
         });
 
         DCOMP.with(|c| {
@@ -753,8 +780,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // `WM_SYSCOMMAND`.
                 if idx == caption::BACK_INDEX {
                     if let Some(s) = shared() {
-                        s.render_host
-                            .with_reconciler_mut(|r| r.backend.raise_back_requested());
+                        dispatch_input(&s, |b| b.raise_back_requested());
                     }
                     repaint_caption();
                     return 0;
@@ -827,14 +853,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
                 track_leave(hwnd);
-                s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_move(x, y));
+                dispatch_input(&s, |b| b.on_pointer_move(x, y));
             }
             0
         }
 
         WM_MOUSELEAVE => {
             if let Some(s) = shared() {
-                s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_leave());
+                dispatch_input(&s, |b| b.on_pointer_leave());
             }
             0
         }
@@ -842,8 +868,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONDOWN => {
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
-                let captured =
-                    s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_down(x, y));
+                let captured = dispatch_input(&s, |b| b.on_pointer_down(x, y));
                 if captured {
                     unsafe {
                         SetCapture(hwnd);
@@ -857,7 +882,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
                 release_capture_self();
-                s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_up(x, y));
+                dispatch_input(&s, |b| b.on_pointer_up(x, y));
             }
             0
         }
@@ -875,8 +900,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if !RELEASING_CAPTURE.with(|c| c.get())
                 && let Some(s) = shared()
             {
-                s.render_host
-                    .with_reconciler_mut(|r| r.backend.on_pointer_cancel());
+                dispatch_input(&s, |b| b.on_pointer_cancel());
             }
             0
         }
@@ -887,10 +911,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         // DefWindowProc so the system context-menu path still works.
         WM_RBUTTONDOWN => {
             let (x, y) = dip_xy(hwnd, lparam);
-            let consumed = shared().is_some_and(|s| {
-                s.render_host
-                    .with_reconciler_mut(|r| r.backend.on_right_pointer_down(x, y))
-            });
+            let consumed =
+                shared().is_some_and(|s| dispatch_input(&s, |b| b.on_right_pointer_down(x, y)));
             if consumed {
                 return 0;
             }
@@ -900,8 +922,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_RBUTTONUP => {
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
-                s.render_host
-                    .with_reconciler_mut(|r| r.backend.on_right_pointer_up(x, y));
+                dispatch_input(&s, |b| b.on_right_pointer_up(x, y));
             }
             0
         }
@@ -926,11 +947,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let delta = ((wparam >> 16) & 0xFFFF) as i16 as i32;
                 let (x, y) = (pt.x as f32 / scale, pt.y as f32 / scale);
                 let horizontal = msg == WM_MOUSEHWHEEL;
-                s.render_host.with_reconciler_mut(|r| {
+                dispatch_input(&s, |b| {
                     if horizontal {
-                        r.backend.on_wheel_h(x, y, delta)
+                        b.on_wheel_h(x, y, delta)
                     } else {
-                        r.backend.on_wheel(x, y, delta)
+                        b.on_wheel(x, y, delta)
                     }
                 });
             }
@@ -942,8 +963,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let vk = (wparam & 0xFFFF) as u32;
                 let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
                 let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
-                s.render_host
-                    .with_reconciler_mut(|r| r.backend.on_key(vk, shift, ctrl));
+                dispatch_input(&s, |b| b.on_key(vk, shift, ctrl));
             }
             0
         }
@@ -952,7 +972,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_KEYUP | WM_SYSKEYUP => {
             if let Some(s) = shared() {
                 let vk = (wparam & 0xFFFF) as u32;
-                s.render_host.with_reconciler_mut(|r| r.backend.on_key_up(vk));
+                dispatch_input(&s, |b| b.on_key_up(vk));
             }
             0
         }
@@ -960,7 +980,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_CHAR => {
             if let Some(s) = shared() {
                 let ch = (wparam & 0xFFFF) as u16;
-                s.render_host.with_reconciler_mut(|r| r.backend.on_char(ch));
+                dispatch_input(&s, |b| b.on_char(ch));
             }
             0
         }
@@ -968,7 +988,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         // ── IME (IMM32 composition fallback) ─────────────────────────────
         WM_IME_STARTCOMPOSITION => {
             if let Some(s) = shared()
-                && s.render_host.with_reconciler_mut(|r| r.backend.ime_begin())
+                && dispatch_input(&s, |b| b.ime_begin())
             {
                 // A text field owns composition: suppress the default IME window.
                 return 0;
@@ -986,13 +1006,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if flags & GCS_RESULTSTR != 0
                         && let Some(res) = unsafe { imm_string(himc, GCS_RESULTSTR) }
                     {
-                        s.render_host
-                            .with_reconciler_mut(|r| r.backend.ime_commit(&res));
+                        dispatch_input(&s, |b| b.ime_commit(&res));
                     }
                     if flags & GCS_COMPSTR != 0 {
                         let comp = unsafe { imm_string(himc, GCS_COMPSTR) }.unwrap_or_default();
-                        s.render_host
-                            .with_reconciler_mut(|r| r.backend.ime_update(&comp));
+                        dispatch_input(&s, |b| b.ime_update(&comp));
                     }
                     unsafe {
                         let _ = ImmReleaseContext(hwnd, himc);
@@ -1007,7 +1025,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(s) = shared()
                 && s.render_host.with_reconciler_mut(|r| r.backend.has_text_focus())
             {
-                s.render_host.with_reconciler_mut(|r| r.backend.ime_end());
+                dispatch_input(&s, |b| b.ime_end());
                 return 0;
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1015,17 +1033,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
         WM_SETFOCUS => {
             if let Some(s) = shared() {
-                s.render_host
-                    .with_reconciler_mut(|r| r.backend.window_focus_changed(true));
+                dispatch_input(&s, |b| b.window_focus_changed(true));
             }
             0
         }
 
         WM_KILLFOCUS => {
             if let Some(s) = shared() {
-                s.render_host.with_reconciler_mut(|r| {
-                    r.backend.window_focus_changed(false);
-                    r.backend.on_focus_lost();
+                dispatch_input(&s, |b| {
+                    b.window_focus_changed(false);
+                    b.on_focus_lost();
                 });
             }
             0

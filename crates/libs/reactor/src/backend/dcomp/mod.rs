@@ -164,6 +164,12 @@ pub struct DCompBackend {
     titlebars: Vec<ControlId>,
     /// The host window handle (as `isize`) — used for clipboard ownership.
     hwnd: isize,
+    /// App notifications queued by the input paths (`fire_*` in [`input`]),
+    /// in fire order, drained by the recorder after each input dispatch
+    /// ([`record::RecordingBackend::drain_intents`]). The backend never
+    /// invokes an app closure: this queue is the seam that keeps handlers on
+    /// the app side.
+    intents: Vec<record::Intent>,
 }
 
 impl DCompBackend {
@@ -192,6 +198,7 @@ impl DCompBackend {
             surfaces: surface::SurfaceHost::default(),
             titlebars: Vec::new(),
             hwnd,
+            intents: Vec::new(),
         }
     }
 
@@ -440,14 +447,13 @@ impl DCompBackend {
             .is_some_and(|n| n.extras().back_button_visible && n.extras().back_button_enabled)
     }
 
-    /// Fire the mounted TitleBar's `BackRequested` handler, if it has one.
+    /// Queue the mounted TitleBar's `BackRequested` for the app, if declared.
     pub(crate) fn raise_back_requested(&mut self) {
-        if let Some(h) = self
+        if let Some(id) = self
             .titlebar_id()
-            .and_then(|id| self.arena.get(id))
-            .and_then(|n| n.handler(Event::BackRequested))
+            .filter(|id| self.arena.get(*id).is_some_and(|n| n.interactivity.back))
         {
-            h.invoke();
+            self.fire_unit(id, Event::BackRequested);
         }
     }
 
@@ -780,25 +786,29 @@ impl Backend for DCompBackend {
         self.arena.remove(id);
     }
 
+    /// This backend never stores or invokes an [`EventHandler`]: the closure
+    /// lives app-side in the recorder's handler map and is invoked from queued
+    /// intents. The trait entry point exists for a directly-driven backend and
+    /// keeps only the declaration, exactly as replay does via
+    /// [`record::FrontBackend::declare_event`].
     fn attach_event(&mut self, id: ControlId, event: Event, handler: EventHandler) {
-        if let Some(node) = self.node_mut(id) {
-            node.handlers.retain(|(e, _)| *e != event);
-            node.handlers.push((event, handler));
-            node.note_interactivity(event, true);
-        }
+        let _ = handler;
+        self.declare_event(id, event);
     }
 
     fn detach_event(&mut self, id: ControlId, event: Event) {
         if let Some(node) = self.node_mut(id) {
-            node.handlers.retain(|(e, _)| *e != event);
             node.note_interactivity(event, false);
         }
     }
 
+    /// Same declaration-only treatment as `attach_event`: the closures stay
+    /// app-side; the node keeps their presence bits.
     fn set_pointer_handlers(&mut self, id: ControlId, handlers: Option<&PointerHandlers>) {
-        if let Some(node) = self.node_mut(id) {
-            node.pointer = handlers.cloned();
-        }
+        self.set_pointer_interest(
+            id,
+            handlers.map(node::PointerInterest::of).unwrap_or_default(),
+        );
     }
 
     fn set_accessibility(&mut self, id: ControlId, accessibility: &AccessibilityModifiers) {
@@ -887,6 +897,64 @@ impl Backend for DCompBackend {
         if config.as_ref().is_some_and(animate::wants_center) {
             animate::note_scale_intent(node);
         }
+    }
+}
+
+// ── Intent seam (see `record`) ──────────────────────────────────────────────
+impl DCompBackend {
+    /// Note that `event` has an app-side handler. The declaration is all this
+    /// backend keeps — see [`Backend::attach_event`] above.
+    pub(crate) fn declare_event(&mut self, id: ControlId, event: Event) {
+        if let Some(node) = self.node_mut(id) {
+            node.note_interactivity(event, true);
+        }
+    }
+
+    /// Note which of the app's pointer callbacks exist for `id` — the bits
+    /// input consults synchronously (hit-testability, pointer capture).
+    pub(crate) fn set_pointer_interest(&mut self, id: ControlId, interest: node::PointerInterest) {
+        if let Some(node) = self.node_mut(id) {
+            node.pointer = interest;
+        }
+    }
+
+    /// Revision-gated `Prop::Value` write (§7.2 applied to control values).
+    ///
+    /// `based_on` is the input revision the app had been consulted about when
+    /// it recorded this write. A node whose revision has moved past it means
+    /// the user drove the value after the app last heard about it — the write
+    /// is a stale echo and applying it would snap the chrome backwards, so it
+    /// is dropped; the app converges through the newer `ValueChanged` intent
+    /// already queued or delivered. The gesture-time half of the same gate
+    /// (`node.pressed`) lives in [`apply_prop`].
+    pub(crate) fn set_value_stamped(&mut self, id: ControlId, value: f64, based_on: u64) {
+        if self.node(id).is_some_and(|n| !n.accepts_value_echo(based_on)) {
+            return;
+        }
+        Backend::set_prop(self, id, Prop::Value, &PropValue::F64(value));
+    }
+
+    /// Hand the queued intents to the recorder's drain, in fire order.
+    pub(crate) fn take_intents(&mut self) -> Vec<record::Intent> {
+        std::mem::take(&mut self.intents)
+    }
+}
+
+impl record::FrontBackend for DCompBackend {
+    fn declare_event(&mut self, id: ControlId, event: Event) {
+        Self::declare_event(self, id, event);
+    }
+
+    fn set_pointer_interest(&mut self, id: ControlId, interest: node::PointerInterest) {
+        Self::set_pointer_interest(self, id, interest);
+    }
+
+    fn set_value_stamped(&mut self, id: ControlId, value: f64, based_on: u64) {
+        Self::set_value_stamped(self, id, value, based_on);
+    }
+
+    fn take_intents(&mut self) -> Vec<record::Intent> {
+        Self::take_intents(self)
     }
 }
 
@@ -1130,10 +1198,12 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             // backwards under the user's finger — the same reason the editor
             // ignores `Prop::Value` while its buffer is focused and seeded.
             //
-            // This covers the visible window (a continuous drag). Closing it
-            // for a value echoed *after* release needs the revision protocol
-            // in docs/INPUT-OFFTHREAD-DESIGN.md §7.2, which requires intents to
-            // carry the revision out and back.
+            // This is the gesture-time half of the gate. The post-release
+            // window is closed by the revision half (`Node::value_rev` +
+            // `DCompBackend::set_value_stamped`): every recorded value write
+            // arrives through `Cmd::SetValue` stamped with the revision the
+            // app was based on, and a stale one is dropped before reaching
+            // this match at all.
             let _ = v;
         }
         (Prop::Value, PropValue::F64(v)) => {

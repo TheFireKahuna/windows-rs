@@ -315,3 +315,31 @@ fn extras_allocates_only_on_write() {
     a.apply_prop(id, Prop::PaneTitle, &V::Str("Chains".into()));
     assert_eq!(a.extras_allocated(id), Some(true), "the write must allocate");
 }
+
+/// The §7.2 revision gate for control values, node half: input-originated
+/// value writes bump the node's revision (`fire_value_changed`), and an app
+/// echo stamped `based_on` an older revision is stale — `set_value_stamped`
+/// drops it through this exact predicate instead of snapping the chrome back.
+#[test]
+fn value_echo_gate_follows_input_revision() {
+    let mut a = harness();
+    let id = a.insert(K::Slider).unwrap();
+
+    // No input yet: every programmatic write applies (rev 0 vs based_on 0).
+    assert_eq!(a.accepts_value_echo(id, 0), Some(true));
+
+    let r1 = a.bump_value_rev(id);
+    let r2 = a.bump_value_rev(id);
+    assert_eq!((r1, r2), (1, 2), "revisions must be monotonic from 1");
+
+    assert_eq!(
+        a.accepts_value_echo(id, r1),
+        Some(false),
+        "an echo based on rev 1 is stale once input reached rev 2"
+    );
+    assert_eq!(
+        a.accepts_value_echo(id, r2),
+        Some(true),
+        "an echo based on the latest delivered revision applies"
+    );
+}
