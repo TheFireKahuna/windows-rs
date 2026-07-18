@@ -224,12 +224,12 @@ impl TextLayout {
 
     /// Update the layout box width (re-flows wrapping / trimming).
     pub fn set_max_width(&self, max_width: f32) -> Result<()> {
-        unsafe { self.raw.SetMaxWidth(max_width) }
+        unsafe { self.raw.SetMaxWidth(max_width).ok() }
     }
 
     /// Update the layout box height.
     pub fn set_max_height(&self, max_height: f32) -> Result<()> {
-        unsafe { self.raw.SetMaxHeight(max_height) }
+        unsafe { self.raw.SetMaxHeight(max_height).ok() }
     }
 
     /// Set word wrapping on / off for this layout.
@@ -239,7 +239,7 @@ impl TextLayout {
         } else {
             DWRITE_WORD_WRAPPING_NO_WRAP
         };
-        unsafe { self.raw.SetWordWrapping(value) }
+        unsafe { self.raw.SetWordWrapping(value).ok() }
     }
 
     /// Apply ellipsis trimming. `Trimming::None` removes it. The ellipsis sign is
@@ -263,7 +263,7 @@ impl TextLayout {
                 Some(factory.CreateEllipsisTrimmingSign(format.raw())?)
             };
             // SetTrimming is inherited from IDWriteTextFormat (the layout derefs to it).
-            self.raw.SetTrimming(&options, sign.as_ref())
+            self.raw.SetTrimming(&options, sign.as_ref()).ok()
         }
     }
 
@@ -271,7 +271,7 @@ impl TextLayout {
     /// [`TextMetrics::width`] (formatted width sans trailing whitespace).
     pub fn metrics(&self) -> Result<TextMetrics> {
         let mut m = DWRITE_TEXT_METRICS::default();
-        unsafe { self.raw.GetMetrics(&mut m)? };
+        unsafe { self.raw.GetMetrics(&mut m).ok()? };
         Ok(TextMetrics {
             left: m.left,
             top: m.top,
@@ -299,7 +299,8 @@ impl TextLayout {
         let mut hm = DWRITE_HIT_TEST_METRICS::default();
         unsafe {
             self.raw
-                .HitTestPoint(x, y, &mut is_trailing, &mut is_inside, &mut hm)?;
+                .HitTestPoint(x, y, &mut is_trailing, &mut is_inside, &mut hm)
+                .ok()?;
         };
         Ok(HitTestResult {
             text_position: hm.textPosition,
@@ -318,7 +319,8 @@ impl TextLayout {
         let mut hm = DWRITE_HIT_TEST_METRICS::default();
         unsafe {
             self.raw
-                .HitTestTextPosition(text_position, after, &mut x, &mut y, &mut hm)?;
+                .HitTestTextPosition(text_position, after, &mut x, &mut y, &mut hm)
+                .ok()?;
         };
         Ok((
             (x, y),
@@ -367,7 +369,8 @@ impl TextLayout {
                 origin_y,
                 Some(&mut metrics),
                 &mut count,
-            )?;
+            )
+            .ok()?;
         }
         Ok(metrics
             .iter()
@@ -383,7 +386,7 @@ impl TextLayout {
             startPosition: start,
             length,
         };
-        unsafe { self.raw.SetUnderline(has_underline, range) }
+        unsafe { self.raw.SetUnderline(has_underline, range).ok() }
     }
 
     /// Returns the underlying `IDWriteTextLayout`.
@@ -420,15 +423,15 @@ pub(crate) fn dwrite_factory() -> Result<IDWriteFactory> {
 }
 
 // `DWRITE_PIXEL_GEOMETRY_FLAT` — grayscale, no RGB/BGR subpixel channels.
-const PIXEL_GEOMETRY_FLAT: u32 = 0;
+const PIXEL_GEOMETRY_FLAT: i32 = 0;
 // `DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC` — the high-quality symmetric
 // anti-aliased outline mode modern Windows UI text uses (v1 enum value 5, shared
 // by `DWRITE_RENDERING_MODE1`).
-const RENDERING_MODE1_NATURAL_SYMMETRIC: u32 = 5;
+const RENDERING_MODE1_NATURAL_SYMMETRIC: i32 = 5;
 // `DWRITE_GRID_FIT_MODE_ENABLED` — snap glyph outlines to the pixel grid
 // (hinting). This is what makes small UI text crisp instead of soft; the base v1
 // `CreateCustomRenderingParams` can't express it, hence the v3 call below.
-const GRID_FIT_MODE_ENABLED: u32 = 2;
+const GRID_FIT_MODE_ENABLED: i32 = 2;
 // Grayscale enhanced contrast for `CreateCustomRenderingParams`. No-op on this path:
 // on NATURAL_SYMMETRIC grayscale, sweeping it (0.5 / 1.5 / 2.5) produced byte-identical
 // output on the dcomp FP16 target. Left at 0.
@@ -459,11 +462,20 @@ const TEXT_AA_COVERAGE_GAMMA: f32 = 2.2;
 /// to `None` (Direct2D defaults) if `IDWriteFactory3` is unavailable; always present
 /// on the Win11 target.
 pub(crate) fn text_rendering_params(linear: bool) -> Option<IDWriteRenderingParams> {
-    static LINEAR: std::sync::OnceLock<Option<IDWriteRenderingParams>> = std::sync::OnceLock::new();
-    static SRGB: std::sync::OnceLock<Option<IDWriteRenderingParams>> = std::sync::OnceLock::new();
+    // DirectWrite rendering params are thread-safe, but the faithful in-house
+    // metadata does not mark `IDWriteRenderingParams` `[agile]`, so it is neither
+    // `Send` nor `Sync`. Wrap it for the process-wide `OnceLock`, exactly as
+    // `dwrite_factory` does for the shared factory.
+    struct SharedParams(Option<IDWriteRenderingParams>);
+    unsafe impl Send for SharedParams {}
+    unsafe impl Sync for SharedParams {}
+
+    static LINEAR: std::sync::OnceLock<SharedParams> = std::sync::OnceLock::new();
+    static SRGB: std::sync::OnceLock<SharedParams> = std::sync::OnceLock::new();
 
     let slot = if linear { &LINEAR } else { &SRGB };
     slot.get_or_init(|| {
+        SharedParams((|| {
         let factory = dwrite_factory().ok()?;
         let factory3: IDWriteFactory3 = Interface::cast(&factory).ok()?;
         unsafe {
@@ -478,7 +490,11 @@ pub(crate) fn text_rendering_params(linear: bool) -> Option<IDWriteRenderingPara
                     GRID_FIT_MODE_ENABLED,
                 )
                 .ok()
+                // v3 call yields IDWriteRenderingParams3; callers take the base type.
+                .and_then(|p| p.cast::<IDWriteRenderingParams>().ok())
         }
+        })())
     })
+    .0
     .clone()
 }

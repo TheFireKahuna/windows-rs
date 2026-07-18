@@ -51,7 +51,8 @@ impl CompositionSurfaceFactory {
     ) -> Result<Self> {
         let interop: sys::ICompositorInterop = compositor.cast()?;
         let device: windows_core::IUnknown = d2d_device.cast()?;
-        let graphics = unsafe { interop.CreateGraphicsDevice(&device)? };
+        let graphics: sys::CompositionGraphicsDevice =
+            unsafe { interop.CreateGraphicsDevice(&device)? }.cast()?;
         Ok(Self {
             compositor: compositor.clone(),
             graphics,
@@ -209,6 +210,6 @@ impl CompositionDrawSurface {
 
     /// Finish drawing and commit the surface contents to the compositor.
     pub fn end_draw(&self) -> Result<()> {
-        unsafe { self.interop.EndDraw() }
+        unsafe { self.interop.EndDraw().ok() }
     }
 }

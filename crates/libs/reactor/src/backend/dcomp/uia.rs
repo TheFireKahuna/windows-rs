@@ -57,7 +57,7 @@ use crate::system_bindings::{
     UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
     UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
     UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_NamePropertyId, UIA_PaneControlTypeId,
-    UIA_PATTERN_ID, UIA_PROPERTY_ID, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
+    PATTERNID, PROPERTYID, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
     UIA_RangeValuePatternId, UIA_RangeValueValuePropertyId,
     UIA_ScrollItemPatternId, UIA_ScrollPatternId, UIA_SelectionItemPatternId,
     UIA_SelectionItem_ElementSelectedEventId, UIA_SelectionPatternId,
@@ -204,7 +204,7 @@ fn is_item_container(kind: ControlKind) -> bool {
     )
 }
 
-fn pattern_supported(kind: ControlKind, item: i32, pid: UIA_PATTERN_ID) -> bool {
+fn pattern_supported(kind: ControlKind, item: i32, pid: PATTERNID) -> bool {
     use ControlKind::*;
     if item >= 0 {
         // Synthetic items select — and also invoke, so `uia:invoke;name=<label>`
@@ -503,7 +503,7 @@ impl DCompBackend {
         &self,
         id: ControlId,
         item: i32,
-        pid: UIA_PATTERN_ID,
+        pid: PATTERNID,
     ) -> bool {
         if is_caption(item) {
             return pid == UIA_InvokePatternId; // caption buttons only invoke
@@ -941,7 +941,7 @@ enum PropVal {
 
 /// Raise `AutomationPropertyChanged` for node `id` — deferred onto the pump.
 /// The old value is reported empty (permitted by the pattern contracts).
-fn raise_property_changed(hwnd: isize, id: ControlId, pid: UIA_PROPERTY_ID, val: PropVal) {
+fn raise_property_changed(hwnd: isize, id: ControlId, pid: PROPERTYID, val: PropVal) {
     host::post_ui(hwnd, move || {
         let provider = stable_provider(ElementProvider::element(hwnd, id));
         // For a BSTR value the VARIANT holds a non-owning alias; `_owner` keeps
@@ -1119,7 +1119,7 @@ impl ElementProvider {
     }
 
     /// A property VARIANT for `pid` (`VT_EMPTY` for anything we don't report).
-    fn property(&self, pid: UIA_PROPERTY_ID) -> VARIANT {
+    fn property(&self, pid: PROPERTYID) -> VARIANT {
         let (hwnd, id, item) = (self.hwnd, self.id, self.item);
         if pid == UIA_NamePropertyId {
             v_bstr(on_backend(hwnd, move |b| b.uia_name(id, item)).unwrap_or_default())
@@ -1227,10 +1227,10 @@ macro_rules! forward_provider {
             fn ProviderOptions(&self) -> Result<ProviderOptions> {
                 self.inner().provider_options()
             }
-            fn GetPatternProvider(&self, patternid: UIA_PATTERN_ID) -> Result<IUnknown> {
+            fn GetPatternProvider(&self, patternid: PATTERNID) -> Result<IUnknown> {
                 self.inner().pattern_provider(patternid)
             }
-            fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> Result<VARIANT> {
+            fn GetPropertyValue(&self, propertyid: PROPERTYID) -> Result<VARIANT> {
                 Ok(self.inner().property(propertyid))
             }
             fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
@@ -1396,7 +1396,7 @@ impl IRawElementProviderFragmentRoot_Impl for RootProvider_Impl {
 impl IRawElementProviderAdviseEvents_Impl for RootProvider_Impl {
     fn AdviseEventAdded(
         &self,
-        _eventid: crate::system_bindings::UIA_EVENT_ID,
+        _eventid: crate::system_bindings::EVENTID,
         _propertyids: *const SAFEARRAY,
     ) -> Result<()> {
         // We use `UiaClientsAreListening` to gate raises, so no bookkeeping is
@@ -1405,7 +1405,7 @@ impl IRawElementProviderAdviseEvents_Impl for RootProvider_Impl {
     }
     fn AdviseEventRemoved(
         &self,
-        _eventid: crate::system_bindings::UIA_EVENT_ID,
+        _eventid: crate::system_bindings::EVENTID,
         _propertyids: *const SAFEARRAY,
     ) -> Result<()> {
         Ok(())
@@ -1419,7 +1419,7 @@ impl ElementProvider {
         Ok(PROVIDER_OPTIONS_SERVER)
     }
 
-    fn pattern_provider(&self, patternid: UIA_PATTERN_ID) -> Result<IUnknown> {
+    fn pattern_provider(&self, patternid: PATTERNID) -> Result<IUnknown> {
         let (id, item) = (self.id, self.item);
         let supported = get(self.hwnd, move |b| Some(b.uia_pattern_supported(id, item, patternid)))?;
         if supported {

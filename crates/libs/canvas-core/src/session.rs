@@ -242,14 +242,15 @@ impl<'a> DrawingSession<'a> {
     ) -> Result<ID2D1GradientStopCollection> {
         unsafe {
             if self.encode_srgb {
-                self.context.CreateGradientStopCollection(
+                ID2D1RenderTarget::CreateGradientStopCollection(
+                    &self.context,
                     abi_stops,
                     D2D1_GAMMA_2_2,
                     D2D1_EXTEND_MODE_CLAMP,
                 )
             } else {
                 self.context
-                    .CreateGradientStopCollection1(
+                    .CreateGradientStopCollection(
                         abi_stops,
                         D2D1_COLOR_SPACE_SCRGB,
                         D2D1_COLOR_SPACE_SCRGB,
@@ -582,7 +583,8 @@ impl<'a> DrawingSession<'a> {
                 D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION as u32,
                 D2D1_PROPERTY_TYPE_FLOAT,
                 &blur_standard_deviation.to_le_bytes(),
-            )?;
+            )
+            .ok()?;
             // The tint composites into the surface, so it follows the same color
             // space: linear on an FP16 target, sRGB passthrough otherwise.
             let color = self.resolve(color);
@@ -591,7 +593,8 @@ impl<'a> DrawingSession<'a> {
             rgba[4..8].copy_from_slice(&color.g.to_le_bytes());
             rgba[8..12].copy_from_slice(&color.b.to_le_bytes());
             rgba[12..16].copy_from_slice(&color.a.to_le_bytes());
-            effect.SetValue(D2D1_SHADOW_PROP_COLOR as u32, D2D1_PROPERTY_TYPE_VECTOR4, &rgba)?;
+            effect.SetValue(D2D1_SHADOW_PROP_COLOR as u32, D2D1_PROPERTY_TYPE_VECTOR4, &rgba)
+                .ok()?;
             Ok(Effect(effect))
         }
     }
@@ -612,7 +615,8 @@ impl<'a> DrawingSession<'a> {
                 D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION as u32,
                 D2D1_PROPERTY_TYPE_FLOAT,
                 &blur_standard_deviation.to_le_bytes(),
-            )?;
+            )
+            .ok()?;
             Ok(Effect(effect))
         }
     }

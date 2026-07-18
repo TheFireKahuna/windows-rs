@@ -46,6 +46,16 @@ pub(crate) use device::D2dLock;
 pub use device::GpuDevice;
 pub use effect::Effect;
 pub use geometry::*;
+/// Set a device context's DPI so drawing happens in DIPs.
+///
+/// The generated binding methods are crate-private, so the `windows-canvas` surface
+/// hosts — which bracket the raw D2D calls themselves — go through this shim rather
+/// than the vtable directly. Not part of the stable surface.
+#[doc(hidden)]
+pub fn set_context_dpi(context: &ID2D1DeviceContext, dpi: f32) {
+    unsafe { context.SetDpi(dpi, dpi) };
+}
+
 pub use session::DrawingSession;
 pub use swap_chain::{SwapChain, WaitObject};
 pub use text::*;

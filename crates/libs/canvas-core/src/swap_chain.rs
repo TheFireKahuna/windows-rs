@@ -105,7 +105,7 @@ impl SwapChain {
         let wait = unsafe {
             let _lock = self.lock();
             let sc2 = self.swap_chain.cast::<IDXGISwapChain2>()?;
-            sc2.SetMaximumFrameLatency(1)?;
+            sc2.SetMaximumFrameLatency(1).ok()?;
             WaitObject(sc2.GetFrameLatencyWaitableObject())
         };
         self.frame_latency = Some(wait);
@@ -182,7 +182,7 @@ impl SwapChain {
         }
         // A waitable chain must keep its creation flag across resizes.
         let flags = if self.frame_latency.is_some() {
-            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT as u32
         } else {
             0
         };
@@ -251,7 +251,7 @@ impl SwapChain {
         if check_device_lost(&result) {
             return Ok(false);
         }
-        result.ok().map(|()| true)
+        result.map(|()| true)
     }
 
     /// Creates a solid color brush. A swap-chain target is 8-bit sRGB, so the brush

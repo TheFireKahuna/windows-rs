@@ -1,171 +1,192 @@
---out crates/libs/canvas/src/bindings.rs
+--out crates/libs/canvas-core/src/bindings.rs
 --flat --minimal --dead-code
 
 --filter
-    Windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, GENERIC_READ}
-    Windows::Win32::Graphics::Direct2D::CLSID_D2D1Shadow
-    Windows::Win32::Graphics::Direct2D::Common::D2D1_ALPHA_MODE_PREMULTIPLIED
-    Windows::Win32::Graphics::Direct2D::Common::D2D1_BEZIER_SEGMENT
-    Windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_FILLED
-    Windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_HOLLOW
-    Windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_CLOSED
-    Windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_OPEN
-    Windows::Win32::Graphics::Direct2D::Common::D2D1_GRADIENT_STOP
-    Windows::Win32::Graphics::Direct2D::Common::ID2D1SimplifiedGeometrySink::{BeginFigure, EndFigure, Close}
-    Windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_CANNOT_DRAW
-    Windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_TARGET
-    Windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1
-    Windows::Win32::Graphics::Direct2D::D2D1_CAP_STYLE_FLAT
-    Windows::Win32::Graphics::Direct2D::D2D1_CAP_STYLE_ROUND
-    Windows::Win32::Graphics::Direct2D::D2D1_CAP_STYLE_SQUARE
-    Windows::Win32::Graphics::Direct2D::D2D1_CAP_STYLE_TRIANGLE
-    Windows::Win32::Graphics::Direct2D::D2D1_DASH_STYLE_DASH
-    Windows::Win32::Graphics::Direct2D::D2D1_DASH_STYLE_DASH_DOT
-    Windows::Win32::Graphics::Direct2D::D2D1_DASH_STYLE_DOT
-    Windows::Win32::Graphics::Direct2D::D2D1_DASH_STYLE_SOLID
-    Windows::Win32::Graphics::Direct2D::D2D1_DEVICE_CONTEXT_OPTIONS_NONE
-    Windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE
-    Windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE
-    Windows::Win32::Graphics::Direct2D::D2D1_EXTEND_MODE_CLAMP
-    Windows::Win32::Graphics::Direct2D::D2D1_FACTORY_TYPE_MULTI_THREADED
-    Windows::Win32::Graphics::Direct2D::D2D1_FACTORY_TYPE_SINGLE_THREADED
-    Windows::Win32::Graphics::Direct2D::D2D1_GAMMA_2_2
-    Windows::Win32::Graphics::Direct2D::D2D1_INTERPOLATION_MODE_LINEAR
-    Windows::Win32::Graphics::Direct2D::D2D1_LINE_JOIN_BEVEL
-    Windows::Win32::Graphics::Direct2D::D2D1_LINE_JOIN_MITER
-    Windows::Win32::Graphics::Direct2D::D2D1_LINE_JOIN_ROUND
-    Windows::Win32::Graphics::Direct2D::D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES
-    Windows::Win32::Graphics::Direct2D::D2D1_PROPERTY_TYPE_FLOAT
-    Windows::Win32::Graphics::Direct2D::D2D1_PROPERTY_TYPE_VECTOR4
-    Windows::Win32::Graphics::Direct2D::D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES
-    Windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT
-    Windows::Win32::Graphics::Direct2D::D2D1_SHADOW_PROP
-    Windows::Win32::Graphics::Direct2D::D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION
-    Windows::Win32::Graphics::Direct2D::D2D1_SHADOW_PROP_COLOR
-    Windows::Win32::Graphics::Direct2D::D2D1CreateFactory
-    Windows::Win32::Graphics::Direct2D::ID2D1Bitmap::GetSize
-    Windows::Win32::Graphics::Direct2D::ID2D1Device::CreateDeviceContext
-    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext::{CreateBitmap, CreateBitmapFromDxgiSurface, CreateBitmapFromWicBitmap, CreateEffect, SetTarget, GetTarget, DrawBitmap, DrawImage}
-    Windows::Win32::Graphics::Direct2D::ID2D1Effect::{SetInput, GetOutput}
-    Windows::Win32::Graphics::Direct2D::ID2D1Factory1::{CreateDevice, CreateStrokeStyle}
-    Windows::Win32::Graphics::Direct2D::ID2D1Factory1::CreatePathGeometry
-    Windows::Win32::Graphics::Direct2D::ID2D1Geometry::{GetBounds, FillContainsPoint, StrokeContainsPoint}
-    Windows::Win32::Graphics::Direct2D::ID2D1GeometrySink::{AddLine, AddBezier}
-    Windows::Win32::Graphics::Direct2D::ID2D1Multithread::{Enter, Leave}
-    Windows::Win32::Graphics::Direct2D::ID2D1PathGeometry::Open
-    Windows::Win32::Graphics::Direct2D::ID2D1Properties::SetValue
-    Windows::Win32::Graphics::Direct2D::ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawTextLayout, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize}
-    Windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush::SetColor
-    Windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE
-    Windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP
-    Windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0
-    Windows::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_BGRA_SUPPORT
-    Windows::Win32::Graphics::Direct3D11::D3D11_SDK_VERSION
-    Windows::Win32::Graphics::Direct3D11::D3D11CreateDevice
-    Windows::Win32::Graphics::DirectWrite::DWRITE_FACTORY_TYPE_SHARED
-    Windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL
-    Windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL
-    Windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT_CENTER
-    Windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT_FAR
-    Windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT_NEAR
-    Windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_CENTER
-    Windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_LEADING
-    Windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_ALIGNMENT_TRAILING
-    Windows::Win32::Graphics::DirectWrite::DWriteCreateFactory
-    Windows::Win32::Graphics::DirectWrite::DWRITE_HIT_TEST_METRICS
-    Windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS
-    Windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING
-    Windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING_GRANULARITY_NONE
-    Windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING_GRANULARITY_CHARACTER
-    Windows::Win32::Graphics::DirectWrite::DWRITE_TRIMMING_GRANULARITY_WORD
-    Windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP
-    Windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_WRAP
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory::{CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign}
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat::{SetTextAlignment, SetParagraphAlignment, SetWordWrapping, SetTrimming}
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout::{SetMaxWidth, SetMaxHeight, GetMetrics, HitTestPoint, HitTestTextPosition}
-    Windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_PREMULTIPLIED
-    Windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM
-    Windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN
-    Windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_HUNG
-    Windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED
-    Windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_RESET
-    Windows::Win32::Graphics::Dxgi::DXGI_ERROR_DRIVER_INTERNAL_ERROR
-    Windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1
-    Windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
-    Windows::Win32::Graphics::Dxgi::DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
-    Windows::Win32::Graphics::Dxgi::DXGI_USAGE_RENDER_TARGET_OUTPUT
-    Windows::Win32::Graphics::Dxgi::IDXGIDevice::GetAdapter
-    Windows::Win32::Graphics::Dxgi::IDXGIFactory2::{CreateSwapChainForComposition, CreateSwapChainForHwnd}
-    Windows::Win32::Graphics::Dxgi::IDXGIObject::GetParent
-    Windows::Win32::Graphics::Dxgi::IDXGISwapChain::{Present, GetBuffer, ResizeBuffers}
-    Windows::Win32::Graphics::Dxgi::IDXGISwapChain2::{SetMatrixTransform, GetFrameLatencyWaitableObject, SetMaximumFrameLatency}
-    Windows::Win32::Graphics::Imaging::CLSID_WICImagingFactory
-    Windows::Win32::Graphics::Imaging::GUID_WICPixelFormat32bppPBGRA
-    Windows::Win32::Graphics::Imaging::IWICBitmapDecoder::GetFrame
-    Windows::Win32::Graphics::Imaging::IWICFormatConverter::Initialize
-    Windows::Win32::Graphics::Imaging::IWICImagingFactory::{CreateDecoderFromFilename, CreateFormatConverter}
-    Windows::Win32::Graphics::Imaging::WICBitmapDitherTypeNone
-    Windows::Win32::Graphics::Imaging::WICBitmapPaletteTypeMedianCut
-    Windows::Win32::Graphics::Imaging::WICDecodeMetadataCacheOnDemand
-    Windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance}
-    Windows::Win32::System::Threading::WaitForSingleObjectEx
-    Windows::Win32::Graphics::Direct2D::ID2D1Factory2
-    Windows::Win32::Graphics::Direct2D::ID2D1Factory3
-    Windows::Win32::Graphics::Direct2D::ID2D1Factory4
-    Windows::Win32::Graphics::Direct2D::ID2D1Factory5
-    Windows::Win32::Graphics::Direct2D::ID2D1Factory6
-    Windows::Win32::Graphics::Direct2D::ID2D1Factory7
-    Windows::Win32::Graphics::Direct2D::ID2D1Device1
-    Windows::Win32::Graphics::Direct2D::ID2D1Device2
-    Windows::Win32::Graphics::Direct2D::ID2D1Device3
-    Windows::Win32::Graphics::Direct2D::ID2D1Device4
-    Windows::Win32::Graphics::Direct2D::ID2D1Device5
-    Windows::Win32::Graphics::Direct2D::ID2D1Device6
-    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext::CreateCommandList
-    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext1::{CreateFilledGeometryRealization, CreateStrokedGeometryRealization, DrawGeometryRealization}
-    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext2
-    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext3
-    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext4
-    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext5::CreateColorContextFromDxgiColorSpace
-    Windows::Win32::Graphics::Direct2D::ID2D1DeviceContext6
-    Windows::Win32::Graphics::Direct2D::ID2D1RenderTarget::{PushAxisAlignedClip, PopAxisAlignedClip, SetTextAntialiasMode}
-    Windows::Win32::Graphics::Direct2D::ID2D1CommandList
-    Windows::Win32::Graphics::Direct2D::ID2D1GeometryRealization
-    Windows::Win32::Graphics::Direct2D::ID2D1ColorContext1
-    Windows::Win32::Graphics::Direct2D::CLSID_D2D1ColorManagement
-    Windows::Win32::Graphics::Direct2D::D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS
-    Windows::Win32::Graphics::Direct2D::D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
-    Windows::Win32::Graphics::Direct2D::D2D1_BITMAP_OPTIONS_NONE
-    Windows::Win32::Graphics::Direct2D::D2D1_GAMMA_1_0
-    Windows::Win32::Graphics::Direct2D::D2D1_COLOR_SPACE
-    Windows::Win32::Graphics::Direct2D::D2D1_BUFFER_PRECISION
-    Windows::Win32::Graphics::Direct2D::D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout::{SetFontWeight, SetFontStyle, SetFontStretch, SetUnderline, SetStrikethrough, SetDrawingEffect, HitTestTextRange}
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout1::SetCharacterSpacing
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout2
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout3
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextLayout4
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat1
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat2
-    Windows::Win32::Graphics::DirectWrite::IDWriteTextFormat3::SetFontAxisValues
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory1
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory2::TranslateColorGlyphRun
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory3
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory4
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory5
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory6
-    Windows::Win32::Graphics::DirectWrite::IDWriteFactory7
-    Windows::Win32::Graphics::DirectWrite::IDWriteColorGlyphRunEnumerator::{MoveNext, GetCurrentRun}
-    Windows::Win32::Graphics::DirectWrite::DWRITE_COLOR_GLYPH_RUN
-    Windows::Win32::Graphics::DirectWrite::DWRITE_FONT_AXIS_VALUE
-    Windows::Win32::Graphics::Dxgi::IDXGISwapChain3::{SetColorSpace1, CheckColorSpaceSupport}
-    Windows::Win32::Graphics::Dxgi::IDXGIOutput1
-    Windows::Win32::Graphics::Dxgi::IDXGIOutput2
-    Windows::Win32::Graphics::Dxgi::IDXGIOutput3
-    Windows::Win32::Graphics::Dxgi::IDXGIOutput4
-    Windows::Win32::Graphics::Dxgi::IDXGIOutput5
-    Windows::Win32::Graphics::Dxgi::IDXGIOutput6::GetDesc1
-    Windows::Win32::Graphics::Dxgi::DXGI_OUTPUT_DESC1
-    Windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT
-    Windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
-    Windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    D2DERR_RECREATE_TARGET
+    GENERIC_READ
+    CLSID_D2D1Shadow
+    D2D1_ALPHA_MODE_PREMULTIPLIED
+    D2D1_BEZIER_SEGMENT
+    D2D1_FIGURE_BEGIN_FILLED
+    D2D1_FIGURE_BEGIN_HOLLOW
+    D2D1_FIGURE_END_CLOSED
+    D2D1_FIGURE_END_OPEN
+    D2D1_GRADIENT_STOP
+    ID2D1SimplifiedGeometrySink::{BeginFigure, EndFigure, Close}
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW
+    D2D1_BITMAP_OPTIONS_TARGET
+    D2D1_BITMAP_OPTIONS_CPU_READ
+    D2D1_BITMAP_PROPERTIES1
+    D2D1_CAP_STYLE_FLAT
+    D2D1_CAP_STYLE_ROUND
+    D2D1_CAP_STYLE_SQUARE
+    D2D1_CAP_STYLE_TRIANGLE
+    D2D1_DASH_STYLE_DASH
+    D2D1_DASH_STYLE_DASH_DOT
+    D2D1_DASH_STYLE_DOT
+    D2D1_DASH_STYLE_SOLID
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE
+    D2D1_DRAW_TEXT_OPTIONS_NONE
+    D2D1_ELLIPSE
+    D2D1_EXTEND_MODE_CLAMP
+    D2D1_EXTEND_MODE_WRAP
+    D2D1_FACTORY_TYPE_MULTI_THREADED
+    D2D1_FACTORY_TYPE_SINGLE_THREADED
+    D2D1_GAMMA_2_2
+    D2D1_INTERPOLATION_MODE_LINEAR
+    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+    D2D1_LINE_JOIN_BEVEL
+    D2D1_LINE_JOIN_MITER
+    D2D1_LINE_JOIN_ROUND
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES
+    D2D1_PROPERTY_TYPE_FLOAT
+    D2D1_PROPERTY_TYPE_VECTOR4
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES
+    D2D1_ROUNDED_RECT
+    D2D1_SHADOW_PROP
+    D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION
+    D2D1_SHADOW_PROP_COLOR
+    D2D1CreateFactory
+    ID2D1Bitmap::{GetSize, CopyFromBitmap}
+    ID2D1Bitmap1::{Map, Unmap}
+    ID2D1Device::CreateDeviceContext
+    ID2D1DeviceContext::{CreateBitmap, CreateBitmapFromDxgiSurface, CreateBitmapFromWicBitmap, CreateEffect, SetTarget, GetTarget, DrawBitmap, DrawImage, CreateBitmapBrush, CreateGradientStopCollection, SetPrimitiveBlend}
+    ID2D1Brush::SetOpacity
+    ID2D1BitmapBrush1
+    ID2D1GradientStopCollection1
+    ID2D1Effect::{SetInput, GetOutput}
+    ID2D1Factory1::{CreateDevice, CreateStrokeStyle}
+    ID2D1Factory1::CreatePathGeometry
+    ID2D1Geometry::{GetBounds, FillContainsPoint, StrokeContainsPoint}
+    ID2D1GeometrySink::{AddLine, AddBezier}
+    ID2D1Multithread::{Enter, Leave}
+    ID2D1PathGeometry::Open
+    ID2D1Properties::SetValue
+    ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawTextLayout, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, SetTextRenderingParams}
+    ID2D1SolidColorBrush::SetColor
+    D3D_DRIVER_TYPE_HARDWARE
+    D3D_DRIVER_TYPE_WARP
+    D3D_FEATURE_LEVEL_11_0
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT
+    D3D11_SDK_VERSION
+    D3D11CreateDevice
+    DWRITE_FACTORY_TYPE_SHARED
+    DWRITE_FONT_STRETCH_NORMAL
+    DWRITE_FONT_STYLE_NORMAL
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+    DWRITE_PARAGRAPH_ALIGNMENT_FAR
+    DWRITE_PARAGRAPH_ALIGNMENT_NEAR
+    DWRITE_TEXT_ALIGNMENT_CENTER
+    DWRITE_TEXT_ALIGNMENT_LEADING
+    DWRITE_TEXT_ALIGNMENT_TRAILING
+    DWriteCreateFactory
+    DWRITE_HIT_TEST_METRICS
+    DWRITE_TEXT_METRICS
+    DWRITE_TRIMMING
+    DWRITE_TRIMMING_GRANULARITY_NONE
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER
+    DWRITE_TRIMMING_GRANULARITY_WORD
+    DWRITE_WORD_WRAPPING_NO_WRAP
+    DWRITE_WORD_WRAPPING_WRAP
+    IDWriteFactory::{CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign, CreateCustomRenderingParams}
+    IDWriteTextFormat::{SetTextAlignment, SetParagraphAlignment, SetWordWrapping, SetTrimming}
+    IDWriteTextLayout::{SetMaxWidth, SetMaxHeight, GetMetrics, HitTestPoint, HitTestTextPosition}
+    DXGI_ALPHA_MODE_PREMULTIPLIED
+    DXGI_FORMAT_B8G8R8A8_UNORM
+    DXGI_FORMAT_UNKNOWN
+    DXGI_ERROR_DEVICE_HUNG
+    DXGI_ERROR_DEVICE_REMOVED
+    DXGI_ERROR_DEVICE_RESET
+    DXGI_ERROR_DRIVER_INTERNAL_ERROR
+    DXGI_SWAP_CHAIN_DESC1
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+    DXGI_USAGE_RENDER_TARGET_OUTPUT
+    IDXGIDevice::GetAdapter
+    IDXGIFactory2::{CreateSwapChainForComposition, CreateSwapChainForHwnd}
+    IDXGIObject::GetParent
+    IDXGISwapChain::{Present, GetBuffer, ResizeBuffers}
+    IDXGISwapChain2::{SetMatrixTransform, GetFrameLatencyWaitableObject, SetMaximumFrameLatency}
+    CLSID_WICImagingFactory
+    GUID_WICPixelFormat32bppPBGRA
+    IWICBitmapDecoder::GetFrame
+    IWICFormatConverter::Initialize
+    IWICImagingFactory::{CreateDecoderFromFilename, CreateFormatConverter}
+    WICBitmapDitherTypeNone
+    WICBitmapPaletteTypeMedianCut
+    WICDecodeMetadataCacheOnDemand
+    CLSCTX_INPROC_SERVER
+    CoCreateInstance
+    WaitForSingleObjectEx
+    ID2D1Factory2
+    ID2D1Factory3
+    ID2D1Factory4
+    ID2D1Factory5
+    ID2D1Factory6
+    ID2D1Factory7
+    ID2D1Device1
+    ID2D1Device2
+    ID2D1Device3
+    ID2D1Device4
+    ID2D1Device5
+    ID2D1Device6
+    ID2D1DeviceContext::CreateCommandList
+    ID2D1DeviceContext1::{CreateFilledGeometryRealization, CreateStrokedGeometryRealization, DrawGeometryRealization}
+    ID2D1DeviceContext2
+    ID2D1DeviceContext3
+    ID2D1DeviceContext4
+    ID2D1DeviceContext5::CreateColorContextFromDxgiColorSpace
+    ID2D1DeviceContext6
+    ID2D1RenderTarget::{PushAxisAlignedClip, PopAxisAlignedClip, SetTextAntialiasMode}
+    ID2D1CommandList
+    ID2D1GeometryRealization
+    ID2D1ColorContext1
+    CLSID_D2D1ColorManagement
+    D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS
+    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
+    D2D1_BITMAP_OPTIONS_NONE
+    D2D1_GAMMA_1_0
+    CLSID_D2D1GaussianBlur
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION
+    D2D1_BITMAP_BRUSH_PROPERTIES1
+    D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT
+    D2D1_MAPPED_RECT
+    D2D1_MAP_OPTIONS_READ
+    D2D1_PRIMITIVE_BLEND_ADD
+    D2D1_PRIMITIVE_BLEND_SOURCE_OVER
+    D2D1_PROPERTY_TYPE_ENUM
+    D2D_POINT_2U
+    D2D_RECT_U
+    DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE
+    D2D1_COLOR_SPACE
+    D2D1_BUFFER_PRECISION
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+    IDWriteTextLayout::{SetFontWeight, SetFontStyle, SetFontStretch, SetUnderline, SetStrikethrough, SetDrawingEffect, HitTestTextRange}
+    IDWriteTextLayout1::SetCharacterSpacing
+    IDWriteTextLayout2
+    IDWriteTextLayout3
+    IDWriteTextLayout4
+    IDWriteTextFormat1
+    IDWriteTextFormat2
+    IDWriteTextFormat3::{SetFontAxisValues, SetAutomaticFontAxes}
+    IDWriteFactory1
+    IDWriteFactory2::TranslateColorGlyphRun
+    IDWriteFactory3
+    IDWriteFactory4
+    IDWriteFactory5
+    IDWriteFactory6
+    IDWriteFactory7
+    IDWriteColorGlyphRunEnumerator::{MoveNext, GetCurrentRun}
+    DWRITE_COLOR_GLYPH_RUN
+    DWRITE_FONT_AXIS_VALUE
+    IDXGISwapChain3::{SetColorSpace1, CheckColorSpaceSupport}
+    IDXGIOutput1
+    IDXGIOutput2
+    IDXGIOutput3
+    IDXGIOutput4
+    IDXGIOutput5
+    IDXGIOutput6::GetDesc1
+    DXGI_OUTPUT_DESC1
+    DXGI_FORMAT_R16G16B16A16_FLOAT
+    DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709

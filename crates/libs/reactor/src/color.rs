@@ -45,6 +45,12 @@ impl Color {
         Self { r, g, b, a }
     }
 
+    /// Fully transparent. Every channel is zero, so it composites as a no-op
+    /// regardless of the target's color space.
+    pub const fn transparent() -> Self {
+        Self::new(0.0, 0.0, 0.0, 0.0)
+    }
+
     /// An opaque color from 8-bit **sRGB** channels — gamma-decoded to linear, so a
     /// legacy hex literal lands at the right luminance. `const` (table lookup).
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {

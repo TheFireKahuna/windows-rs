@@ -1,11 +1,13 @@
 #[win32]
 mod Windows {
     mod Win32 {
+        const DRMACTSERVINFOVERSION: u32 = 0;
         #[repr(i32)]
         enum DRMATTESTTYPE {
             DRMATTESTTYPE_FULLENVIRONMENT = 0,
             DRMATTESTTYPE_HASHONLY = 1,
         }
+        const DRMBINDINGFLAGS_IGNORE_VALIDITY_INTERVALS: u32 = 1;
         struct DRMBOUNDLICENSEPARAMS {
             uVersion: u32,
             hEnablingPrincipal: DRMHANDLE,
@@ -18,7 +20,10 @@ mod Windows {
             wszDefaultEnablingPrincipalCredentials: PWSTR,
             dwFlags: u32,
         }
+        const DRMBOUNDLICENSEPARAMSVERSION: u32 = 1;
         extern fn DRMCALLBACK(param0: DRM_STATUS_MSG, param1: HRESULT, param2: *mut void, param3: *mut void) -> HRESULT;
+        const DRMCALLBACKVERSION: u32 = 1;
+        const DRMCLIENTSTRUCTVERSION: u32 = 1;
         #[repr(i32)]
         enum DRMENCODINGTYPE {
             DRMENCODINGTYPE_BASE64 = 0,
@@ -44,6 +49,8 @@ mod Windows {
             wszIDType: PWSTR,
             wszID: PWSTR,
         }
+        const DRMIDVERSION: u32 = 0;
+        const DRMLICENSEACQDATAVERSION: u32 = 0;
         type DRMPUBHANDLE = u32;
         const DRMPUBHANDLE_INVALID: u32 = 0;
         type DRMQUERYHANDLE = u32;

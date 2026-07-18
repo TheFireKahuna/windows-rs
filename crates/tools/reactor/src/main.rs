@@ -130,7 +130,9 @@ fn generate_reactor_bindings() {
     // server-implemented, so they are emitted with `_Impl` scaffolding.
     let system_args = [
         "--in",
-        "winmd",
+        "crates/libs/bindgen/default/Windows.winmd",
+        "crates/libs/bindgen/default/Windows.Win32.winmd",
+        "crates/tools/reactor/winmd/extras.winmd",
         "--out",
         "crates/libs/reactor/src/system_bindings.rs",
         "--implement",
@@ -152,7 +154,7 @@ fn generate_reactor_bindings() {
         // compositor (Knob value arc → CompositionPath): the WinRT marker the
         // CompositionPath factory accepts + the interop that yields the D2D geometry.
         "Windows.Graphics.IGeometrySource2D",
-        "Windows.Win32.System.WinRT.Graphics.Direct2D.IGeometrySource2DInterop",
+        "extras.IGeometrySource2DInterop",
         "--minimal",
         "--dead-code",
         "--flat",

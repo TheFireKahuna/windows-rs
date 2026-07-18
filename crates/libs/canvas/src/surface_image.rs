@@ -121,7 +121,7 @@ impl SurfaceImage {
         // Draw in DIPs (crisp at high DPI), positioned so the dirty rect's origin
         // lands at the atlas offset: pixel = (S + t)·scale must equal
         // offset + (S − rect.origin)·scale, so t = offset/scale − rect.origin.
-        unsafe { context.SetDpi(self.dpi, self.dpi) };
+        windows_canvas_core::set_context_dpi(&context, self.dpi);
         let tx = offset_x as f32 / scale - rect.left;
         let ty = offset_y as f32 / scale - rect.top;
         {

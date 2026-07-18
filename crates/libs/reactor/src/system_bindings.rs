@@ -5,7 +5,7 @@ windows_core::link!("kernel32.dll" "system" fn CloseHandle(hobject : HANDLE) -> 
 windows_core::link!("coremessaging.dll" "system" fn CreateDispatcherQueueController(options : DispatcherQueueOptions, dispatcherqueuecontroller : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
 windows_core::link!("kernel32.dll" "system" fn CreateEventW(lpeventattributes : *const SECURITY_ATTRIBUTES, bmanualreset : windows_core::BOOL, binitialstate : windows_core::BOOL, lpname : windows_core::PCWSTR) -> HANDLE);
 windows_core::link!("kernel32.dll" "system" fn CreateWaitableTimerExW(lptimerattributes : *const SECURITY_ATTRIBUTES, lptimername : windows_core::PCWSTR, dwflags : u32, dwdesiredaccess : u32) -> HANDLE);
-windows_core::link!("user32.dll" "system" fn CreateWindowExW(dwexstyle : WINDOW_EX_STYLE, lpclassname : windows_core::PCWSTR, lpwindowname : windows_core::PCWSTR, dwstyle : WINDOW_STYLE, x : i32, y : i32, nwidth : i32, nheight : i32, hwndparent : HWND, hmenu : HMENU, hinstance : HINSTANCE, lpparam : *const core::ffi::c_void) -> HWND);
+windows_core::link!("user32.dll" "system" fn CreateWindowExW(dwexstyle : u32, lpclassname : windows_core::PCWSTR, lpwindowname : windows_core::PCWSTR, dwstyle : u32, x : i32, y : i32, nwidth : i32, nheight : i32, hwndparent : HWND, hmenu : HMENU, hinstance : HINSTANCE, lpparam : *const core::ffi::c_void) -> HWND);
 windows_core::link!("dcomp.dll" "system" fn DCompositionWaitForCompositorClock(count : u32, handles : *const HANDLE, timeoutinms : u32) -> u32);
 windows_core::link!("user32.dll" "system" fn DefWindowProcW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
 windows_core::link!("user32.dll" "system" fn DestroyWindow(hwnd : HWND) -> windows_core::BOOL);
@@ -24,37 +24,37 @@ windows_core::link!("user32.dll" "system" fn GetMessageW(lpmsg : *mut MSG, hwnd 
 windows_core::link!("kernel32.dll" "system" fn GetModuleHandleW(lpmodulename : windows_core::PCWSTR) -> HMODULE);
 windows_core::link!("user32.dll" "system" fn GetMonitorInfoW(hmonitor : HMONITOR, lpmi : *mut MONITORINFO) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn GetPointerInfo(pointerid : u32, pointerinfo : *mut POINTER_INFO) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn GetSystemMetricsForDpi(nindex : SYSTEM_METRICS_INDEX, dpi : u32) -> i32);
+windows_core::link!("user32.dll" "system" fn GetSystemMetricsForDpi(nindex : i32, dpi : u32) -> i32);
 #[cfg(any(
     target_arch = "aarch64",
     target_arch = "arm64ec",
     target_arch = "x86_64"
 ))]
-windows_core::link!("user32.dll" "system" fn GetWindowLongPtrW(hwnd : HWND, nindex : WINDOW_LONG_PTR_INDEX) -> isize);
+windows_core::link!("user32.dll" "system" fn GetWindowLongPtrW(hwnd : HWND, nindex : i32) -> isize);
 #[cfg(target_pointer_width = "32")]
 pub use GetWindowLongW as GetWindowLongPtrW;
-windows_core::link!("user32.dll" "system" fn GetWindowLongW(hwnd : HWND, nindex : WINDOW_LONG_PTR_INDEX) -> i32);
+windows_core::link!("user32.dll" "system" fn GetWindowLongW(hwnd : HWND, nindex : i32) -> i32);
 windows_core::link!("user32.dll" "system" fn GetWindowRect(hwnd : HWND, lprect : *mut RECT) -> windows_core::BOOL);
-windows_core::link!("kernel32.dll" "system" fn GlobalAlloc(uflags : GLOBAL_ALLOC_FLAGS, dwbytes : usize) -> HGLOBAL);
+windows_core::link!("kernel32.dll" "system" fn GlobalAlloc(uflags : u32, dwbytes : usize) -> HGLOBAL);
 windows_core::link!("kernel32.dll" "system" fn GlobalFree(hmem : HGLOBAL) -> HGLOBAL);
 windows_core::link!("kernel32.dll" "system" fn GlobalLock(hmem : HGLOBAL) -> *mut core::ffi::c_void);
 windows_core::link!("kernel32.dll" "system" fn GlobalUnlock(hmem : HGLOBAL) -> windows_core::BOOL);
-windows_core::link!("imm32.dll" "system" fn ImmGetCompositionStringW(param0 : HIMC, param1 : IME_COMPOSITION_STRING, lpbuf : *mut core::ffi::c_void, dwbuflen : u32) -> i32);
+windows_core::link!("imm32.dll" "system" fn ImmGetCompositionStringW(param0 : HIMC, param1 : u32, lpbuf : *mut core::ffi::c_void, dwbuflen : u32) -> i32);
 windows_core::link!("imm32.dll" "system" fn ImmGetContext(param0 : HWND) -> HIMC);
 windows_core::link!("imm32.dll" "system" fn ImmGetDefaultIMEWnd(param0 : HWND) -> HWND);
-windows_core::link!("imm32.dll" "system" fn ImmNotifyIME(param0 : HIMC, dwaction : NOTIFY_IME_ACTION, dwindex : NOTIFY_IME_INDEX, dwvalue : u32) -> windows_core::BOOL);
+windows_core::link!("imm32.dll" "system" fn ImmNotifyIME(param0 : HIMC, dwaction : u32, dwindex : u32, dwvalue : u32) -> windows_core::BOOL);
 windows_core::link!("imm32.dll" "system" fn ImmReleaseContext(param0 : HWND, param1 : HIMC) -> windows_core::BOOL);
 windows_core::link!("imm32.dll" "system" fn ImmSetCompositionWindow(param0 : HIMC, lpcompform : *const COMPOSITIONFORM) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn IsZoomed(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn LoadCursorW(hinstance : HINSTANCE, lpcursorname : windows_core::PCWSTR) -> HCURSOR);
-windows_core::link!("user32.dll" "system" fn MonitorFromPoint(pt : POINT, dwflags : MONITOR_FROM_FLAGS) -> HMONITOR);
-windows_core::link!("user32.dll" "system" fn MonitorFromWindow(hwnd : HWND, dwflags : MONITOR_FROM_FLAGS) -> HMONITOR);
+windows_core::link!("user32.dll" "system" fn MonitorFromPoint(pt : POINT, dwflags : u32) -> HMONITOR);
+windows_core::link!("user32.dll" "system" fn MonitorFromWindow(hwnd : HWND, dwflags : u32) -> HMONITOR);
 windows_core::link!("user32.dll" "system" fn OpenClipboard(hwndnewowner : HWND) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn PeekMessageW(lpmsg : *mut MSG, hwnd : HWND, wmsgfiltermin : u32, wmsgfiltermax : u32, wremovemsg : PEEK_MESSAGE_REMOVE_TYPE) -> windows_core::BOOL);
+windows_core::link!("user32.dll" "system" fn PeekMessageW(lpmsg : *mut MSG, hwnd : HWND, wmsgfiltermin : u32, wmsgfiltermax : u32, wremovemsg : u32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn PostMessageW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn PostQuitMessage(nexitcode : i32));
-windows_core::link!("user32.dll" "system" fn RegisterClassExW(param0 : *const WNDCLASSEXW) -> u16);
-windows_core::link!("user32.dll" "system" fn RegisterClassW(lpwndclass : *const WNDCLASSW) -> u16);
+windows_core::link!("user32.dll" "system" fn RegisterClassExW(param0 : *const WNDCLASSEXW) -> ATOM);
+windows_core::link!("user32.dll" "system" fn RegisterClassW(lpwndclass : *const WNDCLASSW) -> ATOM);
 windows_core::link!("user32.dll" "system" fn ReleaseCapture() -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn ScreenToClient(hwnd : HWND, lppoint : *mut POINT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn SendMessageW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
@@ -69,24 +69,24 @@ windows_core::link!("kernel32.dll" "system" fn SetWaitableTimerEx(htimer : HANDL
     target_arch = "arm64ec",
     target_arch = "x86_64"
 ))]
-windows_core::link!("user32.dll" "system" fn SetWindowLongPtrW(hwnd : HWND, nindex : WINDOW_LONG_PTR_INDEX, dwnewlong : isize) -> isize);
+windows_core::link!("user32.dll" "system" fn SetWindowLongPtrW(hwnd : HWND, nindex : i32, dwnewlong : isize) -> isize);
 #[cfg(target_pointer_width = "32")]
 pub use SetWindowLongW as SetWindowLongPtrW;
-windows_core::link!("user32.dll" "system" fn SetWindowLongW(hwnd : HWND, nindex : WINDOW_LONG_PTR_INDEX, dwnewlong : i32) -> i32);
-windows_core::link!("user32.dll" "system" fn SetWindowPos(hwnd : HWND, hwndinsertafter : HWND, x : i32, y : i32, cx : i32, cy : i32, uflags : SET_WINDOW_POS_FLAGS) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn ShowWindow(hwnd : HWND, ncmdshow : SHOW_WINDOW_CMD) -> windows_core::BOOL);
+windows_core::link!("user32.dll" "system" fn SetWindowLongW(hwnd : HWND, nindex : i32, dwnewlong : i32) -> i32);
+windows_core::link!("user32.dll" "system" fn SetWindowPos(hwnd : HWND, hwndinsertafter : HWND, x : i32, y : i32, cx : i32, cy : i32, uflags : u32) -> windows_core::BOOL);
+windows_core::link!("user32.dll" "system" fn ShowWindow(hwnd : HWND, ncmdshow : i32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn TrackMouseEvent(lpeventtrack : *mut TRACKMOUSEEVENT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn TranslateMessage(lpmsg : *const MSG) -> windows_core::BOOL);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaDisconnectProvider(pprovider : *mut core::ffi::c_void) -> windows_core::HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaHostProviderFromHwnd(hwnd : HWND, ppprovider : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
-windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseAutomationEvent(pprovider : *mut core::ffi::c_void, id : UIA_EVENT_ID) -> windows_core::HRESULT);
-windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseAutomationPropertyChangedEvent(pprovider : *mut core::ffi::c_void, id : UIA_PROPERTY_ID, oldvalue : VARIANT, newvalue : VARIANT) -> windows_core::HRESULT);
+windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseAutomationEvent(pprovider : *mut core::ffi::c_void, id : EVENTID) -> windows_core::HRESULT);
+windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseAutomationPropertyChangedEvent(pprovider : *mut core::ffi::c_void, id : PROPERTYID, oldvalue : VARIANT, newvalue : VARIANT) -> windows_core::HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaReturnRawElementProvider(hwnd : HWND, wparam : WPARAM, lparam : LPARAM, el : *mut core::ffi::c_void) -> LRESULT);
 windows_core::link!("user32.dll" "system" fn UnregisterClassW(lpclassname : windows_core::PCWSTR, hinstance : HINSTANCE) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn UpdateWindow(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn ValidateRect(hwnd : HWND, lprect : *const RECT) -> windows_core::BOOL);
-windows_core::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u32, lphandles : *const HANDLE, bwaitall : windows_core::BOOL, dwmilliseconds : u32) -> WAIT_EVENT);
-pub type ADVANCED_FEATURE_FLAGS = u16;
+windows_core::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u32, lphandles : *const HANDLE, bwaitall : windows_core::BOOL, dwmilliseconds : u32) -> u32);
+pub type ATOM = u16;
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AnimationIterationBehavior(pub i32);
@@ -102,20 +102,19 @@ impl windows_core::RuntimeType for AnimationIterationBehavior {
         b"enum(Windows.UI.Composition.AnimationIterationBehavior;i4)",
     );
 }
-pub const CF_UNICODETEXT: CLIPBOARD_FORMAT = 13;
-pub type CLIPBOARD_FORMAT = u16;
-pub const CLSID_TF_ThreadMgr: windows_core::GUID =
-    windows_core::GUID::from_u128(0x529a9e6b_6587_4f23_ab9e_9c7d683e3c50);
+pub const CF_UNICODETEXT: u32 = 13;
+pub type CLIPFORMAT = u16;
 pub type COLORREF = u32;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct COMPOSITIONFORM {
     pub dwStyle: u32,
     pub ptCurrentPos: POINT,
     pub rcArea: RECT,
 }
+pub type CONTROLTYPEID = i32;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CREATESTRUCTW {
     pub lpCreateParams: *mut core::ffi::c_void,
     pub hInstance: HINSTANCE,
@@ -128,17 +127,17 @@ pub struct CREATESTRUCTW {
     pub style: i32,
     pub lpszName: windows_core::PCWSTR,
     pub lpszClass: windows_core::PCWSTR,
-    pub dwExStyle: WINDOW_EX_STYLE,
+    pub dwExStyle: u32,
 }
 impl Default for CREATESTRUCTW {
     fn default() -> Self {
         unsafe { core::mem::zeroed() }
     }
 }
-pub const CS_DBLCLKS: WNDCLASS_STYLES = 8;
-pub const CS_HREDRAW: WNDCLASS_STYLES = 2;
-pub const CS_OWNDC: WNDCLASS_STYLES = 32;
-pub const CS_VREDRAW: WNDCLASS_STYLES = 1;
+pub const CS_DBLCLKS: u32 = 8;
+pub const CS_HREDRAW: u32 = 2;
+pub const CS_OWNDC: u32 = 32;
+pub const CS_VREDRAW: u32 = 1;
 pub const CW_USEDEFAULT: i32 = -2147483648;
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -152,7 +151,7 @@ impl Default for CY {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CY_0 {
     pub Lo: u32,
     pub Hi: i32,
@@ -1134,7 +1133,7 @@ unsafe impl Sync for CubicBezierEasingFunction {}
 #[derive(Clone, Copy)]
 pub struct DECIMAL {
     pub wReserved: u16,
-    pub Anonymous1: DECIMAL_0,
+    pub Anonymous: DECIMAL_0,
     pub Hi32: u32,
     pub Anonymous2: DECIMAL_1,
 }
@@ -1155,7 +1154,7 @@ impl Default for DECIMAL_0 {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DECIMAL_0_0 {
     pub scale: u8,
     pub sign: u8,
@@ -1172,7 +1171,7 @@ impl Default for DECIMAL_1 {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DECIMAL_1_0 {
     pub Lo32: u32,
     pub Mid32: u32,
@@ -1181,8 +1180,13 @@ pub type DISPATCHERQUEUE_THREAD_APARTMENTTYPE = i32;
 pub type DISPATCHERQUEUE_THREAD_TYPE = i32;
 pub type DPI_AWARENESS_CONTEXT = *mut core::ffi::c_void;
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT = -4 as _;
+pub const DQTAT_COM_ASTA: DISPATCHERQUEUE_THREAD_APARTMENTTYPE = 1;
+pub const DQTAT_COM_NONE: DISPATCHERQUEUE_THREAD_APARTMENTTYPE = 0;
+pub const DQTAT_COM_STA: DISPATCHERQUEUE_THREAD_APARTMENTTYPE = 2;
+pub const DQTYPE_THREAD_CURRENT: DISPATCHERQUEUE_THREAD_TYPE = 2;
+pub const DQTYPE_THREAD_DEDICATED: DISPATCHERQUEUE_THREAD_TYPE = 1;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DVTARGETDEVICE {
     pub tdSize: u32,
     pub tdDriverNameOffset: u16,
@@ -1474,13 +1478,18 @@ impl<F: Fn() + 'static> DispatcherQueueHandlerBox<F> {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DispatcherQueueOptions {
     pub dwSize: u32,
     pub threadType: DISPATCHERQUEUE_THREAD_TYPE,
     pub apartmentType: DISPATCHERQUEUE_THREAD_APARTMENTTYPE,
 }
+pub type EVENTID = i32;
 pub type ExpandCollapseState = i32;
+pub const ExpandCollapseState_Collapsed: ExpandCollapseState = 0;
+pub const ExpandCollapseState_Expanded: ExpandCollapseState = 1;
+pub const ExpandCollapseState_LeafNode: ExpandCollapseState = 3;
+pub const ExpandCollapseState_PartiallyExpanded: ExpandCollapseState = 2;
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpressionAnimation(windows_core::IUnknown);
@@ -1515,9 +1524,9 @@ impl windows_core::RuntimeName for ExpressionAnimation {
 unsafe impl Send for ExpressionAnimation {}
 unsafe impl Sync for ExpressionAnimation {}
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FORMATETC {
-    pub cfFormat: u16,
+    pub cfFormat: CLIPFORMAT,
     pub ptd: *mut DVTARGETDEVICE,
     pub dwAspect: u32,
     pub lindex: i32,
@@ -1528,23 +1537,22 @@ impl Default for FORMATETC {
         unsafe { core::mem::zeroed() }
     }
 }
-pub const GCS_COMPSTR: IME_COMPOSITION_STRING = 8;
-pub const GCS_RESULTSTR: IME_COMPOSITION_STRING = 2048;
-pub type GLOBAL_ALLOC_FLAGS = u32;
-pub const GMEM_MOVEABLE: GLOBAL_ALLOC_FLAGS = 2;
-pub const GMEM_ZEROINIT: GLOBAL_ALLOC_FLAGS = 64;
-pub const GWLP_USERDATA: WINDOW_LONG_PTR_INDEX = -21;
-pub const GWLP_WNDPROC: WINDOW_LONG_PTR_INDEX = -4;
+pub const GCS_COMPSTR: u32 = 8;
+pub const GCS_RESULTSTR: u32 = 2048;
+pub const GMEM_MOVEABLE: u32 = 2;
+pub const GMEM_ZEROINIT: u32 = 64;
+pub const GWLP_USERDATA: i32 = -21;
+pub const GWLP_WNDPROC: i32 = -4;
 pub type HANDLE = *mut core::ffi::c_void;
 pub type HBRUSH = *mut core::ffi::c_void;
-pub type HCURSOR = *mut core::ffi::c_void;
+pub type HCURSOR = HICON;
 pub type HDC = *mut core::ffi::c_void;
-pub type HGLOBAL = *mut core::ffi::c_void;
+pub type HGLOBAL = HANDLE;
 pub type HICON = *mut core::ffi::c_void;
 pub type HIMC = *mut core::ffi::c_void;
 pub type HINSTANCE = *mut core::ffi::c_void;
 pub type HMENU = *mut core::ffi::c_void;
-pub type HMODULE = *mut core::ffi::c_void;
+pub type HMODULE = HINSTANCE;
 pub type HMONITOR = *mut core::ffi::c_void;
 pub const HTBOTTOM: u32 = 15;
 pub const HTBOTTOMLEFT: u32 = 16;
@@ -1928,19 +1936,17 @@ impl ICompositionDrawingSurfaceInterop {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
-    pub(crate) unsafe fn EndDraw(&self) -> windows_core::Result<()> {
+    pub(crate) unsafe fn EndDraw(&self) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).EndDraw)(windows_core::Interface::as_raw(self))
-                .ok()
         }
     }
-    pub(crate) unsafe fn Resize(&self, sizepixels: SIZE) -> windows_core::Result<()> {
+    pub(crate) unsafe fn Resize(&self, sizepixels: SIZE) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).Resize)(
                 windows_core::Interface::as_raw(self),
                 sizepixels,
             )
-            .ok()
         }
     }
 }
@@ -3462,7 +3468,7 @@ impl ICompositorDesktopInterop {
         &self,
         hwndtarget: HWND,
         istopmost: bool,
-    ) -> windows_core::Result<DesktopWindowTarget> {
+    ) -> windows_core::Result<IDesktopWindowTarget> {
         unsafe {
             let mut result__ = core::mem::zeroed();
             (windows_core::Interface::vtable(self).CreateDesktopWindowTarget)(
@@ -3496,7 +3502,7 @@ impl ICompositorInterop {
     pub(crate) unsafe fn CreateGraphicsDevice<P0>(
         &self,
         renderingdevice: P0,
-    ) -> windows_core::Result<CompositionGraphicsDevice>
+    ) -> windows_core::Result<ICompositionGraphicsDevice>
     where
         P0: windows_core::Param<windows_core::IUnknown>,
     {
@@ -3617,8 +3623,6 @@ pub struct ID2D1Factory_Vtbl {
     CreateDxgiSurfaceRenderTarget: usize,
     CreateDCRenderTarget: usize,
 }
-unsafe impl Send for ID2D1Factory {}
-unsafe impl Sync for ID2D1Factory {}
 windows_core::imp::define_interface!(
     ID2D1Geometry,
     ID2D1Geometry_Vtbl,
@@ -3648,8 +3652,6 @@ pub struct ID2D1Geometry_Vtbl {
     ComputePointAtLength: usize,
     Widen: usize,
 }
-unsafe impl Send for ID2D1Geometry {}
-unsafe impl Sync for ID2D1Geometry {}
 windows_core::imp::define_interface!(
     ID2D1Resource,
     ID2D1Resource_Vtbl,
@@ -3661,8 +3663,6 @@ pub struct ID2D1Resource_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     GetFactory: usize,
 }
-unsafe impl Send for ID2D1Resource {}
-unsafe impl Sync for ID2D1Resource {}
 pub const IDC_ARROW: windows_core::PCWSTR = windows_core::PCWSTR(32512 as _);
 pub const IDC_HAND: windows_core::PCWSTR = windows_core::PCWSTR(32649 as _);
 pub const IDC_IBEAM: windows_core::PCWSTR = windows_core::PCWSTR(32513 as _);
@@ -3796,11 +3796,61 @@ pub struct IDispatcherQueueController_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    IEnumTfContextViews,
+    IEnumTfContextViews_Vtbl,
+    0xf0c0f8dd_cf38_44e1_bb0f_68cf0d551c78
+);
+windows_core::imp::interface_hierarchy!(IEnumTfContextViews, windows_core::IUnknown);
+#[repr(C)]
+pub struct IEnumTfContextViews_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    Clone: usize,
+    Next: usize,
+    Reset: usize,
+    Skip: usize,
+}
+windows_core::imp::define_interface!(
+    IEnumTfProperties,
+    IEnumTfProperties_Vtbl,
+    0x19188cb0_aca9_11d2_afc5_00105a2799b5
+);
+windows_core::imp::interface_hierarchy!(IEnumTfProperties, windows_core::IUnknown);
+#[repr(C)]
+pub struct IEnumTfProperties_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    Clone: usize,
+    Next: usize,
+    Reset: usize,
+    Skip: usize,
+}
+windows_core::imp::define_interface!(
     IExpandCollapseProvider,
     IExpandCollapseProvider_Vtbl,
     0xd847d3a5_cab0_4a98_8c32_ecb45c59ad24
 );
 windows_core::imp::interface_hierarchy!(IExpandCollapseProvider, windows_core::IUnknown);
+impl IExpandCollapseProvider {
+    pub(crate) unsafe fn Expand(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Expand)(windows_core::Interface::as_raw(self))
+        }
+    }
+    pub(crate) unsafe fn Collapse(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Collapse)(windows_core::Interface::as_raw(self))
+        }
+    }
+    pub(crate) unsafe fn ExpandCollapseState(&self) -> windows_core::Result<ExpandCollapseState> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).ExpandCollapseState)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct IExpandCollapseProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -3811,68 +3861,6 @@ pub struct IExpandCollapseProvider_Vtbl {
         *mut ExpandCollapseState,
     ) -> windows_core::HRESULT,
 }
-pub trait IExpandCollapseProvider_Impl: windows_core::IUnknownImpl {
-    fn Expand(&self) -> windows_core::Result<()>;
-    fn Collapse(&self) -> windows_core::Result<()>;
-    fn ExpandCollapseState(&self) -> windows_core::Result<ExpandCollapseState>;
-}
-impl IExpandCollapseProvider_Vtbl {
-    pub const fn new<Identity: IExpandCollapseProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn Expand<
-            Identity: IExpandCollapseProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IExpandCollapseProvider_Impl::Expand(this).into()
-            }
-        }
-        unsafe extern "system" fn Collapse<
-            Identity: IExpandCollapseProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IExpandCollapseProvider_Impl::Collapse(this).into()
-            }
-        }
-        unsafe extern "system" fn ExpandCollapseState<
-            Identity: IExpandCollapseProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut ExpandCollapseState,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IExpandCollapseProvider_Impl::ExpandCollapseState(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            Expand: Expand::<Identity, OFFSET>,
-            Collapse: Collapse::<Identity, OFFSET>,
-            ExpandCollapseState: ExpandCollapseState::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IExpandCollapseProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IExpandCollapseProvider {}
 windows_core::imp::define_interface!(
     IExpressionAnimation,
     IExpressionAnimation_Vtbl,
@@ -4099,35 +4087,18 @@ windows_core::imp::define_interface!(
     0x54fcb24b_e18e_47a2_b4d3_eccbe77599a2
 );
 windows_core::imp::interface_hierarchy!(IInvokeProvider, windows_core::IUnknown);
+impl IInvokeProvider {
+    pub(crate) unsafe fn Invoke(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Invoke)(windows_core::Interface::as_raw(self))
+        }
+    }
+}
 #[repr(C)]
 pub struct IInvokeProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     pub Invoke: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
 }
-pub trait IInvokeProvider_Impl: windows_core::IUnknownImpl {
-    fn Invoke(&self) -> windows_core::Result<()>;
-}
-impl IInvokeProvider_Vtbl {
-    pub const fn new<Identity: IInvokeProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn Invoke<Identity: IInvokeProvider_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IInvokeProvider_Impl::Invoke(this).into()
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            Invoke: Invoke::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IInvokeProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IInvokeProvider {}
 windows_core::imp::define_interface!(
     IKeyFrameAnimation,
     IKeyFrameAnimation_Vtbl,
@@ -4239,7 +4210,6 @@ impl windows_core::RuntimeType for ILinearEasingFunction {
 pub struct ILinearEasingFunction_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
-pub type IME_COMPOSITION_STRING = u32;
 windows_core::imp::define_interface!(
     INaturalMotionAnimation,
     INaturalMotionAnimation_Vtbl,
@@ -4259,6 +4229,76 @@ windows_core::imp::define_interface!(
     0x36dc7aef_33e6_4691_afe1_2be7274b3d33
 );
 windows_core::imp::interface_hierarchy!(IRangeValueProvider, windows_core::IUnknown);
+impl IRangeValueProvider {
+    pub(crate) unsafe fn SetValue(&self, val: f64) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetValue)(
+                windows_core::Interface::as_raw(self),
+                val,
+            )
+        }
+    }
+    pub(crate) unsafe fn Value(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Value)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn IsReadOnly(&self) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).IsReadOnly)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn Maximum(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Maximum)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn Minimum(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Minimum)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn LargeChange(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).LargeChange)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn SmallChange(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).SmallChange)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct IRangeValueProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -4277,247 +4317,123 @@ pub struct IRangeValueProvider_Vtbl {
     pub SmallChange:
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut f64) -> windows_core::HRESULT,
 }
-pub trait IRangeValueProvider_Impl: windows_core::IUnknownImpl {
-    fn SetValue(&self, val: f64) -> windows_core::Result<()>;
-    fn Value(&self) -> windows_core::Result<f64>;
-    fn IsReadOnly(&self) -> windows_core::Result<windows_core::BOOL>;
-    fn Maximum(&self) -> windows_core::Result<f64>;
-    fn Minimum(&self) -> windows_core::Result<f64>;
-    fn LargeChange(&self) -> windows_core::Result<f64>;
-    fn SmallChange(&self) -> windows_core::Result<f64>;
-}
-impl IRangeValueProvider_Vtbl {
-    pub const fn new<Identity: IRangeValueProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn SetValue<
-            Identity: IRangeValueProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            val: f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IRangeValueProvider_Impl::SetValue(this, core::mem::transmute_copy(&val)).into()
-            }
-        }
-        unsafe extern "system" fn Value<Identity: IRangeValueProvider_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRangeValueProvider_Impl::Value(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn IsReadOnly<
-            Identity: IRangeValueProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRangeValueProvider_Impl::IsReadOnly(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn Maximum<
-            Identity: IRangeValueProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRangeValueProvider_Impl::Maximum(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn Minimum<
-            Identity: IRangeValueProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRangeValueProvider_Impl::Minimum(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn LargeChange<
-            Identity: IRangeValueProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRangeValueProvider_Impl::LargeChange(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn SmallChange<
-            Identity: IRangeValueProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRangeValueProvider_Impl::SmallChange(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            SetValue: SetValue::<Identity, OFFSET>,
-            Value: Value::<Identity, OFFSET>,
-            IsReadOnly: IsReadOnly::<Identity, OFFSET>,
-            Maximum: Maximum::<Identity, OFFSET>,
-            Minimum: Minimum::<Identity, OFFSET>,
-            LargeChange: LargeChange::<Identity, OFFSET>,
-            SmallChange: SmallChange::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IRangeValueProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IRangeValueProvider {}
 windows_core::imp::define_interface!(
     IRawElementProviderAdviseEvents,
     IRawElementProviderAdviseEvents_Vtbl,
     0xa407b27b_0f6d_4427_9292_473c7bf93258
 );
 windows_core::imp::interface_hierarchy!(IRawElementProviderAdviseEvents, windows_core::IUnknown);
+impl IRawElementProviderAdviseEvents {
+    pub(crate) unsafe fn AdviseEventAdded(
+        &self,
+        eventid: EVENTID,
+        propertyids: *const SAFEARRAY,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).AdviseEventAdded)(
+                windows_core::Interface::as_raw(self),
+                eventid,
+                propertyids,
+            )
+        }
+    }
+    pub(crate) unsafe fn AdviseEventRemoved(
+        &self,
+        eventid: EVENTID,
+        propertyids: *const SAFEARRAY,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).AdviseEventRemoved)(
+                windows_core::Interface::as_raw(self),
+                eventid,
+                propertyids,
+            )
+        }
+    }
+}
 #[repr(C)]
 pub struct IRawElementProviderAdviseEvents_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     pub AdviseEventAdded: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        UIA_EVENT_ID,
+        EVENTID,
         *const SAFEARRAY,
     ) -> windows_core::HRESULT,
     pub AdviseEventRemoved: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        UIA_EVENT_ID,
+        EVENTID,
         *const SAFEARRAY,
     ) -> windows_core::HRESULT,
 }
-pub trait IRawElementProviderAdviseEvents_Impl: windows_core::IUnknownImpl {
-    fn AdviseEventAdded(
-        &self,
-        eventid: UIA_EVENT_ID,
-        propertyids: *const SAFEARRAY,
-    ) -> windows_core::Result<()>;
-    fn AdviseEventRemoved(
-        &self,
-        eventid: UIA_EVENT_ID,
-        propertyids: *const SAFEARRAY,
-    ) -> windows_core::Result<()>;
-}
-impl IRawElementProviderAdviseEvents_Vtbl {
-    pub const fn new<Identity: IRawElementProviderAdviseEvents_Impl, const OFFSET: isize>() -> Self
-    {
-        unsafe extern "system" fn AdviseEventAdded<
-            Identity: IRawElementProviderAdviseEvents_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            eventid: UIA_EVENT_ID,
-            propertyids: *const SAFEARRAY,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IRawElementProviderAdviseEvents_Impl::AdviseEventAdded(
-                    this,
-                    core::mem::transmute_copy(&eventid),
-                    core::mem::transmute_copy(&propertyids),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn AdviseEventRemoved<
-            Identity: IRawElementProviderAdviseEvents_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            eventid: UIA_EVENT_ID,
-            propertyids: *const SAFEARRAY,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IRawElementProviderAdviseEvents_Impl::AdviseEventRemoved(
-                    this,
-                    core::mem::transmute_copy(&eventid),
-                    core::mem::transmute_copy(&propertyids),
-                )
-                .into()
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            AdviseEventAdded: AdviseEventAdded::<Identity, OFFSET>,
-            AdviseEventRemoved: AdviseEventRemoved::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IRawElementProviderAdviseEvents as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IRawElementProviderAdviseEvents {}
 windows_core::imp::define_interface!(
     IRawElementProviderFragment,
     IRawElementProviderFragment_Vtbl,
     0xf7063da8_8359_439c_9297_bbc5299a7d87
 );
 windows_core::imp::interface_hierarchy!(IRawElementProviderFragment, windows_core::IUnknown);
+impl IRawElementProviderFragment {
+    pub(crate) unsafe fn Navigate(
+        &self,
+        direction: NavigateDirection,
+    ) -> windows_core::Result<Self> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Navigate)(
+                windows_core::Interface::as_raw(self),
+                direction,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetRuntimeId(&self) -> windows_core::Result<*mut SAFEARRAY> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetRuntimeId)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn get_BoundingRectangle(&self) -> windows_core::Result<UiaRect> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).get_BoundingRectangle)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetEmbeddedFragmentRoots(&self) -> windows_core::Result<*mut SAFEARRAY> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetEmbeddedFragmentRoots)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn SetFocus(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetFocus)(windows_core::Interface::as_raw(self))
+        }
+    }
+    pub(crate) unsafe fn FragmentRoot(
+        &self,
+    ) -> windows_core::Result<IRawElementProviderFragmentRoot> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).FragmentRoot)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
 #[repr(C)]
 pub struct IRawElementProviderFragment_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -4530,7 +4446,7 @@ pub struct IRawElementProviderFragment_Vtbl {
         *mut core::ffi::c_void,
         *mut *mut SAFEARRAY,
     ) -> windows_core::HRESULT,
-    pub BoundingRectangle:
+    pub get_BoundingRectangle:
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut UiaRect) -> windows_core::HRESULT,
     pub GetEmbeddedFragmentRoots: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -4542,151 +4458,40 @@ pub struct IRawElementProviderFragment_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
-pub trait IRawElementProviderFragment_Impl: windows_core::IUnknownImpl {
-    fn Navigate(
-        &self,
-        direction: NavigateDirection,
-    ) -> windows_core::Result<IRawElementProviderFragment>;
-    fn GetRuntimeId(&self) -> windows_core::Result<*mut SAFEARRAY>;
-    fn BoundingRectangle(&self) -> windows_core::Result<UiaRect>;
-    fn GetEmbeddedFragmentRoots(&self) -> windows_core::Result<*mut SAFEARRAY>;
-    fn SetFocus(&self) -> windows_core::Result<()>;
-    fn FragmentRoot(&self) -> windows_core::Result<IRawElementProviderFragmentRoot>;
-}
-impl IRawElementProviderFragment_Vtbl {
-    pub const fn new<Identity: IRawElementProviderFragment_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn Navigate<
-            Identity: IRawElementProviderFragment_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            direction: NavigateDirection,
-            pretval: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderFragment_Impl::Navigate(
-                    this,
-                    core::mem::transmute_copy(&direction),
-                ) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetRuntimeId<
-            Identity: IRawElementProviderFragment_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut *mut SAFEARRAY,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderFragment_Impl::GetRuntimeId(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn BoundingRectangle<
-            Identity: IRawElementProviderFragment_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut UiaRect,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderFragment_Impl::BoundingRectangle(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetEmbeddedFragmentRoots<
-            Identity: IRawElementProviderFragment_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut *mut SAFEARRAY,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderFragment_Impl::GetEmbeddedFragmentRoots(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn SetFocus<
-            Identity: IRawElementProviderFragment_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IRawElementProviderFragment_Impl::SetFocus(this).into()
-            }
-        }
-        unsafe extern "system" fn FragmentRoot<
-            Identity: IRawElementProviderFragment_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderFragment_Impl::FragmentRoot(this) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            Navigate: Navigate::<Identity, OFFSET>,
-            GetRuntimeId: GetRuntimeId::<Identity, OFFSET>,
-            BoundingRectangle: BoundingRectangle::<Identity, OFFSET>,
-            GetEmbeddedFragmentRoots: GetEmbeddedFragmentRoots::<Identity, OFFSET>,
-            SetFocus: SetFocus::<Identity, OFFSET>,
-            FragmentRoot: FragmentRoot::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IRawElementProviderFragment as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IRawElementProviderFragment {}
 windows_core::imp::define_interface!(
     IRawElementProviderFragmentRoot,
     IRawElementProviderFragmentRoot_Vtbl,
     0x620ce2a5_ab8f_40a9_86cb_de3c75599b58
 );
 windows_core::imp::interface_hierarchy!(IRawElementProviderFragmentRoot, windows_core::IUnknown);
+impl IRawElementProviderFragmentRoot {
+    pub(crate) unsafe fn ElementProviderFromPoint(
+        &self,
+        x: f64,
+        y: f64,
+    ) -> windows_core::Result<IRawElementProviderFragment> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).ElementProviderFromPoint)(
+                windows_core::Interface::as_raw(self),
+                x,
+                y,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetFocus(&self) -> windows_core::Result<IRawElementProviderFragment> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFocus)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
 #[repr(C)]
 pub struct IRawElementProviderFragmentRoot_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -4701,78 +4506,62 @@ pub struct IRawElementProviderFragmentRoot_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
-pub trait IRawElementProviderFragmentRoot_Impl: windows_core::IUnknownImpl {
-    fn ElementProviderFromPoint(
-        &self,
-        x: f64,
-        y: f64,
-    ) -> windows_core::Result<IRawElementProviderFragment>;
-    fn GetFocus(&self) -> windows_core::Result<IRawElementProviderFragment>;
-}
-impl IRawElementProviderFragmentRoot_Vtbl {
-    pub const fn new<Identity: IRawElementProviderFragmentRoot_Impl, const OFFSET: isize>() -> Self
-    {
-        unsafe extern "system" fn ElementProviderFromPoint<
-            Identity: IRawElementProviderFragmentRoot_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            x: f64,
-            y: f64,
-            pretval: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderFragmentRoot_Impl::ElementProviderFromPoint(
-                    this,
-                    core::mem::transmute_copy(&x),
-                    core::mem::transmute_copy(&y),
-                ) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetFocus<
-            Identity: IRawElementProviderFragmentRoot_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderFragmentRoot_Impl::GetFocus(this) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            ElementProviderFromPoint: ElementProviderFromPoint::<Identity, OFFSET>,
-            GetFocus: GetFocus::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IRawElementProviderFragmentRoot as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IRawElementProviderFragmentRoot {}
 windows_core::imp::define_interface!(
     IRawElementProviderSimple,
     IRawElementProviderSimple_Vtbl,
     0xd6dd68d1_86fd_4332_8666_9abedea2d24c
 );
 windows_core::imp::interface_hierarchy!(IRawElementProviderSimple, windows_core::IUnknown);
+impl IRawElementProviderSimple {
+    pub(crate) unsafe fn ProviderOptions(&self) -> windows_core::Result<ProviderOptions> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).ProviderOptions)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetPatternProvider(
+        &self,
+        patternid: PATTERNID,
+    ) -> windows_core::Result<windows_core::IUnknown> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetPatternProvider)(
+                windows_core::Interface::as_raw(self),
+                patternid,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetPropertyValue(
+        &self,
+        propertyid: PROPERTYID,
+    ) -> windows_core::Result<VARIANT> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetPropertyValue)(
+                windows_core::Interface::as_raw(self),
+                propertyid,
+                &mut result__,
+            )
+            .map(|| core::mem::transmute(result__))
+        }
+    }
+    pub(crate) unsafe fn HostRawElementProvider(&self) -> windows_core::Result<Self> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).HostRawElementProvider)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
 #[repr(C)]
 pub struct IRawElementProviderSimple_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -4782,12 +4571,12 @@ pub struct IRawElementProviderSimple_Vtbl {
     ) -> windows_core::HRESULT,
     pub GetPatternProvider: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        UIA_PATTERN_ID,
+        PATTERNID,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
     pub GetPropertyValue: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        UIA_PROPERTY_ID,
+        PROPERTYID,
         *mut VARIANT,
     ) -> windows_core::HRESULT,
     pub HostRawElementProvider: unsafe extern "system" fn(
@@ -4795,114 +4584,6 @@ pub struct IRawElementProviderSimple_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
-pub trait IRawElementProviderSimple_Impl: windows_core::IUnknownImpl {
-    fn ProviderOptions(&self) -> windows_core::Result<ProviderOptions>;
-    fn GetPatternProvider(
-        &self,
-        patternid: UIA_PATTERN_ID,
-    ) -> windows_core::Result<windows_core::IUnknown>;
-    fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> windows_core::Result<VARIANT>;
-    fn HostRawElementProvider(&self) -> windows_core::Result<IRawElementProviderSimple>;
-}
-impl IRawElementProviderSimple_Vtbl {
-    pub const fn new<Identity: IRawElementProviderSimple_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn ProviderOptions<
-            Identity: IRawElementProviderSimple_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut ProviderOptions,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderSimple_Impl::ProviderOptions(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetPatternProvider<
-            Identity: IRawElementProviderSimple_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            patternid: UIA_PATTERN_ID,
-            pretval: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderSimple_Impl::GetPatternProvider(
-                    this,
-                    core::mem::transmute_copy(&patternid),
-                ) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetPropertyValue<
-            Identity: IRawElementProviderSimple_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            propertyid: UIA_PROPERTY_ID,
-            pretval: *mut VARIANT,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderSimple_Impl::GetPropertyValue(
-                    this,
-                    core::mem::transmute_copy(&propertyid),
-                ) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn HostRawElementProvider<
-            Identity: IRawElementProviderSimple_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IRawElementProviderSimple_Impl::HostRawElementProvider(this) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            ProviderOptions: ProviderOptions::<Identity, OFFSET>,
-            GetPatternProvider: GetPatternProvider::<Identity, OFFSET>,
-            GetPropertyValue: GetPropertyValue::<Identity, OFFSET>,
-            HostRawElementProvider: HostRawElementProvider::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IRawElementProviderSimple as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IRawElementProviderSimple {}
 windows_core::imp::define_interface!(
     IRecordInfo,
     IRecordInfo_Vtbl,
@@ -5021,44 +4702,114 @@ windows_core::imp::define_interface!(
     0x2360c714_4bf1_4b26_ba65_9b21316127eb
 );
 windows_core::imp::interface_hierarchy!(IScrollItemProvider, windows_core::IUnknown);
+impl IScrollItemProvider {
+    pub(crate) unsafe fn ScrollIntoView(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).ScrollIntoView)(windows_core::Interface::as_raw(
+                self,
+            ))
+        }
+    }
+}
 #[repr(C)]
 pub struct IScrollItemProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     pub ScrollIntoView: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
 }
-pub trait IScrollItemProvider_Impl: windows_core::IUnknownImpl {
-    fn ScrollIntoView(&self) -> windows_core::Result<()>;
-}
-impl IScrollItemProvider_Vtbl {
-    pub const fn new<Identity: IScrollItemProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn ScrollIntoView<
-            Identity: IScrollItemProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IScrollItemProvider_Impl::ScrollIntoView(this).into()
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            ScrollIntoView: ScrollIntoView::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IScrollItemProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IScrollItemProvider {}
 windows_core::imp::define_interface!(
     IScrollProvider,
     IScrollProvider_Vtbl,
     0xb38b8077_1fc3_42a5_8cae_d40c2215055a
 );
 windows_core::imp::interface_hierarchy!(IScrollProvider, windows_core::IUnknown);
+impl IScrollProvider {
+    pub(crate) unsafe fn Scroll(
+        &self,
+        horizontalamount: ScrollAmount,
+        verticalamount: ScrollAmount,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Scroll)(
+                windows_core::Interface::as_raw(self),
+                horizontalamount,
+                verticalamount,
+            )
+        }
+    }
+    pub(crate) unsafe fn SetScrollPercent(
+        &self,
+        horizontalpercent: f64,
+        verticalpercent: f64,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetScrollPercent)(
+                windows_core::Interface::as_raw(self),
+                horizontalpercent,
+                verticalpercent,
+            )
+        }
+    }
+    pub(crate) unsafe fn HorizontalScrollPercent(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).HorizontalScrollPercent)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn VerticalScrollPercent(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).VerticalScrollPercent)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn HorizontalViewSize(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).HorizontalViewSize)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn VerticalViewSize(&self) -> windows_core::Result<f64> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).VerticalViewSize)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn HorizontallyScrollable(&self) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).HorizontallyScrollable)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn VerticallyScrollable(&self) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).VerticallyScrollable)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct IScrollProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -5086,198 +4837,55 @@ pub struct IScrollProvider_Vtbl {
         *mut windows_core::BOOL,
     ) -> windows_core::HRESULT,
 }
-pub trait IScrollProvider_Impl: windows_core::IUnknownImpl {
-    fn Scroll(
-        &self,
-        horizontalamount: ScrollAmount,
-        verticalamount: ScrollAmount,
-    ) -> windows_core::Result<()>;
-    fn SetScrollPercent(
-        &self,
-        horizontalpercent: f64,
-        verticalpercent: f64,
-    ) -> windows_core::Result<()>;
-    fn HorizontalScrollPercent(&self) -> windows_core::Result<f64>;
-    fn VerticalScrollPercent(&self) -> windows_core::Result<f64>;
-    fn HorizontalViewSize(&self) -> windows_core::Result<f64>;
-    fn VerticalViewSize(&self) -> windows_core::Result<f64>;
-    fn HorizontallyScrollable(&self) -> windows_core::Result<windows_core::BOOL>;
-    fn VerticallyScrollable(&self) -> windows_core::Result<windows_core::BOOL>;
-}
-impl IScrollProvider_Vtbl {
-    pub const fn new<Identity: IScrollProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn Scroll<Identity: IScrollProvider_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            horizontalamount: ScrollAmount,
-            verticalamount: ScrollAmount,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IScrollProvider_Impl::Scroll(
-                    this,
-                    core::mem::transmute_copy(&horizontalamount),
-                    core::mem::transmute_copy(&verticalamount),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn SetScrollPercent<
-            Identity: IScrollProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            horizontalpercent: f64,
-            verticalpercent: f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IScrollProvider_Impl::SetScrollPercent(
-                    this,
-                    core::mem::transmute_copy(&horizontalpercent),
-                    core::mem::transmute_copy(&verticalpercent),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn HorizontalScrollPercent<
-            Identity: IScrollProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IScrollProvider_Impl::HorizontalScrollPercent(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn VerticalScrollPercent<
-            Identity: IScrollProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IScrollProvider_Impl::VerticalScrollPercent(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn HorizontalViewSize<
-            Identity: IScrollProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IScrollProvider_Impl::HorizontalViewSize(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn VerticalViewSize<
-            Identity: IScrollProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut f64,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IScrollProvider_Impl::VerticalViewSize(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn HorizontallyScrollable<
-            Identity: IScrollProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IScrollProvider_Impl::HorizontallyScrollable(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn VerticallyScrollable<
-            Identity: IScrollProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IScrollProvider_Impl::VerticallyScrollable(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            Scroll: Scroll::<Identity, OFFSET>,
-            SetScrollPercent: SetScrollPercent::<Identity, OFFSET>,
-            HorizontalScrollPercent: HorizontalScrollPercent::<Identity, OFFSET>,
-            VerticalScrollPercent: VerticalScrollPercent::<Identity, OFFSET>,
-            HorizontalViewSize: HorizontalViewSize::<Identity, OFFSET>,
-            VerticalViewSize: VerticalViewSize::<Identity, OFFSET>,
-            HorizontallyScrollable: HorizontallyScrollable::<Identity, OFFSET>,
-            VerticallyScrollable: VerticallyScrollable::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IScrollProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IScrollProvider {}
 windows_core::imp::define_interface!(
     ISelectionItemProvider,
     ISelectionItemProvider_Vtbl,
     0x2acad808_b2d4_452d_a407_91ff1ad167b2
 );
 windows_core::imp::interface_hierarchy!(ISelectionItemProvider, windows_core::IUnknown);
+impl ISelectionItemProvider {
+    pub(crate) unsafe fn Select(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Select)(windows_core::Interface::as_raw(self))
+        }
+    }
+    pub(crate) unsafe fn AddToSelection(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).AddToSelection)(windows_core::Interface::as_raw(
+                self,
+            ))
+        }
+    }
+    pub(crate) unsafe fn RemoveFromSelection(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).RemoveFromSelection)(
+                windows_core::Interface::as_raw(self),
+            )
+        }
+    }
+    pub(crate) unsafe fn IsSelected(&self) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).IsSelected)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn SelectionContainer(
+        &self,
+    ) -> windows_core::Result<IRawElementProviderSimple> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).SelectionContainer)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
 #[repr(C)]
 pub struct ISelectionItemProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -5294,109 +4902,44 @@ pub struct ISelectionItemProvider_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
-pub trait ISelectionItemProvider_Impl: windows_core::IUnknownImpl {
-    fn Select(&self) -> windows_core::Result<()>;
-    fn AddToSelection(&self) -> windows_core::Result<()>;
-    fn RemoveFromSelection(&self) -> windows_core::Result<()>;
-    fn IsSelected(&self) -> windows_core::Result<windows_core::BOOL>;
-    fn SelectionContainer(&self) -> windows_core::Result<IRawElementProviderSimple>;
-}
-impl ISelectionItemProvider_Vtbl {
-    pub const fn new<Identity: ISelectionItemProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn Select<
-            Identity: ISelectionItemProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ISelectionItemProvider_Impl::Select(this).into()
-            }
-        }
-        unsafe extern "system" fn AddToSelection<
-            Identity: ISelectionItemProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ISelectionItemProvider_Impl::AddToSelection(this).into()
-            }
-        }
-        unsafe extern "system" fn RemoveFromSelection<
-            Identity: ISelectionItemProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ISelectionItemProvider_Impl::RemoveFromSelection(this).into()
-            }
-        }
-        unsafe extern "system" fn IsSelected<
-            Identity: ISelectionItemProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ISelectionItemProvider_Impl::IsSelected(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn SelectionContainer<
-            Identity: ISelectionItemProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ISelectionItemProvider_Impl::SelectionContainer(this) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            Select: Select::<Identity, OFFSET>,
-            AddToSelection: AddToSelection::<Identity, OFFSET>,
-            RemoveFromSelection: RemoveFromSelection::<Identity, OFFSET>,
-            IsSelected: IsSelected::<Identity, OFFSET>,
-            SelectionContainer: SelectionContainer::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<ISelectionItemProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for ISelectionItemProvider {}
 windows_core::imp::define_interface!(
     ISelectionProvider,
     ISelectionProvider_Vtbl,
     0xfb8b03af_3bdf_48d4_bd36_1a65793be168
 );
 windows_core::imp::interface_hierarchy!(ISelectionProvider, windows_core::IUnknown);
+impl ISelectionProvider {
+    pub(crate) unsafe fn GetSelection(&self) -> windows_core::Result<*mut SAFEARRAY> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetSelection)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn CanSelectMultiple(&self) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CanSelectMultiple)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn IsSelectionRequired(&self) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).IsSelectionRequired)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct ISelectionProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -5413,82 +4956,6 @@ pub struct ISelectionProvider_Vtbl {
         *mut windows_core::BOOL,
     ) -> windows_core::HRESULT,
 }
-pub trait ISelectionProvider_Impl: windows_core::IUnknownImpl {
-    fn GetSelection(&self) -> windows_core::Result<*mut SAFEARRAY>;
-    fn CanSelectMultiple(&self) -> windows_core::Result<windows_core::BOOL>;
-    fn IsSelectionRequired(&self) -> windows_core::Result<windows_core::BOOL>;
-}
-impl ISelectionProvider_Vtbl {
-    pub const fn new<Identity: ISelectionProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn GetSelection<
-            Identity: ISelectionProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut *mut SAFEARRAY,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ISelectionProvider_Impl::GetSelection(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn CanSelectMultiple<
-            Identity: ISelectionProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ISelectionProvider_Impl::CanSelectMultiple(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn IsSelectionRequired<
-            Identity: ISelectionProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ISelectionProvider_Impl::IsSelectionRequired(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            GetSelection: GetSelection::<Identity, OFFSET>,
-            CanSelectMultiple: CanSelectMultiple::<Identity, OFFSET>,
-            IsSelectionRequired: IsSelectionRequired::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<ISelectionProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for ISelectionProvider {}
 windows_core::imp::define_interface!(
     IShapeVisual,
     IShapeVisual_Vtbl,
@@ -5686,6 +5153,445 @@ windows_core::imp::define_interface!(
     0x28888fe3_c2a0_483a_a3ea_8cb1ce51ff3d
 );
 windows_core::imp::interface_hierarchy!(ITextStoreACP, windows_core::IUnknown);
+impl ITextStoreACP {
+    pub(crate) unsafe fn AdviseSink<P1>(
+        &self,
+        riid: *const windows_core::GUID,
+        punk: P1,
+        dwmask: u32,
+    ) -> windows_core::HRESULT
+    where
+        P1: windows_core::Param<windows_core::IUnknown>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).AdviseSink)(
+                windows_core::Interface::as_raw(self),
+                riid,
+                punk.param().abi(),
+                dwmask,
+            )
+        }
+    }
+    pub(crate) unsafe fn UnadviseSink<P0>(&self, punk: P0) -> windows_core::HRESULT
+    where
+        P0: windows_core::Param<windows_core::IUnknown>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).UnadviseSink)(
+                windows_core::Interface::as_raw(self),
+                punk.param().abi(),
+            )
+        }
+    }
+    pub(crate) unsafe fn RequestLock(
+        &self,
+        dwlockflags: u32,
+    ) -> windows_core::Result<windows_core::HRESULT> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RequestLock)(
+                windows_core::Interface::as_raw(self),
+                dwlockflags,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetStatus(&self) -> windows_core::Result<TS_STATUS> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetStatus)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn QueryInsert(
+        &self,
+        acpteststart: i32,
+        acptestend: i32,
+        cch: u32,
+        pacpresultstart: *mut i32,
+        pacpresultend: *mut i32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).QueryInsert)(
+                windows_core::Interface::as_raw(self),
+                acpteststart,
+                acptestend,
+                cch,
+                pacpresultstart as _,
+                pacpresultend as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn GetSelection(
+        &self,
+        ulindex: u32,
+        ulcount: u32,
+        pselection: *mut TS_SELECTION_ACP,
+        pcfetched: *mut u32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetSelection)(
+                windows_core::Interface::as_raw(self),
+                ulindex,
+                ulcount,
+                pselection as _,
+                pcfetched as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn SetSelection(
+        &self,
+        ulcount: u32,
+        pselection: *const TS_SELECTION_ACP,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetSelection)(
+                windows_core::Interface::as_raw(self),
+                ulcount,
+                pselection,
+            )
+        }
+    }
+    pub(crate) unsafe fn GetText(
+        &self,
+        acpstart: i32,
+        acpend: i32,
+        pchplain: *mut u16,
+        cchplainreq: u32,
+        pcchplainret: *mut u32,
+        prgruninfo: *mut TS_RUNINFO,
+        cruninforeq: u32,
+        pcruninforet: *mut u32,
+        pacpnext: *mut i32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetText)(
+                windows_core::Interface::as_raw(self),
+                acpstart,
+                acpend,
+                pchplain as _,
+                cchplainreq,
+                pcchplainret as _,
+                prgruninfo as _,
+                cruninforeq,
+                pcruninforet as _,
+                pacpnext as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn SetText(
+        &self,
+        dwflags: u32,
+        acpstart: i32,
+        acpend: i32,
+        pchtext: *const u16,
+        cch: u32,
+    ) -> windows_core::Result<TS_TEXTCHANGE> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).SetText)(
+                windows_core::Interface::as_raw(self),
+                dwflags,
+                acpstart,
+                acpend,
+                pchtext,
+                cch,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetFormattedText(
+        &self,
+        acpstart: i32,
+        acpend: i32,
+    ) -> windows_core::Result<IDataObject> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFormattedText)(
+                windows_core::Interface::as_raw(self),
+                acpstart,
+                acpend,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetEmbedded<T>(
+        &self,
+        acppos: i32,
+        rguidservice: *const windows_core::GUID,
+    ) -> windows_core::Result<T>
+    where
+        T: windows_core::Interface,
+    {
+        let mut result__ = core::ptr::null_mut();
+        unsafe {
+            (windows_core::Interface::vtable(self).GetEmbedded)(
+                windows_core::Interface::as_raw(self),
+                acppos,
+                rguidservice,
+                &T::IID,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn QueryInsertEmbedded(
+        &self,
+        pguidservice: *const windows_core::GUID,
+        pformatetc: *const FORMATETC,
+    ) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).QueryInsertEmbedded)(
+                windows_core::Interface::as_raw(self),
+                pguidservice,
+                pformatetc,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn InsertEmbedded<P3>(
+        &self,
+        dwflags: u32,
+        acpstart: i32,
+        acpend: i32,
+        pdataobject: P3,
+    ) -> windows_core::Result<TS_TEXTCHANGE>
+    where
+        P3: windows_core::Param<IDataObject>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).InsertEmbedded)(
+                windows_core::Interface::as_raw(self),
+                dwflags,
+                acpstart,
+                acpend,
+                pdataobject.param().abi(),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn InsertTextAtSelection(
+        &self,
+        dwflags: u32,
+        pchtext: *const u16,
+        cch: u32,
+        pacpstart: *mut i32,
+        pacpend: *mut i32,
+        pchange: *mut TS_TEXTCHANGE,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).InsertTextAtSelection)(
+                windows_core::Interface::as_raw(self),
+                dwflags,
+                pchtext,
+                cch,
+                pacpstart as _,
+                pacpend as _,
+                pchange as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn InsertEmbeddedAtSelection<P1>(
+        &self,
+        dwflags: u32,
+        pdataobject: P1,
+        pacpstart: *mut i32,
+        pacpend: *mut i32,
+        pchange: *mut TS_TEXTCHANGE,
+    ) -> windows_core::HRESULT
+    where
+        P1: windows_core::Param<IDataObject>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).InsertEmbeddedAtSelection)(
+                windows_core::Interface::as_raw(self),
+                dwflags,
+                pdataobject.param().abi(),
+                pacpstart as _,
+                pacpend as _,
+                pchange as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn RequestSupportedAttrs(
+        &self,
+        dwflags: u32,
+        cfilterattrs: u32,
+        pafilterattrs: *const TS_ATTRID,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).RequestSupportedAttrs)(
+                windows_core::Interface::as_raw(self),
+                dwflags,
+                cfilterattrs,
+                pafilterattrs,
+            )
+        }
+    }
+    pub(crate) unsafe fn RequestAttrsAtPosition(
+        &self,
+        acppos: i32,
+        cfilterattrs: u32,
+        pafilterattrs: *const TS_ATTRID,
+        dwflags: u32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).RequestAttrsAtPosition)(
+                windows_core::Interface::as_raw(self),
+                acppos,
+                cfilterattrs,
+                pafilterattrs,
+                dwflags,
+            )
+        }
+    }
+    pub(crate) unsafe fn RequestAttrsTransitioningAtPosition(
+        &self,
+        acppos: i32,
+        cfilterattrs: u32,
+        pafilterattrs: *const TS_ATTRID,
+        dwflags: u32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).RequestAttrsTransitioningAtPosition)(
+                windows_core::Interface::as_raw(self),
+                acppos,
+                cfilterattrs,
+                pafilterattrs,
+                dwflags,
+            )
+        }
+    }
+    pub(crate) unsafe fn FindNextAttrTransition(
+        &self,
+        acpstart: i32,
+        acphalt: i32,
+        cfilterattrs: u32,
+        pafilterattrs: *const TS_ATTRID,
+        dwflags: u32,
+        pacpnext: *mut i32,
+        pffound: *mut windows_core::BOOL,
+        plfoundoffset: *mut i32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).FindNextAttrTransition)(
+                windows_core::Interface::as_raw(self),
+                acpstart,
+                acphalt,
+                cfilterattrs,
+                pafilterattrs,
+                dwflags,
+                pacpnext as _,
+                pffound as _,
+                plfoundoffset as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn RetrieveRequestedAttrs(
+        &self,
+        ulcount: u32,
+        paattrvals: *mut TS_ATTRVAL,
+        pcfetched: *mut u32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).RetrieveRequestedAttrs)(
+                windows_core::Interface::as_raw(self),
+                ulcount,
+                paattrvals,
+                pcfetched as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn GetEndACP(&self) -> windows_core::Result<i32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetEndACP)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetActiveView(&self) -> windows_core::Result<TsViewCookie> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetActiveView)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetACPFromPoint(
+        &self,
+        vcview: TsViewCookie,
+        ptscreen: *const POINT,
+        dwflags: u32,
+    ) -> windows_core::Result<i32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetACPFromPoint)(
+                windows_core::Interface::as_raw(self),
+                vcview,
+                ptscreen,
+                dwflags,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetTextExt(
+        &self,
+        vcview: TsViewCookie,
+        acpstart: i32,
+        acpend: i32,
+        prc: *mut RECT,
+        pfclipped: *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetTextExt)(
+                windows_core::Interface::as_raw(self),
+                vcview,
+                acpstart,
+                acpend,
+                prc as _,
+                pfclipped as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn GetScreenExt(&self, vcview: TsViewCookie) -> windows_core::Result<RECT> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetScreenExt)(
+                windows_core::Interface::as_raw(self),
+                vcview,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetWnd(&self, vcview: TsViewCookie) -> windows_core::Result<HWND> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetWnd)(
+                windows_core::Interface::as_raw(self),
+                vcview,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct ITextStoreACP_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -5730,7 +5636,7 @@ pub struct ITextStoreACP_Vtbl {
         *mut core::ffi::c_void,
         i32,
         i32,
-        windows_core::PWSTR,
+        *mut u16,
         u32,
         *mut u32,
         *mut TS_RUNINFO,
@@ -5743,7 +5649,7 @@ pub struct ITextStoreACP_Vtbl {
         u32,
         i32,
         i32,
-        windows_core::PCWSTR,
+        *const u16,
         u32,
         *mut TS_TEXTCHANGE,
     ) -> windows_core::HRESULT,
@@ -5777,7 +5683,7 @@ pub struct ITextStoreACP_Vtbl {
     pub InsertTextAtSelection: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         u32,
-        windows_core::PCWSTR,
+        *const u16,
         u32,
         *mut i32,
         *mut i32,
@@ -5795,20 +5701,20 @@ pub struct ITextStoreACP_Vtbl {
         *mut core::ffi::c_void,
         u32,
         u32,
-        *const windows_core::GUID,
+        *const TS_ATTRID,
     ) -> windows_core::HRESULT,
     pub RequestAttrsAtPosition: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         i32,
         u32,
-        *const windows_core::GUID,
+        *const TS_ATTRID,
         u32,
     ) -> windows_core::HRESULT,
     pub RequestAttrsTransitioningAtPosition: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         i32,
         u32,
-        *const windows_core::GUID,
+        *const TS_ATTRID,
         u32,
     )
         -> windows_core::HRESULT,
@@ -5817,7 +5723,7 @@ pub struct ITextStoreACP_Vtbl {
         i32,
         i32,
         u32,
-        *const windows_core::GUID,
+        *const TS_ATTRID,
         u32,
         *mut i32,
         *mut windows_core::BOOL,
@@ -5831,795 +5737,36 @@ pub struct ITextStoreACP_Vtbl {
     ) -> windows_core::HRESULT,
     pub GetEndACP:
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> windows_core::HRESULT,
-    pub GetActiveView:
-        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+    pub GetActiveView: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut TsViewCookie,
+    ) -> windows_core::HRESULT,
     pub GetACPFromPoint: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        u32,
+        TsViewCookie,
         *const POINT,
         u32,
         *mut i32,
     ) -> windows_core::HRESULT,
     pub GetTextExt: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        u32,
+        TsViewCookie,
         i32,
         i32,
         *mut RECT,
         *mut windows_core::BOOL,
     ) -> windows_core::HRESULT,
-    pub GetScreenExt:
-        unsafe extern "system" fn(*mut core::ffi::c_void, u32, *mut RECT) -> windows_core::HRESULT,
-    pub GetWnd:
-        unsafe extern "system" fn(*mut core::ffi::c_void, u32, *mut HWND) -> windows_core::HRESULT,
+    pub GetScreenExt: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TsViewCookie,
+        *mut RECT,
+    ) -> windows_core::HRESULT,
+    pub GetWnd: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TsViewCookie,
+        *mut HWND,
+    ) -> windows_core::HRESULT,
 }
-pub trait ITextStoreACP_Impl: windows_core::IUnknownImpl {
-    fn AdviseSink(
-        &self,
-        riid: *const windows_core::GUID,
-        punk: windows_core::Ref<windows_core::IUnknown>,
-        dwmask: u32,
-    ) -> windows_core::Result<()>;
-    fn UnadviseSink(
-        &self,
-        punk: windows_core::Ref<windows_core::IUnknown>,
-    ) -> windows_core::Result<()>;
-    fn RequestLock(&self, dwlockflags: u32) -> windows_core::Result<windows_core::HRESULT>;
-    fn GetStatus(&self) -> windows_core::Result<TS_STATUS>;
-    fn QueryInsert(
-        &self,
-        acpteststart: i32,
-        acptestend: i32,
-        cch: u32,
-        pacpresultstart: *mut i32,
-        pacpresultend: *mut i32,
-    ) -> windows_core::Result<()>;
-    fn GetSelection(
-        &self,
-        ulindex: u32,
-        ulcount: u32,
-        pselection: *mut TS_SELECTION_ACP,
-        pcfetched: *mut u32,
-    ) -> windows_core::Result<()>;
-    fn SetSelection(
-        &self,
-        ulcount: u32,
-        pselection: *const TS_SELECTION_ACP,
-    ) -> windows_core::Result<()>;
-    fn GetText(
-        &self,
-        acpstart: i32,
-        acpend: i32,
-        pchplain: windows_core::PWSTR,
-        cchplainreq: u32,
-        pcchplainret: *mut u32,
-        prgruninfo: *mut TS_RUNINFO,
-        cruninforeq: u32,
-        pcruninforet: *mut u32,
-        pacpnext: *mut i32,
-    ) -> windows_core::Result<()>;
-    fn SetText(
-        &self,
-        dwflags: u32,
-        acpstart: i32,
-        acpend: i32,
-        pchtext: &windows_core::PCWSTR,
-        cch: u32,
-    ) -> windows_core::Result<TS_TEXTCHANGE>;
-    fn GetFormattedText(&self, acpstart: i32, acpend: i32) -> windows_core::Result<IDataObject>;
-    fn GetEmbedded(
-        &self,
-        acppos: i32,
-        rguidservice: *const windows_core::GUID,
-        riid: *const windows_core::GUID,
-    ) -> windows_core::Result<windows_core::IUnknown>;
-    fn QueryInsertEmbedded(
-        &self,
-        pguidservice: *const windows_core::GUID,
-        pformatetc: *const FORMATETC,
-    ) -> windows_core::Result<windows_core::BOOL>;
-    fn InsertEmbedded(
-        &self,
-        dwflags: u32,
-        acpstart: i32,
-        acpend: i32,
-        pdataobject: windows_core::Ref<IDataObject>,
-    ) -> windows_core::Result<TS_TEXTCHANGE>;
-    fn InsertTextAtSelection(
-        &self,
-        dwflags: u32,
-        pchtext: &windows_core::PCWSTR,
-        cch: u32,
-        pacpstart: *mut i32,
-        pacpend: *mut i32,
-        pchange: *mut TS_TEXTCHANGE,
-    ) -> windows_core::Result<()>;
-    fn InsertEmbeddedAtSelection(
-        &self,
-        dwflags: u32,
-        pdataobject: windows_core::Ref<IDataObject>,
-        pacpstart: *mut i32,
-        pacpend: *mut i32,
-        pchange: *mut TS_TEXTCHANGE,
-    ) -> windows_core::Result<()>;
-    fn RequestSupportedAttrs(
-        &self,
-        dwflags: u32,
-        cfilterattrs: u32,
-        pafilterattrs: *const windows_core::GUID,
-    ) -> windows_core::Result<()>;
-    fn RequestAttrsAtPosition(
-        &self,
-        acppos: i32,
-        cfilterattrs: u32,
-        pafilterattrs: *const windows_core::GUID,
-        dwflags: u32,
-    ) -> windows_core::Result<()>;
-    fn RequestAttrsTransitioningAtPosition(
-        &self,
-        acppos: i32,
-        cfilterattrs: u32,
-        pafilterattrs: *const windows_core::GUID,
-        dwflags: u32,
-    ) -> windows_core::Result<()>;
-    fn FindNextAttrTransition(
-        &self,
-        acpstart: i32,
-        acphalt: i32,
-        cfilterattrs: u32,
-        pafilterattrs: *const windows_core::GUID,
-        dwflags: u32,
-        pacpnext: *mut i32,
-        pffound: *mut windows_core::BOOL,
-        plfoundoffset: *mut i32,
-    ) -> windows_core::Result<()>;
-    fn RetrieveRequestedAttrs(
-        &self,
-        ulcount: u32,
-        paattrvals: *mut TS_ATTRVAL,
-        pcfetched: *mut u32,
-    ) -> windows_core::Result<()>;
-    fn GetEndACP(&self) -> windows_core::Result<i32>;
-    fn GetActiveView(&self) -> windows_core::Result<u32>;
-    fn GetACPFromPoint(
-        &self,
-        vcview: u32,
-        ptscreen: *const POINT,
-        dwflags: u32,
-    ) -> windows_core::Result<i32>;
-    fn GetTextExt(
-        &self,
-        vcview: u32,
-        acpstart: i32,
-        acpend: i32,
-        prc: *mut RECT,
-        pfclipped: *mut windows_core::BOOL,
-    ) -> windows_core::Result<()>;
-    fn GetScreenExt(&self, vcview: u32) -> windows_core::Result<RECT>;
-    fn GetWnd(&self, vcview: u32) -> windows_core::Result<HWND>;
-}
-impl ITextStoreACP_Vtbl {
-    pub const fn new<Identity: ITextStoreACP_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn AdviseSink<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            riid: *const windows_core::GUID,
-            punk: *mut core::ffi::c_void,
-            dwmask: u32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::AdviseSink(
-                    this,
-                    core::mem::transmute_copy(&riid),
-                    core::mem::transmute_copy(&punk),
-                    core::mem::transmute_copy(&dwmask),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn UnadviseSink<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            punk: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::UnadviseSink(this, core::mem::transmute_copy(&punk)).into()
-            }
-        }
-        unsafe extern "system" fn RequestLock<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            dwlockflags: u32,
-            phrsession: *mut windows_core::HRESULT,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::RequestLock(this, core::mem::transmute_copy(&dwlockflags))
-                {
-                    Ok(ok__) => {
-                        phrsession.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetStatus<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            pdcs: *mut TS_STATUS,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::GetStatus(this) {
-                    Ok(ok__) => {
-                        pdcs.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn QueryInsert<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            acpteststart: i32,
-            acptestend: i32,
-            cch: u32,
-            pacpresultstart: *mut i32,
-            pacpresultend: *mut i32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::QueryInsert(
-                    this,
-                    core::mem::transmute_copy(&acpteststart),
-                    core::mem::transmute_copy(&acptestend),
-                    core::mem::transmute_copy(&cch),
-                    core::mem::transmute_copy(&pacpresultstart),
-                    core::mem::transmute_copy(&pacpresultend),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn GetSelection<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            ulindex: u32,
-            ulcount: u32,
-            pselection: *mut TS_SELECTION_ACP,
-            pcfetched: *mut u32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::GetSelection(
-                    this,
-                    core::mem::transmute_copy(&ulindex),
-                    core::mem::transmute_copy(&ulcount),
-                    core::mem::transmute_copy(&pselection),
-                    core::mem::transmute_copy(&pcfetched),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn SetSelection<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            ulcount: u32,
-            pselection: *const TS_SELECTION_ACP,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::SetSelection(
-                    this,
-                    core::mem::transmute_copy(&ulcount),
-                    core::mem::transmute_copy(&pselection),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn GetText<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            acpstart: i32,
-            acpend: i32,
-            pchplain: windows_core::PWSTR,
-            cchplainreq: u32,
-            pcchplainret: *mut u32,
-            prgruninfo: *mut TS_RUNINFO,
-            cruninforeq: u32,
-            pcruninforet: *mut u32,
-            pacpnext: *mut i32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::GetText(
-                    this,
-                    core::mem::transmute_copy(&acpstart),
-                    core::mem::transmute_copy(&acpend),
-                    core::mem::transmute_copy(&pchplain),
-                    core::mem::transmute_copy(&cchplainreq),
-                    core::mem::transmute_copy(&pcchplainret),
-                    core::mem::transmute_copy(&prgruninfo),
-                    core::mem::transmute_copy(&cruninforeq),
-                    core::mem::transmute_copy(&pcruninforet),
-                    core::mem::transmute_copy(&pacpnext),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn SetText<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            dwflags: u32,
-            acpstart: i32,
-            acpend: i32,
-            pchtext: windows_core::PCWSTR,
-            cch: u32,
-            pchange: *mut TS_TEXTCHANGE,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::SetText(
-                    this,
-                    core::mem::transmute_copy(&dwflags),
-                    core::mem::transmute_copy(&acpstart),
-                    core::mem::transmute_copy(&acpend),
-                    core::mem::transmute(&pchtext),
-                    core::mem::transmute_copy(&cch),
-                ) {
-                    Ok(ok__) => {
-                        pchange.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetFormattedText<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            acpstart: i32,
-            acpend: i32,
-            ppdataobject: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::GetFormattedText(
-                    this,
-                    core::mem::transmute_copy(&acpstart),
-                    core::mem::transmute_copy(&acpend),
-                ) {
-                    Ok(ok__) => {
-                        ppdataobject.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetEmbedded<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            acppos: i32,
-            rguidservice: *const windows_core::GUID,
-            riid: *const windows_core::GUID,
-            ppunk: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::GetEmbedded(
-                    this,
-                    core::mem::transmute_copy(&acppos),
-                    core::mem::transmute_copy(&rguidservice),
-                    core::mem::transmute_copy(&riid),
-                ) {
-                    Ok(ok__) => {
-                        ppunk.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn QueryInsertEmbedded<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pguidservice: *const windows_core::GUID,
-            pformatetc: *const FORMATETC,
-            pfinsertable: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::QueryInsertEmbedded(
-                    this,
-                    core::mem::transmute_copy(&pguidservice),
-                    core::mem::transmute_copy(&pformatetc),
-                ) {
-                    Ok(ok__) => {
-                        pfinsertable.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn InsertEmbedded<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            dwflags: u32,
-            acpstart: i32,
-            acpend: i32,
-            pdataobject: *mut core::ffi::c_void,
-            pchange: *mut TS_TEXTCHANGE,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::InsertEmbedded(
-                    this,
-                    core::mem::transmute_copy(&dwflags),
-                    core::mem::transmute_copy(&acpstart),
-                    core::mem::transmute_copy(&acpend),
-                    core::mem::transmute_copy(&pdataobject),
-                ) {
-                    Ok(ok__) => {
-                        pchange.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn InsertTextAtSelection<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            dwflags: u32,
-            pchtext: windows_core::PCWSTR,
-            cch: u32,
-            pacpstart: *mut i32,
-            pacpend: *mut i32,
-            pchange: *mut TS_TEXTCHANGE,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::InsertTextAtSelection(
-                    this,
-                    core::mem::transmute_copy(&dwflags),
-                    core::mem::transmute(&pchtext),
-                    core::mem::transmute_copy(&cch),
-                    core::mem::transmute_copy(&pacpstart),
-                    core::mem::transmute_copy(&pacpend),
-                    core::mem::transmute_copy(&pchange),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn InsertEmbeddedAtSelection<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            dwflags: u32,
-            pdataobject: *mut core::ffi::c_void,
-            pacpstart: *mut i32,
-            pacpend: *mut i32,
-            pchange: *mut TS_TEXTCHANGE,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::InsertEmbeddedAtSelection(
-                    this,
-                    core::mem::transmute_copy(&dwflags),
-                    core::mem::transmute_copy(&pdataobject),
-                    core::mem::transmute_copy(&pacpstart),
-                    core::mem::transmute_copy(&pacpend),
-                    core::mem::transmute_copy(&pchange),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn RequestSupportedAttrs<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            dwflags: u32,
-            cfilterattrs: u32,
-            pafilterattrs: *const windows_core::GUID,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::RequestSupportedAttrs(
-                    this,
-                    core::mem::transmute_copy(&dwflags),
-                    core::mem::transmute_copy(&cfilterattrs),
-                    core::mem::transmute_copy(&pafilterattrs),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn RequestAttrsAtPosition<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            acppos: i32,
-            cfilterattrs: u32,
-            pafilterattrs: *const windows_core::GUID,
-            dwflags: u32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::RequestAttrsAtPosition(
-                    this,
-                    core::mem::transmute_copy(&acppos),
-                    core::mem::transmute_copy(&cfilterattrs),
-                    core::mem::transmute_copy(&pafilterattrs),
-                    core::mem::transmute_copy(&dwflags),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn RequestAttrsTransitioningAtPosition<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            acppos: i32,
-            cfilterattrs: u32,
-            pafilterattrs: *const windows_core::GUID,
-            dwflags: u32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::RequestAttrsTransitioningAtPosition(
-                    this,
-                    core::mem::transmute_copy(&acppos),
-                    core::mem::transmute_copy(&cfilterattrs),
-                    core::mem::transmute_copy(&pafilterattrs),
-                    core::mem::transmute_copy(&dwflags),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn FindNextAttrTransition<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            acpstart: i32,
-            acphalt: i32,
-            cfilterattrs: u32,
-            pafilterattrs: *const windows_core::GUID,
-            dwflags: u32,
-            pacpnext: *mut i32,
-            pffound: *mut windows_core::BOOL,
-            plfoundoffset: *mut i32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::FindNextAttrTransition(
-                    this,
-                    core::mem::transmute_copy(&acpstart),
-                    core::mem::transmute_copy(&acphalt),
-                    core::mem::transmute_copy(&cfilterattrs),
-                    core::mem::transmute_copy(&pafilterattrs),
-                    core::mem::transmute_copy(&dwflags),
-                    core::mem::transmute_copy(&pacpnext),
-                    core::mem::transmute_copy(&pffound),
-                    core::mem::transmute_copy(&plfoundoffset),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn RetrieveRequestedAttrs<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            ulcount: u32,
-            paattrvals: *mut TS_ATTRVAL,
-            pcfetched: *mut u32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::RetrieveRequestedAttrs(
-                    this,
-                    core::mem::transmute_copy(&ulcount),
-                    core::mem::transmute_copy(&paattrvals),
-                    core::mem::transmute_copy(&pcfetched),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn GetEndACP<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            pacp: *mut i32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::GetEndACP(this) {
-                    Ok(ok__) => {
-                        pacp.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetActiveView<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pvcview: *mut u32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::GetActiveView(this) {
-                    Ok(ok__) => {
-                        pvcview.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetACPFromPoint<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            vcview: u32,
-            ptscreen: *const POINT,
-            dwflags: u32,
-            pacp: *mut i32,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::GetACPFromPoint(
-                    this,
-                    core::mem::transmute_copy(&vcview),
-                    core::mem::transmute_copy(&ptscreen),
-                    core::mem::transmute_copy(&dwflags),
-                ) {
-                    Ok(ok__) => {
-                        pacp.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetTextExt<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            vcview: u32,
-            acpstart: i32,
-            acpend: i32,
-            prc: *mut RECT,
-            pfclipped: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                ITextStoreACP_Impl::GetTextExt(
-                    this,
-                    core::mem::transmute_copy(&vcview),
-                    core::mem::transmute_copy(&acpstart),
-                    core::mem::transmute_copy(&acpend),
-                    core::mem::transmute_copy(&prc),
-                    core::mem::transmute_copy(&pfclipped),
-                )
-                .into()
-            }
-        }
-        unsafe extern "system" fn GetScreenExt<
-            Identity: ITextStoreACP_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            vcview: u32,
-            prc: *mut RECT,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::GetScreenExt(this, core::mem::transmute_copy(&vcview)) {
-                    Ok(ok__) => {
-                        prc.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn GetWnd<Identity: ITextStoreACP_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            vcview: u32,
-            phwnd: *mut HWND,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match ITextStoreACP_Impl::GetWnd(this, core::mem::transmute_copy(&vcview)) {
-                    Ok(ok__) => {
-                        phwnd.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            AdviseSink: AdviseSink::<Identity, OFFSET>,
-            UnadviseSink: UnadviseSink::<Identity, OFFSET>,
-            RequestLock: RequestLock::<Identity, OFFSET>,
-            GetStatus: GetStatus::<Identity, OFFSET>,
-            QueryInsert: QueryInsert::<Identity, OFFSET>,
-            GetSelection: GetSelection::<Identity, OFFSET>,
-            SetSelection: SetSelection::<Identity, OFFSET>,
-            GetText: GetText::<Identity, OFFSET>,
-            SetText: SetText::<Identity, OFFSET>,
-            GetFormattedText: GetFormattedText::<Identity, OFFSET>,
-            GetEmbedded: GetEmbedded::<Identity, OFFSET>,
-            QueryInsertEmbedded: QueryInsertEmbedded::<Identity, OFFSET>,
-            InsertEmbedded: InsertEmbedded::<Identity, OFFSET>,
-            InsertTextAtSelection: InsertTextAtSelection::<Identity, OFFSET>,
-            InsertEmbeddedAtSelection: InsertEmbeddedAtSelection::<Identity, OFFSET>,
-            RequestSupportedAttrs: RequestSupportedAttrs::<Identity, OFFSET>,
-            RequestAttrsAtPosition: RequestAttrsAtPosition::<Identity, OFFSET>,
-            RequestAttrsTransitioningAtPosition: RequestAttrsTransitioningAtPosition::<
-                Identity,
-                OFFSET,
-            >,
-            FindNextAttrTransition: FindNextAttrTransition::<Identity, OFFSET>,
-            RetrieveRequestedAttrs: RetrieveRequestedAttrs::<Identity, OFFSET>,
-            GetEndACP: GetEndACP::<Identity, OFFSET>,
-            GetActiveView: GetActiveView::<Identity, OFFSET>,
-            GetACPFromPoint: GetACPFromPoint::<Identity, OFFSET>,
-            GetTextExt: GetTextExt::<Identity, OFFSET>,
-            GetScreenExt: GetScreenExt::<Identity, OFFSET>,
-            GetWnd: GetWnd::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<ITextStoreACP as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for ITextStoreACP {}
 windows_core::imp::define_interface!(
     ITextStoreACPSink,
     ITextStoreACPSink_Vtbl,
@@ -6629,92 +5776,82 @@ windows_core::imp::interface_hierarchy!(ITextStoreACPSink, windows_core::IUnknow
 impl ITextStoreACPSink {
     pub(crate) unsafe fn OnTextChange(
         &self,
-        dwflags: TEXT_STORE_TEXT_CHANGE_FLAGS,
+        dwflags: u32,
         pchange: *const TS_TEXTCHANGE,
-    ) -> windows_core::Result<()> {
+    ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).OnTextChange)(
                 windows_core::Interface::as_raw(self),
                 dwflags,
                 pchange,
             )
-            .ok()
         }
     }
-    pub(crate) unsafe fn OnSelectionChange(&self) -> windows_core::Result<()> {
+    pub(crate) unsafe fn OnSelectionChange(&self) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).OnSelectionChange)(
                 windows_core::Interface::as_raw(self),
             )
-            .ok()
         }
     }
     pub(crate) unsafe fn OnLayoutChange(
         &self,
         lcode: TsLayoutCode,
-        vcview: u32,
-    ) -> windows_core::Result<()> {
+        vcview: TsViewCookie,
+    ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).OnLayoutChange)(
                 windows_core::Interface::as_raw(self),
                 lcode,
                 vcview,
             )
-            .ok()
         }
     }
-    pub(crate) unsafe fn OnStatusChange(&self, dwflags: u32) -> windows_core::Result<()> {
+    pub(crate) unsafe fn OnStatusChange(&self, dwflags: u32) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).OnStatusChange)(
                 windows_core::Interface::as_raw(self),
                 dwflags,
             )
-            .ok()
         }
     }
     pub(crate) unsafe fn OnAttrsChange(
         &self,
         acpstart: i32,
         acpend: i32,
-        paattrs: &[windows_core::GUID],
-    ) -> windows_core::Result<()> {
+        cattrs: u32,
+        paattrs: *const TS_ATTRID,
+    ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).OnAttrsChange)(
                 windows_core::Interface::as_raw(self),
                 acpstart,
                 acpend,
-                paattrs.len().try_into().unwrap(),
-                paattrs.as_ptr(),
+                cattrs,
+                paattrs,
             )
-            .ok()
         }
     }
-    pub(crate) unsafe fn OnLockGranted(
-        &self,
-        dwlockflags: TEXT_STORE_LOCK_FLAGS,
-    ) -> windows_core::Result<()> {
+    pub(crate) unsafe fn OnLockGranted(&self, dwlockflags: u32) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).OnLockGranted)(
                 windows_core::Interface::as_raw(self),
                 dwlockflags,
             )
-            .ok()
         }
     }
-    pub(crate) unsafe fn OnStartEditTransaction(&self) -> windows_core::Result<()> {
+    pub(crate) unsafe fn OnStartEditTransaction(&self) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).OnStartEditTransaction)(
                 windows_core::Interface::as_raw(self),
             )
-            .ok()
         }
     }
-    pub(crate) unsafe fn OnEndEditTransaction(&self) -> windows_core::Result<()> {
+    pub(crate) unsafe fn OnEndEditTransaction(&self) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).OnEndEditTransaction)(
                 windows_core::Interface::as_raw(self),
             )
-            .ok()
         }
     }
 }
@@ -6723,7 +5860,7 @@ pub struct ITextStoreACPSink_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     pub OnTextChange: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        TEXT_STORE_TEXT_CHANGE_FLAGS,
+        u32,
         *const TS_TEXTCHANGE,
     ) -> windows_core::HRESULT,
     pub OnSelectionChange:
@@ -6731,7 +5868,7 @@ pub struct ITextStoreACPSink_Vtbl {
     pub OnLayoutChange: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         TsLayoutCode,
-        u32,
+        TsViewCookie,
     ) -> windows_core::HRESULT,
     pub OnStatusChange:
         unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> windows_core::HRESULT,
@@ -6740,12 +5877,10 @@ pub struct ITextStoreACPSink_Vtbl {
         i32,
         i32,
         u32,
-        *const windows_core::GUID,
+        *const TS_ATTRID,
     ) -> windows_core::HRESULT,
-    pub OnLockGranted: unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        TEXT_STORE_LOCK_FLAGS,
-    ) -> windows_core::HRESULT,
+    pub OnLockGranted:
+        unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> windows_core::HRESULT,
     pub OnStartEditTransaction:
         unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
     pub OnEndEditTransaction:
@@ -6757,24 +5892,311 @@ windows_core::imp::define_interface!(
     0xaa80e7fd_2021_11d2_93e0_0060b067b86e
 );
 windows_core::imp::interface_hierarchy!(ITfContext, windows_core::IUnknown);
+impl ITfContext {
+    pub(crate) unsafe fn RequestEditSession<P1>(
+        &self,
+        tid: TfClientId,
+        pes: P1,
+        dwflags: u32,
+    ) -> windows_core::Result<windows_core::HRESULT>
+    where
+        P1: windows_core::Param<ITfEditSession>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RequestEditSession)(
+                windows_core::Interface::as_raw(self),
+                tid,
+                pes.param().abi(),
+                dwflags,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn InWriteSession(
+        &self,
+        tid: TfClientId,
+    ) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).InWriteSession)(
+                windows_core::Interface::as_raw(self),
+                tid,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetSelection(
+        &self,
+        ec: TfEditCookie,
+        ulindex: u32,
+        ulcount: u32,
+        pselection: *mut TF_SELECTION,
+        pcfetched: *mut u32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetSelection)(
+                windows_core::Interface::as_raw(self),
+                ec,
+                ulindex,
+                ulcount,
+                pselection,
+                pcfetched as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn SetSelection(
+        &self,
+        ec: TfEditCookie,
+        ulcount: u32,
+        pselection: *const TF_SELECTION,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetSelection)(
+                windows_core::Interface::as_raw(self),
+                ec,
+                ulcount,
+                pselection,
+            )
+        }
+    }
+    pub(crate) unsafe fn GetStart(&self, ec: TfEditCookie) -> windows_core::Result<ITfRange> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetStart)(
+                windows_core::Interface::as_raw(self),
+                ec,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetEnd(&self, ec: TfEditCookie) -> windows_core::Result<ITfRange> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetEnd)(
+                windows_core::Interface::as_raw(self),
+                ec,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetActiveView(&self) -> windows_core::Result<ITfContextView> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetActiveView)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn EnumViews(&self) -> windows_core::Result<IEnumTfContextViews> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).EnumViews)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetStatus(&self) -> windows_core::Result<TF_STATUS> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetStatus)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetProperty(
+        &self,
+        guidprop: *const windows_core::GUID,
+    ) -> windows_core::Result<ITfProperty> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetProperty)(
+                windows_core::Interface::as_raw(self),
+                guidprop,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetAppProperty(
+        &self,
+        guidprop: *const windows_core::GUID,
+    ) -> windows_core::Result<ITfReadOnlyProperty> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetAppProperty)(
+                windows_core::Interface::as_raw(self),
+                guidprop,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn TrackProperties(
+        &self,
+        prgprop: *const *const windows_core::GUID,
+        cprop: u32,
+        prgappprop: *const *const windows_core::GUID,
+        cappprop: u32,
+    ) -> windows_core::Result<ITfReadOnlyProperty> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TrackProperties)(
+                windows_core::Interface::as_raw(self),
+                prgprop,
+                cprop,
+                prgappprop,
+                cappprop,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn EnumProperties(&self) -> windows_core::Result<IEnumTfProperties> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).EnumProperties)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetDocumentMgr(&self) -> windows_core::Result<ITfDocumentMgr> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetDocumentMgr)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn CreateRangeBackup<P1>(
+        &self,
+        ec: TfEditCookie,
+        prange: P1,
+    ) -> windows_core::Result<ITfRangeBackup>
+    where
+        P1: windows_core::Param<ITfRange>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateRangeBackup)(
+                windows_core::Interface::as_raw(self),
+                ec,
+                prange.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
 #[repr(C)]
 pub struct ITfContext_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
-    RequestEditSession: usize,
-    InWriteSession: usize,
-    GetSelection: usize,
-    SetSelection: usize,
-    GetStart: usize,
-    GetEnd: usize,
-    GetActiveView: usize,
-    EnumViews: usize,
-    GetStatus: usize,
-    GetProperty: usize,
-    GetAppProperty: usize,
-    TrackProperties: usize,
-    EnumProperties: usize,
-    GetDocumentMgr: usize,
-    CreateRangeBackup: usize,
+    pub RequestEditSession: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfClientId,
+        *mut core::ffi::c_void,
+        u32,
+        *mut windows_core::HRESULT,
+    ) -> windows_core::HRESULT,
+    pub InWriteSession: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfClientId,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub GetSelection: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfEditCookie,
+        u32,
+        u32,
+        *mut TF_SELECTION,
+        *mut u32,
+    ) -> windows_core::HRESULT,
+    pub SetSelection: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfEditCookie,
+        u32,
+        *const TF_SELECTION,
+    ) -> windows_core::HRESULT,
+    pub GetStart: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfEditCookie,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetEnd: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfEditCookie,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetActiveView: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub EnumViews: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetStatus:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut TF_STATUS) -> windows_core::HRESULT,
+    pub GetProperty: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetAppProperty: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub TrackProperties: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const *const windows_core::GUID,
+        u32,
+        *const *const windows_core::GUID,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub EnumProperties: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetDocumentMgr: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub CreateRangeBackup: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfEditCookie,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ITfContextView,
+    ITfContextView_Vtbl,
+    0x2433bf8e_0f9b_435c_ba2c_180611978c30
+);
+windows_core::imp::interface_hierarchy!(ITfContextView, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITfContextView_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetRangeFromPoint: usize,
+    GetTextExt: usize,
+    GetScreenExt: usize,
+    GetWnd: usize,
 }
 windows_core::imp::define_interface!(
     ITfDocumentMgr,
@@ -6785,12 +6207,12 @@ windows_core::imp::interface_hierarchy!(ITfDocumentMgr, windows_core::IUnknown);
 impl ITfDocumentMgr {
     pub(crate) unsafe fn CreateContext<P2>(
         &self,
-        tidowner: u32,
+        tidowner: TfClientId,
         dwflags: u32,
         punk: P2,
         ppic: *mut Option<ITfContext>,
-        pectextstore: *mut u32,
-    ) -> windows_core::Result<()>
+        pectextstore: *mut TfEditCookie,
+    ) -> windows_core::HRESULT
     where
         P2: windows_core::Param<windows_core::IUnknown>,
     {
@@ -6800,13 +6222,12 @@ impl ITfDocumentMgr {
                 tidowner,
                 dwflags,
                 punk.param().abi(),
-                ppic as _,
+                core::mem::transmute(ppic),
                 pectextstore as _,
             )
-            .ok()
         }
     }
-    pub(crate) unsafe fn Push<P0>(&self, pic: P0) -> windows_core::Result<()>
+    pub(crate) unsafe fn Push<P0>(&self, pic: P0) -> windows_core::HRESULT
     where
         P0: windows_core::Param<ITfContext>,
     {
@@ -6815,16 +6236,14 @@ impl ITfDocumentMgr {
                 windows_core::Interface::as_raw(self),
                 pic.param().abi(),
             )
-            .ok()
         }
     }
-    pub(crate) unsafe fn Pop(&self, dwflags: u32) -> windows_core::Result<()> {
+    pub(crate) unsafe fn Pop(&self, dwflags: u32) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).Pop)(
                 windows_core::Interface::as_raw(self),
                 dwflags,
             )
-            .ok()
         }
     }
     pub(crate) unsafe fn GetTop(&self) -> windows_core::Result<ITfContext> {
@@ -6853,11 +6272,11 @@ pub struct ITfDocumentMgr_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     pub CreateContext: unsafe extern "system" fn(
         *mut core::ffi::c_void,
-        u32,
+        TfClientId,
         u32,
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
-        *mut u32,
+        *mut TfEditCookie,
     ) -> windows_core::HRESULT,
     pub Push: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -6875,28 +6294,413 @@ pub struct ITfDocumentMgr_Vtbl {
     EnumContexts: usize,
 }
 windows_core::imp::define_interface!(
+    ITfEditSession,
+    ITfEditSession_Vtbl,
+    0xaa80e803_2021_11d2_93e0_0060b067b86e
+);
+windows_core::imp::interface_hierarchy!(ITfEditSession, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITfEditSession_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    DoEditSession: usize,
+}
+windows_core::imp::define_interface!(
+    ITfKeyEventSink,
+    ITfKeyEventSink_Vtbl,
+    0xaa80e7f5_2021_11d2_93e0_0060b067b86e
+);
+windows_core::imp::interface_hierarchy!(ITfKeyEventSink, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITfKeyEventSink_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    OnSetFocus: usize,
+    OnTestKeyDown: usize,
+    OnTestKeyUp: usize,
+    OnKeyDown: usize,
+    OnKeyUp: usize,
+    OnPreservedKey: usize,
+}
+windows_core::imp::define_interface!(
     ITfKeystrokeMgr,
     ITfKeystrokeMgr_Vtbl,
     0xaa80e7f0_2021_11d2_93e0_0060b067b86e
 );
 windows_core::imp::interface_hierarchy!(ITfKeystrokeMgr, windows_core::IUnknown);
+impl ITfKeystrokeMgr {
+    pub(crate) unsafe fn AdviseKeyEventSink<P1>(
+        &self,
+        tid: TfClientId,
+        psink: P1,
+        fforeground: bool,
+    ) -> windows_core::HRESULT
+    where
+        P1: windows_core::Param<ITfKeyEventSink>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).AdviseKeyEventSink)(
+                windows_core::Interface::as_raw(self),
+                tid,
+                psink.param().abi(),
+                fforeground.into(),
+            )
+        }
+    }
+    pub(crate) unsafe fn UnadviseKeyEventSink(&self, tid: TfClientId) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).UnadviseKeyEventSink)(
+                windows_core::Interface::as_raw(self),
+                tid,
+            )
+        }
+    }
+    pub(crate) unsafe fn GetForeground(&self) -> windows_core::Result<windows_core::GUID> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetForeground)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn TestKeyDown(
+        &self,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TestKeyDown)(
+                windows_core::Interface::as_raw(self),
+                wparam,
+                lparam,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn TestKeyUp(
+        &self,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TestKeyUp)(
+                windows_core::Interface::as_raw(self),
+                wparam,
+                lparam,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn KeyDown(
+        &self,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).KeyDown)(
+                windows_core::Interface::as_raw(self),
+                wparam,
+                lparam,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn KeyUp(
+        &self,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).KeyUp)(
+                windows_core::Interface::as_raw(self),
+                wparam,
+                lparam,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetPreservedKey<P0>(
+        &self,
+        pic: P0,
+        pprekey: *const TF_PRESERVEDKEY,
+    ) -> windows_core::Result<windows_core::GUID>
+    where
+        P0: windows_core::Param<ITfContext>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetPreservedKey)(
+                windows_core::Interface::as_raw(self),
+                pic.param().abi(),
+                pprekey,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn IsPreservedKey(
+        &self,
+        rguid: *const windows_core::GUID,
+        pprekey: *const TF_PRESERVEDKEY,
+    ) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).IsPreservedKey)(
+                windows_core::Interface::as_raw(self),
+                rguid,
+                pprekey,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn PreserveKey(
+        &self,
+        tid: TfClientId,
+        rguid: *const windows_core::GUID,
+        prekey: *const TF_PRESERVEDKEY,
+        pchdesc: *const u16,
+        cchdesc: u32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).PreserveKey)(
+                windows_core::Interface::as_raw(self),
+                tid,
+                rguid,
+                prekey,
+                pchdesc,
+                cchdesc,
+            )
+        }
+    }
+    pub(crate) unsafe fn UnpreserveKey(
+        &self,
+        rguid: *const windows_core::GUID,
+        pprekey: *const TF_PRESERVEDKEY,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).UnpreserveKey)(
+                windows_core::Interface::as_raw(self),
+                rguid,
+                pprekey,
+            )
+        }
+    }
+    pub(crate) unsafe fn SetPreservedKeyDescription(
+        &self,
+        rguid: *const windows_core::GUID,
+        pchdesc: *const u16,
+        cchdesc: u32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetPreservedKeyDescription)(
+                windows_core::Interface::as_raw(self),
+                rguid,
+                pchdesc,
+                cchdesc,
+            )
+        }
+    }
+    pub(crate) unsafe fn GetPreservedKeyDescription(
+        &self,
+        rguid: *const windows_core::GUID,
+    ) -> windows_core::Result<windows_core::BSTR> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetPreservedKeyDescription)(
+                windows_core::Interface::as_raw(self),
+                rguid,
+                &mut result__,
+            )
+            .map(|| core::mem::transmute(result__))
+        }
+    }
+    pub(crate) unsafe fn SimulatePreservedKey<P0>(
+        &self,
+        pic: P0,
+        rguid: *const windows_core::GUID,
+    ) -> windows_core::Result<windows_core::BOOL>
+    where
+        P0: windows_core::Param<ITfContext>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).SimulatePreservedKey)(
+                windows_core::Interface::as_raw(self),
+                pic.param().abi(),
+                rguid,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct ITfKeystrokeMgr_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
-    AdviseKeyEventSink: usize,
-    UnadviseKeyEventSink: usize,
-    GetForeground: usize,
-    TestKeyDown: usize,
-    TestKeyUp: usize,
-    KeyDown: usize,
-    KeyUp: usize,
-    GetPreservedKey: usize,
-    IsPreservedKey: usize,
-    PreserveKey: usize,
-    UnpreserveKey: usize,
-    SetPreservedKeyDescription: usize,
-    GetPreservedKeyDescription: usize,
-    SimulatePreservedKey: usize,
+    pub AdviseKeyEventSink: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfClientId,
+        *mut core::ffi::c_void,
+        windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub UnadviseKeyEventSink:
+        unsafe extern "system" fn(*mut core::ffi::c_void, TfClientId) -> windows_core::HRESULT,
+    pub GetForeground: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::GUID,
+    ) -> windows_core::HRESULT,
+    pub TestKeyDown: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        WPARAM,
+        LPARAM,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub TestKeyUp: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        WPARAM,
+        LPARAM,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub KeyDown: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        WPARAM,
+        LPARAM,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub KeyUp: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        WPARAM,
+        LPARAM,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub GetPreservedKey: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *const TF_PRESERVEDKEY,
+        *mut windows_core::GUID,
+    ) -> windows_core::HRESULT,
+    pub IsPreservedKey: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *const TF_PRESERVEDKEY,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub PreserveKey: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        TfClientId,
+        *const windows_core::GUID,
+        *const TF_PRESERVEDKEY,
+        *const u16,
+        u32,
+    ) -> windows_core::HRESULT,
+    pub UnpreserveKey: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *const TF_PRESERVEDKEY,
+    ) -> windows_core::HRESULT,
+    pub SetPreservedKeyDescription: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *const u16,
+        u32,
+    ) -> windows_core::HRESULT,
+    pub GetPreservedKeyDescription: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub SimulatePreservedKey: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ITfProperty,
+    ITfProperty_Vtbl,
+    0xe2449660_9542_11d2_bf46_00105a2799b5
+);
+impl core::ops::Deref for ITfProperty {
+    type Target = ITfReadOnlyProperty;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(ITfProperty, windows_core::IUnknown, ITfReadOnlyProperty);
+#[repr(C)]
+pub struct ITfProperty_Vtbl {
+    pub base__: ITfReadOnlyProperty_Vtbl,
+    FindRange: usize,
+    SetValueStore: usize,
+    SetValue: usize,
+    Clear: usize,
+}
+windows_core::imp::define_interface!(
+    ITfRange,
+    ITfRange_Vtbl,
+    0xaa80e7ff_2021_11d2_93e0_0060b067b86e
+);
+windows_core::imp::interface_hierarchy!(ITfRange, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITfRange_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetText: usize,
+    SetText: usize,
+    GetFormattedText: usize,
+    GetEmbedded: usize,
+    InsertEmbedded: usize,
+    ShiftStart: usize,
+    ShiftEnd: usize,
+    ShiftStartToRange: usize,
+    ShiftEndToRange: usize,
+    ShiftStartRegion: usize,
+    ShiftEndRegion: usize,
+    IsEmpty: usize,
+    Collapse: usize,
+    IsEqualStart: usize,
+    IsEqualEnd: usize,
+    CompareStart: usize,
+    CompareEnd: usize,
+    AdjustForInsert: usize,
+    GetGravity: usize,
+    SetGravity: usize,
+    Clone: usize,
+    GetContext: usize,
+}
+windows_core::imp::define_interface!(
+    ITfRangeBackup,
+    ITfRangeBackup_Vtbl,
+    0x463a506d_6992_49d2_9b88_93d55e70bb16
+);
+windows_core::imp::interface_hierarchy!(ITfRangeBackup, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITfRangeBackup_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    Restore: usize,
+}
+windows_core::imp::define_interface!(
+    ITfReadOnlyProperty,
+    ITfReadOnlyProperty_Vtbl,
+    0x17d49a3d_f8b8_4b2f_b254_52319dd64c53
+);
+windows_core::imp::interface_hierarchy!(ITfReadOnlyProperty, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITfReadOnlyProperty_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetType: usize,
+    EnumRanges: usize,
+    GetValue: usize,
+    GetContext: usize,
 }
 windows_core::imp::define_interface!(
     ITfSource,
@@ -6924,13 +6728,12 @@ impl ITfSource {
             .map(|| result__)
         }
     }
-    pub(crate) unsafe fn UnadviseSink(&self, dwcookie: u32) -> windows_core::Result<()> {
+    pub(crate) unsafe fn UnadviseSink(&self, dwcookie: u32) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).UnadviseSink)(
                 windows_core::Interface::as_raw(self),
                 dwcookie,
             )
-            .ok()
         }
     }
 }
@@ -6953,7 +6756,7 @@ windows_core::imp::define_interface!(
 );
 windows_core::imp::interface_hierarchy!(ITfThreadMgr, windows_core::IUnknown);
 impl ITfThreadMgr {
-    pub(crate) unsafe fn Activate(&self) -> windows_core::Result<u32> {
+    pub(crate) unsafe fn Activate(&self) -> windows_core::Result<TfClientId> {
         unsafe {
             let mut result__ = core::mem::zeroed();
             (windows_core::Interface::vtable(self).Activate)(
@@ -6963,12 +6766,11 @@ impl ITfThreadMgr {
             .map(|| result__)
         }
     }
-    pub(crate) unsafe fn Deactivate(&self) -> windows_core::Result<()> {
+    pub(crate) unsafe fn Deactivate(&self) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).Deactivate)(windows_core::Interface::as_raw(
                 self,
             ))
-            .ok()
         }
     }
     pub(crate) unsafe fn CreateDocumentMgr(&self) -> windows_core::Result<ITfDocumentMgr> {
@@ -6991,7 +6793,7 @@ impl ITfThreadMgr {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
-    pub(crate) unsafe fn SetFocus<P0>(&self, pdimfocus: P0) -> windows_core::Result<()>
+    pub(crate) unsafe fn SetFocus<P0>(&self, pdimfocus: P0) -> windows_core::HRESULT
     where
         P0: windows_core::Param<ITfDocumentMgr>,
     {
@@ -7000,7 +6802,6 @@ impl ITfThreadMgr {
                 windows_core::Interface::as_raw(self),
                 pdimfocus.param().abi(),
             )
-            .ok()
         }
     }
 }
@@ -7008,7 +6809,7 @@ impl ITfThreadMgr {
 pub struct ITfThreadMgr_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     pub Activate:
-        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut TfClientId) -> windows_core::HRESULT,
     pub Deactivate: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
     pub CreateDocumentMgr: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -7036,7 +6837,7 @@ windows_core::imp::define_interface!(
 );
 windows_core::imp::interface_hierarchy!(ITfThreadMgr2, windows_core::IUnknown);
 impl ITfThreadMgr2 {
-    pub(crate) unsafe fn Activate(&self) -> windows_core::Result<u32> {
+    pub(crate) unsafe fn Activate(&self) -> windows_core::Result<TfClientId> {
         unsafe {
             let mut result__ = core::mem::zeroed();
             (windows_core::Interface::vtable(self).Activate)(
@@ -7046,12 +6847,11 @@ impl ITfThreadMgr2 {
             .map(|| result__)
         }
     }
-    pub(crate) unsafe fn Deactivate(&self) -> windows_core::Result<()> {
+    pub(crate) unsafe fn Deactivate(&self) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).Deactivate)(windows_core::Interface::as_raw(
                 self,
             ))
-            .ok()
         }
     }
     pub(crate) unsafe fn CreateDocumentMgr(&self) -> windows_core::Result<ITfDocumentMgr> {
@@ -7074,7 +6874,7 @@ impl ITfThreadMgr2 {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
-    pub(crate) unsafe fn SetFocus<P0>(&self, pdimfocus: P0) -> windows_core::Result<()>
+    pub(crate) unsafe fn SetFocus<P0>(&self, pdimfocus: P0) -> windows_core::HRESULT
     where
         P0: windows_core::Param<ITfDocumentMgr>,
     {
@@ -7083,7 +6883,6 @@ impl ITfThreadMgr2 {
                 windows_core::Interface::as_raw(self),
                 pdimfocus.param().abi(),
             )
-            .ok()
         }
     }
 }
@@ -7091,7 +6890,7 @@ impl ITfThreadMgr2 {
 pub struct ITfThreadMgr2_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     pub Activate:
-        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut TfClientId) -> windows_core::HRESULT,
     pub Deactivate: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
     pub CreateDocumentMgr: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -7121,6 +6920,23 @@ windows_core::imp::define_interface!(
     0x56d00bd0_c4f4_433c_a836_1a52a57e0892
 );
 windows_core::imp::interface_hierarchy!(IToggleProvider, windows_core::IUnknown);
+impl IToggleProvider {
+    pub(crate) unsafe fn Toggle(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Toggle)(windows_core::Interface::as_raw(self))
+        }
+    }
+    pub(crate) unsafe fn ToggleState(&self) -> windows_core::Result<ToggleState> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).ToggleState)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct IToggleProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -7130,57 +6946,45 @@ pub struct IToggleProvider_Vtbl {
         *mut ToggleState,
     ) -> windows_core::HRESULT,
 }
-pub trait IToggleProvider_Impl: windows_core::IUnknownImpl {
-    fn Toggle(&self) -> windows_core::Result<()>;
-    fn ToggleState(&self) -> windows_core::Result<ToggleState>;
-}
-impl IToggleProvider_Vtbl {
-    pub const fn new<Identity: IToggleProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn Toggle<Identity: IToggleProvider_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IToggleProvider_Impl::Toggle(this).into()
-            }
-        }
-        unsafe extern "system" fn ToggleState<
-            Identity: IToggleProvider_Impl,
-            const OFFSET: isize,
-        >(
-            this: *mut core::ffi::c_void,
-            pretval: *mut ToggleState,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IToggleProvider_Impl::ToggleState(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            Toggle: Toggle::<Identity, OFFSET>,
-            ToggleState: ToggleState::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IToggleProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IToggleProvider {}
 windows_core::imp::define_interface!(
     IValueProvider,
     IValueProvider_Vtbl,
     0xc7935180_6fb3_4201_b174_7df73adbf64a
 );
 windows_core::imp::interface_hierarchy!(IValueProvider, windows_core::IUnknown);
+impl IValueProvider {
+    pub(crate) unsafe fn SetValue<P0>(&self, val: P0) -> windows_core::HRESULT
+    where
+        P0: windows_core::Param<windows_core::PCWSTR>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetValue)(
+                windows_core::Interface::as_raw(self),
+                val.param().abi(),
+            )
+        }
+    }
+    pub(crate) unsafe fn Value(&self) -> windows_core::Result<windows_core::BSTR> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Value)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| core::mem::transmute(result__))
+        }
+    }
+    pub(crate) unsafe fn IsReadOnly(&self) -> windows_core::Result<windows_core::BOOL> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).IsReadOnly)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct IValueProvider_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -7197,67 +7001,6 @@ pub struct IValueProvider_Vtbl {
         *mut windows_core::BOOL,
     ) -> windows_core::HRESULT,
 }
-pub trait IValueProvider_Impl: windows_core::IUnknownImpl {
-    fn SetValue(&self, val: &windows_core::PCWSTR) -> windows_core::Result<()>;
-    fn Value(&self) -> windows_core::Result<windows_core::BSTR>;
-    fn IsReadOnly(&self) -> windows_core::Result<windows_core::BOOL>;
-}
-impl IValueProvider_Vtbl {
-    pub const fn new<Identity: IValueProvider_Impl, const OFFSET: isize>() -> Self {
-        unsafe extern "system" fn SetValue<Identity: IValueProvider_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            val: windows_core::PCWSTR,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                IValueProvider_Impl::SetValue(this, core::mem::transmute(&val)).into()
-            }
-        }
-        unsafe extern "system" fn Value<Identity: IValueProvider_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            pretval: *mut *mut core::ffi::c_void,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IValueProvider_Impl::Value(this) {
-                    Ok(ok__) => {
-                        pretval.write(core::mem::transmute(ok__));
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        unsafe extern "system" fn IsReadOnly<Identity: IValueProvider_Impl, const OFFSET: isize>(
-            this: *mut core::ffi::c_void,
-            pretval: *mut windows_core::BOOL,
-        ) -> windows_core::HRESULT {
-            unsafe {
-                let this: &Identity =
-                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
-                match IValueProvider_Impl::IsReadOnly(this) {
-                    Ok(ok__) => {
-                        pretval.write(ok__);
-                        windows_core::HRESULT(0)
-                    }
-                    Err(err) => err.into(),
-                }
-            }
-        }
-        Self {
-            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
-            SetValue: SetValue::<Identity, OFFSET>,
-            Value: Value::<Identity, OFFSET>,
-            IsReadOnly: IsReadOnly::<Identity, OFFSET>,
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<IValueProvider as windows_core::Interface>::IID
-    }
-}
-impl windows_core::RuntimeName for IValueProvider {}
 windows_core::imp::define_interface!(
     IVector2KeyFrameAnimation,
     IVector2KeyFrameAnimation_Vtbl,
@@ -7882,7 +7625,7 @@ impl windows_core::RuntimeName for LinearEasingFunction {
 unsafe impl Send for LinearEasingFunction {}
 unsafe impl Sync for LinearEasingFunction {}
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MINMAXINFO {
     pub ptReserved: POINT,
     pub ptMaxSize: POINT,
@@ -7891,7 +7634,7 @@ pub struct MINMAXINFO {
     pub ptMaxTrackSize: POINT,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MONITORINFO {
     pub cbSize: u32,
     pub rcMonitor: RECT,
@@ -7899,9 +7642,9 @@ pub struct MONITORINFO {
     pub dwFlags: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MONITORINFOEXW {
-    pub monitorInfo: MONITORINFO,
+    pub Base: MONITORINFO,
     pub szDevice: [u16; 32],
 }
 impl Default for MONITORINFOEXW {
@@ -7909,11 +7652,10 @@ impl Default for MONITORINFOEXW {
         unsafe { core::mem::zeroed() }
     }
 }
-pub const MONITOR_DEFAULTTONEAREST: MONITOR_FROM_FLAGS = 2;
-pub const MONITOR_DEFAULTTOPRIMARY: MONITOR_FROM_FLAGS = 1;
-pub type MONITOR_FROM_FLAGS = u32;
+pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
+pub const MONITOR_DEFAULTTOPRIMARY: u32 = 1;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MSG {
     pub hwnd: HWND,
     pub message: u32,
@@ -7923,18 +7665,16 @@ pub struct MSG {
     pub pt: POINT,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NCCALCSIZE_PARAMS {
     pub rgrc: [RECT; 3],
-    pub lppos: *mut WINDOWPOS,
+    pub lppos: PWINDOWPOS,
 }
 impl Default for NCCALCSIZE_PARAMS {
     fn default() -> Self {
         unsafe { core::mem::zeroed() }
     }
 }
-pub type NOTIFY_IME_ACTION = u32;
-pub type NOTIFY_IME_INDEX = u32;
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NaturalMotionAnimation(windows_core::IUnknown);
@@ -7969,8 +7709,13 @@ impl windows_core::RuntimeName for NaturalMotionAnimation {
 unsafe impl Send for NaturalMotionAnimation {}
 unsafe impl Sync for NaturalMotionAnimation {}
 pub type NavigateDirection = i32;
+pub const NavigateDirection_FirstChild: NavigateDirection = 3;
+pub const NavigateDirection_LastChild: NavigateDirection = 4;
+pub const NavigateDirection_NextSibling: NavigateDirection = 1;
+pub const NavigateDirection_Parent: NavigateDirection = 0;
+pub const NavigateDirection_PreviousSibling: NavigateDirection = 2;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PAINTSTRUCT {
     pub hdc: HDC,
     pub fErase: windows_core::BOOL,
@@ -7984,10 +7729,10 @@ impl Default for PAINTSTRUCT {
         unsafe { core::mem::zeroed() }
     }
 }
-pub type PEEK_MESSAGE_REMOVE_TYPE = u32;
-pub const PM_REMOVE: PEEK_MESSAGE_REMOVE_TYPE = 1;
+pub type PATTERNID = i32;
+pub const PM_REMOVE: u32 = 1;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct POINT {
     pub x: i32,
     pub y: i32,
@@ -7995,7 +7740,7 @@ pub struct POINT {
 pub type POINTER_BUTTON_CHANGE_TYPE = i32;
 pub type POINTER_FLAGS = u32;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct POINTER_INFO {
     pub pointerType: POINTER_INPUT_TYPE,
     pub pointerId: u32,
@@ -8014,8 +7759,8 @@ pub struct POINTER_INFO {
     pub PerformanceCount: u64,
     pub ButtonChangeType: POINTER_BUTTON_CHANGE_TYPE,
 }
-pub type POINTER_INPUT_TYPE = i32;
-pub type POWER_REQUEST_CONTEXT_FLAGS = u32;
+pub type POINTER_INPUT_TYPE = u32;
+pub type PROPERTYID = i32;
 pub type PTIMERAPCROUTINE = Option<
     unsafe extern "system" fn(
         lpargtocompletionroutine: *const core::ffi::c_void,
@@ -8023,12 +7768,22 @@ pub type PTIMERAPCROUTINE = Option<
         dwtimerhighvalue: u32,
     ),
 >;
-pub type ProviderOptions = i32;
+pub type PWINDOWPOS = *mut WINDOWPOS;
+pub type ProviderOptions = u32;
+pub const ProviderOptions_ClientSideProvider: ProviderOptions = 1;
+pub const ProviderOptions_HasNativeIAccessible: ProviderOptions = 128;
+pub const ProviderOptions_NonClientAreaProvider: ProviderOptions = 4;
+pub const ProviderOptions_OverrideProvider: ProviderOptions = 8;
+pub const ProviderOptions_ProviderOwnsSetFocus: ProviderOptions = 16;
+pub const ProviderOptions_RefuseNonClientSupport: ProviderOptions = 64;
+pub const ProviderOptions_ServerSideProvider: ProviderOptions = 2;
+pub const ProviderOptions_UseClientCoordinates: ProviderOptions = 256;
+pub const ProviderOptions_UseComThreading: ProviderOptions = 32;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct REASON_CONTEXT {
     pub Version: u32,
-    pub Flags: POWER_REQUEST_CONTEXT_FLAGS,
+    pub Flags: u32,
     pub Reason: REASON_CONTEXT_0,
 }
 impl Default for REASON_CONTEXT {
@@ -8048,7 +7803,7 @@ impl Default for REASON_CONTEXT_0 {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct REASON_CONTEXT_0_0 {
     pub LocalizedReasonModule: HMODULE,
     pub LocalizedReasonId: u32,
@@ -8061,7 +7816,7 @@ impl Default for REASON_CONTEXT_0_0 {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RECT {
     pub left: i32,
     pub top: i32,
@@ -8069,10 +7824,10 @@ pub struct RECT {
     pub bottom: i32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SAFEARRAY {
     pub cDims: u16,
-    pub fFeatures: ADVANCED_FEATURE_FLAGS,
+    pub fFeatures: u16,
     pub cbElements: u32,
     pub cLocks: u32,
     pub pvData: *mut core::ffi::c_void,
@@ -8084,17 +7839,18 @@ impl Default for SAFEARRAY {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SAFEARRAYBOUND {
     pub cElements: u32,
     pub lLbound: i32,
 }
+pub type SCODE = i32;
 pub const SC_CLOSE: u32 = 61536;
 pub const SC_MAXIMIZE: u32 = 61488;
 pub const SC_MINIMIZE: u32 = 61472;
 pub const SC_RESTORE: u32 = 61728;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SECURITY_ATTRIBUTES {
     pub nLength: u32,
     pub lpSecurityDescriptor: *mut core::ffi::c_void,
@@ -8105,33 +7861,29 @@ impl Default for SECURITY_ATTRIBUTES {
         unsafe { core::mem::zeroed() }
     }
 }
-pub type SET_WINDOW_POS_FLAGS = u32;
-pub type SHOW_WINDOW_CMD = i32;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SIZE {
     pub cx: i32,
     pub cy: i32,
 }
 pub const SIZE_MAXIMIZED: u32 = 2;
 pub const SIZE_MINIMIZED: u32 = 1;
-pub const SM_CXPADDEDBORDER: SYSTEM_METRICS_INDEX = 92;
-pub const SM_CYFRAME: SYSTEM_METRICS_INDEX = 33;
-pub const SWP_FRAMECHANGED: SET_WINDOW_POS_FLAGS = 32;
-pub const SWP_NOACTIVATE: SET_WINDOW_POS_FLAGS = 16;
-pub const SWP_NOMOVE: SET_WINDOW_POS_FLAGS = 2;
-pub const SWP_NOSIZE: SET_WINDOW_POS_FLAGS = 1;
-pub const SWP_NOZORDER: SET_WINDOW_POS_FLAGS = 4;
-pub const SWP_SHOWWINDOW: SET_WINDOW_POS_FLAGS = 64;
-pub const SW_HIDE: SHOW_WINDOW_CMD = 0;
-pub const SW_MAXIMIZE: SHOW_WINDOW_CMD = 3;
-pub const SW_MINIMIZE: SHOW_WINDOW_CMD = 6;
-pub const SW_RESTORE: SHOW_WINDOW_CMD = 9;
-pub const SW_SHOW: SHOW_WINDOW_CMD = 5;
-pub const SW_SHOWDEFAULT: SHOW_WINDOW_CMD = 10;
-pub const SW_SHOWNORMAL: SHOW_WINDOW_CMD = 1;
-pub type SYNCHRONIZATION_ACCESS_RIGHTS = u32;
-pub type SYSTEM_METRICS_INDEX = i32;
+pub const SM_CXPADDEDBORDER: u32 = 92;
+pub const SM_CYFRAME: u32 = 33;
+pub const SWP_FRAMECHANGED: u32 = 32;
+pub const SWP_NOACTIVATE: u32 = 16;
+pub const SWP_NOMOVE: u32 = 2;
+pub const SWP_NOSIZE: u32 = 1;
+pub const SWP_NOZORDER: u32 = 4;
+pub const SWP_SHOWWINDOW: u32 = 64;
+pub const SW_HIDE: u32 = 0;
+pub const SW_MAXIMIZE: u32 = 3;
+pub const SW_MINIMIZE: u32 = 6;
+pub const SW_RESTORE: u32 = 9;
+pub const SW_SHOW: u32 = 5;
+pub const SW_SHOWDEFAULT: u32 = 10;
+pub const SW_SHOWNORMAL: u32 = 1;
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScalarKeyFrameAnimation(windows_core::IUnknown);
@@ -8201,6 +7953,11 @@ impl windows_core::RuntimeName for ScalarNaturalMotionAnimation {
 unsafe impl Send for ScalarNaturalMotionAnimation {}
 unsafe impl Sync for ScalarNaturalMotionAnimation {}
 pub type ScrollAmount = i32;
+pub const ScrollAmount_LargeDecrement: ScrollAmount = 0;
+pub const ScrollAmount_LargeIncrement: ScrollAmount = 3;
+pub const ScrollAmount_NoAmount: ScrollAmount = 2;
+pub const ScrollAmount_SmallDecrement: ScrollAmount = 1;
+pub const ScrollAmount_SmallIncrement: ScrollAmount = 4;
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShapeVisual(windows_core::IUnknown);
@@ -8424,28 +8181,47 @@ impl windows_core::RuntimeName for StepEasingFunction {
 unsafe impl Send for StepEasingFunction {}
 unsafe impl Sync for StepEasingFunction {}
 pub type SupportedTextSelection = i32;
-pub type TEXT_STORE_LOCK_FLAGS = u32;
-pub type TEXT_STORE_TEXT_CHANGE_FLAGS = u32;
-pub type TF_CONTEXT_EDIT_CONTEXT_FLAGS = u32;
-pub const TF_ES_ASYNCDONTCARE: TF_CONTEXT_EDIT_CONTEXT_FLAGS = 0;
-pub const TF_ES_READ: TF_CONTEXT_EDIT_CONTEXT_FLAGS = 2;
-pub const TF_ES_READWRITE: TF_CONTEXT_EDIT_CONTEXT_FLAGS = 6;
-pub const TF_ES_SYNC: TF_CONTEXT_EDIT_CONTEXT_FLAGS = 1;
-pub const TIMER_ALL_ACCESS: SYNCHRONIZATION_ACCESS_RIGHTS = 2031619;
-pub const TME_LEAVE: TRACKMOUSEEVENT_FLAGS = 2;
-pub const TME_NONCLIENT: TRACKMOUSEEVENT_FLAGS = 16;
+pub const SupportedTextSelection_Multiple: SupportedTextSelection = 2;
+pub const SupportedTextSelection_None: SupportedTextSelection = 0;
+pub const SupportedTextSelection_Single: SupportedTextSelection = 1;
+pub const TF_ES_ASYNCDONTCARE: u32 = 0;
+pub const TF_ES_READ: u32 = 2;
+pub const TF_ES_READWRITE: u32 = 6;
+pub const TF_ES_SYNC: u32 = 1;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TF_PRESERVEDKEY {
+    pub uVKey: u32,
+    pub uModifiers: u32,
+}
+#[repr(C)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TF_SELECTION {
+    pub range: core::mem::ManuallyDrop<Option<ITfRange>>,
+    pub style: TF_SELECTIONSTYLE,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TF_SELECTIONSTYLE {
+    pub ase: TfActiveSelEnd,
+    pub fInterimChar: windows_core::BOOL,
+}
+pub type TF_STATUS = TS_STATUS;
+pub const TIMER_ALL_ACCESS: u32 = 2031619;
+pub const TME_LEAVE: u32 = 2;
+pub const TME_NONCLIENT: u32 = 16;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TRACKMOUSEEVENT {
     pub cbSize: u32,
-    pub dwFlags: TRACKMOUSEEVENT_FLAGS,
+    pub dwFlags: u32,
     pub hwndTrack: HWND,
     pub dwHoverTime: u32,
 }
-pub type TRACKMOUSEEVENT_FLAGS = u32;
+pub type TS_ATTRID = windows_core::GUID;
 #[repr(C)]
 pub struct TS_ATTRVAL {
-    pub idAttr: windows_core::GUID,
+    pub idAttr: TS_ATTRID,
     pub dwOverlapId: u32,
     pub varValue: VARIANT,
 }
@@ -8460,37 +8236,40 @@ impl Default for TS_ATTRVAL {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TS_RUNINFO {
     pub uCount: u32,
     pub r#type: TsRunType,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TS_SELECTIONSTYLE {
     pub ase: TsActiveSelEnd,
     pub fInterimChar: windows_core::BOOL,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TS_SELECTION_ACP {
     pub acpStart: i32,
     pub acpEnd: i32,
     pub style: TS_SELECTIONSTYLE,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TS_STATUS {
     pub dwDynamicFlags: u32,
     pub dwStaticFlags: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TS_TEXTCHANGE {
     pub acpStart: i32,
     pub acpOldEnd: i32,
     pub acpNewEnd: i32,
 }
+pub type TfActiveSelEnd = i32;
+pub type TfClientId = u32;
+pub type TfEditCookie = u32;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TimeSpan {
@@ -8504,9 +8283,13 @@ impl windows_core::RuntimeType for TimeSpan {
         windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.Foundation.TimeSpan;i8)");
 }
 pub type ToggleState = i32;
+pub const ToggleState_Indeterminate: ToggleState = 2;
+pub const ToggleState_Off: ToggleState = 0;
+pub const ToggleState_On: ToggleState = 1;
 pub type TsActiveSelEnd = i32;
 pub type TsLayoutCode = i32;
 pub type TsRunType = i32;
+pub type TsViewCookie = u32;
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedEventHandler<TSender, TResult>(
@@ -8583,64 +8366,60 @@ impl<
         }
     }
 }
-pub const UIA_AutomationFocusChangedEventId: UIA_EVENT_ID = 20005;
-pub const UIA_AutomationIdPropertyId: UIA_PROPERTY_ID = 30011;
-pub const UIA_AutomationPropertyChangedEventId: UIA_EVENT_ID = 20004;
-pub const UIA_BoundingRectanglePropertyId: UIA_PROPERTY_ID = 30001;
-pub const UIA_ButtonControlTypeId: UIA_CONTROLTYPE_ID = 50000;
-pub type UIA_CONTROLTYPE_ID = i32;
-pub const UIA_CheckBoxControlTypeId: UIA_CONTROLTYPE_ID = 50002;
-pub const UIA_ComboBoxControlTypeId: UIA_CONTROLTYPE_ID = 50003;
-pub const UIA_ControlTypePropertyId: UIA_PROPERTY_ID = 30003;
-pub const UIA_CustomControlTypeId: UIA_CONTROLTYPE_ID = 50025;
-pub type UIA_EVENT_ID = i32;
-pub const UIA_EditControlTypeId: UIA_CONTROLTYPE_ID = 50004;
-pub const UIA_ExpandCollapseExpandCollapseStatePropertyId: UIA_PROPERTY_ID = 30070;
-pub const UIA_ExpandCollapsePatternId: UIA_PATTERN_ID = 10005;
-pub const UIA_GroupControlTypeId: UIA_CONTROLTYPE_ID = 50026;
-pub const UIA_HasKeyboardFocusPropertyId: UIA_PROPERTY_ID = 30008;
-pub const UIA_HelpTextPropertyId: UIA_PROPERTY_ID = 30013;
-pub const UIA_HyperlinkControlTypeId: UIA_CONTROLTYPE_ID = 50005;
-pub const UIA_ImageControlTypeId: UIA_CONTROLTYPE_ID = 50006;
-pub const UIA_InvokePatternId: UIA_PATTERN_ID = 10000;
-pub const UIA_Invoke_InvokedEventId: UIA_EVENT_ID = 20009;
-pub const UIA_IsContentElementPropertyId: UIA_PROPERTY_ID = 30017;
-pub const UIA_IsControlElementPropertyId: UIA_PROPERTY_ID = 30016;
-pub const UIA_IsEnabledPropertyId: UIA_PROPERTY_ID = 30010;
-pub const UIA_IsKeyboardFocusablePropertyId: UIA_PROPERTY_ID = 30009;
-pub const UIA_IsOffscreenPropertyId: UIA_PROPERTY_ID = 30022;
-pub const UIA_IsPasswordPropertyId: UIA_PROPERTY_ID = 30019;
-pub const UIA_ListControlTypeId: UIA_CONTROLTYPE_ID = 50008;
-pub const UIA_ListItemControlTypeId: UIA_CONTROLTYPE_ID = 50007;
-pub const UIA_LiveRegionChangedEventId: UIA_EVENT_ID = 20024;
-pub const UIA_MenuControlTypeId: UIA_CONTROLTYPE_ID = 50009;
-pub const UIA_MenuItemControlTypeId: UIA_CONTROLTYPE_ID = 50011;
-pub const UIA_NamePropertyId: UIA_PROPERTY_ID = 30005;
-pub type UIA_PATTERN_ID = i32;
-pub type UIA_PROPERTY_ID = i32;
-pub const UIA_PaneControlTypeId: UIA_CONTROLTYPE_ID = 50033;
-pub const UIA_ProgressBarControlTypeId: UIA_CONTROLTYPE_ID = 50012;
-pub const UIA_RadioButtonControlTypeId: UIA_CONTROLTYPE_ID = 50013;
-pub const UIA_RangeValuePatternId: UIA_PATTERN_ID = 10003;
-pub const UIA_RangeValueValuePropertyId: UIA_PROPERTY_ID = 30047;
-pub const UIA_RuntimeIdPropertyId: UIA_PROPERTY_ID = 30000;
-pub const UIA_ScrollBarControlTypeId: UIA_CONTROLTYPE_ID = 50014;
-pub const UIA_ScrollItemPatternId: UIA_PATTERN_ID = 10017;
-pub const UIA_ScrollPatternId: UIA_PATTERN_ID = 10004;
-pub const UIA_SelectionItemPatternId: UIA_PATTERN_ID = 10010;
-pub const UIA_SelectionItem_ElementSelectedEventId: UIA_EVENT_ID = 20012;
-pub const UIA_SelectionPatternId: UIA_PATTERN_ID = 10001;
-pub const UIA_SliderControlTypeId: UIA_CONTROLTYPE_ID = 50015;
-pub const UIA_StructureChangedEventId: UIA_EVENT_ID = 20002;
-pub const UIA_TabControlTypeId: UIA_CONTROLTYPE_ID = 50018;
-pub const UIA_TabItemControlTypeId: UIA_CONTROLTYPE_ID = 50019;
-pub const UIA_TextControlTypeId: UIA_CONTROLTYPE_ID = 50020;
-pub const UIA_TitleBarControlTypeId: UIA_CONTROLTYPE_ID = 50037;
-pub const UIA_TogglePatternId: UIA_PATTERN_ID = 10015;
-pub const UIA_ToggleToggleStatePropertyId: UIA_PROPERTY_ID = 30086;
-pub const UIA_ValuePatternId: UIA_PATTERN_ID = 10002;
-pub const UIA_ValueValuePropertyId: UIA_PROPERTY_ID = 30045;
-pub const UIA_WindowControlTypeId: UIA_CONTROLTYPE_ID = 50032;
+pub const UIA_AutomationFocusChangedEventId: i32 = 20005;
+pub const UIA_AutomationIdPropertyId: i32 = 30011;
+pub const UIA_AutomationPropertyChangedEventId: i32 = 20004;
+pub const UIA_BoundingRectanglePropertyId: i32 = 30001;
+pub const UIA_ButtonControlTypeId: i32 = 50000;
+pub const UIA_CheckBoxControlTypeId: i32 = 50002;
+pub const UIA_ComboBoxControlTypeId: i32 = 50003;
+pub const UIA_ControlTypePropertyId: i32 = 30003;
+pub const UIA_CustomControlTypeId: i32 = 50025;
+pub const UIA_EditControlTypeId: i32 = 50004;
+pub const UIA_ExpandCollapseExpandCollapseStatePropertyId: i32 = 30070;
+pub const UIA_ExpandCollapsePatternId: i32 = 10005;
+pub const UIA_GroupControlTypeId: i32 = 50026;
+pub const UIA_HasKeyboardFocusPropertyId: i32 = 30008;
+pub const UIA_HelpTextPropertyId: i32 = 30013;
+pub const UIA_HyperlinkControlTypeId: i32 = 50005;
+pub const UIA_ImageControlTypeId: i32 = 50006;
+pub const UIA_InvokePatternId: i32 = 10000;
+pub const UIA_Invoke_InvokedEventId: i32 = 20009;
+pub const UIA_IsContentElementPropertyId: i32 = 30017;
+pub const UIA_IsControlElementPropertyId: i32 = 30016;
+pub const UIA_IsEnabledPropertyId: i32 = 30010;
+pub const UIA_IsKeyboardFocusablePropertyId: i32 = 30009;
+pub const UIA_IsOffscreenPropertyId: i32 = 30022;
+pub const UIA_IsPasswordPropertyId: i32 = 30019;
+pub const UIA_ListControlTypeId: i32 = 50008;
+pub const UIA_ListItemControlTypeId: i32 = 50007;
+pub const UIA_LiveRegionChangedEventId: i32 = 20024;
+pub const UIA_MenuControlTypeId: i32 = 50009;
+pub const UIA_MenuItemControlTypeId: i32 = 50011;
+pub const UIA_NamePropertyId: i32 = 30005;
+pub const UIA_PaneControlTypeId: i32 = 50033;
+pub const UIA_ProgressBarControlTypeId: i32 = 50012;
+pub const UIA_RadioButtonControlTypeId: i32 = 50013;
+pub const UIA_RangeValuePatternId: i32 = 10003;
+pub const UIA_RangeValueValuePropertyId: i32 = 30047;
+pub const UIA_RuntimeIdPropertyId: i32 = 30000;
+pub const UIA_ScrollBarControlTypeId: i32 = 50014;
+pub const UIA_ScrollItemPatternId: i32 = 10017;
+pub const UIA_ScrollPatternId: i32 = 10004;
+pub const UIA_SelectionItemPatternId: i32 = 10010;
+pub const UIA_SelectionItem_ElementSelectedEventId: i32 = 20012;
+pub const UIA_SelectionPatternId: i32 = 10001;
+pub const UIA_SliderControlTypeId: i32 = 50015;
+pub const UIA_StructureChangedEventId: i32 = 20002;
+pub const UIA_TabControlTypeId: i32 = 50018;
+pub const UIA_TabItemControlTypeId: i32 = 50019;
+pub const UIA_TextControlTypeId: i32 = 50020;
+pub const UIA_TitleBarControlTypeId: i32 = 50037;
+pub const UIA_TogglePatternId: i32 = 10015;
+pub const UIA_ToggleToggleStatePropertyId: i32 = 30086;
+pub const UIA_ValuePatternId: i32 = 10002;
+pub const UIA_ValueValuePropertyId: i32 = 30045;
+pub const UIA_WindowControlTypeId: i32 = 50032;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UiaRect {
@@ -8649,10 +8428,14 @@ pub struct UiaRect {
     pub width: f64,
     pub height: f64,
 }
-pub type VARENUM = u16;
 #[repr(C)]
 pub struct VARIANT {
     pub Anonymous: VARIANT_0,
+}
+impl Clone for VARIANT {
+    fn clone(&self) -> Self {
+        unsafe { core::mem::transmute_copy(self) }
+    }
 }
 impl Default for VARIANT {
     fn default() -> Self {
@@ -8676,7 +8459,7 @@ impl Default for VARIANT_0 {
 }
 #[repr(C)]
 pub struct VARIANT_0_0 {
-    pub vt: VARENUM,
+    pub vt: VARTYPE,
     pub wReserved1: u16,
     pub wReserved2: u16,
     pub wReserved3: u16,
@@ -8702,7 +8485,7 @@ pub union VARIANT_0_0_0 {
     pub dblVal: f64,
     pub boolVal: VARIANT_BOOL,
     pub __OBSOLETE__VARIANT_BOOL: VARIANT_BOOL,
-    pub scode: i32,
+    pub scode: SCODE,
     pub cyVal: CY,
     pub date: f64,
     pub bstrVal: core::mem::ManuallyDrop<windows_core::BSTR>,
@@ -8717,7 +8500,7 @@ pub union VARIANT_0_0_0 {
     pub pdblVal: *mut f64,
     pub pboolVal: *mut VARIANT_BOOL,
     pub __OBSOLETE__VARIANT_PBOOL: *mut VARIANT_BOOL,
-    pub pscode: *mut i32,
+    pub pscode: *mut SCODE,
     pub pcyVal: *mut CY,
     pub pdate: *mut f64,
     pub pbstrVal: *mut windows_core::BSTR,
@@ -8733,7 +8516,7 @@ pub union VARIANT_0_0_0 {
     pub intVal: i32,
     pub uintVal: u32,
     pub pdecVal: *mut DECIMAL,
-    pub pcVal: windows_core::PSTR,
+    pub pcVal: *mut i8,
     pub puiVal: *mut u16,
     pub pulVal: *mut u32,
     pub pullVal: *mut u64,
@@ -8752,7 +8535,7 @@ impl Default for VARIANT_0_0_0 {
     }
 }
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VARIANT_0_0_0_0 {
     pub pvRecord: *mut core::ffi::c_void,
     pub pRecInfo: core::mem::ManuallyDrop<Option<IRecordInfo>>,
@@ -8763,24 +8546,24 @@ impl Default for VARIANT_0_0_0_0 {
     }
 }
 pub type VARIANT_BOOL = i16;
-pub type VIRTUAL_KEY = u16;
-pub const VK_BACK: VIRTUAL_KEY = 8;
-pub const VK_CONTROL: VIRTUAL_KEY = 17;
-pub const VK_DELETE: VIRTUAL_KEY = 46;
-pub const VK_DOWN: VIRTUAL_KEY = 40;
-pub const VK_END: VIRTUAL_KEY = 35;
-pub const VK_ESCAPE: VIRTUAL_KEY = 27;
-pub const VK_HOME: VIRTUAL_KEY = 36;
-pub const VK_LEFT: VIRTUAL_KEY = 37;
-pub const VK_MENU: VIRTUAL_KEY = 18;
-pub const VK_NEXT: VIRTUAL_KEY = 34;
-pub const VK_PRIOR: VIRTUAL_KEY = 33;
-pub const VK_RETURN: VIRTUAL_KEY = 13;
-pub const VK_RIGHT: VIRTUAL_KEY = 39;
-pub const VK_SHIFT: VIRTUAL_KEY = 16;
-pub const VK_SPACE: VIRTUAL_KEY = 32;
-pub const VK_TAB: VIRTUAL_KEY = 9;
-pub const VK_UP: VIRTUAL_KEY = 38;
+pub type VARTYPE = u16;
+pub const VK_BACK: u32 = 8;
+pub const VK_CONTROL: u32 = 17;
+pub const VK_DELETE: u32 = 46;
+pub const VK_DOWN: u32 = 40;
+pub const VK_END: u32 = 35;
+pub const VK_ESCAPE: u32 = 27;
+pub const VK_HOME: u32 = 36;
+pub const VK_LEFT: u32 = 37;
+pub const VK_MENU: u32 = 18;
+pub const VK_NEXT: u32 = 34;
+pub const VK_PRIOR: u32 = 33;
+pub const VK_RETURN: u32 = 13;
+pub const VK_RIGHT: u32 = 39;
+pub const VK_SHIFT: u32 = 16;
+pub const VK_SPACE: u32 = 32;
+pub const VK_TAB: u32 = 9;
+pub const VK_UP: u32 = 38;
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Vector2KeyFrameAnimation(windows_core::IUnknown);
@@ -8971,12 +8754,11 @@ impl windows_core::RuntimeName for VisualCollection {
 }
 unsafe impl Send for VisualCollection {}
 unsafe impl Sync for VisualCollection {}
-pub type WAIT_EVENT = u32;
-pub const WAIT_FAILED: WAIT_EVENT = 4294967295;
+pub const WAIT_FAILED: u32 = 4294967295;
 pub const WHEEL_DELTA: u32 = 120;
 pub type WIN32_ERROR = u32;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WINDOWPOS {
     pub hwnd: HWND,
     pub hwndInsertAfter: HWND,
@@ -8984,11 +8766,8 @@ pub struct WINDOWPOS {
     pub y: i32,
     pub cx: i32,
     pub cy: i32,
-    pub flags: SET_WINDOW_POS_FLAGS,
+    pub flags: u32,
 }
-pub type WINDOW_EX_STYLE = u32;
-pub type WINDOW_LONG_PTR_INDEX = i32;
-pub type WINDOW_STYLE = u32;
 pub const WM_ACTIVATE: u32 = 6;
 pub const WM_APP: u32 = 32768;
 pub const WM_CAPTURECHANGED: u32 = 533;
@@ -9049,7 +8828,7 @@ pub const WM_WINDOWPOSCHANGED: u32 = 71;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WNDCLASSEXW {
     pub cbSize: u32,
-    pub style: WNDCLASS_STYLES,
+    pub style: u32,
     pub lpfnWndProc: WNDPROC,
     pub cbClsExtra: i32,
     pub cbWndExtra: i32,
@@ -9064,7 +8843,7 @@ pub struct WNDCLASSEXW {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WNDCLASSW {
-    pub style: WNDCLASS_STYLES,
+    pub style: u32,
     pub lpfnWndProc: WNDPROC,
     pub cbClsExtra: i32,
     pub cbWndExtra: i32,
@@ -9075,26 +8854,25 @@ pub struct WNDCLASSW {
     pub lpszMenuName: windows_core::PCWSTR,
     pub lpszClassName: windows_core::PCWSTR,
 }
-pub type WNDCLASS_STYLES = u32;
 pub type WNDPROC = Option<
     unsafe extern "system" fn(param0: HWND, param1: u32, param2: WPARAM, param3: LPARAM) -> LRESULT,
 >;
 pub type WPARAM = usize;
-pub const WS_CAPTION: WINDOW_STYLE = 12582912;
-pub const WS_CHILD: WINDOW_STYLE = 1073741824;
-pub const WS_CLIPCHILDREN: WINDOW_STYLE = 33554432;
-pub const WS_CLIPSIBLINGS: WINDOW_STYLE = 67108864;
-pub const WS_EX_APPWINDOW: WINDOW_EX_STYLE = 262144;
-pub const WS_EX_LAYERED: WINDOW_EX_STYLE = 524288;
-pub const WS_EX_NOACTIVATE: WINDOW_EX_STYLE = 134217728;
-pub const WS_EX_NOREDIRECTIONBITMAP: WINDOW_EX_STYLE = 2097152;
-pub const WS_EX_TOOLWINDOW: WINDOW_EX_STYLE = 128;
-pub const WS_EX_TOPMOST: WINDOW_EX_STYLE = 8;
-pub const WS_MAXIMIZEBOX: WINDOW_STYLE = 65536;
-pub const WS_MINIMIZEBOX: WINDOW_STYLE = 131072;
-pub const WS_OVERLAPPED: WINDOW_STYLE = 0;
-pub const WS_OVERLAPPEDWINDOW: WINDOW_STYLE = 13565952;
-pub const WS_POPUP: WINDOW_STYLE = 2147483648;
-pub const WS_SYSMENU: WINDOW_STYLE = 524288;
-pub const WS_THICKFRAME: WINDOW_STYLE = 262144;
-pub const WS_VISIBLE: WINDOW_STYLE = 268435456;
+pub const WS_CAPTION: u32 = 12582912;
+pub const WS_CHILD: u32 = 1073741824;
+pub const WS_CLIPCHILDREN: u32 = 33554432;
+pub const WS_CLIPSIBLINGS: u32 = 67108864;
+pub const WS_EX_APPWINDOW: u32 = 262144;
+pub const WS_EX_LAYERED: u32 = 524288;
+pub const WS_EX_NOACTIVATE: u32 = 134217728;
+pub const WS_EX_NOREDIRECTIONBITMAP: u32 = 2097152;
+pub const WS_EX_TOOLWINDOW: u32 = 128;
+pub const WS_EX_TOPMOST: u32 = 8;
+pub const WS_MAXIMIZEBOX: u32 = 65536;
+pub const WS_MINIMIZEBOX: u32 = 131072;
+pub const WS_OVERLAPPED: u32 = 0;
+pub const WS_OVERLAPPEDWINDOW: u32 = 13565952;
+pub const WS_POPUP: u32 = 2147483648;
+pub const WS_SYSMENU: u32 = 524288;
+pub const WS_THICKFRAME: u32 = 262144;
+pub const WS_VISIBLE: u32 = 268435456;

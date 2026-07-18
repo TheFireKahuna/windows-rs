@@ -115,7 +115,7 @@ impl VirtualSurfaceImageSource {
     /// Associate the Direct2D device used for drawing. See
     /// [`SurfaceImageSource::set_device`](crate::SurfaceImageSource::set_device).
     pub fn set_device(&self, device: &impl Interface) -> Result<()> {
-        unsafe { self.draw.SetDevice(device.as_raw())? };
+        unsafe { self.draw.SetDevice(device.as_raw()).ok()? };
         let lock = device
             .cast::<bindings::ID2D1Resource>()
             .ok()
@@ -144,7 +144,8 @@ impl VirtualSurfaceImageSource {
         unsafe {
             let _lock = self.lock();
             self.draw
-                .BeginDraw(&update_rect, &T::IID, &mut object, &mut offset)?;
+                .BeginDraw(&update_rect, &T::IID, &mut object, &mut offset)
+                .ok()?;
             Ok((T::from_raw(object), (offset.x, offset.y)))
         }
     }
@@ -153,7 +154,7 @@ impl VirtualSurfaceImageSource {
     pub fn end_draw(&self) -> Result<()> {
         unsafe {
             let _lock = self.lock();
-            self.draw.EndDraw()
+            self.draw.EndDraw().ok()
         }
     }
 
@@ -161,7 +162,7 @@ impl VirtualSurfaceImageSource {
     pub fn suspend_draw(&self) -> Result<()> {
         unsafe {
             let _lock = self.lock();
-            self.draw.SuspendDraw()
+            self.draw.SuspendDraw().ok()
         }
     }
 
@@ -169,7 +170,7 @@ impl VirtualSurfaceImageSource {
     pub fn resume_draw(&self) -> Result<()> {
         unsafe {
             let _lock = self.lock();
-            self.draw.ResumeDraw()
+            self.draw.ResumeDraw().ok()
         }
     }
 
@@ -177,7 +178,7 @@ impl VirtualSurfaceImageSource {
     /// registered update handler for the part of it that is visible.
     pub fn invalidate(&self, rect: UpdateRect) -> Result<()> {
         let _lock = self.lock();
-        unsafe { self.native.Invalidate(rect.to_abi()) }
+        unsafe { self.native.Invalidate(rect.to_abi()).ok() }
     }
 
     /// Resize the virtual surface (in pixels). Existing content outside the new
@@ -186,7 +187,7 @@ impl VirtualSurfaceImageSource {
         // `Resize` can release tile allocations on the shared Direct3D device, so
         // bracket it against the same factory lock the draw calls use.
         let _lock = self.lock();
-        unsafe { self.native.Resize(width, height) }
+        unsafe { self.native.Resize(width, height).ok() }
     }
 
     /// Returns the currently visible region of the surface, in pixels.
@@ -219,7 +220,7 @@ impl VirtualSurfaceImageSource {
             rects: core::cell::RefCell::new(Vec::new()),
         }
         .into();
-        unsafe { self.native.RegisterForUpdatesNeeded(callback.as_raw())? };
+        unsafe { self.native.RegisterForUpdatesNeeded(callback.as_raw()).ok()? };
         Ok(UpdatesRegistration {
             native: self.native.clone(),
             _callback: callback,
@@ -302,7 +303,7 @@ impl IVirtualSurfaceUpdatesCallbackNative_Impl for UpdatesCallback_Impl {
         {
             let mut raw = self.raw.borrow_mut();
             raw.resize(count, bindings::RECT::default());
-            unsafe { self.native.GetUpdateRects(raw.as_mut_ptr(), count as u32)? };
+            unsafe { self.native.GetUpdateRects(raw.as_mut_ptr(), count as u32).ok()? };
             rects.extend(raw.iter().map(|r| UpdateRect::from_abi(*r)));
             cap_scratch(&mut raw);
         }

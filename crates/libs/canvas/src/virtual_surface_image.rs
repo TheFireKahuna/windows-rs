@@ -179,7 +179,7 @@ impl Inner {
 
         // Same atlas-offset mapping as `SurfaceImage::draw`, but the dirty rect
         // arrives in pixels here: t = (offset − rect.origin) / scale.
-        unsafe { context.SetDpi(dpi, dpi) };
+        windows_canvas_core::set_context_dpi(&context, dpi);
         let tx = (offset_x - ur.x) as f32 / scale;
         let ty = (offset_y - ur.y) as f32 / scale;
         let update = Rect::from_xywh(
