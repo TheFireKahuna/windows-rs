@@ -130,6 +130,38 @@ pub(crate) struct Ctrl {
     pub large_change: Option<f64>,
     /// Text field content alignment (WinRT `HorizontalAlignment`; -1 = unset).
     pub content_align: i32,
+    /// Slider: fill origin in value units (`None` = fill from `min`). An
+    /// origin strictly inside the range fills bidirectionally out from it and
+    /// paints a neutral tick notch on the track.
+    pub fill_origin: Option<f64>,
+    /// Slider: fill color at or below the origin (`None` = theme accent).
+    /// Authored linear scRGB, display-mapped at the draw choke.
+    pub fill_color: Option<Color>,
+    /// Slider: fill color above the origin (`None` = same as `fill_color`).
+    pub fill_color_alt: Option<Color>,
+    /// Meter: reference marker hairline position in value units.
+    pub marker: Option<f64>,
+    /// Meter: marker hairline color (`None` = a neutral tick).
+    pub marker_color: Option<Color>,
+    /// Meter fill / Knob arc: gradient stops `(position 0..1, authored color)`.
+    pub stops: Vec<(f64, Color)>,
+    /// Knob: sweep start / end angle (radians, canvas convention: 0 = east,
+    /// clockwise on a y-down surface).
+    pub start_angle: f32,
+    pub end_angle: f32,
+    /// Knob: tick-mark positions (value units).
+    pub ticks: Vec<f64>,
+    /// Knob: `(value, label)` scale labels (labels formatted by the app).
+    pub tick_labels: Vec<(f64, String)>,
+    /// Knob: ticks whose value is an exact multiple draw longer/brighter.
+    pub major_every: Option<f64>,
+    /// Knob: per-value accent color for the value arc / needle glow (`None` =
+    /// theme accent). Authored linear scRGB, display-mapped at the draw choke.
+    pub accent: Option<Color>,
+    /// Knob: small unit string under the center readout (e.g. `"dB"`).
+    pub unit: String,
+    /// Knob: optional sub-line under the unit (e.g. a linear multiplier).
+    pub sub_text: String,
 }
 
 impl Default for Ctrl {
@@ -157,6 +189,20 @@ impl Default for Ctrl {
             precision: None,
             large_change: None,
             content_align: -1,
+            fill_origin: None,
+            fill_color: None,
+            fill_color_alt: None,
+            marker: None,
+            marker_color: None,
+            stops: Vec::new(),
+            start_angle: 0.0,
+            end_angle: 0.0,
+            ticks: Vec::new(),
+            tick_labels: Vec::new(),
+            major_every: None,
+            accent: None,
+            unit: String::new(),
+            sub_text: String::new(),
         }
     }
 }
@@ -196,6 +242,10 @@ pub(crate) struct Node {
     /// whose blink is a compositor-side square-wave opacity animation. Created
     /// lazily on first focused paint; see [`parts::sync_caret`].
     pub caret: Option<parts::Caret>,
+    /// Knob only: the value-arc shape + needle (retained compositor vector
+    /// chrome grown by a `TrimEnd` spring). Created lazily on first paint; see
+    /// [`knob::KnobParts`](super::knob::KnobParts).
+    pub knob: Option<Box<super::knob::KnobParts>>,
     /// ScrollViewer only: the auto-hiding overlay scrollbar thumb sprite (a top
     /// child of the container, above the scrolled content), created lazily.
     pub scroll_thumb: Option<NodeSurface>,
@@ -335,6 +385,7 @@ impl Node {
             surf: None,
             parts: None,
             caret: None,
+            knob: None,
             scroll_thumb: None,
             scroll_content: None,
             scroll_spring: None,
@@ -612,6 +663,7 @@ pub(crate) fn is_interactive_kind(kind: ControlKind) -> bool {
             | ControlKind::HyperlinkButton
             | ControlKind::SelectorBar
             | ControlKind::Slider
+            | ControlKind::Knob
             | ControlKind::ComboBox
             | ControlKind::DropDownButton
             | ControlKind::SplitButton
@@ -626,7 +678,10 @@ fn draws_own_chrome(kind: ControlKind) -> bool {
         || is_text_editable(kind)
         || matches!(
             kind,
-            ControlKind::ProgressBar | ControlKind::ProgressRing | ControlKind::TitleBar
+            ControlKind::ProgressBar
+                | ControlKind::ProgressRing
+                | ControlKind::TitleBar
+                | ControlKind::Meter
         )
 }
 
@@ -653,6 +708,7 @@ fn is_focusable_kind(kind: ControlKind) -> bool {
             | ControlKind::HyperlinkButton
             | ControlKind::SelectorBar
             | ControlKind::Slider
+            | ControlKind::Knob
             | ControlKind::ComboBox
             | ControlKind::DropDownButton
             | ControlKind::SplitButton
@@ -746,6 +802,29 @@ fn default_style(kind: ControlKind) -> taffy::Style {
             s.min_size = Size {
                 width: length(18.0),
                 height: length(18.0),
+            };
+        }
+        ControlKind::Slider => {
+            // Drawn control with no children: without an intrinsic height it
+            // measures 0 tall in a flex row and vanishes. The thumb diameter,
+            // not the (larger) hover halo, so a host can run compact rows —
+            // the halo is an unclipped sprite and may overhang a tight box.
+            s.display = Display::Flex;
+            s.min_size.height = length(theme::SLIDER_THUMB);
+        }
+        ControlKind::Meter => {
+            // Drawn control with no children: intrinsic bar height so a bare
+            // meter doesn't measure 0 tall in a flex row.
+            s.display = Display::Flex;
+            s.min_size.height = length(theme::METER_H);
+        }
+        ControlKind::Knob => {
+            // A square dial with no children — give it an intrinsic box so it
+            // doesn't collapse in a flex row; the host normally sizes it larger.
+            s.display = Display::Flex;
+            s.min_size = Size {
+                width: length(theme::KNOB_D),
+                height: length(theme::KNOB_D),
             };
         }
         ControlKind::TitleBar => {

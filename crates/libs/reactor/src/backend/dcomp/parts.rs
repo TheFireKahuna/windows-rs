@@ -37,16 +37,16 @@ use super::node::{linear, Node};
 use super::theme;
 use crate::backend::ControlKind;
 use crate::system_bindings::{
-    AnimationIterationBehavior, CompositionAnimation, CompositionBrush,
+    AnimationIterationBehavior, CompositionAnimation, CompositionBrush, CompositionClip,
     CompositionDrawingSurface, CompositionEasingFunction, CompositionNineGridBrush,
-    CompositionSurfaceBrush, ICompositionObject, ICompositor2, ICompositor4, IKeyFrameAnimation,
-    ISpringVector2NaturalMotionAnimation, ISpringVector3NaturalMotionAnimation,
-    IVector2NaturalMotionAnimation, IVector3NaturalMotionAnimation, IVisual,
-    SpringVector2NaturalMotionAnimation, SpringVector3NaturalMotionAnimation, SpriteVisual,
-    TimeSpan, Visual,
+    CompositionObject, CompositionSurfaceBrush, ICompositionAnimation, ICompositionObject,
+    ICompositor2, ICompositor4, IKeyFrameAnimation, ISpringVector2NaturalMotionAnimation,
+    ISpringVector3NaturalMotionAnimation, IVector2NaturalMotionAnimation,
+    IVector3NaturalMotionAnimation, IVisual, InsetClip, SpringVector2NaturalMotionAnimation,
+    SpringVector3NaturalMotionAnimation, SpriteVisual, TimeSpan, Visual,
 };
 use windows_canvas_core::{
-    Brush, ColorF, DrawingSession, Ellipse, Rect, RoundedRect, Vector2 as CVec2,
+    Brush, ColorF, DrawingSession, Ellipse, GradientStop, Rect, RoundedRect, Vector2 as CVec2,
 };
 use windows_core::Interface;
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
@@ -83,6 +83,15 @@ enum ShapeKey {
     Circle { d: u32 },
     /// A checkmark glyph (two strokes) in a `d`×`d` DIP box (drawn 1:1).
     Check { d: u32 },
+    /// A horizontal linear-gradient bar of DIP height `h` and corner radius `r`,
+    /// rasterized at a fixed source width and stretched to any destination width
+    /// (the stretch interpolates the ramp linearly, which is exactly the
+    /// gradient's own math). When `r > 0` it is served through a per-part
+    /// nine-grid brush so the rounded ends stay crisp while the middle stretches
+    /// (the meter fill); `r == 0` is a plain full-bleed stretch (the knob arc
+    /// stroke brush). `sig` hashes the stop list; the stops are supplied at bind
+    /// time.
+    GradBar { sig: u64, r: u32, h: u32 },
 }
 
 /// Atlas cache key: shape + the *authored* token colour (the display colour
@@ -111,16 +120,37 @@ impl AtlasKey {
     fn check(d: f32, c: crate::Color, scale: f32) -> Self {
         Self { shape: ShapeKey::Check { d: d.to_bits() }, color: color_bits(c), scale: scale.to_bits() }
     }
+    fn grad_bar(stops: &[(f64, crate::Color)], r: f32, h: f32, scale: f32) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hh = rustc_hash::FxHasher::default();
+        for (p, c) in stops {
+            p.to_bits().hash(&mut hh);
+            color_bits(*c).hash(&mut hh);
+        }
+        Self {
+            shape: ShapeKey::GradBar { sig: hh.finish(), r: r.to_bits(), h: h.to_bits() },
+            color: [0; 4],
+            scale: scale.to_bits(),
+        }
+    }
     /// The nine-grid corner inset in source pixels (`r * scale`), 0 for the
     /// shapes that stretch uniformly.
     fn inset_px(&self) -> f32 {
+        let scale = f32::from_bits(self.scale);
         match self.shape {
-            ShapeKey::HBar { r, .. } => f32::from_bits(r) * f32::from_bits(self.scale),
+            ShapeKey::HBar { r, .. } => f32::from_bits(r) * scale,
+            ShapeKey::GradBar { r, .. } => f32::from_bits(r) * scale,
             _ => 0.0,
         }
     }
-    fn is_hbar(&self) -> bool {
-        matches!(self.shape, ShapeKey::HBar { .. })
+    /// Whether this source is served through a horizontal nine-grid brush
+    /// (rounded ends preserved, middle stretched) rather than a plain stretch.
+    fn uses_nine_grid(&self) -> bool {
+        match self.shape {
+            ShapeKey::HBar { .. } => true,
+            ShapeKey::GradBar { r, .. } => f32::from_bits(r) > 0.0,
+            _ => false,
+        }
     }
 }
 
@@ -154,21 +184,39 @@ impl Atlas {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    fn entry(&mut self, comp: &Compositing, key: AtlasKey) -> Option<&AtlasEntry> {
+    /// The current cache epoch — non-`Part` chrome (the Knob) reads it to know
+    /// when its own rasterized brushes must be rebuilt (display/DPI/theme edge).
+    pub(crate) fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    fn entry(
+        &mut self,
+        comp: &Compositing,
+        key: AtlasKey,
+        stops: &[(f64, crate::Color)],
+    ) -> Option<&AtlasEntry> {
         use std::collections::hash_map::Entry;
         match self.map.entry(key) {
             Entry::Occupied(e) => Some(e.into_mut()),
             Entry::Vacant(v) => {
-                let entry = rasterize(comp, &key)?;
+                let entry = rasterize(comp, &key, stops)?;
                 Some(v.insert(entry))
             }
         }
     }
 }
 
+/// Fixed source width (px) a gradient bar is rasterized at; the sprite's
+/// Fill-stretch interpolates it to any destination width losslessly.
+const GRAD_SRC_W: f32 = 256.0;
+/// Gradient bar source height (px) — the ramp is horizontal, so height is a
+/// uniform stretch.
+const GRAD_SRC_H: f32 = 16.0;
+
 /// Draw one atlas source: an FP16 surface of the shape's exact pixel size,
 /// painted through the app's output colour map ([`linear`]).
-fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
+fn rasterize(comp: &Compositing, key: &AtlasKey, stops: &[(f64, crate::Color)]) -> Option<AtlasEntry> {
     let scale = f32::from_bits(key.scale).max(0.01);
     let color = crate::Color {
         r: f32::from_bits(key.color[0]),
@@ -182,6 +230,13 @@ fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
         // Corners plus a 2-DIP stretchable centre column.
         ShapeKey::HBar { h, r, .. } => (2.0 * f32::from_bits(r) + 2.0, f32::from_bits(h)),
         ShapeKey::Circle { d } | ShapeKey::Check { d } => (f32::from_bits(d), f32::from_bits(d)),
+        // Wide source for gradient resolution; rasterized at the bar's actual
+        // DIP height so a rounded end's corner is circular (never vertically
+        // stretched by the nine-grid, whose insets are horizontal only).
+        ShapeKey::GradBar { h, .. } => {
+            let hh = f32::from_bits(h);
+            (GRAD_SRC_W / scale, if hh > 0.0 { hh } else { GRAD_SRC_H / scale })
+        }
     };
     let px_w = ((dip_w * scale).round() as i32).max(1);
     let px_h = ((dip_h * scale).round() as i32).max(1);
@@ -200,11 +255,55 @@ fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
         m32: origin.y as f32,
     });
     session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
-    if let Ok(b) = session.create_solid_brush(linear(color)) {
+    if let ShapeKey::GradBar { r, .. } = key.shape {
+        // Each stop rides the same output colour map as every solid; the
+        // FP16 stop collection keeps subtle ramps from posterizing.
+        let mapped: Vec<GradientStop> = stops
+            .iter()
+            .map(|(p, c)| GradientStop::new(*p as f32, linear(*c)))
+            .collect();
+        if let Ok(g) = session.create_linear_gradient(
+            CVec2::new(0.0, 0.0),
+            CVec2::new(dip_w, 0.0),
+            &mapped,
+        ) {
+            let rect = Rect::from_xywh(0.0, 0.0, dip_w, dip_h);
+            let radius = f32::from_bits(r);
+            if radius > 0.0 {
+                session.fill_rounded_rect(&RoundedRect::uniform(rect, radius), &g);
+            } else {
+                session.fill_rect(&rect, &g);
+            }
+        }
+    } else if let Ok(b) = session.create_solid_brush(linear(color)) {
         draw_shape(&session, &b, key.shape, dip_w, dip_h);
     }
     unsafe { interop.EndDraw().ok()? };
     Some(AtlasEntry { brush, _surface: surface })
+}
+
+/// A standalone FP16 gradient-bar surface brush (the same display-mapped raster
+/// the meter fill uses), for callers outside the `Part` model — the Knob strokes
+/// its value arc with this so the arc stays HDR-mapped like all chrome. Not
+/// atlas-cached; the caller holds it and rebuilds on an epoch/stops change.
+pub(crate) fn build_gradient_surface(
+    comp: &Compositing,
+    stops: &[(f64, crate::Color)],
+    scale: f32,
+) -> Option<CompositionSurfaceBrush> {
+    // Plain full-bleed stretch (r = 0): the knob strokes an arc SHAPE with this
+    // as a Fill surface brush, so it must have no rounded (transparent) ends.
+    rasterize(comp, &AtlasKey::grad_bar(stops, 0.0, GRAD_SRC_H, scale), stops).map(|e| e.brush)
+}
+
+/// A standalone FP16 solid-color surface brush (display-mapped), for the Knob's
+/// needle. See [`build_gradient_surface`].
+pub(crate) fn build_solid_surface(
+    comp: &Compositing,
+    color: crate::Color,
+    scale: f32,
+) -> Option<CompositionSurfaceBrush> {
+    rasterize(comp, &AtlasKey::solid(color, scale), &[]).map(|e| e.brush)
 }
 
 fn draw_shape(session: &DrawingSession, brush: &Brush, shape: ShapeKey, w: f32, h: f32) {
@@ -230,6 +329,8 @@ fn draw_shape(session: &DrawingSession, brush: &Brush, shape: ShapeKey, w: f32, 
                 brush,
             );
         }
+        // Rasterized directly in `rasterize` (needs the stop list).
+        ShapeKey::GradBar { .. } => {}
         // Stroke coordinates mirror the retired painted checkmark (authored in
         // an 18-DIP box), scaled to `d`.
         ShapeKey::Check { d } => {
@@ -310,12 +411,34 @@ impl Part {
     /// Bind (or re-bind) this part's brush to the atlas source for `key`.
     /// No-op while the key and atlas epoch are unchanged.
     fn bind(&mut self, comp: &Compositing, atlas: &mut Atlas, key: AtlasKey) {
+        self.bind_with(comp, atlas, key, &[]);
+    }
+
+    /// [`bind`](Self::bind) for a gradient-bar key, supplying the stop list
+    /// the raster needs on a cache miss (the key carries only their hash).
+    fn bind_grad(
+        &mut self,
+        comp: &Compositing,
+        atlas: &mut Atlas,
+        key: AtlasKey,
+        stops: &[(f64, crate::Color)],
+    ) {
+        self.bind_with(comp, atlas, key, stops);
+    }
+
+    fn bind_with(
+        &mut self,
+        comp: &Compositing,
+        atlas: &mut Atlas,
+        key: AtlasKey,
+        stops: &[(f64, crate::Color)],
+    ) {
         if self.key == Some(key) && self.epoch == atlas.epoch {
             return;
         }
         let epoch = atlas.epoch;
-        let Some(entry) = atlas.entry(comp, key) else { return };
-        let brush: Option<CompositionBrush> = if key.is_hbar() {
+        let Some(entry) = atlas.entry(comp, key, stops) else { return };
+        let brush: Option<CompositionBrush> = if key.uses_nine_grid() {
             // Corners map 1:1 back to DIPs: source insets are `r * scale` px,
             // scaled down by `1 / scale` on the destination.
             let nine = match &self.nine {
@@ -546,6 +669,11 @@ pub(crate) struct Parts {
     /// Progress: a forever-looping compositor animation is running (the
     /// indeterminate bar sweep / ring spin).
     looping: bool,
+    /// Meter: the fill sprite's reveal clip (its `RightInset` follows the
+    /// needle via an `ExpressionAnimation`).
+    clip: Option<InsetClip>,
+    /// Track width the reveal expression was last built for.
+    clip_w: f32,
 }
 
 impl Parts {
@@ -560,6 +688,8 @@ impl Parts {
             geom: (0.0, 0.0),
             edges_sig: 0.0,
             looping: false,
+            clip: None,
+            clip_w: 0.0,
         }
     }
 
@@ -593,6 +723,7 @@ pub(crate) fn converted(kind: ControlKind) -> bool {
             | ControlKind::Expander
             | ControlKind::ProgressBar
             | ControlKind::ProgressRing
+            | ControlKind::Meter
     )
 }
 
@@ -657,6 +788,7 @@ pub(crate) fn sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale
         ControlKind::ToggleSwitch => toggle_sync(comp, atlas, node, scale),
         ControlKind::CheckBox => check_sync(comp, atlas, node, scale),
         ControlKind::Slider => slider_sync(comp, atlas, node, scale),
+        ControlKind::Meter => meter_sync(comp, atlas, node, scale),
         ControlKind::SelectorBar => segmented_sync(comp, atlas, node, scale),
         ControlKind::NavigationView => nav_sync(comp, atlas, node, scale),
         ControlKind::Expander => expander_sync(comp, atlas, node, scale),
@@ -881,19 +1013,45 @@ fn halo_target(node: &Node) -> f32 {
     }
 }
 
+/// The slider's fill-origin as a 0..1 track fraction (`fill_origin` clamped
+/// into `[min, max]`; unset = 0.0, i.e. fill from the `min` end).
+pub(crate) fn slider_origin_frac(node: &Node) -> f32 {
+    let Some(o) = node.ctrl.fill_origin else { return 0.0 };
+    let span = node.ctrl.max - node.ctrl.min;
+    if span.abs() < f64::EPSILON {
+        0.0
+    } else {
+        ((o - node.ctrl.min) / span).clamp(0.0, 1.0) as f32
+    }
+}
+
+/// The fill color for a value at `vfrac`, split at the fill origin: at or
+/// below → `fill_color`, above → `fill_color_alt` (each falling back toward
+/// the theme accent). Authored colors — the atlas raster display-maps them.
+fn slider_fill_color(node: &Node, vfrac: f32, ofrac: f32) -> crate::Color {
+    let below = node.ctrl.fill_color.unwrap_or_else(theme::accent);
+    if vfrac <= ofrac {
+        below
+    } else {
+        node.ctrl.fill_color_alt.unwrap_or(below)
+    }
+}
+
 /// Above-band roles: `[fill, halo, thumb]`.
 fn slider_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
     if !ensure(comp, node, 0, 3) {
         return;
     }
     let frac = super::ctrl_value_frac(node) as f32;
+    let ofrac = slider_origin_frac(node);
     let dim = dim_of(node);
     let halo_t = halo_target(node);
-    let k_fill = AtlasKey::hbar(theme::SLIDER_TRACK, theme::SLIDER_TRACK / 2.0, 0.0, theme::accent(), scale);
+    let fill_c = slider_fill_color(node, frac, ofrac);
+    let k_fill = AtlasKey::hbar(theme::SLIDER_TRACK, theme::SLIDER_TRACK / 2.0, 0.0, fill_c, scale);
     let k_halo = AtlasKey::circle(theme::SLIDER_THUMB + 6.0, theme::w(1.0), scale);
     let k_thumb = AtlasKey::circle(theme::SLIDER_THUMB, theme::w(1.0), scale);
 
-    let g = slider_geom(node.rect.w, node.rect.h, frac);
+    let g = slider_geom(node.rect.w, node.rect.h, frac, ofrac);
     let geom = (node.rect.w, node.rect.h);
     let Some(parts) = node.parts.as_mut() else { return };
     let snap = !parts.init || parts.geom != geom || node.pressed;
@@ -917,17 +1075,22 @@ struct SliderGeom {
     thumb: (f32, f32, f32, f32),
 }
 
-fn slider_geom(w: f32, h: f32, frac: f32) -> SliderGeom {
+fn slider_geom(w: f32, h: f32, frac: f32, ofrac: f32) -> SliderGeom {
     let cy = h / 2.0;
     let inset = theme::SLIDER_THUMB / 2.0;
     let x0 = inset;
     let x1 = (w - inset).max(x0);
     let frac = frac.clamp(0.0, 1.0);
     let thumb_x = x0 + (x1 - x0) * frac;
+    // The fill spans origin → thumb, whichever side of the origin the value
+    // sits on (ofrac 0.0 = the classic fill-from-min).
+    let origin_x = x0 + (x1 - x0) * ofrac.clamp(0.0, 1.0);
+    let fill_lo = thumb_x.min(origin_x);
+    let fill_hi = thumb_x.max(origin_x);
     let tr = theme::SLIDER_TRACK;
     let halo_d = theme::SLIDER_THUMB + 6.0;
     SliderGeom {
-        fill: (x0, cy - tr / 2.0, thumb_x - x0, tr),
+        fill: (fill_lo, cy - tr / 2.0, fill_hi - fill_lo, tr),
         halo: (thumb_x - halo_d / 2.0, cy - halo_d / 2.0, halo_d, halo_d),
         thumb: (
             thumb_x - theme::SLIDER_THUMB / 2.0,
@@ -953,8 +1116,11 @@ fn slider_apply(parts: &mut Parts, g: &SliderGeom, snap: bool) {
 
 /// Direct event entry: a pointer drag scrubs the slider 1:1 — snap the fill /
 /// halo / thumb to `frac` with plain property sets (no repaint, no tick).
+/// The fill *color* is not touched here; an origin-side crossing marks the
+/// node dirty (see `input::slider_to`) and the repaint's sync rebinds it.
 pub(crate) fn slider_drag(node: &mut Node, frac: f32) -> bool {
-    let g = slider_geom(node.rect.w, node.rect.h, frac);
+    let ofrac = slider_origin_frac(node);
+    let g = slider_geom(node.rect.w, node.rect.h, frac, ofrac);
     let Some(parts) = node.parts.as_mut() else { return false };
     if parts.above.len() != 3 {
         return false;
@@ -962,6 +1128,120 @@ pub(crate) fn slider_drag(node: &mut Node, frac: f32) -> bool {
     slider_apply(parts, &g, true);
     parts.frac = frac;
     true
+}
+
+// ── Meter ────────────────────────────────────────────────────────────────────
+
+/// Above-band roles: `[fill, marker, halo, needle]`.
+///
+/// The fill is a full-track gradient raster revealed by an `InsetClip` whose
+/// `RightInset` FOLLOWS the needle sprite's animated `Offset.X` through an
+/// `ExpressionAnimation` — the one needle glide (a compositor Vector3 spring)
+/// drives both, so the fill edge and the needle never separate and a level
+/// change never repaints or ticks.
+fn meter_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+    if !ensure(comp, node, 0, 4) {
+        return;
+    }
+    let frac = (super::ctrl_value_frac(node) as f32).clamp(0.0, 1.0);
+    let (w, h) = (node.rect.w, node.rect.h);
+    let dim = dim_of(node);
+    let top = theme::METER_INSET;
+    let bar_h = (h - 2.0 * top).max(1.0);
+    let marker_x = super::controls::meter_marker_frac(node).map(|f| f * w);
+    let marker_c = node.ctrl.marker_color.unwrap_or_else(|| theme::w(0.15));
+
+    let k_fill = if node.ctrl.stops.is_empty() {
+        AtlasKey::hbar(bar_h, theme::METER_RADIUS, 0.0, theme::accent(), scale)
+    } else {
+        // Rounded ends (nine-grid) so the coloured fill matches the groove's
+        // rounded corners; the reveal clip trims the straight leading edge.
+        AtlasKey::grad_bar(&node.ctrl.stops, theme::METER_RADIUS, bar_h, scale)
+    };
+    let k_marker = AtlasKey::solid(marker_c, scale);
+    let k_white = AtlasKey::solid(theme::w(1.0), scale);
+
+    let geom = (w, h);
+    let stops = &node.ctrl.stops;
+    let Some(parts) = node.parts.as_mut() else { return };
+    let snap = !parts.init || parts.geom != geom;
+
+    parts.above[0].bind_grad(comp, atlas, k_fill, stops);
+    parts.above[1].bind(comp, atlas, k_marker);
+    parts.above[2].bind(comp, atlas, k_white);
+    parts.above[3].bind(comp, atlas, k_white);
+
+    parts.above[0].place(0.0, top, w, bar_h);
+    if let Some(mx) = marker_x {
+        parts.above[1].place(mx - 0.5, 0.0, 1.0, h);
+    }
+    // The needle (a soft halo under a crisp core) rides the fill edge, full
+    // height so it overhangs the groove like the retired drawn meter.
+    let nx = frac * w;
+    if snap {
+        parts.above[2].place(nx - 2.0, 0.0, 4.0, h);
+        parts.above[3].place(nx - 1.0, 0.0, 2.0, h);
+    } else {
+        parts.above[2].glide(nx - 2.0, 0.0, 4.0, h);
+        parts.above[3].glide(nx - 1.0, 0.0, 2.0, h);
+    }
+    parts.above[0].set_opacity(dim);
+    parts.above[1].set_opacity(if marker_x.is_some() { dim } else { 0.0 });
+    parts.above[2].set_opacity(0.25 * dim);
+    parts.above[3].set_opacity(dim);
+
+    meter_arm_clip(parts, w);
+
+    parts.frac = frac;
+    parts.geom = geom;
+    parts.init = true;
+}
+
+/// Ensure the fill's reveal clip exists and its follower expression matches
+/// the current track width. The expression reads the needle core's animated
+/// `Offset.X`, so a needle glide sweeps the reveal in lock-step; it rebuilds
+/// only on a resize (the width is baked in as a constant).
+fn meter_arm_clip(parts: &mut Parts, w: f32) {
+    if parts.clip.is_some() && parts.clip_w == w {
+        return;
+    }
+    let run = || -> Option<InsetClip> {
+        let comp = parts.above[3].obj.Compositor().ok()?;
+        let clip = match &parts.clip {
+            Some(c) => c.clone(),
+            None => {
+                let c = comp.CreateInsetClip().ok()?;
+                parts.above[0]
+                    .vis
+                    .SetClip(&windows_core::Interface::cast::<CompositionClip>(&c).ok()?)
+                    .ok()?;
+                c
+            }
+        };
+        // Needle core is 2 DIPs wide at `nx - 1` → its centre is Offset.X + 1.
+        let expr = comp.CreateExpressionAnimationWithExpression(&format!(
+            "Max(0.0, {w:.2} - (n.Offset.X + 1.0))"
+        ))
+        .ok()?;
+        let needle: CompositionObject =
+            windows_core::Interface::cast(&parts.above[3].sprite).ok()?;
+        windows_core::Interface::cast::<ICompositionAnimation>(&expr)
+            .ok()?
+            .SetReferenceParameter("n", &needle)
+            .ok()?;
+        let clip_obj: ICompositionObject = windows_core::Interface::cast(&clip).ok()?;
+        clip_obj
+            .StartAnimation(
+                "RightInset",
+                &windows_core::Interface::cast::<CompositionAnimation>(&expr).ok()?,
+            )
+            .ok()?;
+        Some(clip)
+    };
+    if let Some(clip) = run() {
+        parts.clip = Some(clip);
+        parts.clip_w = w;
+    }
 }
 
 // ── Segmented (SelectorBar) ──────────────────────────────────────────────────
@@ -1308,7 +1588,7 @@ impl Caret {
             return;
         }
         let epoch = atlas.epoch;
-        let Some(entry) = atlas.entry(comp, key) else { return };
+        let Some(entry) = atlas.entry(comp, key, &[]) else { return };
         if let Ok(b) = entry.brush.cast::<CompositionBrush>()
             && self.sprite.SetBrush(&b).is_ok()
         {

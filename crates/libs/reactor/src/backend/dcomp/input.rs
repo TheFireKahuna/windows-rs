@@ -249,6 +249,12 @@ impl DCompBackend {
             return;
         }
 
+        // A pressed knob scrubs on a relative vertical drag (up = increase).
+        if let Some((id, origin, y0)) = self.knob_drag {
+            self.knob_drag_to(id, origin, y0, y);
+            return;
+        }
+
         // A dragged scroll thumb tracks the pointer 1:1.
         if let Some(sid) = self.dragging_thumb {
             self.drag_thumb_to(sid, y);
@@ -481,9 +487,19 @@ impl DCompBackend {
                 }
             }
             self.pressed_id = Some(id);
-            // Sliders scrub immediately on press.
+            // Sliders scrub immediately on press (drag capture announced
+            // first, so a host's touch highlight is up before the value).
             if self.node(id).map(|n| n.kind) == Some(ControlKind::Slider) {
+                self.fire_bool(id, Event::DragStateChanged, true);
                 self.slider_to(id, x);
+            }
+            // Knobs latch a RELATIVE vertical-drag origin (no immediate value
+            // change on press — only motion moves it).
+            if self.node(id).map(|n| n.kind) == Some(ControlKind::Knob) {
+                if let Some(n) = self.node(id) {
+                    self.knob_drag = Some((id, n.ctrl.value, y));
+                }
+                self.fire_bool(id, Event::DragStateChanged, true);
             }
             self.fire_pointer(id, x, y, |p| p.on_pointer_pressed.as_ref());
             true
@@ -538,6 +554,17 @@ impl DCompBackend {
             if parts::converted(n.kind) {
                 parts::ink_state_changed(n);
             }
+        }
+
+        // A slider drag ends on release wherever the pointer is (capture
+        // semantics) — the mirror of the press-time `DragStateChanged(true)`.
+        if self.node(id).map(|n| n.kind) == Some(ControlKind::Slider) {
+            self.fire_bool(id, Event::DragStateChanged, false);
+        }
+
+        // A knob drag likewise ends on release; drop the latched origin.
+        if self.knob_drag.take().is_some() {
+            self.fire_bool(id, Event::DragStateChanged, false);
         }
 
         // Capture semantics: the pressed node always sees the release (a drag
@@ -724,7 +751,7 @@ impl DCompBackend {
     /// fill/halo/thumb parts snap 1:1 with the pointer — plain compositor
     /// property sets, no repaint and no tick.
     fn slider_to(&mut self, id: ControlId, x: f32) {
-        let value = {
+        let (value, recolor) = {
             let Some(n) = self.node_mut(id) else { return };
             let inset = theme::SLIDER_THUMB / 2.0;
             let w = (n.rect.w - 2.0 * inset).max(1.0);
@@ -738,14 +765,82 @@ impl DCompBackend {
                 let span = n.ctrl.max - n.ctrl.min;
                 frac = if span.abs() < f64::EPSILON { 0.0 } else { ((v - n.ctrl.min) / span) as f32 };
             }
+            // Crossing the fill origin flips the two-tone fill color — a
+            // discrete edge, handled by one dirty repaint whose parts sync
+            // rebinds the fill's atlas source. Scrub motion stays pure
+            // property snaps.
+            let old = n.ctrl.value;
+            let recolor = n
+                .ctrl
+                .fill_origin
+                .is_some_and(|o| (old <= o) != (v <= o));
             n.ctrl.value = v;
-            if !parts::slider_drag(n, frac) {
-                // Parts not built yet (first interaction before first paint):
-                // fall back to a dirty repaint, whose sync snaps them.
+            if !parts::slider_drag(n, frac) || recolor {
+                // Also the parts-not-built-yet fallback (first interaction
+                // before first paint): the repaint's sync snaps them.
                 n.mark_dirty();
             }
+            (v, recolor)
+        };
+        if recolor {
+            self.repaint();
+        }
+        self.fire_f64(id, Event::ValueChanged, value);
+    }
+
+    /// Map a relative vertical drag to a knob value: `dy` (up = increase) over
+    /// `KNOB_DRAG_RANGE` DIPs covers the whole `[min, max]` domain, from the
+    /// value latched at press. The needle/arc glide runs on the compositor via
+    /// the repaint's knob sync — the drag itself just repaints (readout) and
+    /// retargets the spring.
+    fn knob_drag_to(&mut self, id: ControlId, origin: f64, y0: f32, y: f32) {
+        /// A full-height drag of this many DIPs sweeps the whole domain.
+        const KNOB_DRAG_RANGE: f32 = 200.0;
+        let value = {
+            let Some(n) = self.node_mut(id) else { return };
+            let span = n.ctrl.max - n.ctrl.min;
+            if span == 0.0 {
+                return;
+            }
+            let dy = (y0 - y) as f64; // up (decreasing y) increases
+            let mut v = (origin + (dy / KNOB_DRAG_RANGE as f64) * span).clamp(n.ctrl.min, n.ctrl.max);
+            if let Some(step) = n.ctrl.step
+                && step > 0.0
+            {
+                v = (v / step).round() * step;
+                v = v.clamp(n.ctrl.min, n.ctrl.max);
+            }
+            n.ctrl.value = v;
+            n.mark_dirty();
             v
         };
+        self.repaint();
+        self.fire_f64(id, Event::ValueChanged, value);
+    }
+
+    /// Advance a knob value by `detents` mouse-wheel detents (5% of the domain
+    /// each), clamped/quantized, and report it.
+    fn knob_wheel(&mut self, id: ControlId, detents: f64) {
+        /// Fraction of the domain one wheel detent advances.
+        const KNOB_WHEEL_FRAC: f64 = 0.05;
+        let value = {
+            let Some(n) = self.node_mut(id) else { return };
+            let span = n.ctrl.max - n.ctrl.min;
+            if span == 0.0 {
+                return;
+            }
+            let mut v = (n.ctrl.value + detents * KNOB_WHEEL_FRAC * span).clamp(n.ctrl.min, n.ctrl.max);
+            if let Some(step) = n.ctrl.step
+                && step > 0.0
+            {
+                v = (v / step).round() * step;
+                v = v.clamp(n.ctrl.min, n.ctrl.max);
+            }
+            n.ctrl.value = v;
+            n.mark_dirty();
+            v
+        };
+        self.repaint();
         self.fire_f64(id, Event::ValueChanged, value);
     }
 
@@ -933,6 +1028,15 @@ impl DCompBackend {
             && self.node(id).is_some_and(|n| n.rect.contains(x, y))
         {
             self.number_step(id, if delta > 0 { 1.0 } else { -1.0 }, false);
+            return;
+        }
+
+        // A knob under the pointer adjusts on the wheel (5% of the domain per
+        // detent), consuming it before it falls through to scrolling.
+        if let Some(id) = self.interactive_at(x, y)
+            && self.node(id).map(|n| n.kind) == Some(ControlKind::Knob)
+        {
+            self.knob_wheel(id, delta as f64 / 120.0);
             return;
         }
 
@@ -1453,7 +1557,7 @@ impl DCompBackend {
     fn focus_arrow(&mut self, dir: i32) {
         let Some(id) = self.focused_id else { return };
         match self.node(id).map(|n| n.kind) {
-            Some(ControlKind::Slider) => {
+            Some(ControlKind::Slider | ControlKind::Knob) => {
                 let value = {
                     let Some(n) = self.node_mut(id) else { return };
                     let step = n.ctrl.step.unwrap_or((n.ctrl.max - n.ctrl.min) / 20.0);
@@ -1462,8 +1566,8 @@ impl DCompBackend {
                     n.mark_dirty();
                     v
                 };
-                // The fill/thumb glide runs on the compositor via the repaint's
-                // parts sync — a keyboard nudge needs no tick.
+                // The fill/thumb (slider) or arc/needle (knob) glide runs on the
+                // compositor via the repaint's sync — a keyboard nudge needs no tick.
                 self.repaint();
                 self.fire_f64(id, Event::ValueChanged, value);
             }

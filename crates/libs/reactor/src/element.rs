@@ -350,6 +350,8 @@ define_element! {
     ToggleButton,
     SwapChainPanel,
     WebView2,
+    Meter,
+    Knob,
 }
 
 macro_rules! non_widget_from_table {
@@ -1233,6 +1235,8 @@ impl_element_ext!(
     ToggleButton,
     SwapChainPanel,
     WebView2,
+    Meter,
+    Knob,
 );
 
 impl ElementExt for RichTextBlock {

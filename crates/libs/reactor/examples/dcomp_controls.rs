@@ -80,9 +80,40 @@ fn main() -> windows_reactor::Result<()> {
 
         let slider = Slider::new(gain)
             .range(0.0, 100.0)
-            .on_value_changed(move |v| set_gain.call(v))
+            .on_value_changed({
+                let s = set_gain.clone();
+                move |v| s.call(v)
+            })
             .width(200.0)
             .height(24.0)
+            .into();
+
+        const ACCENT: Color = Color::rgb(0x15, 0xaf, 0xec);
+        const HOT: Color = Color::rgb(0xf5, 0x9e, 0x0b);
+        const ALARM: Color = Color::rgb(0xef, 0x44, 0x44);
+
+        let set_gain_k = set_gain.clone();
+        let knob = Knob::new(gain)
+            .range(0.0, 100.0)
+            .ticks(vec![0.0, 25.0, 50.0, 75.0, 100.0])
+            .tick_labels(vec![(0.0, "0".into()), (50.0, "50".into()), (100.0, "100".into())])
+            .major_every(50.0)
+            .stops(vec![(0.0, ACCENT), (0.7, HOT), (1.0, ALARM)])
+            .accent(ACCENT)
+            .text(format!("{gain:.0}"))
+            .unit("%")
+            .on_value_changed(move |v| set_gain_k.call(v))
+            .width(140.0)
+            .height(140.0)
+            .into();
+
+        let meter = Meter::new(gain)
+            .range(0.0, 100.0)
+            .marker(80.0)
+            .marker_color(ALARM)
+            .stops(vec![(0.0, ACCENT), (0.8, HOT), (1.0, ALARM)])
+            .width(200.0)
+            .height(12.0)
             .into();
 
         let progress = ProgressBar::new(gain).height(8.0).width(200.0).into();
@@ -110,6 +141,8 @@ fn main() -> windows_reactor::Result<()> {
             card(&format!("Analyzer  ({analyzer})"), segmented),
             card("Filter type", select),
             card(&format!("Output gain  ({gain:.0}%)"), slider),
+            card("Gain (knob)", knob),
+            card("Meter", meter),
             card("Level", progress),
             card("Analyzing…", busy),
             card("Loading", ring),

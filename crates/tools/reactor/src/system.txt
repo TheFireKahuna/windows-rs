@@ -69,8 +69,8 @@ Windows::UI::Composition::CompositionNineGridBrush
 // ── Compositor factory methods ──
 Windows::UI::Composition::ICompositor::{CreateContainerVisual, CreateSpriteVisual, CreateColorBrush, CreateColorBrushWithColor, CreateSurfaceBrush, CreateSurfaceBrushWithSurface, CreateScalarKeyFrameAnimation, CreateVector2KeyFrameAnimation, CreateVector3KeyFrameAnimation, CreateExpressionAnimation, CreateExpressionAnimationWithExpression, CreateInsetClip, CreateInsetClipWithInsets, CreateLinearEasingFunction, CreateCubicBezierEasingFunction}
 Windows::UI::Composition::ICompositor::CreateScopedBatch
-Windows::UI::Composition::ICompositor2::{CreateImplicitAnimationCollection, CreateNineGridBrush, CreateStepEasingFunction}
-Windows::UI::Composition::ICompositor4::{CreateSpringScalarAnimation, CreateSpringVector2Animation, CreateSpringVector3Animation}
+Windows::UI::Composition::ICompositor2::{CreateImplicitAnimationCollection, CreateNineGridBrush, CreateStepEasingFunction, CreateMaskBrush}
+Windows::UI::Composition::ICompositor4::{CreateSpringScalarAnimation, CreateSpringVector2Animation, CreateSpringVector3Animation, CreateLinearGradientBrush, CreateColorGradientStopWithOffsetAndColor}
 Windows::UI::Composition::ICompositor6::{CreateGeometricClip, CreateGeometricClipWithGeometry}
 // ── CompositionObject (animation host) ──
 Windows::UI::Composition::ICompositionObject::{get_Compositor, StartAnimation, StopAnimation}
@@ -89,6 +89,32 @@ Windows::UI::Composition::ICompositionDrawingSurface::get_Size
 Windows::UI::Composition::ICompositionDrawingSurface2::Resize
 // ── Clips ──
 Windows::UI::Composition::IInsetClip::{put_LeftInset, put_TopInset, put_RightInset, put_BottomInset}
+Windows::UI::Composition::ICompositionClip2::{put_RotationAngle, put_CenterPoint}
+// ── Vector shapes (Knob value arc: a stroked path grown by an animated TrimEnd;
+//    stroked with the FP16 gradient SURFACE brush so the arc stays HDR-mapped) ──
+Windows::UI::Composition::ShapeVisual
+Windows::UI::Composition::IShapeVisual::get_Shapes
+Windows::UI::Composition::CompositionShapeCollection
+Windows::UI::Composition::CompositionShape
+Windows::UI::Composition::CompositionSpriteShape
+Windows::UI::Composition::ICompositionSpriteShape::{put_Geometry, put_StrokeBrush, put_StrokeThickness, put_StrokeStartCap, put_StrokeEndCap}
+Windows::UI::Composition::CompositionStrokeCap
+Windows::UI::Composition::CompositionGeometry
+Windows::UI::Composition::ICompositionGeometry::{put_TrimStart, put_TrimEnd}
+Windows::UI::Composition::CompositionPathGeometry
+Windows::UI::Composition::CompositionPath
+Windows::UI::Composition::ICompositionPathFactory::Create
+Windows::UI::Composition::ICompositor5::{CreateShapeVisual, CreateSpriteShapeWithGeometry, CreatePathGeometryWithPath}
+// Mask brush for the knob value arc: the FP16 display-mapped gradient SURFACE
+// brush (HDR-correct — surface brushes don't paint as a shape STROKE, but they
+// do as a mask SOURCE) revealed by the TrimEnd arc shape (white stroke) captured
+// live through a CompositionVisualSurface. Keeps the whole arc in the FP16 pipe.
+Windows::UI::Composition::CompositionMaskBrush
+Windows::UI::Composition::ICompositionMaskBrush::{put_Source, put_Mask}
+// D2D geometry → composition path bridge (reactor implements IGeometrySource2DInterop;
+// ::* so the generated _Impl trait covers the full vtable, like the UIA providers)
+Windows::Graphics::IGeometrySource2D::*
+Windows::Win32::System::WinRT::Graphics::Direct2D::IGeometrySource2DInterop::*
 // ── Animation parameters / keyframes ──
 Windows::UI::Composition::IKeyFrameAnimation::{put_Duration, put_DelayTime, put_IterationCount, put_IterationBehavior, InsertExpressionKeyFrameWithEasingFunction}
 Windows::UI::Composition::IScalarKeyFrameAnimation::{InsertKeyFrame, InsertKeyFrameWithEasingFunction}
@@ -426,6 +452,7 @@ Windows::Win32::UI::Accessibility::ISelectionItemProvider::*
 Windows::Win32::UI::Accessibility::IExpandCollapseProvider::*
 Windows::Win32::UI::Accessibility::IScrollProvider::*
 Windows::Win32::UI::Accessibility::IScrollItemProvider::*
+Windows::Win32::UI::Accessibility::IRawElementProviderAdviseEvents::*
 // ── Host / event functions ──
 Windows::Win32::UI::Accessibility::UiaReturnRawElementProvider
 Windows::Win32::UI::Accessibility::UiaHostProviderFromHwnd

@@ -23,7 +23,9 @@
 //!   request/response the message pump services); calls already on the UI thread
 //!   run inline. There is one action path and one arena owner.
 
+use std::collections::HashMap;
 use std::mem::ManuallyDrop;
+use std::sync::{Mutex, OnceLock};
 
 use super::host;
 use super::{caption, controls};
@@ -35,6 +37,7 @@ use crate::system_bindings::{
     IInvokeProvider, IInvokeProvider_Impl, IRangeValueProvider, IRangeValueProvider_Impl,
     IRawElementProviderFragment, IRawElementProviderFragmentRoot,
     IRawElementProviderFragmentRoot_Impl, IRawElementProviderFragment_Impl,
+    IRawElementProviderAdviseEvents, IRawElementProviderAdviseEvents_Impl,
     IRawElementProviderSimple, IRawElementProviderSimple_Impl, IScrollItemProvider,
     IScrollItemProvider_Impl, IScrollProvider,
     IScrollProvider_Impl, ISelectionItemProvider, ISelectionItemProvider_Impl, ISelectionProvider,
@@ -70,11 +73,10 @@ use windows_core::{
 windows_core::link!("oleaut32.dll" "system" fn SafeArrayCreateVector(vt: u16, llbound: i32, celements: u32) -> *mut SAFEARRAY);
 windows_core::link!("oleaut32.dll" "system" fn SafeArrayPutElement(psa: *mut SAFEARRAY, rgindices: *const i32, pv: *const core::ffi::c_void) -> HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaClientsAreListening() -> BOOL);
+windows_core::link!("ole32.dll" "system" fn CoInitializeEx(pvreserved: *const core::ffi::c_void, dwcoinit: u32) -> HRESULT);
 
-// `ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading` — a
-// server-side provider whose state lives on the UI thread. `UseComThreading`
-// makes UIA core honor COM threading for callbacks and, critically, for its
-// event-delivery machinery (raised events can be dropped without it).
+// `ProviderOptions_ServerSideProvider | ProviderOptions_UseComThreading` — the
+// options the canonical Microsoft server-side provider sample advertises.
 const PROVIDER_OPTIONS_SERVER: ProviderOptions = 0x1 | 0x20;
 // `UIA_E_ELEMENTNOTAVAILABLE` — returned when the node has gone (id reused/freed).
 const UIA_E_ELEMENTNOTAVAILABLE: HRESULT = HRESULT(0x8004_0201u32 as i32);
@@ -89,6 +91,15 @@ const CAPTION_ITEM_BASE: i32 = 1 << 20;
 
 fn is_caption(item: i32) -> bool {
     item >= CAPTION_ITEM_BASE
+}
+
+// TEMP: env-gated entry-point trace for the event-delivery investigation.
+macro_rules! uia_trace {
+    ($($t:tt)*) => {
+        if std::env::var_os("REACTOR_UIA_TRACE").is_some() {
+            eprintln!("[uia t{:?}] {}", std::thread::current().id(), format!($($t)*));
+        }
+    };
 }
 
 // `ScrollAmount` values + the Scroll pattern's "no scroll" percent sentinel
@@ -175,8 +186,8 @@ fn control_type(kind: ControlKind) -> i32 {
         CheckBox | ToggleButton => UIA_CheckBoxControlTypeId,
         RadioButton => UIA_RadioButtonControlTypeId,
         TextBox | NumberBox | PasswordBox | AutoSuggestBox | RichEditBox => UIA_EditControlTypeId,
-        Slider => UIA_SliderControlTypeId,
-        ProgressBar | ProgressRing => UIA_ProgressBarControlTypeId,
+        Slider | Knob => UIA_SliderControlTypeId,
+        ProgressBar | ProgressRing | Meter => UIA_ProgressBarControlTypeId,
         ComboBox => UIA_ComboBoxControlTypeId,
         SelectorBar | TabView | Pivot => UIA_TabControlTypeId,
         NavigationView => UIA_ListControlTypeId,
@@ -217,7 +228,7 @@ fn pattern_supported(kind: ControlKind, item: i32, pid: UIA_PATTERN_ID) -> bool 
     } else if pid == UIA_ValuePatternId {
         matches!(kind, TextBox | NumberBox | PasswordBox | AutoSuggestBox)
     } else if pid == UIA_RangeValuePatternId {
-        matches!(kind, Slider | NumberBox | ProgressBar | ProgressRing)
+        matches!(kind, Slider | Knob | NumberBox | ProgressBar | ProgressRing | Meter)
     } else if pid == UIA_ExpandCollapsePatternId {
         matches!(kind, Expander | ComboBox | DropDownButton | SplitButton)
     } else if pid == UIA_SelectionPatternId {
@@ -534,7 +545,10 @@ impl DCompBackend {
     /// `(value, min, max, read-only, step)` for a range control.
     fn uia_range(&self, id: ControlId) -> Option<(f64, f64, f64, bool, f64)> {
         let n = self.arena.get(id)?;
-        let readonly = matches!(n.kind, ControlKind::ProgressBar | ControlKind::ProgressRing);
+        let readonly = matches!(
+            n.kind,
+            ControlKind::ProgressBar | ControlKind::ProgressRing | ControlKind::Meter
+        );
         let step = n.ctrl.step.unwrap_or(1.0);
         Some((n.ctrl.value, n.ctrl.min, n.ctrl.max, readonly, step))
     }
@@ -846,7 +860,7 @@ impl DCompBackend {
         }
         let hwnd = self.hwnd;
         host::post_ui(hwnd, move || {
-            let provider: IRawElementProviderSimple = ElementProvider::element(hwnd, id).into();
+            let provider = stable_provider(ElementProvider::element(hwnd, id));
             unsafe {
                 let _ = UiaRaiseAutomationEvent(provider.as_raw(), UIA_AutomationFocusChangedEventId);
             }
@@ -861,6 +875,7 @@ impl DCompBackend {
     // deferred through the pump so raising never re-enters the input borrow.
 
     pub(crate) fn uia_notify_bool(&self, id: ControlId, event: Event, v: bool) {
+        uia_trace!("notify_bool id={} ev={event:?} v={v} listening={}", id.0, clients_listening());
         if !clients_listening() {
             return;
         }
@@ -902,7 +917,7 @@ impl DCompBackend {
                 };
                 let hwnd = self.hwnd;
                 host::post_ui(hwnd, move || {
-                    let p: IRawElementProviderSimple = ElementProvider::item(hwnd, id, i).into();
+                    let p = stable_provider(ElementProvider::item(hwnd, id, i));
                     unsafe {
                         let _ = UiaRaiseAutomationEvent(
                             p.as_raw(),
@@ -938,8 +953,8 @@ enum PropVal {
 /// Raise `AutomationPropertyChanged` for node `id` — deferred onto the pump.
 /// The old value is reported empty (permitted by the pattern contracts).
 fn raise_property_changed(hwnd: isize, id: ControlId, pid: UIA_PROPERTY_ID, val: PropVal) {
-    host::post_ui(hwnd, move || {
-        let provider: IRawElementProviderSimple = ElementProvider::element(hwnd, id).into();
+    dispatch_raise(hwnd, move || {
+        let provider = stable_provider(ElementProvider::element(hwnd, id));
         // For a BSTR value the VARIANT holds a non-owning alias; `_owner` keeps
         // the string alive across the synchronous raise (UIA deep-copies it),
         // then frees it — a by-value VARIANT is never dropped by anyone else.
@@ -960,14 +975,40 @@ fn raise_property_changed(hwnd: isize, id: ControlId, pid: UIA_PROPERTY_ID, val:
             }
         };
         unsafe {
-            let _ = UiaRaiseAutomationPropertyChangedEvent(
+            let hr = UiaRaiseAutomationPropertyChangedEvent(
                 provider.as_raw(),
                 pid,
                 VARIANT::default(),
                 newv,
             );
+            uia_trace!("RAISE prop pid={pid} id={} -> {hr:?}", id.0);
+        }
+        // TEMP experiment: keep the raised provider alive past the (async)
+        // delivery to test whether UIA retains its pointer.
+        if std::env::var_os("REACTOR_UIA_LEAK_RAISED").is_some() {
+            core::mem::forget(provider);
         }
     });
+}
+
+// TEMP experiment: run a raise closure either on the ASTA UI thread (post_ui,
+// default) or on a fresh unattached thread (REACTOR_UIA_RAISE_OFFTHREAD set), to
+// tell whether the ASTA apartment blocks cross-process event marshaling.
+fn dispatch_raise(hwnd: isize, f: impl FnOnce() + Send + 'static) {
+    if std::env::var_os("REACTOR_UIA_RAISE_OFFTHREAD").is_some() {
+        std::thread::spawn(move || {
+            // COINIT_MULTITHREADED — a proper COM apartment for the native
+            // outgoing event-delivery call (an uninitialized thread cannot make
+            // it; the ASTA UI thread may block it).
+            unsafe {
+                let _ = CoInitializeEx(core::ptr::null(), 0x0);
+            }
+            f();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        });
+    } else {
+        host::post_ui(hwnd, f);
+    }
 }
 
 // ── Marshal helpers ──────────────────────────────────────────────────────────
@@ -1018,11 +1059,11 @@ fn host_provider(hwnd: isize) -> Result<IRawElementProviderSimple> {
 fn nav_provider(hwnd: isize, nav: UiaNav) -> Result<IRawElementProviderFragment> {
     match nav {
         UiaNav::None => Err(Error::empty()),
-        UiaNav::Node(c) => Ok(ElementProvider::element(hwnd, c).into()),
-        UiaNav::Item(c, i) => Ok(ElementProvider::item(hwnd, c, i).into()),
+        UiaNav::Node(c) => stable_fragment(ElementProvider::element(hwnd, c)),
+        UiaNav::Item(c, i) => stable_fragment(ElementProvider::item(hwnd, c, i)),
         UiaNav::Root => {
             let rid = root_id(hwnd).ok_or_else(not_available)?;
-            Ok(ElementProvider::root(hwnd, rid).into())
+            stable_fragment(ElementProvider::root(hwnd, rid))
         }
     }
 }
@@ -1030,13 +1071,56 @@ fn nav_provider(hwnd: isize, nav: UiaNav) -> Result<IRawElementProviderFragment>
 /// The window's root UI Automation provider (a fragment root for the reactor
 /// root node). Returned from `WM_GETOBJECT`.
 pub(crate) fn root_provider(hwnd: isize, root: ControlId) -> IRawElementProviderSimple {
-    ElementProvider::root(hwnd, root).into()
+    stable_provider(ElementProvider::root(hwnd, root))
+}
+
+// ── Stable provider identity ─────────────────────────────────────────────────
+//
+// UI Automation correlates elements across queries — and, critically, matches
+// raised events to registered listeners — partly by the provider's COM object
+// identity, not only its runtime id (see the "map of the providers that have
+// raised events" in the server-side provider docs). Handing UIA a throwaway
+// object per query breaks that correlation, so events raised on a fresh object
+// are silently dropped even though the raise returns S_OK. We therefore mint one
+// object per element identity and return that same object every time.
+//
+// The objects carry only plain data and marshal all real work to the UI thread,
+// and `implement_decl!` makes them agile (they answer `IAgileObject`/`IMarshal`),
+// so a single instance is safely shared across UIA's worker threads. The cache
+// is grow-only for the process; each entry is a few words and UIA holds its own
+// references besides.
+
+/// An agile provider object, sendable because it is callable from any apartment.
+struct SendProvider(IRawElementProviderSimple);
+// SAFETY: `implement_decl!` providers are agile (free-threaded marshaler); the
+// wrapped object may be AddRef'd/called from any thread.
+unsafe impl Send for SendProvider {}
+
+type ProviderKey = (isize, u32, i32, bool);
+
+fn provider_cache() -> &'static Mutex<HashMap<ProviderKey, SendProvider>> {
+    static CACHE: OnceLock<Mutex<HashMap<ProviderKey, SendProvider>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The one stable provider object for `p`'s element identity, created on first
+/// use and reused thereafter.
+fn stable_provider(p: ElementProvider) -> IRawElementProviderSimple {
+    let key = (p.hwnd, p.id.get(), p.item, p.is_root);
+    let mut cache = provider_cache().lock().unwrap();
+    cache.entry(key).or_insert_with(|| SendProvider(p.into())).0.clone()
+}
+
+/// The stable provider for `p`, viewed as a fragment (same object).
+fn stable_fragment(p: ElementProvider) -> Result<IRawElementProviderFragment> {
+    stable_provider(p).cast()
 }
 
 // ── The provider object ──────────────────────────────────────────────────────
 
 /// One UI Automation provider: a value object identifying an arena node (or one
-/// synthetic item of a container). Agile and recreated per query; all real work
+/// synthetic item of a container). Agile; the COM object wrapping it is minted
+/// once per identity and cached (see [`stable_provider`]), and all real work
 /// marshals to the UI thread.
 #[derive(Clone, Copy)]
 struct ElementProvider {
@@ -1111,30 +1195,55 @@ implement_decl! {
         ISelectionItemProvider,
         IExpandCollapseProvider,
         IScrollProvider,
-        IScrollItemProvider
+        IScrollItemProvider,
+        IRawElementProviderAdviseEvents
     ]
+}
+
+impl IRawElementProviderAdviseEvents_Impl for ElementProvider_Impl {
+    fn AdviseEventAdded(
+        &self,
+        eventid: crate::system_bindings::UIA_EVENT_ID,
+        _propertyids: *const SAFEARRAY,
+    ) -> Result<()> {
+        uia_trace!("AdviseEventAdded ev={eventid} id={} root={}", self.id.0, self.is_root);
+        Ok(())
+    }
+    fn AdviseEventRemoved(
+        &self,
+        eventid: crate::system_bindings::UIA_EVENT_ID,
+        _propertyids: *const SAFEARRAY,
+    ) -> Result<()> {
+        uia_trace!("AdviseEventRemoved ev={eventid} id={}", self.id.0);
+        Ok(())
+    }
 }
 
 impl IRawElementProviderSimple_Impl for ElementProvider_Impl {
     fn ProviderOptions(&self) -> Result<ProviderOptions> {
+        uia_trace!("ProviderOptions id={} item={} root={}", self.id.0, self.item, self.is_root);
         Ok(PROVIDER_OPTIONS_SERVER)
     }
 
     fn GetPatternProvider(&self, patternid: UIA_PATTERN_ID) -> Result<IUnknown> {
+        uia_trace!("GetPatternProvider id={} item={} pat={patternid}", self.id.0, self.item);
         let (id, item) = (self.id, self.item);
         let supported = get(self.hwnd, move |b| Some(b.uia_pattern_supported(id, item, patternid)))?;
         if supported {
-            Ok(self.dup().into())
+            // The same stable object answers pattern QIs (it implements them all).
+            stable_provider(self.dup()).cast()
         } else {
             Err(Error::empty()) // S_OK + null: pattern not supported
         }
     }
 
     fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> Result<VARIANT> {
+        uia_trace!("GetPropertyValue id={} item={} pid={propertyid}", self.id.0, self.item);
         Ok(self.property(propertyid))
     }
 
     fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
+        uia_trace!("HostRawElementProvider id={} root={}", self.id.0, self.is_root);
         if self.is_root {
             host_provider(self.hwnd)
         } else {
@@ -1145,12 +1254,14 @@ impl IRawElementProviderSimple_Impl for ElementProvider_Impl {
 
 impl IRawElementProviderFragment_Impl for ElementProvider_Impl {
     fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
+        uia_trace!("Navigate id={} item={} dir={direction}", self.id.0, self.item);
         let (id, item) = (self.id, self.item);
         let nav = get(self.hwnd, move |b| Some(b.uia_navigate(id, item, direction)))?;
         nav_provider(self.hwnd, nav)
     }
 
     fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
+        uia_trace!("GetRuntimeId id={} item={} root={}", self.id.0, self.item, self.is_root);
         if self.is_root {
             // A fragment ROOT must return null: UIA derives its identity from
             // the host HWND, which lets client subscriptions taken on the
@@ -1178,8 +1289,9 @@ impl IRawElementProviderFragment_Impl for ElementProvider_Impl {
     }
 
     fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
+        uia_trace!("FragmentRoot id={} item={}", self.id.0, self.item);
         let rid = root_id(self.hwnd).ok_or_else(not_available)?;
-        Ok(ElementProvider::root(self.hwnd, rid).into())
+        stable_provider(ElementProvider::root(self.hwnd, rid)).cast()
     }
 }
 
@@ -1222,7 +1334,7 @@ impl IInvokeProvider_Impl for ElementProvider_Impl {
         // Clients (e.g. guishot's `uia:invoke`) may wait on the Invoked event.
         let me = self.dup();
         host::post_ui(self.hwnd, move || {
-            let p: IRawElementProviderSimple = me.into();
+            let p = stable_provider(me);
             unsafe {
                 let _ = UiaRaiseAutomationEvent(p.as_raw(), UIA_Invoke_InvokedEventId);
             }
@@ -1308,7 +1420,7 @@ impl ISelectionProvider_Impl for ElementProvider_Impl {
         let Some(i) = on_backend(self.hwnd, move |b| b.uia_selected_item(id)).flatten() else {
             return Ok(core::ptr::null_mut());
         };
-        let sel: IRawElementProviderSimple = ElementProvider::item(self.hwnd, id, i).into();
+        let sel = stable_provider(ElementProvider::item(self.hwnd, id, i));
         unsafe {
             let psa = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
             if !psa.is_null() {
@@ -1354,7 +1466,7 @@ impl ISelectionItemProvider_Impl for ElementProvider_Impl {
     }
 
     fn SelectionContainer(&self) -> Result<IRawElementProviderSimple> {
-        Ok(ElementProvider::element(self.hwnd, self.id).into())
+        Ok(stable_provider(ElementProvider::element(self.hwnd, self.id)))
     }
 }
 

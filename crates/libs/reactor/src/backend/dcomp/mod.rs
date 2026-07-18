@@ -32,6 +32,7 @@ mod display_change;
 mod editor;
 mod host;
 mod input;
+mod knob;
 mod layout;
 mod node;
 mod pacer;
@@ -102,6 +103,10 @@ pub struct DCompBackend {
     hovered_scroll: Option<ControlId>,
     /// The scroll container whose thumb is being dragged, if any.
     dragging_thumb: Option<ControlId>,
+    /// An active knob drag: `(id, value at press, pointer y at press)`. A knob
+    /// scrubs on a RELATIVE vertical drag (up = increase) rather than the
+    /// slider's absolute positional map, so the gesture origin is latched here.
+    knob_drag: Option<(ControlId, f64, f32)>,
     /// The node holding keyboard focus (drives the focus ring + Space/Enter).
     focused_id: Option<ControlId>,
     /// A registered viz pointer surface (knob/slider/EQ canvas) being dragged:
@@ -140,6 +145,7 @@ impl DCompBackend {
             pressed_id: None,
             hovered_scroll: None,
             dragging_thumb: None,
+            knob_drag: None,
             focused_id: None,
             pressed_surface: None,
             hovered_surface: None,
@@ -753,6 +759,62 @@ impl Backend for DCompBackend {
                 node.mark_dirty();
             }
             (Prop::Step, PropValue::F64(v)) => node.ctrl.step = Some(*v),
+            (Prop::FillOrigin, PropValue::F64(v)) => {
+                node.ctrl.fill_origin = Some(*v);
+                node.mark_dirty();
+            }
+            (Prop::FillColor, PropValue::Color(c)) => {
+                node.ctrl.fill_color = Some(*c);
+                node.mark_dirty();
+            }
+            (Prop::FillColorAlt, PropValue::Color(c)) => {
+                node.ctrl.fill_color_alt = Some(*c);
+                node.mark_dirty();
+            }
+            (Prop::Marker, PropValue::F64(v)) => {
+                node.ctrl.marker = Some(*v);
+                node.mark_dirty();
+            }
+            (Prop::MarkerColor, PropValue::Color(c)) => {
+                node.ctrl.marker_color = Some(*c);
+                node.mark_dirty();
+            }
+            (Prop::GradientStops, PropValue::GradientStops(stops)) => {
+                node.ctrl.stops = stops.clone();
+                node.mark_dirty();
+            }
+            (Prop::StartAngle, PropValue::F64(v)) => {
+                node.ctrl.start_angle = *v as f32;
+                node.mark_dirty();
+            }
+            (Prop::EndAngle, PropValue::F64(v)) => {
+                node.ctrl.end_angle = *v as f32;
+                node.mark_dirty();
+            }
+            (Prop::Ticks, PropValue::F64List(list)) => {
+                node.ctrl.ticks = list.clone();
+                node.mark_dirty();
+            }
+            (Prop::TickLabels, PropValue::ValueLabels(list)) => {
+                node.ctrl.tick_labels = list.clone();
+                node.mark_dirty();
+            }
+            (Prop::MajorEvery, PropValue::F64(v)) => {
+                node.ctrl.major_every = Some(*v);
+                node.mark_dirty();
+            }
+            (Prop::Accent, PropValue::Color(c)) => {
+                node.ctrl.accent = Some(*c);
+                node.mark_dirty();
+            }
+            (Prop::Unit, PropValue::Str(s)) => {
+                node.ctrl.unit = s.clone();
+                node.mark_dirty();
+            }
+            (Prop::SubText, PropValue::Str(s)) => {
+                node.ctrl.sub_text = s.clone();
+                node.mark_dirty();
+            }
             (Prop::IsIndeterminate, PropValue::Bool(v)) => {
                 node.ctrl.indeterminate = *v;
                 node.mark_dirty();
@@ -1024,6 +1086,30 @@ fn reset_prop(node: &mut Node, prop: Prop) {
         }
         Prop::Fill => {
             node.paint.fill = None;
+            node.mark_dirty();
+        }
+        Prop::FillOrigin => {
+            node.ctrl.fill_origin = None;
+            node.mark_dirty();
+        }
+        Prop::FillColor => {
+            node.ctrl.fill_color = None;
+            node.mark_dirty();
+        }
+        Prop::FillColorAlt => {
+            node.ctrl.fill_color_alt = None;
+            node.mark_dirty();
+        }
+        Prop::Marker => {
+            node.ctrl.marker = None;
+            node.mark_dirty();
+        }
+        Prop::MarkerColor => {
+            node.ctrl.marker_color = None;
+            node.mark_dirty();
+        }
+        Prop::GradientStops => {
+            node.ctrl.stops.clear();
             node.mark_dirty();
         }
         Prop::Stroke => {

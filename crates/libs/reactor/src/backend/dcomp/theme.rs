@@ -363,6 +363,15 @@ pub const SLIDER_TRACK: f32 = 4.0;
 /// This library draws a single-circle thumb (Fluent's is an 18-epx ring + 12-epx
 /// accent dot); 14 is the nearest single-circle visual weight.
 pub const SLIDER_THUMB: f32 = 14.0;
+/// Knob default dial box (DIPs) when the host doesn't size it larger.
+pub const KNOB_D: f32 = 120.0;
+/// Meter default bar height (the track is inset within it so the position
+/// needle can overhang the groove top/bottom).
+pub const METER_H: f32 = 12.0;
+/// Meter track corner radius.
+pub const METER_RADIUS: f32 = 2.0;
+/// Meter track vertical inset (needle overhang allowance).
+pub const METER_INSET: f32 = 2.0;
 /// `NavigationView.CompactPaneLength` default (48).
 pub const NAV_RAIL_W: f32 = SPACE_32 + SPACE_16; // 48
 

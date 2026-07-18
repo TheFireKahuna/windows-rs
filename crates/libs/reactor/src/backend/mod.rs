@@ -110,6 +110,8 @@ pub enum ControlKind {
     ToggleButton,
     SwapChainPanel,
     WebView2,
+    Meter,
+    Knob,
 }
 
 /// Closed enum of every property that can be set on a control. Each
@@ -117,6 +119,7 @@ pub enum ControlKind {
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Prop {
     AcceptsReturn,
+    Accent,
     ActionButton,
     ActionButtonText,
     AlignBottomWithPanel,
@@ -156,13 +159,18 @@ pub enum Prop {
     Delay,
     DisplayMode,
     DisplayName,
+    EndAngle,
     Fill,
+    FillColor,
+    FillColorAlt,
+    FillOrigin,
     FlyoutContent,
     FlyoutPlacement,
     FontFamily,
     FontSize,
     FontWeight,
     Foreground,
+    GradientStops,
     GridColumns,
     GridRows,
     GroupName,
@@ -209,7 +217,10 @@ pub enum Prop {
     Items,
     LargeChange,
     LineEndpoints,
+    MajorEvery,
     Margin,
+    Marker,
+    MarkerColor,
     MaxColumns,
     MaxHeight,
     Maximum,
@@ -250,13 +261,18 @@ pub enum Prop {
     SelectionMode,
     Severity,
     Spacing,
+    StartAngle,
     Step,
     Stretch,
     Stroke,
     StrokeThickness,
     Style,
+    Ticks,
+    TickLabels,
+    Unit,
     StyleVariant,
     Subtitle,
+    SubText,
     Tall,
     Text,
     TextWrapping,
@@ -302,6 +318,14 @@ pub enum PropValue {
     },
     SelectorBarItems(Vec<SelectorBarItemDef>),
     Resources(HashMap<String, String>),
+    /// Gradient stops `(position 0..1, authored linear-scRGB color)` for a
+    /// value-ramp fill (Meter bar / Knob arc). The backend display-maps each
+    /// stop at its draw choke like every other chrome color.
+    GradientStops(Vec<(f64, Color)>),
+    /// Plain value list (Knob tick marks, in value units).
+    F64List(Vec<f64>),
+    /// `(value, label)` pairs (Knob scale labels — formatted by the app).
+    ValueLabels(Vec<(f64, String)>),
 }
 
 /// Closed enum of every backend-observable input event.
@@ -312,6 +336,7 @@ pub enum Event {
     BackRequested,
     DateChanged,
     Checked,
+    DragStateChanged,
     Click,
     Closed,
     CloseRequested,

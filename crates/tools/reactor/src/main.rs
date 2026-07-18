@@ -146,7 +146,13 @@ fn generate_reactor_bindings() {
         "Windows.Win32.UI.Accessibility.IExpandCollapseProvider",
         "Windows.Win32.UI.Accessibility.IScrollProvider",
         "Windows.Win32.UI.Accessibility.IScrollItemProvider",
+        "Windows.Win32.UI.Accessibility.IRawElementProviderAdviseEvents",
         "Windows.Win32.UI.TextServices.ITextStoreACP",
+        // The backend implements these to hand a D2D path geometry to the
+        // compositor (Knob value arc → CompositionPath): the WinRT marker the
+        // CompositionPath factory accepts + the interop that yields the D2D geometry.
+        "Windows.Graphics.IGeometrySource2D",
+        "Windows.Win32.System.WinRT.Graphics.Direct2D.IGeometrySource2DInterop",
         "--minimal",
         "--dead-code",
         "--flat",

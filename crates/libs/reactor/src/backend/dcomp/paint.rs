@@ -100,6 +100,11 @@ fn paint_node(
                 if n.editor.is_some() {
                     parts::sync_caret(comp, atlas, n, scale);
                 }
+                // Knob: reconcile the value-arc shape + needle (its own retained
+                // vector chrome, outside the flat `Part` model).
+                if n.kind == crate::backend::ControlKind::Knob {
+                    super::knob::sync_knob(comp, n, atlas.epoch(), scale);
+                }
             }
         }
     }

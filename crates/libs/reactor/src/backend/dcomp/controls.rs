@@ -48,6 +48,8 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
             paint_select(session, brush, node, rect, dim)
         }
         ControlKind::Slider => paint_slider(session, brush, node, rect, dim),
+        ControlKind::Meter => paint_meter(session, brush, node, rect, dim),
+        ControlKind::Knob => paint_knob(session, brush, node, rect, dim),
         // Track, fill, and indeterminate sweep are retained chrome parts
         // (`super::parts::progress_sync`) — the sweep loops on the compositor.
         ControlKind::ProgressBar => {}
@@ -426,7 +428,7 @@ fn paint_select(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
 
 // ── Slider (native) ──────────────────────────────────────────────────────────
 
-fn paint_slider(session: &DrawingSession, brush: &Brush, _node: &Node, rect: Rect, dim: f32) {
+fn paint_slider(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let cy = rect.height() / 2.0;
     let inset = theme::SLIDER_THUMB / 2.0;
     let x0 = inset;
@@ -437,6 +439,141 @@ fn paint_slider(session: &DrawingSession, brush: &Brush, _node: &Node, rect: Rec
     // a drag is pure compositor property sets, no repaint.
     let groove = Rect::from_xywh(x0, cy - theme::SLIDER_TRACK / 2.0, x1 - x0, theme::SLIDER_TRACK);
     fill_rr(session, brush, groove, theme::SLIDER_TRACK / 2.0, theme::w(0.06), dim);
+
+    // A fill origin strictly inside the range (a bidirectional gain-style
+    // slider) gets a notch standing proud of the track — brighter than the
+    // groove, dimmer than the thumb — so "where is neutral?" is answerable at
+    // rest. Origins at (or clamped to) an endpoint are just the track end.
+    if let Some(o) = node.ctrl.fill_origin
+        && o > node.ctrl.min.min(node.ctrl.max)
+        && o < node.ctrl.min.max(node.ctrl.max)
+    {
+        let ofrac = super::parts::slider_origin_frac(node);
+        let ox = x0 + (x1 - x0).max(0.0) * ofrac;
+        let tick_h = theme::SLIDER_TRACK + 4.0;
+        let tick = Rect::from_xywh(ox - 0.5, cy - tick_h / 2.0, 1.0, tick_h);
+        fill_rr(session, brush, tick, 0.5, theme::w(0.15), dim);
+    }
+}
+
+// ── Meter ────────────────────────────────────────────────────────────────────
+
+/// The meter's track fraction for its reference marker (`ctrl.marker` clamped
+/// into `[min, max]`; `None` = no marker).
+pub(crate) fn meter_marker_frac(node: &Node) -> Option<f32> {
+    let m = node.ctrl.marker?;
+    let span = node.ctrl.max - node.ctrl.min;
+    if span.abs() < f64::EPSILON {
+        None
+    } else {
+        Some(((m - node.ctrl.min) / span).clamp(0.0, 1.0) as f32)
+    }
+}
+
+/// Only the static groove paints here; the gradient fill, reference marker,
+/// and position needle are retained chrome parts above this surface
+/// (`super::parts::meter_sync` — the marker rides above the fill so it stays
+/// visible when the level passes it) — a level change is a compositor spring
+/// retarget, no repaint.
+fn paint_meter(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
+    let _ = node;
+    let top = theme::METER_INSET;
+    let bot = (rect.height() - theme::METER_INSET).max(top + 1.0);
+    let groove = Rect::new(0.0, top, rect.width(), bot);
+    fill_rr(session, brush, groove, theme::METER_RADIUS, theme::w(0.06), dim);
+}
+
+// ── Knob ─────────────────────────────────────────────────────────────────────
+
+/// Static dial chrome: background track ring, ticks, numeric labels, center hub,
+/// and the center readout. The gradient value arc + needle are retained
+/// compositor vector chrome above this surface (`super::knob`) — the arc grows
+/// on a `TrimEnd` spring, so a value change repaints only the readout here.
+fn paint_knob(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
+    use super::knob::{dial_geom, value_to_angle, LABEL_OFFSET};
+    let (cx, cy, radius) = dial_geom(node);
+    let (min, max) = (node.ctrl.min, node.ctrl.max);
+    let (start, end) = (node.ctrl.start_angle, node.ctrl.end_angle);
+    let _ = rect;
+
+    // Background track (full sweep), a wide soft groove under the value arc.
+    arc(session, brush, cx, cy, radius, 10.0, start, end, theme::w(0.06), dim);
+
+    // Ticks: minor + major (longer/brighter on an exact `major_every` multiple).
+    for &tv in &node.ctrl.ticks {
+        let a = value_to_angle(tv, min, max, start, end);
+        let major = node
+            .ctrl
+            .major_every
+            .filter(|m| *m != 0.0)
+            .is_some_and(|m| (tv % m).abs() < 1e-9);
+        let tick_len = if major { 8.0 } else { 5.0 };
+        let inner = radius - tick_len - 4.0;
+        let outer = radius - 4.0;
+        let (ca, sa) = (a.cos(), a.sin());
+        put(brush, theme::w(if major { 0.28 } else { 0.14 }), dim);
+        session.draw_line(
+            Vector2::new(cx + ca * inner, cy + sa * inner),
+            Vector2::new(cx + ca * outer, cy + sa * outer),
+            brush,
+            if major { 1.5 } else { 1.0 },
+        );
+    }
+
+    // Numeric labels outside the track (app-formatted strings).
+    let label_font = (radius * 0.1).max(10.0);
+    let lr = radius + LABEL_OFFSET;
+    for (v, label) in &node.ctrl.tick_labels {
+        let a = value_to_angle(*v, min, max, start, end);
+        let lx = cx + a.cos() * lr;
+        let ly = cy + a.sin() * lr;
+        let box_ = Rect::from_xywh(lx - lr, ly - label_font, 2.0 * lr, 2.0 * label_font);
+        text(
+            session,
+            brush,
+            label,
+            box_,
+            "Segoe UI",
+            label_font,
+            400,
+            theme::text_tertiary(),
+            TextAlignment::Center,
+            ParagraphAlignment::Center,
+            dim,
+        );
+    }
+
+    // Center hub.
+    put(brush, theme::w(1.0), dim);
+    session.fill_ellipse(&Ellipse::new(Vector2::new(cx, cy), 4.0, 4.0), brush);
+
+    // Center readout: value (large, thin) + unit + sub-line, app-formatted.
+    let readout_size = (radius * 0.38).max(20.0);
+    let base_y = cy + radius * 0.35;
+    if !node.paint.text.is_empty() {
+        let box_ = Rect::from_xywh(cx - radius, base_y - readout_size, 2.0 * radius, 2.0 * readout_size);
+        text(
+            session, brush, &node.paint.text, box_, "Segoe UI", readout_size, 200,
+            theme::w(0.9), TextAlignment::Center, ParagraphAlignment::Center, dim,
+        );
+    }
+    if !node.ctrl.unit.is_empty() {
+        let uy = base_y + readout_size * 0.45;
+        let box_ = Rect::from_xywh(cx - radius, uy, 2.0 * radius, readout_size);
+        text(
+            session, brush, &node.ctrl.unit, box_, "Segoe UI", readout_size * 0.35, 400,
+            theme::w(0.35), TextAlignment::Center, ParagraphAlignment::Top, dim,
+        );
+    }
+    if !node.ctrl.sub_text.is_empty() {
+        let sy = base_y + readout_size * 0.75;
+        let sub_size = (radius * 0.1).max(8.0);
+        let box_ = Rect::from_xywh(cx - radius, sy, 2.0 * radius, 2.0 * sub_size);
+        text(
+            session, brush, &node.ctrl.sub_text, box_, "Segoe UI", sub_size, 400,
+            theme::w(0.25), TextAlignment::Center, ParagraphAlignment::Top, dim,
+        );
+    }
 }
 
 // ── Progress ─────────────────────────────────────────────────────────────────

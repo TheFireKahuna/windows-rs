@@ -47,6 +47,17 @@ macro_rules! define_handles {
                             <bindings::$variant>::new().unwrap(),
                         ),
                     )*
+                    // Meter / Knob are custom controls with no native WinUI
+                    // peer — they exist only on the DirectComposition backend
+                    // (drawn as retained chrome parts). On the legacy WinUI
+                    // backend they degrade to their nearest native range
+                    // control so the tree still builds.
+                    ControlKind::Meter => Handle::ProgressBar(
+                        <bindings::ProgressBar>::new().unwrap(),
+                    ),
+                    ControlKind::Knob => Handle::Slider(
+                        <bindings::Slider>::new().unwrap(),
+                    ),
                 }
             }
         }
