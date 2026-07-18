@@ -138,6 +138,25 @@ pub struct DCompBackend {
     ghosts: Vec<Ghost>,
     /// Monotonic id source for [`Ghost`]s (keys the batch-completed callback).
     next_ghost: u64,
+    /// Live `TitleBar` node ids in mount order — the caption-geometry cache.
+    ///
+    /// `WM_NCHITTEST` asks for [`Self::caption_rect`] on every non-client mouse
+    /// move, so finding the caption may not scan the arena (an unordered map).
+    /// Maintained structurally instead: every arena insert flows through
+    /// `create` / `create_with_id` and every removal through `destroy`, all of
+    /// which know the kind, so this list is exact by construction and can never
+    /// name a node that is no longer in the arena. Ids are never reused, so
+    /// even a leaked entry could not alias a later node — but none can leak.
+    ///
+    /// A `Vec` rather than an `Option` because a tree with two TitleBars is
+    /// structurally reachable (nothing in the seam forbids it) and a remount
+    /// legitimately mounts the replacement *before* destroying the original —
+    /// which an `Option` would resolve by clearing the cache on the destroy,
+    /// leaving the live TitleBar unfindable. Order gives a defined policy:
+    /// **the first-mounted TitleBar owns the caption**; a second is laid out
+    /// and painted as an ordinary node but contributes no non-client region.
+    /// (The scan this replaced picked an arbitrary one — map order.)
+    titlebars: Vec<ControlId>,
     /// The host window handle (as `isize`) — used for clipboard ownership.
     hwnd: isize,
 }
@@ -165,6 +184,7 @@ impl DCompBackend {
             popup: None,
             ghosts: Vec::new(),
             next_ghost: 0,
+            titlebars: Vec::new(),
             hwnd,
         }
     }
@@ -194,6 +214,13 @@ impl DCompBackend {
 
     /// Full layout + surface paint. Run after each reconcile and on resize.
     pub(crate) fn relayout_and_paint(&mut self) {
+        // The tree just settled — audit the caption cache while the structural
+        // edits that could have drifted it are still fresh. `cfg!` rather than
+        // `#[cfg]` so the audit type-checks in every configuration; `if false`
+        // costs a release build nothing.
+        if cfg!(debug_assertions) {
+            self.audit_titlebars();
+        }
         if let Some(root) = self.root {
             let (w, h) = self.dip_size;
             let scale = self.scale();
@@ -345,12 +372,38 @@ impl DCompBackend {
         }
     }
 
-    /// The TitleBar node (the custom caption band), if the tree has one.
+    /// The TitleBar node that owns the caption (the custom caption band), if
+    /// the tree has one. O(1) — see [`Self::titlebars`].
     fn titlebar_id(&self) -> Option<ControlId> {
-        self.arena
+        self.titlebars.first().copied()
+    }
+
+    /// Debug-only: prove [`Self::titlebars`] still names exactly the live
+    /// TitleBar nodes. The list is maintained structurally at create/destroy,
+    /// so drift here would mean a mint or teardown path that bypassed them —
+    /// and a cached id naming a destroyed node would hand `WM_NCHITTEST` a
+    /// stale caption region for the rest of the window's life, which is worse
+    /// than the arena scan this cache replaced.
+    fn audit_titlebars(&self) {
+        // Arena order is unspecified, so compare membership, not sequence.
+        let live = self
+            .arena
             .iter()
-            .find(|(_, n)| n.kind == ControlKind::TitleBar)
-            .map(|(id, _)| id)
+            .filter(|(_, n)| n.kind == ControlKind::TitleBar)
+            .count();
+        debug_assert_eq!(
+            live,
+            self.titlebars.len(),
+            "TitleBar cache drifted: {live} live, {} cached",
+            self.titlebars.len()
+        );
+        debug_assert!(
+            self.titlebars.iter().all(|id| self
+                .arena
+                .get(*id)
+                .is_some_and(|n| n.kind == ControlKind::TitleBar)),
+            "TitleBar cache names a node that is gone or is no longer a TitleBar"
+        );
     }
 
     /// The caption band's layout box in window DIPs (`(x, y, w, h)`), if a
@@ -563,19 +616,37 @@ impl DCompBackend {
         }
         node
     }
+
+    /// Register a freshly inserted node in the kind-keyed id caches. Called
+    /// from both minting paths, so [`Self::titlebars`] tracks the arena exactly.
+    fn note_inserted(&mut self, id: ControlId, kind: ControlKind) {
+        if kind == ControlKind::TitleBar && !self.titlebars.contains(&id) {
+            if !self.titlebars.is_empty() {
+                animate::warn(format_args!(
+                    "TitleBar {id}: a second TitleBar is mounted — the first \
+                     ({:?}) keeps the caption; this one paints as a plain node",
+                    self.titlebars[0]
+                ));
+            }
+            self.titlebars.push(id);
+        }
+    }
 }
 
 impl record::CreateWithId for DCompBackend {
     fn create_with_id(&mut self, id: ControlId, kind: ControlKind) {
         let node = self.build_node(kind);
         self.arena.insert_with_id(id, node);
+        self.note_inserted(id, kind);
     }
 }
 
 impl Backend for DCompBackend {
     fn create(&mut self, kind: ControlKind) -> ControlId {
         let node = self.build_node(kind);
-        self.arena.insert(node)
+        let id = self.arena.insert(node);
+        self.note_inserted(id, kind);
+        id
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
@@ -944,7 +1015,10 @@ impl Backend for DCompBackend {
                 node.ctrl.menu = items.iter().map(menu_row).collect();
                 node.mark_dirty();
             }
-            _ => {}
+            // Every pair this backend does not consume lands here and is
+            // dropped. In a debug build say so — but only when the drop is a
+            // defect (see [`unhandled`]); in release this compiles to nothing.
+            _ => unhandled::note(node.kind, prop, value),
             }
         }
         if refresh_suggest {
@@ -1016,6 +1090,10 @@ impl Backend for DCompBackend {
         size::forget(id);
         pointer::forget(id);
         uia::forget(self.hwnd, id);
+        // Drop the caption cache entry in lock-step with the arena entry: a
+        // cached id naming a destroyed node would hand the host a stale (or
+        // absent) non-client region for the rest of the window's life.
+        self.titlebars.retain(|t| *t != id);
         // This node's parent link dies with the entry, but its children would be
         // left naming a parent that is no longer in the arena. Cut those links so
         // the inverse of `children` stays exact for every node that survives.
@@ -1147,6 +1225,410 @@ impl Backend for DCompBackend {
         // correctly even though it starts after the node stops laying out.
         if config.as_ref().is_some_and(animate::wants_center) {
             animate::note_scale_intent(node);
+        }
+    }
+}
+
+/// Debug-only diagnostics for the terminal `_` arm of [`Backend::set_prop`].
+///
+/// The reconciler seam is one shared vocabulary — ~165 [`Prop`]s × ~24
+/// [`PropValue`] shapes — and any single backend implements a slice of it, so
+/// most pairs legitimately reach that arm. The recorder already refuses a `_`
+/// arm in `SendValue::from_prop` precisely so a new value shape cannot vanish
+/// from the wire; before this module the same value could still vanish one
+/// layer later, at the actual consumer, with no warning and no counter.
+///
+/// A blanket warning would be useless: the large majority of fallthroughs are
+/// props whose only carriers are controls this backend does not render, and
+/// those would drown the handful that are real gaps. So each fallthrough is
+/// classified first (see [`Status`]) and only defects are reported, once each.
+///
+/// [`status`] and [`shape`] are **exhaustive matches with no `_` arm** — the
+/// same discipline as the recorder, and for the same reason: a `Prop` or
+/// `PropValue` variant added to the seam must not be able to slip in already
+/// silently dropped. They stay compiled in release (dead, so no codegen) so
+/// that check holds in every configuration; only the reporting is cfg'd out.
+mod unhandled {
+    // In release nothing calls into here; the matches are kept for their
+    // compile-time exhaustiveness check alone.
+    #![cfg_attr(not(debug_assertions), allow(dead_code))]
+
+    use super::{ControlKind, Prop, PropValue};
+    use std::cell::RefCell;
+    use std::mem::Discriminant;
+
+    /// What a `set_prop` fallthrough means for this backend.
+    enum Status {
+        /// This backend *does* implement the prop — so reaching the `_` arm
+        /// means the value arrived in a shape no arm accepts (`Width` as an
+        /// `I32`, a `Value(Str)` on a node with no editor). Always a defect:
+        /// the write was addressed to a feature that exists here, and was
+        /// dropped anyway.
+        Consumed,
+        /// Every control kind that can carry this prop is one this backend does
+        /// not render. Ignoring it is the design, not a gap — reported never.
+        NotApplicable,
+        /// The prop belongs to a kind this backend renders and is simply not
+        /// wired up yet. The actionable bucket.
+        Unimplemented,
+    }
+
+    thread_local! {
+        /// Pairs already reported. A dropped prop repeats on every reconcile,
+        /// so without this one gap would scroll the console. The backend is
+        /// single-threaded (UI thread), hence a plain thread-local.
+        static SEEN: RefCell<rustc_hash::FxHashSet<(ControlKind, Prop, Discriminant<PropValue>)>> =
+            RefCell::new(rustc_hash::FxHashSet::default());
+        /// Unrendered kinds already reported (one line per kind, not per prop).
+        static SEEN_KINDS: RefCell<rustc_hash::FxHashSet<ControlKind>> =
+            RefCell::new(rustc_hash::FxHashSet::default());
+    }
+
+    /// Report one dropped `(kind, prop, value)` — if it is worth reporting.
+    #[cfg(debug_assertions)]
+    pub(super) fn note(kind: ControlKind, prop: Prop, value: &PropValue) {
+        // Scoped to the reporting path so the release stub leaves no import
+        // behind for either to be unused in.
+        use super::animate::warn;
+        use std::mem::discriminant;
+
+        // A prop dropped on a kind this backend never renders is not a fact
+        // about the prop; the one actionable fact is the kind itself, and it is
+        // worth saying exactly once rather than once per prop it carries.
+        if !renders(kind) {
+            if SEEN_KINDS.with(|s| s.borrow_mut().insert(kind)) {
+                warn(format_args!(
+                    "{kind:?} is not rendered by the DirectComposition backend — \
+                     it lays out as a plain container and its own props are inert"
+                ));
+            }
+            return;
+        }
+        let status = status(prop);
+        if matches!(status, Status::NotApplicable) {
+            return;
+        }
+        if !SEEN.with(|s| s.borrow_mut().insert((kind, prop, discriminant(value)))) {
+            return;
+        }
+        if matches!(status, Status::Consumed) {
+            warn(format_args!(
+                "set_prop({kind:?}, {prop:?}, {}): DROPPED — this backend \
+                 implements {prop:?}, but no arm accepts that value shape",
+                shape(value)
+            ));
+        } else {
+            warn(format_args!(
+                "set_prop({kind:?}, {prop:?}, {}): dropped — not implemented by \
+                 the DirectComposition backend",
+                shape(value)
+            ));
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline(always)]
+    pub(super) fn note(_kind: ControlKind, _prop: Prop, _value: &PropValue) {}
+
+    /// Whether this backend gives `kind` its own behaviour — drawn chrome, or
+    /// (for the panels and host surfaces) a real layout/attachment role. `false`
+    /// means the node exists only as a laid-out, unpainted container.
+    fn renders(kind: ControlKind) -> bool {
+        use ControlKind as K;
+        match kind {
+            // Panels, host surfaces and shapes.
+            K::StackPanel
+            | K::Grid
+            | K::Canvas
+            | K::Border
+            | K::ScrollViewer
+            | K::ScrollView
+            | K::SwapChainPanel
+            | K::Rectangle
+            | K::Ellipse
+            | K::Line
+            // Drawn controls.
+            | K::TextBlock
+            | K::Button
+            | K::RepeatButton
+            | K::HyperlinkButton
+            | K::DropDownButton
+            | K::SplitButton
+            | K::ToggleButton
+            | K::CheckBox
+            | K::ToggleSwitch
+            | K::Slider
+            | K::Knob
+            | K::Meter
+            | K::ProgressBar
+            | K::ProgressRing
+            | K::Expander
+            | K::TextBox
+            | K::PasswordBox
+            | K::NumberBox
+            | K::AutoSuggestBox
+            | K::ComboBox
+            | K::SelectorBar
+            | K::NavigationView
+            | K::TitleBar => true,
+
+            // Not rendered: no drawn chrome and no behaviour of their own.
+            K::RadioButton
+            | K::RadioButtons
+            | K::InfoBar
+            | K::InfoBadge
+            | K::PersonPicture
+            | K::Image
+            | K::TabView
+            | K::TabViewItem
+            | K::Pivot
+            | K::PivotItem
+            | K::BreadcrumbBar
+            | K::RichTextBlock
+            | K::RichEditBox
+            | K::ListView
+            | K::GridView
+            | K::ListBox
+            | K::FlipView
+            | K::TreeView
+            | K::ContentDialog
+            | K::TeachingTip
+            | K::Viewbox
+            | K::RatingControl
+            | K::ColorPicker
+            | K::DatePicker
+            | K::TimePicker
+            | K::CalendarDatePicker
+            | K::CalendarView
+            | K::SplitView
+            | K::MenuBar
+            | K::CommandBar
+            | K::RelativePanel
+            | K::WebView2 => false,
+        }
+    }
+
+    /// Classify a prop that reached the `_` arm. Exhaustive by design.
+    fn status(prop: Prop) -> Status {
+        use Prop as P;
+        use Status::{Consumed, NotApplicable as NA, Unimplemented as TODO};
+        match prop {
+            // ── Implemented by `set_prop` ────────────────────────────────
+            // Reaching the `_` arm with one of these is a value-shape defect.
+            P::Background
+            | P::Foreground
+            | P::BorderBrush
+            | P::BorderThickness
+            | P::CornerRadius
+            | P::Fill
+            | P::Stroke
+            | P::StrokeThickness
+            | P::LineEndpoints
+            | P::StyleVariant
+            | P::IsEnabled
+            | P::Opacity
+            | P::Content
+            | P::Text
+            | P::Header
+            | P::Value
+            | P::Precision
+            | P::LargeChange
+            | P::HorizontalContentAlignment
+            | P::FontSize
+            | P::FontWeight
+            | P::FontFamily
+            | P::TextWrapping
+            | P::TextWrappingWrap
+            | P::Padding
+            | P::Margin
+            | P::Width
+            | P::Height
+            | P::MinWidth
+            | P::MinHeight
+            | P::MaxWidth
+            | P::MaxHeight
+            | P::HorizontalAlignment
+            | P::VerticalAlignment
+            | P::Orientation
+            | P::Spacing
+            | P::ColumnSpacing
+            | P::RowSpacing
+            | P::GridRows
+            | P::GridColumns
+            | P::AttachedGridRow
+            | P::AttachedGridColumn
+            | P::AttachedGridRowSpan
+            | P::AttachedGridColumnSpan
+            | P::AttachedCanvasLeft
+            | P::AttachedCanvasTop
+            | P::AttachedCanvasZIndex
+            | P::IsOn
+            | P::IsChecked
+            | P::Minimum
+            | P::Maximum
+            | P::Step
+            | P::FillOrigin
+            | P::FillColor
+            | P::FillColorAlt
+            | P::Marker
+            | P::MarkerColor
+            | P::GradientStops
+            | P::StartAngle
+            | P::EndAngle
+            | P::Ticks
+            | P::TickLabels
+            | P::MajorEvery
+            | P::Accent
+            | P::Unit
+            | P::SubText
+            | P::IsIndeterminate
+            | P::IsActive
+            | P::IsExpanded
+            | P::SelectedIndex
+            | P::SelectedTag
+            | P::PlaceholderText
+            | P::Items
+            | P::MenuItems
+            | P::MenuFlyoutItems => Consumed,
+
+            // ── Deliberately not applicable ──────────────────────────────
+            // XAML framework machinery with no counterpart in a self-rendering
+            // backend: there is no resource dictionary, no style system, and no
+            // XAML drag-drop here.
+            P::Style | P::Resources | P::AllowDrop => NA,
+            // RelativePanel attached props — this backend has no RelativePanel.
+            P::AlignBottomWithPanel
+            | P::AlignHCenterWithPanel
+            | P::AlignLeftWithPanel
+            | P::AlignRightWithPanel
+            | P::AlignTopWithPanel
+            | P::AlignVCenterWithPanel => NA,
+            // TabView / TabViewItem / Pivot.
+            P::CanReorderTabs | P::IsAddTabButtonVisible | P::IsClosable | P::ItemKey
+            | P::ItemHeader => NA,
+            // ColorPicker.
+            P::ColorValue
+            | P::IsAlphaEnabled
+            | P::IsColorChannelTextInputVisible
+            | P::IsColorSliderVisible
+            | P::IsHexInputVisible => NA,
+            // Date / time / calendar pickers.
+            P::ClockIdentifier
+            | P::MinuteIncrement
+            | P::DayVisible
+            | P::MonthVisible
+            | P::YearVisible
+            | P::IsCalendarOpen
+            | P::IsTodayHighlighted
+            | P::IsGroupLabelVisible => NA,
+            // ContentDialog.
+            P::PrimaryButtonText
+            | P::SecondaryButtonText
+            | P::CloseButtonText
+            | P::IsPrimaryButtonEnabled
+            | P::IsSecondaryButtonEnabled => NA,
+            // InfoBar / TeachingTip (`IsOpen` is carried only by these two and
+            // ContentDialog — all three unrendered).
+            P::Message
+            | P::Severity
+            | P::ActionButton
+            | P::ActionButtonText
+            | P::CloseButton
+            | P::PreferredPlacement
+            | P::IsLightDismissEnabled
+            | P::IsOpen => NA,
+            // CommandBar / TreeView / SplitView-only / PersonPicture / Image /
+            // Viewbox / RatingControl / RadioButton(s).
+            P::PrimaryCommands
+            | P::SecondaryCommands
+            | P::CommandBarFlyoutCommands
+            | P::DefaultLabelPosition
+            | P::Nodes
+            | P::SelectionMode
+            | P::DisplayMode
+            | P::DisplayName
+            | P::Initials
+            | P::ImageSource
+            | P::Stretch
+            | P::MaxRating
+            | P::Caption
+            | P::PlaceholderValue
+            | P::IsReadOnly
+            | P::GroupName
+            | P::MaxColumns => NA,
+            // Seam vocabulary no widget emits.
+            P::Columns | P::Rows => NA,
+
+            // ── Not implemented yet (the kind IS rendered here) ──────────
+            // TitleBar: this backend draws the caption band and its three
+            // window buttons, but no title/subtitle text and no back button —
+            // an app setting these gets nothing.
+            P::Title
+            | P::Subtitle
+            | P::Tall
+            | P::IsBackButtonEnabled
+            | P::IsBackButtonVisible
+            | P::IsPaneToggleButtonVisible => TODO,
+            // NavigationView: pane chrome and the embedded search box.
+            P::IsBackEnabled
+            | P::IsSettingsVisible
+            | P::PaneTitle
+            | P::PaneDisplayMode
+            | P::IsPaneOpen
+            | P::CompactPaneLength
+            | P::OpenPaneLength
+            | P::AutoSuggestBox
+            | P::AutoSuggestItems
+            | P::AutoSuggestPlaceholder => TODO,
+            // Scroll containers: the thumbs are drawn, but their visibility
+            // policy is not honoured.
+            P::HorizontalScrollBarVisibility | P::VerticalScrollBarVisibility => TODO,
+            // Buttons: no attached flyout, no icon glyph.
+            P::FlyoutContent | P::FlyoutPlacement | P::Icon => TODO,
+            // HyperlinkButton navigation.
+            P::NavigateUri => TODO,
+            // ToggleSwitch on/off labels.
+            P::OnContent | P::OffContent => TODO,
+            // Editors and the repeat-button timing.
+            P::IsEditable
+            | P::AcceptsReturn
+            | P::PasswordRevealMode
+            | P::IsPasswordRevealButtonEnabled
+            | P::IsTextSelectionEnabled
+            | P::Delay
+            | P::Interval => TODO,
+        }
+    }
+
+    /// Short name of a value's shape — `Debug` on the value itself would dump
+    /// whole item lists into the log.
+    fn shape(value: &PropValue) -> &'static str {
+        match value {
+            PropValue::Str(_) => "Str",
+            PropValue::F64(_) => "F64",
+            PropValue::U16(_) => "U16",
+            PropValue::Bool(_) => "Bool",
+            PropValue::I32(_) => "I32",
+            PropValue::Thickness(_) => "Thickness",
+            PropValue::Color(_) => "Color",
+            PropValue::Unset => "Unset",
+            PropValue::GridLengths(_) => "GridLengths",
+            PropValue::SurfaceImageSource(_) => "SurfaceImageSource",
+            PropValue::VirtualSurfaceImageSource(_) => "VirtualSurfaceImageSource",
+            PropValue::LineEndpoints(_) => "LineEndpoints",
+            PropValue::NavMenuItems(_) => "NavMenuItems",
+            PropValue::StrList(_) => "StrList",
+            PropValue::MenuBarItems(_) => "MenuBarItems",
+            PropValue::MenuFlyoutItems(_) => "MenuFlyoutItems",
+            PropValue::FlyoutDef(_) => "FlyoutDef",
+            PropValue::TreeViewNodes(_) => "TreeViewNodes",
+            PropValue::CommandBarCommands(_) => "CommandBarCommands",
+            PropValue::CommandBarFlyoutDef { .. } => "CommandBarFlyoutDef",
+            PropValue::SelectorBarItems(_) => "SelectorBarItems",
+            PropValue::Resources(_) => "Resources",
+            PropValue::GradientStops(_) => "GradientStops",
+            PropValue::F64List(_) => "F64List",
+            PropValue::ValueLabels(_) => "ValueLabels",
         }
     }
 }
