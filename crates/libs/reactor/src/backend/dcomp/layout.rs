@@ -13,6 +13,26 @@
 //! needs recomputing. Rebuilding the tree per pass — which is what this used to
 //! do — threw that away and allocated a Taffy node plus a cloned `Style` per
 //! arena node per frame.
+//!
+//! # The two halves of a pass
+//!
+//! A pass is bisected along the render-thread split's seam ([`compute`]):
+//!
+//! - **measure + solve** reads and writes *layout inputs* — text layouts,
+//!   resolved alignment, the Taffy tree — and records every node's placement
+//!   as plain `Send` data ([`Solved`], parked in [`LayoutTree::solved`]). It
+//!   is also the **only writer of `TextLayout` state** (construction in
+//!   [`rebuild_text`], the wrap pin in [`solve_walk`]): paint and the apply
+//!   half only read, so when this half moves to the app thread the layouts
+//!   have a single mutating side by construction.
+//! - **apply + sync** consumes `Solved` and touches the composition tree —
+//!   rect/offset/size pushes, scroll translation, child re-stacking. It never
+//!   reads the Taffy tree. This is the half that stays with the compositor.
+//!
+//! The seam exists so the first half can eventually run on the app thread
+//! against its own arena while the second replays `Solved` on the front
+//! thread; until then both run back-to-back here and the split is enforced
+//! purely by what each half is allowed to touch.
 
 use super::node::{Arena, LaidRect, Node};
 use super::*;
@@ -33,9 +53,7 @@ use windows_core::Interface;
 /// text and hairlines blur. Snapping in DIP space by the physical grid keeps
 /// every surface on integer pixels.
 pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f32, scale: f32) {
-    rebuild_text(arena, root);
-    resolve_align(arena, root, false, false);
-
+    let scale = scale.max(0.01);
     // The persistent tree is moved OUT of the arena for the pass: the measure
     // callback below needs `&Arena` while Taffy holds `&mut TaffyTree`, which it
     // could not have if the tree were still a field of the arena. It is put back
@@ -48,7 +66,8 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
     // and the whole tree rebuilds. Without the stamp a stale `NodeId` would
     // index a fresh Taffy slotmap and panic (or, worse, alias a live node).
     let mut lt = arena.layout.take().unwrap_or_else(LayoutTree::new);
-    lay_out(arena, &mut lt, root, width, height, scale);
+    measure_solve(arena, &mut lt, root, width, height, scale);
+    apply(arena, &lt.solved, root, scale);
     // Re-stack composition children before the tree goes home: `sync` borrows
     // the arena mutably and `lt`'s scratch buffer mutably, which is only two
     // disjoint borrows while `lt` is still a local.
@@ -58,8 +77,13 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
     arena.layout = Some(lt);
 }
 
-/// The Taffy half of a pass, with the tree already extracted from the arena.
-fn lay_out(
+/// The measure + solve half of a pass (see the module docs): text and
+/// alignment inputs, the Taffy solve, and the [`solve_walk`] that turns the
+/// computed tree into [`LayoutTree::solved`]. On a failed solve the previous
+/// pass's placements are cleared rather than kept — [`apply`] finding no entry
+/// leaves the visuals exactly as they are, which is also what the old
+/// single-walk did when the root had no Taffy node.
+fn measure_solve(
     arena: &mut Arena,
     lt: &mut LayoutTree,
     root: ControlId,
@@ -67,6 +91,10 @@ fn lay_out(
     height: f32,
     scale: f32,
 ) {
+    rebuild_text(arena, root);
+    resolve_align(arena, root, false, false);
+
+    lt.solved.clear();
     let Some(root_taffy) = lt.walk_root(arena, root) else {
         return;
     };
@@ -167,8 +195,33 @@ fn lay_out(
         },
     );
 
-    assign(arena, &lt.tree, root, 0.0, 0.0, 0.0, 0.0, scale.max(0.01));
+    solve_walk(arena, &lt.tree, &mut lt.solved, root, 0.0, 0.0, 0.0, 0.0, scale);
 }
+
+/// One node's placement, as the measure + solve half hands it to [`apply`]:
+/// plain data only, `Send` by construction — this is the payload that crosses
+/// the thread boundary once the two halves live on different threads.
+#[derive(Clone, Copy)]
+pub(crate) struct Solved {
+    /// Snapped absolute rect — becomes [`Node::rect`](super::node::Node) for
+    /// hit-testing.
+    rect: LaidRect,
+    /// Offset relative to the parent's snapped origin — what the container
+    /// visual is pushed.
+    rel: (f32, f32),
+    /// The wrap pin re-flowed this node's text: which glyphs land where
+    /// changed without necessarily changing the node's box, so apply must
+    /// repaint even when `resized` says nothing did.
+    reflowed: bool,
+    /// Scroll containers only: the content extent below the node's origin,
+    /// measured from the children's solved rects. Zero elsewhere.
+    content_h: f32,
+}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Solved>();
+};
 
 /// Snap a DIP coordinate to the physical pixel grid.
 #[inline]
@@ -475,6 +528,11 @@ pub(crate) struct LayoutTree {
     /// Reused ordering buffer for [`sync`]'s composition re-stack. Parked here
     /// (rather than on the stack) purely so no pass allocates it afresh.
     pub(crate) order: Stack,
+    /// The plain-data output of the measure + solve half, keyed by raw
+    /// `ControlId`; [`apply`] consumes it. Reused across passes so the steady
+    /// state allocates nothing. Post-split this map is what crosses the thread
+    /// boundary — everything in it is `Send` by the [`Solved`] assertion.
+    solved: rustc_hash::FxHashMap<u32, Solved>,
 }
 
 impl LayoutTree {
@@ -488,6 +546,7 @@ impl LayoutTree {
             vp_child: None,
             scratch: Vec::new(),
             order: Vec::new(),
+            solved: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -714,19 +773,23 @@ fn track(g: &GridLength) -> GridTemplateComponent<String> {
     })
 }
 
-/// Walk the computed tree: write each node's absolute (window-relative) rect for
-/// hit-testing and push its relative offset + size onto its container visual.
+/// Walk the computed Taffy tree and record each node's [`Solved`] placement.
 ///
 /// `(ox, oy)` is the parent's raw (Taffy) absolute origin — children accumulate
 /// raw positions so rounding never drifts down the tree — while `(sox, soy)` is
-/// the parent's *snapped* absolute origin: the visual's relative offset is the
+/// the parent's *snapped* absolute origin: the recorded relative offset is the
 /// difference of snapped absolutes, so each node lands exactly on its snapped
 /// absolute rect on screen. Sizes snap by edge (`right - left`), keeping shared
 /// edges between siblings coincident.
+///
+/// A node whose Taffy node is missing (or whose layout read fails) gets no
+/// entry, and neither does its subtree — [`apply`] then leaves those visuals
+/// untouched, exactly as the old single walk's early return did.
 #[allow(clippy::too_many_arguments)]
-fn assign(
-    arena: &mut Arena,
+fn solve_walk(
+    arena: &Arena,
     tree: &TaffyTree<ControlId>,
+    solved: &mut rustc_hash::FxHashMap<u32, Solved>,
     id: ControlId,
     ox: f32,
     oy: f32,
@@ -734,46 +797,93 @@ fn assign(
     soy: f32,
     scale: f32,
 ) {
-    let Some(taffy_id) = arena.get(id).and_then(|n| n.taffy_id).map(|(_, t)| t) else {
+    let Some(n) = arena.get(id) else { return };
+    let Some(taffy_id) = n.taffy_id.map(|(_, t)| t) else {
         return;
     };
     let l = match tree.layout(taffy_id) {
         Ok(l) => *l,
         Err(_) => return,
     };
-    let rel = (l.location.x, l.location.y);
-    let (ax, ay) = (ox + rel.0, oy + rel.1);
+    let (ax, ay) = (ox + l.location.x, oy + l.location.y);
     let (aw, ah) = (l.size.width, l.size.height);
     // Snapped absolute rect (edge-snapped so adjacent siblings stay flush).
     let (sx, sy) = (snap(ax, scale), snap(ay, scale));
     let w = snap(ax + aw, scale) - sx;
     let h = snap(ay + ah, scale) - sy;
+    // Pin a wrapping run's reflow box to the width it was actually given. This
+    // is the single authoritative writer of that width: the measure callback
+    // probes a node several times per pass (min-content, max-content, then the
+    // definite size), and since the `TextLayout` is shared mutable COM state,
+    // whichever probe ran last would otherwise decide how paint reflows. Here
+    // the final answer is known, so neither paint nor apply needs constraint
+    // logic of its own — and keeping the pin on the solve side keeps every
+    // `TextLayout` write in this half (see the module docs).
+    let reflowed = n.paint.wrap
+        && n.text_layout.as_ref().is_some_and(|layout| {
+            if layout.metrics().is_ok_and(|m| m.layout_width != w) {
+                let _ = layout.set_max_width(w);
+                true
+            } else {
+                false
+            }
+        });
+    solved.insert(
+        id.get(),
+        Solved {
+            rect: LaidRect { x: sx, y: sy, w, h },
+            rel: (sx - sox, sy - soy),
+            reflowed,
+            content_h: 0.0,
+        },
+    );
+    for &c in &n.children {
+        solve_walk(arena, tree, solved, c, ax, ay, sx, sy, scale);
+    }
+    // Scroll containers: content extent from the children just placed. Pure
+    // math here — the clamp against the scroll offset happens in [`apply`],
+    // because the offset is input-owned front-thread state.
+    if n.is_scroll() {
+        let mut content_h = 0.0_f32;
+        for &c in &n.children {
+            if let Some(cs) = solved.get(&c.get()) {
+                content_h = content_h.max(cs.rect.y + cs.rect.h - sy);
+            }
+        }
+        if let Some(s) = solved.get_mut(&id.get()) {
+            s.content_h = content_h;
+        }
+    }
+}
+
+/// The apply half: push each solved placement onto its node — the absolute
+/// rect for hit-testing, the relative offset + size onto the container visual
+/// — then clamp and apply scroll. Consumes [`Solved`] and the arena only;
+/// never reads the Taffy tree or writes a `TextLayout`.
+fn apply(
+    arena: &mut Arena,
+    solved: &rustc_hash::FxHashMap<u32, Solved>,
+    id: ControlId,
+    scale: f32,
+) {
+    let Some(s) = solved.get(&id.get()).copied() else {
+        return;
+    };
+    let LaidRect { x: sx, y: sy, w, h } = s.rect;
     if let Some(n) = arena.get_mut(id) {
         let resized = (n.rect.w, n.rect.h) != (w, h);
-        n.rect = LaidRect { x: sx, y: sy, w, h };
+        n.rect = s.rect;
         // The compositor moves/sizes the node — no repaint for a move; a size
         // change does need the node's surface rebuilt at the new pixel extent.
         // Pushes are change-gated (and, when the node declares a layout
         // animation or translation transition, an actual change GLIDES — the
         // implicit animation triggers on the compositor, no ticks here).
-        n.push_offset(sx - sox, sy - soy);
+        n.push_offset(s.rel.0, s.rel.1);
         n.push_size(w, h);
-        if resized {
-            n.mark_dirty();
-        }
-        // Pin a wrapping run's reflow box to the width it was actually given. This
-        // is the single authoritative writer of that width: the measure callback
-        // probes a node several times per pass (min-content, max-content, then the
-        // definite size), and since the `TextLayout` is shared mutable COM state,
-        // whichever probe ran last would otherwise decide how paint reflows. Here
-        // the final answer is known, so paint needs no constraint logic of its own.
-        // Re-flowing changes which glyphs land where without necessarily changing
-        // the node's box, so this repaints on a width change that `resized` misses.
-        if n.paint.wrap
-            && let Some(layout) = &n.text_layout
-            && layout.metrics().is_ok_and(|m| m.layout_width != w)
-        {
-            let _ = layout.set_max_width(w);
+        // A re-flow (`reflowed`) changes which glyphs land where without
+        // necessarily changing the node's box, so it repaints on a width
+        // change that `resized` misses.
+        if resized || s.reflowed {
             n.mark_dirty();
         }
         // Notify any viz host (SurfacePainter / composition surface) bound to
@@ -792,30 +902,22 @@ fn assign(
     // allocation per node per frame bought purely to dodge `&mut Arena`.
     let mut i = 0;
     while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
-        assign(arena, tree, c, ax, ay, sx, sy, scale);
+        apply(arena, solved, c, scale);
         i += 1;
     }
 
-    // Scroll containers: measure content extent, clamp the offset, and apply the
-    // scroll translation to children (a compositor offset — no repaint).
+    // Scroll containers: adopt the solved content extent, clamp the offset, and
+    // apply the scroll translation to children (a compositor offset — no
+    // repaint).
     let is_scroll = arena.get(id).is_some_and(|n| n.is_scroll());
     if is_scroll {
-        let (nx, ny, vh) = arena.get(id).map(|n| (n.rect.x, n.rect.y, n.rect.h)).unwrap();
-        let mut content_h = 0.0_f32;
-        let mut i = 0;
-        while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
-            if let Some(cn) = arena.get(c) {
-                content_h = content_h.max(cn.rect.y + cn.rect.h - ny);
-            }
-            i += 1;
-        }
-        let max_scroll = (content_h - vh).max(0.0);
+        let max_scroll = (s.content_h - h).max(0.0);
         // Children are placed UNSCROLLED; the scroll translation lives on the
         // content carrier visual they parent into. Snap it: rects are
         // pixel-snapped, so a fractional offset would push every child back
         // off the grid.
         let scroll = if let Some(n) = arena.get_mut(id) {
-            n.ctrl_mut().content_h = content_h;
+            n.ctrl_mut().content_h = s.content_h;
             n.scroll_off = snap(n.scroll_off.clamp(0.0, max_scroll), scale);
             n.scroll_off
         } else {
@@ -824,7 +926,7 @@ fn assign(
         let mut i = 0;
         while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
             if let Some(cn) = arena.get_mut(c) {
-                let (x, y) = (cn.rect.x - nx, cn.rect.y - ny);
+                let (x, y) = (cn.rect.x - sx, cn.rect.y - sy);
                 cn.push_offset(x, y);
             }
             i += 1;
