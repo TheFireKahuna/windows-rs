@@ -20,7 +20,7 @@ use crate::style::{
 };
 use crate::system_bindings::{
     ContainerVisual, ICompositionObject, ICompositionObject2, IVisual, ImplicitAnimationCollection,
-    InsetClip,
+    InsetClip, Visual,
 };
 use crate::Color;
 use crate::LineEndpoints;
@@ -327,8 +327,24 @@ pub(crate) struct Node {
     /// This node's surface needs a repaint (content/size/state changed).
     pub dirty: bool,
 
-    /// Transient: the Taffy node this maps to in the current layout pass.
-    pub taffy_id: Option<taffy::NodeId>,
+    /// The Taffy node this maps to, PERSISTENT across layout passes, stamped
+    /// with the generation of the [`LayoutTree`](super::layout::LayoutTree)
+    /// that minted it. Taffy indexes its slotmap unchecked, so an id from a
+    /// tree that no longer exists must never be dereferenced — the stamp makes
+    /// that unrepresentable rather than merely unlikely: a mismatch reads as
+    /// "no Taffy node yet" and the node is re-created.
+    pub taffy_id: Option<(u32, taffy::NodeId)>,
+    /// Something Taffy cannot see (a rebuilt DirectWrite layout) invalidated
+    /// this node's cached intrinsic measurement. Taffy keys its measure cache
+    /// on constraints alone, so without this a relabelled text node keeps its
+    /// old size forever. Cleared by the layout tree sync that marks it dirty.
+    pub measure_dirty: bool,
+    /// The visuals the composition child-order sync last parented under this
+    /// node, with the collection each went into — see
+    /// [`layout::sync`](super::layout). A re-stack detaches exactly this set
+    /// and nothing else, so a sprite parented in elsewhere (a Knob's arc and
+    /// needle, an editor's caret) is never torn out from under its owner.
+    pub stacked: Vec<(layout::Slot, Visual)>,
     pub rect: LaidRect,
     pub hovered: bool,
     pub pressed: bool,
@@ -417,6 +433,8 @@ impl Node {
             children_dirty: false,
             dirty: true,
             taffy_id: None,
+            measure_dirty: true,
+            stacked: Vec::new(),
             rect: LaidRect::default(),
             hovered: false,
             pressed: false,
@@ -882,6 +900,13 @@ fn default_style(kind: ControlKind) -> taffy::Style {
 pub(crate) struct Arena {
     nodes: rustc_hash::FxHashMap<u32, Node>,
     next: u32,
+    /// Persistent layout state — the Taffy tree, kept in lock-step with these
+    /// nodes across passes instead of rebuilt per pass. Lives with the arena
+    /// because its lifetime is exactly the arena's; see
+    /// [`layout::compute`](super::layout::compute), which takes it out for the
+    /// duration of a pass (the measure callback needs `&Arena` while Taffy
+    /// holds `&mut TaffyTree`) and puts it back at the end.
+    pub(crate) layout: Option<layout::LayoutTree>,
 }
 
 impl Arena {

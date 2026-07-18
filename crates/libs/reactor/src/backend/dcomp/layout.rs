@@ -1,10 +1,18 @@
 //! Layout: reactor props (already folded into each [`Node`]'s `taffy::Style`)
-//! -> a Taffy tree rebuilt from the arena -> per-node composition offset/size and
-//! an absolute DIP rect for hit-testing. Alignment is resolved against each
-//! node's parent (Grid vs Flex axis) before the tree is built, and after layout
-//! the composition child order is re-synced for any node whose children changed.
-//! Text intrinsic sizing is fed to Taffy by a measure callback reading each text
-//! node's cached DirectWrite [`TextLayout`].
+//! -> a **persistent** Taffy tree kept in lock-step with the arena -> per-node
+//! composition offset/size and an absolute DIP rect for hit-testing. Alignment
+//! is resolved against each node's parent (Grid vs Flex axis) before the tree is
+//! synced, and after layout the composition child order is re-stacked for any
+//! node whose children changed. Text intrinsic sizing is fed to Taffy by a
+//! measure callback reading each text node's cached DirectWrite [`TextLayout`].
+//!
+//! The Taffy tree lives in [`Arena::layout`](super::node::Arena) and survives
+//! across passes: [`LayoutTree::walk`] creates and destroys Taffy nodes only as
+//! arena nodes appear and disappear, pushes a style only when it actually
+//! changed, and otherwise leaves Taffy's own dirty propagation to decide what
+//! needs recomputing. Rebuilding the tree per pass — which is what this used to
+//! do — threw that away and allocated a Taffy node plus a cloned `Style` per
+//! arena node per frame.
 
 use super::node::{Arena, LaidRect, Node};
 use super::*;
@@ -28,39 +36,46 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
     rebuild_text(arena, root);
     resolve_align(arena, root, false, false);
 
-    let mut tree: TaffyTree<ControlId> = TaffyTree::new();
-    let root_taffy = build(arena, &mut tree, root, false);
-
-    // Taffy sizes a *root* node with `size: auto` to its content, not to the
-    // available space — so a full-bleed reactor root (default alignment Stretch,
-    // no explicit size) would collapse to 0 on both axes and drag the whole tree
-    // (every Star track resolves against 0) down with it. Mirror WinUI's
-    // "root fills the window" by wrapping the real root in a synthetic 1×1
-    // Star×Star grid cell sized to the viewport: a stretch grid item with
-    // `size: auto` fills the cell, while an item with a fixed size or an explicit
-    // non-stretch alignment is honoured — and its margin insets it correctly
-    // (`percent(1.0)` would overflow by the margin and ignore the offset).
+    // The persistent tree is moved OUT of the arena for the pass: the measure
+    // callback below needs `&Arena` while Taffy holds `&mut TaffyTree`, which it
+    // could not have if the tree were still a field of the arena. It is put back
+    // unconditionally at the end.
     //
-    // The cell uses `flex(1.0)` (`minmax(0, 1fr)`), **not** bare `fr(1.0)`: an `fr`
-    // track has a min-content floor, so a root whose content (a long scrollable
-    // chain) exceeds the window would inflate the cell to its content height
-    // instead of clamping to the viewport — every descendant Star then resolves
-    // against the inflated height and inner ScrollViewers never receive a bounded
-    // extent. The zero-floor cell clamps the root to the window; overflow scrolls.
-    let viewport = {
-        let mut s = Style {
-            display: Display::Grid,
-            size: Size {
-                width: length(width),
-                height: length(height),
-            },
-            ..Style::default()
-        };
-        s.grid_template_columns = vec![flex(1.0)];
-        s.grid_template_rows = vec![flex(1.0)];
-        tree.new_with_children(s, &[root_taffy]).unwrap()
-    };
+    // If a panic unwound between the take and the restore the arena would be
+    // left holding `None` while live nodes still carry a `taffy_id` into the
+    // lost tree. That is survivable *because* the id is generation-stamped: a
+    // fresh `LayoutTree` mints a new generation, every stale stamp mismatches,
+    // and the whole tree rebuilds. Without the stamp a stale `NodeId` would
+    // index a fresh Taffy slotmap and panic (or, worse, alias a live node).
+    let mut lt = arena.layout.take().unwrap_or_else(LayoutTree::new);
+    lay_out(arena, &mut lt, root, width, height, scale);
+    // Re-stack composition children before the tree goes home: `sync` borrows
+    // the arena mutably and `lt`'s scratch buffer mutably, which is only two
+    // disjoint borrows while `lt` is still a local.
+    let mut order = std::mem::take(&mut lt.order);
+    sync(arena, root, &mut order);
+    lt.order = order;
+    arena.layout = Some(lt);
+}
 
+/// The Taffy half of a pass, with the tree already extracted from the arena.
+fn lay_out(
+    arena: &mut Arena,
+    lt: &mut LayoutTree,
+    root: ControlId,
+    width: f32,
+    height: f32,
+    scale: f32,
+) {
+    let Some(root_taffy) = lt.walk_root(arena, root) else {
+        return;
+    };
+    let Some(viewport) = lt.viewport(width, height, root_taffy) else {
+        return;
+    };
+    let tree = &mut lt.tree;
+
+    let arena_ref = &*arena;
     let _ = tree.compute_layout_with_measure(
         viewport,
         Size {
@@ -72,7 +87,7 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
                 return Size { width: w, height: h };
             }
             if let Some(id) = ctx
-                && let Some(node) = arena.get(*id)
+                && let Some(node) = arena_ref.get(*id)
                 && let Some(layout) = &node.text_layout
             {
                 // A wrapping run reflows against whatever width Taffy is asking
@@ -125,8 +140,7 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
         },
     );
 
-    assign(arena, &tree, root, 0.0, 0.0, 0.0, 0.0, scale.max(0.01));
-    sync(arena, root);
+    assign(arena, &lt.tree, root, 0.0, 0.0, 0.0, 0.0, scale.max(0.01));
 }
 
 /// Snap a DIP coordinate to the physical pixel grid.
@@ -153,7 +167,7 @@ fn align(v: i32) -> Option<AlignItems> {
 /// cross axis is horizontal (H→align_self). Main-axis flex alignment is the
 /// parent's `justify_content` and is not expressible per child here.
 fn resolve_align(arena: &mut Arena, id: ControlId, parent_grid: bool, parent_row: bool) {
-    let (children, is_grid, is_row) = {
+    let (is_grid, is_row) = {
         let Some(n) = arena.get_mut(id) else { return };
         if parent_grid {
             if let Some(a) = align(n.h_align) {
@@ -181,19 +195,20 @@ fn resolve_align(arena: &mut Arena, id: ControlId, parent_grid: bool, parent_row
                 n.style.flex_direction,
                 FlexDirection::Row | FlexDirection::RowReverse
             );
-        (n.children.clone(), is_grid, is_row)
+        (is_grid, is_row)
     };
-    for c in children {
+    let mut i = 0;
+    while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
         resolve_align(arena, c, is_grid, is_row);
+        i += 1;
     }
 }
 
 /// (Re)build the DirectWrite layout for any text-bearing node flagged dirty.
 fn rebuild_text(arena: &mut Arena, id: ControlId) {
-    let children = match arena.get(id) {
-        Some(n) => n.children.clone(),
-        None => return,
-    };
+    if arena.get(id).is_none() {
+        return;
+    }
     let needs = arena.get(id).is_some_and(|n| n.text_dirty && is_text(n));
     if needs {
         let (text, size, weight, family, wrap) = {
@@ -210,6 +225,9 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
         if let Some(n) = arena.get_mut(id) {
             n.text_layout = layout;
             n.text_dirty = false;
+            // Taffy's measure cache is keyed on constraints only; a new layout
+            // silently changes the answer, so the node has to be re-measured.
+            n.measure_dirty = true;
         }
     }
     // A SelectorBar measures every item label (each segment sizes to its own
@@ -244,10 +262,13 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
             n.ctrl.seg_label_w = widths;
             n.text_layout = keep;
             n.text_dirty = false;
+            n.measure_dirty = true;
         }
     }
-    for c in children {
+    let mut i = 0;
+    while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
         rebuild_text(arena, c);
+        i += 1;
     }
 }
 
@@ -274,46 +295,248 @@ fn build_text_layout(
     Some(layout)
 }
 
-/// Build a Taffy node (and its subtree) from the arena, recording the mapping in
-/// each node's `taffy_id` and applying grid templates to grid containers.
-///
-/// `hidden` is set for the body subtree of a collapsed [`Expander`]: such nodes
-/// map to `Display::None` so the body reclaims its layout space (height 0) while
-/// staying mounted (its visuals collapse to 0×0). The flag is sticky — it
-/// propagates to the whole subtree so every descendant collapses with it.
-fn build(arena: &mut Arena, tree: &mut TaffyTree<ControlId>, id: ControlId, hidden: bool) -> NodeId {
-    let children = arena.get(id).map(|n| n.children.clone()).unwrap_or_default();
-    // A collapsed Expander hides its body children (the header is drawn on the
-    // node's own surface, so every child is body content).
-    let collapse_children = arena
-        .get(id)
-        .is_some_and(|n| n.kind == ControlKind::Expander && !n.ctrl.expanded);
-    let child_ids: Vec<NodeId> = children
-        .iter()
-        .map(|c| build(arena, tree, *c, hidden || collapse_children))
-        .collect();
+/// Generation source for [`LayoutTree`]. Every tree ever built gets a distinct
+/// stamp, so a [`Node::taffy_id`](super::node::Node::taffy_id) minted by one can
+/// never be mistaken for a live id in another.
+static LAYOUT_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-    let mut style = finalize_style(arena.get(id).unwrap());
-    if hidden {
-        style.display = Display::None;
-    }
-    let taffy_id = if child_ids.is_empty() {
-        tree.new_leaf_with_context(style, id).unwrap()
-    } else {
-        let nid = tree.new_with_children(style, &child_ids).unwrap();
-        tree.set_node_context(nid, Some(id)).unwrap();
-        nid
-    };
-    if let Some(n) = arena.get_mut(id) {
-        n.taffy_id = Some(taffy_id);
-    }
-    taffy_id
+/// The persistent Taffy tree plus the bookkeeping that keeps it in lock-step
+/// with the arena. Owned by [`Arena::layout`](super::node::Arena) so it lives
+/// across layout passes; taken out for the duration of one (see [`compute`]).
+pub(crate) struct LayoutTree {
+    tree: TaffyTree<ControlId>,
+    /// Stamp minted for this tree; mirrored into every `Node::taffy_id` it
+    /// hands out. Taffy indexes its slotmap unchecked, so dereferencing an id
+    /// from a *different* tree is a panic at best — the stamp makes that
+    /// unrepresentable: a mismatched id is simply treated as "no node yet".
+    generation: u32,
+    /// Every Taffy node this tree owns, keyed by the raw `ControlId` that owns
+    /// it. This is the sweep list: an entry whose id has left the arena is a
+    /// dead node and its Taffy node is removed.
+    owned: rustc_hash::FxHashMap<u32, NodeId>,
+    /// The synthetic viewport wrapper and the two things ever pushed to it.
+    viewport: Option<NodeId>,
+    vp_size: (f32, f32),
+    vp_child: Option<NodeId>,
+    /// Reused stack of child ids, so a pass allocates nothing: each `walk`
+    /// frame pushes its children's ids above `base` and truncates back on exit.
+    scratch: Vec<NodeId>,
+    /// Reused ordering buffer for [`sync`]'s composition re-stack. Parked here
+    /// (rather than on the stack) purely so no pass allocates it afresh.
+    pub(crate) order: Stack,
 }
 
-/// Produce the final Taffy style for a node: its accumulated `style` plus grid
-/// track templates for a `Grid` (the only style derived lazily from props).
-fn finalize_style(node: &Node) -> Style {
+impl LayoutTree {
+    fn new() -> Self {
+        Self {
+            tree: TaffyTree::new(),
+            generation: LAYOUT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            owned: rustc_hash::FxHashMap::default(),
+            viewport: None,
+            vp_size: (f32::NAN, f32::NAN),
+            vp_child: None,
+            scratch: Vec::new(),
+            order: Vec::new(),
+        }
+    }
+
+    /// Sync the whole arena subtree under `root` into the Taffy tree and sweep
+    /// away the Taffy nodes of arena nodes that have since died. Returns the
+    /// root's Taffy node.
+    fn walk_root(&mut self, arena: &mut Arena, root: ControlId) -> Option<NodeId> {
+        let mut visited = 0usize;
+        let id = self.walk(arena, root, false, &mut visited);
+        // A node can be alive in the arena yet unreachable from the root (the
+        // reconciler legitimately parks a subtree mid-diff), so "not visited"
+        // does NOT mean "dead" — the sweep re-checks the arena and keeps those.
+        // The count only decides whether a sweep is worth running at all.
+        if visited != self.owned.len() {
+            self.sweep(arena);
+        }
+        id
+    }
+
+    /// Reconcile one arena node (and its subtree) with its Taffy node: create
+    /// the Taffy node if it has none, push its style only if that style
+    /// actually changed, re-parent its children only if the child list changed,
+    /// and mark it dirty when something Taffy cannot see (a rebuilt text
+    /// layout) invalidated its cached measurement.
+    ///
+    /// `hidden` is set for the body subtree of a collapsed [`Expander`]: such
+    /// nodes map to `Display::None` so the body reclaims its layout space
+    /// (height 0) while staying mounted (its visuals collapse to 0×0). The flag
+    /// is sticky — it propagates to the whole subtree so every descendant
+    /// collapses with it.
+    fn walk(
+        &mut self,
+        arena: &mut Arena,
+        id: ControlId,
+        hidden: bool,
+        visited: &mut usize,
+    ) -> Option<NodeId> {
+        // A collapsed Expander hides its body children (the header is drawn on
+        // the node's own surface, so every child is body content).
+        let collapse = arena
+            .get(id)
+            .is_some_and(|n| n.kind == ControlKind::Expander && !n.ctrl.expanded);
+        let child_hidden = hidden || collapse;
+
+        // Children first — their Taffy nodes must exist before `set_children`.
+        // Indexed rather than over a cloned child list: the clone was a heap
+        // allocation per node per frame bought purely to dodge `&mut Arena`.
+        let base = self.scratch.len();
+        let mut i = 0;
+        while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
+            if let Some(cid) = self.walk(arena, c, child_hidden, visited) {
+                self.scratch.push(cid);
+            }
+            i += 1;
+        }
+
+        let Some(n) = arena.get(id) else {
+            self.scratch.truncate(base);
+            return None;
+        };
+        let existing = n.taffy_id.and_then(|(g, t)| (g == self.generation).then_some(t));
+        // Building the finalized style to compare it is a stack copy (plus a
+        // vec clone only for a Grid that declares tracks) — cheap next to the
+        // full subtree invalidation `set_style` would otherwise trigger every
+        // pass. Comparing the WHOLE style with `==` rather than field by field
+        // is deliberate: a future Taffy field cannot be forgotten here.
+        let want = finalize_style(n, hidden);
+        let remeasure = n.measure_dirty
+            // `seg_metrics` reads the style variant, which is not a text prop
+            // and so does not route through `text_dirty` — a SelectorBar whose
+            // chrome changed re-measures with its repaint.
+            || (n.kind == ControlKind::SelectorBar && n.dirty);
+
+        let tid = match existing {
+            Some(t) => {
+                if self.tree.style(t).is_ok_and(|cur| *cur != want) {
+                    let _ = self.tree.set_style(t, want);
+                }
+                t
+            }
+            None => {
+                let Ok(t) = self.tree.new_leaf_with_context(want, id) else {
+                    self.scratch.truncate(base);
+                    return None;
+                };
+                self.owned.insert(id.get(), t);
+                t
+            }
+        };
+        if let Some(n) = arena.get_mut(id) {
+            n.taffy_id = Some((self.generation, tid));
+            n.measure_dirty = false;
+        }
+        // Taffy caches a measured leaf by its constraints alone. A rebuilt
+        // DirectWrite layout changes the ANSWER for constraints it has already
+        // seen, which no style edit reflects — so the cache has to be dropped
+        // by hand or a relabelled node keeps its old intrinsic size forever.
+        if remeasure {
+            let _ = self.tree.mark_dirty(tid);
+        }
+
+        // Re-parent only on an actual change: `set_children` marks the parent
+        // (and its ancestors) dirty. Compared without `TaffyTree::children`,
+        // which hands back a freshly allocated Vec.
+        let kids = &self.scratch[base..];
+        let same = kids
+            .iter()
+            .enumerate()
+            .all(|(i, k)| self.tree.child_at_index(tid, i).is_ok_and(|c| c == *k))
+            && self.tree.child_at_index(tid, kids.len()).is_err();
+        if !same {
+            let _ = self.tree.set_children(tid, kids);
+        }
+        self.scratch.truncate(base);
+        *visited += 1;
+        Some(tid)
+    }
+
+    /// Drop the Taffy node of every tracked id that has left the arena.
+    fn sweep(&mut self, arena: &Arena) {
+        let tree = &mut self.tree;
+        let mut vp_child = self.vp_child;
+        self.owned.retain(|raw, nid| {
+            if arena.get(ControlId::new(*raw)).is_some() {
+                return true;
+            }
+            if vp_child == Some(*nid) {
+                vp_child = None;
+            }
+            let _ = tree.remove(*nid);
+            false
+        });
+        self.vp_child = vp_child;
+    }
+
+    /// The synthetic viewport wrapping the real root, created once and resized
+    /// / re-parented only when the window size or the root's Taffy node change.
+    ///
+    /// Taffy sizes a *root* node with `size: auto` to its content, not to the
+    /// available space — so a full-bleed reactor root (default alignment
+    /// Stretch, no explicit size) would collapse to 0 on both axes and drag the
+    /// whole tree (every Star track resolves against 0) down with it. Mirror
+    /// WinUI's "root fills the window" by wrapping the real root in a synthetic
+    /// 1×1 Star×Star grid cell sized to the viewport: a stretch grid item with
+    /// `size: auto` fills the cell, while an item with a fixed size or an
+    /// explicit non-stretch alignment is honoured — and its margin insets it
+    /// correctly (`percent(1.0)` would overflow by the margin and ignore the
+    /// offset).
+    ///
+    /// The cell uses `flex(1.0)` (`minmax(0, 1fr)`), **not** bare `fr(1.0)`: an
+    /// `fr` track has a min-content floor, so a root whose content (a long
+    /// scrollable chain) exceeds the window would inflate the cell to its
+    /// content height instead of clamping to the viewport — every descendant
+    /// Star then resolves against the inflated height and inner ScrollViewers
+    /// never receive a bounded extent. The zero-floor cell clamps the root to
+    /// the window; overflow scrolls.
+    fn viewport(&mut self, width: f32, height: f32, root: NodeId) -> Option<NodeId> {
+        let vp = match self.viewport {
+            Some(v) => v,
+            None => {
+                let v = self.tree.new_leaf(viewport_style(width, height)).ok()?;
+                self.viewport = Some(v);
+                self.vp_size = (width, height);
+                v
+            }
+        };
+        if self.vp_size != (width, height) {
+            let _ = self.tree.set_style(vp, viewport_style(width, height));
+            self.vp_size = (width, height);
+        }
+        if self.vp_child != Some(root) {
+            let _ = self.tree.set_children(vp, &[root]);
+            self.vp_child = Some(root);
+        }
+        Some(vp)
+    }
+}
+
+fn viewport_style(width: f32, height: f32) -> Style {
+    let mut s = Style {
+        display: Display::Grid,
+        size: Size {
+            width: length(width),
+            height: length(height),
+        },
+        ..Style::default()
+    };
+    s.grid_template_columns = vec![flex(1.0)];
+    s.grid_template_rows = vec![flex(1.0)];
+    s
+}
+
+/// Produce the final Taffy style for a node: its accumulated `style`, the
+/// collapsed-subtree `Display::None` override, plus grid track templates for a
+/// `Grid` (the only style derived lazily from props).
+fn finalize_style(node: &Node, hidden: bool) -> Style {
     let mut s = node.style.clone();
+    if hidden {
+        s.display = Display::None;
+    }
     if node.kind == ControlKind::Grid {
         if !node.grid_rows.is_empty() {
             s.grid_template_rows = node.grid_rows.iter().map(track).collect();
@@ -360,11 +583,9 @@ fn assign(
     soy: f32,
     scale: f32,
 ) {
-    let (taffy_id, children) = match arena.get(id) {
-        Some(n) => (n.taffy_id, n.children.clone()),
-        None => return,
+    let Some(taffy_id) = arena.get(id).and_then(|n| n.taffy_id).map(|(_, t)| t) else {
+        return;
     };
-    let Some(taffy_id) = taffy_id else { return };
     let l = match tree.layout(taffy_id) {
         Ok(l) => *l,
         Err(_) => return,
@@ -416,8 +637,12 @@ fn assign(
             size::fire_element_size(id, w, h);
         }
     }
-    for c in &children {
-        assign(arena, tree, *c, ax, ay, sx, sy, scale);
+    // Indexed rather than over a cloned child list — the clone was a heap
+    // allocation per node per frame bought purely to dodge `&mut Arena`.
+    let mut i = 0;
+    while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
+        assign(arena, tree, c, ax, ay, sx, sy, scale);
+        i += 1;
     }
 
     // Scroll containers: measure content extent, clamp the offset, and apply the
@@ -426,10 +651,12 @@ fn assign(
     if is_scroll {
         let (nx, ny, vh) = arena.get(id).map(|n| (n.rect.x, n.rect.y, n.rect.h)).unwrap();
         let mut content_h = 0.0_f32;
-        for c in &children {
-            if let Some(cn) = arena.get(*c) {
+        let mut i = 0;
+        while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
+            if let Some(cn) = arena.get(c) {
                 content_h = content_h.max(cn.rect.y + cn.rect.h - ny);
             }
+            i += 1;
         }
         let max_scroll = (content_h - vh).max(0.0);
         // Children are placed UNSCROLLED; the scroll translation lives on the
@@ -443,11 +670,13 @@ fn assign(
         } else {
             0.0
         };
-        for c in &children {
-            if let Some(cn) = arena.get_mut(*c) {
+        let mut i = 0;
+        while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
+            if let Some(cn) = arena.get_mut(c) {
                 let (x, y) = (cn.rect.x - nx, cn.rect.y - ny);
                 cn.push_offset(x, y);
             }
+            i += 1;
         }
         // Layout is placement, not motion: snap the carrier (gated inside, so
         // an unchanged pass costs nothing and a glide already heading to this
@@ -458,103 +687,206 @@ fn assign(
     }
 }
 
-/// Re-sync the composition child order for any node whose children list or a
-/// child's Z-order changed: rebuild the collection as `[below-band chrome
-/// parts, own surface, children sorted by (z, doc order), above-band chrome
-/// parts, scroll thumb]`. Retained visuals are merely re-parented, not
-/// recreated.
-fn sync(arena: &mut Arena, id: ControlId) {
-    let children = match arena.get(id) {
-        Some(n) => n.children.clone(),
-        None => return,
-    };
-    let any_z = children
-        .iter()
-        .any(|c| arena.get(*c).is_some_and(|cn| cn.z_dirty));
+/// Where a visual sits in a node's owned stack, bottom → top. The variant
+/// ORDER *is* the z-order: adding a band is a one-line edit here plus wherever
+/// it is collected, and it slots in at the right depth by construction.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Band {
+    /// Chrome parts painted under the node's own surface (ink washes, tracks).
+    BelowChrome,
+    /// The node's own painted-chrome surface.
+    Surface,
+    /// Arena children — or, for a scroll container, the carrier they ride in.
+    /// Ordered among themselves by `(z_index, document order)`.
+    Content,
+    /// Chrome parts painted over the surface (pills, thumbs, indicators).
+    AboveChrome,
+    /// The auto-hiding overlay scrollbar thumb.
+    Overlay,
+}
+
+/// Which collection under a node a visual is parented into. A node's carrier is
+/// created with the node and never appears or disappears, so a visual's slot is
+/// fixed for its whole life — which is what lets [`restack`] detach the
+/// previous set without having to guess where each visual ended up.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Slot {
+    /// The node's own `container.Children()`.
+    Container,
+    /// A scroll container's content-carrier children.
+    Carrier,
+}
+
+/// A visual's place in its node's owned stack. The whole ordering policy is
+/// this struct's **field order** plus `derive(Ord)`: collection first (the two
+/// are independent stacks), then band, then a child's `z_index`, then its
+/// position in the child list. Nothing else sorts the stack, so there is one
+/// place to read — and one place to change — what "z-order" means here.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct StackKey {
+    pub slot: Slot,
+    pub band: Band,
+    pub z: i32,
+    pub doc: usize,
+}
+
+/// One visual in a node's owned stack, with the key it sorts by.
+type Stack = Vec<(StackKey, Visual)>;
+
+/// Re-stack the composition children of any node whose child list or a child's
+/// Z-order changed, as `[below-band chrome parts, own surface, children sorted
+/// by (z, doc order), above-band chrome parts, scroll thumb]`. Retained visuals
+/// are merely re-parented, not recreated.
+///
+/// # Why this detaches by name instead of calling `RemoveAll`
+///
+/// This used to open with `Children().RemoveAll()` and then re-insert the five
+/// categories it knows about. That is a *total* teardown of a collection it
+/// only *partly* owns: a Knob parents its value-arc and needle sprites straight
+/// into the node container ([`knob::KnobParts`](super::knob::KnobParts)) and a
+/// focused editor parents its caret there ([`parts::Caret`](super::parts)), and
+/// neither was ever re-inserted. A Knob or editor that once took this path lost
+/// its arc, needle or caret permanently — latent only because the path needs
+/// `children_dirty` or a `z_dirty` child, and both controls are leaves today.
+/// Give a Knob one child and it breaks.
+///
+/// So the rule is not "re-insert everything sync knows about" — that is exactly
+/// the assumption that failed — but **detach only what sync itself attached**:
+/// each node records the visuals it was last stacked with ([`Node::stacked`]),
+/// and a re-stack removes precisely that set before laying the current one back
+/// down. A visual sync has never heard of is never removed, so a future sprite
+/// category cannot be lost by being forgotten here; the worst it can do is keep
+/// the position its creator chose, which for both of today's strays
+/// (`InsertAtTop`, i.e. above everything) is already where they want to be.
+fn sync(arena: &mut Arena, id: ControlId, order: &mut Stack) {
+    if arena.get(id).is_none() {
+        return;
+    }
+    let mut any_z = false;
+    let mut i = 0;
+    while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
+        any_z |= arena.get(c).is_some_and(|cn| cn.z_dirty);
+        i += 1;
+    }
     let need = arena.get(id).is_some_and(|n| n.children_dirty) || any_z;
 
     if need {
-        let mut kids: Vec<(i32, usize, crate::system_bindings::Visual)> = Vec::new();
-        for (i, c) in children.iter().enumerate() {
-            if let Some(cn) = arena.get(*c)
-                && let Ok(v) = cn.container.cast::<crate::system_bindings::Visual>()
-            {
-                kids.push((cn.z_index, i, v));
-            }
-        }
-        kids.sort_by_key(|(z, i, _)| (*z, *i));
-
-        let surf_sprite = arena
-            .get(id)
-            .and_then(|n| n.surf.as_ref())
-            .and_then(|s| s.sprite.cast::<crate::system_bindings::Visual>().ok());
-
-        // The scroll thumb is an overlay sprite (a top child not tracked in the
-        // arena children); preserve it above the re-synced content.
-        let thumb_sprite = arena
-            .get(id)
-            .and_then(|n| n.scroll_thumb.as_ref())
-            .and_then(|s| s.sprite.cast::<crate::system_bindings::Visual>().ok());
-
-        // Scroll containers parent their children into the content CARRIER
-        // visual (whose Offset is the animated scroll translation); everyone
-        // else parents children directly.
-        let carrier = arena.get(id).and_then(|n| n.scroll_content.clone());
-
-        if let Some(coll) = arena.get(id).and_then(|n| n.container.Children().ok()) {
-            let _ = coll.RemoveAll();
-            // Sequential InsertAtTop stacks in call order, bottom → top.
-            if let Some(n) = arena.get(id)
-                && let Some(parts) = n.parts.as_deref()
-            {
-                for v in parts.below_visuals() {
-                    let _ = coll.InsertAtTop(&v);
-                }
-            }
-            if let Some(sp) = &surf_sprite {
-                let _ = coll.InsertAtTop(sp);
-            }
-            match &carrier {
-                Some(content) => {
-                    if let Ok(cv) = content.cast::<Visual>() {
-                        let _ = coll.InsertAtTop(&cv);
-                    }
-                    if let Ok(cc) = content.Children() {
-                        let _ = cc.RemoveAll();
-                        for (_, _, v) in &kids {
-                            let _ = cc.InsertAtTop(v);
-                        }
-                    }
-                }
-                None => {
-                    for (_, _, v) in &kids {
-                        let _ = coll.InsertAtTop(v);
-                    }
-                }
-            }
-            if let Some(n) = arena.get(id)
-                && let Some(parts) = n.parts.as_deref()
-            {
-                for v in parts.above_visuals() {
-                    let _ = coll.InsertAtTop(&v);
-                }
-            }
-            if let Some(tp) = &thumb_sprite {
-                let _ = coll.InsertAtTop(tp);
-            }
-        }
+        order.clear();
+        collect(arena, id, order);
+        // Stable, so equal keys keep collection order within a band.
+        order.sort_by_key(|(k, _)| *k);
+        restack(arena, id, order);
 
         if let Some(n) = arena.get_mut(id) {
             n.children_dirty = false;
         }
-        for c in &children {
-            if let Some(cn) = arena.get_mut(*c) {
+        let mut i = 0;
+        while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
+            if let Some(cn) = arena.get_mut(c) {
                 cn.z_dirty = false;
             }
+            i += 1;
         }
     }
 
-    for c in children {
-        sync(arena, c);
+    // Indexed rather than over a cloned child list — the clone was a heap
+    // allocation per node per frame bought purely to dodge `&mut Arena`.
+    let mut i = 0;
+    while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
+        sync(arena, c, order);
+        i += 1;
     }
 }
+
+/// Gather every visual `sync` owns under `id`, tagged with its slot and band.
+/// This is the ONE enumeration of the owned set: [`restack`] both detaches the
+/// previous one and attaches this one from it, so the two can never disagree
+/// about what sync is responsible for.
+fn collect(arena: &Arena, id: ControlId, out: &mut Stack) {
+    use Band::*;
+    use Slot::Container;
+    let Some(n) = arena.get(id) else { return };
+    // Chrome bands hold at most a handful of parts each and carry no z of their
+    // own, so their key is the band plus the order they were collected in.
+    let push = |out: &mut Stack, slot, band, v| {
+        let doc = out.len();
+        out.push((StackKey { slot, band, z: 0, doc }, v));
+    };
+
+    if let Some(parts) = n.parts.as_deref() {
+        for v in parts.below_visuals() {
+            push(out, Container, BelowChrome, v);
+        }
+    }
+    if let Some(v) = n.surf.as_ref().and_then(|s| s.sprite.cast::<Visual>().ok()) {
+        push(out, Container, Surface, v);
+    }
+    // A scroll container's children ride the content CARRIER visual (whose
+    // Offset is the animated scroll translation), so the carrier is what
+    // occupies the content band and the children stack inside it; every other
+    // node stacks its children directly.
+    let carrier = n.scroll_content.as_ref().and_then(|c| c.cast::<Visual>().ok());
+    let child_slot = if carrier.is_some() { Slot::Carrier } else { Container };
+    if let Some(carrier) = carrier {
+        push(out, Container, Content, carrier);
+    }
+    for (i, c) in n.children.iter().enumerate() {
+        if let Some(cn) = arena.get(*c)
+            && let Ok(v) = cn.container.cast::<Visual>()
+        {
+            let key = StackKey { slot: child_slot, band: Content, z: cn.z_index, doc: i };
+            out.push((key, v));
+        }
+    }
+    if let Some(parts) = n.parts.as_deref() {
+        for v in parts.above_visuals() {
+            push(out, Container, AboveChrome, v);
+        }
+    }
+    if let Some(v) = n
+        .scroll_thumb
+        .as_ref()
+        .and_then(|s| s.sprite.cast::<Visual>().ok())
+    {
+        push(out, Container, Overlay, v);
+    }
+}
+
+/// Detach exactly the visuals this node was last stacked with, then lay the
+/// current banded set back down *beneath* anything else parented into the same
+/// collections. `order` must already be sorted bottom → top.
+///
+/// Walking top → bottom and pushing each visual to the BOTTOM is what leaves
+/// the owned stack in exact order underneath every stray — the mirror image of
+/// the `InsertAtTop` sequence this replaces, and the reason a stray keeps the
+/// topmost position its creator gave it instead of being buried.
+fn restack(arena: &mut Arena, id: ControlId, order: &Stack) {
+    let Some(n) = arena.get(id) else { return };
+    let Ok(coll) = n.container.Children() else { return };
+    let carrier = n.scroll_content.as_ref().and_then(|c| c.Children().ok());
+    let pick = |slot: Slot| match slot {
+        Slot::Carrier => carrier.as_ref().unwrap_or(&coll),
+        Slot::Container => &coll,
+    };
+
+    // Detach the previous set — and only it. Taken out of the node so the
+    // buffer's allocation is reused rather than reallocated per re-stack, and
+    // handed back BEFORE the inserts so the node's registry always describes
+    // what sync believes it owns.
+    let mut prev = arena
+        .get_mut(id)
+        .map(|n| std::mem::take(&mut n.stacked))
+        .unwrap_or_default();
+    for (slot, v) in prev.drain(..) {
+        let _ = pick(slot).Remove(&v);
+    }
+    prev.extend(order.iter().map(|(k, v)| (k.slot, v.clone())));
+    if let Some(n) = arena.get_mut(id) {
+        n.stacked = prev;
+    }
+
+    for (k, v) in order.iter().rev() {
+        let _ = pick(k.slot).InsertAtBottom(v);
+    }
+}
+

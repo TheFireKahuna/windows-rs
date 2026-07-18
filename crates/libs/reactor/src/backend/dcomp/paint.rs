@@ -111,9 +111,15 @@ fn paint_node(
         }
     }
 
-    let children = arena.get(id).map(|n| n.children.clone()).unwrap_or_default();
-    for c in children {
+    // Indexed rather than over a cloned child list — the clone was a heap
+    // allocation per node per frame bought purely to dodge `&mut Arena`. An
+    // index is also the only shape that stays correct here: this walk can
+    // propagate `?` mid-iteration on device loss, so a `mem::take` of the
+    // children would leave the node permanently childless on the way out.
+    let mut i = 0;
+    while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
         paint_node(comp, cache, atlas, arena, c, scale, scrubbing)?;
+        i += 1;
     }
 
     // Overlay scrollbar thumb (above the scrolled children) for scroll containers.

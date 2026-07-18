@@ -30,6 +30,12 @@ pub fn snap(v: f32, scale: f32) -> f32 {
     dcomp::layout::snap(v, scale)
 }
 
+/// [`dcomp::layout`]'s composition z-order vocabulary. The band ladder and the
+/// key's field order together ARE the ordering policy `layout::sync` applies to
+/// every node's owned stack (via `derive(Ord)`), so sorting these types in a
+/// test sorts the shipping comparator, not a copy of it.
+pub use dcomp::layout::{Band, Slot, StackKey};
+
 /// The exact edge-snapping arithmetic `layout::assign` performs for one node:
 /// given an absolute DIP origin and extent, return the snapped `(x, w)` it
 /// writes into the node's `LaidRect`. Mirrors the two lines in `assign` so a
