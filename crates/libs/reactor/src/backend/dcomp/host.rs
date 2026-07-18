@@ -145,6 +145,25 @@ struct HostShared {
 
 thread_local! {
     static DCOMP: RefCell<Option<Rc<HostShared>>> = const { RefCell::new(None) };
+
+    /// Set for the duration of our own [`release_capture_self`] call.
+    ///
+    /// `ReleaseCapture` delivers `WM_CAPTURECHANGED` **synchronously**, and a
+    /// normal button-up releases capture before dispatching the release. Without
+    /// this flag the capture-lost handler would tear the press down a moment
+    /// before `on_pointer_up` went looking for it, and no click would ever
+    /// activate. Only a capture change we did NOT initiate is a steal.
+    static RELEASING_CAPTURE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Release pointer capture without the resulting synchronous
+/// `WM_CAPTURECHANGED` being mistaken for the OS stealing it.
+fn release_capture_self() {
+    RELEASING_CAPTURE.with(|c| c.set(true));
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+    RELEASING_CAPTURE.with(|c| c.set(false));
 }
 
 /// A self-hosted DirectComposition window hosting one reactor component tree.
@@ -789,10 +808,52 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONUP => {
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
-                unsafe {
-                    let _ = ReleaseCapture();
-                }
+                release_capture_self();
                 s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_up(x, y));
+            }
+            0
+        }
+
+        // Capture was taken from us: a system modal dialog, Alt+Tab, Win+D, a
+        // debugger break. No WM_LBUTTONUP will follow, so the gesture has to be
+        // cancelled here or its state stays live forever — a stuck global
+        // `scrubbing` flag leaves every slider, knob and meter in the window
+        // snapping instead of springing until the next clean press/release.
+        //
+        // Our own ReleaseCapture also lands here (synchronously, from the
+        // button-up arm above); `release_capture_self` marks those so a normal
+        // click is not cancelled out from under itself.
+        WM_CAPTURECHANGED => {
+            if !RELEASING_CAPTURE.with(|c| c.get())
+                && let Some(s) = shared()
+            {
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.on_pointer_cancel());
+            }
+            0
+        }
+
+        // Right button: no capture and no press ink (see
+        // `on_right_pointer_down`) — it only reports a right-tap, which is what
+        // a context menu hangs off. Unhandled presses fall through to
+        // DefWindowProc so the system context-menu path still works.
+        WM_RBUTTONDOWN => {
+            let (x, y) = dip_xy(hwnd, lparam);
+            let consumed = shared().is_some_and(|s| {
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.on_right_pointer_down(x, y))
+            });
+            if consumed {
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_RBUTTONUP => {
+            if let Some(s) = shared() {
+                let (x, y) = dip_xy(hwnd, lparam);
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.on_right_pointer_up(x, y));
             }
             0
         }
@@ -822,6 +883,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
                 s.render_host
                     .with_reconciler_mut(|r| r.backend.on_key(vk, shift, ctrl));
+            }
+            0
+        }
+
+        // Ends the held/auto-repeat state started by the matching key-down.
+        WM_KEYUP | WM_SYSKEYUP => {
+            if let Some(s) = shared() {
+                let vk = (wparam & 0xFFFF) as u32;
+                s.render_host.with_reconciler_mut(|r| r.backend.on_key_up(vk));
             }
             0
         }
