@@ -963,6 +963,11 @@ impl Backend for DCompBackend {
     }
 
     fn destroy(&mut self, id: ControlId) {
+        // Registrations are id-keyed, and ids are never reused, so a stale entry
+        // could not be re-addressed — but dropping them here keeps the registries
+        // bounded when a subscriber leaks its `Subscription`.
+        size::forget(id);
+        pointer::forget(id);
         if self.attached_root == Some(id) {
             if let Some(n) = self.arena.get(id) {
                 self.comp.detach_root(&n.container);

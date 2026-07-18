@@ -105,16 +105,22 @@ impl PaintSurface {
         opaque: bool,
     ) -> Result<Self> {
         // dcomp backend: host a composition child-visual surface under the node.
-        // `from_node` only succeeds when `host.native()` is a system
+        // `from_node` only succeeds when the native object is a system
         // `ContainerVisual`, so this cleanly no-ops on WinUI.
+        //
+        // This is the last place that still needs the node's live visual rather
+        // than its id: parenting a child visual is COM work that only the
+        // thread owning the compositor may do. It becomes a backend command
+        // addressed by `host.id()` when surface creation moves front-side.
         if let Some(host) = host
-            && let Ok(factory) = CompositionSurfaceFactory::from_node(host.native(), device.d2d_device())
+            && let Some(native) = host.native()
+            && let Ok(factory) = CompositionSurfaceFactory::from_node(native, device.d2d_device())
         {
             let scale = dpi / 96.0;
             let pw = ((width * scale).round() as i32).max(1);
             let ph = ((height * scale).round() as i32).max(1);
             let (visual, draw) =
-                factory.create_under_node(host.native(), (pw, ph), (width, height), opaque)?;
+                factory.create_under_node(native, (pw, ph), (width, height), opaque)?;
             return Ok(Self::Comp(CompSurface {
                 target: CompositionDrawTarget::new(draw),
                 _visual: visual,
@@ -189,7 +195,7 @@ pub(crate) struct PainterInner {
     // `element()` to build the `Image` and track its layout size.
     pub(crate) source: RefCell<Option<SurfaceImageSource>>,
     pub(crate) set_size: RefCell<Option<SetState<(u32, u32)>>>,
-    size_revoker: RefCell<Option<EventRevoker>>,
+    size_revoker: RefCell<Option<Subscription>>,
     // Optional user mount hook, run once with the hosting `Image`'s
     // `ElementHandle` (e.g. to open a capture-capable `PointerSurface`). A `Cell`
     // like `stepper`: it is taken out and run, and the hook may re-enter the

@@ -59,7 +59,7 @@ impl SwapChainPanelHandle {
     /// revoked on `Drop`. Coordinates in every [`PointerEventInfo`] are
     /// element-relative DIPs.
     pub fn pointer_surface(&self) -> Result<PointerSurface> {
-        open_pointer_surface(&self.0)
+        xaml_pointer_surface(&self.0).ok_or_else(Error::empty)
     }
 }
 
@@ -70,19 +70,26 @@ impl SwapChainPanelHandle {
 /// DirectComposition backend it is the node's system `ContainerVisual`, and
 /// the subscription registers with the backend's pointer registry instead
 /// (element-relative delivery + implicit capture — see `backend::dcomp::pointer`).
-fn open_pointer_surface(native: &windows_core::IInspectable) -> Result<PointerSurface> {
-    if let Ok(element) = native.cast::<bindings::UIElement>() {
-        return Ok(PointerSurface {
-            inner: PointerInner::Xaml {
-                element,
-                captured: Rc::new(RefCell::new(None)),
-                revokers: RefCell::new(Vec::new()),
-            },
-        });
+fn xaml_pointer_surface(native: &windows_core::IInspectable) -> Option<PointerSurface> {
+    let element = native.cast::<bindings::UIElement>().ok()?;
+    Some(PointerSurface {
+        inner: PointerInner::Xaml {
+            element,
+            captured: Rc::new(RefCell::new(None)),
+            revokers: RefCell::new(Vec::new()),
+        },
+    })
+}
+
+fn open_pointer_surface(handle: &ElementHandle) -> Result<PointerSurface> {
+    if let Some(native) = &handle.native
+        && let Some(surface) = xaml_pointer_surface(native)
+    {
+        return Ok(surface);
     }
     #[cfg(feature = "dcomp-backend")]
-    if let Ok(cv) = native.cast::<system_bindings::ContainerVisual>() {
-        let (sinks, revoker) = backend::dcomp::register_element_pointer(&cv)?;
+    {
+        let (sinks, revoker) = backend::dcomp::register_element_pointer(handle.id)?;
         return Ok(PointerSurface {
             inner: PointerInner::Dcomp {
                 sinks,
@@ -90,37 +97,99 @@ fn open_pointer_surface(native: &windows_core::IInspectable) -> Result<PointerSu
             },
         });
     }
+    #[cfg(not(feature = "dcomp-backend"))]
     Err(Error::empty())
 }
 
-/// Opaque handle to a mounted native `UIElement`, handed to a widget's
-/// `on_mounted` callback (e.g. [`Image::on_mounted`](crate::Image::on_mounted)).
+/// A live subscription — an element's size notifications, a pointer sink —
+/// that ends when this drops.
 ///
-/// Unlike [`SwapChainPanelHandle`] it carries no swap-chain plumbing — its sole
-/// purpose is to expose the imperative, capture-capable
-/// [`PointerSurface`](Self::pointer_surface) over the element. That is what a
-/// custom-drawn control hosted in an `Image` / `SurfaceImageSource` needs so a
-/// knob / slider / node drag keeps tracking after the pointer leaves the element
-/// bounds — the declarative [`on_pointer_moved`](crate::ElementExt::on_pointer_moved)
-/// modifier cannot capture.
-#[derive(Clone)]
-pub struct ElementHandle(pub(crate) windows_core::IInspectable);
+/// Two shapes sit behind it. The WinUI backend subscribes a WinRT event on the
+/// native element and hands back its `EventRevoker`. The DirectComposition
+/// backend registers against an id-keyed backend registry and hands back only a
+/// token: **no COM, so the holder is not pinned to the backend's thread**, which
+/// is what lets app code retain one across renders (and, once the reconciler
+/// moves off the UI thread, across threads).
+pub struct Subscription(SubscriptionInner);
 
-impl ElementHandle {
-    /// Open a live [`PointerSurface`] over this element's native `UIElement`.
-    /// See [`SwapChainPanelHandle::pointer_surface`] for the capture semantics.
-    pub fn pointer_surface(&self) -> Result<PointerSurface> {
-        open_pointer_surface(&self.0)
+enum SubscriptionInner {
+    /// WinRT event registration; revokes itself on drop.
+    Winrt(#[allow(dead_code, reason = "revocation is the Drop impl")] windows_core::EventRevoker),
+    /// Token in an id-keyed backend registry, removed by `remove` on drop.
+    Token { token: i64, remove: fn(i64) },
+}
+
+impl Subscription {
+    pub(crate) fn winrt(revoker: windows_core::EventRevoker) -> Self {
+        Self(SubscriptionInner::Winrt(revoker))
     }
 
-    /// The underlying native object for this mounted element: the XAML
-    /// `UIElement` on the WinUI backend, or the node's system-compositor
-    /// `ContainerVisual` on the self-hosted DirectComposition backend. Cast it to
-    /// the interface you need — e.g. a `ContainerVisual` to host a child-visual
-    /// composition surface under it (see
-    /// [`CompositionSurfaceFactory::from_node`](crate::CompositionSurfaceFactory::from_node)).
-    pub fn native(&self) -> &windows_core::IInspectable {
-        &self.0
+    pub(crate) fn token(token: i64, remove: fn(i64)) -> Self {
+        Self(SubscriptionInner::Token { token, remove })
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // The WinRT arm revokes through `EventRevoker`'s own `Drop`.
+        if let SubscriptionInner::Token { token, remove } = &self.0 {
+            remove(*token);
+        }
+    }
+}
+
+/// Handle to a mounted control, given to a widget's `on_mounted` callback
+/// (e.g. [`Image::on_mounted`](crate::Image::on_mounted)).
+///
+/// It carries the control's [`id`](Self::id) — the address the backend's
+/// id-keyed services take — and, on backends that expose one, the native
+/// element. Its imperative, capture-capable
+/// [`PointerSurface`](Self::pointer_surface) is what a custom-drawn control
+/// hosted in an `Image` / `SurfaceImageSource` needs so a knob / slider / node
+/// drag keeps tracking after the pointer leaves the element bounds — the
+/// declarative [`on_pointer_moved`](crate::ElementExt::on_pointer_moved)
+/// modifier cannot capture.
+#[derive(Clone)]
+pub struct ElementHandle {
+    pub(crate) id: ControlId,
+    pub(crate) native: Option<windows_core::IInspectable>,
+}
+
+impl From<MountInfo> for ElementHandle {
+    fn from(info: MountInfo) -> Self {
+        Self {
+            id: info.id,
+            native: info.native,
+        }
+    }
+}
+
+impl ElementHandle {
+    /// The control's backend id — the address every id-keyed backend service
+    /// takes (size subscription, pointer sinks, composition-surface hosting).
+    ///
+    /// Unlike [`native`](Self::native) this is always present, `Copy`, and
+    /// `Send`, so retaining it across renders pins nothing to a thread.
+    pub fn id(&self) -> ControlId {
+        self.id
+    }
+
+    /// Open a live [`PointerSurface`] over this element.
+    /// See [`SwapChainPanelHandle::pointer_surface`] for the capture semantics.
+    pub fn pointer_surface(&self) -> Result<PointerSurface> {
+        open_pointer_surface(self)
+    }
+
+    /// The underlying native object, when the backend exposes one: the XAML
+    /// `UIElement` on the WinUI backend, where interfaces such as
+    /// `ISwapChainPanelNative` are only reachable through it.
+    ///
+    /// The DirectComposition backend returns `None` — its controls are
+    /// addressed by [`id`](Self::id), so nothing hands out a thread-affine
+    /// visual that app code could retain. Reach for this only on a WinUI-only
+    /// path; anything with an id-keyed equivalent should use that instead.
+    pub fn native(&self) -> Option<&windows_core::IInspectable> {
+        self.native.as_ref()
     }
 
     /// Subscribe `SizeChanged` on this element; the callback receives the new
@@ -130,32 +199,34 @@ impl ElementHandle {
     /// subscription is revoked when the revoker drops (on unmount), so nothing
     /// leaks. Use it to recreate a fixed-size [`SurfaceImageSource`] at the new
     /// size so it stays crisp.
-    pub fn on_size_changed(
-        &self,
-        f: impl Fn(f64, f64) + 'static,
-    ) -> Result<windows_core::EventRevoker> {
+    pub fn on_size_changed(&self, f: impl Fn(f64, f64) + 'static) -> Result<Subscription> {
         // WinUI backend: the native element is a XAML FrameworkElement.
-        if let Ok(fe) = self.0.cast::<bindings::IFrameworkElement>() {
-            return fe.SizeChanged(move |_sender, args| {
-                if let Some(args) = args.as_ref()
-                    && let Ok(s) = args.NewSize()
-                {
-                    f(s.width as f64, s.height as f64);
-                }
-            });
+        if let Some(native) = &self.native
+            && let Ok(fe) = native.cast::<bindings::IFrameworkElement>()
+        {
+            return fe
+                .SizeChanged(move |_sender, args| {
+                    if let Some(args) = args.as_ref()
+                        && let Ok(s) = args.NewSize()
+                    {
+                        f(s.width as f64, s.height as f64);
+                    }
+                })
+                .map(Subscription::winrt);
         }
-        // DirectComposition backend: the native element is a system
-        // `ContainerVisual` whose size the Taffy layout pass sets each reconcile.
-        // Register with the backend's size registry, which fires on a size change
-        // (see `backend::dcomp::fire_element_size`). Returns an `EventRevoker`
-        // that unregisters on drop, so the call site is identical to the XAML path.
+        // DirectComposition backend: the control's size is whatever the Taffy
+        // layout pass last assigned its node. Register with the backend's
+        // id-keyed size registry, which fires on a change (see
+        // `backend::dcomp::fire_element_size`). Returns an `EventRevoker` that
+        // unregisters on drop, so the call site matches the XAML path.
         #[cfg(feature = "dcomp-backend")]
-        if let Ok(cv) = self.0.cast::<system_bindings::ContainerVisual>() {
+        {
             use backend::dcomp::register_element_size;
-            return register_element_size(&cv, move |w, h| {
+            return register_element_size(self.id, move |w, h| {
                 f(w as f64, h as f64);
             });
         }
+        #[cfg(not(feature = "dcomp-backend"))]
         Err(Error::empty())
     }
 }
@@ -190,7 +261,7 @@ enum PointerInner {
     #[cfg(feature = "dcomp-backend")]
     Dcomp {
         sinks: Rc<backend::dcomp::PointerSinks>,
-        _revoker: windows_core::EventRevoker,
+        _revoker: Subscription,
     },
 }
 
@@ -420,8 +491,8 @@ fn pointer_event_info(
 pub struct SwapChainPanel {
     pub key: Option<String>,
     pub modifiers: Modifiers,
-    pub mounted: Option<Callback<Option<windows_core::IInspectable>>>,
-    pub unmounted: Option<Callback<Option<windows_core::IInspectable>>>,
+    pub mounted: Option<Callback<MountInfo>>,
+    pub unmounted: Option<Callback<MountInfo>>,
 }
 
 impl Default for SwapChainPanel {
@@ -444,8 +515,8 @@ impl SwapChainPanel {
     pub fn on_mounted(mut self, f: impl Fn(SwapChainPanelHandle) + 'static) -> Self {
         // A `SwapChainPanel` always has a native control in practice; the
         // handle is only built when one is present.
-        self.mounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            if let Some(native) = info.native {
                 f(SwapChainPanelHandle(native));
             }
         }));
@@ -457,8 +528,8 @@ impl SwapChainPanel {
     /// example, stop and join a render thread that presents into its swap
     /// chain) before the panel — and its swap chain — go away.
     pub fn on_unmounted(mut self, f: impl Fn(SwapChainPanelHandle) + 'static) -> Self {
-        self.unmounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
+        self.unmounted = Some(Callback::new(move |info: MountInfo| {
+            if let Some(native) = info.native {
                 f(SwapChainPanelHandle(native));
             }
         }));
@@ -471,11 +542,11 @@ impl SwapChainPanel {
     pub fn on_resize(mut self, f: impl Fn(f64, f64) + 'static) -> Self {
         let f = Rc::new(f);
         let prev = self.mounted.take();
-        self.mounted = Some(Callback::new(move |native: Option<windows_core::IInspectable>| {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
             if let Some(ref cb) = prev {
-                cb.invoke(native.clone());
+                cb.invoke(info.clone());
             }
-            let Some(native) = native else {
+            let Some(native) = info.native else {
                 return;
             };
             // Subscribe to SizeChanged on the FrameworkElement.
@@ -509,10 +580,10 @@ impl Widget for SwapChainPanel {
     fn bindings(&self) -> PropBindings {
         Vec::new()
     }
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.mounted.as_ref()
     }
-    fn on_unmounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_unmounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.unmounted.as_ref()
     }
 }

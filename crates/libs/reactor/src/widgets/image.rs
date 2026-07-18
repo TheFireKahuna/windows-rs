@@ -6,7 +6,7 @@ pub struct Image {
     pub modifiers: Modifiers,
     pub source: ImageSource,
     pub stretch: Stretch,
-    pub mounted: Option<Callback<Option<windows_core::IInspectable>>>,
+    pub mounted: Option<Callback<MountInfo>>,
 }
 impl Default for Image {
     fn default() -> Self {
@@ -72,10 +72,8 @@ impl Image {
     /// subscribe [`ElementHandle::on_size_changed`](crate::ElementHandle::on_size_changed)
     /// to recreate a fixed-size `SurfaceImageSource` when the layout resizes.
     pub fn on_mounted(mut self, f: impl Fn(ElementHandle) + 'static) -> Self {
-        self.mounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
-                f(ElementHandle(native));
-            }
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            f(ElementHandle::from(info));
         }));
         self
     }
@@ -83,7 +81,7 @@ impl Image {
 
 impl Widget for Image {
     widget_header!(ControlKind::Image);
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.mounted.as_ref()
     }
     fn bindings(&self) -> PropBindings {

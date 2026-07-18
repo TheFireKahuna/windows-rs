@@ -193,21 +193,38 @@ pub trait Widget {
         None
     }
     /// Optional post-mount callback. When present, the reconciler invokes it
-    /// immediately after creation with the native element (`IInspectable`), or
-    /// `None` if the backend exposes no native element for the control.
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    /// immediately after creation with the control's [`MountInfo`].
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
         None
     }
     /// Optional pre-unmount callback. When present, the reconciler invokes it
     /// just before the control is destroyed, while the control still exists,
-    /// with the native element (`IInspectable`), or `None` if the backend
-    /// exposes no native element. Owners use this to tear down external
+    /// with the control's [`MountInfo`]. Owners use this to tear down external
     /// resources bound to the control (e.g. join a render thread that presents
     /// into the control's swap chain) — teardown runs regardless of whether a
     /// native element is present.
-    fn on_unmounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_unmounted_callback(&self) -> Option<&Callback<MountInfo>> {
         None
     }
+}
+
+/// What the reconciler hands a mount/unmount callback: the control's backend
+/// id, and the native element when the backend exposes one.
+///
+/// [`id`](Self::id) is always present and is how app code addresses the
+/// control — subscribing to its size, registering a pointer sink, parenting a
+/// composition surface under it. Being `Copy` and `Send`, it is safe to retain
+/// across renders and, unlike a native element, to carry to another thread.
+///
+/// [`native`](Self::native) is the live backend object: a XAML `UIElement` on
+/// the WinUI backend, where interfaces like `ISwapChainPanelNative` are only
+/// reachable through it. It is thread-affine, so retaining it pins the holder
+/// to the backend's thread — address the control by `id` wherever the backend
+/// offers an id-keyed path instead.
+#[derive(Clone)]
+pub struct MountInfo {
+    pub id: ControlId,
+    pub native: Option<windows_core::IInspectable>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

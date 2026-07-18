@@ -325,7 +325,7 @@ pub fn surface_image(cx: &mut RenderCx, draw: impl Fn(&DrawContext) + 'static) -
     let (generation, set_generation) = cx.use_state::<u32>(0);
     let (source, set_source) = cx.use_state::<Option<SurfaceImageSource>>(None);
     let device_ref = cx.use_ref::<Option<GpuDevice>>(None);
-    let revoker = cx.use_ref::<Option<EventRevoker>>(None);
+    let revoker = cx.use_ref::<Option<Subscription>>(None);
     let draw = Rc::new(draw);
     let (w, h) = size;
 

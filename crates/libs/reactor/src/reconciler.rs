@@ -43,7 +43,7 @@ pub struct Reconciler<B: Backend> {
     /// Pre-unmount callbacks keyed by control id, invoked with the native
     /// element (or `None`) just before the control is destroyed (see
     /// [`Widget::on_unmounted_callback`]).
-    pub unmount_callbacks: FxHashMap<ControlId, Callback<Option<windows_core::IInspectable>>>,
+    pub unmount_callbacks: FxHashMap<ControlId, Callback<MountInfo>>,
     /// Tracks header element control IDs for widgets that use header_element().
     pub header_elements: FxHashMap<ControlId, ControlId>,
     /// Tracks pane element control IDs for widgets that use pane_element().
@@ -364,7 +364,8 @@ impl<B: Backend + 'static> Reconciler<B> {
             // is destroyed. The callback always runs when registered; the
             // native element is passed when available, else `None`.
             if let Some(cb) = self.unmount_callbacks.remove(&node) {
-                cb.invoke(self.backend.get_native_element(node));
+                let native = self.backend.get_native_element(node);
+                cb.invoke(MountInfo { id: node, native });
             }
 
             self.error_boundary_fallbacks.remove(&node);

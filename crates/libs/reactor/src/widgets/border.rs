@@ -8,7 +8,7 @@ pub struct Border {
     pub border_brush: Option<BrushBinding>,
     pub border_thickness: Option<Thickness>,
     pub child: Box<Element>,
-    pub mounted: Option<Callback<Option<windows_core::IInspectable>>>,
+    pub mounted: Option<Callback<MountInfo>>,
 }
 impl Border {
     pub fn new(child: impl Into<Element>) -> Self {
@@ -32,10 +32,8 @@ impl Border {
     /// occupies (the reactor analogue of how Win2D's `CanvasControl` measures its
     /// `UserControl` host rather than the inner `Image`).
     pub fn on_mounted(mut self, f: impl Fn(ElementHandle) + 'static) -> Self {
-        self.mounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
-                f(ElementHandle(native));
-            }
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            f(ElementHandle::from(info));
         }));
         self
     }
@@ -84,7 +82,7 @@ impl Default for Border {
 
 impl Widget for Border {
     widget_header!(ControlKind::Border);
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.mounted.as_ref()
     }
     fn bindings(&self) -> PropBindings {

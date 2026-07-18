@@ -342,20 +342,11 @@ pub(crate) struct Node {
     pub title_content: Option<ControlId>,
     /// TitleBar only: the mounted `RightHeader`/footer (trailing) slot child.
     pub title_footer: Option<ControlId>,
-
-    /// Canonical `IUnknown` identity of `container` — the key the size and
-    /// pointer registries match registrations against (see `size.rs` /
-    /// `pointer.rs`). Cached once; the container never changes.
-    pub ident: *mut core::ffi::c_void,
 }
 
 impl Node {
     pub fn new(kind: ControlKind, container: ContainerVisual) -> Self {
         let vis: IVisual = container.cast().expect("ContainerVisual is an IVisual");
-        let ident = container
-            .cast::<windows_core::IUnknown>()
-            .map(|u| u.as_raw())
-            .unwrap_or(core::ptr::null_mut());
         let mut paint = Paint {
             font_size: default_font_size(kind),
             font_weight: 400,
@@ -421,7 +412,6 @@ impl Node {
             editor: is_text_editable(kind).then(|| Editor::new(kind)),
             title_content: None,
             title_footer: None,
-            ident,
         }
     }
 

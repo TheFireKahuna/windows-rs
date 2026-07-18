@@ -84,8 +84,7 @@ impl DCompBackend {
     ) {
         let Some(node) = self.node(id) else { return };
         if node.rect.contains(x, y)
-            && !node.ident.is_null()
-            && let Some(sinks) = super::pointer::sinks_for(node.ident)
+            && let Some(sinks) = super::pointer::sinks_for(id)
         {
             *out = Some((id, sinks, x, y));
         }
@@ -402,9 +401,8 @@ impl DCompBackend {
     /// it is still mounted with a live registration).
     fn fire_surface_exit(&mut self) {
         if let Some(old) = self.hovered_surface.take()
-            && let Some(node) = self.node(old)
-            && !node.ident.is_null()
-            && let Some(sinks) = super::pointer::sinks_for(node.ident)
+            && self.node(old).is_some()
+            && let Some(sinks) = super::pointer::sinks_for(old)
             && let Some(cb) = sinks.exited.borrow().as_ref()
         {
             cb();

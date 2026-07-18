@@ -20,7 +20,8 @@ impl<B: Backend + 'static> Reconciler<B> {
             self.pane_elements.insert(id, pane_id);
         }
         if let Some(cb) = w.on_mounted_callback() {
-            cb.invoke(self.backend.get_native_element(id));
+            let native = self.backend.get_native_element(id);
+            cb.invoke(MountInfo { id, native });
         }
         if let Some(cb) = w.on_unmounted_callback() {
             self.unmount_callbacks.insert(id, cb.clone());

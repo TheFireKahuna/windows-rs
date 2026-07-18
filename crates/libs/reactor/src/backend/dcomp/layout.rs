@@ -411,11 +411,9 @@ fn assign(
         // already settled (mount callbacks vs layout ordering); the registry
         // change-gates per listener, so an unchanged size is a cheap no-op and a
         // fresh listener is guaranteed its first delivery on the next pass. Skip
-        // the identity cast entirely when nothing is subscribed (the common case).
-        if size::has_listeners()
-            && let Some(key) = size::container_key(&n.container)
-        {
-            size::fire_element_size(key, w, h);
+        // the lookup entirely when nothing is subscribed (the common case).
+        if size::has_listeners() {
+            size::fire_element_size(id, w, h);
         }
     }
     for c in &children {

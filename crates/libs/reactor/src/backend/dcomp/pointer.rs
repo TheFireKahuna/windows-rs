@@ -7,21 +7,20 @@
 //! capture. The self-hosted backend has no XAML element — the mounted native
 //! object is the node's system-compositor `ContainerVisual`. This module is the
 //! bridge, mirroring `size.rs`: `PointerSurface` registers a sink set keyed by
-//! the container's canonical `IUnknown` identity, and the backend's input
-//! router (`input.rs`) delivers element-relative pointer events to the deepest
-//! registered surface under the pointer, with implicit capture for the
-//! press-to-release span of a drag.
+//! [`ControlId`], and the backend's input router (`input.rs`) delivers
+//! element-relative pointer events to the deepest registered surface under the
+//! pointer, with implicit capture for the press-to-release span of a drag. The
+//! hit-test walk already carries the id, so matching costs no COM call.
 
-use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use windows_core::{Error, EventRevoker, Interface, Result, HRESULT, IUnknown};
+use rustc_hash::FxHashMap;
+use windows_core::Result;
 
+use crate::backend::ControlId;
 use crate::style::PointerEventInfo;
-use crate::system_bindings::ContainerVisual;
-
-const S_OK: HRESULT = HRESULT(0);
+use crate::widgets::Subscription;
 
 /// The four pointer transitions a `PointerSurface` can subscribe. Cells are
 /// filled by the surface's `on_down`/`on_move`/`on_up`/`on_wheel` builders
@@ -40,28 +39,24 @@ pub struct PointerSinks {
 
 struct Entry {
     token: i64,
-    /// Canonical `IUnknown` pointer of the surface's container visual (matches
-    /// `Node::ident`).
-    key: *mut c_void,
     sinks: Rc<PointerSinks>,
 }
 
 thread_local! {
-    static LISTENERS: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    static LISTENERS: RefCell<FxHashMap<ControlId, Entry>> =
+        RefCell::new(FxHashMap::default());
     static NEXT_TOKEN: Cell<i64> = const { Cell::new(1) };
 }
 
-/// Register a pointer-sink set for the node whose container is `cv`. Returns
-/// the (initially empty) sinks to fill and an [`EventRevoker`] that
-/// unregisters on drop.
+/// Register a pointer-sink set for node `id`. Returns the (initially empty)
+/// sinks to fill and a [`Subscription`] that unregisters on drop.
+///
+/// One sink set per node: a second registration for the same id replaces the
+/// first, matching the previous behaviour where the newer entry shadowed the
+/// older in the lookup scan.
 pub(crate) fn register_element_pointer(
-    cv: &ContainerVisual,
-) -> Result<(Rc<PointerSinks>, EventRevoker)> {
-    let key = cv
-        .cast::<IUnknown>()
-        .ok()
-        .map(|u| u.as_raw())
-        .ok_or_else(Error::empty)?;
+    id: ControlId,
+) -> Result<(Rc<PointerSinks>, Subscription)> {
     let sinks = Rc::new(PointerSinks::default());
     let token = NEXT_TOKEN.with(|t| {
         let v = t.get();
@@ -69,14 +64,15 @@ pub(crate) fn register_element_pointer(
         v
     });
     LISTENERS.with(|l| {
-        l.borrow_mut().push(Entry {
-            token,
-            key,
-            sinks: Rc::clone(&sinks),
-        })
+        l.borrow_mut().insert(
+            id,
+            Entry {
+                token,
+                sinks: Rc::clone(&sinks),
+            },
+        )
     });
-    let source: IUnknown = cv.cast()?;
-    Ok((sinks, EventRevoker::new(source, token, remove)))
+    Ok((sinks, Subscription::token(token, remove)))
 }
 
 /// Whether any pointer surface is registered — lets the input router skip the
@@ -85,17 +81,19 @@ pub(crate) fn has_listeners() -> bool {
     LISTENERS.with(|l| !l.borrow().is_empty())
 }
 
-/// The sink set registered for the container with canonical identity `key`.
-pub(crate) fn sinks_for(key: *mut c_void) -> Option<Rc<PointerSinks>> {
-    LISTENERS.with(|l| {
-        l.borrow()
-            .iter()
-            .find(|e| e.key == key)
-            .map(|e| Rc::clone(&e.sinks))
-    })
+/// The sink set registered for node `id`.
+pub(crate) fn sinks_for(id: ControlId) -> Option<Rc<PointerSinks>> {
+    LISTENERS.with(|l| l.borrow().get(&id).map(|e| Rc::clone(&e.sinks)))
 }
 
-unsafe extern "system" fn remove(_source: *mut c_void, token: i64) -> HRESULT {
-    LISTENERS.with(|l| l.borrow_mut().retain(|e| e.token != token));
-    S_OK
+/// Drop the registration for `id`. Called when the node is destroyed so a
+/// leaked [`Subscription`] cannot keep sinks alive for a dead id.
+pub(crate) fn forget(id: ControlId) {
+    LISTENERS.with(|l| {
+        l.borrow_mut().remove(&id);
+    });
+}
+
+fn remove(token: i64) {
+    LISTENERS.with(|l| l.borrow_mut().retain(|_, e| e.token != token));
 }

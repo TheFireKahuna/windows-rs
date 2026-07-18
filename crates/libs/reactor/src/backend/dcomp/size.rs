@@ -9,96 +9,76 @@
 //! which lands here, and the layout pass calls [`fire_element_size`] whenever a
 //! node's laid-out size changes.
 //!
-//! The subscription is keyed by the node container's canonical `IUnknown`
-//! identity, so the value returned to the caller is an ordinary
-//! [`EventRevoker`](windows_core::EventRevoker) that unregisters on drop — the
-//! call site is identical to the XAML path.
+//! Subscriptions are keyed by [`ControlId`], not by the container's COM
+//! identity: the layout pass already carries the id, so matching costs a hash
+//! rather than a `QueryInterface` per node per pass, and the handle handed back
+//! to app code holds no COM — nothing pins the subscriber to this thread.
 
-use core::ffi::c_void;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use windows_core::{Error, EventRevoker, Interface, Result, HRESULT, IUnknown};
+use rustc_hash::FxHashMap;
+use windows_core::Result;
 
-use crate::system_bindings::ContainerVisual;
-
-const S_OK: HRESULT = HRESULT(0);
+use crate::backend::ControlId;
+use crate::widgets::Subscription;
 
 struct Entry {
     token: i64,
-    /// Canonical `IUnknown` pointer of the node's container visual (the identity
-    /// key shared with the layout pass).
-    key: *mut c_void,
     cb: Rc<dyn Fn(f32, f32)>,
-    /// Last delivered size; the layout pass fires only on a change.
+    /// Last delivered size; the layout pass fires only on a change. Seeded NaN
+    /// so the first pass after registration always delivers.
     last: Cell<(f32, f32)>,
 }
 
 thread_local! {
-    static LISTENERS: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    static LISTENERS: RefCell<FxHashMap<ControlId, Vec<Entry>>> =
+        RefCell::new(FxHashMap::default());
     static NEXT_TOKEN: Cell<i64> = const { Cell::new(1) };
 }
 
-/// Canonical COM identity pointer for `obj` (the value the layout pass and the
-/// registration both key on). `QueryInterface(IUnknown)` returns the same pointer
-/// regardless of which interface the object was reached through.
-fn identity(obj: &impl Interface) -> Option<*mut c_void> {
-    obj.cast::<IUnknown>().ok().map(|u| u.as_raw())
-}
-
-/// Subscribe to size changes of the node whose container is `cv`. The returned
-/// [`EventRevoker`] unregisters on drop.
+/// Subscribe to size changes of the node `id`. The returned [`Subscription`]
+/// unregisters on drop.
+///
+/// The current size is not read here — that would mean reaching into the arena
+/// from inside the reconcile borrow. Instead `last` is seeded `NaN`, which no
+/// real size compares equal to, so the next layout pass delivers unconditionally
+/// and the "fires once after the first layout pass" contract holds. Layout runs
+/// at the end of every reconcile, so a subscription made while rendering is
+/// always serviced within the same frame.
 pub(crate) fn register_element_size(
-    cv: &ContainerVisual,
+    id: ControlId,
     f: impl Fn(f32, f32) + 'static,
-) -> Result<EventRevoker> {
-    let key = identity(cv).ok_or_else(Error::empty)?;
+) -> Result<Subscription> {
     let token = NEXT_TOKEN.with(|t| {
         let v = t.get();
         t.set(v + 1);
         v
     });
-    let cb: Rc<dyn Fn(f32, f32)> = Rc::new(f);
-    // The node may already be laid out (registration runs from a mount callback,
-    // which can land after the layout pass that sized it). Deliver the current
-    // size immediately — the "fires once after the first layout pass" contract —
-    // and seed `last` with it so the next layout pass doesn't re-deliver. A
-    // not-yet-laid-out node reads (0,0): keep the NaN seed so the first real
-    // layout pass delivers.
-    let current = cv
-        .cast::<crate::system_bindings::IVisual>()
-        .ok()
-        .and_then(|v| v.Size().ok())
-        .map(|s| (s.x, s.y))
-        .filter(|&(w, h)| w > 0.0 && h > 0.0);
     LISTENERS.with(|l| {
-        l.borrow_mut().push(Entry {
+        l.borrow_mut().entry(id).or_default().push(Entry {
             token,
-            key,
-            cb: cb.clone(),
-            last: Cell::new(current.unwrap_or((f32::NAN, f32::NAN))),
+            cb: Rc::new(f),
+            last: Cell::new((f32::NAN, f32::NAN)),
         })
     });
-    if let Some((w, h)) = current {
-        cb(w, h);
-    }
-    // The revoker holds a ref to the container as its `source` (kept alive for the
-    // subscription); `remove` ignores it and unregisters purely by `token`.
-    let source: IUnknown = cv.cast()?;
-    Ok(EventRevoker::new(source, token, remove))
+    Ok(Subscription::token(token, remove))
 }
 
-/// Deliver a size change for the node whose container has canonical identity
-/// `key`. Called by the layout pass when a node's laid-out size changes. Cheap
-/// when there are no listeners (the common case).
-pub(crate) fn fire_element_size(key: *mut c_void, w: f32, h: f32) {
+/// Deliver a size change for node `id`. Called by the layout pass for every
+/// node it assigns; cheap when nothing is subscribed (the common case).
+pub(crate) fn fire_element_size(id: ControlId, w: f32, h: f32) {
     // Collect the callbacks to run, then drop the borrow before invoking them
     // (a callback marks reactor state dirty; keep the registry borrow off the
     // stack while user code runs).
     let to_run: Vec<Rc<dyn Fn(f32, f32)>> = LISTENERS.with(|l| {
-        l.borrow()
+        let map = l.borrow();
+        let Some(entries) = map.get(&id) else {
+            return Vec::new();
+        };
+        entries
             .iter()
-            .filter(|e| e.key == key && e.last.get() != (w, h))
+            .filter(|e| e.last.get() != (w, h))
             .map(|e| {
                 e.last.set((w, h));
                 e.cb.clone()
@@ -111,20 +91,27 @@ pub(crate) fn fire_element_size(key: *mut c_void, w: f32, h: f32) {
 }
 
 /// Whether any size listener is currently registered. The layout pass uses this
-/// to skip the per-node identity cast entirely when nothing is subscribed.
+/// to skip the per-node lookup entirely when nothing is subscribed.
 pub(crate) fn has_listeners() -> bool {
     LISTENERS.with(|l| !l.borrow().is_empty())
 }
 
-/// Canonical identity of a node container, for the layout pass to match against
-/// registered keys.
-pub(crate) fn container_key(cv: &ContainerVisual) -> Option<*mut c_void> {
-    identity(cv)
+/// Drop every subscription for `id`. Called when the node is destroyed, so a
+/// control that goes away without its subscriber dropping the handle cannot
+/// leave entries behind for an id that no longer exists.
+pub(crate) fn forget(id: ControlId) {
+    LISTENERS.with(|l| {
+        l.borrow_mut().remove(&id);
+    });
 }
 
-/// `EventRevoker` removal hook: unregister the entry for `token`. The `source`
-/// pointer (the container) is unused — the token is the identity.
-unsafe extern "system" fn remove(_source: *mut c_void, token: i64) -> HRESULT {
-    LISTENERS.with(|l| l.borrow_mut().retain(|e| e.token != token));
-    S_OK
+/// [`Subscription`] removal hook: unregister the entry for `token`.
+fn remove(token: i64) {
+    LISTENERS.with(|l| {
+        let mut map = l.borrow_mut();
+        for entries in map.values_mut() {
+            entries.retain(|e| e.token != token);
+        }
+        map.retain(|_, entries| !entries.is_empty());
+    });
 }
