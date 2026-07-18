@@ -1,8 +1,12 @@
 windows_core::link!("user32.dll" "system" fn BeginPaint(hwnd : HWND, lppaint : *mut PAINTSTRUCT) -> HDC);
 windows_core::link!("user32.dll" "system" fn ClientToScreen(hwnd : HWND, lppoint : *mut POINT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn CloseClipboard() -> windows_core::BOOL);
+windows_core::link!("kernel32.dll" "system" fn CloseHandle(hobject : HANDLE) -> windows_core::BOOL);
 windows_core::link!("coremessaging.dll" "system" fn CreateDispatcherQueueController(options : DispatcherQueueOptions, dispatcherqueuecontroller : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
+windows_core::link!("kernel32.dll" "system" fn CreateEventW(lpeventattributes : *const SECURITY_ATTRIBUTES, bmanualreset : windows_core::BOOL, binitialstate : windows_core::BOOL, lpname : windows_core::PCWSTR) -> HANDLE);
+windows_core::link!("kernel32.dll" "system" fn CreateWaitableTimerExW(lptimerattributes : *const SECURITY_ATTRIBUTES, lptimername : windows_core::PCWSTR, dwflags : u32, dwdesiredaccess : u32) -> HANDLE);
 windows_core::link!("user32.dll" "system" fn CreateWindowExW(dwexstyle : WINDOW_EX_STYLE, lpclassname : windows_core::PCWSTR, lpwindowname : windows_core::PCWSTR, dwstyle : WINDOW_STYLE, x : i32, y : i32, nwidth : i32, nheight : i32, hwndparent : HWND, hmenu : HMENU, hinstance : HINSTANCE, lpparam : *const core::ffi::c_void) -> HWND);
+windows_core::link!("dcomp.dll" "system" fn DCompositionWaitForCompositorClock(count : u32, handles : *const HANDLE, timeoutinms : u32) -> u32);
 windows_core::link!("user32.dll" "system" fn DefWindowProcW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
 windows_core::link!("user32.dll" "system" fn DestroyWindow(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn DispatchMessageW(lpmsg : *const MSG) -> LRESULT);
@@ -42,7 +46,6 @@ windows_core::link!("imm32.dll" "system" fn ImmNotifyIME(param0 : HIMC, dwaction
 windows_core::link!("imm32.dll" "system" fn ImmReleaseContext(param0 : HWND, param1 : HIMC) -> windows_core::BOOL);
 windows_core::link!("imm32.dll" "system" fn ImmSetCompositionWindow(param0 : HIMC, lpcompform : *const COMPOSITIONFORM) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn IsZoomed(hwnd : HWND) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn KillTimer(hwnd : HWND, uidevent : usize) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn LoadCursorW(hinstance : HINSTANCE, lpcursorname : windows_core::PCWSTR) -> HCURSOR);
 windows_core::link!("user32.dll" "system" fn MonitorFromPoint(pt : POINT, dwflags : MONITOR_FROM_FLAGS) -> HMONITOR);
 windows_core::link!("user32.dll" "system" fn MonitorFromWindow(hwnd : HWND, dwflags : MONITOR_FROM_FLAGS) -> HMONITOR);
@@ -58,8 +61,9 @@ windows_core::link!("user32.dll" "system" fn SendMessageW(hwnd : HWND, msg : u32
 windows_core::link!("user32.dll" "system" fn SetCapture(hwnd : HWND) -> HWND);
 windows_core::link!("user32.dll" "system" fn SetClipboardData(uformat : u32, hmem : HANDLE) -> HANDLE);
 windows_core::link!("user32.dll" "system" fn SetCursor(hcursor : HCURSOR) -> HCURSOR);
+windows_core::link!("kernel32.dll" "system" fn SetEvent(hevent : HANDLE) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn SetProcessDpiAwarenessContext(value : DPI_AWARENESS_CONTEXT) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn SetTimer(hwnd : HWND, nidevent : usize, uelapse : u32, lptimerfunc : TIMERPROC) -> usize);
+windows_core::link!("kernel32.dll" "system" fn SetWaitableTimerEx(htimer : HANDLE, lpduetime : *const i64, lperiod : i32, pfncompletionroutine : PTIMERAPCROUTINE, lpargtocompletionroutine : *const core::ffi::c_void, wakecontext : *const REASON_CONTEXT, tolerabledelay : u32) -> windows_core::BOOL);
 #[cfg(any(
     target_arch = "aarch64",
     target_arch = "arm64ec",
@@ -81,6 +85,7 @@ windows_core::link!("uiautomationcore.dll" "system" fn UiaReturnRawElementProvid
 windows_core::link!("user32.dll" "system" fn UnregisterClassW(lpclassname : windows_core::PCWSTR, hinstance : HINSTANCE) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn UpdateWindow(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn ValidateRect(hwnd : HWND, lprect : *const RECT) -> windows_core::BOOL);
+windows_core::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u32, lphandles : *const HANDLE, bwaitall : windows_core::BOOL, dwmilliseconds : u32) -> WAIT_EVENT);
 pub type ADVANCED_FEATURE_FLAGS = u16;
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -199,6 +204,86 @@ impl windows_core::RuntimeName for CompositionAnimation {
 }
 unsafe impl Send for CompositionAnimation {}
 unsafe impl Sync for CompositionAnimation {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionBatchCompletedEventArgs(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionBatchCompletedEventArgs,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionBatchCompletedEventArgs, CompositionObject);
+impl windows_core::RuntimeType for CompositionBatchCompletedEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionBatchCompletedEventArgs>();
+}
+unsafe impl windows_core::Interface for CompositionBatchCompletedEventArgs {
+    type Vtable = <ICompositionBatchCompletedEventArgs as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICompositionBatchCompletedEventArgs as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionBatchCompletedEventArgs {
+    type Target = ICompositionBatchCompletedEventArgs;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionBatchCompletedEventArgs {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionBatchCompletedEventArgs";
+}
+unsafe impl Send for CompositionBatchCompletedEventArgs {}
+unsafe impl Sync for CompositionBatchCompletedEventArgs {}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompositionBatchTypes(pub u32);
+impl CompositionBatchTypes {
+    pub const None: Self = Self(0);
+    pub const Animation: Self = Self(1);
+    pub const Effect: Self = Self(2);
+    pub const InfiniteAnimation: Self = Self(4);
+    pub const AllAnimations: Self = Self(5);
+}
+impl windows_core::TypeKind for CompositionBatchTypes {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for CompositionBatchTypes {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"enum(Windows.UI.Composition.CompositionBatchTypes;u4)",
+    );
+}
+impl CompositionBatchTypes {
+    pub const fn contains(&self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+impl core::ops::BitOr for CompositionBatchTypes {
+    type Output = Self;
+    fn bitor(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+impl core::ops::BitAnd for CompositionBatchTypes {
+    type Output = Self;
+    fn bitand(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+}
+impl core::ops::BitOrAssign for CompositionBatchTypes {
+    fn bitor_assign(&mut self, other: Self) {
+        self.0.bitor_assign(other.0);
+    }
+}
+impl core::ops::BitAndAssign for CompositionBatchTypes {
+    fn bitand_assign(&mut self, other: Self) {
+        self.0.bitand_assign(other.0);
+    }
+}
+impl core::ops::Not for CompositionBatchTypes {
+    type Output = Self;
+    fn not(self) -> Self {
+        Self(self.0.not())
+    }
+}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionBrush(windows_core::IUnknown);
@@ -490,6 +575,34 @@ impl windows_core::RuntimeName for CompositionObject {
 }
 unsafe impl Send for CompositionObject {}
 unsafe impl Sync for CompositionObject {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionScopedBatch(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionScopedBatch,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionScopedBatch, CompositionObject);
+impl windows_core::RuntimeType for CompositionScopedBatch {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionScopedBatch>();
+}
+unsafe impl windows_core::Interface for CompositionScopedBatch {
+    type Vtable = <ICompositionScopedBatch as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionScopedBatch as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionScopedBatch {
+    type Target = ICompositionScopedBatch;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionScopedBatch {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionScopedBatch";
+}
+unsafe impl Send for CompositionScopedBatch {}
+unsafe impl Sync for CompositionScopedBatch {}
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CompositionStretch(pub i32);
@@ -1294,6 +1407,19 @@ pub struct ICompositionAnimationBase_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
+    ICompositionBatchCompletedEventArgs,
+    ICompositionBatchCompletedEventArgs_Vtbl,
+    0x0d00dad0_9464_450a_a562_2e2698b0a812
+);
+impl windows_core::RuntimeType for ICompositionBatchCompletedEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionBatchCompletedEventArgs_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
     ICompositionBrush,
     ICompositionBrush_Vtbl,
     0xab0d7608_30c0_40e9_b568_b60a6bd1fb46
@@ -1827,6 +1953,80 @@ pub struct ICompositionObject2_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    ICompositionScopedBatch,
+    ICompositionScopedBatch_Vtbl,
+    0x0d00dad0_fb07_46fd_8c72_6280d1a3d1dd
+);
+impl windows_core::RuntimeType for ICompositionScopedBatch {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionScopedBatch {
+    pub(crate) fn End(&self) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).End)(windows_core::Interface::as_raw(self)).ok()
+        }
+    }
+    pub(crate) fn Completed<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(
+                windows_core::Ref<windows_core::IInspectable>,
+                windows_core::Ref<CompositionBatchCompletedEventArgs>,
+            ) + 'static,
+    {
+        let handler: TypedEventHandler<
+            windows_core::IInspectable,
+            CompositionBatchCompletedEventArgs,
+        > = {
+            let com = windows_core::imp::DelegateBox::<
+                TypedEventHandler<windows_core::IInspectable, CompositionBatchCompletedEventArgs>,
+                F,
+            >::new(
+                &TypedEventHandlerBox::<
+                    windows_core::IInspectable,
+                    CompositionBatchCompletedEventArgs,
+                    F,
+                >::VTABLE,
+                handler,
+            );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).Completed)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemoveCompleted,
+            ))
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionScopedBatch_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    IsActive: usize,
+    IsEnded: usize,
+    pub End: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+    Resume: usize,
+    Suspend: usize,
+    pub Completed: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveCompleted:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     ICompositionSurface,
     ICompositionSurface_Vtbl,
     0x1527540d_42c7_47a6_a408_668f79a90dfb
@@ -2128,6 +2328,20 @@ impl ICompositor {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn CreateScopedBatch(
+        &self,
+        batchtype: CompositionBatchTypes,
+    ) -> windows_core::Result<CompositionScopedBatch> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateScopedBatch)(
+                windows_core::Interface::as_raw(self),
+                batchtype,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) fn CreateSpriteVisual(&self) -> windows_core::Result<SpriteVisual> {
         unsafe {
             let mut result__ = core::mem::zeroed();
@@ -2247,7 +2461,11 @@ pub struct ICompositor_Vtbl {
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    CreateScopedBatch: usize,
+    pub CreateScopedBatch: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        CompositionBatchTypes,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub CreateSpriteVisual: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
@@ -2303,6 +2521,16 @@ impl ICompositor2 {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn CreateStepEasingFunction(&self) -> windows_core::Result<StepEasingFunction> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateStepEasingFunction)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
 }
 #[repr(C)]
 pub struct ICompositor2_Vtbl {
@@ -2319,6 +2547,12 @@ pub struct ICompositor2_Vtbl {
     CreateLayerVisual: usize,
     CreateMaskBrush: usize,
     pub CreateNineGridBrush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    CreatePointLight: usize,
+    CreateSpotLight: usize,
+    pub CreateStepEasingFunction: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
@@ -4319,6 +4553,19 @@ pub struct ISpriteVisual_Vtbl {
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IStepEasingFunction,
+    IStepEasingFunction_Vtbl,
+    0xd0caa74b_560c_4a0b_a5f6_206ca8c3ecd6
+);
+impl windows_core::RuntimeType for IStepEasingFunction {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IStepEasingFunction_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
     ITextStoreACP,
@@ -6655,7 +6902,51 @@ pub struct POINTER_INFO {
     pub ButtonChangeType: POINTER_BUTTON_CHANGE_TYPE,
 }
 pub type POINTER_INPUT_TYPE = i32;
+pub type POWER_REQUEST_CONTEXT_FLAGS = u32;
+pub type PTIMERAPCROUTINE = Option<
+    unsafe extern "system" fn(
+        lpargtocompletionroutine: *const core::ffi::c_void,
+        dwtimerlowvalue: u32,
+        dwtimerhighvalue: u32,
+    ),
+>;
 pub type ProviderOptions = i32;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct REASON_CONTEXT {
+    pub Version: u32,
+    pub Flags: POWER_REQUEST_CONTEXT_FLAGS,
+    pub Reason: REASON_CONTEXT_0,
+}
+impl Default for REASON_CONTEXT {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union REASON_CONTEXT_0 {
+    pub Detailed: REASON_CONTEXT_0_0,
+    pub SimpleReasonString: windows_core::PWSTR,
+}
+impl Default for REASON_CONTEXT_0 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct REASON_CONTEXT_0_0 {
+    pub LocalizedReasonModule: HMODULE,
+    pub LocalizedReasonId: u32,
+    pub ReasonStringCount: u32,
+    pub ReasonStrings: *mut windows_core::PWSTR,
+}
+impl Default for REASON_CONTEXT_0_0 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RECT {
@@ -6689,6 +6980,18 @@ pub const SC_CLOSE: u32 = 61536;
 pub const SC_MAXIMIZE: u32 = 61488;
 pub const SC_MINIMIZE: u32 = 61472;
 pub const SC_RESTORE: u32 = 61728;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SECURITY_ATTRIBUTES {
+    pub nLength: u32,
+    pub lpSecurityDescriptor: *mut core::ffi::c_void,
+    pub bInheritHandle: windows_core::BOOL,
+}
+impl Default for SECURITY_ATTRIBUTES {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 pub type SET_WINDOW_POS_FLAGS = u32;
 pub type SHOW_WINDOW_CMD = i32;
 #[repr(C)]
@@ -6714,6 +7017,7 @@ pub const SW_RESTORE: SHOW_WINDOW_CMD = 9;
 pub const SW_SHOW: SHOW_WINDOW_CMD = 5;
 pub const SW_SHOWDEFAULT: SHOW_WINDOW_CMD = 10;
 pub const SW_SHOWNORMAL: SHOW_WINDOW_CMD = 1;
+pub type SYNCHRONIZATION_ACCESS_RIGHTS = u32;
 pub type SYSTEM_METRICS_INDEX = i32;
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6946,6 +7250,38 @@ impl windows_core::RuntimeName for SpriteVisual {
 }
 unsafe impl Send for SpriteVisual {}
 unsafe impl Sync for SpriteVisual {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StepEasingFunction(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    StepEasingFunction,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    StepEasingFunction,
+    CompositionEasingFunction,
+    CompositionObject
+);
+impl windows_core::RuntimeType for StepEasingFunction {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IStepEasingFunction>();
+}
+unsafe impl windows_core::Interface for StepEasingFunction {
+    type Vtable = <IStepEasingFunction as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IStepEasingFunction as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for StepEasingFunction {
+    type Target = IStepEasingFunction;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for StepEasingFunction {
+    const NAME: &'static str = "Windows.UI.Composition.StepEasingFunction";
+}
+unsafe impl Send for StepEasingFunction {}
+unsafe impl Sync for StepEasingFunction {}
 pub type SupportedTextSelection = i32;
 pub type TEXT_STORE_LOCK_FLAGS = u32;
 pub type TEXT_STORE_TEXT_CHANGE_FLAGS = u32;
@@ -6954,8 +7290,7 @@ pub const TF_ES_ASYNCDONTCARE: TF_CONTEXT_EDIT_CONTEXT_FLAGS = 0;
 pub const TF_ES_READ: TF_CONTEXT_EDIT_CONTEXT_FLAGS = 2;
 pub const TF_ES_READWRITE: TF_CONTEXT_EDIT_CONTEXT_FLAGS = 6;
 pub const TF_ES_SYNC: TF_CONTEXT_EDIT_CONTEXT_FLAGS = 1;
-pub type TIMERPROC =
-    Option<unsafe extern "system" fn(param0: HWND, param1: u32, param2: usize, param3: u32)>;
+pub const TIMER_ALL_ACCESS: SYNCHRONIZATION_ACCESS_RIGHTS = 2031619;
 pub const TME_LEAVE: TRACKMOUSEEVENT_FLAGS = 2;
 pub const TME_NONCLIENT: TRACKMOUSEEVENT_FLAGS = 16;
 #[repr(C)]
@@ -7031,6 +7366,82 @@ pub type ToggleState = i32;
 pub type TsActiveSelEnd = i32;
 pub type TsLayoutCode = i32;
 pub type TsRunType = i32;
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedEventHandler<TSender, TResult>(
+    windows_core::IUnknown,
+    core::marker::PhantomData<TSender>,
+    core::marker::PhantomData<TResult>,
+)
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static;
+unsafe impl<
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+> windows_core::Interface for TypedEventHandler<TSender, TResult>
+{
+    type Vtable = TypedEventHandler_Vtbl<TSender, TResult>;
+    const IID: windows_core::GUID =
+        windows_core::GUID::from_signature(<Self as windows_core::RuntimeType>::SIGNATURE);
+}
+impl<TSender: windows_core::RuntimeType + 'static, TResult: windows_core::RuntimeType + 'static>
+    windows_core::RuntimeType for TypedEventHandler<TSender, TResult>
+{
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::new()
+        .push_slice(b"pinterface({9de1c534-6ae1-11e0-84e1-18a905bcc53f}")
+        .push_slice(b";")
+        .push_other(TSender::SIGNATURE)
+        .push_slice(b";")
+        .push_other(TResult::SIGNATURE)
+        .push_slice(b")");
+}
+#[repr(C)]
+pub struct TypedEventHandler_Vtbl<TSender, TResult>
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+{
+    base__: windows_core::IUnknown_Vtbl,
+    Invoke: unsafe extern "system" fn(
+        this: *mut core::ffi::c_void,
+        sender: windows_core::AbiType<TSender>,
+        args: windows_core::AbiType<TResult>,
+    ) -> windows_core::HRESULT,
+    TSender: core::marker::PhantomData<TSender>,
+    TResult: core::marker::PhantomData<TResult>,
+}
+struct TypedEventHandlerBox<
+    TSender,
+    TResult,
+    F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static,
+>(core::marker::PhantomData<(TSender, TResult, fn() -> F)>)
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static;
+impl<
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+    F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static,
+> TypedEventHandlerBox<TSender, TResult, F>
+{
+    const VTABLE : TypedEventHandler_Vtbl < TSender , TResult , > = TypedEventHandler_Vtbl::< TSender , TResult , > { base__ : windows_core::IUnknown_Vtbl { QueryInterface : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::QueryInterface , AddRef : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::AddRef , Release : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::Release , } , Invoke : Self::Invoke , TSender : core::marker::PhantomData::< TSender > , TResult : core::marker::PhantomData::< TResult > } ;
+    unsafe extern "system" fn Invoke(
+        this: *mut core::ffi::c_void,
+        sender: windows_core::AbiType<TSender>,
+        args: windows_core::AbiType<TResult>,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            let this = &mut *(this as *mut *mut core::ffi::c_void
+                as *mut windows_core::imp::DelegateBox<TypedEventHandler<TSender, TResult>, F>);
+            (this.invoke)(
+                core::mem::transmute_copy(&sender),
+                core::mem::transmute_copy(&args),
+            );
+            windows_core::HRESULT(0)
+        }
+    }
+}
 pub const UIA_AutomationFocusChangedEventId: UIA_EVENT_ID = 20005;
 pub const UIA_AutomationIdPropertyId: UIA_PROPERTY_ID = 30011;
 pub const UIA_AutomationPropertyChangedEventId: UIA_EVENT_ID = 20004;
@@ -7411,6 +7822,8 @@ impl windows_core::RuntimeName for VisualCollection {
 }
 unsafe impl Send for VisualCollection {}
 unsafe impl Sync for VisualCollection {}
+pub type WAIT_EVENT = u32;
+pub const WAIT_FAILED: WAIT_EVENT = 4294967295;
 pub const WHEEL_DELTA: u32 = 120;
 pub type WIN32_ERROR = u32;
 #[repr(C)]
@@ -7482,7 +7895,6 @@ pub const WM_SIZE: u32 = 5;
 pub const WM_SYSCOMMAND: u32 = 274;
 pub const WM_SYSKEYDOWN: u32 = 260;
 pub const WM_SYSKEYUP: u32 = 261;
-pub const WM_TIMER: u32 = 275;
 pub const WM_WINDOWPOSCHANGED: u32 = 71;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

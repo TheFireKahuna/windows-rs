@@ -755,8 +755,10 @@ impl RenderCx {
     }
 
     /// Read the host's effective [`ColorScheme`] (Light / Dark) for the
-    /// current render. Re-rendering on theme switches is driven by the
-    /// host via `FrameworkElement::ActualThemeChanged`.
+    /// current render — the resolution of the app's requested-theme override
+    /// against the OS setting. Re-rendering on theme switches is driven by the
+    /// host (XAML's `ActualThemeChanged` on the WinUI backend; the effective-
+    /// theme resolver on the DComp backend).
     pub fn use_color_scheme(&self) -> ColorScheme {
         current_color_scheme()
     }

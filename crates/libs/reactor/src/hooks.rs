@@ -107,10 +107,10 @@ fn duration_to_timespan(d: Duration) -> TimeSpan {
 // A backend-agnostic per-frame callback registry. On the WinUI backend frames
 // come from `CompositionTarget::Rendering` (see `on_rendering`); the self-hosted
 // DirectComposition backend has no XAML static, so it drives this registry from
-// its self-stopping timer instead — and only while at least one subscriber is
-// live, so an idle window keeps zero CPU. Canvas/viz (`SurfacePainter`,
-// `animated_canvas`) can subscribe here to be paced by whichever backend is
-// hosting them, without depending on XAML.
+// its compositor-clock frame pacer instead — one wake per display refresh, and
+// only while at least one subscriber is live, so an idle window keeps zero CPU.
+// Canvas/viz (`SurfacePainter`, `animated_canvas`) can subscribe here to be
+// paced by whichever backend is hosting them, without depending on XAML.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -165,7 +165,7 @@ pub fn frame_ticks_active() -> bool {
 }
 
 /// Invoke every live frame-tick callback once. Called by the host's frame pump
-/// (the DComp backend's self-stopping timer) per frame.
+/// (the DComp backend's compositor-clock pacer) per frame.
 pub fn drive_frame_ticks() {
     let ticks: Vec<Rc<dyn Fn()>> = FRAME_TICKS.with(|t| t.borrow().iter().map(|(_, f)| f.clone()).collect());
     for f in ticks {

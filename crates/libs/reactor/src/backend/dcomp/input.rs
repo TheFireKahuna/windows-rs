@@ -261,9 +261,9 @@ impl DCompBackend {
         if let Some((sid, sinks, dy)) = self.pressed_surface.clone() {
             self.fire_surface(sid, &sinks.moved, x, y + dy, true, 0);
             // Repaint the dragged surface with THIS move rather than on the next
-            // WM_TIMER: the timer is a low-priority message a fast move stream
-            // can starve, which reads as drag lag. Moves are queue-coalesced, so
-            // this self-limits to the pump's processing rate.
+            // paced frame message: moves are queue-coalesced, so this self-limits
+            // to the pump's processing rate and shaves up to a frame of latency
+            // off the drag.
             crate::drive_frame_ticks();
             return;
         }
@@ -849,7 +849,7 @@ impl DCompBackend {
             if let Some(e) = &mut n.editor {
                 e.set_text(&text);
                 e.seeded = true;
-                e.blink_on = true;
+                e.caret_moved = true;
             }
             n.mark_dirty();
         }
@@ -858,16 +858,23 @@ impl DCompBackend {
     }
 
     /// Close the open popup with a compositor-side dismiss fade. The overlay
-    /// visual is parked as a [`Ghost`] and released by the one-shot ghost timer
-    /// once the fade lands — no app frames, one wakeup at the end.
+    /// visual is parked as a [`Ghost`] and released when the scoped batch
+    /// wrapping its fade completes — no app frames, no timer.
     fn close_popup(&mut self) {
         if let Some(p) = self.popup.take() {
-            if let Some(v) = p.into_exit(&self.comp) {
-                let deadline = std::time::Instant::now()
-                    + popup::EXIT_DURATION
-                    + std::time::Duration::from_millis(80);
-                self.ghosts.push(Ghost { shown: v, deadline });
-                self.arm_ghost_timer();
+            let batch = self
+                .comp
+                .compositor()
+                .CreateScopedBatch(CompositionBatchTypes::Animation);
+            let shown = p.into_exit(&self.comp);
+            match (shown, batch) {
+                (Some(v), Ok(batch)) => self.park_ghost(v, batch),
+                (Some(v), Err(_)) => {
+                    // No completion signal possible — drop the overlay now
+                    // (skipping the fade) rather than leak it.
+                    self.comp.remove_root_visual(&v);
+                }
+                (None, _) => {}
             }
         }
     }
@@ -1015,18 +1022,15 @@ impl DCompBackend {
             .then_some(id)
     }
 
-    /// Whether the caret-blink timer should be running (a text field is focused).
-    pub(crate) fn wants_blink_timer(&self) -> bool {
-        self.focused_editable().is_some()
-    }
-
-    /// Show / hide the focused field's caret when the host window gains or
-    /// loses activation (keyboard focus is retained either way).
-    pub(crate) fn window_focus_changed(&mut self, focused: bool) {
+    /// Restart the focused field's caret blink so it picks up the current
+    /// system blink period (`GetCaretBlinkTime` is re-read at animation
+    /// start). Called on `WM_SETTINGCHANGE`, where a control-panel blink-rate
+    /// change lands.
+    pub(crate) fn refresh_caret_blink(&mut self) {
         if let Some(id) = self.focused_editable() {
             if let Some(n) = self.node_mut(id) {
                 if let Some(e) = &mut n.editor {
-                    e.blink_on = focused;
+                    e.caret_moved = true;
                 }
                 n.mark_dirty();
             }
@@ -1034,12 +1038,15 @@ impl DCompBackend {
         }
     }
 
-    /// Flip the focused field's caret-blink phase and repaint just that field.
-    pub(crate) fn blink_tick(&mut self) {
+    /// Show / hide the focused field's caret when the host window gains or
+    /// loses activation (keyboard focus is retained either way). Re-activating
+    /// restarts the blink solid-first.
+    pub(crate) fn window_focus_changed(&mut self, focused: bool) {
         if let Some(id) = self.focused_editable() {
             if let Some(n) = self.node_mut(id) {
                 if let Some(e) = &mut n.editor {
-                    e.blink_on = !e.blink_on;
+                    e.caret_shown = focused;
+                    e.caret_moved = true;
                 }
                 n.mark_dirty();
             }
@@ -1242,7 +1249,7 @@ impl DCompBackend {
     fn editor_caret_moved(&mut self, id: ControlId) {
         if let Some(n) = self.node_mut(id) {
             if let Some(e) = &mut n.editor {
-                e.blink_on = true;
+                e.caret_moved = true;
             }
             n.mark_dirty();
         }
@@ -1256,7 +1263,7 @@ impl DCompBackend {
             Some(n) => {
                 let kind = n.kind;
                 if let Some(e) = &mut n.editor {
-                    e.blink_on = true;
+                    e.caret_moved = true;
                     e.seeded = true;
                 }
                 let text = n.editor.as_ref().map(|e| e.text()).unwrap_or_default();
@@ -1327,7 +1334,7 @@ impl DCompBackend {
             if let Some(e) = &mut n.editor {
                 e.set_text(&s);
                 e.seeded = true;
-                e.blink_on = true;
+                e.caret_moved = true;
             }
             n.mark_dirty();
         }
@@ -1354,7 +1361,7 @@ impl DCompBackend {
             if let Some(e) = &mut n.editor {
                 e.caret = idx;
                 e.anchor = idx;
-                e.blink_on = true;
+                e.caret_moved = true;
             }
             n.mark_dirty();
         }
@@ -1369,7 +1376,7 @@ impl DCompBackend {
         if let Some(n) = self.node_mut(id) {
             if let Some(e) = &mut n.editor {
                 e.caret = idx;
-                e.blink_on = true;
+                e.caret_moved = true;
             }
             n.mark_dirty();
         }
@@ -1546,7 +1553,7 @@ impl DCompBackend {
                 && let Some(e) = &mut n.editor
             {
                 e.select_all();
-                e.blink_on = true;
+                e.caret_moved = true;
             }
             n.mark_dirty();
         }
@@ -1589,7 +1596,7 @@ impl DCompBackend {
             if let Some(e) = &mut n.editor {
                 e.set_text(s);
                 e.seeded = true;
-                e.blink_on = true;
+                e.caret_moved = true;
             }
             n.mark_dirty();
         }

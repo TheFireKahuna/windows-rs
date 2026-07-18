@@ -192,6 +192,10 @@ pub(crate) struct Node {
     /// motion runs DWM-side. Created lazily by the parts sync; `None` for
     /// every other node. See [`parts`](super::parts).
     pub parts: Option<Box<parts::Parts>>,
+    /// Editors only: the caret sprite (topmost child, above the painted text)
+    /// whose blink is a compositor-side square-wave opacity animation. Created
+    /// lazily on first focused paint; see [`parts::sync_caret`].
+    pub caret: Option<parts::Caret>,
     /// ScrollViewer only: the auto-hiding overlay scrollbar thumb sprite (a top
     /// child of the container, above the scrolled content), created lazily.
     pub scroll_thumb: Option<NodeSurface>,
@@ -330,6 +334,7 @@ impl Node {
             vis,
             surf: None,
             parts: None,
+            caret: None,
             scroll_thumb: None,
             scroll_content: None,
             scroll_spring: None,

@@ -39,7 +39,7 @@ use crate::backend::ControlKind;
 use crate::system_bindings::{
     AnimationIterationBehavior, CompositionAnimation, CompositionBrush,
     CompositionDrawingSurface, CompositionEasingFunction, CompositionNineGridBrush,
-    CompositionSurfaceBrush, ICompositionObject, ICompositor4, IKeyFrameAnimation,
+    CompositionSurfaceBrush, ICompositionObject, ICompositor2, ICompositor4, IKeyFrameAnimation,
     ISpringVector2NaturalMotionAnimation, ISpringVector3NaturalMotionAnimation,
     IVector2NaturalMotionAnimation, IVector3NaturalMotionAnimation, IVisual,
     SpringVector2NaturalMotionAnimation, SpringVector3NaturalMotionAnimation, SpriteVisual,
@@ -1266,4 +1266,141 @@ fn ring_sync(comp: &Compositing, node: &mut Node) {
     }
     parts.geom = (w, h);
     parts.init = true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Caret — the focused text editor's blinking insertion bar
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The focused editor's caret: a 1-DIP sprite above the painted text whose
+/// blink is an INFINITE square-wave opacity animation evaluated by the system
+/// compositor. The app touches it only on input edges (type / caret move /
+/// focus / activation) — no timer, no per-blink repaint.
+pub(crate) struct Caret {
+    sprite: SpriteVisual,
+    vis: IVisual,
+    obj: ICompositionObject,
+    /// The atlas source currently bound + the epoch it came from.
+    key: Option<AtlasKey>,
+    epoch: u32,
+    /// Last placed box (change-gated writes).
+    rect: Option<(f32, f32, f32, f32)>,
+    /// Whether the sprite is currently shown (blink running or solid).
+    shown: bool,
+}
+
+impl Caret {
+    /// Create the sprite as the TOPMOST child of the editor's container, above
+    /// its painted surface.
+    fn new(comp: &Compositing, node: &Node) -> Option<Self> {
+        let sprite = comp.new_sprite().ok()?;
+        let vis: IVisual = sprite.cast().ok()?;
+        let obj: ICompositionObject = sprite.cast().ok()?;
+        let v: Visual = sprite.cast().ok()?;
+        node.container.Children().ok()?.InsertAtTop(&v).ok()?;
+        Some(Self { sprite, vis, obj, key: None, epoch: 0, rect: None, shown: false })
+    }
+
+    /// Bind (or re-bind) the solid atlas source for `key` (same epoch contract
+    /// as [`Part::bind`]).
+    fn bind(&mut self, comp: &Compositing, atlas: &mut Atlas, key: AtlasKey) {
+        if self.key == Some(key) && self.epoch == atlas.epoch {
+            return;
+        }
+        let epoch = atlas.epoch;
+        let Some(entry) = atlas.entry(comp, key) else { return };
+        if let Ok(b) = entry.brush.cast::<CompositionBrush>()
+            && self.sprite.SetBrush(&b).is_ok()
+        {
+            self.key = Some(key);
+            self.epoch = epoch;
+        }
+    }
+
+    fn place(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if self.rect != Some((x, y, w, h)) {
+            let _ = self.vis.SetOffset(Vector3::new(x, y, 0.0));
+            let _ = self.vis.SetSize(Vector2::new(w, h));
+            self.rect = Some((x, y, w, h));
+        }
+    }
+
+    /// Stop the blink and hide the sprite (blur / window deactivated).
+    fn hide(&mut self) {
+        if !self.shown {
+            return;
+        }
+        let _ = self.obj.StopAnimation("Opacity");
+        let _ = self.vis.SetIsVisible(false);
+        self.shown = false;
+    }
+
+    /// (Re)start the blink solid-first — or pin a solid caret when the system
+    /// blink is disabled (`GetCaretBlinkTime` of 0 / INFINITE).
+    fn start_blink(&mut self, comp: &Compositing) {
+        let _ = self.vis.SetIsVisible(true);
+        self.shown = true;
+        let interval = unsafe { crate::system_bindings::GetCaretBlinkTime() };
+        if interval == 0 || interval == u32::MAX || self.blink(comp, interval).is_none() {
+            // Blinking disabled (or animation setup failed): a solid caret.
+            let _ = self.obj.StopAnimation("Opacity");
+            let _ = self.vis.SetOpacity(1.0);
+        }
+    }
+
+    /// A square wave on Opacity: solid for `interval_ms`, hidden for
+    /// `interval_ms`, repeated forever — steps(1) easing holds each level and
+    /// jumps at the segment boundary. Runs entirely on the DWM.
+    fn blink(&self, comp: &Compositing, interval_ms: u32) -> Option<()> {
+        let compositor = comp.compositor();
+        let a = compositor.CreateScalarKeyFrameAnimation().ok()?;
+        let kf: IKeyFrameAnimation = a.cast().ok()?;
+        kf.SetDuration(ts_secs(interval_ms as f32 * 2.0 / 1000.0)).ok()?;
+        kf.SetIterationBehavior(AnimationIterationBehavior::Forever).ok()?;
+        let step: CompositionEasingFunction = compositor
+            .cast::<ICompositor2>()
+            .ok()?
+            .CreateStepEasingFunction()
+            .ok()?
+            .cast()
+            .ok()?;
+        a.InsertKeyFrame(0.0, 1.0).ok()?;
+        a.InsertKeyFrameWithEasingFunction(0.5, 0.0, &step).ok()?;
+        a.InsertKeyFrameWithEasingFunction(1.0, 0.0, &step).ok()?;
+        self.obj
+            .StartAnimation("Opacity", &a.cast::<CompositionAnimation>().ok()?)
+            .ok()
+    }
+}
+
+/// Reconcile an editor node's caret sprite against the state just painted:
+/// shown while the node is focused (and the window active), placed from the
+/// same text metrics the paint used, blink restarted solid-first on caret
+/// movement. Rides the repaint choke — every state change that can move the
+/// caret already repaints the field.
+pub(crate) fn sync_caret(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+    let show = node.focused
+        && node.paint.is_enabled
+        && node.editor.as_ref().is_some_and(|e| e.caret_shown);
+    if !show {
+        if let Some(c) = &mut node.caret {
+            c.hide();
+        }
+        return;
+    }
+    let Some(bx) = super::controls::editor_caret_box(node) else { return };
+    if node.caret.is_none() {
+        node.caret = Caret::new(comp, node);
+    }
+    let Some(mut caret) = node.caret.take() else { return };
+    caret.bind(comp, atlas, AtlasKey::solid(theme::text(), scale));
+    caret.place(bx.left, bx.top, bx.width(), bx.height());
+    let moved = node.editor.as_ref().is_some_and(|e| e.caret_moved);
+    if moved || !caret.shown {
+        caret.start_blink(comp);
+    }
+    node.caret = Some(caret);
+    if let Some(e) = node.editor.as_mut() {
+        e.caret_moved = false;
+    }
 }

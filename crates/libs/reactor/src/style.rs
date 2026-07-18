@@ -1,8 +1,9 @@
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
+    rc::Rc,
     time::Duration,
 };
 
@@ -334,10 +335,56 @@ pub fn current_color_scheme() -> ColorScheme {
     CURRENT_COLOR_SCHEME.with(|c| c.get())
 }
 
-/// Update the per-thread [`ColorScheme`]; called by the host on
-/// `ActualThemeChanged` (and once during initial attach).
+/// Update the per-thread [`ColorScheme`]; called by the host when the effective
+/// theme changes (and once during startup/attach).
 pub fn set_current_color_scheme(scheme: ColorScheme) {
     CURRENT_COLOR_SCHEME.with(|c| c.set(scheme));
+}
+
+/// Requested application theme: an app-level override of the OS light/dark
+/// setting. `Default` follows the system; `Light`/`Dark` force the scheme.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum RequestedTheme {
+    /// Use the system default (inherits from the OS app-theme setting).
+    #[default]
+    Default,
+    /// Force light theme.
+    Light,
+    /// Force dark theme.
+    Dark,
+}
+
+thread_local! {
+    /// The app's requested theme override for this UI thread — the single source
+    /// of truth both hosts resolve against. Holding it here (rather than in
+    /// host-specific state) makes a call before the host exists naturally
+    /// pending: the host reads it at startup/attach.
+    static REQUESTED_THEME: Cell<RequestedTheme> = const { Cell::new(RequestedTheme::Default) };
+    /// Host-installed hook that applies a theme change to the live window.
+    /// Absent until a host runs on this thread (the stored request applies then).
+    static THEME_APPLIER: RefCell<Option<Rc<dyn Fn(RequestedTheme)>>> = const { RefCell::new(None) };
+}
+
+/// Set the application theme override. Takes effect immediately when a host is
+/// live on this thread; otherwise it is applied when one starts.
+pub fn set_requested_theme(theme: RequestedTheme) {
+    REQUESTED_THEME.with(|c| c.set(theme));
+    if let Some(applier) = THEME_APPLIER.with(|a| a.borrow().clone()) {
+        applier(theme);
+    }
+}
+
+/// Read the app's requested theme override for the current UI thread.
+pub fn requested_theme() -> RequestedTheme {
+    REQUESTED_THEME.with(|c| c.get())
+}
+
+/// Install (or clear) the host hook [`set_requested_theme`] routes through. The
+/// hook may fire from inside event dispatch — a host whose apply path needs the
+/// reconciler must defer (e.g. post through its message pump) rather than borrow
+/// synchronously.
+pub(crate) fn set_theme_applier(applier: Option<Rc<dyn Fn(RequestedTheme)>>) {
+    THEME_APPLIER.with(|a| *a.borrow_mut() = applier);
 }
 
 /// Symbolic reference to a WinUI XAML theme resource (resolved at apply

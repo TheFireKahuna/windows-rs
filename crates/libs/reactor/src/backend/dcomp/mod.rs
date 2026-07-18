@@ -16,8 +16,9 @@
 //! `with_layout_animation`) are compositor-evaluated (see [`animate`]): the
 //! backend starts a DWM-side animation and returns to the blocking pump — no
 //! ticks, no repaints, zero CPU while motion plays. Exit transitions detach
-//! the dying subtree as a top-level ghost visual and release it via a single
-//! one-shot timer. Gated behind the `dcomp-backend` feature.
+//! the dying subtree as a top-level ghost visual, released when the scoped
+//! batch wrapping its fade reports completion — the compositor's own signal,
+//! no timer. Gated behind the `dcomp-backend` feature.
 
 use crate::backend::ControlId;
 
@@ -33,6 +34,7 @@ mod host;
 mod input;
 mod layout;
 mod node;
+mod pacer;
 mod paint;
 mod parts;
 mod pointer;
@@ -61,25 +63,22 @@ use crate::style::{
     AccessibilityModifiers, AnimationConfig, GridLength, ImplicitTransitions,
     LayoutAnimationConfig, PointerHandlers,
 };
-use crate::system_bindings::{SetTimer, Visual, HWND};
+use crate::system_bindings::{CompositionBatchTypes, CompositionScopedBatch, Visual};
 use windows_core::Interface as _;
 
-/// One-shot `WM_TIMER` id used to release exit-transition ghosts once their
-/// compositor-side animation has finished. Armed to the earliest ghost
-/// deadline; the host's `WM_TIMER` handler calls
-/// [`DCompBackend::prune_ghosts`] and re-arms or kills it. This is the ONLY
-/// app-side cost of an exit animation: one wakeup at the end.
-pub(crate) const GHOST_TIMER_ID: usize = 3;
-
 /// A dying visual's exit presentation, kept alive while the compositor plays
-/// it, plus the instant it can be released. For a destroyed subtree `shown` is
-/// normally a FLATTENED [`animate::snapshot_sprite`] of it (whose brush chain
-/// keeps the detached source alive), or the live container itself when
-/// visual-surface snapshotting failed; for a dismissed popup it is the overlay
-/// container playing its close fade.
+/// it. For a destroyed subtree `shown` is normally a FLATTENED
+/// [`animate::snapshot_sprite`] of it (whose brush chain keeps the detached
+/// source alive), or the live container itself when visual-surface
+/// snapshotting failed; for a dismissed popup it is the overlay container
+/// playing its close fade. Released by [`DCompBackend::release_ghost`] when
+/// the scoped batch wrapping its exit animation reports `Completed` — the
+/// compositor's own signal, no timer and no estimated deadline.
 struct Ghost {
+    id: u64,
     shown: Visual,
-    deadline: std::time::Instant,
+    /// Keeps the batch `Completed` subscription alive until release.
+    _completed: windows_core::EventRevoker,
 }
 
 /// The DirectComposition backend. Owns the node arena, the window's composition
@@ -117,9 +116,11 @@ pub struct DCompBackend {
     /// The live popup overlay (Select/menu dropdown), if one is open.
     popup: Option<popup::Popup>,
     /// Detached visuals (destroyed subtrees, dismissed popups) playing their
-    /// exit fade on the compositor; released by [`Self::prune_ghosts`] when
-    /// their deadline passes.
+    /// exit fade on the compositor; released by [`Self::release_ghost`] when
+    /// their scoped batch completes.
     ghosts: Vec<Ghost>,
+    /// Monotonic id source for [`Ghost`]s (keys the batch-completed callback).
+    next_ghost: u64,
     /// The host window handle (as `isize`) — used for clipboard ownership.
     hwnd: isize,
 }
@@ -144,6 +145,7 @@ impl DCompBackend {
             hovered_surface: None,
             popup: None,
             ghosts: Vec::new(),
+            next_ghost: 0,
             hwnd,
         }
     }
@@ -350,6 +352,18 @@ impl DCompBackend {
             return;
         }
 
+        // Scoped batch around the exit animation: its `Completed` event is the
+        // release signal. Without one there is no way to know when the fade
+        // ends, so skip the effect rather than leak a top-level visual.
+        let Ok(batch) = self
+            .comp
+            .compositor()
+            .CreateScopedBatch(CompositionBatchTypes::Animation)
+        else {
+            animate::warn(format_args!("ghost {id}: scoped batch failed — exit skipped"));
+            return;
+        };
+
         // Walk to the compositor root accumulating the absolute (root-space)
         // offset — exact even inside scrolled containers, whose child offsets
         // include the scroll translation.
@@ -418,45 +432,50 @@ impl DCompBackend {
 
         animate::start(self.comp.compositor(), &shown, &cfg, center);
 
-        // Small grace past the nominal duration so the final frame lands
-        // before the visual disappears.
-        let deadline =
-            std::time::Instant::now() + cfg.duration + std::time::Duration::from_millis(80);
-        self.ghosts.push(Ghost { shown, deadline });
-        self.arm_ghost_timer();
+        self.park_ghost(shown, batch);
     }
 
-    /// Arm (or re-arm) the one-shot ghost-release timer to the earliest
-    /// deadline. `SetTimer` with the same id replaces the previous schedule.
-    fn arm_ghost_timer(&self) {
-        let Some(next) = self.ghosts.iter().map(|g| g.deadline).min() else {
-            return;
-        };
-        let ms = next
-            .saturating_duration_since(std::time::Instant::now())
-            .as_millis()
-            .clamp(16, u32::MAX as u128) as u32;
-        unsafe {
-            SetTimer(self.hwnd as HWND, GHOST_TIMER_ID, ms, None);
+    /// Park `shown` as a [`Ghost`] until `batch` — which must wrap the exit
+    /// animations just started on it — completes. `End` seals the batch; the
+    /// compositor raises `Completed` (on this thread, via the dispatcher queue)
+    /// the moment the last enclosed animation finishes, and the handler
+    /// releases the ghost. A batch that cannot deliver that signal releases the
+    /// visual immediately instead of leaking it.
+    fn park_ghost(&mut self, shown: Visual, batch: CompositionScopedBatch) {
+        let id = self.next_ghost;
+        self.next_ghost += 1;
+        let hwnd = self.hwnd;
+        let revoker = batch
+            .Completed(move |_, _| {
+                // Fires from the message pump, outside any backend borrow. The
+                // re-entrant case (`None`) can only happen if composition events
+                // ever dispatch mid-reconcile — defer through the pump then.
+                if host::with_backend(|b| b.release_ghost(id)).is_none() {
+                    host::post_ui(hwnd, move || {
+                        let _ = host::with_backend(|b| b.release_ghost(id));
+                    });
+                }
+            })
+            .ok()
+            .filter(|_| batch.End().is_ok());
+        match revoker {
+            Some(revoker) => self.ghosts.push(Ghost { id, shown, _completed: revoker }),
+            None => {
+                // No completion signal will ever come — drop the exit
+                // presentation now rather than leak the visual.
+                animate::warn(format_args!("ghost batch subscribe/end failed — released early"));
+                self.comp.remove_root_visual(&shown);
+            }
         }
     }
 
-    /// Release ghosts whose exit animation has finished. Returns the ms until
-    /// the next release is due, or `None` when no ghosts remain (the caller
-    /// kills the timer — back to true idle).
-    pub(crate) fn prune_ghosts(&mut self) -> Option<u32> {
-        let now = std::time::Instant::now();
-        let comp = &self.comp;
-        self.ghosts.retain(|g| {
-            if now >= g.deadline {
-                comp.remove_root_visual(&g.shown);
-                false
-            } else {
-                true
-            }
-        });
-        let next = self.ghosts.iter().map(|g| g.deadline).min()?;
-        Some(next.saturating_duration_since(now).as_millis().max(16) as u32)
+    /// Release one ghost: its scoped batch completed, the exit animation is
+    /// done compositor-side. Dropping the ghost also revokes the subscription.
+    pub(crate) fn release_ghost(&mut self, id: u64) {
+        if let Some(i) = self.ghosts.iter().position(|g| g.id == id) {
+            let g = self.ghosts.swap_remove(i);
+            self.comp.remove_root_visual(&g.shown);
+        }
     }
 }
 

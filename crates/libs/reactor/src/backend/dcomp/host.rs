@@ -1,20 +1,22 @@
 //! `DCompHost`: the Win32 + system-compositor host that drives a root
 //! [`Component`] through `RenderHost<DCompBackend, Win32Dispatcher>`. It owns the
 //! bare HWND and the blocking `GetMessageW` pump (true idle — zero CPU at rest),
-//! routes input/resize/timer messages to the backend, and starts/stops the
-//! self-stopping animation timer that ticks button ink springs.
+//! routes input/resize messages to the backend, and wakes/parks the vsync
+//! [`FramePacer`] that paces canvas/viz frame ticks.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 
 use super::dispatch::{drain, LocalQueue, SendInner, WM_APP_DISPATCH};
+use super::pacer::{FramePacer, WM_APP_FRAME};
 use super::uia;
 use super::*;
 use crate::engine::RenderHost;
+use crate::style::{set_current_color_scheme, set_theme_applier, requested_theme};
 use crate::system_bindings::*;
-use crate::{Component, Element, RenderCx, WindowSize};
+use crate::{ColorScheme, Component, Element, RenderCx, RequestedTheme, WindowSize};
 use windows_core::{Interface, PCWSTR};
 
 /// `WM_GETOBJECT` `lParam` value that asks for the window's root UI Automation
@@ -111,25 +113,22 @@ pub(crate) fn post_ui(hwnd: isize, f: impl FnOnce() + Send + 'static) {
     }
 }
 
-const TIMER_ID: usize = 1;
-/// Caret-blink timer — the one allowed at-rest timer, running only while a text
-/// field holds focus (and the window is active), killed on blur.
-const BLINK_TIMER_ID: usize = 2;
-/// `GetCaretBlinkTime` sentinel meaning "blinking disabled" (solid caret).
-const BLINK_INFINITE: u32 = u32::MAX;
-
-thread_local! {
-    /// Whether the caret-blink timer is currently scheduled (avoids resetting
-    /// the blink phase on unrelated input).
-    static BLINK_RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Per-thread state the WndProc reaches into. `render_host` is a clone (an `Rc`
 /// bump) of the host's render host; `local`/`send` are the dispatcher's queues.
 struct HostShared {
     render_host: RenderHost<DCompBackend, Win32Dispatcher>,
     local: Rc<LocalQueue>,
     send: Arc<SendInner>,
+    /// Vsync pacer for the canvas/viz frame ticks; dropping `HostShared` (end of
+    /// [`DCompHost::run`]) tells its worker to exit.
+    pacer: FramePacer,
+    /// The host window (as `isize`; `HWND` is a raw pointer), for posting
+    /// deferred UI-thread work and the DWM frame attribute.
+    hwnd: isize,
+    /// The last effective light/dark state applied end-to-end, so redundant
+    /// triggers (a system flip under a forced override, a repeated request)
+    /// skip the repaint/re-render fan-out.
+    applied_dark: Cell<Option<bool>>,
 }
 
 thread_local! {
@@ -181,9 +180,15 @@ impl DCompHost {
 
         let comp = Compositing::new(hwnd, pw, ph, dpi as f32)?;
         let mut backend = DCompBackend::new(comp, dip, dpi as f32, hwnd as isize);
-        // Honour the OS light/dark app theme for the window backdrop at startup
-        // (the same flip the `WM_SETTINGCHANGE` handler applies when it changes).
-        backend.apply_theme(system_prefers_dark());
+        // Resolve the effective theme (app override, else the OS app theme)
+        // before the first render, so `use_color_scheme`, the backdrop, and the
+        // DWM frame are correct from frame one. Later changes — the app calling
+        // `set_requested_theme`, or the OS flipping — go through
+        // `apply_effective_theme`.
+        let dark = effective_dark();
+        set_current_color_scheme(scheme_for(dark));
+        backend.apply_theme(dark);
+        apply_frame_dark_mode(hwnd, dark);
 
         let dispatcher = Win32Dispatcher::new(hwnd);
         let marshaller = dispatcher.marshaller();
@@ -212,16 +217,36 @@ impl DCompHost {
                 render_host: render_host.clone_inner(),
                 local,
                 send,
+                pacer: FramePacer::new(hwnd as isize),
+                hwnd: hwnd as isize,
+                applied_dark: Cell::new(Some(dark)),
             }));
         });
 
+        // Route `set_requested_theme` into this host. The setter typically fires
+        // from inside event dispatch, where the reconciler borrow is still held —
+        // so the apply is deferred through the message pump rather than run
+        // synchronously (the hook only pokes; `requested_theme()` is re-read at
+        // apply time, so coalesced posts are harmless).
+        set_theme_applier(Some(Rc::new(|_| {
+            if let Some(s) = shared() {
+                post_ui(s.hwnd, || {
+                    if let Some(s) = shared() {
+                        apply_effective_theme(&s);
+                    }
+                });
+            }
+        })));
+
         // Frame-tick pump: when a canvas/viz subscriber appears (via
-        // `on_frame_tick`) while the timer is idle, start it; the WM_TIMER handler
-        // drives the ticks and stops the timer once no subscriber remains (true
-        // idle). This is the frame timer's ONLY client — control motion never
-        // runs on it.
-        crate::set_frame_pump_wake(Some(Rc::new(move || unsafe {
-            SetTimer(hwnd, TIMER_ID, 16, None);
+        // `on_frame_tick`) while the pacer is parked, wake it; the WM_APP_FRAME
+        // handler drives the ticks and parks the pacer once no subscriber
+        // remains (true idle). This is the pacer's ONLY client — control motion
+        // never runs on it.
+        crate::set_frame_pump_wake(Some(Rc::new(|| {
+            if let Some(s) = shared() {
+                s.pacer.wake();
+            }
         })));
 
         render_host.kick();
@@ -241,6 +266,7 @@ impl DCompHost {
             }
         }
         crate::set_frame_pump_wake(None);
+        set_theme_applier(None);
         DCOMP.with(|c| *c.borrow_mut() = None);
     }
 
@@ -302,6 +328,72 @@ pub(crate) fn window_backdrop(dark: bool) -> Color {
         Color { a: 255, r: 14, g: 14, b: 17 }
     } else {
         Color { a: 255, r: 243, g: 243, b: 245 }
+    }
+}
+
+/// The effective light/dark state: the app's [`requested_theme`] override when
+/// forced, else the live OS app theme.
+fn effective_dark() -> bool {
+    match requested_theme() {
+        RequestedTheme::Dark => true,
+        RequestedTheme::Light => false,
+        RequestedTheme::Default => system_prefers_dark(),
+    }
+}
+
+fn scheme_for(dark: bool) -> ColorScheme {
+    if dark {
+        ColorScheme::Dark
+    } else {
+        ColorScheme::Light
+    }
+}
+
+/// Resolve and apply the effective theme end-to-end: the `use_color_scheme`
+/// signal, the DWM frame, the compositor backdrop, a chrome repaint, and a
+/// component re-render. No-op when the effective state hasn't changed (e.g. a
+/// system flip under a forced override). Both triggers — the app calling
+/// `set_requested_theme` and a `WM_SETTINGCHANGE` "ImmersiveColorSet" — land
+/// here, so override precedence lives in exactly one place.
+fn apply_effective_theme(s: &HostShared) {
+    let dark = effective_dark();
+    if s.applied_dark.get() == Some(dark) {
+        return;
+    }
+    s.applied_dark.set(Some(dark));
+    // Scheme first: the re-render below must already read the new value.
+    set_current_color_scheme(scheme_for(dark));
+    apply_frame_dark_mode(s.hwnd as HWND, dark);
+    s.render_host.with_reconciler_mut(|r| {
+        r.backend.apply_theme(dark);
+        r.backend.mark_all_dirty_and_repaint();
+    });
+    // Re-run component render functions so `use_color_scheme` readers see the
+    // new scheme (the repaint above only covers backend-drawn chrome).
+    s.render_host.request_render();
+}
+
+windows_core::link!("dwmapi.dll" "system" fn DwmSetWindowAttribute(
+    hwnd: HWND,
+    dwattribute: u32,
+    pvattribute: *const core::ffi::c_void,
+    cbattribute: u32,
+) -> i32);
+
+/// Keep the DWM-owned window chrome (frame border, snap-layout flyout) on the
+/// effective theme via `DWMWA_USE_IMMERSIVE_DARK_MODE`. The caption strip is
+/// drawn in-client, but DWM still renders the outer frame around it.
+fn apply_frame_dark_mode(hwnd: HWND, dark: bool) {
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    // The attribute is a Win32 BOOL (4 bytes).
+    let value: i32 = dark as i32;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&value as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
     }
 }
 
@@ -433,46 +525,6 @@ fn track_leave(hwnd: HWND) {
     unsafe {
         let _ = TrackMouseEvent(&mut t);
     }
-}
-
-/// Start or stop the caret-blink timer to match whether a text field is
-/// focused. Only toggles on a change of state so the blink phase is preserved
-/// across unrelated input. A `GetCaretBlinkTime` of 0 / INFINITE (blinking
-/// disabled) keeps the timer off — the caret then stays solid.
-fn sync_blink(hwnd: HWND) {
-    let want = shared()
-        .map(|s| {
-            s.render_host
-                .with_reconciler_mut(|r| r.backend.wants_blink_timer())
-        })
-        .unwrap_or(false);
-    let interval = unsafe { GetCaretBlinkTime() };
-    let blink = want && interval != 0 && interval != BLINK_INFINITE;
-    BLINK_RUNNING.with(|c| {
-        if blink && !c.get() {
-            unsafe {
-                SetTimer(hwnd, BLINK_TIMER_ID, interval, None);
-            }
-            c.set(true);
-        } else if !blink && c.get() {
-            unsafe {
-                let _ = KillTimer(hwnd, BLINK_TIMER_ID);
-            }
-            c.set(false);
-        }
-    });
-}
-
-/// Force the caret-blink timer off (window deactivated).
-fn stop_blink(hwnd: HWND) {
-    BLINK_RUNNING.with(|c| {
-        if c.get() {
-            unsafe {
-                let _ = KillTimer(hwnd, BLINK_TIMER_ID);
-            }
-            c.set(false);
-        }
-    });
 }
 
 /// Physical height of the resize frame at this DPI (also the maximized
@@ -630,6 +682,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             0
         }
 
+        // The pacer worker's vsync tick: drive the canvas/viz frame-tick
+        // subscribers, then park the pacer once none remain (true idle).
+        WM_APP_FRAME => {
+            if let Some(s) = shared() {
+                s.pacer.begin_tick();
+                crate::drive_frame_ticks();
+                if !crate::frame_ticks_active() {
+                    s.pacer.park();
+                }
+            }
+            0
+        }
+
         // A UIA worker thread asked us to run a provider call on the UI thread.
         WM_APP_UIA => {
             let raw = wparam as *mut Box<dyn FnOnce() + Send>;
@@ -686,7 +751,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         SetCapture(hwnd);
                     }
                 }
-                sync_blink(hwnd);
             }
             0
         }
@@ -727,7 +791,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
                 s.render_host
                     .with_reconciler_mut(|r| r.backend.on_key(vk, shift, ctrl));
-                sync_blink(hwnd);
             }
             0
         }
@@ -736,7 +799,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(s) = shared() {
                 let ch = (wparam & 0xFFFF) as u16;
                 s.render_host.with_reconciler_mut(|r| r.backend.on_char(ch));
-                sync_blink(hwnd);
             }
             0
         }
@@ -774,7 +836,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         let _ = ImmReleaseContext(hwnd, himc);
                     }
                 }
-                sync_blink(hwnd);
                 return 0;
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -795,7 +856,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 s.render_host
                     .with_reconciler_mut(|r| r.backend.window_focus_changed(true));
             }
-            sync_blink(hwnd);
             0
         }
 
@@ -805,48 +865,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     r.backend.window_focus_changed(false);
                     r.backend.on_focus_lost();
                 });
-            }
-            stop_blink(hwnd);
-            0
-        }
-
-        WM_TIMER => {
-            if wparam == BLINK_TIMER_ID {
-                if let Some(s) = shared() {
-                    s.render_host.with_reconciler_mut(|r| r.backend.blink_tick());
-                }
-                return 0;
-            }
-            if wparam == GHOST_TIMER_ID {
-                // Release exit-transition ghosts whose compositor animation has
-                // finished; re-arm only while ghosts remain (one wakeup per
-                // exit, then back to the blocking pump).
-                if let Some(s) = shared() {
-                    let next = s.render_host.with_reconciler_mut(|r| r.backend.prune_ghosts());
-                    unsafe {
-                        match next {
-                            Some(ms) => {
-                                SetTimer(hwnd, GHOST_TIMER_ID, ms, None);
-                            }
-                            None => {
-                                let _ = KillTimer(hwnd, GHOST_TIMER_ID);
-                            }
-                        }
-                    }
-                }
-                return 0;
-            }
-            if wparam == TIMER_ID {
-                // Pace the backend frame-tick subscribers (canvas/viz) — the
-                // timer's only client; all control motion is compositor-side.
-                crate::drive_frame_ticks();
-                // Keep the timer only while subscribers remain; otherwise
-                // return to a blocking, zero-CPU pump.
-                if !crate::frame_ticks_active() {
-                    unsafe {
-                        let _ = KillTimer(hwnd, TIMER_ID);
-                    }
-                }
             }
             0
         }
@@ -899,14 +917,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // toggles broadcast a plain WM_SETTINGCHANGE, so re-fit the colour map.
             display_change::note_display_change(hwnd);
             // An "ImmersiveColorSet" change flips the system light/dark theme.
+            // Routed through the effective-theme resolver, so an app-forced
+            // Light/Dark override ignores the system flip.
             if is_immersive_color_set(lparam)
                 && let Some(s) = shared()
             {
-                let dark = system_prefers_dark();
-                s.render_host.with_reconciler_mut(|r| {
-                    r.backend.apply_theme(dark);
-                    r.backend.mark_all_dirty_and_repaint();
-                });
+                apply_effective_theme(&s);
+            }
+            // A caret blink-rate change also broadcasts WM_SETTINGCHANGE:
+            // restart the focused field's compositor blink with the new period
+            // (a no-op when no text field is focused).
+            if let Some(s) = shared() {
+                s.render_host
+                    .with_reconciler_mut(|r| r.backend.refresh_caret_blink());
             }
             0
         }
@@ -920,8 +943,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // (SIZE_MINIMIZED), restoring/maximizing shows it. De-duplicated inside
             // `note_visibility`, so an ordinary resize (already-visible → visible) is a
             // no-op. Lets the app pause expensive off-screen work while minimized.
-            visibility::note_visibility(wparam != SIZE_MINIMIZED as WPARAM);
+            let visible = wparam != SIZE_MINIMIZED as WPARAM;
+            visibility::note_visibility(visible);
             if let Some(s) = shared() {
+                // Same gate for the frame pacer: a minimized window must not
+                // keep rasterizing canvas frames nobody can see.
+                s.pacer.set_visible(visible);
                 let pw = (lparam & 0xFFFF) as i32;
                 let ph = ((lparam >> 16) & 0xFFFF) as i32;
                 if pw > 0 && ph > 0 {

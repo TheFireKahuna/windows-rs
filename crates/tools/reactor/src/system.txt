@@ -29,6 +29,12 @@ Windows::UI::Composition::CompositionStretch
 Windows::UI::Composition::CompositionClip
 Windows::UI::Composition::InsetClip
 Windows::UI::Composition::CompositionGeometricClip
+// ── Animation completion (exit-ghost release) + caret blink easing ──
+Windows::UI::Composition::CompositionScopedBatch
+Windows::UI::Composition::ICompositionScopedBatch::{End, add_Completed, remove_Completed}
+Windows::UI::Composition::CompositionBatchTypes
+Windows::UI::Composition::CompositionBatchCompletedEventArgs
+Windows::UI::Composition::StepEasingFunction
 // ── Animations ──
 Windows::UI::Composition::CompositionAnimation
 Windows::UI::Composition::KeyFrameAnimation
@@ -62,7 +68,8 @@ Windows::UI::Composition::SpringVector3NaturalMotionAnimation
 Windows::UI::Composition::CompositionNineGridBrush
 // ── Compositor factory methods ──
 Windows::UI::Composition::ICompositor::{CreateContainerVisual, CreateSpriteVisual, CreateColorBrush, CreateColorBrushWithColor, CreateSurfaceBrush, CreateSurfaceBrushWithSurface, CreateScalarKeyFrameAnimation, CreateVector2KeyFrameAnimation, CreateVector3KeyFrameAnimation, CreateExpressionAnimation, CreateExpressionAnimationWithExpression, CreateInsetClip, CreateInsetClipWithInsets, CreateLinearEasingFunction, CreateCubicBezierEasingFunction}
-Windows::UI::Composition::ICompositor2::{CreateImplicitAnimationCollection, CreateNineGridBrush}
+Windows::UI::Composition::ICompositor::CreateScopedBatch
+Windows::UI::Composition::ICompositor2::{CreateImplicitAnimationCollection, CreateNineGridBrush, CreateStepEasingFunction}
 Windows::UI::Composition::ICompositor4::{CreateSpringScalarAnimation, CreateSpringVector2Animation, CreateSpringVector3Animation}
 Windows::UI::Composition::ICompositor6::{CreateGeometricClip, CreateGeometricClipWithGeometry}
 // ── CompositionObject (animation host) ──
@@ -166,12 +173,22 @@ Windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW
 Windows::Win32::UI::WindowsAndMessaging::WINDOWPOS
 Windows::Win32::UI::WindowsAndMessaging::NCCALCSIZE_PARAMS
 Windows::Win32::UI::WindowsAndMessaging::MINMAXINFO
-// ── Cursor + timers + caret ──
+// ── Cursor + caret metrics (no timers — blink is compositor-side) ──
 Windows::Win32::UI::WindowsAndMessaging::LoadCursorW
 Windows::Win32::UI::WindowsAndMessaging::SetCursor
-Windows::Win32::UI::WindowsAndMessaging::SetTimer
-Windows::Win32::UI::WindowsAndMessaging::KillTimer
 Windows::Win32::UI::WindowsAndMessaging::GetCaretBlinkTime
+// ── Frame pacer: DWM compositor-clock wait (vsync-paced canvas frame ticks) ──
+Windows::Win32::Graphics::DirectComposition::DCompositionWaitForCompositorClock
+Windows::Win32::Foundation::WAIT_EVENT
+Windows::Win32::Foundation::WAIT_FAILED
+Windows::Win32::Foundation::CloseHandle
+Windows::Win32::System::Threading::CreateEventW
+Windows::Win32::System::Threading::SetEvent
+Windows::Win32::System::Threading::CreateWaitableTimerExW
+Windows::Win32::System::Threading::SetWaitableTimerEx
+Windows::Win32::System::Threading::WaitForMultipleObjects
+Windows::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS
+Windows::Win32::System::Threading::TIMER_ALL_ACCESS
 Windows::Win32::UI::WindowsAndMessaging::HCURSOR
 Windows::Win32::UI::WindowsAndMessaging::HICON
 // ── Window style / class style / show enums (emit all variants) ──
@@ -201,7 +218,6 @@ Windows::Win32::UI::WindowsAndMessaging::WM_SETFOCUS
 Windows::Win32::UI::WindowsAndMessaging::WM_KILLFOCUS
 Windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE
 Windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE
-Windows::Win32::UI::WindowsAndMessaging::WM_TIMER
 Windows::Win32::UI::WindowsAndMessaging::WM_SETCURSOR
 Windows::Win32::UI::WindowsAndMessaging::WM_GETOBJECT
 Windows::Win32::UI::WindowsAndMessaging::WM_APP

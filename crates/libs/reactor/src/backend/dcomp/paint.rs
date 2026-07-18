@@ -95,6 +95,11 @@ fn paint_node(
                 if parts::converted(n.kind) {
                     parts::sync(comp, atlas, n, scale);
                 }
+                // Editors: reconcile the caret sprite (position + compositor
+                // blink) against the text metrics just painted.
+                if n.editor.is_some() {
+                    parts::sync_caret(comp, atlas, n, scale);
+                }
             }
         }
     }

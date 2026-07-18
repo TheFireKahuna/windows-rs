@@ -39,8 +39,15 @@ pub(crate) struct Editor {
     pub layout_dirty: bool,
     /// Box width the cached layout was last built for (detects a resize).
     pub built_w: f32,
-    /// Caret blink phase (true = the caret bar is drawn this interval).
-    pub blink_on: bool,
+    /// Caret visibility gate: false while the host window is deactivated
+    /// (keyboard focus is retained but the caret hides, mirroring system
+    /// behavior). The caret itself is a compositor sprite whose blink plays
+    /// DWM-side (see `parts::sync_caret`) — no timer, no repaints.
+    pub caret_shown: bool,
+    /// Set when the caret moved / text changed; the next paint restarts the
+    /// compositor blink animation solid-first (the standard "caret goes solid
+    /// while typing" behavior) and clears this.
+    pub caret_moved: bool,
     /// True once seeded from a prop. While focused the user owns the buffer, so
     /// programmatic value props are ignored until blur (no clobbering mid-edit).
     pub seeded: bool,
@@ -63,7 +70,8 @@ impl Editor {
             layout: None,
             layout_dirty: true,
             built_w: -1.0,
-            blink_on: true,
+            caret_shown: true,
+            caret_moved: true,
             seeded: false,
             comp_start: 0,
             comp_len: 0,

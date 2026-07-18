@@ -8,26 +8,16 @@ use bindings::*;
 thread_local! {
     static ROOT_FRAMEWORK_ELEMENT: RefCell<Option<FrameworkElement>> = const { RefCell::new(None) };
     static ROOT_WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
-    /// Queued theme; applied once `ROOT_FRAMEWORK_ELEMENT` is available.
-    static PENDING_THEME: Cell<Option<ElementTheme>> = const { Cell::new(None) };
     /// TitleBar height option requested before `ROOT_WINDOW` was set. Applied once
     /// the window becomes available in `post_render`.
     static PENDING_TALL: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Requested application theme, matching `Microsoft.UI.Xaml.ElementTheme`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum RequestedTheme {
-    /// Use the system default (inherits from OS setting).
-    Default,
-    /// Force light theme.
-    Light,
-    /// Force dark theme.
-    Dark,
-}
-
-/// Set the application theme. Queued if the root element isn't attached yet.
-pub fn set_requested_theme(theme: RequestedTheme) {
+/// The WinUI host's theme applier: forwards the request to XAML's
+/// `SetRequestedTheme` on the root element. Before the root attaches this is a
+/// no-op — the attach path in `post_render` applies [`requested_theme`] itself.
+#[cfg(feature = "winui-backend")]
+fn apply_requested_theme_xaml(theme: RequestedTheme) {
     let element_theme = match theme {
         RequestedTheme::Light => ElementTheme::Light,
         RequestedTheme::Dark => ElementTheme::Dark,
@@ -38,12 +28,11 @@ pub fn set_requested_theme(theme: RequestedTheme) {
         if let Some(ife) = cell.borrow().as_ref() {
             let _ = ife.SetRequestedTheme(element_theme);
             update_titlebar_theme();
-        } else {
-            PENDING_THEME.with(|p| p.set(Some(element_theme)));
         }
     });
 }
 
+#[cfg(feature = "winui-backend")]
 fn update_titlebar_theme() {
     ROOT_FRAMEWORK_ELEMENT.with(|cell| {
         if let Some(ife) = cell.borrow().as_ref()
@@ -239,13 +228,10 @@ impl ReactorHost {
                                 ROOT_FRAMEWORK_ELEMENT
                                     .with(|cell| *cell.borrow_mut() = Some(fe.clone()));
 
-                                // Apply any theme that was requested before the
-                                // root element existed (e.g. from a first-mount
-                                // use_effect).
-                                if let Some(theme) = PENDING_THEME.with(|p| p.take()) {
-                                    let _ = fe.SetRequestedTheme(theme);
-                                    update_titlebar_theme();
-                                }
+                                // Apply the stored theme request — it may have
+                                // been set before the root element existed
+                                // (e.g. from a first-mount use_effect).
+                                apply_requested_theme_xaml(requested_theme());
                             }
                         }
 
@@ -268,6 +254,9 @@ impl ReactorHost {
                 }
             }
         });
+
+        // Route `set_requested_theme` to XAML for the lifetime of this host.
+        set_theme_applier(Some(Rc::new(apply_requested_theme_xaml)));
 
         render_host.kick();
 
@@ -494,7 +483,6 @@ fn create_window(
     })?;
 
     app_window.SetPresenterByKind(AppWindowPresenterKind::Overlapped)?;
-    set_requested_theme(RequestedTheme::Default);
 
     let outer_size = app_window.Size()?;
     let inner_size = app_window_2.ClientSize()?;

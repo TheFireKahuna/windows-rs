@@ -633,17 +633,8 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
         }
     }
 
-    // Caret (blink-gated).
-    if node.focused && ed.blink_on {
-        let caret_x = origin_x + ed.caret_x();
-        put(brush, theme::text(), dim);
-        session.draw_line(
-            Vector2::new(caret_x, origin_y + 1.0),
-            Vector2::new(caret_x, origin_y + text_h - 1.0),
-            brush,
-            1.0,
-        );
-    }
+    // The caret is NOT drawn here: it is a compositor sprite whose blink plays
+    // DWM-side (see `parts::sync_caret` and [`editor_caret_box`]).
 
     session.pop_clip();
 
@@ -652,6 +643,29 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     if node.kind == ControlKind::NumberBox && rect.width() >= editor::SPIN_MIN_BOX_W {
         draw_spin(session, brush, rect, node.hovered, dim);
     }
+}
+
+/// The caret's box in surface-local DIPs, mirroring [`paint_editor`]'s text
+/// metrics (same origin, line height, and scroll offset), clamped into the
+/// content column the painted text clips to. `None` when the node is not an
+/// editor. Consumed by `parts::sync_caret` to place the caret sprite.
+pub(crate) fn editor_caret_box(node: &Node) -> Option<Rect> {
+    let ed = node.editor.as_ref()?;
+    let (w, h) = (node.rect.w, node.rect.h);
+    let (pad_left, content_w) = editor::editor_content(node.kind, w);
+    let cx0 = pad_left;
+    let text_h = ed
+        .layout
+        .as_ref()
+        .and_then(|l| l.measure().ok())
+        .map(|(_, h)| h)
+        .filter(|h| *h > 0.0)
+        .unwrap_or(node.paint.font_size * 1.4);
+    let origin_y = (h - text_h) / 2.0;
+    let caret_x = cx0 - ed.scroll_x + ed.caret_x();
+    // A 1-DIP bar centred on the caret position, kept inside the clip column.
+    let x = (caret_x - 0.5).clamp(cx0, (cx0 + content_w - 1.0).max(cx0));
+    Some(Rect::from_xywh(x, origin_y + 1.0, 1.0, (text_h - 2.0).max(1.0)))
 }
 
 /// Two stacked up/down chevrons on the trailing edge of a wide `NumberBox`.
