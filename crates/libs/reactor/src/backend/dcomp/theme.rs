@@ -211,7 +211,7 @@ pub fn stroke_strong() -> Color {
 /// lands ~4× hotter over a dark surface. The cubic reproduces the authored
 /// appearance over the dark base (fit against `#282828`, within ~1% across
 /// `0..=1`).
-const fn dark_wash_alpha(a: f32) -> f32 {
+pub(crate) const fn dark_wash_alpha(a: f32) -> f32 {
     let out = a * (0.2113 + 0.5905 * a + 0.1984 * a * a);
     if out > 1.0 {
         1.0
@@ -225,7 +225,7 @@ const fn dark_wash_alpha(a: f32) -> f32 {
 /// Cubic fit of the exact gamma-blend conversion against the light card
 /// surface (`#f9f9f9`), within ~1% across `0..=1` — the fit is insensitive to
 /// the exact near-white base, so it matches the app-side light cubic.
-const fn light_wash_alpha(a: f32) -> f32 {
+pub(crate) const fn light_wash_alpha(a: f32) -> f32 {
     let out = a * (2.265 - 1.516 * a + 0.251 * a * a);
     if out > 1.0 {
         1.0
