@@ -36,14 +36,27 @@ pub struct SurfaceToken(u64);
 
 /// The Direct2D device a hosted surface draws through.
 ///
-/// The backend builds one `CompositionSurfaceFactory` per device and reuses it
-/// for every surface, so `generation` identifies the caller's device: when it
-/// changes — a device loss, a replacement — the factory is rebuilt.
+/// The device is more than a resource here: it names the surface's
+/// **draw-serialization domain**. A `CompositionGraphicsDevice` allows only one
+/// outstanding `BeginDraw` across all of its surfaces — a second concurrent
+/// `BeginDraw` *fails* (`0x80131509`), it does not block. So the backend keeps
+/// one `CompositionSurfaceFactory` (one `CompositionGraphicsDevice`) per
+/// *distinct* Direct2D device, keyed by the device's COM identity: surfaces
+/// requested with the same device share a factory and its atlas, and surfaces
+/// drawn by different threads — which by the contract below arrive with
+/// different devices — can never collide in `BeginDraw`, with no lock and no
+/// retry. `generation` is a caller-chosen device-loss stamp: when it changes
+/// for the same device identity (a replacement reusing the allocation), the
+/// factory is rebuilt.
 ///
 /// # Safety contract
-/// The device must be multi-threaded (`GpuDevice::new_multi_threaded`), because
-/// the requester goes on to draw through the resulting surface from its own
-/// thread while the backend's thread keeps compositing.
+/// The requester draws through the resulting surface from its own thread while
+/// the backend's thread keeps compositing, so the device must tolerate that
+/// (e.g. `GpuDevice::new_multi_threaded`, or a single-threaded device used only
+/// from the one thread that owns it). Additionally, all draws through **one**
+/// device must be serialized by its owner (one owning thread, or an external
+/// order) — the per-device `CompositionGraphicsDevice` turns that existing
+/// Direct2D discipline into BeginDraw safety.
 pub struct SurfaceDevice {
     pub(crate) device: windows_core::IUnknown,
     pub(crate) generation: u64,
@@ -57,14 +70,25 @@ pub struct SurfaceDevice {
 unsafe impl Send for SurfaceDevice {}
 
 impl SurfaceDevice {
-    /// Wrap a multi-threaded Direct2D device (an `ID2D1Device`) for the backend,
-    /// tagged with a caller-chosen `generation` that changes whenever the device
-    /// is replaced.
+    /// Wrap a Direct2D device (an `ID2D1Device`) for the backend, tagged with a
+    /// caller-chosen `generation` that changes whenever the device is replaced.
+    /// See the type docs for the serialization-domain contract the device carries.
     pub fn new(device: &impl windows_core::Interface, generation: u64) -> windows_core::Result<Self> {
         Ok(Self {
             device: device.cast()?,
             generation,
         })
+    }
+
+    /// The device's COM identity — the canonical `IUnknown` pointer (`cast` in
+    /// [`new`](Self::new) is a `QueryInterface` for `IUnknown`, which COM
+    /// requires to be identity-stable). Two wrappers around the same device
+    /// yield the same key; distinct devices never share one while both are
+    /// alive. Pointer reuse after a device is destroyed is disambiguated by
+    /// `generation`.
+    pub(crate) fn identity(&self) -> usize {
+        use windows_core::Interface;
+        self.device.as_raw() as usize
     }
 }
 

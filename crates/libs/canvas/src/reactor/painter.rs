@@ -77,6 +77,17 @@ pub(crate) enum PaintSurface {
     Comp(CompSurface),
 }
 
+/// An outstanding backend surface request, remembered with the world it was made
+/// for. A request is only adoptable while the element's DIP size and the device
+/// generation still match: the backing pixel size is fixed at request time, and
+/// the build effect's deps settle after adoption — so adopting a request the
+/// world has moved past would freeze the sprite at the stale size forever.
+pub(crate) struct PendingRequest {
+    pub(crate) handle: PendingSurface,
+    dip: (f32, f32),
+    device_gen: u64,
+}
+
 /// A DirectComposition child-visual composition surface, drawn through a
 /// [`CompositionDrawTarget`]. FP16 (`R16G16B16A16Float`) so the viz is HDR — see
 /// [`CompositionSurfaceFactory::create_under_node`].
@@ -98,7 +109,7 @@ impl PaintSurface {
     /// `ContainerVisual` (the WinUI backend) or no host is available yet.
     pub(crate) fn build(
         host: Option<&ElementHandle>,
-        pending: &RefCell<Option<PendingSurface>>,
+        pending: &RefCell<Option<PendingRequest>>,
         device: &GpuDevice,
         device_gen: u64,
         width: f32,
@@ -116,15 +127,27 @@ impl PaintSurface {
         if let Some(host) = host
             && host.native().is_none()
         {
+            // A request the world has moved past — the element resized or the
+            // device was replaced while it was pending — must not be adopted:
+            // the hosted surface carries the old backing size (see
+            // [`PendingRequest`]). Drop it, releasing the hosted surface, and
+            // ask again below at the current size.
+            if pending
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.dip != (width, height) || p.device_gen != device_gen)
+            {
+                *pending.borrow_mut() = None;
+            }
             // Already asked: either it has been hosted since (take the drawing
             // side and keep the handle, which owns the release) or it has not,
             // and `ready` will bring us back.
-            let hosted = pending.borrow().as_ref().and_then(|p| p.take());
+            let hosted = pending.borrow().as_ref().and_then(|p| p.handle.take());
             if let Some(draw) = hosted {
                 let held = pending.borrow_mut().take().expect("pending was just read");
                 return Ok(Some(Self::Comp(CompSurface {
                     target: CompositionDrawTarget::new(draw),
-                    _hosted: held,
+                    _hosted: held.handle,
                     device: device.clone(),
                     width,
                     height,
@@ -136,14 +159,18 @@ impl PaintSurface {
                 let pw = ((width * scale).round() as i32).max(1);
                 let ph = ((height * scale).round() as i32).max(1);
                 let dev = SurfaceDevice::new(device.d2d_device(), device_gen)?;
-                *pending.borrow_mut() = Some(request_surface(
-                    host.id(),
-                    dev,
-                    (pw, ph),
-                    (width, height),
-                    opaque,
-                    ready,
-                ));
+                *pending.borrow_mut() = Some(PendingRequest {
+                    handle: request_surface(
+                        host.id(),
+                        dev,
+                        (pw, ph),
+                        (width, height),
+                        opaque,
+                        ready,
+                    ),
+                    dip: (width, height),
+                    device_gen,
+                });
             }
             return Ok(None);
         }
@@ -215,7 +242,7 @@ pub(crate) struct PainterInner {
     size_revoker: RefCell<Option<Subscription>>,
     // An outstanding backend surface request, kept across renders: it carries the
     // release token, so dropping it detaches the hosted surface.
-    pub(crate) pending_surface: RefCell<Option<PendingSurface>>,
+    pub(crate) pending_surface: RefCell<Option<PendingRequest>>,
     // Optional user mount hook, run once with the hosting `Image`'s
     // `ElementHandle` (e.g. to open a capture-capable `PointerSurface`). A `Cell`
     // like `stepper`: it is taken out and run, and the hook may re-enter the

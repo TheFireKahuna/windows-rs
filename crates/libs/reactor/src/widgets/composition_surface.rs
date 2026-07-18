@@ -12,10 +12,13 @@
 //!
 //! With a multi-threaded Direct2D device the returned [`CompositionDrawSurface`]
 //! is `Send`, so a worker thread can draw the content while the UI thread runs.
-//! [`begin_draw`](CompositionDrawSurface::begin_draw) /
-//! [`end_draw`](CompositionDrawSurface::end_draw) are synchronized by
-//! DirectComposition internally (its own `ContextSession` lock), and the shared
-//! device is multi-threaded (Direct2D serializes each call), so no extra
+//! One rule governs that concurrency: a `CompositionGraphicsDevice` admits only
+//! **one outstanding [`begin_draw`](CompositionDrawSurface::begin_draw)** across
+//! all of its surfaces — a second concurrent `BeginDraw` on any surface of the
+//! same graphics device *fails* (`0x80131509`), it does not block. So surfaces
+//! drawn by different threads must come from different factories (one factory =
+//! one graphics device); within one factory the owner's own sequential
+//! bracketing of `begin_draw`/`end_draw` is the serialization, and no extra
 //! cross-thread lock is needed. Crucially, none is *held across* the surface's
 //! `EndDraw` either: an `ID2D1Multithread` lock held there would invert against the
 //! UI thread's compositor commit (which takes the composition lock, then the D2D

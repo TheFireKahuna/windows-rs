@@ -403,6 +403,18 @@ fn build_painter<R: 'static>(
 
             let device_lost =
                 lost.get() || painted.as_ref().is_err_and(|e| is_device_lost(e.code()));
+            // Debug-build diagnostic: a non-device-lost first-paint failure has no
+            // recovery path — the painter stays not-ready, and a static (draw-once)
+            // painter's surface then remains empty for its lifetime. That must be
+            // loud, not silent (a shared-BeginDraw collision hid exactly this way).
+            #[cfg(debug_assertions)]
+            if !device_lost && let Err(_e) = painted.as_ref() {
+                eprintln!(
+                    "windows-canvas: surface_painter first paint FAILED ({_e:?}) — \
+                     the painter stays not-ready; a draw-once painter will show an \
+                     empty surface until something re-runs its build effect"
+                );
+            }
             if device_lost {
                 reset_device(&device_source, force_software, &owned_device);
                 *resources.borrow_mut() = None;
