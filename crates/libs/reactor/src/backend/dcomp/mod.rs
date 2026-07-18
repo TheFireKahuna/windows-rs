@@ -1745,6 +1745,16 @@ prop_contract! {
             n.text_dirty = true;
         }
 
+        // ── HyperlinkButton target ───────────────────────────────────────
+        // Consumed at activation, not at paint: `input::activate` offers it to
+        // the app's [`crate::set_uri_launcher`] hook — the one path a pointer
+        // release, a Space/Enter press and a UIA `Invoke` all share. This
+        // backend still makes no policy decision about the string; with no
+        // launcher installed the link is inert, which is the default. Purely a
+        // stored value as far as rendering is concerned, so the reset neither
+        // re-measures nor repaints.
+        NavigateUri => |n| { n.extras_reset(|x| x.navigate_uri = Extras::DEFAULT.navigate_uri); }
+
         // ── ToggleSwitch state labels ────────────────────────────────────
         // The switch measures to the WIDER of the two, so dropping either one
         // re-measures — hence `text_dirty` on both.
@@ -1902,20 +1912,6 @@ prop_contract! {
         FlyoutPlacement => |n| {
             n.extras_reset(|x| x.flyout_placement = Extras::DEFAULT.flyout_placement);
         }
-        // Deliberately still stored, not consumed. Drawing a hyperlink is a
-        // rendering problem; *following* one is not. The seam hands over an
-        // arbitrary app-supplied string, and the only way this backend could
-        // act on it is to hand that string to the shell — the first
-        // process-level URI launch anywhere in this crate. Which schemes a
-        // self-hosted window may hand to a registered protocol handler is a
-        // policy decision for the host application, not something a paint pass
-        // should decide on its behalf. The WinUI backend does not face this:
-        // it passes the URI to `HyperlinkButton.SetNavigateUri` and XAML
-        // mediates the navigation inside its own trust context. Consuming this
-        // needs a seam that carries the app's intent (a navigation callback,
-        // or an explicit opt-in), not a `ShellExecute` bolted on here.
-        NavigateUri => |n| { n.extras_reset(|x| x.navigate_uri = Extras::DEFAULT.navigate_uri); }
-
         // ── Editors / text ───────────────────────────────────────────────
         IsEditable => |n| { n.extras_reset(|x| x.is_editable = Extras::DEFAULT.is_editable); }
         AcceptsReturn => |n| {

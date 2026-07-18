@@ -7,6 +7,7 @@
 
 use super::controls;
 use super::editor;
+use super::host;
 use super::popup::Popup;
 use super::*;
 use crate::backend::Event;
@@ -989,6 +990,31 @@ impl DCompBackend {
                     && let Some(cb) = &p.on_tapped
                 {
                     cb.invoke(());
+                }
+                // A HyperlinkButton also follows its `NavigateUri` — through the
+                // app's installed launcher, or not at all. This sits in
+                // `activate`, the ONE path a pointer release, a Space/Enter
+                // press and a UIA `Invoke` all converge on, so a screen reader
+                // invoking a link launches exactly as a click does; there is no
+                // second route to keep in step.
+                //
+                // Deferred, not called here: we are inside the backend's own
+                // `RefCell` borrow, and the launcher is app code that may pump
+                // messages (`ShellExecuteW` does) — a synchronous call could
+                // re-enter the window procedure and find the backend already
+                // borrowed. `post_ui` runs it from the pump with the borrow
+                // released, which is also where the contract on
+                // `set_uri_launcher` promises it runs.
+                if kind == ControlKind::HyperlinkButton
+                    && crate::uri_launcher_installed()
+                    && let Some(uri) = self
+                        .node(id)
+                        .map(|n| n.extras().navigate_uri.clone())
+                        .filter(|u| !u.is_empty())
+                {
+                    host::post_ui(self.hwnd, move || {
+                        crate::launch_uri(&uri);
+                    });
                 }
             }
             // Any other node that hit-tested as clickable (a Border/panel made

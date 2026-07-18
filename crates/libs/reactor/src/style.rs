@@ -4,6 +4,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -371,6 +372,114 @@ pub fn requested_theme() -> RequestedTheme {
 /// synchronously.
 pub(crate) fn set_theme_applier(applier: Option<Rc<dyn Fn(RequestedTheme)>>) {
     THEME_APPLIER.with(|a| *a.borrow_mut() = applier);
+}
+
+// ── URI launch ───────────────────────────────────────────────────────────────
+//
+// Backend-neutral, which is why it lives here and not in the DComp backend: it
+// is app policy, not rendering. The WinUI backend never reaches this — it hands
+// the URI to `HyperlinkButton.SetNavigateUri` and XAML mediates the navigation
+// inside its own trust context — but the declaration is not made backend-shaped
+// for that, any more than [`set_requested_theme`] is.
+
+type UriLauncher = Box<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+
+/// The app-installed launcher. Set once before the window exists; a later
+/// registration is ignored (matches the visibility / display-change setters).
+static URI_LAUNCHER: OnceLock<UriLauncher> = OnceLock::new();
+
+/// Install the process-global URI launcher a [`HyperlinkButton`] activation
+/// routes through. Call **before** the window is created (like
+/// [`crate::set_window_visibility_callback`]); only the first registration is
+/// kept.
+///
+/// **There is no default.** Without a launcher a hyperlink is inert: it paints,
+/// it focuses, it fires its `Click` handler and its UIA `Invoke` — and nothing
+/// is launched. This crate has no URI-launch primitive of its own and does not
+/// acquire one by falling back to the shell.
+///
+/// The launcher receives the control's `NavigateUri` verbatim and returns
+/// whether it handled it. Both halves are the point: the app DECIDES (which
+/// schemes, which hosts, whether a confirmation prompt is due) and the app ACTS
+/// (`ShellExecuteW`, an in-app browser, a queued work item). Returning `false`
+/// means "not handled" and is a normal, silent outcome — this crate does not
+/// take a declined URI anywhere else.
+///
+/// # What the app is taking responsibility for
+///
+/// The string is **untrusted**: it came from whatever built the element tree,
+/// which for a data-driven UI may be a config file, an IPC payload, or a remote
+/// document. This crate deliberately does **not** parse it, resolve it,
+/// percent-decode it, canonicalise it, or judge its scheme — every one of those
+/// is a policy decision (`file:`, `ms-settings:`, a custom protocol handler
+/// registered by another app) whose right answer depends on what the host
+/// application is and what it trusts, and a wrong answer baked in here would be
+/// a wrong answer no app could override. The only thing rejected before the
+/// launcher is called is a string that is not structurally a URI reference at
+/// all — see [`launch_uri`]. Scheme allow-listing is the launcher's job, and it
+/// is not optional: handing this straight to `ShellExecuteW` executes whatever
+/// protocol handler the machine has registered.
+///
+/// # Contract
+///
+/// The launcher runs **on the UI thread**, from the message pump, outside any
+/// backend borrow — never during layout, paint, or event dispatch.
+///
+/// - It must not block. A synchronous `ShellExecuteW` on a cold handler can
+///   stall for seconds; the window is frozen for exactly that long. Post the
+///   real work to another thread and return `true`.
+/// - It must not re-enter the reactor (no `set_state` from inside it); use the
+///   dispatcher, as any other off-thread producer would.
+/// - It may panic without taking the process down: the call is wrapped in the
+///   same fault boundary as an event handler, and the fault is reported under
+///   the `"uri launcher"` context. The URI is **not** part of that report — a
+///   fault handler that logs, and a hyperlink carrying a capability URL, must
+///   not combine into a leak.
+pub fn set_uri_launcher(launcher: impl Fn(&str) -> bool + Send + Sync + 'static) {
+    let _ = URI_LAUNCHER.set(Box::new(launcher));
+}
+
+/// Whether a launcher has been installed with [`set_uri_launcher`].
+///
+/// Lets a UI reflect the truth rather than lie about it — a link that cannot be
+/// followed can be rendered as plain text instead of an affordance that does
+/// nothing.
+pub fn uri_launcher_installed() -> bool {
+    URI_LAUNCHER.get().is_some()
+}
+
+/// Offer `uri` to the installed launcher; returns whether it was handled.
+///
+/// `false` covers all three of "no launcher installed" (the default),
+/// "structurally not a URI reference", and "the launcher declined" — none of
+/// which this crate treats as an error, and all of which end the same way:
+/// nothing is launched.
+///
+/// The structural gate is deliberately the *only* filtering done here, and it
+/// is not a security judgement — it rejects strings that cannot be a URI
+/// reference under RFC 3986 no matter whose policy applies: empty or
+/// whitespace-only, and anything containing a C0/C1 control character (which
+/// includes NUL, CR and LF, the bytes that would let one "URI" become two
+/// arguments or two log lines further down). Everything a policy could
+/// reasonably differ on — the scheme, the authority, the path, the encoding —
+/// is passed through untouched for the launcher to judge.
+///
+/// Public because it is the one chokepoint: an app rendering its own link-like
+/// affordance should route through here rather than reaching for the shell
+/// separately, so a single installed policy governs every launch.
+pub fn launch_uri(uri: &str) -> bool {
+    if uri.trim().is_empty() || uri.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    let Some(launcher) = URI_LAUNCHER.get() else {
+        return false;
+    };
+    // The launcher is app code and may panic; a panic here would otherwise
+    // cross the window procedure's `extern "system"` boundary and abort. The
+    // context string carries no part of the URI.
+    let handled = Cell::new(false);
+    fault::catch("uri launcher", || handled.set(launcher(uri)));
+    handled.get()
 }
 
 /// Symbolic reference to a WinUI XAML theme resource (resolved at apply
