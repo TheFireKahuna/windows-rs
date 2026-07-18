@@ -837,6 +837,20 @@ fn solve_walk(
             content_h: 0.0,
         },
     );
+    // Notify any viz host (SurfacePainter / composition surface) bound to this
+    // node's container of its laid-out size (the DComp analogue of XAML's
+    // FrameworkElement.SizeChanged). Fired every pass — NOT gated on a size
+    // change — because a listener may register after this node's size already
+    // settled (mount callbacks vs layout ordering); the registry change-gates
+    // per listener, so an unchanged size is a cheap no-op and a fresh listener
+    // is guaranteed its first delivery on the next pass. Skip the lookup
+    // entirely when nothing is subscribed (the common case). The fire lives in
+    // this half, not [`apply`], because the listeners are app callbacks that
+    // resize app-owned viz surfaces — solve-side is where app-side work
+    // belongs once the halves split threads.
+    if size::has_listeners() {
+        size::fire_element_size(id, w, h);
+    }
     for &c in &n.children {
         solve_walk(arena, tree, solved, c, ax, ay, sx, sy, scale);
     }
@@ -885,17 +899,6 @@ fn apply(
         // change that `resized` misses.
         if resized || s.reflowed {
             n.mark_dirty();
-        }
-        // Notify any viz host (SurfacePainter / composition surface) bound to
-        // this node's container of its laid-out size (the DComp analogue of
-        // XAML's FrameworkElement.SizeChanged). Fired every pass — NOT gated on
-        // `resized` — because a listener may register after this node's size
-        // already settled (mount callbacks vs layout ordering); the registry
-        // change-gates per listener, so an unchanged size is a cheap no-op and a
-        // fresh listener is guaranteed its first delivery on the next pass. Skip
-        // the lookup entirely when nothing is subscribed (the common case).
-        if size::has_listeners() {
-            size::fire_element_size(id, w, h);
         }
     }
     // Indexed rather than over a cloned child list — the clone was a heap
