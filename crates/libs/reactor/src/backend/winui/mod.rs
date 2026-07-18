@@ -740,6 +740,14 @@ fn run_property_animation_inner(ui: &bindings::UIElement, cfg: AnimationConfig) 
         a.cast::<bindings::IKeyFrameAnimation>()?
             .SetDuration(anim_duration_to_timespan(cfg.duration))?;
         let easing = easing_for(&icomp, cfg.easing)?;
+        // A pinned start makes mount effects deterministic (fade-in from 0);
+        // without one the animation runs from the current value. The easing on
+        // a progress-0 keyframe is inert (easing shapes the segment *ending* at
+        // a keyframe), so the end easing is reused rather than binding a
+        // separate linear function.
+        if let Some(from) = cfg.from_opacity {
+            ia.InsertKeyFrameWithEasingFunction(0.0, from as f32, &easing)?;
+        }
         ia.InsertKeyFrameWithEasingFunction(1.0, opacity as f32, &easing)?;
         let anim = a.cast::<bindings::CompositionAnimation>()?;
         visual_obj.StartAnimation("Opacity", &anim)?;
@@ -771,6 +779,18 @@ fn run_property_animation_inner(ui: &bindings::UIElement, cfg: AnimationConfig) 
         a.cast::<bindings::IKeyFrameAnimation>()?
             .SetDuration(anim_duration_to_timespan(cfg.duration))?;
         let easing = easing_for(&icomp, cfg.easing)?;
+        if let Some(from) = cfg.from_scale {
+            let f = from as f32;
+            ia.InsertKeyFrameWithEasingFunction(
+                0.0,
+                windows_numerics::Vector3 {
+                    x: f,
+                    y: f,
+                    z: current_z,
+                },
+                &easing,
+            )?;
+        }
         let s = scale as f32;
         ia.InsertKeyFrameWithEasingFunction(
             1.0,

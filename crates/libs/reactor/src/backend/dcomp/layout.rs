@@ -13,7 +13,6 @@ use crate::style::GridLength;
 use taffy::prelude::*;
 use windows_canvas_core::{TextFormat, TextLayout};
 use windows_core::Interface;
-use windows_numerics::{Vector2, Vector3};
 
 /// Compute layout for the tree rooted at `root` into a `width` x `height` (DIP)
 /// box, pushing each node's offset/size onto its container and recording its
@@ -99,6 +98,20 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
                     let _ = layout.set_max_width(constraint.unwrap_or(f32::INFINITY));
                 }
                 if let Ok((tw, th)) = layout.measure() {
+                    // A SelectorBar's intrinsic size: each segment is its own
+                    // measured label + padding, side by side inside the tray
+                    // inset. The cached layout supplies the line height.
+                    if node.kind == ControlKind::SelectorBar {
+                        let m = controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
+                        let labels: f32 = node.ctrl.seg_label_w.iter().sum();
+                        let n = node.ctrl.seg_label_w.len().max(1) as f32;
+                        return Size {
+                            width: known
+                                .width
+                                .unwrap_or(labels + n * 2.0 * m.pad_x + 2.0 * m.tray),
+                            height: known.height.unwrap_or(th + 2.0 * (m.pad_y + m.tray)),
+                        };
+                    }
                     return Size {
                         width: known.width.unwrap_or(tw),
                         height: known.height.unwrap_or(th),
@@ -118,7 +131,7 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
 
 /// Snap a DIP coordinate to the physical pixel grid.
 #[inline]
-fn snap(v: f32, scale: f32) -> f32 {
+pub(crate) fn snap(v: f32, scale: f32) -> f32 {
     (v * scale).round() / scale
 }
 
@@ -196,6 +209,40 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
         let layout = build_text_layout(&text, size, weight, &family, wrap);
         if let Some(n) = arena.get_mut(id) {
             n.text_layout = layout;
+            n.text_dirty = false;
+        }
+    }
+    // A SelectorBar measures every item label (each segment sizes to its own
+    // label) and caches one layout as `text_layout` so the measure callback has
+    // the line height. Measured at the active weight (600) so widths hold when
+    // any segment becomes active.
+    let needs_seg = arena.get(id).is_some_and(|n| {
+        n.text_dirty && n.kind == ControlKind::SelectorBar && !n.ctrl.items.is_empty()
+    });
+    if needs_seg {
+        let (items, size, family) = {
+            let n = arena.get(id).unwrap();
+            (
+                n.ctrl.items.clone(),
+                n.paint.font_size,
+                n.paint.font_family.clone().unwrap_or_else(|| "Segoe UI".to_string()),
+            )
+        };
+        let mut widths = Vec::with_capacity(items.len());
+        let mut keep: Option<TextLayout> = None;
+        for item in &items {
+            let mut w = 0.0f32;
+            if let Some(l) = build_text_layout(item, size, 600, &family, false) {
+                if let Ok((lw, _)) = l.measure() {
+                    w = lw;
+                }
+                keep = Some(l);
+            }
+            widths.push(w);
+        }
+        if let Some(n) = arena.get_mut(id) {
+            n.ctrl.seg_label_w = widths;
+            n.text_layout = keep;
             n.text_dirty = false;
         }
     }
@@ -334,8 +381,11 @@ fn assign(
         n.rect = LaidRect { x: sx, y: sy, w, h };
         // The compositor moves/sizes the node — no repaint for a move; a size
         // change does need the node's surface rebuilt at the new pixel extent.
-        let _ = n.vis.SetOffset(Vector3::new(sx - sox, sy - soy, 0.0));
-        let _ = n.vis.SetSize(Vector2::new(w, h));
+        // Pushes are change-gated (and, when the node declares a layout
+        // animation or translation transition, an actual change GLIDES — the
+        // implicit animation triggers on the compositor, no ticks here).
+        n.push_offset(sx - sox, sy - soy);
+        n.push_size(w, h);
         if resized {
             n.mark_dirty();
         }
@@ -384,30 +434,37 @@ fn assign(
             }
         }
         let max_scroll = (content_h - vh).max(0.0);
-        if let Some(n) = arena.get_mut(id) {
+        // Children are placed UNSCROLLED; the scroll translation lives on the
+        // content carrier visual they parent into. Snap it: rects are
+        // pixel-snapped, so a fractional offset would push every child back
+        // off the grid.
+        let scroll = if let Some(n) = arena.get_mut(id) {
             n.ctrl.content_h = content_h;
-            n.anim.target = n.anim.target.clamp(0.0, max_scroll);
-            n.anim.x = n.anim.x.clamp(0.0, max_scroll);
-        }
-        // Snap the scroll translation too: rects are pixel-snapped, so a
-        // fractional scroll offset would push every child back off the grid.
-        let scroll = snap(arena.get(id).map(|n| n.anim.x).unwrap_or(0.0), scale);
+            n.scroll_off = snap(n.scroll_off.clamp(0.0, max_scroll), scale);
+            n.scroll_off
+        } else {
+            0.0
+        };
         for c in &children {
             if let Some(cn) = arena.get_mut(*c) {
-                let _ = cn.vis.SetOffset(Vector3::new(
-                    cn.rect.x - nx,
-                    cn.rect.y - ny - scroll,
-                    0.0,
-                ));
+                let (x, y) = (cn.rect.x - nx, cn.rect.y - ny);
+                cn.push_offset(x, y);
             }
+        }
+        // Layout is placement, not motion: snap the carrier (gated inside, so
+        // an unchanged pass costs nothing and a glide already heading to this
+        // same target keeps flying).
+        if let Some(n) = arena.get_mut(id) {
+            n.scroll_snap(scroll);
         }
     }
 }
 
 /// Re-sync the composition child order for any node whose children list or a
-/// child's Z-order changed: rebuild the collection as `[own surface (bottom),
-/// children sorted by (z, doc order)]`. Retained visuals are merely re-parented,
-/// not recreated.
+/// child's Z-order changed: rebuild the collection as `[below-band chrome
+/// parts, own surface, children sorted by (z, doc order), above-band chrome
+/// parts, scroll thumb]`. Retained visuals are merely re-parented, not
+/// recreated.
 fn sync(arena: &mut Arena, id: ControlId) {
     let children = match arena.get(id) {
         Some(n) => n.children.clone(),
@@ -441,13 +498,48 @@ fn sync(arena: &mut Arena, id: ControlId) {
             .and_then(|n| n.scroll_thumb.as_ref())
             .and_then(|s| s.sprite.cast::<crate::system_bindings::Visual>().ok());
 
+        // Scroll containers parent their children into the content CARRIER
+        // visual (whose Offset is the animated scroll translation); everyone
+        // else parents children directly.
+        let carrier = arena.get(id).and_then(|n| n.scroll_content.clone());
+
         if let Some(coll) = arena.get(id).and_then(|n| n.container.Children().ok()) {
             let _ = coll.RemoveAll();
-            if let Some(sp) = &surf_sprite {
-                let _ = coll.InsertAtBottom(sp);
+            // Sequential InsertAtTop stacks in call order, bottom → top.
+            if let Some(n) = arena.get(id)
+                && let Some(parts) = n.parts.as_deref()
+            {
+                for v in parts.below_visuals() {
+                    let _ = coll.InsertAtTop(&v);
+                }
             }
-            for (_, _, v) in &kids {
-                let _ = coll.InsertAtTop(v);
+            if let Some(sp) = &surf_sprite {
+                let _ = coll.InsertAtTop(sp);
+            }
+            match &carrier {
+                Some(content) => {
+                    if let Ok(cv) = content.cast::<Visual>() {
+                        let _ = coll.InsertAtTop(&cv);
+                    }
+                    if let Ok(cc) = content.Children() {
+                        let _ = cc.RemoveAll();
+                        for (_, _, v) in &kids {
+                            let _ = cc.InsertAtTop(v);
+                        }
+                    }
+                }
+                None => {
+                    for (_, _, v) in &kids {
+                        let _ = coll.InsertAtTop(v);
+                    }
+                }
+            }
+            if let Some(n) = arena.get(id)
+                && let Some(parts) = n.parts.as_deref()
+            {
+                for v in parts.above_visuals() {
+                    let _ = coll.InsertAtTop(&v);
+                }
             }
             if let Some(tp) = &thumb_sprite {
                 let _ = coll.InsertAtTop(tp);

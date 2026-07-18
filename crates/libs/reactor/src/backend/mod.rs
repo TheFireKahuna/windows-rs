@@ -517,6 +517,14 @@ pub trait Backend {
 
     fn run_property_animation(&mut self, _id: ControlId, _config: Option<AnimationConfig>) {}
 
+    /// Register (or clear) the exit transition to play when this control is
+    /// destroyed. A backend that supports it detaches the control's visual on
+    /// `destroy`, plays the animation on the orphaned "ghost", and releases it
+    /// on completion; the default is a no-op (the control disappears
+    /// immediately, which is also the fallback for a control destroyed before
+    /// it was ever laid out).
+    fn set_exit_transition(&mut self, _id: ControlId, _config: Option<AnimationConfig>) {}
+
     fn set_rich_text_paragraphs(&mut self, _id: ControlId, _paragraphs: &[RichTextParagraph]) {}
 
     fn attach_templated_realization(

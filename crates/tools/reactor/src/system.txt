@@ -4,6 +4,12 @@
 // with the lifted Microsoft.UI.Composition types in bindings.rs.
 //
 // Comments must start at column 0 (--etc only strips lines beginning with `//`).
+//
+// This file is the single source of truth for system_bindings.rs — regenerate
+// with `cargo run -p tool_reactor`. Keep it in sync with every symbol the
+// dcomp backend consumes; the historical drift (an uncommitted richer filter
+// carrying the retired D2D1Exposure/effects surface) was reconciled by adding
+// the still-used entries below and letting the dead effect bindings go.
 
 // ── System compositor + visual tree classes ──
 // `::CreateInstance` marks the class activatable so `Compositor::new()` is emitted.
@@ -34,13 +40,36 @@ Windows::UI::Composition::CompositionEasingFunction
 Windows::UI::Composition::LinearEasingFunction
 Windows::UI::Composition::CubicBezierEasingFunction
 Windows::UI::Composition::AnimationIterationBehavior
+// Implicit (property-change-triggered) animations + natural-motion springs —
+// all compositor-evaluated: the app starts them and goes idle (no ticks).
+Windows::UI::Composition::ICompositionAnimationBase
+Windows::UI::Composition::ImplicitAnimationCollection
+// Visual-surface snapshots: re-composite a (possibly detached) visual subtree
+// into ONE surface, so a group fade is a flattened single layer instead of
+// per-visual opacity (used by exit ghosts; the enter-side flatten can reuse it).
+Windows::UI::Composition::CompositionVisualSurface
+Windows::UI::Composition::ICompositorWithVisualSurface::CreateVisualSurface
+Windows::UI::Composition::ICompositionVisualSurface::{put_SourceVisual, put_SourceOffset, put_SourceSize}
+Windows::UI::Composition::NaturalMotionAnimation
+Windows::UI::Composition::ScalarNaturalMotionAnimation
+Windows::UI::Composition::Vector2NaturalMotionAnimation
+Windows::UI::Composition::Vector3NaturalMotionAnimation
+Windows::UI::Composition::SpringScalarNaturalMotionAnimation
+Windows::UI::Composition::SpringVector2NaturalMotionAnimation
+Windows::UI::Composition::SpringVector3NaturalMotionAnimation
+// Nine-grid (9-slice) brush: a rounded chrome source rasterized ONCE stretches
+// to any size with pristine corners — the retained-part (chrome parts) fill.
+Windows::UI::Composition::CompositionNineGridBrush
 // ── Compositor factory methods ──
 Windows::UI::Composition::ICompositor::{CreateContainerVisual, CreateSpriteVisual, CreateColorBrush, CreateColorBrushWithColor, CreateSurfaceBrush, CreateSurfaceBrushWithSurface, CreateScalarKeyFrameAnimation, CreateVector2KeyFrameAnimation, CreateVector3KeyFrameAnimation, CreateExpressionAnimation, CreateExpressionAnimationWithExpression, CreateInsetClip, CreateInsetClipWithInsets, CreateLinearEasingFunction, CreateCubicBezierEasingFunction}
+Windows::UI::Composition::ICompositor2::{CreateImplicitAnimationCollection, CreateNineGridBrush}
+Windows::UI::Composition::ICompositor4::{CreateSpringScalarAnimation, CreateSpringVector2Animation, CreateSpringVector3Animation}
 Windows::UI::Composition::ICompositor6::{CreateGeometricClip, CreateGeometricClipWithGeometry}
 // ── CompositionObject (animation host) ──
 Windows::UI::Composition::ICompositionObject::{get_Compositor, StartAnimation, StopAnimation}
+Windows::UI::Composition::ICompositionObject2::put_ImplicitAnimations
 // ── Visual setters ──
-Windows::UI::Composition::IVisual::{put_Size, get_Size, put_Offset, get_Offset, put_Opacity, put_AnchorPoint, put_CenterPoint, put_Scale, put_RotationAngle, put_IsVisible, put_Clip}
+Windows::UI::Composition::IVisual::{put_Size, get_Size, put_Offset, get_Offset, get_Parent, put_Opacity, put_AnchorPoint, put_CenterPoint, put_Scale, put_RotationAngle, put_IsVisible, put_Clip}
 Windows::UI::Composition::IContainerVisual::get_Children
 Windows::UI::Composition::IVisualCollection::{InsertAtTop, InsertAtBottom, InsertAbove, InsertBelow, Remove, RemoveAll, get_Count}
 Windows::UI::Composition::ISpriteVisual::put_Brush
@@ -60,6 +89,14 @@ Windows::UI::Composition::IVector2KeyFrameAnimation::{InsertKeyFrame, InsertKeyF
 Windows::UI::Composition::IVector3KeyFrameAnimation::{InsertKeyFrame, InsertKeyFrameWithEasingFunction}
 Windows::UI::Composition::IExpressionAnimation::put_Expression
 Windows::UI::Composition::ICompositionAnimation::{SetScalarParameter, SetReferenceParameter, SetVector2Parameter, SetVector3Parameter, SetColorParameter}
+Windows::UI::Composition::ICompositionAnimation2::put_Target
+Windows::UI::Composition::ISpringScalarNaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows::UI::Composition::ISpringVector2NaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows::UI::Composition::ISpringVector3NaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows::UI::Composition::IScalarNaturalMotionAnimation::put_FinalValue
+Windows::UI::Composition::IVector2NaturalMotionAnimation::put_FinalValue
+Windows::UI::Composition::IVector3NaturalMotionAnimation::put_FinalValue
+Windows::UI::Composition::ICompositionNineGridBrush::{put_Source, SetInsets, SetInsetsWithValues, SetInsetScales, SetInsetScalesWithValues}
 // ── Desktop window target (composition on an HWND) ──
 Windows::UI::Composition::Desktop::DesktopWindowTarget
 Windows::UI::Composition::ICompositionTarget::put_Root
@@ -219,6 +256,26 @@ Windows::Win32::UI::WindowsAndMessaging::IDC_SIZEALL
 Windows::Win32::UI::HiDpi::GetDpiForWindow
 Windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext
 Windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+Windows::Win32::UI::HiDpi::GetSystemMetricsForDpi
+Windows::Win32::UI::WindowsAndMessaging::SM_CYFRAME
+Windows::Win32::UI::WindowsAndMessaging::SM_CXPADDEDBORDER
+// ── Custom caption strip (drawn min/max/close, non-client tracking) ──
+Windows::Win32::UI::WindowsAndMessaging::IsZoomed
+Windows::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND
+Windows::Win32::UI::WindowsAndMessaging::WM_NCLBUTTONDOWN
+Windows::Win32::UI::WindowsAndMessaging::WM_NCLBUTTONUP
+Windows::Win32::UI::WindowsAndMessaging::WM_NCMOUSEMOVE
+Windows::Win32::UI::WindowsAndMessaging::WM_NCMOUSELEAVE
+Windows::Win32::UI::WindowsAndMessaging::HTCLOSE
+Windows::Win32::UI::WindowsAndMessaging::HTMAXBUTTON
+Windows::Win32::UI::WindowsAndMessaging::HTMINBUTTON
+Windows::Win32::UI::WindowsAndMessaging::SC_CLOSE
+Windows::Win32::UI::WindowsAndMessaging::SC_MAXIMIZE
+Windows::Win32::UI::WindowsAndMessaging::SC_MINIMIZE
+Windows::Win32::UI::WindowsAndMessaging::SC_RESTORE
+Windows::Win32::UI::WindowsAndMessaging::SIZE_MAXIMIZED
+Windows::Win32::UI::WindowsAndMessaging::SIZE_MINIMIZED
+Windows::Win32::UI::Input::KeyboardAndMouse::TME_NONCLIENT
 // ── Monitors / paint / screen mapping (GDI) ──
 Windows::Win32::Graphics::Gdi::MonitorFromWindow
 Windows::Win32::Graphics::Gdi::MonitorFromPoint
@@ -264,6 +321,7 @@ Windows::Win32::System::Memory::GlobalAlloc
 Windows::Win32::System::Memory::GlobalLock
 Windows::Win32::System::Memory::GlobalUnlock
 Windows::Win32::System::Memory::GLOBAL_ALLOC_FLAGS
+Windows::Win32::Foundation::GlobalFree
 // ── Window-style consts (WINDOW_STYLE newtype) ──
 Windows::Win32::UI::WindowsAndMessaging::WS_OVERLAPPEDWINDOW
 Windows::Win32::UI::WindowsAndMessaging::WS_OVERLAPPED

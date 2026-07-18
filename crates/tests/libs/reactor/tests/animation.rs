@@ -260,6 +260,15 @@ fn equal_animation_config_does_not_re_run() {
     assert_eq!(count, 0);
 }
 
+fn exit_op(ops: &[Op]) -> Option<&AnimationConfig> {
+    ops.iter().rev().find_map(|op| match op {
+        Op::SetExitTransition {
+            config: Some(c), ..
+        } => Some(c),
+        _ => None,
+    })
+}
+
 #[test]
 fn enter_transition_fires_at_mount_time() {
     let mut r = fresh();
@@ -273,6 +282,77 @@ fn enter_transition_fires_at_mount_time() {
 
     let p = property_op(&r.backend.ops).expect("enter should produce a run-property-animation op");
     assert_eq!(p.opacity, Some(1.0));
+}
+
+#[test]
+fn fade_in_pins_a_zero_starting_opacity() {
+    // A mount fade must be deterministic: without a pinned start it would
+    // animate 1.0 -> 1.0 (the visual's resting opacity) and show nothing.
+    let cfg = AnimationConfig::fade_in(Duration::from_millis(200));
+    assert_eq!(cfg.from_opacity, Some(0.0));
+    assert_eq!(cfg.opacity, Some(1.0));
+    // fade_out starts from wherever the visual currently is.
+    let out = AnimationConfig::fade_out(Duration::from_millis(200));
+    assert_eq!(out.from_opacity, None);
+    assert_eq!(out.opacity, Some(0.0));
+}
+
+#[test]
+fn exit_transition_registers_with_the_backend_at_mount() {
+    let mut r = fresh();
+    let el: Element = button("hi")
+        .transition(
+            None,
+            Some(AnimationConfig::fade_out(Duration::from_millis(150))),
+        )
+        .into();
+    let _ = r.reconcile(None, &el, None, no_rerender());
+
+    let e = exit_op(&r.backend.ops).expect("exit should be registered at mount");
+    assert_eq!(e.opacity, Some(0.0));
+    assert_eq!(e.duration, Duration::from_millis(150));
+    // An exit alone must not run anything at mount.
+    assert!(property_op(&r.backend.ops).is_none());
+}
+
+#[test]
+fn exit_transition_diffs_like_other_animation_state() {
+    let mut r = fresh();
+    let v1: Element = button("hi")
+        .transition(
+            None,
+            Some(AnimationConfig::fade_out(Duration::from_millis(100))),
+        )
+        .into();
+    let id = r.reconcile(None, &v1, None, no_rerender()).unwrap();
+    r.backend.clear_ops();
+
+    // Equal exit config: no re-registration.
+    let v2: Element = button("hi")
+        .transition(
+            None,
+            Some(AnimationConfig::fade_out(Duration::from_millis(100))),
+        )
+        .into();
+    let _ = r.reconcile(Some(&v1), &v2, Some(id), no_rerender());
+    let count = r
+        .backend
+        .ops
+        .iter()
+        .filter(|op| matches!(op, Op::SetExitTransition { .. }))
+        .count();
+    assert_eq!(count, 0, "equal exit config must not re-register");
+
+    // Changed exit config: exactly one update.
+    let v3: Element = button("hi")
+        .transition(
+            None,
+            Some(AnimationConfig::fade_out(Duration::from_millis(250))),
+        )
+        .into();
+    let _ = r.reconcile(Some(&v2), &v3, Some(id), no_rerender());
+    let e = exit_op(&r.backend.ops).expect("changed exit config re-registers");
+    assert_eq!(e.duration, Duration::from_millis(250));
 }
 
 #[test]

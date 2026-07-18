@@ -1,7 +1,9 @@
 //! Control-library demo for the self-hosted DirectComposition + Direct2D
 //! backend. Exercises the drawn control set — a `NavigationView` icon rail, a
 //! `ToggleSwitch`, a `SelectorBar` (segmented), a `ComboBox`/Select with a
-//! light-dismissed popup, a `CheckBox`, a `Slider`, a `ProgressBar`, and a
+//! light-dismissed popup, a `CheckBox`, a `Slider`, determinate and
+//! indeterminate progress (bar + ring, looping on the compositor), a
+//! `HyperlinkButton`, an `Expander`, and a
 //! `ScrollViewer` whose content overflows and scrolls on the compositor — all
 //! reacting to pointer + keyboard (Tab focus ring, Space/Enter, arrows) and
 //! idling at true zero CPU (blocking `GetMessageW` pump; springs self-stop).
@@ -84,6 +86,23 @@ fn main() -> windows_reactor::Result<()> {
             .into();
 
         let progress = ProgressBar::new(gain).height(8.0).width(200.0).into();
+        let busy = ProgressBar::indeterminate().height(8.0).width(200.0).into();
+        let ring = ProgressRing::indeterminate().width(28.0).height(28.0).into();
+        let link = HyperlinkButton::new("Release notes")
+            .navigate_uri("https://newapo.dev")
+            .height(24.0)
+            .width(120.0)
+            .into();
+
+        let advanced = Expander::new(
+            vstack((
+                text_block("Oversampling: 4x").font_size(12.0).foreground(TXT2),
+                text_block("Dither: TPDF").font_size(12.0).foreground(TXT2),
+            ))
+            .spacing(6.0),
+        )
+        .header("Advanced")
+        .into();
 
         // A tall stack so the ScrollViewer overflows and scrolls.
         let mut cards: Vec<Element> = vec![
@@ -92,7 +111,11 @@ fn main() -> windows_reactor::Result<()> {
             card("Filter type", select),
             card(&format!("Output gain  ({gain:.0}%)"), slider),
             card("Level", progress),
+            card("Analyzing…", busy),
+            card("Loading", ring),
             card("Dynamics", check),
+            card("About", link),
+            advanced,
         ];
         for i in 1..=8 {
             cards.push(card(
@@ -101,17 +124,23 @@ fn main() -> windows_reactor::Result<()> {
             ));
         }
 
-        let content = vstack((
+        // Header rows auto-size; the STAR row hands the scroll viewer the
+        // REMAINING viewport height — a ScrollViewer only scrolls when a
+        // parent bounds it (in a plain vstack it stretches to its content).
+        let content = grid((
             text_block(format!("Section: {section}"))
                 .font_size(15.0)
                 .semibold()
-                .foreground(TXT),
+                .foreground(TXT)
+                .grid_row(0),
             text_block("Scroll with the wheel · Tab to focus · Space/Enter to toggle")
                 .font_size(12.0)
-                .foreground(TXT2),
-            scroll_viewer(vstack(cards).spacing(12.0)),
+                .foreground(TXT2)
+                .grid_row(1),
+            scroll_viewer(vstack(cards).spacing(12.0)).grid_row(2),
         ))
-        .spacing(12.0);
+        .rows([GridLength::Auto, GridLength::Auto, GridLength::STAR])
+        .row_spacing(12.0);
 
         let body = border(content)
             .background(PANEL)

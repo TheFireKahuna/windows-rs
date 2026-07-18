@@ -4,14 +4,20 @@
 //! of the compositor root, per the parity spec's sanctioned alternative to a
 //! second HWND), anchored under its trigger with monitor/edge flip, light-
 //! dismissed on outside-click or Escape, and keyboard-navigable (Up/Down/Enter/
-//! Esc). It opens with a `SNAPPY` scale+fade on its root visual and idles with no
-//! polling — the host message loop drives its open spring via the frame tick.
+//! Esc). It reveals with a one-shot compositor scale+fade grown out of its
+//! anchored edge and dismisses with a compositor fade (the closing visual rides
+//! the exit-ghost timer) — both play DWM-side, so a popup costs zero app frames
+//! open or closed.
 
+use std::time::Duration;
+
+use super::animate;
 use super::bootstrap::{Compositing, NodeSurface};
-use super::node::{linear, MenuRow, Spring};
+use super::node::{linear, MenuRow};
 use super::theme;
+use crate::style::{AnimationConfig, Easing};
 use crate::backend::ControlId;
-use crate::system_bindings::{ContainerVisual, IVisual, POINT};
+use crate::system_bindings::{ContainerVisual, IVisual, Visual, POINT};
 use windows_canvas_core::{
     bindings::ID2D1DeviceContext, Brush, ColorF, DrawingSession, FontWeight, ParagraphAlignment,
     Rect, RoundedRect, TextAlignment, TextFormat, Vector2,
@@ -33,6 +39,13 @@ const ROW: f32 = theme::ROW_H;
 const SEP: f32 = theme::SPACE_8 + theme::BORDER_W;
 const PANEL_PAD: f32 = theme::SPACE_4;
 
+/// Reveal one-shot: a snappy Fluent-style grow-out-of-the-trigger (0.96→1
+/// scale + fade, decelerating).
+const REVEAL_DURATION: Duration = Duration::from_millis(160);
+/// Dismiss fade length. The backend parks the closing visual as a ghost for
+/// this long (plus grace) before releasing it.
+pub(crate) const EXIT_DURATION: Duration = Duration::from_millis(100);
+
 /// A live popup surface. The backend owns at most one (`Option<Popup>`).
 pub(crate) struct Popup {
     /// The control that opened this popup (its events fire on selection).
@@ -43,7 +56,6 @@ pub(crate) struct Popup {
     /// keeps the field focused, rather than closing a trigger control).
     pub suggest: bool,
     container: ContainerVisual,
-    vis: IVisual,
     surf: NodeSurface,
     items: Vec<MenuRow>,
     /// Drawn-panel rect in window DIPs (excludes the shadow margin).
@@ -54,7 +66,6 @@ pub(crate) struct Popup {
     window: (f32, f32),
     /// Currently highlighted row index (`usize::MAX` = none).
     pub hovered: usize,
-    open: Spring,
     px: f32,
 }
 
@@ -84,7 +95,7 @@ impl Popup {
         panel: Rect,
         surf_w: f32,
         surf_h: f32,
-    ) -> windows_core::Result<(ContainerVisual, IVisual, NodeSurface)> {
+    ) -> windows_core::Result<(ContainerVisual, NodeSurface)> {
         let scale = comp.scale();
         let (container, surf) =
             comp.new_overlay((surf_w * scale).ceil() as i32, (surf_h * scale).ceil() as i32)?;
@@ -92,7 +103,7 @@ impl Popup {
         let vis: IVisual = container.cast()?;
         vis.SetOffset(Vector3::new(panel.left - MARGIN, panel.top - MARGIN, 0.0))?;
         vis.SetSize(Vector2::new(surf_w, surf_h))?;
-        Ok((container, vis, surf))
+        Ok((container, surf))
     }
 
     /// Open a popup of `items` anchored under `anchor` (window DIPs), clamped /
@@ -109,37 +120,64 @@ impl Popup {
         suggest: bool,
     ) -> windows_core::Result<Self> {
         let (panel, surf_w, surf_h) = Self::layout(&items, anchor, window);
-        let (container, vis, surf) = Self::build_surface(comp, panel, surf_w, surf_h)?;
+        let (container, surf) = Self::build_surface(comp, panel, surf_w, surf_h)?;
         let hovered = if combo && selected >= 0 {
             selected as usize
         } else {
             usize::MAX
         };
-        let mut popup = Self {
+        let popup = Self {
             owner,
             combo,
             suggest,
             container,
-            vis,
             surf,
             items,
             panel,
             anchor,
             window,
             hovered,
-            open: Spring::new(0.0),
             px: comp.scale(),
         };
-        popup.open.target = 1.0;
-        popup.apply_anim();
+        popup.reveal(comp);
         popup.draw(comp);
         Ok(popup)
     }
 
+    /// Play the open reveal: a one-shot compositor scale (0.96→1) + fade,
+    /// pivoted on the panel's anchored edge (top-center when it drops below its
+    /// trigger, bottom-center when flipped above), so the menu grows out of the
+    /// control that opened it. DWM plays it; the app takes zero frames.
+    fn reveal(&self, comp: &Compositing) {
+        let Ok(v) = self.container.cast::<Visual>() else { return };
+        let cfg = AnimationConfig {
+            opacity: Some(1.0),
+            from_opacity: Some(0.0),
+            scale: Some(1.0),
+            from_scale: Some(0.96),
+            duration: REVEAL_DURATION,
+            easing: Easing::EaseOut,
+        };
+        // Pivot in surface DIPs: the panel sits at (MARGIN, MARGIN) inside the
+        // shadow-bleed surface; flipped-above panels anchor at their bottom.
+        let pivot_y = if self.panel.top < self.anchor.top {
+            MARGIN + self.panel.height()
+        } else {
+            MARGIN
+        };
+        animate::start(
+            comp.compositor(),
+            &v,
+            &cfg,
+            Some((MARGIN + self.panel.width() / 2.0, pivot_y)),
+        );
+    }
+
     /// Replace a suggestion popup's rows in place (the filtered list changed as the
-    /// user typed). The open spring is preserved so the panel does not re-pop on
-    /// each keystroke; the backing surface is rebuilt only when the row count (and
-    /// thus the panel height) changes.
+    /// user typed). No reveal replays, so the panel does not re-pop on each
+    /// keystroke; the backing surface is rebuilt only when the row count (and
+    /// thus the panel height) changes — the fresh visual mounts at rest
+    /// (opacity 1, scale 1).
     pub fn update_items(&mut self, comp: &Compositing, items: Vec<MenuRow>) {
         let resized = items.len() != self.items.len();
         self.items = items;
@@ -148,36 +186,39 @@ impl Popup {
         }
         if resized {
             let (panel, surf_w, surf_h) = Self::layout(&self.items, self.anchor, self.window);
-            if let Ok((container, vis, surf)) = Self::build_surface(comp, panel, surf_w, surf_h) {
+            if let Ok((container, surf)) = Self::build_surface(comp, panel, surf_w, surf_h) {
                 comp.remove_overlay(&self.container);
                 self.container = container;
-                self.vis = vis;
                 self.surf = surf;
                 self.panel = panel;
-                self.apply_anim();
             }
         }
         self.draw(comp);
     }
 
-    /// Advance the open animation; returns `true` once settled.
-    pub fn tick(&mut self, dt: f32) -> bool {
-        let settled = self.open.step(dt);
-        self.apply_anim();
-        settled
-    }
-
-    /// Apply the open spring as a scale (0.96→1.0) + fade on the root visual.
-    fn apply_anim(&self) {
-        let t = self.open.x.clamp(0.0, 1.0);
-        let s = 0.96 + 0.04 * t;
-        let _ = self.vis.SetOpacity(t);
-        let _ = self.vis.SetScale(Vector3::new(s, s, 1.0));
-    }
-
-    /// Detach the overlay surface from the tree (closing the popup).
-    pub fn dismiss(self, comp: &Compositing) {
-        comp.remove_overlay(&self.container);
+    /// Start the compositor-side dismiss fade and hand the overlay visual back
+    /// to the caller, who parks it as a ghost until the fade lands (the visual
+    /// COM-references the whole surface chain, so nothing else need be held).
+    /// `None` means the visual was removed immediately (cast failure).
+    pub fn into_exit(self, comp: &Compositing) -> Option<Visual> {
+        match self.container.cast::<Visual>() {
+            Ok(v) => {
+                let cfg = AnimationConfig {
+                    opacity: Some(0.0),
+                    from_opacity: None,
+                    scale: None,
+                    from_scale: None,
+                    duration: EXIT_DURATION,
+                    easing: Easing::EaseIn,
+                };
+                animate::start(comp.compositor(), &v, &cfg, None);
+                Some(v)
+            }
+            Err(_) => {
+                comp.remove_overlay(&self.container);
+                None
+            }
+        }
     }
 
     /// `true` if `(x, y)` window-DIP lies inside the drawn panel.

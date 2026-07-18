@@ -596,6 +596,27 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
+    /// Creates a **color-preserving** Gaussian blur effect from `source`: every
+    /// channel is blurred by `blur_standard_deviation` (DIPs) — unlike
+    /// [`create_shadow`](Self::create_shadow), which blurs only the alpha channel and
+    /// re-tints it with a single color. Draw its output with
+    /// [`draw_effect`](Self::draw_effect). Use it for a bloom that must keep a
+    /// multi-colored source's own hues (e.g. a gradient-stroked line glowing in its
+    /// own colors along its length). `source` must be an effect-readable image (see
+    /// [`create_shadow`](Self::create_shadow)).
+    pub fn create_blur(&self, source: &Bitmap, blur_standard_deviation: f32) -> Result<Effect> {
+        unsafe {
+            let effect = self.context.CreateEffect(&CLSID_D2D1GaussianBlur)?;
+            effect.SetInput(0, &source.0, true);
+            effect.SetValue(
+                D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &blur_standard_deviation.to_le_bytes(),
+            )?;
+            Ok(Effect(effect))
+        }
+    }
+
     /// Redirect drawing to a bitmap target for the duration of the closure.
     pub fn with_target(&self, bitmap: &Bitmap, f: impl FnOnce()) {
         unsafe {

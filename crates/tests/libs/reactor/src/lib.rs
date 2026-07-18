@@ -122,6 +122,10 @@ pub enum Op {
         id: ControlId,
         config: Option<AnimationConfig>,
     },
+    SetExitTransition {
+        id: ControlId,
+        config: Option<AnimationConfig>,
+    },
     SetRichTextParagraphs {
         id: ControlId,
         paragraphs: Vec<RichTextParagraph>,
@@ -534,6 +538,10 @@ impl Backend for RecordingBackend {
 
     fn run_property_animation(&mut self, id: ControlId, config: Option<AnimationConfig>) {
         self.ops.push(Op::RunPropertyAnimation { id, config });
+    }
+
+    fn set_exit_transition(&mut self, id: ControlId, config: Option<AnimationConfig>) {
+        self.ops.push(Op::SetExitTransition { id, config });
     }
 
     fn set_rich_text_paragraphs(&mut self, id: ControlId, paragraphs: &[RichTextParagraph]) {

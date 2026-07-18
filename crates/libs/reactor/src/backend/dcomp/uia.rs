@@ -25,7 +25,7 @@
 use std::mem::ManuallyDrop;
 
 use super::host;
-use super::{controls, theme};
+use super::controls;
 use super::*;
 use crate::backend::ControlKind;
 use crate::system_bindings::{
@@ -167,7 +167,9 @@ fn is_item_container(kind: ControlKind) -> bool {
 fn pattern_supported(kind: ControlKind, item: i32, pid: UIA_PATTERN_ID) -> bool {
     use ControlKind::*;
     if item >= 0 {
-        return pid == UIA_SelectionItemPatternId;
+        // Synthetic items select — and also invoke, so `uia:invoke;name=<label>`
+        // scripts written against the old per-segment Buttons keep working.
+        return pid == UIA_SelectionItemPatternId || pid == UIA_InvokePatternId;
     }
     if pid == UIA_InvokePatternId {
         matches!(kind, Button | RepeatButton | HyperlinkButton | DropDownButton | SplitButton)
@@ -441,9 +443,13 @@ impl DCompBackend {
         if item >= 0 {
             match n.kind {
                 ControlKind::SelectorBar => {
-                    let sw = controls::segment_width(n);
-                    x = n.rect.x + theme::BORDER_W + sw * item as f32;
-                    w = sw;
+                    let edges = controls::segment_edges(n);
+                    if let (Some(&l), Some(&r)) =
+                        (edges.get(item as usize), edges.get(item as usize + 1))
+                    {
+                        x = n.rect.x + l;
+                        w = r - l;
+                    }
                 }
                 ControlKind::NavigationView => {
                     y = n.rect.y + controls::NAV_ITEM_H * item as f32;
@@ -724,8 +730,13 @@ impl IRawElementProviderFragmentRoot_Impl for ElementProvider_Impl {
 
 impl IInvokeProvider_Impl for ElementProvider_Impl {
     fn Invoke(&self) -> Result<()> {
-        let id = self.id;
-        act(self.hwnd, move |b| b.uia_activate(id));
+        let (id, item) = (self.id, self.item);
+        if item >= 0 {
+            // Invoking a synthetic container item selects it.
+            act(self.hwnd, move |b| b.uia_select_item(id, item));
+        } else {
+            act(self.hwnd, move |b| b.uia_activate(id));
+        }
         Ok(())
     }
 }

@@ -1,8 +1,8 @@
 //! The retained node arena: one [`Node`] per live [`ControlId`]. Each node owns
 //! a composition `ContainerVisual` (parented to mirror the logical tree), its
 //! Taffy layout inputs, an optional painted-chrome [`NodeSurface`], children,
-//! handlers, and the small interaction state (hover/press springs) the spine
-//! animates.
+//! and the small interaction state (hover/press flags). All motion plays on
+//! the system compositor — the backend keeps no CPU-stepped animation state.
 //!
 //! The arena is the single source of truth for layout and paint. The composition
 //! tree is kept in lock-step incrementally: structural edits mark a parent's
@@ -14,12 +14,19 @@ use super::bootstrap::NodeSurface;
 use super::editor::Editor;
 use super::*;
 use crate::backend::{ControlKind, Event, EventHandler};
-use crate::style::{AccessibilityModifiers, PointerHandlers};
-use crate::system_bindings::{ContainerVisual, IVisual, InsetClip};
+use crate::style::{
+    AccessibilityModifiers, AnimationConfig, ImplicitTransitions, LayoutAnimationConfig,
+    PointerHandlers,
+};
+use crate::system_bindings::{
+    ContainerVisual, ICompositionObject, ICompositionObject2, IVisual, ImplicitAnimationCollection,
+    InsetClip,
+};
 use crate::Color;
 use crate::LineEndpoints;
 use windows_canvas_core::{ColorF, TextLayout};
 use windows_core::Interface;
+use windows_numerics::{Vector2, Vector3};
 
 /// Convert a reactor [`Color`] to a [`ColorF`] for D2D, applying the app's output
 /// colour transform ([`color_out`](super::color_out)) on the way. Both currencies
@@ -29,43 +36,6 @@ use windows_core::Interface;
 pub(crate) fn linear(c: Color) -> ColorF {
     let [r, g, b, a] = super::color_out::apply([c.r, c.g, c.b, c.a]);
     ColorF::new(r, g, b, a)
-}
-
-/// Linearly interpolate two scRGB colors.
-pub(crate) fn lerp_color(a: ColorF, b: ColorF, t: f32) -> ColorF {
-    let l = |x: f32, y: f32| x + (y - x) * t;
-    ColorF::new(l(a.r, b.r), l(a.g, b.g), l(a.b, b.b), l(a.a, b.a))
-}
-
-/// Semi-implicit-Euler spring (snappy tuning), mirroring the project's
-/// `spring.rs`. Stepped only while a node is animating; settles to exact target.
-#[derive(Clone, Copy)]
-pub(crate) struct Spring {
-    pub x: f32,
-    pub v: f32,
-    pub target: f32,
-}
-
-impl Spring {
-    pub fn new(x: f32) -> Self {
-        Self { x, v: 0.0, target: x }
-    }
-
-    /// Advance by `dt` seconds; returns `true` once settled.
-    pub fn step(&mut self, dt: f32) -> bool {
-        let dt = dt.min(0.05);
-        let (k, c) = (520.0_f32, 40.0_f32);
-        let a = -k * (self.x - self.target) - c * self.v;
-        self.v += a * dt;
-        self.x += self.v * dt;
-        if (self.x - self.target).abs() < 1e-3 && self.v.abs() < 1e-3 {
-            self.x = self.target;
-            self.v = 0.0;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 /// An absolute laid-out rectangle, in DIPs (top-left origin, window-relative).
@@ -134,6 +104,12 @@ pub(crate) struct Ctrl {
     pub indeterminate: bool,
     pub is_active: bool,
     pub selected_index: i32,
+    /// SelectorBar: the segment currently under the pointer (-1 = none) — the
+    /// hovered segment gets its own ink wash and brighter label.
+    pub hot_index: i32,
+    /// SelectorBar: measured label width per item (DIPs, parallel to `items`),
+    /// written by the text-rebuild pass — segments size to their own label.
+    pub seg_label_w: Vec<f32>,
     /// Display labels (SelectorBar segments / ComboBox items / nav item names).
     pub items: Vec<String>,
     /// Per-item tag (NavigationView) — parallel to `items` when present.
@@ -168,6 +144,8 @@ impl Default for Ctrl {
             indeterminate: false,
             is_active: true,
             selected_index: -1,
+            hot_index: -1,
+            seg_label_w: Vec::new(),
             items: Vec::new(),
             tags: Vec::new(),
             icons: Vec::new(),
@@ -209,17 +187,66 @@ pub(crate) struct Node {
     pub vis: IVisual,
     /// Painted-chrome surface — created lazily for nodes that draw something.
     pub surf: Option<NodeSurface>,
+    /// Retained chrome parts (indicator pill / toggle knob / slider fill /
+    /// hover ink) for the converted control kinds — compositor sprites whose
+    /// motion runs DWM-side. Created lazily by the parts sync; `None` for
+    /// every other node. See [`parts`](super::parts).
+    pub parts: Option<Box<parts::Parts>>,
     /// ScrollViewer only: the auto-hiding overlay scrollbar thumb sprite (a top
     /// child of the container, above the scrolled content), created lazily.
     pub scroll_thumb: Option<NodeSurface>,
-    /// Thumb opacity (0 hidden … 1 shown); sprung in on hover/scroll, out at rest.
-    pub thumb_fade: Spring,
+    /// ScrollViewer only: the content **carrier** visual all scrolled children
+    /// parent into (created with the node). Scrolling animates this ONE
+    /// visual's Offset with a compositor spring — no per-frame tick, no
+    /// per-child writes while the glide plays.
+    pub scroll_content: Option<ContainerVisual>,
+    /// Cached retargetable compositor spring driving `scroll_content`'s Offset
+    /// (built on first glide; a wheel retarget is `SetFinalValue` + start).
+    pub scroll_spring: Option<crate::system_bindings::SpringVector3NaturalMotionAnimation>,
+    /// Cached spring for the thumb sprite's Offset (same tuning, so the thumb
+    /// tracks the content glide proportionally).
+    pub thumb_spring: Option<crate::system_bindings::SpringVector3NaturalMotionAnimation>,
+    /// Last scroll offset written/targeted on the carrier (gates no-op writes;
+    /// `None` until first placement).
+    pub last_scroll: Option<f32>,
+    /// Whether the thumb is currently revealed (hover/drag/scroll-in-flight).
+    /// The show/hide fade itself plays on the system compositor
+    /// ([`animate::fade_thumb`](super::animate::fade_thumb)) — this is only the
+    /// edge detector that triggers it, never a per-frame value.
+    pub thumb_shown: bool,
     /// Thumb height (DIP) the thumb surface was last drawn at (redraw on change).
     pub thumb_drawn_h: f32,
     /// While dragging the thumb: the pointer-to-thumb-top offset captured at press.
     pub thumb_drag: Option<f32>,
     /// Bounds clip (ScrollViewer/overflow); tracks the container's own size.
     pub clip: Option<InsetClip>,
+
+    // ── Compositor animations (all DWM-evaluated — zero app ticks) ───────
+    /// Declared implicit property transitions (opacity/scale/rotation/
+    /// translation), kept so the merged collection can be rebuilt.
+    pub transitions: Option<ImplicitTransitions>,
+    /// Declared layout (offset/size) glide, merged into the same collection.
+    pub layout_anim: Option<LayoutAnimationConfig>,
+    /// The merged implicit-animation collection built from the two above.
+    pub implicit: Option<ImplicitAnimationCollection>,
+    /// Whether `implicit` is attached to the container. Attachment is deferred
+    /// to the first layout write so initial placement never plays as a fly-in
+    /// from the visual's zeroed defaults.
+    pub implicit_attached: bool,
+    /// Exit transition played on a detached "ghost" of this container when the
+    /// node is destroyed (see `DCompBackend::destroy`).
+    pub exit: Option<AnimationConfig>,
+    /// Cached explicit-start spring for offset glides (built once per config;
+    /// cleared when `layout_anim` changes so damping/period rebuild).
+    pub spring_anim: Option<crate::system_bindings::SpringVector3NaturalMotionAnimation>,
+    /// Keep `CenterPoint` at `size/2` — set once any animation touches scale,
+    /// so scale effects pivot around the node centre at every size.
+    pub wants_center: bool,
+    /// Last offset/size pushed to the visual. Gates the COM writes so an
+    /// unchanged layout pass costs nothing and never re-triggers an implicit
+    /// animation.
+    pub last_off: Option<(f32, f32)>,
+    pub last_size: Option<(f32, f32)>,
     /// WinRT alignment requests (-1 = unset; 0..3 mirror WinRT enums).
     pub h_align: i32,
     pub v_align: i32,
@@ -235,19 +262,17 @@ pub(crate) struct Node {
     /// Transient: the Taffy node this maps to in the current layout pass.
     pub taffy_id: Option<taffy::NodeId>,
     pub rect: LaidRect,
-    pub hover: Spring,
-    pub press: Spring,
     pub hovered: bool,
     pub pressed: bool,
 
     // ── Control library state ────────────────────────────────────────────
     /// Stateful drawn-control data (toggle/slider/segmented/select/nav/…).
     pub ctrl: Ctrl,
-    /// The control's primary animated quantity: toggle-knob / segmented-pill /
-    /// nav-indicator position, slider-thumb fraction, or scroll offset.
-    pub anim: Spring,
-    /// Continuous phase for indeterminate progress (advanced by the frame tick).
-    pub phase: f32,
+    /// ScrollViewer only: the LOGICAL scroll offset (DIPs of content above the
+    /// viewport). Hit-testing and thumb geometry read this; the VISUAL glide
+    /// toward it plays on the compositor (`scroll_glide`), so during a wheel
+    /// glide it already holds the destination.
+    pub scroll_off: f32,
     /// This node accepts keyboard focus (Tab) + Space/Enter activation.
     pub focusable: bool,
     /// This node currently holds keyboard focus (draws the focus ring).
@@ -304,11 +329,25 @@ impl Node {
             container,
             vis,
             surf: None,
+            parts: None,
             scroll_thumb: None,
-            thumb_fade: Spring::new(0.0),
+            scroll_content: None,
+            scroll_spring: None,
+            thumb_spring: None,
+            last_scroll: None,
+            thumb_shown: false,
             thumb_drawn_h: 0.0,
             thumb_drag: None,
             clip: None,
+            transitions: None,
+            layout_anim: None,
+            implicit: None,
+            implicit_attached: false,
+            exit: None,
+            spring_anim: None,
+            wants_center: false,
+            last_off: None,
+            last_size: None,
             h_align: -1,
             v_align: -1,
             z_index: 0,
@@ -317,13 +356,10 @@ impl Node {
             dirty: true,
             taffy_id: None,
             rect: LaidRect::default(),
-            hover: Spring::new(0.0),
-            press: Spring::new(0.0),
             hovered: false,
             pressed: false,
             ctrl: Ctrl::default(),
-            anim: Spring::new(0.0),
-            phase: 0.0,
+            scroll_off: 0.0,
             focusable,
             focused: false,
             editor: is_text_editable(kind).then(|| Editor::new(kind)),
@@ -378,6 +414,171 @@ impl Node {
     /// Mark this node's surface for repaint.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Push the visual's parent-relative offset, skipping the COM write when
+    /// unchanged. All offset writers (layout, scroll) route through here: the
+    /// gate keeps an unchanged pass free AND keeps implicit Offset animations
+    /// from re-triggering on a no-op set. The node's first-ever write also
+    /// attaches any pending implicit collection — *after* the position lands,
+    /// so mounting never animates from (0, 0).
+    ///
+    /// A spring layout glide replaces the property set entirely: the move is
+    /// handed to an explicit compositor spring targeting the new offset
+    /// ([`animate::spring_offset`](super::animate::spring_offset)). Initial
+    /// placement always SETS — mounting must never fly in.
+    pub fn push_offset(&mut self, x: f32, y: f32) {
+        if self.last_off == Some((x, y)) {
+            return;
+        }
+        let first = self.last_off.is_none();
+        if !first
+            && let Some(l) = self.layout_anim.filter(|l| l.animate_offset && l.use_spring)
+            && let Ok(obj) = self.container.cast::<ICompositionObject>()
+            && super::animate::spring_offset(
+                &obj,
+                &mut self.spring_anim,
+                x,
+                y,
+                l.damping_ratio,
+                l.period,
+            )
+            .is_ok()
+        {
+            self.last_off = Some((x, y));
+            return;
+        }
+        let _ = self.vis.SetOffset(Vector3::new(x, y, 0.0));
+        self.last_off = Some((x, y));
+        if first {
+            self.attach_implicit_if_ready();
+        }
+    }
+
+    /// Push the visual's size, skipping the COM write when unchanged; keeps
+    /// the scale pivot centred while any animation wants one.
+    pub fn push_size(&mut self, w: f32, h: f32) {
+        if self.last_size == Some((w, h)) {
+            return;
+        }
+        let _ = self.vis.SetSize(Vector2::new(w, h));
+        self.last_size = Some((w, h));
+        if self.wants_center {
+            let _ = self
+                .vis
+                .SetCenterPoint(Vector3::new(w / 2.0, h / 2.0, 0.0));
+        }
+    }
+
+    // ── Scroll carrier (compositor-side scrolling) ───────────────────────
+
+    /// Snap the scroll carrier to `offset` (content moved up by `offset` DIPs):
+    /// stop any in-flight glide, then a plain property set. Used by layout
+    /// (placement, not motion) and 1:1 thumb drags. Gated on the last written
+    /// target so an unchanged pass costs nothing — and never interrupts a glide
+    /// already heading to the same place.
+    pub fn scroll_snap(&mut self, offset: f32) {
+        if self.last_scroll == Some(offset) {
+            return;
+        }
+        if let Some(c) = &self.scroll_content {
+            if let Ok(o) = c.cast::<ICompositionObject>() {
+                let _ = o.StopAnimation("Offset");
+            }
+            if let Ok(v) = c.cast::<IVisual>() {
+                let _ = v.SetOffset(Vector3::new(0.0, -offset, 0.0));
+            }
+        }
+        self.last_scroll = Some(offset);
+    }
+
+    /// Spring-glide the scroll carrier to `offset` on the compositor (wheel
+    /// scrolling). Retargets smoothly mid-flight; first placement snaps.
+    pub fn scroll_glide(&mut self, offset: f32) {
+        if self.last_scroll == Some(offset) {
+            return;
+        }
+        if self.last_scroll.is_none() {
+            self.scroll_snap(offset);
+            return;
+        }
+        if let Some(c) = &self.scroll_content
+            && let Ok(o) = c.cast::<ICompositionObject>()
+            && animate::spring_offset(
+                &o,
+                &mut self.scroll_spring,
+                0.0,
+                -offset,
+                parts::SPRING_DAMPING,
+                parts::SPRING_PERIOD,
+            )
+            .is_ok()
+        {
+            self.last_scroll = Some(offset);
+            return;
+        }
+        self.scroll_snap(offset);
+    }
+
+    /// Spring-glide the overlay thumb sprite to `(x, y)` — same tuning as the
+    /// carrier, so the thumb rides the content glide.
+    pub fn thumb_glide(&mut self, x: f32, y: f32) {
+        if let Some(t) = &self.scroll_thumb
+            && let Ok(o) = t.sprite.cast::<ICompositionObject>()
+        {
+            let _ = animate::spring_offset(
+                &o,
+                &mut self.thumb_spring,
+                x,
+                y,
+                parts::SPRING_DAMPING,
+                parts::SPRING_PERIOD,
+            );
+        }
+    }
+
+    /// Snap the thumb sprite to `(x, y)` (1:1 drag tracking), stopping any
+    /// in-flight glide first — a plain set while an animation holds the
+    /// property would be ignored.
+    pub fn thumb_snap(&mut self, x: f32, y: f32) {
+        if let Some(t) = &self.scroll_thumb {
+            if let Ok(o) = t.sprite.cast::<ICompositionObject>() {
+                let _ = o.StopAnimation("Offset");
+            }
+            t.set_offset(x, y);
+        }
+    }
+
+    /// Attach the merged implicit collection once the node has a real laid-out
+    /// position. No-op when nothing is pending or the node hasn't laid out.
+    pub fn attach_implicit_if_ready(&mut self) {
+        if self.implicit_attached || self.last_off.is_none() {
+            return;
+        }
+        if let Some(coll) = &self.implicit
+            && let Ok(o2) = self.container.cast::<ICompositionObject2>()
+            && o2.SetImplicitAnimations(coll).is_ok()
+        {
+            self.implicit_attached = true;
+        }
+    }
+
+    /// Install a freshly merged implicit collection (or clear it). Swaps in
+    /// place when the node is already laid out; otherwise attachment defers to
+    /// the first layout write (see [`Self::push_offset`]).
+    pub fn set_implicit(&mut self, coll: Option<ImplicitAnimationCollection>) {
+        self.implicit = coll;
+        if self.implicit.is_none() {
+            if self.implicit_attached
+                && let Ok(o2) = self.container.cast::<ICompositionObject2>()
+            {
+                let _ = o2.SetImplicitAnimations(None);
+            }
+            self.implicit_attached = false;
+            return;
+        }
+        self.implicit_attached = false;
+        self.attach_implicit_if_ready();
     }
 }
 

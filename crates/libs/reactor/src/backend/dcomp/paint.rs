@@ -39,16 +39,18 @@ const CLEAR: ColorF = ColorF::new(0.0, 0.0, 0.0, 0.0);
 pub(crate) fn paint(
     comp: &Compositing,
     cache: &mut PaintCache,
+    atlas: &mut parts::Atlas,
     arena: &mut Arena,
     root: ControlId,
     scale: f32,
 ) -> windows_core::Result<()> {
-    paint_node(comp, cache, arena, root, scale)
+    paint_node(comp, cache, atlas, arena, root, scale)
 }
 
 fn paint_node(
     comp: &Compositing,
     cache: &mut PaintCache,
+    atlas: &mut parts::Atlas,
     arena: &mut Arena,
     id: ControlId,
     scale: f32,
@@ -87,13 +89,19 @@ fn paint_node(
             draw_surface(comp, cache, arena, id, scale)?;
             if let Some(n) = arena.get_mut(id) {
                 n.dirty = false;
+                // Reconcile the converted kinds' retained chrome parts (pill /
+                // knob / fill / ink) against the state just painted: state
+                // changes glide on the compositor, first placement snaps.
+                if parts::converted(n.kind) {
+                    parts::sync(comp, atlas, n, scale);
+                }
             }
         }
     }
 
     let children = arena.get(id).map(|n| n.children.clone()).unwrap_or_default();
     for c in children {
-        paint_node(comp, cache, arena, c, scale)?;
+        paint_node(comp, cache, atlas, arena, c, scale)?;
     }
 
     // Overlay scrollbar thumb (above the scrolled children) for scroll containers.
@@ -103,10 +111,12 @@ fn paint_node(
     Ok(())
 }
 
-/// Ensure / size / position / fade the auto-hiding overlay scrollbar thumb of a
+/// Ensure / size / position the auto-hiding overlay scrollbar thumb of a
 /// scroll container. The thumb is a top child sprite (drawn over the content);
-/// its height tracks viewport/content, its offset tracks the scroll fraction, and
-/// its opacity is the node's `thumb_fade` spring (stepped on hover/scroll).
+/// its height tracks viewport/content and its offset tracks the scroll
+/// fraction. Its show/hide fade plays on the system compositor
+/// ([`animate::fade_thumb`](super::animate::fade_thumb)), edge-triggered from
+/// the tick loop's `thumb_shown` flip — never written per frame here.
 fn update_scroll_thumb(
     comp: &Compositing,
     cache: &mut PaintCache,
@@ -115,16 +125,23 @@ fn update_scroll_thumb(
     scale: f32,
 ) -> windows_core::Result<()> {
     use scroll::{thumb_geom, THUMB_MARGIN, THUMB_W};
-    let (vh, content_h, sc, fade) = match arena.get(id) {
-        Some(n) => (n.rect.h, n.ctrl.content_h, n.anim.x, n.thumb_fade.x),
+    let (vh, content_h, sc, shown) = match arena.get(id) {
+        Some(n) => (n.rect.h, n.ctrl.content_h, n.scroll_off, n.thumb_shown),
         None => return Ok(()),
     };
     let g = thumb_geom(vh, content_h, sc);
     if !g.overflow {
-        if let Some(n) = arena.get(id)
-            && let Some(t) = &n.scroll_thumb
+        // Content no longer overflows: hide a revealed thumb NOW (no fade — it
+        // has nothing to indicate) and reset the reveal state so a future
+        // overflow fades in from hidden. Gated on the flag so steady paints of
+        // a non-overflowing container cost nothing.
+        if let Some(n) = arena.get_mut(id)
+            && n.thumb_shown
         {
-            t.set_opacity(0.0);
+            n.thumb_shown = false;
+            if let Some(t) = &n.scroll_thumb {
+                t.snap_opacity(0.0);
+            }
         }
         return Ok(());
     }
@@ -134,6 +151,12 @@ fn update_scroll_thumb(
     if arena.get(id).is_some_and(|n| n.scroll_thumb.is_none()) {
         let container = arena.get(id).unwrap().container.clone();
         let surf = comp.new_surface_at(&container, pw, ph, true)?;
+        // Born hidden; if the scroll is already active (the tick's edge fired
+        // before the sprite existed) the reveal fade plays from zero.
+        surf.set_opacity(0.0);
+        if shown {
+            animate::fade_thumb(comp.compositor(), &surf, true);
+        }
         if let Some(n) = arena.get_mut(id) {
             n.scroll_thumb = Some(surf);
         }
@@ -157,7 +180,6 @@ fn update_scroll_thumb(
         && let Some(s) = &n.scroll_thumb
     {
         s.set_offset(n.rect.w - THUMB_W - THUMB_MARGIN, g.thumb_y);
-        s.set_opacity(fade);
     }
     Ok(())
 }

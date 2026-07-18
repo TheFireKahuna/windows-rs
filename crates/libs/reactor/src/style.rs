@@ -178,11 +178,22 @@ impl LayoutAnimationConfig {
 }
 
 /// One-shot property animation (opacity / scale / …) driven by
-/// `Backend::run_property_animation`.
+/// `Backend::run_property_animation`. Also the payload of enter/exit
+/// transitions (`ElementExt::transition`).
+///
+/// `opacity`/`scale` are the animation's end values; `from_opacity`/`from_scale`
+/// optionally pin the start. A `None` start animates from the property's
+/// current value — the right default for state changes and retargeting — while
+/// an explicit start makes mount/unmount effects deterministic (a fade-in must
+/// start at 0 regardless of the visual's resting opacity).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct AnimationConfig {
     pub opacity: Option<f64>,
     pub scale: Option<f64>,
+    /// Starting opacity; `None` starts from the current value.
+    pub from_opacity: Option<f64>,
+    /// Starting uniform scale; `None` starts from the current value.
+    pub from_scale: Option<f64>,
     pub duration: Duration,
     pub easing: Easing,
 }
@@ -192,6 +203,8 @@ impl Default for AnimationConfig {
         Self {
             opacity: None,
             scale: None,
+            from_opacity: None,
+            from_scale: None,
             duration: Duration::from_millis(300),
             easing: Easing::EaseOut,
         }
@@ -199,15 +212,18 @@ impl Default for AnimationConfig {
 }
 
 impl AnimationConfig {
+    /// Fade from fully transparent to fully opaque.
     pub fn fade_in(duration: Duration) -> Self {
         Self {
             opacity: Some(1.0),
+            from_opacity: Some(0.0),
             duration,
             easing: Easing::EaseOut,
             ..Self::default()
         }
     }
 
+    /// Fade from the current opacity to fully transparent.
     pub fn fade_out(duration: Duration) -> Self {
         Self {
             opacity: Some(0.0),
@@ -215,6 +231,57 @@ impl AnimationConfig {
             easing: Easing::EaseIn,
             ..Self::default()
         }
+    }
+
+    /// Fade in while growing from a slight shrink — the Fluent "pop" entrance.
+    pub fn pop_in(duration: Duration) -> Self {
+        Self {
+            opacity: Some(1.0),
+            from_opacity: Some(0.0),
+            scale: Some(1.0),
+            from_scale: Some(0.96),
+            duration,
+            easing: Easing::EaseOut,
+        }
+    }
+
+    /// Fade out while shrinking slightly — the matching exit.
+    pub fn pop_out(duration: Duration) -> Self {
+        Self {
+            opacity: Some(0.0),
+            scale: Some(0.96),
+            duration,
+            easing: Easing::EaseIn,
+            ..Self::default()
+        }
+    }
+
+    /// Set the end scale (uniform).
+    pub fn with_scale(mut self, to: f64) -> Self {
+        self.scale = Some(to);
+        self
+    }
+
+    /// Pin the starting opacity.
+    pub fn starting_opacity(mut self, from: f64) -> Self {
+        self.from_opacity = Some(from);
+        self
+    }
+
+    /// Pin the starting scale (uniform).
+    pub fn starting_scale(mut self, from: f64) -> Self {
+        self.from_scale = Some(from);
+        self
+    }
+
+    pub fn with_easing(mut self, easing: Easing) -> Self {
+        self.easing = easing;
+        self
+    }
+
+    /// Whether running this config would visibly change anything.
+    pub fn is_visible_effect(&self) -> bool {
+        self.opacity.is_some() || self.scale.is_some()
     }
 }
 

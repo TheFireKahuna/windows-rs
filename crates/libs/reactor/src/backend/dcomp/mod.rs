@@ -8,12 +8,20 @@
 //! each reconcile the host lays the tree out with Taffy, pushes per-node
 //! offset/size/opacity/clip onto the containers (no repaint — the compositor
 //! handles movement), and repaints only the surfaces of nodes whose own content
-//! or size changed. Input is hit-tested against the layout output; button
-//! hover/press animate via a self-stopping timer (see [`host`]). Gated behind the
-//! `dcomp-backend` feature.
+//! or size changed. Input is hit-tested against the layout output; ALL control
+//! motion (hover/press ink, toggles, scroll glides, progress loops) plays on
+//! the system compositor via retained chrome parts (see [`parts`]).
+//!
+//! Declarative animations (`.animate`, `.transition`, `with_*_transition`,
+//! `with_layout_animation`) are compositor-evaluated (see [`animate`]): the
+//! backend starts a DWM-side animation and returns to the blocking pump — no
+//! ticks, no repaints, zero CPU while motion plays. Exit transitions detach
+//! the dying subtree as a top-level ghost visual and release it via a single
+//! one-shot timer. Gated behind the `dcomp-backend` feature.
 
 use crate::backend::ControlId;
 
+mod animate;
 mod bootstrap;
 mod caption;
 mod color_out;
@@ -26,6 +34,7 @@ mod input;
 mod layout;
 mod node;
 mod paint;
+mod parts;
 mod pointer;
 mod popup;
 mod scroll;
@@ -46,10 +55,32 @@ pub(crate) use size::register_element_size;
 use bootstrap::Compositing;
 use node::{Arena, MenuRow, Node};
 use paint::PaintCache;
-use rustc_hash::FxHashSet;
 
 use crate::backend::{Backend, ControlKind, Event, EventHandler, Prop, PropValue};
-use crate::style::{AccessibilityModifiers, GridLength, PointerHandlers};
+use crate::style::{
+    AccessibilityModifiers, AnimationConfig, GridLength, ImplicitTransitions,
+    LayoutAnimationConfig, PointerHandlers,
+};
+use crate::system_bindings::{SetTimer, Visual, HWND};
+use windows_core::Interface as _;
+
+/// One-shot `WM_TIMER` id used to release exit-transition ghosts once their
+/// compositor-side animation has finished. Armed to the earliest ghost
+/// deadline; the host's `WM_TIMER` handler calls
+/// [`DCompBackend::prune_ghosts`] and re-arms or kills it. This is the ONLY
+/// app-side cost of an exit animation: one wakeup at the end.
+pub(crate) const GHOST_TIMER_ID: usize = 3;
+
+/// A dying visual's exit presentation, kept alive while the compositor plays
+/// it, plus the instant it can be released. For a destroyed subtree `shown` is
+/// normally a FLATTENED [`animate::snapshot_sprite`] of it (whose brush chain
+/// keeps the detached source alive), or the live container itself when
+/// visual-surface snapshotting failed; for a dismissed popup it is the overlay
+/// container playing its close fade.
+struct Ghost {
+    shown: Visual,
+    deadline: std::time::Instant,
+}
 
 /// The DirectComposition backend. Owns the node arena, the window's composition
 /// infrastructure, and the per-device paint cache.
@@ -57,14 +88,14 @@ pub struct DCompBackend {
     arena: Arena,
     comp: Compositing,
     cache: PaintCache,
+    /// Shared rasterized chrome-part sources (see [`parts::Atlas`]).
+    atlas: parts::Atlas,
     root: Option<ControlId>,
     /// The node whose container is currently attached under the compositor root.
     attached_root: Option<ControlId>,
     /// Viewport in DIPs and the window DPI (96 = 100%).
     dip_size: (f32, f32),
     dpi: f32,
-    /// Nodes with a spring still in flight (driven by the self-stopping tick).
-    animating: FxHashSet<ControlId>,
     /// The clickable node currently under the pointer (hover) / pressed.
     hovered_id: Option<ControlId>,
     pressed_id: Option<ControlId>,
@@ -80,10 +111,15 @@ pub struct DCompBackend {
     /// inside a scrolled chain). Set on down over the surface, cleared on up —
     /// implicit capture for the drag's duration.
     pressed_surface: Option<(ControlId, std::rc::Rc<PointerSinks>, f32)>,
+    /// The viz pointer surface currently under the hover, so leaving it can fire
+    /// its `exited` sink (there is no per-node exit event otherwise).
+    hovered_surface: Option<ControlId>,
     /// The live popup overlay (Select/menu dropdown), if one is open.
     popup: Option<popup::Popup>,
-    /// Whether the open popup's reveal animation has settled.
-    popup_settled: bool,
+    /// Detached visuals (destroyed subtrees, dismissed popups) playing their
+    /// exit fade on the compositor; released by [`Self::prune_ghosts`] when
+    /// their deadline passes.
+    ghosts: Vec<Ghost>,
     /// The host window handle (as `isize`) — used for clipboard ownership.
     hwnd: isize,
 }
@@ -94,19 +130,20 @@ impl DCompBackend {
             arena: Arena::default(),
             comp,
             cache: PaintCache::default(),
+            atlas: parts::Atlas::default(),
             root: None,
             attached_root: None,
             dip_size,
             dpi,
-            animating: FxHashSet::default(),
             hovered_id: None,
             pressed_id: None,
             hovered_scroll: None,
             dragging_thumb: None,
             focused_id: None,
             pressed_surface: None,
+            hovered_surface: None,
             popup: None,
-            popup_settled: true,
+            ghosts: Vec::new(),
             hwnd,
         }
     }
@@ -144,14 +181,24 @@ impl DCompBackend {
         }
     }
 
-    /// Repaint dirty node surfaces (no relayout) — also used by the animation
-    /// tick, which marks animating nodes dirty.
+    /// Repaint dirty node surfaces (no relayout).
     pub(crate) fn repaint(&mut self) {
         if let Some(root) = self.root {
             let scale = self.scale();
-            if paint::paint(&self.comp, &mut self.cache, &mut self.arena, root, scale).is_err() {
-                // Device loss: drop cached resources; next paint rebuilds them.
+            if paint::paint(
+                &self.comp,
+                &mut self.cache,
+                &mut self.atlas,
+                &mut self.arena,
+                root,
+                scale,
+            )
+            .is_err()
+            {
+                // Device loss: drop cached resources; next paint rebuilds them
+                // (parts re-bind to freshly rasterized sources by epoch).
                 self.cache.invalidate();
+                self.atlas.clear();
             }
         }
     }
@@ -159,6 +206,10 @@ impl DCompBackend {
     /// React to a window resize (physical pixels). Re-folds DPI into the root
     /// scale and the DIP viewport, then relays out and repaints.
     pub(crate) fn resize(&mut self, pixel_w: i32, pixel_h: i32, dpi: u32) {
+        if dpi > 0 && dpi as f32 != self.dpi {
+            // Pixel scale changed: every atlas source is the wrong resolution.
+            self.atlas.clear();
+        }
         if dpi > 0 {
             self.dpi = dpi as f32;
         }
@@ -276,10 +327,136 @@ impl DCompBackend {
     /// Mark every node's surface for repaint (e.g. on a theme change), then
     /// repaint. Layout is unchanged, so no relayout is needed.
     pub(crate) fn mark_all_dirty_and_repaint(&mut self) {
+        // The output colour map may have changed (display / theme edge): the
+        // atlas sources carry baked mapped colours, so re-rasterize them too.
+        self.atlas.clear();
         for slot in self.arena.iter_mut() {
             slot.mark_dirty();
         }
         self.repaint();
+    }
+
+    /// Detach a to-be-destroyed node's container as a top-level "ghost" and
+    /// play its exit transition on it, compositor-side. The whole visual
+    /// subtree rides along (child visuals are COM-referenced by the
+    /// container), frozen at its last painted content. Skipped when the node
+    /// has no visible exit effect, was never laid out, or is not currently
+    /// reachable from the compositor root (e.g. it already sits inside an
+    /// ancestor's ghost — one fade is enough).
+    fn spawn_exit_ghost(&mut self, id: ControlId) {
+        let Some(node) = self.arena.get(id) else { return };
+        let Some(cfg) = node.exit else { return };
+        if !cfg.is_visible_effect() || node.last_off.is_none() {
+            return;
+        }
+
+        // Walk to the compositor root accumulating the absolute (root-space)
+        // offset — exact even inside scrolled containers, whose child offsets
+        // include the scroll translation.
+        let root_ident = self.comp.root_identity();
+        let (mut ax, mut ay) = (0.0f32, 0.0f32);
+        let mut cur = node.vis.clone();
+        let mut reached_root = false;
+        loop {
+            if let Ok(o) = cur.Offset() {
+                ax += o.x;
+                ay += o.y;
+            }
+            let Ok(parent) = cur.Parent() else { break };
+            let ident = parent
+                .cast::<windows_core::IUnknown>()
+                .map(|u| u.as_raw())
+                .unwrap_or(core::ptr::null_mut());
+            if ident == root_ident {
+                reached_root = true;
+                break;
+            }
+            let Ok(pv) = parent.cast::<crate::system_bindings::IVisual>() else { break };
+            cur = pv;
+        }
+        if !reached_root {
+            animate::warn(format_args!("ghost {id}: parent walk did not reach root — skipped"));
+            return;
+        }
+
+        let container = node.container.clone();
+        let vis = node.vis.clone();
+        let (w, h) = (node.rect.w, node.rect.h);
+        let center = (w > 0.0 && h > 0.0).then(|| (w / 2.0, h / 2.0));
+
+        // Detach the subtree from its parent. A visual can hold only one
+        // parent, and the old parent's child re-sync (already marked dirty by
+        // `remove_child`) no longer knows this visual either way.
+        let Ok(source) = container.cast::<Visual>() else { return };
+        if let Ok(parent) = vis.Parent()
+            && let Ok(children) = parent.Children()
+        {
+            let _ = children.Remove(&source);
+        }
+
+        // Prefer a FLATTENED ghost: one visual-surface sprite re-compositing
+        // the detached subtree, so the exit fade is a single layer and
+        // overlapping translucent children cannot bleed through mid-fade. The
+        // sprite's brush chain keeps the source subtree alive. Fall back to
+        // showing the live container when snapshotting fails.
+        let shown = match animate::snapshot_sprite(self.comp.compositor(), &source, w, h) {
+            Ok(sprite) => sprite.cast::<Visual>().unwrap_or(source),
+            Err(e) => {
+                animate::warn(format_args!("ghost {id}: snapshot failed ({e:?}) — live fallback"));
+                source
+            }
+        };
+
+        // Present top-level at the same on-screen position.
+        if self.comp.attach_root_visual(&shown).is_err() {
+            animate::warn(format_args!("ghost {id}: root attach failed — dropped"));
+            return;
+        }
+        if let Ok(v) = shown.cast::<crate::system_bindings::IVisual>() {
+            let _ = v.SetOffset(windows_numerics::Vector3::new(ax, ay, 0.0));
+        }
+
+        animate::start(self.comp.compositor(), &shown, &cfg, center);
+
+        // Small grace past the nominal duration so the final frame lands
+        // before the visual disappears.
+        let deadline =
+            std::time::Instant::now() + cfg.duration + std::time::Duration::from_millis(80);
+        self.ghosts.push(Ghost { shown, deadline });
+        self.arm_ghost_timer();
+    }
+
+    /// Arm (or re-arm) the one-shot ghost-release timer to the earliest
+    /// deadline. `SetTimer` with the same id replaces the previous schedule.
+    fn arm_ghost_timer(&self) {
+        let Some(next) = self.ghosts.iter().map(|g| g.deadline).min() else {
+            return;
+        };
+        let ms = next
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .clamp(16, u32::MAX as u128) as u32;
+        unsafe {
+            SetTimer(self.hwnd as HWND, GHOST_TIMER_ID, ms, None);
+        }
+    }
+
+    /// Release ghosts whose exit animation has finished. Returns the ms until
+    /// the next release is due, or `None` when no ghosts remain (the caller
+    /// kills the timer — back to true idle).
+    pub(crate) fn prune_ghosts(&mut self) -> Option<u32> {
+        let now = std::time::Instant::now();
+        let comp = &self.comp;
+        self.ghosts.retain(|g| {
+            if now >= g.deadline {
+                comp.remove_root_visual(&g.shown);
+                false
+            } else {
+                true
+            }
+        });
+        let next = self.ghosts.iter().map(|g| g.deadline).min()?;
+        Some(next.saturating_duration_since(now).as_millis().max(16) as u32)
     }
 }
 
@@ -290,9 +467,12 @@ impl Backend for DCompBackend {
             .new_container()
             .expect("compositor container allocation");
         let mut node = Node::new(kind, container);
-        // Scroll/overflow containers clip their children to their own bounds.
-        if matches!(kind, ControlKind::ScrollViewer | ControlKind::ScrollView)
-            && let Ok(clip) = self.comp.new_inset_clip()
+        // Scroll/overflow containers clip their children to their own bounds;
+        // a ProgressBar clips its indeterminate sweep at the track edges.
+        if matches!(
+            kind,
+            ControlKind::ScrollViewer | ControlKind::ScrollView | ControlKind::ProgressBar
+        ) && let Ok(clip) = self.comp.new_inset_clip()
         {
             use windows_core::Interface;
             if let Ok(c) = clip.cast::<crate::system_bindings::CompositionClip>() {
@@ -300,14 +480,17 @@ impl Backend for DCompBackend {
             }
             node.clip = Some(clip);
         }
+        // Scroll containers get a content CARRIER visual their children parent
+        // into: scrolling animates this one visual's Offset on the compositor
+        // (see `Node::scroll_glide`), so a wheel glide never ticks the app.
+        if node.is_scroll() {
+            node.scroll_content = self.comp.new_container().ok();
+        }
         self.arena.insert(node)
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
         use taffy::prelude::*;
-        // Set inside an arm to slide the control's primary spring to a new
-        // target after the node borrow ends (programmatic state change).
-        let mut start_anim = false;
         let mut refresh_suggest = false;
         {
             let Some(node) = self.node_mut(id) else { return };
@@ -368,7 +551,9 @@ impl Backend for DCompBackend {
                 node.mark_dirty();
             }
 
-            (Prop::Content | Prop::Text, PropValue::Str(s)) => {
+            // An Expander's title arrives as `Prop::Header`; it paints as the
+            // node's label like every other text-bearing control.
+            (Prop::Content | Prop::Text | Prop::Header, PropValue::Str(s)) => {
                 // For an editable kind (AutoSuggestBox carries its text via
                 // `Prop::Text`), seed the editor buffer instead of the label.
                 if node.editor.is_some() {
@@ -517,23 +702,21 @@ impl Backend for DCompBackend {
             }
 
             // ── Control state (stateful drawn controls) ──────────────────
+            // The part-converted kinds (toggle / slider / segmented / nav) need
+            // no spring tick here: marking dirty routes them through the paint
+            // pass, whose parts sync glides the change on the compositor.
             (Prop::IsOn, PropValue::Bool(v)) => {
                 node.ctrl.is_on = *v;
-                node.anim.target = if *v { 1.0 } else { 0.0 };
-                start_anim = (node.anim.x - node.anim.target).abs() > 1e-3;
                 node.mark_dirty();
             }
             (Prop::IsChecked, PropValue::Bool(v)) => {
+                // The CheckBox reveal fades via its chrome parts on repaint; a
+                // ToggleButton's checked state is plain painted chrome.
                 node.ctrl.is_checked = *v;
-                node.anim.target = if *v { 1.0 } else { 0.0 };
-                start_anim = (node.anim.x - node.anim.target).abs() > 1e-3;
                 node.mark_dirty();
             }
             (Prop::Value, PropValue::F64(v)) => {
                 node.ctrl.value = *v;
-                node.anim.target = ctrl_value_frac(node) as f32;
-                start_anim = node.kind == ControlKind::Slider
-                    && (node.anim.x - node.anim.target).abs() > 1e-3;
                 // NumberBox: reflect the programmatic value as formatted text
                 // (unless the user is mid-edit — the editor owns the buffer
                 // while focused).
@@ -544,14 +727,10 @@ impl Backend for DCompBackend {
             }
             (Prop::Minimum, PropValue::F64(v)) => {
                 node.ctrl.min = *v;
-                node.anim.x = ctrl_value_frac(node) as f32;
-                node.anim.target = node.anim.x;
                 node.mark_dirty();
             }
             (Prop::Maximum, PropValue::F64(v)) => {
                 node.ctrl.max = *v;
-                node.anim.x = ctrl_value_frac(node) as f32;
-                node.anim.target = node.anim.x;
                 node.mark_dirty();
             }
             (Prop::Step, PropValue::F64(v)) => node.ctrl.step = Some(*v),
@@ -565,15 +744,10 @@ impl Backend for DCompBackend {
             }
             (Prop::IsExpanded, PropValue::Bool(v)) => {
                 node.ctrl.expanded = *v;
-                node.anim.target = if *v { 1.0 } else { 0.0 };
-                start_anim = (node.anim.x - node.anim.target).abs() > 1e-3;
                 node.mark_dirty();
             }
             (Prop::SelectedIndex, PropValue::I32(v)) => {
                 node.ctrl.selected_index = *v;
-                node.anim.target = (*v).max(0) as f32;
-                start_anim = node.kind == ControlKind::SelectorBar
-                    && (node.anim.x - node.anim.target).abs() > 1e-3;
                 node.mark_dirty();
             }
             (Prop::SelectedTag, PropValue::Str(s)) => {
@@ -596,9 +770,9 @@ impl Backend for DCompBackend {
                 node.ctrl.items = items.iter().map(|i| i.text.clone()).collect();
                 if node.ctrl.selected_index < 0 && !node.ctrl.items.is_empty() {
                     node.ctrl.selected_index = 0;
-                    node.anim.x = 0.0;
-                    node.anim.target = 0.0;
                 }
+                // Labels feed the per-item width measure — rebuild it.
+                node.text_dirty = true;
                 node.mark_dirty();
             }
             (Prop::MenuItems, PropValue::NavMenuItems(items)) => {
@@ -624,9 +798,6 @@ impl Backend for DCompBackend {
             }
             _ => {}
             }
-        }
-        if start_anim {
-            self.animating.insert(id);
         }
         if refresh_suggest {
             self.refresh_suggest(id);
@@ -678,13 +849,16 @@ impl Backend for DCompBackend {
     }
 
     fn destroy(&mut self, id: ControlId) {
-        self.animating.remove(&id);
         if self.attached_root == Some(id) {
             if let Some(n) = self.arena.get(id) {
                 self.comp.detach_root(&n.container);
             }
             self.attached_root = None;
         }
+        // An exit transition detaches the container as a compositor-side ghost
+        // before the arena entry (and with it the last live Rust ref outside
+        // the ghost list) goes away.
+        self.spawn_exit_ghost(id);
         self.arena.remove(id);
     }
 
@@ -735,6 +909,70 @@ impl Backend for DCompBackend {
         // The node's container visual — what a viz host element (SurfacePainter /
         // composition-surface) attaches its child visual under via `on_mounted`.
         self.node(id).and_then(|n| n.container.cast().ok())
+    }
+
+    // ── Compositor animations (DWM-evaluated; no app ticks, no repaints) ──
+
+    fn set_implicit_transitions(
+        &mut self,
+        id: ControlId,
+        transitions: Option<ImplicitTransitions>,
+    ) {
+        // Disjoint field borrows: the arena node and the compositor handle.
+        let Some(node) = self.arena.get_mut(id) else { return };
+        node.transitions = transitions;
+        if transitions.is_some_and(|t| t.scale.is_some()) {
+            animate::note_scale_intent(node);
+        }
+        let coll = animate::build_implicit(
+            self.comp.compositor(),
+            node.transitions.as_ref(),
+            node.layout_anim.as_ref(),
+        )
+        .ok()
+        .flatten();
+        node.set_implicit(coll);
+    }
+
+    fn set_layout_animation(&mut self, id: ControlId, config: Option<LayoutAnimationConfig>) {
+        let Some(node) = self.arena.get_mut(id) else { return };
+        node.layout_anim = config;
+        // Damping/period are baked into the cached spring; rebuild on change.
+        node.spring_anim = None;
+        let coll = animate::build_implicit(
+            self.comp.compositor(),
+            node.transitions.as_ref(),
+            node.layout_anim.as_ref(),
+        )
+        .ok()
+        .flatten();
+        node.set_implicit(coll);
+    }
+
+    fn run_property_animation(&mut self, id: ControlId, config: Option<AnimationConfig>) {
+        let Some(cfg) = config else { return };
+        if !cfg.is_visible_effect() {
+            return;
+        }
+        let Some(node) = self.arena.get_mut(id) else { return };
+        if animate::wants_center(&cfg) {
+            animate::note_scale_intent(node);
+        }
+        let center = (node.rect.w > 0.0 && node.rect.h > 0.0)
+            .then(|| (node.rect.w / 2.0, node.rect.h / 2.0));
+        if let Ok(v) = node.container.cast::<Visual>() {
+            animate::start(self.comp.compositor(), &v, &cfg, center);
+        }
+    }
+
+    fn set_exit_transition(&mut self, id: ControlId, config: Option<AnimationConfig>) {
+        let Some(node) = self.arena.get_mut(id) else { return };
+        node.exit = config;
+        // Maintain the centre pivot from now on so a scale-out exit pivots
+        // correctly even though it starts after the node stops laying out.
+        if config.as_ref().is_some_and(animate::wants_center) {
+            animate::note_scale_intent(node);
+        }
     }
 }
 
@@ -835,14 +1073,13 @@ pub(crate) fn ctrl_value_frac(node: &Node) -> f64 {
 }
 
 /// Resolve a pending `selected_tag` against the loaded `tags` into a
-/// `selected_index` (NavigationView), snapping the indicator spring.
+/// `selected_index` (NavigationView). The rail indicator is a chrome part —
+/// the paint pass glides/snaps it from `selected_index` directly.
 fn sync_selected_tag(node: &mut Node) {
     if let Some(tag) = &node.ctrl.selected_tag
         && let Some(i) = node.ctrl.tags.iter().position(|t| t == tag)
     {
         node.ctrl.selected_index = i as i32;
-        node.anim.x = i as f32;
-        node.anim.target = i as f32;
     }
 }
 

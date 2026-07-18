@@ -7,6 +7,8 @@ pub type CLSCTX = u32;
 pub const CLSCTX_INPROC_SERVER: CLSCTX = 1;
 pub const CLSID_D2D1ColorManagement: windows_core::GUID =
     windows_core::GUID::from_u128(0x1a28524c_fdd6_4aa4_ae8f_837eb8267b37);
+pub const CLSID_D2D1GaussianBlur: windows_core::GUID =
+    windows_core::GUID::from_u128(0x1feb6d69_2fe6_4ac9_8c58_1d7f93e7a6a5);
 pub const CLSID_D2D1Shadow: windows_core::GUID =
     windows_core::GUID::from_u128(0xc67ea361_1863_4e69_89db_695d3e9a5b6b);
 pub const CLSID_WICImagingFactory: windows_core::GUID =
@@ -171,6 +173,8 @@ pub struct D2D1_ROUNDED_RECT {
     pub radiusX: f32,
     pub radiusY: f32,
 }
+pub type D2D1_GAUSSIANBLUR_PROP = i32;
+pub const D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION: D2D1_GAUSSIANBLUR_PROP = 0;
 pub type D2D1_SHADOW_PROP = i32;
 pub const D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION: D2D1_SHADOW_PROP = 0;
 pub const D2D1_SHADOW_PROP_COLOR: D2D1_SHADOW_PROP = 1;
@@ -646,10 +650,20 @@ impl core::ops::Deref for ID2D1Brush {
     }
 }
 windows_core::imp::interface_hierarchy!(ID2D1Brush, windows_core::IUnknown, ID2D1Resource);
+impl ID2D1Brush {
+    pub unsafe fn SetOpacity(&self, opacity: f32) {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetOpacity)(
+                windows_core::Interface::as_raw(self),
+                opacity,
+            );
+        }
+    }
+}
 #[repr(C)]
 pub struct ID2D1Brush_Vtbl {
     pub base__: ID2D1Resource_Vtbl,
-    SetOpacity: usize,
+    pub SetOpacity: unsafe extern "system" fn(*mut core::ffi::c_void, f32),
     SetTransform: usize,
     GetOpacity: usize,
     GetTransform: usize,

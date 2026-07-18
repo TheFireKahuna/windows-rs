@@ -155,6 +155,30 @@ impl Compositing {
         }
     }
 
+    /// Attach an arbitrary visual at the top of the compositor root (exit-ghost
+    /// snapshot sprites / fallback containers).
+    pub fn attach_root_visual(&self, v: &Visual) -> windows_core::Result<()> {
+        self.root.Children()?.InsertAtTop(v)?;
+        Ok(())
+    }
+
+    /// Remove a visual previously attached by [`Self::attach_root_visual`].
+    pub fn remove_root_visual(&self, v: &Visual) {
+        if let Ok(children) = self.root.Children() {
+            let _ = children.Remove(v);
+        }
+    }
+
+    /// Canonical COM identity of the compositor root container. Terminates the
+    /// exit-ghost parent walk (a visual whose parent chain doesn't reach this
+    /// is already detached, so it must not be ghosted again).
+    pub fn root_identity(&self) -> *mut core::ffi::c_void {
+        self.root
+            .cast::<windows_core::IUnknown>()
+            .map(|u| u.as_raw())
+            .unwrap_or(core::ptr::null_mut())
+    }
+
     /// Mint a bare container visual for a node (pure layout, no surface).
     pub fn new_container(&self) -> windows_core::Result<ContainerVisual> {
         self.compositor.CreateContainerVisual()
@@ -191,6 +215,49 @@ impl Compositing {
     /// Mint an inset clip that tracks a visual's own bounds (for scroll/overflow).
     pub fn new_inset_clip(&self) -> windows_core::Result<InsetClip> {
         self.compositor.CreateInsetClip()
+    }
+
+    /// Mint a bare sprite visual (chrome parts). Not inserted anywhere — the
+    /// caller parents it at the right band position.
+    pub fn new_sprite(&self) -> windows_core::Result<SpriteVisual> {
+        self.compositor.CreateSpriteVisual()
+    }
+
+    /// Mint a nine-grid (9-slice) brush for a stretchable chrome-part source.
+    pub fn new_nine_grid(
+        &self,
+    ) -> windows_core::Result<crate::system_bindings::CompositionNineGridBrush> {
+        use windows_core::Interface;
+        self.compositor
+            .cast::<crate::system_bindings::ICompositor2>()?
+            .CreateNineGridBrush()
+    }
+
+    /// Mint an FP16 atlas-source surface of exact pixel size, returning the
+    /// surface, its draw interop, and a Fill-stretch brush over it.
+    pub fn new_source_surface(
+        &self,
+        px_w: i32,
+        px_h: i32,
+    ) -> windows_core::Result<(
+        CompositionDrawingSurface,
+        ICompositionDrawingSurfaceInterop,
+        CompositionSurfaceBrush,
+    )> {
+        let surface = self.graphics.CreateDrawingSurface(
+            Size {
+                width: px_w.max(1) as f32,
+                height: px_h.max(1) as f32,
+            },
+            DirectXPixelFormat::R16G16B16A16Float,
+            DirectXAlphaMode::Premultiplied,
+        )?;
+        let brush = self
+            .compositor
+            .CreateSurfaceBrushWithSurface(&surface.cast::<ICompositionSurface>()?)?;
+        let _ = brush.SetStretch(CompositionStretch::Fill);
+        let interop: ICompositionDrawingSurfaceInterop = surface.cast()?;
+        Ok((surface, interop, brush))
     }
 
     /// Create (or recreate) a node's painted-chrome surface at `px` pixels and
@@ -291,6 +358,16 @@ impl NodeSurface {
         if let Ok(v) = self.sprite.cast::<IVisual>() {
             let _ = v.SetOpacity(a.clamp(0.0, 1.0));
         }
+    }
+
+    /// Snap the sprite's opacity to `a`, first stopping any in-flight
+    /// compositor fade on it — a plain property set while an animation holds
+    /// the property would otherwise be ignored.
+    pub fn snap_opacity(&self, a: f32) {
+        if let Ok(o) = self.sprite.cast::<crate::system_bindings::ICompositionObject>() {
+            let _ = o.StopAnimation("Opacity");
+        }
+        self.set_opacity(a);
     }
 }
 

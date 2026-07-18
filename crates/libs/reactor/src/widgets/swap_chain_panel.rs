@@ -306,6 +306,21 @@ impl PointerSurface {
         Ok(self)
     }
 
+    /// Subscribe pointer-exit: the hover left this element's bounds (moved onto
+    /// another surface, onto none, or out of the window). Hover-only — an
+    /// implicitly captured drag keeps delivering moves and fires no exit until
+    /// after release. The natural end-of-hover signal for surfaces that light up
+    /// under the pointer.
+    pub fn on_exit(&self, f: impl Fn() + 'static) -> Result<&Self> {
+        #[cfg(feature = "dcomp-backend")]
+        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
+            *sinks.exited.borrow_mut() = Some(Box::new(f));
+            return Ok(self);
+        }
+        self.subscribe_pointer(move |_| f(), false, |iue, h| iue.PointerExited(h))?;
+        Ok(self)
+    }
+
     /// Subscribe `PointerWheelChanged`; read [`PointerEventInfo::wheel_delta`].
     pub fn on_wheel(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
         #[cfg(feature = "dcomp-backend")]

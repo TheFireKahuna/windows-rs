@@ -595,6 +595,9 @@ impl<B: Backend + 'static> Reconciler<B> {
         } else if let Some(enter) = anim.enter_transition {
             self.backend.run_property_animation(id, Some(enter));
         }
+        if let Some(exit) = anim.exit_transition {
+            self.backend.set_exit_transition(id, Some(exit));
+        }
     }
 
     fn diff_animations_for(
@@ -619,6 +622,12 @@ impl<B: Backend + 'static> Reconciler<B> {
         let new_pa = new.and_then(|a| a.property_animation);
         if old_pa != new_pa {
             self.backend.run_property_animation(id, new_pa);
+        }
+
+        let old_exit = old.and_then(|a| a.exit_transition);
+        let new_exit = new.and_then(|a| a.exit_transition);
+        if old_exit != new_exit {
+            self.backend.set_exit_transition(id, new_exit);
         }
     }
 

@@ -197,20 +197,14 @@ impl DCompHost {
         });
         render_host.set_dpi(dpi);
 
-        // After every reconcile: adopt the new root, lay out, paint. If the
-        // reconcile touched a sprung node, make sure the animation timer runs.
+        // After every reconcile: adopt the new root, lay out, paint. All
+        // control motion plays on the system compositor — no timer to arm.
         let pr_host = render_host.clone_inner();
         render_host.set_post_render(move |root_id| {
-            let animating = pr_host.with_reconciler_mut(|r| {
+            pr_host.with_reconciler_mut(|r| {
                 r.backend.set_root(root_id);
                 r.backend.relayout_and_paint();
-                r.backend.is_animating()
             });
-            if animating {
-                unsafe {
-                    SetTimer(hwnd, TIMER_ID, 16, None);
-                }
-            }
         });
 
         DCOMP.with(|c| {
@@ -223,8 +217,9 @@ impl DCompHost {
 
         // Frame-tick pump: when a canvas/viz subscriber appears (via
         // `on_frame_tick`) while the timer is idle, start it; the WM_TIMER handler
-        // drives the ticks and stops the timer once no subscriber and no spring
-        // remain (true idle).
+        // drives the ticks and stops the timer once no subscriber remains (true
+        // idle). This is the frame timer's ONLY client — control motion never
+        // runs on it.
         crate::set_frame_pump_wake(Some(Rc::new(move || unsafe {
             SetTimer(hwnd, TIMER_ID, 16, None);
         })));
@@ -440,14 +435,6 @@ fn track_leave(hwnd: HWND) {
     }
 }
 
-fn start_timer(hwnd: HWND, needed: bool) {
-    if needed {
-        unsafe {
-            SetTimer(hwnd, TIMER_ID, 16, None);
-        }
-    }
-}
-
 /// Start or stop the caret-blink timer to match whether a text field is
 /// focused. Only toggles on a change of state so the blink phase is preserved
 /// across unrelated input. A `GetCaretBlinkTime` of 0 / INFINITE (blinking
@@ -629,7 +616,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     _ => SC_CLOSE,
                 };
                 unsafe {
-                    let _ = PostMessageW(hwnd, WM_SYSCOMMAND, cmd, 0);
+                    let _ = PostMessageW(hwnd, WM_SYSCOMMAND, cmd as WPARAM, 0);
                 }
                 return 0;
             }
@@ -649,13 +636,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if !raw.is_null() {
                 let job = unsafe { Box::from_raw(raw) };
                 job();
-                // A UIA-driven action (Invoke/Toggle/SetValue) may have started a
-                // spring; keep the animation timer running if so.
-                if let Some(s) = shared() {
-                    let anim =
-                        s.render_host.with_reconciler_mut(|r| r.backend.is_animating());
-                    start_timer(hwnd, anim);
-                }
             }
             0
         }
@@ -684,16 +664,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
                 track_leave(hwnd);
-                let started = s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_move(x, y));
-                start_timer(hwnd, started);
+                s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_move(x, y));
             }
             0
         }
 
         WM_MOUSELEAVE => {
             if let Some(s) = shared() {
-                let started = s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_leave());
-                start_timer(hwnd, started);
+                s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_leave());
             }
             0
         }
@@ -701,14 +679,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_LBUTTONDOWN => {
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
-                let (captured, timer) =
+                let captured =
                     s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_down(x, y));
                 if captured {
                     unsafe {
                         SetCapture(hwnd);
                     }
                 }
-                start_timer(hwnd, timer);
                 sync_blink(hwnd);
             }
             0
@@ -720,8 +697,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 unsafe {
                     let _ = ReleaseCapture();
                 }
-                let timer = s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_up(x, y));
-                start_timer(hwnd, timer);
+                s.render_host.with_reconciler_mut(|r| r.backend.on_pointer_up(x, y));
             }
             0
         }
@@ -739,9 +715,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let scale = dpi_scale(hwnd);
                 let delta = ((wparam >> 16) & 0xFFFF) as i16 as i32;
                 let (x, y) = (pt.x as f32 / scale, pt.y as f32 / scale);
-                let started =
-                    s.render_host.with_reconciler_mut(|r| r.backend.on_wheel(x, y, delta));
-                start_timer(hwnd, started);
+                s.render_host.with_reconciler_mut(|r| r.backend.on_wheel(x, y, delta));
             }
             0
         }
@@ -751,10 +725,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let vk = (wparam & 0xFFFF) as u32;
                 let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
                 let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
-                let started = s
-                    .render_host
+                s.render_host
                     .with_reconciler_mut(|r| r.backend.on_key(vk, shift, ctrl));
-                start_timer(hwnd, started);
                 sync_blink(hwnd);
             }
             0
@@ -845,16 +817,32 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 return 0;
             }
-            if wparam == TIMER_ID
-                && let Some(s) = shared()
-            {
-                // Pace any backend frame-tick subscribers (canvas/viz) first…
+            if wparam == GHOST_TIMER_ID {
+                // Release exit-transition ghosts whose compositor animation has
+                // finished; re-arm only while ghosts remain (one wakeup per
+                // exit, then back to the blocking pump).
+                if let Some(s) = shared() {
+                    let next = s.render_host.with_reconciler_mut(|r| r.backend.prune_ghosts());
+                    unsafe {
+                        match next {
+                            Some(ms) => {
+                                SetTimer(hwnd, GHOST_TIMER_ID, ms, None);
+                            }
+                            None => {
+                                let _ = KillTimer(hwnd, GHOST_TIMER_ID);
+                            }
+                        }
+                    }
+                }
+                return 0;
+            }
+            if wparam == TIMER_ID {
+                // Pace the backend frame-tick subscribers (canvas/viz) — the
+                // timer's only client; all control motion is compositor-side.
                 crate::drive_frame_ticks();
-                // …then advance button ink springs.
-                let springs = s.render_host.with_reconciler_mut(|r| r.backend.tick(1.0 / 60.0));
-                // Keep the timer only while work remains; otherwise return to
-                // a blocking, zero-CPU pump.
-                if !springs && !crate::frame_ticks_active() {
+                // Keep the timer only while subscribers remain; otherwise
+                // return to a blocking, zero-CPU pump.
+                if !crate::frame_ticks_active() {
                     unsafe {
                         let _ = KillTimer(hwnd, TIMER_ID);
                     }
@@ -925,14 +913,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
         WM_SIZE => {
             // Maximize/restore flips the drawn max-button glyph.
-            if caption::set_maximized(wparam == SIZE_MAXIMIZED) {
+            if caption::set_maximized(wparam == SIZE_MAXIMIZED as WPARAM) {
                 repaint_caption();
             }
             // Notify the app of a visibility edge: minimizing hides the window
             // (SIZE_MINIMIZED), restoring/maximizing shows it. De-duplicated inside
             // `note_visibility`, so an ordinary resize (already-visible → visible) is a
             // no-op. Lets the app pause expensive off-screen work while minimized.
-            visibility::note_visibility(wparam != SIZE_MINIMIZED);
+            visibility::note_visibility(wparam != SIZE_MINIMIZED as WPARAM);
             if let Some(s) = shared() {
                 let pw = (lparam & 0xFFFF) as i32;
                 let ph = ((lparam >> 16) & 0xFFFF) as i32;

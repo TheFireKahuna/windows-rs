@@ -89,7 +89,7 @@ impl DCompBackend {
         {
             *out = Some((id, sinks, x, y));
         }
-        let child_y = if node.is_scroll() { y + node.anim.x } else { y };
+        let child_y = if node.is_scroll() { y + node.scroll_off } else { y };
         for c in &node.children {
             self.surface_walk(*c, x, child_y, out);
         }
@@ -124,7 +124,7 @@ impl DCompBackend {
     /// Returns the pointer→thumb-top offset (for drag tracking) when it does.
     fn thumb_at(&self, id: ControlId, x: f32, y: f32) -> Option<f32> {
         let n = self.node(id)?;
-        let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, n.anim.x);
+        let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, n.scroll_off);
         if !g.overflow {
             return None;
         }
@@ -137,23 +137,42 @@ impl DCompBackend {
         }
     }
 
-    /// Switch which scroll container's thumb is shown (fade the old out, the new
-    /// in). The actual targets are (re)applied per tick; this only records the
-    /// hovered id and ensures both are stepped.
+    /// Switch which scroll container's thumb is shown (fade the old out, the
+    /// new in) — a direct edge-trigger of the compositor fade, no tick.
     fn update_hovered_scroll(&mut self, now: Option<ControlId>) {
         if now == self.hovered_scroll {
             return;
         }
-        if let Some(old) = self.hovered_scroll {
-            self.animating.insert(old);
+        let old = self.hovered_scroll;
+        self.hovered_scroll = now;
+        if let Some(old) = old
+            && self.dragging_thumb != Some(old)
+        {
+            self.set_thumb_shown(old, false);
         }
         if let Some(new) = now {
-            self.animating.insert(new);
+            self.set_thumb_shown(new, true);
         }
-        self.hovered_scroll = now;
     }
 
-    /// Drag the thumb of scroll container `id` so its top follows the pointer.
+    /// Edge-trigger the thumb reveal/conceal fade (played on the system
+    /// compositor). A reveal only happens while the content actually overflows.
+    fn set_thumb_shown(&mut self, id: ControlId, shown: bool) {
+        let compositor = self.comp.compositor().clone();
+        if let Some(n) = self.node_mut(id) {
+            let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, n.scroll_off);
+            let show = shown && g.overflow;
+            if show != n.thumb_shown {
+                n.thumb_shown = show;
+                if let Some(t) = &n.scroll_thumb {
+                    animate::fade_thumb(&compositor, t, show);
+                }
+            }
+        }
+    }
+
+    /// Drag the thumb of scroll container `id` so its top follows the pointer
+    /// 1:1 — carrier and thumb move by plain property snaps (no repaint).
     fn drag_thumb_to(&mut self, id: ControlId, y: f32) {
         let (ny, vh, content_h, grab) = match self.node(id) {
             Some(n) => (n.rect.y, n.rect.h, n.ctrl.content_h, n.thumb_drag.unwrap_or(0.0)),
@@ -162,11 +181,12 @@ impl DCompBackend {
         let thumb_y = (y - ny) - grab;
         let scroll = scroll::scroll_for_thumb_y(thumb_y, vh, content_h);
         if let Some(n) = self.node_mut(id) {
-            n.anim.x = scroll; // 1:1 tracking — bypass the settle spring while dragging
-            n.anim.target = scroll;
+            n.scroll_off = scroll;
+            n.scroll_snap(scroll);
+            let g = scroll::thumb_geom(vh, content_h, scroll);
+            let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
+            n.thumb_snap(tx, g.thumb_y);
         }
-        self.animating.insert(id);
-        self.apply_scroll(id);
     }
 
     /// Walk the tree; `y` is pre-adjusted for ancestor scroll. When
@@ -180,7 +200,7 @@ impl DCompBackend {
                 *out = Some(id);
             }
         }
-        let child_y = if node.is_scroll() { y + node.anim.x } else { y };
+        let child_y = if node.is_scroll() { y + node.scroll_off } else { y };
         for c in &node.children {
             self.hit_walk(*c, x, child_y, out, want_interactive);
         }
@@ -188,15 +208,29 @@ impl DCompBackend {
 
     // ── Hover ────────────────────────────────────────────────────────────────
 
-    /// Pointer moved to (x, y) DIPs. Returns `true` if a spring started.
-    pub(crate) fn on_pointer_move(&mut self, x: f32, y: f32) -> bool {
+    /// Pointer moved to (x, y) DIPs.
+    pub(crate) fn on_pointer_move(&mut self, x: f32, y: f32) {
+        #[cfg(debug_assertions)]
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SEEN_TOP: AtomicU32 = AtomicU32::new(0);
+            let n = SEEN_TOP.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                eprintln!(
+                    "reactor: [dev] move#{n} ({x:.0},{y:.0}) popup={} pressed={:?} psurf={}",
+                    self.popup.is_some(),
+                    self.pressed_id,
+                    self.pressed_surface.is_some(),
+                );
+            }
+        }
         // While a popup is open, the move only re-highlights its rows.
         if self.popup.is_some() {
             let hit = self.popup.as_ref().and_then(|p| p.hit(x, y));
             if let Some(p) = &mut self.popup {
                 p.set_hovered(hit, &self.comp);
             }
-            return false;
+            return;
         }
 
         // A pressed text field drag-selects 1:1 with the pointer.
@@ -204,7 +238,7 @@ impl DCompBackend {
             && self.node(pid).is_some_and(|n| n.editor.is_some())
         {
             self.extend_selection(pid, x);
-            return true;
+            return;
         }
 
         // A pressed slider scrubs 1:1 with the pointer.
@@ -212,13 +246,13 @@ impl DCompBackend {
             && self.node(pid).map(|n| n.kind) == Some(ControlKind::Slider)
         {
             self.slider_to(pid, x);
-            return true;
+            return;
         }
 
         // A dragged scroll thumb tracks the pointer 1:1.
         if let Some(sid) = self.dragging_thumb {
             self.drag_thumb_to(sid, y);
-            return true;
+            return;
         }
 
         // A pressed viz pointer surface (knob/slider/EQ drag) receives every
@@ -231,7 +265,7 @@ impl DCompBackend {
             // can starve, which reads as drag lag. Moves are queue-coalesced, so
             // this self-limits to the pump's processing rate.
             crate::drive_frame_ticks();
-            return false;
+            return;
         }
 
         // Pointer capture: a pressed node with pointer handlers (declarative
@@ -243,66 +277,153 @@ impl DCompBackend {
             })
         {
             self.fire_pointer(pid, x, y, |p| p.on_pointer_moved.as_ref());
-            return false;
+            return;
         }
 
         // Fade the scrollbar thumb in for whichever scroll container is hovered.
         self.update_hovered_scroll(self.scroll_at(x, y));
 
         let now = self.interactive_at(x, y);
-        if now == self.hovered_id {
-            return false;
-        }
-        if let Some(old) = self.hovered_id.take()
-            && let Some(n) = self.node_mut(old)
+
+        // Per-segment hover on a SelectorBar: the hot segment changes while the
+        // pointer stays on the same node, so track it before the same-node
+        // early-out below.
+        // Record the new hot segment only — ink placement and the label
+        // repaint are deferred until after the hover flips below, so both
+        // always see consistent hover state (an inline repaint here would run
+        // with a stale `hovered` on re-entry and skip the label brightening).
+        let mut seg_hot_moved = false;
+        if let Some(id) = now
+            && self
+                .node(id)
+                .is_some_and(|n| n.kind == ControlKind::SelectorBar && n.paint.is_enabled)
+            && let Some(hot) = self.segment_at(id, x)
+            && self.node(id).is_some_and(|n| n.ctrl.hot_index != hot)
         {
-            n.hovered = false;
-            n.hover.target = 0.0;
-            self.animating.insert(old);
-        }
-        if let Some(new) = now {
-            if let Some(n) = self.node_mut(new) {
-                n.hovered = true;
-                n.hover.target = 1.0;
+            if let Some(n) = self.node_mut(id) {
+                n.ctrl.hot_index = hot;
+                n.mark_dirty();
             }
-            self.animating.insert(new);
-            self.fire_pointer(new, x, y, |p| p.on_pointer_moved.as_ref());
+            seg_hot_moved = true;
         }
-        self.hovered_id = now;
 
         // Hover moves over a viz pointer surface (EQ node highlight etc.) —
-        // XAML `PointerMoved` fires on hover, not only during a press.
-        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y) {
+        // XAML `PointerMoved` fires on hover, not only during a press, and it fires
+        // on EVERY move: this must run before the same-interactive-node early-out
+        // below, or a surface only ever hears the single move that crossed a button
+        // boundary. Track which surface holds the hover so leaving it (to another
+        // surface, to none) can fire its `exited` sink — there is no per-node exit
+        // event otherwise.
+        let surf = self.surface_at(x, y);
+        let now_surface = surf.as_ref().map(|(sid, ..)| *sid);
+        if self.hovered_surface != now_surface {
+            self.fire_surface_exit();
+            self.hovered_surface = now_surface;
+        }
+        if let Some((sid, sinks, ax, ay)) = surf {
             self.fire_surface(sid, &sinks.moved, ax, ay, false, 0);
         }
 
-        !self.animating.is_empty()
+        if now == self.hovered_id {
+            // Same node, new segment: hover state is already correct — snap
+            // the ink to the new segment and refresh the labels.
+            if seg_hot_moved
+                && let Some(id) = now
+            {
+                if let Some(n) = self.node_mut(id) {
+                    parts::seg_hot_changed(n);
+                }
+                self.repaint();
+            }
+            return;
+        }
+        let mut redraw = false;
+        if let Some(old) = self.hovered_id.take() {
+            redraw |= self.hover_flip(old, false);
+        }
+        if let Some(new) = now {
+            redraw |= self.hover_flip(new, true);
+            self.fire_pointer(new, x, y, |p| p.on_pointer_moved.as_ref());
+        }
+        self.hovered_id = now;
+        if redraw {
+            self.repaint();
+        }
     }
 
-    pub(crate) fn on_pointer_leave(&mut self) -> bool {
-        if let Some(old) = self.hovered_id.take()
-            && let Some(n) = self.node_mut(old)
-        {
-            n.hovered = false;
-            n.hover.target = 0.0;
-            self.animating.insert(old);
+    /// Flip a node's hover state. Converted (chrome-part) kinds retarget their
+    /// compositor ink fades directly; kinds with painted hover feedback mark
+    /// dirty and return `true` so the caller repaints once — AFTER the flip,
+    /// so paint always sees the new hover state.
+    fn hover_flip(&mut self, id: ControlId, hovered: bool) -> bool {
+        let mut redraw = false;
+        if let Some(n) = self.node_mut(id) {
+            n.hovered = hovered;
+            match n.kind {
+                ControlKind::SelectorBar => {
+                    // Label brightening is painted; entering keeps the hot
+                    // segment recorded by the caller, leaving clears it.
+                    if !hovered {
+                        n.ctrl.hot_index = -1;
+                    }
+                    n.mark_dirty();
+                    redraw = true;
+                }
+                // Painted hover feedback (outline brighten / link recolor /
+                // NumberBox spin-chevron brighten): one event-driven repaint
+                // per flip, no tick.
+                ControlKind::CheckBox
+                | ControlKind::HyperlinkButton
+                | ControlKind::NumberBox => {
+                    n.mark_dirty();
+                    redraw = true;
+                }
+                _ => {}
+            }
+            if parts::converted(n.kind) {
+                parts::ink_state_changed(n);
+            }
         }
+        redraw
+    }
+
+    /// Fire the `exited` sink of the surface that held the hover, if any (and if
+    /// it is still mounted with a live registration).
+    fn fire_surface_exit(&mut self) {
+        if let Some(old) = self.hovered_surface.take()
+            && let Some(node) = self.node(old)
+            && !node.ident.is_null()
+            && let Some(sinks) = super::pointer::sinks_for(node.ident)
+            && let Some(cb) = sinks.exited.borrow().as_ref()
+        {
+            cb();
+        }
+    }
+
+    pub(crate) fn on_pointer_leave(&mut self) {
+        if let Some(old) = self.hovered_id.take() {
+            let redraw = self.hover_flip(old, false);
+            if redraw {
+                self.repaint();
+            }
+        }
+        // A hovered viz pointer surface loses the pointer at the window edge too.
+        self.fire_surface_exit();
         // Fade out the scrollbar thumb when the pointer leaves the window.
         self.update_hovered_scroll(None);
-        !self.animating.is_empty()
     }
 
     // ── Press / release ──────────────────────────────────────────────────────
 
-    /// Left button down. Returns `(captured, needs_timer)`.
-    pub(crate) fn on_pointer_down(&mut self, x: f32, y: f32) -> (bool, bool) {
+    /// Left button down. Returns whether the pointer should be captured.
+    pub(crate) fn on_pointer_down(&mut self, x: f32, y: f32) -> bool {
         // Popup open: outside-click light-dismisses; inside is handled on up.
         if self.popup.is_some() {
             let inside = self.popup.as_ref().is_some_and(|p| p.contains(x, y));
             if !inside {
                 self.close_popup();
             }
-            return (false, false);
+            return false;
         }
 
         // Pressing the overlay scrollbar thumb starts a drag-to-scroll (the thumb
@@ -315,16 +436,21 @@ impl DCompBackend {
             }
             self.dragging_thumb = Some(sid);
             self.update_hovered_scroll(Some(sid));
-            return (true, true);
+            return true;
         }
 
         // A registered viz pointer surface wins over generic controls: it is the
         // deepest interactive thing under the point, and its press starts an
-        // implicitly captured drag.
-        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y) {
+        // implicitly captured drag. But only when it actually LISTENS for presses —
+        // a surface with no `down` sink is hover-only (e.g. a plot that lights up
+        // under the pointer), and must stay click-transparent so buttons layered
+        // over it keep working.
+        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y)
+            && sinks.down.borrow().is_some()
+        {
             self.pressed_surface = Some((sid, std::rc::Rc::clone(&sinks), ay - y));
             self.fire_surface(sid, &sinks.down, ax, ay, true, 0);
-            return (true, false);
+            return true;
         }
 
         let target = self.interactive_at(x, y);
@@ -339,47 +465,52 @@ impl DCompBackend {
             if self.node(id).map(|n| n.kind) == Some(ControlKind::NumberBox)
                 && self.spin_hit(id, x, y)
             {
-                return (true, false);
+                return true;
             }
             self.place_caret(id, x);
             self.pressed_id = Some(id);
-            return (true, false);
+            return true;
         }
 
         if let Some(id) = target {
             if let Some(n) = self.node_mut(id) {
                 n.pressed = true;
-                n.press.target = 1.0;
+                if parts::converted(n.kind) {
+                    // Press ink is a compositor fade — no tick.
+                    parts::ink_state_changed(n);
+                }
             }
-            self.animating.insert(id);
             self.pressed_id = Some(id);
             // Sliders scrub immediately on press.
             if self.node(id).map(|n| n.kind) == Some(ControlKind::Slider) {
                 self.slider_to(id, x);
             }
             self.fire_pointer(id, x, y, |p| p.on_pointer_pressed.as_ref());
-            (true, true)
+            true
         } else {
-            (false, false)
+            false
         }
     }
 
-    /// Left button up. Returns `needs_timer`.
-    pub(crate) fn on_pointer_up(&mut self, x: f32, y: f32) -> bool {
+    /// Left button up.
+    pub(crate) fn on_pointer_up(&mut self, x: f32, y: f32) {
         // End a viz pointer-surface drag: the surface always sees the release
         // (capture semantics), wherever the pointer is.
         if let Some((sid, sinks, dy)) = self.pressed_surface.take() {
             self.fire_surface(sid, &sinks.up, x, y + dy, false, 0);
-            return false;
+            return;
         }
 
-        // End a scrollbar-thumb drag (keep the timer so the thumb can fade out).
+        // End a scrollbar-thumb drag; conceal the thumb unless the pointer is
+        // still over its container (leaving conceals it via hover tracking).
         if let Some(sid) = self.dragging_thumb.take() {
             if let Some(n) = self.node_mut(sid) {
                 n.thumb_drag = None;
             }
-            self.animating.insert(sid);
-            return true;
+            if self.hovered_scroll != Some(sid) {
+                self.set_thumb_shown(sid, false);
+            }
+            return;
         }
 
         // Popup open: a click on a row selects it, then dismisses.
@@ -388,7 +519,7 @@ impl DCompBackend {
             if let Some(idx) = hit {
                 self.commit_popup(idx);
             }
-            return self.popup.is_some() && !self.popup_settled;
+            return;
         }
 
         // A text-field drag ended: just drop the press (no activation / ink).
@@ -396,17 +527,18 @@ impl DCompBackend {
             && self.node(pid).is_some_and(|n| n.editor.is_some())
         {
             self.pressed_id = None;
-            return false;
+            return;
         }
 
         let Some(id) = self.pressed_id.take() else {
-            return false;
+            return;
         };
         if let Some(n) = self.node_mut(id) {
             n.pressed = false;
-            n.press.target = 0.0;
+            if parts::converted(n.kind) {
+                parts::ink_state_changed(n);
+            }
         }
-        self.animating.insert(id);
 
         // Capture semantics: the pressed node always sees the release (a drag
         // must end even when the pointer strays off the control). Activation
@@ -415,7 +547,6 @@ impl DCompBackend {
         if self.is_over(id, x, y) {
             self.activate_pointer(id, x, y);
         }
-        true
     }
 
     /// Whether `(x, y)` still lies over node `id` (scroll-adjusted).
@@ -446,34 +577,34 @@ impl DCompBackend {
                 let on = !self.node(id).map(|n| n.ctrl.is_on).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
                     n.ctrl.is_on = on;
-                    n.anim.target = if on { 1.0 } else { 0.0 };
                     n.mark_dirty();
                 }
-                self.animating.insert(id);
+                // The knob/track glide runs on the compositor: the repaint's
+                // parts sync sees the flipped state and retargets the springs.
+                self.repaint();
                 self.fire_bool(id, Event::Toggled, on);
             }
             ControlKind::CheckBox | ControlKind::ToggleButton => {
                 let on = !self.node(id).map(|n| n.ctrl.is_checked).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
                     n.ctrl.is_checked = on;
-                    n.anim.target = if on { 1.0 } else { 0.0 };
                     n.mark_dirty();
                 }
-                self.animating.insert(id);
+                // The CheckBox reveal fades on the compositor (the repaint's
+                // parts sync); a ToggleButton's checked chrome just repaints.
+                self.repaint();
                 self.fire_bool(id, Event::Checked, on);
             }
             ControlKind::Expander => {
                 let ex = !self.node(id).map(|n| n.ctrl.expanded).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
                     n.ctrl.expanded = ex;
-                    n.anim.target = if ex { 1.0 } else { 0.0 };
                     n.mark_dirty();
                 }
-                self.animating.insert(id);
                 self.fire_bool(id, Event::Expanding, ex);
-                // The body subtree's `Display::None` flips with `expanded`, so the
-                // layout must be recomputed for the body to reclaim/release space
-                // (the chevron keeps animating via the timer).
+                // The body subtree's `Display::None` flips with `expanded`, so
+                // the layout must be recomputed for the body to reclaim/release
+                // space (this also repaints the flipped chevron).
                 self.relayout_and_paint();
             }
             ControlKind::ComboBox | ControlKind::DropDownButton | ControlKind::SplitButton => {
@@ -512,30 +643,36 @@ impl DCompBackend {
         }
     }
 
-    fn select_segment(&mut self, id: ControlId, x: f32) {
-        let Some(node) = self.node(id) else { return };
+    /// The segment index under window-relative `x`, or `None` for an empty bar.
+    fn segment_at(&self, id: ControlId, x: f32) -> Option<i32> {
+        let node = self.node(id)?;
         let n = node.ctrl.items.len();
         if n == 0 {
-            return;
+            return None;
         }
-        let seg_w = controls::segment_width(node);
-        let rel = x - node.rect.x - theme::BORDER_W;
-        let i = ((rel / seg_w).floor() as i32).clamp(0, n as i32 - 1);
-        self.set_segment(id, i);
+        let edges = controls::segment_edges(node);
+        let rel = x - node.rect.x;
+        let i = edges[1..n].iter().take_while(|&&e| rel >= e).count();
+        Some(i as i32)
+    }
+
+    fn select_segment(&mut self, id: ControlId, x: f32) {
+        if let Some(i) = self.segment_at(id, x) {
+            self.set_segment(id, i);
+        }
     }
 
     fn set_segment(&mut self, id: ControlId, i: i32) {
         let label = {
             let Some(n) = self.node_mut(id) else { return };
-            if n.ctrl.selected_index == i {
+            if n.ctrl.selected_index == i || !n.paint.is_enabled {
                 return;
             }
             n.ctrl.selected_index = i;
-            n.anim.target = i as f32;
             n.mark_dirty();
             n.ctrl.items.get(i as usize).cloned().unwrap_or_default()
         };
-        self.animating.insert(id);
+        self.repaint();
         self.fire_string(id, Event::SelectionChanged, label);
     }
 
@@ -559,11 +696,12 @@ impl DCompBackend {
                 return;
             }
             nd.ctrl.selected_index = i;
-            nd.anim.target = i as f32;
             nd.mark_dirty();
             nd.ctrl.tags.get(i as usize).cloned().unwrap_or_default()
         };
-        self.animating.insert(id);
+        // Indicator glide + glyph recolor both flow from the repaint (the
+        // parts sync glides the tile/bar on the compositor).
+        self.repaint();
         self.fire_string(id, Event::SelectionChanged, tag);
     }
 
@@ -582,7 +720,9 @@ impl DCompBackend {
         self.fire_i32(id, Event::SelectionChanged, i);
     }
 
-    /// Map pointer x to a slider value, clamp/quantize, and report it.
+    /// Map pointer x to a slider value, clamp/quantize, and report it. The
+    /// fill/halo/thumb parts snap 1:1 with the pointer — plain compositor
+    /// property sets, no repaint and no tick.
     fn slider_to(&mut self, id: ControlId, x: f32) {
         let value = {
             let Some(n) = self.node_mut(id) else { return };
@@ -599,12 +739,13 @@ impl DCompBackend {
                 frac = if span.abs() < f64::EPSILON { 0.0 } else { ((v - n.ctrl.min) / span) as f32 };
             }
             n.ctrl.value = v;
-            n.anim.x = frac; // 1:1 tracking (bypass the settle spring during drag)
-            n.anim.target = frac;
-            n.mark_dirty();
+            if !parts::slider_drag(n, frac) {
+                // Parts not built yet (first interaction before first paint):
+                // fall back to a dirty repaint, whose sync snaps them.
+                n.mark_dirty();
+            }
             v
         };
-        self.animating.insert(id);
         self.fire_f64(id, Event::ValueChanged, value);
     }
 
@@ -636,7 +777,6 @@ impl DCompBackend {
             Ok(p) => {
                 self.close_popup();
                 self.popup = Some(p);
-                self.popup_settled = false;
             }
             Err(_) => {}
         }
@@ -695,7 +835,6 @@ impl DCompBackend {
         if let Ok(p) = Popup::open(&self.comp, owner, rows, rect, self.dip_size, false, -1, true) {
             self.close_popup();
             self.popup = Some(p);
-            self.popup_settled = false;
         }
     }
 
@@ -718,11 +857,19 @@ impl DCompBackend {
         self.fire_string(owner, Event::SuggestionChosen, text);
     }
 
+    /// Close the open popup with a compositor-side dismiss fade. The overlay
+    /// visual is parked as a [`Ghost`] and released by the one-shot ghost timer
+    /// once the fade lands — no app frames, one wakeup at the end.
     fn close_popup(&mut self) {
         if let Some(p) = self.popup.take() {
-            p.dismiss(&self.comp);
+            if let Some(v) = p.into_exit(&self.comp) {
+                let deadline = std::time::Instant::now()
+                    + popup::EXIT_DURATION
+                    + std::time::Duration::from_millis(80);
+                self.ghosts.push(Ghost { shown: v, deadline });
+                self.arm_ghost_timer();
+            }
         }
-        self.popup_settled = true;
     }
 
     /// Window lost activation: commit a focused NumberBox and light-dismiss any
@@ -761,16 +908,16 @@ impl DCompBackend {
 
     // ── Wheel ────────────────────────────────────────────────────────────────
 
-    /// Mouse wheel at (x, y) DIPs, `delta` in WHEEL_DELTA (120) units. Returns
-    /// `true` if a scroll spring started.
-    pub(crate) fn on_wheel(&mut self, x: f32, y: f32, delta: i32) -> bool {
+    /// Mouse wheel at (x, y) DIPs, `delta` in WHEEL_DELTA (120) units. The
+    /// scroll glide plays on the compositor — nothing here needs the timer.
+    pub(crate) fn on_wheel(&mut self, x: f32, y: f32, delta: i32) {
         // A viz pointer surface that subscribed the wheel (EQ Q-adjust) consumes
         // it; surfaces without a wheel sink fall through to scrolling.
         if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y)
             && sinks.wheel.borrow().is_some()
         {
             self.fire_surface(sid, &sinks.wheel, ax, ay, false, delta);
-            return false;
+            return;
         }
 
         // A focused NumberBox under the pointer steps on the wheel.
@@ -779,35 +926,43 @@ impl DCompBackend {
             && self.node(id).is_some_and(|n| n.rect.contains(x, y))
         {
             self.number_step(id, if delta > 0 { 1.0 } else { -1.0 }, false);
-            return false;
+            return;
         }
 
         if let Some(id) = self.scroll_at(x, y) {
-            // 48 DIPs per detent, downward wheel scrolls content up.
+            // 48 DIPs per detent, downward wheel scrolls content up. The glide
+            // is a compositor spring on the content carrier (and the thumb),
+            // retargeted per detent — no tick, no repaint. `scroll_off` jumps
+            // to the destination immediately: it is the LOGICAL scroll offset
+            // (hit-testing, thumb geometry), and mid-glide hits land where the
+            // content is about to settle.
             let step = -(delta as f32 / 120.0) * 48.0;
+            let scale = self.scale();
             let max = self.node(id).map(|n| (n.ctrl.content_h - n.rect.h).max(0.0)).unwrap_or(0.0);
             if let Some(n) = self.node_mut(id) {
-                n.anim.target = (n.anim.target + step).clamp(0.0, max);
+                let target = layout::snap((n.scroll_off + step).clamp(0.0, max), scale);
+                n.scroll_off = target;
+                n.scroll_glide(target);
+                let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, target);
+                let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
+                n.thumb_glide(tx, g.thumb_y);
             }
-            // Reveal the thumb while scrolling (it auto-hides once the pointer
-            // leaves and the scroll spring settles).
+            // Reveal the thumb while scrolling (it conceals when the pointer
+            // leaves the container).
             self.update_hovered_scroll(Some(id));
-            self.animating.insert(id);
-            return true;
         }
-        false
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
 
     /// A key was pressed (`shift` / `ctrl` held?). Returns `true` if a
     /// spring/timer should run.
-    pub(crate) fn on_key(&mut self, vk: u32, shift: bool, ctrl: bool) -> bool {
+    pub(crate) fn on_key(&mut self, vk: u32, shift: bool, ctrl: bool) {
         // A focused text editor consumes editing keys before the generic ring.
         if let Some(id) = self.focused_editable()
-            && let Some(needs) = self.editor_key(id, vk, shift, ctrl)
+            && self.editor_key(id, vk, shift, ctrl).is_some()
         {
-            return needs;
+            return;
         }
 
         // Popup keyboard navigation takes priority.
@@ -834,23 +989,19 @@ impl DCompBackend {
                 }
                 _ => {}
             }
-            return self.popup.is_some() && !self.popup_settled;
+            return;
         }
 
         match vk {
-            VK_TAB => {
-                self.move_focus(if shift { -1 } else { 1 });
-                false
-            }
+            VK_TAB => self.move_focus(if shift { -1 } else { 1 }),
             VK_SPACE | VK_RETURN => {
                 if let Some(id) = self.focused_id {
                     self.activate(id);
                 }
-                !self.animating.is_empty()
             }
             VK_LEFT | VK_UP => self.focus_arrow(-1),
             VK_RIGHT | VK_DOWN => self.focus_arrow(1),
-            _ => false,
+            _ => {}
         }
     }
 
@@ -900,9 +1051,9 @@ impl DCompBackend {
         self.node_mut(id).and_then(|n| n.editor.as_mut()).map(f)
     }
 
-    /// Route an editing key to the focused editor. Returns `Some(needs_timer)`
-    /// when consumed, or `None` to let the generic ring handle it (e.g. Tab).
-    fn editor_key(&mut self, id: ControlId, vk: u32, shift: bool, ctrl: bool) -> Option<bool> {
+    /// Route an editing key to the focused editor. Returns `Some(())` when
+    /// consumed, or `None` to let the generic ring handle it (e.g. Tab).
+    fn editor_key(&mut self, id: ControlId, vk: u32, shift: bool, ctrl: bool) -> Option<()> {
         let kind = self.node(id)?.kind;
         if vk == VK_TAB {
             return None; // Tab leaves the field (commit happens in set_focus).
@@ -920,17 +1071,17 @@ impl DCompBackend {
                     if let Some(p) = &mut self.popup {
                         p.move_highlight(1, &self.comp);
                     }
-                    return Some(false);
+                    return Some(());
                 }
                 VK_UP => {
                     if let Some(p) = &mut self.popup {
                         p.move_highlight(-1, &self.comp);
                     }
-                    return Some(false);
+                    return Some(());
                 }
                 VK_ESCAPE => {
                     self.close_popup();
-                    return Some(false);
+                    return Some(());
                 }
                 VK_RETURN => {
                     let h = self.popup.as_ref().map(|p| p.hovered);
@@ -941,7 +1092,7 @@ impl DCompBackend {
                         self.close_popup();
                         self.fire_string(id, Event::QuerySubmitted, t);
                     }
-                    return Some(false);
+                    return Some(());
                 }
                 _ => {}
             }
@@ -951,29 +1102,29 @@ impl DCompBackend {
                 VK_A => {
                     self.with_editor(id, |e| e.select_all());
                     self.editor_caret_moved(id);
-                    return Some(false);
+                    return Some(());
                 }
                 VK_C => {
                     self.editor_copy(id);
-                    return Some(false);
+                    return Some(());
                 }
                 VK_X => {
                     self.editor_cut(id);
-                    return Some(false);
+                    return Some(());
                 }
                 VK_V => {
                     self.editor_paste(id);
-                    return Some(false);
+                    return Some(());
                 }
                 VK_LEFT => {
                     self.with_editor(id, |e| e.move_left(true, shift));
                     self.editor_caret_moved(id);
-                    return Some(false);
+                    return Some(());
                 }
                 VK_RIGHT => {
                     self.with_editor(id, |e| e.move_right(true, shift));
                     self.editor_caret_moved(id);
-                    return Some(false);
+                    return Some(());
                 }
                 _ => {}
             }
@@ -1017,7 +1168,7 @@ impl DCompBackend {
             VK_NEXT if kind == ControlKind::NumberBox => self.number_step(id, -1.0, true),
             _ => {} // consume; printable input arrives via WM_CHAR
         }
-        Some(false)
+        Some(())
     }
 
     /// IME composition started (IMM32 fallback): anchor the composition span.
@@ -1292,22 +1443,22 @@ impl DCompBackend {
 
     /// Left/Right (or Up/Down) on the focused control: nudge a slider or move a
     /// segmented selection.
-    fn focus_arrow(&mut self, dir: i32) -> bool {
-        let Some(id) = self.focused_id else { return false };
+    fn focus_arrow(&mut self, dir: i32) {
+        let Some(id) = self.focused_id else { return };
         match self.node(id).map(|n| n.kind) {
             Some(ControlKind::Slider) => {
                 let value = {
-                    let Some(n) = self.node_mut(id) else { return false };
+                    let Some(n) = self.node_mut(id) else { return };
                     let step = n.ctrl.step.unwrap_or((n.ctrl.max - n.ctrl.min) / 20.0);
                     let v = (n.ctrl.value + dir as f64 * step).clamp(n.ctrl.min, n.ctrl.max);
                     n.ctrl.value = v;
-                    n.anim.target = ctrl_value_frac(n) as f32;
                     n.mark_dirty();
                     v
                 };
-                self.animating.insert(id);
+                // The fill/thumb glide runs on the compositor via the repaint's
+                // parts sync — a keyboard nudge needs no tick.
+                self.repaint();
                 self.fire_f64(id, Event::ValueChanged, value);
-                true
             }
             Some(ControlKind::SelectorBar) => {
                 let (cur, n) = self
@@ -1317,9 +1468,8 @@ impl DCompBackend {
                 if n > 0 {
                     self.set_segment(id, (cur + dir).clamp(0, n - 1));
                 }
-                true
             }
-            _ => false,
+            _ => {}
         }
     }
 
@@ -1462,11 +1612,11 @@ impl DCompBackend {
             let Some(n) = self.node_mut(id) else { return };
             let v = v.clamp(n.ctrl.min, n.ctrl.max);
             n.ctrl.value = v;
-            n.anim.target = ctrl_value_frac(n) as f32;
             n.mark_dirty();
             v
         };
-        self.animating.insert(id);
+        // Compositor glide via the repaint's parts sync (see `focus_arrow`).
+        self.repaint();
         self.fire_f64(id, Event::ValueChanged, value);
     }
 
@@ -1542,79 +1692,6 @@ impl DCompBackend {
             ..PointerEventInfo::default()
         };
         cb.invoke(info);
-    }
-
-    // ── Animation tick ───────────────────────────────────────────────────────
-
-    /// Advance all in-flight springs by `dt` and repaint. Returns `true` while
-    /// any animation (node spring, indeterminate progress, or popup) remains.
-    pub(crate) fn tick(&mut self, dt: f32) -> bool {
-        let hovered_scroll = self.hovered_scroll;
-        let ids: Vec<ControlId> = self.animating.iter().copied().collect();
-        for id in ids {
-            let (settled, scroll) = match self.node_mut(id) {
-                Some(n) => {
-                    let h = n.hover.step(dt);
-                    let p = n.press.step(dt);
-                    let a = n.anim.step(dt);
-                    // Scroll thumb auto-hide: visible while hovered, dragging, or the
-                    // scroll spring is still in flight; fades out otherwise.
-                    let mut tf = true;
-                    if n.is_scroll() {
-                        let active = hovered_scroll == Some(id)
-                            || n.thumb_drag.is_some()
-                            || (n.anim.x - n.anim.target).abs() > 1e-3;
-                        n.thumb_fade.target = if active { 1.0 } else { 0.0 };
-                        tf = n.thumb_fade.step(dt);
-                    }
-                    let indeterminate = n.ctrl.indeterminate
-                        && matches!(n.kind, ControlKind::ProgressBar | ControlKind::ProgressRing);
-                    if indeterminate {
-                        n.phase = (n.phase + dt * 0.6) % 1_000_000.0;
-                    }
-                    n.mark_dirty();
-                    let settled = h && p && a && tf && !indeterminate;
-                    (settled, n.is_scroll())
-                }
-                None => (true, false),
-            };
-            if scroll {
-                self.apply_scroll(id);
-            }
-            if settled {
-                self.animating.remove(&id);
-            }
-        }
-
-        // Advance the popup open animation.
-        if let Some(p) = &mut self.popup
-            && !self.popup_settled
-            && p.tick(dt)
-        {
-            self.popup_settled = true;
-        }
-
-        self.repaint();
-        self.is_animating()
-    }
-
-    /// Re-apply a scroll container's offset to its children (compositor move).
-    fn apply_scroll(&mut self, id: ControlId) {
-        let (children, nx, ny, scroll) = match self.node(id) {
-            Some(n) => (n.children.clone(), n.rect.x, n.rect.y, n.anim.x),
-            None => return,
-        };
-        for c in children {
-            if let Some(cn) = self.node_mut(c) {
-                use windows_numerics::Vector3;
-                let _ = cn.vis.SetOffset(Vector3::new(cn.rect.x - nx, cn.rect.y - ny - scroll, 0.0));
-            }
-        }
-    }
-
-    /// True while any spring, indeterminate progress, or the popup is animating.
-    pub(crate) fn is_animating(&self) -> bool {
-        !self.animating.is_empty() || (self.popup.is_some() && !self.popup_settled)
     }
 
     fn hwnd(&self) -> HWND {

@@ -179,6 +179,15 @@ impl Paint for Brush {
 /// A linear gradient brush.
 pub struct LinearGradient(pub(crate) ID2D1LinearGradientBrush);
 
+impl LinearGradient {
+    /// Sets the brush-level opacity (0..=1) — multiplies every stop's alpha at
+    /// draw time. The cheap way to animate a gradient's strength: the stop list
+    /// (and thus the brush) stays fixed while only this state moves per frame.
+    pub fn set_opacity(&self, opacity: f32) {
+        unsafe { self.0.SetOpacity(opacity) };
+    }
+}
+
 impl sealed::Sealed for LinearGradient {}
 impl Paint for LinearGradient {
     fn as_raw_brush(&self) -> &ID2D1Brush {

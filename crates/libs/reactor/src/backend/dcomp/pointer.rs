@@ -32,6 +32,10 @@ pub struct PointerSinks {
     pub moved: RefCell<Option<Box<dyn Fn(PointerEventInfo)>>>,
     pub up: RefCell<Option<Box<dyn Fn(PointerEventInfo)>>>,
     pub wheel: RefCell<Option<Box<dyn Fn(PointerEventInfo)>>>,
+    /// Fired when the hover leaves this surface's bounds (another surface, none,
+    /// or the window edge). Hover-only: a captured drag suppresses hover routing
+    /// until release, so no exit fires mid-drag.
+    pub exited: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 struct Entry {

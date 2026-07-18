@@ -5,12 +5,12 @@
 //! literal except geometric ratios and glyph codepoints.
 
 use super::editor;
-use super::node::{is_text_editable, linear, lerp_color, Node};
+use super::node::{is_text_editable, linear, Node};
 use super::theme;
 use crate::backend::ControlKind;
 use crate::Color;
 use windows_canvas_core::{
-    Brush, ColorF, DrawingSession, Ellipse, FontWeight, ParagraphAlignment, Rect, RoundedRect,
+    Brush, DrawingSession, Ellipse, FontWeight, ParagraphAlignment, Rect, RoundedRect,
     TextAlignment, TextFormat, Vector2,
 };
 
@@ -39,14 +39,18 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         | ControlKind::RepeatButton
         | ControlKind::SplitButton => paint_button(session, brush, node, rect, dim),
         ControlKind::HyperlinkButton => paint_hyperlink(session, brush, node, rect, dim),
-        ControlKind::ToggleSwitch => paint_toggle_switch(session, brush, node, rect, dim),
+        // Track, outline, and knob are retained chrome parts (compositor
+        // sprites — see `super::parts`); only the focus-ring tail below paints.
+        ControlKind::ToggleSwitch => {}
         ControlKind::CheckBox => paint_check_box(session, brush, node, rect, dim),
         ControlKind::SelectorBar => paint_segmented(session, brush, node, rect, dim),
         ControlKind::ComboBox | ControlKind::DropDownButton => {
             paint_select(session, brush, node, rect, dim)
         }
         ControlKind::Slider => paint_slider(session, brush, node, rect, dim),
-        ControlKind::ProgressBar => paint_progress_bar(session, brush, node, rect, dim),
+        // Track, fill, and indeterminate sweep are retained chrome parts
+        // (`super::parts::progress_sync`) — the sweep loops on the compositor.
+        ControlKind::ProgressBar => {}
         ControlKind::ProgressRing => paint_progress_ring(session, brush, node, rect, dim),
         ControlKind::NavigationView => paint_nav(session, brush, node, rect, dim),
         ControlKind::Expander => paint_expander(session, brush, node, rect, dim),
@@ -56,7 +60,13 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         _ => return false,
     }
     if node.focused {
-        draw_focus_ring(session, brush, rect, focus_radius(node.kind));
+        // The accent segmented tray is a stadium — its focus ring follows suit.
+        let radius = if node.kind == ControlKind::SelectorBar && node.paint.style_variant == 1 {
+            rect.height() / 2.0
+        } else {
+            focus_radius(node.kind)
+        };
+        draw_focus_ring(session, brush, rect, radius);
     }
     true
 }
@@ -68,11 +78,6 @@ fn put(brush: &Brush, c: Color, dim: f32) {
     let mut l = linear(c);
     l.a *= dim;
     brush.set_color(l);
-}
-
-fn put_f(brush: &Brush, mut c: ColorF, dim: f32) {
-    c.a *= dim;
-    brush.set_color(c);
 }
 
 fn fill_rr(session: &DrawingSession, brush: &Brush, r: Rect, radius: f32, c: Color, dim: f32) {
@@ -107,11 +112,6 @@ fn stroke_rr(
     }
 }
 
-fn circle(session: &DrawingSession, brush: &Brush, cx: f32, cy: f32, r: f32, c: Color, dim: f32) {
-    put(brush, c, dim);
-    session.fill_ellipse(&Ellipse::new(Vector2::new(cx, cy), r, r), brush);
-}
-
 /// One-shot text draw inside `rect` (builds + caches nothing — only runs on a
 /// dirty repaint, never per frame). `align`/`valign` position within the box.
 #[allow(clippy::too_many_arguments)]
@@ -141,12 +141,6 @@ pub(crate) fn text(
 
 fn glyph_str(cp: u32) -> Option<String> {
     char::from_u32(cp).map(|c| c.to_string())
-}
-
-/// The hover/press ink overlay alpha (white wash) from the node's springs.
-fn ink_wash(node: &Node) -> f32 {
-    // hover → w(0.06), pressed adds toward w(0.10).
-    0.06 * node.hover.x.clamp(0.0, 1.0) + 0.04 * node.press.x.clamp(0.0, 1.0)
 }
 
 /// A focus ring: a 2px `STROKE_STRONG` rounded outline inset 1px from the edge.
@@ -190,11 +184,8 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     };
     fill_rr(session, brush, rect, radius, base, dim);
 
-    // Hover/press white wash.
-    let wash = ink_wash(node);
-    if wash > 0.0 {
-        fill_rr(session, brush, rect, radius, theme::w(wash), dim);
-    }
+    // The hover/press white wash is a retained ink part above this surface
+    // (`super::parts::ink_state_changed` fades it compositor-side).
     if !accent && !checked && !chromeless {
         stroke_rr(session, brush, rect, radius, theme::stroke(), theme::BORDER_W, dim);
     }
@@ -223,8 +214,10 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
 }
 
 fn paint_hyperlink(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let c = lerp_color(linear(theme::accent()), linear(theme::accent_light()), node.hover.x);
-    put_f(brush, c, dim);
+    // Hover recolor is event-driven (one repaint per flip, no tick) — links
+    // switch colour instantly, as native hyperlinks do.
+    let c = if node.hovered { theme::accent_light() } else { theme::accent() };
+    put(brush, c, dim);
     let Ok(fmt) = TextFormat::with_weight(
         "Segoe UI",
         node.paint.font_size.max(theme::FONT_SIZE_MD),
@@ -238,75 +231,19 @@ fn paint_hyperlink(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
     session.draw_text(&node.paint.text, &fmt, &rect, brush);
 }
 
-// ── ToggleSwitch ─────────────────────────────────────────────────────────────
-
-fn paint_toggle_switch(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let t = node.anim.x.clamp(0.0, 1.0);
-    let track_w = 40.0_f32;
-    let track_h = 20.0_f32;
-    let cy = rect.height() / 2.0;
-    let tx = 0.0_f32;
-    let track = Rect::from_xywh(tx, cy - track_h / 2.0, track_w, track_h);
-    let radius = track_h / 2.0;
-
-    // Track: neutral outline (off) cross-fading to accent fill (on).
-    let off = ColorF::new(0.0, 0.0, 0.0, 0.0);
-    let on = linear(theme::accent());
-    put_f(brush, lerp_color(off, on, t), dim);
-    session.fill_rounded_rect(&RoundedRect::uniform(track, radius), brush);
-    if t < 0.999 {
-        // Off outline brightening slightly on hover.
-        let a = 0.20 + 0.08 * node.hover.x;
-        stroke_rr(session, brush, track, radius, theme::w(a * (1.0 - t)), 1.5, dim);
-    }
-
-    // Knob: white circle sliding L→R.
-    let knob_r = 6.0_f32;
-    let left = tx + 2.0 + knob_r;
-    let right = tx + track_w - 2.0 - knob_r;
-    let kx = left + (right - left) * t;
-    circle(session, brush, kx, cy, knob_r, theme::w(1.0), dim);
-}
-
 // ── CheckBox ─────────────────────────────────────────────────────────────────
 
 fn paint_check_box(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let box_d = 18.0_f32;
     let cy = rect.height() / 2.0;
     let bx = Rect::from_xywh(0.0, cy - box_d / 2.0, box_d, box_d);
-    let on = node.anim.x.clamp(0.0, 1.0);
 
-    // Box fill cross-fades transparent → accent.
-    put_f(brush, lerp_color(ColorF::new(0.0, 0.0, 0.0, 0.0), linear(theme::accent()), on), dim);
-    session.fill_rounded_rect(&RoundedRect::uniform(bx, theme::RADIUS_SM), brush);
-    stroke_rr(
-        session,
-        brush,
-        bx,
-        theme::RADIUS_SM,
-        theme::w(0.30 + 0.06 * node.hover.x),
-        1.5,
-        dim,
-    );
-
-    // Checkmark (two strokes) revealed with the fill.
-    if on > 0.05 {
-        put(brush, theme::w(on), dim);
-        let lx = bx.left;
-        let ty = bx.top;
-        session.draw_line(
-            Vector2::new(lx + 4.0, ty + 9.0),
-            Vector2::new(lx + 7.5, ty + 12.5),
-            brush,
-            2.0,
-        );
-        session.draw_line(
-            Vector2::new(lx + 7.5, ty + 12.5),
-            Vector2::new(lx + 14.0, ty + 5.5),
-            brush,
-            2.0,
-        );
-    }
+    // The accent box fill and the checkmark are retained chrome parts
+    // (`super::parts::check_sync`) — a check/uncheck fades on the compositor.
+    // Only the outline (hover-brightened by an event repaint) and the label
+    // paint here.
+    let stroke = theme::w(if node.hovered { 0.36 } else { 0.30 });
+    stroke_rr(session, brush, bx, theme::RADIUS_SM, stroke, 1.5, dim);
 
     // Optional trailing label.
     if !node.paint.text.is_empty() {
@@ -329,48 +266,97 @@ fn paint_check_box(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
 
 // ── Segmented / SelectorBar ──────────────────────────────────────────────────
 
-/// Equal segment width inside the tray (1px tray padding).
-pub(crate) fn segment_width(node: &Node) -> f32 {
-    let n = node.ctrl.items.len().max(1) as f32;
-    (node.rect.w - 2.0 * theme::BORDER_W) / n
+/// Per-variant segmented geometry: segment label padding + tray inset. The
+/// accent (mode-toggle) variant is a roomy full pill; the subtle variant is the
+/// dense toolbar tray. Shared by paint, hit-testing, and intrinsic measure.
+pub(crate) struct SegMetrics {
+    /// Horizontal label padding inside a segment.
+    pub pad_x: f32,
+    /// Vertical label padding inside a segment.
+    pub pad_y: f32,
+    /// Inset from the tray edge to the segment pills.
+    pub tray: f32,
+}
+
+/// The subtle variant keys its density off the label size: at the compact
+/// (toolbar) font it tightens to the mockup's `--sm` padding.
+pub(crate) fn seg_metrics(style_variant: i32, font_size: f32) -> SegMetrics {
+    if style_variant == 1 {
+        SegMetrics { pad_x: 14.0, pad_y: 5.0, tray: 2.0 }
+    } else if font_size <= 10.0 {
+        SegMetrics { pad_x: 8.0, pad_y: 3.0, tray: theme::BORDER_W }
+    } else {
+        SegMetrics { pad_x: 10.0, pad_y: 4.0, tray: theme::BORDER_W }
+    }
+}
+
+/// Segment boundaries in node-local X (n+1 entries, first = tray inset): each
+/// segment sizes to its own measured label + padding, scaled proportionally to
+/// fill the tray's inner width. Falls back to equal widths until labels have
+/// been measured. Shared by paint, hit-testing, and UIA item rects.
+pub(crate) fn segment_edges(node: &Node) -> Vec<f32> {
+    let n = node.ctrl.items.len();
+    let m = seg_metrics(node.paint.style_variant, node.paint.font_size);
+    let inner = (node.rect.w - 2.0 * m.tray).max(0.0);
+    let mut widths: Vec<f32> = if node.ctrl.seg_label_w.len() == n {
+        node.ctrl.seg_label_w.iter().map(|w| w + 2.0 * m.pad_x).collect()
+    } else {
+        vec![inner / n.max(1) as f32; n]
+    };
+    let total: f32 = widths.iter().sum();
+    if total > 0.0 {
+        let s = inner / total;
+        for w in &mut widths {
+            *w *= s;
+        }
+    }
+    let mut edges = Vec::with_capacity(n + 1);
+    let mut x = m.tray;
+    edges.push(x);
+    for w in widths {
+        x += w;
+        edges.push(x);
+    }
+    edges
 }
 
 fn paint_segmented(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let accent = node.paint.style_variant == 1;
-    let tray_radius = if accent { theme::RADIUS_LG } else { theme::RADIUS_SM };
-    let seg_radius = if accent { theme::RADIUS_LG - theme::SPACE_4 / 2.0 } else { theme::RADIUS_BADGE };
-    let tray_bg = if accent { theme::stroke_divider() } else { theme::stroke_subtle() };
+    let m = seg_metrics(node.paint.style_variant, node.paint.font_size);
+    let h = rect.height();
 
-    fill_rr(session, brush, rect, tray_radius, tray_bg, dim);
-    stroke_rr(session, brush, rect, tray_radius, theme::stroke(), theme::BORDER_W, dim);
-
+    // The tray (fill + 1px stroke), the sliding indicator pill, and the hover
+    // ink are retained chrome parts UNDER this surface (`super::parts`) — the
+    // pill glides between segments on the compositor. Only the labels (and the
+    // focus-ring tail) are painted here, so they stay crisp above the pill.
     let n = node.ctrl.items.len();
     if n == 0 {
         return;
     }
-    let seg_w = segment_width(node);
-    let pad = theme::BORDER_W;
-
-    // Active indicator pill, slid via the spring (fractional index).
-    let idx = node.anim.x.clamp(0.0, (n.saturating_sub(1)) as f32);
-    let px = pad + idx * seg_w;
-    let pill = Rect::from_xywh(px + 1.0, rect.top + 1.0, seg_w - 2.0, rect.height() - 2.0);
-    let fill = if accent { theme::accent() } else { theme::stroke() };
-    fill_rr(session, brush, pill, seg_radius, fill, dim);
+    let edges = segment_edges(node);
+    let pill_h = h - 2.0 * m.tray;
+    let seg_rect = |i: usize| {
+        Rect::from_xywh(rect.left + edges[i], rect.top + m.tray, edges[i + 1] - edges[i], pill_h)
+    };
+    let hot = node.ctrl.hot_index;
 
     // Segment labels.
     for (i, label) in node.ctrl.items.iter().enumerate() {
-        let sx = pad + i as f32 * seg_w;
-        let sr = Rect::from_xywh(sx, rect.top, seg_w, rect.height());
         let active = i as i32 == node.ctrl.selected_index;
-        let color = if active { theme::text() } else { theme::text_tertiary() };
+        let hovered = node.paint.is_enabled && node.hovered && i as i32 == hot;
+        let color = if active {
+            theme::text()
+        } else if hovered {
+            theme::text_secondary()
+        } else {
+            theme::text_tertiary()
+        };
         text(
             session,
             brush,
             label,
-            sr,
+            seg_rect(i),
             "Segoe UI",
-            theme::FONT_SIZE_SM,
+            node.paint.font_size.max(theme::FONT_SIZE_MICRO),
             if active { 600 } else { 400 },
             color,
             TextAlignment::Center,
@@ -385,12 +371,9 @@ fn paint_segmented(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
 fn paint_select(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let radius = theme::RADIUS_SM;
     fill_rr(session, brush, rect, radius, theme::surface_raised(), dim);
-    let wash = ink_wash(node);
-    if wash > 0.0 {
-        fill_rr(session, brush, rect, radius, theme::w(wash), dim);
-    }
     stroke_rr(session, brush, rect, radius, theme::stroke(), theme::BORDER_W, dim);
 
+    // Hover/press wash: a retained ink part above this surface.
     // Label: ComboBox shows the selected item; DropDownButton shows its Content.
     let label = if node.kind == ControlKind::ComboBox {
         node.ctrl
@@ -443,50 +426,20 @@ fn paint_select(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
 
 // ── Slider (native) ──────────────────────────────────────────────────────────
 
-fn paint_slider(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
+fn paint_slider(session: &DrawingSession, brush: &Brush, _node: &Node, rect: Rect, dim: f32) {
     let cy = rect.height() / 2.0;
     let inset = theme::SLIDER_THUMB / 2.0;
     let x0 = inset;
     let x1 = rect.width() - inset;
-    let frac = node.anim.x.clamp(0.0, 1.0);
-    let thumb_x = x0 + (x1 - x0) * frac;
 
-    // Groove (neutral) then accent fill up to the thumb.
+    // Only the static groove paints here; the accent fill, hover halo, and
+    // thumb are retained chrome parts above this surface (`super::parts`) —
+    // a drag is pure compositor property sets, no repaint.
     let groove = Rect::from_xywh(x0, cy - theme::SLIDER_TRACK / 2.0, x1 - x0, theme::SLIDER_TRACK);
     fill_rr(session, brush, groove, theme::SLIDER_TRACK / 2.0, theme::w(0.06), dim);
-    let fill = Rect::from_xywh(x0, cy - theme::SLIDER_TRACK / 2.0, thumb_x - x0, theme::SLIDER_TRACK);
-    fill_rr(session, brush, fill, theme::SLIDER_TRACK / 2.0, theme::accent(), dim);
-
-    // Thumb (white) with a faint hover halo.
-    if node.hover.x > 0.01 || node.pressed {
-        circle(session, brush, thumb_x, cy, theme::SLIDER_THUMB / 2.0 + 3.0, theme::w(0.10), dim);
-    }
-    circle(session, brush, thumb_x, cy, theme::SLIDER_THUMB / 2.0, theme::w(1.0), dim);
 }
 
 // ── Progress ─────────────────────────────────────────────────────────────────
-
-fn paint_progress_bar(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let h = rect.height().min(6.0).max(4.0);
-    let cy = rect.height() / 2.0;
-    let track = Rect::from_xywh(0.0, cy - h / 2.0, rect.width(), h);
-    fill_rr(session, brush, track, h / 2.0, theme::w(0.08), dim);
-
-    if node.ctrl.indeterminate {
-        // A travelling lit segment (one-third width), position from the phase.
-        let seg_w = rect.width() * 0.33;
-        let travel = rect.width() + seg_w;
-        let x = (node.phase % 1.0) * travel - seg_w;
-        let seg = Rect::from_xywh(x.max(0.0), cy - h / 2.0, seg_w.min(rect.width()), h);
-        fill_rr(session, brush, seg, h / 2.0, theme::accent(), dim);
-    } else {
-        let frac = super::ctrl_value_frac(node) as f32;
-        if frac > 0.0 {
-            let fill = Rect::from_xywh(0.0, cy - h / 2.0, rect.width() * frac, h);
-            fill_rr(session, brush, fill, h / 2.0, theme::accent(), dim);
-        }
-    }
-}
 
 fn paint_progress_ring(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let cx = rect.width() / 2.0;
@@ -498,8 +451,11 @@ fn paint_progress_ring(session: &DrawingSession, brush: &Brush, node: &Node, rec
     put(brush, theme::w(0.08), dim);
     session.draw_ellipse(&Ellipse::new(Vector2::new(cx, cy), r, r), brush, thick);
 
+    // Indeterminate: paint the arc ONCE at a fixed angle — the revolve is a
+    // forever-looping RotationAngle animation on this surface's sprite
+    // (`super::parts::ring_sync`; the track circle is rotation-invariant).
     let (a0, a1) = if node.ctrl.indeterminate {
-        let s = node.phase * std::f32::consts::TAU;
+        let s = -std::f32::consts::FRAC_PI_2;
         (s, s + std::f32::consts::FRAC_PI_2 * 2.4)
     } else {
         let frac = super::ctrl_value_frac(node) as f32;
@@ -540,9 +496,10 @@ fn arc(
 pub(crate) const NAV_ITEM_H: f32 = theme::NAV_RAIL_W;
 
 fn paint_nav(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let rail = Rect::from_xywh(0.0, 0.0, theme::NAV_RAIL_W, rect.height());
-    fill_rr(session, brush, rail, 0.0, theme::surface_sunken(), dim);
-    // Right divider.
+    // The rail background, active tile wash, and accent indicator bar are
+    // retained chrome parts UNDER this surface (`super::parts`) — a selection
+    // change glides them on the compositor. The divider and per-item glyphs
+    // paint here, above them.
     put(brush, theme::stroke_divider(), dim);
     session.draw_line(
         Vector2::new(theme::NAV_RAIL_W, 0.0),
@@ -556,16 +513,6 @@ fn paint_nav(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, d
         return;
     }
     let sel = node.ctrl.selected_index;
-
-    // Active tile wash + sliding accent indicator bar.
-    if sel >= 0 {
-        let iy = node.anim.x * NAV_ITEM_H;
-        let tile = Rect::from_xywh(theme::SPACE_4, iy + theme::SPACE_4, theme::NAV_RAIL_W - theme::SPACE_8, NAV_ITEM_H - theme::SPACE_8);
-        fill_rr(session, brush, tile, theme::RADIUS_SM, theme::accent_fill(), dim);
-        let bar_h = theme::SPACE_16;
-        let bar = Rect::from_xywh(0.0, iy + (NAV_ITEM_H - bar_h) / 2.0, theme::BORDER_W * 3.0, bar_h);
-        fill_rr(session, brush, bar, theme::BORDER_W, theme::accent(), dim);
-    }
 
     for (i, label) in node.ctrl.items.iter().enumerate() {
         let iy = i as f32 * NAV_ITEM_H;
@@ -700,14 +647,15 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
 
     session.pop_clip();
 
-    // Spin buttons (wide NumberBox only).
+    // Spin buttons (wide NumberBox only). The chevron brighten keys off the
+    // hover flag — the flip repaints once, event-driven (no tick).
     if node.kind == ControlKind::NumberBox && rect.width() >= editor::SPIN_MIN_BOX_W {
-        draw_spin(session, brush, rect, node.hover.x, dim);
+        draw_spin(session, brush, rect, node.hovered, dim);
     }
 }
 
 /// Two stacked up/down chevrons on the trailing edge of a wide `NumberBox`.
-fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, hover: f32, dim: f32) {
+fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, hover: bool, dim: f32) {
     let col_x = rect.right - editor::SPIN_W;
     let mid = rect.top + rect.height() / 2.0;
     // Hairline divider before the spin column.
@@ -718,7 +666,7 @@ fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, hover: f32, di
         brush,
         theme::BORDER_W,
     );
-    let color = theme::with_alpha(theme::text_secondary(), 0.6 + 0.4 * hover.clamp(0.0, 1.0));
+    let color = theme::with_alpha(theme::text_secondary(), if hover { 1.0 } else { 0.6 });
     let cr_up = Rect::new(col_x, rect.top, rect.right, mid);
     let cr_down = Rect::new(col_x, mid, rect.right, rect.bottom);
     if let Some(g) = glyph_str(GLYPH_CHEVRON_UP) {
@@ -736,10 +684,8 @@ fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, hover: f32, di
 fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let header = Rect::from_xywh(0.0, 0.0, rect.width(), theme::ROW_H + theme::SPACE_8);
     fill_rr(session, brush, header, theme::RADIUS_MD, theme::surface_raised(), dim);
-    let wash = ink_wash(node);
-    if wash > 0.0 {
-        fill_rr(session, brush, header, theme::RADIUS_MD, theme::w(wash), dim);
-    }
+    // The hover/press wash is a retained ink part over the header strip
+    // (`super::parts::expander_sync`) — a compositor fade, no tick.
     stroke_rr(session, brush, header, theme::RADIUS_MD, theme::stroke(), theme::BORDER_W, dim);
 
     let lr = Rect::new(theme::SPACE_12, header.top, header.right - theme::SPACE_32, header.bottom);
@@ -757,8 +703,8 @@ fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Re
         dim,
     );
 
-    // Chevron: right (collapsed) → down (expanded). Swap the glyph by progress.
-    let g = if node.anim.x > 0.5 { GLYPH_CHEVRON_DOWN } else { GLYPH_CHEVRON_RIGHT };
+    // Chevron: right (collapsed) → down (expanded); the toggle repaints once.
+    let g = if node.ctrl.expanded { GLYPH_CHEVRON_DOWN } else { GLYPH_CHEVRON_RIGHT };
     if let Some(gs) = glyph_str(g) {
         let cr = Rect::new(header.right - theme::SPACE_32, header.top, header.right - theme::SPACE_8, header.bottom);
         text(
