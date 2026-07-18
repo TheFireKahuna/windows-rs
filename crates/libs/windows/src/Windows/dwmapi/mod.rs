@@ -402,3 +402,6 @@ pub struct UNSIGNED_RATIO {
     pub uiNumerator: u32,
     pub uiDenominator: u32,
 }
+pub const c_DwmMaxAdapters: u32 = 16;
+pub const c_DwmMaxMonitors: u32 = 16;
+pub const c_DwmMaxQueuedBuffers: u32 = 8;

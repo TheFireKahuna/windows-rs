@@ -279,7 +279,7 @@ fn rasterize(comp: &Compositing, key: &AtlasKey, stops: &[(f64, crate::Color)]) 
     } else if let Ok(b) = session.create_solid_brush(linear(color)) {
         draw_shape(&session, &b, key.shape, dip_w, dip_h);
     }
-    unsafe { interop.EndDraw().ok()? };
+    unsafe { interop.EndDraw() }.ok().ok()?;
     Some(AtlasEntry { brush, _surface: surface })
 }
 

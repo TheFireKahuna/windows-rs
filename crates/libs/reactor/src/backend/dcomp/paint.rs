@@ -227,7 +227,7 @@ fn draw_thumb(
         let r = Rect::from_xywh(0.0, 0.0, scroll::THUMB_W, thumb_h);
         session.fill_rounded_rect(&RoundedRect::uniform(r, scroll::THUMB_W / 2.0), brush);
     }
-    unsafe { interop.EndDraw()? };
+    unsafe { interop.EndDraw().ok()? };
     Ok(())
 }
 
@@ -284,7 +284,7 @@ fn draw_surface(
         paint_chrome(&session, brush, node, local);
     }
 
-    unsafe { interop.EndDraw()? };
+    unsafe { interop.EndDraw().ok()? };
     Ok(())
 }
 

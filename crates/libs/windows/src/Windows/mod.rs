@@ -234,6 +234,8 @@ pub mod dinput;
 pub mod directmanipulation;
 #[cfg(feature = "directml")]
 pub mod directml;
+#[cfg(feature = "dispatcherqueue")]
+pub mod dispatcherqueue;
 #[cfg(feature = "dispex")]
 pub mod dispex;
 #[cfg(feature = "dlgs")]
@@ -436,6 +438,8 @@ pub mod jobapi2;
 pub mod joystickapi;
 #[cfg(feature = "kernelspecs")]
 pub mod kernelspecs;
+#[cfg(feature = "knownfolders")]
+pub mod knownfolders;
 #[cfg(feature = "ks")]
 pub mod ks;
 #[cfg(feature = "ksmedia")]
@@ -946,6 +950,8 @@ pub mod uianimation;
 pub mod uiautomationclient;
 #[cfg(feature = "uiautomationcore")]
 pub mod uiautomationcore;
+#[cfg(feature = "uiautomationcoreapi")]
+pub mod uiautomationcoreapi;
 #[cfg(feature = "uiviewsettingsinterop")]
 pub mod uiviewsettingsinterop;
 #[cfg(feature = "unknwnbase")]

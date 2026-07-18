@@ -136,20 +136,25 @@ fn generate_reactor_bindings() {
         "--out",
         "crates/libs/reactor/src/system_bindings.rs",
         "--implement",
-        "Windows.Win32.UI.Accessibility.IRawElementProviderSimple",
-        "Windows.Win32.UI.Accessibility.IRawElementProviderFragment",
-        "Windows.Win32.UI.Accessibility.IRawElementProviderFragmentRoot",
-        "Windows.Win32.UI.Accessibility.IInvokeProvider",
-        "Windows.Win32.UI.Accessibility.IToggleProvider",
-        "Windows.Win32.UI.Accessibility.IValueProvider",
-        "Windows.Win32.UI.Accessibility.IRangeValueProvider",
-        "Windows.Win32.UI.Accessibility.ISelectionProvider",
-        "Windows.Win32.UI.Accessibility.ISelectionItemProvider",
-        "Windows.Win32.UI.Accessibility.IExpandCollapseProvider",
-        "Windows.Win32.UI.Accessibility.IScrollProvider",
-        "Windows.Win32.UI.Accessibility.IScrollItemProvider",
-        "Windows.Win32.UI.Accessibility.IRawElementProviderAdviseEvents",
-        "Windows.Win32.UI.TextServices.ITextStoreACP",
+        // The canonical Win32 metadata is a flat `Windows.Win32` namespace (the
+        // per-header partition is synthesised only for the published package
+        // crates), so these name the interface directly under it — matching how
+        // `system.txt` lists them. A stale sub-namespace here silently matches
+        // nothing and the `_Impl` scaffolding is simply not emitted.
+        "Windows.Win32.IRawElementProviderSimple",
+        "Windows.Win32.IRawElementProviderFragment",
+        "Windows.Win32.IRawElementProviderFragmentRoot",
+        "Windows.Win32.IInvokeProvider",
+        "Windows.Win32.IToggleProvider",
+        "Windows.Win32.IValueProvider",
+        "Windows.Win32.IRangeValueProvider",
+        "Windows.Win32.ISelectionProvider",
+        "Windows.Win32.ISelectionItemProvider",
+        "Windows.Win32.IExpandCollapseProvider",
+        "Windows.Win32.IScrollProvider",
+        "Windows.Win32.IScrollItemProvider",
+        "Windows.Win32.IRawElementProviderAdviseEvents",
+        "Windows.Win32.ITextStoreACP",
         // The backend implements these to hand a D2D path geometry to the
         // compositor (Knob value arc → CompositionPath): the WinRT marker the
         // CompositionPath factory accepts + the interop that yields the D2D geometry.

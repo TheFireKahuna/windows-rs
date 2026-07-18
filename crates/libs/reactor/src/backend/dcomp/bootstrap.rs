@@ -67,11 +67,14 @@ impl Compositing {
 
         let compositor = Compositor::new()?;
         let interop: ICompositorInterop = compositor.cast()?;
+        // The interop factories hand back the WinRT *interface*; the concrete
+        // runtime class is one QI away.
         let graphics: CompositionGraphicsDevice =
-            unsafe { interop.CreateGraphicsDevice(gpu.d2d_device())? };
+            unsafe { interop.CreateGraphicsDevice(gpu.d2d_device())? }.cast()?;
 
         let desktop: ICompositorDesktopInterop = compositor.cast()?;
-        let target: DesktopWindowTarget = unsafe { desktop.CreateDesktopWindowTarget(hwnd, false)? };
+        let target: DesktopWindowTarget =
+            unsafe { desktop.CreateDesktopWindowTarget(hwnd, false)? }.cast()?;
         let root = compositor.CreateContainerVisual()?;
         target.cast::<ICompositionTarget>()?.SetRoot(&root)?;
 

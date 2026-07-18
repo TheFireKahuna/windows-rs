@@ -277,7 +277,7 @@ impl DCompHost {
 
         render_host.kick();
         unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, SW_SHOW as i32);
         }
         Ok(Self { hwnd })
     }
@@ -563,7 +563,7 @@ fn track_leave(hwnd: HWND) {
 fn frame_y_px(hwnd: HWND) -> i32 {
     let dpi = effective_dpi(hwnd);
     unsafe {
-        GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+        GetSystemMetricsForDpi(SM_CYFRAME as i32, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER as i32, dpi)
     }
 }
 

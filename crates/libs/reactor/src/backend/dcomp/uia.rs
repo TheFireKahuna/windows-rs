@@ -1247,7 +1247,7 @@ macro_rules! forward_provider {
             fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
                 self.inner().runtime_id()
             }
-            fn BoundingRectangle(&self) -> Result<UiaRect> {
+            fn get_BoundingRectangle(&self) -> Result<UiaRect> {
                 self.inner().bounding_rect()
             }
             fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {

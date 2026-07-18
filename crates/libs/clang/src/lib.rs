@@ -511,12 +511,19 @@ impl<'a> Parser<'a> {
                     self.flag_enums.insert(enum_name);
                 }
             }
-            // Detect `DEFINE_GUID(name, ...)` / `DEFINE_OLEGUID(name, ...)` macro
-            // invocations and emit them as named GUID constants. Without `INITGUID`
-            // these expand to a valueless `extern const GUID name` declaration, so the
-            // faithful value lives only in the macro arguments parsed here.
+            // Detect `DEFINE_GUID(name, ...)` / `DEFINE_OLEGUID(name, ...)` /
+            // `DEFINE_KNOWN_FOLDER(name, ...)` macro invocations and emit them as named
+            // GUID constants. Without `INITGUID` these expand to a valueless
+            // `extern const GUID name` declaration, so the faithful value lives only in
+            // the macro arguments parsed here. `DEFINE_KNOWN_FOLDER` takes the same
+            // twelve arguments as `DEFINE_GUID` and expands to the same declaration, so
+            // it parses identically; without it every `FOLDERID_*` in knownfolders.h is
+            // dropped and the header yields no metadata at all.
             CXCursor_MacroExpansion
-                if matches!(child.name().as_str(), "DEFINE_GUID" | "DEFINE_OLEGUID") =>
+                if matches!(
+                    child.name().as_str(),
+                    "DEFINE_GUID" | "DEFINE_OLEGUID" | "DEFINE_KNOWN_FOLDER"
+                ) =>
             {
                 let ole = child.name() == "DEFINE_OLEGUID";
                 let tokens = self.tu.tokenize(child.extent());
