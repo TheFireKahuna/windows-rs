@@ -144,7 +144,7 @@ fn update_scroll_thumb(
 ) -> windows_core::Result<()> {
     use scroll::{thumb_geom, THUMB_MARGIN, THUMB_W};
     let (vh, content_h, sc, shown) = match arena.get(id) {
-        Some(n) => (n.rect.h, n.ctrl.content_h, n.scroll_off, n.thumb_shown),
+        Some(n) => (n.rect.h, n.ctrl().content_h, n.scroll_off, n.thumb_shown),
         None => return Ok(()),
     };
     let g = thumb_geom(vh, content_h, sc);
@@ -256,7 +256,7 @@ fn draw_surface(
     if arena.get(id).is_some_and(|n| n.editor.is_some()) {
         let (kind, w, fs, weight, align) = {
             let n = arena.get(id).unwrap();
-            (n.kind, n.rect.w, n.paint.font_size, n.paint.font_weight, n.ctrl.content_align)
+            (n.kind, n.rect.w, n.paint.font_size, n.paint.font_weight, n.ctrl().content_align)
         };
         let (_, content_w) = editor::editor_content(kind, w);
         if let Some(n) = arena.get_mut(id)

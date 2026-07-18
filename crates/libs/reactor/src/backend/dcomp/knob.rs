@@ -82,13 +82,13 @@ pub(crate) fn dial_geom(node: &Node) -> (f32, f32, f32) {
     let (w, h) = (node.rect.w, node.rect.h);
     let (cx, cy) = (w * 0.5, h * 0.56);
     let mut radius = (w * 0.42).min(h * 0.44);
-    if !node.ctrl.tick_labels.is_empty() {
+    if !node.ctrl().tick_labels.is_empty() {
         let max_cos = node
-            .ctrl
+            .ctrl()
             .tick_labels
             .iter()
             .map(|(v, _)| {
-                value_to_angle(*v, node.ctrl.min, node.ctrl.max, node.ctrl.start_angle, node.ctrl.end_angle)
+                value_to_angle(*v, node.ctrl().min, node.ctrl().max, node.ctrl().start_angle, node.ctrl().end_angle)
                     .cos()
                     .abs()
             })
@@ -120,7 +120,7 @@ pub(crate) fn value_at_point(node: &Node, x: f32, y: f32) -> Option<f64> {
     if (dx * dx + dy * dy).sqrt() < radius * HUB_FRAC {
         return None;
     }
-    let (start, end) = (node.ctrl.start_angle, node.ctrl.end_angle);
+    let (start, end) = (node.ctrl().start_angle, node.ctrl().end_angle);
     // Canvas convention: 0 = east, clockwise — matching `value_to_angle`.
     let tau = std::f32::consts::TAU;
     let mut a = dy.atan2(dx);
@@ -138,7 +138,7 @@ pub(crate) fn value_at_point(node: &Node, x: f32, y: f32) -> Option<f64> {
     } else {
         0.0
     };
-    Some(node.ctrl.min + f64::from(t.clamp(0.0, 1.0)) * (node.ctrl.max - node.ctrl.min))
+    Some(node.ctrl().min + f64::from(t.clamp(0.0, 1.0)) * (node.ctrl().max - node.ctrl().min))
 }
 
 /// Map a value to its needle/sweep angle (radians), clamped to `[min, max]`.
@@ -329,7 +329,7 @@ impl KnobParts {
     fn new(comp: &Compositing, node: &Node) -> Option<Self> {
         let (w, h) = (node.rect.w, node.rect.h);
         let (cx, cy, radius) = dial_geom(node);
-        let path = build_arc_path(&comp.gpu, cx, cy, radius, node.ctrl.start_angle, node.ctrl.end_angle)?;
+        let path = build_arc_path(&comp.gpu, cx, cy, radius, node.ctrl().start_angle, node.ctrl().end_angle)?;
 
         let needle = comp.new_sprite().ok()?;
         let needle_vis: IVisual = needle.cast().ok()?;
@@ -427,8 +427,8 @@ impl KnobParts {
     ) {
         let (w, h) = (node.rect.w, node.rect.h);
         let (cx, cy, radius) = dial_geom(node);
-        let start = node.ctrl.start_angle;
-        let end = node.ctrl.end_angle;
+        let start = node.ctrl().start_angle;
+        let end = node.ctrl().end_angle;
 
         let resized = self.geom != (cx, cy, radius);
         if resized {
@@ -471,13 +471,13 @@ impl KnobParts {
         // FP16 gradient SOURCE (display-mapped) + needle colour: rebind on a
         // display epoch or a stops-list change.
         if self.grad_epoch != atlas_epoch
-            || !stops_eq(&self.stops_seen, &node.ctrl.stops)
+            || !stops_eq(&self.stops_seen, &node.ctrl().stops)
             || resized
         {
-            let src = if node.ctrl.stops.is_empty() {
-                super::parts::build_solid_surface(comp, node.ctrl.accent.unwrap_or_else(theme::accent), scale)
+            let src = if node.ctrl().stops.is_empty() {
+                super::parts::build_solid_surface(comp, node.ctrl().accent.unwrap_or_else(theme::accent), scale)
             } else {
-                super::parts::build_gradient_surface(comp, &node.ctrl.stops, scale)
+                super::parts::build_gradient_surface(comp, &node.ctrl().stops, scale)
             };
             if let Some(s) = src
                 && let Ok(cb) = s.cast::<CompositionBrush>()
@@ -491,7 +491,7 @@ impl KnobParts {
             }
             self.grad_epoch = atlas_epoch;
             self.stops_seen.clear();
-            self.stops_seen.extend_from_slice(&node.ctrl.stops);
+            self.stops_seen.extend_from_slice(&node.ctrl().stops);
         }
 
         if !self.thumb_bound {
@@ -529,7 +529,7 @@ impl KnobParts {
         // discrete change (including a click-to-position jump the bar took
         // instantly) on its own spring. It still tracks 1:1 during a live drag,
         // for the same restart-pinning reason as the bar.
-        let angle = value_to_angle(node.ctrl.value, node.ctrl.min, node.ctrl.max, start, end);
+        let angle = value_to_angle(node.ctrl().value, node.ctrl().min, node.ctrl().max, start, end);
         let spring_needle = self.angle.is_finite() && !resized && !scrubbing;
         if !self.angle.is_finite()
             || (self.angle - angle).abs() > f32::EPSILON
@@ -661,11 +661,11 @@ impl KnobParts {
 
 /// The node's value fraction (0..1) over `[min, max]`.
 fn ctrl_frac(node: &Node) -> f64 {
-    let span = node.ctrl.max - node.ctrl.min;
+    let span = node.ctrl().max - node.ctrl().min;
     if span.abs() < f64::EPSILON {
         0.0
     } else {
-        ((node.ctrl.value - node.ctrl.min) / span).clamp(0.0, 1.0)
+        ((node.ctrl().value - node.ctrl().min) / span).clamp(0.0, 1.0)
     }
 }
 

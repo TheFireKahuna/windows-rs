@@ -171,7 +171,7 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     // custom visual in (segmented-pill segments, icon buttons), so the wrapped
     // child frames itself; a stray Button outline would double-box it.
     let chromeless = matches!(node.paint.style_variant, 2 | 3);
-    let checked = node.ctrl.is_checked && node.kind == ControlKind::ToggleButton;
+    let checked = node.ctrl().is_checked && node.kind == ControlKind::ToggleButton;
 
     // Base fill.
     let base = if accent {
@@ -297,11 +297,11 @@ pub(crate) fn seg_metrics(style_variant: i32, font_size: f32) -> SegMetrics {
 /// fill the tray's inner width. Falls back to equal widths until labels have
 /// been measured. Shared by paint, hit-testing, and UIA item rects.
 pub(crate) fn segment_edges(node: &Node) -> Vec<f32> {
-    let n = node.ctrl.items.len();
+    let n = node.ctrl().items.len();
     let m = seg_metrics(node.paint.style_variant, node.paint.font_size);
     let inner = (node.rect.w - 2.0 * m.tray).max(0.0);
-    let mut widths: Vec<f32> = if node.ctrl.seg_label_w.len() == n {
-        node.ctrl.seg_label_w.iter().map(|w| w + 2.0 * m.pad_x).collect()
+    let mut widths: Vec<f32> = if node.ctrl().seg_label_w.len() == n {
+        node.ctrl().seg_label_w.iter().map(|w| w + 2.0 * m.pad_x).collect()
     } else {
         vec![inner / n.max(1) as f32; n]
     };
@@ -330,7 +330,7 @@ fn paint_segmented(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
     // ink are retained chrome parts UNDER this surface (`super::parts`) — the
     // pill glides between segments on the compositor. Only the labels (and the
     // focus-ring tail) are painted here, so they stay crisp above the pill.
-    let n = node.ctrl.items.len();
+    let n = node.ctrl().items.len();
     if n == 0 {
         return;
     }
@@ -339,11 +339,11 @@ fn paint_segmented(session: &DrawingSession, brush: &Brush, node: &Node, rect: R
     let seg_rect = |i: usize| {
         Rect::from_xywh(rect.left + edges[i], rect.top + m.tray, edges[i + 1] - edges[i], pill_h)
     };
-    let hot = node.ctrl.hot_index;
+    let hot = node.ctrl().hot_index;
 
     // Segment labels.
-    for (i, label) in node.ctrl.items.iter().enumerate() {
-        let active = i as i32 == node.ctrl.selected_index;
+    for (i, label) in node.ctrl().items.iter().enumerate() {
+        let active = i as i32 == node.ctrl().selected_index;
         let hovered = node.paint.is_enabled && node.hovered && i as i32 == hot;
         let color = if active {
             theme::text()
@@ -378,17 +378,17 @@ fn paint_select(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     // Hover/press wash: a retained ink part above this surface.
     // Label: ComboBox shows the selected item; DropDownButton shows its Content.
     let label = if node.kind == ControlKind::ComboBox {
-        node.ctrl
+        node.ctrl()
             .items
-            .get(node.ctrl.selected_index.max(0) as usize)
+            .get(node.ctrl().selected_index.max(0) as usize)
             .cloned()
-            .filter(|_| node.ctrl.selected_index >= 0)
-            .unwrap_or_else(|| node.ctrl.placeholder.clone())
+            .filter(|_| node.ctrl().selected_index >= 0)
+            .unwrap_or_else(|| node.ctrl().placeholder.clone())
     } else {
         node.paint.text.clone()
     };
     let lr = Rect::new(rect.left + theme::SPACE_8, rect.top, rect.right - theme::SPACE_24, rect.bottom);
-    let label_color = if node.ctrl.selected_index < 0 && node.kind == ControlKind::ComboBox {
+    let label_color = if node.ctrl().selected_index < 0 && node.kind == ControlKind::ComboBox {
         theme::text_tertiary()
     } else {
         theme::text()
@@ -444,9 +444,9 @@ fn paint_slider(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     // slider) gets a notch standing proud of the track — brighter than the
     // groove, dimmer than the thumb — so "where is neutral?" is answerable at
     // rest. Origins at (or clamped to) an endpoint are just the track end.
-    if let Some(o) = node.ctrl.fill_origin
-        && o > node.ctrl.min.min(node.ctrl.max)
-        && o < node.ctrl.min.max(node.ctrl.max)
+    if let Some(o) = node.ctrl().fill_origin
+        && o > node.ctrl().min.min(node.ctrl().max)
+        && o < node.ctrl().min.max(node.ctrl().max)
     {
         let ofrac = super::parts::slider_origin_frac(node);
         let ox = x0 + (x1 - x0).max(0.0) * ofrac;
@@ -461,12 +461,12 @@ fn paint_slider(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
 /// The meter's track fraction for its reference marker (`ctrl.marker` clamped
 /// into `[min, max]`; `None` = no marker).
 pub(crate) fn meter_marker_frac(node: &Node) -> Option<f32> {
-    let m = node.ctrl.marker?;
-    let span = node.ctrl.max - node.ctrl.min;
+    let m = node.ctrl().marker?;
+    let span = node.ctrl().max - node.ctrl().min;
     if span.abs() < f64::EPSILON {
         None
     } else {
-        Some(((m - node.ctrl.min) / span).clamp(0.0, 1.0) as f32)
+        Some(((m - node.ctrl().min) / span).clamp(0.0, 1.0) as f32)
     }
 }
 
@@ -492,18 +492,18 @@ fn paint_meter(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect,
 fn paint_knob(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     use super::knob::{dial_geom, value_to_angle, LABEL_OFFSET};
     let (cx, cy, radius) = dial_geom(node);
-    let (min, max) = (node.ctrl.min, node.ctrl.max);
-    let (start, end) = (node.ctrl.start_angle, node.ctrl.end_angle);
+    let (min, max) = (node.ctrl().min, node.ctrl().max);
+    let (start, end) = (node.ctrl().start_angle, node.ctrl().end_angle);
     let _ = rect;
 
     // Background track (full sweep), a wide soft groove under the value arc.
     arc(session, brush, cx, cy, radius, 10.0, start, end, theme::w(0.06), dim);
 
     // Ticks: minor + major (longer/brighter on an exact `major_every` multiple).
-    for &tv in &node.ctrl.ticks {
+    for &tv in &node.ctrl().ticks {
         let a = value_to_angle(tv, min, max, start, end);
         let major = node
-            .ctrl
+            .ctrl()
             .major_every
             .filter(|m| *m != 0.0)
             .is_some_and(|m| (tv % m).abs() < 1e-9);
@@ -523,7 +523,7 @@ fn paint_knob(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, 
     // Numeric labels outside the track (app-formatted strings).
     let label_font = (radius * 0.1).max(10.0);
     let lr = radius + LABEL_OFFSET;
-    for (v, label) in &node.ctrl.tick_labels {
+    for (v, label) in &node.ctrl().tick_labels {
         let a = value_to_angle(*v, min, max, start, end);
         let lx = cx + a.cos() * lr;
         let ly = cy + a.sin() * lr;
@@ -557,20 +557,20 @@ fn paint_knob(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, 
             theme::w(0.9), TextAlignment::Center, ParagraphAlignment::Center, dim,
         );
     }
-    if !node.ctrl.unit.is_empty() {
+    if !node.ctrl().unit.is_empty() {
         let uy = base_y + readout_size * 0.45;
         let box_ = Rect::from_xywh(cx - radius, uy, 2.0 * radius, readout_size);
         text(
-            session, brush, &node.ctrl.unit, box_, "Segoe UI", readout_size * 0.35, 400,
+            session, brush, &node.ctrl().unit, box_, "Segoe UI", readout_size * 0.35, 400,
             theme::w(0.35), TextAlignment::Center, ParagraphAlignment::Top, dim,
         );
     }
-    if !node.ctrl.sub_text.is_empty() {
+    if !node.ctrl().sub_text.is_empty() {
         let sy = base_y + readout_size * 0.75;
         let sub_size = (radius * 0.1).max(8.0);
         let box_ = Rect::from_xywh(cx - radius, sy, 2.0 * radius, 2.0 * sub_size);
         text(
-            session, brush, &node.ctrl.sub_text, box_, "Segoe UI", sub_size, 400,
+            session, brush, &node.ctrl().sub_text, box_, "Segoe UI", sub_size, 400,
             theme::w(0.25), TextAlignment::Center, ParagraphAlignment::Top, dim,
         );
     }
@@ -591,7 +591,7 @@ fn paint_progress_ring(session: &DrawingSession, brush: &Brush, node: &Node, rec
     // Indeterminate: paint the arc ONCE at a fixed angle — the revolve is a
     // forever-looping RotationAngle animation on this surface's sprite
     // (`super::parts::ring_sync`; the track circle is rotation-invariant).
-    let (a0, a1) = if node.ctrl.indeterminate {
+    let (a0, a1) = if node.ctrl().indeterminate {
         let s = -std::f32::consts::FRAC_PI_2;
         (s, s + std::f32::consts::FRAC_PI_2 * 2.4)
     } else {
@@ -645,26 +645,26 @@ fn paint_nav(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, d
         theme::BORDER_W,
     );
 
-    let n = node.ctrl.items.len();
+    let n = node.ctrl().items.len();
     if n == 0 {
         return;
     }
-    let sel = node.ctrl.selected_index;
+    let sel = node.ctrl().selected_index;
 
-    for (i, label) in node.ctrl.items.iter().enumerate() {
+    for (i, label) in node.ctrl().items.iter().enumerate() {
         let iy = i as f32 * NAV_ITEM_H;
         let active = i as i32 == sel;
         let color = if active { theme::accent() } else { theme::text_tertiary() };
         let cell = Rect::from_xywh(0.0, iy, theme::NAV_RAIL_W, NAV_ITEM_H);
         let glyph = node
-            .ctrl
+            .ctrl()
             .icons
             .get(i)
             .copied()
             .filter(|g| *g != 0)
             .and_then(glyph_str)
             .unwrap_or_else(|| label.chars().next().map(|c| c.to_string()).unwrap_or_default());
-        let family = if node.ctrl.icons.get(i).copied().unwrap_or(0) != 0 {
+        let family = if node.ctrl().icons.get(i).copied().unwrap_or(0) != 0 {
             theme::FONT_ICON
         } else {
             "Segoe UI"
@@ -710,7 +710,7 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     stroke_rr(session, brush, rect, radius, border_c, border_w, dim);
 
     let Some(ed) = &node.editor else { return };
-    let align = node.ctrl.content_align;
+    let align = node.ctrl().content_align;
     let (pad_left, content_w) = editor::editor_content(node.kind, rect.width());
     let cx0 = rect.left + pad_left;
     let font_size = node.paint.font_size;
@@ -737,7 +737,7 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
         text(
             session,
             brush,
-            &node.ctrl.placeholder,
+            &node.ctrl().placeholder,
             Rect::new(cx0, rect.top, cx0 + content_w, rect.bottom),
             "Segoe UI",
             font_size,
@@ -855,7 +855,7 @@ fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Re
     );
 
     // Chevron: right (collapsed) → down (expanded); the toggle repaints once.
-    let g = if node.ctrl.expanded { GLYPH_CHEVRON_DOWN } else { GLYPH_CHEVRON_RIGHT };
+    let g = if node.ctrl().expanded { GLYPH_CHEVRON_DOWN } else { GLYPH_CHEVRON_RIGHT };
     if let Some(gs) = glyph_str(g) {
         let cr = Rect::new(header.right - theme::SPACE_32, header.top, header.right - theme::SPACE_8, header.bottom);
         text(

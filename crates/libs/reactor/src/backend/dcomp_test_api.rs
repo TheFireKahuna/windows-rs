@@ -408,4 +408,73 @@ impl ArenaHarness {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Whether this node has actually ALLOCATED its [`Ctrl`](dcomp::node::Ctrl).
+    ///
+    /// `Ctrl` is the largest per-node payload after the Taffy style and is
+    /// boxed lazily, so a node that never receives control state must not carry
+    /// one. This is the observation that makes the saving real rather than
+    /// nominal — hence a seam of its own.
+    pub fn ctrl_allocated(&self, id: ControlId) -> Option<bool> {
+        self.arena.get(id).map(|n| n.ctrl_allocated())
+    }
+
+    /// A representative slice of a node's [`Ctrl`](dcomp::node::Ctrl) as read
+    /// through the normal accessor, so a test can compare what an *absent*
+    /// `Ctrl` reads as against what a materialised-but-untouched one reads as.
+    ///
+    /// The non-zero defaults are the interesting ones: `max`, `is_active`,
+    /// `selected_index`, `hot_index` and `content_align` all start at values a
+    /// zeroed struct would NOT have, so they are the fields a lazily-created
+    /// `Ctrl` would silently get wrong.
+    pub fn ctrl_probe(&self, id: ControlId) -> Option<CtrlProbe> {
+        self.arena.get(id).map(|n| {
+            let c = n.ctrl();
+            CtrlProbe {
+                value: c.value,
+                min: c.min,
+                max: c.max,
+                is_on: c.is_on,
+                is_active: c.is_active,
+                selected_index: c.selected_index,
+                hot_index: c.hot_index,
+                content_align: c.content_align,
+                items: c.items.len(),
+                menu: c.menu.len(),
+                placeholder: c.placeholder.clone(),
+            }
+        })
+    }
+
+    /// Force this node's `Ctrl` into existence without changing any field —
+    /// the "materialised but untouched" state `ctrl_probe` is compared against.
+    pub fn ctrl_materialize(&mut self, id: ControlId) {
+        if let Some(n) = self.arena.get_mut(id) {
+            let _ = n.ctrl_mut();
+        }
+    }
+
+    /// Write one `Ctrl` field (`is_on`), as `set_prop` would.
+    pub fn ctrl_set_is_on(&mut self, id: ControlId, v: bool) {
+        if let Some(n) = self.arena.get_mut(id) {
+            n.ctrl_mut().is_on = v;
+        }
+    }
+}
+
+/// A snapshot of the [`Ctrl`](dcomp::node::Ctrl) fields whose defaults are not
+/// all-zero — see [`ArenaHarness::ctrl_probe`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CtrlProbe {
+    pub value: f64,
+    pub min: f64,
+    pub max: f64,
+    pub is_on: bool,
+    pub is_active: bool,
+    pub selected_index: i32,
+    pub hot_index: i32,
+    pub content_align: i32,
+    pub items: usize,
+    pub menu: usize,
+    pub placeholder: String,
 }

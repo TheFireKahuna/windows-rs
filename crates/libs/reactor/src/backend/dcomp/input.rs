@@ -277,7 +277,7 @@ impl DCompBackend {
     /// Returns the pointer→thumb-top offset (for drag tracking) when it does.
     fn thumb_at(&self, id: ControlId, x: f32, y: f32) -> Option<f32> {
         let n = self.node(id)?;
-        let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, n.scroll_off);
+        let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, n.scroll_off);
         if !g.overflow {
             return None;
         }
@@ -313,7 +313,7 @@ impl DCompBackend {
     fn set_thumb_shown(&mut self, id: ControlId, shown: bool) {
         let compositor = self.comp.compositor().clone();
         if let Some(n) = self.node_mut(id) {
-            let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, n.scroll_off);
+            let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, n.scroll_off);
             let show = shown && g.overflow;
             if show != n.thumb_shown {
                 n.thumb_shown = show;
@@ -328,7 +328,7 @@ impl DCompBackend {
     /// 1:1 — carrier and thumb move by plain property snaps (no repaint).
     fn drag_thumb_to(&mut self, id: ControlId, y: f32) {
         let (ny, vh, content_h, grab) = match self.node(id) {
-            Some(n) => (n.rect.y, n.rect.h, n.ctrl.content_h, n.thumb_drag.unwrap_or(0.0)),
+            Some(n) => (n.rect.y, n.rect.h, n.ctrl().content_h, n.thumb_drag.unwrap_or(0.0)),
             None => return,
         };
         let thumb_y = (y - ny) - grab;
@@ -456,10 +456,10 @@ impl DCompBackend {
                 .node(id)
                 .is_some_and(|n| n.kind == ControlKind::SelectorBar && n.paint.is_enabled)
             && let Some(hot) = self.segment_at(id, x)
-            && self.node(id).is_some_and(|n| n.ctrl.hot_index != hot)
+            && self.node(id).is_some_and(|n| n.ctrl().hot_index != hot)
         {
             if let Some(n) = self.node_mut(id) {
-                n.ctrl.hot_index = hot;
+                n.ctrl_mut().hot_index = hot;
                 n.mark_dirty();
             }
             seg_hot_moved = true;
@@ -522,7 +522,7 @@ impl DCompBackend {
                     // Label brightening is painted; entering keeps the hot
                     // segment recorded by the caller, leaving clears it.
                     if !hovered {
-                        n.ctrl.hot_index = -1;
+                        n.ctrl_mut().hot_index = -1;
                     }
                     n.mark_dirty();
                     redraw = true;
@@ -659,7 +659,7 @@ impl DCompBackend {
                 self.fire_bool(id, Event::DragStateChanged, true);
                 self.knob_press_to(id, x, y);
                 if let Some(n) = self.node(id) {
-                    self.knob_drag = Some((id, n.ctrl.value, y));
+                    self.knob_drag = Some((id, n.ctrl().value, y));
                 }
             }
             self.fire_pointer(id, x, y, |p| p.on_pointer_pressed.as_ref());
@@ -886,9 +886,9 @@ impl DCompBackend {
         let Some(kind) = self.node(id).map(|n| n.kind) else { return };
         match kind {
             ControlKind::ToggleSwitch => {
-                let on = !self.node(id).map(|n| n.ctrl.is_on).unwrap_or(false);
+                let on = !self.node(id).map(|n| n.ctrl().is_on).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
-                    n.ctrl.is_on = on;
+                    n.ctrl_mut().is_on = on;
                     n.mark_dirty();
                 }
                 // The knob/track glide runs on the compositor: the repaint's
@@ -897,9 +897,9 @@ impl DCompBackend {
                 self.fire_bool(id, Event::Toggled, on);
             }
             ControlKind::CheckBox | ControlKind::ToggleButton => {
-                let on = !self.node(id).map(|n| n.ctrl.is_checked).unwrap_or(false);
+                let on = !self.node(id).map(|n| n.ctrl().is_checked).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
-                    n.ctrl.is_checked = on;
+                    n.ctrl_mut().is_checked = on;
                     n.mark_dirty();
                 }
                 // The CheckBox reveal fades on the compositor (the repaint's
@@ -908,9 +908,9 @@ impl DCompBackend {
                 self.fire_bool(id, Event::Checked, on);
             }
             ControlKind::Expander => {
-                let ex = !self.node(id).map(|n| n.ctrl.expanded).unwrap_or(false);
+                let ex = !self.node(id).map(|n| n.ctrl().expanded).unwrap_or(false);
                 if let Some(n) = self.node_mut(id) {
-                    n.ctrl.expanded = ex;
+                    n.ctrl_mut().expanded = ex;
                     n.mark_dirty();
                 }
                 self.fire_bool(id, Event::Expanding, ex);
@@ -925,7 +925,7 @@ impl DCompBackend {
             ControlKind::Button | ControlKind::RepeatButton | ControlKind::HyperlinkButton => {
                 // A Button carrying a MenuFlyout (e.g. "+ Add Processor") opens its
                 // menu in the popup overlay, mirroring the native WinUI button-flyout.
-                if self.node(id).is_some_and(|n| !n.ctrl.menu.is_empty()) {
+                if self.node(id).is_some_and(|n| !n.ctrl().menu.is_empty()) {
                     self.open_popup(id);
                     return;
                 }
@@ -958,7 +958,7 @@ impl DCompBackend {
     /// The segment index under window-relative `x`, or `None` for an empty bar.
     fn segment_at(&self, id: ControlId, x: f32) -> Option<i32> {
         let node = self.node(id)?;
-        let n = node.ctrl.items.len();
+        let n = node.ctrl().items.len();
         if n == 0 {
             return None;
         }
@@ -977,12 +977,12 @@ impl DCompBackend {
     fn set_segment(&mut self, id: ControlId, i: i32) {
         let label = {
             let Some(n) = self.node_mut(id) else { return };
-            if n.ctrl.selected_index == i || !n.paint.is_enabled {
+            if n.ctrl().selected_index == i || !n.paint.is_enabled {
                 return;
             }
-            n.ctrl.selected_index = i;
+            n.ctrl_mut().selected_index = i;
             n.mark_dirty();
-            n.ctrl.items.get(i as usize).cloned().unwrap_or_default()
+            n.ctrl().items.get(i as usize).cloned().unwrap_or_default()
         };
         self.repaint();
         self.fire_string(id, Event::SelectionChanged, label);
@@ -990,7 +990,7 @@ impl DCompBackend {
 
     fn select_nav(&mut self, id: ControlId, y: f32) {
         let Some(node) = self.node(id) else { return };
-        let n = node.ctrl.items.len();
+        let n = node.ctrl().items.len();
         if n == 0 {
             return;
         }
@@ -1004,12 +1004,12 @@ impl DCompBackend {
     fn set_nav_index(&mut self, id: ControlId, i: i32) {
         let tag = {
             let Some(nd) = self.node_mut(id) else { return };
-            if nd.ctrl.selected_index == i {
+            if nd.ctrl().selected_index == i {
                 return;
             }
-            nd.ctrl.selected_index = i;
+            nd.ctrl_mut().selected_index = i;
             nd.mark_dirty();
-            nd.ctrl.tags.get(i as usize).cloned().unwrap_or_default()
+            nd.ctrl().tags.get(i as usize).cloned().unwrap_or_default()
         };
         // Indicator glide + glyph recolor both flow from the repaint (the
         // parts sync glides the tile/bar on the compositor).
@@ -1022,10 +1022,10 @@ impl DCompBackend {
     fn set_combo_index(&mut self, id: ControlId, i: i32) {
         {
             let Some(n) = self.node_mut(id) else { return };
-            if n.ctrl.selected_index == i {
+            if n.ctrl().selected_index == i {
                 return;
             }
-            n.ctrl.selected_index = i;
+            n.ctrl_mut().selected_index = i;
             n.mark_dirty();
         }
         self.repaint();
@@ -1041,25 +1041,25 @@ impl DCompBackend {
             let inset = theme::SLIDER_THUMB / 2.0;
             let w = (n.rect.w - 2.0 * inset).max(1.0);
             let mut frac = ((x - n.rect.x - inset) / w).clamp(0.0, 1.0);
-            let mut v = n.ctrl.min + frac as f64 * (n.ctrl.max - n.ctrl.min);
-            if let Some(step) = n.ctrl.step
+            let mut v = n.ctrl().min + frac as f64 * (n.ctrl().max - n.ctrl().min);
+            if let Some(step) = n.ctrl().step
                 && step > 0.0
             {
                 v = (v / step).round() * step;
-                v = v.clamp(n.ctrl.min, n.ctrl.max);
-                let span = n.ctrl.max - n.ctrl.min;
-                frac = if span.abs() < f64::EPSILON { 0.0 } else { ((v - n.ctrl.min) / span) as f32 };
+                v = v.clamp(n.ctrl().min, n.ctrl().max);
+                let span = n.ctrl().max - n.ctrl().min;
+                frac = if span.abs() < f64::EPSILON { 0.0 } else { ((v - n.ctrl().min) / span) as f32 };
             }
             // Crossing the fill origin flips the two-tone fill color — a
             // discrete edge, handled by one dirty repaint whose parts sync
             // rebinds the fill's atlas source. Scrub motion stays pure
             // property snaps.
-            let old = n.ctrl.value;
+            let old = n.ctrl().value;
             let recolor = n
-                .ctrl
+                .ctrl()
                 .fill_origin
                 .is_some_and(|o| (old <= o) != (v <= o));
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             if !parts::slider_drag(n, frac) || recolor {
                 // Also the parts-not-built-yet fallback (first interaction
                 // before first paint): the repaint's sync snaps them.
@@ -1081,16 +1081,16 @@ impl DCompBackend {
         let value = {
             let Some(n) = self.node_mut(id) else { return };
             let Some(raw) = knob::value_at_point(n, x, y) else { return };
-            let mut v = raw.clamp(n.ctrl.min, n.ctrl.max);
-            if let Some(step) = n.ctrl.step
+            let mut v = raw.clamp(n.ctrl().min, n.ctrl().max);
+            if let Some(step) = n.ctrl().step
                 && step > 0.0
             {
-                v = ((v / step).round() * step).clamp(n.ctrl.min, n.ctrl.max);
+                v = ((v / step).round() * step).clamp(n.ctrl().min, n.ctrl().max);
             }
-            if (v - n.ctrl.value).abs() < f64::EPSILON {
+            if (v - n.ctrl().value).abs() < f64::EPSILON {
                 return;
             }
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             n.mark_dirty();
             v
         };
@@ -1108,19 +1108,19 @@ impl DCompBackend {
         const KNOB_DRAG_RANGE: f32 = 200.0;
         let value = {
             let Some(n) = self.node_mut(id) else { return };
-            let span = n.ctrl.max - n.ctrl.min;
+            let span = n.ctrl().max - n.ctrl().min;
             if span == 0.0 {
                 return;
             }
             let dy = (y0 - y) as f64; // up (decreasing y) increases
-            let mut v = (origin + (dy / KNOB_DRAG_RANGE as f64) * span).clamp(n.ctrl.min, n.ctrl.max);
-            if let Some(step) = n.ctrl.step
+            let mut v = (origin + (dy / KNOB_DRAG_RANGE as f64) * span).clamp(n.ctrl().min, n.ctrl().max);
+            if let Some(step) = n.ctrl().step
                 && step > 0.0
             {
                 v = (v / step).round() * step;
-                v = v.clamp(n.ctrl.min, n.ctrl.max);
+                v = v.clamp(n.ctrl().min, n.ctrl().max);
             }
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             n.mark_dirty();
             v
         };
@@ -1135,18 +1135,18 @@ impl DCompBackend {
         const KNOB_WHEEL_FRAC: f64 = 0.05;
         let value = {
             let Some(n) = self.node_mut(id) else { return };
-            let span = n.ctrl.max - n.ctrl.min;
+            let span = n.ctrl().max - n.ctrl().min;
             if span == 0.0 {
                 return;
             }
-            let mut v = (n.ctrl.value + detents * KNOB_WHEEL_FRAC * span).clamp(n.ctrl.min, n.ctrl.max);
-            if let Some(step) = n.ctrl.step
+            let mut v = (n.ctrl().value + detents * KNOB_WHEEL_FRAC * span).clamp(n.ctrl().min, n.ctrl().max);
+            if let Some(step) = n.ctrl().step
                 && step > 0.0
             {
                 v = (v / step).round() * step;
-                v = v.clamp(n.ctrl.min, n.ctrl.max);
+                v = v.clamp(n.ctrl().min, n.ctrl().max);
             }
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             n.mark_dirty();
             v
         };
@@ -1161,7 +1161,7 @@ impl DCompBackend {
         let combo = node.kind == ControlKind::ComboBox;
         let rect = CanvasRect::from_xywh(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
         let rows: Vec<MenuRow> = if combo {
-            node.ctrl
+            node.ctrl()
                 .items
                 .iter()
                 .map(|s| MenuRow {
@@ -1172,12 +1172,12 @@ impl DCompBackend {
                 })
                 .collect()
         } else {
-            node.ctrl.menu.clone()
+            node.ctrl().menu.clone()
         };
         if rows.is_empty() {
             return;
         }
-        let selected = node.ctrl.selected_index;
+        let selected = node.ctrl().selected_index;
         match Popup::open(&self.comp, owner, rows, rect, self.dip_size, combo, selected, false) {
             Ok(p) => {
                 self.close_popup();
@@ -1199,7 +1199,7 @@ impl DCompBackend {
         let rows: Vec<MenuRow> = if focused {
             self.node(owner)
                 .map(|n| {
-                    n.ctrl
+                    n.ctrl()
                         .items
                         .iter()
                         .map(|s| MenuRow {
@@ -1309,7 +1309,7 @@ impl DCompBackend {
         self.close_popup();
         if combo {
             if let Some(n) = self.node_mut(owner) {
-                n.ctrl.selected_index = idx as i32;
+                n.ctrl_mut().selected_index = idx as i32;
                 n.mark_dirty();
             }
             self.fire_i32(owner, Event::SelectionChanged, idx as i32);
@@ -1360,12 +1360,12 @@ impl DCompBackend {
             // content is about to settle.
             let step = -(delta as f32 / 120.0) * 48.0;
             let scale = self.scale();
-            let max = self.node(id).map(|n| (n.ctrl.content_h - n.rect.h).max(0.0)).unwrap_or(0.0);
+            let max = self.node(id).map(|n| (n.ctrl().content_h - n.rect.h).max(0.0)).unwrap_or(0.0);
             if let Some(n) = self.node_mut(id) {
                 let target = layout::snap((n.scroll_off + step).clamp(0.0, max), scale);
                 n.scroll_off = target;
                 n.scroll_glide(target);
-                let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, target);
+                let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, target);
                 let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
                 n.thumb_glide(tx, g.thumb_y);
             }
@@ -1791,7 +1791,7 @@ impl DCompBackend {
         let (text, fallback) = match self.node(id) {
             Some(n) => (
                 n.editor.as_ref().map(|e| e.text()).unwrap_or_default(),
-                n.ctrl.value,
+                n.ctrl().value,
             ),
             None => return,
         };
@@ -1805,10 +1805,10 @@ impl DCompBackend {
         let value = match self.node(id) {
             Some(n) => {
                 let text = n.editor.as_ref().map(|e| e.text()).unwrap_or_default();
-                let cur = editor::eval_numeric(&text).unwrap_or(n.ctrl.value);
-                let step = n.ctrl.step.unwrap_or(1.0);
+                let cur = editor::eval_numeric(&text).unwrap_or(n.ctrl().value);
+                let step = n.ctrl().step.unwrap_or(1.0);
                 let inc = if large {
-                    n.ctrl.large_change.unwrap_or(step * 10.0)
+                    n.ctrl().large_change.unwrap_or(step * 10.0)
                 } else {
                     step
                 };
@@ -1823,12 +1823,12 @@ impl DCompBackend {
     /// fire `ValueChanged`.
     fn apply_number(&mut self, id: ControlId, value: f64) {
         let (min, max, precision) = match self.node(id) {
-            Some(n) => (n.ctrl.min, n.ctrl.max, n.ctrl.precision),
+            Some(n) => (n.ctrl().min, n.ctrl().max, n.ctrl().precision),
             None => return,
         };
         let (v, s) = editor::commit_format(value, min, max, precision);
         if let Some(n) = self.node_mut(id) {
-            n.ctrl.value = v;
+            n.ctrl_mut().value = v;
             if let Some(e) = &mut n.editor {
                 e.set_text(&s);
                 e.seeded = true;
@@ -1954,9 +1954,9 @@ impl DCompBackend {
             Some(ControlKind::Slider | ControlKind::Knob) => {
                 let value = {
                     let Some(n) = self.node_mut(id) else { return };
-                    let step = n.ctrl.step.unwrap_or((n.ctrl.max - n.ctrl.min) / 20.0);
-                    let v = (n.ctrl.value + dir as f64 * step).clamp(n.ctrl.min, n.ctrl.max);
-                    n.ctrl.value = v;
+                    let step = n.ctrl().step.unwrap_or((n.ctrl().max - n.ctrl().min) / 20.0);
+                    let v = (n.ctrl().value + dir as f64 * step).clamp(n.ctrl().min, n.ctrl().max);
+                    n.ctrl_mut().value = v;
                     n.mark_dirty();
                     v
                 };
@@ -1968,7 +1968,7 @@ impl DCompBackend {
             Some(ControlKind::SelectorBar) => {
                 let (cur, n) = self
                     .node(id)
-                    .map(|nd| (nd.ctrl.selected_index, nd.ctrl.items.len() as i32))
+                    .map(|nd| (nd.ctrl().selected_index, nd.ctrl().items.len() as i32))
                     .unwrap_or((0, 0));
                 if n > 0 {
                     self.set_segment(id, (cur + dir).clamp(0, n - 1));
@@ -2115,8 +2115,8 @@ impl DCompBackend {
         }
         let value = {
             let Some(n) = self.node_mut(id) else { return };
-            let v = v.clamp(n.ctrl.min, n.ctrl.max);
-            n.ctrl.value = v;
+            let v = v.clamp(n.ctrl().min, n.ctrl().max);
+            n.ctrl_mut().value = v;
             n.mark_dirty();
             v
         };
@@ -2141,7 +2141,7 @@ impl DCompBackend {
     pub(crate) fn uia_set_expanded(&mut self, id: ControlId, want: bool) {
         match self.node(id).map(|n| n.kind) {
             Some(ControlKind::Expander) => {
-                let cur = self.node(id).map(|n| n.ctrl.expanded).unwrap_or(false);
+                let cur = self.node(id).map(|n| n.ctrl().expanded).unwrap_or(false);
                 if cur != want {
                     self.activate(id);
                 }

@@ -299,7 +299,7 @@ impl DCompBackend {
 
     fn uia_item_count(&self, id: ControlId) -> i32 {
         match self.arena.get(id) {
-            Some(n) if is_item_container(n.kind) => n.ctrl.items.len() as i32,
+            Some(n) if is_item_container(n.kind) => n.ctrl().items.len() as i32,
             _ => 0,
         }
     }
@@ -467,7 +467,7 @@ impl DCompBackend {
             return String::new();
         };
         if item >= 0 {
-            return n.ctrl.items.get(item as usize).cloned().unwrap_or_default();
+            return n.ctrl().items.get(item as usize).cloned().unwrap_or_default();
         }
         if let Some(a) = &n.accessibility
             && let Some(name) = &a.automation_name
@@ -546,8 +546,8 @@ impl DCompBackend {
 
     fn uia_toggle_state(&self, id: ControlId) -> i32 {
         match self.arena.get(id) {
-            Some(n) if n.ctrl.indeterminate => 2,
-            Some(n) if n.ctrl.is_on || n.ctrl.is_checked => 1,
+            Some(n) if n.ctrl().indeterminate => 2,
+            Some(n) if n.ctrl().is_on || n.ctrl().is_checked => 1,
             _ => 0,
         }
     }
@@ -568,14 +568,14 @@ impl DCompBackend {
             n.kind,
             ControlKind::ProgressBar | ControlKind::ProgressRing | ControlKind::Meter
         );
-        let step = n.ctrl.step.unwrap_or(1.0);
-        Some((n.ctrl.value, n.ctrl.min, n.ctrl.max, readonly, step))
+        let step = n.ctrl().step.unwrap_or(1.0);
+        Some((n.ctrl().value, n.ctrl().min, n.ctrl().max, readonly, step))
     }
 
     fn uia_expand_state(&self, id: ControlId) -> i32 {
         match self.arena.get(id).map(|n| n.kind) {
             Some(ControlKind::Expander) => {
-                if self.arena.get(id).is_some_and(|n| n.ctrl.expanded) {
+                if self.arena.get(id).is_some_and(|n| n.ctrl().expanded) {
                     1
                 } else {
                     0
@@ -593,7 +593,7 @@ impl DCompBackend {
     }
 
     fn uia_item_selected(&self, id: ControlId, item: i32) -> bool {
-        self.arena.get(id).is_some_and(|n| n.ctrl.selected_index == item)
+        self.arena.get(id).is_some_and(|n| n.ctrl().selected_index == item)
     }
 
     /// The selected item index of container `id`, or `None` when the index is
@@ -603,15 +603,15 @@ impl DCompBackend {
         if !is_item_container(n.kind) {
             return None;
         }
-        let i = n.ctrl.selected_index;
-        (0..n.ctrl.items.len() as i32).contains(&i).then_some(i)
+        let i = n.ctrl().selected_index;
+        (0..n.ctrl().items.len() as i32).contains(&i).then_some(i)
     }
 
     /// `(offset, viewport height, content height)` in DIPs for a scroll
     /// container.
     fn uia_scroll_info(&self, id: ControlId) -> Option<(f32, f32, f32)> {
         let n = self.arena.get(id)?;
-        n.is_scroll().then(|| (n.scroll_off, n.rect.h, n.ctrl.content_h))
+        n.is_scroll().then(|| (n.scroll_off, n.rect.h, n.ctrl().content_h))
     }
 
     /// UIA `Scroll`/`SetScrollPercent`: glide scroll container `id` to logical
@@ -625,11 +625,11 @@ impl DCompBackend {
         if !n.is_scroll() {
             return;
         }
-        let max = (n.ctrl.content_h - n.rect.h).max(0.0);
+        let max = (n.ctrl().content_h - n.rect.h).max(0.0);
         let target = layout::snap(off.clamp(0.0, max), scale);
         n.scroll_off = target;
         n.scroll_glide(target);
-        let g = scroll::thumb_geom(n.rect.h, n.ctrl.content_h, target);
+        let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, target);
         let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
         n.thumb_glide(tx, g.thumb_y);
     }
@@ -838,7 +838,7 @@ impl DCompBackend {
         // Window-space → the container's unscrolled layout space.
         let py = py + self.uia_scroll_adjust(id);
         let n = self.arena.get(id)?;
-        let count = n.ctrl.items.len();
+        let count = n.ctrl().items.len();
         if count == 0 {
             return None;
         }

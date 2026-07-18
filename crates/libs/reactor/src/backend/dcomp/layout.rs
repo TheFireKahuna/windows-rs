@@ -118,8 +118,8 @@ fn lay_out(
                     // inset. The cached layout supplies the line height.
                     if node.kind == ControlKind::SelectorBar {
                         let m = controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
-                        let labels: f32 = node.ctrl.seg_label_w.iter().sum();
-                        let n = node.ctrl.seg_label_w.len().max(1) as f32;
+                        let labels: f32 = node.ctrl().seg_label_w.iter().sum();
+                        let n = node.ctrl().seg_label_w.len().max(1) as f32;
                         return Size {
                             width: known
                                 .width
@@ -235,13 +235,13 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
     // the line height. Measured at the active weight (600) so widths hold when
     // any segment becomes active.
     let needs_seg = arena.get(id).is_some_and(|n| {
-        n.text_dirty && n.kind == ControlKind::SelectorBar && !n.ctrl.items.is_empty()
+        n.text_dirty && n.kind == ControlKind::SelectorBar && !n.ctrl().items.is_empty()
     });
     if needs_seg {
         let (items, size, family) = {
             let n = arena.get(id).unwrap();
             (
-                n.ctrl.items.clone(),
+                n.ctrl().items.clone(),
                 n.paint.font_size,
                 n.paint.font_family.clone().unwrap_or_else(|| "Segoe UI".to_string()),
             )
@@ -259,7 +259,7 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
             widths.push(w);
         }
         if let Some(n) = arena.get_mut(id) {
-            n.ctrl.seg_label_w = widths;
+            n.ctrl_mut().seg_label_w = widths;
             n.text_layout = keep;
             n.text_dirty = false;
             n.measure_dirty = true;
@@ -378,7 +378,7 @@ impl LayoutTree {
         // the node's own surface, so every child is body content).
         let collapse = arena
             .get(id)
-            .is_some_and(|n| n.kind == ControlKind::Expander && !n.ctrl.expanded);
+            .is_some_and(|n| n.kind == ControlKind::Expander && !n.ctrl().expanded);
         let child_hidden = hidden || collapse;
 
         // Children first — their Taffy nodes must exist before `set_children`.
@@ -664,7 +664,7 @@ fn assign(
         // pixel-snapped, so a fractional offset would push every child back
         // off the grid.
         let scroll = if let Some(n) = arena.get_mut(id) {
-            n.ctrl.content_h = content_h;
+            n.ctrl_mut().content_h = content_h;
             n.scroll_off = snap(n.scroll_off.clamp(0.0, max_scroll), scale);
             n.scroll_off
         } else {

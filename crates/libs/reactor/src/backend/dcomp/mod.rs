@@ -733,12 +733,12 @@ impl Backend for DCompBackend {
                 node.mark_dirty();
             }
             (Prop::Precision, PropValue::I32(v)) => {
-                node.ctrl.precision = Some(*v);
+                node.ctrl_mut().precision = Some(*v);
                 // Reformat the seeded value to the new precision (the `Value`
                 // prop usually arrives before `Precision`). Never while focused
                 // — the user owns the buffer mid-edit.
                 if node.kind == ControlKind::NumberBox && !node.focused {
-                    let value = node.ctrl.value;
+                    let value = node.ctrl().value;
                     if let Some(ed) = &mut node.editor {
                         ed.seeded = false;
                     }
@@ -746,9 +746,9 @@ impl Backend for DCompBackend {
                     node.mark_dirty();
                 }
             }
-            (Prop::LargeChange, PropValue::F64(v)) => node.ctrl.large_change = Some(*v),
+            (Prop::LargeChange, PropValue::F64(v)) => node.ctrl_mut().large_change = Some(*v),
             (Prop::HorizontalContentAlignment, PropValue::I32(v)) => {
-                node.ctrl.content_align = *v;
+                node.ctrl_mut().content_align = *v;
                 if let Some(ed) = &mut node.editor {
                     ed.layout_dirty = true;
                 }
@@ -869,17 +869,17 @@ impl Backend for DCompBackend {
             // no spring tick here: marking dirty routes them through the paint
             // pass, whose parts sync glides the change on the compositor.
             (Prop::IsOn, PropValue::Bool(v)) => {
-                node.ctrl.is_on = *v;
+                node.ctrl_mut().is_on = *v;
                 node.mark_dirty();
             }
             (Prop::IsChecked, PropValue::Bool(v)) => {
                 // The CheckBox reveal fades via its chrome parts on repaint; a
                 // ToggleButton's checked state is plain painted chrome.
-                node.ctrl.is_checked = *v;
+                node.ctrl_mut().is_checked = *v;
                 node.mark_dirty();
             }
             (Prop::Value, PropValue::F64(v)) => {
-                node.ctrl.value = *v;
+                node.ctrl_mut().value = *v;
                 // NumberBox: reflect the programmatic value as formatted text
                 // (unless the user is mid-edit — the editor owns the buffer
                 // while focused).
@@ -889,130 +889,130 @@ impl Backend for DCompBackend {
                 node.mark_dirty();
             }
             (Prop::Minimum, PropValue::F64(v)) => {
-                node.ctrl.min = *v;
+                node.ctrl_mut().min = *v;
                 node.mark_dirty();
             }
             (Prop::Maximum, PropValue::F64(v)) => {
-                node.ctrl.max = *v;
+                node.ctrl_mut().max = *v;
                 node.mark_dirty();
             }
-            (Prop::Step, PropValue::F64(v)) => node.ctrl.step = Some(*v),
+            (Prop::Step, PropValue::F64(v)) => node.ctrl_mut().step = Some(*v),
             (Prop::FillOrigin, PropValue::F64(v)) => {
-                node.ctrl.fill_origin = Some(*v);
+                node.ctrl_mut().fill_origin = Some(*v);
                 node.mark_dirty();
             }
             (Prop::FillColor, PropValue::Color(c)) => {
-                node.ctrl.fill_color = Some(*c);
+                node.ctrl_mut().fill_color = Some(*c);
                 node.mark_dirty();
             }
             (Prop::FillColorAlt, PropValue::Color(c)) => {
-                node.ctrl.fill_color_alt = Some(*c);
+                node.ctrl_mut().fill_color_alt = Some(*c);
                 node.mark_dirty();
             }
             (Prop::Marker, PropValue::F64(v)) => {
-                node.ctrl.marker = Some(*v);
+                node.ctrl_mut().marker = Some(*v);
                 node.mark_dirty();
             }
             (Prop::MarkerColor, PropValue::Color(c)) => {
-                node.ctrl.marker_color = Some(*c);
+                node.ctrl_mut().marker_color = Some(*c);
                 node.mark_dirty();
             }
             (Prop::GradientStops, PropValue::GradientStops(stops)) => {
-                node.ctrl.stops = stops.clone();
+                node.ctrl_mut().stops = stops.clone();
                 node.mark_dirty();
             }
             (Prop::StartAngle, PropValue::F64(v)) => {
-                node.ctrl.start_angle = *v as f32;
+                node.ctrl_mut().start_angle = *v as f32;
                 node.mark_dirty();
             }
             (Prop::EndAngle, PropValue::F64(v)) => {
-                node.ctrl.end_angle = *v as f32;
+                node.ctrl_mut().end_angle = *v as f32;
                 node.mark_dirty();
             }
             (Prop::Ticks, PropValue::F64List(list)) => {
-                node.ctrl.ticks = list.clone();
+                node.ctrl_mut().ticks = list.clone();
                 node.mark_dirty();
             }
             (Prop::TickLabels, PropValue::ValueLabels(list)) => {
-                node.ctrl.tick_labels = list.clone();
+                node.ctrl_mut().tick_labels = list.clone();
                 node.mark_dirty();
             }
             (Prop::MajorEvery, PropValue::F64(v)) => {
-                node.ctrl.major_every = Some(*v);
+                node.ctrl_mut().major_every = Some(*v);
                 node.mark_dirty();
             }
             (Prop::Accent, PropValue::Color(c)) => {
-                node.ctrl.accent = Some(*c);
+                node.ctrl_mut().accent = Some(*c);
                 node.mark_dirty();
             }
             (Prop::Unit, PropValue::Str(s)) => {
-                node.ctrl.unit = s.clone();
+                node.ctrl_mut().unit = s.clone();
                 node.mark_dirty();
             }
             (Prop::SubText, PropValue::Str(s)) => {
-                node.ctrl.sub_text = s.clone();
+                node.ctrl_mut().sub_text = s.clone();
                 node.mark_dirty();
             }
             (Prop::IsIndeterminate, PropValue::Bool(v)) => {
-                node.ctrl.indeterminate = *v;
+                node.ctrl_mut().indeterminate = *v;
                 node.mark_dirty();
             }
             (Prop::IsActive, PropValue::Bool(v)) => {
-                node.ctrl.is_active = *v;
+                node.ctrl_mut().is_active = *v;
                 node.mark_dirty();
             }
             (Prop::IsExpanded, PropValue::Bool(v)) => {
-                node.ctrl.expanded = *v;
+                node.ctrl_mut().expanded = *v;
                 node.mark_dirty();
             }
             (Prop::SelectedIndex, PropValue::I32(v)) => {
-                node.ctrl.selected_index = *v;
+                node.ctrl_mut().selected_index = *v;
                 node.mark_dirty();
             }
             (Prop::SelectedTag, PropValue::Str(s)) => {
-                node.ctrl.selected_tag = Some(s.clone());
+                node.ctrl_mut().selected_tag = Some(s.clone());
                 sync_selected_tag(node);
                 node.mark_dirty();
             }
             (Prop::PlaceholderText, PropValue::Str(s)) => {
-                node.ctrl.placeholder = s.clone();
+                node.ctrl_mut().placeholder = s.clone();
                 node.mark_dirty();
             }
             (Prop::Items, PropValue::StrList(list)) => {
-                node.ctrl.items = list.clone();
+                node.ctrl_mut().items = list.clone();
                 node.mark_dirty();
                 // A focused AutoSuggestBox whose filtered list just changed refreshes
                 // its open dropdown in place (deferred until the node borrow ends).
                 refresh_suggest = node.kind == ControlKind::AutoSuggestBox;
             }
             (Prop::Items, PropValue::SelectorBarItems(items)) => {
-                node.ctrl.items = items.iter().map(|i| i.text.clone()).collect();
-                if node.ctrl.selected_index < 0 && !node.ctrl.items.is_empty() {
-                    node.ctrl.selected_index = 0;
+                node.ctrl_mut().items = items.iter().map(|i| i.text.clone()).collect();
+                if node.ctrl().selected_index < 0 && !node.ctrl().items.is_empty() {
+                    node.ctrl_mut().selected_index = 0;
                 }
                 // Labels feed the per-item width measure — rebuild it.
                 node.text_dirty = true;
                 node.mark_dirty();
             }
             (Prop::MenuItems, PropValue::NavMenuItems(items)) => {
-                node.ctrl.items.clear();
-                node.ctrl.tags.clear();
-                node.ctrl.icons.clear();
+                let ctrl = node.ctrl_mut();
+                ctrl.items.clear();
+                ctrl.tags.clear();
+                ctrl.icons.clear();
                 for it in items {
                     if it.is_header {
                         continue;
                     }
-                    node.ctrl.items.push(it.content.clone());
-                    node.ctrl
-                        .tags
+                    ctrl.items.push(it.content.clone());
+                    ctrl.tags
                         .push(it.tag.clone().unwrap_or_else(|| it.content.clone()));
-                    node.ctrl.icons.push(it.icon.map(|s| s.0 as u32).unwrap_or(0));
+                    ctrl.icons.push(it.icon.map(|s| s.0 as u32).unwrap_or(0));
                 }
                 sync_selected_tag(node);
                 node.mark_dirty();
             }
             (Prop::MenuFlyoutItems, PropValue::MenuFlyoutItems(items)) => {
-                node.ctrl.menu = items.iter().map(menu_row).collect();
+                node.ctrl_mut().menu = items.iter().map(menu_row).collect();
                 node.mark_dirty();
             }
             // Every pair this backend does not consume lands here and is
@@ -1665,27 +1665,27 @@ fn reset_prop(node: &mut Node, prop: Prop) {
             node.mark_dirty();
         }
         Prop::FillOrigin => {
-            node.ctrl.fill_origin = None;
+            node.ctrl_mut().fill_origin = None;
             node.mark_dirty();
         }
         Prop::FillColor => {
-            node.ctrl.fill_color = None;
+            node.ctrl_mut().fill_color = None;
             node.mark_dirty();
         }
         Prop::FillColorAlt => {
-            node.ctrl.fill_color_alt = None;
+            node.ctrl_mut().fill_color_alt = None;
             node.mark_dirty();
         }
         Prop::Marker => {
-            node.ctrl.marker = None;
+            node.ctrl_mut().marker = None;
             node.mark_dirty();
         }
         Prop::MarkerColor => {
-            node.ctrl.marker_color = None;
+            node.ctrl_mut().marker_color = None;
             node.mark_dirty();
         }
         Prop::GradientStops => {
-            node.ctrl.stops.clear();
+            node.ctrl_mut().stops.clear();
             node.mark_dirty();
         }
         Prop::Stroke => {
@@ -1733,7 +1733,7 @@ fn seed_editor_text(node: &mut Node, s: &str) {
 /// configured precision. Skipped while focused (the user owns the buffer).
 fn seed_number_text(node: &mut Node, v: f64) {
     let focused = node.focused;
-    let precision = node.ctrl.precision;
+    let precision = node.ctrl().precision;
     if let Some(ed) = &mut node.editor
         && (!focused || !ed.seeded)
     {
@@ -1745,11 +1745,11 @@ fn seed_number_text(node: &mut Node, v: f64) {
 
 /// The control's value as a 0..1 fraction of its `[min, max]` range.
 pub(crate) fn ctrl_value_frac(node: &Node) -> f64 {
-    let span = node.ctrl.max - node.ctrl.min;
+    let span = node.ctrl().max - node.ctrl().min;
     if span.abs() < f64::EPSILON {
         0.0
     } else {
-        ((node.ctrl.value - node.ctrl.min) / span).clamp(0.0, 1.0)
+        ((node.ctrl().value - node.ctrl().min) / span).clamp(0.0, 1.0)
     }
 }
 
@@ -1757,10 +1757,10 @@ pub(crate) fn ctrl_value_frac(node: &Node) -> f64 {
 /// `selected_index` (NavigationView). The rail indicator is a chrome part —
 /// the paint pass glides/snaps it from `selected_index` directly.
 fn sync_selected_tag(node: &mut Node) {
-    if let Some(tag) = &node.ctrl.selected_tag
-        && let Some(i) = node.ctrl.tags.iter().position(|t| t == tag)
+    if let Some(tag) = &node.ctrl().selected_tag
+        && let Some(i) = node.ctrl().tags.iter().position(|t| t == tag)
     {
-        node.ctrl.selected_index = i as i32;
+        node.ctrl_mut().selected_index = i as i32;
     }
 }
 

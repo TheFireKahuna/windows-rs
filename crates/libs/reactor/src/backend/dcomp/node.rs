@@ -164,48 +164,65 @@ pub(crate) struct Ctrl {
     pub sub_text: String,
 }
 
+impl Ctrl {
+    /// The state every control starts in, as a `const` so it can also back
+    /// [`EMPTY_CTRL`] — the value a node with no allocated [`Ctrl`] reads as.
+    ///
+    /// This constant is the SINGLE definition: [`Default`] returns it and the
+    /// absent-read path returns a reference to it. A node that has never been
+    /// written therefore reads exactly what an eagerly-constructed `Ctrl` would
+    /// have held, and the two cannot drift apart because there is only one.
+    pub const DEFAULT: Ctrl = Ctrl {
+        is_on: false,
+        is_checked: false,
+        value: 0.0,
+        min: 0.0,
+        max: 100.0,
+        step: None,
+        indeterminate: false,
+        is_active: true,
+        selected_index: -1,
+        hot_index: -1,
+        seg_label_w: Vec::new(),
+        items: Vec::new(),
+        tags: Vec::new(),
+        icons: Vec::new(),
+        expanded: false,
+        selected_tag: None,
+        menu: Vec::new(),
+        placeholder: String::new(),
+        content_h: 0.0,
+        precision: None,
+        large_change: None,
+        content_align: -1,
+        fill_origin: None,
+        fill_color: None,
+        fill_color_alt: None,
+        marker: None,
+        marker_color: None,
+        stops: Vec::new(),
+        start_angle: 0.0,
+        end_angle: 0.0,
+        ticks: Vec::new(),
+        tick_labels: Vec::new(),
+        major_every: None,
+        accent: None,
+        unit: String::new(),
+        sub_text: String::new(),
+    };
+}
+
 impl Default for Ctrl {
     fn default() -> Self {
-        Self {
-            is_on: false,
-            is_checked: false,
-            value: 0.0,
-            min: 0.0,
-            max: 100.0,
-            step: None,
-            indeterminate: false,
-            is_active: true,
-            selected_index: -1,
-            hot_index: -1,
-            seg_label_w: Vec::new(),
-            items: Vec::new(),
-            tags: Vec::new(),
-            icons: Vec::new(),
-            expanded: false,
-            selected_tag: None,
-            menu: Vec::new(),
-            placeholder: String::new(),
-            content_h: 0.0,
-            precision: None,
-            large_change: None,
-            content_align: -1,
-            fill_origin: None,
-            fill_color: None,
-            fill_color_alt: None,
-            marker: None,
-            marker_color: None,
-            stops: Vec::new(),
-            start_angle: 0.0,
-            end_angle: 0.0,
-            ticks: Vec::new(),
-            tick_labels: Vec::new(),
-            major_every: None,
-            accent: None,
-            unit: String::new(),
-            sub_text: String::new(),
-        }
+        Self::DEFAULT
     }
 }
+
+/// The [`Ctrl`] a node that has never had control state written reads as.
+///
+/// Every heap field in [`Ctrl::DEFAULT`] is an empty `Vec`/`String`, so this
+/// static owns no allocation and is never dropped.
+pub(crate) static EMPTY_CTRL: Ctrl = Ctrl::DEFAULT;
 
 /// One live control.
 pub(crate) struct Node {
@@ -350,8 +367,16 @@ pub(crate) struct Node {
     pub pressed: bool,
 
     // ── Control library state ────────────────────────────────────────────
-    /// Stateful drawn-control data (toggle/slider/segmented/select/nav/…).
-    pub ctrl: Ctrl,
+    /// Stateful drawn-control data (toggle/slider/segmented/select/nav/…),
+    /// allocated on the first write and absent until then.
+    ///
+    /// [`Ctrl`] is the largest per-node payload after the Taffy style, yet a
+    /// real tree is mostly `TextBlock`/`Border`/`Grid`/`StackPanel` — kinds that
+    /// never hold any of it. Boxing it keeps that majority out of the arena's
+    /// working set entirely. Read it through [`Node::ctrl`] and write it through
+    /// [`Node::ctrl_mut`]; the field is deliberately not accessed directly so an
+    /// absent `Ctrl` cannot be mistaken for a present one.
+    ctrl: Option<Box<Ctrl>>,
     /// ScrollViewer only: the LOGICAL scroll offset (DIPs of content above the
     /// viewport). Hit-testing and thumb geometry read this; the VISUAL glide
     /// toward it plays on the compositor (`scroll_glide`), so during a wheel
@@ -438,7 +463,7 @@ impl Node {
             rect: LaidRect::default(),
             hovered: false,
             pressed: false,
-            ctrl: Ctrl::default(),
+            ctrl: None,
             scroll_off: 0.0,
             focusable,
             focused: false,
@@ -446,6 +471,38 @@ impl Node {
             title_content: None,
             title_footer: None,
         }
+    }
+
+    /// This node's control state for reading. A node that has never had any
+    /// written reads [`EMPTY_CTRL`] — which IS [`Ctrl::DEFAULT`], the same value
+    /// an eagerly-allocated `Ctrl` was constructed with, so an absent `Ctrl` and
+    /// an untouched one are indistinguishable to every reader.
+    pub fn ctrl(&self) -> &Ctrl {
+        self.ctrl.as_deref().unwrap_or(&EMPTY_CTRL)
+    }
+
+    /// This node's control state for writing, allocated on first use.
+    pub fn ctrl_mut(&mut self) -> &mut Ctrl {
+        self.ctrl.get_or_insert_with(|| Box::new(Ctrl::DEFAULT))
+    }
+
+    /// Whether the boxed [`Ctrl`] has actually been allocated. Only the test
+    /// seam asks — the backend proper never distinguishes the two states.
+    #[cfg(feature = "test")]
+    pub fn ctrl_allocated(&self) -> bool {
+        self.ctrl.is_some()
+    }
+
+    /// The control state and the retained chrome parts as two disjoint borrows.
+    ///
+    /// Two field accesses can be split by the borrow checker; a method call
+    /// borrowing the whole `Node` cannot. A parts sync that reads `ctrl` while
+    /// mutating `parts` goes through here instead of cloning either.
+    pub fn ctrl_and_parts(&mut self) -> (&Ctrl, Option<&mut parts::Parts>) {
+        (
+            self.ctrl.as_deref().unwrap_or(&EMPTY_CTRL),
+            self.parts.as_deref_mut(),
+        )
     }
 
     pub fn handler(&self, event: Event) -> Option<&EventHandler> {
@@ -885,6 +942,20 @@ fn default_style(kind: ControlKind) -> taffy::Style {
     s.grid_column.start = line(1);
     s
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 /// Node arena keyed by [`ControlId`] (a `NonZeroU32`).
 ///

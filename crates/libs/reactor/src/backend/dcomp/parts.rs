@@ -1239,7 +1239,7 @@ fn toggle_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
         return;
     }
     let cy = node.rect.h / 2.0;
-    let on = node.ctrl.is_on;
+    let on = node.ctrl().is_on;
     let dim = dim_of(node);
     let (kx_off, kx_on) = knob_xs();
     let kx = if on { kx_on } else { kx_off };
@@ -1292,7 +1292,7 @@ fn track_targets(on: bool, hovered: bool, dim: f32) -> (f32, f32) {
 
 /// Hover flipped on the toggle: refade the off-track outline.
 fn toggle_fades(node: &mut Node) {
-    let (_, off_t) = track_targets(node.ctrl.is_on, node.hovered, dim_of(node));
+    let (_, off_t) = track_targets(node.ctrl().is_on, node.hovered, dim_of(node));
     if let Some(parts) = node.parts.as_mut()
         && parts.below.len() == 3
     {
@@ -1313,7 +1313,7 @@ fn check_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32
     if !ensure(comp, node, 1, 1) {
         return;
     }
-    let on = node.ctrl.is_checked;
+    let on = node.ctrl().is_checked;
     let t = if on { dim_of(node) } else { 0.0 };
     let y = node.rect.h / 2.0 - CHECK_BOX_D / 2.0;
     let k_fill = AtlasKey::hbar(CHECK_BOX_D, theme::RADIUS_SM, 0.0, theme::accent(), scale);
@@ -1351,12 +1351,12 @@ fn halo_target(node: &Node) -> f32 {
 /// The slider's fill-origin as a 0..1 track fraction (`fill_origin` clamped
 /// into `[min, max]`; unset = 0.0, i.e. fill from the `min` end).
 pub(crate) fn slider_origin_frac(node: &Node) -> f32 {
-    let Some(o) = node.ctrl.fill_origin else { return 0.0 };
-    let span = node.ctrl.max - node.ctrl.min;
+    let Some(o) = node.ctrl().fill_origin else { return 0.0 };
+    let span = node.ctrl().max - node.ctrl().min;
     if span.abs() < f64::EPSILON {
         0.0
     } else {
-        ((o - node.ctrl.min) / span).clamp(0.0, 1.0) as f32
+        ((o - node.ctrl().min) / span).clamp(0.0, 1.0) as f32
     }
 }
 
@@ -1364,11 +1364,11 @@ pub(crate) fn slider_origin_frac(node: &Node) -> f32 {
 /// below → `fill_color`, above → `fill_color_alt` (each falling back toward
 /// the theme accent). Authored colors — the atlas raster display-maps them.
 fn slider_fill_color(node: &Node, vfrac: f32, ofrac: f32) -> crate::Color {
-    let below = node.ctrl.fill_color.unwrap_or_else(theme::accent);
+    let below = node.ctrl().fill_color.unwrap_or_else(theme::accent);
     if vfrac <= ofrac {
         below
     } else {
-        node.ctrl.fill_color_alt.unwrap_or(below)
+        node.ctrl().fill_color_alt.unwrap_or(below)
     }
 }
 
@@ -1658,18 +1658,19 @@ fn meter_sync(
     let top = theme::METER_INSET;
     let bar_h = (h - 2.0 * top).max(1.0);
     let marker_x = super::controls::meter_marker_frac(node).map(|f| f * w);
-    let marker_c = node.ctrl.marker_color.unwrap_or_else(|| theme::w(0.15));
+    let marker_c = node.ctrl().marker_color.unwrap_or_else(|| theme::w(0.15));
 
     let k_marker = AtlasKey::solid(marker_c, scale);
     let k_white = AtlasKey::solid(theme::w(1.0), scale);
 
     let geom = (w, h);
-    let gradient = !node.ctrl.stops.is_empty();
-    let Some(parts) = node.parts.as_mut() else { return };
+    let gradient = !node.ctrl().stops.is_empty();
+    let (ctrl, parts) = node.ctrl_and_parts();
+    let Some(parts) = parts else { return };
     let k_fill = if gradient {
         // Rounded ends (nine-grid) so the coloured fill matches the groove's
         // rounded corners; the reveal clip trims the straight leading edge.
-        grad_bar_key(&mut parts.grad_key, &node.ctrl.stops, theme::METER_RADIUS, bar_h, scale)
+        grad_bar_key(&mut parts.grad_key, &ctrl.stops, theme::METER_RADIUS, bar_h, scale)
     } else {
         AtlasKey::hbar(bar_h, theme::METER_RADIUS, 0.0, theme::accent(), scale)
     };
@@ -1763,7 +1764,7 @@ fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale:
     if !ensure(comp, node, 4, 0) {
         return;
     }
-    let n = node.ctrl.items.len();
+    let n = node.ctrl().items.len();
     let (w, h) = (node.rect.w, node.rect.h);
     let accent = node.paint.style_variant == 1;
     let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
@@ -1782,14 +1783,14 @@ fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale:
     let k_pill = AtlasKey::hbar(pill_h, seg_radius, 0.0, pill_fill, scale);
     let k_ink = AtlasKey::hbar(pill_h, seg_radius, 0.0, theme::w(1.0), scale);
 
-    let sel = if n == 0 { -1 } else { (node.ctrl.selected_index.max(0)).min(n as i32 - 1) };
+    let sel = if n == 0 { -1 } else { (node.ctrl().selected_index.max(0)).min(n as i32 - 1) };
     let seg_rect = |i: i32| -> Option<(f32, f32, f32, f32)> {
         let i = usize::try_from(i).ok()?;
         let (a, b) = (*edges.get(i)?, *edges.get(i + 1)?);
         Some((a, m.tray, b - a, pill_h))
     };
     let pill = seg_rect(sel);
-    let hot = node.ctrl.hot_index;
+    let hot = node.ctrl().hot_index;
     let ink = seg_rect(hot);
     let ink_t = seg_ink_target(node);
 
@@ -1833,7 +1834,7 @@ fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale:
 }
 
 fn seg_ink_target(node: &Node) -> f32 {
-    if node.paint.is_enabled && node.hovered && node.ctrl.hot_index >= 0 {
+    if node.paint.is_enabled && node.hovered && node.ctrl().hot_index >= 0 {
         wash(0.05)
     } else {
         0.0
@@ -1847,7 +1848,7 @@ pub(crate) fn seg_hot_changed(node: &mut Node) {
     let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
     let edges = super::controls::segment_edges(node);
     let pill_h = (node.rect.h - 2.0 * m.tray).max(0.0);
-    let hot = node.ctrl.hot_index;
+    let hot = node.ctrl().hot_index;
     let rect = usize::try_from(hot).ok().and_then(|i| {
         let (a, b) = (*edges.get(i)?, *edges.get(i + 1)?);
         Some((a, m.tray, b - a, pill_h))
@@ -1873,8 +1874,8 @@ fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) 
     let h = node.rect.h;
     let dim = dim_of(node);
     let item_h = super::controls::NAV_ITEM_H;
-    let sel = node.ctrl.selected_index;
-    let visible = sel >= 0 && !node.ctrl.items.is_empty();
+    let sel = node.ctrl().selected_index;
+    let visible = sel >= 0 && !node.ctrl().items.is_empty();
     let iy = sel.max(0) as f32 * item_h;
 
     let k_bg = AtlasKey::solid(theme::surface_sunken(), scale);
@@ -1969,7 +1970,7 @@ fn progress_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: 
     let y = h / 2.0 - bar_h / 2.0;
     let dim = dim_of(node);
     let frac = (super::ctrl_value_frac(node) as f32).clamp(0.0, 1.0);
-    let ind = node.ctrl.indeterminate;
+    let ind = node.ctrl().indeterminate;
     let k_track = AtlasKey::hbar(bar_h, bar_h / 2.0, 0.0, theme::w(0.08), scale);
     let k_fill = AtlasKey::hbar(bar_h, bar_h / 2.0, 0.0, theme::accent(), scale);
 
@@ -2021,7 +2022,7 @@ fn ring_sync(comp: &Compositing, node: &mut Node) {
         return;
     }
     let (w, h) = (node.rect.w, node.rect.h);
-    let ind = node.ctrl.indeterminate;
+    let ind = node.ctrl().indeterminate;
     let Some(surf) = node.surf.as_ref() else { return };
     let (Ok(vis), Ok(obj)) = (
         surf.sprite.cast::<IVisual>(),
