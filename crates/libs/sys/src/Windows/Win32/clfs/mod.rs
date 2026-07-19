@@ -53,6 +53,7 @@ impl Default for CLFS_LOG_NAME_INFORMATION {
 pub type CLFS_LSN = CLS_LSN;
 pub const CLFS_MARSHALLING_FLAG_DISABLE_BUFF_INIT: u32 = 1;
 pub const CLFS_MARSHALLING_FLAG_NONE: u32 = 0;
+pub const CLFS_MAX_CONTAINER_INFO: u32 = 256;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CLFS_NODE_ID {
@@ -67,8 +68,14 @@ pub struct CLFS_PHYSICAL_LSN_INFORMATION {
     pub PhysicalLsn: CLFS_LSN,
 }
 pub type CLFS_RECORD_TYPE = CLS_RECORD_TYPE;
+pub const CLFS_SCAN_BACKWARD: u8 = 4;
+pub const CLFS_SCAN_BUFFERED: u8 = 32;
+pub const CLFS_SCAN_CLOSE: u8 = 8;
 #[cfg(feature = "winnt")]
 pub type CLFS_SCAN_CONTEXT = CLS_SCAN_CONTEXT;
+pub const CLFS_SCAN_FORWARD: u8 = 2;
+pub const CLFS_SCAN_INIT: u8 = 1;
+pub const CLFS_SCAN_INITIALIZED: u8 = 16;
 pub type CLFS_SCAN_MODE = u8;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -203,10 +210,18 @@ impl Default for CLS_WRITE_ENTRY {
         unsafe { core::mem::zeroed() }
     }
 }
+pub const ClfsClientRecord: u8 = 3;
+pub const ClfsContainerActive: u32 = 4;
+pub const ClfsContainerActivePendingDelete: u32 = 8;
+pub const ClfsContainerInactive: u32 = 2;
+pub const ClfsContainerInitializing: u32 = 1;
+pub const ClfsContainerPendingArchive: u32 = 16;
+pub const ClfsContainerPendingArchiveAndDelete: u32 = 32;
 pub const ClfsContextForward: CLFS_CONTEXT_MODE = 3;
 pub const ClfsContextNone: CLFS_CONTEXT_MODE = 0;
 pub const ClfsContextPrevious: CLFS_CONTEXT_MODE = 2;
 pub const ClfsContextUndoNext: CLFS_CONTEXT_MODE = 1;
+pub const ClfsDataRecord: u8 = 1;
 pub const ClfsIoStatsDefault: CLFS_IOSTATS_CLASS = 0;
 pub const ClfsIoStatsMax: CLFS_IOSTATS_CLASS = 65535;
 pub const ClfsLogArchiveDisabled: CLFS_LOG_ARCHIVE_MODE = 2;
@@ -217,6 +232,14 @@ pub const ClfsLogPhysicalLsnInformation: CLS_LOG_INFORMATION_CLASS = 5;
 pub const ClfsLogPhysicalNameInformation: CLS_LOG_INFORMATION_CLASS = 2;
 pub const ClfsLogStreamIdentifierInformation: CLS_LOG_INFORMATION_CLASS = 3;
 pub const ClfsLogSystemMarkingInformation: CLS_LOG_INFORMATION_CLASS = 4;
+pub const ClfsNullRecord: u8 = 0;
+pub const ClfsRestartRecord: u8 = 2;
+pub const ClsContainerActive: u32 = 4;
+pub const ClsContainerActivePendingDelete: u32 = 8;
+pub const ClsContainerInactive: u32 = 2;
+pub const ClsContainerInitializing: u32 = 1;
+pub const ClsContainerPendingArchive: u32 = 16;
+pub const ClsContainerPendingArchiveAndDelete: u32 = 32;
 pub const ClsContextForward: CLS_CONTEXT_MODE = 3;
 pub const ClsContextNone: CLS_CONTEXT_MODE = 0;
 pub const ClsContextPrevious: CLS_CONTEXT_MODE = 2;

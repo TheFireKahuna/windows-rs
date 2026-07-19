@@ -677,3 +677,6 @@ pub struct WM_WRITER_STATISTICS_EX {
     pub dwTotalSampleDropsInCodec: u32,
     pub dwTotalSampleDropsInMultiplexer: u32,
 }
+pub const g_dwWMContentAttributes: u32 = 5;
+pub const g_dwWMNSCAttributes: u32 = 5;
+pub const g_dwWMSpecialAttributes: u32 = 20;

@@ -399,6 +399,10 @@ pub use directmanipulation::*;
 pub mod directml;
 #[cfg(feature = "directml")]
 pub use directml::*;
+#[cfg(feature = "dispatcherqueue")]
+pub mod dispatcherqueue;
+#[cfg(feature = "dispatcherqueue")]
+pub use dispatcherqueue::*;
 #[cfg(feature = "dispex")]
 pub mod dispex;
 #[cfg(feature = "dispex")]
@@ -803,6 +807,10 @@ pub use joystickapi::*;
 pub mod kernelspecs;
 #[cfg(feature = "kernelspecs")]
 pub use kernelspecs::*;
+#[cfg(feature = "knownfolders")]
+pub mod knownfolders;
+#[cfg(feature = "knownfolders")]
+pub use knownfolders::*;
 #[cfg(feature = "ks")]
 pub mod ks;
 #[cfg(feature = "ks")]
@@ -1823,6 +1831,10 @@ pub use uiautomationclient::*;
 pub mod uiautomationcore;
 #[cfg(feature = "uiautomationcore")]
 pub use uiautomationcore::*;
+#[cfg(feature = "uiautomationcoreapi")]
+pub mod uiautomationcoreapi;
+#[cfg(feature = "uiautomationcoreapi")]
+pub use uiautomationcoreapi::*;
 #[cfg(feature = "uiviewsettingsinterop")]
 pub mod uiviewsettingsinterop;
 #[cfg(feature = "uiviewsettingsinterop")]

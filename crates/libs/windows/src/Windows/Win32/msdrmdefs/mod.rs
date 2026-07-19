@@ -1,6 +1,8 @@
+pub const DRMACTSERVINFOVERSION: u32 = 0;
 pub type DRMATTESTTYPE = i32;
 pub const DRMATTESTTYPE_FULLENVIRONMENT: DRMATTESTTYPE = 0;
 pub const DRMATTESTTYPE_HASHONLY: DRMATTESTTYPE = 1;
+pub const DRMBINDINGFLAGS_IGNORE_VALIDITY_INTERVALS: u32 = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DRMBOUNDLICENSEPARAMS {
@@ -20,7 +22,10 @@ impl Default for DRMBOUNDLICENSEPARAMS {
         unsafe { core::mem::zeroed() }
     }
 }
+pub const DRMBOUNDLICENSEPARAMSVERSION: u32 = 1;
 pub type DRMCALLBACK = Option<unsafe extern "system" fn(param0: DRM_STATUS_MSG, param1: windows_core::HRESULT, param2: *mut core::ffi::c_void, param3: *mut core::ffi::c_void) -> windows_core::HRESULT>;
+pub const DRMCALLBACKVERSION: u32 = 1;
+pub const DRMCLIENTSTRUCTVERSION: u32 = 1;
 pub type DRMENCODINGTYPE = i32;
 pub const DRMENCODINGTYPE_BASE64: DRMENCODINGTYPE = 0;
 pub const DRMENCODINGTYPE_LONG: DRMENCODINGTYPE = 2;
@@ -50,6 +55,8 @@ pub struct DRMID {
     pub wszIDType: windows_core::PWSTR,
     pub wszID: windows_core::PWSTR,
 }
+pub const DRMIDVERSION: u32 = 0;
+pub const DRMLICENSEACQDATAVERSION: u32 = 0;
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct DRMPUBHANDLE(pub u32);
