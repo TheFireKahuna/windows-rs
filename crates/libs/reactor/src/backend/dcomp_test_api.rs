@@ -491,9 +491,21 @@ impl Recorder {
 /// Registration goes through the shipping ops queue and is serviced
 /// immediately, so a test sees the same map the router reads. Dropping this
 /// forgets the gesture and unregisters the drain.
+/// Serializes gesture harnesses across the test runner's threads.
+///
+/// Declarations cross app→front through a process-wide `OPS` queue, but
+/// `service_ops` drains it into the **calling thread's** registry — correct in a
+/// shipping build, where exactly one front thread ever services it. The test
+/// runner threads its tests, so two harnesses on two threads would race for one
+/// queue and one could swallow the other's declaration. Holding this for a
+/// harness's lifetime keeps the queue single-consumer, as the design assumes.
+static HARNESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct GestureHarness {
     id: ControlId,
     _sub: Subscription,
+    /// Held for the harness's lifetime — see [`HARNESS_LOCK`].
+    _serialized: std::sync::MutexGuard<'static, ()>,
 }
 
 impl GestureHarness {
@@ -508,10 +520,13 @@ impl GestureHarness {
     where
         G: FnMut(GestureEvent) -> GestureOutcome + Send + 'static,
     {
+        let serialized = HARNESS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         dcomp::declare_gesture(id, interest, Box::new(gesture));
         dcomp::service_gesture_ops();
         let sub = dcomp::register_gesture_action(id, Callback::new(move |()| on_action()));
-        Self { id, _sub: sub }
+        Self { id, _sub: sub, _serialized: serialized }
     }
 
     /// The routing bits the router would read for this gesture.

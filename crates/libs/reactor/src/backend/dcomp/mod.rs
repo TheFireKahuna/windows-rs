@@ -65,8 +65,14 @@ pub use host::DCompHost;
 pub use display_change::set_display_change_callback;
 pub use visibility::set_window_visibility_callback;
 pub(crate) use pointer::{
-    declare as declare_gesture, dispatch as dispatch_gesture, forget as forget_gesture,
-    interest_for as gesture_interest_for, register_action as register_gesture_action,
+    declare as declare_gesture, forget as forget_gesture, register_action as register_gesture_action,
+};
+/// The router-side half, re-exported only for `dcomp_test_api`: a test drives a
+/// gesture through the same `dispatch` the input router calls, rather than a
+/// parallel path that could diverge from it.
+#[cfg(feature = "test")]
+pub(crate) use pointer::{
+    dispatch as dispatch_gesture, interest_for as gesture_interest_for,
     service_ops as service_gesture_ops,
 };
 pub(crate) use size::register_element_size;
