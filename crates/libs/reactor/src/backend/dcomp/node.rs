@@ -1588,8 +1588,27 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
             // native caption owns min/max/close above the client area, so the
             // whole strip is ours end-to-end.
             s.display = Display::Grid;
-            s.grid_template_columns =
-                vec![GridTemplateComponent::Single(flex(1.0)), GridTemplateComponent::Single(auto())];
+            // Three tracks: the drawn title block, the Content slot, the footer.
+            //
+            // The title has a track of its own — as it does in WinUI's own
+            // TitleBar template, where every element is a column — rather than
+            // being reserved as leading PADDING. That distinction is the whole
+            // ballgame: a node's border box can never be narrower than its own
+            // padding, so a measured title reserved that way is a hard floor on
+            // the band's width, and a long one pushed the min/max/close cluster
+            // clean off the screen. `minmax(0, block)` is a track that WANTS the
+            // title's measured width and yields it back when the band cannot
+            // afford it — which is what an XAML `Auto` column does under
+            // compression, and what lets the title ellipsize instead of the
+            // window losing its buttons.
+            //
+            // Its max is set from the measured runs by `apply_caption_metrics`;
+            // a band with no title keeps the zero it is born with.
+            s.grid_template_columns = vec![
+                GridTemplateComponent::Single(minmax(length(0.0), length(0.0))),
+                GridTemplateComponent::Single(flex(1.0)),
+                GridTemplateComponent::Single(auto()),
+            ];
             s.grid_template_rows = vec![GridTemplateComponent::Single(auto())];
             // Caption height and side padding, both reserving the band's own
             // drawn chrome: the trailing min/max/close cluster (the frame is
@@ -1602,6 +1621,16 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
             s.min_size.height = length(caption::band_height(&Extras::DEFAULT));
             s.padding.left = length(caption::pad_left(&Extras::DEFAULT));
             s.padding.right = length(theme::SPACE_16 + caption::CLUSTER_W);
+            // NOTE: a long title still makes this band unshrinkable, and the
+            // fix is NOT a `min_size.width` of zero — that was tried. A node's
+            // border box can never be narrower than its own padding, so
+            // reserving the MEASURED title block as `padding.left`
+            // (`caption::title_block`, applied by `apply_caption_metrics`) puts
+            // a hard floor under the band by construction: measured at a 480
+            // DIP window, the strip sat at 543 — its `pad_left` + block +
+            // cluster reservation — and the trailing cluster went off screen
+            // with it. Fixing it means the block stops being padding, or stops
+            // being a length; see `caption::title_block`.
         }
         _ => {
             s.display = Display::Flex;

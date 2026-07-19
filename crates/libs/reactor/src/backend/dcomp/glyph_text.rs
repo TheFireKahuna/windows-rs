@@ -805,95 +805,156 @@ impl RowText {
     }
 }
 
-/// Place a run at the top-left of `b`, without centring it.
+/// Where a run sits inside the box it is given.
 ///
-/// The entry point for text whose own layout already decides where each line
-/// goes: wrapped prose, and anything leading-aligned. Wrapping needs nothing
-/// beyond this — DirectWrite expresses it as one glyph run per line at its own
-/// descending baseline, and [`TextPart::sync`] already walks runs and honours
-/// each one's baseline origin, so a wrapped layout places correctly through the
-/// identical code path a single line does.
-#[allow(clippy::too_many_arguments)]
-fn place_leading(
-    part: &mut TextPart,
-    comp: &Compositing,
-    atlas: &mut GlyphAtlas,
-    parent: &ContainerVisual,
-    layout: &TextLayout,
-    b: Rect,
-    host_box: Rect,
-    color: crate::Color,
-    dim: f32,
-    scale: f32,
-) {
-    part.sync(
-        comp,
-        atlas,
-        parent,
-        layout,
-        (b.left, b.top),
-        host_box,
-        color,
-        dim,
-        scale,
-    );
+/// Alignment is an origin rather than a text format because a shaped run carries
+/// none of its own once it is placed by hand: `TextAlignment` and
+/// `ParagraphAlignment` are instructions to the drawing call this path no longer
+/// makes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Align {
+    /// Top-left, unmeasured — for text whose own layout already decides where
+    /// each line goes: wrapped prose, and anything leading-aligned. Wrapping
+    /// needs nothing beyond this: DirectWrite gives one run per line at its own
+    /// descending baseline and [`TextPart::sync`] honours each run's origin.
+    Leading,
+    /// Leading edge, centred on the vertical axis — a label beside something.
+    LeadingCentered,
+    /// Centred both ways.
+    Centered,
 }
 
-/// Place one run at the leading edge of `b`, centred on its vertical axis — the
-/// alignment a label beside something else takes.
+/// Everything a placement needs that the control does not choose.
 ///
-/// Expressed as an origin rather than as a text format because a shaped run
-/// carries no alignment of its own once it is placed by hand: `TextAlignment`
-/// and `ParagraphAlignment` are instructions to the drawing call this path no
-/// longer makes.
-#[allow(clippy::too_many_arguments)]
-fn place_leading_centered(
-    part: &mut TextPart,
-    comp: &Compositing,
-    atlas: &mut GlyphAtlas,
-    parent: &ContainerVisual,
-    layout: &TextLayout,
-    b: Rect,
-    host_box: Rect,
-    color: crate::Color,
-    dim: f32,
-    scale: f32,
-) {
-    let Ok((_, th)) = layout.measure() else {
-        part.hide_all();
-        return;
-    };
-    let origin = (b.left, b.top + ((b.height() - th) / 2.0).max(0.0));
-    part.sync(comp, atlas, parent, layout, origin, host_box, color, dim, scale);
+/// The four fields were positional arguments on every `place_*` call, which put
+/// ten parameters on each and left the choice of alignment encoded in the
+/// function's *name*. Carrying them together makes a placement one line and its
+/// alignment a value — which is what lets the per-kind sync functions live
+/// beside their own geometry instead of here.
+pub(crate) struct Pen<'a> {
+    pub(crate) comp: &'a Compositing,
+    pub(crate) atlas: &'a mut GlyphAtlas,
+    /// The node's container; every run's host parents into it.
+    ///
+    /// Held **owned** rather than borrowed, which is what lets a run be placed
+    /// straight out of the node's own field. Borrowing it froze the node, so
+    /// every sync had to lift its text out with `take()` and put it back at the
+    /// end — a dance that also made an early `return` in between silently orphan
+    /// the sprites already on screen. `ContainerVisual` is refcounted, so the
+    /// clone is an `AddRef` and the hazard is gone by construction.
+    pub(crate) host: ContainerVisual,
+    /// The node's disabled dim, carried on each host's opacity.
+    pub(crate) dim: f32,
+    pub(crate) scale: f32,
 }
 
-/// Place one run centred in `b`, or hide it if it cannot be measured.
-///
-/// Centring is clamped at the leading edge so a run too wide for its box loses
-/// its tail — which the host's clip hides — rather than its head.
-#[allow(clippy::too_many_arguments)]
-fn place_centered(
-    part: &mut TextPart,
-    comp: &Compositing,
-    atlas: &mut GlyphAtlas,
-    parent: &ContainerVisual,
-    layout: &TextLayout,
-    b: Rect,
-    host_box: Rect,
-    color: crate::Color,
-    dim: f32,
-    scale: f32,
-) {
-    let Ok((tw, th)) = layout.measure() else {
-        part.hide_all();
-        return;
-    };
-    let origin = (
-        b.left + ((b.width() - tw) / 2.0).max(0.0),
-        b.top + ((b.height() - th) / 2.0).max(0.0),
-    );
-    part.sync(comp, atlas, parent, layout, origin, host_box, color, dim, scale);
+impl<'a> Pen<'a> {
+    /// A pen over `node`, taking its enabled state as the dim every run carries.
+    pub(crate) fn new(comp: &'a Compositing, atlas: &'a mut GlyphAtlas, node: &Node, scale: f32) -> Self {
+        Self {
+            comp,
+            atlas,
+            host: node.container.clone(),
+            dim: if node.paint.is_enabled { 1.0 } else { theme::disabled_opacity() },
+            scale,
+        }
+    }
 }
+
+impl Pen<'_> {
+    /// Place `run` in `b`, or hide `part` if there is nothing to place.
+    ///
+    /// Absent and unmeasurable are the same outcome deliberately: a run that
+    /// cannot be measured cannot be aligned, and a half-placed label is worse
+    /// than an absent one.
+    pub(crate) fn place(
+        &mut self,
+        part: &mut TextPart,
+        run: Option<&TextLayout>,
+        b: Rect,
+        a: Align,
+        color: crate::Color,
+    ) {
+        self.place_in(part, run, b, b, a, color);
+    }
+
+    /// [`place`](Self::place), with the host's clip box given separately.
+    ///
+    /// The two differ only where a run is placed against one rectangle but must
+    /// be *cut* to another — a title measured against its own block but clipped
+    /// to the column it shares.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn place_in(
+        &mut self,
+        part: &mut TextPart,
+        run: Option<&TextLayout>,
+        b: Rect,
+        host_box: Rect,
+        a: Align,
+        color: crate::Color,
+    ) {
+        let Some(layout) = run else {
+            part.hide_all();
+            return;
+        };
+        // Leading takes no measurement, so a run that cannot report its extent
+        // still places — the alignment does not depend on knowing it.
+        let origin = if a == Align::Leading {
+            (b.left, b.top)
+        } else {
+            let Ok((tw, th)) = layout.measure() else {
+                part.hide_all();
+                return;
+            };
+            let x = match a {
+                // Clamped at the leading edge so a run too wide for its box
+                // loses its tail — which the host's clip hides — not its head.
+                Align::Centered => b.left + ((b.width() - tw) / 2.0).max(0.0),
+                _ => b.left,
+            };
+            (x, b.top + ((b.height() - th) / 2.0).max(0.0))
+        };
+        part.sync(
+            self.comp,
+            self.atlas,
+            &self.host,
+            layout,
+            origin,
+            host_box,
+            color,
+            self.dim,
+            self.scale,
+        );
+    }
+}
+
+// ── Pilot scaffolding ────────────────────────────────────────────────────────
+// Temporary shims so the sites not yet moved onto `Pen` keep building. Each is
+// the old signature forwarding to `Pen`; they go away as the remaining
+// `*_sync`s convert.
+macro_rules! shim {
+    ($name:ident, $align:expr) => {
+        #[allow(clippy::too_many_arguments)]
+        fn $name(
+            part: &mut TextPart,
+            comp: &Compositing,
+            atlas: &mut GlyphAtlas,
+            parent: &ContainerVisual,
+            layout: &TextLayout,
+            b: Rect,
+            host_box: Rect,
+            color: crate::Color,
+            dim: f32,
+            scale: f32,
+        ) {
+            Pen { comp, atlas, host: parent.clone(), dim, scale }
+                .place_in(part, Some(layout), b, host_box, $align, color);
+        }
+    };
+}
+shim!(place_leading, Align::Leading);
+shim!(place_leading_centered, Align::LeadingCentered);
+shim!(place_centered, Align::Centered);
 
 /// Reconcile a `TextBlock`'s prose as retained glyph sprites.
 ///
@@ -905,29 +966,14 @@ pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut N
     if node.kind != crate::backend::ControlKind::TextBlock {
         return;
     }
-    let (w, h) = (node.rect.w, node.rect.h);
-    let mut part = node.text_part.take().unwrap_or_default();
-    match node.text_layout.as_ref() {
-        Some(layout) => {
-            // Un-styled text takes the themable primary text token — never a
-            // literal — so a host token table restyles default text too.
-            let fg = node.paint.foreground.unwrap_or_else(theme::text);
-            place_leading(
-                &mut part,
-                comp,
-                atlas,
-                &node.container,
-                layout,
-                Rect::from_xywh(0.0, 0.0, w, h),
-                Rect::from_xywh(0.0, 0.0, w, h),
-                fg,
-                1.0,
-                scale,
-            );
-        }
-        None => part.hide_all(),
-    }
-    node.text_part = Some(part);
+    let b = Rect::from_xywh(0.0, 0.0, node.rect.w, node.rect.h);
+    // Un-styled text takes the themable primary text token — never a literal —
+    // so a host token table restyles default text too.
+    let fg = node.paint.foreground.unwrap_or_else(theme::text);
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    pen.dim = 1.0; // A TextBlock is not interactive; it never dims.
+    let part = node.text_part.get_or_insert_default();
+    pen.place(part, node.text_layout.as_ref(), b, Align::Leading, fg);
 }
 
 /// Reconcile a `HyperlinkButton`'s words as retained glyph sprites.
@@ -948,36 +994,11 @@ pub(crate) fn hyperlink_sync(
     if node.kind != crate::backend::ControlKind::HyperlinkButton {
         return;
     }
-    let (w, h) = (node.rect.w, node.rect.h);
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
-    let ink = if node.hovered {
-        theme::accent_light()
-    } else {
-        theme::accent()
-    };
-
-    let mut part = node.text_part.take().unwrap_or_default();
-    let b = Rect::from_xywh(0.0, 0.0, w, h);
-    match node.text_layout.as_ref() {
-        Some(layout) => place_leading_centered(
-            &mut part,
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            b,
-            b,
-            ink,
-            dim,
-            scale,
-        ),
-        None => part.hide_all(),
-    }
-    node.text_part = Some(part);
+    let b = Rect::from_xywh(0.0, 0.0, node.rect.w, node.rect.h);
+    let ink = if node.hovered { theme::accent_light() } else { theme::accent() };
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    let part = node.text_part.get_or_insert_default();
+    pen.place(part, node.text_layout.as_ref(), b, Align::LeadingCentered, ink);
 }
 
 /// Reconcile an `Expander`'s header label and chevron as retained glyph sprites.
@@ -997,53 +1018,19 @@ pub(crate) fn expander_sync(
     if node.kind != crate::backend::ControlKind::Expander {
         return;
     }
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
     let ink = node.paint.foreground.unwrap_or_else(theme::text);
     let label_box = super::controls::expander_label_box(node);
     let chev_box = super::controls::expander_chevron_box(node);
     let i = usize::from(node.ctrl().expanded);
+    let mut pen = Pen::new(comp, atlas, node, scale);
 
     // The header label lives in the generic single-run slot — the Expander has
     // one run of its own, and the chevron is not one of its words.
-    let mut part = node.text_part.take().unwrap_or_default();
-    match node.text_layout.as_ref() {
-        Some(layout) => place_leading_centered(
-            &mut part,
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            label_box,
-            label_box,
-            ink,
-            dim,
-            scale,
-        ),
-        None => part.hide_all(),
-    }
-    node.text_part = Some(part);
+    let label = node.text_part.get_or_insert_default();
+    pen.place(label, node.text_layout.as_ref(), label_box, Align::LeadingCentered, ink);
 
-    let mut t = node.item_text.take().unwrap_or_default();
-    match t.slot(0, i, false) {
-        (part, Some(layout)) => place_centered(
-            part,
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            chev_box,
-            chev_box,
-            theme::text_secondary(),
-            dim,
-            scale,
-        ),
-        (part, None) => part.hide_all(),
-    }
-    node.item_text = Some(t);
+    let (chev, run) = node.item_text.get_or_insert_default().slot(0, i, false);
+    pen.place(chev, run, chev_box, Align::Centered, theme::text_secondary());
 }
 
 /// Reconcile a `CheckBox`'s trailing label as retained glyph sprites.
@@ -1055,31 +1042,11 @@ pub(crate) fn check_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut 
     if node.kind != crate::backend::ControlKind::CheckBox {
         return;
     }
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
     let ink = node.paint.foreground.unwrap_or_else(theme::text);
     let b = super::controls::check_label_box(node);
-
-    let mut part = node.text_part.take().unwrap_or_default();
-    match node.text_layout.as_ref() {
-        Some(layout) => place_leading_centered(
-            &mut part,
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            b,
-            b,
-            ink,
-            dim,
-            scale,
-        ),
-        None => part.hide_all(),
-    }
-    node.text_part = Some(part);
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    let part = node.text_part.get_or_insert_default();
+    pen.place(part, node.text_layout.as_ref(), b, Align::LeadingCentered, ink);
 }
 
 /// The caption band's six runs: two titles, and one glyph per button.
@@ -1115,6 +1082,7 @@ pub(crate) fn caption_sync(
     atlas: &mut GlyphAtlas,
     node: &mut Node,
     scale: f32,
+    content_left: Option<f32>,
 ) {
     if node.kind != crate::backend::ControlKind::TitleBar {
         return;
@@ -1132,7 +1100,7 @@ pub(crate) fn caption_sync(
     let mut g = node.caption_glyphs.take().unwrap_or_default();
 
     // The two titles, placed from one resolved coupling.
-    match super::caption::title_placement(&t, back_w, band) {
+    match super::caption::title_placement(&t, back_w, band, content_left) {
         Some(p) => {
             place_trimmed(
                 &mut g.title,
@@ -1352,12 +1320,7 @@ pub(crate) fn info_badge_sync(
     if node.kind != crate::backend::ControlKind::InfoBadge {
         return;
     }
-    let (w, h) = (node.rect.w, node.rect.h);
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
+    let b = Rect::from_xywh(0.0, 0.0, node.rect.w, node.rect.h);
     // The count sits ON the fill, so its default is the on-accent ink rather
     // than the body-text token — which is near-invisible against a light-theme
     // accent.
@@ -1369,25 +1332,9 @@ pub(crate) fn info_badge_sync(
     // from the theme's accent would be answering a question about a colour the
     // theme never saw.
     let ink = node.paint.foreground.unwrap_or_else(theme::text_on_accent);
-
-    let mut part = node.text_part.take().unwrap_or_default();
-    let b = Rect::from_xywh(0.0, 0.0, w, h);
-    match node.text_layout.as_ref() {
-        Some(layout) => place_centered(
-            &mut part,
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            b,
-            b,
-            ink,
-            dim,
-            scale,
-        ),
-        None => part.hide_all(),
-    }
-    node.text_part = Some(part);
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    let part = node.text_part.get_or_insert_default();
+    pen.place(part, node.text_layout.as_ref(), b, Align::Centered, ink);
 }
 
 /// Reconcile a `ToggleSwitch`'s state label as retained glyph sprites.
@@ -1407,36 +1354,15 @@ pub(crate) fn toggle_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
     if node.kind != crate::backend::ControlKind::ToggleSwitch {
         return;
     }
-    let (w, h) = (node.rect.w, node.rect.h);
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
     let fg = node.paint.foreground.unwrap_or_else(theme::text);
     let x0 = super::parts::TRACK_W + super::controls::TOGGLE_LABEL_GAP;
-    let b = Rect::from_xywh(x0, 0.0, (w - x0).max(0.0), h);
+    let b = Rect::from_xywh(x0, 0.0, (node.rect.w - x0).max(0.0), node.rect.h);
     // Index, not a stored string: `layouts` is `[off, on]`, so the state picks
     // the run and the same single part re-places on every flip.
     let i = usize::from(node.ctrl().is_on);
-
-    let mut t = node.item_text.take().unwrap_or_default();
-    match t.slot(0, i, false) {
-        (part, Some(layout)) => place_leading_centered(
-            part,
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            b,
-            b,
-            fg,
-            dim,
-            scale,
-        ),
-        (part, None) => part.hide_all(),
-    }
-    node.item_text = Some(t);
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    let (part, run) = node.item_text.get_or_insert_default().slot(0, i, false);
+    pen.place(part, run, b, Align::LeadingCentered, fg);
 }
 
 /// Reconcile a `SelectorBar`'s segment labels as retained glyph sprites.

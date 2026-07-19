@@ -104,6 +104,17 @@ fn paint_node(
             }
         }
 
+        // Where a caption band's Content slot landed, in the band's own space —
+        // read BEFORE the mutable borrow below, because it lives on a different
+        // node. It is the far edge of the title's grid track, so it is what the
+        // drawn title ellipsizes against; re-deriving the track here instead
+        // would be this module second-guessing the layout that just ran.
+        let caption_content_left = arena
+            .get(id)
+            .filter(|n| n.kind == ControlKind::TitleBar)
+            .and_then(|n| n.title_content.map(|c| (n.rect.x, c)))
+            .and_then(|(bx, c)| arena.get(c).map(|c| c.rect.x - bx));
+
         let dirty = arena.get(id).is_some_and(|n| n.dirty);
         if dirty && w > 0.0 && h > 0.0 {
             if draws {
@@ -139,7 +150,7 @@ fn paint_node(
                 super::glyph_text::info_bar_sync(comp, glyphs, n, scale);
                 // The caption's coupled title/subtitle pair and its four button
                 // glyphs.
-                super::glyph_text::caption_sync(comp, glyphs, n, scale);
+                super::glyph_text::caption_sync(comp, glyphs, n, scale, caption_content_left);
                 // …and a checkbox's trailing label.
                 super::glyph_text::check_sync(comp, glyphs, n, scale);
                 // …and an expander's header label plus its chevron.

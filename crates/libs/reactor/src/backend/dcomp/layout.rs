@@ -793,10 +793,19 @@ pub(crate) fn apply_caption_metrics(n: &mut Node) {
     // Both come straight from `caption`, which is also what `birth_style`
     // builds a virgin TitleBar from — so a node whose caption state is back at
     // its defaults re-derives exactly the style it was born with.
-    let pad = caption::pad_left(n.extras())
-        + caption::title_block(n.caption_text.as_deref(), n.rect.w);
+    //
+    // The leading PADDING carries only the back button — a bounded constant.
+    // The measured title block is the first grid TRACK's maximum instead, so it
+    // compresses when the band cannot afford it rather than flooring the band's
+    // width. See the `TitleBar` arm of `default_style`.
     n.style.min_size.height = length(caption::band_height(n.extras()));
-    n.style.padding.left = length(pad);
+    n.style.padding.left = length(caption::pad_left(n.extras()));
+    if let Some(first) = n.style.grid_template_columns.first_mut() {
+        *first = GridTemplateComponent::Single(minmax(
+            length(0.0),
+            length(caption::title_block(n.caption_text.as_deref())),
+        ));
+    }
     n.mark_dirty();
 }
 

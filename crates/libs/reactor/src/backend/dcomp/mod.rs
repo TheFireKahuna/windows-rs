@@ -470,19 +470,30 @@ impl DCompBackend {
             && let Some(child) = self.node_mut(new)
         {
             child.style.grid_row.start = line(1);
+            // Track 1 is the drawn title block, so both slots sit after it —
+            // see the `TitleBar` arm of `default_style`. The title used to be
+            // reserved as the band's leading PADDING, which is what let Content
+            // start at line 1 and still clear it; a padding that could not
+            // compress was also what floored the band's width and pushed the
+            // window buttons off screen at a long title.
             if footer {
                 // Trailing auto column, vertically centered; its own horizontal
                 // alignment is irrelevant in a track sized to its content.
-                child.style.grid_column.start = line(2);
+                child.style.grid_column.start = line(3);
                 child.style.grid_column.end = span(1);
                 child.v_align = 1;
             } else {
-                // Span both columns and stretch across the full caption width:
+                // The Star track between the title and the footer, stretched:
                 // the app's content row owns its own spread (brand hard-left,
                 // device centered — the mockup layout). A child with an
                 // explicit alignment still wins via `resolve_align`.
-                child.style.grid_column.start = line(1);
-                child.style.grid_column.end = span(2);
+                //
+                // It no longer underlaps the footer, which is WinUI's own
+                // arrangement — its `TitleBar.Content` likewise occupies the
+                // `*` column BETWEEN the title area and the footer, so content
+                // that centres now centres in the room actually left for it.
+                child.style.grid_column.start = line(2);
+                child.style.grid_column.end = span(1);
                 child.h_align = 3;
                 child.v_align = 1;
             }

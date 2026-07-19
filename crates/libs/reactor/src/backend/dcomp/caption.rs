@@ -190,12 +190,28 @@ pub(crate) struct TitlePlacement {
 
 /// Resolve [`TitlePlacement`] for a band of `rect` whose back button occupies
 /// `back_w`. `None` when the band has no horizontal room for text at all.
-pub(crate) fn title_placement(t: &CaptionText, back_w: f32, rect: Rect) -> Option<TitlePlacement> {
+///
+/// `content_left` is where the Content slot actually landed, in the same space
+/// as `rect` — i.e. the far edge of the title's own grid track, read back from
+/// layout rather than re-derived. It is what makes the drawn title agree with
+/// the track that was sized for it: when the band compresses that track, the
+/// title has to ellipsize into the compressed width, exactly as an XAML
+/// TextBlock clipped to its column does. Without it a squeezed title would
+/// simply draw over the app's content.
+///
+/// `None` when the band hosts no Content, and then the title may use everything
+/// up to the window-button cluster — which is the one case where it should
+/// *grow* into the room nothing else is claiming.
+pub(crate) fn title_placement(
+    t: &CaptionText,
+    back_w: f32,
+    rect: Rect,
+    content_left: Option<f32>,
+) -> Option<TitlePlacement> {
     let x0 = rect.left + back_w;
-    // Everything up to the window-button cluster is available; the block was
-    // already clamped when the inset was reserved, so this only ever *grows*
-    // the room a title has (e.g. when no Content child was mounted).
-    let avail = (rect.right - CLUSTER_W - theme::SPACE_12 - x0).max(0.0);
+    let edge = (rect.right - CLUSTER_W - theme::SPACE_12)
+        .min(content_left.unwrap_or(f32::INFINITY));
+    let avail = (edge - x0).max(0.0);
     if avail <= 0.0 {
         return None;
     }
@@ -370,9 +386,21 @@ pub(crate) fn pad_left(x: &Extras) -> f32 {
 /// [`pad_left`]. Zero when the band carries no titles, which is what keeps a
 /// virgin TitleBar's derived padding equal to its birth padding.
 ///
-/// Clamped to half the band so a very long title cannot push the app's own
-/// content off the strip — past the clamp the title ellipsizes instead.
-pub(crate) fn title_block(text: Option<&CaptionText>, band_w: f32) -> f32 {
+/// This is the title track's DESIRED width — the caller makes it the maximum of
+/// a `minmax(0, block)` grid track, never a padding — so it is deliberately
+/// unclamped. The track yields it back when the band cannot afford it, and the
+/// title ellipsizes into whatever is left.
+///
+/// It used to be clamped to half the band, and applied as `padding.left`. That
+/// could not work and the clamp was not what was wrong with it: a node's border
+/// box can never be narrower than its own padding, so a measured title reserved
+/// that way was a hard floor on the band's width no matter what it was clamped
+/// to. Measured against a 480 DIP window with a long title, the band sat at 543
+/// — `pad_left` + block + the cluster reservation — and since the min/max/close
+/// cluster is positioned from the band's own right edge, it went off screen.
+/// (`min_size.width = 0` does not rescue that: it lets the CONTENT box
+/// collapse, not the padding.)
+pub(crate) fn title_block(text: Option<&CaptionText>) -> f32 {
     let Some(t) = text else { return 0.0 };
     let mut block = t.title_w;
     if t.subtitle_w > 0.0 {
@@ -381,11 +409,7 @@ pub(crate) fn title_block(text: Option<&CaptionText>, band_w: f32) -> f32 {
     if block <= 0.0 {
         return 0.0;
     }
-    block += theme::SPACE_12;
-    if band_w > 0.0 {
-        block = block.min(band_w * 0.5);
-    }
-    block
+    block + theme::SPACE_12
 }
 
 /// The drawn back button's box within the band, or `None` when it is hidden.
@@ -429,7 +453,7 @@ mod tests {
         };
         let t = build_text(&x).expect("build_text always yields a cache");
         let rect = Rect::from_xywh(0.0, 0.0, w, BAND_H);
-        let p = title_placement(&t, 0.0, rect);
+        let p = title_placement(&t, 0.0, rect, None);
         (t, p)
     }
 
@@ -526,5 +550,41 @@ mod tests {
         // The other two are indifferent to it.
         assert_eq!(window_glyph_slot(0, true), glyph_slot::MINIMIZE);
         assert_eq!(window_glyph_slot(2, true), glyph_slot::CLOSE);
+    }
+
+    /// A mounted Content slot is the title's far edge: the title ellipsizes into
+    /// the track that was sized for it rather than drawing over the app.
+    ///
+    /// This is the half of the fix that lives outside layout. The title block is
+    /// a `minmax(0, block)` grid TRACK now, so a band too narrow for it hands
+    /// some of it back — and the drawn title has to agree with the width the
+    /// track actually got, which is exactly where Content begins.
+    #[test]
+    fn content_takes_precedence_over_the_cluster_as_the_titles_far_edge() {
+        let x = Extras {
+            title: "A Deliberately Long Window Title".to_string(),
+            ..Extras::DEFAULT
+        };
+        let t = build_text(&x).expect("build_text always yields a cache");
+        let rect = Rect::from_xywh(0.0, 0.0, 900.0, BAND_H);
+
+        // No Content: the title may run up to the window-button cluster.
+        let free = title_placement(&t, 0.0, rect, None).expect("a 900 DIP band has room");
+        let (_, free_w) = free.title.expect("a title was set");
+
+        // Content mounted closer in than the title's own natural width: the
+        // title must stop at Content, not at the cluster.
+        let edge = free_w / 2.0;
+        let bounded = title_placement(&t, 0.0, rect, Some(edge)).expect("still has room");
+        let (_, bounded_w) = bounded.title.expect("a title was set");
+
+        assert!(
+            bounded_w < free_w,
+            "Content must narrow the title ({bounded_w} vs {free_w})",
+        );
+        assert!(
+            bounded_w <= edge,
+            "the title must not cross into Content (got {bounded_w}, edge {edge})",
+        );
     }
 }

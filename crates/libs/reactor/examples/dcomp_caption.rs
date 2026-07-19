@@ -81,8 +81,13 @@ fn main() -> windows_reactor::Result<()> {
         .padding(Thickness::uniform(16.0))
         .into();
 
+        // A STAR column, explicitly: an unspecified grid column sizes to its
+        // items' MAX-content, which for a caption band is its whole natural
+        // title block — so the band would be handed a track wider than the
+        // window and never reach the width it is supposed to clamp against.
         grid((caption.grid_row(0), body.grid_row(1)))
             .rows([GridLength::Auto, GridLength::STAR])
+            .columns([GridLength::STAR])
             .into()
     }
 
