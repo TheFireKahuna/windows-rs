@@ -72,6 +72,17 @@ fn toggle(a: &mut ArenaHarness, on: bool) -> PartPlanProbe {
     a.part_plan(id, 1.0).unwrap()
 }
 
+/// A ProgressBar at `frac` (0..1), determinate or not.
+fn progress(a: &mut ArenaHarness, frac: f64, indeterminate: bool) -> PartPlanProbe {
+    let id = a.insert(K::ProgressBar).unwrap();
+    a.apply_prop(id, Prop::Value, &V::F64(frac * 100.0));
+    if indeterminate {
+        a.apply_prop(id, Prop::IsIndeterminate, &V::Bool(true));
+    }
+    a.set_rect(id, 200.0, 8.0);
+    a.part_plan(id, 1.0).unwrap()
+}
+
 /// A NavigationView laid out at `w` x `h` with `items` rows, `sel` selected.
 fn pane(a: &mut ArenaHarness, w: f32, h: f32, items: &[&str], sel: i32) -> PartPlanProbe {
     let id = a.insert(K::NavigationView).unwrap();
@@ -260,6 +271,77 @@ fn the_toggle_knob_travels_between_the_ends_and_glides() {
     assert!(
         on.below[TRACK_ON].unwrap().opacity > off.below[TRACK_ON].unwrap().opacity,
         "the accent track shows when on",
+    );
+}
+
+// ── ProgressBar ──────────────────────────────────────────────────────────────
+
+/// The gap this file could not reach until the determinate fill became
+/// plan-driven. `progress_sync` compared `parts.frac` and took the
+/// authoritative `place` branch when it matched, so the fill STEPPED to each new
+/// length instead of growing into it.
+#[test]
+fn the_progress_fill_grows_with_the_value_and_glides() {
+    let mut a = harness();
+    let quarter = progress(&mut a, 0.25, false);
+    let half = progress(&mut a, 0.5, false);
+
+    let fw = |p: &PartPlanProbe| p.below[1].unwrap().rect.unwrap().2;
+    assert!(
+        fw(&half) > fw(&quarter),
+        "the fill must lengthen with the value: {} then {}",
+        fw(&quarter),
+        fw(&half),
+    );
+    assert!(half.below[1].unwrap().glides, "the fill must grow, not step");
+    assert!(!half.below[0].unwrap().glides, "the track never travels");
+}
+
+/// Indeterminate hands the lane to the sweep. The sweep slot is deliberately
+/// ABSENT from the plan while it runs — it is a forever animation, not a
+/// placement — and the determinate fill hides without being moved.
+#[test]
+fn indeterminate_yields_the_lane_to_the_sweep() {
+    let mut a = harness();
+    let ind = progress(&mut a, 0.5, true);
+
+    let fill = ind.below[1].unwrap();
+    assert_eq!(fill.rect, None, "the determinate fill must not be placed");
+    assert_eq!(fill.opacity, 0.0, "the determinate fill must be hidden");
+    assert!(
+        ind.below[2].is_none(),
+        "the sweep slot must be left alone while the loop owns it",
+    );
+
+    // ...and a determinate bar claims it back, hidden and not moved.
+    let det = progress(&mut a, 0.5, false);
+    assert!(det.below[2].is_some(), "a determinate bar hides the sweep slot");
+    assert_eq!(det.below[2].unwrap().rect, None, "hiding must not move it");
+}
+
+// ── Button family ────────────────────────────────────────────────────────────
+
+/// Focus rings sit OUTSIDE the control's bounds — an inset ring eats into the
+/// button's own face — and they exist only while focused.
+#[test]
+fn focus_rings_sit_outside_the_button_and_only_when_focused() {
+    let mut a = harness();
+    let id = a.insert(K::Button).unwrap();
+    a.set_rect(id, 120.0, 32.0);
+
+    let blurred = a.part_plan(id, 1.0).unwrap();
+    assert_eq!(blurred.above[1].unwrap().rect, None, "no ring while blurred");
+    assert_eq!(blurred.above[1].unwrap().opacity, 0.0);
+
+    a.set_focused(id, true);
+    let focused = a.part_plan(id, 1.0).unwrap();
+    let inner = focused.above[1].unwrap().rect.expect("focused places the inner ring");
+    let outer = focused.above[2].unwrap().rect.expect("focused places the outer ring");
+
+    assert!(inner.0 < 0.0 && inner.1 < 0.0, "the ring must sit outside the box: {inner:?}");
+    assert!(
+        outer.0 < inner.0 && outer.2 > inner.2,
+        "the outer ring must enclose the inner one: {outer:?} vs {inner:?}",
     );
 }
 

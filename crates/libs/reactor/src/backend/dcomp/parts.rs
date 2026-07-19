@@ -1182,7 +1182,8 @@ pub(crate) enum Fade {
 /// One retained part's whole intent for this sync.
 #[derive(Clone)]
 pub(crate) struct SlotPlan {
-    pub(crate) key: AtlasKey,
+    /// `None` binds no source — the variant has nothing to draw in this slot.
+    pub(crate) key: Option<AtlasKey>,
     /// `None` leaves the geometry untouched (the part is being hidden, and
     /// moving a sprite nobody can see only risks it being seen moving).
     pub(crate) rect: Option<Rect4>,
@@ -1194,12 +1195,22 @@ pub(crate) struct SlotPlan {
 impl SlotPlan {
     /// A part that JUMPS to `rect`.
     pub(crate) fn snap(key: AtlasKey, rect: Option<Rect4>, opacity: f32) -> Self {
-        Self { key, rect, opacity, motion: Motion::Snap, fade: Fade::Snap }
+        Self { key: Some(key), rect, opacity, motion: Motion::Snap, fade: Fade::Snap }
     }
 
     /// A part that SPRINGS to `rect` when it moves.
     pub(crate) fn glide(key: AtlasKey, rect: Option<Rect4>, opacity: f32) -> Self {
-        Self { key, rect, opacity, motion: Motion::Glide, fade: Fade::Snap }
+        Self { key: Some(key), rect, opacity, motion: Motion::Glide, fade: Fade::Snap }
+    }
+
+    /// Nothing to draw here: no source, nothing placed, invisible.
+    ///
+    /// The sprite stays ALLOCATED rather than being freed — the variant can flip
+    /// back, and `Parts` has no per-part free — so this is the difference between
+    /// a slot the plan hides and a slot the plan simply does not mention, which
+    /// `apply` leaves entirely alone.
+    pub(crate) fn hidden() -> Self {
+        Self { key: None, rect: None, opacity: 0.0, motion: Motion::Snap, fade: Fade::Snap }
     }
 
     /// Opacity changes fade rather than jump (hover inks).
@@ -1259,8 +1270,12 @@ impl PartPlan {
 }
 
 /// Carry out a [`PartPlan`] — the one place a plan meets the compositor.
-fn apply(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, plan: &PartPlan) {
-    let Some(parts) = node.parts.as_mut() else { return };
+///
+/// Returns whether this was a RE-LAYOUT (or the first sync), which is the one
+/// fact a caller with its own bespoke motion needs — the indeterminate progress
+/// sweep re-arms on it.
+fn apply(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, plan: &PartPlan) -> bool {
+    let Some(parts) = node.parts.as_mut() else { return false };
     // A re-layout retires every cached position as a MOTION reference: springing
     // from a rect the control no longer has reads as a glitch rather than as
     // motion. The first sync snaps for the same reason — mounting must not fly
@@ -1271,6 +1286,7 @@ fn apply(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, plan: &PartPlan
     apply_band(comp, atlas, &mut parts.above, &plan.above, relaid, init);
     parts.layout_sig = plan.layout_sig;
     parts.init = true;
+    relaid
 }
 
 /// Apply one band's slots.
@@ -1291,7 +1307,9 @@ fn apply_band(
         let (Some(slot), Some(part)) = (slot.as_ref(), band.get_mut(i)) else {
             continue;
         };
-        part.bind(comp, atlas, slot.key.clone());
+        if let Some(k) = &slot.key {
+            part.bind(comp, atlas, k.clone());
+        }
         if let Some(r) = slot.rect {
             if relaid || slot.motion == Motion::Snap {
                 part.place(r.0, r.1, r.2, r.3);
@@ -1527,6 +1545,17 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
     if !ensure(comp, node, slot::N_BELOW, slot::N_ABOVE) {
         return;
     }
+    let plan = button_plan(node, scale);
+    apply(comp, atlas, node, &plan);
+}
+
+/// Below: `[fill, border, badge plate]`; above: `[ink, focus ring inner, focus
+/// ring outer]`.
+///
+/// Nothing in the family travels: the control is a stack of sprites cut to one
+/// curve, and every state it has is carried by opacity. The ink fades; the rest
+/// snaps.
+pub(crate) fn button_plan(node: &Node, scale: f32) -> PartPlan {
     let (w, h) = (node.rect.w, node.rect.h);
     let pal = super::controls::button_palette(node);
     // From the palette, not re-derived: the fill, the border and the ink are
@@ -1534,15 +1563,21 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
     // is decided (see [`ButtonPalette`]).
     let radius = pal.radius;
     let dim = dim_of(node);
+    let box_rect = Some((0.0, 0.0, w, h));
     // A fully transparent fill (the bare / chromeless variants at rest) binds
     // nothing: an atlas source that paints no pixels is a wasted raster and a
     // wasted cache slot.
-    let fill_key = (pal.fill.a > 0.0).then(|| AtlasKey::hbar(h, radius, 0.0, pal.fill, scale));
-    let border_key = pal
+    let fill = match (pal.fill.a > 0.0).then(|| AtlasKey::hbar(h, radius, 0.0, pal.fill, scale)) {
+        Some(k) => SlotPlan::snap(k, box_rect, dim),
+        None => SlotPlan::hidden(),
+    };
+    let border = match pal
         .border
-        .map(|c| AtlasKey::hbar(h, radius, theme::BORDER_W, c, scale));
-    let ink_key = AtlasKey::hbar(h, ink_radius(node), 0.0, theme::w(1.0), scale);
-    let target = ink_target(node);
+        .map(|c| AtlasKey::hbar(h, radius, theme::BORDER_W, c, scale))
+    {
+        Some(k) => SlotPlan::snap(k, box_rect, dim),
+        None => SlotPlan::hidden(),
+    };
 
     // The badge plate: a stadium in the badge's own tint, over the button's
     // fill and under the count's glyph sprites. Its radius is half its height,
@@ -1553,91 +1588,68 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
         .zip(super::controls::badge_paint(node, &pal))
         .map(|(b, (fill, _))| {
             let bh = b.height();
-            (b, AtlasKey::hbar(bh, bh / 2.0, 0.0, fill, scale))
-        });
+            SlotPlan::snap(
+                AtlasKey::hbar(bh, bh / 2.0, 0.0, fill, scale),
+                Some((b.left, b.top, b.width(), b.height())),
+                dim,
+            )
+        })
+        .unwrap_or_else(SlotPlan::hidden);
 
     // The focus visual as parts rather than a draw: the family owns no surface
     // to paint one on. Each ring's radius follows the AUTHORED one, grown by
     // how far out it sits — a ring whose corners disagree with the button
     // inside it is the most visible way for a custom radius to look broken.
-    let rings = node.focused.then(|| {
-        focus_rings(scale).map(|(out, sw, c)| {
-            (
-                out,
-                sw,
-                AtlasKey::hbar((h + 2.0 * out).max(0.0), radius + out, sw, c, scale),
-            )
-        })
-    });
-
-    let Some(parts) = node.parts.as_mut() else { return };
-
-    for (i, key) in [(slot::FILL, fill_key), (slot::BORDER, border_key)] {
-        match key {
-            Some(k) => {
-                parts.below[i].bind(comp, atlas, k);
-                parts.below[i].place(0.0, 0.0, w, h);
-                parts.below[i].set_opacity(dim);
-            }
-            // Kept allocated and hidden rather than freed: the variant can flip
-            // back, and `Parts` has no per-part free.
-            None => parts.below[i].set_opacity(0.0),
-        }
-    }
-    match plate {
-        Some((b, k)) => {
-            parts.below[slot::PLATE].bind(comp, atlas, k);
-            parts.below[slot::PLATE].place(b.left, b.top, b.width(), b.height());
-            parts.below[slot::PLATE].set_opacity(dim);
-        }
-        None => parts.below[slot::PLATE].set_opacity(0.0),
-    }
-
-    parts.above[slot::INK].bind(comp, atlas, ink_key);
-    parts.above[slot::INK].place(0.0, 0.0, w, h);
-    if parts.init {
-        parts.above[slot::INK].fade_to(target);
-    } else {
-        parts.above[slot::INK].set_opacity(target);
-        parts.init = true;
-    }
-
-    match rings {
+    let ring = |i: usize| match node.focused.then(|| focus_rings(scale)) {
         Some(rings) => {
-            for (i, (out, _, key)) in [slot::RING_INNER, slot::RING_OUTER]
-                .into_iter()
-                .zip(rings)
-            {
-                parts.above[i].bind(comp, atlas, key);
-                parts.above[i].place(-out, -out, w + 2.0 * out, h + 2.0 * out);
-                parts.above[i].set_opacity(1.0);
-            }
+            let (out, sw, c) = rings[i];
+            SlotPlan::snap(
+                AtlasKey::hbar((h + 2.0 * out).max(0.0), radius + out, sw, c, scale),
+                Some((-out, -out, w + 2.0 * out, h + 2.0 * out)),
+                1.0,
+            )
         }
-        None => {
-            parts.above[slot::RING_INNER].set_opacity(0.0);
-            parts.above[slot::RING_OUTER].set_opacity(0.0);
-        }
-    }
-    parts.geom = (w, h);
+        None => SlotPlan::hidden(),
+    };
+
+    PartPlan::new([w, h, 0.0])
+        .below(slot::FILL, fill)
+        .below(slot::BORDER, border)
+        .below(slot::PLATE, plate)
+        .above(
+            slot::INK,
+            SlotPlan::snap(
+                AtlasKey::hbar(h, ink_radius(node), 0.0, theme::w(1.0), scale),
+                box_rect,
+                ink_target(node),
+            )
+            .fading(),
+        )
+        .above(slot::RING_INNER, ring(0))
+        .above(slot::RING_OUTER, ring(1))
 }
 
 fn ink_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
     if !ensure(comp, node, 0, 1) {
         return;
     }
+    let plan = ink_plan(node, scale);
+    apply(comp, atlas, node, &plan);
+}
+
+/// Above: `[hover/press wash]`. The select triggers paint their own fill and
+/// border, so the ink is the whole of their retained chrome.
+pub(crate) fn ink_plan(node: &Node, scale: f32) -> PartPlan {
     let (w, h) = (node.rect.w, node.rect.h);
-    let key = AtlasKey::hbar(h, ink_radius(node), 0.0, theme::w(1.0), scale);
-    let target = ink_target(node);
-    let Some(parts) = node.parts.as_mut() else { return };
-    parts.above[0].bind(comp, atlas, key);
-    parts.above[0].place(0.0, 0.0, w, h);
-    if parts.init {
-        parts.above[0].fade_to(target);
-    } else {
-        parts.above[0].set_opacity(target);
-        parts.init = true;
-    }
-    parts.geom = (w, h);
+    PartPlan::new([w, h, 0.0]).above(
+        0,
+        SlotPlan::snap(
+            AtlasKey::hbar(h, ink_radius(node), 0.0, theme::w(1.0), scale),
+            Some((0.0, 0.0, w, h)),
+            ink_target(node),
+        )
+        .fading(),
+    )
 }
 
 /// The combined hover + press wash target (endpoint parity with the painted
@@ -2530,20 +2542,24 @@ fn expander_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: 
     if !ensure(comp, node, 0, 1) {
         return;
     }
+    let plan = expander_plan(node, scale);
+    apply(comp, atlas, node, &plan);
+}
+
+/// Above: `[header hover wash]`. Only the HEADER takes the wash — the expanded
+/// content below it is ordinary layout, not part of the control's chrome.
+pub(crate) fn expander_plan(node: &Node, scale: f32) -> PartPlan {
     let header_h = theme::ROW_H + theme::SPACE_8;
     let w = node.rect.w;
-    let key = AtlasKey::hbar(header_h, theme::RADIUS_MD, 0.0, theme::w(1.0), scale);
-    let target = ink_target(node);
-    let Some(parts) = node.parts.as_mut() else { return };
-    parts.above[0].bind(comp, atlas, key);
-    parts.above[0].place(0.0, 0.0, w, header_h);
-    if parts.init {
-        parts.above[0].fade_to(target);
-    } else {
-        parts.above[0].set_opacity(target);
-        parts.init = true;
-    }
-    parts.geom = (w, node.rect.h);
+    PartPlan::new([w, node.rect.h, 0.0]).above(
+        0,
+        SlotPlan::snap(
+            AtlasKey::hbar(header_h, theme::RADIUS_MD, 0.0, theme::w(1.0), scale),
+            Some((0.0, 0.0, w, header_h)),
+            ink_target(node),
+        )
+        .fading(),
+    )
 }
 
 // ── Progress (bar + ring) ────────────────────────────────────────────────────
@@ -2567,57 +2583,78 @@ fn progress_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: 
     if !ensure(comp, node, 3, 0) {
         return;
     }
+    let plan = progress_plan(node, scale);
+    let relaid = apply(comp, atlas, node, &plan);
+    progress_sweep(node, relaid);
+}
+
+/// Below: `[track, determinate fill, indeterminate sweep segment]`.
+///
+/// The sweep is deliberately absent from this plan while it is running: it is a
+/// FOREVER animation, not a placement, and a plan describes where a sprite comes
+/// to rest. `progress_sweep` owns it, and the slot the plan does not mention is
+/// the slot `apply` leaves alone.
+pub(crate) fn progress_plan(node: &Node, scale: f32) -> PartPlan {
     let (w, h) = (node.rect.w, node.rect.h);
     let bar_h = progress_bar_h(h);
     let y = h / 2.0 - bar_h / 2.0;
     let dim = dim_of(node);
     let frac = (super::ctrl_value_frac(node) as f32).clamp(0.0, 1.0);
-    let ind = node.ctrl().indeterminate;
     let k_track = AtlasKey::hbar(bar_h, bar_h / 2.0, 0.0, theme::w(0.08), scale);
     let k_fill = AtlasKey::hbar(bar_h, bar_h / 2.0, 0.0, theme::accent(), scale);
 
+    let plan =
+        PartPlan::new([w, h, 0.0]).below(0, SlotPlan::snap(k_track, Some((0.0, y, w, bar_h)), dim));
+
+    if node.ctrl().indeterminate {
+        // The sweep owns the lane; the determinate fill hides without moving.
+        return plan.below(1, SlotPlan::snap(k_fill, None, 0.0));
+    }
+
+    // Floor the fill at one full pill so the nine-grid corners never degenerate
+    // at tiny fractions.
+    let fw = if frac > 0.0 { (w * frac).max(bar_h) } else { 0.0 };
+    // No "was the fraction different last time" shadow: the fill's rect is a
+    // pure function of `frac`, and the channel already knows whether it moved —
+    // `glide` on an unchanged rect is a no-op.
+    plan.below(
+        1,
+        SlotPlan::glide(
+            k_fill.clone(),
+            Some((0.0, y, fw.max(0.01), bar_h)),
+            if frac > 0.0 { dim } else { 0.0 },
+        ),
+    )
+    .below(2, SlotPlan::snap(k_fill, None, 0.0))
+}
+
+/// Arm or retire the indeterminate sweep — a travelling lit segment (one-third
+/// width) looping forever on the compositor, so the app is fully idle while the
+/// bar animates.
+///
+/// `relaid` comes from [`apply`]: the loop is anchored to a `place` at the track
+/// geometry, so a resize has to re-arm it.
+fn progress_sweep(node: &mut Node, relaid: bool) {
+    let (w, h) = (node.rect.w, node.rect.h);
+    let bar_h = progress_bar_h(h);
+    let y = h / 2.0 - bar_h / 2.0;
+    let dim = dim_of(node);
+    let ind = node.ctrl().indeterminate;
     let Some(parts) = node.parts.as_mut() else { return };
-    let snap = !parts.init || parts.geom != (w, h);
-
-    parts.below[0].bind(comp, atlas, k_track);
-    parts.below[1].bind(comp, atlas, k_fill.clone());
-    parts.below[2].bind(comp, atlas, k_fill);
-    parts.below[0].place(0.0, y, w, bar_h);
-    parts.below[0].set_opacity(dim);
-
+    if parts.below.len() < 3 {
+        return;
+    }
     if ind {
-        parts.below[1].set_opacity(0.0);
-        // A travelling lit segment (one-third width), sweeping forever.
         let seg_w = w * 0.33;
-        if snap || !parts.looping {
+        if relaid || !parts.looping {
             parts.below[2].place(-seg_w, y, seg_w, bar_h);
             parts.looping = parts.below[2].loop_x(-seg_w, w, PROGRESS_CYCLE_SECS);
         }
         parts.below[2].set_opacity(dim);
-    } else {
-        if parts.looping {
-            parts.below[2].stop_loop_x();
-            parts.looping = false;
-        }
-        parts.below[2].set_opacity(0.0);
-        // Floor the fill at one full pill so the nine-grid corners never
-        // degenerate at tiny fractions.
-        let fw = if frac > 0.0 { (w * frac).max(bar_h) } else { 0.0 };
-        // No "was the fraction different last time" shadow: the fill's rect is a
-        // pure function of `frac`, and the channel already knows whether it
-        // moved — `glide` on an unchanged rect is a no-op. The shadow was the
-        // whole defect, because committing it while taking the AUTHORITATIVE
-        // `place` branch stopped the spring a frame after starting it, so the
-        // fill stepped to each new length instead of growing into it.
-        if snap {
-            parts.below[1].place(0.0, y, fw.max(0.01), bar_h);
-        } else {
-            parts.below[1].glide(0.0, y, fw.max(0.01), bar_h);
-        }
-        parts.below[1].set_opacity(if frac > 0.0 { dim } else { 0.0 });
+    } else if parts.looping {
+        parts.below[2].stop_loop_x();
+        parts.looping = false;
     }
-    parts.geom = (w, h);
-    parts.init = true;
 }
 
 /// The ring has no sprite parts — its track + arc stay painted (drawn once).
@@ -2733,15 +2770,17 @@ impl Caret {
             return;
         }
         let _ = self.obj.StopAnimation("Opacity");
-        let _ = self.vis.SetIsVisible(false);
-        self.shown = false;
+        // `Channel::wrote`'s evidence rule: a failed hide leaves the caret
+        // visible, and recording it as hidden would make every later `hide`
+        // return at the guard above — a caret blinking over a field that no
+        // longer has focus, for as long as the window lives.
+        self.shown = self.vis.SetIsVisible(false).is_err();
     }
 
     /// (Re)start the blink solid-first — or pin a solid caret when the system
     /// blink is disabled (`GetCaretBlinkTime` of 0 / INFINITE).
     fn start_blink(&mut self, comp: &Compositing) {
-        let _ = self.vis.SetIsVisible(true);
-        self.shown = true;
+        self.shown = self.vis.SetIsVisible(true).is_ok();
         let interval = unsafe { crate::system_bindings::GetCaretBlinkTime() };
         if interval == 0 || interval == u32::MAX || self.blink(comp, interval).is_none() {
             // Blinking disabled (or animation setup failed): a solid caret.
@@ -2784,20 +2823,24 @@ pub(crate) fn sync_caret(comp: &Compositing, atlas: &mut Atlas, node: &mut Node,
     let show = node.focused
         && node.paint.is_enabled
         && node.editor.as_ref().is_some_and(|e| e.caret_shown);
+    eprintln!("CARETDBG: sync focused={} enabled={} shown_flag={:?}", node.focused, node.paint.is_enabled, node.editor.as_ref().map(|e| e.caret_shown));
     if !show {
         if let Some(c) = &mut node.caret {
             c.hide();
         }
         return;
     }
-    let Some(bx) = super::controls::editor_caret_box(node) else { return };
+    let Some(bx) = super::controls::editor_caret_box(node) else { eprintln!("CARETDBG: no box"); return };
+    eprintln!("CARETDBG: show box={:?} had={}", (bx.left,bx.top,bx.width(),bx.height()), node.caret.is_some());
     if node.caret.is_none() {
         node.caret = Caret::new(comp, node);
+        eprintln!("CARETDBG: created={}", node.caret.is_some());
     }
-    let Some(mut caret) = node.caret.take() else { return };
+    let Some(mut caret) = node.caret.take() else { eprintln!("CARETDBG: take failed"); return };
     caret.bind(comp, atlas, AtlasKey::solid(theme::text(), scale));
     caret.place(bx.left, bx.top, bx.width(), bx.height());
     let moved = node.editor.as_ref().is_some_and(|e| e.caret_moved);
+    eprintln!("CARETDBG: bound={} rect={:?} moved={} shown={}", caret.key.is_some(), caret.rect, moved, caret.shown);
     if moved || !caret.shown {
         caret.start_blink(comp);
     }

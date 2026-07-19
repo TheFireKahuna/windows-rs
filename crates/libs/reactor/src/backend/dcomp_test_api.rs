@@ -970,6 +970,13 @@ impl ArenaHarness {
             ControlKind::NavigationView => dcomp::parts::nav_plan(n, scale),
             ControlKind::ToggleSwitch => dcomp::parts::toggle_plan(n, scale),
             ControlKind::CheckBox => dcomp::parts::check_plan(n, scale),
+            ControlKind::ProgressBar => dcomp::parts::progress_plan(n, scale),
+            ControlKind::Expander => dcomp::parts::expander_plan(n, scale),
+            ControlKind::ComboBox | ControlKind::DropDownButton => dcomp::parts::ink_plan(n, scale),
+            ControlKind::Button
+            | ControlKind::ToggleButton
+            | ControlKind::RepeatButton
+            | ControlKind::SplitButton => dcomp::parts::button_plan(n, scale),
             _ => return None,
         };
         let (below, above) = plan.slots();
@@ -986,6 +993,15 @@ impl ArenaHarness {
             below: below.iter().map(probe).collect(),
             above: above.iter().map(probe).collect(),
         })
+    }
+
+    /// Stamp the keyboard-focus flag a real focus move would have written.
+    /// Chrome that exists only while focused — the button family's rings — is
+    /// testing the blurred case and nothing else until this has run.
+    pub fn set_focused(&mut self, id: ControlId, focused: bool) {
+        if let Some(n) = self.arena.get_mut(id) {
+            n.focused = focused;
+        }
     }
 
     /// Whether this node would be given a paint surface — the test-visible form
