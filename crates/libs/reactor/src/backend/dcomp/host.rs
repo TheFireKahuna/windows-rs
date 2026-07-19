@@ -1,29 +1,29 @@
-//! `DCompHost`: the Win32 + system-compositor host that drives a root
-//! [`Component`] through the two halves of the record seam: the reconciler
-//! drives a [`RecordingBackend`] (the app half — a `Send` command buffer plus
-//! the app-side closure maps), and the host owns the real [`DCompBackend`]
-//! outright (the front half), replaying taken buffers into it after each
-//! reconcile and feeding its queued intents back to the recorder (see
-//! [`record`](super::record)). Input, UIA, caption and resize paths borrow the
-//! backend directly — never the reconciler — which is the decoupling the
-//! render-thread split needs. It owns the bare HWND and the blocking
-//! `GetMessageW` pump (true idle — zero CPU at rest), and wakes/parks the
-//! vsync [`FramePacer`] that paces canvas/viz frame ticks.
+//! `DCompHost`: the **front thread** of the render-thread split — the Win32 +
+//! system-compositor host that owns the HWND, the blocking `GetMessageW` pump
+//! (true idle — zero CPU at rest), the input state machine, the real
+//! [`DCompBackend`] (retained tree + compositor), and the vsync [`FramePacer`].
+//! The root [`Component`] runs on a separate **app thread**
+//! ([`dispatch::spawn_app_thread`]): its reconciler drives a
+//! [`RecordingBackend`] whose `Send` command buffer ships here per reconcile
+//! ([`post_commit`]) and is replayed into the backend, and input's queued
+//! intents ship the other way ([`run_intents`] →
+//! [`dispatch::deliver_intents`]). The two threads share nothing but `Send`
+//! data; input, UIA, caption and resize paths borrow the front backend
+//! directly and never block on app logic.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 
-use super::dispatch::{drain, LocalQueue, SendInner, WM_APP_DISPATCH};
+use super::dispatch::{self, AppQueue};
 use super::pacer::{FramePacer, WM_APP_FRAME};
-use super::record::{self, FrontBackend, RecordingBackend};
+use super::record::{self, FrontBackend};
 use super::uia;
 use super::*;
-use crate::engine::RenderHost;
 use crate::style::{set_current_color_scheme, set_theme_applier, requested_theme};
 use crate::system_bindings::*;
-use crate::{ColorScheme, Component, Element, RenderCx, RequestedTheme, WindowSize};
+use crate::{ColorScheme, Component, ControlId, Element, RenderCx, RequestedTheme, WindowSize};
 use windows_core::{Interface, PCWSTR};
 
 /// `WM_GETOBJECT` `lParam` value that asks for the window's root UI Automation
@@ -47,46 +47,36 @@ pub(crate) fn on_ui_thread() -> bool {
     UI_THREAD_ID.load(Ordering::Relaxed) == unsafe { GetCurrentThreadId() }
 }
 
-/// Run `f` against the backend on the UI thread, then deliver any app intents
-/// it queued. Returns `None` when there is no live host on this thread, or
-/// when either half is already borrowed — a re-entrant call, e.g. a
-/// composition scoped batch whose `Completed` fires synchronously from inside
-/// a backend mutation (the `try_` borrows refuse instead of panicking, and
-/// callers defer through the pump). Must be called on the UI thread (the UIA
-/// layer reaches it through [`marshal_to_ui`]).
+/// Run `f` against the backend on the UI thread, then ship any app intents it
+/// queued to the app thread. Returns `None` when there is no live host on
+/// this thread, or when the backend is already borrowed — a re-entrant call,
+/// e.g. a composition scoped batch whose `Completed` fires synchronously from
+/// inside a backend mutation (the `try_` borrow refuses instead of panicking,
+/// and callers defer through the pump). Must be called on the UI thread (the
+/// UIA layer reaches it through [`marshal_to_ui`]). The tree it reads is
+/// always whole: each app commit is replayed in full within one message
+/// ([`post_commit`]), so between messages there is no half-applied state.
 pub(crate) fn with_backend<R>(f: impl FnOnce(&mut DCompBackend) -> R) -> Option<R> {
     let s = shared()?;
     let (out, intents) = {
-        // Backend first: only once it is secured may the buffer be taken, so a
-        // refusal can never strand taken commands unreplayed.
         let mut b = s.backend.try_borrow_mut().ok()?;
-        // Input, UIA and caption reads all hit-test against laid-out
-        // geometry, so any buffered commands must be replayed first. The
-        // buffer is normally already empty here (`post_render` replays every
-        // reconcile); this is the guarantee, not the common path.
-        let cmds = s
-            .render_host
-            .try_with_reconciler_mut(|r| r.backend.take_cmds())?;
-        record::replay(&mut *b, cmds);
         let out = f(&mut b);
         // UIA actions (Invoke/Toggle/SetValue) fire the same intents input
-        // does...
+        // does — front state flips synchronously above, the app closure runs
+        // a hop later on its own thread.
         (out, b.take_intents())
     };
-    // ...resolved app-side and run here, with every borrow released, so a
-    // handler that pumps messages or re-enters the backend finds nothing held.
     run_intents(&s, intents);
     Some(out)
 }
 
-/// Route one input entry point into the front backend, then deliver the
-/// intents it queued: the recorder resolves them against its app-side handler
-/// maps, and the handlers run with every borrow released — same thread, same
-/// message, so app-visible behaviour matches the old synchronous fire while
-/// the queue stays the seam. Every wndproc arm that can make the backend fire
-/// an event goes through here. Input never touches the reconciler: it borrows
-/// the backend the host owns, which is exactly the coupling the render-thread
-/// split removes.
+/// Route one input entry point into the front backend, then ship the intents
+/// it queued to the app thread. Every wndproc arm that can make the backend
+/// fire an event goes through here. Input touches nothing but the front
+/// backend — immediate feedback (hover/press ink, drag echo, scroll) is
+/// served from the retained tree in this borrow, and app logic runs a hop
+/// later from the queue, so input latency no longer couples to app-thread
+/// load. That decoupling is the point of the render-thread split.
 fn dispatch_input<R>(s: &HostShared, f: impl FnOnce(&mut DCompBackend) -> R) -> R {
     let (out, intents) = {
         let mut b = s.backend.borrow_mut();
@@ -97,27 +87,49 @@ fn dispatch_input<R>(s: &HostShared, f: impl FnOnce(&mut DCompBackend) -> R) -> 
     out
 }
 
-/// Resolve queued intents against the recorder's app-side maps and run the
-/// jobs, with no borrow held across a job.
+/// Ship queued intents to the app thread, where the recorder resolves them
+/// against its app-side handler maps and runs the jobs
+/// ([`dispatch::deliver_intents`]). Fire-and-forget: the front never waits on
+/// app logic.
 fn run_intents(s: &HostShared, intents: Vec<record::Intent>) {
     if intents.is_empty() {
         return;
     }
-    let jobs = s
-        .render_host
-        .with_reconciler_mut(|r| r.backend.resolve_intents(intents));
-    // A viz surface drag/scrub sink drove `drive_frame_ticks()` synchronously
-    // when it ran inline; now that it runs a hop later as a job, the tick moves
-    // here — after the sink has streamed its value, before the message returns —
-    // so the drag preview repaints in the same message instead of waiting for
-    // the next paced frame.
-    let tick = jobs.iter().any(|j| j.drives_frame_tick());
-    for job in jobs {
-        job.run();
-    }
-    if tick {
-        crate::drive_frame_ticks();
-    }
+    s.app
+        .post(Box::new(move || dispatch::deliver_intents(intents)));
+}
+
+/// The app→front commit edge: called from the app thread after each reconcile
+/// with the recorded command buffer and the new root. The posted job replays
+/// the buffer into the front backend, services the queued surface and
+/// pointer-interest declarations, re-lays-out and paints — the front half of
+/// what `post_render` used to run inline — then ships any intents the replay
+/// raised back to the app thread (today replay fires no events; taken anyway
+/// so one can never sit in the queue until the next input message).
+pub(crate) fn post_commit(hwnd: isize, cmds: Vec<record::Cmd>, root_id: Option<ControlId>) {
+    post_ui(hwnd, move || {
+        let Some(s) = shared() else { return };
+        let intents = {
+            let mut b = s.backend.borrow_mut();
+            // Replay before anything reads the arena: `set_root` looks the
+            // new root up and silently no-ops if it is absent, and layout
+            // walks the whole tree.
+            record::replay(&mut *b, cmds);
+            // After the buffer, so a surface requested in the same frame its
+            // host mounts finds the control already in the arena; before
+            // layout, so the sprite is parented when sizes are pushed.
+            b.service_surface_ops();
+            // Apply the frame's pointer-surface presence declarations into
+            // the front-side interest map so a bit filled during this render
+            // is visible to the next input message (one frame ahead, by
+            // design — the router routes on these bits, never the closures).
+            pointer::service_ops();
+            b.set_root(root_id);
+            b.relayout_and_paint();
+            b.take_intents()
+        };
+        run_intents(&s, intents);
+    });
 }
 
 /// Marshal `f` onto the UI thread and block until it completes, returning its
@@ -172,17 +184,16 @@ pub(crate) fn post_ui(hwnd: isize, f: impl FnOnce() + Send + 'static) {
     }
 }
 
-/// Per-thread state the WndProc reaches into. `render_host` is a clone (an `Rc`
-/// bump) of the host's render host; `local`/`send` are the dispatcher's queues.
+/// Per-thread state the front WndProc reaches into.
 struct HostShared {
-    render_host: RenderHost<RecordingBackend, Win32Dispatcher>,
     /// The front half of the record seam: the real backend, owned by the host
     /// — not by the reconciler. Input, UIA, caption and resize paths borrow it
-    /// here directly; the reconciler reaches it only through the taken command
-    /// buffer `post_render` replays.
+    /// here directly; the app thread's reconciler reaches it only through the
+    /// command buffers [`post_commit`] replays.
     backend: Rc<RefCell<DCompBackend>>,
-    local: Rc<LocalQueue>,
-    send: Arc<SendInner>,
+    /// The app thread's run loop: intents, size/theme notifications and frame
+    /// ticks post here. Fire-and-forget — the front never blocks on it.
+    app: Arc<AppQueue>,
     /// Vsync pacer for the canvas/viz frame ticks; dropping `HostShared` (end of
     /// [`DCompHost::run`]) tells its worker to exit.
     pacer: FramePacer,
@@ -219,14 +230,26 @@ fn release_capture_self() {
 }
 
 /// A self-hosted DirectComposition window hosting one reactor component tree.
+/// The window, input and compositor live on the creating (front) thread; the
+/// component tree runs on a spawned app thread, so `root` must be `Send` —
+/// it is *constructed* wherever the caller builds it but only ever *runs* on
+/// the app thread.
 pub struct DCompHost {
     hwnd: HWND,
+    /// The app thread's queue (for the shutdown quit) and join handle, taken
+    /// by [`run`](Self::run) when the pump exits.
+    app: Arc<AppQueue>,
+    app_join: RefCell<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl DCompHost {
-    /// Create the window, compositor, backend, and render host, mount `root`, and
-    /// paint the first frame. Call [`run`](Self::run) to enter the message loop.
-    pub fn new(title: impl AsRef<str>, root: Box<dyn Component>) -> windows_core::Result<Self> {
+    /// Create the window, compositor and backend, spawn the app thread, mount
+    /// `root` on it, and schedule the first frame. Call [`run`](Self::run) to
+    /// enter the message loop.
+    pub fn new(
+        title: impl AsRef<str>,
+        root: Box<dyn Component + Send>,
+    ) -> windows_core::Result<Self> {
         // Default client size scales with the display: 80% of the monitor's work
         // area (floored to a usable minimum), so the window opens proportionate
         // on anything from a laptop panel to a 4K desktop. Explicit sizes go
@@ -239,7 +262,7 @@ impl DCompHost {
         title: impl AsRef<str>,
         client_w_dip: f64,
         client_h_dip: f64,
-        root: Box<dyn Component>,
+        root: Box<dyn Component + Send>,
     ) -> windows_core::Result<Self> {
         Self::new_impl(title, Some((client_w_dip, client_h_dip)), root)
     }
@@ -247,7 +270,7 @@ impl DCompHost {
     fn new_impl(
         title: impl AsRef<str>,
         client_dip: Option<(f64, f64)>,
-        root: Box<dyn Component>,
+        root: Box<dyn Component + Send>,
     ) -> windows_core::Result<Self> {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -273,73 +296,31 @@ impl DCompHost {
         backend.apply_theme(dark);
         apply_frame_dark_mode(hwnd, dark);
 
-        let dispatcher = Win32Dispatcher::new(hwnd);
-        let marshaller = dispatcher.marshaller();
-        let (local, send) = dispatcher.queues();
-
-        // The two halves of the record seam: the host owns the real backend
-        // outright, and the reconciler drives a recorder that holds no backend
-        // reference at all — its calls become a `Send` command buffer that
-        // `post_render` replays below. Replay is synchronous and on this
-        // thread, so behaviour is unchanged; the ownership split is what lets
-        // the reconciler later run off the thread that owns the HWND, the pump
-        // and the compositor.
+        // The two halves of the record seam, now on two threads: the host owns
+        // the real backend outright, and the app thread runs the reconciler
+        // against a recorder that holds no backend reference at all — its
+        // calls become a `Send` command buffer each reconcile ships here via
+        // [`post_commit`]. The spawn builds the `RenderHost` on the app thread
+        // (it is `!Send`), installs the marshaller from there so async-state
+        // writes and re-renders land app-side, and kicks the first render;
+        // the resulting commit is replayed by the pump once [`run`] starts.
         let backend = Rc::new(RefCell::new(backend));
-        let render_host = RenderHost::new(RecordingBackend::new(), root, dispatcher);
-        render_host.set_marshaller(Some(marshaller));
-        render_host.set_inner_size(WindowSize {
-            width: dip.0 as f64,
-            height: dip.1 as f64,
-        });
-        render_host.set_dpi(dpi);
-
-        // After every reconcile: replay the buffer, adopt the new root, lay
-        // out, paint. All control motion plays on the system compositor — no
-        // timer to arm.
-        let pr_host = render_host.clone_inner();
-        let pr_backend = Rc::clone(&backend);
-        render_host.set_post_render(move |root_id| {
-            // Take the reconcile's commands, then release the reconciler
-            // before touching the backend: the two borrows never overlap.
-            let cmds = pr_host.with_reconciler_mut(|r| r.backend.take_cmds());
-            let intents = {
-                let mut b = pr_backend.borrow_mut();
-                // Replay before anything reads the arena: `set_root` looks the
-                // new root up and silently no-ops if it is absent, and layout
-                // walks the whole tree.
-                record::replay(&mut *b, cmds);
-                // After the buffer, so a surface requested in the same frame its
-                // host mounts finds the control already in the arena; before
-                // layout, so the sprite is parented when sizes are pushed.
-                b.service_surface_ops();
-                // Apply the frame's pointer-surface presence declarations into
-                // the front-side interest map so a bit filled during this render
-                // is visible to the next input message (one frame ahead, by
-                // design — the router routes on these bits, never the closures).
-                pointer::service_ops();
-                b.set_root(root_id);
-                b.relayout_and_paint();
-                // Replay fires no events today, so this is normally empty —
-                // taken anyway so an intent can never sit in the queue until
-                // the next input message if a replayed path ever gains one.
-                b.take_intents()
-            };
-            if !intents.is_empty() {
-                let jobs = pr_host.with_reconciler_mut(|r| r.backend.resolve_intents(intents));
-                for job in jobs {
-                    job.run();
-                }
-            }
-        });
+        let (app, app_join) = dispatch::spawn_app_thread(
+            hwnd as isize,
+            root,
+            WindowSize {
+                width: dip.0 as f64,
+                height: dip.1 as f64,
+            },
+            dpi,
+        );
 
         let pacer = FramePacer::new(hwnd as isize);
         let pump_wake = pacer.wake_handle();
         DCOMP.with(|c| {
             *c.borrow_mut() = Some(Rc::new(HostShared {
-                render_host: render_host.clone_inner(),
                 backend,
-                local,
-                send,
+                app: Arc::clone(&app),
                 pacer,
                 hwnd: hwnd as isize,
                 applied_dark: Cell::new(Some(dark)),
@@ -372,14 +353,18 @@ impl DCompHost {
         // the app thread once the reconciler moves off the pump thread.
         crate::set_frame_pump_wake(Some(std::sync::Arc::new(move || pump_wake.wake())));
 
-        render_host.kick();
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW as i32);
         }
-        Ok(Self { hwnd })
+        Ok(Self {
+            hwnd,
+            app,
+            app_join: RefCell::new(Some(app_join)),
+        })
     }
 
-    /// Run the blocking message loop until the window closes.
+    /// Run the blocking message loop until the window closes, then stop the
+    /// app thread and tear down.
     pub fn run(&self) {
         let mut msg: MSG = unsafe { core::mem::zeroed() };
         unsafe {
@@ -388,6 +373,14 @@ impl DCompHost {
                 DispatchMessageW(&msg);
             }
         }
+        // Quit and join the app thread before tearing down front state, so no
+        // late job races the teardown. Its posts to this (now dead) window
+        // fail harmlessly; jobs still queued for it are dropped unrun.
+        self.app.post_quit();
+        if let Some(join) = self.app_join.borrow_mut().take() {
+            let _ = join.join();
+        }
+        size::set_delivery(None);
         crate::set_frame_pump_wake(None);
         set_theme_applier(None);
         DCOMP.with(|c| *c.borrow_mut() = None);
@@ -398,10 +391,11 @@ impl DCompHost {
     }
 
     /// Convenience: build the host from a render function (the same `Fn(&mut
-    /// RenderCx) -> Element` shape `App::render` takes) and run the message loop.
+    /// RenderCx) -> Element` shape `App::render` takes) and run the message
+    /// loop. `Send` because the function runs on the app thread.
     pub fn render<F>(title: impl AsRef<str>, f: F) -> windows_core::Result<()>
     where
-        F: Fn(&mut RenderCx) -> Element + 'static,
+        F: Fn(&mut RenderCx) -> Element + Send + 'static,
     {
         struct RenderFn<F>(F);
         impl<F: Fn(&mut RenderCx) -> Element + 'static> Component for RenderFn<F> {
@@ -422,7 +416,7 @@ impl DCompHost {
         f: F,
     ) -> windows_core::Result<()>
     where
-        F: Fn(&mut RenderCx) -> Element + 'static,
+        F: Fn(&mut RenderCx) -> Element + Send + 'static,
     {
         struct RenderFn<F>(F);
         impl<F: Fn(&mut RenderCx) -> Element + 'static> Component for RenderFn<F> {
@@ -484,7 +478,8 @@ fn apply_effective_theme(s: &HostShared) {
         return;
     }
     s.applied_dark.set(Some(dark));
-    // Scheme first: the re-render below must already read the new value.
+    // Scheme first: it is process-global, so the app-side re-render posted
+    // below is guaranteed to read the new value.
     set_current_color_scheme(scheme_for(dark));
     apply_frame_dark_mode(s.hwnd as HWND, dark);
     {
@@ -494,13 +489,15 @@ fn apply_effective_theme(s: &HostShared) {
     }
     // Every component re-renders on the next pass: value-color props are
     // recomputed only inside render functions, so memoised components with
-    // unchanged props would otherwise keep the old palette.
-    s.render_host
-        .with_reconciler_mut(|r| r.invalidate_all_components());
-    // Re-run component render functions so scheme-derived values (colors,
-    // `use_color_scheme`) are re-read (the repaint above only covers
-    // backend-drawn chrome).
-    s.render_host.request_render();
+    // unchanged props would otherwise keep the old palette. Component
+    // invalidation and the re-render are app-thread work.
+    s.app.post(Box::new(|| {
+        if let Some(a) = dispatch::app_shared() {
+            a.render_host
+                .with_reconciler_mut(|r| r.invalidate_all_components());
+            a.render_host.request_render();
+        }
+    }));
 }
 
 windows_core::link!("dwmapi.dll" "system" fn DwmSetWindowAttribute(
@@ -844,19 +841,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
-        WM_APP_DISPATCH => {
-            if let Some(s) = shared() {
-                drain(&s.local, &s.send);
-            }
-            0
-        }
 
         // The pacer worker's vsync tick: drive the canvas/viz frame-tick
         // subscribers, then park the pacer once none remain (true idle).
         WM_APP_FRAME => {
+            // The subscribers are app closures in the app thread's registry,
+            // so the tick is carried there rather than driven here. Coalesced:
+            // while the last tick job hasn't run — the app thread is
+            // mid-reconcile — further frames fold into it instead of queueing
+            // a burst it would drain back-to-back.
+            static TICK_PENDING: AtomicBool = AtomicBool::new(false);
             if let Some(s) = shared() {
                 s.pacer.begin_tick();
-                crate::drive_frame_ticks();
+                if !TICK_PENDING.swap(true, Ordering::AcqRel) {
+                    s.app.post(Box::new(|| {
+                        TICK_PENDING.store(false, Ordering::Release);
+                        crate::drive_frame_ticks();
+                    }));
+                }
                 if !crate::frame_ticks_active() {
                     s.pacer.park();
                 }
@@ -1195,12 +1197,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if pw > 0 && ph > 0 {
                     let dpi = effective_dpi(hwnd);
                     let scale = dpi as f32 / 96.0;
-                    s.render_host.set_dpi(dpi);
-                    s.render_host.set_inner_size(WindowSize {
-                        width: pw as f64 / scale as f64,
-                        height: ph as f64 / scale as f64,
-                    });
+                    // Relayout the current tree at the new size immediately —
+                    // the solve is front-side, so the window never shows a
+                    // stale-sized frame during an interactive resize. The app
+                    // thread is then told, so components reading
+                    // `use_inner_size` / `use_dpi` re-render; their commit
+                    // lands a hop later.
                     s.backend.borrow_mut().resize(pw, ph, dpi);
+                    let (w, h) = (pw as f64 / scale as f64, ph as f64 / scale as f64);
+                    s.app.post(Box::new(move || {
+                        if let Some(a) = dispatch::app_shared() {
+                            a.render_host.set_dpi(dpi);
+                            a.render_host
+                                .set_inner_size(WindowSize { width: w, height: h });
+                        }
+                    }));
                 }
             }
             0

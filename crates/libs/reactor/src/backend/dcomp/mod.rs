@@ -54,7 +54,6 @@ mod uia;
 pub(crate) mod visibility;
 
 pub use color_out::set_output_color_transform;
-pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;
 pub use display_change::set_display_change_callback;
 pub use visibility::set_window_visibility_callback;

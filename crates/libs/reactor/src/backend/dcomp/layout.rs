@@ -934,10 +934,10 @@ fn solve_walk(
     // settled (mount callbacks vs layout ordering); the registry change-gates
     // per listener, so an unchanged size is a cheap no-op and a fresh listener
     // is guaranteed its first delivery on the next pass. Skip the lookup
-    // entirely when nothing is subscribed (the common case). The fire lives in
-    // this half, not [`apply`], because the listeners are app callbacks that
-    // resize app-owned viz surfaces — solve-side is where app-side work
-    // belongs once the halves split threads.
+    // entirely when nothing is subscribed (the common case). The listeners are
+    // app closures on the app thread; the fire queues plain triples that
+    // `size`'s delivery hook carries over (see `size.rs`), so solving here on
+    // the front thread never runs app code.
     if size::has_listeners() {
         size::fire_element_size(id, w, h);
     }

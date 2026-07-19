@@ -120,6 +120,12 @@ thread_local! {
     static FRAME_TICK_NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
+/// Live subscriber count across every thread's registry. The registries are
+/// thread-local (the `Rc` callbacks cannot cross), but the pump that paces
+/// them runs on the front thread while subscribers register on the app
+/// thread — the keep-ticking/park decision needs a count both can see.
+static FRAME_TICK_ALIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Installed by a host that owns a frame pump (the DComp pacer); called when a
 /// subscriber is added so the pump can start ticking. Process-global, not
 /// thread-local, for two reasons that both come due under the render-thread
@@ -146,6 +152,7 @@ impl Drop for FrameTick {
         FRAME_TICKS.with(|t| {
             t.borrow_mut().retain(|(id, _)| *id != self.id);
         });
+        FRAME_TICK_ALIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -162,6 +169,7 @@ where
         v
     });
     FRAME_TICKS.with(|t| t.borrow_mut().push((id, Rc::new(f))));
+    FRAME_TICK_ALIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Kick the host pump so the new subscriber starts receiving ticks.
     if let Some(wake) = frame_pump_wake() {
         wake();
@@ -169,10 +177,12 @@ where
     FrameTick { id }
 }
 
-/// Whether any backend frame-tick subscriber is currently live. A host pump uses
-/// this to decide whether to keep ticking or return to idle.
+/// Whether any backend frame-tick subscriber is currently live, on **any**
+/// thread. The front pump uses this to decide whether to keep ticking or park;
+/// the subscribers it paces live on the app thread, so the check is a
+/// process-wide count, not this thread's registry.
 pub fn frame_ticks_active() -> bool {
-    FRAME_TICKS.with(|t| !t.borrow().is_empty())
+    FRAME_TICK_ALIVE.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
 /// Invoke every live frame-tick callback once. Called by the host's frame pump
