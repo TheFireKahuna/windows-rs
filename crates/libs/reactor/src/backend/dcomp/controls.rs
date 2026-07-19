@@ -544,6 +544,17 @@ pub(crate) fn label_is_retained(node: &Node) -> bool {
 /// Gap between the switch track and its state label (the WinUI metric).
 pub(crate) const TOGGLE_LABEL_GAP: f32 = theme::SPACE_12;
 
+/// The word a switch currently shows: `on_content` when on, `off_content` when
+/// off, and empty when that side was never given one.
+///
+/// This is the same choice `glyph_text::toggle_sync` makes when it picks which
+/// of the two shaped runs to place, expressed once so a screen reader is told
+/// the word that is actually on screen rather than a second guess at it.
+pub(crate) fn toggle_state_label(node: &Node) -> &str {
+    let x = node.extras();
+    if node.ctrl().is_on { &x.on_content } else { &x.off_content }
+}
+
 // ── CheckBox ─────────────────────────────────────────────────────────────────
 
 fn paint_check_box(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {

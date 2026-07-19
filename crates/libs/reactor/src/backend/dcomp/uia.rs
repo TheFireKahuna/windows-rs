@@ -751,6 +751,20 @@ impl DCompBackend {
                 ControlKind::InfoBadge => {
                     return info_badge::label(n).unwrap_or_default();
                 }
+                // A switch carries its label in `on_content`/`off_content`
+                // rather than `paint.text`, and hosts no child to fall back
+                // to, so without this it is the one interactive control in the
+                // set that reaches a screen reader unnamed. The word it is
+                // currently showing is its visible content, exactly as a
+                // badge's count is — and it changing when the switch flips is
+                // that content changing, which `uia_notify_bool` announces.
+                //
+                // A switch given no content stays nameless on purpose: there
+                // is nothing on screen to read, and a host that means
+                // something by a bare track says so with an `automation_name`.
+                ControlKind::ToggleSwitch => {
+                    return controls::toggle_state_label(n).to_string();
+                }
                 _ => {}
             }
         }
@@ -1447,12 +1461,37 @@ impl DCompBackend {
         }
         let state = i32::from(v);
         match event {
-            Event::Toggled | Event::Checked => raise_property_changed(
-                self.hwnd,
-                id,
-                UIA_ToggleToggleStatePropertyId,
-                PropVal::I4(state),
-            ),
+            Event::Toggled | Event::Checked => {
+                raise_property_changed(
+                    self.hwnd,
+                    id,
+                    UIA_ToggleToggleStatePropertyId,
+                    PropVal::I4(state),
+                );
+                // A switch that names itself from the word it shows just
+                // changed that word, so the name changed with the state.
+                // Raised only when it genuinely moved: an authored
+                // `automation_name` outranks the content, and two identical
+                // sides read the same either way — announcing a name that did
+                // not change would make a screen reader repeat itself on every
+                // flip.
+                if let Some(n) = self.arena.get(id)
+                    && n.kind == ControlKind::ToggleSwitch
+                    && n.accessibility
+                        .as_ref()
+                        .and_then(|a| a.automation_name.as_ref())
+                        .is_none_or(|s| s.is_empty())
+                    && n.extras().on_content != n.extras().off_content
+                {
+                    let name = controls::toggle_state_label(n).to_string();
+                    raise_property_changed(
+                        self.hwnd,
+                        id,
+                        UIA_NamePropertyId,
+                        PropVal::Bstr(name),
+                    );
+                }
+            }
             Event::Expanding => raise_property_changed(
                 self.hwnd,
                 id,
