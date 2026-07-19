@@ -414,13 +414,17 @@ fn paint_chrome(
         // cutover. Falling through to `fill_and_stroke` would paint a
         // background a TextBlock has never had.
         ControlKind::TextBlock => {}
+        // Likewise nothing: a Border's fill and outline are retained parts
+        // (`parts::box_plan`). Falling through to `fill_and_stroke` would paint
+        // a second copy of the box directly under the sprites drawing it.
+        ControlKind::Border => {}
         ControlKind::Rectangle => {
             fill_and_stroke(session, brush, node, rect, node.paint.corner_radius)
         }
         ControlKind::Ellipse => paint_ellipse(session, brush, node, rect),
         ControlKind::Line => paint_line(session, brush, node, rect),
         _ => {
-            // Border / StackPanel / Grid / Canvas / ScrollViewer: bg + border box.
+            // StackPanel / Grid / Canvas / ScrollViewer: bg + border box.
             fill_and_stroke(session, brush, node, rect, node.paint.corner_radius)
         }
     }

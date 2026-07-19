@@ -1117,6 +1117,11 @@ impl Node {
             // Header fill, border, wash and ring are parts; the header label
             // and its chevron are sprites. Only the header was ever chrome.
             ControlKind::Expander => false,
+            // A Border is a fill and an outline cut to one radius, and both are
+            // parts now (`parts::box_plan`). It was the last primitive in the
+            // library still rasterizing a rounded rect, and the most numerous —
+            // every card, panel and chip in a tree is one of these.
+            ControlKind::Border => false,
             ControlKind::Line => self.paint.stroke.is_some(),
             ControlKind::Ellipse | ControlKind::Rectangle => {
                 self.paint.fill.is_some()

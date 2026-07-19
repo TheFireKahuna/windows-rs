@@ -1833,6 +1833,12 @@ fn look(kind: ControlKind) -> Option<Look> {
         K::InfoBadge => (1, 0, badge_plan),
         K::InfoBar => (3, 1, bar_plan),
         K::TitleBar => (0, 1, caption_plan),
+        // The one container converted so far. `box_plan` reads nothing but the
+        // three generic paint props, so the other kinds still on
+        // `fill_and_stroke`'s catch-all arm — StackPanel, Grid, Canvas — would
+        // take it unchanged; they are left painted only because nothing has
+        // needed them converted yet, not because they differ.
+        K::Border => (box_slot::N_BELOW, 0, box_plan),
         _ => return None,
     };
     Some(Look { below, above, plan })
@@ -1862,10 +1868,10 @@ fn ensure(comp: &Compositing, node: &mut Node, n_below: usize, n_above: usize) -
         return true;
     }
     let Ok(children) = node.container.Children() else { return false };
-    // Absent for a node that draws nothing (the button family). The `below`
-    // group then stacks at the top in creation order instead of under the
-    // surface — which lands it in exactly the same relative z-order, because
-    // "below" only ever meant "below the surface", and there is none.
+    // Absent for a node that draws nothing (the button family, the Border).
+    // The `below` group then stacks from the bottom in creation order instead
+    // of under the surface — "below" only ever meant "below the surface", and
+    // with none the floor of the collection is the same place.
     let surf_vis = node
         .surf
         .as_ref()
@@ -1874,16 +1880,29 @@ fn ensure(comp: &Compositing, node: &mut Node, n_below: usize, n_above: usize) -
     let mut parts = Box::new(Parts::new());
     // Creation order = bottom→top within the band: each `InsertBelow(surface)`
     // lands directly under the surface, pushing earlier parts further down.
+    //
+    // A surfaceless kind stacks from the BOTTOM instead, not the top. For the
+    // button family the two are indistinguishable — the collection is empty
+    // this early, and the glyph hosts that follow insert above regardless. For
+    // a CONTAINER they are not: a Border's children are already parented by the
+    // time the paint pass mints its parts, so `InsertAtTop` would lay the fill
+    // over the very content it exists to sit behind. `restack` would put it
+    // right on the next pass that touches the child list — but a mint dirties
+    // nothing, so "the next pass" can be never, and the box reads as a solid
+    // slab with its label lost underneath.
+    let mut prev: Option<Visual> = None;
     for _ in 0..n_below {
         let Some(p) = Part::new(comp) else { return false };
         let Some(v) = p.visual() else { return false };
-        let placed = match surf_vis.as_ref() {
-            Some(sv) => children.InsertBelow(&v, sv),
-            None => children.InsertAtTop(&v),
+        let placed = match (surf_vis.as_ref(), prev.as_ref()) {
+            (Some(sv), _) => children.InsertBelow(&v, sv),
+            (None, Some(pv)) => children.InsertAbove(&v, pv),
+            (None, None) => children.InsertAtBottom(&v),
         };
         if placed.is_err() {
             return false;
         }
+        prev = Some(v);
         parts.below.push(p);
     }
     for _ in 0..n_above {
@@ -2097,6 +2116,74 @@ pub(crate) fn button_plan(node: &Node, scale: f32) -> PartPlan {
             .fading(),
         )
         .focus_ring(slot::RING_INNER, node.focus_ring, w, h, radius, scale)
+}
+
+/// A container's two slots. Deliberately its own names rather than the button
+/// family's: the two bands happen to start with a fill and an outline, but a
+/// container has no plate, no ink and no ring under them, and borrowing indices
+/// from a longer band is how a shared literal ends up outliving the reason the
+/// two agreed.
+mod box_slot {
+    pub const FILL: usize = 0;
+    pub const BORDER: usize = 1;
+    pub const N_BELOW: usize = BORDER + 1;
+}
+
+/// A container's fill and outline: `[fill, border]`, nothing above.
+///
+/// This is the plainest plan in the file, and that is the point. A Border is a
+/// background and maybe an outline cut to one radius — precisely the two
+/// sprites the button family already binds — so the primitive whose entire job
+/// is a filled rounded box has no business being the last thing in the library
+/// to rasterize one. It was allocating an FP16 surface the size of its full
+/// rect and re-entering `BeginDraw` on every resize to draw what the atlas
+/// hands out for free.
+///
+/// Nothing here travels and nothing fades. A container has no hover, no press
+/// and no focus; its appearance changes only when a prop changes, and a prop
+/// write already marks the node dirty and re-syncs. So both slots snap, and the
+/// steady-state cost of every card, panel and chip in a tree is two sprites
+/// sharing one cached raster with every other box of the same height, radius
+/// and colour.
+///
+/// The stroke inset matches the painted path exactly: `ShapeKey::HBar` insets
+/// by half the stroke width and strokes outward from there, which is the same
+/// geometry `fill_and_stroke` produced.
+pub(crate) fn box_plan(node: &Node, scale: f32) -> PartPlan {
+    let (w, h) = (node.rect.w, node.rect.h);
+    let radius = node.paint.corner_radius;
+    let dim = dim_of(node);
+    let box_rect = Some((0.0, 0.0, w, h));
+
+    // A fully transparent fill binds nothing: an atlas source that paints no
+    // pixels is a wasted raster and a wasted cache slot. Same rule as the
+    // button family's chromeless variants.
+    let fill = match node
+        .paint
+        .background
+        .filter(|c| c.a > 0.0)
+        .map(|c| AtlasKey::hbar(h, radius, 0.0, c, scale))
+    {
+        Some(k) => SlotPlan::snap(k, box_rect, dim),
+        None => SlotPlan::hidden(),
+    };
+
+    // Thickness gates the outline the same way it gated the painted `draw_rect`
+    // — a brush with no width drew nothing there either.
+    let t = node.paint.border_thickness;
+    let border = match node
+        .paint
+        .border_brush
+        .filter(|c| c.a > 0.0 && t > 0.0)
+        .map(|c| AtlasKey::hbar(h, radius, t, c, scale))
+    {
+        Some(k) => SlotPlan::snap(k, box_rect, dim),
+        None => SlotPlan::hidden(),
+    };
+
+    PartPlan::new([w, h, 0.0])
+        .below(box_slot::FILL, fill)
+        .below(box_slot::BORDER, border)
 }
 
 /// The focus visual as two parts rather than a draw, for any control that owns

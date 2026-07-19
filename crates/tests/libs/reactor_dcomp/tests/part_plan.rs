@@ -25,7 +25,10 @@
 //! **These tests are not headless** — see `arena_ids.rs`.
 
 use windows_reactor::dcomp_test_api::{ArenaHarness, NavHit, PartPlanProbe};
-use windows_reactor::{ControlKind as K, NavViewItem, Prop, PropValue as V, selector_bar_item};
+use windows_reactor::{
+    Color, ControlId, ControlKind as K, NavViewItem, Prop, PropValue as V, Thickness,
+    selector_bar_item,
+};
 
 /// Below-band slot roles, mirroring `parts.rs`.
 const TRAY_FILL: usize = 0;
@@ -649,4 +652,131 @@ fn an_expander_owns_no_surface() {
     let id = a.insert(K::Expander).unwrap();
     a.set_rect(id, 300.0, 40.0);
     assert_eq!(a.has_chrome(id), Some(false));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Border — the container box, `parts::box_plan`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A Border's two below-band slots.
+const BOX_FILL: usize = 0;
+const BOX_BORDER: usize = 1;
+
+/// A Border at `w` x `h`, with whatever paint props the caller sets first.
+fn boxed(a: &mut ArenaHarness, w: f32, h: f32, set: impl FnOnce(&mut ArenaHarness, ControlId)) -> PartPlanProbe {
+    let id = a.insert(K::Border).unwrap();
+    set(a, id);
+    a.set_rect(id, w, h);
+    a.part_plan(id, 1.0).unwrap()
+}
+
+/// A Border reaches no `BeginDraw`. It was the last primitive in the library
+/// still rasterizing a rounded rect — and by a wide margin the most numerous,
+/// since every card, panel and chip in a tree is one of these.
+#[test]
+fn a_border_owns_no_surface() {
+    let mut a = harness();
+    let id = a.insert(K::Border).unwrap();
+    a.apply_prop(id, Prop::Background, &V::Color(Color::rgb(30, 30, 30)));
+    a.set_rect(id, 200.0, 40.0);
+    assert_eq!(
+        a.has_chrome(id),
+        Some(false),
+        "a filled Border must bind its fill as a part, not buy a surface for it",
+    );
+}
+
+/// The fill covers the whole node box.
+#[test]
+fn a_border_fills_its_whole_box() {
+    let mut a = harness();
+    let p = boxed(&mut a, 200.0, 40.0, |a, id| {
+        a.apply_prop(id, Prop::Background, &V::Color(Color::rgb(30, 30, 30)));
+    });
+    assert_eq!(
+        p.below[BOX_FILL].as_ref().and_then(|s| s.rect),
+        Some((0.0, 0.0, 200.0, 40.0)),
+        "the fill is the node's own box",
+    );
+}
+
+/// No background binds no source. An atlas entry that paints nothing is a
+/// wasted raster and a wasted cache slot, and the 256-slot LRU is shared with
+/// every other box in the tree.
+#[test]
+fn a_border_without_a_background_binds_nothing() {
+    let mut a = harness();
+    let p = boxed(&mut a, 200.0, 40.0, |_, _| {});
+    assert_eq!(
+        p.below[BOX_FILL].as_ref().map(|s| s.opacity),
+        Some(0.0),
+        "an unfilled Border must not bind a fill source",
+    );
+    assert_eq!(
+        p.below[BOX_BORDER].as_ref().map(|s| s.opacity),
+        Some(0.0),
+        "…nor an outline it was never given",
+    );
+}
+
+/// A brush with no thickness draws nothing — the same gate the painted
+/// `draw_rounded_rect` sat behind. Without it a Border authored with a brush
+/// and no width would grow an outline it never had on the painted path.
+#[test]
+fn a_border_outline_needs_a_thickness() {
+    let mut a = harness();
+    let brush_only = boxed(&mut a, 200.0, 40.0, |a, id| {
+        a.apply_prop(id, Prop::BorderBrush, &V::Color(Color::rgb(90, 90, 90)));
+    });
+    assert_eq!(
+        brush_only.below[BOX_BORDER].as_ref().map(|s| s.opacity),
+        Some(0.0),
+        "a brush with no width drew nothing before and must draw nothing now",
+    );
+
+    let with_width = boxed(&mut a, 200.0, 40.0, |a, id| {
+        a.apply_prop(id, Prop::BorderBrush, &V::Color(Color::rgb(90, 90, 90)));
+        a.apply_prop(id, Prop::BorderThickness, &V::Thickness(Thickness::uniform(1.0)));
+    });
+    assert_eq!(
+        with_width.below[BOX_BORDER].as_ref().and_then(|s| s.rect),
+        Some((0.0, 0.0, 200.0, 40.0)),
+        "given a width, the outline takes the same box as the fill",
+    );
+}
+
+/// A container has no hover, no press and no focus, so neither slot travels and
+/// neither fades. Everything it can express is a prop write, and a prop write
+/// marks the node dirty and re-syncs — there is no state for motion to carry.
+#[test]
+fn a_borders_chrome_never_moves_or_fades() {
+    let mut a = harness();
+    let p = boxed(&mut a, 200.0, 40.0, |a, id| {
+        a.apply_prop(id, Prop::Background, &V::Color(Color::rgb(30, 30, 30)));
+        a.apply_prop(id, Prop::BorderBrush, &V::Color(Color::rgb(90, 90, 90)));
+        a.apply_prop(id, Prop::BorderThickness, &V::Thickness(Thickness::uniform(1.0)));
+    });
+    for (i, name) in [(BOX_FILL, "fill"), (BOX_BORDER, "outline")] {
+        let s = p.below[i].as_ref().expect("slot planned");
+        assert!(!s.glides, "the {name} must snap — a container's box never travels");
+        assert!(!s.fades, "the {name} must snap — a container has no state to fade between");
+    }
+}
+
+/// A resize re-lays the box out, so `layout_sig` must carry the size. Without
+/// it a Border that changed shape would spring its fill from the rect it no
+/// longer has.
+#[test]
+fn a_border_relayouts_on_resize() {
+    let mut a = harness();
+    let small = boxed(&mut a, 200.0, 40.0, |a, id| {
+        a.apply_prop(id, Prop::Background, &V::Color(Color::rgb(30, 30, 30)));
+    });
+    let large = boxed(&mut a, 300.0, 40.0, |a, id| {
+        a.apply_prop(id, Prop::Background, &V::Color(Color::rgb(30, 30, 30)));
+    });
+    assert_ne!(
+        small.layout_sig, large.layout_sig,
+        "a size change must read as a re-layout",
+    );
 }
