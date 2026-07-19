@@ -420,6 +420,9 @@ impl Default for DWRITE_GLYPH_RUN_DESCRIPTION {
     }
 }
 pub type DWRITE_GRID_FIT_MODE = i32;
+pub const DWRITE_GRID_FIT_MODE_DEFAULT: DWRITE_GRID_FIT_MODE = 0;
+pub const DWRITE_GRID_FIT_MODE_DISABLED: DWRITE_GRID_FIT_MODE = 1;
+pub const DWRITE_GRID_FIT_MODE_ENABLED: DWRITE_GRID_FIT_MODE = 2;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DWRITE_HIT_TEST_METRICS {
@@ -481,6 +484,7 @@ pub type DWRITE_PIXEL_GEOMETRY = i32;
 pub type DWRITE_READING_DIRECTION = i32;
 pub type DWRITE_RENDERING_MODE = i32;
 pub type DWRITE_RENDERING_MODE1 = i32;
+pub const DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC: DWRITE_RENDERING_MODE1 = 5;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DWRITE_STRIKETHROUGH {
@@ -497,11 +501,15 @@ impl Default for DWRITE_STRIKETHROUGH {
         unsafe { core::mem::zeroed() }
     }
 }
+pub const DWRITE_TEXTURE_ALIASED_1x1: DWRITE_TEXTURE_TYPE = 0;
+pub const DWRITE_TEXTURE_CLEARTYPE_3x1: DWRITE_TEXTURE_TYPE = 1;
+pub type DWRITE_TEXTURE_TYPE = i32;
 pub type DWRITE_TEXT_ALIGNMENT = i32;
 pub const DWRITE_TEXT_ALIGNMENT_CENTER: DWRITE_TEXT_ALIGNMENT = 2;
 pub const DWRITE_TEXT_ALIGNMENT_LEADING: DWRITE_TEXT_ALIGNMENT = 0;
 pub const DWRITE_TEXT_ALIGNMENT_TRAILING: DWRITE_TEXT_ALIGNMENT = 1;
 pub type DWRITE_TEXT_ANTIALIAS_MODE = i32;
+pub const DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE: DWRITE_TEXT_ANTIALIAS_MODE = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DWRITE_TEXT_METRICS {
@@ -4936,6 +4944,34 @@ impl IDWriteFactory2 {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) unsafe fn CreateGlyphRunAnalysis(
+        &self,
+        glyphrun: *const DWRITE_GLYPH_RUN,
+        transform: Option<*const DWRITE_MATRIX>,
+        renderingmode: DWRITE_RENDERING_MODE,
+        measuringmode: DWRITE_MEASURING_MODE,
+        gridfitmode: DWRITE_GRID_FIT_MODE,
+        antialiasmode: DWRITE_TEXT_ANTIALIAS_MODE,
+        baselineoriginx: f32,
+        baselineoriginy: f32,
+    ) -> windows_core::Result<IDWriteGlyphRunAnalysis> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateGlyphRunAnalysis)(
+                windows_core::Interface::as_raw(self),
+                glyphrun,
+                transform.unwrap_or(core::mem::zeroed()) as _,
+                renderingmode,
+                measuringmode,
+                gridfitmode,
+                antialiasmode,
+                baselineoriginx,
+                baselineoriginy,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
 }
 #[repr(C)]
 pub struct IDWriteFactory2_Vtbl {
@@ -4954,7 +4990,18 @@ pub struct IDWriteFactory2_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
     CreateCustomRenderingParams: usize,
-    CreateGlyphRunAnalysis: usize,
+    pub CreateGlyphRunAnalysis: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const DWRITE_GLYPH_RUN,
+        *const DWRITE_MATRIX,
+        DWRITE_RENDERING_MODE,
+        DWRITE_MEASURING_MODE,
+        DWRITE_GRID_FIT_MODE,
+        DWRITE_TEXT_ANTIALIAS_MODE,
+        f32,
+        f32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IDWriteFactory3,
@@ -6149,11 +6196,53 @@ windows_core::imp::define_interface!(
     0x7d97dbf7_e085_42d4_81e3_6a883bded118
 );
 windows_core::imp::interface_hierarchy!(IDWriteGlyphRunAnalysis, windows_core::IUnknown);
+impl IDWriteGlyphRunAnalysis {
+    pub(crate) unsafe fn GetAlphaTextureBounds(
+        &self,
+        texturetype: DWRITE_TEXTURE_TYPE,
+    ) -> windows_core::Result<RECT> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetAlphaTextureBounds)(
+                windows_core::Interface::as_raw(self),
+                texturetype,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn CreateAlphaTexture(
+        &self,
+        texturetype: DWRITE_TEXTURE_TYPE,
+        texturebounds: *const RECT,
+        alphavalues: &mut [u8],
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).CreateAlphaTexture)(
+                windows_core::Interface::as_raw(self),
+                texturetype,
+                texturebounds,
+                alphavalues.as_mut_ptr(),
+                alphavalues.len().try_into().unwrap(),
+            )
+        }
+    }
+}
 #[repr(C)]
 pub struct IDWriteGlyphRunAnalysis_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
-    GetAlphaTextureBounds: usize,
-    CreateAlphaTexture: usize,
+    pub GetAlphaTextureBounds: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DWRITE_TEXTURE_TYPE,
+        *mut RECT,
+    ) -> windows_core::HRESULT,
+    pub CreateAlphaTexture: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DWRITE_TEXTURE_TYPE,
+        *const RECT,
+        *mut u8,
+        u32,
+    ) -> windows_core::HRESULT,
     GetAlphaBlendParams: usize,
 }
 windows_core::imp::define_interface!(

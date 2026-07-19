@@ -501,4 +501,118 @@ mod tests {
             "glyph advances ({walked}) must sum to the layout width ({measured})"
         );
     }
+
+    /// Rasterize one glyph at four fractional baseline origins and compare the
+    /// coverage bytes.
+    ///
+    /// A glyph atlas that caches N subpixel phases is betting that a fractional
+    /// origin changes the pixels. If the rasterizer grid-fits horizontally it
+    /// snaps that origin away, every phase collapses to one image, and the
+    /// atlas pays N× the memory for nothing. A composition surface has no CPU
+    /// read path, so this asks DirectWrite directly — the same rasterizer D2D
+    /// draws glyph runs with.
+    ///
+    /// Reports rather than asserts a specific answer: which grid-fit modes
+    /// preserve phase is a property of the platform's rasterizer, not of this
+    /// code, and the useful output is the count.
+    #[test]
+    fn subpixel_phases_are_distinct_or_are_not() {
+        use crate::bindings::{
+            IDWriteFactory2, DWRITE_GRID_FIT_MODE_DEFAULT, DWRITE_GRID_FIT_MODE_DISABLED,
+            DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_MEASURING_MODE_NATURAL,
+            DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, DWRITE_TEXTURE_ALIASED_1x1,
+            DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+        };
+        use windows_core::Interface;
+
+        // Grayscale antialiasing produces a 1-byte-per-pixel texture. Asking
+        // for the 3x1 ClearType type against a grayscale analysis is not an
+        // error — DirectWrite just reports empty bounds, which reads exactly
+        // like "the glyph rasterized to nothing".
+        const TEX: crate::bindings::DWRITE_TEXTURE_TYPE = DWRITE_TEXTURE_ALIASED_1x1;
+
+        const EM: f32 = 14.0;
+        let fmt = TextFormat::new("Segoe UI", EM).unwrap();
+        let layout = TextLayout::new("n", &fmt, 500.0, 100.0).unwrap();
+        let runs = layout.glyph_runs().unwrap();
+        let run = runs.into_iter().next().expect("one run");
+        eprintln!(
+            "  run: {} glyph(s) {:?} em {} advances {:?}",
+            run.len(),
+            run.glyph_indices,
+            run.font_em_size,
+            run.glyph_advances
+        );
+
+        let factory = dwrite_factory()
+            .unwrap()
+            .cast::<IDWriteFactory2>()
+            .expect("IDWriteFactory2");
+
+        for (label, mode) in [
+            ("default ", DWRITE_GRID_FIT_MODE_DEFAULT),
+            ("disabled", DWRITE_GRID_FIT_MODE_DISABLED),
+            ("enabled ", DWRITE_GRID_FIT_MODE_ENABLED),
+        ] {
+            // (bounds, coverage) per phase — bounds are part of the identity:
+            // a phase that only shifts the box is still a distinct raster.
+            let mut rasters: Vec<((i32, i32, i32, i32), Vec<u8>)> = Vec::new();
+            for step in 0..4u32 {
+                let phase = step as f32 / 4.0;
+                let analysis = run.with_abi(|abi| unsafe {
+                    factory.CreateGlyphRunAnalysis(
+                        abi,
+                        None,
+                        DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                        mode,
+                        DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+                        phase,
+                        0.0,
+                    )
+                });
+                let Ok(analysis) = analysis else {
+                    eprintln!("  {label}: analysis unavailable");
+                    break;
+                };
+                let b = unsafe { analysis.GetAlphaTextureBounds(TEX) }
+                    .unwrap();
+                let len = ((b.right - b.left) * (b.bottom - b.top) * 3).max(0) as usize;
+                let mut buf = vec![0u8; len];
+                if len > 0 {
+                    unsafe {
+                        analysis.CreateAlphaTexture(TEX, &b, &mut buf)
+                    }
+                    .ok()
+                    .unwrap();
+                }
+                rasters.push(((b.left, b.top, b.right, b.bottom), buf));
+            }
+
+            let mut distinct: Vec<&((i32, i32, i32, i32), Vec<u8>)> = Vec::new();
+            for r in &rasters {
+                if !distinct.iter().any(|d| *d == r) {
+                    distinct.push(r);
+                }
+            }
+            eprintln!(
+                "  grid-fit {label}: {}/{} phases distinct  (bounds {:?})",
+                distinct.len(),
+                rasters.len(),
+                rasters.iter().map(|r| r.0).collect::<Vec<_>>()
+            );
+            // Measured: all four phases differ under every grid-fit mode, so
+            // caching per phase buys real subpixel positioning. Asserted at
+            // ">1 distinct" rather than "all 4" because the exact count is the
+            // platform rasterizer's business — what must not silently become
+            // true is that the origin is snapped away and every phase is the
+            // same image, which would make the whole atlas dimension dead
+            // weight.
+            assert!(
+                distinct.len() > 1,
+                "grid-fit {label}: every subpixel phase rasterized identically — \
+                 the phase dimension of the glyph atlas is pure overhead"
+            );
+        }
+    }
 }

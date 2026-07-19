@@ -182,7 +182,19 @@
     IDWriteTextFormat2
     IDWriteTextFormat3::{SetFontAxisValues, SetAutomaticFontAxes}
     IDWriteFactory1
-    IDWriteFactory2::TranslateColorGlyphRun
+    IDWriteFactory2::{TranslateColorGlyphRun, CreateGlyphRunAnalysis}
+// Rasterizes a glyph run to a CPU alpha texture. The only way to observe what
+// the rasterizer actually produced: a composition surface has no read path, so
+// without this "the glyph landed where we asked" is unfalsifiable.
+    IDWriteGlyphRunAnalysis::{GetAlphaTextureBounds, CreateAlphaTexture}
+    DWRITE_TEXTURE_TYPE
+    DWRITE_TEXTURE_ALIASED_1x1
+    DWRITE_TEXTURE_CLEARTYPE_3x1
+    DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC
+    DWRITE_GRID_FIT_MODE_DEFAULT
+    DWRITE_GRID_FIT_MODE_DISABLED
+    DWRITE_GRID_FIT_MODE_ENABLED
+    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE
     IDWriteFactory3
     IDWriteFactory4
     IDWriteFactory5
