@@ -665,4 +665,39 @@ mod tests {
              visual run, got {rects:?}"
         );
     }
+
+    /// The cluster cases only shaping can resolve. A surrogate pair is visible
+    /// in the encoding, but a base character plus a combining mark is one
+    /// cluster of two *separately encoded* characters — nothing short of asking
+    /// DirectWrite reveals that the caret must not sit between them.
+    ///
+    /// This is the oracle `Editor::cluster_at` consults; its own fallback knows
+    /// only about surrogate pairs, so this is where the rest is pinned.
+    #[test]
+    fn a_combining_mark_joins_its_base_into_one_cluster() {
+        // `e` + U+0301 COMBINING ACUTE ACCENT — two chars, one grapheme.
+        let l = layout("e\u{0301}x");
+        let base = l.caret_at(0, false).unwrap().1;
+        assert_eq!(
+            base.length, 2,
+            "the base and its accent are one indivisible caret stop"
+        );
+        // The mark itself reports the same cluster, so a caret landing on it is
+        // pulled back to the base rather than left between the two.
+        let mark = l.caret_at(1, false).unwrap().1;
+        assert_eq!(mark.text_position, 0, "the cluster starts at the base");
+        assert_eq!(mark.length, 2);
+    }
+
+    /// A zero-width cluster draws nothing, so a caret stopping on one appears
+    /// not to have moved. `width == 0` is the signal movement skips on.
+    #[test]
+    fn a_zero_width_cluster_reports_zero_width() {
+        // U+200B ZERO WIDTH SPACE between two visible letters.
+        let l = layout("a\u{200B}b");
+        let zw = l.caret_at(1, false).unwrap().1;
+        assert_eq!(zw.glyph_rect.2, 0.0, "a zero-width space occupies no width");
+        let visible = l.caret_at(0, false).unwrap().1;
+        assert!(visible.glyph_rect.2 > 0.0, "an ordinary letter does not");
+    }
 }

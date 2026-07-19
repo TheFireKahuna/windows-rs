@@ -329,9 +329,11 @@ impl Editor {
             return;
         }
         if self.caret > 0 {
-            let at = self.caret - 1;
-            self.buf.remove(at);
-            self.set_caret(at, Affinity::Upstream, false);
+            // The whole cluster, not one code unit: removing half a surrogate
+            // pair leaves a buffer that is not valid UTF-16.
+            let from = self.prev_stop(self.caret);
+            self.buf.drain(from..self.caret);
+            self.set_caret(from, Affinity::Upstream, false);
             self.mark_dirty();
         }
     }
@@ -342,7 +344,8 @@ impl Editor {
             return;
         }
         if self.caret < self.buf.len() {
-            self.buf.remove(self.caret);
+            let to = self.next_stop(self.caret);
+            self.buf.drain(self.caret..to);
             // The index does not move, but a Downstream caret was anchored to
             // the character just removed. Re-anchor upstream, to text that
             // still exists, rather than silently re-pointing at whatever slid
@@ -354,6 +357,105 @@ impl Editor {
 
     fn clamp(&self, i: usize) -> usize {
         i.min(self.buf.len())
+    }
+
+    // ── Cluster stops ────────────────────────────────────────────────────────
+    //
+    // A caret stop is a whole *cluster*, not a code unit. A surrogate pair, a
+    // base character plus its diacritics, a character plus a variation selector
+    // and a ZWJ emoji sequence are each one indivisible thing the caret may sit
+    // either side of but never inside. Stepping or deleting by one code unit
+    // splits them — for a surrogate pair that produces text which is not valid
+    // UTF-16 at all.
+    //
+    // This mirrors what Microsoft's own DirectWrite editor sample does
+    // (PadWrite `AlignCaretToNearestCluster`): only DirectWrite knows where
+    // clusters begin and end, because only DirectWrite has shaped the text, so
+    // it is asked rather than second-guessed.
+
+    /// The whole cluster containing code-unit `i`, as `[start, end)`.
+    ///
+    /// `end` is guaranteed strictly greater than `i` for any `i` inside the
+    /// buffer, so a caller stepping through the text always makes progress even
+    /// if DirectWrite reports a degenerate zero-length cluster.
+    fn cluster_at(&self, i: usize) -> (usize, usize) {
+        let n = self.buf.len();
+        if i >= n {
+            return (n, n);
+        }
+        if let Some(layout) = &self.layout
+            && let Ok((_, hit)) = layout.caret_at(i as u32, false)
+        {
+            let start = (hit.text_position as usize).min(i);
+            let end = start.saturating_add(hit.length as usize).clamp(i + 1, n);
+            return (start, end);
+        }
+        // No layout yet (the field has not been painted). DirectWrite cannot be
+        // asked, so fall back to the one cluster rule that is a property of the
+        // encoding rather than of shaping: a surrogate pair is inseparable.
+        // Combining marks are not caught here, but a caret cannot reach this
+        // path in a field the user is looking at.
+        let start = if i > 0
+            && is_low_surrogate(self.buf[i])
+            && is_high_surrogate(self.buf[i - 1])
+        {
+            i - 1
+        } else {
+            i
+        };
+        let end = if is_high_surrogate(self.buf[start])
+            && start + 1 < n
+            && is_low_surrogate(self.buf[start + 1])
+        {
+            start + 2
+        } else {
+            start + 1
+        };
+        (start, end.min(n))
+    }
+
+    /// The caret stop after `from`, skipping clusters that occupy no width.
+    ///
+    /// Zero-width clusters are real — a zero-width joiner, a bidi mark, a
+    /// zero-width space all survive a paste — and stopping on one parks the
+    /// caret at a position visually identical to the last, which is
+    /// indistinguishable from a dropped keypress. PadWrite forces past them for
+    /// the same reason. The skip is bounded because the loop's termination
+    /// otherwise depends on DirectWrite's answers rather than on this code.
+    fn next_stop(&self, from: usize) -> usize {
+        let mut i = self.cluster_at(from).1;
+        for _ in 0..MAX_ZERO_WIDTH_SKIP {
+            if i >= self.buf.len() || !self.is_zero_width_at(i) {
+                break;
+            }
+            i = self.cluster_at(i).1;
+        }
+        i
+    }
+
+    /// The caret stop before `from`, skipping zero-width clusters.
+    fn prev_stop(&self, from: usize) -> usize {
+        if from == 0 {
+            return 0;
+        }
+        let mut i = self.cluster_at(from - 1).0;
+        for _ in 0..MAX_ZERO_WIDTH_SKIP {
+            if i == 0 || !self.is_zero_width_at(i) {
+                break;
+            }
+            i = self.cluster_at(i - 1).0;
+        }
+        i
+    }
+
+    /// Whether the cluster starting at `i` draws nothing. Only answerable with a
+    /// layout; without one every cluster is treated as visible, which costs a
+    /// caret stop on an invisible character rather than a correctness failure.
+    fn is_zero_width_at(&self, i: usize) -> bool {
+        self.layout
+            .as_ref()
+            .and_then(|l| l.caret_at(i as u32, false).ok())
+            .is_some_and(|(_, hit)| hit.glyph_rect.2 == 0.0)
     }
 
     /// Move the caret one unit (or one word with `word`) left, optionally
@@ -371,9 +473,11 @@ impl Editor {
         let to = if self.has_selection() && !select {
             self.sel().0
         } else if word {
-            self.word_left(self.caret)
+            // A word boundary is normally also a cluster boundary, but a
+            // combining mark can follow a space; align rather than assume.
+            self.cluster_at(self.word_left(self.caret)).0
         } else {
-            self.caret.saturating_sub(1)
+            self.prev_stop(self.caret)
         };
         // Stepping backwards onto a character puts the caret on its leading side.
         self.set_caret(to, Affinity::Downstream, select);
@@ -385,9 +489,9 @@ impl Editor {
         let to = if self.has_selection() && !select {
             self.sel().1
         } else if word {
-            self.word_right(self.caret)
+            self.cluster_at(self.word_right(self.caret)).0
         } else {
-            self.clamp(self.caret + 1)
+            self.next_stop(self.caret)
         };
         // Stepping forward over a character puts the caret on its trailing side.
         self.set_caret(to, Affinity::Upstream, select);
@@ -753,6 +857,25 @@ impl TextBand {
 /// UTF-16 whitespace test (covers the common ASCII / NBSP cases).
 fn is_space(u: u16) -> bool {
     matches!(u, 0x20 | 0x09 | 0x0A | 0x0D | 0xA0)
+}
+
+/// How many consecutive zero-width clusters a caret move will step over before
+/// giving up and stopping on one.
+///
+/// A bound rather than a `while`: the loop's termination would otherwise rest on
+/// DirectWrite always reporting progress, and a caret that cannot be moved is a
+/// field that cannot be edited. Real runs of invisible characters are one or two
+/// long — a joiner, a bidi mark — so this never binds in practice.
+const MAX_ZERO_WIDTH_SKIP: usize = 16;
+
+/// First half of a UTF-16 surrogate pair.
+fn is_high_surrogate(u: u16) -> bool {
+    (0xD800..0xDC00).contains(&u)
+}
+
+/// Second half of a UTF-16 surrogate pair.
+fn is_low_surrogate(u: u16) -> bool {
+    (0xDC00..0xE000).contains(&u)
 }
 
 /// Whether a typed character is admissible in a numeric field (digits, sign,
@@ -1151,5 +1274,24 @@ mod tests {
                 "caret {cx} must land inside the window after scrolling to {s}"
             );
         }
+    }
+
+    /// A thumbs-up is one character of two UTF-16 code units. Stepping or
+    /// deleting by one unit splits it into a lone surrogate — text that is not
+    /// valid UTF-16 and renders as a replacement glyph.
+    #[test]
+    fn clusters_are_not_split_by_movement_or_deletion() {
+        let mut e = editor_with("a\u{1F44D}b", 0);
+        e.end(false);
+        e.move_left(false, false);
+        assert_eq!(e.caret(), 3, "left from the end must clear the whole emoji");
+        e.move_left(false, false);
+        assert_eq!(e.caret(), 1, "and again must land before it, not inside it");
+
+        let mut e = editor_with("a\u{1F44D}b", 0);
+        e.end(false);
+        e.backspace();
+        e.backspace();
+        assert_eq!(e.text(), "a", "backspace must remove the emoji whole");
     }
 }
