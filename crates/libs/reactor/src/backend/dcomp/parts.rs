@@ -1052,10 +1052,6 @@ pub(crate) struct Parts {
     above: Vec<Part>,
     /// First sync completed — until then every write snaps.
     init: bool,
-    /// Last toggle state.
-    on: bool,
-    /// Last slider fraction.
-    frac: f32,
     /// Last node size; a change snaps (resize must not glide).
     geom: (f32, f32),
     /// The layout signature the parts were last applied against
@@ -1107,8 +1103,6 @@ impl Parts {
             below: Vec::new(),
             above: Vec::new(),
             init: false,
-            on: false,
-            frac: 0.0,
             geom: (0.0, 0.0),
             layout_sig: [0.0; 3],
             looping: false,
@@ -1140,6 +1134,15 @@ impl Parts {
         self.looping = false;
         self.clip = None;
         self.clip_w = 0.0;
+        // The slider's fill derivation, retired the way the machinery itself
+        // retires it. `fill_live` left standing is the failure its own doc
+        // names — this side would believe it was still following and skip
+        // re-arming, freezing the fill — and bumping the generation is how
+        // `slider_fill_static` invalidates an in-flight settle, so a completion
+        // for the dead batch can no longer match and write a stale rect.
+        self.fill_live.set(false);
+        self.fill_gen.set(self.fill_gen.get().wrapping_add(1));
+        self._fill_settle = None;
     }
 
     pub(crate) fn below_visuals(&self) -> impl Iterator<Item = Visual> + '_ {
@@ -1711,40 +1714,57 @@ fn toggle_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
     if !ensure(comp, node, 3, 0) {
         return;
     }
+    let plan = toggle_plan(node, scale);
+    apply(comp, atlas, node, &plan);
+}
+
+/// Below-band roles: `[on track, off track, knob]`.
+///
+/// The knob GLIDES and carries no "was it on last time" shadow, for the same
+/// reason the segmented pill carries none: its x is a pure function of `is_on`,
+/// and `Part`'s own channel already knows whether that moved. The shadow is
+/// exactly what stopped the knob sliding — a flip would start the glide, and the
+/// next sync would find `parts.on == on` and take the AUTHORITATIVE `place`
+/// branch, which stops the spring dead and jumps the knob to the end.
+pub(crate) fn toggle_plan(node: &Node, scale: f32) -> PartPlan {
     let cy = node.rect.h / 2.0;
     let on = node.ctrl().is_on;
     let dim = dim_of(node);
     let (kx_off, kx_on) = knob_xs();
     let kx = if on { kx_on } else { kx_off };
-
-    let k_on = AtlasKey::hbar(TRACK_H, TRACK_H / 2.0, 0.0, theme::accent(), scale);
-    let k_off = AtlasKey::hbar(TRACK_H, TRACK_H / 2.0, 1.5, theme::w(OUTLINE_AUTHORED), scale);
-    let k_knob = AtlasKey::circle(KNOB_D, theme::w(1.0), scale);
-
     let (on_t, off_t) = track_targets(on, node.hovered, dim);
-    let geom = (node.rect.w, node.rect.h);
-    let Some(parts) = node.parts.as_mut() else { return };
-    let snap = !parts.init || parts.geom != geom;
 
-    parts.below[0].bind(comp, atlas, k_on);
-    parts.below[1].bind(comp, atlas, k_off);
-    parts.below[2].bind(comp, atlas, k_knob);
-    parts.below[0].place(0.0, cy - TRACK_H / 2.0, TRACK_W, TRACK_H);
-    parts.below[1].place(0.0, cy - TRACK_H / 2.0, TRACK_W, TRACK_H);
+    let track = Some((0.0, cy - TRACK_H / 2.0, TRACK_W, TRACK_H));
+    let knob = Some((kx, cy - KNOB_D / 2.0, KNOB_D, KNOB_D));
 
-    let ky = cy - KNOB_D / 2.0;
-    if snap || parts.on == on {
-        parts.below[2].place(kx, ky, KNOB_D, KNOB_D);
-        parts.below[0].set_opacity(on_t);
-        parts.below[1].set_opacity(off_t);
-    } else {
-        parts.below[2].glide(kx, ky, KNOB_D, KNOB_D);
-        parts.below[0].fade_to(on_t);
-        parts.below[1].fade_to(off_t);
-    }
-    parts.on = on;
-    parts.geom = geom;
-    parts.init = true;
+    PartPlan::new([node.rect.w, node.rect.h, 0.0])
+        // The two tracks are stacked and cross-fade in place; only their opacity
+        // carries the state, so neither ever travels.
+        .below(
+            0,
+            SlotPlan::snap(
+                AtlasKey::hbar(TRACK_H, TRACK_H / 2.0, 0.0, theme::accent(), scale),
+                track,
+                on_t,
+            )
+            .fading(),
+        )
+        .below(
+            1,
+            SlotPlan::snap(
+                AtlasKey::hbar(TRACK_H, TRACK_H / 2.0, 1.5, theme::w(OUTLINE_AUTHORED), scale),
+                track,
+                off_t,
+            )
+            .fading(),
+        )
+        // The knob is the one thing that moves. Opacity 1.0 rather than `dim`
+        // preserves the previous behaviour, which never wrote the knob's opacity
+        // at all.
+        .below(
+            2,
+            SlotPlan::glide(AtlasKey::circle(KNOB_D, theme::w(1.0), scale), knob, 1.0),
+        )
 }
 
 fn knob_xs() -> (f32, f32) {
@@ -1786,29 +1806,34 @@ fn check_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32
     if !ensure(comp, node, 1, 1) {
         return;
     }
-    let on = node.ctrl().is_checked;
-    let t = if on { dim_of(node) } else { 0.0 };
-    let y = node.rect.h / 2.0 - CHECK_BOX_D / 2.0;
-    let k_fill = AtlasKey::hbar(CHECK_BOX_D, theme::RADIUS_SM, 0.0, theme::accent(), scale);
-    let k_check = AtlasKey::check(CHECK_BOX_D, theme::w(1.0), scale);
-    let geom = (node.rect.w, node.rect.h);
-    let Some(parts) = node.parts.as_mut() else { return };
-    let snap = !parts.init || parts.geom != geom;
+    let plan = check_plan(node, scale);
+    apply(comp, atlas, node, &plan);
+}
 
-    parts.below[0].bind(comp, atlas, k_fill);
-    parts.above[0].bind(comp, atlas, k_check);
-    parts.below[0].place(0.0, y, CHECK_BOX_D, CHECK_BOX_D);
-    parts.above[0].place(0.0, y, CHECK_BOX_D, CHECK_BOX_D);
-    if snap || parts.on == on {
-        parts.below[0].set_opacity(t);
-        parts.above[0].set_opacity(t);
-    } else {
-        parts.below[0].fade_to(t);
-        parts.above[0].fade_to(t);
-    }
-    parts.on = on;
-    parts.geom = geom;
-    parts.init = true;
+/// Below: `[accent box fill]`; above: `[checkmark]`.
+///
+/// Nothing here travels — a check is a pair of fades — so the `parts.on` shadow
+/// was suppressing the fades rather than a glide, snapping the crossfade to its
+/// endpoint on the sync after the one that started it.
+pub(crate) fn check_plan(node: &Node, scale: f32) -> PartPlan {
+    let t = if node.ctrl().is_checked { dim_of(node) } else { 0.0 };
+    let y = node.rect.h / 2.0 - CHECK_BOX_D / 2.0;
+    let box_rect = Some((0.0, y, CHECK_BOX_D, CHECK_BOX_D));
+
+    PartPlan::new([node.rect.w, node.rect.h, 0.0])
+        .below(
+            0,
+            SlotPlan::snap(
+                AtlasKey::hbar(CHECK_BOX_D, theme::RADIUS_SM, 0.0, theme::accent(), scale),
+                box_rect,
+                t,
+            )
+            .fading(),
+        )
+        .above(
+            0,
+            SlotPlan::snap(AtlasKey::check(CHECK_BOX_D, theme::w(1.0), scale), box_rect, t).fading(),
+        )
 }
 
 // ── Slider ───────────────────────────────────────────────────────────────────
@@ -1882,7 +1907,6 @@ fn slider_sync(
     parts.above[0].set_opacity(dim);
     parts.above[1].fade_to(halo_t);
     parts.above[2].set_opacity(dim);
-    parts.frac = frac;
     parts.geom = geom;
     parts.init = true;
 }
@@ -2102,7 +2126,6 @@ pub(crate) fn slider_drag(node: &mut Node, frac: f32) -> bool {
         return false;
     }
     slider_apply(parts, &g, true);
-    parts.frac = frac;
     true
 }
 
@@ -2178,7 +2201,6 @@ fn meter_sync(
 
     meter_arm_clip(parts, w);
 
-    parts.frac = frac;
     parts.geom = geom;
     parts.init = true;
 }
@@ -2581,13 +2603,18 @@ fn progress_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: 
         // Floor the fill at one full pill so the nine-grid corners never
         // degenerate at tiny fractions.
         let fw = if frac > 0.0 { (w * frac).max(bar_h) } else { 0.0 };
-        if snap || parts.frac == frac {
+        // No "was the fraction different last time" shadow: the fill's rect is a
+        // pure function of `frac`, and the channel already knows whether it
+        // moved — `glide` on an unchanged rect is a no-op. The shadow was the
+        // whole defect, because committing it while taking the AUTHORITATIVE
+        // `place` branch stopped the spring a frame after starting it, so the
+        // fill stepped to each new length instead of growing into it.
+        if snap {
             parts.below[1].place(0.0, y, fw.max(0.01), bar_h);
         } else {
             parts.below[1].glide(0.0, y, fw.max(0.01), bar_h);
         }
         parts.below[1].set_opacity(if frac > 0.0 { dim } else { 0.0 });
-        parts.frac = frac;
     }
     parts.geom = (w, h);
     parts.init = true;

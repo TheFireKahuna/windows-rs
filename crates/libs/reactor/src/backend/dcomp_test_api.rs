@@ -968,6 +968,8 @@ impl ArenaHarness {
         let plan = match n.kind {
             ControlKind::SelectorBar => dcomp::parts::segmented_plan(n, scale),
             ControlKind::NavigationView => dcomp::parts::nav_plan(n, scale),
+            ControlKind::ToggleSwitch => dcomp::parts::toggle_plan(n, scale),
+            ControlKind::CheckBox => dcomp::parts::check_plan(n, scale),
             _ => return None,
         };
         let (below, above) = plan.slots();

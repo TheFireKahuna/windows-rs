@@ -35,6 +35,9 @@ const NAV_TILE: usize = 1;
 const NAV_BAR: usize = 2;
 const SET_TILE: usize = 3;
 
+const TRACK_ON: usize = 0;
+const KNOB: usize = 2;
+
 /// `nav::SETTINGS_INDEX` — the sentinel slot the settings row selects at.
 const SETTINGS_INDEX: i32 = 1 << 16;
 
@@ -58,6 +61,14 @@ fn bar(a: &mut ArenaHarness, w: f32, h: f32, labels: &[&str], sel: i32) -> PartP
     // The segment edges are derived from MEASURED label runs; without this the
     // widths fall back to an even split and the test asserts a degenerate case.
     a.rebuild_text(id);
+    a.part_plan(id, 1.0).unwrap()
+}
+
+/// A ToggleSwitch in the given state, laid out at its usual row size.
+fn toggle(a: &mut ArenaHarness, on: bool) -> PartPlanProbe {
+    let id = a.insert(K::ToggleSwitch).unwrap();
+    a.apply_prop(id, Prop::IsOn, &V::Bool(on));
+    a.set_rect(id, 40.0, 32.0);
     a.part_plan(id, 1.0).unwrap()
 }
 
@@ -214,6 +225,41 @@ fn the_settings_row_has_its_own_indicator() {
     assert!(
         menu.below[NAV_TILE].unwrap().fades && settings.below[SET_TILE].unwrap().fades,
         "region handoff must cross-fade, not pop",
+    );
+}
+
+// ── ToggleSwitch ─────────────────────────────────────────────────────────────
+
+/// The knob must actually TRAVEL between the two ends, and it must glide doing
+/// it. The `parts.on` shadow made a flip start a glide and then take the
+/// authoritative `place` branch on the next sync, stopping the spring dead — so
+/// the knob appeared to jump rather than slide.
+#[test]
+fn the_toggle_knob_travels_between_the_ends_and_glides() {
+    let mut a = harness();
+    let off = toggle(&mut a, false);
+    let on = toggle(&mut a, true);
+
+    let kx = |p: &PartPlanProbe| p.below[KNOB].unwrap().rect.unwrap().0;
+    assert!(
+        kx(&on) > kx(&off),
+        "the knob must move right when switched on: {} then {}",
+        kx(&off),
+        kx(&on),
+    );
+    assert!(on.below[KNOB].unwrap().glides, "the knob must glide, not jump");
+
+    // The tracks carry the state as opacity and never travel.
+    assert!(!on.below[TRACK_ON].unwrap().glides, "the track must not travel");
+    assert!(on.below[TRACK_ON].unwrap().fades, "the tracks cross-fade");
+    assert_eq!(
+        off.below[TRACK_ON].unwrap().rect,
+        on.below[TRACK_ON].unwrap().rect,
+        "both track sprites sit at the same place in both states",
+    );
+    assert!(
+        on.below[TRACK_ON].unwrap().opacity > off.below[TRACK_ON].unwrap().opacity,
+        "the accent track shows when on",
     );
 }
 
