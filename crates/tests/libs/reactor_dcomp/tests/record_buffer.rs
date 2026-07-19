@@ -452,6 +452,116 @@ fn destroyed_node_accelerators_die() {
     assert_eq!(fired.get(), 1);
 }
 
+/// The §7.2 revision protocol for editor text, recorder half: a `TextBox`'s
+/// string `Prop::Value` write becomes a stamped `SetText`, a write matching
+/// the recorder's view of the front buffer is not re-recorded (the reconciler
+/// re-emits the binding every render — the dedupe here is what keeps the
+/// steady state silent), and a write that *disagrees* with a delivered edit —
+/// the app declining it, "revert to the same prop value" — crosses as a
+/// corrective `SetText` stamped with the delivered revision.
+#[test]
+fn text_writes_are_stamped_and_view_deduped() {
+    let mut rec = Recorder::new();
+    rec.backend().create(id(1), ControlKind::TextBox);
+
+    let seen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let s = Rc::clone(&seen);
+    rec.backend().attach_event(
+        id(1),
+        Event::TextChanged,
+        EventHandler::Str(Callback::new(move |t: String| s.borrow_mut().push(t))),
+    );
+
+    // Mount seed: stamped against revision 0.
+    rec.backend()
+        .set_prop(id(1), Prop::Value, &PropValue::Str("seed".into()));
+    // The reconciler re-emits the same binding next render: deduped.
+    rec.backend()
+        .set_prop(id(1), Prop::Value, &PropValue::Str("seed".into()));
+
+    // The user types; the app is consulted at revision 3.
+    rec.queue_editor_text(id(1), Event::TextChanged, "typed", 3);
+    assert_eq!(rec.drain_and_run(), 1);
+    assert_eq!(*seen.borrow(), vec!["typed".to_string()]);
+
+    // The app's verbatim echo of what it was shown: deduped, no wire traffic.
+    rec.backend()
+        .set_prop(id(1), Prop::Value, &PropValue::Str("typed".into()));
+    // The app declines the edit and re-declares other text: a corrective
+    // write, stamped with the revision it was consulted at.
+    rec.backend()
+        .set_prop(id(1), Prop::Value, &PropValue::Str("seed".into()));
+
+    rec.flush();
+    let applied = rec.applied();
+    let texts: Vec<&str> = applied
+        .iter()
+        .filter(|l| l.starts_with("set_text"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "set_text 1 \"seed\" based_on=0",
+            "set_text 1 \"seed\" based_on=3",
+        ],
+        "duplicate writes must dedupe and corrective writes must cross stamped: {applied:?}"
+    );
+}
+
+/// An editor nobody listens to keeps revision 0 at the recorder: the drain
+/// advances `delivered_text_rev` only when a handler exists, so a later
+/// programmatic write cannot arrive stamped fresh against user text the app
+/// was never told about — the front drops it instead of retracting the edit.
+#[test]
+fn unconsulted_editor_revision_never_advances() {
+    let mut rec = Recorder::new();
+    rec.backend().create(id(1), ControlKind::TextBox);
+
+    // The user typed at revisions 1..=5, but no handler is attached.
+    rec.queue_editor_text(id(1), Event::TextChanged, "user text", 5);
+    assert_eq!(rec.drain_and_run(), 0, "no handler must run");
+
+    // An unrelated re-render re-emits the app's stale declaration. It must be
+    // stamped 0 (never consulted), which the front's revision gate drops.
+    rec.backend()
+        .set_prop(id(1), Prop::Value, &PropValue::Str("stale".into()));
+    rec.flush();
+    let applied = rec.applied();
+    assert!(
+        applied.iter().any(|l| l == "set_text 1 \"stale\" based_on=0"),
+        "an unconsulted editor's write must be stamped 0: {applied:?}"
+    );
+}
+
+/// An `AutoSuggestBox` declares its text via `Prop::Text` (not `Prop::Value`);
+/// the recorder's kind gate routes exactly that prop through `SetText`, while
+/// `Prop::Text` on a label kind stays an ordinary prop write.
+#[test]
+fn text_prop_routes_by_kind() {
+    let mut rec = Recorder::new();
+    rec.backend().create(id(1), ControlKind::AutoSuggestBox);
+    rec.backend().create(id(2), ControlKind::TextBlock);
+
+    rec.backend()
+        .set_prop(id(1), Prop::Text, &PropValue::Str("query".into()));
+    rec.backend()
+        .set_prop(id(2), Prop::Text, &PropValue::Str("label".into()));
+
+    rec.flush();
+    let applied = rec.applied();
+    assert!(
+        applied.iter().any(|l| l == "set_text 1 \"query\" based_on=0"),
+        "AutoSuggestBox text must ride SetText: {applied:?}"
+    );
+    assert!(
+        applied
+            .iter()
+            .any(|l| l.starts_with("set_prop") && l.contains("label")),
+        "a TextBlock's text must stay an ordinary prop write: {applied:?}"
+    );
+}
+
 /// Nothing thread-affine has leaked into a `Cmd` or `Intent` variant. The lib
 /// asserts this at compile time; this restates it where the test build can
 /// fail on it.

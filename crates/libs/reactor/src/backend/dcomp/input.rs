@@ -1506,8 +1506,12 @@ impl DCompBackend {
         }
     }
 
-    /// Commit a chosen suggestion to its AutoSuggestBox: set the field text to the
-    /// suggestion, fire `SuggestionChosen`, and dismiss the dropdown (focus stays).
+    /// Commit a chosen suggestion to its AutoSuggestBox: set the field text to
+    /// the suggestion, fire `TextChanged` then `SuggestionChosen` (the buffer
+    /// changed, and both are how the app's controlled value and the §7.2
+    /// delivered revision stay current — mirroring WinUI, where choosing a
+    /// suggestion raises TextChanged with reason SuggestionChosen), and
+    /// dismiss the dropdown (focus stays).
     fn choose_suggestion(&mut self, idx: usize) {
         let Some(p) = &self.popup else { return };
         let owner = p.owner;
@@ -1518,11 +1522,13 @@ impl DCompBackend {
                 e.set_text(&text);
                 e.seeded = true;
                 e.caret_moved = true;
+                e.text_rev += 1;
             }
             n.mark_dirty();
         }
         self.repaint();
-        self.fire_string(owner, Event::SuggestionChosen, text);
+        self.fire_editor_text(owner, Event::TextChanged, text.clone());
+        self.fire_editor_text(owner, Event::SuggestionChosen, text);
     }
 
     /// Close the open popup with a compositor-side dismiss fade. The overlay
@@ -1933,7 +1939,7 @@ impl DCompBackend {
                     } else {
                         let t = self.with_editor(id, |e| e.text()).unwrap_or_default();
                         self.close_popup();
-                        self.fire_string(id, Event::QuerySubmitted, t);
+                        self.fire_editor_text(id, Event::QuerySubmitted, t);
                     }
                     return Some(());
                 }
@@ -2002,7 +2008,7 @@ impl DCompBackend {
                     self.commit_number(id);
                 } else if kind == ControlKind::AutoSuggestBox {
                     let t = self.with_editor(id, |e| e.text()).unwrap_or_default();
-                    self.fire_string(id, Event::QuerySubmitted, t);
+                    self.fire_editor_text(id, Event::QuerySubmitted, t);
                 }
             }
             VK_UP if kind == ControlKind::NumberBox => self.number_step(id, 1.0, false),
@@ -2109,7 +2115,10 @@ impl DCompBackend {
     }
 
     /// Text changed: reset blink, repaint, and fire the per-kind change event
-    /// (NumberBox fires only on commit).
+    /// (NumberBox fires only on commit). Every user-originated buffer edit
+    /// funnels through here (keystroke, backspace, paste, IME commit, UIA
+    /// SetValue), so this is where the editor's §7.2 text revision bumps —
+    /// the fired intent carries the new revision out to the app.
     fn editor_after_edit(&mut self, id: ControlId) {
         let (kind, text) = match self.node_mut(id) {
             Some(n) => {
@@ -2117,6 +2126,7 @@ impl DCompBackend {
                 if let Some(e) = &mut n.editor {
                     e.caret_moved = true;
                     e.seeded = true;
+                    e.text_rev += 1;
                 }
                 let text = n.editor.as_ref().map(|e| e.text()).unwrap_or_default();
                 n.mark_dirty();
@@ -2126,15 +2136,15 @@ impl DCompBackend {
         };
         self.repaint();
         match kind {
-            ControlKind::TextBox => self.fire_string(id, Event::TextChanged, text),
+            ControlKind::TextBox => self.fire_editor_text(id, Event::TextChanged, text),
             ControlKind::AutoSuggestBox => {
-                self.fire_string(id, Event::TextChanged, text);
+                self.fire_editor_text(id, Event::TextChanged, text);
                 // Reflect the edit in the suggestion dropdown from whatever rows the
                 // node currently carries; the app's filtered list (set on the next
                 // render via `Prop::Items`) refreshes it again in place.
                 self.refresh_suggest(id);
             }
-            ControlKind::PasswordBox => self.fire_string(id, Event::PasswordChanged, text),
+            ControlKind::PasswordBox => self.fire_editor_text(id, Event::PasswordChanged, text),
             _ => {}
         }
     }
@@ -2566,6 +2576,31 @@ impl DCompBackend {
             id,
             event,
             payload: record::IntentPayload::I32(v),
+        });
+    }
+
+    /// An editor-owned string event (`TextChanged` / `PasswordChanged` /
+    /// `QuerySubmitted` / `SuggestionChosen`) — carries the editor's buffer
+    /// revision so the app's programmatic write can come back stamped against
+    /// it ([`Cmd::SetText`]) and a stale one be dropped — the §7.2 revision
+    /// protocol, text half. The *bump* happens at the edit site
+    /// ([`editor_after_edit`](Self::editor_after_edit) /
+    /// [`choose_suggestion`](Self::choose_suggestion)); a commit-boundary
+    /// event that leaves the buffer untouched (`QuerySubmitted`) fires with
+    /// the current revision, which is what lets the app's response to it — a
+    /// clear-search, a canonicalization — apply without a force lane.
+    fn fire_editor_text(&mut self, id: ControlId, event: Event, v: String) {
+        self.uia_notify_string(id, event, &v);
+        let rev = self
+            .node(id)
+            .and_then(|n| n.editor.as_ref())
+            .map(|e| e.text_rev)
+            .unwrap_or(0);
+        self.intents.push(record::Intent::EditorText {
+            id,
+            event,
+            text: v,
+            rev,
         });
     }
 

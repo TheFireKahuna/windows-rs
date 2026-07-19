@@ -964,6 +964,28 @@ impl DCompBackend {
         Backend::set_prop(self, id, Prop::Value, &PropValue::F64(value));
     }
 
+    /// Revision-gated editor-text write — the §7.2 arrival rules, text half.
+    ///
+    /// In order: while an IME composition is active **nothing** applies (the
+    /// composition guard — every platform that let a programmatic write land
+    /// mid-composition shipped broken CJK input; the app converges through
+    /// the `TextChanged` the commit fires). An echo-identical write is a
+    /// strict no-op — it never moves the caret. A write stamped older than
+    /// the buffer's revision is a stale echo of text the user has already
+    /// superseded and is dropped — the app converges through the newer
+    /// intent already queued. A fresh write applies with caret
+    /// position-mapping ([`editor::Editor::apply_program_text`]), never
+    /// collapse-to-end.
+    pub(crate) fn set_text_stamped(&mut self, id: ControlId, text: &str, based_on: u64) {
+        let Some(node) = self.node_mut(id) else { return };
+        if !apply_text_stamped(node, text, based_on) {
+            // Not an editor (a stamped write can only reach one through the
+            // recorder's kind gate, so this is a direct caller): fall through
+            // to the plain prop path.
+            Backend::set_prop(self, id, Prop::Value, &PropValue::Str(text.into()));
+        }
+    }
+
     /// Record the node's declared accelerator chords (§7.3). An empty list
     /// clears the entry; input matches keydowns against this table
     /// ([`input`]'s `match_accelerator`) and fires the app callback through
@@ -993,6 +1015,10 @@ impl record::FrontBackend for DCompBackend {
 
     fn set_value_stamped(&mut self, id: ControlId, value: f64, based_on: u64) {
         Self::set_value_stamped(self, id, value, based_on);
+    }
+
+    fn set_text_stamped(&mut self, id: ControlId, text: &str, based_on: u64) {
+        Self::set_text_stamped(self, id, text, based_on);
     }
 
     fn set_keybindings(
@@ -1083,9 +1109,9 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
         // node's label like every other text-bearing control.
         (Prop::Content | Prop::Text | Prop::Header, PropValue::Str(s)) => {
             // For an editable kind (AutoSuggestBox carries its text via
-            // `Prop::Text`), seed the editor buffer instead of the label.
+            // `Prop::Text`), write the editor buffer instead of the label.
             if node.editor.is_some() {
-                seed_editor_text(node, s);
+                direct_editor_text(node, s);
             } else {
                 node.paint.text = s.clone();
                 node.text_dirty = true;
@@ -1094,7 +1120,7 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
         }
         // TextBox / PasswordBox carry their text via `Prop::Value(Str)`.
         (Prop::Value, PropValue::Str(s)) if node.editor.is_some() => {
-            seed_editor_text(node, s);
+            direct_editor_text(node, s);
             node.mark_dirty();
         }
         (Prop::Precision, PropValue::I32(v)) => {
@@ -2387,15 +2413,41 @@ fn clone_lengths(g: &[GridLength]) -> Vec<GridLength> {
     g.to_vec()
 }
 
-/// Seed an editor's buffer from a programmatic string prop. Skipped while the
-/// field is focused so the user's in-progress edit is never clobbered.
-fn seed_editor_text(node: &mut Node, s: &str) {
-    let focused = node.focused;
+/// The §7.2 arrival rules for a revision-stamped editor-text write, node
+/// half — the REAL body [`DCompBackend::set_text_stamped`] applies (and the
+/// headless harness drives). Returns `false` when the node has no editor
+/// (the write is not editor text and the caller falls back to the plain
+/// prop path). In order: composition guard, echo-identical no-op,
+/// stale-revision drop, then apply with caret position-mapping.
+pub(crate) fn apply_text_stamped(node: &mut Node, text: &str, based_on: u64) -> bool {
+    let Some(ed) = &mut node.editor else {
+        return false;
+    };
+    if ed.comp_len > 0 || ed.text_eq(text) || based_on < ed.text_rev {
+        return true;
+    }
+    ed.apply_program_text(text);
+    ed.seeded = true;
+    ed.caret_moved = true;
+    node.mark_dirty();
+    true
+}
+
+/// Direct (unstamped) programmatic editor text — the arrival path for a plain
+/// `Backend::set_prop` string write, which on the shipping pipeline only a
+/// direct caller (a test, a headless harness) can produce: the recorder
+/// routes every reconciler-originated write through the revision-stamped
+/// [`DCompBackend::set_text_stamped`] instead. Applies with the same caret
+/// position-mapping and composition guard, but no revision gate — an
+/// unstamped caller has no revision to be stale against.
+fn direct_editor_text(node: &mut Node, s: &str) {
     if let Some(ed) = &mut node.editor
-        && (!focused || !ed.seeded)
+        && ed.comp_len == 0
+        && !ed.text_eq(s)
     {
-        ed.set_text(s);
+        ed.apply_program_text(s);
         ed.seeded = true;
+        ed.caret_moved = true;
     }
 }
 

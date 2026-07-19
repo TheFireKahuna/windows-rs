@@ -51,6 +51,14 @@ pub(crate) struct Editor {
     /// True once seeded from a prop. While focused the user owns the buffer, so
     /// programmatic value props are ignored until blur (no clobbering mid-edit).
     pub seeded: bool,
+    /// Monotonic revision of the buffer, bumped on every **user-originated**
+    /// edit (keystroke, paste, IME commit, suggestion choice, UIA SetValue).
+    /// Rides out on the editor-text intents; the app's programmatic write
+    /// comes back stamped with the revision it was based on, and a stale one
+    /// is dropped instead of retracting text the user typed since — the §7.2
+    /// revision protocol, text half (the control-value twin is
+    /// `Node::value_rev`).
+    pub text_rev: u64,
     /// Active IME composition span `[comp_start, comp_start + comp_len)`.
     pub comp_start: usize,
     pub comp_len: usize,
@@ -73,6 +81,7 @@ impl Editor {
             caret_shown: true,
             caret_moved: true,
             seeded: false,
+            text_rev: 0,
             comp_start: 0,
             comp_len: 0,
             mask: kind == ControlKind::PasswordBox,
@@ -97,6 +106,55 @@ impl Editor {
         self.caret = self.buf.len();
         self.anchor = self.caret;
         self.scroll_x = 0.0;
+        self.mark_dirty();
+    }
+
+    /// Whether the buffer already holds exactly `s` (no allocation).
+    pub fn text_eq(&self, s: &str) -> bool {
+        s.encode_utf16().eq(self.buf.iter().copied())
+    }
+
+    /// Apply a programmatic (reconciliation) write with caret
+    /// **position-mapping** — never collapse-to-end, which is reserved for
+    /// user-action replacements ([`set_text`](Self::set_text)). The old and
+    /// new documents are aligned by their common prefix/suffix; a caret or
+    /// anchor before the changed region stays put, one after it shifts by the
+    /// length delta, and one inside it lands at the end of the replacement.
+    /// This is what keeps an app echo (or a light transform) from teleporting
+    /// the caret out from under the user.
+    pub fn apply_program_text(&mut self, s: &str) {
+        let new: Vec<u16> = s.encode_utf16().collect();
+        if new == self.buf {
+            return;
+        }
+        let prefix = self
+            .buf
+            .iter()
+            .zip(&new)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let max_suffix = (self.buf.len() - prefix).min(new.len() - prefix);
+        let mut suffix = 0;
+        while suffix < max_suffix
+            && self.buf[self.buf.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        // The changed region is `[prefix, old_end)` → `[prefix, new_end)`.
+        let old_end = self.buf.len() - suffix;
+        let new_end = new.len() - suffix;
+        let map = |i: usize| {
+            if i <= prefix {
+                i
+            } else if i >= old_end {
+                new_end + (i - old_end)
+            } else {
+                new_end
+            }
+        };
+        self.caret = map(self.caret).min(new.len());
+        self.anchor = map(self.anchor).min(new.len());
+        self.buf = new;
         self.mark_dirty();
     }
 
@@ -534,5 +592,67 @@ impl Parser {
         }
         let s: String = self.chars[start..self.pos].iter().collect();
         s.parse::<f64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor_with(text: &str, caret: usize) -> Editor {
+        let mut e = Editor::new(ControlKind::TextBox);
+        e.set_text(text);
+        e.caret = caret;
+        e.anchor = caret;
+        e
+    }
+
+    /// Insertion after the caret must not move it; insertion before shifts it.
+    #[test]
+    fn program_text_maps_caret_across_insertion() {
+        let mut e = editor_with("hello world", 5);
+        e.apply_program_text("hello brave world");
+        assert_eq!(e.text(), "hello brave world");
+        assert_eq!(e.caret, 5, "caret before the change must stay put");
+
+        let mut e = editor_with("hello world", 11);
+        e.apply_program_text("well hello world");
+        assert_eq!(e.caret, 16, "caret after the change shifts by the delta");
+    }
+
+    /// A caret inside the replaced region lands at the end of the replacement,
+    /// and deletion ahead of the caret pulls it back by the removed length.
+    #[test]
+    fn program_text_maps_caret_across_replacement_and_deletion() {
+        let mut e = editor_with("abcdef", 3);
+        e.apply_program_text("abXYef");
+        assert_eq!(e.caret, 4, "caret inside the changed region → end of the replacement");
+
+        let mut e = editor_with("abcdef", 6);
+        e.apply_program_text("adef");
+        // Common prefix "a", common suffix "def": "bc" was deleted ahead of
+        // the caret, which pulls it back by the removed length.
+        assert_eq!(e.caret, 4);
+    }
+
+    /// Identical text is a strict no-op — the caret never moves on an echo.
+    #[test]
+    fn program_text_identical_is_a_noop() {
+        let mut e = editor_with("query", 2);
+        e.layout_dirty = false;
+        e.apply_program_text("query");
+        assert_eq!(e.caret, 2);
+        assert!(!e.layout_dirty, "an identical write must not dirty the layout");
+    }
+
+    /// The selection anchor is mapped independently of the caret, so a
+    /// selection spanning an untouched region survives the write.
+    #[test]
+    fn program_text_maps_anchor_independently() {
+        let mut e = editor_with("hello world", 0);
+        e.anchor = 0;
+        e.caret = 5; // "hello" selected
+        e.apply_program_text("hello there world");
+        assert_eq!((e.anchor, e.caret), (0, 5), "selection over the prefix survives");
     }
 }

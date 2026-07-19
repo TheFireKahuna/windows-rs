@@ -126,6 +126,10 @@ impl FrontBackend for Spy {
         self.note(format!("set_value {} {value} based_on={based_on}", id.get()));
     }
 
+    fn set_text_stamped(&mut self, id: ControlId, text: &str, based_on: u64) {
+        self.note(format!("set_text {} {text:?} based_on={based_on}", id.get()));
+    }
+
     fn set_keybindings(
         &mut self,
         id: ControlId,
@@ -394,6 +398,18 @@ impl Recorder {
     /// Stage a `ValueChanged` intent carrying revision `rev`.
     pub fn queue_value_changed(&mut self, id: ControlId, value: f64, rev: u64) {
         self.intents.borrow_mut().push(Intent::ValueChanged { id, value, rev });
+    }
+
+    /// Stage an editor-text intent (`TextChanged` / `QuerySubmitted` / …)
+    /// carrying buffer revision `rev`, as the backend's `fire_editor_text`
+    /// would (§7.2, text half).
+    pub fn queue_editor_text(&mut self, id: ControlId, event: Event, text: &str, rev: u64) {
+        self.intents.borrow_mut().push(Intent::EditorText {
+            id,
+            event,
+            text: text.to_string(),
+            rev,
+        });
     }
 
     /// Stage an `on_tapped` intent.
@@ -705,6 +721,52 @@ impl ArenaHarness {
     /// `Node::accepts_value_echo` predicate `set_value_stamped` applies.
     pub fn accepts_value_echo(&self, id: ControlId, based_on: u64) -> Option<bool> {
         self.arena.get(id).map(|n| n.accepts_value_echo(based_on))
+    }
+
+    /// Bump the editor's §7.2 text revision, as the backend's
+    /// `editor_after_edit` does on every user-originated buffer edit.
+    /// Returns the new revision (0 for a node with no editor).
+    pub fn bump_text_rev(&mut self, id: ControlId) -> u64 {
+        match self.arena.get_mut(id).and_then(|n| n.editor.as_mut()) {
+            Some(e) => {
+                e.text_rev += 1;
+                e.text_rev
+            }
+            None => 0,
+        }
+    }
+
+    /// The editor's `(anchor, caret)` selection endpoints.
+    pub fn editor_caret(&self, id: ControlId) -> Option<(usize, usize)> {
+        self.arena
+            .get(id)
+            .and_then(|n| n.editor.as_ref().map(|e| (e.anchor, e.caret)))
+    }
+
+    /// Place the editor caret (collapsed selection) at a code-unit index.
+    pub fn set_editor_caret(&mut self, id: ControlId, caret: usize) {
+        if let Some(e) = self.arena.get_mut(id).and_then(|n| n.editor.as_mut()) {
+            e.caret = caret;
+            e.anchor = caret;
+        }
+    }
+
+    /// Toggle an active IME composition on the editor (the §7.2 composition
+    /// guard's signal), as the IMM32/TSF path does around a composition.
+    pub fn set_composition_active(&mut self, id: ControlId, active: bool) {
+        if let Some(e) = self.arena.get_mut(id).and_then(|n| n.editor.as_mut()) {
+            e.comp_start = 0;
+            e.comp_len = if active { e.buf.len().max(1) } else { 0 };
+        }
+    }
+
+    /// `dcomp::apply_text_stamped` — the REAL §7.2 arrival rules a replayed
+    /// [`Cmd::SetText`] goes through (composition guard → echo-identical
+    /// no-op → stale-revision drop → caret-mapped apply).
+    pub fn apply_text_stamped(&mut self, id: ControlId, text: &str, based_on: u64) {
+        if let Some(n) = self.arena.get_mut(id) {
+            dcomp::apply_text_stamped(n, text, based_on);
+        }
     }
 
     /// `dcomp::apply_prop` — the REAL body of `Backend::set_prop`, including

@@ -30,7 +30,7 @@ impl<B: Backend + 'static> Reconciler<B> {
     }
 
     pub fn update_widget(&mut self, old: &dyn Widget, new: &dyn Widget, id: ControlId) {
-        self.diff_props(id, &old.bindings(), &new.bindings());
+        self.diff_props(id, new.kind(), &old.bindings(), &new.bindings());
         self.diff_modifiers(id, old.modifiers(), new.modifiers());
         self.diff_attached(id, old.attached(), new.attached());
         self.update_widget_children(id, old.children(), new.children());

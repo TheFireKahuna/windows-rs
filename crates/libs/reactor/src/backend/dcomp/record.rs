@@ -288,6 +288,19 @@ pub(crate) enum Intent {
         value: f64,
         rev: u64,
     },
+    /// An editor-owned string event (`TextChanged` / `PasswordChanged` /
+    /// `QuerySubmitted` / `SuggestionChosen`), carrying the editor's buffer
+    /// revision — the text twin of [`ValueChanged`](Self::ValueChanged). The
+    /// drain records `rev` (and the text the app saw) **only when a handler
+    /// exists**: an uncontrolled field's revision must stay unconsulted, so a
+    /// later programmatic write cannot silently retract text the app was
+    /// never told about.
+    EditorText {
+        id: ControlId,
+        event: Event,
+        text: String,
+        rev: u64,
+    },
     /// A positional pointer callback (`on_pointer_pressed/released/moved`).
     Pointer {
         id: ControlId,
@@ -452,6 +465,18 @@ pub(crate) enum Cmd {
         value: f64,
         based_on: u64,
     },
+    /// `set_prop(Prop::Value, Str)` — an editor's programmatic text, stamped
+    /// with the editor-text revision the app had been consulted about when
+    /// the write was recorded (§7.2, text half). Replay routes it through the
+    /// front's arrival rules ([`FrontBackend::set_text_stamped`]): an
+    /// echo-identical write no-ops, a stale one drops, a fresh one applies
+    /// with caret position-mapping, and none applies while an IME composition
+    /// is active.
+    SetText {
+        id: ControlId,
+        text: String,
+        based_on: u64,
+    },
     SetTemplatedItemCount {
         id: ControlId,
         count: usize,
@@ -576,6 +601,10 @@ pub(crate) trait FrontBackend: Backend {
     fn set_pointer_interest(&mut self, id: ControlId, interest: PointerInterest);
     /// [`Cmd::SetValue`]: the revision-gated `Prop::Value` write.
     fn set_value_stamped(&mut self, id: ControlId, value: f64, based_on: u64);
+    /// [`Cmd::SetText`]: the revision-gated editor-text write (§7.2 arrival
+    /// rules — echo no-op / stale drop / caret-mapped apply / composition
+    /// guard).
+    fn set_text_stamped(&mut self, id: ControlId, text: &str, based_on: u64);
     /// [`Cmd::SetKeybindings`]: the `(key, mods)` chords the front matches
     /// against on keydown (§7.3). The `on_invoked` callbacks stay app-side in
     /// the recorder's `accels` map, addressed by the matched index.
@@ -626,6 +655,28 @@ pub(crate) struct RecordingBackend {
     /// purely app-driven value writes (a meter, a follower) applying even
     /// while nobody listens for `ValueChanged`.
     delivered_value_rev: FxHashMap<ControlId, u64>,
+    /// Per editor, the latest [`Intent::EditorText`] revision a *handler* was
+    /// handed (§7.2, text half). Unlike `delivered_value_rev` this advances
+    /// only when a handler exists: text is user-authored state, and marking an
+    /// uncontrolled field "consulted" would let an unrelated re-render's echo
+    /// retract what the user typed. A field the app never listens to keeps
+    /// revision 0, so its programmatic writes apply only while the user has
+    /// never edited it.
+    delivered_text_rev: FxHashMap<ControlId, u64>,
+    /// Per editor, this recorder's view of the front buffer: the last text a
+    /// handler was shown or this side sent, with the stamp it carried. A
+    /// text-prop string write matching this view verbatim is not re-recorded
+    /// — that is what lets the reconciler re-emit the value binding every
+    /// render (see `diff_props`) without flooding the buffer, while a genuine
+    /// disagreement (the app declining a delivered edit — "revert to the same
+    /// prop value") still crosses as a corrective [`Cmd::SetText`].
+    text_view: FxHashMap<ControlId, (String, u64)>,
+    /// Which prop carries each editor's programmatic text (`Value` for
+    /// TextBox/PasswordBox, `Text` for AutoSuggestBox), noted at `create` so
+    /// `set_prop` can route exactly those writes through [`Cmd::SetText`] —
+    /// `Prop::Text` on anything else is a plain label and stays on the
+    /// ordinary prop path.
+    text_prop: FxHashMap<ControlId, Prop>,
 }
 
 impl RecordingBackend {
@@ -641,6 +692,9 @@ impl RecordingBackend {
             selection_changed: FxHashMap::default(),
             reorder: FxHashMap::default(),
             delivered_value_rev: FxHashMap::default(),
+            delivered_text_rev: FxHashMap::default(),
+            text_view: FxHashMap::default(),
+            text_prop: FxHashMap::default(),
         }
     }
 
@@ -674,6 +728,20 @@ impl RecordingBackend {
                         && let Some(job) = event_job(h, IntentPayload::F64(value))
                     {
                         jobs.push(job);
+                    }
+                }
+                Intent::EditorText { id, event, text, rev } => {
+                    if let Some(h) = self.handler(id, event) {
+                        let job = event_job(h, IntentPayload::Str(text.clone()));
+                        // The app is being consulted: record what it saw and
+                        // the revision it saw it at, so its next text-prop
+                        // write is stamped fresh and its verbatim echo is
+                        // recognised without re-recording.
+                        self.delivered_text_rev.insert(id, rev);
+                        self.text_view.insert(id, (text, rev));
+                        if let Some(job) = job {
+                            jobs.push(job);
+                        }
                     }
                 }
                 Intent::Pointer { id, kind, info } => {
@@ -797,6 +865,7 @@ fn apply<B: FrontBackend>(backend: &mut B, cmd: Cmd) {
         Cmd::AttachEvent { id, event } => backend.declare_event(id, event),
         Cmd::DetachEvent { id, event } => backend.detach_event(id, event),
         Cmd::SetValue { id, value, based_on } => backend.set_value_stamped(id, value, based_on),
+        Cmd::SetText { id, text, based_on } => backend.set_text_stamped(id, &text, based_on),
         Cmd::SetTemplatedItemCount { id, count } => backend.set_templated_item_count(id, count),
         Cmd::SetTemplatedRowContent {
             list_id,
@@ -868,6 +937,15 @@ fn apply<B: FrontBackend>(backend: &mut B, cmd: Cmd) {
 
 impl Backend for RecordingBackend {
     fn create(&mut self, id: ControlId, kind: ControlKind) {
+        match kind {
+            ControlKind::TextBox | ControlKind::PasswordBox => {
+                self.text_prop.insert(id, Prop::Value);
+            }
+            ControlKind::AutoSuggestBox => {
+                self.text_prop.insert(id, Prop::Text);
+            }
+            _ => {}
+        }
         self.push(Cmd::Create { id, kind });
     }
 
@@ -883,6 +961,39 @@ impl Backend for RecordingBackend {
             let based_on = self.delivered_value_rev.get(&id).copied().unwrap_or(0);
             self.push(Cmd::SetValue { id, value: *v, based_on });
             return;
+        }
+        // A write to an editor's text prop (`Value` for TextBox/PasswordBox,
+        // `Text` for AutoSuggestBox — noted at `create`) is the app's
+        // programmatic buffer text (§7.2, text half). The reconciler
+        // re-emits this binding every render (see `diff_props`) so that
+        // "revert to the same prop value" is expressible; the view
+        // comparison here is what keeps the steady state silent — only a
+        // write that disagrees with what this side believes the front buffer
+        // holds (or carries a fresher stamp) crosses the seam.
+        if self.text_prop.get(&id) == Some(&prop) {
+            if let PropValue::Str(s) = value {
+                let based_on = self.delivered_text_rev.get(&id).copied().unwrap_or(0);
+                if self
+                    .text_view
+                    .get(&id)
+                    .is_some_and(|(t, b)| t == s && *b == based_on)
+                {
+                    return;
+                }
+                self.text_view.insert(id, (s.clone(), based_on));
+                self.push(Cmd::SetText {
+                    id,
+                    text: s.clone(),
+                    based_on,
+                });
+                return;
+            }
+            // Unsetting the text prop drops the view too: the front clears
+            // the buffer through its own reset path, so the next string
+            // write must cross the seam rather than be mistaken for an echo.
+            if matches!(value, PropValue::Unset) {
+                self.text_view.remove(&id);
+            }
         }
         match SendValue::from_prop(value) {
             Some(value) => self.push(Cmd::SetProp { id, prop, value }),
@@ -933,6 +1044,9 @@ impl Backend for RecordingBackend {
         self.selection_changed.remove(&id);
         self.reorder.remove(&id);
         self.delivered_value_rev.remove(&id);
+        self.delivered_text_rev.remove(&id);
+        self.text_view.remove(&id);
+        self.text_prop.remove(&id);
         self.push(Cmd::Destroy { id });
     }
 
