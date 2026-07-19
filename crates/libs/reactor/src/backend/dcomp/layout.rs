@@ -429,10 +429,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
     // different family at a different size) and the badge's count (the badge's
     // own smaller, heavier type). They live in `button_text` because the
     // generic `text_layout` slot below is already the label's.
-    //
-    // This runs first and deliberately leaves `text_dirty` set: the generic
-    // block is what clears it, and the family always reaches that block —
-    // `is_text` covers the whole family whether or not it carries words.
     let needs_ornaments = arena
         .get(id)
         .is_some_and(|n| n.text_dirty && super::node::is_button_family(n.kind));
@@ -468,10 +464,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
     // `[off, on]` shape the switch uses — index `0` is collapsed, `1` expanded,
     // which is what `glyph_text::expander_sync` indexes with `expanded`.
     // Expanding never sets `text_dirty`, so both have to exist up front.
-    //
-    // ABOVE the generic run build below, which CLEARS `text_dirty` — an
-    // Expander's header now qualifies as text, so anything of its own gated on
-    // that flag and placed after it would simply never run.
     let needs_chevron = arena
         .get(id)
         .is_some_and(|n| n.text_dirty && n.kind == ControlKind::Expander);
@@ -533,7 +525,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
         let layout = build_text_layout(&text, size, weight, &family, wrap);
         if let Some(n) = arena.get_mut(id) {
             n.text_layout = layout;
-            n.text_dirty = false;
             // Taffy's measure cache is keyed on constraints only; a new layout
             // silently changes the answer, so the node has to be re-measured.
             n.measure_dirty = true;
@@ -580,7 +571,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
             let t = n.item_text.get_or_insert_with(Default::default);
             t.layouts = rest;
             t.strong = strong;
-            n.text_dirty = false;
             n.measure_dirty = true;
         }
     }
@@ -624,7 +614,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
         }
         if let Some(n) = arena.get_mut(id) {
             n.text_layout = widest;
-            n.text_dirty = false;
             n.measure_dirty = true;
         }
     }
@@ -664,7 +653,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
             let t = n.item_text.get_or_insert_with(Default::default);
             t.layouts = built;
             t.strong.clear();
-            n.text_dirty = false;
             n.measure_dirty = true;
         }
     }
@@ -678,7 +666,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
         let built = arena.get(id).map(|n| caption::build_text(n.extras()));
         if let Some(n) = arena.get_mut(id) {
             n.caption_text = built.flatten();
-            n.text_dirty = false;
             n.measure_dirty = true;
             apply_caption_metrics(n);
         }
@@ -700,7 +687,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
             // glyph already on screen and mint a second set beside it.
             let t = n.nav_text.get_or_insert_with(Default::default);
             t.adopt(built.unwrap_or_default());
-            n.text_dirty = false;
             n.measure_dirty = true;
             apply_nav_metrics(n);
         }
@@ -716,7 +702,6 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
         let built = arena.get(id).map(|n| info_bar::build_text(n.extras()));
         if let Some(n) = arena.get_mut(id) {
             n.bar_text = built.flatten();
-            n.text_dirty = false;
             n.measure_dirty = true;
         }
     }
@@ -744,9 +729,20 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
         let built = label.and_then(|s| build_text_layout(&s, size, weight, &family, false));
         if let Some(n) = arena.get_mut(id) {
             n.text_layout = built;
-            n.text_dirty = false;
             n.measure_dirty = true;
         }
+    }
+    // One clear, after every block has had its look, rather than one per block.
+    //
+    // Each block used to clear the flag itself, which made the ORDER of the
+    // blocks load-bearing in a way nothing checked: the two that shape a
+    // control's ornaments — the button family's icon and badge, the Expander's
+    // pair of chevrons — deliberately did not clear, because they had to run
+    // ABOVE the generic block that did. Move either one below it and it stops
+    // running, silently, on every control that also carries words. Clearing once
+    // at the end means a block can go anywhere.
+    if let Some(n) = arena.get_mut(id) {
+        n.text_dirty = false;
     }
     let mut i = 0;
     while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
