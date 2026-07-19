@@ -1,6 +1,18 @@
 --out crates/libs/canvas-core/src/bindings.rs
 --flat --minimal --dead-code
 
+// The glyph-run walker implements a DirectWrite text renderer so that a shaped
+// `IDWriteTextLayout` can be replayed as individual glyph runs (the input a
+// glyph-atlas text renderer needs). `IDWriteTextRenderer` derives from
+// `IDWritePixelSnapping`, so both need `_Impl` scaffolding for the callback
+// object to be constructible. The canonical Win32 metadata is a flat
+// `Windows.Win32` namespace, so these name the interface directly under it —
+// a stale sub-namespace here silently matches nothing and the `_Impl`
+// scaffolding is simply not emitted.
+--implement
+    Windows.Win32.IDWriteTextRenderer
+    Windows.Win32.IDWritePixelSnapping
+
 --filter
     D2DERR_RECREATE_TARGET
     GENERIC_READ
@@ -190,3 +202,13 @@
     DXGI_FORMAT_R16G16B16A16_FLOAT
     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    ID2D1DeviceContext::DrawGlyphRun
+    IDWriteTextLayout::Draw
+    IDWriteTextRenderer
+    IDWritePixelSnapping
+    DWRITE_GLYPH_RUN
+    DWRITE_GLYPH_RUN_DESCRIPTION
+    DWRITE_GLYPH_OFFSET
+    DWRITE_MEASURING_MODE_NATURAL
+    DWRITE_MATRIX
+    IDWriteFontFace::{GetMetrics, GetDesignGlyphMetrics, GetGlyphIndices}
