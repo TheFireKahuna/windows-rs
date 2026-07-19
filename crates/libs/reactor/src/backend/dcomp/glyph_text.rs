@@ -58,7 +58,7 @@
 //! *below* the surface band, so the count lands above it whichever order the
 //! three runs happen to mint their hosts in.
 
-use windows_canvas_core::{Rect, TextLayout};
+use windows_canvas_core::{Rect, TextDecoration, TextLayout};
 use windows_core::Interface;
 use windows_numerics::{Vector2, Vector3};
 
@@ -69,7 +69,7 @@ use super::parts::build_solid_surface;
 use super::theme;
 use crate::system_bindings::{
     CompositionBrush, CompositionClip, CompositionMaskBrush, CompositionSurfaceBrush,
-    ContainerVisual, ICompositionObject, ICompositor2, IVisual, Visual,
+    ContainerVisual, ICompositionObject, ICompositor2, IVisual, SpriteVisual, Visual,
 };
 
 /// One glyph's sprite and the mask brush that colours it.
@@ -134,6 +134,76 @@ impl GlyphSprite {
     }
 }
 
+/// A solid rectangle inside a text host: a decoration rule, or a selection
+/// fill.
+///
+/// Currently unconsumed. Both users are the editor — its selection highlight
+/// and its IME composition underline — and the editor cannot move to sprites
+/// until its placement rule stops existing in four separate copies
+/// (`controls::paint_editor`, `controls::editor_caret_box`, `tsf::doc::text_band`
+/// and `uia::uia_text_origin`), because a fifth copy is what would let the
+/// caret, the candidate window and the screen-reader rects drift apart.
+///
+/// Not a glyph and not a mask — a rule has no outline and no coverage, so it is
+/// a sprite painted with a colour source directly rather than one cut by an
+/// atlas entry.
+#[allow(dead_code)]
+struct RectSprite {
+    vis: IVisual,
+    sprite: SpriteVisual,
+    /// Raw pointer of the brush currently bound, on the same identity argument
+    /// [`GlyphSprite::bound`] makes.
+    bound: Option<*mut core::ffi::c_void>,
+    offset: Option<(f32, f32)>,
+    size: Option<(f32, f32)>,
+    shown: bool,
+}
+
+impl RectSprite {
+    fn new(comp: &Compositing, parent: &ContainerVisual) -> Option<Self> {
+        let sprite = comp.new_sprite().ok()?;
+        let vis: IVisual = sprite.cast().ok()?;
+        parent
+            .Children()
+            .ok()?
+            .InsertAtTop(&sprite.cast::<Visual>().ok()?)
+            .ok()?;
+        Some(Self {
+            vis,
+            sprite,
+            bound: None,
+            offset: None,
+            size: None,
+            shown: false,
+        })
+    }
+
+    fn paint(&mut self, brush: &CompositionBrush) {
+        let raw = brush.as_raw();
+        if self.bound != Some(raw) && self.sprite.SetBrush(brush).is_ok() {
+            self.bound = Some(raw);
+        }
+    }
+
+    fn place(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        if self.offset != Some((x, y)) {
+            let _ = self.vis.SetOffset(Vector3::new(x, y, 0.0));
+            self.offset = Some((x, y));
+        }
+        if self.size != Some((w, h)) {
+            let _ = self.vis.SetSize(Vector2::new(w, h));
+            self.size = Some((w, h));
+        }
+    }
+
+    fn show(&mut self, on: bool) {
+        if self.shown != on {
+            let _ = self.vis.SetIsVisible(on);
+            self.shown = on;
+        }
+    }
+}
+
 /// The retained glyph sprites of one label.
 #[derive(Default)]
 pub(crate) struct TextPart {
@@ -155,6 +225,24 @@ pub(crate) struct TextPart {
     source: Option<CompositionSurfaceBrush>,
     /// `(colour bits, scale bits)` the source was built for.
     source_for: Option<([u32; 4], u32)>,
+    /// Underline / strikethrough rules. They take the text's own colour source,
+    /// so they cost no surface of their own, and they sit among the glyphs
+    /// rather than under them — with identical ink, the order is immaterial.
+    rules: Vec<RectSprite>,
+    /// Selection fills, and the container that keeps them BELOW every glyph.
+    ///
+    /// The container is what makes the ordering robust rather than incidental.
+    /// Sprites here are minted lazily, so relying on insertion order against the
+    /// glyphs would mean a fill minted after a glyph landing on top of it —
+    /// which is exactly the bug (text disappearing behind its own highlight)
+    /// that is invisible until a selection happens to grow.
+    fill_host: Option<ContainerVisual>,
+    fills: Vec<RectSprite>,
+    /// The one colour source every fill reads, and the `(colour, scale)` it was
+    /// built for. Separate from [`source`](Self::source) because a highlight is
+    /// deliberately not the text's colour.
+    fill_source: Option<CompositionSurfaceBrush>,
+    fill_source_for: Option<([u32; 4], u32)>,
     /// The atlas epoch the bound masks came from; a bump invalidates them all.
     epoch: u32,
 }
@@ -355,6 +443,152 @@ impl TextPart {
         self.hide_from(slot);
     }
 
+    /// Place the layout's underline / strikethrough rules.
+    ///
+    /// Call after [`sync`](Self::sync), which is what mints the host and builds
+    /// the colour source these share. `decorations` come from
+    /// [`TextLayout::shape`] — [`glyph_runs`](TextLayout::glyph_runs) drops
+    /// them, and does so silently.
+    ///
+    /// `origin` must be the same one `sync` was given: a decoration's baseline
+    /// origin is reported in the layout's space exactly as a run's is.
+    #[allow(dead_code)]
+    pub(crate) fn sync_rules(
+        &mut self,
+        comp: &Compositing,
+        decorations: &[TextDecoration],
+        origin: (f32, f32),
+        scale: f32,
+    ) {
+        let (Some(host), Some(src)) = (self.host.clone(), self.source.clone()) else {
+            self.hide_rules_from(0);
+            return;
+        };
+        let Ok(brush) = src.cast::<CompositionBrush>() else {
+            self.hide_rules_from(0);
+            return;
+        };
+
+        let mut slot = 0usize;
+        for d in decorations {
+            let (x, y, w, h) = d.rect(false);
+            if !(w > 0.0 && h > 0.0) {
+                continue;
+            }
+            if slot == self.rules.len() {
+                match RectSprite::new(comp, &host) {
+                    Some(r) => self.rules.push(r),
+                    None => break,
+                }
+            }
+            let r = &mut self.rules[slot];
+            r.paint(&brush);
+            // Snapped to whole physical pixels for the same reason a glyph box
+            // is: a hairline rule at a fractional offset is resampled across two
+            // rows and renders as a grey smear at half the intended weight.
+            let top = ((origin.1 + y) * scale).round() / scale;
+            let bottom = (((origin.1 + y) + h) * scale).round().max((origin.1 + y) * scale + 1.0) / scale;
+            r.place(origin.0 + x, top, w, bottom - top);
+            r.show(true);
+            slot += 1;
+        }
+        self.hide_rules_from(slot);
+    }
+
+    /// Place selection fills BELOW the glyphs.
+    ///
+    /// `rects` are layout-relative, as [`TextLayout::hit_test_range`] returns
+    /// them; `origin` is the same one [`sync`](Self::sync) was given.
+    #[allow(dead_code)]
+    pub(crate) fn sync_fills(
+        &mut self,
+        comp: &Compositing,
+        rects: &[(f32, f32, f32, f32)],
+        origin: (f32, f32),
+        color: crate::Color,
+        scale: f32,
+    ) {
+        if rects.is_empty() {
+            self.hide_fills_from(0);
+            return;
+        }
+        let Some(host) = self.host.clone() else {
+            self.hide_fills_from(0);
+            return;
+        };
+        // The fill container hangs at the BOTTOM of the host, so everything in
+        // it is under every glyph however the two are minted relative to
+        // each other.
+        if self.fill_host.is_none() {
+            self.fill_host = (|| {
+                let c = comp.new_container().ok()?;
+                host.Children()
+                    .ok()?
+                    .InsertAtBottom(&c.cast::<Visual>().ok()?)
+                    .ok()?;
+                Some(c)
+            })();
+        }
+        let Some(fill_host) = self.fill_host.clone() else {
+            self.hide_fills_from(0);
+            return;
+        };
+
+        let want = (color_bits(color), scale.to_bits());
+        if self.fill_source_for != Some(want) {
+            match build_solid_surface(comp, color, scale) {
+                Some(s) => {
+                    self.fill_source = Some(s);
+                    self.fill_source_for = Some(want);
+                    // Re-point every fill, hidden ones included — a fill shown
+                    // again later must not surface the previous colour.
+                    self.fills.iter_mut().for_each(|f| f.bound = None);
+                }
+                None => {
+                    self.hide_fills_from(0);
+                    return;
+                }
+            }
+        }
+        let Some(brush) = self
+            .fill_source
+            .as_ref()
+            .and_then(|s| s.cast::<CompositionBrush>().ok())
+        else {
+            self.hide_fills_from(0);
+            return;
+        };
+
+        let mut slot = 0usize;
+        for &(x, y, w, h) in rects {
+            if !(w > 0.0 && h > 0.0) {
+                continue;
+            }
+            if slot == self.fills.len() {
+                match RectSprite::new(comp, &fill_host) {
+                    Some(f) => self.fills.push(f),
+                    None => break,
+                }
+            }
+            let f = &mut self.fills[slot];
+            f.paint(&brush);
+            f.place(origin.0 + x, origin.1 + y, w, h);
+            f.show(true);
+            slot += 1;
+        }
+        self.hide_fills_from(slot);
+    }
+
+    fn hide_rules_from(&mut self, from: usize) {
+        let start = from.min(self.rules.len());
+        self.rules[start..].iter_mut().for_each(|r| r.show(false));
+    }
+
+    fn hide_fills_from(&mut self, from: usize) {
+        let start = from.min(self.fills.len());
+        self.fills[start..].iter_mut().for_each(|f| f.show(false));
+    }
+
     fn hide_from(&mut self, from: usize) {
         let start = from.min(self.glyphs.len());
         for g in &mut self.glyphs[start..] {
@@ -368,8 +602,9 @@ impl TextPart {
     /// allocated: the same node very often gets a label back.
     pub(crate) fn hide_all(&mut self) {
         self.hide_from(0);
+        self.hide_rules_from(0);
+        self.hide_fills_from(0);
     }
-
 }
 
 /// Every retained run a button-family node draws.
@@ -388,6 +623,40 @@ pub(crate) struct ButtonText {
     /// dot form, which has no text at all.
     pub(crate) badge_layout: Option<TextLayout>,
     badge: TextPart,
+}
+
+/// Place a run at the top-left of `b`, without centring it.
+///
+/// The entry point for text whose own layout already decides where each line
+/// goes: wrapped prose, and anything leading-aligned. Wrapping needs nothing
+/// beyond this — DirectWrite expresses it as one glyph run per line at its own
+/// descending baseline, and [`TextPart::sync`] already walks runs and honours
+/// each one's baseline origin, so a wrapped layout places correctly through the
+/// identical code path a single line does.
+#[allow(clippy::too_many_arguments)]
+fn place_leading(
+    part: &mut TextPart,
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    parent: &ContainerVisual,
+    layout: &TextLayout,
+    b: Rect,
+    box_size: (f32, f32),
+    color: crate::Color,
+    dim: f32,
+    scale: f32,
+) {
+    part.sync(
+        comp,
+        atlas,
+        parent,
+        layout,
+        (b.left, b.top),
+        box_size,
+        color,
+        dim,
+        scale,
+    );
 }
 
 /// Place one run centred in `b`, or hide it if it cannot be measured.
@@ -416,6 +685,41 @@ fn place_centered(
         b.top + ((b.height() - th) / 2.0).max(0.0),
     );
     part.sync(comp, atlas, parent, layout, origin, box_size, color, dim, scale);
+}
+
+/// Reconcile a `TextBlock`'s prose as retained glyph sprites.
+///
+/// The counterpart to [`button_sync`] for the one control that is nothing but
+/// text. It places at the node's top-left rather than centring, because a
+/// TextBlock's own layout — its alignment, and its wrapping — has already
+/// decided where every line goes; centring the block here would fight it.
+pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+    if node.kind != crate::backend::ControlKind::TextBlock {
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let mut part = node.text_part.take().unwrap_or_default();
+    match node.text_layout.as_ref() {
+        Some(layout) => {
+            // Un-styled text takes the themable primary text token — never a
+            // literal — so a host token table restyles default text too.
+            let fg = node.paint.foreground.unwrap_or_else(theme::text);
+            place_leading(
+                &mut part,
+                comp,
+                atlas,
+                &node.container,
+                layout,
+                Rect::from_xywh(0.0, 0.0, w, h),
+                (w, h),
+                fg,
+                1.0,
+                scale,
+            );
+        }
+        None => part.hide_all(),
+    }
+    node.text_part = Some(part);
 }
 
 /// Reconcile a button-family node's label and ornaments as retained glyph

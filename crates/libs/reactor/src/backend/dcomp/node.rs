@@ -621,6 +621,14 @@ pub(crate) struct Node {
     /// Rebuilt by the layout pass on `text_dirty`; see
     /// [`glyph_text::button_sync`](super::glyph_text::button_sync).
     pub button_text: Option<Box<super::glyph_text::ButtonText>>,
+    /// `TextBlock` only: its prose as retained per-glyph sprites.
+    ///
+    /// One run, not three, so it is a bare [`TextPart`] rather than a
+    /// [`ButtonText`](super::glyph_text::ButtonText) — a TextBlock has no icon
+    /// and no badge. Wrapped text needs nothing extra: DirectWrite reports each
+    /// wrapped line as its own glyph run at its own baseline, and the placement
+    /// walk honours those already.
+    pub text_part: Option<Box<super::glyph_text::TextPart>>,
     /// Editors only: the caret sprite (topmost child, above the painted text)
     /// whose blink is a compositor-side square-wave opacity animation. Created
     /// lazily on first focused paint; see [`parts::sync_caret`].
@@ -795,6 +803,7 @@ impl Node {
             surf: None,
             parts: None,
             button_text: None,
+            text_part: None,
             caret: None,
             knob: None,
             scroll_thumb: None,
@@ -972,7 +981,11 @@ impl Node {
             // it one is what turns "draws nothing" into "allocates nothing and
             // never enters `BeginDraw`". See `controls::paint`.
             k if is_button_family(k) => false,
-            ControlKind::TextBlock => !self.paint.text.is_empty(),
+            // A TextBlock is its text and nothing else — its paint arm never
+            // filled a background or stroked a border — so once the text is
+            // glyph sprites there is likewise nothing left for a surface to
+            // hold. Same reasoning as the button family above.
+            ControlKind::TextBlock => false,
             ControlKind::Line => self.paint.stroke.is_some(),
             ControlKind::Ellipse | ControlKind::Rectangle => {
                 self.paint.fill.is_some()

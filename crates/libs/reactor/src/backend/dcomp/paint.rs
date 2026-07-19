@@ -65,9 +65,15 @@ fn paint_node(
     // surface) or because it owns retained chrome to reconcile. The two are no
     // longer the same set: the button family draws nothing at all, and its
     // parts and glyph sprites ARE its appearance.
-    let needs = arena
-        .get(id)
-        .is_some_and(|n| n.has_chrome() || n.surf.is_some() || parts::converted(n.kind));
+    let needs = arena.get(id).is_some_and(|n| {
+        n.has_chrome()
+            || n.surf.is_some()
+            || parts::converted(n.kind)
+            // A TextBlock now reports no chrome and owns no surface, so without
+            // this it would never be visited and its glyph sprites would never
+            // be placed — the node would simply render nothing.
+            || n.kind == ControlKind::TextBlock
+    });
     if needs {
         let (w, h) = arena.get(id).map(|n| (n.rect.w, n.rect.h)).unwrap_or((0.0, 0.0));
         // Layout rects are pixel-snapped, so `w * scale` is integral (mod FP
@@ -115,6 +121,8 @@ fn paint_node(
                 // glyph sprites, placed AFTER the parts sync so their hosts land
                 // above the ink that sync creates on first use.
                 super::glyph_text::button_sync(comp, glyphs, n, scale);
+                // The same, for the one control that is only text.
+                super::glyph_text::text_sync(comp, glyphs, n, scale);
                 // Editors: reconcile the caret sprite (position + compositor
                 // blink) against the text metrics just painted.
                 if n.editor.is_some() {
@@ -355,7 +363,11 @@ fn paint_chrome(
         return;
     }
     match node.kind {
-        ControlKind::TextBlock => paint_text(session, brush, node, rect),
+        // Nothing: a TextBlock's prose is retained glyph sprites, so it owns no
+        // surface at all and only reaches here on one left over from before the
+        // cutover. Falling through to `fill_and_stroke` would paint a
+        // background a TextBlock has never had.
+        ControlKind::TextBlock => {}
         ControlKind::Rectangle => {
             fill_and_stroke(session, brush, node, rect, node.paint.corner_radius)
         }
@@ -395,20 +407,6 @@ fn fill_and_stroke(
             session.draw_rect(&inset, brush, t);
         }
     }
-}
-
-fn paint_text(
-    session: &DrawingSession,
-    brush: &windows_canvas_core::Brush,
-    node: &Node,
-    rect: Rect,
-) {
-    let Some(layout) = &node.text_layout else { return };
-    // Un-styled text takes the themable primary text token — never a literal —
-    // so a host token table (e.g. HDR-anchored values) restyles default text too.
-    let fg = node.paint.foreground.unwrap_or_else(theme::text);
-    brush.set_color(linear(fg));
-    session.draw_text_layout(Vector2::new(rect.left, rect.top), layout, brush);
 }
 
 fn paint_ellipse(
