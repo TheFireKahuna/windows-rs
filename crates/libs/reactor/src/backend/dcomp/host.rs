@@ -1,10 +1,14 @@
 //! `DCompHost`: the Win32 + system-compositor host that drives a root
-//! [`Component`] through `RenderHost<RecordingBackend<DCompBackend>, Win32Dispatcher>`
-//! — the reconciler records a `Send` command buffer that `post_render` replays
-//! into the backend (see [`record`](super::record)). It owns the
-//! bare HWND and the blocking `GetMessageW` pump (true idle — zero CPU at rest),
-//! routes input/resize messages to the backend, and wakes/parks the vsync
-//! [`FramePacer`] that paces canvas/viz frame ticks.
+//! [`Component`] through the two halves of the record seam: the reconciler
+//! drives a [`RecordingBackend`] (the app half — a `Send` command buffer plus
+//! the app-side closure maps), and the host owns the real [`DCompBackend`]
+//! outright (the front half), replaying taken buffers into it after each
+//! reconcile and feeding its queued intents back to the recorder (see
+//! [`record`](super::record)). Input, UIA, caption and resize paths borrow the
+//! backend directly — never the reconciler — which is the decoupling the
+//! render-thread split needs. It owns the bare HWND and the blocking
+//! `GetMessageW` pump (true idle — zero CPU at rest), and wakes/parks the
+//! vsync [`FramePacer`] that paces canvas/viz frame ticks.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -13,7 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, Once};
 
 use super::dispatch::{drain, LocalQueue, SendInner, WM_APP_DISPATCH};
 use super::pacer::{FramePacer, WM_APP_FRAME};
-use super::record::RecordingBackend;
+use super::record::{self, FrontBackend, RecordingBackend};
 use super::uia;
 use super::*;
 use crate::engine::RenderHost;
@@ -45,48 +49,63 @@ pub(crate) fn on_ui_thread() -> bool {
 
 /// Run `f` against the backend on the UI thread, then deliver any app intents
 /// it queued. Returns `None` when there is no live host on this thread, or
-/// when the reconciler is already borrowed — a re-entrant call, e.g. a
+/// when either half is already borrowed — a re-entrant call, e.g. a
 /// composition scoped batch whose `Completed` fires synchronously from inside
-/// a backend mutation (`try_with_reconciler_mut` refuses instead of
-/// panicking on the `RefCell`, and callers defer through the pump). Must be
-/// called on the UI thread (the UIA layer reaches it through
-/// [`marshal_to_ui`]).
+/// a backend mutation (the `try_` borrows refuse instead of panicking, and
+/// callers defer through the pump). Must be called on the UI thread (the UIA
+/// layer reaches it through [`marshal_to_ui`]).
 pub(crate) fn with_backend<R>(f: impl FnOnce(&mut DCompBackend) -> R) -> Option<R> {
     let s = shared()?;
-    let (r, jobs) = s.render_host.try_with_reconciler_mut(|r| {
+    let (out, intents) = {
+        // Backend first: only once it is secured may the buffer be taken, so a
+        // refusal can never strand taken commands unreplayed.
+        let mut b = s.backend.try_borrow_mut().ok()?;
         // Input, UIA and caption reads all hit-test against laid-out
-        // geometry, so the buffer must be drained first. It is normally
-        // already empty here (`post_render` drains every reconcile); this
-        // is the guarantee, not the common path.
-        r.backend.flush();
-        let out = f(&mut r.backend);
+        // geometry, so any buffered commands must be replayed first. The
+        // buffer is normally already empty here (`post_render` replays every
+        // reconcile); this is the guarantee, not the common path.
+        let cmds = s
+            .render_host
+            .try_with_reconciler_mut(|r| r.backend.take_cmds())?;
+        record::replay(&mut *b, cmds);
+        let out = f(&mut b);
         // UIA actions (Invoke/Toggle/SetValue) fire the same intents input
-        // does; resolve them app-side while the borrow is still held...
-        (out, r.backend.drain_intents())
-    })?;
-    // ...and run them here, with the borrow released, so a handler that pumps
-    // messages or re-enters the backend finds nothing held.
-    for job in jobs {
-        job.run();
-    }
-    Some(r)
+        // does...
+        (out, b.take_intents())
+    };
+    // ...resolved app-side and run here, with every borrow released, so a
+    // handler that pumps messages or re-enters the backend finds nothing held.
+    run_intents(&s, intents);
+    Some(out)
 }
 
-/// Route one input entry point into the backend, then deliver the intents it
-/// queued: the recorder resolves them against its app-side handler map inside
-/// the borrow, and the handlers run here after it is released — same thread,
-/// same message, so app-visible behaviour matches the old synchronous fire
-/// while the queue stays the seam. Every wndproc arm that can make the
-/// backend fire an event goes through here.
-fn dispatch_input<R>(
-    s: &HostShared,
-    f: impl FnOnce(&mut RecordingBackend<DCompBackend>) -> R,
-) -> R {
-    let (out, jobs) = s.render_host.with_reconciler_mut(|r| {
-        let out = f(&mut r.backend);
-        let jobs = r.backend.drain_intents();
-        (out, jobs)
-    });
+/// Route one input entry point into the front backend, then deliver the
+/// intents it queued: the recorder resolves them against its app-side handler
+/// maps, and the handlers run with every borrow released — same thread, same
+/// message, so app-visible behaviour matches the old synchronous fire while
+/// the queue stays the seam. Every wndproc arm that can make the backend fire
+/// an event goes through here. Input never touches the reconciler: it borrows
+/// the backend the host owns, which is exactly the coupling the render-thread
+/// split removes.
+fn dispatch_input<R>(s: &HostShared, f: impl FnOnce(&mut DCompBackend) -> R) -> R {
+    let (out, intents) = {
+        let mut b = s.backend.borrow_mut();
+        let out = f(&mut b);
+        (out, b.take_intents())
+    };
+    run_intents(s, intents);
+    out
+}
+
+/// Resolve queued intents against the recorder's app-side maps and run the
+/// jobs, with no borrow held across a job.
+fn run_intents(s: &HostShared, intents: Vec<record::Intent>) {
+    if intents.is_empty() {
+        return;
+    }
+    let jobs = s
+        .render_host
+        .with_reconciler_mut(|r| r.backend.resolve_intents(intents));
     // A viz surface drag/scrub sink drove `drive_frame_ticks()` synchronously
     // when it ran inline; now that it runs a hop later as a job, the tick moves
     // here — after the sink has streamed its value, before the message returns —
@@ -99,7 +118,6 @@ fn dispatch_input<R>(
     if tick {
         crate::drive_frame_ticks();
     }
-    out
 }
 
 /// Marshal `f` onto the UI thread and block until it completes, returning its
@@ -157,7 +175,12 @@ pub(crate) fn post_ui(hwnd: isize, f: impl FnOnce() + Send + 'static) {
 /// Per-thread state the WndProc reaches into. `render_host` is a clone (an `Rc`
 /// bump) of the host's render host; `local`/`send` are the dispatcher's queues.
 struct HostShared {
-    render_host: RenderHost<RecordingBackend<DCompBackend>, Win32Dispatcher>,
+    render_host: RenderHost<RecordingBackend, Win32Dispatcher>,
+    /// The front half of the record seam: the real backend, owned by the host
+    /// — not by the reconciler. Input, UIA, caption and resize paths borrow it
+    /// here directly; the reconciler reaches it only through the taken command
+    /// buffer `post_render` replays.
+    backend: Rc<RefCell<DCompBackend>>,
     local: Rc<LocalQueue>,
     send: Arc<SendInner>,
     /// Vsync pacer for the canvas/viz frame ticks; dropping `HostShared` (end of
@@ -254,12 +277,15 @@ impl DCompHost {
         let marshaller = dispatcher.marshaller();
         let (local, send) = dispatcher.queues();
 
-        // The reconciler drives a recording wrapper, not the backend directly:
-        // its calls become a `Send` command buffer that `post_render` replays
-        // below. Replay is synchronous and on this thread, so behaviour is
-        // unchanged — the seam exists so the reconciler can later run off the
-        // thread that owns the HWND, the pump and the compositor.
-        let render_host = RenderHost::new(RecordingBackend::new(backend), root, dispatcher);
+        // The two halves of the record seam: the host owns the real backend
+        // outright, and the reconciler drives a recorder that holds no backend
+        // reference at all — its calls become a `Send` command buffer that
+        // `post_render` replays below. Replay is synchronous and on this
+        // thread, so behaviour is unchanged; the ownership split is what lets
+        // the reconciler later run off the thread that owns the HWND, the pump
+        // and the compositor.
+        let backend = Rc::new(RefCell::new(backend));
+        let render_host = RenderHost::new(RecordingBackend::new(), root, dispatcher);
         render_host.set_marshaller(Some(marshaller));
         render_host.set_inner_size(WindowSize {
             width: dip.0 as f64,
@@ -267,44 +293,49 @@ impl DCompHost {
         });
         render_host.set_dpi(dpi);
 
-        // After every reconcile: adopt the new root, lay out, paint. All
-        // control motion plays on the system compositor — no timer to arm.
+        // After every reconcile: replay the buffer, adopt the new root, lay
+        // out, paint. All control motion plays on the system compositor — no
+        // timer to arm.
         let pr_host = render_host.clone_inner();
+        let pr_backend = Rc::clone(&backend);
         render_host.set_post_render(move |root_id| {
-            let jobs = pr_host.with_reconciler_mut(|r| {
-                // Drain the reconcile's command buffer before anything reads
-                // the arena: `set_root` looks the new root up and silently
-                // no-ops if it is absent, and layout walks the whole tree.
-                r.backend.flush();
-                debug_assert_eq!(
-                    r.backend.pending(),
-                    0,
-                    "layout must never read the arena behind a partial buffer"
-                );
+            // Take the reconcile's commands, then release the reconciler
+            // before touching the backend: the two borrows never overlap.
+            let cmds = pr_host.with_reconciler_mut(|r| r.backend.take_cmds());
+            let intents = {
+                let mut b = pr_backend.borrow_mut();
+                // Replay before anything reads the arena: `set_root` looks the
+                // new root up and silently no-ops if it is absent, and layout
+                // walks the whole tree.
+                record::replay(&mut *b, cmds);
                 // After the buffer, so a surface requested in the same frame its
                 // host mounts finds the control already in the arena; before
                 // layout, so the sprite is parented when sizes are pushed.
-                r.backend.service_surface_ops();
+                b.service_surface_ops();
                 // Apply the frame's pointer-surface presence declarations into
                 // the front-side interest map so a bit filled during this render
                 // is visible to the next input message (one frame ahead, by
                 // design — the router routes on these bits, never the closures).
                 pointer::service_ops();
-                r.backend.set_root(root_id);
-                r.backend.relayout_and_paint();
+                b.set_root(root_id);
+                b.relayout_and_paint();
                 // Replay fires no events today, so this is normally empty —
-                // drained anyway so an intent can never sit in the queue until
+                // taken anyway so an intent can never sit in the queue until
                 // the next input message if a replayed path ever gains one.
-                r.backend.drain_intents()
-            });
-            for job in jobs {
-                job.run();
+                b.take_intents()
+            };
+            if !intents.is_empty() {
+                let jobs = pr_host.with_reconciler_mut(|r| r.backend.resolve_intents(intents));
+                for job in jobs {
+                    job.run();
+                }
             }
         });
 
         DCOMP.with(|c| {
             *c.borrow_mut() = Some(Rc::new(HostShared {
                 render_host: render_host.clone_inner(),
+                backend,
                 local,
                 send,
                 pacer: FramePacer::new(hwnd as isize),
@@ -454,14 +485,16 @@ fn apply_effective_theme(s: &HostShared) {
     // Scheme first: the re-render below must already read the new value.
     set_current_color_scheme(scheme_for(dark));
     apply_frame_dark_mode(s.hwnd as HWND, dark);
-    s.render_host.with_reconciler_mut(|r| {
-        r.backend.apply_theme(dark);
-        r.backend.mark_all_dirty_and_repaint();
-        // Every component re-renders on the next pass: value-color props are
-        // recomputed only inside render functions, so memoised components with
-        // unchanged props would otherwise keep the old palette.
-        r.invalidate_all_components();
-    });
+    {
+        let mut b = s.backend.borrow_mut();
+        b.apply_theme(dark);
+        b.mark_all_dirty_and_repaint();
+    }
+    // Every component re-renders on the next pass: value-color props are
+    // recomputed only inside render functions, so memoised components with
+    // unchanged props would otherwise keep the old palette.
+    s.render_host
+        .with_reconciler_mut(|r| r.invalidate_all_components());
     // Re-run component render functions so scheme-derived values (colors,
     // `use_color_scheme`) are re-read (the repaint above only covers
     // backend-drawn chrome).
@@ -634,7 +667,7 @@ fn frame_y_px(hwnd: HWND) -> i32 {
 /// Repaint the caption band after a hover/maximize state flip.
 fn repaint_caption() {
     if let Some(s) = shared() {
-        s.render_host.with_reconciler_mut(|r| r.backend.repaint_caption());
+        s.backend.borrow_mut().repaint_caption();
     }
 }
 
@@ -689,8 +722,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let Some(s) = shared() else {
                 return HTCLIENT as LRESULT;
             };
-            if let Some((cx, cy, cw, ch)) =
-                s.render_host.with_reconciler_mut(|r| r.backend.caption_rect())
+            if let Some((cx, cy, cw, ch)) = s.backend.borrow_mut().caption_rect()
                 && x >= cx
                 && x < cx + cw
                 && y >= cy
@@ -702,9 +734,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // hover/press pipeline the window buttons already use — see
                 // `caption::index_for_hit` for the double-click hazard it
                 // brings and the `WM_NCLBUTTONDBLCLK` arm that defuses it.
-                if s.render_host.with_reconciler_mut(|r| r.backend.back_button_active())
-                    && let Some((bx, by, bw, bh)) =
-                        s.render_host.with_reconciler_mut(|r| r.backend.back_button_rect())
+                if s.backend.borrow_mut().back_button_active()
+                    && let Some((bx, by, bw, bh)) = s.backend.borrow_mut().back_button_rect()
                     && x >= bx
                     && x < bx + bw
                     && y >= by
@@ -722,9 +753,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if from_right <= 3.0 * caption::BTN_W {
                     return HTMINBUTTON as LRESULT;
                 }
-                let keep_client = s
-                    .render_host
-                    .with_reconciler_mut(|r| r.backend.wants_client_at(x, y));
+                let keep_client = s.backend.borrow_mut().wants_client_at(x, y);
                 if !keep_client {
                     return HTCAPTION as LRESULT;
                 }
@@ -849,7 +878,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_GETOBJECT => {
             if lparam as i32 == UIA_ROOT_OBJECT_ID
                 && let Some(s) = shared()
-                && let Some(root) = s.render_host.with_reconciler_mut(|r| r.backend.uia_root())
+                && let Some(root) = s.backend.borrow_mut().uia_root()
             {
                 let provider = uia::root_provider(hwnd as isize, root);
                 return unsafe {
@@ -1012,7 +1041,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
         WM_IME_COMPOSITION => {
             if let Some(s) = shared()
-                && s.render_host.with_reconciler_mut(|r| r.backend.has_text_focus())
+                && s.backend.borrow_mut().has_text_focus()
             {
                 let himc = unsafe { ImmGetContext(hwnd) };
                 if !himc.is_null() {
@@ -1037,7 +1066,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
         WM_IME_ENDCOMPOSITION => {
             if let Some(s) = shared()
-                && s.render_host.with_reconciler_mut(|r| r.backend.has_text_focus())
+                && s.backend.borrow_mut().has_text_focus()
             {
                 dispatch_input(&s, |b| b.ime_end());
                 return 0;
@@ -1091,8 +1120,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_DISPLAYCHANGE => {
             display_change::note_display_change(hwnd);
             if let Some(s) = shared() {
-                s.render_host
-                    .with_reconciler_mut(|r| r.backend.mark_all_dirty_and_repaint());
+                s.backend.borrow_mut().mark_all_dirty_and_repaint();
             }
             0
         }
@@ -1121,8 +1149,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // restart the focused field's compositor blink with the new period
             // (a no-op when no text field is focused).
             if let Some(s) = shared() {
-                s.render_host
-                    .with_reconciler_mut(|r| r.backend.refresh_caret_blink());
+                s.backend.borrow_mut().refresh_caret_blink();
             }
             0
         }
@@ -1152,8 +1179,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         width: pw as f64 / scale as f64,
                         height: ph as f64 / scale as f64,
                     });
-                    s.render_host
-                        .with_reconciler_mut(|r| r.backend.resize(pw, ph, dpi));
+                    s.backend.borrow_mut().resize(pw, ph, dpi);
                 }
             }
             0

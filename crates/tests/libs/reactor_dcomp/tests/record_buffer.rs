@@ -231,22 +231,30 @@ fn value_writes_are_stamped_with_delivered_revision() {
     );
 }
 
-/// `set_tooltip(_, None)` must round-trip as `None`, not as a dropped command:
-/// the side-table key is optional and the clear path has no payload.
+/// A tooltip is a declaration, not a payload: the full `Tooltip` (a rich one
+/// holds an `Element` tree) stays in the recorder's app-side map, the buffer
+/// carries only the `Send` declaration, and replay routes **nothing** to the
+/// backend's `set_tooltip` — this backend has no tooltip presenter yet, and
+/// when it grows one it will consume the declaration, never the payload.
 #[test]
-fn side_table_round_trips_tooltip_set_then_clear() {
+fn tooltip_payload_never_reaches_the_backend() {
     let mut rec = Recorder::new();
     rec.backend().create(id(1), ControlKind::Button);
 
     let tip = Tooltip::text("hello");
     rec.backend().set_tooltip(id(1), Some(&tip));
     rec.backend().set_tooltip(id(1), None);
+    assert_eq!(
+        rec.pending(),
+        3,
+        "set and clear must each buffer a declaration"
+    );
     rec.flush();
 
     assert_eq!(
         rec.replayed_tooltips(),
-        vec![Some(tip), None],
-        "tooltip set/clear did not survive the buffer"
+        Vec::<Option<Tooltip>>::new(),
+        "the tooltip payload crossed the seam — it must stay app-side"
     );
 }
 

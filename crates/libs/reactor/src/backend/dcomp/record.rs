@@ -1,25 +1,28 @@
 //! Command-buffer seam between the reconciler and the DComp backend.
 //!
-//! [`RecordingBackend`] wraps a concrete backend and implements [`Backend`] by
-//! encoding every call as a plain-data [`Cmd`] instead of mutating the
-//! composition tree directly. A later [`RecordingBackend::flush`] replays the
-//! buffer into the wrapped backend. Today replay is synchronous and on the same
-//! thread, so behaviour is identical to calling through; the point of the seam
-//! is that the buffer is **`Send`**, which is what lets the reconciler
-//! eventually run on a thread that is not the one owning the HWND, the message
-//! pump and the compositor.
+//! [`RecordingBackend`] is the **app half** of that seam: it implements
+//! [`Backend`] by encoding every call as a plain-data [`Cmd`] instead of
+//! mutating the composition tree directly, and it owns every app closure input
+//! can ever invoke. The **front half** is the concrete [`FrontBackend`] (the
+//! real `DCompBackend`, or a test spy) into which the host [`replay`]s the
+//! taken buffer. Today replay is synchronous and on the same thread, so
+//! behaviour is identical to calling through; the point of the seam is that
+//! the buffer is **`Send`** and the recorder holds no backend reference at
+//! all, which is what lets the reconciler eventually run on a thread that is
+//! not the one owning the HWND, the message pump and the compositor.
 //!
 //! Two properties are load-bearing and are enforced by the compiler rather than
 //! by convention:
 //!
 //! * **[`Cmd`] and [`Intent`] are `Send`.** Anything thread-affine — `Rc<dyn Fn>`
-//!   handlers, COM image sources — is kept out of both buffers. Remaining
-//!   thread-affine prop payloads are parked in a side table keyed by [`SideId`]
-//!   and referenced by id. The assertion at the bottom of this module fails the
-//!   build if a `!Send` payload ever leaks in.
+//!   handlers, COM image sources, `Element` trees — never enters either buffer:
+//!   closures live in this recorder's app-side maps and cross as declarations
+//!   (presence bits, key lists) the front consults without ever holding them.
+//!   The assertion at the bottom of this module fails the build if a `!Send`
+//!   payload ever leaks in.
 //! * **[`SendValue::from_prop`] matches [`PropValue`] exhaustively.** A new
 //!   `PropValue` variant upstream breaks this build instead of being silently
-//!   dropped from the wire, forcing a deliberate send-or-side-table decision.
+//!   dropped from the wire, forcing a deliberate send-or-declare decision.
 //!
 //! The reconciler mints control ids, so `create` takes one rather than
 //! returning one and the trait has no call that must be answered synchronously.
@@ -64,24 +67,16 @@ use crate::backend::{
 };
 use crate::drag::DragHandlers;
 use crate::interaction::Callback;
-use crate::style::PointerEventInfo;
-
-/// Key into the recorder's side table of thread-affine payloads.
-///
-/// The buffer carries these instead of the payload itself, which is what keeps
-/// [`Cmd`] `Send`.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-pub(crate) struct SideId(u32);
+use crate::style::{PointerEventInfo, TooltipContent, TooltipPlacement};
 
 /// The `Send` subset of [`PropValue`].
 ///
 /// Three `PropValue` variants hold thread-affine payloads — `SurfaceImageSource`
 /// and `VirtualSurfaceImageSource` wrap COM interfaces, `FlyoutDef` holds a
 /// `Box<Element>` and a callback — so they cannot ride the buffer. All three are
-/// inert on this backend today (no `Prop::ImageSource` arm exists in
-/// `DCompBackend::set_prop`; flyouts are a WinUI feature), so they are parked in
-/// the side table and replayed verbatim rather than being dropped: the recorder
-/// stays faithful even where the backend currently ignores the value.
+/// inert on this backend (no `Prop::ImageSource` arm exists in
+/// `DCompBackend::set_prop`; flyouts are a WinUI feature), so `set_prop` drops
+/// them at record time — see the note there.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) enum SendValue {
     Str(String),
@@ -185,22 +180,55 @@ impl SendValue {
     }
 }
 
-/// A thread-affine payload parked out of the buffer, retrieved at replay by
-/// [`SideId`].
-///
-/// Every variant here holds an `Rc<dyn Fn>`, a COM interface, or an `Element`
-/// tree. When replay moves to the front thread these do not travel with it:
-/// the COM-bearing prop values become front-side creation commands, and the
-/// remaining callback payloads (drag, templated realization) get the same
-/// stay-app-side treatment [`Event`] handlers and pointer callbacks already
-/// have. Until then the side table simply keeps [`Cmd`] honest.
-enum SidePayload {
-    Drag(DragHandlers),
-    Tooltip(Tooltip),
-    Accelerators(Vec<KeyboardAccelerator>),
-    Realization(Rc<dyn Fn(usize)>, Rc<dyn Fn(usize)>),
-    SelectionChanged(Callback<i32>),
-    Prop(PropValue),
+/// Which drag callbacks the app declared for a node — the drag analogue of
+/// [`PointerInterest`]: the `DragHandlers` closures stay in the recorder's
+/// app-side map, and these bits are all the front will ever consult when the
+/// backend grows an OLE `IDropTarget` (today it has none, so replay records
+/// nothing — but the declaration shape is settled now, so the drop-target work
+/// starts from bits + intents instead of re-deriving this split).
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub(crate) struct DragInterest {
+    pub enter: bool,
+    pub leave: bool,
+    pub over: bool,
+    pub drop: bool,
+}
+
+impl DragInterest {
+    fn of(h: &DragHandlers) -> Self {
+        Self {
+            enter: h.on_drag_enter.is_some(),
+            leave: h.on_drag_leave.is_some(),
+            over: h.on_drag_over.is_some(),
+            drop: h.on_drag_drop.is_some(),
+        }
+    }
+}
+
+/// The `Send` face of a [`Tooltip`]: what the front needs to *show* one. A
+/// rich tooltip's `Element` tree cannot cross (and could only be realized
+/// through the reconciler anyway), so it declares its presence and nothing
+/// more; the full `Tooltip` stays in the recorder's app-side map for whichever
+/// future path realizes it.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum TooltipDecl {
+    Text {
+        text: String,
+        placement: Option<TooltipPlacement>,
+    },
+    Rich,
+}
+
+impl TooltipDecl {
+    fn of(t: &Tooltip) -> Self {
+        match &t.content {
+            TooltipContent::Text(s) => Self::Text {
+                text: s.clone(),
+                placement: t.placement,
+            },
+            TooltipContent::Rich(_) => Self::Rich,
+        }
+    }
 }
 
 /// The typed payload of an [`Intent::Event`], mirroring the [`EventHandler`]
@@ -370,12 +398,6 @@ pub(crate) enum Cmd {
         prop: Prop,
         value: SendValue,
     },
-    /// `set_prop` whose value is thread-affine; the value is in the side table.
-    SetPropSide {
-        id: ControlId,
-        prop: Prop,
-        side: SideId,
-    },
     AppendChild {
         parent: ControlId,
         child: ControlId,
@@ -465,13 +487,18 @@ pub(crate) enum Cmd {
         id: ControlId,
         index: i32,
     },
+    /// Declarations only — the `Callback`/`Rc<dyn Fn>` payloads stay in the
+    /// recorder's app-side maps, exactly like event handlers. The backend does
+    /// not consume templated lists today; when it does, these become presence
+    /// bits it routes on and the closures fire as intents.
     AttachTemplatedSelectionChanged {
         id: ControlId,
-        side: SideId,
     },
     AttachTemplatedRealization {
         id: ControlId,
-        side: SideId,
+    },
+    AttachTemplatedReorder {
+        id: ControlId,
     },
     SetThemeBindings {
         id: ControlId,
@@ -503,13 +530,17 @@ pub(crate) enum Cmd {
         id: ControlId,
         accessibility: AccessibilityModifiers,
     },
-    SetKeyboardAccelerators {
+    /// The plain `(key, modifiers)` list of the app's accelerators; the
+    /// `on_invoked` callbacks stay in the recorder's app-side map. Matching a
+    /// chord is front-side work against exactly this list (§7.3's
+    /// `SetKeybindings`); firing is an intent resolved against the map.
+    SetKeybindings {
         id: ControlId,
-        side: SideId,
+        keys: Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>,
     },
     SetTooltip {
         id: ControlId,
-        side: Option<SideId>,
+        decl: Option<TooltipDecl>,
     },
     /// The presence bits of the app's pointer callbacks — the closures stay in
     /// the recorder's app-side map, invoked from [`Intent::Pointer`]/
@@ -519,9 +550,10 @@ pub(crate) enum Cmd {
         id: ControlId,
         interest: PointerInterest,
     },
-    SetDragHandlers {
+    /// The presence bits of the app's drag callbacks — see [`DragInterest`].
+    SetDragInterest {
         id: ControlId,
-        side: Option<SideId>,
+        interest: DragInterest,
     },
 }
 
@@ -542,29 +574,37 @@ pub(crate) trait FrontBackend: Backend {
     fn take_intents(&mut self) -> Vec<Intent>;
 }
 
-/// Records [`Backend`] calls into a `Send` buffer, then replays them into the
-/// wrapped backend on [`flush`](Self::flush).
-///
-/// Also the app-side keeper of every input-invoked closure: the `(id, event)`
-/// handler map and the per-node pointer callbacks live here, never in the
-/// backend, and [`drain_intents`](Self::drain_intents) resolves the backend's
-/// queued [`Intent`]s against them.
-///
-/// Derefs to the wrapped backend so the host's inherent-method call sites
-/// (input dispatch, UIA, layout, caption) reach through unchanged. Those sites
-/// are exactly the surface that stays on the front thread when replay goes
-/// cross-thread, at which point the `Deref` is removed deliberately and each
-/// one is re-pointed.
-pub(crate) struct RecordingBackend<B: FrontBackend> {
-    inner: B,
+/// The app half of the seam: records [`Backend`] calls into a `Send` buffer
+/// the host [`take_cmds`](Self::take_cmds) and [`replay`]s into the front
+/// backend, and keeps every input-invoked closure — the `(id, event)` handler
+/// map, the per-node pointer callbacks, and the declared-but-dormant payloads
+/// (accelerators, drag, tooltips, templated-list callbacks). It holds **no**
+/// backend reference: the front half is reached only through the buffer going
+/// one way and [`Intent`]s coming back, which is the whole point — the two
+/// halves share nothing but `Send` data, so they can live on different
+/// threads.
+pub(crate) struct RecordingBackend {
     cmds: Vec<Cmd>,
-    side: FxHashMap<SideId, SidePayload>,
-    next_side: u32,
     /// App-side event handlers, keyed by control. The inner `Vec` mirrors the
     /// shape the backend node used to hold — a handful of events per control.
     handlers: FxHashMap<ControlId, Vec<(Event, EventHandler)>>,
     /// App-side pointer callbacks (`on_tapped` / `on_pointer_*`), whole.
     pointer: FxHashMap<ControlId, PointerHandlers>,
+    /// App-side accelerator callbacks; the front sees only the `(key, mods)`
+    /// list ([`Cmd::SetKeybindings`]).
+    accels: FxHashMap<ControlId, Vec<KeyboardAccelerator>>,
+    /// App-side drag callbacks; the front sees only [`DragInterest`].
+    drag: FxHashMap<ControlId, DragHandlers>,
+    /// Full tooltips (a rich one holds an `Element` tree); the front sees only
+    /// [`TooltipDecl`].
+    tooltips: FxHashMap<ControlId, Tooltip>,
+    /// Templated-list callbacks — realize/recycle, selection, reorder. Declared
+    /// to the front by presence only; nothing consumes them on this backend
+    /// yet, but they are held here so the templated work starts from the same
+    /// closures-stay-app-side split as everything else.
+    realization: FxHashMap<ControlId, (Rc<dyn Fn(usize)>, Rc<dyn Fn(usize)>)>,
+    selection_changed: FxHashMap<ControlId, Callback<i32>>,
+    reorder: FxHashMap<ControlId, Callback<Vec<usize>>>,
     /// Per control, the latest [`Intent::ValueChanged`] revision the drain has
     /// handed the app — what a subsequent `Prop::Value` echo is stamped
     /// `based_on`. Advanced at drain whether or not a handler is mapped: the
@@ -574,30 +614,33 @@ pub(crate) struct RecordingBackend<B: FrontBackend> {
     delivered_value_rev: FxHashMap<ControlId, u64>,
 }
 
-impl<B: FrontBackend> RecordingBackend<B> {
-    pub(crate) fn new(inner: B) -> Self {
+impl RecordingBackend {
+    pub(crate) fn new() -> Self {
         Self {
-            inner,
             cmds: Vec::new(),
-            side: FxHashMap::default(),
-            next_side: 0,
             handlers: FxHashMap::default(),
             pointer: FxHashMap::default(),
+            accels: FxHashMap::default(),
+            drag: FxHashMap::default(),
+            tooltips: FxHashMap::default(),
+            realization: FxHashMap::default(),
+            selection_changed: FxHashMap::default(),
+            reorder: FxHashMap::default(),
             delivered_value_rev: FxHashMap::default(),
         }
     }
 
-    /// Drain the backend's intent queue into ready-to-run handler jobs, in
-    /// fire order. Called by the host after every entry point that can queue
-    /// intents; the returned jobs must be [`run`](IntentJob::run) **after** the
-    /// reconciler borrow is released, which is what lets a handler pump
-    /// messages or re-enter the backend without deadlocking on this borrow.
+    /// Resolve the front backend's queued intents into ready-to-run handler
+    /// jobs, in fire order. The host takes the intents from the front half and
+    /// brings them here (the only place that knows what the app subscribed
+    /// to); the returned jobs must be [`run`](IntentJob::run) **after** every
+    /// borrow is released, which is what lets a handler pump messages or
+    /// re-enter the backend without deadlocking.
     ///
     /// An intent whose control has no mapped handler resolves to nothing —
     /// firing is unconditional backend-side precisely because only this map
     /// knows what the app subscribed to.
-    pub(crate) fn drain_intents(&mut self) -> Vec<IntentJob> {
-        let intents = self.inner.take_intents();
+    pub(crate) fn resolve_intents(&mut self, intents: Vec<Intent>) -> Vec<IntentJob> {
         if intents.is_empty() {
             return Vec::new();
         }
@@ -674,59 +717,130 @@ impl<B: FrontBackend> RecordingBackend<B> {
             .map(|(_, h)| h)
     }
 
-    /// Park a thread-affine payload and return its buffer-safe key.
-    fn park(&mut self, payload: SidePayload) -> SideId {
-        self.next_side += 1;
-        let key = SideId(self.next_side);
-        self.side.insert(key, payload);
-        key
-    }
-
     fn push(&mut self, cmd: Cmd) {
         self.cmds.push(cmd);
     }
 
-    /// Number of commands currently buffered. Used by the host to assert the
-    /// buffer was drained before layout reads the arena.
+    /// Take the buffered commands for the host to [`replay`] into the front
+    /// backend, leaving the buffer empty. The take is atomic — a command can
+    /// never be observed both here and in a replay — so "everything recorded
+    /// has been replayed" holds by construction after the host applies the
+    /// returned batch.
+    pub(crate) fn take_cmds(&mut self) -> Vec<Cmd> {
+        std::mem::take(&mut self.cmds)
+    }
+
+    /// Number of commands currently buffered (test observability — the
+    /// headless harness is this count's only consumer).
+    #[cfg(feature = "test")]
     pub(crate) fn pending(&self) -> usize {
         self.cmds.len()
     }
+}
 
-    /// Replay every buffered command into the wrapped backend, in issue order.
-    ///
-    /// Commands are applied literally — never reordered, coalesced or repaired.
-    /// The reconciler is the authority on tree shape (it updates its own
-    /// `children_mirror` *before* issuing each call), so the backend is a
-    /// follower and any "fix-up" here would desynchronise the two. In
-    /// particular the buffer legitimately contains transient states the
-    /// reconciler itself produces — a child destroyed before it is unparented,
-    /// and the reverse order on the tab/pivot paths — so replay must not
-    /// validate intermediate consistency.
-    pub(crate) fn flush(&mut self) {
-        if self.cmds.is_empty() {
-            return;
+/// Replay a taken command batch into the front backend, in issue order.
+///
+/// Commands are applied literally — never reordered, coalesced or repaired.
+/// The reconciler is the authority on tree shape (it updates its own
+/// `children_mirror` *before* issuing each call), so the backend is a
+/// follower and any "fix-up" here would desynchronise the two. In
+/// particular the buffer legitimately contains transient states the
+/// reconciler itself produces — a child destroyed before it is unparented,
+/// and the reverse order on the tab/pivot paths — so replay must not
+/// validate intermediate consistency.
+pub(crate) fn replay<B: FrontBackend>(backend: &mut B, cmds: Vec<Cmd>) {
+    for cmd in cmds {
+        apply(backend, cmd);
+    }
+}
+
+/// Apply one recorded command to the front backend.
+fn apply<B: FrontBackend>(backend: &mut B, cmd: Cmd) {
+    match cmd {
+        Cmd::Create { id, kind } => backend.create(id, kind),
+        Cmd::SetProp { id, prop, value } => backend.set_prop(id, prop, &value.into_prop()),
+        Cmd::AppendChild { parent, child } => backend.append_child(parent, child),
+        Cmd::RemoveChild { parent, index } => backend.remove_child(parent, index),
+        Cmd::ReplaceChild { parent, index, new } => backend.replace_child(parent, index, new),
+        Cmd::MoveChild { parent, from, to } => backend.move_child(parent, from, to),
+        Cmd::InsertChild {
+            parent,
+            index,
+            child,
+        } => backend.insert_child(parent, index, child),
+        Cmd::Destroy { id } => backend.destroy(id),
+        Cmd::AttachEvent { id, event } => backend.declare_event(id, event),
+        Cmd::DetachEvent { id, event } => backend.detach_event(id, event),
+        Cmd::SetValue { id, value, based_on } => backend.set_value_stamped(id, value, based_on),
+        Cmd::SetTemplatedItemCount { id, count } => backend.set_templated_item_count(id, count),
+        Cmd::SetTemplatedRowContent {
+            list_id,
+            row_idx,
+            content,
+        } => backend.set_templated_row_content(list_id, row_idx, content),
+        Cmd::SetTemplatedSelectedIndex { id, index } => {
+            backend.set_templated_selected_index(id, index)
         }
-        for cmd in std::mem::take(&mut self.cmds) {
-            self.apply(cmd);
+        Cmd::SetTemplatedSelectionMode { id, mode } => {
+            backend.set_templated_selection_mode(id, mode)
         }
+        Cmd::SetTemplatedCanDragItems { id, value } => {
+            backend.set_templated_can_drag_items(id, value)
+        }
+        Cmd::SetTemplatedCanReorderItems { id, value } => {
+            backend.set_templated_can_reorder_items(id, value)
+        }
+        Cmd::SetTemplatedAllowDrop { id, value } => backend.set_templated_allow_drop(id, value),
+        Cmd::SetHeaderElement { id, header_id } => backend.set_header_element(id, header_id),
+        Cmd::SetPaneElement { id, pane_id } => backend.set_pane_element(id, pane_id),
+        Cmd::ScrollTemplatedToIndex { id, index } => backend.scroll_templated_to_index(id, index),
+        // Declarations whose closures live in the recorder's maps and whose
+        // features the DComp backend has not grown yet: nothing consumes them
+        // front-side, so replay records nothing. Each names its future
+        // consumer — templated-list virtualization, the §7.3 accelerator
+        // table, the tooltip presenter, an OLE drop target — and lands here,
+        // not in a trait method, so growing the feature is an additive edit.
+        // The payloads are bound and dropped (not wildcarded) so the variants
+        // stay honest data, not vestigial fields the lint would flag.
+        Cmd::AttachTemplatedSelectionChanged { id } => {
+            let _ = id;
+        }
+        Cmd::AttachTemplatedRealization { id } => {
+            let _ = id;
+        }
+        Cmd::AttachTemplatedReorder { id } => {
+            let _ = id;
+        }
+        Cmd::SetKeybindings { id, keys } => {
+            let _ = (id, keys);
+        }
+        Cmd::SetTooltip { id, decl } => {
+            let _ = (id, decl);
+        }
+        Cmd::SetDragInterest { id, interest } => {
+            let _ = (id, interest);
+        }
+        Cmd::SetThemeBindings { id, kind, bindings } => {
+            backend.set_theme_bindings(id, kind, &bindings)
+        }
+        Cmd::OnThemeChanged => backend.on_theme_changed(),
+        Cmd::SetImplicitTransitions { id, transitions } => {
+            backend.set_implicit_transitions(id, transitions)
+        }
+        Cmd::SetLayoutAnimation { id, config } => backend.set_layout_animation(id, config),
+        Cmd::RunPropertyAnimation { id, config } => backend.run_property_animation(id, config),
+        Cmd::SetExitTransition { id, config } => backend.set_exit_transition(id, config),
+        Cmd::SetRichTextParagraphs { id, paragraphs } => {
+            backend.set_rich_text_paragraphs(id, &paragraphs)
+        }
+        Cmd::SetAccessibility { id, accessibility } => {
+            backend.set_accessibility(id, &accessibility)
+        }
+        Cmd::SetPointerInterest { id, interest } => backend.set_pointer_interest(id, interest),
     }
 }
 
-impl<B: FrontBackend> std::ops::Deref for RecordingBackend<B> {
-    type Target = B;
-
-    fn deref(&self) -> &B {
-        &self.inner
-    }
-}
-
-impl<B: FrontBackend> std::ops::DerefMut for RecordingBackend<B> {
-    fn deref_mut(&mut self) -> &mut B {
-        &mut self.inner
-    }
-}
-
-impl<B: FrontBackend> Backend for RecordingBackend<B> {
+impl Backend for RecordingBackend {
     fn create(&mut self, id: ControlId, kind: ControlKind) {
         self.push(Cmd::Create { id, kind });
     }
@@ -746,10 +860,12 @@ impl<B: FrontBackend> Backend for RecordingBackend<B> {
         }
         match SendValue::from_prop(value) {
             Some(value) => self.push(Cmd::SetProp { id, prop, value }),
-            None => {
-                let side = self.park(SidePayload::Prop(value.clone()));
-                self.push(Cmd::SetPropSide { id, prop, side });
-            }
+            // Thread-affine prop values (XAML image sources, flyout Element
+            // trees) have no consumer on this backend — `DCompBackend::set_prop`
+            // has no arm for any of them — so there is nothing to declare and
+            // nothing to keep. If the backend ever grows one, `from_prop`'s
+            // exhaustive match is where the decision resurfaces.
+            None => {}
         }
     }
 
@@ -784,6 +900,12 @@ impl<B: FrontBackend> Backend for RecordingBackend<B> {
         // runs before the reconcile that recorded this destroy.
         self.handlers.remove(&id);
         self.pointer.remove(&id);
+        self.accels.remove(&id);
+        self.drag.remove(&id);
+        self.tooltips.remove(&id);
+        self.realization.remove(&id);
+        self.selection_changed.remove(&id);
+        self.reorder.remove(&id);
         self.delivered_value_rev.remove(&id);
         self.push(Cmd::Destroy { id });
     }
@@ -855,8 +977,13 @@ impl<B: FrontBackend> Backend for RecordingBackend<B> {
     }
 
     fn attach_templated_selection_changed(&mut self, id: ControlId, handler: Callback<i32>) {
-        let side = self.park(SidePayload::SelectionChanged(handler));
-        self.push(Cmd::AttachTemplatedSelectionChanged { id, side });
+        self.selection_changed.insert(id, handler);
+        self.push(Cmd::AttachTemplatedSelectionChanged { id });
+    }
+
+    fn attach_templated_reorder(&mut self, id: ControlId, handler: Callback<Vec<usize>>) {
+        self.reorder.insert(id, handler);
+        self.push(Cmd::AttachTemplatedReorder { id });
     }
 
     fn set_theme_bindings(&mut self, id: ControlId, kind: ControlKind, bindings: &[(Prop, ThemeRef)]) {
@@ -904,8 +1031,8 @@ impl<B: FrontBackend> Backend for RecordingBackend<B> {
         realize: Rc<dyn Fn(usize)>,
         recycle: Rc<dyn Fn(usize)>,
     ) {
-        let side = self.park(SidePayload::Realization(realize, recycle));
-        self.push(Cmd::AttachTemplatedRealization { id, side });
+        self.realization.insert(id, (realize, recycle));
+        self.push(Cmd::AttachTemplatedRealization { id });
     }
 
     fn set_accessibility(&mut self, id: ControlId, accessibility: &AccessibilityModifiers) {
@@ -916,13 +1043,26 @@ impl<B: FrontBackend> Backend for RecordingBackend<B> {
     }
 
     fn set_keyboard_accelerators(&mut self, id: ControlId, accelerators: &[KeyboardAccelerator]) {
-        let side = self.park(SidePayload::Accelerators(accelerators.to_vec()));
-        self.push(Cmd::SetKeyboardAccelerators { id, side });
+        let keys = accelerators.iter().map(|a| (a.key, a.modifiers)).collect();
+        if accelerators.is_empty() {
+            self.accels.remove(&id);
+        } else {
+            self.accels.insert(id, accelerators.to_vec());
+        }
+        self.push(Cmd::SetKeybindings { id, keys });
     }
 
     fn set_tooltip(&mut self, id: ControlId, tooltip: Option<&Tooltip>) {
-        let side = tooltip.map(|t| self.park(SidePayload::Tooltip(t.clone())));
-        self.push(Cmd::SetTooltip { id, side });
+        let decl = tooltip.map(TooltipDecl::of);
+        match tooltip {
+            Some(t) => {
+                self.tooltips.insert(id, t.clone());
+            }
+            None => {
+                self.tooltips.remove(&id);
+            }
+        }
+        self.push(Cmd::SetTooltip { id, decl });
     }
 
     fn set_pointer_handlers(&mut self, id: ControlId, handlers: Option<&PointerHandlers>) {
@@ -940,143 +1080,27 @@ impl<B: FrontBackend> Backend for RecordingBackend<B> {
     }
 
     fn set_drag_handlers(&mut self, id: ControlId, handlers: Option<&DragHandlers>) {
-        let side = handlers.map(|h| self.park(SidePayload::Drag(h.clone())));
-        self.push(Cmd::SetDragHandlers { id, side });
+        let interest = match handlers {
+            Some(h) => {
+                self.drag.insert(id, h.clone());
+                DragInterest::of(h)
+            }
+            None => {
+                self.drag.remove(&id);
+                DragInterest::default()
+            }
+        };
+        self.push(Cmd::SetDragInterest { id, interest });
     }
 
-    /// Reads straight through. The DirectComposition backend exposes no native
-    /// element — its controls are addressed by id — so this answers `None`
-    /// there regardless of what the buffer still holds, and nothing on that
-    /// path observes a control before its creation is replayed.
-    fn get_native_element(&self, id: ControlId) -> Option<windows_core::IInspectable> {
-        self.inner.get_native_element(id)
+    /// The DirectComposition backend exposes no native element — its controls
+    /// are addressed by id — so the recorder answers `None` without consulting
+    /// anything: there is nothing to consult, it holds no backend.
+    fn get_native_element(&self, _id: ControlId) -> Option<windows_core::IInspectable> {
+        None
     }
 }
 
-impl<B: FrontBackend> RecordingBackend<B> {
-    /// Apply one recorded command to the wrapped backend.
-    ///
-    /// Side-table payloads are *taken*, not cloned: a command is replayed once,
-    /// so the entry is dead afterwards and leaving it would grow the table
-    /// without bound. A missing entry means the same command was replayed
-    /// twice, which is a bug in the buffer plumbing rather than a recoverable
-    /// state, so it is asserted in debug and skipped in release.
-    fn apply(&mut self, cmd: Cmd) {
-        match cmd {
-            Cmd::Create { id, kind } => self.inner.create(id, kind),
-            Cmd::SetProp { id, prop, value } => self.inner.set_prop(id, prop, &value.into_prop()),
-            Cmd::SetPropSide { id, prop, side } => {
-                if let Some(SidePayload::Prop(value)) = self.take_side(side) {
-                    self.inner.set_prop(id, prop, &value);
-                }
-            }
-            Cmd::AppendChild { parent, child } => self.inner.append_child(parent, child),
-            Cmd::RemoveChild { parent, index } => self.inner.remove_child(parent, index),
-            Cmd::ReplaceChild { parent, index, new } => {
-                self.inner.replace_child(parent, index, new)
-            }
-            Cmd::MoveChild { parent, from, to } => self.inner.move_child(parent, from, to),
-            Cmd::InsertChild {
-                parent,
-                index,
-                child,
-            } => self.inner.insert_child(parent, index, child),
-            Cmd::Destroy { id } => self.inner.destroy(id),
-            Cmd::AttachEvent { id, event } => self.inner.declare_event(id, event),
-            Cmd::DetachEvent { id, event } => self.inner.detach_event(id, event),
-            Cmd::SetValue { id, value, based_on } => {
-                self.inner.set_value_stamped(id, value, based_on)
-            }
-            Cmd::SetTemplatedItemCount { id, count } => {
-                self.inner.set_templated_item_count(id, count)
-            }
-            Cmd::SetTemplatedRowContent {
-                list_id,
-                row_idx,
-                content,
-            } => self.inner.set_templated_row_content(list_id, row_idx, content),
-            Cmd::SetTemplatedSelectedIndex { id, index } => {
-                self.inner.set_templated_selected_index(id, index)
-            }
-            Cmd::SetTemplatedSelectionMode { id, mode } => {
-                self.inner.set_templated_selection_mode(id, mode)
-            }
-            Cmd::SetTemplatedCanDragItems { id, value } => {
-                self.inner.set_templated_can_drag_items(id, value)
-            }
-            Cmd::SetTemplatedCanReorderItems { id, value } => {
-                self.inner.set_templated_can_reorder_items(id, value)
-            }
-            Cmd::SetTemplatedAllowDrop { id, value } => {
-                self.inner.set_templated_allow_drop(id, value)
-            }
-            Cmd::SetHeaderElement { id, header_id } => self.inner.set_header_element(id, header_id),
-            Cmd::SetPaneElement { id, pane_id } => self.inner.set_pane_element(id, pane_id),
-            Cmd::ScrollTemplatedToIndex { id, index } => {
-                self.inner.scroll_templated_to_index(id, index)
-            }
-            Cmd::AttachTemplatedSelectionChanged { id, side } => {
-                if let Some(SidePayload::SelectionChanged(handler)) = self.take_side(side) {
-                    self.inner.attach_templated_selection_changed(id, handler);
-                }
-            }
-            Cmd::AttachTemplatedRealization { id, side } => {
-                if let Some(SidePayload::Realization(realize, recycle)) = self.take_side(side) {
-                    self.inner.attach_templated_realization(id, realize, recycle);
-                }
-            }
-            Cmd::SetThemeBindings { id, kind, bindings } => {
-                self.inner.set_theme_bindings(id, kind, &bindings)
-            }
-            Cmd::OnThemeChanged => self.inner.on_theme_changed(),
-            Cmd::SetImplicitTransitions { id, transitions } => {
-                self.inner.set_implicit_transitions(id, transitions)
-            }
-            Cmd::SetLayoutAnimation { id, config } => self.inner.set_layout_animation(id, config),
-            Cmd::RunPropertyAnimation { id, config } => {
-                self.inner.run_property_animation(id, config)
-            }
-            Cmd::SetExitTransition { id, config } => self.inner.set_exit_transition(id, config),
-            Cmd::SetRichTextParagraphs { id, paragraphs } => {
-                self.inner.set_rich_text_paragraphs(id, &paragraphs)
-            }
-            Cmd::SetAccessibility { id, accessibility } => {
-                self.inner.set_accessibility(id, &accessibility)
-            }
-            Cmd::SetKeyboardAccelerators { id, side } => {
-                if let Some(SidePayload::Accelerators(accelerators)) = self.take_side(side) {
-                    self.inner.set_keyboard_accelerators(id, &accelerators);
-                }
-            }
-            Cmd::SetTooltip { id, side } => {
-                let tooltip = side.and_then(|s| match self.take_side(s) {
-                    Some(SidePayload::Tooltip(t)) => Some(t),
-                    _ => None,
-                });
-                self.inner.set_tooltip(id, tooltip.as_ref());
-            }
-            Cmd::SetPointerInterest { id, interest } => {
-                self.inner.set_pointer_interest(id, interest)
-            }
-            Cmd::SetDragHandlers { id, side } => {
-                let handlers = side.and_then(|s| match self.take_side(s) {
-                    Some(SidePayload::Drag(h)) => Some(h),
-                    _ => None,
-                });
-                self.inner.set_drag_handlers(id, handlers.as_ref());
-            }
-        }
-    }
-
-    fn take_side(&mut self, side: SideId) -> Option<SidePayload> {
-        let payload = self.side.remove(&side);
-        debug_assert!(
-            payload.is_some(),
-            "side-table entry {side:?} missing — command replayed twice?"
-        );
-        payload
-    }
-}
 
 /// The buffers must stay `Send`: [`Cmd`] is the payload that will cross to the
 /// app thread, and [`Intent`] is the payload that will cross back from the

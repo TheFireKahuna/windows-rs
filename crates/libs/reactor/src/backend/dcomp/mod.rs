@@ -935,10 +935,6 @@ impl DCompBackend {
         Backend::set_prop(self, id, Prop::Value, &PropValue::F64(value));
     }
 
-    /// Hand the queued intents to the recorder's drain, in fire order.
-    pub(crate) fn take_intents(&mut self) -> Vec<record::Intent> {
-        std::mem::take(&mut self.intents)
-    }
 }
 
 impl record::FrontBackend for DCompBackend {
@@ -954,8 +950,10 @@ impl record::FrontBackend for DCompBackend {
         Self::set_value_stamped(self, id, value, based_on);
     }
 
+    /// Hand the queued intents to the host, in fire order, for the recorder's
+    /// app-side resolution.
     fn take_intents(&mut self) -> Vec<record::Intent> {
-        Self::take_intents(self)
+        std::mem::take(&mut self.intents)
     }
 }
 

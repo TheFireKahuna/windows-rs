@@ -152,8 +152,12 @@ impl Backend for Spy {
         self.note(format!("detach_event {} {event:?}", id.get()));
     }
 
+    /// Never reached through the recorder — the full `Tooltip` stays in the
+    /// recorder's app-side map and only a `Send` declaration rides the buffer.
+    /// Logged (and collected) so a regression that routes the payload back
+    /// into the backend is visible.
     fn set_tooltip(&mut self, id: ControlId, tooltip: Option<&Tooltip>) {
-        self.note(format!("set_tooltip {} {tooltip:?}", id.get()));
+        self.note(format!("set_tooltip {} (payload reached backend!)", id.get()));
         self.tooltips.borrow_mut().push((id, tooltip.cloned()));
     }
 
@@ -165,9 +169,11 @@ impl Backend for Spy {
         ));
     }
 
+    /// Never reached through the recorder — drag closures stay app-side and
+    /// the buffer carries only `DragInterest` bits.
     fn set_drag_handlers(&mut self, id: ControlId, handlers: Option<&DragHandlers>) {
         self.note(format!(
-            "set_drag_handlers {} {}",
+            "set_drag_handlers {} {} (payload reached backend!)",
             id.get(),
             handlers.is_some()
         ));
@@ -272,9 +278,11 @@ impl Backend for Spy {
     }
 }
 
-/// The real [`RecordingBackend`] — the command-buffer seam between the
-/// reconciler and the composition tree — wrapped around a spy that records
-/// what replay actually applied.
+/// The real [`RecordingBackend`] — the app half of the record seam — beside a
+/// spy front half that records what replay actually applied, held apart
+/// exactly as the host holds them: the recorder never touches the spy except
+/// through a taken `Send` buffer, and the spy's intents reach the recorder
+/// only through [`Self::drain_and_run`].
 ///
 /// [`Self::backend`] hands out the full public [`Backend`] surface, so a test
 /// drives the recorder exactly as the reconciler does. The intent half of the
@@ -282,7 +290,8 @@ impl Backend for Spy {
 /// the real backend's input paths would, and [`Self::drain_and_run`] performs
 /// the recorder's app-side resolution + invocation exactly as the host does.
 pub struct Recorder {
-    inner: RecordingBackend<Spy>,
+    rec: RecordingBackend,
+    spy: Spy,
     log: Rc<RefCell<AppliedLog>>,
     tooltips: Rc<RefCell<Vec<(ControlId, Option<Tooltip>)>>>,
     intents: Rc<RefCell<Vec<Intent>>>,
@@ -301,7 +310,8 @@ impl Recorder {
         let tooltips = Rc::clone(&spy.tooltips);
         let intents = Rc::clone(&spy.intents);
         Self {
-            inner: RecordingBackend::new(spy),
+            rec: RecordingBackend::new(),
+            spy,
             log,
             tooltips,
             intents,
@@ -310,17 +320,19 @@ impl Recorder {
 
     /// Drive the recorder through the public backend trait.
     pub fn backend(&mut self) -> &mut dyn Backend {
-        &mut self.inner
+        &mut self.rec
     }
 
     /// Commands buffered but not yet replayed.
     pub fn pending(&self) -> usize {
-        self.inner.pending()
+        self.rec.pending()
     }
 
-    /// Replay the buffer into the spy.
+    /// Take the buffer and replay it into the spy — what `post_render` does
+    /// into the real backend.
     pub fn flush(&mut self) {
-        self.inner.flush();
+        let cmds = self.rec.take_cmds();
+        dcomp::record::replay(&mut self.spy, cmds);
     }
 
     /// Everything the spy has been asked to apply, in order.
@@ -395,7 +407,8 @@ impl Recorder {
     /// ran should drive a prompt frame tick — the drag-preview latency path the
     /// host takes when a surface drag/scrub sink runs (`IntentJob::drives_frame_tick`).
     pub fn drain_run_report(&mut self) -> (usize, bool) {
-        let jobs = self.inner.drain_intents();
+        let intents = self.spy.take_intents();
+        let jobs = self.rec.resolve_intents(intents);
         let n = jobs.len();
         let drives_tick = jobs.iter().any(|j| j.drives_frame_tick());
         for job in jobs {
