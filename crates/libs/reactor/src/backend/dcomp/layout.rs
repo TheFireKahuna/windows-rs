@@ -550,13 +550,19 @@ pub(crate) fn apply_caption_metrics(n: &mut Node) {
 
 fn is_text(n: &Node) -> bool {
     match n.kind {
-        // A Button with only an icon and no label still needs a layout: it is
+        ControlKind::TextBlock => !n.paint.text.is_empty(),
+        // A button with only an icon and no label still needs a layout: it is
         // what carries the line height, and without one the measure callback
         // has nothing to key on and the button collapses to 0x0. The empty
         // run measures zero wide, so the icon width is the whole intrinsic
         // size — which is the right answer.
-        ControlKind::Button => !n.paint.text.is_empty() || n.extras().icon != 0,
-        ControlKind::TextBlock => !n.paint.text.is_empty(),
+        //
+        // The WHOLE family, not `Button` alone: a ToggleButton or RepeatButton
+        // that never built a layout measured to nothing and wrapped its label
+        // one letter per line inside a collapsed box.
+        k if super::node::is_button_family(k) => {
+            !n.paint.text.is_empty() || n.extras().icon != 0
+        }
         _ => false,
     }
 }

@@ -1155,7 +1155,9 @@ fn ink_radius(node: &Node) -> f32 {
         // The button family carries its own radius from birth, so the ink
         // follows it exactly — a wash with a different corner than the fill it
         // sits on reads as a rendering fault at any radius but the default.
-        _ => node.paint.corner_radius,
+        // Resolved, not raw: a pill's authored radius is unbounded, and the ink
+        // has to land on the same curve the fill under it was cut to.
+        _ => super::controls::resolve_radius(node.paint.corner_radius, node.rect.h),
     }
 }
 

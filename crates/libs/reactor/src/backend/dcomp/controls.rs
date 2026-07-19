@@ -74,7 +74,7 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
             // Follow the authored radius, not the kind's nominal one: a ring
             // whose corners disagree with the button inside it is the most
             // visible way for a custom radius to look broken.
-            node.paint.corner_radius
+            resolve_radius(node.paint.corner_radius, rect.height())
         } else {
             focus_radius(node.kind)
         };
@@ -247,8 +247,24 @@ pub(crate) fn button_palette(node: &Node) -> ButtonPalette {
         // No floor: the family is BORN at `RADIUS_MD` (`node::birth_paint`), so
         // an authored radius here is one the app asked for — including a
         // smaller one, which a `.max()` used to swallow.
-        radius: node.paint.corner_radius,
+        radius: resolve_radius(node.paint.corner_radius, node.rect.h),
     }
+}
+
+/// Clamp an authored corner radius to what the box can actually curve.
+///
+/// A rounded rectangle's corners overlap past half the shorter side, so this is
+/// the geometric bound rather than a style choice. It is also what makes
+/// [`crate::PILL_RADIUS`] work: an unbounded authored radius lands here and
+/// resolves to the fully-rounded end for whatever height the button measured.
+pub(crate) fn resolve_radius(authored: f32, h: f32) -> f32 {
+    if h <= 0.0 {
+        // Pre-layout, before a height exists. Returning the authored value
+        // unchanged would hand `f32::INFINITY` to the geometry; 0 draws a
+        // square that the first real sync immediately replaces.
+        return if authored.is_finite() { authored } else { 0.0 };
+    }
+    authored.clamp(0.0, h * 0.5)
 }
 
 /// The label and leading glyph only.
@@ -947,5 +963,37 @@ fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Re
             ParagraphAlignment::Center,
             dim,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_radius;
+    use crate::PILL_RADIUS;
+
+    #[test]
+    fn pill_radius_resolves_to_half_the_height() {
+        assert_eq!(resolve_radius(PILL_RADIUS as f32, 32.0), 16.0);
+        assert_eq!(resolve_radius(PILL_RADIUS as f32, 48.0), 24.0);
+    }
+
+    #[test]
+    fn an_authored_radius_passes_through_untouched() {
+        assert_eq!(resolve_radius(0.0, 32.0), 0.0);
+        assert_eq!(resolve_radius(2.0, 32.0), 2.0);
+        assert_eq!(resolve_radius(8.0, 32.0), 8.0);
+    }
+
+    #[test]
+    fn an_over_large_radius_clamps_rather_than_overlapping() {
+        assert_eq!(resolve_radius(100.0, 24.0), 12.0);
+    }
+
+    /// Before layout there is no height to resolve against. An unbounded
+    /// radius must not reach the geometry as an infinity.
+    #[test]
+    fn an_unmeasured_box_never_yields_a_non_finite_radius() {
+        assert_eq!(resolve_radius(PILL_RADIUS as f32, 0.0), 0.0);
+        assert_eq!(resolve_radius(8.0, 0.0), 8.0);
     }
 }

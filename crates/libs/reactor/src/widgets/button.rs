@@ -18,6 +18,15 @@ impl ButtonStyle {
     pub const TextLink: Self = Self(3);
 }
 
+/// The [`Button::pill`] radius: "as round as the box allows".
+///
+/// A corner radius is clamped to half the shorter side — a rounded rectangle
+/// cannot curve further than that without its corners overlapping — so an
+/// unbounded radius resolves to exactly the fully-rounded end, whatever the
+/// button's measured height turns out to be. Naming the intent instead of a
+/// number is what keeps a pill round across font sizes and display scales.
+pub const PILL_RADIUS: f64 = f64::INFINITY;
+
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Button {
     pub key: Option<String>,
@@ -30,6 +39,9 @@ pub struct Button {
     pub content_element: Option<Box<Element>>,
     pub is_enabled: bool,
     pub style: ButtonStyle,
+    /// Uniform corner radius in DIPs. `None` leaves the button at the radius
+    /// its kind is born with, which is the framework default for a button.
+    pub corner_radius: Option<f64>,
     pub icon: Option<Symbol>,
     pub on_click: Option<Callback<()>>,
     pub flyout: Option<FlyoutDef>,
@@ -79,6 +91,9 @@ impl Widget for Button {
         }
         if self.style != ButtonStyle::Default {
             out.push(Binding::Prop(Prop::StyleVariant, PropValue::I32(self.style.0)));
+        }
+        if let Some(v) = self.corner_radius {
+            out.push(Binding::Prop(Prop::CornerRadius, PropValue::F64(v)));
         }
         // Flyout and CommandBarFlyout are compound types not in TOML.
         if let Some(ref fly) = self.flyout {
@@ -149,6 +164,22 @@ impl Button {
 
     pub fn icon(mut self, sym: Symbol) -> Self {
         self.icon = Some(sym);
+        self
+    }
+
+    /// Override the corner radius, in DIPs. `0.0` squares the corners.
+    pub fn corner_radius(mut self, v: f64) -> Self {
+        self.corner_radius = Some(v);
+        self
+    }
+
+    /// Fully rounded ends — the shape a status pill or a filter chip wants.
+    ///
+    /// The radius is resolved against the button's measured height at paint
+    /// time rather than fixed here, so a pill stays a pill when its font size,
+    /// padding or the display scale changes.
+    pub fn pill(mut self) -> Self {
+        self.corner_radius = Some(PILL_RADIUS);
         self
     }
 
