@@ -276,21 +276,12 @@ fn measure_solve(
                             height: known.height.unwrap_or(th),
                         };
                     }
-                    // A leading icon widens the button by its box plus the gap
-                    // — without this an icon button sizes to its label alone
-                    // and the glyph overlaps the text.
-                    let icon_w = if node.extras().icon != 0 {
-                        controls::ICON_SIZE
-                            + if node.paint.text.is_empty() {
-                                0.0
-                            } else {
-                                controls::ICON_GAP
-                            }
-                    } else {
-                        0.0
-                    };
+                    // The ornaments widen the button by exactly what
+                    // `button_boxes` reserves for them — without this an
+                    // adorned button sizes to its label alone and the ornament
+                    // overlaps the text.
                     return Size {
-                        width: known.width.unwrap_or(tw + icon_w),
+                        width: known.width.unwrap_or(tw + controls::ornament_width(node)),
                         height: known.height.unwrap_or(th),
                     };
                 }
@@ -412,15 +403,54 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
     if arena.get(id).is_none() {
         return;
     }
+    // The button family shapes two runs BESIDE its label: the leading icon (a
+    // different family at a different size) and the badge's count (the badge's
+    // own smaller, heavier type). They live in `button_text` because the
+    // generic `text_layout` slot below is already the label's.
+    //
+    // This runs first and deliberately leaves `text_dirty` set: the generic
+    // block is what clears it, and the family always reaches that block —
+    // `is_text` covers the whole family whether or not it carries words.
+    let needs_ornaments = arena
+        .get(id)
+        .is_some_and(|n| n.text_dirty && super::node::is_button_family(n.kind));
+    if needs_ornaments {
+        let icon = arena
+            .get(id)
+            .map(|n| n.extras().icon)
+            .filter(|cp| *cp != 0)
+            .and_then(controls::glyph_str)
+            .and_then(|g| {
+                build_text_layout(&g, controls::ICON_SIZE, 400, theme::FONT_ICON, false)
+            });
+        let badge = arena
+            .get(id)
+            .and_then(|n| n.extras().badge)
+            .and_then(|b| b.count)
+            .and_then(|c| {
+                build_text_layout(
+                    &c.to_string(),
+                    info_badge::FONT_SIZE,
+                    info_badge::FONT_WEIGHT,
+                    "Segoe UI",
+                    false,
+                )
+            });
+        if let Some(n) = arena.get_mut(id) {
+            let t = n.button_text.get_or_insert_with(Default::default);
+            t.icon_layout = icon;
+            t.badge_layout = badge;
+        }
+    }
     let needs = arena.get(id).is_some_and(|n| n.text_dirty && is_text(n));
     if needs {
         let (text, size, weight, family, wrap) = {
             let n = arena.get(id).unwrap();
-            // A button is measured exactly as it is painted. `paint_button`
-            // floors the size at `FONT_SIZE_MD` and takes the weight from the
-            // palette — an accent button draws at 600 — so reading the raw
-            // `paint` values here measured a lighter, smaller run than the one
-            // that actually lands, and the label crowded its padding.
+            // A button is measured exactly as it is drawn: the size floors at
+            // `FONT_SIZE_MD` and the weight comes from the palette — an accent
+            // button sets at 600 — so reading the raw `paint` values here
+            // measured a lighter, smaller run than the one that actually lands,
+            // and the label crowded its padding.
             let (size, weight) = if super::node::is_button_family(n.kind) {
                 (
                     n.paint.font_size.max(theme::FONT_SIZE_MD),

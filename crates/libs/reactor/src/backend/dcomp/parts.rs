@@ -38,6 +38,11 @@
 //! re-sync): *below* parts sit under the node's painted surface (tray / pill /
 //! indicator under the labels), *above* parts sit over it (ink wash, slider
 //! fill + thumb over the painted groove).
+//!
+//! A node with **no** surface has no band to straddle — the button family draws
+//! nothing at all (`Node::has_chrome`). The two groups then keep their relative
+//! order simply by being created in it, which is the same z-order the banded
+//! case produces; see [`ensure`].
 
 use rustc_hash::FxHashMap;
 
@@ -1064,9 +1069,15 @@ fn ensure(comp: &Compositing, node: &mut Node, n_below: usize, n_above: usize) -
     if node.parts.is_some() {
         return true;
     }
-    let Some(surf) = node.surf.as_ref() else { return false };
-    let Ok(surf_vis) = surf.sprite.cast::<Visual>() else { return false };
     let Ok(children) = node.container.Children() else { return false };
+    // Absent for a node that draws nothing (the button family). The `below`
+    // group then stacks at the top in creation order instead of under the
+    // surface — which lands it in exactly the same relative z-order, because
+    // "below" only ever meant "below the surface", and there is none.
+    let surf_vis = node
+        .surf
+        .as_ref()
+        .and_then(|s| s.sprite.cast::<Visual>().ok());
 
     let mut parts = Box::new(Parts::new());
     // Creation order = bottom→top within the band: each `InsertBelow(surface)`
@@ -1074,7 +1085,11 @@ fn ensure(comp: &Compositing, node: &mut Node, n_below: usize, n_above: usize) -
     for _ in 0..n_below {
         let Some(p) = Part::new(comp) else { return false };
         let Some(v) = p.visual() else { return false };
-        if children.InsertBelow(&v, &surf_vis).is_err() {
+        let placed = match surf_vis.as_ref() {
+            Some(sv) => children.InsertBelow(&v, sv),
+            None => children.InsertAtTop(&v),
+        };
+        if placed.is_err() {
             return false;
         }
         parts.below.push(p);
@@ -1170,11 +1185,33 @@ fn ink_radius(node: &Node) -> f32 {
 /// label still paints (it is the only thing left on the surface), so a text
 /// change is the one edit that costs a repaint.
 ///
-/// Both chrome parts sit below the surface deliberately: the label draws over
-/// them, and the ink wash above draws over all three — the same stacking the
-/// fully-painted version produced.
+/// Five parts, and no surface between them: fill, border and badge plate in the
+/// lower group, ink wash and focus ring in the upper. The label and the two
+/// ornament runs are glyph sprites above all of it
+/// (`glyph_text::button_sync`), which is the stacking the fully-painted version
+/// produced — except for the wash, which now sits under the text rather than
+/// over it.
+/// The button family's part slots, named next to the counts they must agree
+/// with.
+///
+/// The count passed to [`ensure`] and the indices used to reach the parts were
+/// once two independent sets of literals in two places; adding the badge plate
+/// raised one and not the other, and the miss is an index-out-of-bounds on the
+/// first button that paints. Deriving the counts from the last index is what
+/// makes that particular mistake unspellable.
+mod slot {
+    pub const FILL: usize = 0;
+    pub const BORDER: usize = 1;
+    pub const PLATE: usize = 2;
+    pub const N_BELOW: usize = PLATE + 1;
+
+    pub const INK: usize = 0;
+    pub const RING: usize = 1;
+    pub const N_ABOVE: usize = RING + 1;
+}
+
 fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 2, 1) {
+    if !ensure(comp, node, slot::N_BELOW, slot::N_ABOVE) {
         return;
     }
     let (w, h) = (node.rect.w, node.rect.h);
@@ -1193,28 +1230,73 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
         .map(|c| AtlasKey::hbar(h, radius, theme::BORDER_W, c, scale));
     let ink_key = AtlasKey::hbar(h, ink_radius(node), 0.0, theme::w(1.0), scale);
     let target = ink_target(node);
+
+    // The badge plate: a stadium in the badge's own tint, over the button's
+    // fill and under the count's glyph sprites. Its radius is half its height,
+    // so it stays round at any width — the dot form is simply the case where
+    // that width IS the height.
+    let plate = super::controls::button_boxes(node, Rect::from_xywh(0.0, 0.0, w, h))
+        .badge
+        .zip(super::controls::badge_paint(node, &pal))
+        .map(|(b, (fill, _))| {
+            let bh = b.height();
+            (b, AtlasKey::hbar(bh, bh / 2.0, 0.0, fill, scale))
+        });
+
+    // The focus ring as a part rather than a draw: the family owns no surface
+    // to paint one on. The geometry is the shared painted ring's exactly (a
+    // `FOCUS_RING_W` stroke inset 1px), and the radius follows the AUTHORED one
+    // — a ring whose corners disagree with the button inside it is the most
+    // visible way for a custom radius to look broken.
+    let ring_key = node.focused.then(|| {
+        AtlasKey::hbar(
+            (h - 2.0).max(0.0),
+            radius,
+            super::controls::FOCUS_RING_W,
+            theme::stroke_strong(),
+            scale,
+        )
+    });
+
     let Some(parts) = node.parts.as_mut() else { return };
 
-    for (slot, key) in [fill_key, border_key].into_iter().enumerate() {
+    for (i, key) in [(slot::FILL, fill_key), (slot::BORDER, border_key)] {
         match key {
             Some(k) => {
-                parts.below[slot].bind(comp, atlas, k);
-                parts.below[slot].place(0.0, 0.0, w, h);
-                parts.below[slot].set_opacity(dim);
+                parts.below[i].bind(comp, atlas, k);
+                parts.below[i].place(0.0, 0.0, w, h);
+                parts.below[i].set_opacity(dim);
             }
             // Kept allocated and hidden rather than freed: the variant can flip
             // back, and `Parts` has no per-part free.
-            None => parts.below[slot].set_opacity(0.0),
+            None => parts.below[i].set_opacity(0.0),
         }
     }
+    match plate {
+        Some((b, k)) => {
+            parts.below[slot::PLATE].bind(comp, atlas, k);
+            parts.below[slot::PLATE].place(b.left, b.top, b.width(), b.height());
+            parts.below[slot::PLATE].set_opacity(dim);
+        }
+        None => parts.below[slot::PLATE].set_opacity(0.0),
+    }
 
-    parts.above[0].bind(comp, atlas, ink_key);
-    parts.above[0].place(0.0, 0.0, w, h);
+    parts.above[slot::INK].bind(comp, atlas, ink_key);
+    parts.above[slot::INK].place(0.0, 0.0, w, h);
     if parts.init {
-        parts.above[0].fade_to(target);
+        parts.above[slot::INK].fade_to(target);
     } else {
-        parts.above[0].set_opacity(target);
+        parts.above[slot::INK].set_opacity(target);
         parts.init = true;
+    }
+
+    match ring_key {
+        Some(k) => {
+            parts.above[slot::RING].bind(comp, atlas, k);
+            parts.above[slot::RING].place(1.0, 1.0, (w - 2.0).max(0.0), (h - 2.0).max(0.0));
+            parts.above[slot::RING].set_opacity(1.0);
+        }
+        None => parts.above[slot::RING].set_opacity(0.0),
     }
     parts.geom = (w, h);
 }

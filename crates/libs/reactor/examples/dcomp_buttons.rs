@@ -72,6 +72,39 @@ fn main() -> windows_reactor::Result<()> {
         .spacing(10.0)
         .into();
 
+        // ── Badges: the InfoBadge's two forms, hosted in the button ──────
+        let badges = hstack((
+            button("Inbox").badge(Badge::count(12)),
+            button("Sync").badge(Badge::count(3)).accent(),
+            button("Live").badge(Badge::dot().leading()).subtle(),
+            button("Errors").badge(Badge::count(7).tint(Color::rgb(0xd1, 0x34, 0x38))),
+            button("Downloads").icon(Symbol::Download).badge(Badge::count(2)),
+            button("").icon(Symbol::Mail).badge(Badge::dot()),
+        ))
+        .spacing(10.0)
+        .into();
+
+        // ── Authored fill / stroke: the pills and chips a host builds out of
+        //    a button now that `Background` reaches the family ─────────────
+        let tinted = hstack((
+            button("+6 dB")
+                .pill()
+                .background(Color::rgba(0x4c, 0x9a, 0xff, 0x2e))
+                .foreground(Color::rgb(0x9c, 0xc8, 0xff)),
+            button("Bypassed")
+                .pill()
+                .background(Color::rgba(0xff, 0xff, 0xff, 0x10))
+                .border_brush(Color::rgba(0xff, 0xff, 0xff, 0x1a))
+                .foreground(TXT2),
+            button("Graphic EQ")
+                .pill()
+                .badge(Badge::dot().tint(Color::rgb(0x7a, 0xd1, 0x8c)).leading())
+                .background(Color::rgba(0x7a, 0xd1, 0x8c, 0x26))
+                .foreground(TXT2),
+        ))
+        .spacing(10.0)
+        .into();
+
         // ── Radius: authored below the family default must survive, and
         //    `pill` must resolve against the measured height ───────────────
         let radii = hstack((
@@ -153,6 +186,8 @@ fn main() -> windows_reactor::Result<()> {
             group("Styles", styles),
             group("Disabled", disabled),
             group("With icons", icons),
+            group("Badges", badges),
+            group("Authored fill · stroke", tinted),
             group("Corner radius", radii),
             group("Toggle · Repeat", family),
             group("Flyouts", flyouts),

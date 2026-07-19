@@ -23,7 +23,7 @@
 //! **These tests are not headless** — see `arena_ids.rs`.
 
 use windows_reactor::dcomp_test_api::ArenaHarness;
-use windows_reactor::{ControlKind as K, Prop, PropValue as V, Thickness};
+use windows_reactor::{Badge, Color, ControlKind as K, Prop, PropValue as V, Thickness};
 
 fn harness() -> ArenaHarness {
     ArenaHarness::new().expect(
@@ -189,6 +189,19 @@ fn cases() -> Vec<Case> {
             V::Str("search".into()),
         ),
         c(K::Button, Prop::Icon, V::I32(42)),
+        // Every field of a `Badge` set away from its default at once, so a
+        // reset that restores the struct but keeps, say, the tint is caught.
+        c(
+            K::Button,
+            Prop::Badge,
+            V::Badge(
+                Badge::count(7).tint(Color::rgb(255, 0, 128)).leading(),
+            ),
+        ),
+        // The dot form separately: its `count: None` is the same value the
+        // struct's absence would produce if the reset stored `Some(default)`
+        // instead of `None`.
+        c(K::Button, Prop::Badge, V::Badge(Badge::dot())),
         // `Prop::FlyoutContent` is deliberately absent: a flyout does not
         // travel as a prop on this backend. It splits at the record seam into
         // a `Cmd::SetFlyout` declaration plus an app-side entry, so its set /

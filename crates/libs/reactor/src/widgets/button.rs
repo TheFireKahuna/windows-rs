@@ -27,6 +27,57 @@ impl ButtonStyle {
 /// number is what keeps a pill round across font sizes and display scales.
 pub const PILL_RADIUS: f64 = f64::INFINITY;
 
+/// The badge a [`Button`] carries beside its label — the two forms an
+/// [`InfoBadge`](super::InfoBadge) takes, hosted inside the button's own box
+/// instead of beside it.
+///
+/// A button with no badge holds no `Badge` at all, so the absent case is
+/// absence rather than a value: `count: None` is unambiguously the dot form,
+/// and no count is reserved to mean "nothing here".
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Badge {
+    /// The count, or `None` for the bare status dot.
+    pub count: Option<i32>,
+    /// Plate fill. `None` takes the accent role — what a standalone
+    /// `InfoBadge` uses, and what makes an untinted badge match one.
+    pub tint: Option<Color>,
+    /// Sit before the label rather than after it.
+    ///
+    /// Trailing is the default because a count annotates the label it follows
+    /// ("Inbox 12"); a dot placed leading reads instead as a status lamp on the
+    /// thing the label names.
+    pub leading: bool,
+}
+
+impl Badge {
+    /// A bare status dot.
+    pub fn dot() -> Self {
+        Self {
+            count: None,
+            tint: None,
+            leading: false,
+        }
+    }
+    /// A count, in a stadium plate that floors at a circle for one digit.
+    pub fn count(n: i32) -> Self {
+        Self {
+            count: Some(n),
+            tint: None,
+            leading: false,
+        }
+    }
+    /// Fill the plate with `c` instead of the accent role.
+    pub fn tint(mut self, c: Color) -> Self {
+        self.tint = Some(c);
+        self
+    }
+    /// Place the badge before the label.
+    pub fn leading(mut self) -> Self {
+        self.leading = true;
+        self
+    }
+}
+
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Button {
     pub key: Option<String>,
@@ -42,7 +93,14 @@ pub struct Button {
     /// Uniform corner radius in DIPs. `None` leaves the button at the radius
     /// its kind is born with, which is the framework default for a button.
     pub corner_radius: Option<f64>,
+    /// Outline colour. `None` leaves the variant's own decision — an outline on
+    /// a Default button, none on Accent or Subtle. The *width* stays the
+    /// family's, so a chip authors the colour that frames it without being able
+    /// to draw a heavier border than any other button on the surface.
+    pub border_brush: Option<Color>,
     pub icon: Option<Symbol>,
+    /// The badge beside the label; `None` for a button that carries none.
+    pub badge: Option<Badge>,
     pub on_click: Option<Callback<()>>,
     pub flyout: Option<FlyoutDef>,
     pub menu_flyout_items: Option<Vec<MenuItemDef>>,
@@ -86,6 +144,9 @@ impl Widget for Button {
         if let Some(v) = self.icon {
             out.push(Binding::Prop(Prop::Icon, PropValue::I32(v.0)));
         }
+        if let Some(v) = self.badge {
+            out.push(Binding::Prop(Prop::Badge, PropValue::Badge(v)));
+        }
         if let Some(v) = &self.menu_flyout_items {
             out.push(Binding::Prop(
                 Prop::MenuFlyoutItems,
@@ -97,6 +158,9 @@ impl Widget for Button {
         }
         if let Some(v) = self.corner_radius {
             out.push(Binding::Prop(Prop::CornerRadius, PropValue::F64(v)));
+        }
+        if let Some(v) = self.border_brush {
+            out.push(Binding::Prop(Prop::BorderBrush, PropValue::Color(v)));
         }
         // Flyout and CommandBarFlyout are compound types not in TOML.
         if let Some(ref fly) = self.flyout {
@@ -170,9 +234,22 @@ impl Button {
         self
     }
 
+    /// Carry a [`Badge`] beside the label — `Badge::dot()` or
+    /// `Badge::count(n)`, optionally tinted and optionally leading.
+    pub fn badge(mut self, b: Badge) -> Self {
+        self.badge = Some(b);
+        self
+    }
+
     /// Override the corner radius, in DIPs. `0.0` squares the corners.
     pub fn corner_radius(mut self, v: f64) -> Self {
         self.corner_radius = Some(v);
+        self
+    }
+
+    /// Outline the button in `c` instead of leaving the outline to its variant.
+    pub fn border_brush(mut self, c: Color) -> Self {
+        self.border_brush = Some(c);
         self
     }
 

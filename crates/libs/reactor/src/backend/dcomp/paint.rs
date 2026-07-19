@@ -61,9 +61,13 @@ fn paint_node(
     scale: f32,
     scrubbing: bool,
 ) -> windows_core::Result<()> {
+    // A node reaches this block either because it draws (and so wants a
+    // surface) or because it owns retained chrome to reconcile. The two are no
+    // longer the same set: the button family draws nothing at all, and its
+    // parts and glyph sprites ARE its appearance.
     let needs = arena
         .get(id)
-        .is_some_and(|n| n.has_chrome() || n.surf.is_some());
+        .is_some_and(|n| n.has_chrome() || n.surf.is_some() || parts::converted(n.kind));
     if needs {
         let (w, h) = arena.get(id).map(|n| (n.rect.w, n.rect.h)).unwrap_or((0.0, 0.0));
         // Layout rects are pixel-snapped, so `w * scale` is integral (mod FP
@@ -72,26 +76,33 @@ fn paint_node(
         let pw = (w * scale).round() as i32;
         let ph = (h * scale).round() as i32;
 
-        let has_surface = arena.get(id).is_some_and(|n| n.surf.is_some());
-        if !has_surface {
-            let container = arena.get(id).unwrap().container.clone();
-            let surf = comp.new_surface(&container, pw, ph)?;
-            if let Some(n) = arena.get_mut(id) {
-                n.surf = Some(surf);
+        let draws = arena
+            .get(id)
+            .is_some_and(|n| n.has_chrome() || n.surf.is_some());
+        if draws {
+            let has_surface = arena.get(id).is_some_and(|n| n.surf.is_some());
+            if !has_surface {
+                let container = arena.get(id).unwrap().container.clone();
+                let surf = comp.new_surface(&container, pw, ph)?;
+                if let Some(n) = arena.get_mut(id) {
+                    n.surf = Some(surf);
+                }
             }
-        }
-        // Both writes self-gate, so a surface just minted at (pw, ph) skips the
-        // resize and takes the DIP push once.
-        if let Some(n) = arena.get_mut(id)
-            && let Some(s) = &mut n.surf
-        {
-            let _ = s.resize(pw, ph);
-            s.set_dip_size(w, h);
+            // Both writes self-gate, so a surface just minted at (pw, ph) skips
+            // the resize and takes the DIP push once.
+            if let Some(n) = arena.get_mut(id)
+                && let Some(s) = &mut n.surf
+            {
+                let _ = s.resize(pw, ph);
+                s.set_dip_size(w, h);
+            }
         }
 
         let dirty = arena.get(id).is_some_and(|n| n.dirty);
         if dirty && w > 0.0 && h > 0.0 {
-            draw_surface(comp, cache, arena, id, scale)?;
+            if draws {
+                draw_surface(comp, cache, arena, id, scale)?;
+            }
             if let Some(n) = arena.get_mut(id) {
                 n.dirty = false;
                 // Reconcile the converted kinds' retained chrome parts (pill /
@@ -100,12 +111,10 @@ fn paint_node(
                 if parts::converted(n.kind) {
                     parts::sync(comp, atlas, n, scale, scrubbing);
                 }
-                // The button family's label: retained glyph sprites, placed
-                // AFTER the parts sync so the label's host lands above the ink
-                // that sync creates on first use.
-                if super::node::is_button_family(n.kind) {
-                    super::glyph_text::label_sync(comp, glyphs, n, scale);
-                }
+                // The button family's label, icon and badge count: retained
+                // glyph sprites, placed AFTER the parts sync so their hosts land
+                // above the ink that sync creates on first use.
+                super::glyph_text::button_sync(comp, glyphs, n, scale);
                 // Editors: reconcile the caret sprite (position + compositor
                 // blink) against the text metrics just painted.
                 if n.editor.is_some() {

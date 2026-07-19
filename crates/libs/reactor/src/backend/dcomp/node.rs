@@ -22,6 +22,7 @@ use crate::system_bindings::{
     ContainerVisual, ICompositionObject, ICompositionObject2, IVisual, ImplicitAnimationCollection,
     InsetClip, Visual,
 };
+use crate::Badge;
 use crate::Color;
 use crate::LineEndpoints;
 use super::record::FlyoutDecl;
@@ -217,6 +218,10 @@ pub(crate) struct Extras {
     /// Leading icon glyph codepoint (a `Symbol`'s value), 0 = none — the same
     /// encoding [`Ctrl::icons`] and [`MenuRow::icon`] already use.
     pub icon: u32,
+    /// The badge flanking the label, or `None` for a button carrying none.
+    /// Unlike [`icon`](Self::icon) there is no in-band "absent" value to
+    /// reserve: the dot form is a badge with no count.
+    pub badge: Option<Badge>,
 
     // ── HyperlinkButton ──────────────────────────────────────────────────
     /// Target URI (empty = none).
@@ -301,6 +306,7 @@ impl Extras {
         flyout: None,
         flyout_placement: FlyoutPlacementMode::Top.0,
         icon: 0,
+        badge: None,
         navigate_uri: String::new(),
         on_content: String::new(),
         off_content: String::new(),
@@ -605,10 +611,16 @@ pub(crate) struct Node {
     /// motion runs DWM-side. Created lazily by the parts sync; `None` for
     /// every other node. See [`parts`](super::parts).
     pub parts: Option<Box<parts::Parts>>,
-    /// Button family only: the label as retained per-glyph sprites, above both
-    /// the chrome parts and the ink. Created lazily on first painted sync; see
-    /// [`glyph_text::label_sync`](super::glyph_text::label_sync).
-    pub text_part: Option<Box<super::glyph_text::TextPart>>,
+    /// Button family only: every run the control draws — its label, its leading
+    /// icon glyph and its badge's count — as retained per-glyph sprites above
+    /// both the chrome parts and the ink, plus the cached layouts the two
+    /// ornament runs are shaped from.
+    ///
+    /// Boxed and lazy for the reason [`Extras`] is: it exists only for the
+    /// button family, and every other node would carry the dead weight.
+    /// Rebuilt by the layout pass on `text_dirty`; see
+    /// [`glyph_text::button_sync`](super::glyph_text::button_sync).
+    pub button_text: Option<Box<super::glyph_text::ButtonText>>,
     /// Editors only: the caret sprite (topmost child, above the painted text)
     /// whose blink is a compositor-side square-wave opacity animation. Created
     /// lazily on first focused paint; see [`parts::sync_caret`].
@@ -782,7 +794,7 @@ impl Node {
             vis,
             surf: None,
             parts: None,
-            text_part: None,
+            button_text: None,
             caret: None,
             knob: None,
             scroll_thumb: None,
@@ -954,7 +966,12 @@ impl Node {
     /// Whether this node draws any chrome (and therefore needs a surface).
     pub fn has_chrome(&self) -> bool {
         match self.kind {
-            ControlKind::Button => true,
+            // The button family is fully retained: chrome, ink, badge plate and
+            // focus ring are compositor parts, label and ornaments are glyph
+            // sprites. There is nothing left for a surface to hold, so denying
+            // it one is what turns "draws nothing" into "allocates nothing and
+            // never enters `BeginDraw`". See `controls::paint`.
+            k if is_button_family(k) => false,
             ControlKind::TextBlock => !self.paint.text.is_empty(),
             ControlKind::Line => self.paint.stroke.is_some(),
             ControlKind::Ellipse | ControlKind::Rectangle => {

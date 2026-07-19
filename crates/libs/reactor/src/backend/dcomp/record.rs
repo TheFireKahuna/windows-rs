@@ -68,7 +68,7 @@ use rustc_hash::FxHashMap;
 
 use super::node::PointerInterest;
 use crate::backend::{
-    AccessibilityModifiers, AnimationConfig, Backend, Color, CommandBarCommandDef, ControlId,
+    AccessibilityModifiers, AnimationConfig, Backend, Badge, Color, CommandBarCommandDef, ControlId,
     ControlKind, Event, EventHandler, GridLength, ImplicitTransitions, KeyboardAccelerator,
     LayoutAnimationConfig, LineEndpoints, MenuBarItemDef, MenuItemDef, NavViewItem,
     PointerHandlers, Prop, PropValue, RichTextParagraph, SelectionMode, SelectorBarItemDef,
@@ -113,6 +113,7 @@ pub(crate) enum SendValue {
     GradientStops(Vec<(f64, Color)>),
     F64List(Vec<f64>),
     ValueLabels(Vec<(f64, String)>),
+    Badge(Badge),
 }
 
 impl SendValue {
@@ -150,6 +151,7 @@ impl SendValue {
             PropValue::GradientStops(v) => Self::GradientStops(v.clone()),
             PropValue::F64List(v) => Self::F64List(v.clone()),
             PropValue::ValueLabels(v) => Self::ValueLabels(v.clone()),
+            PropValue::Badge(v) => Self::Badge(*v),
             // A flyout never reaches here: `set_prop` intercepts
             // `Prop::FlyoutContent` and splits it into a `Cmd::SetFlyout`
             // declaration plus an app-side entry, the way a tooltip does.
@@ -190,6 +192,7 @@ impl SendValue {
             Self::GradientStops(v) => PropValue::GradientStops(v),
             Self::F64List(v) => PropValue::F64List(v),
             Self::ValueLabels(v) => PropValue::ValueLabels(v),
+            Self::Badge(v) => PropValue::Badge(v),
         }
     }
 }

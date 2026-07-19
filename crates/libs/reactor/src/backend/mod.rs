@@ -147,6 +147,7 @@ pub enum Prop {
     AutoSuggestItems,
     AutoSuggestPlaceholder,
     Background,
+    Badge,
     BorderBrush,
     BorderThickness,
     CanReorderTabs,
@@ -333,6 +334,10 @@ pub enum PropValue {
     F64List(Vec<f64>),
     /// `(value, label)` pairs (Knob scale labels — formatted by the app).
     ValueLabels(Vec<(f64, String)>),
+    /// A button's in-box badge — the count-or-dot form, its tint and its side.
+    /// One value rather than a prop each, so the parts cannot contradict one
+    /// another and "no badge" stays `Unset` rather than a reserved count.
+    Badge(Badge),
 }
 
 /// Closed enum of every backend-observable input event.

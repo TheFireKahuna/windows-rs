@@ -27,7 +27,7 @@ mod backdrop;
 mod bootstrap;
 mod caption;
 mod color_out;
-mod controls;
+pub(crate) mod controls;
 mod dispatch;
 mod display_change;
 mod editor;
@@ -1716,6 +1716,14 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.text_dirty = true;
             node.mark_dirty();
         }
+        // The badge flanking the label. Re-measures for the reason the icon
+        // does — the plate widens the button — and a count change re-shapes the
+        // numeral, which is what decides that width.
+        (Prop::Badge, PropValue::Badge(b)) => {
+            node.extras_mut().badge = Some(*b);
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
         (Prop::NavigateUri, PropValue::Str(s)) => {
             node.extras_mut().navigate_uri = s.clone();
         }
@@ -2081,6 +2089,15 @@ prop_contract! {
         // text layout at all.
         Icon => |n| {
             n.extras_reset(|x| x.icon = Extras::DEFAULT.icon);
+            n.text_dirty = true;
+        }
+
+        // ── Button badge ─────────────────────────────────────────────────
+        // Re-measures for the same reason the icon does, and additionally
+        // drops the count's shaped run: the badge is gone, so the numeral it
+        // would have been sized from is too.
+        Badge => |n| {
+            n.extras_reset(|x| x.badge = Extras::DEFAULT.badge);
             n.text_dirty = true;
         }
 
@@ -2554,6 +2571,7 @@ mod unhandled {
             PropValue::GradientStops(_) => "GradientStops",
             PropValue::F64List(_) => "F64List",
             PropValue::ValueLabels(_) => "ValueLabels",
+            PropValue::Badge(_) => "Badge",
         }
     }
 }

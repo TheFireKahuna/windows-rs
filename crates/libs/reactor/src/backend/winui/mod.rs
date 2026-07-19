@@ -1255,64 +1255,52 @@ impl Backend for WinUIBackend {
                 (Prop::TextWrappingWrap, PropValue::I32(v), Handle::RichTextBlock(tb)) => {
                     tb.SetTextWrapping(TextWrapping(*v))
                 }
+                // The three content arms all go through the same decomposition
+                // so that whichever order they arrive in, each replaces only
+                // its own piece of the row. See [`take_row`].
                 (Prop::Content, PropValue::Str(s), Handle::Button(b)) => {
                     let cc = b.cast::<bindings::IContentControl>()?;
-                    // If the button has an icon+text layout (StackPanel from
-                    // Icon), update just the TextBlock child so the icon
-                    // is preserved when only the label changes.
-                    if let Ok(existing) = cc.Content()
-                        && let Ok(panel) = existing.cast::<bindings::IPanel>()
-                    {
-                        let children = panel.Children()?;
-                        if children.Size()? >= 2
-                            && let Ok(tb) = children.GetAt(1)?.cast::<bindings::ITextBlock>()
-                        {
-                            return tb.SetText(s);
-                        }
+                    let mut row = take_row(&cc);
+                    row.rest.clear();
+                    if !s.is_empty() {
+                        row.rest.push(string_as_textblock(s)?.cast()?);
                     }
-                    let tb = string_as_textblock(s)?;
-                    cc.SetContent(&tb)
+                    write_row(&cc, &row)
                 }
                 (Prop::Icon, PropValue::I32(v), Handle::Button(b)) => {
-                    let icon_elem = bindings::SymbolIcon::CreateInstanceWithSymbol(Symbol(*v))?;
                     let cc = b.cast::<bindings::IContentControl>()?;
-                    // If the button already has an icon+text StackPanel layout,
-                    // replace just the icon child (index 0) to preserve the text.
-                    if let Ok(existing) = cc.Content()
-                        && let Ok(panel) = existing.cast::<bindings::IPanel>()
-                    {
-                        let children = panel.Children()?;
-                        if children.Size()? >= 2 {
-                            children.SetAt(0, &icon_elem.cast::<bindings::UIElement>()?)?;
-                            return Ok(());
-                        }
+                    let mut row = take_row(&cc);
+                    row.icon =
+                        Some(bindings::SymbolIcon::CreateInstanceWithSymbol(Symbol(*v))?.cast()?);
+                    write_row(&cc, &row)
+                }
+                (Prop::Icon, PropValue::Unset, Handle::Button(b)) => {
+                    let cc = b.cast::<bindings::IContentControl>()?;
+                    let mut row = take_row(&cc);
+                    row.icon = None;
+                    write_row(&cc, &row)
+                }
+                (Prop::Badge, PropValue::Badge(bg), Handle::Button(b)) => {
+                    let badge = bindings::InfoBadge::new()?;
+                    // `-1` is WinUI's own "no count", which is the dot style —
+                    // the same distinction `Badge::count: None` carries.
+                    badge.SetValue(bg.count.unwrap_or(-1))?;
+                    if let Some(c) = bg.tint {
+                        badge
+                            .cast::<bindings::IControl>()?
+                            .SetBackground(&solid_brush(c)?)?;
                     }
-                    let use_icon_only = if let Ok(existing) = cc.Content() {
-                        // Already in icon-only mode (existing is a SymbolIcon).
-                        existing.cast::<bindings::ISymbolIcon>().is_ok()
-                            || existing
-                                .cast::<bindings::ITextBlock>()
-                                .ok()
-                                .and_then(|tb| tb.Text().ok())
-                                .is_some_and(|t| t.is_empty())
-                    } else {
-                        true
-                    };
-                    if use_icon_only {
-                        cc.SetContent(&icon_elem)
-                    } else {
-                        let panel = bindings::StackPanel::new()?;
-                        panel.SetOrientation(Orientation::Horizontal)?;
-                        panel.SetSpacing(8.0)?;
-                        let children = panel.cast::<bindings::IPanel>()?.Children()?;
-                        children.Append(&icon_elem.cast::<bindings::UIElement>()?)?;
-                        if let Ok(existing) = cc.Content()
-                            && let Ok(ui) = existing.cast::<bindings::UIElement>()
-                        {
-                            children.Append(&ui)?;
-                        }
-                        cc.SetContent(&panel)
-                    }
+                    let cc = b.cast::<bindings::IContentControl>()?;
+                    let mut row = take_row(&cc);
+                    row.badge = Some(badge.cast()?);
+                    row.badge_leading = bg.leading;
+                    write_row(&cc, &row)
+                }
+                (Prop::Badge, PropValue::Unset, Handle::Button(b)) => {
+                    let cc = b.cast::<bindings::IContentControl>()?;
+                    let mut row = take_row(&cc);
+                    row.badge = None;
+                    write_row(&cc, &row)
                 }
                 (Prop::StyleVariant, PropValue::I32(v), Handle::Button(b)) => {
                     let fe = b.cast::<bindings::IFrameworkElement>()?;

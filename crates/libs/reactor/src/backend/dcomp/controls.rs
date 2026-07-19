@@ -34,10 +34,16 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         return true;
     }
     match node.kind {
+        // The button family draws nothing. Its fill, border, hover/press ink,
+        // badge plate and focus ring are all retained compositor parts
+        // (`parts::button_sync`), and its label, icon and badge count are
+        // retained glyph sprites (`glyph_text::button_sync`) — so `has_chrome`
+        // denies the family a surface entirely and this arm is what makes the
+        // generic fill/border path skip it on the way there.
         ControlKind::Button
         | ControlKind::ToggleButton
         | ControlKind::RepeatButton
-        | ControlKind::SplitButton => paint_button(session, brush, node, rect, dim),
+        | ControlKind::SplitButton => {}
         ControlKind::HyperlinkButton => paint_hyperlink(session, brush, node, rect, dim),
         // Track, outline, and knob are retained chrome parts (compositor
         // sprites — see `super::parts`); the state label beside them is static
@@ -66,15 +72,12 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         ControlKind::TitleBar => super::caption::paint(session, brush, node, rect),
         _ => return false,
     }
-    if node.focused {
+    // The button family's ring is a retained part, so it is deliberately absent
+    // from this shared tail — see `parts::focus_ring_key`.
+    if node.focused && !super::node::is_button_family(node.kind) {
         // The accent segmented tray is a stadium — its focus ring follows suit.
         let radius = if node.kind == ControlKind::SelectorBar && node.paint.style_variant == 1 {
             rect.height() / 2.0
-        } else if super::node::is_button_family(node.kind) {
-            // Follow the authored radius, not the kind's nominal one: a ring
-            // whose corners disagree with the button inside it is the most
-            // visible way for a custom radius to look broken.
-            resolve_radius(node.paint.corner_radius, rect.height())
         } else {
             focus_radius(node.kind)
         };
@@ -158,7 +161,7 @@ pub(crate) fn text(
     session.draw_text(s, &fmt, &rect, brush);
 }
 
-fn glyph_str(cp: u32) -> Option<String> {
+pub(crate) fn glyph_str(cp: u32) -> Option<String> {
     char::from_u32(cp).map(|c| c.to_string())
 }
 
@@ -169,14 +172,27 @@ pub(crate) fn glyph_into(cp: u32, buf: &mut [u8; 4]) -> Option<&str> {
     char::from_u32(cp).map(|c| &*c.encode_utf8(buf))
 }
 
-/// A button's leading icon: box size, and the gap before the label.
+/// A button's leading icon box.
 pub(crate) const ICON_SIZE: f32 = 16.0;
-pub(crate) const ICON_GAP: f32 = theme::SPACE_8;
+/// The gap between any two adjacent things in a button's content row — icon to
+/// label, label to badge, or one ornament to the next on a button with no
+/// words. One constant, because the row is a single sequence and a gap that
+/// varied by which pair it separated would read as a misalignment.
+pub(crate) const ORNAMENT_GAP: f32 = theme::SPACE_8;
+/// How far a button's ornaments sit from its edge — the family's own padding,
+/// so a content-sized button centres its ornaments exactly.
+const ORNAMENT_INSET: f32 = theme::SPACE_12;
 
-/// A focus ring: a 2px `STROKE_STRONG` rounded outline inset 1px from the edge.
+/// A focus ring's stroke width. Shared with the button family's retained ring
+/// (`parts::button_sync`), which reproduces this geometry as a part because the
+/// family owns no surface to draw on.
+pub(crate) const FOCUS_RING_W: f32 = 2.0;
+
+/// A focus ring: a [`FOCUS_RING_W`] `STROKE_STRONG` rounded outline inset 1px
+/// from the edge.
 pub(crate) fn draw_focus_ring(session: &DrawingSession, brush: &Brush, rect: Rect, radius: f32) {
     let r = Rect::new(rect.left + 1.0, rect.top + 1.0, rect.right - 1.0, rect.bottom - 1.0);
-    stroke_rr(session, brush, r, radius, theme::stroke_strong(), 2.0, 1.0);
+    stroke_rr(session, brush, r, radius, theme::stroke_strong(), FOCUS_RING_W, 1.0);
 }
 
 fn focus_radius(kind: ControlKind) -> f32 {
@@ -205,6 +221,33 @@ pub(crate) struct ButtonPalette {
     pub fg: Color,
     pub weight: u16,
     pub radius: f32,
+    /// The variant fills itself with the accent role (Accent, or a checked
+    /// ToggleButton). Read by [`badge_paint`], which has to invert against it.
+    pub lit: bool,
+}
+
+/// A badge's plate fill and its count's ink, or `None` when the button carries
+/// no badge.
+///
+/// One definition, two consumers that must not disagree: `parts::button_sync`
+/// binds the plate and `glyph_text::button_sync` colours the numeral on it.
+///
+/// The default plate is the accent role, as a standalone `InfoBadge`'s is — but
+/// on a LIT button the accent is already the surface, and an accent plate on an
+/// accent fill is invisible. There the badge inverts instead, taking the
+/// button's own ink for its plate and the button's fill for its count, which
+/// preserves exactly the contrast the neutral case has.
+///
+/// An authored tint always wins, and takes the on-accent ink with it: the host
+/// picked a colour the theme never saw, so it owns that contrast decision —
+/// the same reasoning `info_badge::paint` documents for a standalone one.
+pub(crate) fn badge_paint(node: &Node, pal: &ButtonPalette) -> Option<(Color, Color)> {
+    let badge = node.extras().badge?;
+    Some(match badge.tint {
+        Some(t) => (t, theme::text_on_accent()),
+        None if pal.lit => (pal.fg, pal.fill),
+        None => (theme::accent(), theme::text_on_accent()),
+    })
 }
 
 pub(crate) fn button_palette(node: &Node) -> ButtonPalette {
@@ -222,18 +265,31 @@ pub(crate) fn button_palette(node: &Node) -> ButtonPalette {
     // rather than a primary action. Its label is therefore the on-accent token
     // — accent text on an accent fill is the same hue twice and fails contrast
     // outright.
-    let fill = if lit {
+    // An authored fill wins outright. A pill or chip is a button whose whole
+    // identity is its tint — a filter chip in the accent wash, a layer chip in
+    // its layer's colour — and deriving that from a style variant would mean
+    // enumerating the app's palette here. `Background` on a button used to be
+    // silently inert, which is what made every such control hand-roll a
+    // `Border` around a chromeless button instead of just being one.
+    let fill = node.paint.background.unwrap_or(if lit {
         theme::accent()
     } else if chromeless || matches!(node.kind, ControlKind::Button | ControlKind::RepeatButton) {
         // Chromeless / bare button: transparent at rest, wash appears via ink.
         theme::w(0.0)
     } else {
         theme::surface_raised()
-    };
+    });
 
     ButtonPalette {
         fill,
-        border: (!lit && !chromeless).then(theme::stroke),
+        // Same rule for the outline, and it has to be the same rule: a chip
+        // authoring a fill almost always authors the stroke that frames it, and
+        // honouring one but not the other would draw the theme's border around
+        // the app's fill.
+        border: node
+            .paint
+            .border_brush
+            .or_else(|| (!lit && !chromeless).then(theme::stroke)),
         fg: node.paint.foreground.unwrap_or(if lit {
             theme::text_on_accent()
         } else if node.paint.style_variant == 3 {
@@ -244,6 +300,7 @@ pub(crate) fn button_palette(node: &Node) -> ButtonPalette {
             theme::text()
         }),
         weight: if accent { 600 } else { 400 },
+        lit,
         // No floor: the family is BORN at `RADIUS_MD` (`node::birth_paint`), so
         // an authored radius here is one the app asked for — including a
         // smaller one, which a `.max()` used to swallow.
@@ -277,90 +334,137 @@ fn has_leading_icon(node: &Node) -> bool {
     node.extras().icon != 0
 }
 
-/// The box a button-family label is centred in: the whole control, less the
-/// leading icon and its gap when the button carries both.
+/// A button's badge as laid out: its `(width, height)`, or `None` when the
+/// button carries none.
 ///
-/// An icon-only button keeps the full box, so its glyph reads as centred chrome
-/// rather than pinned to one side.
+/// The dot is a fixed square. The count's plate takes its height from the
+/// badge's pill metric and its width from the measured numeral plus padding,
+/// floored at a circle so a single digit reads as round rather than squashed —
+/// the same geometry a standalone `InfoBadge` measures, because it is the same
+/// control hosted in a different box.
+pub(crate) fn badge_size(node: &Node) -> Option<(f32, f32)> {
+    let badge = node.extras().badge?;
+    if badge.count.is_none() {
+        return Some((super::info_badge::DOT_D, super::info_badge::DOT_D));
+    }
+    let text_w = node
+        .button_text
+        .as_ref()
+        .and_then(|t| t.badge_layout.as_ref())
+        .and_then(|l| l.measure().ok())
+        .map_or(0.0, |(w, _)| w);
+    let h = super::info_badge::PILL_H;
+    Some((
+        (text_w + 2.0 * super::info_badge::PILL_PAD_X).max(h),
+        h,
+    ))
+}
+
+/// Where a button's content sits: the leading icon, the badge, and the label
+/// between them. All node-local, all derived from `rect`.
 ///
-/// One definition, two consumers that must not disagree — the same discipline
-/// [`ButtonPalette`] documents. `glyph_text::label_sync` places the retained
-/// label from this, and [`paint_button`] insets the icon it still draws from it.
-pub(crate) fn button_label_box(node: &Node, rect: Rect) -> Rect {
-    if has_leading_icon(node) && !node.paint.text.is_empty() {
-        Rect::new(
-            rect.left + theme::SPACE_12 + ICON_SIZE + ICON_GAP,
-            rect.top,
-            rect.right,
-            rect.bottom,
-        )
+/// One definition, four consumers that must not disagree — the same discipline
+/// [`ButtonPalette`] documents. `glyph_text::button_sync` places all three runs
+/// from this, `parts::button_sync` sizes the badge plate from it, and the
+/// layout measure widens the control by exactly the ornaments it reserves here.
+pub(crate) struct ButtonBoxes {
+    pub icon: Option<Rect>,
+    pub badge: Option<Rect>,
+    pub label: Rect,
+}
+
+pub(crate) fn button_boxes(node: &Node, rect: Rect) -> ButtonBoxes {
+    let has_label = !node.paint.text.is_empty();
+    let leads = node.extras().badge.is_some_and(|b| b.leading);
+    let badge_sz = badge_size(node);
+
+    // Vertically centred rather than full-height: unlike the icon, the badge
+    // has a plate, and a plate as tall as the button is not a badge.
+    let plate = |x: f32, (bw, bh): (f32, f32)| {
+        let y = rect.top + ((rect.height() - bh) / 2.0).max(0.0);
+        Rect::new(x, y, x + bw, y + bh)
+    };
+
+    // The leading cluster, laid out left to right with one gap between each
+    // pair: the badge first when it leads, then the icon. A leading badge is a
+    // status lamp for the whole control — "● Live" — so it belongs at the head
+    // of the row rather than between the icon and the words it qualifies.
+    let mut x = rect.left + ORNAMENT_INSET;
+    let mut placed = 0;
+    let mut advance = |w: f32, x: &mut f32, placed: &mut i32| {
+        if *placed > 0 {
+            *x += ORNAMENT_GAP;
+        }
+        *placed += 1;
+        let at = *x;
+        *x += w;
+        at
+    };
+
+    let lead_badge = badge_sz
+        .filter(|_| leads)
+        .map(|sz| plate(advance(sz.0, &mut x, &mut placed), sz));
+    let icon = has_leading_icon(node)
+        .then(|| advance(ICON_SIZE, &mut x, &mut placed))
+        .map(|at| Rect::new(at, rect.top, at + ICON_SIZE, rect.bottom));
+    // One more gap only if a label follows the cluster.
+    if has_label && placed > 0 {
+        x += ORNAMENT_GAP;
+    }
+
+    let mut right = rect.right;
+    let trail_badge = badge_sz.filter(|_| !leads).map(|sz| {
+        let x0 = right - ORNAMENT_INSET - sz.0;
+        right = x0 - if has_label { ORNAMENT_GAP } else { 0.0 };
+        plate(x0, sz)
+    });
+
+    // An ornament-only button keeps the full box, so a lone icon or badge reads
+    // as centred chrome rather than pinned to one side.
+    let label = if has_label {
+        Rect::new(x, rect.top, right.max(x), rect.bottom)
     } else {
         rect
+    };
+    ButtonBoxes {
+        icon,
+        badge: lead_badge.or(trail_badge),
+        label,
     }
 }
 
-/// Whether this node's label is retained glyph sprites rather than a painted
-/// run — see [`glyph_text`](super::glyph_text).
+/// The width a button's ornaments add to its measured label.
+///
+/// The row is a sequence — leading badge, icon, label, trailing badge — so the
+/// reservation is the items' own widths plus one gap between each adjacent
+/// pair. Counting the gaps from the items is what keeps an icon-and-badge
+/// button with no words from measuring the two flush against each other.
+pub(crate) fn ornament_width(node: &Node) -> f32 {
+    let mut total = 0.0;
+    let mut items = i32::from(!node.paint.text.is_empty());
+    if node.extras().icon != 0 {
+        total += ICON_SIZE;
+        items += 1;
+    }
+    if let Some((bw, _)) = badge_size(node) {
+        total += bw;
+        items += 1;
+    }
+    total + ORNAMENT_GAP * (items - 1).max(0) as f32
+}
+
+/// Whether this node draws a label at all.
 ///
 /// The layout is required, not merely preferred: it is the shaped run the
 /// sprites are placed from, and without one there is nothing to place. In
 /// practice a button-family node with a label always has one — `layout::is_text`
 /// covers the whole family — so the `None` arm is a genuine failure (a
-/// `TextFormat` that would not build), and a painted fallback is the right
-/// answer for it rather than a blank button.
+/// `TextFormat` that would not build), and a button with no words is a better
+/// answer for it than a fallback path nothing else in the family has.
 pub(crate) fn label_is_retained(node: &Node) -> bool {
     super::node::is_button_family(node.kind)
         && !node.paint.text.is_empty()
         && node.text_layout.is_some()
-}
-
-/// The leading glyph, and the label only when it is not retained.
-///
-/// The fill, the border and the hover/press wash are all retained compositor
-/// sprites below and above this surface (`parts::button_sync`), and the label
-/// itself is retained glyph sprites above them (`glyph_text::label_sync`) — so
-/// on an ordinary button this draws nothing at all, and a recolour, an
-/// enable/disable or a state flip never reaches a `BeginDraw`.
-fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let pal = button_palette(node);
-
-    // The icon stays painted: it is one static glyph from the symbol font, it
-    // never recolours independently of the label, and routing it through the
-    // atlas would need a second shaped run to place a character we already know.
-    let mut gbuf = [0u8; 4];
-    if has_leading_icon(node)
-        && let Some(g) = glyph_into(node.extras().icon, &mut gbuf)
-    {
-        let ix = rect.left + theme::SPACE_12;
-        text(
-            session,
-            brush,
-            g,
-            Rect::new(ix, rect.top, ix + ICON_SIZE, rect.bottom),
-            theme::FONT_ICON,
-            ICON_SIZE,
-            400,
-            pal.fg,
-            TextAlignment::Center,
-            ParagraphAlignment::Center,
-            dim,
-        );
-    }
-    if !label_is_retained(node) {
-        text(
-            session,
-            brush,
-            &node.paint.text,
-            button_label_box(node, rect),
-            "Segoe UI",
-            node.paint.font_size.max(theme::FONT_SIZE_MD),
-            pal.weight,
-            pal.fg,
-            TextAlignment::Center,
-            ParagraphAlignment::Center,
-            dim,
-        );
-    }
 }
 
 // ── ToggleSwitch ─────────────────────────────────────────────────────────────

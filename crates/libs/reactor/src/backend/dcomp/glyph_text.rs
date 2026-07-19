@@ -1,9 +1,9 @@
-//! A label drawn as one composition sprite per glyph.
+//! Text drawn as one composition sprite per glyph.
 //!
 //! The glyph atlas ([`super::glyph_atlas`]) holds one mask per glyph; this
 //! places them. Every glyph is a [`SpriteVisual`] whose brush is a
 //! [`CompositionMaskBrush`] — the atlas mask cutting a **shared** FP16 colour
-//! source. Once placed, nothing about the label reaches a `BeginDraw` again:
+//! source. Once placed, nothing about the text reaches a `BeginDraw` again:
 //!
 //! - a **recolour** rebuilds one source surface and points every glyph's mask
 //!   brush at it, so it costs N `SetSource` calls and zero rasters;
@@ -11,14 +11,26 @@
 //! - a **text change** re-places sprites against masks that are already cached
 //!   whenever the letters have been seen before.
 //!
-//! One source per label, not per glyph, is the whole point of the sharing: the
+//! One source per run, not per glyph, is the whole point of the sharing: the
 //! source is a 4×4 solid, and minting one per glyph would put an allocation on
 //! a path whose reason to exist is that it has none.
 //!
+//! ## Three runs, not one
+//!
+//! A [`TextPart`] is one shaped run — it knows nothing about what the run
+//! means. A button-family node owns [`ButtonText`]: its label, its leading icon
+//! glyph and its badge's count, each an independent run with its own layout,
+//! colour and origin. The icon is a run rather than a painted character because
+//! a button that painted even one glyph would need a surface, and the whole
+//! point of the family's chrome being retained is that it never gets one.
+//!
+//! A part with nothing to place never mints its host, so an ordinary label-only
+//! button still owns exactly one container.
+//!
 //! ## The host visual
 //!
-//! Every glyph sprite parents into ONE container the label owns, rather than
-//! into the node directly. That container is what makes the two whole-label
+//! Every glyph sprite parents into ONE container the run owns, rather than
+//! into the node directly. That container is what makes the two whole-run
 //! operations single writes instead of per-glyph loops:
 //!
 //! - **disabled dim** is its `Opacity`, which is also the only correct place for
@@ -33,17 +45,18 @@
 //!
 //! ## Z-order
 //!
-//! The host is inserted at the top of the node's children, so the label sits
+//! Each host is inserted at the top of the node's children, so the text sits
 //! above both the chrome parts *and* the hover/press ink. That is a deliberate
 //! departure from the painted label, which sat under the ink and was lightened
 //! by it: a wash belongs on the surface behind text, not over the text, and
 //! WinUI's own button states recolour the background alone.
 //!
-//! The ordering is positional, not declared — it holds because the host is
+//! The ordering is positional, not declared — it holds because the hosts are
 //! created after `parts::ensure` has built the ink, and it would break if
-//! anything re-stacked the node's children afterwards. Because the whole label
-//! is one child, re-asserting it would be a single `InsertAtTop`; nothing needs
-//! that today, so nothing carries the code for it.
+//! anything re-stacked the node's children afterwards. The badge count is the
+//! one run whose order against a sibling matters: its plate is a chrome part
+//! *below* the surface band, so the count lands above it whichever order the
+//! three runs happen to mint their hosts in.
 
 use windows_canvas_core::{Rect, TextLayout};
 use windows_core::Interface;
@@ -359,50 +372,149 @@ impl TextPart {
 
 }
 
-/// Reconcile a button-family node's label as retained glyph sprites.
+/// Every retained run a button-family node draws.
+///
+/// The label's shaped run lives in the node's generic `text_layout` slot, which
+/// the layout pass already maintains for every text-bearing control. The two
+/// ornament runs need their own: the icon is a different family at a different
+/// size, and the count is the badge's smaller, heavier type.
+#[derive(Default)]
+pub(crate) struct ButtonText {
+    label: TextPart,
+    /// The leading icon glyph's shaped run, rebuilt by the layout pass.
+    pub(crate) icon_layout: Option<TextLayout>,
+    icon: TextPart,
+    /// The badge count's shaped run, rebuilt by the layout pass. `None` for the
+    /// dot form, which has no text at all.
+    pub(crate) badge_layout: Option<TextLayout>,
+    badge: TextPart,
+}
+
+/// Place one run centred in `b`, or hide it if it cannot be measured.
+///
+/// Centring is clamped at the leading edge so a run too wide for its box loses
+/// its tail — which the host's clip hides — rather than its head.
+#[allow(clippy::too_many_arguments)]
+fn place_centered(
+    part: &mut TextPart,
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    parent: &ContainerVisual,
+    layout: &TextLayout,
+    b: Rect,
+    box_size: (f32, f32),
+    color: crate::Color,
+    dim: f32,
+    scale: f32,
+) {
+    let Ok((tw, th)) = layout.measure() else {
+        part.hide_all();
+        return;
+    };
+    let origin = (
+        b.left + ((b.width() - tw) / 2.0).max(0.0),
+        b.top + ((b.height() - th) / 2.0).max(0.0),
+    );
+    part.sync(comp, atlas, parent, layout, origin, box_size, color, dim, scale);
+}
+
+/// Reconcile a button-family node's label and ornaments as retained glyph
+/// sprites.
 ///
 /// Runs from the paint pass, on a dirty node, straight after `parts::sync` — so
-/// the host lands above the ink the parts sync just created (see the module
+/// the hosts land above the ink the parts sync just created (see the module
 /// header on z-order), and so a state flip that does not dirty the node never
 /// gets here at all.
 ///
-/// The geometry is deliberately not re-derived: [`controls::button_label_box`]
-/// is the one definition of where a label goes, and `paint_button` reads the
-/// same function for the icon it still draws beside it.
-pub(crate) fn label_sync(
-    comp: &Compositing,
-    atlas: &mut GlyphAtlas,
-    node: &mut Node,
-    scale: f32,
-) {
-    if !super::controls::label_is_retained(node) {
-        if let Some(p) = node.text_part.as_mut() {
-            p.hide_all();
-        }
+/// The geometry is deliberately not re-derived here:
+/// [`controls::button_boxes`](super::controls::button_boxes) is the one
+/// definition of where a button's content sits, and the measure pass sizes the
+/// control from the same answer.
+pub(crate) fn button_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+    if !super::node::is_button_family(node.kind) {
         return;
     }
     let (w, h) = (node.rect.w, node.rect.h);
-    let fg = super::controls::button_palette(node).fg;
+    let boxes = super::controls::button_boxes(node, Rect::from_xywh(0.0, 0.0, w, h));
+    let pal = super::controls::button_palette(node);
+    let fg = pal.fg;
+    let badge_ink = super::controls::badge_paint(node, &pal).map(|(_, ink)| ink);
     let dim = if node.paint.is_enabled {
         1.0
     } else {
         theme::disabled_opacity()
     };
 
-    let mut part = node.text_part.take().unwrap_or_default();
-    if let Some(layout) = node.text_layout.as_ref()
-        && let Ok((tw, th)) = layout.measure()
+    let mut t = node.button_text.take().unwrap_or_default();
+
+    match node
+        .text_layout
+        .as_ref()
+        .filter(|_| super::controls::label_is_retained(node))
     {
-        // Centred in the label box, exactly as the retired `TextAlignment::Center`
-        // / `ParagraphAlignment::Center` draw placed it. Clamped at the leading
-        // edge so a run too wide for its control loses its tail (which the clip
-        // hides) rather than its head.
-        let b = super::controls::button_label_box(node, Rect::from_xywh(0.0, 0.0, w, h));
-        let origin = (
-            b.left + ((b.width() - tw) / 2.0).max(0.0),
-            b.top + ((b.height() - th) / 2.0).max(0.0),
-        );
-        part.sync(comp, atlas, &node.container, layout, origin, (w, h), fg, dim, scale);
+        Some(layout) => place_centered(
+            &mut t.label,
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            boxes.label,
+            (w, h),
+            fg,
+            dim,
+            scale,
+        ),
+        None => t.label.hide_all(),
     }
-    node.text_part = Some(part);
+
+    // The icon takes the label's ink: it is chrome belonging to the same
+    // control, and a glyph that recoloured independently of the words beside it
+    // would read as a second, unrelated element.
+    match (boxes.icon, t.icon_layout.take()) {
+        (Some(b), Some(layout)) => {
+            place_centered(
+                &mut t.icon,
+                comp,
+                atlas,
+                &node.container,
+                &layout,
+                b,
+                (w, h),
+                fg,
+                dim,
+                scale,
+            );
+            t.icon_layout = Some(layout);
+        }
+        (_, layout) => {
+            t.icon_layout = layout;
+            t.icon.hide_all();
+        }
+    }
+
+    // The count sits ON the badge plate, so its ink comes from the same place
+    // the plate's fill does — see `controls::badge_paint`.
+    match (boxes.badge.zip(badge_ink), t.badge_layout.take()) {
+        (Some((b, ink)), Some(layout)) => {
+            place_centered(
+                &mut t.badge,
+                comp,
+                atlas,
+                &node.container,
+                &layout,
+                b,
+                (w, h),
+                ink,
+                dim,
+                scale,
+            );
+            t.badge_layout = Some(layout);
+        }
+        (_, layout) => {
+            t.badge_layout = layout;
+            t.badge.hide_all();
+        }
+    }
+
+    node.button_text = Some(t);
 }

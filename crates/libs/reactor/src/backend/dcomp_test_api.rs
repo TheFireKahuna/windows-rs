@@ -883,7 +883,43 @@ pub struct NavProbe {
     pub settings_y: Option<f32>,
 }
 
+/// Where a button's content landed — the three boxes
+/// [`dcomp::controls::button_boxes`] resolves, each as
+/// `(left, top, right, bottom)` in node-local DIPs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ButtonBoxProbe {
+    pub icon: Option<(f32, f32, f32, f32)>,
+    pub badge: Option<(f32, f32, f32, f32)>,
+    pub label: (f32, f32, f32, f32),
+}
+
 impl ArenaHarness {
+    /// Resolve a button's content geometry through the real
+    /// [`dcomp::controls::button_boxes`] the placement, the badge plate and the
+    /// measure all call.
+    pub fn button_boxes(&self, id: ControlId) -> Option<ButtonBoxProbe> {
+        let n = self.arena.get(id)?;
+        let r = windows_canvas_core::Rect::from_xywh(0.0, 0.0, n.rect.w, n.rect.h);
+        let b = dcomp::controls::button_boxes(n, r);
+        let t = |r: windows_canvas_core::Rect| (r.left, r.top, r.right, r.bottom);
+        Some(ButtonBoxProbe {
+            icon: b.icon.map(t),
+            badge: b.badge.map(t),
+            label: t(b.label),
+        })
+    }
+
+    /// The badge's intrinsic size, or `None` when the button carries none.
+    pub fn badge_size(&self, id: ControlId) -> Option<(f32, f32)> {
+        dcomp::controls::badge_size(self.arena.get(id)?)
+    }
+
+    /// Whether this node would be given a paint surface — the test-visible form
+    /// of "does it ever reach a `BeginDraw`".
+    pub fn has_chrome(&self, id: ControlId) -> Option<bool> {
+        Some(self.arena.get(id)?.has_chrome())
+    }
+
     /// Stamp the laid-out rect a real layout pass would have written. The pane
     /// is adaptive — its display mode and how many rows fit both depend on the
     /// node's own size — so a test that never lays out is testing the pane at

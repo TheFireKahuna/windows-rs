@@ -16,8 +16,10 @@ use super::theme;
 pub(crate) const DOT_D: f32 = 4.0;
 /// The numeric pill's height (Fluent's value style).
 pub(crate) const PILL_H: f32 = 16.0;
-/// Horizontal padding either side of the count inside the pill.
-const PILL_PAD_X: f32 = theme::SPACE_4;
+/// Horizontal padding either side of the count inside the pill. Shared with the
+/// in-button badge (`controls::badge_size`), which is this same control hosted
+/// in a button's box rather than beside it.
+pub(crate) const PILL_PAD_X: f32 = theme::SPACE_4;
 
 /// The count's type size and weight — the values a badge is BORN with.
 ///
