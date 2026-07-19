@@ -40,17 +40,26 @@
 //! synchronous fire — the queue is the seam that lets the two halves later live
 //! on different threads.
 //!
-//! **Viz pointer surfaces ride the same queue.** A knob/slider/EQ surface's
-//! sinks (`on_down`/`on_move`/`on_up`/`on_wheel`/`on_exit`) are the one place
-//! immediate feedback used to run an app closure inline in the input router.
-//! Now the router routes on plain presence bits (`pointer::SurfaceInterest`) and
-//! queues an [`Intent::Surface`]/[`Intent::SurfaceExit`]; the drain resolves it
-//! against the app-side sink closures (`pointer::sinks_for`) — kept out of the
-//! recorder's own maps only because the surface is registered imperatively from
-//! an effect, not through the [`Backend`] trait, but owned by the same app half.
-//! The drag path's synchronous `drive_frame_ticks()` moves to the host: after
-//! running the jobs, a surface job that ran drives one tick so the drag preview
-//! repaints in the same message ([`IntentJob::drives_frame_tick`]).
+//! ## What an intent means
+//!
+//! **An intent is a post-visual notification. No intent may be the cause of a
+//! visual.** By the time one is queued, the pixels it describes have already
+//! moved: a slider snaps its thumb inside the input router and *then* queues
+//! `F64`. That is what makes the hop harmless — the app learns about the change
+//! on its own schedule, and a busy app thread cannot stall the gesture.
+//!
+//! Viz pointer surfaces used to be the exception, and the exception was a bug.
+//! Their sinks were app-thread closures, so `Intent::Surface` meant the opposite
+//! of every other variant: not "this happened" but "please make this happen".
+//! A pointer move produced no pixels until the intent had crossed the seam and
+//! the app had run, which put reconcile load in the path of the one gesture the
+//! thread split exists to make fast.
+//!
+//! Those surfaces now run a `Send` gesture front-side (`super::pointer`,
+//! [`crate::gesture`]) and publish their own visual before returning. What they
+//! queue is [`Intent::Gesture`] — a bare "your gesture has news", carrying no
+//! payload, coalesced so a burst of moves wakes the app once. Every variant here
+//! now means the same thing, which is the property that keeps the rule checkable.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -297,16 +306,6 @@ pub(crate) enum PointerIntentKind {
     Moved,
 }
 
-/// Which viz-surface sink an [`Intent::Surface`] addresses (the drag/scrub/wheel
-/// transitions; hover-exit is [`Intent::SurfaceExit`]).
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum SurfaceIntentKind {
-    Down,
-    Move,
-    Up,
-    Wheel,
-}
-
 /// One queued app notification: everything the app needs to run the matching
 /// handler, as plain `Send` data — no fire site's closure reads backend state,
 /// so the payload is complete by construction.
@@ -356,20 +355,17 @@ pub(crate) enum Intent {
     Tapped { id: ControlId },
     /// `on_right_tapped`.
     RightTapped { id: ControlId },
-    /// A viz pointer-surface transition (knob/slider/EQ drag or wheel),
-    /// addressed to the app-side sink map (`pointer::sinks_for`). Rides the same
-    /// FIFO queue as everything else, so a gesture's down → moves → up reach the
-    /// app in that order.
-    Surface {
-        id: ControlId,
-        kind: SurfaceIntentKind,
-        info: PointerEventInfo,
-    },
-    /// A viz surface's hover-exit sink (`on_exit`): the hover left this surface
-    /// for another, for none, or the window edge. Queued where the old
-    /// synchronous `fire_surface_exit` fired, so its order relative to the next
-    /// surface's `Move` is preserved.
-    SurfaceExit { id: ControlId },
+    /// A front-hosted gesture has an action waiting. Carries **no payload**:
+    /// the gesture already published its visual, and the action itself sits in
+    /// the typed [`ActionSlot`](crate::gesture::ActionSlot) the gesture captured
+    /// and the app drains.
+    ///
+    /// Coalesced at the source — the slot returns
+    /// [`Notify`](crate::gesture::GestureOutcome::Notify) only on the empty→full
+    /// edge — so a fifty-move drag between two app turns queues one of these,
+    /// not fifty. The notification path therefore gets cheaper under load, which
+    /// is the opposite of the per-move posting it replaces.
+    Gesture { id: ControlId },
     /// A keyboard accelerator fired: a declared `(key, mods)` chord matched on
     /// keydown (§7.3). `index` is the position in the node's declared
     /// accelerator list — the same order [`Cmd::SetKeybindings`] carried — so
@@ -394,11 +390,6 @@ pub(crate) enum IntentJob {
     F64(Callback<f64>, f64),
     I32(Callback<i32>, i32),
     Pointer(Callback<PointerEventInfo>, PointerEventInfo),
-    /// A viz surface sink (`on_down`/`on_move`/`on_up`/`on_wheel`), cloned out of
-    /// the app-side [`PointerSinks`](super::PointerSinks) cell.
-    Surface(Rc<dyn Fn(PointerEventInfo)>, PointerEventInfo),
-    /// A viz surface's hover-exit sink (`on_exit`).
-    SurfaceExit(Rc<dyn Fn()>),
 }
 
 impl IntentJob {
@@ -411,18 +402,7 @@ impl IntentJob {
             Self::F64(cb, v) => cb.invoke(v),
             Self::I32(cb, v) => cb.invoke(v),
             Self::Pointer(cb, info) => cb.invoke(info),
-            Self::Surface(cb, info) => cb(info),
-            Self::SurfaceExit(cb) => cb(),
         }
-    }
-
-    /// Whether running this job should drive a frame tick promptly rather than
-    /// waiting for the next paced `WM_APP_FRAME`. True for a surface drag/scrub
-    /// sink: that is the EQ/knob drag path, whose preview must repaint from the
-    /// value the sink just streamed within this same input message (the tightest
-    /// latency coupling in the backend). Hover-exit alone advances no preview.
-    pub(crate) fn drives_frame_tick(&self) -> bool {
-        matches!(self, Self::Surface(..))
     }
 }
 
@@ -839,24 +819,14 @@ impl RecordingBackend {
                         jobs.push(IntentJob::Unit(cb.clone()));
                     }
                 }
-                Intent::Surface { id, kind, info } => {
-                    if let Some(sinks) = super::pointer::sinks_for(id) {
-                        let cell = match kind {
-                            SurfaceIntentKind::Down => &sinks.down,
-                            SurfaceIntentKind::Move => &sinks.moved,
-                            SurfaceIntentKind::Up => &sinks.up,
-                            SurfaceIntentKind::Wheel => &sinks.wheel,
-                        };
-                        if let Some(cb) = cell.borrow().as_ref() {
-                            jobs.push(IntentJob::Surface(cb.clone(), info));
-                        }
-                    }
-                }
-                Intent::SurfaceExit { id } => {
-                    if let Some(sinks) = super::pointer::sinks_for(id)
-                        && let Some(cb) = sinks.exited.borrow().as_ref()
-                    {
-                        jobs.push(IntentJob::SurfaceExit(cb.clone()));
+                Intent::Gesture { id } => {
+                    // The gesture already published its visual front-side; this
+                    // only invites the app to drain the newest action. A surface
+                    // unmounted between the wake and the drain resolves to
+                    // nothing, and the action in its slot dies with it — correct,
+                    // since there is no longer anything to apply it to.
+                    if let Some(cb) = super::pointer::action_for(id) {
+                        jobs.push(IntentJob::Unit(cb));
                     }
                 }
                 Intent::Accelerator { id, index } => {

@@ -159,20 +159,19 @@ pub(crate) fn app_shared() -> Option<Rc<AppShared>> {
 /// Resolve front-queued intents against the recorder's app-side maps and run
 /// the handler jobs. Runs on the app thread (posted by the front's
 /// `run_intents`); jobs execute with no borrow held, so a handler that
-/// re-enters render state finds nothing locked. A surface drag/scrub job
-/// drives one frame tick after the batch so the drag preview's canvas
-/// subscribers repaint from the value the sink just streamed.
+/// re-enters render state finds nothing locked.
+///
+/// No job drives a frame tick any more. That existed for the surface sinks —
+/// their pixels could not appear until the app had run, so the batch forced a
+/// tick to shorten the wait. A gesture publishes its own visual front-side
+/// before this is even posted, so there is nothing here left to hurry.
 pub(crate) fn deliver_intents(intents: Vec<Intent>) {
     let Some(a) = app_shared() else { return };
     let jobs = a
         .render_host
         .with_reconciler_mut(|r| r.backend.resolve_intents(intents));
-    let tick = jobs.iter().any(|j| j.drives_frame_tick());
     for job in jobs {
         job.run();
-    }
-    if tick {
-        crate::drive_frame_ticks();
     }
 }
 

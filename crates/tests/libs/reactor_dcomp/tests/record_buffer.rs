@@ -7,8 +7,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
-use windows_reactor::dcomp_test_api::{Recorder, SurfaceSinks};
+use windows_reactor::dcomp_test_api::{GestureHarness, Recorder};
+use windows_reactor::{ActionSlot, GestureEvent, GestureInterest, GestureOutcome};
 use windows_reactor::{
     Callback, ControlId, ControlKind, Event, EventHandler, KeyboardAccelerator, PointerEventInfo,
     PointerHandlers, Prop, PropValue, Tooltip, VirtualKey, VirtualKeyModifiers,
@@ -274,82 +276,145 @@ fn empty_flush_is_a_no_op() {
     );
 }
 
-/// Viz pointer surfaces ride the same intent seam: the router queues a
-/// `Surface`/`SurfaceExit` intent, and the drain resolves it against the
-/// app-side sink closures (`pointer::sinks_for`) — the router never touches a
-/// closure. Each transition addresses its own cell, a gesture stays FIFO
-/// (down → move → up), and a transition whose cell is unfilled resolves to
-/// nothing (the click-transparent case).
+/// A gesture runs **inline, on the routing thread** — the property the whole
+/// front-hosted design exists to guarantee. Every transition reaches it during
+/// delivery, before any drain, so whatever it publishes is committed before the
+/// app has heard that input happened at all.
 #[test]
-fn surface_sinks_resolve_from_intents_in_gesture_order() {
+fn a_gesture_runs_inline_during_delivery_not_at_drain() {
     let mut rec = Recorder::new();
-    let surf = SurfaceSinks::register(id(1));
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
 
-    let log = Rc::new(RefCell::new(Vec::<String>::new()));
-    let l = Rc::clone(&log);
-    surf.on_down(move |info: PointerEventInfo| l.borrow_mut().push(format!("down@{}", info.x)));
-    let l = Rc::clone(&log);
-    surf.on_move(move |info: PointerEventInfo| l.borrow_mut().push(format!("move@{}", info.x)));
-    let l = Rc::clone(&log);
-    surf.on_up(move |info: PointerEventInfo| l.borrow_mut().push(format!("up@{}", info.x)));
-    // Deliberately no `on_wheel`: that transition must resolve to nothing.
+    let l = Arc::clone(&log);
+    let _g = GestureHarness::register(
+        id(1),
+        GestureInterest::drag(),
+        move |ev: GestureEvent| {
+            l.lock().unwrap().push(match ev {
+                GestureEvent::Down(i) => format!("down@{}", i.x),
+                GestureEvent::Move(i) => format!("move@{}", i.x),
+                GestureEvent::Up(i) => format!("up@{}", i.x),
+                GestureEvent::Wheel(i) => format!("wheel@{}", i.x),
+                GestureEvent::Exit => "exit".to_string(),
+            });
+            GestureOutcome::Handled
+        },
+        || panic!("a Handled gesture must never notify the app"),
+    );
 
-    rec.queue_surface_down(id(1), PointerEventInfo { x: 1.0, ..Default::default() });
-    rec.queue_surface_move(id(1), PointerEventInfo { x: 2.0, ..Default::default() });
-    rec.queue_surface_move(id(1), PointerEventInfo { x: 3.0, ..Default::default() });
-    rec.queue_surface_up(id(1), PointerEventInfo { x: 4.0, ..Default::default() });
-    rec.queue_surface_wheel(id(1), PointerEventInfo::default());
+    let at = |x: f64| PointerEventInfo { x, ..Default::default() };
+    rec.deliver_gesture(id(1), GestureEvent::Down(at(1.0)));
+    rec.deliver_gesture(id(1), GestureEvent::Move(at(2.0)));
+    rec.deliver_gesture(id(1), GestureEvent::Up(at(3.0)));
 
-    assert_eq!(rec.drain_and_run(), 4, "the wheel had no sink and must not run");
     assert_eq!(
-        *log.borrow(),
-        vec!["down@1", "move@2", "move@3", "up@4"],
-        "surface transitions must resolve to their own cell, in queue order"
+        &*log.lock().unwrap(),
+        &["down@1", "move@2", "up@3"],
+        "the gesture must see every transition, in order, at delivery time"
+    );
+    assert_eq!(
+        rec.drain_and_run(),
+        0,
+        "a gesture that handled its own visual must stage no app work"
     );
 }
 
-/// A surface hover-exit intent resolves against the `on_exit` sink, and an
-/// intent for a surface with no live registration resolves to nothing.
+/// The coalescing contract: a burst of moves between two app turns wakes the
+/// app **once** and delivers only the newest action.
+///
+/// This is what makes the notification path cheapen under load instead of
+/// dearer — the sink design it replaces posted one intent per move.
 #[test]
-fn surface_exit_resolves_and_unregistration_is_honoured() {
+fn a_burst_of_moves_wakes_the_app_once_with_the_newest_action() {
     let mut rec = Recorder::new();
+    let slot = Arc::new(ActionSlot::<f64>::new());
+    let drained = Rc::new(RefCell::new(Vec::<f64>::new()));
 
-    let exits = Rc::new(Cell::new(0u32));
-    {
-        let surf = SurfaceSinks::register(id(1));
-        let e = Rc::clone(&exits);
-        surf.on_exit(move || e.set(e.get() + 1));
+    let post = Arc::clone(&slot);
+    let d = Rc::clone(&drained);
+    let take = Arc::clone(&slot);
+    let _g = GestureHarness::register(
+        id(1),
+        GestureInterest::drag(),
+        move |ev: GestureEvent| match ev {
+            GestureEvent::Move(i) => post.post(i.x),
+            _ => GestureOutcome::Handled,
+        },
+        move || {
+            if let Some(v) = take.take() {
+                d.borrow_mut().push(v);
+            }
+        },
+    );
 
-        rec.queue_surface_exit(id(1));
-        assert_eq!(rec.drain_and_run(), 1);
-        assert_eq!(exits.get(), 1, "the exit sink did not run");
-        // `surf` drops here, unregistering the app-side sinks.
-    }
+    let at = |x: f64| PointerEventInfo { x, ..Default::default() };
+    let notified: Vec<bool> = (1..=5)
+        .map(|x| rec.deliver_gesture(id(1), GestureEvent::Move(at(f64::from(x)))))
+        .collect();
 
-    rec.queue_surface_exit(id(1));
-    assert_eq!(rec.drain_and_run(), 0, "a dropped surface must resolve to nothing");
-    assert_eq!(exits.get(), 1);
+    assert_eq!(
+        notified,
+        vec![true, false, false, false, false],
+        "only the first post of a burst may stage a wake"
+    );
+    assert_eq!(rec.drain_and_run(), 1, "five moves must resolve to one app job");
+    assert_eq!(
+        &*drained.borrow(),
+        &[5.0],
+        "the app must see only the newest action, not the whole burst"
+    );
+
+    // Drained, so the next burst re-arms.
+    assert!(rec.deliver_gesture(id(1), GestureEvent::Move(at(6.0))));
+    assert_eq!(rec.drain_and_run(), 1);
+    assert_eq!(&*drained.borrow(), &[5.0, 6.0]);
 }
 
-/// The drag-preview latency path: a surface drag/scrub sink that runs asks the
-/// host to drive a frame tick promptly (so the preview repaints in the same
-/// message), while a hover-exit that runs does not.
+/// Hover-exit reaches the gesture like any other transition, and a forgotten
+/// gesture receives nothing — neither the handler nor its app-side drain.
 #[test]
-fn surface_drag_drives_a_frame_tick_but_exit_does_not() {
+fn exit_reaches_the_gesture_and_forgetting_is_honoured() {
     let mut rec = Recorder::new();
-    let surf = SurfaceSinks::register(id(1));
-    surf.on_move(|_| {});
-    surf.on_exit(|| {});
+    let exits = Arc::new(Mutex::new(0u32));
 
-    rec.queue_surface_move(id(1), PointerEventInfo::default());
-    let (ran, drives_tick) = rec.drain_run_report();
-    assert_eq!(ran, 1);
-    assert!(drives_tick, "a surface drag/scrub sink must drive a prompt tick");
+    {
+        let e = Arc::clone(&exits);
+        let _g = GestureHarness::register(
+            id(1),
+            GestureInterest::hover(),
+            move |ev: GestureEvent| {
+                if matches!(ev, GestureEvent::Exit) {
+                    *e.lock().unwrap() += 1;
+                }
+                GestureOutcome::Handled
+            },
+            || {},
+        );
+        rec.deliver_gesture(id(1), GestureEvent::Exit);
+        assert_eq!(*exits.lock().unwrap(), 1, "the gesture did not see its exit");
+        // `_g` drops here, forgetting the gesture.
+    }
 
-    rec.queue_surface_exit(id(1));
-    let (ran, drives_tick) = rec.drain_run_report();
-    assert_eq!(ran, 1);
-    assert!(!drives_tick, "a hover-exit advances no preview and drives no tick");
+    assert!(
+        !rec.deliver_gesture(id(1), GestureEvent::Exit),
+        "a forgotten gesture must stage nothing"
+    );
+    assert_eq!(*exits.lock().unwrap(), 1, "a forgotten gesture must not run");
+    assert_eq!(rec.drain_and_run(), 0);
+}
+
+/// A hover-only gesture stays **click-transparent**: it declares no `down`, so
+/// the router lets a press fall through to whatever lies beneath — a button
+/// layered over a plot keeps working.
+#[test]
+fn a_hover_gesture_declares_no_press_interest() {
+    let _rec = Recorder::new();
+    let g = GestureHarness::register(id(1), GestureInterest::hover(), |_| GestureOutcome::Handled, || {});
+
+    let interest = g.interest().expect("a declared gesture must be routable");
+    assert!(!interest.down, "a hover gesture must not claim presses");
+    assert!(!interest.up && !interest.wheel);
+    assert!(interest.moved && interest.exited);
 }
 
 /// §7.3 accelerators, declaration half: `set_keyboard_accelerators` records a

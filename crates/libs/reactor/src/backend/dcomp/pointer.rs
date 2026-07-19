@@ -1,115 +1,119 @@
-//! Capture-capable pointer subscriptions for viz surfaces on the
-//! DirectComposition backend.
+//! The front-side gesture registry for viz surfaces on the DirectComposition
+//! backend.
 //!
-//! On the WinUI backend a custom-drawn control (knob / slider / EQ canvas)
-//! opens a [`PointerSurface`](crate::PointerSurface) over its hosting XAML
-//! `UIElement` and receives `PointerPressed/Moved/Released/WheelChanged` with
-//! capture. The self-hosted backend has no XAML element — the mounted native
-//! object is the node's system-compositor `ContainerVisual`. This module is the
-//! bridge, mirroring `size.rs`: `PointerSurface` registers a sink set keyed by
-//! [`ControlId`], and the backend's input router (`input.rs`) delivers
-//! element-relative pointer events to the deepest registered surface under the
+//! A custom-drawn control (knob / slider / EQ canvas) has no XAML element to
+//! subscribe — the mounted native object is the node's system-compositor
+//! `ContainerVisual`. This module is the bridge: a gesture is registered against
+//! a [`ControlId`], and the backend's input router (`input.rs`) delivers
+//! element-relative transitions to the deepest registered surface under the
 //! pointer, with implicit capture for the press-to-release span of a drag. The
 //! hit-test walk already carries the id, so matching costs no COM call.
 //!
-//! **The closures live app-side; the router reads only plain bits.** The sink
-//! set is split across the same seam the event handlers ride (`record.rs`):
+//! ## The gesture runs *here*, on the input thread
 //!
-//! * The [`PointerSinks`] closures stay in the app-side [`SINKS`] map. Nothing
-//!   on the input path touches them — they are consulted **only** by the
-//!   recorder's intent drain, which clones one into a deferred
-//!   [`IntentJob`](super::record::IntentJob) that runs after the input borrow
-//!   is released. That is why a cell holds an `Rc<dyn Fn>`, not a `Box`.
-//! * The router routes on [`SurfaceInterest`] — the plain presence bits — read
-//!   from the front-side [`INTEREST`] map. Because the cells fill *after*
-//!   registration (the `on_down`/`on_move`/… builders set them), each fill
-//!   redeclares the bits through the [`OPS`] queue, mirroring `crate::surface`:
-//!   a `Send` declaration path so the two halves can later live on different
-//!   threads. The router services that queue once per frame, so a freshly
-//!   filled bit is visible on the next input message — one frame stale by
-//!   design (the declared-ahead-of-time model).
+//! This is the whole point, and the reason the module looks the way it does. The
+//! handler is `Send` and lives front-side, so a pointer move produces its visual
+//! inside the input router — no thread hop, no reconcile in the path. What
+//! crosses to the app afterwards is a bare notification that the gesture has
+//! news; the app drains the newest action from a slot the handler captured.
+//!
+//! The sink design this replaces put the closures app-side and routed on
+//! separate presence bits, which meant a move produced *no* pixels until the
+//! intent had crossed the seam and the app had run. See [`crate::gesture`] for
+//! why that was a rule violation rather than a tuning problem.
+//!
+//! ## Registration still crosses a seam
+//!
+//! A gesture is declared where its element mounts — an effect on the app thread
+//! — and consumed by the router on the front thread. So declarations ride a
+//! `Send` [`OPS`] queue that the front services once per frame, exactly as
+//! `crate::surface` does for surface requests. A gesture declared during a
+//! render is therefore routed from the next input message: one frame of
+//! registration latency, by design, and unchanged from the sink model.
+//!
+//! What *did* change is that a declaration is now atomic. The old sinks filled
+//! one cell per builder call and redeclared after each, so a surface could be
+//! routed to while still half-wired; a gesture arrives whole or not at all.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use std::sync::Mutex;
 
 use rustc_hash::FxHashMap;
-use windows_core::Result;
 
 use crate::backend::ControlId;
-use crate::style::PointerEventInfo;
+use crate::gesture::{GestureEvent, GestureInterest, GestureOutcome};
+use crate::interaction::Callback;
 use crate::widgets::Subscription;
 
-/// The four pointer transitions plus hover-exit a `PointerSurface` can
-/// subscribe. Cells are filled by the surface's `on_down`/`on_move`/`on_up`/
-/// `on_wheel`/`on_exit` builders after registration.
-///
-/// Each cell holds an `Rc<dyn Fn>`, not a `Box`: the recorder's intent drain
-/// clones the closure out to run it a hop later, after the input borrow is
-/// released, exactly as it clones an event handler's [`Callback`](crate::interaction::Callback).
-#[derive(Default)]
-pub struct PointerSinks {
-    pub down: RefCell<Option<Rc<dyn Fn(PointerEventInfo)>>>,
-    pub moved: RefCell<Option<Rc<dyn Fn(PointerEventInfo)>>>,
-    pub up: RefCell<Option<Rc<dyn Fn(PointerEventInfo)>>>,
-    pub wheel: RefCell<Option<Rc<dyn Fn(PointerEventInfo)>>>,
-    /// Fired when the hover leaves this surface's bounds (another surface, none,
-    /// or the window edge). Hover-only: a captured drag suppresses hover routing
-    /// until release, so no exit fires mid-drag.
-    pub exited: RefCell<Option<Rc<dyn Fn()>>>,
-}
-
-impl PointerSinks {
-    /// The front-side presence declaration for the currently-filled cells.
-    fn interest(&self) -> SurfaceInterest {
-        SurfaceInterest {
-            down: self.down.borrow().is_some(),
-            moved: self.moved.borrow().is_some(),
-            up: self.up.borrow().is_some(),
-            wheel: self.wheel.borrow().is_some(),
-            exited: self.exited.borrow().is_some(),
-        }
-    }
-}
-
-/// Which of a surface's sinks are filled — the plain-data declaration the input
-/// router routes on. `Send` (unlike the closures), so it crosses the [`OPS`]
-/// queue into the front-side interest map.
-///
-/// Spec §6.1: a surface with no `down` sink stays click-transparent, and wheel
-/// routing gates on `wheel`; the router reads these bits and never the closure.
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
-pub(crate) struct SurfaceInterest {
-    pub down: bool,
-    pub moved: bool,
-    pub up: bool,
-    pub wheel: bool,
-    pub exited: bool,
-}
+/// The boxed front-side handler. `FnMut` because a gesture owns its own live
+/// state (drag anchor, hovered index) and mutates it in place; `Send` because it
+/// is declared on one thread and run on another — and, more importantly,
+/// because that bound is what stops app-thread state being captured at all.
+pub(crate) type GestureFn = Box<dyn FnMut(GestureEvent) -> GestureOutcome + Send>;
 
 struct Entry {
-    token: i64,
-    sinks: Rc<PointerSinks>,
+    interest: GestureInterest,
+    gesture: GestureFn,
 }
 
 thread_local! {
-    /// App-side: the sink closures, by node. Consulted only by the recorder's
-    /// intent drain ([`sinks_for`]); the router never reaches it.
-    static SINKS: RefCell<FxHashMap<ControlId, Entry>> =
+    /// Front-side: the gestures, by node. Both the routing bits and the handler
+    /// live here — there is no app-side half any more.
+    static GESTURES: RefCell<FxHashMap<ControlId, Entry>> =
         RefCell::new(FxHashMap::default());
-    /// Front-side: the presence bits the router routes on, refreshed from
-    /// [`OPS`] once per frame ([`service_ops`]). One frame stale by design.
-    static INTEREST: RefCell<FxHashMap<ControlId, SurfaceInterest>> =
+}
+
+thread_local! {
+    /// App-side: the action-drain callbacks, by node.
+    ///
+    /// **Not in the input path.** Nothing here is reachable from the router; a
+    /// callback is consulted only when an [`Intent::Gesture`](super::record::Intent::Gesture)
+    /// is drained, which is already a hop past the visual. It holds a `Callback`
+    /// (an `Rc`) precisely because it never has to cross a thread — that is what
+    /// distinguishes it from the gesture itself, and the distinction is the
+    /// design.
+    static ACTIONS: RefCell<FxHashMap<ControlId, ActionEntry>> =
         RefCell::new(FxHashMap::default());
     static NEXT_TOKEN: Cell<i64> = const { Cell::new(1) };
 }
 
-/// A presence declaration crossing app→front. A plain `Mutex` rather than a
-/// thread-local, mirroring `crate::surface`: the cell is filled wherever the
-/// surface's builder runs, which is not necessarily the thread that routes
-/// input.
+struct ActionEntry {
+    token: i64,
+    cb: Callback<()>,
+}
+
+/// Register the app-side drain for `id` — the callback that reads the newest
+/// action out of the gesture's slot. Returns a [`Subscription`] that
+/// unregisters on drop.
+pub(crate) fn register_action(id: ControlId, cb: Callback<()>) -> Subscription {
+    let token = NEXT_TOKEN.with(|t| {
+        let v = t.get();
+        t.set(v + 1);
+        v
+    });
+    ACTIONS.with(|m| m.borrow_mut().insert(id, ActionEntry { token, cb }));
+    Subscription::token(token, remove_action)
+}
+
+/// The app-side drain for node `id`, if one is registered.
+pub(crate) fn action_for(id: ControlId) -> Option<Callback<()>> {
+    ACTIONS.with(|m| m.borrow().get(&id).map(|e| e.cb.clone()))
+}
+
+/// [`Subscription`] drop: unregister the drain holding `token`.
+fn remove_action(token: i64) {
+    ACTIONS.with(|m| {
+        let mut map = m.borrow_mut();
+        if let Some(id) = map.iter().find(|(_, e)| e.token == token).map(|(id, _)| *id) {
+            map.remove(&id);
+        }
+    });
+}
+
+/// A declaration crossing app→front. A plain `Mutex` rather than a thread-local:
+/// the declaring thread (wherever the element mounts) is not the routing thread.
 enum Op {
-    Declare { id: ControlId, interest: SurfaceInterest },
+    Declare { id: ControlId, interest: GestureInterest, gesture: GestureFn },
     Forget { id: ControlId },
 }
 
@@ -121,59 +125,35 @@ fn push_op(op: Op) {
     }
 }
 
-/// Register a pointer-sink set for node `id`. Returns the (initially empty)
-/// sinks to fill and a [`Subscription`] that unregisters on drop.
+/// Declare `id`'s gesture to the router. One gesture per node: a second
+/// declaration replaces the first.
 ///
-/// No interest is declared here — the cells are all empty, so the surface is
-/// inert until a builder fills one and [`declare`]s it. One sink set per node: a
-/// second registration for the same id replaces the first, matching the previous
-/// behaviour where the newer entry shadowed the older in the lookup scan.
-pub(crate) fn register_element_pointer(
-    id: ControlId,
-) -> Result<(Rc<PointerSinks>, Subscription)> {
-    let sinks = Rc::new(PointerSinks::default());
-    let token = NEXT_TOKEN.with(|t| {
-        let v = t.get();
-        t.set(v + 1);
-        v
-    });
-    SINKS.with(|l| {
-        l.borrow_mut().insert(
-            id,
-            Entry {
-                token,
-                sinks: Rc::clone(&sinks),
-            },
-        )
-    });
-    Ok((sinks, Subscription::token(token, remove)))
+/// A gesture interested in nothing is still recorded, so that forgetting it
+/// later is symmetric; the router simply never matches it ([`GestureInterest::any`]).
+pub(crate) fn declare(id: ControlId, interest: GestureInterest, gesture: GestureFn) {
+    push_op(Op::Declare { id, interest, gesture });
 }
 
-/// Redeclare `id`'s sink presence to the router. Called by the surface's
-/// `on_*` builders after a cell is filled: the cells fill *after* registration,
-/// so the router learns the bits at fill time, not register time.
-pub(crate) fn declare(id: ControlId, sinks: &PointerSinks) {
-    push_op(Op::Declare {
-        id,
-        interest: sinks.interest(),
-    });
+/// Drop the declaration for `id`. Called when the node is destroyed, and by a
+/// dropped subscription, so a dead id cannot keep a gesture alive.
+pub(crate) fn forget(id: ControlId) {
+    push_op(Op::Forget { id });
 }
 
-/// Apply the queued declarations into the front-side interest map. Runs once
-/// per frame, after the reconcile buffer is replayed, so a bit filled during a
-/// render is visible to the next input message. Cheap when the queue is empty
-/// (the common case).
+/// Apply the queued declarations. Runs once per frame, after the reconcile
+/// buffer is replayed, so a gesture declared during a render is visible to the
+/// next input message. Cheap when the queue is empty — the common case.
 pub(crate) fn service_ops() {
     let ops = match OPS.lock() {
         Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
         _ => return,
     };
-    INTEREST.with(|m| {
+    GESTURES.with(|m| {
         let mut m = m.borrow_mut();
         for op in ops {
             match op {
-                Op::Declare { id, interest } => {
-                    m.insert(id, interest);
+                Op::Declare { id, interest, gesture } => {
+                    m.insert(id, Entry { interest, gesture });
                 }
                 Op::Forget { id } => {
                     m.remove(&id);
@@ -183,46 +163,33 @@ pub(crate) fn service_ops() {
     });
 }
 
-/// Whether any surface presence is declared — lets the input router skip the
-/// surface walk entirely in the common case.
+/// Whether any gesture is declared — lets the input router skip the surface
+/// walk entirely in the common case.
 pub(crate) fn has_listeners() -> bool {
-    INTEREST.with(|m| !m.borrow().is_empty())
+    GESTURES.with(|m| !m.borrow().is_empty())
 }
 
-/// The declared presence bits for node `id` (front-side, plain data).
-pub(crate) fn interest_for(id: ControlId) -> Option<SurfaceInterest> {
-    INTEREST.with(|m| m.borrow().get(&id).copied())
+/// The declared routing bits for node `id`.
+pub(crate) fn interest_for(id: ControlId) -> Option<GestureInterest> {
+    GESTURES.with(|m| m.borrow().get(&id).map(|e| e.interest))
 }
 
-/// The sink closures registered for node `id` (app-side). Only the recorder's
-/// intent drain calls this; the router routes on [`interest_for`] instead.
-pub(crate) fn sinks_for(id: ControlId) -> Option<Rc<PointerSinks>> {
-    SINKS.with(|l| l.borrow().get(&id).map(|e| Rc::clone(&e.sinks)))
-}
-
-/// Drop the registration for `id`. Called when the node is destroyed so a
-/// leaked [`Subscription`] cannot keep sinks alive for a dead id. Drops the
-/// app-side closures now and queues a [`Op::Forget`] so the front-side bits are
-/// cleared in order behind any declaration still pending for this id.
-pub(crate) fn forget(id: ControlId) {
-    SINKS.with(|l| {
-        l.borrow_mut().remove(&id);
-    });
-    push_op(Op::Forget { id });
-}
-
-/// [`Subscription`] drop: unregister the app-side entry for `token` and forget
-/// its front-side bits.
-fn remove(token: i64) {
-    let removed = SINKS.with(|l| {
-        let mut map = l.borrow_mut();
-        let id = map.iter().find(|(_, e)| e.token == token).map(|(id, _)| *id);
-        if let Some(id) = id {
-            map.remove(&id);
-        }
-        id
-    });
-    if let Some(id) = removed {
-        push_op(Op::Forget { id });
-    }
+/// Run node `id`'s gesture with `event`, on this (the input) thread.
+///
+/// Returns the gesture's outcome, or `None` when no gesture is registered —
+/// which the router treats as "nothing to notify", not as an error: an element
+/// can be unregistered between a press and the release that follows it.
+///
+/// ## Re-entrancy
+///
+/// The map is borrowed mutably for the duration of the call, because the handler
+/// is `FnMut`. A gesture that re-entered this function would panic — but it
+/// cannot: it is handed only the transition, with no route back to the backend,
+/// the arena, or this module. The `Send` bound and the bare signature together
+/// make the re-entrant call unwritable rather than merely unwise.
+pub(crate) fn dispatch(id: ControlId, event: GestureEvent) -> Option<GestureOutcome> {
+    GESTURES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.get_mut(&id).map(|e| (e.gesture)(event))
+    })
 }

@@ -89,12 +89,10 @@ fn open_pointer_surface(handle: &ElementHandle) -> Result<PointerSurface> {
     }
     #[cfg(feature = "dcomp-backend")]
     {
-        let (sinks, revoker) = backend::dcomp::register_element_pointer(handle.id)?;
         return Ok(PointerSurface {
             inner: PointerInner::Dcomp {
                 id: handle.id,
-                sinks,
-                _revoker: revoker,
+                action: RefCell::new(None),
             },
         });
     }
@@ -256,16 +254,19 @@ enum PointerInner {
         captured: Rc<RefCell<Option<bindings::Pointer>>>,
         revokers: RefCell<Vec<windows_core::EventRevoker>>,
     },
-    /// DirectComposition: sinks the backend input router delivers to, with
-    /// implicit capture for the press-to-release span (see
-    /// `backend::dcomp::pointer`). The revoker unregisters on drop. `id` is the
-    /// registered node, so each builder can redeclare the surface's presence
-    /// bits to the router as it fills a sink cell.
+    /// DirectComposition: the node the input router delivers gesture
+    /// transitions to, with implicit capture for the press-to-release span (see
+    /// `backend::dcomp::pointer`).
+    ///
+    /// Nothing is registered until [`on_gesture`](PointerSurface::on_gesture) —
+    /// opening a surface declares no interest, so an element with no gesture is
+    /// wholly inert rather than routed-but-empty. `action` holds the app-side
+    /// drain's subscription, which unregisters it on drop; the front-side
+    /// gesture is forgotten in this type's `Drop`.
     #[cfg(feature = "dcomp-backend")]
     Dcomp {
         id: ControlId,
-        sinks: Rc<backend::dcomp::PointerSinks>,
-        _revoker: Subscription,
+        action: RefCell<Option<Subscription>>,
     },
 }
 
@@ -314,103 +315,152 @@ impl PointerSurface {
         Ok(())
     }
 
-    /// Subscribe `PointerPressed`. Also records the active pointer so a
-    /// subsequent [`capture`](Self::capture) can grab it.
-    pub fn on_down(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
+    /// Install this surface's **gesture** — the handler that turns pointer
+    /// transitions into visible change, and the only way to get input-driven
+    /// feedback out of a custom-drawn element.
+    ///
+    /// `gesture` runs wherever input is routed. On the DirectComposition backend
+    /// that is the front thread, *inside the input router*, with the transition
+    /// handled and whatever it publishes committed before the app is told
+    /// anything at all. `on_action` runs on the app thread afterwards, and only
+    /// when the gesture asked for it.
+    ///
+    /// ## Why `gesture` is `Send`
+    ///
+    /// Because it must be able to run on the input thread, and the bound is what
+    /// makes that checkable. A closure that captured a `HookRef`, a `Dispatch`,
+    /// or anything else living in app-thread render state will not compile here
+    /// — which is the point: the previous design accepted such closures happily,
+    /// deferred them across the seam, and so put reconcile load in the path of
+    /// every drag. See [`crate::gesture`].
+    ///
+    /// A gesture owns its live state (drag anchor, hovered index) by capturing
+    /// it `mut`, and publishes through whatever shared channel its renderer
+    /// reads — typically an `Arc` draw slot. The reactor never sees that slot.
+    ///
+    /// ## The action half
+    ///
+    /// Anything the app must *persist* travels as an action: the gesture posts
+    /// the newest one to an [`ActionSlot`](crate::ActionSlot) it captured and
+    /// returns [`GestureOutcome::Notify`]; `on_action` then drains it. Posting
+    /// coalesces, so a burst of moves wakes the app once and it applies only the
+    /// newest — the notification path gets cheaper under load, not dearer.
+    ///
+    /// `interest` declares which transitions to route, all at once, so a surface
+    /// is never half-registered. A gesture without
+    /// [`down`](crate::GestureInterest::down) leaves the element
+    /// click-transparent.
+    pub fn on_gesture<G>(
+        &self,
+        interest: GestureInterest,
+        gesture: G,
+        on_action: impl Fn() + 'static,
+    ) -> Result<&Self>
+    where
+        G: FnMut(GestureEvent) -> GestureOutcome + Send + 'static,
+    {
         #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
-            *sinks.down.borrow_mut() = Some(Rc::new(f));
-            dcomp::declare(*id, sinks);
+        if let PointerInner::Dcomp { id, action, .. } = &self.inner {
+            dcomp::declare_gesture(*id, interest, Box::new(gesture));
+            *action.borrow_mut() =
+                Some(dcomp::register_gesture_action(*id, Callback::new(move |()| on_action())));
             return Ok(self);
         }
-        self.subscribe_pointer(f, true, |iue, h| iue.PointerPressed(h))?;
+        self.subscribe_xaml_gesture(interest, gesture, on_action)?;
         Ok(self)
     }
 
-    /// Subscribe `PointerPressed` and **capture** the pointer to this element as
-    /// part of the same handler, so a drag that leaves the element keeps
-    /// delivering `PointerMoved`. Convenience for the common scrub / drag start;
-    /// pair with [`release`](Self::release) on the matching up. (The
-    /// DirectComposition backend captures implicitly for every surface press,
-    /// so there this is identical to [`on_down`](Self::on_down).)
-    pub fn on_down_capture(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
-        #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
-            *sinks.down.borrow_mut() = Some(Rc::new(f));
-            dcomp::declare(*id, sinks);
-            return Ok(self);
-        }
+    /// The XAML arm of [`on_gesture`](Self::on_gesture): subscribe each
+    /// interested transition and run the gesture in the handler.
+    ///
+    /// There is no seam on this backend — input, render and app state are all
+    /// the one thread — so `on_action` is invoked inline the moment the gesture
+    /// asks for it. The coalescing an [`ActionSlot`](crate::ActionSlot) performs
+    /// is then merely harmless rather than load-bearing.
+    #[allow(unused_variables)]
+    fn subscribe_xaml_gesture<G>(
+        &self,
+        interest: GestureInterest,
+        gesture: G,
+        on_action: impl Fn() + 'static,
+    ) -> Result<()>
+    where
+        G: FnMut(GestureEvent) -> GestureOutcome + Send + 'static,
+    {
         let PointerInner::Xaml {
             element, captured, ..
         } = &self.inner
         else {
-            return Ok(self);
+            return Ok(());
         };
-        let element = element.clone();
-        let captured = captured.clone();
-        self.subscribe_pointer(
-            move |info| {
-                if let Some(p) = captured.borrow().as_ref() {
-                    let _ = element.CapturePointer(p);
+
+        // One gesture shared by up to five event handlers. `RefCell` rather than
+        // a plain `Rc` because the handler is `FnMut`; XAML pointer events do not
+        // nest, so the borrow is never contended.
+        let gesture = Rc::new(RefCell::new(gesture));
+        let on_action = Rc::new(on_action);
+
+        // Build the per-transition sink once: run the gesture, and honour a
+        // `Notify` immediately.
+        macro_rules! sink {
+            ($make:expr) => {{
+                let g = gesture.clone();
+                let a = on_action.clone();
+                let make = $make;
+                move |info: PointerEventInfo| {
+                    if (g.borrow_mut())(make(info)) == GestureOutcome::Notify {
+                        a();
+                    }
                 }
-                f(info);
-            },
-            true,
-            |iue, h| iue.PointerPressed(h),
-        )?;
-        Ok(self)
-    }
-
-    /// Subscribe `PointerMoved`. Also refreshes the active pointer.
-    pub fn on_move(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
-        #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
-            *sinks.moved.borrow_mut() = Some(Rc::new(f));
-            dcomp::declare(*id, sinks);
-            return Ok(self);
+            }};
         }
-        self.subscribe_pointer(f, true, |iue, h| iue.PointerMoved(h))?;
-        Ok(self)
-    }
 
-    /// Subscribe `PointerReleased`.
-    pub fn on_up(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
-        #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
-            *sinks.up.borrow_mut() = Some(Rc::new(f));
-            dcomp::declare(*id, sinks);
-            return Ok(self);
+        if interest.down {
+            // Capture on press so a drag that leaves the element keeps
+            // delivering moves — the DComp router does this implicitly.
+            let element = element.clone();
+            let captured = captured.clone();
+            let inner = sink!(GestureEvent::Down);
+            self.subscribe_pointer(
+                move |info| {
+                    if let Some(p) = captured.borrow().as_ref() {
+                        let _ = element.CapturePointer(p);
+                    }
+                    inner(info);
+                },
+                true,
+                |iue, h| iue.PointerPressed(h),
+            )?;
         }
-        self.subscribe_pointer(f, false, |iue, h| iue.PointerReleased(h))?;
-        Ok(self)
-    }
-
-    /// Subscribe pointer-exit: the hover left this element's bounds (moved onto
-    /// another surface, onto none, or out of the window). Hover-only — an
-    /// implicitly captured drag keeps delivering moves and fires no exit until
-    /// after release. The natural end-of-hover signal for surfaces that light up
-    /// under the pointer.
-    pub fn on_exit(&self, f: impl Fn() + 'static) -> Result<&Self> {
-        #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
-            *sinks.exited.borrow_mut() = Some(Rc::new(f));
-            dcomp::declare(*id, sinks);
-            return Ok(self);
+        if interest.moved {
+            self.subscribe_pointer(sink!(GestureEvent::Move), true, |iue, h| {
+                iue.PointerMoved(h)
+            })?;
         }
-        self.subscribe_pointer(move |_| f(), false, |iue, h| iue.PointerExited(h))?;
-        Ok(self)
-    }
-
-    /// Subscribe `PointerWheelChanged`; read [`PointerEventInfo::wheel_delta`].
-    pub fn on_wheel(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
-        #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
-            *sinks.wheel.borrow_mut() = Some(Rc::new(f));
-            dcomp::declare(*id, sinks);
-            return Ok(self);
+        if interest.up {
+            self.subscribe_pointer(sink!(GestureEvent::Up), false, |iue, h| {
+                iue.PointerReleased(h)
+            })?;
         }
-        self.subscribe_pointer(f, false, |iue, h| iue.PointerWheelChanged(h))?;
-        Ok(self)
+        if interest.wheel {
+            self.subscribe_pointer(sink!(GestureEvent::Wheel), false, |iue, h| {
+                iue.PointerWheelChanged(h)
+            })?;
+        }
+        if interest.exited {
+            let g = gesture.clone();
+            let a = on_action.clone();
+            self.subscribe_pointer(
+                move |_| {
+                    if (g.borrow_mut())(GestureEvent::Exit) == GestureOutcome::Notify {
+                        a();
+                    }
+                },
+                false,
+                |iue, h| iue.PointerExited(h),
+            )?;
+        }
+        Ok(())
     }
 
     /// Capture the most recently seen pointer to this element for the duration
@@ -442,9 +492,17 @@ impl PointerSurface {
 
 impl Drop for PointerSurface {
     fn drop(&mut self) {
-        // Release any held capture; the EventRevokers (XAML subscriptions or the
-        // dcomp registry entry) revoke on their own Drop.
+        // Release any held capture; the XAML EventRevokers and the app-side
+        // action subscription revoke on their own Drop.
         self.release();
+        // The front-side gesture is not owned by a Subscription — it lives in
+        // the router's own map, reached only through the ops queue — so forget
+        // it explicitly. Ordering behind any pending declaration is what the
+        // queue is for.
+        #[cfg(feature = "dcomp-backend")]
+        if let PointerInner::Dcomp { id, .. } = &self.inner {
+            dcomp::forget_gesture(*id);
+        }
     }
 }
 

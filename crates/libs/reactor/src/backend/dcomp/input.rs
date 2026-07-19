@@ -11,12 +11,27 @@ use super::host;
 use super::popup::{Popup, PopupBody};
 use super::*;
 use crate::backend::Event;
+use crate::gesture::{GestureEvent, GestureInterest, GestureOutcome};
 use crate::style::{PointerEventInfo, WheelAxis};
 use crate::system_bindings::{
     CloseClipboard, EmptyClipboard, GetClipboardData, GlobalAlloc, GlobalLock, GlobalUnlock,
     OpenClipboard, SetClipboardData, CF_UNICODETEXT, GMEM_MOVEABLE, HWND,
 };
 use windows_canvas_core::Rect as CanvasRect;
+
+/// Which positioned transition the router is delivering to a gesture.
+///
+/// Router-internal, and deliberately not [`GestureEvent`] itself: the event
+/// carries the pointer sample, which the router can only assemble after it has
+/// confirmed the node is still alive and resolved its rect. Naming the kind
+/// first keeps that ordering explicit at every call site.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum GestureKind {
+    Down,
+    Move,
+    Up,
+    Wheel,
+}
 
 // Virtual-key codes used by keyboard handling.
 const VK_BACK: u32 = 0x08;
@@ -252,7 +267,7 @@ impl DCompBackend {
         &self,
         x: f32,
         y: f32,
-    ) -> Option<(ControlId, pointer::SurfaceInterest, f32, f32)> {
+    ) -> Option<(ControlId, GestureInterest, f32, f32)> {
         if !pointer::has_listeners() {
             return None;
         }
@@ -267,7 +282,7 @@ impl DCompBackend {
         id: ControlId,
         x: f32,
         y: f32,
-        out: &mut Option<(ControlId, pointer::SurfaceInterest, f32, f32)>,
+        out: &mut Option<(ControlId, GestureInterest, f32, f32)>,
     ) {
         let Some(node) = self.node(id) else { return };
         let inside = node.rect.contains(x, y);
@@ -285,35 +300,32 @@ impl DCompBackend {
         }
     }
 
-    /// Queue a pointer transition to a viz surface's sink with element-relative
-    /// DIP coordinates. `(x, y)` must be in the node's layout space (scroll-
-    /// adjusted, as returned by [`surface_at`](Self::surface_at)). The closure is
-    /// never invoked here: this pushes an [`Intent::Surface`] the recorder drains
-    /// against the app-side sink map after the input borrow is released.
+    /// Run a viz surface's gesture for one transition, with element-relative DIP
+    /// coordinates. `(x, y)` must be in the node's layout space (scroll-adjusted,
+    /// as returned by [`surface_at`](Self::surface_at)).
+    ///
+    /// **The gesture runs here, inline, on this thread.** Whatever it publishes
+    /// is committed before this returns, and before the app is told anything —
+    /// which is the entire reason the handler is `Send` and lives front-side.
+    /// The only thing that crosses the seam is a bare
+    /// [`Intent::Gesture`](record::Intent::Gesture), and only when the gesture's
+    /// action slot says a wake is not already in flight.
     ///
     /// Reports the vertical wheel axis — correct for every pointer transition
     /// (which carries `wheel_delta` 0) and for the classic wheel. The
-    /// horizontal tilt goes through [`queue_surface_wheel`](Self::queue_surface_wheel).
-    fn queue_surface(
-        &mut self,
-        id: ControlId,
-        kind: record::SurfaceIntentKind,
-        x: f32,
-        y: f32,
-        left: bool,
-        wheel_delta: i32,
-    ) {
-        self.queue_surface_wheel(id, kind, x, y, left, wheel_delta, WheelAxis::Vertical);
+    /// horizontal tilt goes through [`run_gesture_wheel`](Self::run_gesture_wheel).
+    fn run_gesture(&mut self, id: ControlId, kind: GestureKind, x: f32, y: f32, left: bool) {
+        self.run_gesture_wheel(id, kind, x, y, left, 0, WheelAxis::Vertical);
     }
 
-    /// [`queue_surface`](Self::queue_surface) with an explicit wheel axis, so a
-    /// surface sink can tell a sideways tilt from a wheel turn and opt in to
-    /// (or ignore) each independently.
+    /// [`run_gesture`](Self::run_gesture) with an explicit wheel axis, so a
+    /// gesture can tell a sideways tilt from a wheel turn and opt in to (or
+    /// ignore) each independently.
     #[allow(clippy::too_many_arguments)]
-    fn queue_surface_wheel(
+    fn run_gesture_wheel(
         &mut self,
         id: ControlId,
-        kind: record::SurfaceIntentKind,
+        kind: GestureKind,
         x: f32,
         y: f32,
         left: bool,
@@ -329,7 +341,23 @@ impl DCompBackend {
             wheel_axis,
             ..PointerEventInfo::default()
         };
-        self.intents.push(record::Intent::Surface { id, kind, info });
+        let event = match kind {
+            GestureKind::Down => GestureEvent::Down(info),
+            GestureKind::Move => GestureEvent::Move(info),
+            GestureKind::Up => GestureEvent::Up(info),
+            GestureKind::Wheel => GestureEvent::Wheel(info),
+        };
+        self.deliver_gesture(id, event);
+    }
+
+    /// Deliver one already-built transition and queue the app notification if
+    /// the gesture asked for one. The single choke point through which every
+    /// gesture runs — including [`Exit`](GestureEvent::Exit), which carries no
+    /// sample and so cannot go through [`run_gesture_wheel`](Self::run_gesture_wheel).
+    fn deliver_gesture(&mut self, id: ControlId, event: GestureEvent) {
+        if pointer::dispatch(id, event) == Some(GestureOutcome::Notify) {
+            self.intents.push(record::Intent::Gesture { id });
+        }
     }
 
     /// Whether `(x, y)` (absolute DIP) lies over scroll container `id`'s thumb.
@@ -495,7 +523,7 @@ impl DCompBackend {
         // the pump's processing rate and shaves up to a frame of latency off the
         // drag.
         if let Some((sid, dy)) = self.pressed_surface {
-            self.queue_surface(sid, record::SurfaceIntentKind::Move, x, y + dy, true, 0);
+            self.run_gesture(sid, GestureKind::Move, x, y + dy, true);
             return;
         }
 
@@ -602,13 +630,13 @@ impl DCompBackend {
         let surf = self.surface_at(x, y);
         let now_surface = surf.as_ref().map(|(sid, ..)| *sid);
         if self.hovered_surface != now_surface {
-            self.queue_surface_exit();
+            self.run_gesture_exit();
             self.hovered_surface = now_surface;
         }
         if let Some((sid, interest, ax, ay)) = surf
             && interest.moved
         {
-            self.queue_surface(sid, record::SurfaceIntentKind::Move, ax, ay, false, 0);
+            self.run_gesture(sid, GestureKind::Move, ax, ay, false);
         }
 
         if now == self.hovered_id {
@@ -690,15 +718,14 @@ impl DCompBackend {
         redraw
     }
 
-    /// Queue the `exited` sink of the surface that held the hover, if it is still
-    /// mounted. The exited-sink presence is checked at drain (the closure lives
-    /// app-side); here the router only knows a surface it was tracking is being
-    /// left.
-    fn queue_surface_exit(&mut self) {
+    /// Tell the surface that held the hover it is being left, if it is still
+    /// mounted. Runs its gesture inline like every other transition, so a
+    /// highlight dims front-side rather than a frame later.
+    fn run_gesture_exit(&mut self) {
         if let Some(old) = self.hovered_surface.take()
             && self.node(old).is_some()
         {
-            self.intents.push(record::Intent::SurfaceExit { id: old });
+            self.deliver_gesture(old, GestureEvent::Exit);
         }
     }
 
@@ -710,7 +737,7 @@ impl DCompBackend {
             }
         }
         // A hovered viz pointer surface loses the pointer at the window edge too.
-        self.queue_surface_exit();
+        self.run_gesture_exit();
         // Fade out the scrollbar thumb when the pointer leaves the window.
         self.update_hovered_scroll(None);
     }
@@ -757,7 +784,7 @@ impl DCompBackend {
             && interest.down
         {
             self.pressed_surface = Some((sid, ay - y));
-            self.queue_surface(sid, record::SurfaceIntentKind::Down, ax, ay, true, 0);
+            self.run_gesture(sid, GestureKind::Down, ax, ay, true);
             return true;
         }
 
@@ -858,7 +885,7 @@ impl DCompBackend {
         // pointer was (capture semantics). No value is committed — every value
         // was already streamed by the `moved` sink.
         if let Some((sid, dy)) = self.pressed_surface.take() {
-            self.queue_surface(sid, record::SurfaceIntentKind::Up, x, y + dy, false, 0);
+            self.run_gesture(sid, GestureKind::Up, x, y + dy, false);
         }
 
         // A scrollbar-thumb drag: `scroll_off` is applied live as the thumb
@@ -908,7 +935,7 @@ impl DCompBackend {
         // End a viz pointer-surface drag: the surface always sees the release
         // (capture semantics), wherever the pointer is.
         if let Some((sid, dy)) = self.pressed_surface.take() {
-            self.queue_surface(sid, record::SurfaceIntentKind::Up, x, y + dy, false, 0);
+            self.run_gesture(sid, GestureKind::Up, x, y + dy, false);
             return;
         }
 
@@ -1777,7 +1804,7 @@ impl DCompBackend {
         if let Some((sid, interest, ax, ay)) = self.surface_at(x, y)
             && interest.wheel
         {
-            self.queue_surface(sid, record::SurfaceIntentKind::Wheel, ax, ay, false, delta);
+            self.run_gesture_wheel(sid, GestureKind::Wheel, ax, ay, false, delta, WheelAxis::Vertical);
             return;
         }
 
@@ -1861,9 +1888,9 @@ impl DCompBackend {
         if let Some((sid, interest, ax, ay)) = self.surface_at(x, y)
             && interest.wheel
         {
-            self.queue_surface_wheel(
+            self.run_gesture_wheel(
                 sid,
-                record::SurfaceIntentKind::Wheel,
+                GestureKind::Wheel,
                 ax,
                 ay,
                 false,
