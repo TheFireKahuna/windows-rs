@@ -1,43 +1,26 @@
 #![doc = include_str!("../readme.md")]
 
-#[expect(
-    non_snake_case,
-    non_upper_case_globals,
-    non_camel_case_types,
-    clippy::upper_case_acronyms,
-    clippy::too_many_arguments
-)]
-mod bindings;
-mod bitmap;
-mod color;
-mod device;
-mod device_lost;
-mod effect;
-mod geometry;
-#[cfg(feature = "reactor")]
-mod reactor;
-mod session;
-mod swap_chain;
-mod text;
-mod types;
+//! `windows-canvas` is a thin wrapper over [`windows-canvas-core`](windows_canvas_core)
+//! (the reactor-free drawing primitives — re-exported below, so every
+//! `windows_canvas::*` path is unchanged) plus the reactor-coupled helpers
+//! gated behind the `reactor` feature.
 
-use bindings::*;
-pub use device_lost::{check_device_lost, is_device_lost};
+// Re-export the entire reactor-free drawing core. Keeps `windows_canvas::GpuDevice`,
+// `windows_canvas::DrawingSession`, `windows_canvas::ColorF`, `windows_canvas::Rect`,
+// text, geometry, etc. working exactly as before.
+pub use windows_canvas_core::*;
+
+// The reactor-coupled module below was written against the old single-crate
+// layout, reaching a handful of names through `use super::*`. Re-establish them
+// at the crate root so it compiles unchanged.
+#[cfg(feature = "reactor")]
 use std::cell::Cell;
-use std::os::windows::ffi::OsStrExt;
+#[cfg(feature = "reactor")]
+#[allow(unused_imports)]
 use windows_core::*;
 
-pub use bitmap::Bitmap;
-pub use color::ColorF;
-pub use device::GpuDevice;
-pub use effect::Effect;
-pub use geometry::*;
+#[cfg(feature = "reactor")]
+mod reactor;
+
 #[cfg(feature = "reactor")]
 pub use reactor::{CanvasImageSource, DrawContext, animated_canvas};
-pub use session::DrawingSession;
-pub use swap_chain::SwapChain;
-pub use text::*;
-pub use types::*;
-
-pub use windows_core::Result;
-pub use windows_numerics::{Matrix3x2, Vector2};

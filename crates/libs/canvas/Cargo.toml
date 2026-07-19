@@ -16,10 +16,16 @@ reactor = ["windows-reactor"]
 [dependencies]
 windows-core = { workspace = true }
 windows-numerics = { workspace = true }
+windows-canvas-core = { workspace = true }
 
+# Taken without default features so enabling canvas's `reactor` integration does
+# not decide the app's backend: an app on the DComp backend keeps
+# `winui-backend` off, while WinUI apps get it back through their own direct
+# `windows-reactor` dependency (features unify additively).
 [dependencies.windows-reactor]
 workspace = true
 optional = true
+default-features = false
 
 [lints]
 workspace = true
