@@ -58,6 +58,16 @@ macro_rules! define_handles {
                     ControlKind::Knob => Handle::Slider(
                         <bindings::Slider>::new().unwrap(),
                     ),
+                    // Geometry transport (`Prop::PathGeometry`) is a
+                    // DirectComposition-backend feature — no `Windows.UI.Xaml
+                    // .Shapes.Path` peer is scraped into `bindings`, so there is
+                    // nothing here to hand the curve to. The node degrades to a
+                    // Rectangle so the tree still builds; it will render as the
+                    // shape's BOUNDING BOX, since `Fill`/`Stroke` still apply
+                    // and the geometry that would have cut it does not.
+                    ControlKind::Path => Handle::Rectangle(
+                        <bindings::Rectangle>::new().unwrap(),
+                    ),
                 }
             }
         }

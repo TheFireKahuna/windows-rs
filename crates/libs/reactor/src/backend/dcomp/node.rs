@@ -24,7 +24,7 @@ use crate::system_bindings::{
 };
 use crate::Badge;
 use crate::Color;
-use crate::LineEndpoints;
+use crate::{LineEndpoints, PathGeometry};
 use super::record::FlyoutDecl;
 use crate::{
     FlyoutPlacementMode, NavigationViewPaneDisplayMode, PasswordRevealMode, ScrollBarVisibility,
@@ -111,7 +111,7 @@ impl PointerInterest {
 
 /// The painted content of a node, separate from layout. All optional — a bare
 /// `StackPanel`/`Grid`/`Canvas` paints nothing itself.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct Paint {
     pub background: Option<Color>,
     pub corner_radius: f32,
@@ -122,6 +122,11 @@ pub(crate) struct Paint {
     pub stroke_thickness: f32,
     pub foreground: Option<Color>,
     pub line: LineEndpoints,
+    /// Geometry for a `ControlKind::Path`, in this node's local DIP space.
+    pub path: Option<PathGeometry>,
+    /// `(TrimStart, TrimEnd)` on that geometry — the draw-on window. Born at
+    /// full extent so a path that never mentions trim renders whole.
+    pub path_trim: (f32, f32),
     /// Text content (TextBlock text or Button label).
     pub text: String,
     pub font_size: f32,
@@ -131,6 +136,34 @@ pub(crate) struct Paint {
     /// Button accent/subtle/etc. variant (0 = default).
     pub style_variant: i32,
     pub is_enabled: bool,
+}
+
+/// Hand-written rather than derived for ONE field: `path_trim` is born at FULL
+/// extent `(0.0, 1.0)`, not at `Default`'s `(0.0, 0.0)` — which would render
+/// every path that never mentions trim as nothing at all.
+impl Default for Paint {
+    fn default() -> Self {
+        Self {
+            background: None,
+            corner_radius: 0.0,
+            border_brush: None,
+            border_thickness: 0.0,
+            fill: None,
+            stroke: None,
+            stroke_thickness: 0.0,
+            foreground: None,
+            line: LineEndpoints::default(),
+            path: None,
+            path_trim: (0.0, 1.0),
+            text: String::new(),
+            font_size: 0.0,
+            font_weight: 0,
+            font_family: None,
+            wrap: false,
+            style_variant: 0,
+            is_enabled: false,
+        }
+    }
 }
 
 /// A single command row in a popup menu / dropdown list.
@@ -661,6 +694,10 @@ pub(crate) struct Node {
     /// chrome grown by a `TrimEnd` spring). Created lazily on first paint; see
     /// [`knob::KnobParts`](super::knob::KnobParts).
     pub knob: Option<Box<super::knob::KnobParts>>,
+    /// A path node's retained sprite layers
+    /// ([`path_shape::PathParts`](super::path_shape::PathParts)). Boxed and
+    /// lazy, like the knob's: only a `ControlKind::Path` ever allocates one.
+    pub path: Option<Box<super::path_shape::PathParts>>,
     /// Knob only: its readout, unit, sub-line and tick labels as retained glyph
     /// sprites, each carrying the string and em it was shaped from.
     ///
@@ -870,6 +907,7 @@ impl Node {
             placeholder: None,
             caret: None,
             knob: None,
+            path: None,
             scroll_thumb: None,
             scroll_content: None,
             scroll_spring: None,
@@ -1123,6 +1161,10 @@ impl Node {
             // every card, panel and chip in a tree is one of these.
             ControlKind::Border => false,
             ControlKind::Line => self.paint.stroke.is_some(),
+            // A path's geometry is retained compositor sprite shapes
+            // (`path_shape::PathParts`), never rasterized — so it owns no
+            // surface at all, exactly like the Border and TextBlock above.
+            ControlKind::Path => false,
             ControlKind::Ellipse | ControlKind::Rectangle => {
                 self.paint.fill.is_some()
                     || self.paint.background.is_some()
