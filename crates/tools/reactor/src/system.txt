@@ -538,6 +538,15 @@ Windows::Win32::ITfSource::{AdviseSink, UnadviseSink}
 // ── TSF text store: ACP sink is called by the backend; ACP store is IMPLEMENTED ──
 Windows::Win32::ITextStoreACPSink
 Windows::Win32::ITextStoreACP
+// ── TSF display attributes: composition-underline resolution (the store CALLS these) ──
+Windows::Win32::ITfDisplayAttributeMgr
+Windows::Win32::ITfDisplayAttributeProvider
+Windows::Win32::ITfDisplayAttributeInfo
+Windows::Win32::TF_DISPLAYATTRIBUTE
+Windows::Win32::TF_DA_COLOR
+Windows::Win32::TF_DA_LINESTYLE
+Windows::Win32::TF_DA_COLORTYPE
+Windows::Win32::TF_DA_ATTR_INFO
 // ── TSF activation CLSID + edit-cookie flags ──
 Windows::Win32::TF_ES_READ
 Windows::Win32::TF_ES_READWRITE

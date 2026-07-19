@@ -3810,6 +3810,20 @@ pub struct IEnumTfContextViews_Vtbl {
     Skip: usize,
 }
 windows_core::imp::define_interface!(
+    IEnumTfDisplayAttributeInfo,
+    IEnumTfDisplayAttributeInfo_Vtbl,
+    0x7cef04d7_cb75_4e80_a7ab_5f5bc7d332de
+);
+windows_core::imp::interface_hierarchy!(IEnumTfDisplayAttributeInfo, windows_core::IUnknown);
+#[repr(C)]
+pub struct IEnumTfDisplayAttributeInfo_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    Clone: usize,
+    Next: usize,
+    Reset: usize,
+    Skip: usize,
+}
+windows_core::imp::define_interface!(
     IEnumTfProperties,
     IEnumTfProperties_Vtbl,
     0x19188cb0_aca9_11d2_afc5_00105a2799b5
@@ -7790,6 +7804,186 @@ pub struct ITfContextView_Vtbl {
     GetWnd: usize,
 }
 windows_core::imp::define_interface!(
+    ITfDisplayAttributeInfo,
+    ITfDisplayAttributeInfo_Vtbl,
+    0x70528852_2f26_4aea_8c96_215150578932
+);
+windows_core::imp::interface_hierarchy!(ITfDisplayAttributeInfo, windows_core::IUnknown);
+impl ITfDisplayAttributeInfo {
+    pub(crate) unsafe fn GetGUID(&self) -> windows_core::Result<windows_core::GUID> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetGUID)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetDescription(&self) -> windows_core::Result<windows_core::BSTR> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetDescription)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| core::mem::transmute(result__))
+        }
+    }
+    pub(crate) unsafe fn GetAttributeInfo(
+        &self,
+        pda: *mut TF_DISPLAYATTRIBUTE,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetAttributeInfo)(
+                windows_core::Interface::as_raw(self),
+                pda as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn SetAttributeInfo(
+        &self,
+        pda: *const TF_DISPLAYATTRIBUTE,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetAttributeInfo)(
+                windows_core::Interface::as_raw(self),
+                pda,
+            )
+        }
+    }
+    pub(crate) unsafe fn Reset(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Reset)(windows_core::Interface::as_raw(self))
+        }
+    }
+}
+#[repr(C)]
+pub struct ITfDisplayAttributeInfo_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub GetGUID: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_core::GUID,
+    ) -> windows_core::HRESULT,
+    pub GetDescription: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetAttributeInfo: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut TF_DISPLAYATTRIBUTE,
+    ) -> windows_core::HRESULT,
+    pub SetAttributeInfo: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const TF_DISPLAYATTRIBUTE,
+    ) -> windows_core::HRESULT,
+    pub Reset: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ITfDisplayAttributeMgr,
+    ITfDisplayAttributeMgr_Vtbl,
+    0x8ded7393_5db1_475c_9e71_a39111b0ff67
+);
+windows_core::imp::interface_hierarchy!(ITfDisplayAttributeMgr, windows_core::IUnknown);
+impl ITfDisplayAttributeMgr {
+    pub(crate) unsafe fn OnUpdateInfo(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).OnUpdateInfo)(windows_core::Interface::as_raw(
+                self,
+            ))
+        }
+    }
+    pub(crate) unsafe fn EnumDisplayAttributeInfo(
+        &self,
+    ) -> windows_core::Result<IEnumTfDisplayAttributeInfo> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).EnumDisplayAttributeInfo)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetDisplayAttributeInfo(
+        &self,
+        guid: *const windows_core::GUID,
+        ppinfo: *mut Option<ITfDisplayAttributeInfo>,
+        pclsidowner: *mut windows_core::GUID,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetDisplayAttributeInfo)(
+                windows_core::Interface::as_raw(self),
+                guid,
+                core::mem::transmute(ppinfo),
+                pclsidowner as _,
+            )
+        }
+    }
+}
+#[repr(C)]
+pub struct ITfDisplayAttributeMgr_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub OnUpdateInfo: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
+    pub EnumDisplayAttributeInfo: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetDisplayAttributeInfo: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *mut *mut core::ffi::c_void,
+        *mut windows_core::GUID,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ITfDisplayAttributeProvider,
+    ITfDisplayAttributeProvider_Vtbl,
+    0xfee47777_163c_4769_996a_6e9c50ad8f54
+);
+windows_core::imp::interface_hierarchy!(ITfDisplayAttributeProvider, windows_core::IUnknown);
+impl ITfDisplayAttributeProvider {
+    pub(crate) unsafe fn EnumDisplayAttributeInfo(
+        &self,
+    ) -> windows_core::Result<IEnumTfDisplayAttributeInfo> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).EnumDisplayAttributeInfo)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetDisplayAttributeInfo(
+        &self,
+        guid: *const windows_core::GUID,
+    ) -> windows_core::Result<ITfDisplayAttributeInfo> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetDisplayAttributeInfo)(
+                windows_core::Interface::as_raw(self),
+                guid,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct ITfDisplayAttributeProvider_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub EnumDisplayAttributeInfo: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetDisplayAttributeInfo: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_core::GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     ITfDocumentMgr,
     ITfDocumentMgr_Vtbl,
     0xaa80e7f4_2021_11d2_93e0_0060b067b86e
@@ -9832,10 +10026,65 @@ pub const SupportedTextSelection_Multiple: SupportedTextSelection = 2;
 pub const SupportedTextSelection_None: SupportedTextSelection = 0;
 pub const SupportedTextSelection_Single: SupportedTextSelection = 1;
 pub type TEXTATTRIBUTEID = i32;
+pub const TF_ATTR_CONVERTED: TF_DA_ATTR_INFO = 2;
+pub const TF_ATTR_FIXEDCONVERTED: TF_DA_ATTR_INFO = 5;
+pub const TF_ATTR_INPUT: TF_DA_ATTR_INFO = 0;
+pub const TF_ATTR_INPUT_ERROR: TF_DA_ATTR_INFO = 4;
+pub const TF_ATTR_OTHER: TF_DA_ATTR_INFO = -1;
+pub const TF_ATTR_TARGET_CONVERTED: TF_DA_ATTR_INFO = 1;
+pub const TF_ATTR_TARGET_NOTCONVERTED: TF_DA_ATTR_INFO = 3;
+pub const TF_CT_COLORREF: TF_DA_COLORTYPE = 2;
+pub const TF_CT_NONE: TF_DA_COLORTYPE = 0;
+pub const TF_CT_SYSCOLOR: TF_DA_COLORTYPE = 1;
+pub type TF_DA_ATTR_INFO = i32;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TF_DA_COLOR {
+    pub r#type: TF_DA_COLORTYPE,
+    pub Anonymous: TF_DA_COLOR_0,
+}
+impl Default for TF_DA_COLOR {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union TF_DA_COLOR_0 {
+    pub nIndex: i32,
+    pub cr: COLORREF,
+}
+impl Default for TF_DA_COLOR_0 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+pub type TF_DA_COLORTYPE = i32;
+pub type TF_DA_LINESTYLE = i32;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TF_DISPLAYATTRIBUTE {
+    pub crText: TF_DA_COLOR,
+    pub crBk: TF_DA_COLOR,
+    pub lsStyle: TF_DA_LINESTYLE,
+    pub fBoldLine: windows_core::BOOL,
+    pub crLine: TF_DA_COLOR,
+    pub bAttr: TF_DA_ATTR_INFO,
+}
+impl Default for TF_DISPLAYATTRIBUTE {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 pub const TF_ES_ASYNCDONTCARE: u32 = 0;
 pub const TF_ES_READ: u32 = 2;
 pub const TF_ES_READWRITE: u32 = 6;
 pub const TF_ES_SYNC: u32 = 1;
+pub const TF_LS_DASH: TF_DA_LINESTYLE = 3;
+pub const TF_LS_DOT: TF_DA_LINESTYLE = 2;
+pub const TF_LS_NONE: TF_DA_LINESTYLE = 0;
+pub const TF_LS_SOLID: TF_DA_LINESTYLE = 1;
+pub const TF_LS_SQUIGGLE: TF_DA_LINESTYLE = 4;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TF_PRESERVEDKEY {
