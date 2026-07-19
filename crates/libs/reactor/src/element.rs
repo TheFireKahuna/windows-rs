@@ -32,8 +32,12 @@ pub trait CustomElement: 'static {
     /// Boxed clone so [`Element`] stays `Clone`.
     fn clone_dyn(&self) -> Box<dyn CustomElement>;
 
-    /// Create the underlying control via `backend` and return its id.
-    fn mount(&self, backend: &mut dyn Backend) -> ControlId;
+    /// Create the underlying control at `id` via `backend`.
+    ///
+    /// The id is minted by the reconciler — implementations pass it straight to
+    /// [`Backend::create`] rather than assigning their own, so every control in
+    /// the tree comes from one monotonic, never-reused source.
+    fn mount(&self, id: ControlId, backend: &mut dyn Backend);
 
     /// Apply the diff from `prev` (same `type_id`) to the live control `id`.
     fn update(&self, prev: &dyn CustomElement, id: ControlId, backend: &mut dyn Backend);
@@ -350,6 +354,8 @@ define_element! {
     ToggleButton,
     SwapChainPanel,
     WebView2,
+    Meter,
+    Knob,
 }
 
 macro_rules! non_widget_from_table {
@@ -896,6 +902,16 @@ pub trait ElementExt: Sized {
         self
     }
 
+    /// Register a `PointerWheelChanged` handler; the callback receives the
+    /// element-relative position and the signed wheel delta
+    /// ([`PointerEventInfo::wheel_delta`], 120 per detent).
+    fn on_pointer_wheel(mut self, f: impl IntoCallback<PointerEventInfo>) -> Self {
+        if let Some(m) = self.modifiers_mut() {
+            ensure_pointer_handlers(m).on_pointer_wheel = Some(f.into_callback());
+        }
+        self
+    }
+
     // ── Accessibility modifiers ──────────────────────────────────────────
 
     fn automation_name(mut self, name: impl Into<String>) -> Self {
@@ -1223,6 +1239,8 @@ impl_element_ext!(
     ToggleButton,
     SwapChainPanel,
     WebView2,
+    Meter,
+    Knob,
 );
 
 impl ElementExt for RichTextBlock {

@@ -755,8 +755,10 @@ impl RenderCx {
     }
 
     /// Read the host's effective [`ColorScheme`] (Light / Dark) for the
-    /// current render. Re-rendering on theme switches is driven by the
-    /// host via `FrameworkElement::ActualThemeChanged`.
+    /// current render — the resolution of the app's requested-theme override
+    /// against the OS setting. Re-rendering on theme switches is driven by the
+    /// host (XAML's `ActualThemeChanged` on the WinUI backend; the effective-
+    /// theme resolver on the DComp backend).
     pub fn use_color_scheme(&self) -> ColorScheme {
         current_color_scheme()
     }
@@ -1395,6 +1397,16 @@ impl<B: Backend + 'static, D: Dispatcher + 'static> RenderHost<B, D> {
 
     pub fn with_reconciler_mut<R>(&self, f: impl FnOnce(&mut Reconciler<B>) -> R) -> R {
         f(&mut self.inner.reconciler.borrow_mut())
+    }
+
+    /// Non-panicking [`Self::with_reconciler_mut`]: `None` when the reconciler
+    /// is already borrowed on this thread — a re-entrant call from inside a
+    /// backend mutation, such as a composition scoped batch whose `Completed`
+    /// event fires synchronously from `End()`. Callers own the fallback
+    /// (typically deferring through the message pump).
+    pub fn try_with_reconciler_mut<R>(&self, f: impl FnOnce(&mut Reconciler<B>) -> R) -> Option<R> {
+        let mut r = self.inner.reconciler.try_borrow_mut().ok()?;
+        Some(f(&mut r))
     }
 
     pub fn clone_inner(&self) -> Self {

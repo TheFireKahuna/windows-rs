@@ -31,8 +31,8 @@ impl WebView2Handle {
 pub struct WebView2 {
     pub key: Option<String>,
     pub modifiers: Modifiers,
-    pub mounted: Option<Callback<Option<windows_core::IInspectable>>>,
-    pub unmounted: Option<Callback<Option<windows_core::IInspectable>>>,
+    pub mounted: Option<Callback<MountInfo>>,
+    pub unmounted: Option<Callback<MountInfo>>,
 }
 
 impl Default for WebView2 {
@@ -53,8 +53,8 @@ impl WebView2 {
 
     /// Callback invoked once after the native control is created.
     pub fn on_mounted(mut self, f: impl Fn(WebView2Handle) + 'static) -> Self {
-        self.mounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            if let Some(native) = info.native {
                 f(WebView2Handle(native));
             }
         }));
@@ -64,8 +64,8 @@ impl WebView2 {
     /// Callback invoked just before the native control is destroyed, while it
     /// still exists. Use this to tear down resources bound to the control.
     pub fn on_unmounted(mut self, f: impl Fn(WebView2Handle) + 'static) -> Self {
-        self.unmounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
+        self.unmounted = Some(Callback::new(move |info: MountInfo| {
+            if let Some(native) = info.native {
                 f(WebView2Handle(native));
             }
         }));
@@ -78,10 +78,10 @@ impl Widget for WebView2 {
     fn bindings(&self) -> PropBindings {
         Vec::new()
     }
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.mounted.as_ref()
     }
-    fn on_unmounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_unmounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.unmounted.as_ref()
     }
 }

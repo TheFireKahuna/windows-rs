@@ -30,8 +30,9 @@ pub struct Fault {
     pub message: String,
 }
 
-/// Install the per-thread fault handler. Called by [`App::on_fault`](crate::App::on_fault)
+/// Install the per-thread fault handler. Called by `App::on_fault`
 /// on the UI thread before the first render.
+#[cfg(feature = "winui-backend")]
 pub(crate) fn set_handler<F: Fn(&Fault) + 'static>(handler: F) {
     HANDLER.with(|slot| *slot.borrow_mut() = Some(Rc::new(handler)));
 }
@@ -68,6 +69,7 @@ pub(crate) fn render_scope<F: FnOnce()>(f: F) {
 /// deferred best-effort work that runs behind a WinUI callback and therefore
 /// cannot return its `Result` to the caller (e.g. applying the window icon,
 /// backdrop, or presenter during `activate`).
+#[cfg(feature = "winui-backend")]
 pub(crate) fn report(context: &'static str, message: String) {
     deliver(&Fault { context, message });
 }
@@ -92,7 +94,10 @@ fn deliver(fault: &Fault) {
     }
 }
 
-#[cfg(test)]
+// Gated to match `set_handler` above, which these tests install through: without
+// the `winui-backend` feature there is no handler seam to test, and an ungated
+// module makes `cargo test --lib` fail to COMPILE on a dcomp-only build.
+#[cfg(all(test, feature = "winui-backend"))]
 mod tests {
     use super::*;
     use std::cell::RefCell;

@@ -3,6 +3,7 @@ use std::{
     borrow::Cow,
     cell::Cell,
     collections::HashMap,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -32,20 +33,6 @@ impl Thickness {
 impl From<f64> for Thickness {
     fn from(v: f64) -> Self {
         Self::uniform(v)
-    }
-}
-
-impl Color {
-    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
-        Self { a: 255, r, g, b }
-    }
-    pub const fn transparent() -> Self {
-        Self {
-            a: 0,
-            r: 0,
-            g: 0,
-            b: 0,
-        }
     }
 }
 
@@ -178,11 +165,22 @@ impl LayoutAnimationConfig {
 }
 
 /// One-shot property animation (opacity / scale / …) driven by
-/// `Backend::run_property_animation`.
+/// `Backend::run_property_animation`. Also the payload of enter/exit
+/// transitions (`ElementExt::transition`).
+///
+/// `opacity`/`scale` are the animation's end values; `from_opacity`/`from_scale`
+/// optionally pin the start. A `None` start animates from the property's
+/// current value — the right default for state changes and retargeting — while
+/// an explicit start makes mount/unmount effects deterministic (a fade-in must
+/// start at 0 regardless of the visual's resting opacity).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct AnimationConfig {
     pub opacity: Option<f64>,
     pub scale: Option<f64>,
+    /// Starting opacity; `None` starts from the current value.
+    pub from_opacity: Option<f64>,
+    /// Starting uniform scale; `None` starts from the current value.
+    pub from_scale: Option<f64>,
     pub duration: Duration,
     pub easing: Easing,
 }
@@ -192,6 +190,8 @@ impl Default for AnimationConfig {
         Self {
             opacity: None,
             scale: None,
+            from_opacity: None,
+            from_scale: None,
             duration: Duration::from_millis(300),
             easing: Easing::EaseOut,
         }
@@ -199,15 +199,18 @@ impl Default for AnimationConfig {
 }
 
 impl AnimationConfig {
+    /// Fade from fully transparent to fully opaque.
     pub fn fade_in(duration: Duration) -> Self {
         Self {
             opacity: Some(1.0),
+            from_opacity: Some(0.0),
             duration,
             easing: Easing::EaseOut,
             ..Self::default()
         }
     }
 
+    /// Fade from the current opacity to fully transparent.
     pub fn fade_out(duration: Duration) -> Self {
         Self {
             opacity: Some(0.0),
@@ -215,6 +218,57 @@ impl AnimationConfig {
             easing: Easing::EaseIn,
             ..Self::default()
         }
+    }
+
+    /// Fade in while growing from a slight shrink — the Fluent "pop" entrance.
+    pub fn pop_in(duration: Duration) -> Self {
+        Self {
+            opacity: Some(1.0),
+            from_opacity: Some(0.0),
+            scale: Some(1.0),
+            from_scale: Some(0.96),
+            duration,
+            easing: Easing::EaseOut,
+        }
+    }
+
+    /// Fade out while shrinking slightly — the matching exit.
+    pub fn pop_out(duration: Duration) -> Self {
+        Self {
+            opacity: Some(0.0),
+            scale: Some(0.96),
+            duration,
+            easing: Easing::EaseIn,
+            ..Self::default()
+        }
+    }
+
+    /// Set the end scale (uniform).
+    pub fn with_scale(mut self, to: f64) -> Self {
+        self.scale = Some(to);
+        self
+    }
+
+    /// Pin the starting opacity.
+    pub fn starting_opacity(mut self, from: f64) -> Self {
+        self.from_opacity = Some(from);
+        self
+    }
+
+    /// Pin the starting scale (uniform).
+    pub fn starting_scale(mut self, from: f64) -> Self {
+        self.from_scale = Some(from);
+        self
+    }
+
+    pub fn with_easing(mut self, easing: Easing) -> Self {
+        self.easing = easing;
+        self
+    }
+
+    /// Whether running this config would visibly change anything.
+    pub fn is_visible_effect(&self) -> bool {
+        self.opacity.is_some() || self.scale.is_some()
     }
 }
 
@@ -258,19 +312,319 @@ pub enum ColorScheme {
     Dark,
 }
 
-thread_local! {
-    static CURRENT_COLOR_SCHEME: Cell<ColorScheme> = const { Cell::new(ColorScheme::Light) };
+/// Process-global, not thread-local: the effective scheme is a fact about the
+/// process — app-side hooks (`use_color_scheme`) and front-side chrome paint
+/// both read it, and under the render-thread split those sit on different
+/// threads. One atomic serves both; a thread-local here would leave whichever
+/// side didn't get the push painting the old palette.
+static CURRENT_COLOR_SCHEME: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+fn scheme_from_u8(v: u8) -> ColorScheme {
+    if v == 1 { ColorScheme::Dark } else { ColorScheme::Light }
 }
 
-/// Read the host's last-known [`ColorScheme`] for the current UI thread.
+/// Read the host's last-known effective [`ColorScheme`].
 pub fn current_color_scheme() -> ColorScheme {
-    CURRENT_COLOR_SCHEME.with(|c| c.get())
+    scheme_from_u8(CURRENT_COLOR_SCHEME.load(std::sync::atomic::Ordering::Acquire))
 }
 
-/// Update the per-thread [`ColorScheme`]; called by the host on
-/// `ActualThemeChanged` (and once during initial attach).
+/// Update the effective [`ColorScheme`]; called by the host when the effective
+/// theme changes (and once during startup/attach). Release-ordered so the
+/// invalidation fan-out that follows a theme flip observes the new value on
+/// every thread it reaches.
 pub fn set_current_color_scheme(scheme: ColorScheme) {
-    CURRENT_COLOR_SCHEME.with(|c| c.set(scheme));
+    let v = match scheme {
+        ColorScheme::Light => 0,
+        ColorScheme::Dark => 1,
+    };
+    CURRENT_COLOR_SCHEME.store(v, std::sync::atomic::Ordering::Release);
+}
+
+/// Requested application theme: an app-level override of the OS light/dark
+/// setting. `Default` follows the system; `Light`/`Dark` force the scheme.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum RequestedTheme {
+    /// Use the system default (inherits from the OS app-theme setting).
+    #[default]
+    Default,
+    /// Force light theme.
+    Light,
+    /// Force dark theme.
+    Dark,
+}
+
+/// The app's requested theme override — the single source of truth both hosts
+/// resolve against. Process-global for the same reason as the scheme: the
+/// setter fires from app code and the host resolves it at apply time, and
+/// under the render-thread split those are different threads. Holding it here
+/// (rather than in host-specific state) also makes a call before the host
+/// exists naturally pending: the host reads it at startup/attach.
+static REQUESTED_THEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Host-installed hook that applies a theme change to the live window. Absent
+/// until a host runs (the stored request applies then). `Send + Sync` is part
+/// of the contract: the setter may fire on a thread that is not the one the
+/// host pumps on, so the hook must carry the change over itself (post to the
+/// window, never touch host state directly).
+static THEME_APPLIER: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(RequestedTheme) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
+
+/// Set the application theme override. Takes effect immediately when a host is
+/// live; otherwise it is applied when one starts.
+pub fn set_requested_theme(theme: RequestedTheme) {
+    let v = match theme {
+        RequestedTheme::Default => 0,
+        RequestedTheme::Light => 1,
+        RequestedTheme::Dark => 2,
+    };
+    REQUESTED_THEME.store(v, std::sync::atomic::Ordering::Release);
+    let applier = THEME_APPLIER.lock().ok().and_then(|a| a.clone());
+    if let Some(applier) = applier {
+        applier(theme);
+    }
+}
+
+/// Read the app's requested theme override.
+pub fn requested_theme() -> RequestedTheme {
+    match REQUESTED_THEME.load(std::sync::atomic::Ordering::Acquire) {
+        1 => RequestedTheme::Light,
+        2 => RequestedTheme::Dark,
+        _ => RequestedTheme::Default,
+    }
+}
+
+/// Install (or clear) the host hook [`set_requested_theme`] routes through. The
+/// hook may fire from inside event dispatch, and — under the render-thread
+/// split — from a thread that is not the host's: it must defer by carrying the
+/// change to the host's own thread (post through its message pump), never by
+/// borrowing host state synchronously.
+pub(crate) fn set_theme_applier(
+    applier: Option<std::sync::Arc<dyn Fn(RequestedTheme) + Send + Sync>>,
+) {
+    if let Ok(mut slot) = THEME_APPLIER.lock() {
+        *slot = applier;
+    }
+}
+
+// ── URI launch ───────────────────────────────────────────────────────────────
+//
+// Backend-neutral, which is why it lives here and not in the DComp backend: it
+// is app policy, not rendering. The WinUI backend never reaches this — it hands
+// the URI to `HyperlinkButton.SetNavigateUri` and XAML mediates the navigation
+// inside its own trust context — but the declaration is not made backend-shaped
+// for that, any more than [`set_requested_theme`] is.
+
+type UriLauncher = Box<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+
+/// The app-installed launcher. Set once before the window exists; a later
+/// registration is ignored (matches the visibility / display-change setters).
+static URI_LAUNCHER: OnceLock<UriLauncher> = OnceLock::new();
+
+/// Install the process-global URI launcher a [`HyperlinkButton`] activation
+/// routes through. Call **before** the window is created (like
+/// [`crate::set_window_visibility_callback`]); only the first registration is
+/// kept.
+///
+/// **There is no default.** Without a launcher a hyperlink is inert: it paints,
+/// it focuses, it fires its `Click` handler and its UIA `Invoke` — and nothing
+/// is launched. This crate has no URI-launch primitive of its own and does not
+/// acquire one by falling back to the shell.
+///
+/// The launcher receives the control's `NavigateUri` verbatim and returns
+/// whether it handled it. Both halves are the point: the app DECIDES (which
+/// schemes, which hosts, whether a confirmation prompt is due) and the app ACTS
+/// (`ShellExecuteW`, an in-app browser, a queued work item). Returning `false`
+/// means "not handled" and is a normal, silent outcome — this crate does not
+/// take a declined URI anywhere else.
+///
+/// # What the app is taking responsibility for
+///
+/// The string is **untrusted**: it came from whatever built the element tree,
+/// which for a data-driven UI may be a config file, an IPC payload, or a remote
+/// document. This crate deliberately does **not** parse it, resolve it,
+/// percent-decode it, canonicalise it, or judge its scheme — every one of those
+/// is a policy decision (`file:`, `ms-settings:`, a custom protocol handler
+/// registered by another app) whose right answer depends on what the host
+/// application is and what it trusts, and a wrong answer baked in here would be
+/// a wrong answer no app could override. The only thing rejected before the
+/// launcher is called is a string that is not structurally a URI reference at
+/// all — see [`launch_uri`]. Scheme allow-listing is the launcher's job, and it
+/// is not optional: handing this straight to `ShellExecuteW` executes whatever
+/// protocol handler the machine has registered.
+///
+/// Three things the structural gate specifically does **not** cover, because
+/// each is a judgement only the app can make:
+///
+/// - **Percent-encoding is not decoded.** `%00`, `%0A` and `%2E%2E%2F` reach the
+///   launcher as those literal characters. The gate rejects a literal control
+///   character; it cannot reject one that does not exist until something
+///   decodes. If your launcher percent-decodes — or hands the string to
+///   something that does — apply the same structural check again on the decoded
+///   form, and expect an embedded NUL there.
+/// - **The authority is not judged.** IDN, punycode and homoglyphs pass through:
+///   `https://xn--80ak6aa92e.com/` is a well-formed URI reference and this crate
+///   has no basis for deciding it is not the host you meant. An app that shows
+///   the target to a user should render the decoded form, or the ASCII form,
+///   deliberately — not whichever one it happened to get.
+/// - **Nothing is canonicalised.** Dot segments, case, and duplicate slashes
+///   arrive as authored. Screen the string you will actually launch, not a
+///   normalisation of it that you then discard.
+///
+/// # Being called is not evidence of a user gesture
+///
+/// Activation converges on one path, which a pointer release, a Space/Enter
+/// press and a UI-Automation `Invoke` all share — deliberately, so a screen
+/// reader follows a link exactly as a click does. UIA is cross-process: any
+/// process able to automate this window can drive that `Invoke` with no user
+/// present. That is not a new capability (a process that can automate your UI
+/// can already press the button), and the URI is still one your own tree
+/// supplied, so the launcher is not being handed anything an attacker authored.
+/// But it does mean a launcher must not treat the call itself as proof a human
+/// asked. If a scheme needs consent, prompt for it; do not infer it.
+///
+/// # Contract
+///
+/// When *this crate* routes a `HyperlinkButton` activation, the launcher runs
+/// **on the UI thread**, from the message pump, outside any backend borrow —
+/// never during layout, paint, or event dispatch. That is a property of the
+/// routing, not of the seam: [`launch_uri`] is public and the `Send + Sync`
+/// bound is real, so an app calling it directly can reach the launcher from any
+/// thread, concurrently with itself, and re-entrantly from inside it. Nothing
+/// here serialises those; write the launcher to tolerate them.
+///
+/// - It must not block. A synchronous `ShellExecuteW` on a cold handler can
+///   stall for seconds; the window is frozen for exactly that long. Post the
+///   real work to another thread and return `true`.
+/// - It must not re-enter the reactor (no `set_state` from inside it); use the
+///   dispatcher, as any other off-thread producer would.
+/// - It may panic without taking the process down: the call is wrapped in the
+///   same fault boundary as an event handler, and the fault is reported under
+///   the `"uri launcher"` context. The URI is **not** part of that report — a
+///   fault handler that logs, and a hyperlink carrying a capability URL, must
+///   not combine into a leak. Two limits on that, both inherited from the fault
+///   module rather than chosen here: the boundary deliberately does not catch
+///   during a render pass (so a launcher reached by calling [`launch_uri`] from
+///   inside a component body is not covered), and the fault handler is a
+///   `winui-backend` facility — under `dcomp-backend` a caught panic goes to
+///   stderr. The context string is still URI-free either way, but the panic
+///   *message* is yours: do not put the URI in it.
+/// Returns whether THIS registration is the one now installed. `false` means a
+/// launcher was already present and yours was discarded — check it. First-wins
+/// is the fail-safe direction (a component loaded later cannot silently swap out
+/// the policy the app installed at startup), but it means losing the race is
+/// indistinguishable from winning it unless you look: [`uri_launcher_installed`]
+/// would answer `true` either way, and an app that assumed its own allow-list
+/// was in force would render links as followable while someone else's policy
+/// decided where they go.
+pub fn set_uri_launcher(launcher: impl Fn(&str) -> bool + Send + Sync + 'static) -> bool {
+    URI_LAUNCHER.set(Box::new(launcher)).is_ok()
+}
+
+/// Whether a launcher has been installed with [`set_uri_launcher`].
+///
+/// Lets a UI reflect the truth rather than lie about it — a link that cannot be
+/// followed can be rendered as plain text instead of an affordance that does
+/// nothing.
+pub fn uri_launcher_installed() -> bool {
+    URI_LAUNCHER.get().is_some()
+}
+
+/// Offer `uri` to the installed launcher; returns whether it was handled.
+///
+/// `false` covers all three of "no launcher installed" (the default),
+/// "structurally not a URI reference", and "the launcher declined" — none of
+/// which this crate treats as an error, and all of which end the same way:
+/// nothing is launched.
+///
+/// The structural gate is deliberately the *only* filtering done here, and it
+/// is not a security judgement — it rejects strings that cannot be a URI
+/// reference under RFC 3986 no matter whose policy applies: the empty string,
+/// anything with leading or trailing whitespace, and anything containing a
+/// character RFC 3986 §2 does not admit literally — see
+/// [`not_a_uri_character`]. That is the class of byte that would let one "URI"
+/// become two arguments or two log lines further down, or render as one host
+/// and parse as another. Everything a policy could reasonably differ on — the
+/// scheme, the authority, the path, the encoding — is passed through untouched
+/// for the launcher to judge.
+///
+/// The string handed to the launcher is the string that cleared the gate,
+/// byte-for-byte. Nothing is trimmed, decoded or normalised on the way through,
+/// so the launcher's allow-list and whatever eventually parses the URI are
+/// looking at the same characters.
+///
+/// Public because it is the one chokepoint: an app rendering its own link-like
+/// affordance should route through here rather than reaching for the shell
+/// separately, so a single installed policy governs every launch.
+pub fn launch_uri(uri: &str) -> bool {
+    if uri.is_empty()
+        // Rejected, NOT trimmed. Trimming and passing the trimmed string would
+        // be a policy edit; passing the untrimmed one after testing `trim()` for
+        // emptiness — which is what this used to do — is worse than either: the
+        // app's allow-list reads a different string from the one the shell
+        // eventually parses. `" file:///C:/Windows/System32/cmd.exe"` cleared
+        // the old gate, and a launcher screening with `!uri.starts_with("file:")`
+        // — the exact shape this module documents — called it handled.
+        || uri.starts_with(char::is_whitespace)
+        || uri.ends_with(char::is_whitespace)
+        || uri.chars().any(not_a_uri_character)
+    {
+        return false;
+    }
+    let Some(launcher) = URI_LAUNCHER.get() else {
+        return false;
+    };
+    // The launcher is app code and may panic; a panic here would otherwise
+    // cross the window procedure's `extern "system"` boundary and abort. The
+    // context string carries no part of the URI.
+    let handled = Cell::new(false);
+    fault::catch("uri launcher", || handled.set(launcher(uri)));
+    handled.get()
+}
+
+/// A character that cannot appear literally in a URI reference, so rejecting it
+/// is the same structural call the control-character test already makes rather
+/// than a new policy one.
+///
+/// RFC 3986 §2 fixes the whole repertoire — ALPHA / DIGIT / the unreserved
+/// marks / the reserved set / `%` — and nothing below is in it. To carry any of
+/// these a URI must percent-encode them, and the encoded form passes through
+/// here untouched, which is the point: this rejects the *literal* character, it
+/// does not decode or judge what the URI is trying to say.
+///
+/// Why these and not merely `is_control`: `char::is_control` is Unicode category
+/// Cc alone, so the old gate stopped CR and LF and NUL and U+0085 while letting
+/// through the characters that do the same damage from outside Cc.
+///
+/// - **U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR** — line terminators to
+///   JavaScript and to several log formats. One URI, two log lines: precisely
+///   what this gate exists to stop, and it did not stop it.
+/// - **Other non-space whitespace** (U+00A0 NBSP, U+3000 IDEOGRAPHIC SPACE, …) —
+///   a separator to anything tokenising on Unicode whitespace, and invisible or
+///   near-invisible in the string the reviewer read.
+/// - **Bidi controls and invisibles** (U+202E RIGHT-TO-LEFT OVERRIDE, the
+///   isolates, U+200B ZWSP, U+FEFF, U+00AD SOFT HYPHEN) — these make the
+///   rendered string and the parsed string differ, so the host a user sees is
+///   not the host that is launched, and two different URIs can render
+///   identically.
+///
+/// A plain U+0020 in the interior is deliberately still allowed: it is visible,
+/// an app can see it and decide, and `file:///C:/Program Files/…` is a real
+/// thing apps launch. Leading and trailing whitespace is rejected outright by
+/// the caller — no URI has it, and it is what makes the app's reading of the
+/// scheme diverge from the shell's.
+fn not_a_uri_character(c: char) -> bool {
+    c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c,
+            '\u{00AD}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}')
 }
 
 /// Symbolic reference to a WinUI XAML theme resource (resolved at apply
@@ -372,7 +726,11 @@ impl ThemeRef {
 
 /// Brush slot that can be either a literal [`Color`]
 /// or a [`ThemeRef`]; used for `background` / `foreground` modifiers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// [`Color`] now carries `f32` linear channels (no `Eq`), so this derives only
+/// `PartialEq` — the reconciler diffs it by exact value, which is correct because
+/// tokens are computed deterministically.
+#[derive(Clone, Debug, PartialEq)]
 pub enum BrushBinding {
     Direct(Color),
     Theme(ThemeRef),
@@ -628,6 +986,7 @@ pub struct PointerHandlers {
     pub on_pointer_moved: Option<Callback<PointerEventInfo>>,
     pub on_pointer_entered: Option<Callback<PointerEventInfo>>,
     pub on_pointer_exited: Option<Callback<()>>,
+    pub on_pointer_wheel: Option<Callback<PointerEventInfo>>,
 }
 
 impl PointerHandlers {
@@ -639,14 +998,45 @@ impl PointerHandlers {
             && self.on_pointer_moved.is_none()
             && self.on_pointer_entered.is_none()
             && self.on_pointer_exited.is_none()
+            && self.on_pointer_wheel.is_none()
     }
 }
 
+/// Which axis a wheel event travelled on.
+///
+/// [`Vertical`](WheelAxis::Vertical) is the classic wheel (`WM_MOUSEWHEEL` /
+/// WinUI `PointerWheelChanged`); [`Horizontal`](WheelAxis::Horizontal) is the
+/// tilt-wheel or touchpad sideways pan (`WM_MOUSEHWHEEL`).
+///
+/// The two axes do **not** share a sign convention, because the platform's
+/// don't: a positive vertical delta is *up / away from the user*, a positive
+/// horizontal delta is *to the right*. Deltas are passed through raw rather
+/// than normalised to some common "forward", so a sink reads each axis with
+/// the convention its users already expect.
+///
+/// `Vertical` is the [`Default`] deliberately: a sink written before this
+/// enum existed, and every non-wheel pointer callback (which leaves
+/// `wheel_delta` at 0), sees precisely the axis it always implicitly assumed.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WheelAxis {
+    #[default]
+    Vertical,
+    Horizontal,
+}
+
 /// Pointer state captured at a pointer callback (`PointerPressed`,
-/// `PointerReleased`, `PointerMoved`, or `PointerEntered`). `x`/`y` are the
-/// pointer position in DIPs, relative to the top-left of the element the
-/// handler is attached to. Non-mouse pointer kinds report all three button
-/// flags as `false`.
+/// `PointerReleased`, `PointerMoved`, `PointerEntered`, or
+/// `PointerWheelChanged`). `x`/`y` are the pointer position in DIPs, relative
+/// to the top-left of the element the handler is attached to. Non-mouse
+/// pointer kinds report all three button flags as `false`. `wheel_delta` is
+/// the raw `MouseWheelDelta` (120 per detent, signed) and is only meaningful
+/// in a wheel callback; [`wheel_axis`](Self::wheel_axis) says which axis it
+/// travelled on and is [`WheelAxis::Vertical`] everywhere else.
+///
+/// A sink that wants exactly one axis should read it through
+/// [`wheel_delta_on`](Self::wheel_delta_on) rather than `wheel_delta`, so a
+/// sideways tilt cannot drive a control that only ever meant to respond to the
+/// vertical wheel.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct PointerEventInfo {
     pub x: f64,
@@ -654,6 +1044,19 @@ pub struct PointerEventInfo {
     pub is_left_button_pressed: bool,
     pub is_right_button_pressed: bool,
     pub is_middle_button_pressed: bool,
+    pub wheel_delta: i32,
+    pub wheel_axis: WheelAxis,
+}
+
+impl PointerEventInfo {
+    /// The wheel delta if it arrived on `axis`, otherwise 0.
+    ///
+    /// This is the opt-in read: a control that adjusts a value on the vertical
+    /// wheel calls `wheel_delta_on(WheelAxis::Vertical)` and is inert under a
+    /// horizontal tilt, without having to match on the axis itself.
+    pub fn wheel_delta_on(&self, axis: WheelAxis) -> i32 {
+        if self.wheel_axis == axis { self.wheel_delta } else { 0 }
+    }
 }
 
 // --- Accessibility ---

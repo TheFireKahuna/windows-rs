@@ -55,9 +55,21 @@ impl<B: Backend> Reconciler<B> {
         }
     }
 
-    pub fn diff_props(&mut self, id: ControlId, old: &[Binding], new: &[Binding]) {
+    pub fn diff_props(&mut self, id: ControlId, kind: ControlKind, old: &[Binding], new: &[Binding]) {
         for b in new {
             match b {
+                // An editor's declared text is exempt from equality-dropping:
+                // the backend buffer is front-authoritative (the user types
+                // into it), so "old prop == new prop" does not mean the
+                // backend already holds this text — and dropping the write
+                // would make "revert to the same prop value" (an app
+                // declining a delivered edit) inexpressible. The write is
+                // re-emitted every render; the dcomp recorder dedupes it
+                // against its delivered-text view, so the steady state stays
+                // silent (§7.2, text half).
+                Binding::Prop(p, v) if editor_text_prop(kind, *p) && matches!(v, PropValue::Str(_)) => {
+                    self.backend.set_prop(id, *p, v)
+                }
                 Binding::Prop(p, v) => match find_prop(old, *p) {
                     Some(ov) if ov == v => {}
                     _ => self.backend.set_prop(id, *p, v),
@@ -88,5 +100,17 @@ impl<B: Backend> Reconciler<B> {
                 }
             }
         }
+    }
+}
+
+/// Which prop carries a text editor's programmatic buffer text, per widget
+/// contract: `TextBox` / `PasswordBox` declare it as `Prop::Value`, an
+/// `AutoSuggestBox` as `Prop::Text`. (A `NumberBox` seeds its buffer from the
+/// numeric `Prop::Value`, which has its own revision gate.)
+fn editor_text_prop(kind: ControlKind, prop: Prop) -> bool {
+    match kind {
+        ControlKind::TextBox | ControlKind::PasswordBox => prop == Prop::Value,
+        ControlKind::AutoSuggestBox => prop == Prop::Text,
+        _ => false,
     }
 }

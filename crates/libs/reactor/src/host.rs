@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+#[cfg(feature = "winui-backend")]
 use std::rc::Rc;
 
 use super::*;
@@ -7,26 +8,16 @@ use bindings::*;
 thread_local! {
     static ROOT_FRAMEWORK_ELEMENT: RefCell<Option<FrameworkElement>> = const { RefCell::new(None) };
     static ROOT_WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
-    /// Queued theme; applied once `ROOT_FRAMEWORK_ELEMENT` is available.
-    static PENDING_THEME: Cell<Option<ElementTheme>> = const { Cell::new(None) };
     /// TitleBar height option requested before `ROOT_WINDOW` was set. Applied once
     /// the window becomes available in `post_render`.
     static PENDING_TALL: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// Requested application theme, matching `Microsoft.UI.Xaml.ElementTheme`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum RequestedTheme {
-    /// Use the system default (inherits from OS setting).
-    Default,
-    /// Force light theme.
-    Light,
-    /// Force dark theme.
-    Dark,
-}
-
-/// Set the application theme. Queued if the root element isn't attached yet.
-pub fn set_requested_theme(theme: RequestedTheme) {
+/// The WinUI host's theme applier: forwards the request to XAML's
+/// `SetRequestedTheme` on the root element. Before the root attaches this is a
+/// no-op — the attach path in `post_render` applies [`requested_theme`] itself.
+#[cfg(feature = "winui-backend")]
+fn apply_requested_theme_xaml(theme: RequestedTheme) {
     let element_theme = match theme {
         RequestedTheme::Light => ElementTheme::Light,
         RequestedTheme::Dark => ElementTheme::Dark,
@@ -37,12 +28,11 @@ pub fn set_requested_theme(theme: RequestedTheme) {
         if let Some(ife) = cell.borrow().as_ref() {
             let _ = ife.SetRequestedTheme(element_theme);
             update_titlebar_theme();
-        } else {
-            PENDING_THEME.with(|p| p.set(Some(element_theme)));
         }
     });
 }
 
+#[cfg(feature = "winui-backend")]
 fn update_titlebar_theme() {
     ROOT_FRAMEWORK_ELEMENT.with(|cell| {
         if let Some(ife) = cell.borrow().as_ref()
@@ -118,6 +108,7 @@ pub enum PresenterKind {
     CompactOverlay,
 }
 
+#[cfg(feature = "winui-backend")]
 impl PresenterKind {
     fn to_native(self) -> Option<AppWindowPresenterKind> {
         match self {
@@ -159,6 +150,7 @@ impl Backdrop {
 
 /// WinUI-bound [`RenderHost`] hosting a single root [`Component`] inside
 /// a `Microsoft.UI.Xaml.Window`.
+#[cfg(feature = "winui-backend")]
 pub struct ReactorHost {
     render_host: RenderHost<WinUIBackend, WinUIDispatcher>,
     window: Window,
@@ -167,6 +159,7 @@ pub struct ReactorHost {
     icon: RefCell<Option<String>>,
 }
 
+#[cfg(feature = "winui-backend")]
 impl ReactorHost {
     pub fn new(title: impl AsRef<str>, root: Box<dyn Component>) -> Result<Self> {
         Self::new_with(title, root, |_| {})
@@ -235,13 +228,10 @@ impl ReactorHost {
                                 ROOT_FRAMEWORK_ELEMENT
                                     .with(|cell| *cell.borrow_mut() = Some(fe.clone()));
 
-                                // Apply any theme that was requested before the
-                                // root element existed (e.g. from a first-mount
-                                // use_effect).
-                                if let Some(theme) = PENDING_THEME.with(|p| p.take()) {
-                                    let _ = fe.SetRequestedTheme(theme);
-                                    update_titlebar_theme();
-                                }
+                                // Apply the stored theme request — it may have
+                                // been set before the root element existed
+                                // (e.g. from a first-mount use_effect).
+                                apply_requested_theme_xaml(requested_theme());
                             }
                         }
 
@@ -264,6 +254,9 @@ impl ReactorHost {
                 }
             }
         });
+
+        // Route `set_requested_theme` to XAML for the lifetime of this host.
+        set_theme_applier(Some(std::sync::Arc::new(apply_requested_theme_xaml)));
 
         render_host.kick();
 
@@ -359,6 +352,7 @@ impl ReactorHost {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 fn get_default_display_size(hwnd: HWND, dpi: u32) -> WindowSize {
     unsafe {
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -384,6 +378,7 @@ fn get_default_display_size(hwnd: HWND, dpi: u32) -> WindowSize {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 fn center_window_on_display(
     hwnd: HWND,
     client_width_px: i32,
@@ -423,6 +418,7 @@ fn center_window_on_display(
     }
 }
 
+#[cfg(feature = "winui-backend")]
 fn subscribe_size_and_dpi(
     fe: &FrameworkElement,
     render_host: RenderHost<WinUIBackend, WinUIDispatcher>,
@@ -451,6 +447,7 @@ fn subscribe_size_and_dpi(
         .map(|r| r.into_token());
 }
 
+#[cfg(feature = "winui-backend")]
 fn create_window(
     title: impl AsRef<str>,
     size: Option<WindowSize>,
@@ -486,7 +483,6 @@ fn create_window(
     })?;
 
     app_window.SetPresenterByKind(AppWindowPresenterKind::Overlapped)?;
-    set_requested_theme(RequestedTheme::Default);
 
     let outer_size = app_window.Size()?;
     let inner_size = app_window_2.ClientSize()?;
@@ -528,6 +524,7 @@ fn create_window(
 
 /// Re-apply DIP `constraints` to the window's `OverlappedPresenter`,
 /// re-measuring the non-client offset at current DPI.
+#[cfg(feature = "winui-backend")]
 fn apply_constraints_for_window(
     window: &Window,
     dpi: u32,
@@ -567,6 +564,7 @@ impl<B: Backend + 'static, D: Dispatcher + 'static> RenderHost<B, D> {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 fn subscribe_actual_theme_changed(
     fe: &FrameworkElement,
     render_host: RenderHost<WinUIBackend, WinUIDispatcher>,
@@ -579,13 +577,20 @@ fn subscribe_actual_theme_changed(
                 update_color_scheme_from(fe);
                 update_titlebar_theme();
             }
-            render_host.with_reconciler_mut(|r| r.notify_theme_changed());
+            render_host.with_reconciler_mut(|r| {
+                r.notify_theme_changed();
+                // Memoised components recompute value-color props only inside
+                // their render functions — force a full pass so none keeps the
+                // old scheme's palette.
+                r.invalidate_all_components();
+            });
             render_host.request_render();
         })
         .ok()
         .map(|r| r.into_token());
 }
 
+#[cfg(feature = "winui-backend")]
 fn update_color_scheme_from(fe: &FrameworkElement) {
     if let Ok(theme) = fe.ActualTheme() {
         let scheme = match theme {
@@ -596,6 +601,7 @@ fn update_color_scheme_from(fe: &FrameworkElement) {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 struct AttachState {
     window: Window,
     render_host: RenderHost<WinUIBackend, WinUIDispatcher>,

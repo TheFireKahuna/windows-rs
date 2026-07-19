@@ -47,6 +47,17 @@ macro_rules! define_handles {
                             <bindings::$variant>::new().unwrap(),
                         ),
                     )*
+                    // Meter / Knob are custom controls with no native WinUI
+                    // peer — they exist only on the DirectComposition backend
+                    // (drawn as retained chrome parts). On the legacy WinUI
+                    // backend they degrade to their nearest native range
+                    // control so the tree still builds.
+                    ControlKind::Meter => Handle::ProgressBar(
+                        <bindings::ProgressBar>::new().unwrap(),
+                    ),
+                    ControlKind::Knob => Handle::Slider(
+                        <bindings::Slider>::new().unwrap(),
+                    ),
                 }
             }
         }
@@ -168,6 +179,7 @@ struct PointerRevokerSet {
     moved: Option<windows_core::EventRevoker>,
     entered: Option<windows_core::EventRevoker>,
     exited: Option<windows_core::EventRevoker>,
+    wheel: Option<windows_core::EventRevoker>,
 }
 
 #[derive(Default)]
@@ -441,6 +453,11 @@ fn classify_container(h: &Handle) -> Option<ContainerChildren<'_>> {
             r.cast::<bindings::IPanel>().ok()?.Children().ok()?,
         )),
         Handle::Border(_) | Handle::Viewbox(_) => Some(ContainerChildren::SingleChild(h)),
+        // A Button is a ContentControl: when a `content_element` child is supplied
+        // it is mounted here (the text-content path emits no child, so plain text
+        // buttons report `Children::None` and never reach this). Lets a real
+        // Button host rich visuals while keeping its InvokePattern peer.
+        Handle::Button(b) => Some(ContainerChildren::ContentControl(b.cast().ok()?)),
         Handle::ScrollViewer(s) => Some(ContainerChildren::ContentControl(s.cast().ok()?)),
         Handle::Expander(e) => Some(ContainerChildren::ContentControl(e.cast().ok()?)),
         Handle::TabViewItem(ti) => Some(ContainerChildren::ContentControl(ti.cast().ok()?)),
@@ -734,6 +751,14 @@ fn run_property_animation_inner(ui: &bindings::UIElement, cfg: AnimationConfig) 
         a.cast::<bindings::IKeyFrameAnimation>()?
             .SetDuration(anim_duration_to_timespan(cfg.duration))?;
         let easing = easing_for(&icomp, cfg.easing)?;
+        // A pinned start makes mount effects deterministic (fade-in from 0);
+        // without one the animation runs from the current value. The easing on
+        // a progress-0 keyframe is inert (easing shapes the segment *ending* at
+        // a keyframe), so the end easing is reused rather than binding a
+        // separate linear function.
+        if let Some(from) = cfg.from_opacity {
+            ia.InsertKeyFrameWithEasingFunction(0.0, from as f32, &easing)?;
+        }
         ia.InsertKeyFrameWithEasingFunction(1.0, opacity as f32, &easing)?;
         let anim = a.cast::<bindings::CompositionAnimation>()?;
         visual_obj.StartAnimation("Opacity", &anim)?;
@@ -765,6 +790,18 @@ fn run_property_animation_inner(ui: &bindings::UIElement, cfg: AnimationConfig) 
         a.cast::<bindings::IKeyFrameAnimation>()?
             .SetDuration(anim_duration_to_timespan(cfg.duration))?;
         let easing = easing_for(&icomp, cfg.easing)?;
+        if let Some(from) = cfg.from_scale {
+            let f = from as f32;
+            ia.InsertKeyFrameWithEasingFunction(
+                0.0,
+                windows_numerics::Vector3 {
+                    x: f,
+                    y: f,
+                    z: current_z,
+                },
+                &easing,
+            )?;
+        }
         let s = scale as f32;
         ia.InsertKeyFrameWithEasingFunction(
             1.0,
@@ -1192,11 +1229,9 @@ fn unbox_index(value: &windows_core::IInspectable) -> Option<usize> {
 const CONTENT_TEMPLATE_XAML: &str = "<DataTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'><ContentControl HorizontalContentAlignment='Stretch' VerticalContentAlignment='Stretch'/></DataTemplate>";
 
 impl Backend for WinUIBackend {
-    fn create(&mut self, kind: ControlKind) -> ControlId {
-        let id = self.alloc_id();
+    fn create(&mut self, id: ControlId, kind: ControlKind) {
         let handle = Self::make_handle_for_kind(kind);
         self.controls.borrow_mut().insert(id, handle);
-        id
     }
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
         let map = self.controls.borrow();
@@ -1220,64 +1255,52 @@ impl Backend for WinUIBackend {
                 (Prop::TextWrappingWrap, PropValue::I32(v), Handle::RichTextBlock(tb)) => {
                     tb.SetTextWrapping(TextWrapping(*v))
                 }
+                // The three content arms all go through the same decomposition
+                // so that whichever order they arrive in, each replaces only
+                // its own piece of the row. See [`take_row`].
                 (Prop::Content, PropValue::Str(s), Handle::Button(b)) => {
                     let cc = b.cast::<bindings::IContentControl>()?;
-                    // If the button has an icon+text layout (StackPanel from
-                    // Icon), update just the TextBlock child so the icon
-                    // is preserved when only the label changes.
-                    if let Ok(existing) = cc.Content()
-                        && let Ok(panel) = existing.cast::<bindings::IPanel>()
-                    {
-                        let children = panel.Children()?;
-                        if children.Size()? >= 2
-                            && let Ok(tb) = children.GetAt(1)?.cast::<bindings::ITextBlock>()
-                        {
-                            return tb.SetText(s);
-                        }
+                    let mut row = take_row(&cc);
+                    row.rest.clear();
+                    if !s.is_empty() {
+                        row.rest.push(string_as_textblock(s)?.cast()?);
                     }
-                    let tb = string_as_textblock(s)?;
-                    cc.SetContent(&tb)
+                    write_row(&cc, &row)
                 }
                 (Prop::Icon, PropValue::I32(v), Handle::Button(b)) => {
-                    let icon_elem = bindings::SymbolIcon::CreateInstanceWithSymbol(Symbol(*v))?;
                     let cc = b.cast::<bindings::IContentControl>()?;
-                    // If the button already has an icon+text StackPanel layout,
-                    // replace just the icon child (index 0) to preserve the text.
-                    if let Ok(existing) = cc.Content()
-                        && let Ok(panel) = existing.cast::<bindings::IPanel>()
-                    {
-                        let children = panel.Children()?;
-                        if children.Size()? >= 2 {
-                            children.SetAt(0, &icon_elem.cast::<bindings::UIElement>()?)?;
-                            return Ok(());
-                        }
+                    let mut row = take_row(&cc);
+                    row.icon =
+                        Some(bindings::SymbolIcon::CreateInstanceWithSymbol(Symbol(*v))?.cast()?);
+                    write_row(&cc, &row)
+                }
+                (Prop::Icon, PropValue::Unset, Handle::Button(b)) => {
+                    let cc = b.cast::<bindings::IContentControl>()?;
+                    let mut row = take_row(&cc);
+                    row.icon = None;
+                    write_row(&cc, &row)
+                }
+                (Prop::Badge, PropValue::Badge(bg), Handle::Button(b)) => {
+                    let badge = bindings::InfoBadge::new()?;
+                    // `-1` is WinUI's own "no count", which is the dot style —
+                    // the same distinction `Badge::count: None` carries.
+                    badge.SetValue(bg.count.unwrap_or(-1))?;
+                    if let Some(c) = bg.tint {
+                        badge
+                            .cast::<bindings::IControl>()?
+                            .SetBackground(&solid_brush(c)?)?;
                     }
-                    let use_icon_only = if let Ok(existing) = cc.Content() {
-                        // Already in icon-only mode (existing is a SymbolIcon).
-                        existing.cast::<bindings::ISymbolIcon>().is_ok()
-                            || existing
-                                .cast::<bindings::ITextBlock>()
-                                .ok()
-                                .and_then(|tb| tb.Text().ok())
-                                .is_some_and(|t| t.is_empty())
-                    } else {
-                        true
-                    };
-                    if use_icon_only {
-                        cc.SetContent(&icon_elem)
-                    } else {
-                        let panel = bindings::StackPanel::new()?;
-                        panel.SetOrientation(Orientation::Horizontal)?;
-                        panel.SetSpacing(8.0)?;
-                        let children = panel.cast::<bindings::IPanel>()?.Children()?;
-                        children.Append(&icon_elem.cast::<bindings::UIElement>()?)?;
-                        if let Ok(existing) = cc.Content()
-                            && let Ok(ui) = existing.cast::<bindings::UIElement>()
-                        {
-                            children.Append(&ui)?;
-                        }
-                        cc.SetContent(&panel)
-                    }
+                    let cc = b.cast::<bindings::IContentControl>()?;
+                    let mut row = take_row(&cc);
+                    row.badge = Some(badge.cast()?);
+                    row.badge_leading = bg.leading;
+                    write_row(&cc, &row)
+                }
+                (Prop::Badge, PropValue::Unset, Handle::Button(b)) => {
+                    let cc = b.cast::<bindings::IContentControl>()?;
+                    let mut row = take_row(&cc);
+                    row.badge = None;
+                    write_row(&cc, &row)
                 }
                 (Prop::StyleVariant, PropValue::I32(v), Handle::Button(b)) => {
                     let fe = b.cast::<bindings::IFrameworkElement>()?;
@@ -1340,6 +1363,26 @@ impl Backend for WinUIBackend {
                 (Prop::Step, PropValue::Unset, Handle::Slider(s)) => {
                     s.SetStepFrequency(1.0)?;
                     s.cast::<bindings::IRangeBase>()?.SetSmallChange(1.0)
+                }
+                (Prop::Step, PropValue::F64(v), Handle::NumberBox(nb)) => nb.SetSmallChange(*v),
+                (Prop::Step, PropValue::Unset, Handle::NumberBox(nb)) => nb.SetSmallChange(1.0),
+                (Prop::LargeChange, PropValue::F64(v), Handle::NumberBox(nb)) => {
+                    nb.SetLargeChange(*v)
+                }
+                (Prop::Precision, PropValue::I32(v), Handle::NumberBox(nb)) => {
+                    // A DecimalFormatter pinned to `v` fraction digits gives the
+                    // NumberBox a fixed display precision.
+                    let fmt = bindings::DecimalFormatter::new()?;
+                    let opts: bindings::INumberFormatterOptions = fmt.cast()?;
+                    opts.SetFractionDigits(*v)?;
+                    // Allow the integer part to render with no left-padding.
+                    opts.SetIntegerDigits(1)?;
+                    let fmt2: bindings::INumberFormatter2 = fmt.cast()?;
+                    nb.SetNumberFormatter(&fmt2)
+                }
+                (Prop::HorizontalContentAlignment, PropValue::I32(v), Handle::NumberBox(nb)) => {
+                    let ctl: bindings::IControl = nb.cast()?;
+                    ctl.SetHorizontalContentAlignment(HorizontalAlignment(*v))
                 }
                 (Prop::NavigateUri, PropValue::Str(s), Handle::HyperlinkButton(h)) => {
                     let uri = bindings::Uri::CreateUri(s.as_str())?;
@@ -1437,6 +1480,11 @@ impl Backend for WinUIBackend {
                 (Prop::ImageSource, PropValue::SurfaceImageSource(sis), Handle::Image(img)) => {
                     img.SetSource(&sis.image_source()?)
                 }
+                (
+                    Prop::ImageSource,
+                    PropValue::VirtualSurfaceImageSource(vsis),
+                    Handle::Image(img),
+                ) => img.SetSource(&vsis.image_source()?),
                 (Prop::ImageSource, PropValue::Unset, Handle::Image(img)) => img.SetSource(None),
                 (Prop::Header, PropValue::Str(s), Handle::TabViewItem(ti)) => {
                     let tb = string_as_textblock(s)?;
@@ -1520,7 +1568,9 @@ impl Backend for WinUIBackend {
                     &c.cast::<bindings::IItemsControl>()?.Items()?.cast()?,
                     items,
                 ),
-                (Prop::ColorValue, PropValue::Color(c), Handle::ColorPicker(cp)) => cp.SetColor(*c),
+                (Prop::ColorValue, PropValue::Color(c), Handle::ColorPicker(cp)) => {
+                    cp.SetColor(to_winrt(*c))
+                }
                 (Prop::Items, PropValue::StrList(items), Handle::ListBox(lb)) => set_str_items(
                     &lb.cast::<bindings::IItemsControl>()?.Items()?.cast()?,
                     items,
@@ -1737,6 +1787,30 @@ impl Backend for WinUIBackend {
                     let tb = string_as_textblock(s)?;
                     flyout.SetContent(&tb)?;
                     b.SetFlyout(&flyout)?;
+                    Ok(())
+                }
+                (Prop::FlyoutContent, PropValue::FlyoutDef(def), Handle::Button(b)) => {
+                    let flyout = bindings::Flyout::new()?;
+                    // Rich element-tree content takes precedence over plain text.
+                    if let Some(elem) = &def.rich {
+                        if let Some(ui) = mount_static_tooltip_element(elem) {
+                            flyout.SetContent(&ui)?;
+                        }
+                    } else {
+                        let tb = string_as_textblock(&def.text)?;
+                        flyout.SetContent(&tb)?;
+                    }
+                    if def.placement != FlyoutPlacementMode::default() {
+                        let _ = flyout
+                            .cast::<bindings::IFlyoutBase>()?
+                            .SetPlacement(def.placement);
+                    }
+                    b.SetFlyout(&flyout)?;
+                    // The button's native click opens the attached flyout, and
+                    // light-dismiss / Escape closes it. `def.open` / `def.on_closed`
+                    // are part of the API surface; programmatic show/hide and the
+                    // Closed callback require IFlyoutBase::ShowAt/Closed, which a
+                    // metadata regen will surface (see base.txt note).
                     Ok(())
                 }
                 (Prop::FlyoutPlacement, PropValue::I32(v), Handle::Button(b)) => {
@@ -2511,15 +2585,12 @@ impl Backend for WinUIBackend {
             (Event::ColorChanged, Handle::ColorPicker(cp)) => {
                 revokers.push(
                     cp.ColorChanged(move |_sender, args| {
+                        // `NewColor` is a WinRT `Windows.UI.Color` (8-bit sRGB); the
+                        // picker payload is raw ARGB bytes, so it stays in that ABI type.
                         let color =
                             args.as_ref()
                                 .and_then(|a| a.NewColor().ok())
-                                .unwrap_or(Color {
-                                    a: 255,
-                                    r: 0,
-                                    g: 0,
-                                    b: 0,
-                                });
+                                .unwrap_or(bindings::Color { a: 255, r: 0, g: 0, b: 0 });
                         handler.invoke_color((color.a, color.r, color.g, color.b));
                     })
                     .unwrap(),
@@ -3073,6 +3144,16 @@ impl Backend for WinUIBackend {
                 .ok();
         }
 
+        if let Some(cb) = handlers.on_pointer_wheel.clone() {
+            let element = ui.clone();
+            tokens.wheel = ui
+                .PointerWheelChanged(move |_sender, args| {
+                    let info = pointer_event_info(&element, args);
+                    cb.invoke(info);
+                })
+                .ok();
+        }
+
         self.pointer_revokers.borrow_mut().insert(id, tokens);
     }
 
@@ -3499,6 +3580,7 @@ fn pointer_event_info(
     info.is_left_button_pressed = props.IsLeftButtonPressed().unwrap_or(false);
     info.is_right_button_pressed = props.IsRightButtonPressed().unwrap_or(false);
     info.is_middle_button_pressed = props.IsMiddleButtonPressed().unwrap_or(false);
+    info.wheel_delta = props.MouseWheelDelta().unwrap_or(0);
     info
 }
 
@@ -3551,6 +3633,11 @@ fn mount_static_tooltip_element(el: &Element) -> Option<bindings::UIElement> {
                 ImageSource::Surface(sis) => {
                     if let Ok(src) = sis.image_source() {
                         diag::dropped(i.SetSource(&src));
+                    }
+                }
+                ImageSource::Virtual(vsis) => {
+                    if let Ok(src) = vsis.image_source() {
+                        let _ = i.SetSource(&src);
                     }
                 }
                 ImageSource::None => {}
