@@ -89,10 +89,9 @@ impl CustomElement for BadgeText {
     fn clone_dyn(&self) -> Box<dyn CustomElement> {
         Box::new(self.clone())
     }
-    fn mount(&self, backend: &mut dyn Backend) -> ControlId {
-        let id = backend.create(ControlKind::TextBlock);
+    fn mount(&self, id: ControlId, backend: &mut dyn Backend) {
+        backend.create(id, ControlKind::TextBlock);
         backend.set_prop(id, Prop::Text, &PropValue::Str(self.rendered()));
-        id
     }
     fn update(&self, prev: &dyn CustomElement, id: ControlId, backend: &mut dyn Backend) {
         let prev = prev
@@ -125,8 +124,8 @@ impl CustomElement for AltCustom {
     fn clone_dyn(&self) -> Box<dyn CustomElement> {
         Box::new(self.clone())
     }
-    fn mount(&self, backend: &mut dyn Backend) -> ControlId {
-        backend.create(ControlKind::Border)
+    fn mount(&self, id: ControlId, backend: &mut dyn Backend) {
+        backend.create(id, ControlKind::Border);
     }
     fn update(&self, _prev: &dyn CustomElement, _id: ControlId, _backend: &mut dyn Backend) {}
 }
@@ -163,10 +162,9 @@ impl CustomElement for KeyedBadge {
     fn clone_dyn(&self) -> Box<dyn CustomElement> {
         Box::new(self.clone())
     }
-    fn mount(&self, backend: &mut dyn Backend) -> ControlId {
-        let id = backend.create(ControlKind::TextBlock);
+    fn mount(&self, id: ControlId, backend: &mut dyn Backend) {
+        backend.create(id, ControlKind::TextBlock);
         backend.set_prop(id, Prop::Text, &PropValue::Str(self.rendered()));
-        id
     }
     fn update(&self, prev: &dyn CustomElement, id: ControlId, backend: &mut dyn Backend) {
         let prev = prev.as_any().downcast_ref::<Self>().unwrap();

@@ -16,7 +16,7 @@ use std::rc::Rc;
 use test_reactor::{Op, RecordingBackend};
 use windows_reactor::{
     Border, Callback, ControlId, Element, ElementExt, IntoCallback, PointerEventInfo,
-    PointerHandlers, Reconciler,
+    PointerHandlers, Reconciler, WheelAxis,
 };
 
 fn noop_rr() -> Rc<dyn Fn()> {
@@ -159,6 +159,8 @@ fn recorded_handler_invokes_with_pointer_info() {
         is_left_button_pressed: true,
         is_right_button_pressed: false,
         is_middle_button_pressed: false,
+        wheel_delta: 0,
+        wheel_axis: WheelAxis::Vertical,
     };
     bundle.on_pointer_moved.unwrap().invoke(info);
 
