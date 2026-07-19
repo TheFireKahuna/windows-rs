@@ -186,8 +186,23 @@ fn focus_radius(kind: ControlKind) -> f32 {
 
 // ── Button family ────────────────────────────────────────────────────────────
 
-fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let radius = node.paint.corner_radius.max(theme::RADIUS_MD);
+/// Everything about a button-family node's appearance that is a pure function
+/// of its state.
+///
+/// One definition, two consumers that must not disagree: `parts::button_sync`
+/// builds the retained fill / border sprites from it, and [`paint_button`]
+/// draws the label with it. Splitting the chrome across a compositor part and a
+/// painted surface only works while both read the same answer.
+pub(crate) struct ButtonPalette {
+    pub fill: Color,
+    /// `None` when the variant draws no outline.
+    pub border: Option<Color>,
+    pub fg: Color,
+    pub weight: u16,
+    pub radius: f32,
+}
+
+pub(crate) fn button_palette(node: &Node) -> ButtonPalette {
     let accent = node.paint.style_variant == 1;
     // Subtle (2) and TextLink (3) are chromeless by definition — no resting fill
     // and no border, only a hover/press wash. This is what `pressable` wraps a
@@ -195,11 +210,9 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     // child frames itself; a stray Button outline would double-box it.
     let chromeless = matches!(node.paint.style_variant, 2 | 3);
     let checked = node.ctrl().is_checked && node.kind == ControlKind::ToggleButton;
+    let lit = accent || checked;
 
-    // Base fill.
-    let base = if accent {
-        theme::accent_fill()
-    } else if checked {
+    let fill = if lit {
         theme::accent_fill()
     } else if chromeless || matches!(node.kind, ControlKind::Button | ControlKind::RepeatButton) {
         // Chromeless / bare button: transparent at rest, wash appears via ink.
@@ -207,28 +220,42 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     } else {
         theme::surface_raised()
     };
-    fill_rr(session, brush, rect, radius, base, dim);
 
-    // The hover/press white wash is a retained ink part above this surface
-    // (`super::parts::ink_state_changed` fades it compositor-side).
-    if !accent && !checked && !chromeless {
-        stroke_rr(session, brush, rect, radius, theme::stroke(), theme::BORDER_W, dim);
-    }
-
-    // Label (centered). A TextLink reads as an inline accent hyperlink.
-    let fg = node.paint.foreground.unwrap_or(
-        if accent || checked || node.paint.style_variant == 3 {
+    ButtonPalette {
+        fill,
+        border: (!lit && !chromeless).then(theme::stroke),
+        // A TextLink reads as an inline accent hyperlink.
+        fg: node.paint.foreground.unwrap_or(if lit || node.paint.style_variant == 3 {
             theme::accent()
         } else {
             theme::text()
-        },
-    );
+        }),
+        weight: if accent { 600 } else { 400 },
+        radius: node.paint.corner_radius.max(theme::RADIUS_MD),
+    }
+}
+
+/// The label and leading glyph only.
+///
+/// The fill, the border and the hover/press wash are all retained compositor
+/// sprites below and above this surface (`parts::button_sync`), so a state flip
+/// that changes nothing but those never reaches a `BeginDraw`.
+fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
+    let pal = button_palette(node);
+
     // A leading icon glyph, when the app set one. It takes the leading inset
     // and the label centres in what is left, so an icon-only button (no label)
     // still reads as centred chrome.
+    //
+    // `0` is the "no icon" convention (`Ctrl::icons`), and it must be tested
+    // here rather than left to `glyph_into`: `char::from_u32(0)` is `Some('\0')`,
+    // so every un-iconed button would otherwise lay out and draw a NUL.
     let mut label_box = rect;
     let mut gbuf = [0u8; 4];
-    if let Some(g) = glyph_into(node.extras().icon, &mut gbuf) {
+    let icon = node.extras().icon;
+    if icon != 0
+        && let Some(g) = glyph_into(icon, &mut gbuf)
+    {
         let ix = rect.left + theme::SPACE_12;
         text(
             session,
@@ -238,7 +265,7 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
             theme::FONT_ICON,
             ICON_SIZE,
             400,
-            fg,
+            pal.fg,
             TextAlignment::Center,
             ParagraphAlignment::Center,
             dim,
@@ -254,8 +281,8 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
         label_box,
         "Segoe UI",
         node.paint.font_size.max(theme::FONT_SIZE_MD),
-        if accent { 600 } else { 400 },
-        fg,
+        pal.weight,
+        pal.fg,
         TextAlignment::Center,
         ParagraphAlignment::Center,
         dim,

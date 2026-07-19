@@ -57,7 +57,8 @@ use crate::system_bindings::{
     SpringVector3NaturalMotionAnimation, SpriteVisual, TimeSpan, Visual,
 };
 use windows_canvas_core::{
-    Brush, ColorF, DrawingSession, Ellipse, GradientStop, Rect, RoundedRect, Vector2 as CVec2,
+    Brush, ColorF, DrawingSession, Ellipse, FontWeight, GradientStop, Rect, RoundedRect,
+    TextFormat, TextLayout, Vector2 as CVec2,
 };
 use windows_core::Interface;
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
@@ -533,6 +534,68 @@ pub(crate) fn build_solid_surface(
     scale: f32,
 ) -> Option<CompositionSurfaceBrush> {
     rasterize(comp, &AtlasKey::solid(color, scale)).map(|e| e.brush)
+}
+
+/// A standalone FP16 **alpha mask** of one text run — the glyphs in opaque
+/// white on transparent — plus its measured DIP size. For a caller that tints
+/// it through a `CompositionMaskBrush` (see `shape::TextPart`).
+///
+/// Colour is deliberately NOT an input. The atlas bakes colour into its sources
+/// and keys on it, which is right for a handful of quantized shapes and wrong
+/// for a label: text would fork a fresh raster per colour × weight × disabled
+/// state. Masking instead gives one raster per (string, family, size, weight,
+/// scale), recoloured by swapping the mask brush's SOURCE — no re-shaping, no
+/// re-raster, and no repaint of anything.
+///
+/// Not atlas-cached, deliberately: the string is app-authored and so unbounded,
+/// where [`ATLAS_CAP`] is sized on the assumption that ~16 converted control
+/// kinds bind 1–4 quantized sources each. The caller owns the brush and
+/// rebuilds it when the text, font or scale actually changes.
+pub(crate) fn build_text_mask(
+    comp: &Compositing,
+    text: &str,
+    family: &str,
+    size: f32,
+    weight: u16,
+    scale: f32,
+) -> Option<(CompositionSurfaceBrush, f32, f32)> {
+    if text.is_empty() {
+        return None;
+    }
+    let fmt = TextFormat::with_weight(family, size, FontWeight(weight as i32)).ok()?;
+    let layout = TextLayout::new(text, &fmt, 100_000.0, 100_000.0).ok()?;
+    let _ = layout.set_word_wrap(false);
+    let (dip_w, dip_h) = layout.measure().ok()?;
+    // Round up: a run clipped by a fractional pixel loses the last stem.
+    let px_w = (((dip_w * scale).ceil()) as i32).max(1);
+    let px_h = (((dip_h * scale).ceil()) as i32).max(1);
+
+    let (surface, interop, brush) = comp.new_source_surface(px_w, px_h).ok()?;
+    let mut origin = crate::system_bindings::POINT::default();
+    comp.device_lost.set(false);
+    let ctx = unsafe { interop.BeginDraw(None, &mut origin).ok()? };
+    let session = DrawingSession::new_borrowed(&ctx, &comp.device_lost);
+    // Mandatory here for the same reason it is on a node surface: the source is
+    // premultiplied and cleared transparent, and ClearType's subpixel coverages
+    // assume an opaque backdrop it can sample. Without this the mask carries
+    // colour fringes that the tint then multiplies into the chrome.
+    session.set_grayscale_text_antialiasing();
+    session.set_transform(&Matrix3x2 {
+        m11: scale,
+        m12: 0.0,
+        m21: 0.0,
+        m22: scale,
+        m31: origin.x as f32,
+        m32: origin.y as f32,
+    });
+    session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
+    // Opaque white: the mask brush reads only alpha, so the glyph coverage IS
+    // the mask. Drawn through `linear` like every other source so a host output
+    // transform cannot make the mask disagree with the chrome it cuts.
+    let white = session.create_solid_brush(linear(crate::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 })).ok()?;
+    session.draw_text_layout(CVec2::new(0.0, 0.0), &layout, &white);
+    unsafe { interop.EndDraw() }.ok().ok()?;
+    Some((brush, dip_w, dip_h))
 }
 
 fn draw_shape(session: &DrawingSession, brush: &Brush, shape: &ShapeKey, w: f32, h: f32) {
@@ -1133,9 +1196,13 @@ pub(crate) fn sync(
         ControlKind::Button
         | ControlKind::ToggleButton
         | ControlKind::RepeatButton
-        | ControlKind::SplitButton
-        | ControlKind::ComboBox
-        | ControlKind::DropDownButton => ink_sync(comp, atlas, node, scale),
+        | ControlKind::SplitButton => button_sync(comp, atlas, node, scale),
+        // The select triggers paint their own fill + border (`paint_select`),
+        // so they take the ink wash alone — a second, retained fill under a
+        // painted one would double the chrome.
+        ControlKind::ComboBox | ControlKind::DropDownButton => {
+            ink_sync(comp, atlas, node, scale)
+        }
         // HyperlinkButton: painted only (hover recolor is an event repaint).
         _ => {}
     }
@@ -1149,6 +1216,61 @@ fn ink_radius(node: &Node) -> f32 {
         ControlKind::ComboBox | ControlKind::DropDownButton => theme::RADIUS_SM,
         _ => node.paint.corner_radius.max(theme::RADIUS_MD),
     }
+}
+
+/// The button family's full retained chrome: fill and border BELOW the painted
+/// surface, the hover/press wash above it.
+///
+/// Lifting the fill and border out of the surface is what makes a state flip
+/// free: an enable/disable is a part opacity, a variant or checked change is a
+/// re-bind to a different atlas source, and neither reaches a `BeginDraw`. The
+/// label still paints (it is the only thing left on the surface), so a text
+/// change is the one edit that costs a repaint.
+///
+/// Both chrome parts sit below the surface deliberately: the label draws over
+/// them, and the ink wash above draws over all three — the same stacking the
+/// fully-painted version produced.
+fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+    if !ensure(comp, node, 2, 1) {
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let radius = ink_radius(node);
+    let pal = super::controls::button_palette(node);
+    let dim = dim_of(node);
+    // A fully transparent fill (the bare / chromeless variants at rest) binds
+    // nothing: an atlas source that paints no pixels is a wasted raster and a
+    // wasted cache slot.
+    let fill_key = (pal.fill.a > 0.0).then(|| AtlasKey::hbar(h, radius, 0.0, pal.fill, scale));
+    let border_key = pal
+        .border
+        .map(|c| AtlasKey::hbar(h, radius, theme::BORDER_W, c, scale));
+    let ink_key = AtlasKey::hbar(h, radius, 0.0, theme::w(1.0), scale);
+    let target = ink_target(node);
+    let Some(parts) = node.parts.as_mut() else { return };
+
+    for (slot, key) in [fill_key, border_key].into_iter().enumerate() {
+        match key {
+            Some(k) => {
+                parts.below[slot].bind(comp, atlas, k);
+                parts.below[slot].place(0.0, 0.0, w, h);
+                parts.below[slot].set_opacity(dim);
+            }
+            // Kept allocated and hidden rather than freed: the variant can flip
+            // back, and `Parts` has no per-part free.
+            None => parts.below[slot].set_opacity(0.0),
+        }
+    }
+
+    parts.above[0].bind(comp, atlas, ink_key);
+    parts.above[0].place(0.0, 0.0, w, h);
+    if parts.init {
+        parts.above[0].fade_to(target);
+    } else {
+        parts.above[0].set_opacity(target);
+        parts.init = true;
+    }
+    parts.geom = (w, h);
 }
 
 fn ink_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {

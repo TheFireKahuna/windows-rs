@@ -91,20 +91,25 @@ Windows::UI::Composition::ICompositionDrawingSurface2::Resize
 Windows::UI::Composition::IInsetClip::{put_LeftInset, put_TopInset, put_RightInset, put_BottomInset}
 Windows::UI::Composition::ICompositionClip2::{put_RotationAngle, put_CenterPoint}
 // ── Vector shapes (Knob value arc: a stroked path grown by an animated TrimEnd;
-//    stroked with the FP16 gradient SURFACE brush so the arc stays HDR-mapped) ──
+//    retained control chrome: rounded-rect / ellipse primitives. Shapes are
+//    always the MASK — the FP16 surface is the source, see the mask brush) ──
 Windows::UI::Composition::ShapeVisual
 Windows::UI::Composition::IShapeVisual::get_Shapes
 Windows::UI::Composition::CompositionShapeCollection
 Windows::UI::Composition::CompositionShape
 Windows::UI::Composition::CompositionSpriteShape
-Windows::UI::Composition::ICompositionSpriteShape::{put_Geometry, put_StrokeBrush, put_StrokeThickness, put_StrokeStartCap, put_StrokeEndCap}
+Windows::UI::Composition::ICompositionSpriteShape::{put_Geometry, put_FillBrush, put_StrokeBrush, put_StrokeThickness, put_StrokeStartCap, put_StrokeEndCap}
 Windows::UI::Composition::CompositionStrokeCap
 Windows::UI::Composition::CompositionGeometry
 Windows::UI::Composition::ICompositionGeometry::{put_TrimStart, put_TrimEnd}
 Windows::UI::Composition::CompositionPathGeometry
 Windows::UI::Composition::CompositionPath
 Windows::UI::Composition::ICompositionPathFactory::Create
-Windows::UI::Composition::ICompositor5::{CreateShapeVisual, CreateSpriteShapeWithGeometry, CreatePathGeometryWithPath}
+Windows::UI::Composition::CompositionRoundedRectangleGeometry
+Windows::UI::Composition::ICompositionRoundedRectangleGeometry::{put_CornerRadius, put_Offset, put_Size}
+Windows::UI::Composition::CompositionEllipseGeometry
+Windows::UI::Composition::ICompositionEllipseGeometry::{put_Center, put_Radius}
+Windows::UI::Composition::ICompositor5::{CreateShapeVisual, CreateSpriteShape, CreateSpriteShapeWithGeometry, CreatePathGeometryWithPath, CreateRoundedRectangleGeometry, CreateEllipseGeometry}
 // Mask brush for the knob value arc: the FP16 display-mapped gradient SURFACE
 // brush (HDR-correct — surface brushes don't paint as a shape STROKE, but they
 // do as a mask SOURCE) revealed by the TrimEnd arc shape (white stroke) captured

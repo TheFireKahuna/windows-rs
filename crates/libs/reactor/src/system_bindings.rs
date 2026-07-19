@@ -457,6 +457,38 @@ unsafe impl Send for CompositionEasingFunction {}
 unsafe impl Sync for CompositionEasingFunction {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionEllipseGeometry(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionEllipseGeometry,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    CompositionEllipseGeometry,
+    CompositionGeometry,
+    CompositionObject
+);
+impl windows_core::RuntimeType for CompositionEllipseGeometry {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionEllipseGeometry>();
+}
+unsafe impl windows_core::Interface for CompositionEllipseGeometry {
+    type Vtable = <ICompositionEllipseGeometry as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionEllipseGeometry as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionEllipseGeometry {
+    type Target = ICompositionEllipseGeometry;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionEllipseGeometry {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionEllipseGeometry";
+}
+unsafe impl Send for CompositionEllipseGeometry {}
+unsafe impl Sync for CompositionEllipseGeometry {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionGeometricClip(windows_core::IUnknown);
 windows_core::imp::interface_hierarchy!(
     CompositionGeometricClip,
@@ -782,6 +814,39 @@ impl windows_core::RuntimeName for CompositionPathGeometry {
 }
 unsafe impl Send for CompositionPathGeometry {}
 unsafe impl Sync for CompositionPathGeometry {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionRoundedRectangleGeometry(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionRoundedRectangleGeometry,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    CompositionRoundedRectangleGeometry,
+    CompositionGeometry,
+    CompositionObject
+);
+impl windows_core::RuntimeType for CompositionRoundedRectangleGeometry {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionRoundedRectangleGeometry>();
+}
+unsafe impl windows_core::Interface for CompositionRoundedRectangleGeometry {
+    type Vtable = <ICompositionRoundedRectangleGeometry as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICompositionRoundedRectangleGeometry as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionRoundedRectangleGeometry {
+    type Target = ICompositionRoundedRectangleGeometry;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionRoundedRectangleGeometry {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionRoundedRectangleGeometry";
+}
+unsafe impl Send for CompositionRoundedRectangleGeometry {}
+unsafe impl Sync for CompositionRoundedRectangleGeometry {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionScopedBatch(windows_core::IUnknown);
@@ -1980,6 +2045,49 @@ pub struct ICompositionEasingFunction_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
+    ICompositionEllipseGeometry,
+    ICompositionEllipseGeometry_Vtbl,
+    0x4801f884_f6ad_4b93_afa9_897b64e57b1f
+);
+impl windows_core::RuntimeType for ICompositionEllipseGeometry {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionEllipseGeometry {
+    pub(crate) fn SetCenter(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetCenter)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetRadius(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetRadius)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionEllipseGeometry_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    Center: usize,
+    pub SetCenter: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    Radius: usize,
+    pub SetRadius: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     ICompositionGeometricClip,
     ICompositionGeometricClip_Vtbl,
     0xc840b581_81c9_4444_a2c1_ccaece3a50e5
@@ -2480,6 +2588,66 @@ pub struct ICompositionPathGeometry_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
+    ICompositionRoundedRectangleGeometry,
+    ICompositionRoundedRectangleGeometry_Vtbl,
+    0x8770c822_1d50_4b8b_b013_7c9a0e46935f
+);
+impl windows_core::RuntimeType for ICompositionRoundedRectangleGeometry {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionRoundedRectangleGeometry {
+    pub(crate) fn SetCornerRadius(
+        &self,
+        value: windows_numerics::Vector2,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetCornerRadius)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetOffset(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetOffset)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetSize(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetSize)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionRoundedRectangleGeometry_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    CornerRadius: usize,
+    pub SetCornerRadius: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    Offset: usize,
+    pub SetOffset: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    Size: usize,
+    pub SetSize: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     ICompositionScopedBatch,
     ICompositionScopedBatch_Vtbl,
     0x0d00dad0_fb07_46fd_8c72_6280d1a3d1dd
@@ -2576,6 +2744,18 @@ impl windows_core::RuntimeType for ICompositionSpriteShape {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl ICompositionSpriteShape {
+    pub(crate) fn SetFillBrush<P0>(&self, value: P0) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<CompositionBrush>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetFillBrush)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetGeometry<P0>(&self, value: P0) -> windows_core::Result<()>
     where
         P0: windows_core::Param<CompositionGeometry>,
@@ -2635,7 +2815,10 @@ impl ICompositionSpriteShape {
 pub struct ICompositionSpriteShape_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
     FillBrush: usize,
-    SetFillBrush: usize,
+    pub SetFillBrush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     Geometry: usize,
     pub SetGeometry: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -3328,6 +3511,16 @@ impl windows_core::RuntimeType for ICompositor5 {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl ICompositor5 {
+    pub(crate) fn CreateEllipseGeometry(&self) -> windows_core::Result<CompositionEllipseGeometry> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateEllipseGeometry)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) fn CreatePathGeometryWithPath<P0>(
         &self,
         path: P0,
@@ -3345,10 +3538,32 @@ impl ICompositor5 {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn CreateRoundedRectangleGeometry(
+        &self,
+    ) -> windows_core::Result<CompositionRoundedRectangleGeometry> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateRoundedRectangleGeometry)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) fn CreateShapeVisual(&self) -> windows_core::Result<ShapeVisual> {
         unsafe {
             let mut result__ = core::mem::zeroed();
             (windows_core::Interface::vtable(self).CreateShapeVisual)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn CreateSpriteShape(&self) -> windows_core::Result<CompositionSpriteShape> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateSpriteShape)(
                 windows_core::Interface::as_raw(self),
                 &mut result__,
             )
@@ -3384,7 +3599,10 @@ pub struct ICompositor5_Vtbl {
     CreateBounceVector2Animation: usize,
     CreateBounceVector3Animation: usize,
     CreateContainerShape: usize,
-    CreateEllipseGeometry: usize,
+    pub CreateEllipseGeometry: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CreateLineGeometry: usize,
     CreatePathGeometry: usize,
     pub CreatePathGeometryWithPath: unsafe extern "system" fn(
@@ -3394,12 +3612,18 @@ pub struct ICompositor5_Vtbl {
     ) -> windows_core::HRESULT,
     CreatePathKeyFrameAnimation: usize,
     CreateRectangleGeometry: usize,
-    CreateRoundedRectangleGeometry: usize,
+    pub CreateRoundedRectangleGeometry: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub CreateShapeVisual: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    CreateSpriteShape: usize,
+    pub CreateSpriteShape: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub CreateSpriteShapeWithGeometry: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,

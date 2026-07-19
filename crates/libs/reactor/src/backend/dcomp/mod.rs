@@ -45,6 +45,7 @@ mod pointer;
 mod popup;
 pub(crate) mod record;
 mod scroll;
+mod shape;
 mod size;
 mod surface;
 pub(crate) mod theme;
