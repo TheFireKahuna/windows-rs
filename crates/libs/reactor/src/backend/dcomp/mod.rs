@@ -23,6 +23,7 @@
 use crate::backend::ControlId;
 
 mod animate;
+mod backdrop;
 mod bootstrap;
 mod caption;
 mod color_out;
@@ -56,6 +57,9 @@ pub(crate) mod tsf;
 mod uia;
 pub(crate) mod visibility;
 
+pub use backdrop::{
+    set_root_backdrop_provider, BackdropDither, BackdropGlow, BackdropSpec, GlowDrift,
+};
 pub use color_out::set_output_color_transform;
 pub use host::DCompHost;
 pub use display_change::set_display_change_callback;
@@ -552,6 +556,11 @@ impl DCompBackend {
         // The output colour map may have changed (display / theme edge): the
         // atlas sources carry baked mapped colours, so re-rasterize them too.
         self.atlas.clear();
+        // The backdrop's layers bake display-fitted colours into their surfaces
+        // for the same reason, and it is not a node, so the arena sweep below
+        // does not reach it. Re-querying the provider here picks up the app's
+        // new fit — this runs after the app's display callback / scheme flip.
+        self.comp.build_backdrop();
         for slot in self.arena.iter_mut() {
             slot.mark_dirty();
         }

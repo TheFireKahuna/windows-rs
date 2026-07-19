@@ -14,13 +14,15 @@
 
 use std::cell::Cell;
 
+use super::backdrop::{self, Backdrop};
 use crate::system_bindings::{
     Color, CompositionColorBrush, CompositionDrawingSurface, CompositionGraphicsDevice,
     CompositionStretch, CompositionSurfaceBrush, Compositor, ContainerVisual, DesktopWindowTarget,
     DirectXAlphaMode, DirectXPixelFormat, ICompositionDrawingSurface2,
     ICompositionDrawingSurfaceInterop, ICompositionSurface, ICompositionTarget,
     ICompositorDesktopInterop, ICompositorInterop, IVisual, InsetClip, Size, SizeInt32,
-    SpriteVisual, Visual, HWND,
+    SpriteVisual, Visual, GetMonitorInfoW, MonitorFromWindow, HWND, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows_canvas_core::GpuDevice;
 use windows_core::Interface;
@@ -59,6 +61,16 @@ pub(crate) struct Compositing {
     /// Opaque window background, kept at the bottom of the root (in DIPs).
     bg: SpriteVisual,
     bg_brush: CompositionColorBrush,
+    /// The band the backdrop's layers live in — above `bg`, below the reactor
+    /// tree, rooted once so a rebuild cannot disturb z-order.
+    backdrop_host: ContainerVisual,
+    /// Kept for [`Self::monitor_px`] — screen-fixed backdrop layers size to the
+    /// monitor the window is on.
+    hwnd: HWND,
+    /// The app's backdrop layer stack. Built here (before the window is shown)
+    /// rather than as a reactor element, so it is present on the very first
+    /// composited frame.
+    backdrop: Option<Backdrop>,
     _target: DesktopWindowTarget,
     dip_size: (f32, f32),
     scale: f32,
@@ -97,7 +109,16 @@ impl Compositing {
             .SetSize(Vector2::new(dip_size.0, dip_size.1))?;
         root.Children()?.InsertAtTop(&bg.cast::<Visual>()?)?;
 
-        Ok(Self {
+        // The backdrop's own band, rooted ONCE directly above the window
+        // background. Rebuilding the backdrop (a display change re-fits its
+        // colours) only ever repopulates this container, so it can never land
+        // above the reactor tree the way a fresh `InsertAtTop` on the root
+        // would once content is attached.
+        let backdrop_host = compositor.CreateContainerVisual()?;
+        root.Children()?
+            .InsertAtTop(&backdrop_host.cast::<Visual>()?)?;
+
+        let mut this = Self {
             gpu,
             device_lost: Cell::new(false),
             compositor,
@@ -105,10 +126,82 @@ impl Compositing {
             root,
             bg,
             bg_brush,
+            backdrop_host,
+            hwnd,
+            backdrop: None,
             _target: target,
             dip_size,
             scale,
-        })
+        };
+        // Every layer is painted and rooted before this returns, and the caller
+        // runs before `ShowWindow` — so there is no frame in which the window is
+        // mapped without its backdrop.
+        this.build_backdrop();
+        Ok(this)
+    }
+
+    /// (Re)build the app's backdrop from the registered provider, replacing any
+    /// existing one. Called at startup and whenever the display's colour
+    /// capability may have changed — the provider re-queries the app's colour
+    /// fit, so the backdrop can never be left holding a stale mapping.
+    pub fn build_backdrop(&mut self) {
+        let Some(spec) = backdrop::spec() else {
+            if let Some(old) = self.backdrop.take() {
+                old.remove(self);
+            }
+            return;
+        };
+        // Build the replacement BEFORE detaching the incumbent, and only then
+        // swap. Tearing down first leaves a frame with no backdrop at all — not
+        // a theoretical race: painting the new layers runs `BeginDraw`/`EndDraw`,
+        // which flushes the compositor batch, so the empty state is guaranteed to
+        // be composited. The new layers are opaque and land on top of the old, so
+        // the incumbent is covered the instant they exist.
+        let Some(built) = Backdrop::build(self, &spec, self.dip_size, self.scale, self.monitor_px())
+        else {
+            // Keep whatever is already up: a backdrop fitted for the previous
+            // display beats no backdrop.
+            return;
+        };
+        if let Some(old) = self.backdrop.take() {
+            old.remove(self);
+        }
+        self.backdrop = Some(built);
+    }
+
+    /// The pixel size of the monitor this window is on. Screen-fixed backdrop
+    /// layers are allocated at this size so no window resize — up to and
+    /// including a maximize — can outgrow them and force a repaint.
+    fn monitor_px(&self) -> (i32, i32) {
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        if mon.is_null() || !unsafe { GetMonitorInfoW(mon, &mut info) }.as_bool() {
+            // No monitor answer: fall back to the window itself. A later display
+            // change rebuilds the backdrop and gets another chance at this.
+            return (
+                ((self.dip_size.0 * self.scale).round() as i32).max(1),
+                ((self.dip_size.1 * self.scale).round() as i32).max(1),
+            );
+        }
+        let r = info.rcMonitor;
+        ((r.right - r.left).max(1), (r.bottom - r.top).max(1))
+    }
+
+    /// Insert one backdrop layer at the top of the backdrop band. Layers are
+    /// added bottom-up, so call order is z-order.
+    pub(crate) fn attach_backdrop_visual(&self, v: &Visual) -> windows_core::Result<()> {
+        self.backdrop_host.Children()?.InsertAtTop(v)?;
+        Ok(())
+    }
+
+    /// Remove one backdrop layer.
+    pub(crate) fn remove_backdrop_visual(&self, v: &Visual) {
+        if let Ok(children) = self.backdrop_host.Children() {
+            let _ = children.Remove(v);
+        }
     }
 
     pub fn dip_size(&self) -> (f32, f32) {
@@ -137,6 +230,11 @@ impl Compositing {
         }
         if let Ok(v) = self.bg.cast::<IVisual>() {
             let _ = v.SetSize(Vector2::new(self.dip_size.0, self.dip_size.1));
+        }
+        // Cheap by construction: a few visual property writes, no repaint and no
+        // animation restart — see `Backdrop::place`.
+        if let Some(b) = &self.backdrop {
+            b.place(self.dip_size, self.scale);
         }
     }
 
@@ -412,6 +510,11 @@ impl NodeSurface {
 /// The opaque window background (dark), composited beneath the reactor tree. This is
 /// a raw WinRT `Windows.UI.Color` (8-bit sRGB) handed to the compositor's color
 /// brush, not a reactor theming `Color`, so it stays a plain ARGB literal.
+///
+/// It is deliberately NOT tuned to match whatever backdrop sits above it. 8-bit
+/// cannot represent a display-fitted base anyway (an HDR fit exceeds 1.0), and a
+/// near-match would only disguise a backdrop that failed to cover the window —
+/// which is a bug worth seeing, not hiding.
 const WINDOW_BG: Color = Color {
     a: 255,
     r: 14,
