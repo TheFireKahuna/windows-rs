@@ -83,7 +83,7 @@ where
 {
     // A host frame pump (DComp) being installed is the runtime signal that we are
     // not under XAML; pace via the backend frame tick in that case.
-    if FRAME_PUMP_WAKE.with(|w| w.borrow().is_some()) {
+    if frame_pump_wake().is_some() {
         return Ok(Rendering {
             _xaml: None,
             _tick: Some(on_frame_tick(f)),
@@ -118,9 +118,20 @@ use std::rc::Rc;
 thread_local! {
     static FRAME_TICKS: RefCell<Vec<(u64, Rc<dyn Fn()>)>> = const { RefCell::new(Vec::new()) };
     static FRAME_TICK_NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-    // Installed by a host that owns a frame pump (e.g. the DComp timer); called
-    // when a subscriber is added so the pump can start ticking.
-    static FRAME_PUMP_WAKE: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Installed by a host that owns a frame pump (the DComp pacer); called when a
+/// subscriber is added so the pump can start ticking. Process-global, not
+/// thread-local, for two reasons that both come due under the render-thread
+/// split: [`on_frame_tick`] runs where app code runs, which will not be the
+/// pump's thread, and [`on_rendering`] uses this slot's presence to detect
+/// "not under XAML" — a per-thread slot would send app-thread subscribers down
+/// the XAML path of a window that has none.
+static FRAME_PUMP_WAKE: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+fn frame_pump_wake() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+    FRAME_PUMP_WAKE.lock().ok().and_then(|w| w.clone())
 }
 
 /// RAII handle for a backend frame-tick subscription; unsubscribes on drop.
@@ -152,7 +163,7 @@ where
     });
     FRAME_TICKS.with(|t| t.borrow_mut().push((id, Rc::new(f))));
     // Kick the host pump so the new subscriber starts receiving ticks.
-    if let Some(wake) = FRAME_PUMP_WAKE.with(|w| w.borrow().clone()) {
+    if let Some(wake) = frame_pump_wake() {
         wake();
     }
     FrameTick { id }
@@ -175,7 +186,12 @@ pub fn drive_frame_ticks() {
 
 /// Install (or clear) the host frame-pump wake hook. A host that owns a frame
 /// pump installs this so [`on_frame_tick`] can start the pump when a subscriber
-/// appears while the pump is idle. Returns nothing; pass `None` to clear.
-pub fn set_frame_pump_wake(wake: Option<Rc<dyn Fn()>>) {
-    FRAME_PUMP_WAKE.with(|w| *w.borrow_mut() = wake);
+/// appears while the pump is idle. The hook may fire on whatever thread the
+/// subscriber registers from — `Send + Sync` is the contract, and the wake
+/// must carry itself to the pump (a kernel event, a posted message), never
+/// touch the host's thread state directly. Pass `None` to clear.
+pub fn set_frame_pump_wake(wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>) {
+    if let Ok(mut slot) = FRAME_PUMP_WAKE.lock() {
+        *slot = wake;
+    }
 }

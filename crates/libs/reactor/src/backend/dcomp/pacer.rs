@@ -17,7 +17,6 @@
 //! changes (park, hide, quit) signal it, so the worker reacts within the wait
 //! instead of one frame later.
 
-use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -82,6 +81,12 @@ struct Shared {
     /// instead of "noticed at the next vsync"). `0` if creation failed — the
     /// worker then just reacts at the next clock tick.
     wake_evt: isize,
+    /// Whether the worker thread exists yet — spawned lazily on the first
+    /// wake, so a window that never animates a canvas never pays for the
+    /// thread. Atomic because a wake may arrive from any thread (the
+    /// frame-pump hook fires wherever a subscriber registers): the swap
+    /// elects exactly one spawner.
+    spawned: AtomicBool,
 }
 
 impl Drop for Shared {
@@ -105,15 +110,51 @@ impl Shared {
             }
         }
     }
+
+    /// Start vsync ticks — a frame-tick subscriber appeared. Idempotent while
+    /// already running; callable from any thread. The first call spawns the
+    /// worker (the swap elects one spawner; on spawn failure the flag reopens
+    /// so a later wake retries). The load in front keeps the steady state
+    /// read-only: once the worker exists, a wake never writes the shared line
+    /// — the swap runs only in the race window before anyone has spawned.
+    fn wake(self: &Arc<Self>) {
+        if !self.spawned.load(Ordering::Acquire) && !self.spawned.swap(true, Ordering::AcqRel) {
+            let worker = Arc::clone(self);
+            // Detached on purpose: joining could block the UI thread. Quit is
+            // signalled via `Phase::Quit` + the wake event on drop, so the
+            // worker exits promptly.
+            if std::thread::Builder::new()
+                .name("reactor-frame-pacer".into())
+                .spawn(move || run_worker(&worker))
+                .is_err()
+            {
+                self.spawned.store(false, Ordering::Release);
+                return;
+            }
+        }
+        let mut st = self.state.lock().unwrap();
+        if st.phase == Phase::Parked {
+            st.phase = Phase::Running;
+            self.cv.notify_all();
+        }
+    }
+}
+
+/// A `Send + Sync` wake handle for the frame-pump hook: wherever a subscriber
+/// registers, this reaches the worker through the shared state alone.
+pub(crate) struct PacerWake {
+    shared: Arc<Shared>,
+}
+
+impl PacerWake {
+    pub fn wake(&self) {
+        self.shared.wake();
+    }
 }
 
 /// Owning handle held by the host; dropping it tells the worker to exit.
 pub(crate) struct FramePacer {
     shared: Arc<Shared>,
-    /// Whether the worker thread exists yet — spawned lazily on the first
-    /// [`wake`](Self::wake), so a window that never animates a canvas never
-    /// pays for the thread. UI-thread only (like every other pacer entry).
-    spawned: Cell<bool>,
 }
 
 impl FramePacer {
@@ -128,32 +169,21 @@ impl FramePacer {
             tick_pending: AtomicBool::new(false),
             hwnd,
             wake_evt,
+            spawned: AtomicBool::new(false),
         });
-        Self { shared, spawned: Cell::new(false) }
+        Self { shared }
     }
 
-    /// Start vsync ticks — a frame-tick subscriber appeared. Idempotent while
-    /// already running. The first call spawns the worker.
+    /// See [`Shared::wake`].
     pub fn wake(&self) {
-        if !self.spawned.get() {
-            let worker = self.shared.clone();
-            // Detached on purpose: joining could block the UI thread. Quit is
-            // signalled via `Phase::Quit` + the wake event on drop, so the
-            // worker exits promptly.
-            if std::thread::Builder::new()
-                .name("reactor-frame-pacer".into())
-                .spawn(move || run_worker(&worker))
-                .is_err()
-            {
-                // Spawn failed: leave `spawned` false so the next wake retries.
-                return;
-            }
-            self.spawned.set(true);
-        }
-        let mut st = self.shared.state.lock().unwrap();
-        if st.phase == Phase::Parked {
-            st.phase = Phase::Running;
-            self.shared.cv.notify_all();
+        self.shared.wake();
+    }
+
+    /// A wake handle for [`crate::set_frame_pump_wake`] — safe to fire from
+    /// any thread.
+    pub fn wake_handle(&self) -> PacerWake {
+        PacerWake {
+            shared: Arc::clone(&self.shared),
         }
     }
 

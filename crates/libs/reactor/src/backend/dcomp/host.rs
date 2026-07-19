@@ -332,13 +332,15 @@ impl DCompHost {
             }
         });
 
+        let pacer = FramePacer::new(hwnd as isize);
+        let pump_wake = pacer.wake_handle();
         DCOMP.with(|c| {
             *c.borrow_mut() = Some(Rc::new(HostShared {
                 render_host: render_host.clone_inner(),
                 backend,
                 local,
                 send,
-                pacer: FramePacer::new(hwnd as isize),
+                pacer,
                 hwnd: hwnd as isize,
                 applied_dark: Cell::new(Some(dark)),
             }));
@@ -365,12 +367,10 @@ impl DCompHost {
         // `on_frame_tick`) while the pacer is parked, wake it; the WM_APP_FRAME
         // handler drives the ticks and parks the pacer once no subscriber
         // remains (true idle). This is the pacer's ONLY client — control motion
-        // never runs on it.
-        crate::set_frame_pump_wake(Some(Rc::new(|| {
-            if let Some(s) = shared() {
-                s.pacer.wake();
-            }
-        })));
+        // never runs on it. The hook holds a cross-thread wake handle rather
+        // than reading this thread's host state: a subscriber may register on
+        // the app thread once the reconciler moves off the pump thread.
+        crate::set_frame_pump_wake(Some(std::sync::Arc::new(move || pump_wake.wake())));
 
         render_host.kick();
         unsafe {
