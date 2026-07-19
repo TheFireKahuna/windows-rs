@@ -215,6 +215,27 @@ pub fn stroke_strong() -> Color {
     w(0x8b as f32 / 255.0)
 }
 
+/// `FocusStrokeColorOuter` — the focus visual's outer ring.
+///
+/// The scheme's ink at FULL strength, not a wash: a keyboard focus ring has to
+/// read on every fill the family can carry, including an accent one, and a
+/// translucent ring over an accent button is the same hue slightly lighter.
+pub fn focus_outer() -> Color {
+    let ink = host().ink;
+    Color::scrgb(ink.r, ink.g, ink.b, 1.0)
+}
+
+/// `FocusStrokeColorInner` — the hairline BETWEEN the outer ring and the
+/// control.
+///
+/// The window base, so the pair reads as a gap cut around the control rather
+/// than a thicker ring. This is what keeps the outer ring's edge legible when
+/// the control's own fill is close to the ink — an accent button in dark mode
+/// is light enough that a lone white ring loses its inner boundary.
+pub fn focus_inner() -> Color {
+    host().surface_sunken
+}
+
 /// sRGB-authored → linear-blend wash alpha over the **dark** base. Fluent's
 /// translucent tokens (`#0AFFFFFF`-style washes) assume gamma-space
 /// compositing; this pipeline blends in linear light, where the same alpha

@@ -403,7 +403,7 @@ fn resolve_align(arena: &mut Arena, id: ControlId, parent_grid: bool, parent_row
 }
 
 /// (Re)build the DirectWrite layout for any text-bearing node flagged dirty.
-fn rebuild_text(arena: &mut Arena, id: ControlId) {
+pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
     if arena.get(id).is_none() {
         return;
     }

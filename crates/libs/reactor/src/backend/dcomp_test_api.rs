@@ -894,6 +894,16 @@ pub struct ButtonBoxProbe {
 }
 
 impl ArenaHarness {
+    /// Shape this node's cached runs, through the real
+    /// [`dcomp::layout::rebuild_text`] the layout pass calls.
+    ///
+    /// Geometry that reads a MEASURED run — which is all of a button's content
+    /// row — is testing a degenerate empty-label case until this has run, and
+    /// would pass while asserting nothing.
+    pub fn rebuild_text(&mut self, id: ControlId) {
+        dcomp::layout::rebuild_text(&mut self.arena, id);
+    }
+
     /// Resolve a button's content geometry through the real
     /// [`dcomp::controls::button_boxes`] the placement, the badge plate and the
     /// measure all call.

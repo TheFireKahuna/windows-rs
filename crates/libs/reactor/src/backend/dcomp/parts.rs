@@ -1206,8 +1206,28 @@ mod slot {
     pub const N_BELOW: usize = PLATE + 1;
 
     pub const INK: usize = 0;
-    pub const RING: usize = 1;
-    pub const N_ABOVE: usize = RING + 1;
+    pub const RING_INNER: usize = 1;
+    pub const RING_OUTER: usize = 2;
+    pub const N_ABOVE: usize = RING_OUTER + 1;
+}
+
+/// The focus visual, WinUI's shape: a solid outer ring with a hairline of the
+/// window base between it and the control, both sitting just OUTSIDE the
+/// control's bounds.
+///
+/// Outside, not inset, is the part that matters visually. An inset ring eats
+/// into the control's own fill, so a focused button reads as having grown a
+/// thick border and lost 3 DIP of its face; WinUI cuts the ring out of the gap
+/// around the control instead, which is why its focus never changes how big the
+/// control looks.
+///
+/// Returned as `(outward offset, stroke width, colour)` per ring, outermost
+/// last, so the caller places them without restating the ladder.
+fn focus_rings() -> [(f32, f32, crate::Color); 2] {
+    [
+        (1.0, super::controls::FOCUS_RING_INNER_W, theme::focus_inner()),
+        (3.0, super::controls::FOCUS_RING_W, theme::focus_outer()),
+    ]
 }
 
 fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
@@ -1243,19 +1263,18 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
             (b, AtlasKey::hbar(bh, bh / 2.0, 0.0, fill, scale))
         });
 
-    // The focus ring as a part rather than a draw: the family owns no surface
-    // to paint one on. The geometry is the shared painted ring's exactly (a
-    // `FOCUS_RING_W` stroke inset 1px), and the radius follows the AUTHORED one
-    // — a ring whose corners disagree with the button inside it is the most
-    // visible way for a custom radius to look broken.
-    let ring_key = node.focused.then(|| {
-        AtlasKey::hbar(
-            (h - 2.0).max(0.0),
-            radius,
-            super::controls::FOCUS_RING_W,
-            theme::stroke_strong(),
-            scale,
-        )
+    // The focus visual as parts rather than a draw: the family owns no surface
+    // to paint one on. Each ring's radius follows the AUTHORED one, grown by
+    // how far out it sits — a ring whose corners disagree with the button
+    // inside it is the most visible way for a custom radius to look broken.
+    let rings = node.focused.then(|| {
+        focus_rings().map(|(out, sw, c)| {
+            (
+                out,
+                sw,
+                AtlasKey::hbar((h + 2.0 * out).max(0.0), radius + out, sw, c, scale),
+            )
+        })
     });
 
     let Some(parts) = node.parts.as_mut() else { return };
@@ -1290,13 +1309,21 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
         parts.init = true;
     }
 
-    match ring_key {
-        Some(k) => {
-            parts.above[slot::RING].bind(comp, atlas, k);
-            parts.above[slot::RING].place(1.0, 1.0, (w - 2.0).max(0.0), (h - 2.0).max(0.0));
-            parts.above[slot::RING].set_opacity(1.0);
+    match rings {
+        Some(rings) => {
+            for (i, (out, _, key)) in [slot::RING_INNER, slot::RING_OUTER]
+                .into_iter()
+                .zip(rings)
+            {
+                parts.above[i].bind(comp, atlas, key);
+                parts.above[i].place(-out, -out, w + 2.0 * out, h + 2.0 * out);
+                parts.above[i].set_opacity(1.0);
+            }
         }
-        None => parts.above[slot::RING].set_opacity(0.0),
+        None => {
+            parts.above[slot::RING_INNER].set_opacity(0.0);
+            parts.above[slot::RING_OUTER].set_opacity(0.0);
+        }
     }
     parts.geom = (w, h);
 }

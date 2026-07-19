@@ -21,12 +21,23 @@ fn harness() -> ArenaHarness {
     )
 }
 
-/// A button of a usable size carrying `text`, plus whatever props the case adds.
+const W: f32 = 200.0;
+const H: f32 = 32.0;
+
+/// A button of a usable size carrying `text`, with its run actually shaped —
+/// the content row is placed from MEASURED widths, so a test that skips this
+/// is testing an empty label and asserting nothing.
 fn button(a: &mut ArenaHarness, text: &str) -> windows_reactor::ControlId {
     let id = a.insert(K::Button).unwrap();
     a.apply_prop(id, Prop::Content, &V::Str(text.into()));
-    a.set_rect(id, 200.0, 32.0);
+    a.set_rect(id, W, H);
+    a.rebuild_text(id);
     id
+}
+
+/// How far a box's centre sits from the control's, on x.
+fn off_centre(b: (f32, f32, f32, f32)) -> f32 {
+    (b.0 + b.2) / 2.0 - W / 2.0
 }
 
 const ICON: i32 = 0xE72C; // Segoe Fluent "Refresh"
@@ -56,40 +67,77 @@ fn no_button_in_the_family_ever_wants_a_surface() {
 
 // ── The badge's own size ─────────────────────────────────────────────────────
 
-/// A plain button's label box is its WHOLE box.
+/// The content row centres AS A GROUP, whatever it is carrying.
 ///
-/// The ornament inset is where an ornament starts, not a margin every label
-/// pays. Charging it unconditionally leaves the box asymmetric, and since the
-/// label is centred *within* it, every unadorned button in the tree renders its
-/// text half an inset off centre — a defect that is obvious once seen and
-/// invisible while reading the code that causes it.
+/// This is the single placement rule, and it is the one the family kept getting
+/// wrong: laying ornaments against the edges and centring the label in what
+/// survives is only the same arithmetic when the row is symmetric. A leading
+/// icon makes it asymmetric, and the label then centres inside a box that still
+/// holds the trailing padding — half a padding right of where it belongs, on
+/// every iconed button in the tree.
+///
+/// Stated as "the row's own centre is the control's centre" so it holds for
+/// every combination rather than for the numbers of any one of them.
 #[test]
-fn a_button_with_no_ornaments_centres_on_its_whole_box() {
+fn the_content_row_centres_as_a_group() {
     let mut a = harness();
-    for kind in [K::Button, K::ToggleButton, K::RepeatButton, K::SplitButton] {
-        let id = a.insert(kind).unwrap();
-        a.apply_prop(id, Prop::Content, &V::Str("Apply".into()));
-        a.set_rect(id, 200.0, 32.0);
-        assert_eq!(
-            a.button_boxes(id).unwrap().label,
-            (0.0, 0.0, 200.0, 32.0),
-            "{kind:?}: the label box is not the whole control"
+    let cases: Vec<(&str, Option<i32>, Option<Badge>)> = vec![
+        ("bare", None, None),
+        ("icon", Some(ICON), None),
+        ("trailing count", None, Some(Badge::count(12))),
+        ("leading dot", None, Some(Badge::dot().leading())),
+        ("icon + trailing count", Some(ICON), Some(Badge::count(3))),
+        ("icon + leading dot", Some(ICON), Some(Badge::dot().leading())),
+    ];
+    for (name, icon, badge) in cases {
+        let id = button(&mut a, "Apply");
+        if let Some(cp) = icon {
+            a.apply_prop(id, Prop::Icon, &V::I32(cp));
+        }
+        if let Some(b) = badge {
+            a.apply_prop(id, Prop::Badge, &V::Badge(b));
+        }
+        a.rebuild_text(id);
+        let b = a.button_boxes(id).unwrap();
+
+        // The row spans from the leading edge of whatever comes first to the
+        // trailing edge of whatever comes last.
+        let lo = [Some(b.label.0), b.icon.map(|r| r.0), b.badge.map(|r| r.0)]
+            .into_iter()
+            .flatten()
+            .fold(f32::MAX, f32::min);
+        let hi = [Some(b.label.2), b.icon.map(|r| r.2), b.badge.map(|r| r.2)]
+            .into_iter()
+            .flatten()
+            .fold(f32::MIN, f32::max);
+        let centre = (lo + hi) / 2.0;
+        assert!(
+            (centre - W / 2.0).abs() < 0.51,
+            "{name}: the row spans {lo}..{hi}, centre {centre}, control centre {}",
+            W / 2.0
         );
     }
 }
 
-/// Symmetry, stated directly: with one trailing ornament the label box loses
-/// room on the trailing side ONLY. A leading inset creeping in here is the same
-/// off-centre bug wearing a badge.
+/// A bare button's label is centred on the control — the plainest case of the
+/// rule above, kept separate because it is the one that regressed and the one
+/// a reader checks first.
 #[test]
-fn a_trailing_badge_only_eats_the_trailing_edge() {
+fn a_bare_button_centres_its_label() {
     let mut a = harness();
-    let id = button(&mut a, "Inbox");
-    a.apply_prop(id, Prop::Badge, &V::Badge(Badge::count(4)));
-
-    let b = a.button_boxes(id).unwrap();
-    assert_eq!(b.label.0, 0.0, "the label box lost its leading edge");
-    assert!(b.label.2 < 200.0, "the label box kept its trailing edge");
+    for kind in [K::Button, K::ToggleButton, K::RepeatButton, K::SplitButton] {
+        let id = a.insert(kind).unwrap();
+        a.apply_prop(id, Prop::Content, &V::Str("Apply".into()));
+        a.set_rect(id, W, H);
+        a.rebuild_text(id);
+        let b = a.button_boxes(id).unwrap();
+        assert!(
+            off_centre(b.label).abs() < 0.51,
+            "{kind:?}: the label sits {} off centre",
+            off_centre(b.label)
+        );
+        assert!(b.label.2 - b.label.0 < W, "{kind:?}: the label box is the whole control, so it cannot have been measured");
+    }
 }
 
 /// A button with no badge has no badge box — absence is absence, not a

@@ -179,9 +179,10 @@ pub(crate) const ICON_SIZE: f32 = 16.0;
 /// words. One constant, because the row is a single sequence and a gap that
 /// varied by which pair it separated would read as a misalignment.
 pub(crate) const ORNAMENT_GAP: f32 = theme::SPACE_8;
-/// How far a button's ornaments sit from its edge — the family's own padding,
-/// so a content-sized button centres its ornaments exactly.
-const ORNAMENT_INSET: f32 = theme::SPACE_12;
+
+/// The hairline of window base between the focus ring and the control it rings
+/// (`parts::focus_rings`).
+pub(crate) const FOCUS_RING_INNER_W: f32 = 1.0;
 
 /// A focus ring's stroke width. Shared with the button family's retained ring
 /// (`parts::button_sync`), which reproduces this geometry as a part because the
@@ -374,9 +375,36 @@ pub(crate) struct ButtonBoxes {
 }
 
 pub(crate) fn button_boxes(node: &Node, rect: Rect) -> ButtonBoxes {
-    let has_label = !node.paint.text.is_empty();
     let leads = node.extras().badge.is_some_and(|b| b.leading);
     let badge_sz = badge_size(node);
+    let label_w = label_width(node);
+
+    // The row, in visual order, with the width each present item occupies. A
+    // leading badge heads it: it is a status lamp for the whole control —
+    // "● Live" — so it reads at the start rather than wedged between the icon
+    // and the words it qualifies.
+    let row = [
+        (Slot::Badge, badge_sz.filter(|_| leads).map(|s| s.0)),
+        (Slot::Icon, has_leading_icon(node).then_some(ICON_SIZE)),
+        (Slot::Label, (label_w > 0.0).then_some(label_w)),
+        (Slot::Badge, badge_sz.filter(|_| !leads).map(|s| s.0)),
+    ];
+    let n = row.iter().filter(|(_, w)| w.is_some()).count();
+
+    // The row is CENTRED AS A GROUP, and that is the whole placement rule.
+    //
+    // Pinning the ornaments to the edges and centring the label in whatever
+    // survives is the same arithmetic only when the row is symmetric: give a
+    // button a leading icon and the label centres inside a box that still
+    // contains the TRAILING padding, so it sits half that padding right of
+    // where it belongs — visible on every iconed button in the family.
+    //
+    // Centring the group is also what makes the row honour whatever padding
+    // the host authored, instead of an inset constant that is only ever right
+    // for the family's own.
+    let content: f32 = row.iter().filter_map(|(_, w)| *w).sum::<f32>()
+        + ORNAMENT_GAP * n.saturating_sub(1) as f32;
+    let mut cursor = rect.left + ((rect.width() - content) / 2.0).max(0.0);
 
     // Vertically centred rather than full-height: unlike the icon, the badge
     // has a plate, and a plate as tall as the button is not a badge.
@@ -385,57 +413,26 @@ pub(crate) fn button_boxes(node: &Node, rect: Rect) -> ButtonBoxes {
         Rect::new(x, y, x + bw, y + bh)
     };
 
-    // The leading cluster, laid out left to right with one gap between each
-    // pair: the badge first when it leads, then the icon. A leading badge is a
-    // status lamp for the whole control — "● Live" — so it belongs at the head
-    // of the row rather than between the icon and the words it qualifies.
-    let mut cursor = rect.left + ORNAMENT_INSET;
-    let mut placed = 0;
-    let mut advance = |w: f32, cursor: &mut f32, placed: &mut i32| {
-        if *placed > 0 {
-            *cursor += ORNAMENT_GAP;
+    let (mut icon, mut badge, mut label) = (None, None, rect);
+    let mut first = true;
+    for (slot, w) in row {
+        let Some(w) = w else { continue };
+        if !first {
+            cursor += ORNAMENT_GAP;
         }
-        *placed += 1;
-        let at = *cursor;
-        *cursor += w;
-        at
-    };
-
-    let lead_badge = badge_sz
-        .filter(|_| leads)
-        .map(|sz| plate(advance(sz.0, &mut cursor, &mut placed), sz));
-    let icon = has_leading_icon(node)
-        .then(|| advance(ICON_SIZE, &mut cursor, &mut placed))
-        .map(|at| Rect::new(at, rect.top, at + ICON_SIZE, rect.bottom));
-
-    let mut right = rect.right;
-    let trail_badge = badge_sz.filter(|_| !leads).map(|sz| {
-        let x0 = right - ORNAMENT_INSET - sz.0;
-        right = x0 - ORNAMENT_GAP;
-        plate(x0, sz)
-    });
-
-    // What the ornaments left. The inset above is where an ORNAMENT starts, not
-    // a margin every label pays: a button carrying none keeps its whole box, so
-    // its centred label stays centred on the control rather than drifting by
-    // half the inset.
-    let label = if has_label {
-        let left = if placed > 0 {
-            cursor + ORNAMENT_GAP
-        } else {
-            rect.left
-        };
-        Rect::new(left, rect.top, right.max(left), rect.bottom)
-    } else {
-        // An ornament-only button keeps the full box, so a lone icon or badge
-        // reads as centred chrome rather than pinned to one side.
-        rect
-    };
-    ButtonBoxes {
-        icon,
-        badge: lead_badge.or(trail_badge),
-        label,
+        first = false;
+        let at = cursor;
+        cursor += w;
+        match slot {
+            Slot::Icon => icon = Some(Rect::new(at, rect.top, at + w, rect.bottom)),
+            Slot::Badge => badge = badge_sz.map(|sz| plate(at, sz)),
+            // Full height so the run still centres VERTICALLY on the control.
+            // Horizontally this box is exactly the run's own width, so the
+            // centring `place_centered` does becomes a no-op on x.
+            Slot::Label => label = Rect::new(at, rect.top, at + w, rect.bottom),
+        }
     }
+    ButtonBoxes { icon, badge, label }
 }
 
 /// What a button's own outline takes out of its box, on each axis.
@@ -455,6 +452,26 @@ pub(crate) fn chrome_inset(node: &Node) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Which piece of the content row a slot holds.
+#[derive(Copy, Clone)]
+enum Slot {
+    Badge,
+    Icon,
+    Label,
+}
+
+/// The measured width of the label's cached run, or `0.0` when there is none.
+///
+/// Read here rather than passed in, so every consumer of [`button_boxes`]
+/// answers from the same shaped run the sprites are actually placed from.
+fn label_width(node: &Node) -> f32 {
+    node.text_layout
+        .as_ref()
+        .filter(|_| label_is_retained(node))
+        .and_then(|l| l.measure().ok())
+        .map_or(0.0, |(w, _)| w)
 }
 
 /// The width a button's ornaments add to its measured label.
