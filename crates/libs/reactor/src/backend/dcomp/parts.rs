@@ -2404,12 +2404,10 @@ pub(crate) const CHECK_BOX_D: f32 = 18.0;
 const CHECK_OUTLINE_W: f32 = 1.5;
 
 /// Below: `[accent box fill, outline]`. Above: `[checkmark, focus ring ×2]`.
+///
 /// A check/uncheck is a pair of compositor fades — endpoint parity with the
 /// retired painted crossfade (`transparent→accent` fill, `w(on)` checkmark).
-
-/// Below: `[accent box fill]`; above: `[checkmark]`.
-///
-/// Nothing here travels — a check is a pair of fades — so the `parts.on` shadow
+/// Nothing here travels, so the `parts.on` shadow
 /// was suppressing the fades rather than a glide, snapping the crossfade to its
 /// endpoint on the sync after the one that started it.
 pub(crate) fn check_plan(node: &Node, scale: f32) -> PartPlan {
@@ -2861,8 +2859,6 @@ fn meter_arm_clip(parts: &mut Parts, w: f32) {
 // ── Segmented (SelectorBar) ──────────────────────────────────────────────────
 
 /// Below-band roles: `[tray fill, tray stroke, pill, hover ink]`.
-
-/// Below-band roles: `[tray fill, tray stroke, pill, hover ink]`.
 ///
 /// The pill GLIDES and carries no "was the selection different last time"
 /// shadow: its rect is a pure function of the selection, and `Part`'s own
@@ -3001,9 +2997,9 @@ mod nav_slot {
 /// The pane's runs SNAP to the new width in the same repaint that starts the
 /// glide — the geometry is retained chrome, the text is not, and a text layout
 /// cannot be interpolated.
-
-/// Below-band roles: `[pane background, menu tile, menu bar, settings tile,
-/// settings bar]`; above: `[row hover ink]`.
+///
+/// Below-band roles: `[pane background, divider, menu tile, menu bar, settings
+/// tile, settings bar]`; above: `[row hover ink, chrome-button wash]`.
 ///
 /// The menu list and the settings row get their OWN indicators rather than one
 /// that travels between them. The settings row is pinned a pane-height below the
@@ -3197,11 +3193,9 @@ pub(crate) fn nav_hot_changed(node: &mut Node) {
 
 // ── Expander ─────────────────────────────────────────────────────────────────
 
-/// Above: `[header ink]` — the hover/press wash over the header strip only
-/// (the body below it stays wash-free). Chevron + header chrome are painted;
-/// the chevron flip is a single event-driven repaint.
-
 /// Below: `[header fill, header border]`. Above: `[hover wash, focus ring ×2]`.
+///
+/// The wash covers the header strip only; the body below it stays wash-free.
 ///
 /// Only the HEADER carries any of it — the expanded content below is ordinary
 /// layout, not part of the control's chrome, which is also why the ring rings
@@ -3246,14 +3240,13 @@ fn progress_bar_h(node_h: f32) -> f32 {
     node_h.min(6.0).max(4.0)
 }
 
-/// Below: `[track, determinate fill, indeterminate sweep segment]`. The
-/// surface paints nothing — a value change glides the fill (spring size), and
-/// the indeterminate sweep is a forever-looping compositor keyframe animation:
-/// the app is fully idle while the bar animates. The node's container carries
-/// an InsetClip (set at create) so the sweep slides in/out at the track edges
-/// instead of overhanging them.
-
 /// Below: `[track, determinate fill, indeterminate sweep segment]`.
+///
+/// The surface paints nothing — a value change glides the fill (spring size),
+/// and the indeterminate sweep is a forever-looping compositor keyframe: the app
+/// is fully idle while the bar animates. The node's container carries an
+/// InsetClip (set at create) so the sweep slides in and out at the track edges
+/// instead of overhanging them.
 ///
 /// The sweep is deliberately absent from this plan while it is running: it is a
 /// FOREVER animation, not a placement, and a plan describes where a sprite comes

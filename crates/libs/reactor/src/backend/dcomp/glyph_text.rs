@@ -767,7 +767,11 @@ impl RowText {
     /// parts must not go with them: they own compositor visuals parented into
     /// the node, so dropping them would orphan the sprites already on screen and
     /// mint a second set beside them on the next sync.
-    pub(crate) fn adopt(&mut self, leading: Vec<Option<TextLayout>>, labels: Vec<Option<TextLayout>>) {
+    pub(crate) fn adopt(
+        &mut self,
+        leading: Vec<Option<TextLayout>>,
+        labels: Vec<Option<TextLayout>>,
+    ) {
         self.leading = leading;
         self.labels = labels;
     }
@@ -850,7 +854,12 @@ pub(crate) struct Pen<'a> {
 
 impl<'a> Pen<'a> {
     /// A pen over `node`, taking its enabled state as the dim every run carries.
-    pub(crate) fn new(comp: &'a Compositing, atlas: &'a mut GlyphAtlas, node: &Node, scale: f32) -> Self {
+    pub(crate) fn new(
+        comp: &'a Compositing,
+        atlas: &'a mut GlyphAtlas,
+        node: &Node,
+        scale: f32,
+    ) -> Self {
         Self {
             comp,
             atlas,
