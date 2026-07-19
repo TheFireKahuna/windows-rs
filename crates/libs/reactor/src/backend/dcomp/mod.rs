@@ -102,6 +102,12 @@ pub struct DCompBackend {
     cache: PaintCache,
     /// Shared rasterized chrome-part sources (see [`parts::Atlas`]).
     atlas: parts::Atlas,
+    /// Shared rasterized glyph masks, behind every retained label (see
+    /// [`glyph_atlas::GlyphAtlas`]). Separate from `atlas` because the
+    /// populations differ by an order of magnitude and because the two are
+    /// invalidated by different things — a glyph mask carries no colour, so a
+    /// theme change leaves every entry valid.
+    glyphs: glyph_atlas::GlyphAtlas,
     root: Option<ControlId>,
     /// The node whose container is currently attached under the compositor root.
     attached_root: Option<ControlId>,
@@ -209,6 +215,7 @@ impl DCompBackend {
             comp,
             cache: PaintCache::default(),
             atlas: parts::Atlas::default(),
+            glyphs: glyph_atlas::GlyphAtlas::default(),
             root: None,
             attached_root: None,
             dip_size,
@@ -325,6 +332,7 @@ impl DCompBackend {
                 &self.comp,
                 &mut self.cache,
                 &mut self.atlas,
+                &mut self.glyphs,
                 &mut self.arena,
                 root,
                 scale,
@@ -333,9 +341,11 @@ impl DCompBackend {
             .is_err()
             {
                 // Device loss: drop cached resources; next paint rebuilds them
-                // (parts re-bind to freshly rasterized sources by epoch).
+                // (parts and glyph sprites re-bind to freshly rasterized sources
+                // by epoch).
                 self.cache.invalidate();
                 self.atlas.clear();
+                self.glyphs.clear();
                 return;
             }
         }
@@ -346,7 +356,9 @@ impl DCompBackend {
     pub(crate) fn resize(&mut self, pixel_w: i32, pixel_h: i32, dpi: u32) {
         if dpi > 0 && dpi as f32 != self.dpi {
             // Pixel scale changed: every atlas source is the wrong resolution.
+            // Glyph masks are rasterized per scale too, so they go with them.
             self.atlas.clear();
+            self.glyphs.clear();
         }
         if dpi > 0 {
             self.dpi = dpi as f32;
@@ -556,6 +568,11 @@ impl DCompBackend {
         // The output colour map may have changed (display / theme edge): the
         // atlas sources carry baked mapped colours, so re-rasterize them too.
         self.atlas.clear();
+        // `self.glyphs` deliberately does NOT go with it. A glyph mask is pure
+        // coverage and holds no colour, so a recolour is a `SetSource` on each
+        // label's mask brush — which the dirty sweep below already performs.
+        // Clearing here would re-rasterize every glyph on screen to produce
+        // byte-identical masks.
         // The backdrop's layers bake display-fitted colours into their surfaces
         // for the same reason, and it is not a node, so the arena sweep below
         // does not reach it. Re-querying the provider here picks up the app's

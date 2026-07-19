@@ -605,6 +605,10 @@ pub(crate) struct Node {
     /// motion runs DWM-side. Created lazily by the parts sync; `None` for
     /// every other node. See [`parts`](super::parts).
     pub parts: Option<Box<parts::Parts>>,
+    /// Button family only: the label as retained per-glyph sprites, above both
+    /// the chrome parts and the ink. Created lazily on first painted sync; see
+    /// [`glyph_text::label_sync`](super::glyph_text::label_sync).
+    pub text_part: Option<Box<super::glyph_text::TextPart>>,
     /// Editors only: the caret sprite (topmost child, above the painted text)
     /// whose blink is a compositor-side square-wave opacity animation. Created
     /// lazily on first focused paint; see [`parts::sync_caret`].
@@ -778,6 +782,7 @@ impl Node {
             vis,
             surf: None,
             parts: None,
+            text_part: None,
             caret: None,
             knob: None,
             scroll_thumb: None,

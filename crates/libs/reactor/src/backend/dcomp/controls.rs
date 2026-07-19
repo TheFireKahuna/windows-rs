@@ -267,26 +267,69 @@ pub(crate) fn resolve_radius(authored: f32, h: f32) -> f32 {
     authored.clamp(0.0, h * 0.5)
 }
 
-/// The label and leading glyph only.
+/// Whether a button-family node has a leading icon glyph *and* a label to sit
+/// beside it.
+///
+/// `0` is the "no icon" convention (`Ctrl::icons`), and it must be tested rather
+/// than left to `glyph_into`: `char::from_u32(0)` is `Some('\0')`, so every
+/// un-iconed button would otherwise lay out and draw a NUL.
+fn has_leading_icon(node: &Node) -> bool {
+    node.extras().icon != 0
+}
+
+/// The box a button-family label is centred in: the whole control, less the
+/// leading icon and its gap when the button carries both.
+///
+/// An icon-only button keeps the full box, so its glyph reads as centred chrome
+/// rather than pinned to one side.
+///
+/// One definition, two consumers that must not disagree — the same discipline
+/// [`ButtonPalette`] documents. `glyph_text::label_sync` places the retained
+/// label from this, and [`paint_button`] insets the icon it still draws from it.
+pub(crate) fn button_label_box(node: &Node, rect: Rect) -> Rect {
+    if has_leading_icon(node) && !node.paint.text.is_empty() {
+        Rect::new(
+            rect.left + theme::SPACE_12 + ICON_SIZE + ICON_GAP,
+            rect.top,
+            rect.right,
+            rect.bottom,
+        )
+    } else {
+        rect
+    }
+}
+
+/// Whether this node's label is retained glyph sprites rather than a painted
+/// run — see [`glyph_text`](super::glyph_text).
+///
+/// The layout is required, not merely preferred: it is the shaped run the
+/// sprites are placed from, and without one there is nothing to place. In
+/// practice a button-family node with a label always has one — `layout::is_text`
+/// covers the whole family — so the `None` arm is a genuine failure (a
+/// `TextFormat` that would not build), and a painted fallback is the right
+/// answer for it rather than a blank button.
+pub(crate) fn label_is_retained(node: &Node) -> bool {
+    super::node::is_button_family(node.kind)
+        && !node.paint.text.is_empty()
+        && node.text_layout.is_some()
+}
+
+/// The leading glyph, and the label only when it is not retained.
 ///
 /// The fill, the border and the hover/press wash are all retained compositor
-/// sprites below and above this surface (`parts::button_sync`), so a state flip
-/// that changes nothing but those never reaches a `BeginDraw`.
+/// sprites below and above this surface (`parts::button_sync`), and the label
+/// itself is retained glyph sprites above them (`glyph_text::label_sync`) — so
+/// on an ordinary button this draws nothing at all, and a recolour, an
+/// enable/disable or a state flip never reaches a `BeginDraw`.
 fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
     let pal = button_palette(node);
 
-    // A leading icon glyph, when the app set one. It takes the leading inset
-    // and the label centres in what is left, so an icon-only button (no label)
-    // still reads as centred chrome.
-    //
-    // `0` is the "no icon" convention (`Ctrl::icons`), and it must be tested
-    // here rather than left to `glyph_into`: `char::from_u32(0)` is `Some('\0')`,
-    // so every un-iconed button would otherwise lay out and draw a NUL.
-    let mut label_box = rect;
+    // The icon stays painted: it is one static glyph from the symbol font, it
+    // never recolours independently of the label, and routing it through the
+    // atlas would need a second shaped run to place a character we already know.
     let mut gbuf = [0u8; 4];
-    let icon = node.extras().icon;
-    if icon != 0
-        && let Some(g) = glyph_into(icon, &mut gbuf)
+    if has_leading_icon(node)
+        && let Some(g) = glyph_into(node.extras().icon, &mut gbuf)
     {
         let ix = rect.left + theme::SPACE_12;
         text(
@@ -302,23 +345,22 @@ fn paint_button(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
             ParagraphAlignment::Center,
             dim,
         );
-        if !node.paint.text.is_empty() {
-            label_box = Rect::new(ix + ICON_SIZE + ICON_GAP, rect.top, rect.right, rect.bottom);
-        }
     }
-    text(
-        session,
-        brush,
-        &node.paint.text,
-        label_box,
-        "Segoe UI",
-        node.paint.font_size.max(theme::FONT_SIZE_MD),
-        pal.weight,
-        pal.fg,
-        TextAlignment::Center,
-        ParagraphAlignment::Center,
-        dim,
-    );
+    if !label_is_retained(node) {
+        text(
+            session,
+            brush,
+            &node.paint.text,
+            button_label_box(node, rect),
+            "Segoe UI",
+            node.paint.font_size.max(theme::FONT_SIZE_MD),
+            pal.weight,
+            pal.fg,
+            TextAlignment::Center,
+            ParagraphAlignment::Center,
+            dim,
+        );
+    }
 }
 
 // ── ToggleSwitch ─────────────────────────────────────────────────────────────

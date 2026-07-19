@@ -36,22 +36,26 @@ const CLEAR: ColorF = ColorF::new(0.0, 0.0, 0.0, 0.0);
 
 /// Walk the tree, repainting each dirty node's own surface. Returns `Err` on
 /// device loss so the caller can drop and rebuild cached resources.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint(
     comp: &Compositing,
     cache: &mut PaintCache,
     atlas: &mut parts::Atlas,
+    glyphs: &mut super::glyph_atlas::GlyphAtlas,
     arena: &mut Arena,
     root: ControlId,
     scale: f32,
     scrubbing: bool,
 ) -> windows_core::Result<()> {
-    paint_node(comp, cache, atlas, arena, root, scale, scrubbing)
+    paint_node(comp, cache, atlas, glyphs, arena, root, scale, scrubbing)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_node(
     comp: &Compositing,
     cache: &mut PaintCache,
     atlas: &mut parts::Atlas,
+    glyphs: &mut super::glyph_atlas::GlyphAtlas,
     arena: &mut Arena,
     id: ControlId,
     scale: f32,
@@ -96,6 +100,12 @@ fn paint_node(
                 if parts::converted(n.kind) {
                     parts::sync(comp, atlas, n, scale, scrubbing);
                 }
+                // The button family's label: retained glyph sprites, placed
+                // AFTER the parts sync so the label's host lands above the ink
+                // that sync creates on first use.
+                if super::node::is_button_family(n.kind) {
+                    super::glyph_text::label_sync(comp, glyphs, n, scale);
+                }
                 // Editors: reconcile the caret sprite (position + compositor
                 // blink) against the text metrics just painted.
                 if n.editor.is_some() {
@@ -117,7 +127,7 @@ fn paint_node(
     // children would leave the node permanently childless on the way out.
     let mut i = 0;
     while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
-        paint_node(comp, cache, atlas, arena, c, scale, scrubbing)?;
+        paint_node(comp, cache, atlas, glyphs, arena, c, scale, scrubbing)?;
         i += 1;
     }
 

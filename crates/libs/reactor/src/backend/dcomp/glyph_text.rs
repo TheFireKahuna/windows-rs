@@ -15,20 +15,37 @@
 //! source is a 4×4 solid, and minting one per glyph would put an allocation on
 //! a path whose reason to exist is that it has none.
 //!
+//! ## The host visual
+//!
+//! Every glyph sprite parents into ONE container the label owns, rather than
+//! into the node directly. That container is what makes the two whole-label
+//! operations single writes instead of per-glyph loops:
+//!
+//! - **disabled dim** is its `Opacity`, which is also the only correct place for
+//!   it. The painted path folded the dim into the brush alpha *after* the output
+//!   colour transform, and a mask brush's FP16 source is rasterized through that
+//!   transform — so there is no pre-transform alpha that reproduces it. A visual
+//!   opacity composites after everything, which is exactly what the old
+//!   `put(brush, c, dim)` did.
+//! - **clipping** is its `InsetClip`. A painted run got clipped for free by the
+//!   fixed-size surface it drew into; sprites are not clipped by anything, so a
+//!   label wider than its control would spill outside the button without this.
+//!
 //! ## Z-order
 //!
-//! Glyph sprites are inserted at the top of the node's children, so they sit
+//! The host is inserted at the top of the node's children, so the label sits
 //! above both the chrome parts *and* the hover/press ink. That is a deliberate
 //! departure from the painted label, which sat under the ink and was lightened
 //! by it: a wash belongs on the surface behind text, not over the text, and
 //! WinUI's own button states recolour the background alone.
 //!
-//! The ordering is positional, not declared — it holds because these are
-//! inserted after `parts::ensure` has built the ink, and it would break if
-//! anything re-stacked the node's children afterwards. [`TextPart::restack`]
-//! re-asserts it for a caller that has done so.
+//! The ordering is positional, not declared — it holds because the host is
+//! created after `parts::ensure` has built the ink, and it would break if
+//! anything re-stacked the node's children afterwards. Because the whole label
+//! is one child, re-asserting it would be a single `InsertAtTop`; nothing needs
+//! that today, so nothing carries the code for it.
 
-use windows_canvas_core::TextLayout;
+use windows_canvas_core::{Rect, TextLayout};
 use windows_core::Interface;
 use windows_numerics::{Vector2, Vector3};
 
@@ -36,19 +53,28 @@ use super::bootstrap::Compositing;
 use super::glyph_atlas::{pen_phase, GlyphAtlas};
 use super::node::Node;
 use super::parts::build_solid_surface;
+use super::theme;
 use crate::system_bindings::{
-    CompositionBrush, CompositionMaskBrush, CompositionSurfaceBrush, ICompositionObject,
-    ICompositor2, IVisual, SpriteVisual, Visual,
+    CompositionBrush, CompositionClip, CompositionMaskBrush, CompositionSurfaceBrush,
+    ContainerVisual, ICompositionObject, ICompositor2, IVisual, Visual,
 };
 
 /// One glyph's sprite and the mask brush that colours it.
+///
+/// Only the `IVisual` view is retained: the sprite itself is parented into the
+/// host, which owns the reference that keeps it alive, and every operation here
+/// (place, show) is a visual one.
 struct GlyphSprite {
-    sprite: SpriteVisual,
     vis: IVisual,
     mask: CompositionMaskBrush,
     /// Raw pointer of the atlas mask currently bound. Identity is the right
     /// test here: the atlas hands back a clone of the same COM object for a
     /// cache hit, so an unchanged glyph compares equal and re-binds nothing.
+    ///
+    /// It cannot go stale through address reuse, because `SetMask` retains the
+    /// brush: whatever this points at is kept alive by the very binding it
+    /// describes, so the address cannot be recycled while the comparison still
+    /// means anything — the same argument `GlyphKey` makes for its face pointer.
     bound: Option<*mut core::ffi::c_void>,
     offset: Option<(f32, f32)>,
     size: Option<(f32, f32)>,
@@ -56,19 +82,17 @@ struct GlyphSprite {
 }
 
 impl GlyphSprite {
-    fn new(comp: &Compositing, node: &Node) -> Option<Self> {
+    fn new(comp: &Compositing, host: &ContainerVisual) -> Option<Self> {
         let sprite = comp.new_sprite().ok()?;
         let vis: IVisual = sprite.cast().ok()?;
         let compositor = sprite.cast::<ICompositionObject>().ok()?.Compositor().ok()?;
         let mask = compositor.cast::<ICompositor2>().ok()?.CreateMaskBrush().ok()?;
         sprite.SetBrush(&mask.cast::<CompositionBrush>().ok()?).ok()?;
-        node.container
-            .Children()
+        host.Children()
             .ok()?
             .InsertAtTop(&sprite.cast::<Visual>().ok()?)
             .ok()?;
         Some(Self {
-            sprite,
             vis,
             mask,
             bound: None,
@@ -100,6 +124,15 @@ impl GlyphSprite {
 /// The retained glyph sprites of one label.
 #[derive(Default)]
 pub(crate) struct TextPart {
+    /// The container every glyph parents into — the label's dim and its clip.
+    /// See the module header for why both belong on a visual rather than on the
+    /// glyphs or the colour.
+    host: Option<ContainerVisual>,
+    host_vis: Option<IVisual>,
+    /// Last size pushed to the host (which is what its zero inset clip cuts to).
+    host_size: Option<(f32, f32)>,
+    /// Last dim pushed to the host's opacity.
+    host_dim: Option<f32>,
     glyphs: Vec<GlyphSprite>,
     /// How many of `glyphs` the last sync actually used. The rest stay
     /// allocated and hidden — a label that shortens will very likely lengthen
@@ -118,6 +151,55 @@ fn color_bits(c: crate::Color) -> [u32; 4] {
 }
 
 impl TextPart {
+    /// Mint the host container (once) and hang it at the top of `parent`'s
+    /// children. Its inset clip is all zeros, which cuts to the host's own
+    /// `Size` — pushed per sync by [`place_host`](Self::place_host).
+    fn ensure_host(&mut self, comp: &Compositing, parent: &ContainerVisual) -> bool {
+        if self.host.is_some() {
+            return true;
+        }
+        let built = || -> Option<(ContainerVisual, IVisual)> {
+            let host = comp.new_container().ok()?;
+            let vis: IVisual = host.cast().ok()?;
+            let clip = host
+                .cast::<ICompositionObject>()
+                .ok()?
+                .Compositor()
+                .ok()?
+                .CreateInsetClip()
+                .ok()?;
+            vis.SetClip(&clip.cast::<CompositionClip>().ok()?).ok()?;
+            parent
+                .Children()
+                .ok()?
+                .InsertAtTop(&host.cast::<Visual>().ok()?)
+                .ok()?;
+            Some((host, vis))
+        }();
+        match built {
+            Some((h, v)) => {
+                self.host = Some(h);
+                self.host_vis = Some(v);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Size the host to the control's box (what the clip cuts to) and carry the
+    /// disabled dim on its opacity. Both self-gate.
+    fn place_host(&mut self, size: (f32, f32), dim: f32) {
+        let Some(vis) = self.host_vis.as_ref() else { return };
+        if self.host_size != Some(size) {
+            let _ = vis.SetSize(Vector2::new(size.0, size.1));
+            self.host_size = Some(size);
+        }
+        if self.host_dim != Some(dim) {
+            let _ = vis.SetOpacity(dim);
+            self.host_dim = Some(dim);
+        }
+    }
+
     /// Rebuild the shared colour source if the colour or scale moved, and point
     /// every live glyph at it.
     ///
@@ -155,16 +237,26 @@ impl TextPart {
     /// the atlas reports — kerning and other GPOS positioning live in the
     /// former, and using the latter would space text correctly only for pairs
     /// the font does not kern.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn sync(
         &mut self,
         comp: &Compositing,
         atlas: &mut GlyphAtlas,
-        node: &Node,
+        parent: &ContainerVisual,
         layout: &TextLayout,
         origin: (f32, f32),
+        box_size: (f32, f32),
         color: crate::Color,
+        dim: f32,
         scale: f32,
     ) {
+        if !self.ensure_host(comp, parent) {
+            return;
+        }
+        self.place_host(box_size, dim);
+        // One AddRef per dirty sync, so the placement loop can grow sprites into
+        // the host while `self.glyphs` is mutably borrowed.
+        let Some(host) = self.host.clone() else { return };
         let Ok(runs) = layout.glyph_runs() else {
             self.hide_from(0);
             return;
@@ -184,16 +276,34 @@ impl TextPart {
 
         let mut slot = 0usize;
         for run in &runs {
-            let baseline_y = origin.1 + run.baseline_origin.y;
+            // The baseline row is snapped to a whole physical pixel, once per
+            // run. There is no vertical subpixel phase (glyphs are rasterized at
+            // horizontal phases only), so an unsnapped baseline would put every
+            // sprite in the run between two pixel rows and the compositor would
+            // resample all of them.
+            let baseline_py = ((origin.1 + run.baseline_origin.y) * scale).round() as i32;
             let mut pen_x = origin.0 + run.baseline_origin.x;
             for (i, &glyph) in run.glyph_indices.iter().enumerate() {
-                let (whole_px, phase) = pen_phase(pen_x, scale);
+                // A glyph offset DISPLACES this one glyph; it does not move the
+                // pen. GPOS mark positioning is expressed entirely through it —
+                // an acute accent is a glyph at the pen of the letter it sits on,
+                // nudged up and sideways — so folding it into the pen would both
+                // drop the vertical half and smear the horizontal half across
+                // every glyph after it.
+                let (off_x, off_y) = run
+                    .glyph_offsets
+                    .get(i)
+                    .map_or((0.0, 0.0), |o| (o.advance_offset, o.ascender_offset));
+                let (whole_px, phase) = pen_phase(pen_x + off_x, scale);
+                // `ascender_offset` points toward the ascender, i.e. up the
+                // screen, which is the negative y direction.
+                let glyph_py = baseline_py - (off_y * scale).round() as i32;
                 if let Some(raster) =
                     atlas.get(comp, &run.font_face, glyph, run.font_em_size, scale, phase)
                 {
                     // Grow on demand; a label only pays for the glyphs it has.
                     if slot == self.glyphs.len() {
-                        match GlyphSprite::new(comp, node) {
+                        match GlyphSprite::new(comp, &host) {
                             Some(g) => self.glyphs.push(g),
                             None => break,
                         }
@@ -208,22 +318,24 @@ impl TextPart {
                             g.bound = Some(raw);
                         }
                     }
+                    // Integer minus integer, then one divide: the sprite lands
+                    // exactly on the pixel grid, which is what keeps the mask a
+                    // 1:1 blit instead of a bilinear resample.
                     let (w, h) = raster.geom.size_dip;
+                    let (ox, oy) = raster.geom.origin_px;
                     g.place(
-                        whole_px as f32 / scale - raster.geom.baseline_dip.0,
-                        baseline_y - raster.geom.baseline_dip.1,
+                        (whole_px - ox) as f32 / scale,
+                        (glyph_py - oy) as f32 / scale,
                         w,
                         h,
                     );
                     g.show(true);
                     slot += 1;
                 }
-                // Advance by the shaped advance, plus this glyph's own nudge if
-                // the run carries offsets.
+                // The pen moves by the SHAPED advance alone — kerning and other
+                // GPOS positioning are already in it, and the per-glyph offset
+                // above is not part of it.
                 pen_x += run.glyph_advances.get(i).copied().unwrap_or(0.0);
-                if let Some(off) = run.glyph_offsets.get(i) {
-                    pen_x += off.advance_offset;
-                }
             }
         }
         self.live = slot;
@@ -238,16 +350,59 @@ impl TextPart {
         self.live = self.live.min(from);
     }
 
-    /// Re-assert the glyphs above everything else in the node's children, for a
-    /// caller that has re-stacked them. See the module header.
-    pub(crate) fn restack(&self, node: &Node) {
-        let Ok(children) = node.container.Children() else {
-            return;
-        };
-        for g in self.glyphs.iter().take(self.live) {
-            if let Ok(v) = g.sprite.cast::<Visual>() {
-                let _ = children.InsertAtTop(&v);
-            }
-        }
+    /// Hide the whole label — for a node that has stopped owning a retained one
+    /// (its text was cleared, or it stopped being a button). The sprites stay
+    /// allocated: the same node very often gets a label back.
+    pub(crate) fn hide_all(&mut self) {
+        self.hide_from(0);
     }
+
+}
+
+/// Reconcile a button-family node's label as retained glyph sprites.
+///
+/// Runs from the paint pass, on a dirty node, straight after `parts::sync` — so
+/// the host lands above the ink the parts sync just created (see the module
+/// header on z-order), and so a state flip that does not dirty the node never
+/// gets here at all.
+///
+/// The geometry is deliberately not re-derived: [`controls::button_label_box`]
+/// is the one definition of where a label goes, and `paint_button` reads the
+/// same function for the icon it still draws beside it.
+pub(crate) fn label_sync(
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    node: &mut Node,
+    scale: f32,
+) {
+    if !super::controls::label_is_retained(node) {
+        if let Some(p) = node.text_part.as_mut() {
+            p.hide_all();
+        }
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let fg = super::controls::button_palette(node).fg;
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+
+    let mut part = node.text_part.take().unwrap_or_default();
+    if let Some(layout) = node.text_layout.as_ref()
+        && let Ok((tw, th)) = layout.measure()
+    {
+        // Centred in the label box, exactly as the retired `TextAlignment::Center`
+        // / `ParagraphAlignment::Center` draw placed it. Clamped at the leading
+        // edge so a run too wide for its control loses its tail (which the clip
+        // hides) rather than its head.
+        let b = super::controls::button_label_box(node, Rect::from_xywh(0.0, 0.0, w, h));
+        let origin = (
+            b.left + ((b.width() - tw) / 2.0).max(0.0),
+            b.top + ((b.height() - th) / 2.0).max(0.0),
+        );
+        part.sync(comp, atlas, &node.container, layout, origin, (w, h), fg, dim, scale);
+    }
+    node.text_part = Some(part);
 }

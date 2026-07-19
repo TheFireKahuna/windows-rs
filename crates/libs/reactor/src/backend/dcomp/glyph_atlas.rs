@@ -32,10 +32,13 @@
 //!   drawn in, and a recolour is a `SetSource` on the mask brush — no re-raster,
 //!   no repaint, and no loss of dynamic range.
 //!
-//! Because the mask holds no colour, [`DirectXPixelFormat::A8UIntNormalized`] is
-//! sufficient for it and is tried first (8× fewer bytes per glyph than the FP16
-//! the rest of the atlas uses). A device that rejects A8 falls back to FP16 with
-//! identical output — see [`GlyphAtlas::format`].
+//! The mask is FP16, and the depth is load-bearing rather than incidental:
+//! DirectWrite writes coverage through a steeply compressive gamma ramp (2.2 —
+//! see `canvas_core::text`), and quantizing that to 8 bits collapses its top, so
+//! the near-saturated pixels along every stem round up together and the text
+//! renders measurably heavier. At FP16 a placed label is `+0.04/255` against the
+//! same run drawn directly; at 8-bit it was `+3.5`, and `+16` on the
+//! high-coverage pixels.
 //!
 //! ## Subpixel positioning
 //!
@@ -103,8 +106,8 @@ const GLYPH_PAD_PX: f32 = 1.0;
 /// control kinds binding 1–4 quantized shape sources, and letting glyphs into it
 /// would evict the chrome sources on the first paragraph of text.
 ///
-/// Memory stays small because the entries are masks: a 16-DIP glyph is roughly
-/// 12×22 px, so a full cache is about 0.5 MB in A8 (4 MB on the FP16 fallback).
+/// Memory stays modest because the entries are masks: a 16-DIP glyph is roughly
+/// 12×22 px, so a full cache is about 4 MB at [`MASK_FORMAT`].
 /// Eviction is an O(n) scan, and only on a miss at capacity.
 ///
 /// Evicting an entry a sprite is still bound to is safe, exactly as in the shape
@@ -122,6 +125,20 @@ const GLYPH_ATLAS_CAP: usize = 2048;
 /// The box is expressed BOTH in physical pixels (what the surface is minted at)
 /// and in DIPs (what the sprite is sized and offset by), because the two must
 /// agree exactly or the glyph resamples and blurs.
+///
+/// ## Everything but the phase is a whole physical pixel
+///
+/// A composition sprite placed at a fractional pixel offset is **bilinearly
+/// resampled**, and a resampled glyph mask reads as soft and noticeably heavier
+/// than the same glyph drawn directly — which defeats the entire point of
+/// caching the raster. So the box's padding and its internal baseline are
+/// rounded to whole pixels *here*, where the surface is minted, rather than left
+/// for a caller to round and get subtly wrong.
+///
+/// The subpixel phase is the deliberate exception: it is baked INTO the raster
+/// (the glyph is drawn a fraction of a pixel to the right inside its box), never
+/// into the sprite's offset. That is what lets placement stay integral while
+/// still honouring fractional shaped advances.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GlyphBox {
     /// Surface size in physical pixels.
@@ -131,12 +148,23 @@ pub(crate) struct GlyphBox {
     /// must be given for a 1:1 blit.
     pub size_dip: (f32, f32),
     /// The glyph's baseline origin, measured in DIPs from the box's TOP-LEFT.
+    /// What the RASTERIZER draws at; carries the subpixel phase in `x`.
     ///
-    /// A caller places the sprite at `pen - baseline_dip`. The `x` component
-    /// already carries the selected subpixel phase, so the same box at two
-    /// phases has two different `baseline_dip.0` values — that is what makes
-    /// phase selection a pure offset lookup at placement time.
+    /// Placement uses [`origin_px`](Self::origin_px) instead — see there.
     pub baseline_dip: (f32, f32),
+    /// The glyph's baseline origin measured in WHOLE physical pixels from the
+    /// box's top-left, with the subpixel phase excluded.
+    ///
+    /// This is the placement anchor: a caller puts the box's top-left at
+    /// `(pen_px - origin_px) / scale`, where `pen_px` is the whole-pixel half of
+    /// [`pen_phase`] and the pixel-snapped baseline row. Both subtrahends are
+    /// integers, so the sprite lands exactly on the pixel grid.
+    ///
+    /// The phase is excluded precisely because it is already in the raster;
+    /// subtracting it here as well would shift every glyph left by up to
+    /// `(SUBPIXEL_PHASES - 1) / SUBPIXEL_PHASES` of a pixel *and* knock it off
+    /// the grid.
+    pub origin_px: (i32, i32),
     /// The glyph's DESIGN advance in DIPs.
     ///
     /// For box sizing and for pre-warming only. Placement must use the SHAPED
@@ -184,36 +212,43 @@ pub(crate) fn glyph_box(
     let ink_top = ascent - glyph.top_side_bearing as f32 * k;
     let ink_bottom = descent - glyph.bottom_side_bearing as f32 * k;
 
-    // Pad every side, and grow further wherever the ink leaves the advance box.
-    let pad = GLYPH_PAD_PX / scale;
-    let left = pad + (-ink_left).max(0.0);
-    let right = pad + (ink_right - advance).max(0.0);
-    let top = pad + (ink_top - ascent).max(0.0);
-    let bottom = pad + (ink_bottom - descent).max(0.0);
+    // Pad every side (in PHYSICAL pixels, whole), and grow further wherever the
+    // ink leaves the advance box. Whole pixels because these are exactly the
+    // distances placement subtracts, and a fractional one would put the sprite
+    // between pixels — see the type header.
+    let left_px = (GLYPH_PAD_PX + (-ink_left).max(0.0) * scale).ceil();
+    let right_px = (GLYPH_PAD_PX + (ink_right - advance).max(0.0) * scale).ceil();
+    let top_px = (GLYPH_PAD_PX + (ink_top - ascent).max(0.0) * scale).ceil();
+    let bottom_px = (GLYPH_PAD_PX + (ink_bottom - descent).max(0.0) * scale).ceil();
+    // The baseline's own row, likewise whole: the ascent is what separates the
+    // box's top from it, so rounding it is what makes the vertical anchor an
+    // integer.
+    let ascent_px = (ascent * scale).round();
+    let descent_px = (descent * scale).round();
 
     // The pixel box is authoritative; the DIP box is derived from it so the two
     // cannot disagree. The extra column absorbs the subpixel phase shift, which
     // is strictly less than one pixel.
-    let px_w = (((left + advance + right) * scale).ceil() as i32 + 1).max(1);
-    let px_h = (((top + ascent + descent + bottom) * scale).ceil() as i32).max(1);
+    let px_w = ((left_px + (advance * scale).ceil() + right_px) as i32 + 1).max(1);
+    let px_h = ((top_px + ascent_px + descent_px + bottom_px) as i32).max(1);
 
     GlyphBox {
         px_w,
         px_h,
         size_dip: (px_w as f32 / scale, px_h as f32 / scale),
         baseline_dip: (
-            left + phase_offset_dip(phase, scale),
-            top + ascent,
+            (left_px + phase_offset_px(phase)) / scale,
+            (top_px + ascent_px) / scale,
         ),
+        origin_px: (left_px as i32, (top_px + ascent_px) as i32),
         advance_dip: advance,
     }
 }
 
-/// The DIP shift a subpixel phase applies to the baseline origin: `phase`
-/// quarters (at [`SUBPIXEL_PHASES`] `== 4`) of one PHYSICAL pixel, expressed in
-/// DIPs so it survives the `scale` transform the rasterizer draws under.
-fn phase_offset_dip(phase: u32, scale: f32) -> f32 {
-    (phase % SUBPIXEL_PHASES) as f32 / (SUBPIXEL_PHASES as f32 * scale)
+/// The shift a subpixel phase applies to the baseline origin, in PHYSICAL
+/// pixels: `phase` quarters of one pixel at [`SUBPIXEL_PHASES`] `== 4`.
+fn phase_offset_px(phase: u32) -> f32 {
+    (phase % SUBPIXEL_PHASES) as f32 / SUBPIXEL_PHASES as f32
 }
 
 /// Split a pen position into the whole physical pixel a glyph's box is placed
@@ -381,13 +416,13 @@ impl MaskSurfaces for Compositing {
     }
 }
 
+/// The pixel format every glyph mask is rasterized in. See the module header.
+pub(crate) const MASK_FORMAT: DirectXPixelFormat = DirectXPixelFormat::R16G16B16A16Float;
+
 /// Rasterized glyph masks, shared across every piece of text.
 #[derive(Default)]
 pub(crate) struct GlyphAtlas {
     map: FxHashMap<GlyphKey, GlyphEntry>,
-    /// The pixel format this device actually accepted for a mask, resolved on
-    /// first use. `None` until then.
-    format: Option<DirectXPixelFormat>,
     /// Bumped on [`clear`](Self::clear); callers re-bind when their bound epoch
     /// no longer matches.
     epoch: u32,
@@ -413,17 +448,6 @@ impl GlyphAtlas {
         self.map.len()
     }
 
-    /// The pixel format masks are rasterized in on this device, once resolved.
-    ///
-    /// Probed by ATTEMPTING A8: `CreateDrawingSurface` is the only authority on
-    /// what a given composition graphics device accepts, and it reports a
-    /// rejected format as a failed call. A device that says no falls back to
-    /// FP16, which is what every other atlas source already uses — same output,
-    /// 8× the bytes.
-    pub(crate) fn format(&self) -> Option<DirectXPixelFormat> {
-        self.format
-    }
-
     /// Fetch (rasterizing on a miss) the mask for one glyph.
     ///
     /// `em` is the run's font size in DIPs, `scale` the DIP→px factor, `phase`
@@ -442,9 +466,8 @@ impl GlyphAtlas {
         let now = self.clock;
 
         if !self.map.contains_key(&key) {
-            let format = self.resolve_format(dev);
             let (brush, surface, geom) =
-                rasterize(dev, format, face, glyph, em, scale, phase % SUBPIXEL_PHASES)?;
+                rasterize(dev, face, glyph, em, scale, phase % SUBPIXEL_PHASES)?;
             if self.map.len() >= GLYPH_ATLAS_CAP {
                 self.evict_lru();
             }
@@ -468,22 +491,6 @@ impl GlyphAtlas {
         })
     }
 
-    /// Resolve (once) the mask pixel format for this device — see [`format`](Self::format).
-    fn resolve_format(&mut self, dev: &impl MaskSurfaces) -> DirectXPixelFormat {
-        if let Some(f) = self.format {
-            return f;
-        }
-        // A 1×1 probe: cheap, and it exercises exactly the call the rasterizer
-        // will make. The surface is dropped immediately; only the verdict is kept.
-        let f = if dev.mint(1, 1, DirectXPixelFormat::A8UIntNormalized).is_ok() {
-            DirectXPixelFormat::A8UIntNormalized
-        } else {
-            DirectXPixelFormat::R16G16B16A16Float
-        };
-        self.format = Some(f);
-        f
-    }
-
     /// Drop the least recently bound raster. Called only on a miss at capacity.
     fn evict_lru(&mut self) {
         if let Some(k) = self.map.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| *k) {
@@ -499,7 +506,6 @@ impl GlyphAtlas {
 /// already knows which glyph id it wants.
 fn rasterize(
     dev: &impl MaskSurfaces,
-    format: DirectXPixelFormat,
     face: &FontFace,
     glyph: u16,
     em: f32,
@@ -510,7 +516,7 @@ fn rasterize(
     let gm = *face.design_glyph_metrics(&[glyph], false).ok()?.first()?;
     let geom = glyph_box(metrics, gm, em, scale, phase);
 
-    let (surface, interop, brush) = dev.mint(geom.px_w, geom.px_h, format).ok()?;
+    let (surface, interop, brush) = dev.mint(geom.px_w, geom.px_h, MASK_FORMAT).ok()?;
     let mut origin = crate::system_bindings::POINT::default();
     dev.device_lost().set(false);
     let ctx = unsafe { interop.BeginDraw(None, &mut origin).ok()? };
@@ -600,21 +606,111 @@ mod tests {
                     let k = em / 2048.0;
                     let ascent = 2100.0 * k;
                     let descent = 500.0 * k;
-                    let pad = 1.0 / scale;
+                    let pad = GLYPH_PAD_PX / scale;
 
+                    // The baseline is the padding plus the ascent, both rounded
+                    // to whole pixels — so it can differ from the exact
+                    // `pad + ascent` by up to half a pixel, and no more.
+                    let want = pad + ascent;
                     assert!(
-                        (b.baseline_dip.1 - (pad + ascent)).abs() < 1.0e-4,
-                        "baseline y must be pad + ascent (em {em}, scale {scale})"
+                        (b.baseline_dip.1 - want).abs() <= 0.5 / scale + 1.0e-4,
+                        "baseline y {} vs pad + ascent {want} (em {em}, scale {scale})",
+                        b.baseline_dip.1
                     );
                     assert!((b.advance_dip - 1024.0 * k).abs() < 1.0e-4);
                     // The box must contain the whole advance box plus padding.
                     assert!(b.size_dip.0 >= 1024.0 * k + 2.0 * pad - 1.0e-4);
-                    assert!(b.size_dip.1 >= ascent + descent + 2.0 * pad - 1.0e-4);
+                    assert!(b.size_dip.1 >= ascent + descent - 1.0 / scale);
                     assert!(b.px_w >= 1 && b.px_h >= 1);
                     // The DIP box is exactly the pixel box.
                     assert!((b.size_dip.0 * scale - b.px_w as f32).abs() < 1.0e-3);
                     assert!((b.size_dip.1 * scale - b.px_h as f32).abs() < 1.0e-3);
                 }
+            }
+        }
+    }
+
+    /// The placement anchor must be whole physical pixels, and must agree with
+    /// where the rasterizer actually put the baseline to within the subpixel
+    /// phase — which is the ONLY fractional part allowed anywhere in the box.
+    ///
+    /// This is the invariant that keeps a placed glyph a 1:1 blit. Violating it
+    /// costs no test failure anywhere else and no error at runtime: the glyph
+    /// simply gets bilinearly resampled, and the text quietly renders soft and
+    /// too heavy.
+    #[test]
+    fn placement_anchor_is_whole_pixels() {
+        let fm = face_metrics();
+        let cases = [
+            glyph_metrics(1024, 60, 60, 400, 100),
+            glyph_metrics(1024, -200, -300, -150, -250), // heavy overhang
+            glyph_metrics(0, 0, 0, 0, 0),                // degenerate
+            glyph_metrics(1536, 3, 900, 7, 11),          // awkward bearings
+        ];
+        for &em in &[10.0f32, 11.5, 13.0, 16.0, 22.0] {
+            for &scale in &[1.0f32, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+                for gm in cases {
+                    for phase in 0..SUBPIXEL_PHASES {
+                        let b = glyph_box(fm, gm, em, scale, phase);
+
+                        // The rasterizer's baseline, in physical pixels, must be
+                        // the integer anchor plus exactly this phase's fraction.
+                        let raster_px = (b.baseline_dip.0 * scale, b.baseline_dip.1 * scale);
+                        let want_x = b.origin_px.0 as f32 + phase_offset_px(phase);
+                        assert!(
+                            (raster_px.0 - want_x).abs() < 1.0e-3,
+                            "x anchor {} + phase != raster {} (em {em}, scale {scale}, phase {phase})",
+                            b.origin_px.0,
+                            raster_px.0
+                        );
+                        assert!(
+                            (raster_px.1 - b.origin_px.1 as f32).abs() < 1.0e-3,
+                            "y anchor {} != raster {} — the vertical anchor carries no phase",
+                            b.origin_px.1,
+                            raster_px.1
+                        );
+
+                        // The anchor must be inside the box: a glyph placed by it
+                        // would otherwise hang its baseline outside its own raster.
+                        assert!(b.origin_px.0 >= 0 && b.origin_px.0 < b.px_w);
+                        assert!(b.origin_px.1 >= 0 && b.origin_px.1 <= b.px_h);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pen position placed through the full pipeline must land the ink within
+    /// half a subpixel phase of where shaping asked for it, at whole-pixel
+    /// sprite offsets. This is `pen_phase` and `glyph_box` composed exactly as
+    /// `glyph_text::TextPart::sync` composes them.
+    #[test]
+    fn placement_reconstructs_the_pen_on_the_grid() {
+        let fm = face_metrics();
+        let gm = glyph_metrics(1024, 60, 60, 400, 100);
+        let tolerance = 0.5 / SUBPIXEL_PHASES as f32;
+        for &scale in &[1.0f32, 1.25, 1.5, 2.0] {
+            let mut pen = 3.3f32;
+            while pen < 200.0 {
+                let (whole_px, phase) = pen_phase(pen, scale);
+                let b = glyph_box(fm, gm, 16.0, scale, phase);
+
+                // What `sync` computes for the sprite's offset.
+                let sprite_x_px = (whole_px - b.origin_px.0) as f32;
+                assert_eq!(
+                    sprite_x_px,
+                    sprite_x_px.round(),
+                    "sprite offset must be whole pixels"
+                );
+
+                // Where the ink's baseline origin therefore lands.
+                let ink_px = sprite_x_px + b.baseline_dip.0 * scale;
+                assert!(
+                    (ink_px - pen * scale).abs() <= tolerance + 1.0e-3,
+                    "pen {pen} at scale {scale}: ink at {ink_px}, wanted {}",
+                    pen * scale
+                );
+                pen += 0.031;
             }
         }
     }
@@ -659,16 +755,19 @@ mod tests {
         );
     }
 
-    /// Each phase must shift the origin by exactly one more quarter-pixel, and
-    /// the phases must be distinct at every scale.
+    /// Each phase must shift the RASTER's origin by exactly one more
+    /// quarter-pixel while leaving the placement anchor untouched — the phase
+    /// lives in the mask, never in the sprite offset.
     #[test]
     fn phases_step_by_a_quarter_pixel() {
         let fm = face_metrics();
         let gm = glyph_metrics(1024, 60, 60, 400, 100);
         for &scale in &[1.0f32, 1.25, 1.5, 2.0] {
             let mut seen: Vec<f32> = Vec::new();
+            let anchor = glyph_box(fm, gm, 16.0, scale, 0).origin_px;
             for phase in 0..SUBPIXEL_PHASES {
                 let b = glyph_box(fm, gm, 16.0, scale, phase);
+                assert_eq!(b.origin_px, anchor, "the phase must not move the anchor");
                 // In PHYSICAL pixels the step is exactly 1 / SUBPIXEL_PHASES.
                 let px = b.baseline_dip.0 * scale;
                 if let Some(prev) = seen.last() {
@@ -841,18 +940,12 @@ mod tests {
 
         let mut atlas = GlyphAtlas::default();
         assert_eq!(atlas.len(), 0);
-        assert!(atlas.format().is_none(), "format is resolved lazily");
 
         let g = run.glyph_indices[0];
         let first = atlas
             .get(&dev, face, g, 16.0, 1.0, 0)
             .expect("rasterize one glyph");
         assert_eq!(atlas.len(), 1);
-        eprintln!(
-            "mask pixel format resolved to {:?} (A8 = {:?})",
-            atlas.format(),
-            DirectXPixelFormat::A8UIntNormalized
-        );
 
         // A hit returns the SAME surface brush, not a re-raster.
         let again = atlas.get(&dev, face, g, 16.0, 1.0, 0).expect("cache hit");

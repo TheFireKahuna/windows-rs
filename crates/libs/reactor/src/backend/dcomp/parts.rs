@@ -1178,8 +1178,11 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
         return;
     }
     let (w, h) = (node.rect.w, node.rect.h);
-    let radius = ink_radius(node);
     let pal = super::controls::button_palette(node);
+    // From the palette, not re-derived: the fill, the border and the ink are
+    // three sprites cut to the same curve, and the palette is where that curve
+    // is decided (see [`ButtonPalette`]).
+    let radius = pal.radius;
     let dim = dim_of(node);
     // A fully transparent fill (the bare / chromeless variants at rest) binds
     // nothing: an atlas source that paints no pixels is a wasted raster and a
@@ -1188,7 +1191,7 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
     let border_key = pal
         .border
         .map(|c| AtlasKey::hbar(h, radius, theme::BORDER_W, c, scale));
-    let ink_key = AtlasKey::hbar(h, radius, 0.0, theme::w(1.0), scale);
+    let ink_key = AtlasKey::hbar(h, ink_radius(node), 0.0, theme::w(1.0), scale);
     let target = ink_target(node);
     let Some(parts) = node.parts.as_mut() else { return };
 

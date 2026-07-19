@@ -1579,6 +1579,7 @@ impl DCompBackend {
             &self.comp,
             &mut self.cache,
             &mut self.atlas,
+            &mut self.glyphs,
             &mut self.arena,
             root,
             scale,
