@@ -48,14 +48,19 @@ impl Const {
         Ok(Some(Self { name, value }))
     }
 
-    /// Try to parse a file-scope floating-point `const` variable declaration
-    /// (e.g. `const double UIA_ScrollPatternNoScroll = -1;`) as a typed
-    /// constant. Win32 headers use this pattern for a handful of floating-point
-    /// API constants that have no other representation in the flat metadata, so
-    /// they would otherwise be dropped entirely. Only const-qualified scalar
-    /// `float`/`double` variables with an evaluable constant initializer are
-    /// accepted; pointers, aggregates, integers, non-const variables, and
-    /// anything that fails constant evaluation return `None`.
+    /// Try to parse a file-scope scalar `const` variable declaration
+    /// (e.g. `const double UIA_ScrollPatternNoScroll = -1;`, or the MIDL
+    /// `module UIA_PropertyIds { const long UIA_NamePropertyId = 30005; }`
+    /// idiom) as a typed constant. Win32 headers use this pattern for API
+    /// constants that have no other representation in the flat metadata, so
+    /// they would otherwise be dropped entirely.
+    ///
+    /// Only const-qualified scalar variables with an evaluable constant
+    /// initializer are accepted; pointers, aggregates, non-const variables, and
+    /// anything that fails constant evaluation return `None`. Width and
+    /// signedness follow the *declared* type (LLP64), not the value, so
+    /// `const long x = 1;` stays `i32` rather than collapsing to `u32` the way
+    /// an untyped `#define` would.
     pub fn parse_var_decl(cursor: &Cursor) -> Option<Self> {
         let name = cursor.name();
         if name.is_empty() || name.starts_with('_') {
@@ -68,6 +73,19 @@ impl Const {
         let value = match ty.canonical_type().kind() {
             CXType_Float => metadata::Value::F32(cursor.evaluate_double()? as f32),
             CXType_Double | CXType_LongDouble => metadata::Value::F64(cursor.evaluate_double()?),
+            CXType_Bool => metadata::Value::Bool(cursor.evaluate_signed()? != 0),
+            CXType_Char_U | CXType_UChar => metadata::Value::U8(cursor.evaluate_unsigned()? as u8),
+            CXType_UShort | CXType_WChar | CXType_Char16 => {
+                metadata::Value::U16(cursor.evaluate_unsigned()? as u16)
+            }
+            CXType_UInt | CXType_ULong | CXType_Char32 => {
+                metadata::Value::U32(cursor.evaluate_unsigned()? as u32)
+            }
+            CXType_ULongLong => metadata::Value::U64(cursor.evaluate_unsigned()?),
+            CXType_Char_S | CXType_SChar => metadata::Value::I8(cursor.evaluate_signed()? as i8),
+            CXType_Short => metadata::Value::I16(cursor.evaluate_signed()? as i16),
+            CXType_Int | CXType_Long => metadata::Value::I32(cursor.evaluate_signed()? as i32),
+            CXType_LongLong => metadata::Value::I64(cursor.evaluate_signed()?),
             _ => return None,
         };
         Some(Self { name, value })
