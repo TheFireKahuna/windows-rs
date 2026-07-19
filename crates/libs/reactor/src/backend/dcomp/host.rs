@@ -280,7 +280,7 @@ impl DCompHost {
         UI_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
         // Seed the motion preference before anything can animate, so the very
         // first enter transition already honours it.
-        super::animate::refresh_reduced_motion();
+        crate::motion::refresh_reduced_motion();
         ensure_dispatcher_queue()?;
 
         let (hwnd, dpi, (pw, ph)) = create_window(title.as_ref(), client_dip)?;
@@ -1147,7 +1147,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             // So does an Accessibility animation-effects flip. Only a real
             // change rebuilds implicit collections — this message arrives for
             // every unrelated setting in the system.
-            if super::animate::refresh_reduced_motion()
+            if crate::motion::refresh_reduced_motion()
                 && let Some(s) = shared()
             {
                 s.backend.borrow_mut().refresh_motion();

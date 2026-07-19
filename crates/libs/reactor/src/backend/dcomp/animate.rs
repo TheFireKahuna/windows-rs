@@ -35,8 +35,9 @@
 //! `from` value and make the element permanently invisible, which is why
 //! [`settle`] exists rather than a bare `return`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use crate::motion::reduced_motion;
 
 use super::node::Node;
 use crate::style::{AnimationConfig, Easing, ImplicitTransitions, LayoutAnimationConfig};
@@ -54,64 +55,6 @@ pub(crate) fn warn(args: std::fmt::Arguments<'_>) {
     if cfg!(debug_assertions) {
         eprintln!("windows-reactor: {args}");
     }
-}
-
-/// The user's system animation preference, cached. Refreshed by
-/// [`refresh_reduced_motion`] at startup and on every `WM_SETTINGCHANGE`.
-///
-/// Process-global rather than per-backend: it is a user-level preference, the
-/// same for every window, and the animation helpers here are free functions
-/// that have no backend to reach through.
-static REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
-
-/// Whether the user has asked the system to minimise animation — Settings →
-/// Accessibility → Visual effects → **Animation effects**, which is what
-/// `SPI_GETCLIENTAREAANIMATION` reports.
-pub(crate) fn reduced_motion() -> bool {
-    REDUCED_MOTION.load(Ordering::Relaxed)
-}
-
-/// Re-read the system animation preference into the cache.
-///
-/// Returns `true` when the value **changed**, which is the caller's signal that
-/// already-built implicit-animation collections are now stale and need
-/// rebuilding (see `DCompBackend::refresh_motion`). A plain re-read that finds
-/// the same value must not trigger that walk — `WM_SETTINGCHANGE` broadcasts
-/// for every unrelated setting in the system.
-pub(crate) fn refresh_reduced_motion() -> bool {
-    let now = read_reduced_motion();
-    REDUCED_MOTION.swap(now, Ordering::Relaxed) != now
-}
-
-/// Force the cached preference — test seam only, so a test does not depend on
-/// the developer machine's accessibility settings.
-pub(crate) fn set_reduced_motion_for_test(reduced: bool) {
-    REDUCED_MOTION.store(reduced, Ordering::Relaxed);
-}
-
-/// Ask the OS whether client-area animation is enabled.
-///
-/// Uses the Win32 read rather than WinRT `UISettings.AnimationsEnabled`, which
-/// is documented to surface this same setting: the value is identical, the
-/// change signal (`WM_SETTINGCHANGE`) is already handled on the pump, and the
-/// Win32 read is synchronous on the thread that needs it. `UISettings` would
-/// add a WinRT activation and deliver its change event on a thread-pool thread,
-/// requiring a marshal back for a value we can simply read here.
-///
-/// **Fails open** (animations enabled). A transient failure to read a
-/// preference should not silently disable motion across the whole app; the
-/// setting defaults to enabled, and this call does not realistically fail.
-fn read_reduced_motion() -> bool {
-    let mut enabled = windows_core::BOOL(1);
-    let ok = unsafe {
-        crate::system_bindings::SystemParametersInfoW(
-            crate::system_bindings::SPI_GETCLIENTAREAANIMATION,
-            0,
-            (&raw mut enabled).cast(),
-            0,
-        )
-    };
-    ok.as_bool() && !enabled.as_bool()
 }
 
 /// Apply a one-shot config's **end state** with no animation.

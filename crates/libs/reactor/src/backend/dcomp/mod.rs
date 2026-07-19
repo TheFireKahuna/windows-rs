@@ -356,6 +356,12 @@ impl DCompBackend {
                 self.cache.invalidate();
                 self.atlas.clear();
                 self.glyphs.clear();
+                // Brushes re-bind by epoch, but a part's cached OFFSET, SIZE and
+                // OPACITY are claims about a compositor that just went away, and
+                // no epoch covers them. Left standing, each one self-gates the
+                // write that would put its sprite back — stranding it for the
+                // rest of the window's life.
+                self.invalidate_parts();
                 return;
             }
         }
@@ -572,6 +578,22 @@ impl DCompBackend {
         }
     }
 
+    /// Route every node's retained chrome through [`parts::Parts::invalidate`]
+    /// — the one reclaim authority — and dirty it so the next paint re-places
+    /// the sprites from scratch.
+    ///
+    /// Marking dirty is not optional: `parts::sync` only runs on a dirty node,
+    /// so a reclaim without it would leave the caches empty and the sprites
+    /// untouched until something unrelated happened to dirty them.
+    fn invalidate_parts(&mut self) {
+        for slot in self.arena.iter_mut() {
+            if let Some(parts) = slot.parts.as_mut() {
+                parts.invalidate();
+            }
+            slot.mark_dirty();
+        }
+    }
+
     /// Mark every node's surface for repaint (e.g. on a theme change), then
     /// repaint. Layout is unchanged, so no relayout is needed.
     pub(crate) fn mark_all_dirty_and_repaint(&mut self) {
@@ -606,7 +628,7 @@ impl DCompBackend {
         // ghost would be snapshotted, settled to its end opacity and released
         // on the next frame having shown nothing. Skip it: the element just
         // disappears, which is what the preference asks for.
-        if animate::reduced_motion() {
+        if crate::motion::reduced_motion() {
             return;
         }
         let Some(node) = self.arena.get(id) else { return };
@@ -1040,7 +1062,7 @@ impl DCompBackend {
     /// Rebuild every node's implicit-animation collection after the system
     /// motion preference flipped.
     ///
-    /// The one-shot helpers read [`animate::reduced_motion`] as they run, so
+    /// The one-shot helpers read [`crate::motion::reduced_motion`] as they run, so
     /// they need nothing here — but implicit collections are built once and
     /// attached to the visual, so nodes that already exist would keep gliding
     /// (or keep jumping) until something else happened to rebuild them.

@@ -948,7 +948,7 @@ impl ArenaHarness {
     /// must not depend on — it is whatever the developer's machine happens to
     /// be set to. Restore it when the test is done; it is process-global.
     pub fn set_reduced_motion(&self, reduced: bool) {
-        dcomp::animate::set_reduced_motion_for_test(reduced);
+        crate::motion::set_reduced_motion_for_test(reduced);
     }
 
     /// Run a one-shot animation config on a node, exactly as
