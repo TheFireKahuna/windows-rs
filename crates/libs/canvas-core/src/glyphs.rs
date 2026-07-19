@@ -218,7 +218,7 @@ impl GlyphRun {
     /// Scoped rather than returned: `DWRITE_GLYPH_RUN` borrows this run's three
     /// arrays as raw pointers and owns a font-face reference that has to be
     /// released again, so the ABI struct cannot outlive the borrow.
-    fn with_abi<R>(&self, f: impl FnOnce(&DWRITE_GLYPH_RUN) -> R) -> R {
+    pub(crate) fn with_abi<R>(&self, f: impl FnOnce(&DWRITE_GLYPH_RUN) -> R) -> R {
         let mut run = DWRITE_GLYPH_RUN {
             fontFace: core::mem::ManuallyDrop::new(Some(self.font_face.raw.clone())),
             fontEmSize: self.font_em_size,

@@ -29,6 +29,7 @@ mod device;
 mod device_lost;
 mod effect;
 mod geometry;
+mod glyph_coverage;
 mod glyphs;
 mod session;
 mod swap_chain;
@@ -47,6 +48,7 @@ pub(crate) use device::D2dLock;
 pub use device::GpuDevice;
 pub use effect::Effect;
 pub use geometry::*;
+pub use glyph_coverage::{condition, glyph_run_coverage, GlyphCoverage};
 pub use glyphs::{FontFace, FontMetrics, GlyphMetrics, GlyphOffset, GlyphRun};
 /// Set a device context's DPI so drawing happens in DIPs.
 ///

@@ -60,7 +60,8 @@ use std::cell::Cell;
 
 use rustc_hash::FxHashMap;
 use windows_canvas_core::{
-    ColorF, DrawingSession, FontFace, FontMetrics, GlyphMetrics, GlyphRun, Vector2 as CVec2,
+    glyph_run_coverage, ColorF, DrawingSession, FontFace, FontMetrics, GlyphMetrics, GlyphRun,
+    Rect, Vector2 as CVec2,
 };
 use windows_numerics::Matrix3x2;
 
@@ -499,11 +500,30 @@ impl GlyphAtlas {
     }
 }
 
-/// Draw one glyph into its own surface and return the mask brush.
+/// Take one glyph's coverage from the rasterizer and upload it as a mask.
 ///
-/// The glyph is drawn as a one-glyph [`GlyphRun`] rather than through a
+/// The glyph is described as a one-glyph [`GlyphRun`] rather than a
 /// `TextLayout`, so nothing is shaped, measured, or laid out here — the caller
 /// already knows which glyph id it wants.
+///
+/// ## Nothing is drawn
+///
+/// [`glyph_run_coverage`] asks DirectWrite's rasterizer for the coverage
+/// directly, so `BeginDraw` carries an upload and nothing else: no glyph run, no
+/// brush, no text antialias mode, no rendering params. Coverage is produced on
+/// the CPU, which is also why the result no longer depends on a GPU at all.
+///
+/// That last point is the reason to do it this way rather than for the saved
+/// work. Direct2D picks a coverage gamma from **what it believes the target's
+/// encoding to be**: drawing the same run onto an FP16 target writes linear
+/// coverage, and onto an 8-bit one writes it through a ~2.0 ramp. A mask is read
+/// back as linear by the compositor either way, so that choice was a silent
+/// correctness dependency on `MASK_FORMAT`. Uploading measured coverage removes
+/// the dependency instead of tuning around it — the bytes here are the
+/// rasterizer's own, whatever the surface is made of.
+///
+/// The box comes from [`glyph_box`] exactly as before; the coverage carries its
+/// own tight bounds and lands at them inside that box.
 fn rasterize(
     dev: &impl MaskSurfaces,
     face: &FontFace,
@@ -516,33 +536,6 @@ fn rasterize(
     let gm = *face.design_glyph_metrics(&[glyph], false).ok()?.first()?;
     let geom = glyph_box(metrics, gm, em, scale, phase);
 
-    let (surface, interop, brush) = dev.mint(geom.px_w, geom.px_h, MASK_FORMAT).ok()?;
-    let mut origin = crate::system_bindings::POINT::default();
-    dev.device_lost().set(false);
-    let ctx = unsafe { interop.BeginDraw(None, &mut origin).ok()? };
-    let session = DrawingSession::new_borrowed(&ctx, dev.device_lost());
-
-    // Mandatory: the surface is premultiplied and cleared transparent, and an A8
-    // target has nowhere to put subpixel coverages even if it were not. See the
-    // module header.
-    session.set_grayscale_text_antialiasing();
-    session.set_transform(&Matrix3x2 {
-        m11: scale,
-        m12: 0.0,
-        m21: 0.0,
-        m22: scale,
-        m31: origin.x as f32,
-        m32: origin.y as f32,
-    });
-    session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
-
-    // Opaque white, NOT run through `node::linear`. The mask brush reads alpha
-    // only, so the glyph's coverage IS the mask; putting the app's output colour
-    // transform on a coverage value would fold display mapping into glyph shape
-    // and then double-apply once the FP16 source is tinted. The tonemap belongs
-    // on the source, which is where it already happens.
-    let white = session.create_solid_brush(ColorF::new(1.0, 1.0, 1.0, 1.0)).ok()?;
-
     let run = GlyphRun {
         font_face: face.clone(),
         font_em_size: em,
@@ -553,11 +546,61 @@ fn rasterize(
         is_sideways: false,
         bidi_level: 0,
     };
-    session.draw_glyph_run_at(
-        CVec2::new(geom.baseline_dip.0, geom.baseline_dip.1),
-        &run,
-        &white,
-    );
+    // The baseline the box already places the glyph at — which carries the
+    // subpixel phase — so the returned bounds are physical pixels measured from
+    // the box's own top-left.
+    let coverage = glyph_run_coverage(&run, scale, geom.baseline_dip)
+        .ok()
+        .flatten();
+
+    let (surface, interop, brush) = dev.mint(geom.px_w, geom.px_h, MASK_FORMAT).ok()?;
+    let mut origin = crate::system_bindings::POINT::default();
+    dev.device_lost().set(false);
+    let ctx = unsafe { interop.BeginDraw(None, &mut origin).ok()? };
+    let session = DrawingSession::new_borrowed(&ctx, dev.device_lost());
+
+    // No scale in the transform: coverage is already rasterized at `scale`, and
+    // its bounds are physical pixels. Only the surface's place in its atlas.
+    session.set_transform(&Matrix3x2 {
+        m11: 1.0,
+        m12: 0.0,
+        m21: 0.0,
+        m22: 1.0,
+        m31: origin.x as f32,
+        m32: origin.y as f32,
+    });
+    session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
+
+    // A glyph that marks no pixels — a space — keeps its cleared surface rather
+    // than failing: the cache entry is what stops it being asked again.
+    if let Some(cov) = coverage {
+        // Premultiplied white at the coverage, i.e. exactly what drawing an
+        // opaque white run produced. The mask brush reads alpha, but the colour
+        // channels are kept equal to it so the surface is unchanged in kind.
+        //
+        // Uploaded unmapped, NOT through `node::linear`: coverage is not a
+        // colour, and putting the app's output transform on it would fold
+        // display mapping into glyph shape and then double-apply once the FP16
+        // source is tinted. The tonemap belongs on the source, where it already
+        // happens.
+        let mut rgba = vec![0.0f32; (cov.width as usize) * (cov.height as usize) * 4];
+        for (i, &a) in cov.alpha.iter().enumerate() {
+            let v = f32::from(a) / 255.0;
+            rgba[i * 4..i * 4 + 4].copy_from_slice(&[v, v, v, v]);
+        }
+        if let Ok(bitmap) = session.create_bitmap_fp16(cov.width, cov.height, &rgba) {
+            session.draw_bitmap(
+                &bitmap,
+                &Rect::from_xywh(
+                    cov.left as f32,
+                    cov.top as f32,
+                    cov.width as f32,
+                    cov.height as f32,
+                ),
+                1.0,
+            );
+        }
+    }
 
     unsafe { interop.EndDraw() }.ok().ok()?;
     Some((brush, surface, geom))
