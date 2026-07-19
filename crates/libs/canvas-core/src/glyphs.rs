@@ -15,6 +15,78 @@
 use super::*;
 use std::cell::RefCell;
 
+/// Which of the two baseline-relative rules a [`TextDecoration`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DecorationKind {
+    /// Below the baseline — what `TextLayout::set_underline` marks, and what an
+    /// IME draws under its active composition span.
+    Underline,
+    /// Through the x-height.
+    Strikethrough,
+}
+
+/// One underline or strikethrough rule, in DIPs.
+///
+/// DirectWrite resolves these against the font's own
+/// [`underline_position`](FontMetrics::underline_position) /
+/// [`strikethrough_position`](FontMetrics::strikethrough_position) and the
+/// span's tallest run, so the values here are already the final geometry — a
+/// caller places the rect and does no font arithmetic of its own.
+///
+/// A decoration is NOT a glyph: it has no outline, no coverage, and no atlas
+/// entry. Whoever renders it draws a rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextDecoration {
+    pub kind: DecorationKind,
+    /// Baseline origin of the decorated span, in the same space the sibling
+    /// [`GlyphRun::baseline_origin`]s are reported in.
+    pub baseline_origin: Vector2,
+    /// Length along the reading direction.
+    pub width: f32,
+    /// Rule thickness.
+    pub thickness: f32,
+    /// Baseline-relative position of the rule's top edge, positive DOWNWARD —
+    /// DirectWrite's sign convention, and the opposite of
+    /// [`GlyphOffset::ascender_offset`]'s.
+    pub offset: f32,
+}
+
+impl TextDecoration {
+    /// The rule's rect as `(left, top, width, height)`, in the same space as
+    /// [`baseline_origin`](Self::baseline_origin).
+    ///
+    /// Right-to-left spans report their origin at the span's right edge, so the
+    /// left edge is derived rather than assumed.
+    pub fn rect(&self, right_to_left: bool) -> (f32, f32, f32, f32) {
+        let left = if right_to_left {
+            self.baseline_origin.x - self.width
+        } else {
+            self.baseline_origin.x
+        };
+        (
+            left,
+            self.baseline_origin.y + self.offset,
+            self.width,
+            self.thickness,
+        )
+    }
+}
+
+/// Everything a [`TextLayout::Draw`](TextLayout) walk produces: the shaped glyph
+/// runs, and the decorations that are not glyphs.
+///
+/// The two come from ONE walk because DirectWrite emits them from one walk. A
+/// caller that wanted both from [`TextLayout::glyph_runs`] plus a second query
+/// would shape the layout twice to learn things it was already told once.
+#[derive(Clone, Default)]
+pub struct ShapedText {
+    pub runs: Vec<GlyphRun>,
+    /// Empty for the overwhelming majority of text — only a layout with
+    /// [`set_underline`](TextLayout::set_underline) or a strikethrough applied
+    /// to some range produces any.
+    pub decorations: Vec<TextDecoration>,
+}
+
 /// Per-glyph positional adjustment, in DIPs, relative to where the advance
 /// alone would place the glyph.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -266,10 +338,31 @@ impl TextLayout {
     /// passing the same origin the text will be drawn at yields runs already in
     /// target space.
     pub fn glyph_runs_at(&self, origin_x: f32, origin_y: f32) -> Result<Vec<GlyphRun>> {
+        Ok(self.shape_at(origin_x, origin_y)?.runs)
+    }
+
+    /// Walk the shaped layout for its glyph runs AND its decorations, with the
+    /// layout box's top-left at the origin.
+    ///
+    /// Prefer this over [`glyph_runs`](Self::glyph_runs) wherever a layout can
+    /// carry an underline or a strikethrough — an IME composition span, most
+    /// obviously. `glyph_runs` discards them, which is silent: the text renders
+    /// correctly and the rule simply never appears.
+    pub fn shape(&self) -> Result<ShapedText> {
+        self.shape_at(0.0, 0.0)
+    }
+
+    /// [`shape`](Self::shape) with the layout box's top-left placed at
+    /// `(origin_x, origin_y)`.
+    pub fn shape_at(&self, origin_x: f32, origin_y: f32) -> Result<ShapedText> {
         let collector = ComObject::new(RunCollector::default());
         let renderer: IDWriteTextRenderer = collector.to_interface();
         unsafe { self.raw().Draw(None, &renderer, origin_x, origin_y).ok()? };
-        Ok(collector.get().runs.take())
+        let c = collector.get();
+        Ok(ShapedText {
+            runs: c.runs.take(),
+            decorations: c.decorations.take(),
+        })
     }
 }
 
@@ -310,13 +403,18 @@ impl DrawingSession<'_> {
 /// A [`IDWriteTextRenderer`] that draws nothing and records everything: the
 /// callback DirectWrite drives from `IDWriteTextLayout::Draw`.
 ///
-/// Only [`DrawGlyphRun`](IDWriteTextRenderer_Impl::DrawGlyphRun) is honoured.
-/// Underlines, strikethroughs, and inline objects are decorations the caller
-/// draws itself (they are not glyphs and carry no atlas entry), so those
-/// callbacks succeed without recording anything.
+/// Glyph runs and decorations are both recorded. A decoration is not a glyph —
+/// it has no outline and no atlas entry, and whoever renders one draws a
+/// rectangle — but it is still something DirectWrite resolved and the caller
+/// cannot re-derive without redoing the layout's own arithmetic, so dropping it
+/// here would be losing information rather than declining to draw.
+///
+/// Inline objects are genuinely not recorded: they are caller-supplied content
+/// the caller already holds, so that callback succeeds without doing anything.
 #[derive(Default)]
 struct RunCollector {
     runs: RefCell<Vec<GlyphRun>>,
+    decorations: RefCell<Vec<TextDecoration>>,
 }
 
 implement_decl! {
@@ -420,22 +518,52 @@ impl IDWriteTextRenderer_Impl for RunCollector_Impl {
     fn DrawUnderline(
         &self,
         _context: *const core::ffi::c_void,
-        _baseline_origin_x: f32,
-        _baseline_origin_y: f32,
-        _underline: *const DWRITE_UNDERLINE,
+        baseline_origin_x: f32,
+        baseline_origin_y: f32,
+        underline: *const DWRITE_UNDERLINE,
         _client_drawing_effect: Ref<IUnknown>,
     ) -> Result<()> {
+        // As in `DrawGlyphRun`: a null payload is nothing to record, not an
+        // error — failing here would abort the walk and lose what came before.
+        if underline.is_null() {
+            return Ok(());
+        }
+        let u = unsafe { &*underline };
+        self.decorations.borrow_mut().push(TextDecoration {
+            kind: DecorationKind::Underline,
+            baseline_origin: Vector2 {
+                x: baseline_origin_x,
+                y: baseline_origin_y,
+            },
+            width: u.width,
+            thickness: u.thickness,
+            offset: u.offset,
+        });
         Ok(())
     }
 
     fn DrawStrikethrough(
         &self,
         _context: *const core::ffi::c_void,
-        _baseline_origin_x: f32,
-        _baseline_origin_y: f32,
-        _strikethrough: *const DWRITE_STRIKETHROUGH,
+        baseline_origin_x: f32,
+        baseline_origin_y: f32,
+        strikethrough: *const DWRITE_STRIKETHROUGH,
         _client_drawing_effect: Ref<IUnknown>,
     ) -> Result<()> {
+        if strikethrough.is_null() {
+            return Ok(());
+        }
+        let s = unsafe { &*strikethrough };
+        self.decorations.borrow_mut().push(TextDecoration {
+            kind: DecorationKind::Strikethrough,
+            baseline_origin: Vector2 {
+                x: baseline_origin_x,
+                y: baseline_origin_y,
+            },
+            width: s.width,
+            thickness: s.thickness,
+            offset: s.offset,
+        });
         Ok(())
     }
 
@@ -500,6 +628,87 @@ mod tests {
             (walked - measured).abs() < 0.5,
             "glyph advances ({walked}) must sum to the layout width ({measured})"
         );
+    }
+
+    /// An underline applied to a range must come back from the walk with
+    /// geometry that lands under exactly that range.
+    ///
+    /// This is the callback that used to discard its argument, so the failure it
+    /// guards is silent: the text renders perfectly and the rule is simply
+    /// absent — which for an IME composition span means the user cannot see what
+    /// they are composing.
+    #[test]
+    fn an_underline_is_recorded_with_usable_geometry() {
+        let format = TextFormat::new("Segoe UI", 16.0).unwrap();
+        let text = "abcdefghij";
+        let layout = TextLayout::new(text, &format, 1000.0, 100.0).unwrap();
+
+        // Nothing marked: no decorations, and the runs are unaffected.
+        let bare = layout.shape().unwrap();
+        assert!(bare.decorations.is_empty(), "unmarked text has no rules");
+        assert!(!bare.runs.is_empty());
+
+        // Mark the middle four code units, as an IME marks its composition.
+        layout.set_underline(true, 3, 4).unwrap();
+        let marked = layout.shape().unwrap();
+        assert_eq!(marked.decorations.len(), 1, "one span, one rule");
+
+        let d = marked.decorations[0];
+        assert_eq!(d.kind, DecorationKind::Underline);
+        assert!(d.thickness > 0.0, "a rule with no thickness draws nothing");
+        assert!(d.width > 0.0);
+
+        // The rule sits BELOW the baseline: DirectWrite's offset is positive
+        // downward, which is the opposite of `GlyphOffset::ascender_offset`.
+        assert!(
+            d.offset > 0.0,
+            "underline offset {} should be below the baseline",
+            d.offset
+        );
+
+        // And it spans the marked range, not the whole string. Compare against
+        // what the layout itself says those code units occupy.
+        let range = layout.hit_test_range(3, 4, 0.0, 0.0).unwrap();
+        assert_eq!(range.len(), 1, "an unwrapped range is one rect");
+        let (rx, _, rw, _) = range[0];
+        let (dx, dy, dw, dh) = d.rect(false);
+        assert!(
+            (dx - rx).abs() < 0.5,
+            "rule starts at {dx}, range at {rx}"
+        );
+        assert!(
+            (dw - rw).abs() < 0.5,
+            "rule spans {dw}, range spans {rw}"
+        );
+        assert!(dh > 0.0);
+        // Strictly inside the string's width — the whole point of a span.
+        let full = layout.metrics().unwrap().width;
+        assert!(dw < full, "rule ({dw}) must be narrower than the text ({full})");
+        assert!(dy > 0.0, "rule must be below the layout's top edge");
+
+        // Clearing it takes the rule away again.
+        layout.set_underline(false, 3, 4).unwrap();
+        assert!(layout.shape().unwrap().decorations.is_empty());
+    }
+
+    /// The runs a decoration walk yields must be the same runs `glyph_runs`
+    /// yields — recording decorations must not perturb glyph collection, since
+    /// every existing caller goes through the narrower entry point.
+    #[test]
+    fn recording_decorations_leaves_the_runs_alone() {
+        let format = TextFormat::new("Segoe UI", 16.0).unwrap();
+        let layout = TextLayout::new("Hello glyphs", &format, 1000.0, 100.0).unwrap();
+        layout.set_underline(true, 0, 5).unwrap();
+
+        let shaped = layout.shape().unwrap();
+        let runs = layout.glyph_runs().unwrap();
+        assert!(!shaped.decorations.is_empty(), "the mark must be recorded");
+        assert_eq!(runs.len(), shaped.runs.len());
+        for (a, b) in runs.iter().zip(&shaped.runs) {
+            assert_eq!(a.glyph_indices, b.glyph_indices);
+            assert_eq!(a.glyph_advances, b.glyph_advances);
+            assert_eq!(a.baseline_origin, b.baseline_origin);
+        }
     }
 
     /// Rasterize one glyph at four fractional baseline origins and compare the

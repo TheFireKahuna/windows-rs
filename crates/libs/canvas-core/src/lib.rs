@@ -49,7 +49,10 @@ pub use device::GpuDevice;
 pub use effect::Effect;
 pub use geometry::*;
 pub use glyph_coverage::{condition, glyph_run_coverage, GlyphCoverage};
-pub use glyphs::{FontFace, FontMetrics, GlyphMetrics, GlyphOffset, GlyphRun};
+pub use glyphs::{
+    DecorationKind, FontFace, FontMetrics, GlyphMetrics, GlyphOffset, GlyphRun, ShapedText,
+    TextDecoration,
+};
 /// Set a device context's DPI so drawing happens in DIPs.
 ///
 /// The generated binding methods are crate-private, so the `windows-canvas` surface
