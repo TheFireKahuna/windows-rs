@@ -10,8 +10,22 @@ categories = ["os::windows-apis"]
 readme = "readme.md"
 
 [features]
-default = []
+default = ["winui-backend"]
 test = []
+# The WinUI 3 (Windows App SDK XAML) backend: `WinUIBackend`, `App`, the XAML
+# host, `bootstrap()`, and `WinUIDispatcher`. On by default so existing consumers
+# and samples are unaffected. Apps hosted entirely on the DComp backend can turn
+# it off (`default-features = false, features = ["dcomp-backend"]`) to skip
+# compiling the XAML machinery. The generated `bindings` module stays compiled
+# either way — its plain structs/enums (`Thickness`, alignment enums, virtual
+# keys, …) are the shared vocabulary of the widget layer.
+winui-backend = []
+# Self-hosted DirectComposition + Direct2D 1.3 backend (DCompBackend / DCompHost),
+# beside the default WinUI backend. Pulls in the canvas crate's D2D/DWrite drawing
+# primitives and Taffy for layout. `windows-canvas` is taken with default features
+# off so it does NOT activate its own `reactor` feature here (which would form a
+# canvas -> reactor -> canvas package cycle).
+dcomp-backend = ["dep:windows-canvas-core", "dep:taffy"]
 
 [dependencies]
 rustc-hash = { workspace = true }
@@ -22,6 +36,8 @@ windows-future = { workspace = true }
 windows-reference = { workspace = true, features = ["std"] }
 windows-threading = { workspace = true }
 windows-time = { workspace = true }
+windows-canvas-core = { workspace = true, optional = true }
+taffy = { version = "0.11", optional = true }
 
 [lints]
 workspace = true
