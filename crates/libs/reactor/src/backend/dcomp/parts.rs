@@ -67,12 +67,59 @@ use windows_canvas_core::{
 use windows_core::Interface;
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
 
-/// Spring tuning, matching the retired CPU spring (`node::Spring`: `k = 520`,
-/// `c = 40`): natural period `2π/√k`, damping ratio `c / (2√k)`. Shared with
-/// the scroll-carrier glide (`Node::scroll_glide`) so scrolling feels the same
-/// as it did on the CPU spring.
+/// The SCROLL-CARRIER tuning, matching the retired CPU spring (`node::Spring`:
+/// `k = 520`, `c = 40`): natural period `2π/√k`, damping ratio `c / (2√k)`.
+/// Read by `Node::scroll_glide`, where carrying momentum is the point.
 pub(crate) const SPRING_PERIOD: f32 = 0.2756;
 pub(crate) const SPRING_DAMPING: f32 = 0.877;
+
+/// The CONTROL-CHROME tuning — every [`Part::glide`], and nothing else.
+///
+/// Split from the scroll carrier because they are different motions: a scroll
+/// surface carries momentum, an indicator reports a choice the user already
+/// made and should simply be there. Inheriting the carrier's period made a
+/// selection pill travel for roughly a fifth of a second, which reads as lag
+/// rather than as motion.
+///
+/// Tuned BY EYE, and it has to be: the textbook settling time for a spring of
+/// this period predicts a motion several times shorter than what the compositor
+/// actually plays, so `Period` here does not mean the undamped natural period a
+/// second-order model would assume. Do not re-derive this constant from the
+/// scroll carrier's `k`/`c` — that derivation is what made a selection pill
+/// travel for what felt like a fifth of a second.
+///
+/// What IS dependable is that duration scales linearly with `PERIOD` at a fixed
+/// damping ratio, so halving this halves the travel. Tune the period; leave the
+/// damping ratio alone unless the complaint is overshoot rather than speed.
+///
+/// What must NOT change is that ONE pair serves every `Part::glide` —
+/// `slider_settle` reads a batch completion as "the derived fill has arrived",
+/// which is only sound while every animation in that batch shares this tuning.
+const CHROME_SPRING_PERIOD: f32 = 0.025;
+const CHROME_SPRING_DAMPING: f32 = 0.90;
+
+/// The travel [`CHROME_SPRING_PERIOD`] is tuned against — about one segment of a
+/// selector bar, or one row of a nav pane.
+const REF_TRAVEL: f32 = 60.0;
+
+/// The spring period a glide covering `dist` DIPs plays at.
+///
+/// A spring settles in the same time WHATEVER the distance, so a long move does
+/// not take longer — it travels faster. Uncorrected, that makes a single tuning
+/// impossible to choose: the value that keeps a segment pill crisp throws a
+/// pane-height indicator across the pane, and the value that makes the long move
+/// calm leaves the short one wallowing.
+///
+/// Duration therefore follows distance the way Fluent and Material both specify
+/// it: SUB-linearly, so travel ten times longer takes about three times longer
+/// rather than ten, and clamped at both ends so nothing is instant and nothing
+/// drags. Equal distances still yield equal periods, which is what keeps the
+/// slider's settle batch (`slider_settle`) coherent — its halo and thumb track
+/// the same value and so always travel together.
+pub(crate) fn spring_period(dist: f32) -> f32 {
+    let scale = (dist.max(1.0) / REF_TRAVEL).sqrt().clamp(0.65, 3.0);
+    CHROME_SPRING_PERIOD * scale
+}
 
 /// `TimeSpan` (100 ns units) from seconds.
 fn ts_secs(s: f32) -> TimeSpan {
@@ -639,9 +686,21 @@ mod channel {
             self.animated.take()
         }
 
-        /// Record a plain property write of `t` (a snap).
-        pub(super) fn wrote(&mut self, t: (f32, f32)) {
-            self.target = Some(t);
+        /// Record a plain property write of `t`, given the RESULT of the COM
+        /// call meant to land it.
+        ///
+        /// That result is the only evidence this cache may advance on, so it is
+        /// a required argument rather than something the caller checks first. A
+        /// discarded failure wedges the part forever: the visual stays put while
+        /// the cache claims `t` arrived, and every later request for `t` is then
+        /// dropped as redundant.
+        pub(super) fn wrote(&mut self, t: (f32, f32), write: windows_core::Result<()>) {
+            match write {
+                Ok(()) => self.target = Some(t),
+                // An unknown value is left behind, so the next write must be
+                // unconditional — which is exactly what `reclaimed` says.
+                Err(_) => self.reclaimed(),
+            }
         }
 
         /// A spring this `Part` owns now drives `prop` toward `t`.
@@ -781,16 +840,16 @@ impl Part {
             let _ = self.obj.StopAnimation(prop);
         }
         if off_held.is_some() || self.off.target() != Some((x, y)) {
-            let _ = self.vis.SetOffset(Vector3::new(x, y, 0.0));
-            self.off.wrote((x, y));
+            let wrote = self.vis.SetOffset(Vector3::new(x, y, 0.0));
+            self.off.wrote((x, y), wrote);
         }
         let size_held = self.size.begin_snap();
         if let Some(prop) = size_held {
             let _ = self.obj.StopAnimation(prop);
         }
         if size_held.is_some() || self.size.target() != Some((w, h)) {
-            let _ = self.vis.SetSize(Vector2::new(w, h));
-            self.size.wrote((w, h));
+            let wrote = self.vis.SetSize(Vector2::new(w, h));
+            self.size.wrote((w, h), wrote);
         }
     }
 
@@ -802,7 +861,14 @@ impl Part {
             return;
         }
         if self.off.target() != Some((x, y)) {
-            if self.glide_offset(x, y).is_some() {
+            // Measured from the last target rather than from the visual: while a
+            // glide is in flight the visual is somewhere between the two, and the
+            // target is the only figure this side actually knows.
+            let dist = self
+                .off
+                .target()
+                .map_or(0.0, |(px, py)| (x - px).hypot(y - py));
+            if self.glide_offset(x, y, dist).is_some() {
                 self.off.animating("Offset", (x, y));
             } else {
                 self.place(x, y, w, h);
@@ -810,7 +876,11 @@ impl Part {
             }
         }
         if self.size.target() != Some((w, h)) {
-            if self.glide_size(w, h).is_some() {
+            let dist = self
+                .size
+                .target()
+                .map_or(0.0, |(pw, ph)| (w - pw).hypot(h - ph));
+            if self.glide_size(w, h, dist).is_some() {
                 self.size.animating("Size", (w, h));
             } else {
                 self.place(x, y, w, h);
@@ -818,16 +888,21 @@ impl Part {
         }
     }
 
-    fn glide_offset(&mut self, x: f32, y: f32) -> Option<()> {
+    fn glide_offset(&mut self, x: f32, y: f32, dist: f32) -> Option<()> {
         if self.s_off.is_none() {
             let c = self.obj.Compositor().ok()?;
             let a = c.cast::<ICompositor4>().ok()?.CreateSpringVector3Animation().ok()?;
             let sa: ISpringVector3NaturalMotionAnimation = a.cast().ok()?;
-            sa.SetDampingRatio(SPRING_DAMPING).ok()?;
-            sa.SetPeriod(ts_secs(SPRING_PERIOD)).ok()?;
+            sa.SetDampingRatio(CHROME_SPRING_DAMPING).ok()?;
             self.s_off = Some(a);
         }
+        // Re-tuned per retarget, not once at construction: the period is a
+        // function of THIS move's distance.
         let a = self.s_off.as_ref()?;
+        a.cast::<ISpringVector3NaturalMotionAnimation>()
+            .ok()?
+            .SetPeriod(ts_secs(spring_period(dist)))
+            .ok()?;
         a.cast::<IVector3NaturalMotionAnimation>()
             .ok()?
             .SetFinalValue(Some(Vector3::new(x, y, 0.0)))
@@ -837,16 +912,19 @@ impl Part {
             .ok()
     }
 
-    fn glide_size(&mut self, w: f32, h: f32) -> Option<()> {
+    fn glide_size(&mut self, w: f32, h: f32, dist: f32) -> Option<()> {
         if self.s_size.is_none() {
             let c = self.obj.Compositor().ok()?;
             let a = c.cast::<ICompositor4>().ok()?.CreateSpringVector2Animation().ok()?;
             let sa: ISpringVector2NaturalMotionAnimation = a.cast().ok()?;
-            sa.SetDampingRatio(SPRING_DAMPING).ok()?;
-            sa.SetPeriod(ts_secs(SPRING_PERIOD)).ok()?;
+            sa.SetDampingRatio(CHROME_SPRING_DAMPING).ok()?;
             self.s_size = Some(a);
         }
         let a = self.s_size.as_ref()?;
+        a.cast::<ISpringVector2NaturalMotionAnimation>()
+            .ok()?
+            .SetPeriod(ts_secs(spring_period(dist)))
+            .ok()?;
         a.cast::<IVector2NaturalMotionAnimation>()
             .ok()?
             .SetFinalValue(Some(Vector2::new(w, h)))
@@ -865,8 +943,10 @@ impl Part {
             let _ = self.obj.StopAnimation("Opacity");
             self.op_gliding = false;
         }
-        let _ = self.vis.SetOpacity(a);
-        self.opacity = Some(a);
+        // `Channel::wrote`'s evidence rule, for the one property that is not a
+        // `Channel`: caching `a` over a failed write would suppress every later
+        // attempt to reach `a`, stranding the part at whatever it is showing.
+        self.opacity = self.vis.SetOpacity(a).is_ok().then_some(a);
     }
 
     /// Fade opacity to a target — a compositor keyframe glide (the mechanism
@@ -939,6 +1019,19 @@ impl Part {
         // visual at an unknown X, so the next write must be unconditional.
         self.off.reclaimed();
     }
+
+    /// Every cached fact this part holds describes a compositor state that no
+    /// longer exists. Drop them so the next sync writes unconditionally.
+    ///
+    /// Reclaiming the channels is also what makes that sync SNAP: `glide`
+    /// refuses to spring from an unplaced channel, and motion out of an unknown
+    /// position is not motion anyone asked for.
+    fn invalidate(&mut self) {
+        self.off.reclaimed();
+        self.size.reclaimed();
+        self.opacity = None;
+        self.op_gliding = false;
+    }
 }
 
 /// Ink/halo fade durations (ms): a quick reveal, a slightly gentler conceal —
@@ -959,16 +1052,16 @@ pub(crate) struct Parts {
     above: Vec<Part>,
     /// First sync completed — until then every write snaps.
     init: bool,
-    /// Last glided-to selection (segmented / nav).
-    sel: i32,
     /// Last toggle state.
     on: bool,
     /// Last slider fraction.
     frac: f32,
     /// Last node size; a change snaps (resize must not glide).
     geom: (f32, f32),
-    /// Segmented: checksum of the segment edges (labels / widths changed).
-    edges_sig: f32,
+    /// The layout signature the parts were last applied against
+    /// ([`PartPlan::layout_sig`]) — plan-driven kinds use this in place of the
+    /// hand-maintained `sel` / `geom` / `edges_sig` shadows.
+    layout_sig: [f32; 3],
     /// Progress: a forever-looping compositor animation is running (the
     /// indeterminate bar sweep / ring spin).
     looping: bool,
@@ -1014,11 +1107,10 @@ impl Parts {
             below: Vec::new(),
             above: Vec::new(),
             init: false,
-            sel: -1,
             on: false,
             frac: 0.0,
             geom: (0.0, 0.0),
-            edges_sig: 0.0,
+            layout_sig: [0.0; 3],
             looping: false,
             clip: None,
             clip_w: 0.0,
@@ -1029,11 +1121,186 @@ impl Parts {
         }
     }
 
+    /// THE reclaim authority: drop every cached compositor fact this node's
+    /// parts hold, plus the logical state reconciled against it.
+    ///
+    /// Called for any event that breaks the correspondence between what these
+    /// caches claim and what the compositor actually holds — device loss above
+    /// all. Without it a part survives such an edge still asserting a position
+    /// its sprite never reached, and self-gates every later write to that
+    /// position away, which strands the sprite for the rest of the window's
+    /// life.
+    pub(crate) fn invalidate(&mut self) {
+        for p in self.below.iter_mut().chain(self.above.iter_mut()) {
+            p.invalidate();
+        }
+        self.init = false;
+        // Both are claims that a compositor animation / object is live: the
+        // indeterminate sweep, and the meter's reveal clip. Neither survives.
+        self.looping = false;
+        self.clip = None;
+        self.clip_w = 0.0;
+    }
+
     pub(crate) fn below_visuals(&self) -> impl Iterator<Item = Visual> + '_ {
         self.below.iter().filter_map(Part::visual)
     }
     pub(crate) fn above_visuals(&self) -> impl Iterator<Item = Visual> + '_ {
         self.above.iter().filter_map(Part::visual)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PartPlan — where the parts belong, decided without touching the compositor
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A part rect in node-local DIPs: `(x, y, w, h)`.
+pub(crate) type Rect4 = (f32, f32, f32, f32);
+
+/// The widest band any plan-driven control uses.
+const MAX_SLOTS: usize = 6;
+
+/// How a slot travels when its rect moves.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Motion {
+    /// Jump — chrome that must never be seen in transit.
+    Snap,
+    /// Spring to the new rect: an indicator following the selection.
+    Glide,
+}
+
+/// How a slot's opacity changes.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Fade {
+    Snap,
+    Fade,
+}
+
+/// One retained part's whole intent for this sync.
+#[derive(Clone)]
+pub(crate) struct SlotPlan {
+    pub(crate) key: AtlasKey,
+    /// `None` leaves the geometry untouched (the part is being hidden, and
+    /// moving a sprite nobody can see only risks it being seen moving).
+    pub(crate) rect: Option<Rect4>,
+    pub(crate) opacity: f32,
+    pub(crate) motion: Motion,
+    pub(crate) fade: Fade,
+}
+
+impl SlotPlan {
+    /// A part that JUMPS to `rect`.
+    pub(crate) fn snap(key: AtlasKey, rect: Option<Rect4>, opacity: f32) -> Self {
+        Self { key, rect, opacity, motion: Motion::Snap, fade: Fade::Snap }
+    }
+
+    /// A part that SPRINGS to `rect` when it moves.
+    pub(crate) fn glide(key: AtlasKey, rect: Option<Rect4>, opacity: f32) -> Self {
+        Self { key, rect, opacity, motion: Motion::Glide, fade: Fade::Snap }
+    }
+
+    /// Opacity changes fade rather than jump (hover inks).
+    pub(crate) fn fading(mut self) -> Self {
+        self.fade = Fade::Fade;
+        self
+    }
+}
+
+/// Where every part of one control belongs this sync, and how it should get
+/// there — computed from node state alone.
+///
+/// This is the placement DECISION, separated from the compositor writes that
+/// carry it out ([`apply`]). It touches no COM, so it is a pure function of the
+/// node and can be asserted directly in a test; a decision welded to a
+/// `SetOffset` cannot be tested at all, which is why this file's placement bugs
+/// have historically only ever surfaced as something a user noticed on screen.
+#[derive(Clone)]
+pub(crate) struct PartPlan {
+    /// The layout inputs whose change means the control RE-LAID OUT, so every
+    /// part must jump rather than spring from a rect that no longer means
+    /// anything.
+    ///
+    /// One field with one meaning, replacing a per-kind mix of last-size,
+    /// last-selection and edge-checksum shadows — each maintained by hand, and
+    /// each therefore committable on a path that never placed the sprite it
+    /// claimed to describe. Unused lanes stay `0.0`.
+    pub(crate) layout_sig: [f32; 3],
+    below: [Option<SlotPlan>; MAX_SLOTS],
+    above: [Option<SlotPlan>; MAX_SLOTS],
+}
+
+impl PartPlan {
+    pub(crate) fn new(layout_sig: [f32; 3]) -> Self {
+        Self {
+            layout_sig,
+            below: std::array::from_fn(|_| None),
+            above: std::array::from_fn(|_| None),
+        }
+    }
+
+    pub(crate) fn below(mut self, i: usize, slot: SlotPlan) -> Self {
+        self.below[i] = Some(slot);
+        self
+    }
+
+    pub(crate) fn above(mut self, i: usize, slot: SlotPlan) -> Self {
+        self.above[i] = Some(slot);
+        self
+    }
+
+    /// The slot plans, for tests asserting where a control decided its chrome
+    /// belongs.
+    pub(crate) fn slots(&self) -> (&[Option<SlotPlan>], &[Option<SlotPlan>]) {
+        (&self.below, &self.above)
+    }
+}
+
+/// Carry out a [`PartPlan`] — the one place a plan meets the compositor.
+fn apply(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, plan: &PartPlan) {
+    let Some(parts) = node.parts.as_mut() else { return };
+    // A re-layout retires every cached position as a MOTION reference: springing
+    // from a rect the control no longer has reads as a glitch rather than as
+    // motion. The first sync snaps for the same reason — mounting must not fly
+    // in from the visual's zeroed defaults.
+    let relaid = !parts.init || parts.layout_sig != plan.layout_sig;
+    let init = parts.init;
+    apply_band(comp, atlas, &mut parts.below, &plan.below, relaid, init);
+    apply_band(comp, atlas, &mut parts.above, &plan.above, relaid, init);
+    parts.layout_sig = plan.layout_sig;
+    parts.init = true;
+}
+
+/// Apply one band's slots.
+///
+/// Nothing here gates on "did the plan change": `Part`'s own channels already
+/// know whether a target moved, and they are the only cache that knows whether
+/// the last write actually LANDED. A second gate at this level would suppress
+/// exactly the re-write a failed one needs.
+fn apply_band(
+    comp: &Compositing,
+    atlas: &mut Atlas,
+    band: &mut [Part],
+    slots: &[Option<SlotPlan>; MAX_SLOTS],
+    relaid: bool,
+    init: bool,
+) {
+    for (i, slot) in slots.iter().enumerate() {
+        let (Some(slot), Some(part)) = (slot.as_ref(), band.get_mut(i)) else {
+            continue;
+        };
+        part.bind(comp, atlas, slot.key.clone());
+        if let Some(r) = slot.rect {
+            if relaid || slot.motion == Motion::Snap {
+                part.place(r.0, r.1, r.2, r.3);
+            } else {
+                part.glide(r.0, r.1, r.2, r.3);
+            }
+        }
+        if init && slot.fade == Fade::Fade {
+            part.fade_to(slot.opacity);
+        } else {
+            part.set_opacity(slot.opacity);
+        }
     }
 }
 
@@ -1662,7 +1929,7 @@ fn slider_geom(w: f32, h: f32, frac: f32, ofrac: f32) -> SliderGeom {
 
 fn slider_apply(parts: &mut Parts, g: &SliderGeom, snap: bool) {
     // The ONE way a part moves here. Everything that animates therefore goes
-    // through `Part::glide` and so shares `SPRING_PERIOD` / `SPRING_DAMPING` —
+    // through `Part::glide` and so shares `CHROME_SPRING_PERIOD` / `_DAMPING` —
     // the coupling the settle batch below depends on.
     let put = |p: &mut Part, r: (f32, f32, f32, f32), snap: bool| {
         if snap {
@@ -1692,8 +1959,8 @@ fn slider_apply(parts: &mut Parts, g: &SliderGeom, snap: bool) {
     // not complete when the thumb does — it completes when the last of them
     // does. Reading that completion as "the derived fill has arrived" is sound
     // only because every animation in the batch is a `Part::glide`, and every
-    // `Part::glide` is a spring built with the one shared `SPRING_PERIOD` /
-    // `SPRING_DAMPING` pair: same tuning, both retargeted in the same tick, so
+    // `Part::glide` is a spring built with the one shared `CHROME_SPRING_PERIOD`
+    // / `_DAMPING` pair: same tuning, both retargeted in the same tick, so
     // they settle together and the thumb-derived fill is at its final rect
     // whichever one reports last.
     //
@@ -1970,12 +2237,23 @@ fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale:
     if !ensure(comp, node, 4, 0) {
         return;
     }
+    let plan = segmented_plan(node, scale);
+    apply(comp, atlas, node, &plan);
+}
+
+/// Below-band roles: `[tray fill, tray stroke, pill, hover ink]`.
+///
+/// The pill GLIDES and carries no "was the selection different last time"
+/// shadow: its rect is a pure function of the selection, and `Part`'s own
+/// channel already knows whether that rect moved. The shadow was only ever a
+/// proxy for that question, and a proxy that could be committed on a path which
+/// never placed the pill — which is precisely how it stranded.
+pub(crate) fn segmented_plan(node: &Node, scale: f32) -> PartPlan {
     let n = node.ctrl().items.len();
     let (w, h) = (node.rect.w, node.rect.h);
     let accent = node.paint.style_variant == 1;
     let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
     let edges = super::controls::segment_edges(node);
-    let edges_sig = edges.iter().sum::<f32>() + edges.len() as f32;
     let dim = dim_of(node);
 
     let tray_radius = if accent { h / 2.0 } else { theme::RADIUS_SM };
@@ -1984,59 +2262,42 @@ fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale:
     let seg_radius = if accent { pill_h / 2.0 } else { theme::RADIUS_BADGE };
     let pill_fill = if accent { theme::accent() } else { theme::stroke() };
 
-    let k_tray = AtlasKey::hbar(h, tray_radius, 0.0, tray_bg, scale);
-    let k_stroke = AtlasKey::hbar(h, tray_radius, theme::BORDER_W, theme::stroke(), scale);
-    let k_pill = AtlasKey::hbar(pill_h, seg_radius, 0.0, pill_fill, scale);
-    let k_ink = AtlasKey::hbar(pill_h, seg_radius, 0.0, theme::w(1.0), scale);
-
     let sel = if n == 0 { -1 } else { (node.ctrl().selected_index.max(0)).min(n as i32 - 1) };
-    let seg_rect = |i: i32| -> Option<(f32, f32, f32, f32)> {
+    let seg_rect = |i: i32| -> Option<Rect4> {
         let i = usize::try_from(i).ok()?;
         let (a, b) = (*edges.get(i)?, *edges.get(i + 1)?);
         Some((a, m.tray, b - a, pill_h))
     };
+    let tray = Some((0.0, 0.0, w, h));
     let pill = seg_rect(sel);
-    let hot = node.ctrl().hot_index;
-    let ink = seg_rect(hot);
-    let ink_t = seg_ink_target(node);
+    let k_pill = AtlasKey::hbar(pill_h, seg_radius, 0.0, pill_fill, scale);
+    let k_ink = AtlasKey::hbar(pill_h, seg_radius, 0.0, theme::w(1.0), scale);
 
-    let Some(parts) = node.parts.as_mut() else { return };
-    let snap = !parts.init || parts.geom != (w, h) || parts.edges_sig != edges_sig;
+    // Segment boundaries move when a label re-measures, so the edge checksum
+    // joins the size: the pill must jump to boundaries that changed under it
+    // rather than slide to them.
+    let edges_sig = edges.iter().sum::<f32>() + edges.len() as f32;
 
-    parts.below[0].bind(comp, atlas, k_tray);
-    parts.below[1].bind(comp, atlas, k_stroke);
-    parts.below[2].bind(comp, atlas, k_pill);
-    parts.below[3].bind(comp, atlas, k_ink);
-
-    parts.below[0].place(0.0, 0.0, w, h);
-    parts.below[1].place(0.0, 0.0, w, h);
-    parts.below[0].set_opacity(dim);
-    parts.below[1].set_opacity(dim);
-
-    match pill {
-        Some(r) => {
-            if snap || parts.sel == sel {
-                parts.below[2].place(r.0, r.1, r.2, r.3);
-            } else {
-                parts.below[2].glide(r.0, r.1, r.2, r.3);
-            }
-            parts.below[2].set_opacity(dim);
-        }
-        None => parts.below[2].set_opacity(0.0),
-    }
-    if let Some(r) = ink {
-        parts.below[3].place(r.0, r.1, r.2, r.3);
-    }
-    if parts.init {
-        parts.below[3].fade_to(ink_t);
-    } else {
-        parts.below[3].set_opacity(ink_t);
-    }
-
-    parts.sel = sel;
-    parts.geom = (w, h);
-    parts.edges_sig = edges_sig;
-    parts.init = true;
+    PartPlan::new([w, h, edges_sig])
+        .below(
+            0,
+            SlotPlan::snap(AtlasKey::hbar(h, tray_radius, 0.0, tray_bg, scale), tray, dim),
+        )
+        .below(
+            1,
+            SlotPlan::snap(
+                AtlasKey::hbar(h, tray_radius, theme::BORDER_W, theme::stroke(), scale),
+                tray,
+                dim,
+            ),
+        )
+        .below(2, SlotPlan::glide(k_pill, pill, if pill.is_some() { dim } else { 0.0 }))
+        // The ink SNAPS to the hot segment and fades: a glide would draw a wash
+        // sliding across segments the pointer never crossed.
+        .below(
+            3,
+            SlotPlan::snap(k_ink, seg_rect(node.ctrl().hot_index), seg_ink_target(node)).fading(),
+        )
 }
 
 fn seg_ink_target(node: &Node) -> f32 {
@@ -2082,9 +2343,28 @@ pub(crate) fn seg_hot_changed(node: &mut Node) {
 /// the same repaint that starts the glide — the geometry is retained chrome,
 /// the text is not, and a text layout cannot be interpolated.
 fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 3, 1) {
+    if !ensure(comp, node, 5, 1) {
         return;
     }
+    let plan = nav_plan(node, scale);
+    apply(comp, atlas, node, &plan);
+}
+
+/// Below-band roles: `[pane background, menu tile, menu bar, settings tile,
+/// settings bar]`; above: `[row hover ink]`.
+///
+/// The menu list and the settings row get their OWN indicators rather than one
+/// that travels between them. The settings row is pinned a pane-height below the
+/// list, and sliding one indicator across that gap implies a continuity that is
+/// not there — it reads as the tile falling past every row on the way. WinUI
+/// gives its settings item a separate selection visual for the same reason.
+/// Nothing travels between the regions; the two cross-fade in place, and each
+/// still glides freely WITHIN its own region.
+///
+/// Only the HEIGHT enters the layout signature: a width change is exactly the
+/// pane opening or closing, which is motion the pane is supposed to play, while
+/// a height change is a resize and must not.
+pub(crate) fn nav_plan(node: &Node, scale: f32) -> PartPlan {
     let (w, h) = (node.rect.w, node.rect.h);
     let dim = dim_of(node);
     let count = node.ctrl().items.len();
@@ -2093,17 +2373,14 @@ fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) 
     let n = nav::visible_items(&m, h, count);
     let sel = node.ctrl().selected_index;
     let enabled = node.paint.is_enabled;
-    // The selected row's box: a visible menu row, or the settings row when the
-    // selection sits at its sentinel slot. `None` (no selection, or a selected
-    // row that no longer fits) fades the tile and bar out.
-    let sel_row = if sel == nav::SETTINGS_INDEX {
-        nav::settings_rect(&m, h)
-    } else if sel >= 0 && (sel as usize) < n {
-        Some(nav::item_rect(&m, sel))
-    } else {
-        None
-    };
-    let visible = sel_row.is_some();
+    // Each region's own selected row, resolved independently — at most one is
+    // ever `Some`. A region with no selection fades its indicator out WITHOUT
+    // moving it, so returning to that region later resumes from the row it was
+    // last on rather than flying in from wherever the other region sat.
+    let menu_row = (sel >= 0 && (sel as usize) < n).then(|| nav::item_rect(&m, sel));
+    let settings_row = (sel == nav::SETTINGS_INDEX)
+        .then(|| nav::settings_rect(&m, h))
+        .flatten();
 
     let k_bg = AtlasKey::solid(theme::surface_sunken(), scale);
     let k_tile = AtlasKey::hbar(
@@ -2123,73 +2400,50 @@ fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) 
         scale,
     );
 
-    let row = sel_row.unwrap_or_else(|| nav::item_rect(&m, 0));
-    let tile = (
-        theme::SPACE_4,
-        row.top + theme::SPACE_4,
-        (m.width - theme::SPACE_8).max(0.0),
-        nav::ITEM_H - theme::SPACE_8,
-    );
-    let bar = (
-        0.0,
-        row.top + (nav::ITEM_H - bar_h) / 2.0,
-        theme::BORDER_W * 3.0,
-        bar_h,
-    );
+    let tile_of = |row: &Rect| {
+        (
+            theme::SPACE_4,
+            row.top + theme::SPACE_4,
+            (m.width - theme::SPACE_8).max(0.0),
+            nav::ITEM_H - theme::SPACE_8,
+        )
+    };
+    let bar_of = |row: &Rect| {
+        (
+            0.0,
+            row.top + (nav::ITEM_H - bar_h) / 2.0,
+            theme::BORDER_W * 3.0,
+            bar_h,
+        )
+    };
+    // One indicator pair per region. Both FADE, so the handoff between regions
+    // is a cross-fade in place; within a region the opacity never changes, so
+    // the fade never fires and the tile simply glides row to row.
+    let pair = |row: Option<&Rect>, tile_key: AtlasKey, bar_key: AtlasKey| {
+        (
+            SlotPlan::glide(tile_key, row.map(tile_of), if row.is_some() { dim } else { 0.0 })
+                .fading(),
+            SlotPlan::glide(bar_key, row.map(bar_of), if row.is_some() { dim } else { 0.0 })
+                .fading(),
+        )
+    };
+    let (menu_tile, menu_bar) = pair(menu_row.as_ref(), k_tile.clone(), k_bar.clone());
+    let (set_tile, set_bar) = pair(settings_row.as_ref(), k_tile, k_bar);
 
-    let ink_row = nav_ink_rect(node);
+    let ink = nav_ink_rect(node).filter(|_| enabled);
 
-    let Some(parts) = node.parts.as_mut() else { return };
-    // A HEIGHT change snaps (a resize must not play as motion); a WIDTH change
-    // is exactly the pane opening or closing, so it glides.
-    let snap = !parts.init || parts.geom.1 != h;
-
-    parts.below[0].bind(comp, atlas, k_bg);
-    parts.below[1].bind(comp, atlas, k_tile);
-    parts.below[2].bind(comp, atlas, k_bar);
-    parts.above[0].bind(comp, atlas, k_ink);
-
-    if snap {
-        parts.below[0].place(0.0, 0.0, m.width, h);
-    } else {
-        parts.below[0].glide(0.0, 0.0, m.width, h);
-    }
-    parts.below[0].set_opacity(dim);
-
-    if visible {
-        if snap || parts.sel == sel {
-            parts.below[1].place(tile.0, tile.1, tile.2, tile.3);
-            parts.below[2].place(bar.0, bar.1, bar.2, bar.3);
-        } else {
-            parts.below[1].glide(tile.0, tile.1, tile.2, tile.3);
-            parts.below[2].glide(bar.0, bar.1, bar.2, bar.3);
-        }
-        parts.below[1].set_opacity(dim);
-        parts.below[2].set_opacity(dim);
-    } else {
-        parts.below[1].set_opacity(0.0);
-        parts.below[2].set_opacity(0.0);
-    }
-
-    match ink_row.filter(|_| enabled) {
-        Some(r) => {
-            // Snap the ink to the newly hovered row, then fade it in: a glide
-            // would draw a wash sliding down the pane between two rows the
-            // pointer never paused on.
-            parts.above[0].place(r.0, r.1, r.2, r.3);
-            if parts.init {
-                parts.above[0].fade_to(wash(0.06) * dim);
-            } else {
-                parts.above[0].set_opacity(wash(0.06) * dim);
-            }
-        }
-        None if parts.init => parts.above[0].fade_to(0.0),
-        None => parts.above[0].set_opacity(0.0),
-    }
-
-    parts.sel = sel;
-    parts.geom = (m.width, h);
-    parts.init = true;
+    PartPlan::new([h, 0.0, 0.0])
+        .below(0, SlotPlan::glide(k_bg, Some((0.0, 0.0, m.width, h)), dim))
+        .below(1, menu_tile)
+        .below(2, menu_bar)
+        .below(3, set_tile)
+        .below(4, set_bar)
+        // The ink SNAPS to the hovered row and fades: a glide would draw a wash
+        // sliding down the pane between two rows the pointer never paused on.
+        .above(
+            0,
+            SlotPlan::snap(k_ink, ink, if ink.is_some() { wash(0.06) * dim } else { 0.0 }).fading(),
+        )
 }
 
 /// The hover ink's box for whatever row a nav pane currently calls hot, in
@@ -2438,9 +2692,11 @@ impl Caret {
 
     fn place(&mut self, x: f32, y: f32, w: f32, h: f32) {
         if self.rect != Some((x, y, w, h)) {
-            let _ = self.vis.SetOffset(Vector3::new(x, y, 0.0));
-            let _ = self.vis.SetSize(Vector2::new(w, h));
-            self.rect = Some((x, y, w, h));
+            let off = self.vis.SetOffset(Vector3::new(x, y, 0.0));
+            let size = self.vis.SetSize(Vector2::new(w, h));
+            // Cache only a rect BOTH writes landed (`Channel::wrote`'s rule): a
+            // half-applied rect the cache calls current would freeze the caret.
+            self.rect = (off.is_ok() && size.is_ok()).then_some((x, y, w, h));
         }
     }
 

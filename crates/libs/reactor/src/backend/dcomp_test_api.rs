@@ -894,6 +894,38 @@ pub struct ButtonBoxProbe {
     pub label: (f32, f32, f32, f32),
 }
 
+/// The spring period a control-chrome glide of `dist` DIPs plays at, through the
+/// real `parts::spring_period` every `Part::glide` calls.
+///
+/// Published because it is the whole of the distance-aware duration policy, and
+/// a policy that only shows up as "does that look right to you" is one nobody
+/// can regression-test.
+pub fn chrome_spring_period(dist: f32) -> f32 {
+    dcomp::parts::spring_period(dist)
+}
+
+/// One part slot's planned placement — a `SlotPlan` without its atlas key,
+/// which is a brush identity rather than a placement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlotProbe {
+    /// `None` leaves the sprite's geometry untouched (it is being hidden).
+    pub rect: Option<(f32, f32, f32, f32)>,
+    pub opacity: f32,
+    /// Springs to a moved rect rather than jumping.
+    pub glides: bool,
+    /// Opacity changes fade rather than jump.
+    pub fades: bool,
+}
+
+/// Where a control decided every one of its retained parts belongs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartPlanProbe {
+    /// Inputs whose change forces every part to jump rather than glide.
+    pub layout_sig: [f32; 3],
+    pub below: Vec<Option<SlotProbe>>,
+    pub above: Vec<Option<SlotProbe>>,
+}
+
 impl ArenaHarness {
     /// Shape this node's cached runs, through the real
     /// [`dcomp::layout::rebuild_text`] the layout pass calls.
@@ -923,6 +955,35 @@ impl ArenaHarness {
     /// The badge's intrinsic size, or `None` when the button carries none.
     pub fn badge_size(&self, id: ControlId) -> Option<(f32, f32)> {
         dcomp::controls::badge_size(self.arena.get(id)?)
+    }
+
+    /// Where this control decided its retained chrome belongs — the pure half
+    /// of `parts::sync`, resolved with no compositor in the picture.
+    ///
+    /// `None` for kinds whose chrome is not plan-driven (the slider and meter
+    /// derive geometry from live compositor expressions, which is not a static
+    /// placement and cannot be one).
+    pub fn part_plan(&self, id: ControlId, scale: f32) -> Option<PartPlanProbe> {
+        let n = self.arena.get(id)?;
+        let plan = match n.kind {
+            ControlKind::SelectorBar => dcomp::parts::segmented_plan(n, scale),
+            ControlKind::NavigationView => dcomp::parts::nav_plan(n, scale),
+            _ => return None,
+        };
+        let (below, above) = plan.slots();
+        let probe = |s: &Option<dcomp::parts::SlotPlan>| {
+            s.as_ref().map(|s| SlotProbe {
+                rect: s.rect,
+                opacity: s.opacity,
+                glides: s.motion == dcomp::parts::Motion::Glide,
+                fades: s.fade == dcomp::parts::Fade::Fade,
+            })
+        };
+        Some(PartPlanProbe {
+            layout_sig: plan.layout_sig,
+            below: below.iter().map(probe).collect(),
+            above: above.iter().map(probe).collect(),
+        })
     }
 
     /// Whether this node would be given a paint surface — the test-visible form

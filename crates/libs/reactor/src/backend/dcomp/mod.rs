@@ -43,7 +43,7 @@ pub(crate) mod nav;
 pub(crate) mod node;
 mod pacer;
 mod paint;
-mod parts;
+pub(crate) mod parts;
 mod pointer;
 mod popup;
 pub(crate) mod record;
