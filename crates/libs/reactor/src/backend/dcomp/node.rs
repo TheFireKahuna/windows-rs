@@ -24,9 +24,9 @@ use crate::system_bindings::{
 };
 use crate::Color;
 use crate::LineEndpoints;
+use super::record::FlyoutDecl;
 use crate::{
-    FlyoutDef, FlyoutPlacementMode, NavigationViewPaneDisplayMode, PasswordRevealMode,
-    ScrollBarVisibility,
+    FlyoutPlacementMode, NavigationViewPaneDisplayMode, PasswordRevealMode, ScrollBarVisibility,
 };
 use windows_canvas_core::{ColorF, TextLayout};
 use windows_core::Interface;
@@ -205,10 +205,14 @@ pub(crate) struct Extras {
     pub v_scrollbar: i32,
 
     // ── Button ───────────────────────────────────────────────────────────
-    /// Attached flyout. A `Str` value arrives as [`FlyoutDef::text`], so both
-    /// shapes the seam sends land in the same field with nothing dropped.
-    pub flyout: Option<Box<FlyoutDef>>,
-    /// `FlyoutPlacementMode` as delivered (WinRT discriminant).
+    /// Attached flyout, as the seam declares it — plain data only. The
+    /// `Element` behind [`FlyoutDecl::rich`] and the `on_closed` callback stay
+    /// in the recorder's app-side map: neither is `Send`, and an `Element` can
+    /// only become pixels by going back through the reconciler.
+    pub flyout: Option<Box<FlyoutDecl>>,
+    /// `FlyoutPlacementMode` as delivered by a standalone `Prop::FlyoutPlacement`
+    /// write. A `FlyoutDecl` carries its own, which wins — this is the value a
+    /// placement set without any flyout content would use.
     pub flyout_placement: i32,
     /// Leading icon glyph codepoint (a `Symbol`'s value), 0 = none — the same
     /// encoding [`Ctrl::icons`] and [`MenuRow::icon`] already use.
@@ -359,12 +363,9 @@ impl LazyExtras {
 
 /// The [`Extras`] a node that has never had any written reads as.
 ///
-/// An inline `const` block rather than a `static` like [`EMPTY_CTRL`]: a
-/// `static` must be `Sync`, and [`FlyoutDef`] carries the app's `Rc` callbacks
-/// and element tree, which are not. The block still yields one `&'static` the
-/// whole process shares, and every heap field in [`Extras::DEFAULT`] is an
-/// empty `Vec`/`String`/`None`, so it owns no allocation.
-pub(crate) const EMPTY_EXTRAS: &Extras = &Extras::DEFAULT;
+/// Every heap field in [`Extras::DEFAULT`] is an empty `Vec`/`String`/`None`,
+/// so this owns no allocation.
+pub(crate) static EMPTY_EXTRAS: &Extras = &Extras::DEFAULT;
 
 /// Control-specific state, distinct from generic layout/paint. Populated by
 /// `set_prop` for the stateful drawn controls (toggle, slider, segmented, …).
@@ -539,12 +540,9 @@ impl Default for Ctrl {
 
 /// The [`Ctrl`] a node that has never had control state written reads as.
 ///
-/// An inline `const` rather than a `static` for the reason given on
-/// [`EMPTY_EXTRAS`]: `Ctrl` reaches a [`FlyoutDef`] through its `Extras`, and
-/// that is not `Sync`. Every heap field in [`Ctrl::DEFAULT`] is an empty
-/// `Vec`/`String`/`None`, so this owns no allocation either way, and no caller
-/// depends on it having one address — it is only ever read through.
-pub(crate) const EMPTY_CTRL: &Ctrl = &Ctrl::DEFAULT;
+/// Every heap field in [`Ctrl::DEFAULT`] is an empty `Vec`/`String`/`None`, so
+/// this owns no allocation.
+pub(crate) static EMPTY_CTRL: &Ctrl = &Ctrl::DEFAULT;
 
 /// One live control.
 pub(crate) struct Node {

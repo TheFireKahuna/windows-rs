@@ -8,7 +8,7 @@
 use super::controls;
 use super::editor;
 use super::host;
-use super::popup::Popup;
+use super::popup::{Popup, PopupBody};
 use super::*;
 use crate::backend::Event;
 use crate::style::{PointerEventInfo, WheelAxis};
@@ -1094,9 +1094,12 @@ impl DCompBackend {
                 self.open_popup(id);
             }
             ControlKind::Button | ControlKind::RepeatButton | ControlKind::HyperlinkButton => {
-                // A Button carrying a MenuFlyout (e.g. "+ Add Processor") opens its
-                // menu in the popup overlay, mirroring the native WinUI button-flyout.
-                if self.node(id).is_some_and(|n| !n.ctrl().menu.is_empty()) {
+                // A Button carrying a MenuFlyout (e.g. "+ Add Processor") or an
+                // attached Flyout opens it in the popup overlay, mirroring the
+                // native WinUI button-flyout.
+                if self.node(id).is_some_and(|n| {
+                    !n.ctrl().menu.is_empty() || n.extras().flyout.is_some()
+                }) {
                     self.open_popup(id);
                     return;
                 }
@@ -1419,7 +1422,7 @@ impl DCompBackend {
 
     // ── Popup ────────────────────────────────────────────────────────────────
 
-    fn open_popup(&mut self, owner: ControlId) {
+    pub(crate) fn open_popup(&mut self, owner: ControlId) {
         let Some(node) = self.node(owner) else { return };
         let combo = node.kind == ControlKind::ComboBox;
         let rect = CanvasRect::from_xywh(node.rect.x, node.rect.y, node.rect.w, node.rect.h);
@@ -1437,16 +1440,31 @@ impl DCompBackend {
         } else {
             node.ctrl().menu.clone()
         };
-        if rows.is_empty() {
-            return;
-        }
-        let selected = node.ctrl().selected_index;
-        match Popup::open(&self.comp, owner, rows, rect, self.dip_size, combo, selected, false) {
-            Ok(p) => {
-                self.close_popup();
-                self.popup = Some(p);
+        // Menu rows win over an attached flyout: a control carrying both is
+        // asking for a menu, and the flyout is the fallback content.
+        let body = if rows.is_empty() {
+            match node.extras().flyout.as_deref() {
+                Some(def) if !def.text.is_empty() => PopupBody::Text(def.text.clone()),
+                _ => return,
             }
-            Err(_) => {}
+        } else {
+            PopupBody::Menu(rows)
+        };
+        let placement = node.extras().flyout_placement;
+        let selected = node.ctrl().selected_index;
+        if let Ok(p) = Popup::open(
+            &self.comp,
+            owner,
+            body,
+            rect,
+            self.dip_size,
+            combo,
+            selected,
+            false,
+            placement,
+        ) {
+            self.close_popup();
+            self.popup = Some(p);
         }
     }
 
@@ -1500,7 +1518,20 @@ impl DCompBackend {
             .node(owner)
             .map(|n| CanvasRect::from_xywh(n.rect.x, n.rect.y, n.rect.w, n.rect.h));
         let Some(rect) = rect else { return };
-        if let Ok(p) = Popup::open(&self.comp, owner, rows, rect, self.dip_size, false, -1, true) {
+        // A suggestion list always drops below its field, whatever placement
+        // the node happens to carry — it is a continuation of the text being
+        // typed, not an attached flyout.
+        if let Ok(p) = Popup::open(
+            &self.comp,
+            owner,
+            PopupBody::Menu(rows),
+            rect,
+            self.dip_size,
+            false,
+            -1,
+            true,
+            crate::FlyoutPlacementMode::Bottom.0,
+        ) {
             self.close_popup();
             self.popup = Some(p);
         }
@@ -1534,8 +1565,20 @@ impl DCompBackend {
     /// Close the open popup with a compositor-side dismiss fade. The overlay
     /// visual is parked as a [`Ghost`] and released when the scoped batch
     /// wrapping its fade completes — no app frames, no timer.
-    fn close_popup(&mut self) {
+    pub(crate) fn close_popup(&mut self) {
         if let Some(p) = self.popup.take() {
+            // A popup that came from an attached flyout reports its dismissal,
+            // whatever dismissed it — light-dismiss, Escape, or a selection.
+            // This is the ONE close path, so `on_closed` cannot be missed by a
+            // route that forgot to fire it.
+            if self
+                .node(p.owner)
+                .and_then(|n| n.extras().flyout.as_deref())
+                .is_some_and(|f| f.notifies_closed)
+            {
+                self.intents
+                    .push(record::Intent::FlyoutClosed { id: p.owner });
+            }
             let batch = self
                 .comp
                 .compositor()

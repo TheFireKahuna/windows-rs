@@ -24,7 +24,9 @@ use crate::interaction::Callback;
 use crate::style::PointerEventInfo;
 use crate::widgets::Subscription;
 use dcomp::node::PointerInterest;
-use dcomp::record::{FrontBackend, Intent, IntentPayload, RecordingBackend, SurfaceIntentKind};
+use dcomp::record::{
+    FlyoutDecl, FrontBackend, Intent, IntentPayload, RecordingBackend, SurfaceIntentKind,
+};
 use dcomp::{register_element_pointer, PointerSinks};
 
 // ── layout.rs ────────────────────────────────────────────────────────────────
@@ -39,6 +41,11 @@ pub fn snap(v: f32, scale: f32) -> f32 {
 /// every node's owned stack (via `derive(Ord)`), so sorting these types in a
 /// test sorts the shipping comparator, not a copy of it.
 pub use dcomp::layout::{Band, Slot, StackKey};
+
+/// The `Send` face of an attached flyout, as it crosses the record seam — see
+/// `dcomp::record::FlyoutDecl`. Re-published so a test can assert what does
+/// (and does not) reach the front.
+pub use dcomp::record::FlyoutDecl as ReplayedFlyout;
 
 /// The exact edge-snapping arithmetic `layout::assign` performs for one node:
 /// given an absolute DIP origin and extent, return the snapped `(x, w)` it
@@ -101,6 +108,7 @@ pub type AppliedLog = Vec<String>;
 struct Spy {
     log: Rc<RefCell<AppliedLog>>,
     tooltips: Rc<RefCell<Vec<(ControlId, Option<Tooltip>)>>>,
+    flyouts: Rc<RefCell<Vec<(ControlId, Option<FlyoutDecl>)>>>,
     /// Intents a test has staged (via [`Recorder::queue_*`]) for the next
     /// [`FrontBackend::take_intents`] — the headless stand-in for the input
     /// paths that queue them in the real backend.
@@ -136,6 +144,11 @@ impl FrontBackend for Spy {
         keys: Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>,
     ) {
         self.note(format!("set_keybindings {} {}", id.get(), keys.len()));
+    }
+
+    fn set_flyout(&mut self, id: ControlId, decl: Option<FlyoutDecl>) {
+        self.note(format!("set_flyout {} {decl:?}", id.get()));
+        self.flyouts.borrow_mut().push((id, decl));
     }
 
     fn take_intents(&mut self) -> Vec<Intent> {
@@ -330,6 +343,7 @@ pub struct Recorder {
     spy: Spy,
     log: Rc<RefCell<AppliedLog>>,
     tooltips: Rc<RefCell<Vec<(ControlId, Option<Tooltip>)>>>,
+    flyouts: Rc<RefCell<Vec<(ControlId, Option<FlyoutDecl>)>>>,
     intents: Rc<RefCell<Vec<Intent>>>,
 }
 
@@ -344,12 +358,14 @@ impl Recorder {
         let spy = Spy::default();
         let log = Rc::clone(&spy.log);
         let tooltips = Rc::clone(&spy.tooltips);
+        let flyouts = Rc::clone(&spy.flyouts);
         let intents = Rc::clone(&spy.intents);
         Self {
             rec: RecordingBackend::new(),
             spy,
             log,
             tooltips,
+            flyouts,
             intents,
         }
     }
@@ -374,6 +390,12 @@ impl Recorder {
     /// Everything the spy has been asked to apply, in order.
     pub fn applied(&self) -> AppliedLog {
         self.log.borrow().clone()
+    }
+
+    /// Flyout declarations as they arrived at replay — the `Send` face only;
+    /// the `Element` and the `on_closed` callback never cross.
+    pub fn replayed_flyouts(&self) -> Vec<Option<FlyoutDecl>> {
+        self.flyouts.borrow().iter().map(|(_, d)| d.clone()).collect()
     }
 
     /// Tooltips as they arrived at replay.
@@ -442,6 +464,14 @@ impl Recorder {
     /// would when the hover leaves a surface it was tracking.
     pub fn queue_surface_exit(&mut self, id: ControlId) {
         self.intents.borrow_mut().push(Intent::SurfaceExit { id });
+    }
+
+    /// Stage a flyout-dismissed intent, as `close_popup` would queue it for a
+    /// popup whose owner declared an `on_closed` callback.
+    pub fn queue_flyout_closed(&mut self, id: ControlId) {
+        self.intents
+            .borrow_mut()
+            .push(Intent::FlyoutClosed { id });
     }
 
     /// Stage an accelerator-fired intent, as the input router's

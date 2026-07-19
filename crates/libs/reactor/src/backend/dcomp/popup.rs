@@ -38,6 +38,81 @@ const ROW: f32 = theme::ROW_H;
 /// Separator row height (DIPs).
 const SEP: f32 = theme::SPACE_8 + theme::BORDER_W;
 const PANEL_PAD: f32 = theme::SPACE_4;
+/// Widest a text flyout's paragraph column gets before it wraps (DIPs). A
+/// flyout is explanatory prose, and prose set wider than this stops scanning
+/// cleanly — the same reason the menu panel caps at 360.
+const TEXT_MAX_W: f32 = 320.0;
+/// Inset around a text flyout's paragraph (DIPs). Wider than `PANEL_PAD`
+/// because nothing here is a row: the padding IS the panel's whole margin.
+const TEXT_PAD: f32 = theme::SPACE_12;
+
+/// What a popup is showing.
+///
+/// A menu is a list of hit-testable rows; a text flyout is one wrapped
+/// paragraph with nothing to hit. They share the panel, the shadow, the reveal
+/// and the light dismiss — and differ in every part that treats content as
+/// selectable, which is why this is a sum type rather than an empty row list.
+pub(crate) enum PopupBody {
+    Menu(Vec<MenuRow>),
+    Text(String),
+}
+
+impl PopupBody {
+    /// The rows, or nothing at all for a text flyout. Every selection path
+    /// (hit-testing, arrow keys, commit) reads through here, so a text flyout
+    /// is inert on all of them by construction rather than by a check at each.
+    fn rows(&self) -> &[MenuRow] {
+        match self {
+            Self::Menu(v) => v,
+            Self::Text(_) => &[],
+        }
+    }
+}
+
+/// The four sides a popup can take, once the thirteen `FlyoutPlacementMode`
+/// values are reduced to the axis each one actually names.
+///
+/// The edge-aligned variants differ from their plain counterparts only in how
+/// the panel aligns along the free axis, and this backend centres (text) or
+/// leading-aligns (menus) rather than honouring each alignment separately — so
+/// they collapse onto the side they are edge-aligned to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Placement {
+    Above,
+    Below,
+    Left,
+    Right,
+}
+
+impl Placement {
+    fn of(mode: i32) -> Self {
+        use crate::FlyoutPlacementMode as M;
+        match M(mode) {
+            M::Top | M::TopEdgeAlignedLeft | M::TopEdgeAlignedRight => Self::Above,
+            M::Left | M::LeftEdgeAlignedTop | M::LeftEdgeAlignedBottom => Self::Left,
+            M::Right | M::RightEdgeAlignedTop | M::RightEdgeAlignedBottom => Self::Right,
+            // Bottom, the edge-aligned bottoms, Full and Auto. `Full` has no
+            // meaning without a dialog host to fill, and `Auto` means "let the
+            // framework decide" — which here is the drop-down direction every
+            // menu already uses.
+            _ => Self::Below,
+        }
+    }
+}
+
+/// Measure a text flyout's paragraph, and the panel it needs around it.
+///
+/// Returns `None` when DirectWrite cannot lay the run out, which the caller
+/// treats as "do not open": a flyout panel sized to nothing is a bare shadow
+/// with no way to tell what it failed to say.
+fn measure_text_body(s: &str) -> Option<(f32, f32)> {
+    let fmt = TextFormat::with_weight("Segoe UI", theme::FONT_SIZE_MD, FontWeight(400)).ok()?;
+    let column = TEXT_MAX_W - TEXT_PAD * 2.0;
+    let layout = windows_canvas_core::TextLayout::new(s, &fmt, column, 100_000.0).ok()?;
+    let _ = layout.set_word_wrap(true);
+    let (tw, th) = layout.measure().ok()?;
+    Some((tw + TEXT_PAD * 2.0, th + TEXT_PAD * 2.0))
+}
 
 /// Reveal one-shot: a snappy Fluent-style grow-out-of-the-trigger (0.96→1
 /// scale + fade, decelerating).
@@ -57,7 +132,7 @@ pub(crate) struct Popup {
     pub suggest: bool,
     container: ContainerVisual,
     surf: NodeSurface,
-    items: Vec<MenuRow>,
+    body: PopupBody,
     /// Drawn-panel rect in window DIPs (excludes the shadow margin).
     panel: Rect,
     /// The trigger/field rect this popup is anchored under (window DIPs).
@@ -66,26 +141,85 @@ pub(crate) struct Popup {
     window: (f32, f32),
     /// Currently highlighted row index (`usize::MAX` = none).
     pub hovered: usize,
+    /// The `FlyoutPlacementMode` discriminant this popup was opened with, kept
+    /// so a re-layout (a suggestion list that grew) lands on the same side.
+    placement: i32,
     px: f32,
 }
 
 impl Popup {
-    /// Panel + surface geometry for `items` anchored under `anchor`, clamped /
+    /// Panel + surface geometry for `body` anchored on `anchor`, clamped /
     /// flipped to fit `window`. Returns `(panel_rect, surf_w, surf_h)` in DIPs.
-    fn layout(items: &[MenuRow], anchor: Rect, window: (f32, f32)) -> (Rect, f32, f32) {
-        let h: f32 = items
-            .iter()
-            .map(|r| if r.separator { SEP } else { ROW })
-            .sum::<f32>()
-            + PANEL_PAD * 2.0;
-        let w = anchor.width().max(200.0).min(360.0);
-        // Anchor below the trigger; flip above on the bottom monitor edge.
-        let mut y = anchor.bottom + theme::SPACE_4;
-        if y + h > window.1 - theme::SPACE_4 {
-            y = (anchor.top - h - theme::SPACE_4).max(theme::SPACE_4);
-        }
-        let x = anchor.left.min(window.0 - w - theme::SPACE_4).max(theme::SPACE_4);
-        (Rect::from_xywh(x, y, w, h), w + MARGIN * 2.0, h + MARGIN * 2.0)
+    ///
+    /// `placement` is the app's requested side. It is a REQUEST: a side with no
+    /// room flips to its opposite, and the result is clamped into the viewport
+    /// regardless — an off-screen flyout is worse than a differently-placed one.
+    fn layout(
+        body: &PopupBody,
+        anchor: Rect,
+        window: (f32, f32),
+        placement: i32,
+    ) -> Option<(Rect, f32, f32)> {
+        let (w, h) = match body {
+            PopupBody::Menu(items) => {
+                let h: f32 = items
+                    .iter()
+                    .map(|r| if r.separator { SEP } else { ROW })
+                    .sum::<f32>()
+                    + PANEL_PAD * 2.0;
+                // A menu is at least as wide as the control it drops from, so
+                // it reads as belonging to it.
+                (anchor.width().max(200.0).min(360.0), h)
+            }
+            PopupBody::Text(s) => measure_text_body(s)?,
+        };
+
+        const GAP: f32 = theme::SPACE_4;
+        const EDGE: f32 = theme::SPACE_4;
+        let fits_below = anchor.bottom + GAP + h <= window.1 - EDGE;
+        let fits_above = anchor.top - GAP - h >= EDGE;
+        let fits_right = anchor.right + GAP + w <= window.0 - EDGE;
+        let fits_left = anchor.left - GAP - w >= EDGE;
+
+        // Centre the panel on the anchor across the free axis, which is what
+        // makes a Top/Bottom flyout read as attached to its trigger rather than
+        // merely near it. A menu keeps its historical leading-edge alignment.
+        let centred_x = anchor.left + (anchor.width() - w) * 0.5;
+        let leading_x = anchor.left;
+        let x_for_vertical = match body {
+            PopupBody::Menu(_) => leading_x,
+            PopupBody::Text(_) => centred_x,
+        };
+        let centred_y = anchor.top + (anchor.height() - h) * 0.5;
+
+        // Each side falls back to its opposite, and only to its opposite: a
+        // flyout asked to sit left belongs on the horizontal axis even when
+        // neither side is roomy, and the clamp below keeps it on screen.
+        let (mut x, mut y) = match Placement::of(placement) {
+            Placement::Left => {
+                let left = fits_left || !fits_right;
+                (if left { anchor.left - GAP - w } else { anchor.right + GAP }, centred_y)
+            }
+            Placement::Right => {
+                let right = fits_right || !fits_left;
+                (if right { anchor.right + GAP } else { anchor.left - GAP - w }, centred_y)
+            }
+            Placement::Above => {
+                let above = fits_above || !fits_below;
+                (x_for_vertical, if above { anchor.top - GAP - h } else { anchor.bottom + GAP })
+            }
+            Placement::Below => {
+                let below = fits_below || !fits_above;
+                (x_for_vertical, if below { anchor.bottom + GAP } else { anchor.top - GAP - h })
+            }
+        };
+        x = x.min(window.0 - w - EDGE).max(EDGE);
+        y = y.min(window.1 - h - EDGE).max(EDGE);
+        Some((
+            Rect::from_xywh(x, y, w, h),
+            w + MARGIN * 2.0,
+            h + MARGIN * 2.0,
+        ))
     }
 
     /// Mint the overlay surface for `panel`, position it (accounting for the shadow
@@ -112,14 +246,19 @@ impl Popup {
     pub fn open(
         comp: &Compositing,
         owner: ControlId,
-        items: Vec<MenuRow>,
+        body: PopupBody,
         anchor: Rect,
         window: (f32, f32),
         combo: bool,
         selected: i32,
         suggest: bool,
+        placement: i32,
     ) -> windows_core::Result<Self> {
-        let (panel, surf_w, surf_h) = Self::layout(&items, anchor, window);
+        let Some((panel, surf_w, surf_h)) = Self::layout(&body, anchor, window, placement) else {
+            return Err(windows_core::Error::from_hresult(windows_core::HRESULT(
+                -2147024809, // E_INVALIDARG: nothing measurable to show.
+            )));
+        };
         let (container, surf) = Self::build_surface(comp, panel, surf_w, surf_h)?;
         let hovered = if combo && selected >= 0 {
             selected as usize
@@ -132,11 +271,12 @@ impl Popup {
             suggest,
             container,
             surf,
-            items,
+            body,
             panel,
             anchor,
             window,
             hovered,
+            placement,
             px: comp.scale(),
         };
         popup.reveal(comp);
@@ -179,19 +319,20 @@ impl Popup {
     /// thus the panel height) changes — the fresh visual mounts at rest
     /// (opacity 1, scale 1).
     pub fn update_items(&mut self, comp: &Compositing, items: Vec<MenuRow>) {
-        let resized = items.len() != self.items.len();
-        self.items = items;
-        if self.hovered != usize::MAX && self.hovered >= self.items.len() {
+        let resized = items.len() != self.body.rows().len();
+        self.body = PopupBody::Menu(items);
+        if self.hovered != usize::MAX && self.hovered >= self.body.rows().len() {
             self.hovered = usize::MAX;
         }
-        if resized {
-            let (panel, surf_w, surf_h) = Self::layout(&self.items, self.anchor, self.window);
-            if let Ok((container, surf)) = Self::build_surface(comp, panel, surf_w, surf_h) {
-                comp.remove_overlay(&self.container);
-                self.container = container;
-                self.surf = surf;
-                self.panel = panel;
-            }
+        if resized
+            && let Some((panel, surf_w, surf_h)) =
+                Self::layout(&self.body, self.anchor, self.window, self.placement)
+            && let Ok((container, surf)) = Self::build_surface(comp, panel, surf_w, surf_h)
+        {
+            comp.remove_overlay(&self.container);
+            self.container = container;
+            self.surf = surf;
+            self.panel = panel;
         }
         self.draw(comp);
     }
@@ -233,7 +374,7 @@ impl Popup {
             return None;
         }
         let mut ry = self.panel.top + PANEL_PAD;
-        for (i, r) in self.items.iter().enumerate() {
+        for (i, r) in self.body.rows().iter().enumerate() {
             let rh = if r.separator { SEP } else { ROW };
             if y >= ry && y < ry + rh && !r.separator && r.enabled {
                 return Some(i);
@@ -245,7 +386,7 @@ impl Popup {
 
     /// The tag/text the row at `index` reports on selection.
     pub fn row_tag(&self, index: usize) -> Option<String> {
-        self.items.get(index).map(|r| {
+        self.body.rows().get(index).map(|r| {
             if r.tag.is_empty() {
                 r.text.clone()
             } else {
@@ -256,7 +397,7 @@ impl Popup {
 
     /// Move the highlight by `delta`, skipping separators/disabled rows.
     pub fn move_highlight(&mut self, delta: i32, comp: &Compositing) {
-        let n = self.items.len() as i32;
+        let n = self.body.rows().len() as i32;
         if n == 0 {
             return;
         }
@@ -271,7 +412,7 @@ impl Popup {
         };
         for _ in 0..n {
             i = (i + delta).rem_euclid(n);
-            if let Some(r) = self.items.get(i as usize)
+            if let Some(r) = self.body.rows().get(i as usize)
                 && !r.separator
                 && r.enabled
             {
@@ -347,8 +488,36 @@ impl Popup {
         let inset = Rect::new(p.left + 0.5, p.top + 0.5, p.right - 0.5, p.bottom - 0.5);
         session.draw_rounded_rect(&RoundedRect::uniform(inset, theme::RADIUS_MD), brush, theme::BORDER_W);
 
+        // A text flyout is one wrapped paragraph inside the same panel: no
+        // rows, no highlight, nothing to hit. It draws leading-aligned and
+        // top-anchored, because prose that grows downward from a fixed corner
+        // is what a reader expects — a centred paragraph shifts every line
+        // when the text changes.
+        let rows = match &self.body {
+            PopupBody::Text(s) => {
+                let tr = Rect::new(
+                    p.left + TEXT_PAD,
+                    p.top + TEXT_PAD,
+                    p.right - TEXT_PAD,
+                    p.bottom - TEXT_PAD,
+                );
+                if let Ok(fmt) =
+                    TextFormat::with_weight("Segoe UI", theme::FONT_SIZE_MD, FontWeight(400))
+                {
+                    let fmt = fmt
+                        .with_alignment(TextAlignment::Leading)
+                        .with_paragraph_alignment(ParagraphAlignment::Top)
+                        .with_word_wrap(true);
+                    set(brush, theme::text());
+                    session.draw_text(s, &fmt, &tr, brush);
+                }
+                return;
+            }
+            PopupBody::Menu(rows) => rows,
+        };
+
         let mut ry = p.top + PANEL_PAD;
-        for (i, row) in self.items.iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             if row.separator {
                 set(brush, theme::stroke_divider());
                 let y = ry + SEP / 2.0;

@@ -141,10 +141,15 @@ impl SendValue {
             PropValue::GradientStops(v) => Self::GradientStops(v.clone()),
             PropValue::F64List(v) => Self::F64List(v.clone()),
             PropValue::ValueLabels(v) => Self::ValueLabels(v.clone()),
-            // Thread-affine: COM interfaces and an Element/callback tree.
-            PropValue::SurfaceImageSource(_)
-            | PropValue::VirtualSurfaceImageSource(_)
-            | PropValue::FlyoutDef(_) => return None,
+            // A flyout never reaches here: `set_prop` intercepts
+            // `Prop::FlyoutContent` and splits it into a `Cmd::SetFlyout`
+            // declaration plus an app-side entry, the way a tooltip does.
+            // Reaching this arm means an interception was lost.
+            PropValue::FlyoutDef(_) => return None,
+            // Thread-affine COM interfaces, with no consumer on this backend.
+            PropValue::SurfaceImageSource(_) | PropValue::VirtualSurfaceImageSource(_) => {
+                return None
+            }
         })
     }
 
@@ -227,6 +232,45 @@ impl TooltipDecl {
                 placement: t.placement,
             },
             TooltipContent::Rich(_) => Self::Rich,
+        }
+    }
+}
+
+/// The `Send` face of a [`crate::FlyoutDef`]: what the front needs to *show*
+/// one.
+///
+/// The same split [`TooltipDecl`] makes, and for the same reason — a flyout
+/// holds a `Box<Element>` and an `on_closed` callback, neither of which can
+/// ride a `Send` buffer. What crosses is the plain data the popup is built
+/// from; the `Element` and the callback stay in the recorder's app-side map,
+/// reachable by owner id.
+///
+/// `Rich` carries no content because an `Element` can only become pixels by
+/// going through the reconciler. The front records that this owner has rich
+/// content and asks for it to be realized when the flyout actually opens,
+/// which is also what keeps a never-opened flyout free.
+#[derive(Clone, PartialEq, Debug)]
+pub struct FlyoutDecl {
+    pub text: String,
+    /// `FlyoutPlacementMode` discriminant.
+    pub placement: i32,
+    /// `Some` only when the app is driving open/closed itself; `None` leaves
+    /// the popup to click-to-open and light-dismiss.
+    pub open: Option<bool>,
+    pub rich: bool,
+    /// Whether an `on_closed` callback is registered, so the front knows to
+    /// queue a dismissal intent rather than closing silently.
+    pub notifies_closed: bool,
+}
+
+impl FlyoutDecl {
+    fn of(f: &crate::FlyoutDef) -> Self {
+        Self {
+            text: f.text.clone(),
+            placement: f.placement.0,
+            open: f.open,
+            rich: f.rich.is_some(),
+            notifies_closed: f.on_closed.is_some(),
         }
     }
 }
@@ -332,6 +376,11 @@ pub(crate) enum Intent {
     /// the drain addresses the right `on_invoked` in the app-side `accels` map
     /// without the front ever holding the callback.
     Accelerator { id: ControlId, index: usize },
+    /// An attached flyout was dismissed — light-dismiss, Escape, or a
+    /// selection that closed it. Addressed to the `on_closed` callback in the
+    /// app-side `flyouts` map. Queued unconditionally; the drain finds no
+    /// callback and does nothing when the app registered none.
+    FlyoutClosed { id: ControlId },
 }
 
 /// A handler invocation resolved from an [`Intent`] at drain time: the cloned
@@ -573,6 +622,14 @@ pub(crate) enum Cmd {
         id: ControlId,
         decl: Option<TooltipDecl>,
     },
+    /// The `Send` face of an attached flyout — see [`FlyoutDecl`]. The
+    /// `Element` and the `on_closed` callback stay in the recorder's app-side
+    /// map; the front realizes rich content by asking for it at open time and
+    /// reports a dismissal as [`Intent::FlyoutClosed`].
+    SetFlyout {
+        id: ControlId,
+        decl: Option<FlyoutDecl>,
+    },
     /// The presence bits of the app's pointer callbacks — the closures stay in
     /// the recorder's app-side map, invoked from [`Intent::Pointer`]/
     /// [`Intent::Tapped`]; the backend keeps only what input consults
@@ -613,6 +670,11 @@ pub(crate) trait FrontBackend: Backend {
         id: ControlId,
         keys: Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>,
     );
+    /// [`Cmd::SetFlyout`]: the plain data an attached flyout is built from.
+    /// Rich content and the `on_closed` callback stay app-side; the front
+    /// asks for the former by id at open time and reports the latter as
+    /// [`Intent::FlyoutClosed`].
+    fn set_flyout(&mut self, id: ControlId, decl: Option<FlyoutDecl>);
     /// Intents queued by input since the last drain, in fire order.
     fn take_intents(&mut self) -> Vec<Intent>;
 }
@@ -641,6 +703,9 @@ pub(crate) struct RecordingBackend {
     /// Full tooltips (a rich one holds an `Element` tree); the front sees only
     /// [`TooltipDecl`].
     tooltips: FxHashMap<ControlId, Tooltip>,
+    /// Full flyouts (rich content is an `Element` tree, and `on_closed` is an
+    /// app callback); the front sees only [`FlyoutDecl`].
+    flyouts: FxHashMap<ControlId, crate::FlyoutDef>,
     /// Templated-list callbacks — realize/recycle, selection, reorder. Declared
     /// to the front by presence only; nothing consumes them on this backend
     /// yet, but they are held here so the templated work starts from the same
@@ -688,6 +753,7 @@ impl RecordingBackend {
             accels: FxHashMap::default(),
             drag: FxHashMap::default(),
             tooltips: FxHashMap::default(),
+            flyouts: FxHashMap::default(),
             realization: FxHashMap::default(),
             selection_changed: FxHashMap::default(),
             reorder: FxHashMap::default(),
@@ -795,6 +861,14 @@ impl RecordingBackend {
                     // nothing.
                     if let Some(accel) = self.accels.get(&id).and_then(|list| list.get(index)) {
                         jobs.push(IntentJob::Unit(accel.on_invoked.clone()));
+                    }
+                }
+                Intent::FlyoutClosed { id } => {
+                    // The callback never crossed the seam, so this map is the
+                    // only place it exists. A flyout the app removed, or a
+                    // destroyed owner, resolves to nothing.
+                    if let Some(cb) = self.flyouts.get(&id).and_then(|f| f.on_closed.as_ref()) {
+                        jobs.push(IntentJob::Unit(cb.clone()));
                     }
                 }
             }
@@ -932,6 +1006,7 @@ fn apply<B: FrontBackend>(backend: &mut B, cmd: Cmd) {
             backend.set_accessibility(id, &accessibility)
         }
         Cmd::SetPointerInterest { id, interest } => backend.set_pointer_interest(id, interest),
+        Cmd::SetFlyout { id, decl } => backend.set_flyout(id, decl),
     }
 }
 
@@ -995,6 +1070,32 @@ impl Backend for RecordingBackend {
                 self.text_view.remove(&id);
             }
         }
+        // A flyout splits at this seam rather than crossing it: the `Element`
+        // and the `on_closed` callback stay here, keyed by owner, and only the
+        // plain data the popup is built from goes into the buffer. `Unset`
+        // clears both sides together, so a flyout removed by a re-render
+        // cannot leave a stale callback behind.
+        if prop == Prop::FlyoutContent {
+            let decl = match value {
+                PropValue::FlyoutDef(def) => {
+                    self.flyouts.insert(id, def.clone());
+                    Some(FlyoutDecl::of(def))
+                }
+                // The text shorthand, which the widget layer also emits.
+                PropValue::Str(s) => {
+                    let def = crate::FlyoutDef::text(s.clone());
+                    let decl = FlyoutDecl::of(&def);
+                    self.flyouts.insert(id, def);
+                    Some(decl)
+                }
+                _ => {
+                    self.flyouts.remove(&id);
+                    None
+                }
+            };
+            self.push(Cmd::SetFlyout { id, decl });
+            return;
+        }
         match SendValue::from_prop(value) {
             Some(value) => self.push(Cmd::SetProp { id, prop, value }),
             // Thread-affine prop values (XAML image sources, flyout Element
@@ -1040,6 +1141,7 @@ impl Backend for RecordingBackend {
         self.accels.remove(&id);
         self.drag.remove(&id);
         self.tooltips.remove(&id);
+        self.flyouts.remove(&id);
         self.realization.remove(&id);
         self.selection_changed.remove(&id);
         self.reorder.remove(&id);

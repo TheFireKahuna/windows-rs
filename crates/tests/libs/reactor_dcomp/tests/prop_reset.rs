@@ -189,7 +189,10 @@ fn cases() -> Vec<Case> {
             V::Str("search".into()),
         ),
         c(K::Button, Prop::Icon, V::I32(42)),
-        c(K::Button, Prop::FlyoutContent, V::Str("more".into())),
+        // `Prop::FlyoutContent` is deliberately absent: a flyout does not
+        // travel as a prop on this backend. It splits at the record seam into
+        // a `Cmd::SetFlyout` declaration plus an app-side entry, so its set /
+        // clear round trip is covered by `flyout.rs`, not here.
         c(K::Button, Prop::FlyoutPlacement, V::I32(3)),
         c(K::HyperlinkButton, Prop::NavigateUri, V::Str("https://newapo.dev".into())),
         c(K::ToggleSwitch, Prop::OnContent, V::Str("On".into())),

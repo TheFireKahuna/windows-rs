@@ -988,6 +988,33 @@ impl DCompBackend {
         }
     }
 
+    /// Take the `Send` face of an attached flyout ([`record::FlyoutDecl`]) and
+    /// reconcile the popup against it.
+    ///
+    /// The declaration is the whole of what this backend knows about a flyout:
+    /// its text, its placement, whether it has rich content, and whether the
+    /// app wants to hear about dismissal. The `Element` and the `on_closed`
+    /// callback never crossed the seam.
+    ///
+    /// `open` is a CONTROLLED state, so it is applied here rather than only on
+    /// click: an app that binds it owns the flyout's visibility, and a render
+    /// that flips it to `false` must close a popup the user opened by clicking.
+    /// `None` leaves visibility to click-to-open and light-dismiss, which is
+    /// the uncontrolled default.
+    pub(crate) fn set_flyout(&mut self, id: ControlId, decl: Option<record::FlyoutDecl>) {
+        let want_open = decl.as_ref().and_then(|d| d.open);
+        let Some(node) = self.node_mut(id) else { return };
+        node.extras_mut().flyout = decl.map(Box::new);
+        node.mark_dirty();
+
+        let showing = self.popup.as_ref().is_some_and(|p| p.owner == id);
+        match want_open {
+            Some(true) if !showing => self.open_popup(id),
+            Some(false) if showing => self.close_popup(),
+            _ => {}
+        }
+    }
+
     /// Record the node's declared accelerator chords (§7.3). An empty list
     /// clears the entry; input matches keydowns against this table
     /// ([`input`]'s `match_accelerator`) and fires the app callback through
@@ -1021,6 +1048,10 @@ impl record::FrontBackend for DCompBackend {
 
     fn set_text_stamped(&mut self, id: ControlId, text: &str, based_on: u64) {
         Self::set_text_stamped(self, id, text, based_on);
+    }
+
+    fn set_flyout(&mut self, id: ControlId, decl: Option<record::FlyoutDecl>) {
+        Self::set_flyout(self, id, decl);
     }
 
     fn set_keybindings(
@@ -1549,17 +1580,10 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.extras_mut().v_scrollbar = *v;
             node.mark_dirty();
         }
-        // A plain-text flyout is a `FlyoutDef` with only its text set — the
-        // seam's own constructor for that case, so the two shapes converge
-        // with nothing dropped and no second field to keep in step.
-        (Prop::FlyoutContent, PropValue::Str(s)) => {
-            node.extras_mut().flyout = Some(Box::new(crate::FlyoutDef::text(s.clone())));
-            node.mark_dirty();
-        }
-        (Prop::FlyoutContent, PropValue::FlyoutDef(def)) => {
-            node.extras_mut().flyout = Some(Box::new(def.clone()));
-            node.mark_dirty();
-        }
+        // `Prop::FlyoutContent` has no arm: a flyout does not cross the seam as
+        // a prop at all. The recorder splits it — plain data into
+        // `Cmd::SetFlyout`, the `Element` and the `on_closed` callback into its
+        // own map — and the front takes it through `set_flyout` below.
         (Prop::FlyoutPlacement, PropValue::I32(v)) => {
             node.extras_mut().flyout_placement = *v;
             node.mark_dirty();
@@ -2125,7 +2149,6 @@ prop_contract! {
         }
 
         // ── Button / HyperlinkButton ─────────────────────────────────────
-        FlyoutContent => |n| { n.extras_reset(|x| x.flyout = Extras::DEFAULT.flyout); }
         FlyoutPlacement => |n| {
             n.extras_reset(|x| x.flyout_placement = Extras::DEFAULT.flyout_placement);
         }
@@ -2162,6 +2185,12 @@ prop_contract! {
         // backend: there is no resource dictionary, no style system, and no
         // XAML drag-drop here.
         Style, Resources, AllowDrop;
+        // Not "unrendered" — a flyout simply does not travel as a PROP here. It
+        // holds a `Box<Element>` and an `on_closed` callback, so the recorder
+        // splits it into a `Cmd::SetFlyout` declaration plus an app-side entry
+        // (`record::FlyoutDecl`) and the front takes it through
+        // `DCompBackend::set_flyout`, which is also where clearing happens.
+        FlyoutContent;
         // RelativePanel attached props — this backend has no RelativePanel.
         AlignBottomWithPanel, AlignHCenterWithPanel, AlignLeftWithPanel,
         AlignRightWithPanel, AlignTopWithPanel, AlignVCenterWithPanel;
