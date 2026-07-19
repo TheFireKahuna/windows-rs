@@ -2869,28 +2869,42 @@ fn meter_arm_clip(parts: &mut Parts, w: f32) {
 /// channel already knows whether that rect moved. The shadow was only ever a
 /// proxy for that question, and a proxy that could be committed on a path which
 /// never placed the pill — which is precisely how it stranded.
+/// The bar's derived geometry: the segment boundaries, the inset the tray keeps
+/// and the height of a segment pill.
+///
+/// One definition because two consumers must agree on it. [`segmented_plan`]
+/// places the selection pill from these numbers and [`seg_hot_changed`] places
+/// the hover wash from them on the input thread, and a wash computed from a
+/// second copy of the arithmetic lands beside the pill rather than under it —
+/// silently, and only for whichever style variant the copies disagreed about.
+fn seg_geom(node: &Node) -> (Vec<f32>, f32, f32) {
+    let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
+    let edges = super::controls::segment_edges(node);
+    (edges, m.tray, (node.rect.h - 2.0 * m.tray).max(0.0))
+}
+
+/// Segment `i`'s rect, or `None` if the bar has no such segment.
+fn seg_rect(edges: &[f32], tray: f32, pill_h: f32, i: i32) -> Option<Rect4> {
+    let i = usize::try_from(i).ok()?;
+    let (a, b) = (*edges.get(i)?, *edges.get(i + 1)?);
+    Some((a, tray, b - a, pill_h))
+}
+
 pub(crate) fn segmented_plan(node: &Node, scale: f32) -> PartPlan {
     let n = node.ctrl().items.len();
     let (w, h) = (node.rect.w, node.rect.h);
     let accent = node.paint.style_variant == 1;
-    let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
-    let edges = super::controls::segment_edges(node);
+    let (edges, tray_y, pill_h) = seg_geom(node);
     let dim = dim_of(node);
 
     let tray_radius = if accent { h / 2.0 } else { theme::RADIUS_SM };
     let tray_bg = if accent { theme::w(0.06) } else { theme::stroke_subtle() };
-    let pill_h = (h - 2.0 * m.tray).max(0.0);
     let seg_radius = if accent { pill_h / 2.0 } else { theme::RADIUS_BADGE };
     let pill_fill = if accent { theme::accent() } else { theme::stroke() };
 
     let sel = if n == 0 { -1 } else { (node.ctrl().selected_index.max(0)).min(n as i32 - 1) };
-    let seg_rect = |i: i32| -> Option<Rect4> {
-        let i = usize::try_from(i).ok()?;
-        let (a, b) = (*edges.get(i)?, *edges.get(i + 1)?);
-        Some((a, m.tray, b - a, pill_h))
-    };
     let tray = Some((0.0, 0.0, w, h));
-    let pill = seg_rect(sel);
+    let pill = seg_rect(&edges, tray_y, pill_h, sel);
     let k_pill = AtlasKey::hbar(pill_h, seg_radius, 0.0, pill_fill, scale);
     let k_ink = AtlasKey::hbar(pill_h, seg_radius, 0.0, theme::w(1.0), scale);
 
@@ -2914,7 +2928,12 @@ pub(crate) fn segmented_plan(node: &Node, scale: f32) -> PartPlan {
         // sliding across segments the pointer never crossed.
         .below(
             3,
-            SlotPlan::snap(k_ink, seg_rect(node.ctrl().hot_index), seg_ink_target(node)).fading(),
+            k_ink
+                .snap_at(
+                    seg_rect(&edges, tray_y, pill_h, node.ctrl().hot_index),
+                    seg_ink_target(node),
+                )
+                .fading(),
         )
         // The ring rings the TRAY, not the selected segment: focus is on the
         // bar, and the selection already has the pill to show where it is.
@@ -2933,14 +2952,8 @@ fn seg_ink_target(node: &Node) -> f32 {
 /// segment and refade. (The caller still repaints the surface for the label
 /// hover brightening.)
 pub(crate) fn seg_hot_changed(node: &mut Node) {
-    let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
-    let edges = super::controls::segment_edges(node);
-    let pill_h = (node.rect.h - 2.0 * m.tray).max(0.0);
-    let hot = node.ctrl().hot_index;
-    let rect = usize::try_from(hot).ok().and_then(|i| {
-        let (a, b) = (*edges.get(i)?, *edges.get(i + 1)?);
-        Some((a, m.tray, b - a, pill_h))
-    });
+    let (edges, tray_y, pill_h) = seg_geom(node);
+    let rect = seg_rect(&edges, tray_y, pill_h, node.ctrl().hot_index);
     let t = seg_ink_target(node);
     if let Some(parts) = node.parts.as_mut()
         && parts.below.len() == 4
@@ -3106,7 +3119,7 @@ pub(crate) fn nav_plan(node: &Node, scale: f32) -> PartPlan {
             nav_slot::CHROME_INK,
             SlotPlan::snap(
                 k_chrome,
-                chrome.map(|r| (r.left, r.top, r.width(), r.height())),
+                chrome.map(r4),
                 if chrome.is_some() { wash(0.06) * dim } else { 0.0 },
             )
             .fading(),
@@ -3160,7 +3173,7 @@ pub(crate) fn nav_hot_changed(node: &mut Node) {
     let m = nav::metrics(node.extras(), node.rect.w, has_title);
     let chrome = nav::chrome_rect(&m, node.ctrl().hot_index)
         .filter(|_| live)
-        .map(|r| (r.left, r.top, r.width(), r.height()));
+        .map(r4);
     let dim = dim_of(node);
 
     let Some(parts) = node.parts.as_mut() else { return };
