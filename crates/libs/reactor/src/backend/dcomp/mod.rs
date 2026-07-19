@@ -1579,6 +1579,12 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
         }
         (Prop::Severity, PropValue::I32(v)) => {
             node.extras_mut().severity = *v;
+            // The status icon is a SHAPED RUN, not a glyph painted from the
+            // severity on the spot, so a new severity is new text: without this
+            // the layout pass never re-runs and the previous icon stays on
+            // screen. It also renames the bar for a screen reader, which reads
+            // the role out loud (`info_bar::accessible_name`).
+            node.text_dirty = true;
             node.mark_dirty();
         }
         (Prop::IsOpen, PropValue::Bool(v)) => {
@@ -1593,6 +1599,9 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             // The close button's column is part of the text budget, so losing
             // or gaining it re-wraps the paragraph.
             node.measure_dirty = true;
+            // …and it decides whether the close GLYPH is shaped at all, which
+            // is the layout pass's job.
+            node.text_dirty = true;
             node.mark_dirty();
         }
         (Prop::IsIndeterminate, PropValue::Bool(v)) => {

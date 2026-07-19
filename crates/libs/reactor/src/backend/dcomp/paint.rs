@@ -131,6 +131,19 @@ fn paint_node(
                 super::glyph_text::segmented_sync(comp, glyphs, n, scale);
                 // …and the count on a badge's plate.
                 super::glyph_text::info_badge_sync(comp, glyphs, n, scale);
+                // …and the pane's two chrome glyphs, its header, and the glyph
+                // plus label on every row it has room for.
+                super::glyph_text::nav_sync(comp, glyphs, n, scale);
+                // The bar's severity glyph, its wrapped paragraph and its close
+                // glyph — the paragraph re-pinned to its column first.
+                super::glyph_text::info_bar_sync(comp, glyphs, n, scale);
+                // The caption's coupled title/subtitle pair and its four button
+                // glyphs.
+                super::glyph_text::caption_sync(comp, glyphs, n, scale);
+                // …and a checkbox's trailing label.
+                super::glyph_text::check_sync(comp, glyphs, n, scale);
+                // …and an expander's header label plus its chevron.
+                super::glyph_text::expander_sync(comp, glyphs, n, scale);
                 // Editors: the text run, its selection and its composition rule
                 // as sprites, then the caret sprite. Both are placed from the
                 // same `editor::TextBand`, so they cannot disagree.

@@ -15,19 +15,30 @@
 //! one row selects the wrong page — so they share this one definition rather
 //! than each re-deriving from `Extras`.
 //!
-//! The split between what is painted here and what is a retained compositor
-//! sprite follows the rule the rest of the backend uses: anything that MOVES
-//! (the pane's width transition, the selection tile and its accent bar, the row
-//! hover ink) is a sprite whose motion runs DWM-side; anything that is simply
-//! *there* at a given state (glyphs, labels, the divider) paints onto the
-//! node's own surface, once per dirty repaint.
+//! **The pane owns no surface.** Its chrome — the background, the divider, the
+//! selection tile and its accent bar, the row hover ink and the chrome-button
+//! wash — is retained compositor parts ([`parts::nav_plan`](super::parts)), and
+//! every run it shows — the two chrome glyphs, the header, and a leading glyph
+//! plus a label per row — is retained glyph sprites
+//! ([`glyph_text::nav_sync`](super::glyph_text::nav_sync)). Nothing here reaches
+//! a `BeginDraw`, so a pane that opens, a selection that moves, or a pointer
+//! crossing rows costs no raster at all.
+//!
+//! What still divides the two halves is *motion*: anything that MOVES (the
+//! pane's width transition, the tile, the bar, the ink) is a part whose motion
+//! runs DWM-side, and every run SNAPS to the state that repaint published,
+//! because a shaped text layout cannot be interpolated.
+//!
+//! The row runs live in a [`RowText`](super::glyph_text::RowText) — the
+//! index-addressed leading-glyph-plus-label primitive. That is deliberate and
+//! not merely convenient: this control is one of the backend's node-less,
+//! index-addressed item containers, and the same primitive is what a virtualized
+//! items control draws its window of rows through.
 
-use windows_canvas_core::{
-    Brush, DrawingSession, ParagraphAlignment, Rect, TextAlignment, TextFormat, TextLayout,
-    Trimming, Vector2,
-};
+use windows_canvas_core::{Rect, TextFormat, TextLayout, Trimming};
 
-use super::node::{linear, Extras, Node};
+use super::glyph_text::RowText;
+use super::node::Extras;
 use super::theme;
 use crate::NavigationViewPaneDisplayMode as Mode;
 
@@ -307,72 +318,168 @@ pub(crate) fn hit(m: &Metrics, node_h: f32, count: usize, lx: f32, ly: f32) -> O
 
 // ── Cached text ──────────────────────────────────────────────────────────────
 
-/// The pane's own drawn text, laid out once and reused.
+/// The pane's shaped runs and the sprites that place them.
 ///
-/// Built by the layout pass whenever the NavigationView's `text_dirty` is set —
-/// i.e. exactly when the pane title, the items or the settings row changed —
-/// and read by [`paint`], which only runs on a dirty repaint. Nothing here is
-/// constructed per frame: a repaint reuses these `IDWriteTextLayout`s and at
-/// most re-points a max width, which is a property set, not an allocation.
+/// The runs are built by the layout pass whenever the NavigationView's
+/// `text_dirty` is set — i.e. exactly when the pane title, the items or the
+/// settings row changed — and read by
+/// [`glyph_text::nav_sync`](super::glyph_text::nav_sync), which only runs on a
+/// dirty repaint. Nothing here is constructed per frame: a repaint reuses these
+/// `IDWriteTextLayout`s and at most re-points a max width, which is a property
+/// set, not an allocation.
 ///
 /// This is the same mechanism [`CaptionText`](super::caption::CaptionText) uses
 /// for the caption band, and it needs its own home for the same reason: a pane
-/// carries one run per item plus two of its own, and `Node::text_layout` holds
+/// carries two runs per row plus three of its own, and `Node::text_layout` holds
 /// exactly one.
+///
+/// **The sprites live here too, and are never rebuilt with the runs.** A rebuild
+/// goes through [`adopt`](Self::adopt), which swaps the layouts and leaves every
+/// part alone — the parts own compositor visuals parented into the node, so
+/// replacing this struct wholesale would orphan the sprites already on screen.
+#[derive(Default)]
 pub(crate) struct NavPaneText {
     pub title: Option<TextLayout>,
     pub title_w: f32,
-    /// One laid-out label per menu item, parallel to `Ctrl::items`. An entry is
-    /// `None` only if DirectWrite refused the run.
-    pub items: Vec<Option<TextLayout>>,
-    pub settings: Option<TextLayout>,
-    /// Line height of the item runs, for vertical centring. One value for all
-    /// of them: they share a format, so they share a line height.
+    /// The back arrow and the hamburger, shaped from the Fluent icon face. They
+    /// are runs rather than painted characters for the reason the button
+    /// family's icon is: a pane that painted even one glyph would need a
+    /// surface, and this control no longer gets one.
+    pub back: Option<TextLayout>,
+    pub toggle: Option<TextLayout>,
+    /// Line height of the item runs. Kept for the intrinsic measure; placement
+    /// centres on each run's own measured height rather than this shared one.
     pub line_h: f32,
+    /// The menu rows, followed by the settings row at index `items.len()`.
+    ///
+    /// The settings row is a row of this list rather than a case beside it
+    /// because it *is* one — the same leading-glyph-plus-label shape, the same
+    /// geometry, and it selects like a menu item ([`SETTINGS_INDEX`]). Its index
+    /// is the item count and not the visible-row count, so shrinking the window
+    /// the pane has room for never re-points its runs at a menu item's.
+    pub rows: RowText,
+    /// The three chrome runs' sprites, in the order [`ChromeRun`] names them.
+    pub chrome: [super::glyph_text::TextPart; 3],
 }
 
-fn pane_format(size: f32, weight: u16) -> Option<TextFormat> {
-    TextFormat::with_weight(
-        "Segoe UI",
-        size,
-        windows_canvas_core::FontWeight(weight as i32),
-    )
-    .ok()
+/// Which of the pane's own three runs a chrome sprite carries. The pane's rows
+/// are addressed by index; these three are not, so they are named.
+#[derive(Clone, Copy)]
+pub(crate) enum ChromeRun {
+    Back = 0,
+    Toggle = 1,
+    Title = 2,
 }
 
-/// Lay out one pane run, ellipsized. Built at its natural width; [`paint`]
-/// narrows it to the room actually available, at which point the trimming sign
-/// takes over — so a long item label degrades to "Equalizer…" rather than
-/// spilling across the divider.
-fn run(text: &str, size: f32, weight: u16) -> Option<(TextLayout, f32, f32)> {
+/// The shaped runs alone, as the layout pass builds them.
+///
+/// A plain value with no sprites in it, so it can be built from an immutable
+/// borrow of the node and then moved into the live [`NavPaneText`] under a
+/// mutable one — which is what keeps the parts across a rebuild.
+#[derive(Default)]
+pub(crate) struct NavRuns {
+    title: Option<TextLayout>,
+    title_w: f32,
+    back: Option<TextLayout>,
+    toggle: Option<TextLayout>,
+    line_h: f32,
+    leading: Vec<Option<TextLayout>>,
+    labels: Vec<Option<TextLayout>>,
+}
+
+impl NavPaneText {
+    /// Take a freshly shaped run set, keeping every sprite.
+    pub(crate) fn adopt(&mut self, r: NavRuns) {
+        self.title = r.title;
+        self.title_w = r.title_w;
+        self.back = r.back;
+        self.toggle = r.toggle;
+        self.line_h = r.line_h;
+        self.rows.adopt(r.leading, r.labels);
+    }
+
+    /// The sprite carrying one of the pane's own runs.
+    pub(crate) fn chrome(&mut self, which: ChromeRun) -> &mut super::glyph_text::TextPart {
+        &mut self.chrome[which as usize]
+    }
+}
+
+/// Lay out one pane run at its natural width.
+///
+/// `trim` marks the runs that must degrade rather than spill: a label is built
+/// unconstrained here and narrowed to the room actually available at sync time,
+/// at which point the trimming sign takes over — so a long item label reads
+/// "Equalizer…" rather than running across the divider. A glyph run is never
+/// trimmed; there is nothing to elide in one character, and an ellipsis sign on
+/// the icon face is not a character anyone wants to see.
+fn run(text: &str, family: &str, size: f32, weight: u16, trim: bool) -> Option<(TextLayout, f32, f32)> {
     if text.is_empty() {
         return None;
     }
-    let fmt = pane_format(size, weight)?;
+    let fmt = TextFormat::with_weight(family, size, windows_canvas_core::FontWeight(weight as i32))
+        .ok()?;
     let layout = TextLayout::new(text, &fmt, 100_000.0, 100_000.0).ok()?;
     let _ = layout.set_word_wrap(false);
-    let _ = layout.set_trimming(Trimming::CharacterEllipsis, &fmt);
+    if trim {
+        let _ = layout.set_trimming(Trimming::CharacterEllipsis, &fmt);
+    }
     let (w, h) = layout.measure().ok()?;
     Some((layout, w, h))
 }
 
-/// (Re)build the pane's cached text. `None` when the pane carries no title, no
-/// items and no settings row, so a NavigationView used as a bare rail with
-/// glyph-only items allocates nothing at all.
-pub(crate) fn build_text(x: &Extras, items: &[String]) -> Option<Box<NavPaneText>> {
-    let title = run(&x.pane_title, theme::FONT_SIZE_SM, 600);
-    let settings = run(SETTINGS_LABEL, theme::FONT_SIZE_MD, 400);
-    if title.is_none() && items.is_empty() && settings.is_none() {
-        return None;
-    }
-    let mut runs = Vec::with_capacity(items.len());
+/// A pane label: Segoe UI, ellipsized.
+fn label_run(text: &str, size: f32, weight: u16) -> Option<(TextLayout, f32, f32)> {
+    run(text, "Segoe UI", size, weight, true)
+}
+
+/// One row's leading glyph, shaped from the Fluent icon face.
+///
+/// Falls back to the label's first character in the text face when the item
+/// carries no icon — which is what makes a compact rail of icon-less items still
+/// readable. The fallback borrows from the label, so it allocates nothing.
+fn leading_run(icon: u32, label: &str, size: f32) -> Option<TextLayout> {
+    let mut buf = [0u8; 4];
+    let (glyph, family) = match super::controls::glyph_into(icon, &mut buf) {
+        Some(g) if icon != 0 => (g, theme::FONT_ICON),
+        _ => (
+            label
+                .char_indices()
+                .next()
+                .map(|(_, c)| &label[..c.len_utf8()])
+                .unwrap_or(""),
+            "Segoe UI",
+        ),
+    };
+    run(glyph, family, size, 400, false).map(|(l, _, _)| l)
+}
+
+/// (Re)build the pane's shaped runs.
+///
+/// Everything the pane could show is shaped, not merely what the current state
+/// displays: the header of a collapsed pane, the labels of a rail, and the
+/// settings row of a pane that has hidden it. All three are per-repaint
+/// decisions that do not set `text_dirty`, so a build that skipped them would
+/// leave the pane with no run to place on the repaint that reveals them — and
+/// would put a DirectWrite layout build on the click path that opens the pane.
+pub(crate) fn build_runs(x: &Extras, items: &[String], icons: &[u32]) -> NavRuns {
+    let title = label_run(&x.pane_title, theme::FONT_SIZE_SM, 600);
+    let settings = label_run(SETTINGS_LABEL, theme::FONT_SIZE_MD, 400);
+
+    // One entry per row: the menu items, then the settings row.
+    let mut leading = Vec::with_capacity(items.len() + 1);
+    let mut labels = Vec::with_capacity(items.len() + 1);
     let mut line_h = 0.0f32;
-    for label in items {
-        let r = run(label, theme::FONT_SIZE_MD, 400);
+    for (i, label) in items.iter().enumerate() {
+        let r = label_run(label, theme::FONT_SIZE_MD, 400);
         if let Some((_, _, h)) = &r {
             line_h = line_h.max(*h);
         }
-        runs.push(r.map(|(l, _, _)| l));
+        leading.push(leading_run(
+            icons.get(i).copied().unwrap_or(0),
+            label,
+            theme::FONT_SIZE_LG,
+        ));
+        labels.push(r.map(|(l, _, _)| l));
     }
     if line_h <= 0.0 {
         line_h = settings
@@ -381,108 +488,28 @@ pub(crate) fn build_text(x: &Extras, items: &[String]) -> Option<Box<NavPaneText
             .or(title.as_ref().map(|t| t.2))
             .unwrap_or(theme::FONT_SIZE_MD * 1.4);
     }
-    Some(Box::new(NavPaneText {
+    // The settings glyph sets a size smaller than an item's: it is a fixed
+    // Fluent cog rather than an app-chosen icon, and at rail size it reads as
+    // heavier than the icons above it.
+    leading.push(leading_run(
+        GLYPH_SETTINGS.chars().next().map(u32::from).unwrap_or(0),
+        SETTINGS_LABEL,
+        theme::FONT_SIZE_MD,
+    ));
+    labels.push(settings.map(|s| s.0));
+
+    NavRuns {
         title_w: title.as_ref().map(|t| t.1).unwrap_or(0.0),
         title: title.map(|t| t.0),
-        items: runs,
-        settings: settings.map(|s| s.0),
+        back: run(GLYPH_BACK, theme::FONT_ICON, 12.0, 400, false).map(|r| r.0),
+        toggle: run(GLYPH_TOGGLE, theme::FONT_ICON, 14.0, 400, false).map(|r| r.0),
         line_h,
-    }))
-}
-
-// ── Paint ────────────────────────────────────────────────────────────────────
-
-/// Paint the pane's static chrome onto the NavigationView node's surface.
-///
-/// The pane background, the selection tile and its accent bar, and the row
-/// hover ink are retained sprites UNDER this surface
-/// ([`parts::nav_sync`](super::parts)) — a selection change or a pane-width
-/// change glides them on the compositor. What paints here is everything that
-/// does not move: the divider, the chrome glyphs, the header, the per-item
-/// icons and labels, and the settings row.
-pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let x = node.extras();
-    let text = node.nav_text.as_deref();
-    let m = metrics(x, rect.width(), text.is_some_and(|t| t.title.is_some()));
-
-    // The divider between pane and content.
-    super::controls::put(brush, theme::stroke_divider(), dim);
-    session.draw_line(
-        Vector2::new(m.width, 0.0),
-        Vector2::new(m.width, rect.height()),
-        brush,
-        theme::BORDER_W,
-    );
-
-    paint_chrome(session, brush, node, &m, dim);
-    paint_title(session, brush, &m, text, dim);
-    paint_items(session, brush, node, &m, rect, text, dim);
-    paint_settings(session, brush, node, &m, rect, text, dim);
-}
-
-/// The back arrow and the hamburger. Their hover/press wash is a flat state
-/// fill painted here rather than a retained sprite — the same call the drawn
-/// caption back button makes, and for the same reason: the wash does not
-/// animate, and splitting one row's two buttons across two paint mechanisms
-/// would let them drift apart.
-fn paint_chrome(
-    session: &DrawingSession,
-    brush: &Brush,
-    node: &Node,
-    m: &Metrics,
-    dim: f32,
-) {
-    let hot = node.ctrl().hot_index;
-    if let Some(r) = back_rect(m) {
-        // A disabled back arrow is still DRAWN (greyed), exactly like the
-        // caption band's — hiding it on disable would reflow the pane every
-        // time the navigation stack hit depth zero.
-        let enabled = node.extras().back_enabled;
-        if enabled && hot == HOT_BACK {
-            wash(session, brush, r, dim);
-        }
-        super::controls::text(
-            session,
-            brush,
-            GLYPH_BACK,
-            r,
-            theme::FONT_ICON,
-            12.0,
-            400,
-            if enabled {
-                theme::text()
-            } else {
-                theme::text_disabled()
-            },
-            TextAlignment::Center,
-            ParagraphAlignment::Center,
-            dim,
-        );
-    }
-    if let Some(r) = toggle_rect(m) {
-        if hot == HOT_TOGGLE {
-            wash(session, brush, r, dim);
-        }
-        super::controls::text(
-            session,
-            brush,
-            GLYPH_TOGGLE,
-            r,
-            theme::FONT_ICON,
-            14.0,
-            400,
-            theme::text(),
-            TextAlignment::Center,
-            ParagraphAlignment::Center,
-            dim,
-        );
+        leading,
+        labels,
     }
 }
 
-/// The hover wash under a pane chrome button.
-fn wash(session: &DrawingSession, brush: &Brush, r: Rect, dim: f32) {
-    super::controls::fill_rr(session, brush, r, theme::RADIUS_SM, theme::w(0.06), dim);
-}
+// ── Row geometry ────────────────────────────────────────────
 
 /// `hot_index` values the pane's chrome buttons occupy. Negative, so they can
 /// never collide with an item index — `Ctrl::hot_index` is the item-hover slot
@@ -498,200 +525,59 @@ pub(crate) const HOT_TOGGLE: i32 = -3;
 /// themselves on [`settings_rect`] from it).
 pub(crate) const SETTINGS_INDEX: i32 = 1 << 16;
 
-/// The pane header. Drawn only in an expanded pane — a rail has no room for it,
-/// and [`metrics`] has already reserved no header row in that case.
-fn paint_title(
-    session: &DrawingSession,
-    brush: &Brush,
-    m: &Metrics,
-    text: Option<&NavPaneText>,
-    dim: f32,
-) {
-    let Some(t) = text else { return };
-    let Some(title) = &t.title else { return };
-    if !m.kind.expanded() {
-        return;
-    }
-    let avail = (m.width - theme::SPACE_16 - LABEL_PAD_R).max(0.0);
-    if avail <= 0.0 {
-        return;
-    }
-    let _ = title.set_max_width(t.title_w.min(avail));
-    let y = CHROME_H + (TITLE_H - t.line_h) / 2.0;
-    let mut c = linear(theme::text_secondary());
-    c.a *= dim;
-    brush.set_color(c);
-    session.draw_text_layout(Vector2 { x: theme::SPACE_16, y }, title, brush);
+/// The rail column of a row — where its leading glyph is centred.
+///
+/// A square at the head of the row whatever the pane's width, so a glyph does
+/// not shift sideways when the pane opens and the row grows a label beside it.
+pub(crate) fn icon_cell(row: Rect) -> Rect {
+    Rect::from_xywh(row.left, row.top, theme::NAV_RAIL_W, row.height())
 }
 
-/// Per-item icon glyph plus, in an expanded pane, its label.
-fn paint_items(
-    session: &DrawingSession,
-    brush: &Brush,
-    node: &Node,
-    m: &Metrics,
-    rect: Rect,
-    text: Option<&NavPaneText>,
-    dim: f32,
-) {
-    let ctrl = node.ctrl();
-    let count = ctrl.items.len();
-    let n = visible_items(m, rect.height(), count);
-    if n == 0 {
-        return;
-    }
-    let sel = ctrl.selected_index;
-    for i in 0..n {
-        let row = item_rect(m, i as i32);
-        let active = i as i32 == sel;
-        let color = if active {
-            theme::accent()
-        } else {
-            theme::text_tertiary()
-        };
-        paint_row_icon(
-            session,
-            brush,
-            ctrl.icons.get(i).copied().unwrap_or(0),
-            &ctrl.items[i],
-            row,
-            color,
-            dim,
-        );
-        if m.kind.expanded() {
-            paint_row_label(
-                session,
-                brush,
-                text.and_then(|t| t.items.get(i)).and_then(|l| l.as_ref()),
-                text.map(|t| t.line_h).unwrap_or(0.0),
-                row,
-                m.width,
-                if active { theme::text() } else { theme::text_secondary() },
-                dim,
-            );
-        }
-    }
+/// The column a row's label occupies: after the rail, before the divider.
+///
+/// The one definition of that box, and it is read twice per row for two
+/// different purposes — as the origin the run is placed from, and as the clip
+/// the run is cut to. A sprite is clipped by nothing it is not given, so a label
+/// too long to elide (or one whose trimming sign DirectWrite declined to apply)
+/// would otherwise cross the divider and land on the content beside it.
+///
+/// Empty when the pane is too narrow to hold a label at all, which is what makes
+/// a rail show glyphs alone without a second code path deciding so.
+pub(crate) fn label_box(m: &Metrics, row: Rect) -> Rect {
+    let w = (m.width - LABEL_X - LABEL_PAD_R).max(0.0);
+    Rect::from_xywh(row.left + LABEL_X, row.top, w, row.height())
 }
 
-/// One row's leading glyph, centred in the rail column. Falls back to the
-/// label's first character when the item carries no icon — which is what makes
-/// a compact rail of icon-less items still readable.
-fn paint_row_icon(
-    session: &DrawingSession,
-    brush: &Brush,
-    icon: u32,
-    label: &str,
-    row: Rect,
-    color: crate::Color,
-    dim: f32,
-) {
-    let cell = Rect::from_xywh(row.left, row.top, theme::NAV_RAIL_W, row.height());
-    let mut buf = [0u8; 4];
-    let (glyph, family) = match super::controls::glyph_into(icon, &mut buf) {
-        Some(g) if icon != 0 => (g, theme::FONT_ICON),
-        // The fallback borrows from the label itself, so it allocates nothing.
-        _ => (
-            label.char_indices().next().map(|(_, c)| &label[..c.len_utf8()]).unwrap_or(""),
-            "Segoe UI",
-        ),
-    };
-    super::controls::text(
-        session,
-        brush,
-        glyph,
-        cell,
-        family,
-        theme::FONT_SIZE_LG,
-        400,
-        color,
-        TextAlignment::Center,
-        ParagraphAlignment::Center,
-        dim,
-    );
+/// The pane header's box, or `None` when no header is shown.
+///
+/// Both the height and the top are **decomposed from what [`metrics`] already
+/// reserved**, never re-tested against the pane state. `items_y` is the chrome
+/// row plus the header row, so subtracting the one leaves the other — and a
+/// header therefore exists here exactly when `metrics` made room for it.
+///
+/// Deriving it instead of re-deriving it is load-bearing twice over. A pane with
+/// no back arrow and no hamburger has NO chrome row, so a header pinned to a
+/// constant `CHROME_H` would float 40 DIPs below its own reserved row; and a
+/// header gated on a constant would vanish entirely in that same state, because
+/// the row it was reserved is shorter than the chrome row it was compared to.
+pub(crate) fn title_box(m: &Metrics) -> Option<Rect> {
+    let chrome_h = if m.back || m.toggle { CHROME_H } else { 0.0 };
+    let title_h = m.items_y - chrome_h;
+    let w = (m.width - theme::SPACE_16 - LABEL_PAD_R).max(0.0);
+    (m.kind.expanded() && title_h > 0.0 && w > 0.0)
+        .then(|| Rect::from_xywh(theme::SPACE_16, chrome_h, w, title_h))
 }
 
-/// One row's label, from the cached layout. The only per-repaint work is
-/// narrowing it to the room the current pane width leaves, which is what makes
-/// labels ellipsize as the pane narrows.
-fn paint_row_label(
-    session: &DrawingSession,
-    brush: &Brush,
-    layout: Option<&TextLayout>,
-    line_h: f32,
-    row: Rect,
-    pane_w: f32,
-    color: crate::Color,
-    dim: f32,
-) {
-    let Some(l) = layout else { return };
-    let avail = (pane_w - LABEL_X - LABEL_PAD_R).max(0.0);
-    if avail <= 0.0 {
-        return;
-    }
-    let _ = l.set_max_width(avail);
-    let mut c = linear(color);
-    c.a *= dim;
-    brush.set_color(c);
-    session.draw_text_layout(
-        Vector2 {
-            x: row.left + LABEL_X,
-            y: row.top + (row.height() - line_h) / 2.0,
-        },
-        l,
-        brush,
-    );
-}
-
-/// The settings row at the foot of the pane — the same icon-plus-label shape as
-/// a menu item, and it selects like one: when the settings page is current
-/// (`selected_index == `[`SETTINGS_INDEX`]) the row takes the same active
-/// colors a selected menu item does, and the selection tile/bar sprites sit
-/// under it.
-fn paint_settings(
-    session: &DrawingSession,
-    brush: &Brush,
-    node: &Node,
-    m: &Metrics,
-    rect: Rect,
-    text: Option<&NavPaneText>,
-    dim: f32,
-) {
-    let Some(row) = settings_rect(m, rect.height()) else {
-        return;
-    };
-    if node.ctrl().hot_index == SETTINGS_INDEX {
-        wash(session, brush, row, dim);
-    }
-    let active = node.ctrl().selected_index == SETTINGS_INDEX;
-    let cell = Rect::from_xywh(row.left, row.top, theme::NAV_RAIL_W, row.height());
-    super::controls::text(
-        session,
-        brush,
-        GLYPH_SETTINGS,
-        cell,
-        theme::FONT_ICON,
-        theme::FONT_SIZE_MD,
-        400,
-        if active {
-            theme::accent()
-        } else {
-            theme::text_tertiary()
-        },
-        TextAlignment::Center,
-        ParagraphAlignment::Center,
-        dim,
-    );
-    if m.kind.expanded() {
-        paint_row_label(
-            session,
-            brush,
-            text.and_then(|t| t.settings.as_ref()),
-            text.map(|t| t.line_h).unwrap_or(0.0),
-            row,
-            m.width,
-            if active { theme::text() } else { theme::text_secondary() },
-            dim,
-        );
+/// The chrome button a `hot_index` names, if it names one.
+///
+/// The wash under a hovered back arrow or hamburger is one part that snaps
+/// between the two — only one can be hot, because `hot_index` holds a single
+/// value — so this is the single place that resolves which box it takes.
+pub(crate) fn chrome_rect(m: &Metrics, hot: i32) -> Option<Rect> {
+    match hot {
+        HOT_BACK => back_rect(m),
+        HOT_TOGGLE => toggle_rect(m),
+        _ => None,
     }
 }
 

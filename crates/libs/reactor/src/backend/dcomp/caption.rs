@@ -3,9 +3,9 @@
 //!
 //! The dcomp host removes the native caption in `WM_NCCALCSIZE`, so the OS
 //! draws no title bar at all: the reactor `TitleBar` control's band is the
-//! caption. The three window buttons are painted onto the TitleBar node's own
-//! surface at its trailing edge (the node's default style reserves their width
-//! as right padding), and hit-tested by the host's `WM_NCHITTEST` as
+//! caption. The three window buttons sit at its trailing edge (the node's
+//! default style reserves their width as right padding) as retained sprites,
+//! and are hit-tested by the host's `WM_NCHITTEST` as
 //! `HTMINBUTTON` / `HTMAXBUTTON` / `HTCLOSE` — which is also what makes Win11
 //! snap layouts appear on max-button hover. Hover/pressed state arrives from
 //! `WM_NCMOUSEMOVE`/`WM_NCLBUTTON*` (non-client messages), so it lives here as
@@ -14,12 +14,9 @@
 
 use std::cell::Cell;
 
-use windows_canvas_core::{
-    Brush, DrawingSession, ParagraphAlignment, Rect, TextAlignment, TextFormat, TextLayout,
-    Trimming, Vector2,
-};
+use windows_canvas_core::{Rect, TextFormat, TextLayout, Trimming};
 
-use super::node::{linear, Extras, Node};
+use super::node::{Extras, Node};
 use super::theme;
 
 /// One caption button's width in DIPs (the Win11 caption metric).
@@ -43,9 +40,9 @@ pub(crate) const BACK_INDEX: i32 = 3;
 pub(crate) const BAND_H: f32 = theme::ROW_H + theme::SPACE_16;
 pub(crate) const BAND_H_TALL: f32 = BAND_H + theme::SPACE_16;
 
-/// Segoe Fluent Icons glyphs. Held as `&str`, not `char`, because the paint
-/// path hands them straight to `draw_text` — a `char` would have to be
-/// `to_string()`d into a fresh `String` on every caption repaint.
+/// Segoe Fluent Icons glyphs. Held as `&str`, not `char`, because they are
+/// shaped straight into cached runs — a `char` would have to be `to_string()`d
+/// into a fresh `String` to get there.
 const GLYPH_MINIMIZE: &str = "\u{E921}";
 const GLYPH_MAXIMIZE: &str = "\u{E922}";
 const GLYPH_RESTORE: &str = "\u{E923}";
@@ -126,12 +123,11 @@ pub(crate) fn maximized() -> bool {
 ///
 /// Built by the layout pass ([`build_text`]) whenever the TitleBar's
 /// `text_dirty` is set — i.e. exactly when `Title`/`Subtitle` changed — and
-/// read by [`paint`], which only runs on a dirty repaint. Nothing here is
-/// constructed per frame: a repaint reuses these two `IDWriteTextLayout`s and
-/// at most re-points their max width, which is a property set, not an
-/// allocation. This mirrors [`Node::text_layout`](super::node::Node) for
-/// TextBlock/Button, but needs its own home because a caption carries *two*
-/// independent runs.
+/// read by the sprite sync, which only runs on a dirty reconcile. Nothing here
+/// is constructed per frame: a sync reuses these `IDWriteTextLayout`s and at
+/// most re-points a max width, which is a property set, not an allocation. This
+/// mirrors [`Node::text_layout`](super::node::Node) for TextBlock/Button, but
+/// needs its own home because a caption carries *several* independent runs.
 pub(crate) struct CaptionText {
     pub title: Option<TextLayout>,
     pub subtitle: Option<TextLayout>,
@@ -142,6 +138,117 @@ pub(crate) struct CaptionText {
     pub subtitle_w: f32,
     /// Line height of the title run, for vertical centring.
     pub line_h: f32,
+    /// The band's five icon runs: the leading back chevron, then the window
+    /// cluster indexed by [`glyph_slot`].
+    ///
+    /// Maximize and restore are BOTH shaped, and the state picks between them at
+    /// placement. They have to be: the maximized flag is thread-local window
+    /// state rather than a prop, so it never sets `text_dirty` and the layout
+    /// pass never re-runs on it — a single slot reshaped on demand would put a
+    /// DirectWrite build on the path a window snap takes. Same argument, and the
+    /// same shape, as a ToggleSwitch keeping both of its state labels.
+    pub glyphs: [Option<TextLayout>; GLYPH_N],
+}
+
+/// Indices into [`CaptionText::glyphs`].
+pub(crate) mod glyph_slot {
+    pub const BACK: usize = 0;
+    pub const MINIMIZE: usize = 1;
+    pub const MAXIMIZE: usize = 2;
+    pub const RESTORE: usize = 3;
+    pub const CLOSE: usize = 4;
+}
+pub(crate) const GLYPH_N: usize = 5;
+
+/// Which glyph slot window-button `i` shows, given the maximized state.
+pub(crate) fn window_glyph_slot(i: i32, maximized: bool) -> usize {
+    match i {
+        0 => glyph_slot::MINIMIZE,
+        1 if maximized => glyph_slot::RESTORE,
+        1 => glyph_slot::MAXIMIZE,
+        _ => glyph_slot::CLOSE,
+    }
+}
+
+/// Where the caption's two text runs go, and how wide each may be before its
+/// trimming sign takes over.
+///
+/// The two are **coupled**: the subtitle begins after whatever width the title
+/// was clamped to, and gets only the room left over. That used to be computed as
+/// a side effect of drawing the title — `pen` advanced mid-draw — so the
+/// subtitle's position could not be established without drawing the title first,
+/// and neither could be established at all without a device. Pulling it out
+/// makes the coupling a value, which is the only form of it a test can hold.
+pub(crate) struct TitlePlacement {
+    /// `(x, max_width)` for the title; `None` when the band carries none.
+    pub title: Option<(f32, f32)>,
+    /// The same for the subtitle, `None` when it is absent or has no room left.
+    pub subtitle: Option<(f32, f32)>,
+    /// Top of the shared line box — both runs sit on one baseline.
+    pub y: f32,
+}
+
+/// Resolve [`TitlePlacement`] for a band of `rect` whose back button occupies
+/// `back_w`. `None` when the band has no horizontal room for text at all.
+pub(crate) fn title_placement(t: &CaptionText, back_w: f32, rect: Rect) -> Option<TitlePlacement> {
+    let x0 = rect.left + back_w;
+    // Everything up to the window-button cluster is available; the block was
+    // already clamped when the inset was reserved, so this only ever *grows*
+    // the room a title has (e.g. when no Content child was mounted).
+    let avail = (rect.right - CLUSTER_W - theme::SPACE_12 - x0).max(0.0);
+    if avail <= 0.0 {
+        return None;
+    }
+    let y = rect.top + (rect.height() - t.line_h) / 2.0;
+    let mut pen = x0;
+    let title = t.title.as_ref().map(|_| {
+        let w = t.title_w.min(avail);
+        let at = (pen, w);
+        pen += w + TITLE_GAP;
+        at
+    });
+    let subtitle = t.subtitle.as_ref().and_then(|_| {
+        let left = (x0 + avail - pen).max(0.0);
+        (left > 0.0).then(|| (pen, t.subtitle_w.min(left)))
+    });
+    Some(TitlePlacement { title, subtitle, y })
+}
+
+/// Window-button `i`'s box within the band (0 = min, 1 = max, 2 = close).
+pub(crate) fn button_rect(i: i32, rect: Rect) -> Rect {
+    let bx = rect.right - (3 - i) as f32 * BTN_W;
+    Rect::from_xywh(bx, rect.top, BTN_W, rect.height())
+}
+
+/// The one hover wash the band shows, as `(box, corner radius, colour)`.
+///
+/// One wash, not four: [`HOVER`] holds a single index, so at most one of the
+/// band's four buttons is lit at a time and a second sprite could only ever be
+/// invisible. It moves and re-binds between them instead — which is also what
+/// keeps the four reading identically, the property the painted version got by
+/// drawing them in one loop.
+pub(crate) fn hot_wash(node: &Node, rect: Rect) -> Option<(Rect, f32, crate::Color)> {
+    let hot = hover();
+    if hot == BACK_INDEX {
+        let x = node.extras();
+        if !x.back_button_enabled {
+            return None;
+        }
+        let br = back_rect(x, rect)?;
+        let a = if pressed() == BACK_INDEX { 0.10 } else { 0.06 };
+        return Some((br, theme::RADIUS_SM, theme::w(a)));
+    }
+    if !(0..3).contains(&hot) {
+        return None;
+    }
+    // Close hovers the system alarm red; the others take a subtle wash. Square,
+    // not rounded: the window cluster runs to the band's edges.
+    let c = if hot == 2 {
+        crate::Color::rgb(0xC4, 0x2B, 0x1C)
+    } else {
+        theme::w(0.06)
+    };
+    Some((button_rect(hot, rect), 0.0, c))
 }
 
 /// Gap between the title and the subtitle that follows it.
@@ -174,27 +281,52 @@ fn run(text: &str, weight: u16) -> Option<(TextLayout, f32, f32)> {
     Some((layout, w, h))
 }
 
-/// (Re)build the caption's cached text. `None` when the band carries neither a
-/// title nor a subtitle, so a TitleBar used purely as a drag strip allocates
-/// nothing at all.
+/// (Re)build the caption's cached text: the two title runs, and the band's five
+/// icon glyphs.
+///
+/// Always `Some`. A band carrying neither a title nor a subtitle used to
+/// allocate nothing, because its four buttons were painted from glyph literals
+/// on the spot; now that those are shaped runs too, a bare drag strip still
+/// needs this cache to show its window cluster at all. The title slots simply
+/// stay `None`, which is what [`title_placement`] and [`title_block`] already
+/// read them as.
 pub(crate) fn build_text(x: &Extras) -> Option<Box<CaptionText>> {
     let title = run(&x.title, 600);
     let subtitle = run(&x.subtitle, 400);
-    if title.is_none() && subtitle.is_none() {
-        return None;
-    }
     let line_h = title
         .as_ref()
         .map(|t| t.2)
         .or(subtitle.as_ref().map(|s| s.2))
         .unwrap_or(0.0);
+    let mut glyphs: [Option<TextLayout>; GLYPH_N] = Default::default();
+    glyphs[glyph_slot::BACK] = icon_run(GLYPH_BACK, BACK_GLYPH_SIZE);
+    glyphs[glyph_slot::MINIMIZE] = icon_run(GLYPH_MINIMIZE, BTN_GLYPH_SIZE);
+    glyphs[glyph_slot::MAXIMIZE] = icon_run(GLYPH_MAXIMIZE, BTN_GLYPH_SIZE);
+    glyphs[glyph_slot::RESTORE] = icon_run(GLYPH_RESTORE, BTN_GLYPH_SIZE);
+    glyphs[glyph_slot::CLOSE] = icon_run(GLYPH_CLOSE, BTN_GLYPH_SIZE);
     Some(Box::new(CaptionText {
         title_w: title.as_ref().map(|t| t.1).unwrap_or(0.0),
         subtitle_w: subtitle.as_ref().map(|s| s.1).unwrap_or(0.0),
         line_h,
         title: title.map(|t| t.0),
         subtitle: subtitle.map(|s| s.0),
+        glyphs,
     }))
+}
+
+/// Type sizes for the band's icon runs — the values the painted calls passed.
+pub(crate) const BTN_GLYPH_SIZE: f32 = 10.0;
+pub(crate) const BACK_GLYPH_SIZE: f32 = 12.0;
+
+/// Shape one icon-font glyph at `size`.
+fn icon_run(glyph: &str, size: f32) -> Option<TextLayout> {
+    let fmt = TextFormat::with_weight(
+        theme::FONT_ICON,
+        size,
+        windows_canvas_core::FontWeight(400),
+    )
+    .ok()?;
+    TextLayout::new(glyph, &fmt, 100_000.0, 100_000.0).ok()
 }
 
 /// The band height this TitleBar's `tall` state asks for.
@@ -268,118 +400,131 @@ pub(crate) fn back_rect(x: &Extras, rect: Rect) -> Option<Rect> {
     Some(Rect::from_xywh(rect.left, top, BACK_W, h))
 }
 
-/// Paint the caption band's own chrome onto the TitleBar node's surface:
-/// the leading back button, the title/subtitle, and the trailing window-button
-/// cluster. `rect` is the node's local box.
-pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect) {
-    paint_back(session, brush, node, rect);
-    paint_titles(session, brush, node, rect);
-    let hover = hover();
-    let maximized = maximized();
-    for i in 0..3 {
-        let bx = rect.right - (3 - i) as f32 * BTN_W;
-        let br = Rect::from_xywh(bx, rect.top, BTN_W, rect.height());
-        if hover == i {
-            // Close hovers the system alarm red; the others a subtle wash.
-            let fill = if i == 2 {
-                // #C42B1C, decoded to linear by the shared Color helper.
-                linear(crate::Color::rgb(0xC4, 0x2B, 0x1C))
-            } else {
-                linear(theme::w(0.06))
-            };
-            brush.set_color(fill);
-            session.fill_rect(&br, brush);
-        }
-        let glyph = match i {
-            0 => GLYPH_MINIMIZE,
-            1 if maximized => GLYPH_RESTORE,
-            1 => GLYPH_MAXIMIZE,
-            _ => GLYPH_CLOSE,
+// ── Retained ────────────────────────────────────────────────────────────────
+
+// The band draws nothing. Its one hover wash is a retained part
+// (`parts::caption_plan`) and its six runs — two titles, four button glyphs —
+// are glyph sprites (`glyph_text::caption_sync`).
+//
+// The earlier note here argued the back button must NOT be a retained sprite,
+// on the grounds that splitting one band's four buttons across two paint
+// mechanisms would make them drift apart. That argument is kept, not discarded:
+// all four moved together, and they share a SINGLE wash part precisely so there
+// is only one place their appearance can be decided.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A band carrying `title` and `subtitle`, laid out `w` wide.
+    ///
+    /// Uses the real `build_text`, so the widths are DirectWrite's own — the
+    /// coupling under test is about how two measured runs share a budget, and
+    /// inventing the measurements would test only the arithmetic.
+    fn placed(title: &str, subtitle: &str, w: f32) -> (Box<CaptionText>, Option<TitlePlacement>) {
+        let x = Extras {
+            title: title.to_string(),
+            subtitle: subtitle.to_string(),
+            ..Extras::DEFAULT
         };
-        super::controls::text(
-            session,
-            brush,
-            glyph,
-            br,
-            theme::FONT_ICON,
-            10.0,
-            400,
-            theme::text(),
-            TextAlignment::Center,
-            ParagraphAlignment::Center,
-            1.0,
-        );
+        let t = build_text(&x).expect("build_text always yields a cache");
+        let rect = Rect::from_xywh(0.0, 0.0, w, BAND_H);
+        let p = title_placement(&t, 0.0, rect);
+        (t, p)
     }
-}
 
-/// The leading back button: a hover/press wash plus the chevron glyph, drawn
-/// with the same mechanism as its three siblings in this band (a fill on the
-/// node's own surface, repainted on the hover edge). It is deliberately NOT a
-/// retained `parts` sprite — the wash is a flat state fill with no animation,
-/// and splitting one band's four buttons across two paint mechanisms would
-/// make them drift apart.
-fn paint_back(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect) {
-    let x = node.extras();
-    let Some(br) = back_rect(x, rect) else { return };
-    let enabled = x.back_button_enabled;
-    if enabled && hover() == BACK_INDEX {
-        let wash = if pressed() == BACK_INDEX { 0.10 } else { 0.06 };
-        brush.set_color(linear(theme::w(wash)));
-        session.fill_rounded_rect(
-            &windows_canvas_core::RoundedRect::uniform(br, theme::RADIUS_SM),
-            brush,
+    /// The subtitle starts after the width the title was CLAMPED to, not after
+    /// its natural width.
+    ///
+    /// This is the whole coupling. While the band is wide enough the two are
+    /// indistinguishable — the clamp does nothing — so the case that matters is
+    /// the narrow one, where a subtitle placed from the natural width would sit
+    /// somewhere past the window buttons with nothing visible under it.
+    #[test]
+    fn the_subtitle_starts_after_the_title_was_clamped_not_after_its_natural_width() {
+        // Wide: nothing clamps, and the subtitle follows the natural width.
+        let (t, wide) = placed("A Fairly Long Window Title", "subtitle", 1200.0);
+        let wide = wide.expect("a 1200 DIP band has room for text");
+        let (tx, tw) = wide.title.expect("a title was set");
+        assert_eq!(tw, t.title_w, "nothing should clamp at this width");
+        assert_eq!(
+            wide.subtitle.expect("a subtitle was set").0,
+            tx + tw + TITLE_GAP,
+            "the subtitle follows the title by exactly one gap",
         );
-    }
-    super::controls::text(
-        session,
-        brush,
-        GLYPH_BACK,
-        br,
-        theme::FONT_ICON,
-        12.0,
-        400,
-        if enabled {
-            theme::text()
-        } else {
-            theme::text_disabled()
-        },
-        TextAlignment::Center,
-        ParagraphAlignment::Center,
-        1.0,
-    );
-}
 
-/// Title and subtitle, left-aligned after any back button and vertically
-/// centred in the band. Both runs are cached layouts; the only per-repaint work
-/// is narrowing them to the width actually left over, which is what makes them
-/// ellipsize as the window shrinks.
-fn paint_titles(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect) {
-    let Some(t) = node.caption_text.as_deref() else {
-        return;
-    };
-    let x0 = rect.left + back_width(node.extras());
-    // Everything up to the window-button cluster is available; the block was
-    // already clamped when the inset was reserved, so this only ever *grows*
-    // the room a title has (e.g. when no Content child was mounted).
-    let avail = (rect.right - CLUSTER_W - theme::SPACE_12 - x0).max(0.0);
-    if avail <= 0.0 {
-        return;
-    }
-    let y = rect.top + (rect.height() - t.line_h) / 2.0;
-    let mut pen = x0;
-    if let Some(title) = &t.title {
-        let w = t.title_w.min(avail);
-        let _ = title.set_max_width(w);
-        brush.set_color(linear(theme::text()));
-        session.draw_text_layout(Vector2 { x: pen, y }, title, brush);
-        pen += w + TITLE_GAP;
-    }
-    if let Some(sub) = &t.subtitle {
-        let left = (x0 + avail - pen).max(0.0);
-        if left > 0.0 {
-            let _ = sub.set_max_width(t.subtitle_w.min(left));
-            brush.set_color(linear(theme::text_secondary()));
-            session.draw_text_layout(Vector2 { x: pen, y }, sub, brush);
+        // Narrow: the title clamps, and the subtitle must follow the CLAMP.
+        let (t, tight) = placed("A Fairly Long Window Title", "subtitle", 260.0);
+        let tight = tight.expect("260 DIP still leaves a text column");
+        let (tx, tw) = tight.title.expect("a title was set");
+        assert!(tw < t.title_w, "the title must clamp in a 260 DIP band");
+        match tight.subtitle {
+            Some((sx, _)) => assert_eq!(
+                sx,
+                tx + tw + TITLE_GAP,
+                "the subtitle must follow the CLAMPED title, not the natural one",
+            ),
+            // Legitimate: the clamped title can consume the whole budget.
+            None => {}
         }
+    }
+
+    /// A title that eats the whole budget leaves the subtitle nothing, and a
+    /// run with no room is dropped rather than placed at zero width.
+    #[test]
+    fn a_title_that_fills_the_band_leaves_no_subtitle() {
+        let (_, p) = placed(
+            "An Extremely Long Window Title That Cannot Possibly Fit In The Band",
+            "subtitle",
+            230.0,
+        );
+        let p = p.expect("the band still has a text column");
+        assert!(p.title.is_some(), "the title is placed, ellipsized");
+        assert!(
+            p.subtitle.is_none(),
+            "a subtitle with no room left must be dropped, not placed at zero width",
+        );
+    }
+
+    /// A band too narrow to hold anything past its window cluster places
+    /// nothing at all — the early return the paint path had.
+    #[test]
+    fn a_band_with_no_text_column_places_nothing() {
+        let (_, p) = placed("Title", "subtitle", CLUSTER_W);
+        assert!(p.is_none(), "no room past the cluster means no placement");
+    }
+
+    /// A bare drag strip still gets its window glyphs.
+    ///
+    /// `build_text` used to return `None` for a band with no title, because the
+    /// four buttons were painted from literals on the spot. Now that they are
+    /// shaped runs, that early return would have left the window cluster blank.
+    #[test]
+    fn a_band_with_no_titles_still_shapes_its_buttons() {
+        let t = build_text(&Extras::DEFAULT).expect("a bare band still needs its glyphs");
+        assert!(t.title.is_none() && t.subtitle.is_none());
+        for slot in [
+            glyph_slot::BACK,
+            glyph_slot::MINIMIZE,
+            glyph_slot::MAXIMIZE,
+            glyph_slot::RESTORE,
+            glyph_slot::CLOSE,
+        ] {
+            assert!(t.glyphs[slot].is_some(), "glyph slot {slot} must be shaped");
+        }
+    }
+
+    /// Maximize and restore are both shaped, and the state picks between them.
+    ///
+    /// The maximized flag never sets `text_dirty` — it is thread-local window
+    /// state, not a prop — so a design that shaped only the current one would
+    /// leave the wrong glyph on screen after a snap.
+    #[test]
+    fn the_middle_button_swaps_glyphs_without_reshaping() {
+        assert_eq!(window_glyph_slot(1, false), glyph_slot::MAXIMIZE);
+        assert_eq!(window_glyph_slot(1, true), glyph_slot::RESTORE);
+        // The other two are indifferent to it.
+        assert_eq!(window_glyph_slot(0, true), glyph_slot::MINIMIZE);
+        assert_eq!(window_glyph_slot(2, true), glyph_slot::CLOSE);
     }
 }

@@ -778,7 +778,7 @@ impl ArenaHarness {
     /// Place the editor caret (collapsed selection) at a code-unit index.
     pub fn set_editor_caret(&mut self, id: ControlId, caret: usize) {
         if let Some(e) = self.arena.get_mut(id).and_then(|n| n.editor.as_mut()) {
-            e.set_caret(caret, crate::backend::dcomp::editor::Affinity::Downstream, false);
+            e.set_caret(caret, dcomp::editor::Affinity::Downstream, false);
         }
     }
 
@@ -1159,6 +1159,68 @@ impl ArenaHarness {
         let has_title = n.nav_text.as_ref().is_some_and(|t| t.title.is_some());
         let m = dcomp::nav::metrics(n.extras(), n.rect.w, has_title);
         let r = dcomp::nav::item_rect(&m, i);
+        Some((r.left, r.top, r.width(), r.height()))
+    }
+
+    /// The two boxes a row's runs are placed from: its rail column and its label
+    /// column. Both forward to [`dcomp::nav`], so an assertion here is a
+    /// statement about where the sprites land and not about this seam.
+    ///
+    /// The label box is also the run's CLIP, so a zero width is the rail state —
+    /// the pane showing glyphs alone — and not a missing label.
+    pub fn nav_row_boxes(
+        &self,
+        id: ControlId,
+        i: i32,
+    ) -> Option<((f32, f32, f32, f32), (f32, f32, f32, f32))> {
+        let n = self.arena.get(id)?;
+        let has_title = n.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+        let m = dcomp::nav::metrics(n.extras(), n.rect.w, has_title);
+        let row = dcomp::nav::item_rect(&m, i);
+        let cell = dcomp::nav::icon_cell(row);
+        let label = dcomp::nav::label_box(&m, row);
+        Some((
+            (cell.left, cell.top, cell.width(), cell.height()),
+            (label.left, label.top, label.width(), label.height()),
+        ))
+    }
+
+    /// The pane header's box, or `None` when the pane shows no header.
+    pub fn nav_title_box(&self, id: ControlId) -> Option<(f32, f32, f32, f32)> {
+        let n = self.arena.get(id)?;
+        let has_title = n.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+        let m = dcomp::nav::metrics(n.extras(), n.rect.w, has_title);
+        let r = dcomp::nav::title_box(&m)?;
+        Some((r.left, r.top, r.width(), r.height()))
+    }
+
+    /// Put the pane's hot slot on whatever a [`NavHit`] names, through the real
+    /// sentinels [`dcomp::nav`] defines.
+    ///
+    /// The chrome buttons and the settings row live in the SAME `hot_index`
+    /// field as the menu items, at values carved out not to collide with an item
+    /// index. A test that spelled those values itself would keep passing if the
+    /// carve-out ever moved, while the pane it describes washed the wrong row.
+    pub fn set_nav_hot(&mut self, id: ControlId, hit: Option<NavHit>) {
+        let hot = match hit {
+            None => -1,
+            Some(NavHit::Back) => dcomp::nav::HOT_BACK,
+            Some(NavHit::Toggle) => dcomp::nav::HOT_TOGGLE,
+            Some(NavHit::Settings) => dcomp::nav::SETTINGS_INDEX,
+            Some(NavHit::Item(i)) => i,
+        };
+        if let Some(n) = self.arena.get_mut(id) {
+            n.ctrl_mut().hot_index = hot;
+        }
+    }
+
+    /// The box the chrome-button wash takes for the pane's current `hot_index`,
+    /// or `None` when the hot slot names a row rather than a chrome button.
+    pub fn nav_chrome_ink_box(&self, id: ControlId) -> Option<(f32, f32, f32, f32)> {
+        let n = self.arena.get(id)?;
+        let has_title = n.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+        let m = dcomp::nav::metrics(n.extras(), n.rect.w, has_title);
+        let r = dcomp::nav::chrome_rect(&m, n.ctrl().hot_index)?;
         Some((r.left, r.top, r.width(), r.height()))
     }
 }

@@ -524,25 +524,42 @@ impl Editor {
         }
     }
 
-    /// Previous word boundary before `from` (skip spaces, then word chars).
+    /// Start of the word before `from` — Ctrl+Left.
+    ///
+    /// Steps back over any whitespace, then over one run of a single
+    /// [`CharClass`]. Because punctuation is its own class, `foo.bar` stops at
+    /// `bar`, then at `.`, then at `foo`, which is what every other Windows
+    /// text field does.
     fn word_left(&self, from: usize) -> usize {
-        let mut i = from;
-        while i > 0 && is_space(self.buf[i - 1]) {
+        let mut i = from.min(self.buf.len());
+        while i > 0 && class_of(self.buf[i - 1]) == CharClass::Space {
             i -= 1;
         }
-        while i > 0 && !is_space(self.buf[i - 1]) {
+        if i == 0 {
+            return 0;
+        }
+        let class = class_of(self.buf[i - 1]);
+        while i > 0 && class_of(self.buf[i - 1]) == class {
             i -= 1;
         }
         i
     }
 
+    /// Start of the word after `from` — Ctrl+Right.
+    ///
+    /// Steps over the run `from` sits in, then over the whitespace that trails
+    /// it, so the caret lands at the *beginning* of the next word rather than
+    /// in the gap before it.
     fn word_right(&self, from: usize) -> usize {
         let n = self.buf.len();
-        let mut i = from;
-        while i < n && !is_space(self.buf[i]) {
-            i += 1;
+        let mut i = from.min(n);
+        if i < n {
+            let class = class_of(self.buf[i]);
+            while i < n && class_of(self.buf[i]) == class {
+                i += 1;
+            }
         }
-        while i < n && is_space(self.buf[i]) {
+        while i < n && class_of(self.buf[i]) == CharClass::Space {
             i += 1;
         }
         i
@@ -857,6 +874,47 @@ impl TextBand {
 /// UTF-16 whitespace test (covers the common ASCII / NBSP cases).
 fn is_space(u: u16) -> bool {
     matches!(u, 0x20 | 0x09 | 0x0A | 0x0D | 0xA0)
+}
+
+/// How a code unit participates in word navigation.
+///
+/// Ctrl+Arrow in a Windows edit control does not split on whitespace alone —
+/// punctuation is its own word. `foo.bar` is three words there (`foo`, `.`,
+/// `bar`) and Ctrl+Left from the end stops at `bar`, not at the start of the
+/// whole token. Splitting on whitespace only is the single largest behavioural
+/// divergence a text field can have from the rest of the system, because the
+/// user's hands already know the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CharClass {
+    /// Whitespace: never a word on its own; trails the word before it.
+    Space,
+    /// Letters, digits, and `_` — the run that Ctrl+Arrow treats as one word.
+    Word,
+    /// Everything else. A run of punctuation is a word in its own right.
+    Punct,
+}
+
+/// Classify one UTF-16 code unit for word navigation.
+///
+/// Both halves of a surrogate pair classify as [`Word`](CharClass::Word), so a
+/// supplementary character — an emoji, a rarer CJK ideograph — is traversed as
+/// content rather than splitting a word down its middle.
+pub(crate) fn class_of(u: u16) -> CharClass {
+    if is_space(u) {
+        return CharClass::Space;
+    }
+    if is_high_surrogate(u) || is_low_surrogate(u) {
+        return CharClass::Word;
+    }
+    match char::from_u32(u as u32) {
+        // `is_alphanumeric` is the Unicode property, not the ASCII range: an
+        // accented letter and a Cyrillic one are word characters like any other.
+        Some(c) if c.is_alphanumeric() || c == '_' => CharClass::Word,
+        // The whitespace `is_space` does not list — ideographic space, the
+        // various fixed-width spaces.
+        Some(c) if c.is_whitespace() => CharClass::Space,
+        _ => CharClass::Punct,
+    }
 }
 
 /// How many consecutive zero-width clusters a caret move will step over before
@@ -1293,5 +1351,89 @@ mod tests {
         e.backspace();
         e.backspace();
         assert_eq!(e.text(), "a", "backspace must remove the emoji whole");
+    }
+
+    // ── Word navigation ──────────────────────────────────────────────────────
+
+    /// Punctuation is its own word, as it is in every other Windows text field.
+    /// Splitting on whitespace alone made `foo.bar` one nine-unit token, so
+    /// Ctrl+Left from the end jumped the whole thing.
+    #[test]
+    fn punctuation_is_its_own_word() {
+        let mut e = editor_with("foo.bar", 7);
+        e.move_left(true, false);
+        assert_eq!(e.caret(), 4, "back to the start of `bar`");
+        e.move_left(true, false);
+        assert_eq!(e.caret(), 3, "then to the `.`, not past it");
+        e.move_left(true, false);
+        assert_eq!(e.caret(), 0, "then to the start of `foo`");
+    }
+
+    /// Ctrl+Right lands on the *beginning* of the next word, stepping over the
+    /// whitespace that trails the current one rather than stopping in the gap.
+    #[test]
+    fn word_right_lands_on_the_next_word_not_the_gap() {
+        let mut e = editor_with("alpha   beta", 0);
+        e.move_right(true, false);
+        assert_eq!(e.caret(), 8, "past `alpha` and its three spaces");
+        e.move_right(true, false);
+        assert_eq!(e.caret(), 12, "and to the end");
+    }
+
+    /// A run of punctuation is one word, not one word per mark.
+    #[test]
+    fn a_run_of_punctuation_is_one_word() {
+        let mut e = editor_with("a...b", 0);
+        e.move_right(true, false);
+        assert_eq!(e.caret(), 1);
+        e.move_right(true, false);
+        assert_eq!(e.caret(), 4, "the three dots are a single word");
+    }
+
+    /// Word characters are the Unicode property, not the ASCII range — an
+    /// accented or Cyrillic letter must not read as punctuation and split a
+    /// word down its middle.
+    #[test]
+    fn accented_and_non_latin_letters_are_word_characters() {
+        assert_eq!(class_of('é' as u16), CharClass::Word);
+        assert_eq!(class_of('ж' as u16), CharClass::Word);
+        assert_eq!(class_of('_' as u16), CharClass::Word);
+        assert_eq!(class_of('7' as u16), CharClass::Word);
+        assert_eq!(class_of('.' as u16), CharClass::Punct);
+        assert_eq!(class_of('-' as u16), CharClass::Punct);
+        assert_eq!(class_of(' ' as u16), CharClass::Space);
+        // U+3000 IDEOGRAPHIC SPACE — whitespace `is_space` does not list.
+        assert_eq!(class_of(0x3000), CharClass::Space);
+    }
+
+    /// Both halves of a surrogate pair are content, so a word move never stops
+    /// inside a supplementary character.
+    #[test]
+    fn a_surrogate_pair_does_not_break_a_word() {
+        let mut e = editor_with("a\u{1F44D}b c", 0);
+        e.move_right(true, false);
+        assert_eq!(e.caret(), 5, "the emoji is part of the word, not a break in it");
+    }
+
+    /// Word navigation must terminate at both ends whatever it starts on —
+    /// including on whitespace, on punctuation, and on an empty buffer.
+    #[test]
+    fn word_navigation_terminates_from_every_starting_class() {
+        for text in ["", " ", "..", "a b", "  a  ", ".a.", "\u{1F44D}"] {
+            let n = text.encode_utf16().count();
+            for start in 0..=n {
+                let mut e = editor_with(text, start);
+                for _ in 0..n + 2 {
+                    e.move_right(true, false);
+                }
+                assert_eq!(e.caret(), n, "{text:?} from {start} must reach the end");
+
+                let mut e = editor_with(text, start);
+                for _ in 0..n + 2 {
+                    e.move_left(true, false);
+                }
+                assert_eq!(e.caret(), 0, "{text:?} from {start} must reach the start");
+            }
+        }
     }
 }

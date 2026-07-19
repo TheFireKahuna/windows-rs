@@ -321,3 +321,67 @@ fn a_row_that_does_not_fit_is_not_hittable() {
         "an undrawn row was still hittable"
     );
 }
+
+/// The header sits in the row `metrics` reserved for it — including when there
+/// is no chrome row above it to sit below.
+///
+/// The header's box is decomposed out of `items_y` rather than pinned to
+/// `CHROME_H`, and this is the state that tells the two apart: hide the back
+/// arrow and the hamburger and the chrome row is gone, so a header measured
+/// from the constant floats 40 DIPs into the item list — or, gated on that same
+/// constant, vanishes altogether.
+#[test]
+fn the_header_follows_the_row_reserved_for_it() {
+    let mut a = harness();
+    let id = pane(&mut a, 1200.0, 600.0, &["One", "Two"]);
+    a.apply_prop(id, Prop::PaneTitle, &V::Str("Library".into()));
+    a.apply_prop(id, Prop::IsPaneOpen, &V::Bool(true));
+    a.rebuild_text(id);
+
+    let with_chrome = a.nav_title_box(id).expect("an expanded pane shows its header");
+    assert_eq!(
+        with_chrome.1, CHROME_H,
+        "with a chrome row the header sits directly below it",
+    );
+
+    // Take both chrome buttons away: the chrome row goes with them.
+    a.apply_prop(id, Prop::IsBackButtonVisible, &V::Bool(false));
+    a.apply_prop(id, Prop::IsPaneToggleButtonVisible, &V::Bool(false));
+    a.rebuild_text(id);
+
+    let bare = a
+        .nav_title_box(id)
+        .expect("a pane with no chrome row still shows its header");
+    assert_eq!(
+        bare.1, 0.0,
+        "with no chrome row the header sits at the pane's top, got {bare:?}",
+    );
+    assert_eq!(
+        bare.3, with_chrome.3,
+        "the header row is the same height either way",
+    );
+
+    // And the items start immediately below it, in both states.
+    let (_, item_y, _, _) = a.nav_item_box(id, 0).unwrap();
+    assert_eq!(
+        item_y,
+        bare.1 + bare.3,
+        "the first row must begin where the header ends",
+    );
+}
+
+/// A rail has no room for a header, so it reserves none and shows none.
+#[test]
+fn a_closed_pane_shows_no_header() {
+    let mut a = harness();
+    let id = pane(&mut a, 1200.0, 600.0, &["One", "Two"]);
+    a.apply_prop(id, Prop::PaneTitle, &V::Str("Library".into()));
+    a.apply_prop(id, Prop::IsPaneOpen, &V::Bool(false));
+    a.rebuild_text(id);
+
+    assert_eq!(
+        a.nav_title_box(id),
+        None,
+        "a collapsed rail must not place a header it has no width for",
+    );
+}

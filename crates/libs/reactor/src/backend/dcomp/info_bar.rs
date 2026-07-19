@@ -1,8 +1,8 @@
 //! The InfoBar band: its severity chrome, the wrapped title + message, and the
-//! drawn close button.
+//! close button.
 //!
 //! Everything here is **derived geometry**, the same discipline
-//! [`nav`](super::nav) follows: the paint, the pointer hit test
+//! [`nav`](super::nav) follows: the placement, the pointer hit test
 //! ([`input`](super::input)) and the accessibility tree ([`uia`](super::uia))
 //! all read one set of rects rather than each re-deriving them from `Extras`.
 //! A hit test that disagreed with the paint by a few DIPs would dismiss a bar
@@ -23,12 +23,9 @@
 //! of its width, which is why [`measure`] exists and why `InfoBar` gets its own
 //! arm in the Taffy measure callback.
 
-use windows_canvas_core::{
-    Brush, DrawingSession, FontWeight, ParagraphAlignment, Rect, TextAlignment, TextFormat,
-    TextLayout, Vector2,
-};
+use windows_canvas_core::{FontWeight, Rect, TextFormat, TextLayout};
 
-use super::node::{linear, Extras, Node};
+use super::node::{Extras, Node};
 use super::theme;
 use crate::Color;
 
@@ -58,9 +55,9 @@ impl Severity {
     }
 
     /// The status glyph (Segoe Fluent Icons), held as `&str` for the reason
-    /// [`caption`](super::caption) holds its own that way: it goes straight to
-    /// `draw_text`, and a `char` would mean a fresh `String` per repaint.
-    fn glyph(self) -> &'static str {
+    /// [`caption`](super::caption) holds its own that way: it is shaped straight
+    /// into a cached run, and a `char` would mean a fresh `String` to do it.
+    pub(crate) fn glyph(self) -> &'static str {
         match self {
             Self::Informational => "\u{E946}", // Info
             Self::Success => "\u{E930}",       // Completed
@@ -72,7 +69,7 @@ impl Severity {
     /// The role colour the icon takes and the background tint derives from.
     /// Straight off the Fluent status roles, so a host token table restyles
     /// every severity with the rest of the control library.
-    fn color(self) -> Color {
+    pub(crate) fn color(self) -> Color {
         match self {
             Self::Informational => theme::accent(),
             Self::Success => theme::ok(),
@@ -118,10 +115,38 @@ const CLOSE_PAD: f32 = theme::SPACE_8;
 
 /// `ChromeClose` — the same glyph the caption cluster's close button draws, so
 /// the two dismiss affordances in one window read identically.
-const GLYPH_CLOSE: &str = "\u{E8BB}";
+pub(crate) const GLYPH_CLOSE: &str = "\u{E8BB}";
+
+/// Type sizes for the two icon runs, named because the layout pass shapes them
+/// and the sprite sync places them — two consumers, one number each.
+pub(crate) const ICON_SIZE: f32 = 16.0;
+pub(crate) const CLOSE_SIZE: f32 = 10.0;
 
 /// Where the text column starts.
-const TEXT_X: f32 = PAD_X + ICON_W + ICON_GAP;
+pub(crate) const TEXT_X: f32 = PAD_X + ICON_W + ICON_GAP;
+
+/// The severity icon's cell, in node-local DIPs.
+///
+/// Aligned with the FIRST line of the paragraph rather than with the band: in a
+/// wrapped bar a vertically centred icon drifts away from the text it labels.
+pub(crate) fn icon_cell(node_h: f32) -> Rect {
+    Rect::from_xywh(PAD_X, 0.0, ICON_W, MIN_H.min(node_h))
+}
+
+/// The paragraph's box, in node-local DIPs, for a band `node_w` x `node_h`
+/// whose cached run measured `text_h` tall.
+///
+/// Centred on the band, which is correct for the single-line case and for a
+/// wrapped block alike since [`measure`] sized the band to the block plus
+/// padding.
+pub(crate) fn text_box(node_w: f32, node_h: f32, text_h: f32, closable: bool) -> Rect {
+    Rect::from_xywh(
+        TEXT_X,
+        (node_h - text_h) / 2.0,
+        text_w(node_w, closable),
+        text_h,
+    )
+}
 
 /// Everything the band spends on chrome rather than text: the icon column and
 /// its gap, plus whatever the trailing edge reserves.
@@ -134,7 +159,7 @@ fn chrome_w(closable: bool) -> f32 {
 }
 
 /// The text column's width inside a band `node_w` wide.
-fn text_w(node_w: f32, closable: bool) -> f32 {
+pub(crate) fn text_w(node_w: f32, closable: bool) -> f32 {
     (node_w - chrome_w(closable)).max(0.0)
 }
 
@@ -195,6 +220,40 @@ pub(crate) struct InfoBarText {
     /// The plain string the layout carries, reused as the accessible name so
     /// what a screen reader announces and what the eye reads cannot diverge.
     pub plain: String,
+    /// The severity glyph's shaped run.
+    ///
+    /// Rebuilt with the paragraph rather than on its own, which is why
+    /// `Prop::Severity` now marks the bar's text dirty: the glyph IS text here,
+    /// and a severity change that only marked the node dirty would have left
+    /// the previous status icon shaped and on screen.
+    pub icon: Option<TextLayout>,
+    /// The close button's glyph, shaped once for the same reason.
+    pub close: Option<TextLayout>,
+}
+
+impl InfoBarText {
+    /// The paragraph, re-pinned to the column it is about to be placed in, with
+    /// its measured height.
+    ///
+    /// [`measure`] leaves the run flowed at whatever width Taffy last probed —
+    /// it probes several times per pass, and the last probe is not the final
+    /// width — so **anything that places this run must re-pin it first**. The
+    /// painted path did exactly that on every repaint; a sprite placement that
+    /// skipped it would lay glyphs out for a wrap the band no longer has, and
+    /// the error would only show at the widths where the two disagree.
+    ///
+    /// `None` when there is no room to flow into at all, which is the case the
+    /// paint path returned early on.
+    pub(crate) fn pinned(&self, node_w: f32, closable: bool) -> Option<(&TextLayout, f32)> {
+        let run = self.run.as_ref()?;
+        let column = text_w(node_w, closable);
+        if column <= 0.0 {
+            return None;
+        }
+        let _ = run.set_max_width(column);
+        let h = run.measure().map(|(_, h)| h).unwrap_or(0.0);
+        Some((run, h))
+    }
 }
 
 /// Separator between the title and the message when the bar carries both.
@@ -206,14 +265,20 @@ fn bar_format() -> Option<TextFormat> {
     TextFormat::with_weight("Segoe UI", theme::FONT_SIZE_MD, FontWeight(400)).ok()
 }
 
-/// (Re)build the bar's cached text. `None` when it carries neither a title nor
-/// a message, so a bar used purely as a coloured strip allocates nothing.
+/// (Re)build the bar's cached text: the paragraph, the severity glyph, and the
+/// close glyph.
+///
+/// Always `Some`. A bar carrying neither a title nor a message used to allocate
+/// nothing here, because the icon it still shows was painted from the severity
+/// on the spot; now that the icon is a shaped run too, a bar used as a bare
+/// coloured strip needs this cache to have anything to show at all. The
+/// paragraph itself stays `None` in that case, which is what [`measure`] and
+/// [`accessible_name`] already read it as.
 pub(crate) fn build_text(x: &Extras) -> Option<Box<InfoBarText>> {
     let (title, message) = (x.title.as_str(), x.message.as_str());
-    if title.is_empty() && message.is_empty() {
-        return None;
-    }
-    let plain = if title.is_empty() {
+    let plain = if title.is_empty() && message.is_empty() {
+        String::new()
+    } else if title.is_empty() {
         message.to_string()
     } else if message.is_empty() {
         title.to_string()
@@ -221,7 +286,9 @@ pub(crate) fn build_text(x: &Extras) -> Option<Box<InfoBarText>> {
         format!("{title}{TITLE_GAP}{message}")
     };
 
-    let run = bar_format().and_then(|fmt| {
+    // An empty paragraph shapes to nothing; keep the slot `None` so `measure`
+    // and `accessible_name` take their no-text paths unchanged.
+    let run = (!plain.is_empty()).then(bar_format).flatten().and_then(|fmt| {
         // A generous construction box, i.e. the paragraph's max-content state,
         // exactly as `layout::build_text_layout` builds the generic runs;
         // `measure` re-flows it against the real column width.
@@ -237,7 +304,19 @@ pub(crate) fn build_text(x: &Extras) -> Option<Box<InfoBarText>> {
         }
         Some(layout)
     });
-    Some(Box::new(InfoBarText { run, plain }))
+    // The two icon runs. Each is a single glyph in a fixed box, so it is shaped
+    // at its natural size and placed centred — the alignment the painted
+    // `controls::text` call applied through a TextFormat, which a run placed by
+    // hand no longer carries.
+    let icon = icon_run(severity(x).glyph(), ICON_SIZE);
+    let close = x.bar_closable.then(|| icon_run(GLYPH_CLOSE, CLOSE_SIZE)).flatten();
+    Some(Box::new(InfoBarText { run, plain, icon, close }))
+}
+
+/// Shape one icon-font glyph at `size`.
+fn icon_run(glyph: &str, size: f32) -> Option<TextLayout> {
+    let fmt = TextFormat::with_weight(theme::FONT_ICON, size, FontWeight(400)).ok()?;
+    TextLayout::new(glyph, &fmt, 100_000.0, 100_000.0).ok()
 }
 
 // ── Measure ──────────────────────────────────────────────────────────────────
@@ -260,8 +339,10 @@ pub(crate) fn build_text(x: &Extras) -> Option<Box<InfoBarText>> {
 /// mapping the generic wrapping-run path makes.
 ///
 /// This LEAVES the layout re-flowed at whatever width it was last asked about
-/// — Taffy probes several times per pass — which is why [`paint`] re-pins the
-/// column width itself rather than trusting what it finds.
+/// — Taffy probes several times per pass — which is why anything that PLACES
+/// the run re-pins the column width itself rather than trusting what it finds.
+/// [`InfoBarText::pinned`] is that step, and the only supported way to read
+/// this layout for placement.
 pub(crate) fn measure(node: &Node, avail_w: Option<f32>) -> (f32, f32) {
     let closable = node.extras().bar_closable;
     let chrome = chrome_w(closable);
@@ -280,123 +361,18 @@ pub(crate) fn measure(node: &Node, avail_w: Option<f32>) -> (f32, f32) {
     (chrome + tw, (th + 2.0 * PAD_Y).max(MIN_H))
 }
 
-// ── Paint ────────────────────────────────────────────────────────────────────
+// ── Retained ────────────────────────────────────────────────────────────────
 
-/// Paint the band onto the InfoBar node's surface: the tinted card, the
-/// severity icon, the paragraph, and the close button.
-///
-/// Nothing here is a retained compositor sprite. That is the deliberate
-/// application of the rule the rest of the backend follows — sprites are for
-/// what MOVES — and on this control nothing does: the card, the icon and the
-/// text are simply *there* at a given state, and the close button's hover wash
-/// is a flat state fill with no animation, so it repaints on the hover edge
-/// exactly as the caption band's and the nav pane's chrome buttons do.
-pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let x = node.extras();
-    let sev = severity(x);
-    let radius = theme::RADIUS_SM;
-
-    // The card: a raised surface carrying a wash of the severity role, so the
-    // bar reads as its status at a glance without the text having to say so.
-    super::controls::fill_rr(session, brush, rect, radius, theme::surface_raised(), dim);
-    super::controls::fill_rr(
-        session,
-        brush,
-        rect,
-        radius,
-        theme::with_alpha(sev.color(), 0.10),
-        dim,
-    );
-    super::controls::stroke_rr(
-        session,
-        brush,
-        rect,
-        radius,
-        theme::stroke(),
-        theme::BORDER_W,
-        dim,
-    );
-
-    paint_icon(session, brush, sev, rect, dim);
-    paint_text(session, brush, node, rect, dim);
-    paint_close(session, brush, node, rect, dim);
-}
-
-/// The severity glyph, centred in its column and aligned with the FIRST line of
-/// the paragraph rather than with the band — in a wrapped bar a vertically
-/// centred icon drifts away from the text it is labelling.
-fn paint_icon(session: &DrawingSession, brush: &Brush, sev: Severity, rect: Rect, dim: f32) {
-    let h = MIN_H.min(rect.height());
-    let cell = Rect::from_xywh(rect.left + PAD_X, rect.top, ICON_W, h);
-    super::controls::text(
-        session,
-        brush,
-        sev.glyph(),
-        cell,
-        theme::FONT_ICON,
-        16.0,
-        400,
-        sev.color(),
-        TextAlignment::Center,
-        ParagraphAlignment::Center,
-        dim,
-    );
-}
-
-/// The title + message paragraph, from the cached layout. The only per-repaint
-/// work is re-pinning it to the current text column, which is what makes it
-/// re-wrap as the window resizes.
-fn paint_text(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let Some(t) = node.bar_text.as_deref() else {
-        return;
-    };
-    let Some(run) = &t.run else { return };
-    let column = text_w(rect.width(), node.extras().bar_closable);
-    if column <= 0.0 {
-        return;
-    }
-    let _ = run.set_max_width(column);
-    let h = run.measure().map(|(_, h)| h).unwrap_or(0.0);
-    // Centred on the band: correct for the single-line case and for a wrapped
-    // block alike, since `measure` sized the band to the block plus padding.
-    let y = rect.top + (rect.height() - h) / 2.0;
-    let mut c = linear(node.paint.foreground.unwrap_or_else(theme::text));
-    c.a *= dim;
-    brush.set_color(c);
-    session.draw_text_layout(
-        Vector2 {
-            x: rect.left + TEXT_X,
-            y,
-        },
-        run,
-        brush,
-    );
-}
-
-/// The close button: a hover/press wash plus the glyph.
-fn paint_close(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let Some(r) = close_rect(rect.width(), rect.height(), node.extras().bar_closable) else {
-        return;
-    };
-    let r = Rect::from_xywh(rect.left + r.left, rect.top + r.top, r.width(), r.height());
-    if node.paint.is_enabled && node.ctrl().hot_index == HOT_CLOSE {
-        let wash = if node.pressed { 0.10 } else { 0.06 };
-        super::controls::fill_rr(session, brush, r, theme::RADIUS_SM, theme::w(wash), dim);
-    }
-    super::controls::text(
-        session,
-        brush,
-        GLYPH_CLOSE,
-        r,
-        theme::FONT_ICON,
-        10.0,
-        400,
-        theme::text_secondary(),
-        TextAlignment::Center,
-        ParagraphAlignment::Center,
-        dim,
-    );
-}
+// The band draws nothing. Its card, severity tint, border and the close
+// button's hover wash are retained parts (`parts::bar_plan`); its paragraph and
+// its two icon glyphs are glyph sprites (`glyph_text::info_bar_sync`).
+//
+// The earlier note here argued the opposite — that sprites are for what MOVES,
+// and nothing on this control does — which was true of MOTION and beside the
+// point for cost. Retained chrome is also what keeps a state change off the
+// raster path: hovering the close button now fades one part's opacity on the
+// compositor instead of redrawing a card, an icon and a wrapped paragraph, and
+// the paragraph is the largest run in the library.
 
 /// The accessible name for the whole band: the severity role followed by the
 /// text as drawn, so a screen reader conveys what the icon shows visually.

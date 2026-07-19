@@ -464,6 +464,41 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
             t.badge_layout = badge;
         }
     }
+    // The Expander's two chevrons, shaped together into the same positional
+    // `[off, on]` shape the switch uses — index `0` is collapsed, `1` expanded,
+    // which is what `glyph_text::expander_sync` indexes with `expanded`.
+    // Expanding never sets `text_dirty`, so both have to exist up front.
+    //
+    // ABOVE the generic run build below, which CLEARS `text_dirty` — an
+    // Expander's header now qualifies as text, so anything of its own gated on
+    // that flag and placed after it would simply never run.
+    let needs_chevron = arena
+        .get(id)
+        .is_some_and(|n| n.text_dirty && n.kind == ControlKind::Expander);
+    if needs_chevron {
+        let built: Vec<Option<TextLayout>> = [
+            controls::EXPANDER_GLYPH_COLLAPSED,
+            controls::EXPANDER_GLYPH_EXPANDED,
+        ]
+        .into_iter()
+        .map(|cp| {
+            controls::glyph_str(cp).and_then(|g| {
+                build_text_layout(
+                    &g,
+                    controls::EXPANDER_CHEVRON_SIZE,
+                    400,
+                    theme::FONT_ICON,
+                    false,
+                )
+            })
+        })
+        .collect();
+        if let Some(n) = arena.get_mut(id) {
+            let t = n.item_text.get_or_insert_with(Default::default);
+            t.layouts = built;
+            t.strong.clear();
+        }
+    }
     let needs = arena.get(id).is_some_and(|n| n.text_dirty && is_text(n));
     if needs {
         let (text, size, weight, family, wrap) = {
@@ -657,9 +692,14 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
     if needs_nav {
         let built = arena
             .get(id)
-            .map(|n| nav::build_text(n.extras(), &n.ctrl().items));
+            .map(|n| nav::build_runs(n.extras(), &n.ctrl().items, &n.ctrl().icons));
         if let Some(n) = arena.get_mut(id) {
-            n.nav_text = built.flatten();
+            // Adopted into the live text, never assigned over it: the pane's
+            // sprites live beside its runs and own compositor visuals parented
+            // into the node, so replacing the whole struct would orphan every
+            // glyph already on screen and mint a second set beside it.
+            let t = n.nav_text.get_or_insert_with(Default::default);
+            t.adopt(built.unwrap_or_default());
             n.text_dirty = false;
             n.measure_dirty = true;
             apply_nav_metrics(n);
@@ -780,6 +820,13 @@ fn is_text(n: &Node) -> bool {
         // a string. Without one it renders nothing at all, silently: the sync
         // has no run to walk and simply hides.
         ControlKind::HyperlinkButton => !n.paint.text.is_empty(),
+        // Same story as the hyperlink: the trailing label is glyph sprites now,
+        // and sprites are placed from a shaped run. A checkbox with no label is
+        // just the box, so an empty string needs no layout.
+        ControlKind::CheckBox => !n.paint.text.is_empty(),
+        // Its header label, likewise. The chevron beside it is not this run —
+        // it lives in `item_text`, because there are two of them.
+        ControlKind::Expander => !n.paint.text.is_empty(),
         _ => false,
     }
 }

@@ -789,6 +789,9 @@ pub(crate) struct Node {
     /// TitleBars, and every other node would carry the dead weight. Rebuilt by
     /// the layout pass on `text_dirty`; `None` when the band has no titles.
     pub caption_text: Option<Box<caption::CaptionText>>,
+    /// The sprites placing the six runs `caption_text` holds — same split, and
+    /// for the same reason, as `bar_text` / `bar_glyphs`.
+    pub caption_glyphs: Option<Box<super::glyph_text::CaptionGlyphs>>,
 
     // ── NavigationView pane ────────────────────────────────────────
     /// NavigationView only: the pane's cached header / item / settings label
@@ -803,6 +806,10 @@ pub(crate) struct Node {
     /// lazy for the reason [`Extras`] is. Rebuilt by the layout pass on
     /// `text_dirty`; `None` when the bar carries no text at all.
     pub bar_text: Option<Box<info_bar::InfoBarText>>,
+    /// The sprites placing the three runs `bar_text` holds. Separate from it
+    /// because the layouts are rebuilt by the layout pass and these are
+    /// reconciled by the paint walk — two lifetimes, two owners.
+    pub bar_glyphs: Option<Box<super::glyph_text::BarText>>,
 }
 
 impl Node {
@@ -873,8 +880,10 @@ impl Node {
             title_content: None,
             title_footer: None,
             caption_text: None,
+            caption_glyphs: None,
             nav_text: None,
             bar_text: None,
+            bar_glyphs: None,
         }
     }
 
@@ -1031,6 +1040,27 @@ impl Node {
             // sprites, and it has neither ring nor ink because it is neither
             // focusable nor interactive. The whole control, retained.
             ControlKind::InfoBadge => false,
+            // The pane background, the divider, the selection tile and its
+            // accent bar, the row ink and the chrome-button wash are all parts;
+            // the two chrome glyphs, the header and every row's glyph-plus-label
+            // are sprites. The divider was the last thing it drew.
+            ControlKind::NavigationView => false,
+            // The band's card, tint, border and close wash are parts; its
+            // paragraph and its two icon glyphs are sprites. Nothing is left to
+            // draw, which is what takes the largest run in the library — a
+            // wrapped paragraph — off the raster path for good.
+            ControlKind::InfoBar => false,
+            // The caption band is transparent, its one hover wash is a part and
+            // its six runs are sprites. It never drew a background of its own,
+            // so denying it a surface removes the last thing it had.
+            ControlKind::TitleBar => false,
+            // Box fill, outline, checkmark and ring are parts; the trailing
+            // label is sprites. The outline was the last thing drawing, and it
+            // was redrawing the label with it on every hover.
+            ControlKind::CheckBox => false,
+            // Header fill, border, wash and ring are parts; the header label
+            // and its chevron are sprites. Only the header was ever chrome.
+            ControlKind::Expander => false,
             ControlKind::Line => self.paint.stroke.is_some(),
             ControlKind::Ellipse | ControlKind::Rectangle => {
                 self.paint.fill.is_some()
@@ -1295,6 +1325,11 @@ fn default_font_size(kind: ControlKind) -> f32 {
 fn default_font_weight(kind: ControlKind) -> u16 {
     match kind {
         ControlKind::InfoBadge => info_badge::FONT_WEIGHT,
+        // The header reads heavier than body text. Carried from BIRTH rather
+        // than applied at draw time, exactly as a badge's is: the layout pass
+        // shapes from `paint`, so this is what keeps an untouched Expander
+        // looking unchanged while `.bold()` still reaches it.
+        ControlKind::Expander => controls::EXPANDER_HEADER_WEIGHT,
         _ => 400,
     }
 }
@@ -1333,10 +1368,7 @@ fn draws_own_chrome(kind: ControlKind) -> bool {
         || is_text_editable(kind)
         || matches!(
             kind,
-            ControlKind::ProgressBar
-                | ControlKind::ProgressRing
-                | ControlKind::TitleBar
-                | ControlKind::Meter
+            ControlKind::ProgressBar | ControlKind::ProgressRing | ControlKind::Meter
         )
 }
 

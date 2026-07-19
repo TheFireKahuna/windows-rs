@@ -175,12 +175,7 @@ fn nav_chrome_item(hit: nav::Hit) -> Option<i32> {
     }
 }
 
-/// UTF-16 word separator — the rule [`Editor`](super::editor::Editor)'s private
-/// `is_space` uses, repeated here because the Text pattern needs word units and
-/// that helper is not exported.
-fn is_word_break(u: u16) -> bool {
-    matches!(u, 0x20 | 0x09 | 0x0A | 0x0D | 0xA0)
-}
+use super::editor::{Affinity, CharClass, class_of};
 
 /// Cycle guard on the parent-link walk. Real UI trees are tens of levels deep;
 /// this only bounds the damage if a future mutator ever introduces a cycle,
@@ -1349,7 +1344,7 @@ impl DCompBackend {
         // A UIA `Select` names two offsets and nothing about direction, so the
         // affinity is the store's to pick. The caret sits at the range's logical
         // end, which is the far side of the selected run — upstream of it.
-        ed.set_caret(b.min(len), super::editor::Affinity::Upstream, true);
+        ed.set_caret(b.min(len), Affinity::Upstream, true);
         ed.anchor = a.min(len);
         // Restart the compositor caret blink solid-first, exactly as a keyboard
         // caret move does.
@@ -1367,17 +1362,29 @@ impl DCompBackend {
         let buf = &ed.buf;
         let n = buf.len();
         let i = i.min(n);
+        // The same classifier Ctrl+Arrow uses, so a screen reader and the
+        // keyboard agree on where the words are. They previously did not: this
+        // split on whitespace alone while the editor now treats a run of
+        // punctuation as its own word.
+        let class_at = |j: usize| class_of(buf[j]);
+        let here = if i < n {
+            class_at(i)
+        } else if n > 0 {
+            class_at(n - 1)
+        } else {
+            CharClass::Space
+        };
         let mut start = i;
-        while start > 0 && !is_word_break(buf[start - 1]) {
+        while start > 0 && class_at(start - 1) == here {
             start -= 1;
         }
         let mut end = i;
         // A word run plus the whitespace that trails it — the unit UIA expects,
         // so `Move(Word, 1)` lands on the next word rather than on the gap.
-        while end < n && !is_word_break(buf[end]) {
+        while end < n && class_at(end) == here {
             end += 1;
         }
-        while end < n && is_word_break(buf[end]) {
+        while end < n && class_at(end) == CharClass::Space {
             end += 1;
         }
         Some((start, end))

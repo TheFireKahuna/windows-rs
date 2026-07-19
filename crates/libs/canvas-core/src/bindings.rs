@@ -6273,10 +6273,48 @@ windows_core::imp::define_interface!(
     0x8339fde3_106f_47ab_8373_1c6295eb10b3
 );
 windows_core::imp::interface_hierarchy!(IDWriteInlineObject, windows_core::IUnknown);
+impl IDWriteInlineObject {
+    pub(crate) unsafe fn Draw<P1, P6>(
+        &self,
+        clientdrawingcontext: Option<*const core::ffi::c_void>,
+        renderer: P1,
+        originx: f32,
+        originy: f32,
+        issideways: bool,
+        isrighttoleft: bool,
+        clientdrawingeffect: P6,
+    ) -> windows_core::HRESULT
+    where
+        P1: windows_core::Param<IDWriteTextRenderer>,
+        P6: windows_core::Param<windows_core::IUnknown>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).Draw)(
+                windows_core::Interface::as_raw(self),
+                clientdrawingcontext.unwrap_or(core::mem::zeroed()) as _,
+                renderer.param().abi(),
+                originx,
+                originy,
+                issideways.into(),
+                isrighttoleft.into(),
+                clientdrawingeffect.param().abi(),
+            )
+        }
+    }
+}
 #[repr(C)]
 pub struct IDWriteInlineObject_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
-    Draw: usize,
+    pub Draw: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const core::ffi::c_void,
+        *mut core::ffi::c_void,
+        f32,
+        f32,
+        windows_core::BOOL,
+        windows_core::BOOL,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     GetMetrics: usize,
     GetOverhangMetrics: usize,
     GetBreakConditions: usize,

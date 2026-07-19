@@ -409,8 +409,17 @@ impl DrawingSession<'_> {
 /// cannot re-derive without redoing the layout's own arithmetic, so dropping it
 /// here would be losing information rather than declining to draw.
 ///
-/// Inline objects are genuinely not recorded: they are caller-supplied content
-/// the caller already holds, so that callback succeeds without doing anything.
+/// Inline objects are asked to draw THEMSELVES back into this renderer, which is
+/// what turns an ellipsis into recorded glyphs. A trimming sign is an inline
+/// object — DirectWrite builds one inside `set_trimming` — so a callback that
+/// succeeded without doing anything dropped it silently: the run was still
+/// shortened at the trim point, and the `…` that says so simply never arrived.
+/// Text then read as cut off mid-word rather than as ellipsized, and only where
+/// it happened to overflow.
+///
+/// An app-supplied inline object (an image, say) draws whatever it draws through
+/// the same path; anything it emits that is not a glyph run or a decoration is
+/// still dropped, which is the original claim narrowed to the case it is true of.
 #[derive(Default)]
 struct RunCollector {
     runs: RefCell<Vec<GlyphRun>>,
@@ -569,15 +578,34 @@ impl IDWriteTextRenderer_Impl for RunCollector_Impl {
 
     fn DrawInlineObject(
         &self,
-        _context: *const core::ffi::c_void,
-        _origin_x: f32,
-        _origin_y: f32,
-        _inline_object: Ref<IDWriteInlineObject>,
-        _is_sideways: BOOL,
-        _is_right_to_left: BOOL,
-        _client_drawing_effect: Ref<IUnknown>,
+        context: *const core::ffi::c_void,
+        origin_x: f32,
+        origin_y: f32,
+        inline_object: Ref<IDWriteInlineObject>,
+        is_sideways: BOOL,
+        is_right_to_left: BOOL,
+        client_drawing_effect: Ref<IUnknown>,
     ) -> Result<()> {
-        Ok(())
+        // Re-enter with this same renderer so the object's own glyphs land in
+        // `runs` — for a trimming sign that is the ellipsis, and dropping it is
+        // the difference between text that reads as ellipsized and text that
+        // reads as truncated.
+        let Some(obj) = inline_object.as_ref() else {
+            return Ok(());
+        };
+        let renderer: IDWriteTextRenderer = self.to_interface();
+        unsafe {
+            obj.Draw(
+                Some(context),
+                &renderer,
+                origin_x,
+                origin_y,
+                is_sideways.as_bool(),
+                is_right_to_left.as_bool(),
+                client_drawing_effect.as_ref(),
+            )
+            .ok()
+        }
     }
 }
 
@@ -823,5 +851,47 @@ mod tests {
                  the phase dimension of the glyph atlas is pure overhead"
             );
         }
+    }
+
+    /// A trimmed layout must yield the ellipsis as GLYPHS, not merely truncate.
+    ///
+    /// DirectWrite renders a trimming sign as an *inline object*, delivered
+    /// through `DrawInlineObject` rather than `DrawGlyphRun`. A collector that
+    /// ignored that callback still saw the shortened text — so the failure was
+    /// silent and partial: text ellipsized correctly on the painted path and
+    /// came out cut mid-word, with no ellipsis, once the same layout was walked
+    /// into sprites. Only text narrow enough to overflow showed it.
+    #[test]
+    fn a_trimmed_layout_yields_its_ellipsis_as_glyphs() {
+        const TEXT: &str = "A Deliberately Long Window Title";
+        let format = TextFormat::new("Segoe UI", 16.0).unwrap();
+        let layout = TextLayout::new(TEXT, &format, 10_000.0, 100.0).unwrap();
+        layout.set_word_wrap(false).unwrap();
+
+        let full: usize = layout.glyph_runs().unwrap().iter().map(GlyphRun::len).sum();
+        assert_eq!(full, TEXT.len(), "untrimmed, every character is shaped");
+
+        // Narrow it to roughly a third and arm the trimming sign.
+        layout.set_trimming(Trimming::CharacterEllipsis, &format).unwrap();
+        let narrow = layout.metrics().unwrap().width / 3.0;
+        layout.set_max_width(narrow).unwrap();
+
+        let runs = layout.glyph_runs().unwrap();
+        let trimmed: usize = runs.iter().map(GlyphRun::len).sum();
+        assert!(
+            trimmed < full,
+            "the run must actually shorten ({trimmed} of {full})",
+        );
+        assert!(
+            runs.len() >= 2,
+            "the sign arrives as its own run: the text, then the ellipsis              (got {} run(s) — DrawInlineObject dropped it)",
+            runs.len(),
+        );
+        // The sign sits at the trim point, so it is the last thing drawn and it
+        // carries at least one glyph of its own.
+        assert!(
+            runs.last().is_some_and(|r| r.len() > 0),
+            "the trailing ellipsis run must carry glyphs",
+        );
     }
 }

@@ -218,6 +218,7 @@
     IDWriteTextLayout::Draw
     IDWriteTextRenderer
     IDWritePixelSnapping
+    IDWriteInlineObject::Draw
     DWRITE_GLYPH_RUN
     DWRITE_GLYPH_RUN_DESCRIPTION
     DWRITE_GLYPH_OFFSET

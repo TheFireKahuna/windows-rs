@@ -723,6 +723,88 @@ impl ItemText {
     }
 }
 
+/// The retained runs of a list whose rows are a **leading glyph plus a label**,
+/// addressed by row index.
+///
+/// [`ItemText`] holds one run per item; this holds two, and they are not
+/// interchangeable — the glyph is a different family at a different size, and
+/// the two take different colours in the same row (an active row's icon goes
+/// accent while its label goes primary). A control with this shape therefore
+/// cannot express itself as an `ItemText` without shaping the two into one run,
+/// which would tie their colours together.
+///
+/// The three vectors are positional — index `i` is row `i` — so a run that
+/// failed to build holds its slot as `None` rather than shifting every row after
+/// it onto the wrong words. `leading` is sparse in the same sense: a row with no
+/// icon is `None` there and still owns its label.
+///
+/// The parts are stored **interleaved**, `[glyph 0, label 0, glyph 1, …]`,
+/// rather than as two vectors. One `resize_with` grows a whole row and one
+/// [`hide_from`](Self::hide_from) retires one, so a row count that drops can
+/// never hide a departed row's label while leaving its glyph on screen — a
+/// split that two vectors would make it possible to get half right.
+#[derive(Default)]
+pub(crate) struct RowText {
+    /// One shaped leading glyph per row, or `None` where the row carries none.
+    pub(crate) leading: Vec<Option<TextLayout>>,
+    /// One shaped label per row.
+    pub(crate) labels: Vec<Option<TextLayout>>,
+    /// Two placed runs per row. Grown on demand and never shrunk — a row count
+    /// that drops usually comes back, and a hidden part costs nothing.
+    parts: Vec<TextPart>,
+}
+
+/// One row's two runs, each paired with the part that places it.
+pub(crate) struct RowSlot<'a> {
+    pub leading: (&'a mut TextPart, Option<&'a TextLayout>),
+    pub label: (&'a mut TextPart, Option<&'a TextLayout>),
+}
+
+impl RowText {
+    /// Replace the shaped runs, keeping every part.
+    ///
+    /// The layout pass rebuilds the runs whenever `text_dirty` is set, and the
+    /// parts must not go with them: they own compositor visuals parented into
+    /// the node, so dropping them would orphan the sprites already on screen and
+    /// mint a second set beside them on the next sync.
+    pub(crate) fn adopt(&mut self, leading: Vec<Option<TextLayout>>, labels: Vec<Option<TextLayout>>) {
+        self.leading = leading;
+        self.labels = labels;
+    }
+
+    /// How many rows have shaped runs.
+    pub(crate) fn len(&self) -> usize {
+        self.labels.len().max(self.leading.len())
+    }
+
+    /// Row `i`'s two parts and two runs, borrowed together.
+    ///
+    /// One call rather than four accessors for the reason [`ItemText::slot`] is
+    /// one: the parts are taken mutably and the runs shared, out of fields the
+    /// borrow checker will only let a caller split by hand. The row's parts are
+    /// grown into existence if this is the first sync to reach that far.
+    pub(crate) fn row(&mut self, i: usize) -> RowSlot<'_> {
+        let end = 2 * i + 2;
+        if self.parts.len() < end {
+            self.parts.resize_with(end, TextPart::default);
+        }
+        // Disjoint borrows: the two parts come from one slice split in half, and
+        // the two runs from fields the slice does not touch.
+        let (glyph, label) = self.parts[2 * i..end].split_at_mut(1);
+        RowSlot {
+            leading: (&mut glyph[0], self.leading.get(i).and_then(Option::as_ref)),
+            label: (&mut label[0], self.labels.get(i).and_then(Option::as_ref)),
+        }
+    }
+
+    /// Hide every part from row `i` on — the rows that no longer exist.
+    pub(crate) fn hide_from(&mut self, i: usize) {
+        for p in self.parts.iter_mut().skip(2 * i) {
+            p.hide_all();
+        }
+    }
+}
+
 /// Place a run at the top-left of `b`, without centring it.
 ///
 /// The entry point for text whose own layout already decides where each line
@@ -896,6 +978,364 @@ pub(crate) fn hyperlink_sync(
         None => part.hide_all(),
     }
     node.text_part = Some(part);
+}
+
+/// Reconcile an `Expander`'s header label and chevron as retained glyph sprites.
+///
+/// The chevron reads out of [`ItemText`] for the reason a ToggleSwitch's label
+/// does: `layouts` is `[collapsed, expanded]` and the state indexes it, so
+/// expanding is a re-place of ONE part rather than a reshape. It has to be —
+/// `IsExpanded` marks the node dirty but not `text_dirty`, so the layout pass
+/// never re-runs on it and a single reshaped slot would keep pointing the old
+/// way.
+pub(crate) fn expander_sync(
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    node: &mut Node,
+    scale: f32,
+) {
+    if node.kind != crate::backend::ControlKind::Expander {
+        return;
+    }
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    let ink = node.paint.foreground.unwrap_or_else(theme::text);
+    let label_box = super::controls::expander_label_box(node);
+    let chev_box = super::controls::expander_chevron_box(node);
+    let i = usize::from(node.ctrl().expanded);
+
+    // The header label lives in the generic single-run slot — the Expander has
+    // one run of its own, and the chevron is not one of its words.
+    let mut part = node.text_part.take().unwrap_or_default();
+    match node.text_layout.as_ref() {
+        Some(layout) => place_leading_centered(
+            &mut part,
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            label_box,
+            label_box,
+            ink,
+            dim,
+            scale,
+        ),
+        None => part.hide_all(),
+    }
+    node.text_part = Some(part);
+
+    let mut t = node.item_text.take().unwrap_or_default();
+    match t.slot(0, i, false) {
+        (part, Some(layout)) => place_centered(
+            part,
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            chev_box,
+            chev_box,
+            theme::text_secondary(),
+            dim,
+            scale,
+        ),
+        (part, None) => part.hide_all(),
+    }
+    node.item_text = Some(t);
+}
+
+/// Reconcile a `CheckBox`'s trailing label as retained glyph sprites.
+///
+/// Leading horizontally, centred vertically — the alignment the painted label
+/// had, expressed as an origin because a shaped run carries no alignment of its
+/// own once it is placed by hand.
+pub(crate) fn check_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+    if node.kind != crate::backend::ControlKind::CheckBox {
+        return;
+    }
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    let ink = node.paint.foreground.unwrap_or_else(theme::text);
+    let b = super::controls::check_label_box(node);
+
+    let mut part = node.text_part.take().unwrap_or_default();
+    match node.text_layout.as_ref() {
+        Some(layout) => place_leading_centered(
+            &mut part,
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            b,
+            b,
+            ink,
+            dim,
+            scale,
+        ),
+        None => part.hide_all(),
+    }
+    node.text_part = Some(part);
+}
+
+/// The caption band's six runs: two titles, and one glyph per button.
+///
+/// One part per BUTTON, not per glyph slot — maximize and restore share button
+/// 1's part, exactly as a ToggleSwitch's two labels share one. A part per slot
+/// would light both the moment a window was maximized and leave the other glyph
+/// on screen underneath it.
+#[derive(Default)]
+pub(crate) struct CaptionGlyphs {
+    title: TextPart,
+    subtitle: TextPart,
+    /// Index 0 is the leading back button; 1..4 are the window cluster.
+    buttons: [TextPart; 4],
+}
+
+/// Reconcile the caption band's text as retained glyph sprites.
+///
+/// The two titles come from one [`caption::title_placement`], so the coupling
+/// between them — the subtitle starts after whatever width the title was clamped
+/// to — is resolved once, as a value, before a glyph is placed.
+///
+/// ## Z-order against the band's slot children
+///
+/// A TitleBar is the one converted kind with real children (the app's `Content`
+/// and trailing header elements), and a glyph host inserts at the TOP of the
+/// node's children — so the caption's own text now sits ABOVE them, where the
+/// painted version sat below on the node's surface. That is safe because they do
+/// not overlap by construction: `caption::title_block` reserves the measured
+/// title block as leading inset precisely so the app's content begins after it.
+pub(crate) fn caption_sync(
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    node: &mut Node,
+    scale: f32,
+) {
+    if node.kind != crate::backend::ControlKind::TitleBar {
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let band = Rect::from_xywh(0.0, 0.0, w, h);
+    let back_w = super::caption::back_width(node.extras());
+    let back_enabled = node.extras().back_button_enabled;
+    let back_box = super::caption::back_rect(node.extras(), band);
+    let maximized = super::caption::maximized();
+
+    let Some(t) = node.caption_text.take() else {
+        return;
+    };
+    let mut g = node.caption_glyphs.take().unwrap_or_default();
+
+    // The two titles, placed from one resolved coupling.
+    match super::caption::title_placement(&t, back_w, band) {
+        Some(p) => {
+            place_trimmed(
+                &mut g.title,
+                comp,
+                atlas,
+                &node.container,
+                t.title.as_ref(),
+                p.title,
+                p.y,
+                t.line_h,
+                theme::text(),
+                scale,
+            );
+            place_trimmed(
+                &mut g.subtitle,
+                comp,
+                atlas,
+                &node.container,
+                t.subtitle.as_ref(),
+                p.subtitle,
+                p.y,
+                t.line_h,
+                theme::text_secondary(),
+                scale,
+            );
+        }
+        None => {
+            g.title.hide_all();
+            g.subtitle.hide_all();
+        }
+    }
+
+    // The back chevron, then the window cluster. Disabled greys the arrow
+    // rather than hiding it, exactly as WinUI does — hiding it would reflow the
+    // whole band every time navigation depth hit zero.
+    let back_ink = if back_enabled {
+        theme::text()
+    } else {
+        theme::text_disabled()
+    };
+    match t.glyphs[super::caption::glyph_slot::BACK].as_ref().zip(back_box) {
+        Some((layout, r)) => place_centered(
+            &mut g.buttons[0],
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            r,
+            r,
+            back_ink,
+            1.0,
+            scale,
+        ),
+        None => g.buttons[0].hide_all(),
+    }
+    for i in 0..3 {
+        let slot = super::caption::window_glyph_slot(i, maximized);
+        let r = super::caption::button_rect(i, band);
+        match t.glyphs[slot].as_ref() {
+            Some(layout) => place_centered(
+                &mut g.buttons[1 + i as usize],
+                comp,
+                atlas,
+                &node.container,
+                layout,
+                r,
+                r,
+                theme::text(),
+                1.0,
+                scale,
+            ),
+            None => g.buttons[1 + i as usize].hide_all(),
+        }
+    }
+
+    node.caption_glyphs = Some(g);
+    node.caption_text = Some(t);
+}
+
+/// Place one caption title run at `(x, max_width)`, or hide it.
+///
+/// Re-pins the run's max width before placing, which is what arms its
+/// `CharacterEllipsis` trimming: the layout is built at natural width and only
+/// ellipsizes once narrowed. The painted path did the same thing on every
+/// repaint; skipping it here would render a title at full length over the
+/// window buttons.
+#[allow(clippy::too_many_arguments)]
+fn place_trimmed(
+    part: &mut TextPart,
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    parent: &ContainerVisual,
+    layout: Option<&TextLayout>,
+    at: Option<(f32, f32)>,
+    y: f32,
+    line_h: f32,
+    color: crate::Color,
+    scale: f32,
+) {
+    let Some((layout, (x, max_w))) = layout.zip(at) else {
+        part.hide_all();
+        return;
+    };
+    let _ = layout.set_max_width(max_w);
+    let host = Rect::from_xywh(x, y, max_w, line_h);
+    part.sync(comp, atlas, parent, layout, (x, y), host, color, 1.0, scale);
+}
+
+/// The three runs an `InfoBar` places: its severity glyph, its paragraph, and
+/// its close glyph.
+///
+/// Named rather than indexed, like [`ButtonText`] and unlike [`ItemText`]:
+/// these are three different things, not three of one thing, and each has its
+/// own box and its own ink. The shaped layouts live in
+/// [`info_bar::InfoBarText`](super::info_bar::InfoBarText) — the module that
+/// builds and re-pins them — so this holds only their sprites.
+#[derive(Default)]
+pub(crate) struct BarText {
+    icon: TextPart,
+    para: TextPart,
+    close: TextPart,
+}
+
+/// Reconcile an `InfoBar`'s text as retained glyph sprites.
+///
+/// The paragraph is the one run in the library that WRAPS, so it is also the
+/// only one whose layout is stateful: `info_bar::measure` leaves it flowed at
+/// whatever width Taffy last probed. It is re-pinned through
+/// [`InfoBarText::pinned`](super::info_bar::InfoBarText::pinned) before a single
+/// glyph is placed, which is the same thing the painted path did on every
+/// repaint and the reason a sprite placement cannot simply read the run.
+///
+/// Its host box is the text column, so a paragraph that overflows a band too
+/// short for it loses the overflow to the clip rather than spilling across the
+/// close button.
+pub(crate) fn info_bar_sync(
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    node: &mut Node,
+    scale: f32,
+) {
+    if node.kind != crate::backend::ControlKind::InfoBar {
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    let closable = node.extras().bar_closable;
+    let sev_color = super::info_bar::severity(node.extras()).color();
+    let ink = node.paint.foreground.unwrap_or_else(theme::text);
+
+    let Some(t) = node.bar_text.take() else {
+        return;
+    };
+    let mut g = node.bar_glyphs.take().unwrap_or_default();
+
+    // The severity glyph, centred in its column.
+    match t.icon.as_ref() {
+        Some(layout) => {
+            let cell = super::info_bar::icon_cell(h);
+            place_centered(
+                &mut g.icon, comp, atlas, &node.container, layout, cell, cell, sev_color, dim,
+                scale,
+            );
+        }
+        None => g.icon.hide_all(),
+    }
+
+    // The paragraph, re-pinned to the column it is about to be placed in.
+    match t.pinned(w, closable) {
+        Some((run, th)) => {
+            let b = super::info_bar::text_box(w, h, th, closable);
+            place_leading(&mut g.para, comp, atlas, &node.container, run, b, b, ink, dim, scale);
+        }
+        None => g.para.hide_all(),
+    }
+
+    // The close glyph, centred in the button box the hit test uses.
+    match t
+        .close
+        .as_ref()
+        .zip(super::info_bar::close_rect(w, h, closable))
+    {
+        Some((layout, r)) => place_centered(
+            &mut g.close,
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            r,
+            r,
+            theme::text_secondary(),
+            dim,
+            scale,
+        ),
+        None => g.close.hide_all(),
+    }
+
+    node.bar_glyphs = Some(g);
+    node.bar_text = Some(t);
 }
 
 /// Reconcile an `InfoBadge`'s count as retained glyph sprites.
@@ -1074,6 +1514,234 @@ pub(crate) fn segmented_sync(
     // departed ones' words on screen.
     t.hide_from(n);
     node.item_text = Some(t);
+}
+
+/// Reconcile a NavigationView pane's every run as retained sprites: its two
+/// chrome glyphs, its header, and a leading glyph plus a label per row.
+///
+/// The pane owns no surface, so this and [`parts::nav_plan`](super::parts) are
+/// its entire appearance. Everything geometric is read from
+/// [`nav`](super::nav) — the same [`Metrics`](super::nav::Metrics) the hit test
+/// and the accessibility tree resolve — so a label cannot land on a row the
+/// pointer will report as a different one.
+///
+/// Ellipsization comes for free and is not a special case: the runs were shaped
+/// with a trimming sign and no width, and narrowing one to the room the current
+/// pane leaves makes DirectWrite re-walk it on this very sync. That is why a
+/// label degrades to "Equalizer…" as the pane closes without anything here
+/// deciding that it should.
+pub(crate) fn nav_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+    if node.kind != crate::backend::ControlKind::NavigationView {
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    let count = node.ctrl().items.len();
+    let sel = node.ctrl().selected_index;
+
+    // Taken, not borrowed: the placement below needs the node's container at the
+    // same time as the pane's runs, and the two are fields of the same node.
+    let Some(mut t) = node.nav_text.take() else {
+        return;
+    };
+    let m = super::nav::metrics(node.extras(), w, t.title.is_some());
+
+    // ── The pane's own three runs ────────────────────────────────────────────
+    // A disabled back arrow is still SHOWN, greyed — hiding it on disable would
+    // reflow the pane every time the navigation stack hit depth zero. The grey
+    // is the run's colour and not the host's dim, which carries the whole
+    // control's enablement and would grey the hamburger beside it too.
+    match (super::nav::back_rect(&m), t.back.take()) {
+        (Some(b), Some(layout)) => {
+            let ink = if node.extras().back_enabled {
+                theme::text()
+            } else {
+                theme::text_disabled()
+            };
+            place_centered(
+                t.chrome(super::nav::ChromeRun::Back),
+                comp,
+                atlas,
+                &node.container,
+                &layout,
+                b,
+                b,
+                ink,
+                dim,
+                scale,
+            );
+            t.back = Some(layout);
+        }
+        (_, layout) => {
+            t.back = layout;
+            t.chrome(super::nav::ChromeRun::Back).hide_all();
+        }
+    }
+    match (super::nav::toggle_rect(&m), t.toggle.take()) {
+        (Some(b), Some(layout)) => {
+            place_centered(
+                t.chrome(super::nav::ChromeRun::Toggle),
+                comp,
+                atlas,
+                &node.container,
+                &layout,
+                b,
+                b,
+                theme::text(),
+                dim,
+                scale,
+            );
+            t.toggle = Some(layout);
+        }
+        (_, layout) => {
+            t.toggle = layout;
+            t.chrome(super::nav::ChromeRun::Toggle).hide_all();
+        }
+    }
+    // The header is clamped to its own natural width before the pane's, so a
+    // short title stays short: `set_max_width` is a wrap/trim bound, and handing
+    // it the whole column would place an ellipsis budget the title never needs.
+    match (super::nav::title_box(&m), t.title.take()) {
+        (Some(b), Some(layout)) => {
+            let _ = layout.set_max_width(t.title_w.min(b.width()));
+            place_leading_centered(
+                t.chrome(super::nav::ChromeRun::Title),
+                comp,
+                atlas,
+                &node.container,
+                &layout,
+                b,
+                b,
+                theme::text_secondary(),
+                dim,
+                scale,
+            );
+            t.title = Some(layout);
+        }
+        (_, layout) => {
+            t.title = layout;
+            t.chrome(super::nav::ChromeRun::Title).hide_all();
+        }
+    }
+
+    // ── The rows ─────────────────────────────────────────────────────────────
+    let n = super::nav::visible_items(&m, h, count);
+    let labels = m.kind.expanded();
+    for i in 0..n {
+        nav_row(
+            comp,
+            atlas,
+            &node.container,
+            &mut t.rows,
+            i,
+            super::nav::item_rect(&m, i as i32),
+            &m,
+            i as i32 == sel,
+            labels,
+            dim,
+            scale,
+        );
+    }
+    // Every row past the visible ones — a pane too short for its whole menu must
+    // not leave the surplus rows' words floating over the settings row, and a
+    // menu rebuilt with fewer items must not leave the departed ones at all.
+    // This sweeps the settings row's slot too; the placement below restores it.
+    t.rows.hide_from(n);
+
+    // The settings row is row `count`, not row `n`: its index follows the ITEM
+    // COUNT so that a pane shrinking its visible window never re-points the
+    // settings sprites at a menu item's runs.
+    if let Some(row) = super::nav::settings_rect(&m, h) {
+        nav_row(
+            comp,
+            atlas,
+            &node.container,
+            &mut t.rows,
+            count,
+            row,
+            &m,
+            sel == super::nav::SETTINGS_INDEX,
+            labels,
+            dim,
+            scale,
+        );
+    }
+
+    node.nav_text = Some(t);
+}
+
+/// Place one pane row: its leading glyph in the rail column, and — in an
+/// expanded pane — its label in the column beside it.
+///
+/// The two runs take DIFFERENT colours in the same row on purpose, and it is why
+/// a row is two runs rather than one shaped string: an active row's glyph goes
+/// accent while its words go primary, which is WinUI's own selected-item
+/// treatment and cannot be expressed by one run with one colour source.
+#[allow(clippy::too_many_arguments)]
+fn nav_row(
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    parent: &ContainerVisual,
+    rows: &mut RowText,
+    i: usize,
+    row: Rect,
+    m: &super::nav::Metrics,
+    active: bool,
+    labels: bool,
+    dim: f32,
+    scale: f32,
+) {
+    let slot = rows.row(i);
+    let cell = super::nav::icon_cell(row);
+    match slot.leading {
+        (part, Some(layout)) => place_centered(
+            part,
+            comp,
+            atlas,
+            parent,
+            layout,
+            cell,
+            cell,
+            if active {
+                theme::accent()
+            } else {
+                theme::text_tertiary()
+            },
+            dim,
+            scale,
+        ),
+        (part, None) => part.hide_all(),
+    }
+    let b = super::nav::label_box(m, row);
+    match slot.label {
+        (part, Some(layout)) if labels && b.width() > 0.0 => {
+            // Narrow the run to the room this pane width leaves, which is what
+            // makes labels ellipsize as the pane closes. `sync` re-walks the
+            // layout below, so the reshape lands in this same pass.
+            let _ = layout.set_max_width(b.width());
+            place_leading_centered(
+                part,
+                comp,
+                atlas,
+                parent,
+                layout,
+                b,
+                b,
+                if active {
+                    theme::text()
+                } else {
+                    theme::text_secondary()
+                },
+                dim,
+                scale,
+            );
+        }
+        (part, _) => part.hide_all(),
+    }
 }
 
 /// Reconcile an editor's text run, its selection highlight and its IME
@@ -1271,6 +1939,66 @@ mod tests {
             strong: Vec::new(),
             parts: Vec::new(),
         }
+    }
+
+    /// The same argument for [`RowText`]: no device is needed to exercise the
+    /// indexing, because an unplaced part has minted nothing.
+    fn row_text(rows: usize) -> RowText {
+        RowText {
+            leading: (0..rows).map(|_| None).collect(),
+            labels: (0..rows).map(|_| None).collect(),
+            parts: Vec::new(),
+        }
+    }
+
+    /// A row is TWO parts, and reaching row `i` must grow both — the leading
+    /// glyph and the label are placed from one call and neither may find its
+    /// slot missing.
+    #[test]
+    fn a_row_grows_both_its_parts() {
+        let mut t = row_text(3);
+        t.row(0);
+        assert_eq!(t.parts.len(), 2, "one row is a glyph part and a label part");
+        t.row(2);
+        assert_eq!(
+            t.parts.len(),
+            6,
+            "reaching row 2 grows every row up to it, not just its own"
+        );
+    }
+
+    /// The interleaving is the invariant: row `i` owns parts `2i` and `2i+1`.
+    ///
+    /// Two parallel vectors would let a row be half-retired — its label hidden
+    /// while its glyph stayed lit — which is precisely what one `hide_from` over
+    /// one interleaved vector makes unspellable.
+    #[test]
+    fn hiding_a_row_retires_both_of_its_parts() {
+        let mut t = row_text(3);
+        for i in 0..3 {
+            t.row(i);
+        }
+        t.labels.truncate(1);
+        t.leading.truncate(1);
+        t.hide_from(1);
+        assert_eq!(t.parts.len(), 6, "the parts are retained for reuse…");
+        assert!(
+            t.parts[2..].iter().all(|p| p.host.is_none()),
+            "…but BOTH runs of every departed row show nothing"
+        );
+    }
+
+    /// A rebuild swaps the runs and must not take the sprites with them: the
+    /// parts own compositor visuals parented into the node, so dropping them
+    /// would orphan what is on screen and mint a second set beside it.
+    #[test]
+    fn adopting_new_runs_keeps_every_part() {
+        let mut t = row_text(2);
+        t.row(1);
+        assert_eq!(t.parts.len(), 4);
+        t.adopt(vec![None], vec![None]);
+        assert_eq!(t.len(), 1, "the runs are the new, shorter set…");
+        assert_eq!(t.parts.len(), 4, "…and every part survived the swap");
     }
 
     /// The part index and the item index are separate questions, and a toggle is

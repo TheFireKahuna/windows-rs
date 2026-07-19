@@ -53,7 +53,10 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         // (`glyph_text::toggle_sync`). Nothing left to draw, so `has_chrome`
         // denies it a surface.
         ControlKind::ToggleSwitch => {}
-        ControlKind::CheckBox => paint_check_box(session, brush, node, rect, dim),
+        // Box fill, outline, checkmark and ring are parts
+        // (`parts::check_plan`); the trailing label is glyph sprites
+        // (`glyph_text::check_sync`).
+        ControlKind::CheckBox => {}
         // The same: tray, sliding pill, hover ink and ring are parts
         // (`parts::segmented_plan`), the segment labels are sprites
         // (`glyph_text::segmented_sync`).
@@ -68,14 +71,18 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         // (`super::parts::progress_sync`) — the sweep loops on the compositor.
         ControlKind::ProgressBar => {}
         ControlKind::ProgressRing => paint_progress_ring(session, brush, node, rect, dim),
-        ControlKind::NavigationView => super::nav::paint(session, brush, node, rect, dim),
-        // Draws everything it has on its own surface: nothing on the bar moves,
-        // so it owns no retained chrome part.
-        ControlKind::InfoBar => super::info_bar::paint(session, brush, node, rect, dim),
-        ControlKind::Expander => paint_expander(session, brush, node, rect, dim),
-        // The custom caption band: only the min/max/close cluster is drawn
-        // here (the band itself is transparent; slot children are real nodes).
-        ControlKind::TitleBar => super::caption::paint(session, brush, node, rect),
+        // Fully retained: background, divider, selection tile, accent bar and
+        // both washes are parts (`parts::nav_plan`), every run is sprites
+        // (`glyph_text::nav_sync`), and `has_chrome` denies it a surface.
+        ControlKind::NavigationView => {}
+        // Header fill, border, hover wash and ring are parts
+        // (`parts::expander_plan`); the header label and its chevron are glyph
+        // sprites (`glyph_text::expander_sync`).
+        ControlKind::Expander => {}
+        // The custom caption band draws nothing either: it is transparent, its
+        // one hover wash is a part (`parts::caption_plan`), and its two titles
+        // and four button glyphs are sprites (`glyph_text::caption_sync`).
+        ControlKind::TitleBar => {}
         _ => return false,
     }
     // Kinds whose ring is a retained part are deliberately absent from this
@@ -213,7 +220,11 @@ fn ring_is_retained(kind: ControlKind) -> bool {
     super::node::is_button_family(kind)
         || matches!(
             kind,
-            ControlKind::HyperlinkButton | ControlKind::ToggleSwitch | ControlKind::SelectorBar
+            ControlKind::HyperlinkButton
+                | ControlKind::ToggleSwitch
+                | ControlKind::SelectorBar
+                | ControlKind::CheckBox
+                | ControlKind::Expander
         )
 }
 
@@ -556,35 +567,15 @@ pub(crate) fn toggle_state_label(node: &Node) -> &str {
 
 // ── CheckBox ─────────────────────────────────────────────────────────────────
 
-fn paint_check_box(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let box_d = 18.0_f32;
-    let cy = rect.height() / 2.0;
-    let bx = Rect::from_xywh(0.0, cy - box_d / 2.0, box_d, box_d);
-
-    // The accent box fill and the checkmark are retained chrome parts
-    // (`super::parts::check_sync`) — a check/uncheck fades on the compositor.
-    // Only the outline (hover-brightened by an event repaint) and the label
-    // paint here.
-    let stroke = theme::w(if node.hovered { 0.36 } else { 0.30 });
-    stroke_rr(session, brush, bx, theme::RADIUS_SM, stroke, 1.5, dim);
-
-    // Optional trailing label.
-    if !node.paint.text.is_empty() {
-        let lr = Rect::new(bx.right + theme::SPACE_8, rect.top, rect.right, rect.bottom);
-        text(
-            session,
-            brush,
-            &node.paint.text,
-            lr,
-            "Segoe UI",
-            theme::FONT_SIZE_MD,
-            400,
-            theme::text(),
-            TextAlignment::Leading,
-            ParagraphAlignment::Center,
-            dim,
-        );
-    }
+/// The trailing label's box: everything right of the box and its gap.
+///
+/// Shared by the sprite placement and by nothing else today, but stated here
+/// rather than inline because it is derived from the box side the PART is cut
+/// to — a label that measured its own gap from a second literal would drift the
+/// moment the box changed size.
+pub(crate) fn check_label_box(node: &Node) -> Rect {
+    let x = super::parts::CHECK_BOX_D + theme::SPACE_8;
+    Rect::from_xywh(x, 0.0, (node.rect.w - x).max(0.0), node.rect.h)
 }
 
 // ── Segmented / SelectorBar ──────────────────────────────────────────────────
@@ -1088,47 +1079,40 @@ fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, hover: bool, d
 
 // ── Expander ─────────────────────────────────────────────────────────────────
 
-fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let header = Rect::from_xywh(0.0, 0.0, rect.width(), theme::ROW_H + theme::SPACE_8);
-    fill_rr(session, brush, header, theme::RADIUS_MD, theme::surface_raised(), dim);
-    // The hover/press wash is a retained ink part over the header strip
-    // (`super::parts::expander_sync`) — a compositor fade, no tick.
-    stroke_rr(session, brush, header, theme::RADIUS_MD, theme::stroke(), theme::BORDER_W, dim);
-
-    let lr = Rect::new(theme::SPACE_12, header.top, header.right - theme::SPACE_32, header.bottom);
-    text(
-        session,
-        brush,
-        &node.paint.text,
-        lr,
-        "Segoe UI",
-        theme::FONT_SIZE_MD,
-        600,
-        theme::text(),
-        TextAlignment::Leading,
-        ParagraphAlignment::Center,
-        dim,
-    );
-
-    // Chevron: right (collapsed) → down (expanded); the toggle repaints once.
-    let g = if node.ctrl().expanded { GLYPH_CHEVRON_DOWN } else { GLYPH_CHEVRON_RIGHT };
-    if let Some(gs) = glyph_str(g) {
-        let cr = Rect::new(header.right - theme::SPACE_32, header.top, header.right - theme::SPACE_8, header.bottom);
-        text(
-            session,
-            brush,
-            &gs,
-            cr,
-            theme::FONT_ICON,
-            10.0,
-            400,
-            theme::text_secondary(),
-            TextAlignment::Center,
-            ParagraphAlignment::Center,
-            dim,
-        );
-    }
+/// The header strip's height — the only part of an Expander that is chrome; the
+/// content below it is ordinary layout.
+///
+/// One definition, read by the retained fill, the border, the wash, the label
+/// and the chevron. It was previously written twice — here and in
+/// `parts::expander_plan` — which is two places to change a strip that has to
+/// stay one strip.
+pub(crate) fn expander_header_h() -> f32 {
+    theme::ROW_H + theme::SPACE_8
 }
+
+/// The header label's box: leading inset to the chevron column.
+pub(crate) fn expander_label_box(node: &Node) -> Rect {
+    let right = (node.rect.w - theme::SPACE_32).max(theme::SPACE_12);
+    Rect::new(theme::SPACE_12, 0.0, right, expander_header_h())
+}
+
+/// The chevron's box at the header's trailing edge.
+pub(crate) fn expander_chevron_box(node: &Node) -> Rect {
+    Rect::new(
+        (node.rect.w - theme::SPACE_32).max(0.0),
+        0.0,
+        (node.rect.w - theme::SPACE_8).max(0.0),
+        expander_header_h(),
+    )
+}
+
+/// The chevron's type size, and the two glyphs it alternates between.
+pub(crate) const EXPANDER_CHEVRON_SIZE: f32 = 10.0;
+/// The header label's weight — heavier than body text, and carried from birth
+/// (`default_font_weight`) so `.font_size(..)` / `.bold()` still reach it.
+pub(crate) const EXPANDER_HEADER_WEIGHT: u16 = 600;
+pub(crate) const EXPANDER_GLYPH_COLLAPSED: u32 = GLYPH_CHEVRON_RIGHT;
+pub(crate) const EXPANDER_GLYPH_EXPANDED: u32 = GLYPH_CHEVRON_DOWN;
 
 #[cfg(test)]
 mod tests {

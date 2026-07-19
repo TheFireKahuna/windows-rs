@@ -1772,6 +1772,8 @@ pub(crate) fn converted(kind: ControlKind) -> bool {
             | ControlKind::ProgressRing
             | ControlKind::Meter
             | ControlKind::InfoBadge
+            | ControlKind::InfoBar
+            | ControlKind::TitleBar
     )
 }
 
@@ -1873,6 +1875,10 @@ pub(crate) fn sync(
         ControlKind::HyperlinkButton => hyperlink_sync(comp, atlas, node, scale),
         // Also fully retained: a plate below, its count's sprites above.
         ControlKind::InfoBadge => badge_sync(comp, atlas, node, scale),
+        // Card, tint, border and the close wash; paragraph and icons are sprites.
+        ControlKind::InfoBar => bar_sync(comp, atlas, node, scale),
+        // One hover wash shared by the band's four buttons.
+        ControlKind::TitleBar => caption_sync(comp, atlas, node, scale),
         _ => {}
     }
 }
@@ -2075,6 +2081,105 @@ pub(crate) fn focus_ring_slots(
             1.0,
         )
     })
+}
+
+/// The caption band's chrome: one hover wash, and nothing else.
+///
+/// The band itself is transparent (the window's backdrop shows through) and its
+/// six runs are sprites, so the wash is all the chrome there is. It fades rather
+/// than snapping — a pointer sweeping the window cluster crosses three buttons
+/// in a few frames, and a plate that popped on and off at that rate reads as a
+/// flicker.
+pub(crate) fn caption_plan(node: &Node, scale: f32) -> PartPlan {
+    let (w, h) = (node.rect.w, node.rect.h);
+    let wash = super::caption::hot_wash(node, Rect::from_xywh(0.0, 0.0, w, h))
+        .map(|(r, radius, c)| {
+            SlotPlan::snap(
+                AtlasKey::hbar(r.height(), radius, 0.0, c, scale),
+                Some((r.left, r.top, r.width(), r.height())),
+                1.0,
+            )
+            .fading()
+        })
+        .unwrap_or_else(SlotPlan::hidden);
+    PartPlan::new([w, h, 0.0]).above(0, wash)
+}
+
+fn caption_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+    if !ensure(comp, node, 0, 1) {
+        return;
+    }
+    let plan = caption_plan(node, scale);
+    apply(comp, atlas, node, &plan);
+}
+
+/// An `InfoBar`'s chrome: the card, its severity tint, its border, and the
+/// close button's hover wash.
+///
+/// Four sprites cut to one curve, replacing four fills that were redrawn
+/// together whenever any one of them changed. The wash is the only part with a
+/// state: it fades, because a hover that snapped a plate on and off reads as a
+/// flicker at the speed a pointer crosses a button.
+///
+/// The band takes no focus ring — the BAR is not focusable; only its close
+/// button is, and that is a synthetic UIA item rather than a node with a rect
+/// of its own.
+pub(crate) fn bar_plan(node: &Node, scale: f32) -> PartPlan {
+    let (w, h) = (node.rect.w, node.rect.h);
+    let x = node.extras();
+    let sev = super::info_bar::severity(x);
+    let r = theme::RADIUS_SM;
+    let dim = dim_of(node);
+    let box_rect = Some((0.0, 0.0, w, h));
+
+    // The card, then a wash of the severity role over it, so the bar reads as
+    // its status at a glance without the text having to say so.
+    let card = SlotPlan::snap(
+        AtlasKey::hbar(h, r, 0.0, theme::surface_raised(), scale),
+        box_rect,
+        dim,
+    );
+    let tint = SlotPlan::snap(
+        AtlasKey::hbar(h, r, 0.0, theme::with_alpha(sev.color(), 0.10), scale),
+        box_rect,
+        dim,
+    );
+    let border = SlotPlan::snap(
+        AtlasKey::hbar(h, r, theme::BORDER_W, theme::stroke(), scale),
+        box_rect,
+        dim,
+    );
+
+    // The close button's wash. Hidden rather than transparent when the pointer
+    // is elsewhere: a part bound to a source it never shows still holds an
+    // atlas slot.
+    let hot = node.paint.is_enabled && node.ctrl().hot_index == super::info_bar::HOT_CLOSE;
+    let wash = super::info_bar::close_rect(w, h, x.bar_closable)
+        .filter(|_| hot)
+        .map(|c| {
+            let a = if node.pressed { 0.10 } else { 0.06 };
+            SlotPlan::snap(
+                AtlasKey::hbar(c.height(), r, 0.0, theme::w(a), scale),
+                Some((c.left, c.top, c.width(), c.height())),
+                dim,
+            )
+            .fading()
+        })
+        .unwrap_or_else(SlotPlan::hidden);
+
+    PartPlan::new([w, h, 0.0])
+        .below(0, card)
+        .below(1, tint)
+        .below(2, border)
+        .above(0, wash)
+}
+
+fn bar_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+    if !ensure(comp, node, 3, 1) {
+        return;
+    }
+    let plan = bar_plan(node, scale);
+    apply(comp, atlas, node, &plan);
 }
 
 /// An `InfoBadge`'s whole appearance: one plate, and nothing else.
@@ -2330,14 +2435,15 @@ fn toggle_fades(node: &mut Node) {
 // ── CheckBox ─────────────────────────────────────────────────────────────────
 
 /// Box side, mirroring the retired `paint_check_box`.
-const CHECK_BOX_D: f32 = 18.0;
+pub(crate) const CHECK_BOX_D: f32 = 18.0;
+/// Its outline's stroke width, from the same retired paint.
+const CHECK_OUTLINE_W: f32 = 1.5;
 
-/// Below: `[accent box fill]` (under the painted stroke + label). Above:
-/// `[checkmark]`. A check/uncheck is a pair of compositor fades — endpoint
-/// parity with the retired painted crossfade (`transparent→accent` fill,
-/// `w(on)` checkmark).
+/// Below: `[accent box fill, outline]`. Above: `[checkmark, focus ring ×2]`.
+/// A check/uncheck is a pair of compositor fades — endpoint parity with the
+/// retired painted crossfade (`transparent→accent` fill, `w(on)` checkmark).
 fn check_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 1, 1) {
+    if !ensure(comp, node, 2, 3) {
         return;
     }
     let plan = check_plan(node, scale);
@@ -2354,6 +2460,26 @@ pub(crate) fn check_plan(node: &Node, scale: f32) -> PartPlan {
     let y = node.rect.h / 2.0 - CHECK_BOX_D / 2.0;
     let box_rect = Some((0.0, y, CHECK_BOX_D, CHECK_BOX_D));
 
+    // The outline, hover-brightened. A part rather than a stroke on a surface,
+    // which is what lets the hover be a re-bind instead of the repaint that
+    // used to redraw the label alongside it.
+    let stroke = theme::w(if node.hovered { 0.36 } else { 0.30 });
+    let outline = SlotPlan::snap(
+        AtlasKey::hbar(CHECK_BOX_D, theme::RADIUS_SM, CHECK_OUTLINE_W, stroke, scale),
+        box_rect,
+        dim_of(node),
+    );
+
+    // The ring takes the WHOLE node — box, gap and label — as WinUI's does, and
+    // as the painted ring this replaces did.
+    let ring = focus_ring_slots(
+        node.focus_ring,
+        node.rect.w,
+        node.rect.h,
+        super::controls::focus_radius(node),
+        scale,
+    );
+
     PartPlan::new([node.rect.w, node.rect.h, 0.0])
         .below(
             0,
@@ -2364,10 +2490,13 @@ pub(crate) fn check_plan(node: &Node, scale: f32) -> PartPlan {
             )
             .fading(),
         )
+        .below(1, outline)
         .above(
             0,
             SlotPlan::snap(AtlasKey::check(CHECK_BOX_D, theme::w(1.0), scale), box_rect, t).fading(),
         )
+        .above(1, ring[0].clone())
+        .above(2, ring[1].clone())
 }
 
 // ── Slider ───────────────────────────────────────────────────────────────────
@@ -2900,17 +3029,42 @@ pub(crate) fn seg_hot_changed(node: &mut Node) {
 
 // ── NavigationView pane ──────────────────────────────────────────
 
-/// Below-band roles: `[pane background, active tile, accent bar]`; above:
-/// `[row hover ink]`.
+/// The pane's slots. The counts derive from the last index in each band, so
+/// adding a role cannot raise one and leave the other behind — the miss is an
+/// index-out-of-bounds on the first pane that syncs.
+mod nav_slot {
+    pub const BG: usize = 0;
+    /// The hairline between pane and content. It was the last thing the pane
+    /// painted; as a part it glides in lockstep with the background rather than
+    /// snapping to the new width a frame ahead of it.
+    pub const DIVIDER: usize = 1;
+    pub const MENU_TILE: usize = 2;
+    pub const MENU_BAR: usize = 3;
+    pub const SET_TILE: usize = 4;
+    pub const SET_BAR: usize = 5;
+    pub const N_BELOW: usize = SET_BAR + 1;
+
+    pub const INK: usize = 0;
+    /// The wash under a hovered back arrow or hamburger. One part for both:
+    /// `hot_index` holds a single value, so only one can ever be hot.
+    pub const CHROME_INK: usize = 1;
+    pub const N_ABOVE: usize = CHROME_INK + 1;
+}
+
+/// Below-band roles: `[pane background, divider, menu tile, menu bar, settings
+/// tile, settings bar]`; above: `[row hover ink, chrome-button wash]`.
 ///
-/// Three things move here and all three move on the compositor: the pane's
-/// WIDTH when it opens or closes, the selection tile and its accent bar when
-/// the selected page changes, and the hover ink as the pointer crosses rows.
-/// The pane's painted layer (glyphs, labels, divider) snaps to the new width in
-/// the same repaint that starts the glide — the geometry is retained chrome,
-/// the text is not, and a text layout cannot be interpolated.
+/// Everything the pane shows that is not a glyph is here — it owns no surface
+/// ([`nav`](super::nav)), so this band and the pane's sprites are its whole
+/// appearance. Four things move and all four move on the compositor: the pane's
+/// WIDTH when it opens or closes, the selection tile and its accent bar when the
+/// selected page changes, and the hover ink as the pointer crosses rows.
+///
+/// The pane's runs SNAP to the new width in the same repaint that starts the
+/// glide — the geometry is retained chrome, the text is not, and a text layout
+/// cannot be interpolated.
 fn nav_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 5, 1) {
+    if !ensure(comp, node, nav_slot::N_BELOW, nav_slot::N_ABOVE) {
         return;
     }
     let plan = nav_plan(node, scale);
@@ -2998,18 +3152,49 @@ pub(crate) fn nav_plan(node: &Node, scale: f32) -> PartPlan {
     let (set_tile, set_bar) = pair(settings_row.as_ref(), k_tile, k_bar);
 
     let ink = nav_ink_rect(node).filter(|_| enabled);
+    // The chrome wash takes the same rounded-square treatment the caption band's
+    // buttons do, and the same alpha the row ink does — the two are one hover
+    // language, and a pane whose head washed differently from its rows would
+    // read as two controls stacked.
+    let chrome = nav::chrome_rect(&m, node.ctrl().hot_index).filter(|_| enabled);
+    let k_chrome = AtlasKey::hbar(nav::CHROME_H, theme::RADIUS_SM, 0.0, theme::w(1.0), scale);
 
     PartPlan::new([h, 0.0, 0.0])
-        .below(0, SlotPlan::glide(k_bg, Some((0.0, 0.0, m.width, h)), dim))
-        .below(1, menu_tile)
-        .below(2, menu_bar)
-        .below(3, set_tile)
-        .below(4, set_bar)
+        .below(
+            nav_slot::BG,
+            SlotPlan::glide(k_bg, Some((0.0, 0.0, m.width, h)), dim),
+        )
+        // A plain stretch, not a nine-grid: a hairline has no corners to
+        // preserve, and it rides the same glide as the background so the pane's
+        // edge stays one line rather than separating as the pane opens.
+        .below(
+            nav_slot::DIVIDER,
+            SlotPlan::glide(
+                AtlasKey::solid(theme::stroke_divider(), scale),
+                Some((m.width, 0.0, theme::BORDER_W, h)),
+                dim,
+            ),
+        )
+        .below(nav_slot::MENU_TILE, menu_tile)
+        .below(nav_slot::MENU_BAR, menu_bar)
+        .below(nav_slot::SET_TILE, set_tile)
+        .below(nav_slot::SET_BAR, set_bar)
         // The ink SNAPS to the hovered row and fades: a glide would draw a wash
         // sliding down the pane between two rows the pointer never paused on.
         .above(
-            0,
+            nav_slot::INK,
             SlotPlan::snap(k_ink, ink, if ink.is_some() { wash(0.06) * dim } else { 0.0 }).fading(),
+        )
+        // Snaps for the same reason, one row up: the two chrome buttons sit side
+        // by side, and a glide between them would wash the gap they share.
+        .above(
+            nav_slot::CHROME_INK,
+            SlotPlan::snap(
+                k_chrome,
+                chrome.map(|r| (r.left, r.top, r.width(), r.height())),
+                if chrome.is_some() { wash(0.06) * dim } else { 0.0 },
+            )
+            .fading(),
         )
 }
 
@@ -3033,8 +3218,9 @@ fn nav_ink_rect(node: &Node) -> Option<(f32, f32, f32, f32)> {
     } else if hot == nav::SETTINGS_INDEX {
         nav::settings_rect(&m, node.rect.h)?
     } else {
-        // The two chrome buttons wash on the node's own surface (a flat state
-        // fill, like the caption band's back button), not through this sprite.
+        // The two chrome buttons take their own wash, on their own part: theirs
+        // is a 40-DIP rounded square at the head of the pane, not a full-width
+        // row tile, and one sprite cannot be both.
         return None;
     };
     Some((
@@ -3051,18 +3237,33 @@ fn nav_ink_rect(node: &Node) -> Option<(f32, f32, f32, f32)> {
 /// before this call, so the ink must land on it rather than fade in wherever it
 /// last sat.
 pub(crate) fn nav_hot_changed(node: &mut Node) {
-    let rect = nav_ink_rect(node).filter(|_| node.paint.is_enabled && node.hovered);
+    let live = node.paint.is_enabled && node.hovered;
+    let row = nav_ink_rect(node).filter(|_| live);
+    // Resolved before the borrow below: both reads take the node, the writes
+    // take it mutably.
+    let has_title = node.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+    let m = nav::metrics(node.extras(), node.rect.w, has_title);
+    let chrome = nav::chrome_rect(&m, node.ctrl().hot_index)
+        .filter(|_| live)
+        .map(|r| (r.left, r.top, r.width(), r.height()));
     let dim = dim_of(node);
+
     let Some(parts) = node.parts.as_mut() else { return };
-    if parts.above.is_empty() {
+    if parts.above.len() != nav_slot::N_ABOVE {
         return;
     }
-    match rect {
-        Some((x, y, w, h)) => {
-            parts.above[0].place(x, y, w, h);
-            parts.above[0].fade_to(wash(0.06) * dim);
+    // BOTH washes are written on every edge, not only the one that gained a
+    // target. Moving between a chrome button and a row changes WHICH part is
+    // lit, and refreshing only the newly-hot one would leave the other still
+    // showing the row the pointer has already left.
+    for (slot, rect) in [(nav_slot::INK, row), (nav_slot::CHROME_INK, chrome)] {
+        match rect {
+            Some((x, y, w, h)) => {
+                parts.above[slot].place(x, y, w, h);
+                parts.above[slot].fade_to(wash(0.06) * dim);
+            }
+            None => parts.above[slot].fade_to(0.0),
         }
-        None => parts.above[0].fade_to(0.0),
     }
 }
 
@@ -3072,27 +3273,56 @@ pub(crate) fn nav_hot_changed(node: &mut Node) {
 /// (the body below it stays wash-free). Chevron + header chrome are painted;
 /// the chevron flip is a single event-driven repaint.
 fn expander_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 0, 1) {
+    if !ensure(comp, node, 2, 3) {
         return;
     }
     let plan = expander_plan(node, scale);
     apply(comp, atlas, node, &plan);
 }
 
-/// Above: `[header hover wash]`. Only the HEADER takes the wash — the expanded
-/// content below it is ordinary layout, not part of the control's chrome.
+/// Below: `[header fill, header border]`. Above: `[hover wash, focus ring ×2]`.
+///
+/// Only the HEADER carries any of it — the expanded content below is ordinary
+/// layout, not part of the control's chrome, which is also why the ring rings
+/// the header strip rather than the whole node: a ring around an expanded
+/// Expander would enclose its content and read as a group box.
 pub(crate) fn expander_plan(node: &Node, scale: f32) -> PartPlan {
-    let header_h = theme::ROW_H + theme::SPACE_8;
+    let header_h = super::controls::expander_header_h();
     let w = node.rect.w;
-    PartPlan::new([w, node.rect.h, 0.0]).above(
-        0,
-        SlotPlan::snap(
-            AtlasKey::hbar(header_h, theme::RADIUS_MD, 0.0, theme::w(1.0), scale),
-            Some((0.0, 0.0, w, header_h)),
-            ink_target(node),
+    let dim = dim_of(node);
+    let r = theme::RADIUS_MD;
+    let strip = Some((0.0, 0.0, w, header_h));
+
+    let ring = focus_ring_slots(node.focus_ring, w, header_h, r, scale);
+
+    PartPlan::new([w, node.rect.h, 0.0])
+        .below(
+            0,
+            SlotPlan::snap(
+                AtlasKey::hbar(header_h, r, 0.0, theme::surface_raised(), scale),
+                strip,
+                dim,
+            ),
         )
-        .fading(),
-    )
+        .below(
+            1,
+            SlotPlan::snap(
+                AtlasKey::hbar(header_h, r, theme::BORDER_W, theme::stroke(), scale),
+                strip,
+                dim,
+            ),
+        )
+        .above(
+            0,
+            SlotPlan::snap(
+                AtlasKey::hbar(header_h, r, 0.0, theme::w(1.0), scale),
+                strip,
+                ink_target(node),
+            )
+            .fading(),
+        )
+        .above(1, ring[0].clone())
+        .above(2, ring[1].clone())
 }
 
 // ── Progress (bar + ring) ────────────────────────────────────────────────────

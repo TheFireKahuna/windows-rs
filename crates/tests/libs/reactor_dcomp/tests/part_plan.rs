@@ -24,16 +24,22 @@
 //!
 //! **These tests are not headless** — see `arena_ids.rs`.
 
-use windows_reactor::dcomp_test_api::{ArenaHarness, PartPlanProbe};
+use windows_reactor::dcomp_test_api::{ArenaHarness, NavHit, PartPlanProbe};
 use windows_reactor::{ControlKind as K, NavViewItem, Prop, PropValue as V, selector_bar_item};
 
 /// Below-band slot roles, mirroring `parts.rs`.
 const TRAY_FILL: usize = 0;
 const PILL: usize = 2;
 const SEG_INK: usize = 3;
-const NAV_TILE: usize = 1;
-const NAV_BAR: usize = 2;
-const SET_TILE: usize = 3;
+/// The pane's band, after the divider joined it at index 1: the hairline
+/// between pane and content was the last thing the NavigationView painted, and
+/// it is a part now that the control owns no surface.
+const NAV_DIVIDER: usize = 1;
+const NAV_TILE: usize = 2;
+const NAV_BAR: usize = 3;
+const SET_TILE: usize = 4;
+/// Above-band: the row wash, then the chrome-button wash.
+const NAV_CHROME_INK: usize = 1;
 
 const TRACK_ON: usize = 0;
 const KNOB: usize = 2;
@@ -147,6 +153,93 @@ fn the_nav_tile_and_bar_land_on_the_selected_row() {
     assert!(
         tops[0] < tops[1] && tops[1] < tops[2],
         "the tile must descend with the selection, got tops {tops:?}",
+    );
+}
+
+/// The divider is a part, and it stands at the pane's trailing edge.
+///
+/// It was the last thing the NavigationView painted, and the pane's surface went
+/// away with it. A hairline that landed anywhere but on `metrics.width` would
+/// read as the pane being a different width than the content beside it thinks it
+/// is — the two are laid out from that one number.
+#[test]
+fn the_divider_stands_at_the_panes_trailing_edge() {
+    let mut a = harness();
+    let plan = pane(&mut a, 320.0, 400.0, &["One", "Two"], 0);
+    let bg = plan.below[0]
+        .expect("the background slot is always planned")
+        .rect
+        .expect("a pane always places its background");
+    let div = plan.below[NAV_DIVIDER]
+        .expect("the divider slot is always planned")
+        .rect
+        .expect("a pane always places its divider");
+
+    assert_eq!(
+        div.0, bg.2,
+        "the divider must stand at the pane's width, got {div:?} against a {bg:?} background",
+    );
+    assert_eq!(div.1, 0.0, "the divider runs from the pane's top…");
+    assert_eq!(div.3, bg.3, "…to its full height");
+    assert!(
+        div.2 > 0.0 && div.2 < 2.0,
+        "a divider is a hairline, got {} DIPs wide",
+        div.2,
+    );
+    assert!(
+        plan.below[NAV_DIVIDER].unwrap().glides,
+        "the divider must ride the same glide as the background, or the pane's \
+         edge separates into two lines as it opens",
+    );
+}
+
+/// The chrome wash is a second part, not the row ink moved.
+///
+/// The two never share a sprite: a chrome button's wash is a 40-DIP rounded
+/// square at the head of the pane and a row's is a full-width tile, so one part
+/// serving both would size itself wrong for whichever it was not built for.
+#[test]
+fn a_hovered_chrome_button_washes_on_its_own_part() {
+    let mut a = harness();
+    let id = a.insert(K::NavigationView).unwrap();
+    a.apply_prop(
+        id,
+        Prop::MenuItems,
+        &V::NavMenuItems(vec![NavViewItem::new("One"), NavViewItem::new("Two")]),
+    );
+    a.apply_prop(id, Prop::SelectedIndex, &V::I32(0));
+    a.set_rect(id, 320.0, 400.0);
+
+    // Nothing hovered: neither wash has a target.
+    let rest = a.part_plan(id, 1.0).unwrap();
+    assert_eq!(
+        rest.above[NAV_CHROME_INK].unwrap().rect,
+        None,
+        "an unhovered pane must not place its chrome wash",
+    );
+
+    // The hamburger, at the pane's own negative hot sentinel.
+    a.set_nav_hot(id, Some(NavHit::Toggle));
+    let hot = a.part_plan(id, 1.0).unwrap();
+    let chrome = hot.above[NAV_CHROME_INK]
+        .expect("the chrome wash slot is always planned")
+        .rect
+        .expect("a hovered chrome button must place the wash");
+    assert_eq!(chrome.1, 0.0, "the chrome row is at the pane's head");
+    assert!(
+        chrome.3 <= 40.0,
+        "the chrome wash is a button-sized square, not a row tile, got {chrome:?}",
+    );
+    assert_eq!(
+        hot.above[0].unwrap().rect,
+        None,
+        "hovering a chrome button must leave the ROW ink unplaced — the two are \
+         separate parts and a chrome hover is not on any row",
+    );
+    assert!(
+        !hot.above[NAV_CHROME_INK].unwrap().glides,
+        "the chrome wash must snap: the two buttons sit side by side, and a \
+         glide between them would wash the gap they share",
     );
 }
 
@@ -472,4 +565,88 @@ fn a_badge_owns_no_surface() {
             "an InfoBadge ({count:?}) must never be given a paint surface",
         );
     }
+}
+
+/// The checkbox's focus ring wraps the WHOLE control — box, gap and label —
+/// not just the box.
+///
+/// WinUI rings the control, and the label is part of the control: it is inside
+/// the hit target and clicking it toggles. A ring cut to the 18-DIP box would
+/// read as ringing an icon that happens to sit next to some text.
+#[test]
+fn the_checkbox_ring_wraps_the_label_not_just_the_box() {
+    let mut a = harness();
+    let id = a.insert(K::CheckBox).unwrap();
+    a.set_rect(id, 180.0, 24.0);
+
+    // Blurred: no ring at all. Focus alone must not draw one — only a Tab does.
+    let blurred = a.part_plan(id, 1.0).unwrap();
+    assert!(
+        blurred.above[1].as_ref().is_none_or(|s| s.opacity == 0.0),
+        "an unringed checkbox must show no focus ring",
+    );
+
+    a.set_focus_ring(id, true);
+    let ringed = a.part_plan(id, 1.0).unwrap();
+    let (_, _, w, _) = ringed.above[1]
+        .as_ref()
+        .and_then(|s| s.rect)
+        .expect("a ringed checkbox places its inner ring");
+    assert!(
+        w > 180.0,
+        "the ring spans the whole control (got {w} for a 180 DIP box), \
+         so it must be wider than the node, not cut to the 18 DIP box",
+    );
+}
+
+/// A checkbox reaches no `BeginDraw`: fill, outline, checkmark and ring are
+/// parts, and the label is glyph sprites.
+///
+/// The outline was the last thing drawing, and because it is hover-brightened
+/// it dragged the label through a repaint on every pointer crossing.
+#[test]
+fn a_checkbox_owns_no_surface() {
+    let mut a = harness();
+    let id = a.insert(K::CheckBox).unwrap();
+    a.set_rect(id, 180.0, 24.0);
+    assert_eq!(a.has_chrome(id), Some(false));
+}
+
+/// The Expander's ring encloses the HEADER STRIP, not the expanded node.
+///
+/// Only the header is chrome — the content below it is ordinary layout — so a
+/// ring cut to the node would grow as the control expands and read as a group
+/// box drawn around the content rather than as focus on the thing Space
+/// activates.
+#[test]
+fn the_expander_ring_stays_on_the_header_however_tall_the_content() {
+    let mut a = harness();
+    let id = a.insert(K::Expander).unwrap();
+    a.set_focus_ring(id, true);
+
+    // Collapsed: node is the header.
+    a.set_rect(id, 300.0, 40.0);
+    let short = a.part_plan(id, 1.0).unwrap();
+    let (_, _, _, h1) = short.above[1].as_ref().and_then(|s| s.rect).expect("ring placed");
+
+    // Expanded: the node is far taller, the header is not.
+    a.set_rect(id, 300.0, 400.0);
+    let tall = a.part_plan(id, 1.0).unwrap();
+    let (_, _, _, h2) = tall.above[1].as_ref().and_then(|s| s.rect).expect("ring placed");
+
+    assert_eq!(
+        h1, h2,
+        "the ring must not grow with the content ({h1} then {h2})",
+    );
+    assert!(h2 < 400.0, "a ring the height of the node would enclose the content");
+}
+
+/// An expander reaches no `BeginDraw`: header fill, border, wash and ring are
+/// parts, and its label and chevron are glyph sprites.
+#[test]
+fn an_expander_owns_no_surface() {
+    let mut a = harness();
+    let id = a.insert(K::Expander).unwrap();
+    a.set_rect(id, 300.0, 40.0);
+    assert_eq!(a.has_chrome(id), Some(false));
 }
