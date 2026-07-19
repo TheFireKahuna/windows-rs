@@ -7,8 +7,8 @@ use windows_reactor::{Backend, ControlId, ControlKind, Event, EventHandler, Prop
 #[test]
 fn recording_backend_assigns_sequential_ids() {
     let mut b = RecordingBackend::new();
-    let a = b.create(ControlKind::TextBlock);
-    let c = b.create(ControlKind::Button);
+    let a = b.create_id(ControlKind::TextBlock);
+    let c = b.create_id(ControlKind::Button);
     assert_eq!(a.get(), 1);
     assert_eq!(c.get(), 2);
 }
@@ -16,7 +16,7 @@ fn recording_backend_assigns_sequential_ids() {
 #[test]
 fn set_prop_is_logged_verbatim() {
     let mut b = RecordingBackend::new();
-    let id = b.create(ControlKind::TextBlock);
+    let id = b.create_id(ControlKind::TextBlock);
     b.set_prop(id, Prop::Text, &PropValue::Str("hi".into()));
     assert_eq!(b.ops.len(), 2);
     match &b.ops[1] {
@@ -36,10 +36,10 @@ fn set_prop_is_logged_verbatim() {
 #[test]
 fn append_remove_replace_child_maintains_structure() {
     let mut b = RecordingBackend::new();
-    let parent = b.create(ControlKind::StackPanel);
-    let a = b.create(ControlKind::TextBlock);
-    let c = b.create(ControlKind::TextBlock);
-    let d = b.create(ControlKind::TextBlock);
+    let parent = b.create_id(ControlKind::StackPanel);
+    let a = b.create_id(ControlKind::TextBlock);
+    let c = b.create_id(ControlKind::TextBlock);
+    let d = b.create_id(ControlKind::TextBlock);
 
     b.append_child(parent, a);
     b.append_child(parent, c);
@@ -55,8 +55,8 @@ fn append_remove_replace_child_maintains_structure() {
 #[test]
 fn destroy_deletes_children_map_entry() {
     let mut b = RecordingBackend::new();
-    let parent = b.create(ControlKind::StackPanel);
-    let a = b.create(ControlKind::TextBlock);
+    let parent = b.create_id(ControlKind::StackPanel);
+    let a = b.create_id(ControlKind::TextBlock);
     b.append_child(parent, a);
     assert_eq!(b.children_of(parent).len(), 1);
     b.destroy(parent);
@@ -66,7 +66,7 @@ fn destroy_deletes_children_map_entry() {
 #[test]
 fn attached_event_handler_can_be_fired() {
     let mut b = RecordingBackend::new();
-    let id = b.create(ControlKind::Button);
+    let id = b.create_id(ControlKind::Button);
     let fired = Rc::new(Cell::new(0_i32));
     let fired_c = Rc::clone(&fired);
     b.attach_event(
@@ -82,8 +82,8 @@ fn attached_event_handler_can_be_fired() {
 #[test]
 fn live_control_count_reflects_create_destroy() {
     let mut b = RecordingBackend::new();
-    let a = b.create(ControlKind::TextBlock);
-    let _c = b.create(ControlKind::TextBlock);
+    let a = b.create_id(ControlKind::TextBlock);
+    let _c = b.create_id(ControlKind::TextBlock);
     assert_eq!(b.live_control_count(), 2);
     b.destroy(a);
     assert_eq!(b.live_control_count(), 1);

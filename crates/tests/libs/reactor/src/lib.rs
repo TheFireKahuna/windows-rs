@@ -122,6 +122,10 @@ pub enum Op {
         id: ControlId,
         config: Option<AnimationConfig>,
     },
+    SetExitTransition {
+        id: ControlId,
+        config: Option<AnimationConfig>,
+    },
     SetRichTextParagraphs {
         id: ControlId,
         paragraphs: Vec<RichTextParagraph>,
@@ -180,6 +184,15 @@ fn stub_native_element() -> windows_core::IInspectable {
 impl RecordingBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mint an id and create a control with it. The reconciler does this in
+    /// production; tests that drive the backend directly do it here.
+    pub fn create_id(&mut self, kind: ControlKind) -> ControlId {
+        self.next_id += 1;
+        let id = ControlId::new(self.next_id);
+        self.create(id, kind);
+        id
     }
 
     pub fn op_count(&self) -> usize {
@@ -321,12 +334,9 @@ impl RecordingBackend {
 }
 
 impl Backend for RecordingBackend {
-    fn create(&mut self, kind: ControlKind) -> ControlId {
-        self.next_id += 1;
-        let id = ControlId::new(self.next_id);
+    fn create(&mut self, id: ControlId, kind: ControlKind) {
         self.ops.push(Op::Create { id, kind });
         self.native_elements.insert(id, stub_native_element());
-        id
     }
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue) {
@@ -534,6 +544,10 @@ impl Backend for RecordingBackend {
 
     fn run_property_animation(&mut self, id: ControlId, config: Option<AnimationConfig>) {
         self.ops.push(Op::RunPropertyAnimation { id, config });
+    }
+
+    fn set_exit_transition(&mut self, id: ControlId, config: Option<AnimationConfig>) {
+        self.ops.push(Op::SetExitTransition { id, config });
     }
 
     fn set_rich_text_paragraphs(&mut self, id: ControlId, paragraphs: &[RichTextParagraph]) {
