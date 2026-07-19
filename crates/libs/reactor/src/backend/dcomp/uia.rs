@@ -305,6 +305,20 @@ fn is_item_container(kind: ControlKind) -> bool {
     )
 }
 
+/// Whether a run is nothing but icon-font glyphs.
+///
+/// Icon fonts live in the Unicode private use area, where a code point has no
+/// meaning outside the font that drew it. A screen reader handed one announces
+/// a garbage character, which is worse than announcing nothing — an unnamed
+/// element at least prompts a client to fall back to its control type. Icon
+/// buttons are expected to carry a real `AutomationName` (which is checked
+/// first); this only stops the absence of one from being filled with noise.
+fn is_icon_text(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| matches!(c, '\u{E000}'..='\u{F8FF}') || c.is_whitespace())
+}
+
 fn pattern_supported(kind: ControlKind, item: i32, pid: PATTERNID) -> bool {
     use ControlKind::*;
     // The InfoBar's close button shares the nav pane's chrome index space, so
@@ -749,7 +763,39 @@ impl DCompBackend {
         if !n.paint.text.is_empty() {
             return n.paint.text.clone();
         }
+        // A Button given rich element content carries no text of its OWN — the
+        // label is a TextBlock inside it. That is how every pill, chip and icon
+        // button in a reactor app is built (`pressable` is exactly this), so
+        // without a fallback the entire interactive surface is nameless to a
+        // screen reader and to the automation harness. Fall back to the text
+        // the subtree actually renders.
+        //
+        // Only for kinds that need a name: giving every layout container the
+        // first string beneath it would name panels after whatever happened to
+        // be at their top-left.
+        if super::node::is_interactive_kind(n.kind) {
+            return self.descendant_text(id, 0).unwrap_or_default();
+        }
         String::new()
+    }
+
+    /// The first text this node's subtree renders, depth-first.
+    ///
+    /// Depth-bounded because a name is a short label and UIA asks for it
+    /// constantly — an unbounded walk would put the cost of the whole subtree
+    /// on a property fetched per element per pass.
+    fn descendant_text(&self, id: ControlId, depth: u32) -> Option<String> {
+        const MAX_DEPTH: u32 = 4;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let n = self.arena.get(id)?;
+        if depth > 0 && !n.paint.text.is_empty() && !is_icon_text(&n.paint.text) {
+            return Some(n.paint.text.clone());
+        }
+        n.children
+            .iter()
+            .find_map(|&c| self.descendant_text(c, depth + 1))
     }
 
     fn uia_automation_id(&self, id: ControlId) -> String {
@@ -814,8 +860,26 @@ impl DCompBackend {
             // Never on a synthetic item, never on a password field.
             return item < 0 && self.uia_text_supported(id);
         }
+        // A plain Button carrying a MenuFlyout opens a popup exactly as a
+        // DropDownButton does (`input`'s `activate`), so it expands and
+        // collapses whatever its ControlKind says. This cannot be answered by
+        // kind alone — the same kind without a menu is a pure Invoke — so it is
+        // gated on the node's own state rather than in `pattern_supported`.
+        if pid == UIA_ExpandCollapsePatternId && item < 0 && self.opens_a_menu(id) {
+            return true;
+        }
         self.uia_kind(id)
             .is_some_and(|k| pattern_supported(k, item, pid))
+    }
+
+    /// Whether this node activates by opening the menu popup.
+    fn opens_a_menu(&self, id: ControlId) -> bool {
+        self.arena.get(id).is_some_and(|n| {
+            matches!(
+                n.kind,
+                ControlKind::Button | ControlKind::RepeatButton | ControlKind::ToggleButton
+            ) && !n.ctrl().menu.is_empty()
+        })
     }
 
     fn uia_toggle_state(&self, id: ControlId) -> i32 {
@@ -856,6 +920,17 @@ impl DCompBackend {
                 }
             }
             Some(ControlKind::ComboBox | ControlKind::DropDownButton | ControlKind::SplitButton) => {
+                if self.popup.as_ref().is_some_and(|p| p.owner == id) {
+                    1
+                } else {
+                    0
+                }
+            }
+            // Same question for a menu-carrying Button, and the same answer:
+            // the backend owns at most one popup, so "is it mine?" IS the
+            // expanded state. Reported only when the node actually has a menu,
+            // so a plain Button keeps answering 0 to a client that asks anyway.
+            _ if self.opens_a_menu(id) => {
                 if self.popup.as_ref().is_some_and(|p| p.owner == id) {
                     1
                 } else {
@@ -2907,5 +2982,32 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
 
     fn RemoveFromSelection(&self) -> Result<()> {
         Err(Error::from_hresult(UIA_E_INVALIDOPERATION))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_icon_text;
+
+    /// The name fallback must not announce icon-font code points.
+    ///
+    /// Only the classifier is covered here: `descendant_text` walks a live
+    /// arena, which needs a backend the harness does not currently hand out.
+    #[test]
+    fn icon_runs_are_not_names() {
+        // Segoe Fluent Icons: chevron, and the power glyph the GUI's bypass
+        // pill uses. Private use area — meaningless outside the font.
+        assert!(is_icon_text("\u{E70D}"));
+        assert!(is_icon_text("\u{E7E8}"));
+        // A glyph with layout whitespace around it is still just a glyph.
+        assert!(is_icon_text("  \u{E70D} "));
+
+        // Real labels, including ones that merely contain a symbol.
+        assert!(!is_icon_text("Apply"));
+        assert!(!is_icon_text("+  Add Processor"));
+        assert!(!is_icon_text("\u{E70D} Collapse"));
+        // Empty is not an icon run — it is simply no name, and the caller
+        // must not report it as one.
+        assert!(!is_icon_text(""));
     }
 }
