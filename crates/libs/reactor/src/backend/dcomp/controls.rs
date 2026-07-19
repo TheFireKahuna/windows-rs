@@ -187,6 +187,11 @@ pub(crate) const FOCUS_RING_INNER_W: f32 = 1.0;
 /// A focus ring's stroke width. Shared with the button family's retained ring
 /// (`parts::button_sync`), which reproduces this geometry as a part because the
 /// family owns no surface to draw on.
+///
+/// Fluent's nominal focus thickness. It only reads as that thickness once it is
+/// snapped to whole physical pixels — see `parts::focus_rings`, where an
+/// unsnapped ring picked up a partial-coverage edge on BOTH sides and looked
+/// both softer and fatter than the number it was given.
 pub(crate) const FOCUS_RING_W: f32 = 2.0;
 
 /// A focus ring: a [`FOCUS_RING_W`] `STROKE_STRONG` rounded outline inset 1px

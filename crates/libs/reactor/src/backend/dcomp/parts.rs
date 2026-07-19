@@ -1223,10 +1223,33 @@ mod slot {
 ///
 /// Returned as `(outward offset, stroke width, colour)` per ring, outermost
 /// last, so the caller places them without restating the ladder.
-fn focus_rings() -> [(f32, f32, crate::Color); 2] {
+///
+/// A part's stroke runs from its box edge INWARD, so each ring's offset is how
+/// far its own outer face sits from the control — the inner ring by its own
+/// width, the outer by both. Derived rather than written down, because the two
+/// were once a hardcoded `1.0` and `3.0` that only agreed with a 2 DIP stroke
+/// and would have opened a gap the moment the width changed.
+///
+/// ## Both widths are snapped to WHOLE PHYSICAL PIXELS first
+///
+/// A stroke whose width is a fraction of a pixel has no clean edge on either
+/// side: the rasterizer antialiases both, so the ring reads soft, slightly
+/// wider than its number, and unmistakably "not high-DPI" — the same tell a
+/// hairline drawn at a fractional offset gives. An authored width in DIPs
+/// becomes fractional at most display scales (1.5 DIP is 1.875 px at 125%),
+/// which is exactly when it happens.
+///
+/// Snapping the OFFSET matters as much as the width: it is what puts the ring's
+/// outer face on a pixel boundary in the first place, and a crisp width at a
+/// half-pixel offset is just as soft.
+fn focus_rings(scale: f32) -> [(f32, f32, crate::Color); 2] {
+    // At least one physical pixel — a ring rounded away is worse than a thin one.
+    let px = |v: f32| ((v * scale).round().max(1.0)) / scale;
+    let inner = px(super::controls::FOCUS_RING_INNER_W);
+    let outer = px(super::controls::FOCUS_RING_W);
     [
-        (1.0, super::controls::FOCUS_RING_INNER_W, theme::focus_inner()),
-        (3.0, super::controls::FOCUS_RING_W, theme::focus_outer()),
+        (inner, inner, theme::focus_inner()),
+        (inner + outer, outer, theme::focus_outer()),
     ]
 }
 
@@ -1268,7 +1291,7 @@ fn button_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f3
     // how far out it sits — a ring whose corners disagree with the button
     // inside it is the most visible way for a custom radius to look broken.
     let rings = node.focused.then(|| {
-        focus_rings().map(|(out, sw, c)| {
+        focus_rings(scale).map(|(out, sw, c)| {
             (
                 out,
                 sw,
