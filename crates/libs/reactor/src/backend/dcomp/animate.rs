@@ -24,7 +24,18 @@
 //! - Scale animations pivot around the node centre: any config touching scale
 //!   flags the node (`wants_center`) and layout keeps `CenterPoint` at
 //!   `size/2` from then on.
+//!
+//! ## Reduced motion
+//!
+//! Every entry point above is gated on [`reduced_motion`]. The rule the gate
+//! upholds is that **reduced motion changes the path, never the destination**:
+//! an animation that would have played is replaced by a direct write of its end
+//! state, so the pixels land exactly where they would have — just immediately.
+//! Returning early instead would leave an enter transition's opacity at its
+//! `from` value and make the element permanently invisible, which is why
+//! [`settle`] exists rather than a bare `return`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::node::Node;
@@ -43,6 +54,85 @@ pub(crate) fn warn(args: std::fmt::Arguments<'_>) {
     if cfg!(debug_assertions) {
         eprintln!("windows-reactor: {args}");
     }
+}
+
+/// The user's system animation preference, cached. Refreshed by
+/// [`refresh_reduced_motion`] at startup and on every `WM_SETTINGCHANGE`.
+///
+/// Process-global rather than per-backend: it is a user-level preference, the
+/// same for every window, and the animation helpers here are free functions
+/// that have no backend to reach through.
+static REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
+
+/// Whether the user has asked the system to minimise animation — Settings →
+/// Accessibility → Visual effects → **Animation effects**, which is what
+/// `SPI_GETCLIENTAREAANIMATION` reports.
+pub(crate) fn reduced_motion() -> bool {
+    REDUCED_MOTION.load(Ordering::Relaxed)
+}
+
+/// Re-read the system animation preference into the cache.
+///
+/// Returns `true` when the value **changed**, which is the caller's signal that
+/// already-built implicit-animation collections are now stale and need
+/// rebuilding (see `DCompBackend::refresh_motion`). A plain re-read that finds
+/// the same value must not trigger that walk — `WM_SETTINGCHANGE` broadcasts
+/// for every unrelated setting in the system.
+pub(crate) fn refresh_reduced_motion() -> bool {
+    let now = read_reduced_motion();
+    REDUCED_MOTION.swap(now, Ordering::Relaxed) != now
+}
+
+/// Force the cached preference — test seam only, so a test does not depend on
+/// the developer machine's accessibility settings.
+pub(crate) fn set_reduced_motion_for_test(reduced: bool) {
+    REDUCED_MOTION.store(reduced, Ordering::Relaxed);
+}
+
+/// Ask the OS whether client-area animation is enabled.
+///
+/// Uses the Win32 read rather than WinRT `UISettings.AnimationsEnabled`, which
+/// is documented to surface this same setting: the value is identical, the
+/// change signal (`WM_SETTINGCHANGE`) is already handled on the pump, and the
+/// Win32 read is synchronous on the thread that needs it. `UISettings` would
+/// add a WinRT activation and deliver its change event on a thread-pool thread,
+/// requiring a marshal back for a value we can simply read here.
+///
+/// **Fails open** (animations enabled). A transient failure to read a
+/// preference should not silently disable motion across the whole app; the
+/// setting defaults to enabled, and this call does not realistically fail.
+fn read_reduced_motion() -> bool {
+    let mut enabled = windows_core::BOOL(1);
+    let ok = unsafe {
+        crate::system_bindings::SystemParametersInfoW(
+            crate::system_bindings::SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&raw mut enabled).cast(),
+            0,
+        )
+    };
+    ok.as_bool() && !enabled.as_bool()
+}
+
+/// Apply a one-shot config's **end state** with no animation.
+///
+/// Any in-flight animation on the property is stopped first: a compositor
+/// property that has a running animation ignores a plain set, so without the
+/// stop a preference flip mid-animation would leave the old animation owning
+/// the property.
+fn settle(target: &Visual, cfg: &AnimationConfig) -> Result<()> {
+    let obj: ICompositionObject = target.cast()?;
+    let vis: IVisual = target.cast()?;
+    if let Some(opacity) = cfg.opacity {
+        obj.StopAnimation("Opacity")?;
+        vis.SetOpacity(opacity as f32)?;
+    }
+    if let Some(scale) = cfg.scale {
+        obj.StopAnimation("Scale")?;
+        let s = scale as f32;
+        vis.SetScale(Vector3::new(s, s, 1.0))?;
+    }
+    Ok(())
 }
 
 /// WinRT `TimeSpan` (100 ns units) from a std `Duration`.
@@ -93,6 +183,10 @@ fn start_inner(
     cfg: &AnimationConfig,
     center: Option<(f32, f32)>,
 ) -> Result<()> {
+    if reduced_motion() {
+        return settle(target, cfg);
+    }
+
     let obj: ICompositionObject = target.cast()?;
     let easing = easing_for(comp, cfg.easing)?;
 
@@ -140,6 +234,13 @@ pub(crate) fn build_implicit(
     transitions: Option<&ImplicitTransitions>,
     layout: Option<&LayoutAnimationConfig>,
 ) -> Result<Option<ImplicitAnimationCollection>> {
+    // Under reduced motion there is nothing to attach: the prop and layout
+    // writers are the only writers, so with no collection their sets simply
+    // take effect immediately. The end state is unchanged — only the glide is.
+    if reduced_motion() {
+        return Ok(None);
+    }
+
     let has_transitions = transitions.is_some_and(|t| !t.is_empty());
     let layout_offset = layout.is_some_and(|l| l.animate_offset);
     let layout_size = layout.is_some_and(|l| l.animate_size);
@@ -241,6 +342,17 @@ pub(crate) fn fade_opacity(
     duration: Duration,
     easing: Easing,
 ) {
+    if reduced_motion() {
+        let set = || -> Result<()> {
+            target.cast::<ICompositionObject>()?.StopAnimation("Opacity")?;
+            target.cast::<IVisual>()?.SetOpacity(to)
+        };
+        if let Err(e) = set() {
+            warn(format_args!("dcomp opacity settle failed: {e:?}"));
+        }
+        return;
+    }
+
     let run = || -> Result<()> {
         let a = comp.CreateScalarKeyFrameAnimation()?;
         a.cast::<IKeyFrameAnimation>()?.SetDuration(ts(duration))?;
@@ -291,6 +403,16 @@ pub(crate) fn spring_offset(
     damping_ratio: f32,
     period: f32,
 ) -> Result<()> {
+    // The spring's whole purpose is the overshoot; under reduced motion the
+    // destination is written straight to Offset. Layout knows that destination
+    // exactly, so this is lossless — the element simply arrives without travel.
+    if reduced_motion() {
+        target.StopAnimation("Offset")?;
+        return target
+            .cast::<IVisual>()?
+            .SetOffset(Vector3::new(x, y, 0.0));
+    }
+
     if cache.is_none() {
         let comp = target.Compositor()?;
         let a = comp.cast::<ICompositor4>()?.CreateSpringVector3Animation()?;

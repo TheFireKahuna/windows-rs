@@ -69,6 +69,7 @@ pub use SetWindowLongW as SetWindowLongPtrW;
 windows_core::link!("user32.dll" "system" fn SetWindowLongW(hwnd : HWND, nindex : i32, dwnewlong : i32) -> i32);
 windows_core::link!("user32.dll" "system" fn SetWindowPos(hwnd : HWND, hwndinsertafter : HWND, x : i32, y : i32, cx : i32, cy : i32, uflags : u32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn ShowWindow(hwnd : HWND, ncmdshow : i32) -> windows_core::BOOL);
+windows_core::link!("user32.dll" "system" fn SystemParametersInfoW(uiaction : u32, uiparam : u32, pvparam : *mut core::ffi::c_void, fwinini : u32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn TrackMouseEvent(lpeventtrack : *mut TRACKMOUSEEVENT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn TranslateMessage(lpmsg : *const MSG) -> windows_core::BOOL);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaDisconnectProvider(pprovider : *mut core::ffi::c_void) -> windows_core::HRESULT);
@@ -9496,6 +9497,16 @@ impl IVisual {
             .ok()
         }
     }
+    pub(crate) fn Opacity(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Opacity)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
     pub(crate) fn SetOpacity(&self, value: f32) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetOpacity)(
@@ -9522,6 +9533,16 @@ impl IVisual {
                 value,
             )
             .ok()
+        }
+    }
+    pub(crate) fn Scale(&self) -> windows_core::Result<windows_numerics::Vector3> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Scale)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
         }
     }
     pub(crate) fn SetScale(&self, value: windows_numerics::Vector3) -> windows_core::Result<()> {
@@ -9588,7 +9609,8 @@ pub struct IVisual_Vtbl {
         *mut core::ffi::c_void,
         windows_numerics::Vector3,
     ) -> windows_core::HRESULT,
-    Opacity: usize,
+    pub Opacity:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
     pub SetOpacity: unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
     Orientation: usize,
     SetOrientation: usize,
@@ -9603,7 +9625,10 @@ pub struct IVisual_Vtbl {
     SetRotationAngleInDegrees: usize,
     RotationAxis: usize,
     SetRotationAxis: usize,
-    Scale: usize,
+    pub Scale: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_numerics::Vector3,
+    ) -> windows_core::HRESULT,
     pub SetScale: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         windows_numerics::Vector3,
@@ -10106,6 +10131,7 @@ pub const SIZE_MAXIMIZED: u32 = 2;
 pub const SIZE_MINIMIZED: u32 = 1;
 pub const SM_CXPADDEDBORDER: u32 = 92;
 pub const SM_CYFRAME: u32 = 33;
+pub const SPI_GETCLIENTAREAANIMATION: u32 = 4162;
 pub const SWP_FRAMECHANGED: u32 = 32;
 pub const SWP_NOACTIVATE: u32 = 16;
 pub const SWP_NOMOVE: u32 = 2;

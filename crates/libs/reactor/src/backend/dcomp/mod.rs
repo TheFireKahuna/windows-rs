@@ -22,7 +22,7 @@
 
 use crate::backend::ControlId;
 
-mod animate;
+pub(crate) mod animate;
 mod backdrop;
 mod bootstrap;
 mod caption;
@@ -602,6 +602,13 @@ impl DCompBackend {
     /// reachable from the compositor root (e.g. it already sits inside an
     /// ancestor's ghost — one fade is enough).
     fn spawn_exit_ghost(&mut self, id: ControlId) {
+        // Under reduced motion there is no fade to outlive the node, so the
+        // ghost would be snapshotted, settled to its end opacity and released
+        // on the next frame having shown nothing. Skip it: the element just
+        // disappears, which is what the preference asks for.
+        if animate::reduced_motion() {
+            return;
+        }
         let Some(node) = self.arena.get(id) else { return };
         let Some(cfg) = node.exit else { return };
         if !cfg.is_visible_effect() || node.last_off.is_none() {
@@ -1025,6 +1032,28 @@ impl Backend for DCompBackend {
         // correctly even though it starts after the node stops laying out.
         if config.as_ref().is_some_and(animate::wants_center) {
             animate::note_scale_intent(node);
+        }
+    }
+}
+
+impl DCompBackend {
+    /// Rebuild every node's implicit-animation collection after the system
+    /// motion preference flipped.
+    ///
+    /// The one-shot helpers read [`animate::reduced_motion`] as they run, so
+    /// they need nothing here — but implicit collections are built once and
+    /// attached to the visual, so nodes that already exist would keep gliding
+    /// (or keep jumping) until something else happened to rebuild them.
+    /// `build_implicit` returns `None` under reduced motion, and `set_implicit`
+    /// detaches on `None`, so this one walk covers both directions of the flip.
+    pub(crate) fn refresh_motion(&mut self) {
+        let comp = self.comp.compositor().clone();
+        for node in self.arena.iter_mut() {
+            let coll =
+                animate::build_implicit(&comp, node.transitions.as_ref(), node.layout_anim.as_ref())
+                    .ok()
+                    .flatten();
+            node.set_implicit(coll);
         }
     }
 }

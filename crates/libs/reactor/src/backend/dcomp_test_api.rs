@@ -22,6 +22,7 @@ use crate::backend::{
 use crate::drag::DragHandlers;
 use crate::interaction::Callback;
 use crate::style::PointerEventInfo;
+use windows_core::Interface;
 use crate::widgets::Subscription;
 use dcomp::node::PointerInterest;
 use dcomp::record::{FlyoutDecl, FrontBackend, Intent, IntentPayload, RecordingBackend};
@@ -939,6 +940,81 @@ impl ArenaHarness {
             n.rect.w = w;
             n.rect.h = h;
         }
+    }
+
+    /// Override the cached system motion preference.
+    ///
+    /// The shipping value comes from `SPI_GETCLIENTAREAANIMATION`, which a test
+    /// must not depend on — it is whatever the developer's machine happens to
+    /// be set to. Restore it when the test is done; it is process-global.
+    pub fn set_reduced_motion(&self, reduced: bool) {
+        dcomp::animate::set_reduced_motion_for_test(reduced);
+    }
+
+    /// Run a one-shot animation config on a node, exactly as
+    /// `run_property_animation` does in the shipping path.
+    pub fn run_animation(&mut self, id: ControlId, cfg: &AnimationConfig) {
+        let Some(node) = self.arena.get(id) else { return };
+        let Ok(vis) = node.container.cast::<crate::system_bindings::Visual>() else {
+            return;
+        };
+        dcomp::animate::start(&self.compositor, &vis, cfg, None);
+    }
+
+    /// Write Opacity/Scale directly, with no animation involved.
+    ///
+    /// A test needs this to move the visual OFF its birth values (opacity 1.0,
+    /// scale 1.0) before asserting that an animation settled it back — those
+    /// birth values are what most enter transitions animate *to*, so a test
+    /// starting from them cannot tell a settle from a skip.
+    pub fn set_visual_state(&mut self, id: ControlId, opacity: f32, scale: f32) {
+        let Some(node) = self.arena.get(id) else { return };
+        let Ok(vis) = node.container.cast::<crate::system_bindings::IVisual>() else {
+            return;
+        };
+        let _ = vis.SetOpacity(opacity);
+        let _ = vis.SetScale(windows_numerics::Vector3::new(scale, scale, 1.0));
+    }
+
+    /// The node visual's current Opacity, straight off the compositor object.
+    pub fn opacity(&self, id: ControlId) -> Option<f32> {
+        let node = self.arena.get(id)?;
+        node.container
+            .cast::<crate::system_bindings::IVisual>()
+            .ok()?
+            .Opacity()
+            .ok()
+    }
+
+    /// The node visual's current uniform Scale (the X component — the animation
+    /// helpers only ever write uniform scale).
+    pub fn scale(&self, id: ControlId) -> Option<f32> {
+        let node = self.arena.get(id)?;
+        Some(
+            node.container
+                .cast::<crate::system_bindings::IVisual>()
+                .ok()?
+                .Scale()
+                .ok()?
+                .x,
+        )
+    }
+
+    /// Whether the node currently holds an implicit-animation collection.
+    pub fn has_implicit(&self, id: ControlId) -> Option<bool> {
+        Some(self.arena.get(id)?.implicit.is_some())
+    }
+
+    /// Rebuild this node's implicit collection from its declared transitions —
+    /// the per-node half of `DCompBackend::refresh_motion`.
+    pub fn rebuild_implicit(&mut self, id: ControlId, transitions: ImplicitTransitions) {
+        let comp = self.compositor.clone();
+        let Some(node) = self.arena.get_mut(id) else { return };
+        node.transitions = Some(transitions);
+        let coll = dcomp::animate::build_implicit(&comp, node.transitions.as_ref(), None)
+            .ok()
+            .flatten();
+        node.set_implicit(coll);
     }
 
     /// Resolve the pane geometry, through the real
