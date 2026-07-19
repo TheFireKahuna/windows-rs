@@ -469,6 +469,81 @@ pub(crate) fn editor_content(kind: ControlKind, box_w: f32) -> (f32, f32) {
     (PAD_X, width)
 }
 
+/// Where an editor's text run sits inside its box, in NODE-LOCAL DIPs.
+///
+/// The one definition of that geometry. It used to exist in four:
+/// `controls::paint_editor` (which drew the run), `controls::editor_caret_box`
+/// (which placed the caret sprite), `tsf::doc::text_band` (which parked the IME
+/// candidate window) and `uia::uia_text_origin` (which answered screen readers).
+/// Each recomputed the same fallback line height and the same vertical centring,
+/// and two of them carried comments promising they matched the painter — which
+/// is the tell: a promise in a comment is what a shared function makes
+/// unnecessary.
+///
+/// The cost of them drifting is not a wrong pixel. It is the caret landing off
+/// the text, the candidate window opening away from the composition, and
+/// Narrator reading a rectangle that is not where the words are — three
+/// failures with no common symptom, each looking like a bug in its own
+/// subsystem.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TextBand {
+    /// Measured line height, or a font-size-derived fallback before the layout
+    /// exists.
+    pub text_h: f32,
+    /// Top of the text band — the run's baseline box, vertically centred.
+    pub origin_y: f32,
+    /// Left edge of the run, with horizontal scroll already applied. Left of
+    /// [`content_x`](Self::content_x) exactly when the field is scrolled.
+    pub origin_x: f32,
+    /// Left edge of the content column (the clip), scroll NOT applied.
+    pub content_x: f32,
+    /// Width of the content column.
+    pub content_w: f32,
+}
+
+impl TextBand {
+    /// The band from its scalars alone — no node, no layout, no device, so the
+    /// arithmetic every consumer depends on is exhaustively testable.
+    ///
+    /// `measured_h` is the laid-out line height where one exists. `None` covers
+    /// the window between a field gaining content and its first paint, and the
+    /// fallback it selects is not incidental: it is what the caret sprite and
+    /// the IME candidate window are placed by for that whole window.
+    pub(crate) fn compute(
+        kind: ControlKind,
+        box_w: f32,
+        box_h: f32,
+        font_size: f32,
+        measured_h: Option<f32>,
+        scroll_x: f32,
+    ) -> Self {
+        let (content_x, content_w) = editor_content(kind, box_w);
+        let text_h = measured_h
+            .filter(|h| *h > 0.0)
+            .unwrap_or(font_size * 1.4);
+        Self {
+            text_h,
+            origin_y: (box_h - text_h) / 2.0,
+            origin_x: content_x - scroll_x,
+            content_x,
+            content_w,
+        }
+    }
+
+    /// The band for `node`, or `None` if it is not an editor.
+    pub(crate) fn of(node: &super::node::Node) -> Option<Self> {
+        let ed = node.editor.as_ref()?;
+        Some(Self::compute(
+            node.kind,
+            node.rect.w,
+            node.rect.h,
+            node.paint.font_size,
+            ed.layout.as_ref().and_then(|l| l.measure().ok()).map(|(_, h)| h),
+            ed.scroll_x,
+        ))
+    }
+}
+
 /// UTF-16 whitespace test (covers the common ASCII / NBSP cases).
 fn is_space(u: u16) -> bool {
     matches!(u, 0x20 | 0x09 | 0x0A | 0x0D | 0xA0)
@@ -642,6 +717,94 @@ mod tests {
         // Common prefix "a", common suffix "def": "bc" was deleted ahead of
         // the caret, which pulls it back by the removed length.
         assert_eq!(e.caret, 4);
+    }
+
+    // ── TextBand ─────────────────────────────────────────────────────────────
+
+    /// The run must sit vertically centred in the box, and the band must report
+    /// the same height it centred by. Every consumer derives its own geometry
+    /// from these two, so an inconsistency here is one the caret, the IME and
+    /// the screen reader each inherit separately.
+    #[test]
+    fn the_band_centres_the_run_it_measures() {
+        for &box_h in &[24.0f32, 32.0, 40.0, 57.0] {
+            for &measured in &[14.0f32, 18.0, 21.5] {
+                let b = TextBand::compute(
+                    ControlKind::TextBox,
+                    200.0,
+                    box_h,
+                    14.0,
+                    Some(measured),
+                    0.0,
+                );
+                assert_eq!(b.text_h, measured);
+                // Equal space above and below is what "centred" means, and it
+                // is the property the four old copies each re-derived.
+                let above = b.origin_y;
+                let below = box_h - (b.origin_y + b.text_h);
+                assert!(
+                    (above - below).abs() < 1.0e-4,
+                    "box {box_h} run {measured}: {above} above vs {below} below"
+                );
+            }
+        }
+    }
+
+    /// With no layout yet the band must fall back rather than collapse — a
+    /// zero-height band would park the caret and the candidate window on the
+    /// box's centre line instead of on the text.
+    #[test]
+    fn an_unmeasured_band_falls_back_to_the_font_size() {
+        for &(measured, why) in &[(None, "no layout"), (Some(0.0), "degenerate measure")] {
+            let b = TextBand::compute(ControlKind::TextBox, 200.0, 32.0, 15.0, measured, 0.0);
+            assert!(b.text_h > 0.0, "{why}: band collapsed");
+            assert_eq!(b.text_h, 15.0 * 1.4, "{why}");
+        }
+    }
+
+    /// Horizontal scroll moves the RUN and not the column. The clip is what
+    /// stays put; the text slides under it.
+    #[test]
+    fn scroll_moves_the_run_and_not_the_column() {
+        let at_rest = TextBand::compute(ControlKind::TextBox, 200.0, 32.0, 14.0, Some(18.0), 0.0);
+        let scrolled = TextBand::compute(ControlKind::TextBox, 200.0, 32.0, 14.0, Some(18.0), 37.0);
+
+        assert_eq!(at_rest.origin_x, at_rest.content_x, "unscrolled: run at the column");
+        assert_eq!(scrolled.content_x, at_rest.content_x, "the column must not move");
+        assert_eq!(scrolled.content_w, at_rest.content_w);
+        assert_eq!(scrolled.origin_x, at_rest.origin_x - 37.0);
+        // Vertical geometry is untouched by horizontal scroll.
+        assert_eq!(scrolled.origin_y, at_rest.origin_y);
+        assert_eq!(scrolled.text_h, at_rest.text_h);
+    }
+
+    /// A wide NumberBox reserves its spin column; the band's content width must
+    /// be the one the text is actually clipped to, not the whole box.
+    #[test]
+    fn the_band_honours_the_spin_column() {
+        let wide = TextBand::compute(
+            ControlKind::NumberBox,
+            SPIN_MIN_BOX_W + 40.0,
+            32.0,
+            14.0,
+            Some(18.0),
+            0.0,
+        );
+        let plain = TextBand::compute(
+            ControlKind::TextBox,
+            SPIN_MIN_BOX_W + 40.0,
+            32.0,
+            14.0,
+            Some(18.0),
+            0.0,
+        );
+        assert!(
+            wide.content_w < plain.content_w,
+            "the spin column must narrow the content: {} vs {}",
+            wide.content_w,
+            plain.content_w
+        );
+        assert_eq!(wide.content_x, plain.content_x, "only the width changes");
     }
 
     /// Identical text is a strict no-op — the caret never moves on an echo.

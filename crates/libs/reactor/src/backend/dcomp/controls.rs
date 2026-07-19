@@ -994,23 +994,17 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     stroke_rr(session, brush, rect, radius, border_c, border_w, dim);
 
     let Some(ed) = &node.editor else { return };
+    let Some(band) = editor::TextBand::of(node) else { return };
     let align = node.ctrl().content_align;
-    let (pad_left, content_w) = editor::editor_content(node.kind, rect.width());
-    let cx0 = rect.left + pad_left;
+    let content_w = band.content_w;
+    let cx0 = rect.left + band.content_x;
     let font_size = node.paint.font_size;
 
-    // Vertical centering from the measured line height.
-    let text_h = ed
-        .layout
-        .as_ref()
-        .and_then(|l| l.measure().ok())
-        .map(|(_, h)| h)
-        .filter(|h| *h > 0.0)
-        .unwrap_or(font_size * 1.4);
-    let origin_y = rect.top + (rect.height() - text_h) / 2.0;
+    // The band is node-local; this surface's rect is where the node starts.
     // Left-aligned fields scroll; centered/right fields keep `scroll_x == 0` and
     // let DWrite position the run within `content_w`.
-    let origin_x = cx0 - ed.scroll_x;
+    let origin_x = rect.left + band.origin_x;
+    let origin_y = rect.top + band.origin_y;
 
     // Confine drawing to the content column (clip overflow / spin area).
     let clip = Rect::from_xywh(cx0, rect.top, content_w, rect.height());
@@ -1066,27 +1060,26 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     }
 }
 
-/// The caret's box in surface-local DIPs, mirroring [`paint_editor`]'s text
-/// metrics (same origin, line height, and scroll offset), clamped into the
-/// content column the painted text clips to. `None` when the node is not an
-/// editor. Consumed by `parts::sync_caret` to place the caret sprite.
+/// The caret's box in node-local DIPs, clamped into the content column the
+/// painted text clips to. `None` when the node is not an editor. Consumed by
+/// `parts::sync_caret` to place the caret sprite.
+///
+/// Takes its origin and line height from [`editor::TextBand`], which is the
+/// same answer the painter draws the run at — so the caret cannot drift from
+/// the text it sits in.
 pub(crate) fn editor_caret_box(node: &Node) -> Option<Rect> {
     let ed = node.editor.as_ref()?;
-    let (w, h) = (node.rect.w, node.rect.h);
-    let (pad_left, content_w) = editor::editor_content(node.kind, w);
-    let cx0 = pad_left;
-    let text_h = ed
-        .layout
-        .as_ref()
-        .and_then(|l| l.measure().ok())
-        .map(|(_, h)| h)
-        .filter(|h| *h > 0.0)
-        .unwrap_or(node.paint.font_size * 1.4);
-    let origin_y = (h - text_h) / 2.0;
-    let caret_x = cx0 - ed.scroll_x + ed.caret_x();
+    let band = editor::TextBand::of(node)?;
+    let caret_x = band.origin_x + ed.caret_x();
     // A 1-DIP bar centred on the caret position, kept inside the clip column.
-    let x = (caret_x - 0.5).clamp(cx0, (cx0 + content_w - 1.0).max(cx0));
-    Some(Rect::from_xywh(x, origin_y + 1.0, 1.0, (text_h - 2.0).max(1.0)))
+    let lo = band.content_x;
+    let x = (caret_x - 0.5).clamp(lo, (lo + band.content_w - 1.0).max(lo));
+    Some(Rect::from_xywh(
+        x,
+        band.origin_y + 1.0,
+        1.0,
+        (band.text_h - 2.0).max(1.0),
+    ))
 }
 
 /// Two stacked up/down chevrons on the trailing edge of a wide `NumberBox`.

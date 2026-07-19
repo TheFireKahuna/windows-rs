@@ -21,7 +21,6 @@
 
 use super::store::TsfDocument;
 use super::{bridge, DocRect, DocSelection};
-use crate::backend::dcomp::node::Node;
 use crate::backend::dcomp::{editor, DCompBackend};
 use crate::system_bindings::{ClientToScreen, POINT};
 
@@ -112,20 +111,19 @@ impl TsfDocument for DCompBackend {
         // paint. Answering with a guess would park the candidate window in the
         // wrong place for the whole composition.
         let layout = ed.layout.as_ref()?;
-        let (pad_left, _) = editor::editor_content(n.kind, n.rect.w);
+        let band = editor::TextBand::of(n)?;
         let x_at = |i: usize| {
             layout
                 .caret_at(i as u32, false)
                 .map(|((x, _), _)| x)
                 .unwrap_or(0.0)
         };
-        let (text_h, origin_y) = text_band(n, ed);
-        let x0 = n.rect.x + pad_left - ed.scroll_x;
+        let x0 = n.rect.x + band.origin_x;
         self.to_screen(
             x0 + x_at(start),
-            n.rect.y + origin_y,
+            n.rect.y + band.origin_y,
             x0 + x_at(end.max(start)),
-            n.rect.y + origin_y + text_h,
+            n.rect.y + band.origin_y + band.text_h,
         )
     }
 
@@ -175,16 +173,3 @@ impl DCompBackend {
     }
 }
 
-/// The text band inside an editor box: `(height, y offset from the box top)`,
-/// mirroring how `controls::paint_editor` centres the run vertically — a TIP's
-/// candidate window must sit under the text it is composing, not under the box.
-fn text_band(n: &Node, ed: &editor::Editor) -> (f32, f32) {
-    let text_h = ed
-        .layout
-        .as_ref()
-        .and_then(|l| l.measure().ok())
-        .map(|(_, h)| h)
-        .filter(|h| *h > 0.0)
-        .unwrap_or(n.paint.font_size * 1.4);
-    (text_h, (n.rect.h - text_h) / 2.0)
-}

@@ -1366,20 +1366,12 @@ impl DCompBackend {
         Some((start, end))
     }
 
-    /// Node-local text-draw origin `(origin_x, origin_y)` in DIPs, matching the
-    /// geometry `controls::draw_editor` paints the run at.
+    /// Node-local text-draw origin `(origin_x, origin_y)` in DIPs — the same
+    /// [`TextBand`](super::editor::TextBand) the painter draws the run at, so a
+    /// screen reader is told where the words actually are.
     fn uia_text_origin(&self, id: ControlId) -> Option<(f32, f32)> {
-        let n = self.arena.get(id)?;
-        let ed = n.editor.as_ref()?;
-        let (pad_left, _) = super::editor::editor_content(n.kind, n.rect.w);
-        let text_h = ed
-            .layout
-            .as_ref()
-            .and_then(|l| l.measure().ok())
-            .map(|(_, h)| h)
-            .filter(|h| *h > 0.0)
-            .unwrap_or(n.paint.font_size * 1.4);
-        Some((pad_left - ed.scroll_x, (n.rect.h - text_h) / 2.0))
+        let band = editor::TextBand::of(self.arena.get(id)?)?;
+        Some((band.origin_x, band.origin_y))
     }
 
     /// Screen-pixel rectangles covering `[a, b)` — one per line the range spans
