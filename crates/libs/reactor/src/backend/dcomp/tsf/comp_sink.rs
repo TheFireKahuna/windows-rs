@@ -9,35 +9,28 @@
 //! The span is read as ACP offsets by casting the composition's `ITfRange` to
 //! `ITfRangeACP` — the same range the store's own offsets live in — so no
 //! coordinate translation is needed.
+//!
+//! ## Why this hangs off `TextStore`
+//!
+//! This sink is **not** advised through `ITfSource::AdviseSink`. TSF obtains it
+//! by `QueryInterface` on the object passed to `ITfDocumentMgr::CreateContext`,
+//! i.e. the text store itself; advising it explicitly fails with
+//! `CONNECT_E_CANNOTCONNECT` (0x80040202). So the implementation lives on
+//! [`TextStore_Impl`] rather than on a sink object of its own — the same shape
+//! Chromium's and Mozilla's TSF stores use.
 
-use windows_core::{implement_decl, Interface, Ref, Result, BOOL};
+use windows_core::{Interface, Ref, Result, BOOL};
 
-use super::acp::TextInput;
+use super::acp::TextStore_Impl;
 use crate::system_bindings::{
-    ITfCompositionView, ITfContextOwnerCompositionSink, ITfContextOwnerCompositionSink_Impl,
-    ITfRange, ITfRangeACP,
+    ITfCompositionView, ITfContextOwnerCompositionSink_Impl, ITfRange, ITfRangeACP,
 };
 
-/// The sink object handed to `ITfSource::AdviseSink` on the context.
-pub(crate) struct CompositionSink {
-    input: TextInput,
-}
-
-implement_decl! {
-    impl CompositionSink as pub(crate) CompositionSink_Impl: [ITfContextOwnerCompositionSink]
-}
-
-impl CompositionSink {
-    pub(crate) fn new(input: TextInput) -> Self {
-        Self { input }
-    }
-}
-
 #[allow(non_snake_case)]
-impl ITfContextOwnerCompositionSink_Impl for CompositionSink_Impl {
+impl ITfContextOwnerCompositionSink_Impl for TextStore_Impl {
     fn OnStartComposition(&self, pcomposition: Ref<ITfCompositionView>) -> Result<BOOL> {
         if let Some((start, len)) = view_extent(pcomposition) {
-            self.input.on_composition_update(start, len);
+            self.input().on_composition_update(start, len);
         }
         // `TRUE` = allow the composition. We never refuse one: refusing is for
         // apps that own a region they will not let a TIP edit, and every field
@@ -54,13 +47,13 @@ impl ITfContextOwnerCompositionSink_Impl for CompositionSink_Impl {
         // composition's text changed but its extent did not, in which case the
         // span the store already marked still holds.
         if let Some((start, len)) = prangenew.ok().ok().and_then(range_extent) {
-            self.input.on_composition_update(start, len);
+            self.input().on_composition_update(start, len);
         }
         Ok(())
     }
 
     fn OnEndComposition(&self, _pcomposition: Ref<ITfCompositionView>) -> Result<()> {
-        self.input.on_composition_end();
+        self.input().on_composition_end();
         Ok(())
     }
 }

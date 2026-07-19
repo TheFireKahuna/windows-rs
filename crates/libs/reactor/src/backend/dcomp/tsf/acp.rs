@@ -20,9 +20,9 @@ use super::store::{
 use super::{active_end, hr, layout_code, DocRect, DocSelection, TS_DEFAULT_SELECTION, TS_RT_PLAIN,
     TS_SD_READONLY, TS_SS_NOHIDDENTEXT};
 use crate::system_bindings::{
-    FORMATETC, HWND, IDataObject, ITextStoreACP, ITextStoreACPSink, ITextStoreACP_Impl, POINT,
-    RECT, TS_ATTRID, TS_ATTRVAL, TS_RUNINFO, TS_SELECTIONSTYLE, TS_SELECTION_ACP, TS_STATUS,
-    TS_TEXTCHANGE, TsViewCookie,
+    FORMATETC, HWND, IDataObject, ITextStoreACP, ITextStoreACPSink, ITextStoreACP_Impl,
+    ITfContextOwnerCompositionSink, POINT, RECT, TS_ATTRID, TS_ATTRVAL, TS_RUNINFO,
+    TS_SELECTIONSTYLE, TS_SELECTION_ACP, TS_STATUS, TS_TEXTCHANGE, TsViewCookie,
 };
 
 /// Standard `HRESULT`s not surfaced as named consts by the minimal bindings.
@@ -123,10 +123,17 @@ fn rect_of(r: DocRect) -> RECT {
 /// The `ITextStoreACP` implementer. Construct with [`TextStore::new`]; hand the
 /// resulting interface to a TSF context and keep the [`TextInput`] handle for the
 /// backend.
+///
+/// It also implements [`ITfContextOwnerCompositionSink`](super::comp_sink) —
+/// **on this same object, deliberately**. That sink is not advised through
+/// `ITfSource`; TSF `QueryInterface`s it off the object handed to
+/// `ITfDocumentMgr::CreateContext`, and advising it instead fails with
+/// `CONNECT_E_CANNOTCONNECT`. Chromium's `TSFTextStore` and Mozilla's
+/// `TSFTextStore` both carry the two interfaces on one object for this reason.
 pub(crate) struct TextStore(Rc<StoreState>);
 
 implement_decl! {
-    impl TextStore as pub(crate) TextStore_Impl: [ITextStoreACP]
+    impl TextStore as pub(crate) TextStore_Impl: [ITextStoreACP, ITfContextOwnerCompositionSink]
 }
 
 impl TextStore {

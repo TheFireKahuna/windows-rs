@@ -28,11 +28,9 @@ use std::cell::Cell;
 use windows_core::{Interface, Result, GUID};
 
 use super::acp::TextStore;
-use super::comp_sink::CompositionSink;
 use super::TextInput;
 use crate::system_bindings::{
-    ITextStoreACP, ITfContext, ITfContextOwnerCompositionSink, ITfDocumentMgr, ITfKeystrokeMgr,
-    ITfSource, ITfThreadMgr2,
+    ITextStoreACP, ITfContext, ITfDocumentMgr, ITfKeystrokeMgr, ITfThreadMgr2,
 };
 
 // `CoCreateInstance` is not in the generated system set; link it directly, as
@@ -68,8 +66,6 @@ pub(crate) struct TsfActivation {
     /// Keystroke pre-emption, so a TIP claims composition keys before the
     /// editor sees them. `None` if the thread manager does not expose it.
     keystroke: Option<ITfKeystrokeMgr>,
-    /// The composition sink's advise cookie, unadvised on teardown.
-    comp_cookie: Option<u32>,
     focused: Cell<bool>,
 }
 
@@ -127,15 +123,11 @@ impl TsfActivation {
         // SAFETY: push the context onto the document manager's stack.
         step("ITfDocumentMgr::Push", unsafe { doc_mgr.Push(&context).ok() })?;
 
-        // Composition boundaries. Without this advise a composition would still
-        // edit the document, but with no underline and no §7.2 guard — so a
-        // failure here is a real degradation and is reported, not swallowed.
-        let sink: ITfContextOwnerCompositionSink = CompositionSink::new(input.clone()).into();
-        let source: ITfSource = step("ITfContext::cast::<ITfSource>", context.cast())?;
-        // SAFETY: live interfaces; the sink is kept alive by TSF until unadvise.
-        let comp_cookie = step("ITfSource::AdviseSink(CompositionSink)", unsafe {
-            source.AdviseSink(&ITfContextOwnerCompositionSink::IID, &sink)
-        })?;
+        // Composition boundaries need no advise: the store handed to
+        // `CreateContext` above implements `ITfContextOwnerCompositionSink`, and
+        // TSF picks it up by `QueryInterface` when it opens a composition. (An
+        // explicit `ITfSource::AdviseSink` for that interface is rejected with
+        // `CONNECT_E_CANNOTCONNECT` — see `comp_sink`.)
 
         let keystroke: Option<ITfKeystrokeMgr> = thread_mgr.cast().ok();
 
@@ -146,7 +138,6 @@ impl TsfActivation {
             store: store_acp,
             input,
             keystroke,
-            comp_cookie: Some(comp_cookie),
             focused: Cell::new(false),
         })
     }
@@ -182,15 +173,11 @@ impl TsfActivation {
 
 impl Drop for TsfActivation {
     fn drop(&mut self) {
-        // Unadvise the sink, pop our context and deactivate the thread manager.
+        // Pop our context and deactivate the thread manager. The composition
+        // sink needs no unadvise — it was never advised, it rides the store.
         // Errors on teardown are not actionable (the objects are going away).
         // SAFETY: live COM objects; a failing teardown call is ignored.
         unsafe {
-            if let Some(c) = self.comp_cookie.take()
-                && let Ok(source) = self.context.cast::<ITfSource>()
-            {
-                let _ = source.UnadviseSink(c);
-            }
             let _ = self.doc_mgr.Pop(0);
             let _ = self.thread_mgr.SetFocus(None::<&ITfDocumentMgr>);
             let _ = self.thread_mgr.Deactivate();
