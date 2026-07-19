@@ -977,6 +977,7 @@ impl ArenaHarness {
             | ControlKind::ToggleButton
             | ControlKind::RepeatButton
             | ControlKind::SplitButton => dcomp::parts::button_plan(n, scale),
+            ControlKind::Border => dcomp::parts::box_plan(n, scale),
             _ => return None,
         };
         let (below, above) = plan.slots();
