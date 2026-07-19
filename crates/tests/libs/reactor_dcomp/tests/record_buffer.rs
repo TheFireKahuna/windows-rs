@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 use windows_reactor::dcomp_test_api::{Recorder, SurfaceSinks};
 use windows_reactor::{
-    Callback, ControlId, ControlKind, Event, EventHandler, PointerEventInfo, PointerHandlers, Prop,
-    PropValue, Tooltip,
+    Callback, ControlId, ControlKind, Event, EventHandler, KeyboardAccelerator, PointerEventInfo,
+    PointerHandlers, Prop, PropValue, Tooltip, VirtualKey, VirtualKeyModifiers,
 };
 
 fn id(raw: u32) -> ControlId {
@@ -350,6 +350,106 @@ fn surface_drag_drives_a_frame_tick_but_exit_does_not() {
     let (ran, drives_tick) = rec.drain_run_report();
     assert_eq!(ran, 1);
     assert!(!drives_tick, "a hover-exit advances no preview and drives no tick");
+}
+
+/// §7.3 accelerators, declaration half: `set_keyboard_accelerators` records a
+/// pure `(key, mods)` list into the buffer, and replay hands the front only
+/// that list (`set_keybindings`) — never the `on_invoked` closures, which stay
+/// in the recorder's app-side `accels` map. An empty list clears the entry.
+#[test]
+fn keybindings_declaration_reaches_the_front_via_replay() {
+    let mut rec = Recorder::new();
+    rec.backend().create(id(1), ControlKind::Button);
+
+    let accels = vec![
+        KeyboardAccelerator::new(VirtualKey::S, VirtualKeyModifiers::Control, || {}),
+        KeyboardAccelerator::new(VirtualKey::F5, VirtualKeyModifiers::None, || {}),
+    ];
+    rec.backend().set_keyboard_accelerators(id(1), &accels);
+    rec.flush();
+
+    let applied = rec.applied();
+    assert!(
+        applied.iter().any(|l| l == "set_keybindings 1 2"),
+        "the chord list must replay as a front declaration: {applied:?}"
+    );
+    assert!(
+        !applied.iter().any(|l| l.contains("on_invoked") || l.contains("Callback")),
+        "no accelerator callback may cross the seam: {applied:?}"
+    );
+
+    // Clearing the accelerators replays an empty declaration.
+    rec.backend().set_keyboard_accelerators(id(1), &[]);
+    rec.flush();
+    assert!(
+        rec.applied().iter().any(|l| l == "set_keybindings 1 0"),
+        "clearing must replay an empty list: {:?}",
+        rec.applied()
+    );
+}
+
+/// §7.3 accelerators, fire half: an `Intent::Accelerator { id, index }` resolves
+/// against the recorder's app-side `accels` map **by index**, so a node with
+/// several chords invokes exactly the one the front matched.
+#[test]
+fn accelerator_intent_resolves_to_callback_by_index() {
+    let mut rec = Recorder::new();
+    rec.backend().create(id(1), ControlKind::Button);
+
+    let fired = Rc::new(RefCell::new(Vec::<&'static str>::new()));
+    let f0 = Rc::clone(&fired);
+    let f1 = Rc::clone(&fired);
+    let accels = vec![
+        KeyboardAccelerator::new(VirtualKey::S, VirtualKeyModifiers::Control, move || {
+            f0.borrow_mut().push("save")
+        }),
+        KeyboardAccelerator::new(VirtualKey::O, VirtualKeyModifiers::Control, move || {
+            f1.borrow_mut().push("open")
+        }),
+    ];
+    rec.backend().set_keyboard_accelerators(id(1), &accels);
+
+    // The front matched the second chord (index 1) — only "open" must fire.
+    rec.queue_accelerator(id(1), 1);
+    assert_eq!(rec.drain_and_run(), 1);
+    assert_eq!(*fired.borrow(), vec!["open"], "wrong accelerator by index");
+
+    // An index past the declared list resolves to nothing (never panics).
+    rec.queue_accelerator(id(1), 9);
+    assert_eq!(rec.drain_and_run(), 0);
+    assert_eq!(*fired.borrow(), vec!["open"]);
+}
+
+/// A destroyed node's accelerators die with it: the recorder drops the
+/// `accels` entry on `destroy`, so a later `Intent::Accelerator` for that id
+/// resolves to nothing (ids are never reused, so it can never re-address a
+/// live node).
+#[test]
+fn destroyed_node_accelerators_die() {
+    let mut rec = Recorder::new();
+    rec.backend().create(id(1), ControlKind::Button);
+
+    let fired = Rc::new(Cell::new(0u32));
+    let f = Rc::clone(&fired);
+    rec.backend().set_keyboard_accelerators(
+        id(1),
+        &[KeyboardAccelerator::new(
+            VirtualKey::S,
+            VirtualKeyModifiers::Control,
+            move || f.set(f.get() + 1),
+        )],
+    );
+
+    // Live: the accelerator fires.
+    rec.queue_accelerator(id(1), 0);
+    assert_eq!(rec.drain_and_run(), 1);
+    assert_eq!(fired.get(), 1);
+
+    // Destroyed: the same intent resolves to nothing.
+    rec.backend().destroy(id(1));
+    rec.queue_accelerator(id(1), 0);
+    assert_eq!(rec.drain_and_run(), 0, "a destroyed node's accelerator still fired");
+    assert_eq!(fired.get(), 1);
 }
 
 /// Nothing thread-affine has leaked into a `Cmd` or `Intent` variant. The lib

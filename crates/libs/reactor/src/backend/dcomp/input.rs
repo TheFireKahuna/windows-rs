@@ -58,9 +58,10 @@ pub(crate) fn editor_claims_key(vk: u32, ctrl: bool, alt: bool) -> bool {
         return false;
     }
     if ctrl {
-        // Only the editor's own clipboard/select chords; other Ctrl-chords
-        // (Ctrl+S, Ctrl+Z, …) are the app's to bind.
-        return matches!(vk, VK_A | VK_C | VK_X | VK_V);
+        // Only the editor's own clipboard/select chords, and only as a plain
+        // Ctrl-chord: Ctrl+Alt (AltGr) is printable input, not select-all, and
+        // other Ctrl-chords (Ctrl+S, Ctrl+Z, …) are the app's to bind.
+        return !alt && matches!(vk, VK_A | VK_C | VK_X | VK_V);
     }
     if alt {
         return false;
@@ -1778,6 +1779,14 @@ impl DCompBackend {
             return true;
         }
 
+        // An Alt-chord that reached here matched no accelerator and is not
+        // editor input, so it is a system chord (Alt+Space, Alt+F4, F10-style
+        // menu keys). The focus ring must NOT consume it — leave it unconsumed
+        // so the sys-key path falls it through to `DefWindowProc` (§7.3).
+        if alt {
+            return false;
+        }
+
         match vk {
             VK_TAB => {
                 self.move_focus(if shift { -1 } else { 1 });
@@ -2016,7 +2025,7 @@ impl DCompBackend {
     /// value, since a NumberBox commits only on Enter/blur.
     fn revert_number(&mut self, id: ControlId) {
         if let Some(n) = self.node_mut(id) {
-            super::revert_number_text(n);
+            revert_number_text(n);
         }
         self.repaint();
     }

@@ -313,6 +313,12 @@ pub(crate) enum Intent {
     /// synchronous `fire_surface_exit` fired, so its order relative to the next
     /// surface's `Move` is preserved.
     SurfaceExit { id: ControlId },
+    /// A keyboard accelerator fired: a declared `(key, mods)` chord matched on
+    /// keydown (§7.3). `index` is the position in the node's declared
+    /// accelerator list — the same order [`Cmd::SetKeybindings`] carried — so
+    /// the drain addresses the right `on_invoked` in the app-side `accels` map
+    /// without the front ever holding the callback.
+    Accelerator { id: ControlId, index: usize },
 }
 
 /// A handler invocation resolved from an [`Intent`] at drain time: the cloned
@@ -570,6 +576,14 @@ pub(crate) trait FrontBackend: Backend {
     fn set_pointer_interest(&mut self, id: ControlId, interest: PointerInterest);
     /// [`Cmd::SetValue`]: the revision-gated `Prop::Value` write.
     fn set_value_stamped(&mut self, id: ControlId, value: f64, based_on: u64);
+    /// [`Cmd::SetKeybindings`]: the `(key, mods)` chords the front matches
+    /// against on keydown (§7.3). The `on_invoked` callbacks stay app-side in
+    /// the recorder's `accels` map, addressed by the matched index.
+    fn set_keybindings(
+        &mut self,
+        id: ControlId,
+        keys: Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>,
+    );
     /// Intents queued by input since the last drain, in fire order.
     fn take_intents(&mut self) -> Vec<Intent>;
 }
@@ -704,6 +718,17 @@ impl RecordingBackend {
                         jobs.push(IntentJob::SurfaceExit(cb.clone()));
                     }
                 }
+                Intent::Accelerator { id, index } => {
+                    // The front matched the chord against the `(key, mods)`
+                    // list and named its position; this is the only map that
+                    // holds the `on_invoked` callback, so resolution is a plain
+                    // index into the declared list. A destroyed node dropped its
+                    // entry (see `destroy`), so a stale accelerator resolves to
+                    // nothing.
+                    if let Some(accel) = self.accels.get(&id).and_then(|list| list.get(index)) {
+                        jobs.push(IntentJob::Unit(accel.on_invoked.clone()));
+                    }
+                }
             }
         }
         jobs
@@ -797,11 +822,11 @@ fn apply<B: FrontBackend>(backend: &mut B, cmd: Cmd) {
         // Declarations whose closures live in the recorder's maps and whose
         // features the DComp backend has not grown yet: nothing consumes them
         // front-side, so replay records nothing. Each names its future
-        // consumer — templated-list virtualization, the §7.3 accelerator
-        // table, the tooltip presenter, an OLE drop target — and lands here,
-        // not in a trait method, so growing the feature is an additive edit.
-        // The payloads are bound and dropped (not wildcarded) so the variants
-        // stay honest data, not vestigial fields the lint would flag.
+        // consumer — templated-list virtualization, the tooltip presenter, an
+        // OLE drop target — and lands here, not in a trait method, so growing
+        // the feature is an additive edit. The payloads are bound and dropped
+        // (not wildcarded) so the variants stay honest data, not vestigial
+        // fields the lint would flag.
         Cmd::AttachTemplatedSelectionChanged { id } => {
             let _ = id;
         }
@@ -811,9 +836,10 @@ fn apply<B: FrontBackend>(backend: &mut B, cmd: Cmd) {
         Cmd::AttachTemplatedReorder { id } => {
             let _ = id;
         }
-        Cmd::SetKeybindings { id, keys } => {
-            let _ = (id, keys);
-        }
+        // The §7.3 accelerator table: the front records the `(key, mods)` list
+        // it matches keydowns against; the `on_invoked` callbacks stay in the
+        // recorder's `accels` map and fire as `Intent::Accelerator`.
+        Cmd::SetKeybindings { id, keys } => backend.set_keybindings(id, keys),
         Cmd::SetTooltip { id, decl } => {
             let _ = (id, decl);
         }

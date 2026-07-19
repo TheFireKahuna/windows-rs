@@ -63,6 +63,30 @@ pub fn light_wash_alpha(a: f32) -> f32 {
     dcomp::theme::light_wash_alpha(a)
 }
 
+// ── input.rs (§7.3 keyboard decision policy) ─────────────────────────────────
+//
+// The three consumption decisions §7.3 requires stay synchronous, re-published
+// as the pure functions they are. A WndProc is unreachable headless, so a test
+// exercises the shipping decision directly rather than the message plumbing.
+
+/// [`dcomp::editor_claims_key`] — the fixed editor-vs-accelerator conflict rule:
+/// a focused editor keeps its Ctrl+A/C/X/V and unmodified printable/editing
+/// keys; chorded bindings and F-keys win over it.
+pub fn editor_claims_key(vk: u32, ctrl: bool, alt: bool) -> bool {
+    dcomp::input::editor_claims_key(vk, ctrl, alt)
+}
+
+/// [`dcomp::input::is_function_key`] — F1..F24.
+pub fn is_function_key(vk: u32) -> bool {
+    dcomp::input::is_function_key(vk)
+}
+
+/// [`dcomp::input::sys_key_falls_through`] — whether an unconsumed sys-key must
+/// reach `DefWindowProc` (the Alt+F4 / F10 / Alt+Space fix).
+pub fn sys_key_falls_through(is_sys: bool, consumed: bool) -> bool {
+    dcomp::input::sys_key_falls_through(is_sys, consumed)
+}
+
 // ── record.rs ────────────────────────────────────────────────────────────────
 
 /// One replayed backend call, captured by [`Recorder`]'s spy.
@@ -100,6 +124,14 @@ impl FrontBackend for Spy {
 
     fn set_value_stamped(&mut self, id: ControlId, value: f64, based_on: u64) {
         self.note(format!("set_value {} {value} based_on={based_on}", id.get()));
+    }
+
+    fn set_keybindings(
+        &mut self,
+        id: ControlId,
+        keys: Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>,
+    ) {
+        self.note(format!("set_keybindings {} {}", id.get(), keys.len()));
     }
 
     fn take_intents(&mut self) -> Vec<Intent> {
@@ -396,6 +428,15 @@ impl Recorder {
         self.intents.borrow_mut().push(Intent::SurfaceExit { id });
     }
 
+    /// Stage an accelerator-fired intent, as the input router's
+    /// `match_accelerator` → `fire_accelerator` would for a matched `(key,
+    /// mods)` chord at position `index` in the node's declared list (§7.3).
+    pub fn queue_accelerator(&mut self, id: ControlId, index: usize) {
+        self.intents
+            .borrow_mut()
+            .push(Intent::Accelerator { id, index });
+    }
+
     /// Drain the staged intents through the recorder's real app-side
     /// resolution and run the resulting handler jobs — the exact sequence the
     /// host performs after an input dispatch. Returns how many handlers ran.
@@ -602,6 +643,42 @@ impl ArenaHarness {
     pub fn ctrl_set_is_on(&mut self, id: ControlId, v: bool) {
         if let Some(n) = self.arena.get_mut(id) {
             n.ctrl_mut().is_on = v;
+        }
+    }
+
+    /// Write the committed `Ctrl` value (`ctrl().value`), as a numeric commit
+    /// would — the pre-edit value a §7.3 Escape-revert restores to the buffer.
+    pub fn ctrl_set_value(&mut self, id: ControlId, v: f64) {
+        if let Some(n) = self.arena.get_mut(id) {
+            n.ctrl_mut().value = v;
+        }
+    }
+
+    /// Replace a node's editor buffer text directly, simulating an in-progress
+    /// (uncommitted) edit. A no-op for a node with no editor.
+    pub fn set_editor_text(&mut self, id: ControlId, s: &str) {
+        if let Some(n) = self.arena.get_mut(id)
+            && let Some(e) = &mut n.editor
+        {
+            e.set_text(s);
+            e.seeded = true;
+        }
+    }
+
+    /// A node's editor buffer text, if it has an editor.
+    pub fn editor_text(&self, id: ControlId) -> Option<String> {
+        self.arena
+            .get(id)
+            .and_then(|n| n.editor.as_ref().map(|e| e.text()))
+    }
+
+    /// Run the shipping §7.3 NumberBox Escape-revert
+    /// ([`dcomp::revert_number_text`]) against this node — restore the committed
+    /// value into the buffer. Fires nothing; the caller inspects the buffer and
+    /// the untouched `ctrl().value` through the other probes.
+    pub fn number_escape_revert(&mut self, id: ControlId) {
+        if let Some(n) = self.arena.get_mut(id) {
+            dcomp::revert_number_text(n);
         }
     }
 

@@ -1004,20 +1004,39 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
 
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let mut consumed = false;
             if let Some(s) = shared() {
                 let vk = (wparam & 0xFFFF) as u32;
-                let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-                let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
-                dispatch_input(&s, |b| b.on_key(vk, shift, ctrl));
+                let mut mods = crate::VirtualKeyModifiers::None;
+                if unsafe { GetKeyState(VK_SHIFT as i32) } < 0 {
+                    mods |= crate::VirtualKeyModifiers::Shift;
+                }
+                if unsafe { GetKeyState(VK_CONTROL as i32) } < 0 {
+                    mods |= crate::VirtualKeyModifiers::Control;
+                }
+                if unsafe { GetKeyState(VK_MENU as i32) } < 0 {
+                    mods |= crate::VirtualKeyModifiers::Menu;
+                }
+                consumed = dispatch_input(&s, |b| b.on_key(vk, mods));
+            }
+            // A sys-key (Alt-chord, F10) the backend did not consume must reach
+            // `DefWindowProc`, or Alt+F4 / F10 / Alt+Space are swallowed (§7.3).
+            if input::sys_key_falls_through(msg == WM_SYSKEYDOWN, consumed) {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
             0
         }
 
         // Ends the held/auto-repeat state started by the matching key-down.
         WM_KEYUP | WM_SYSKEYUP => {
+            let mut consumed = false;
             if let Some(s) = shared() {
                 let vk = (wparam & 0xFFFF) as u32;
-                dispatch_input(&s, |b| b.on_key_up(vk));
+                consumed = dispatch_input(&s, |b| b.on_key_up(vk));
+            }
+            // Sys-key releases (Alt-tap-to-menu, F10) likewise fall through.
+            if input::sys_key_falls_through(msg == WM_SYSKEYUP, consumed) {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
             0
         }

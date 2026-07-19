@@ -33,7 +33,7 @@ mod editor;
 mod host;
 pub(crate) mod info_badge;
 pub(crate) mod info_bar;
-mod input;
+pub(crate) mod input;
 mod knob;
 pub(crate) mod layout;
 pub(crate) mod nav;
@@ -60,9 +60,6 @@ pub use display_change::set_display_change_callback;
 pub use visibility::set_window_visibility_callback;
 pub(crate) use pointer::{declare, register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
-// The §7.3 keyboard conflict-policy predicates, pure and front-decidable, so
-// the headless test seam can exercise the decision without a WndProc.
-pub(crate) use input::{editor_claims_key, is_function_key, sys_key_falls_through};
 
 use bootstrap::Compositing;
 use node::{Arena, Ctrl, Extras, MenuRow, Node};
