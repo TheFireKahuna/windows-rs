@@ -29,6 +29,8 @@ mod device;
 mod device_lost;
 mod effect;
 mod geometry;
+mod glyph_coverage;
+mod glyphs;
 mod session;
 mod swap_chain;
 mod text;
@@ -46,6 +48,11 @@ pub(crate) use device::D2dLock;
 pub use device::{GpuDevice, SharedGpuDevice};
 pub use effect::Effect;
 pub use geometry::*;
+pub use glyph_coverage::{condition, glyph_run_coverage, GlyphCoverage};
+pub use glyphs::{
+    DecorationKind, FontFace, FontMetrics, GlyphMetrics, GlyphOffset, GlyphRun, ShapedText,
+    TextDecoration,
+};
 /// Set a device context's DPI so drawing happens in DIPs.
 ///
 /// The generated binding methods are crate-private, so the `windows-canvas` surface
