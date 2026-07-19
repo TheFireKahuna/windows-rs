@@ -35,6 +35,36 @@ pub(crate) struct CaretGeom {
     pub height: f32,
 }
 
+/// Which side of the caret index the insertion point visually belongs to.
+///
+/// A caret index names a *gap* between characters, and in bidirectional text one
+/// gap has two places on screen. Take `abc` followed by the Hebrew `אבג`: index
+/// 3 is the gap between `c` and `א`, and it can be drawn immediately after `c`
+/// or immediately after `א` — on the far side of the Hebrew word, because the
+/// Hebrew renders right-to-left. Both are index 3. Affinity is the bit that says
+/// which, and it is the difference between a caret that follows the user and one
+/// that teleports across a word.
+///
+/// In left-to-right text the two resolve to the same point, which is why an
+/// editor can ship without the bit and look correct — right up until someone
+/// pastes Arabic or Hebrew into a field.
+///
+/// Maintained at every caret write and read at three places (the sprite, the IME
+/// candidate rect, UIA). That asymmetry is the hazard: a site that forgets to
+/// set it is invisible in Latin test data, so [`Editor::set_caret`] takes it as
+/// a required argument rather than defaulting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Affinity {
+    /// The caret belongs to the character *after* it — its leading edge.
+    /// Where a caret lands when it moves backwards onto a character, and the
+    /// safe default for a position with no history behind it.
+    Downstream,
+    /// The caret belongs to the character *before* it — its trailing edge.
+    /// Where a caret lands after typing, or after stepping forward over a
+    /// character: adjacent to what it just passed.
+    Upstream,
+}
+
 // ── Caret width (Settings → Accessibility → Text cursor → thickness) ─────────
 
 /// The widest the Settings slider goes. Clamped rather than trusted: this is a
@@ -85,7 +115,17 @@ pub(crate) struct Editor {
     /// Document, in UTF-16 code units.
     pub buf: Vec<u16>,
     /// Caret position (code-unit index, `0..=buf.len()`).
-    pub caret: usize,
+    ///
+    /// Private, unlike its `anchor` twin, because it carries an invariant the
+    /// anchor does not: it is only half of the insertion point, and moving it
+    /// without deciding [`caret_affinity`](Self::caret_affinity) leaves the
+    /// other half describing where the caret used to be. Read it with
+    /// [`caret`](Self::caret), move it with [`set_caret`](Self::set_caret).
+    caret: usize,
+    /// Which side of `caret` the insertion point belongs to. Only observable
+    /// where visual and logical order disagree, which is why it is written
+    /// through one required-argument setter rather than left to each caller.
+    caret_affinity: Affinity,
     /// Selection anchor; the selection is `[min(anchor, caret), max(..))`.
     pub anchor: usize,
     /// Horizontal scroll offset (DIP) keeping the caret in view (single-line).
@@ -132,6 +172,7 @@ impl Editor {
         Self {
             buf: Vec::new(),
             caret: 0,
+            caret_affinity: Affinity::Downstream,
             anchor: 0,
             scroll_x: 0.0,
             layout: None,
@@ -150,6 +191,11 @@ impl Editor {
 
     // ── Buffer / selection helpers ────────────────────────────────────────
 
+    /// Caret position (code-unit index, `0..=buf.len()`).
+    pub fn caret(&self) -> usize {
+        self.caret
+    }
+
     /// The document as a `String`.
     pub fn text(&self) -> String {
         String::from_utf16_lossy(&self.buf)
@@ -162,8 +208,9 @@ impl Editor {
             return;
         }
         self.buf = new;
-        self.caret = self.buf.len();
-        self.anchor = self.caret;
+        // Collapsed to the end of a document it did not type: the caret trails
+        // the last character, as it would after typing it.
+        self.set_caret(self.buf.len(), Affinity::Upstream, false);
         self.scroll_x = 0.0;
         self.mark_dirty();
     }
@@ -211,9 +258,20 @@ impl Editor {
                 new_end
             }
         };
-        self.caret = map(self.caret).min(new.len());
-        self.anchor = map(self.anchor).min(new.len());
+        let moved = map(self.caret).min(new.len());
+        // A caret the mapping did not move kept whatever it meant; one that did
+        // move landed by arithmetic on a region it has no relationship to, and
+        // claiming it still trails a specific character would be inventing
+        // history. Downstream is the honest answer there.
+        let affinity = if moved == self.caret {
+            self.caret_affinity
+        } else {
+            Affinity::Downstream
+        };
+        let anchor = map(self.anchor).min(new.len());
         self.buf = new;
+        self.set_caret(moved, affinity, true);
+        self.anchor = anchor;
         self.mark_dirty();
     }
 
@@ -245,8 +303,9 @@ impl Editor {
         }
         let (a, b) = self.sel();
         self.buf.drain(a..b);
-        self.caret = a;
-        self.anchor = a;
+        // The removed run is what the caret was last adjacent to, so there is
+        // nothing left downstream of it to belong to; it trails the text before.
+        self.set_caret(a, Affinity::Upstream, false);
         self.mark_dirty();
         true
     }
@@ -258,8 +317,9 @@ impl Editor {
         let units: Vec<u16> = s.encode_utf16().collect();
         let at = self.caret.min(self.buf.len());
         self.buf.splice(at..at, units.iter().copied());
-        self.caret = at + units.len();
-        self.anchor = self.caret;
+        // "The caret follows what you typed" — it trails the inserted run, on
+        // the run's own side even when that run reads right-to-left.
+        self.set_caret(at + units.len(), Affinity::Upstream, false);
         self.mark_dirty();
     }
 
@@ -269,9 +329,9 @@ impl Editor {
             return;
         }
         if self.caret > 0 {
-            self.caret -= 1;
-            self.buf.remove(self.caret);
-            self.anchor = self.caret;
+            let at = self.caret - 1;
+            self.buf.remove(at);
+            self.set_caret(at, Affinity::Upstream, false);
             self.mark_dirty();
         }
     }
@@ -283,6 +343,11 @@ impl Editor {
         }
         if self.caret < self.buf.len() {
             self.buf.remove(self.caret);
+            // The index does not move, but a Downstream caret was anchored to
+            // the character just removed. Re-anchor upstream, to text that
+            // still exists, rather than silently re-pointing at whatever slid
+            // into the gap.
+            self.set_caret(self.caret, Affinity::Upstream, false);
             self.mark_dirty();
         }
     }
@@ -293,6 +358,15 @@ impl Editor {
 
     /// Move the caret one unit (or one word with `word`) left, optionally
     /// extending the selection.
+    ///
+    /// Movement is **logical**, not visual: the index decreases, and across a
+    /// direction boundary the caret may therefore travel rightwards on screen.
+    /// This is a deliberate choice over visual movement — word moves, Home/End
+    /// and selection extension are all logical here, and a model that is
+    /// logical for four operations and visual for two is worse than either
+    /// consistently. What affinity buys is that the caret is drawn *adjacent to
+    /// the character it just stepped over* instead of at whichever edge
+    /// DirectWrite was asked for.
     pub fn move_left(&mut self, word: bool, select: bool) {
         let to = if self.has_selection() && !select {
             self.sel().0
@@ -301,9 +375,12 @@ impl Editor {
         } else {
             self.caret.saturating_sub(1)
         };
-        self.set_caret(to, select);
+        // Stepping backwards onto a character puts the caret on its leading side.
+        self.set_caret(to, Affinity::Downstream, select);
     }
 
+    /// Right-moving twin of [`move_left`](Self::move_left); see it for why the
+    /// movement is logical.
     pub fn move_right(&mut self, word: bool, select: bool) {
         let to = if self.has_selection() && !select {
             self.sel().1
@@ -312,24 +389,32 @@ impl Editor {
         } else {
             self.clamp(self.caret + 1)
         };
-        self.set_caret(to, select);
+        // Stepping forward over a character puts the caret on its trailing side.
+        self.set_caret(to, Affinity::Upstream, select);
     }
 
     pub fn home(&mut self, select: bool) {
-        self.set_caret(0, select);
+        self.set_caret(0, Affinity::Downstream, select);
     }
 
     pub fn end(&mut self, select: bool) {
-        self.set_caret(self.buf.len(), select);
+        self.set_caret(self.buf.len(), Affinity::Upstream, select);
     }
 
     pub fn select_all(&mut self) {
+        self.set_caret(self.buf.len(), Affinity::Upstream, true);
         self.anchor = 0;
-        self.caret = self.buf.len();
     }
 
-    fn set_caret(&mut self, to: usize, select: bool) {
+    /// Move the caret, stating where it belongs. The one write path — every
+    /// other mutation in this file and every caller outside it goes through
+    /// here, so a new caret move cannot forget the affinity: there is no
+    /// signature that lets it.
+    ///
+    /// `select` extends the selection rather than collapsing it.
+    pub fn set_caret(&mut self, to: usize, affinity: Affinity, select: bool) {
         self.caret = self.clamp(to);
+        self.caret_affinity = affinity;
         if !select {
             self.anchor = self.caret;
         }
@@ -447,10 +532,26 @@ impl Editor {
     /// NaN reaching a visual's Size is not a wrong caret, it is a caret that
     /// silently stops being composited.
     pub fn caret_geom(&self) -> Option<CaretGeom> {
-        let ((x, y), hit) = self.layout.as_ref()?.caret_at(self.caret as u32, false).ok()?;
+        let (pos, after) = self.caret_query();
+        let ((x, y), hit) = self.layout.as_ref()?.caret_at(pos, after).ok()?;
         let h = hit.glyph_rect.3;
         (x.is_finite() && y.is_finite() && h.is_finite() && h > 0.0)
             .then_some(CaretGeom { x, top: y, height: h })
+    }
+
+    /// The `(text_position, after)` pair that asks DirectWrite for the caret's
+    /// point, resolving [`Affinity`] into `HitTestTextPosition`'s edge model.
+    ///
+    /// Upstream is the trailing edge of the *preceding* character, which is why
+    /// it queries `caret - 1`. At index 0 there is no preceding character, so
+    /// the upstream position does not exist and the downstream one is the only
+    /// answer — a degeneracy, not a fallback: the two coincide there for the
+    /// same reason they coincide throughout left-to-right text.
+    pub fn caret_query(&self) -> (u32, bool) {
+        match self.caret_affinity {
+            Affinity::Upstream if self.caret > 0 => (self.caret as u32 - 1, true),
+            _ => (self.caret as u32, false),
+        }
     }
 
     /// Keep the caret inside the visible content width by adjusting `scroll_x`
@@ -460,16 +561,7 @@ impl Editor {
             self.scroll_x = 0.0;
             return;
         }
-        let cx = self.caret_x();
-        if cx - self.scroll_x > content_w {
-            self.scroll_x = cx - content_w;
-        }
-        if cx - self.scroll_x < 0.0 {
-            self.scroll_x = cx;
-        }
-        if self.scroll_x < 0.0 {
-            self.scroll_x = 0.0;
-        }
+        self.scroll_x = scroll_for(self.scroll_x, self.caret_x(), content_w);
     }
 
     /// Rebuild the layout (if needed) and re-scroll the caret into view, in one
@@ -495,8 +587,9 @@ impl Editor {
         let start = start.min(self.buf.len());
         let end = end.clamp(start, self.buf.len());
         self.buf.splice(start..end, units.iter().copied());
-        self.caret = start + units.len();
-        self.anchor = self.caret;
+        // Same rule as `insert`: a committed composition trails the run it
+        // produced.
+        self.set_caret(start + units.len(), Affinity::Upstream, false);
         self.mark_dirty();
     }
 
@@ -515,20 +608,58 @@ impl Editor {
         self.mark_dirty();
     }
 
-    /// Map a surface-local x (DIP, relative to the box) to a caret index, given
-    /// the text origin x the layout is drawn at.
-    pub fn index_at_x(&self, x: f32, origin_x: f32) -> usize {
-        match &self.layout {
-            Some(l) => l
-                .hit_test_point(x - origin_x, 1.0)
-                .map(|h| {
-                    let i = h.text_position as usize + usize::from(h.is_trailing_hit);
-                    i.min(self.buf.len())
-                })
-                .unwrap_or(self.caret),
-            None => self.caret,
+    /// Map a surface-local x (DIP, relative to the box) to a caret index and the
+    /// affinity the click implies, given the text origin x the layout is drawn at.
+    ///
+    /// Both halves come from the same hit test. A trailing hit means the point
+    /// fell on the far half of a cluster, so the caret goes *after* that cluster
+    /// and belongs to it — upstream. A leading hit puts the caret before the
+    /// cluster, belonging to it — downstream. Taking only the index and
+    /// discarding which half was hit is what makes a click near a direction
+    /// boundary land on the wrong side of a word.
+    ///
+    /// The step past a trailing hit is the cluster's own `length`, not one code
+    /// unit: a surrogate pair, a combining sequence and a ligature are each one
+    /// indivisible caret stop spanning several units, and stepping by one lands
+    /// the caret inside a character that has no inside.
+    pub fn index_at_x(&self, x: f32, origin_x: f32) -> (usize, Affinity) {
+        let Some(layout) = &self.layout else {
+            return (self.caret, self.caret_affinity);
+        };
+        match layout.hit_test_point(x - origin_x, 1.0) {
+            Ok(h) if h.is_trailing_hit => (
+                (h.text_position as usize + h.length as usize).min(self.buf.len()),
+                Affinity::Upstream,
+            ),
+            Ok(h) => (
+                (h.text_position as usize).min(self.buf.len()),
+                Affinity::Downstream,
+            ),
+            Err(_) => (self.caret, self.caret_affinity),
         }
     }
+}
+
+/// The scroll offset that brings caret x `cx` inside the window
+/// `[scroll_x, scroll_x + content_w)`, moving as little as possible.
+///
+/// Split out from [`Editor::scroll_to_caret`] so it can be tested without a
+/// device: the caret x it is handed is the only thing DirectWrite contributes,
+/// and this function's job is purely to keep that number in the window.
+///
+/// Affinity does not change the shape of the problem. A caret in a
+/// right-to-left run still has a single x within a left-to-right field, and it
+/// is still that x that has to be visible — what affinity changed is *which* x,
+/// which is decided before this is called.
+fn scroll_for(scroll_x: f32, cx: f32, content_w: f32) -> f32 {
+    let mut s = scroll_x;
+    if cx - s > content_w {
+        s = cx - content_w;
+    }
+    if cx - s < 0.0 {
+        s = cx;
+    }
+    s.max(0.0)
 }
 
 /// Content geometry inside an editor box of width `box_w`: `(left_pad,
@@ -761,8 +892,7 @@ mod tests {
     fn editor_with(text: &str, caret: usize) -> Editor {
         let mut e = Editor::new(ControlKind::TextBox);
         e.set_text(text);
-        e.caret = caret;
-        e.anchor = caret;
+        e.set_caret(caret, Affinity::Downstream, false);
         e
     }
 
@@ -772,11 +902,11 @@ mod tests {
         let mut e = editor_with("hello world", 5);
         e.apply_program_text("hello brave world");
         assert_eq!(e.text(), "hello brave world");
-        assert_eq!(e.caret, 5, "caret before the change must stay put");
+        assert_eq!(e.caret(), 5, "caret before the change must stay put");
 
         let mut e = editor_with("hello world", 11);
         e.apply_program_text("well hello world");
-        assert_eq!(e.caret, 16, "caret after the change shifts by the delta");
+        assert_eq!(e.caret(), 16, "caret after the change shifts by the delta");
     }
 
     /// A caret inside the replaced region lands at the end of the replacement,
@@ -785,13 +915,13 @@ mod tests {
     fn program_text_maps_caret_across_replacement_and_deletion() {
         let mut e = editor_with("abcdef", 3);
         e.apply_program_text("abXYef");
-        assert_eq!(e.caret, 4, "caret inside the changed region → end of the replacement");
+        assert_eq!(e.caret(), 4, "caret inside the changed region → end of the replacement");
 
         let mut e = editor_with("abcdef", 6);
         e.apply_program_text("adef");
         // Common prefix "a", common suffix "def": "bc" was deleted ahead of
         // the caret, which pulls it back by the removed length.
-        assert_eq!(e.caret, 4);
+        assert_eq!(e.caret(), 4);
     }
 
     // ── TextBand ─────────────────────────────────────────────────────────────
@@ -888,7 +1018,7 @@ mod tests {
         let mut e = editor_with("query", 2);
         e.layout_dirty = false;
         e.apply_program_text("query");
-        assert_eq!(e.caret, 2);
+        assert_eq!(e.caret(), 2);
         assert!(!e.layout_dirty, "an identical write must not dirty the layout");
     }
 
@@ -897,9 +1027,129 @@ mod tests {
     #[test]
     fn program_text_maps_anchor_independently() {
         let mut e = editor_with("hello world", 0);
+        e.set_caret(5, Affinity::Upstream, true); // "hello" selected
         e.anchor = 0;
-        e.caret = 5; // "hello" selected
         e.apply_program_text("hello there world");
-        assert_eq!((e.anchor, e.caret), (0, 5), "selection over the prefix survives");
+        assert_eq!((e.anchor, e.caret()), (0, 5), "selection over the prefix survives");
+    }
+
+    // ── Caret affinity ───────────────────────────────────────────────────────
+
+    /// Every operation that moves the caret must leave the affinity describing
+    /// where it *now* is. These are unobservable in Latin text, which is exactly
+    /// why they are asserted here rather than left to a rendering check: a site
+    /// that forgets the rule looks perfectly correct in every English fixture.
+    #[test]
+    fn typing_leaves_the_caret_trailing_what_was_typed() {
+        let mut e = editor_with("", 0);
+        e.insert("abc");
+        assert_eq!((e.caret(), e.caret_affinity), (3, Affinity::Upstream));
+    }
+
+    /// Stepping forward puts the caret on the trailing side of the character it
+    /// crossed; stepping backward puts it on the leading side. This is the whole
+    /// user-visible payoff of the bit — the caret stays adjacent to the letter
+    /// the arrow key just moved over, instead of jumping to the far end of a
+    /// word whose direction differs.
+    #[test]
+    fn arrow_keys_anchor_to_the_character_they_cross() {
+        let mut e = editor_with("abcdef", 3);
+        e.move_right(false, false);
+        assert_eq!((e.caret(), e.caret_affinity), (4, Affinity::Upstream));
+        e.move_left(false, false);
+        assert_eq!((e.caret(), e.caret_affinity), (3, Affinity::Downstream));
+    }
+
+    /// Home and End sit at the two ends of the line, and the character each can
+    /// belong to is forced: there is nothing before Home and nothing after End.
+    #[test]
+    fn home_and_end_take_the_only_affinity_available() {
+        let mut e = editor_with("abcdef", 3);
+        e.home(false);
+        assert_eq!((e.caret(), e.caret_affinity), (0, Affinity::Downstream));
+        e.end(false);
+        assert_eq!((e.caret(), e.caret_affinity), (6, Affinity::Upstream));
+    }
+
+    /// Deleting re-anchors the caret to text that still exists. A caret left
+    /// pointing at a character that was just removed silently re-points at
+    /// whatever slid into the gap.
+    #[test]
+    fn deleting_re_anchors_to_surviving_text() {
+        let mut e = editor_with("abcdef", 3);
+        e.backspace();
+        assert_eq!((e.caret(), e.caret_affinity), (2, Affinity::Upstream));
+
+        let mut e = editor_with("abcdef", 3);
+        e.set_caret(3, Affinity::Downstream, false);
+        e.delete_forward();
+        assert_eq!(
+            (e.caret(), e.caret_affinity),
+            (3, Affinity::Upstream),
+            "the index holds but the anchor must leave the deleted character"
+        );
+    }
+
+    /// At index 0 the upstream position does not exist — there is no preceding
+    /// character to trail — so the query must degenerate to the downstream one
+    /// rather than underflow or ask DirectWrite for position -1.
+    #[test]
+    fn upstream_at_the_start_degenerates_to_downstream() {
+        let mut e = editor_with("abc", 0);
+        e.set_caret(0, Affinity::Upstream, false);
+        assert_eq!(e.caret_query(), (0, false));
+    }
+
+    /// Upstream anywhere else is the trailing edge of the preceding character —
+    /// the formulation that makes the two affinities different points in bidi
+    /// text and identical points everywhere else.
+    #[test]
+    fn upstream_queries_the_preceding_characters_trailing_edge() {
+        let mut e = editor_with("abc", 2);
+        e.set_caret(2, Affinity::Upstream, false);
+        assert_eq!(e.caret_query(), (1, true));
+        e.set_caret(2, Affinity::Downstream, false);
+        assert_eq!(e.caret_query(), (2, false));
+    }
+
+    /// A programmatic write that did not move the caret must not silently
+    /// rewrite what it meant; one that did move it has no grounds to claim the
+    /// caret still trails any particular character.
+    #[test]
+    fn program_text_only_resets_affinity_when_it_moves_the_caret() {
+        let mut e = editor_with("hello world", 5);
+        e.set_caret(5, Affinity::Upstream, false);
+        e.apply_program_text("hello brave world");
+        assert_eq!((e.caret(), e.caret_affinity), (5, Affinity::Upstream));
+
+        let mut e = editor_with("hello world", 11);
+        e.set_caret(11, Affinity::Upstream, false);
+        e.apply_program_text("well hello world");
+        assert_eq!((e.caret(), e.caret_affinity), (16, Affinity::Downstream));
+    }
+
+    // ── Scroll ───────────────────────────────────────────────────────────────
+
+    /// The caret must end up inside the window whatever it started outside of,
+    /// and a caret already visible must not move the view at all. The affinity
+    /// work changed *which* x arrives here; this asserts the window logic is
+    /// indifferent to that, so a caret in a right-to-left run is kept in view by
+    /// the same rule as any other.
+    #[test]
+    fn scroll_brings_the_caret_into_view_and_otherwise_holds_still() {
+        const W: f32 = 100.0;
+        assert_eq!(scroll_for(0.0, 50.0, W), 0.0, "already visible: no movement");
+        assert_eq!(scroll_for(0.0, 150.0, W), 50.0, "past the right edge: scroll to it");
+        assert_eq!(scroll_for(80.0, 20.0, W), 20.0, "left of the window: scroll back");
+        assert_eq!(scroll_for(0.0, 0.0, W), 0.0, "never scrolls negative");
+        assert_eq!(scroll_for(-5.0, 10.0, W), 0.0, "a negative offset is clamped away");
+
+        for &cx in &[0.0f32, 1.0, 99.0, 100.0, 250.0] {
+            let s = scroll_for(0.0, cx, W);
+            assert!(
+                cx - s >= 0.0 && cx - s <= W,
+                "caret {cx} must land inside the window after scrolling to {s}"
+            );
+        }
     }
 }

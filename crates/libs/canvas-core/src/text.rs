@@ -196,6 +196,26 @@ pub struct HitTestResult {
     pub is_inside: bool,
     /// Bounding box of the hit glyph cluster, in DIPs: `(left, top, width, height)`.
     pub glyph_rect: (f32, f32, f32, f32),
+    /// Length of the hit cluster in code units. A cluster is not always one
+    /// code unit: a surrogate pair, a combining sequence and a ligature are all
+    /// one indivisible caret stop spanning several.
+    pub length: u32,
+    /// Bidi embedding level of the run this position sits in. **Odd means
+    /// right-to-left** — the one field that says whether visual and logical
+    /// order agree here, and so whether caret affinity is observable at all.
+    pub bidi_level: u32,
+    /// False for a position that is not backed by a character — the region past
+    /// the end of a line, most commonly.
+    pub is_text: bool,
+    /// True if the cluster was trimmed away (ellipsis) and is not drawn.
+    pub is_trimmed: bool,
+}
+
+impl HitTestResult {
+    /// True if this position sits in a right-to-left run.
+    pub fn is_rtl(&self) -> bool {
+        self.bidi_level % 2 == 1
+    }
 }
 
 /// A laid-out, measurable run of text — wraps `IDWriteTextLayout`.
@@ -307,12 +327,30 @@ impl TextLayout {
             is_trailing_hit: is_trailing.as_bool(),
             is_inside: is_inside.as_bool(),
             glyph_rect: (hm.left, hm.top, hm.width, hm.height),
+            length: hm.length,
+            bidi_level: hm.bidiLevel,
+            is_text: hm.isText.as_bool(),
+            is_trimmed: hm.isTrimmed.as_bool(),
         })
     }
 
     /// Map a text position to a caret point (layout-relative DIPs) and the
     /// cluster bounds. The returned `(x, y)` is the caret origin; the
     /// [`HitTestResult::glyph_rect`] gives the cluster box.
+    ///
+    /// `after` selects which **edge of the character at `text_position`** is
+    /// wanted: `false` its leading edge, `true` its trailing edge. In
+    /// left-to-right text `caret_at(i, false)` and `caret_at(i - 1, true)` name
+    /// the same point, which is why a caret can get away with only ever asking
+    /// for the first. Across a direction boundary they are different points on
+    /// opposite sides of a word, and the choice between them is the caret's
+    /// affinity.
+    ///
+    /// The returned `is_trailing_hit` echoes `after` and `is_inside` is always
+    /// true: `DWRITE_HIT_TEST_METRICS` carries neither, because both are
+    /// answers to *point* hit-testing and a text position is by construction a
+    /// position in the text. `bidi_level` is the field to read here — it says
+    /// whether this position sits somewhere the affinity is observable.
     pub fn caret_at(&self, text_position: u32, after: bool) -> Result<((f32, f32), HitTestResult)> {
         let mut x = 0.0f32;
         let mut y = 0.0f32;
@@ -329,6 +367,10 @@ impl TextLayout {
                 is_trailing_hit: after,
                 is_inside: true,
                 glyph_rect: (hm.left, hm.top, hm.width, hm.height),
+                length: hm.length,
+                bidi_level: hm.bidiLevel,
+                is_text: hm.isText.as_bool(),
+                is_trimmed: hm.isTrimmed.as_bool(),
             },
         ))
     }
@@ -514,4 +556,113 @@ pub(crate) fn text_rendering_params(linear: bool) -> Option<IDWriteRenderingPara
     })
     .0
     .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `abc` then the Hebrew `אבג`. Logical order is `a b c א ב ג`; visual order
+    /// is `a b c ג ב א`, so logical index 3 — the gap between `c` and `א` — has
+    /// two correct places on screen.
+    const MIXED: &str = "abc\u{05D0}\u{05D1}\u{05D2}";
+    /// Index of that boundary, in UTF-16 code units.
+    const BOUNDARY: u32 = 3;
+
+    fn layout(text: &str) -> TextLayout {
+        let format = TextFormat::new("Segoe UI", 16.0).expect("Segoe UI is a system font");
+        TextLayout::new(text, &format, 1000.0, 100.0).expect("layout the fixture")
+    }
+
+    /// The premise the whole affinity mechanism rests on: at a direction
+    /// boundary the two edges are genuinely different points. If DirectWrite
+    /// answered the same x for both, carrying the bit would buy nothing.
+    #[test]
+    fn the_two_affinities_differ_at_a_direction_boundary() {
+        let l = layout(MIXED);
+        let ((downstream, _), _) = l.caret_at(BOUNDARY, false).unwrap();
+        let ((upstream, _), _) = l.caret_at(BOUNDARY - 1, true).unwrap();
+        assert!(
+            (downstream - upstream).abs() > 1.0,
+            "index {BOUNDARY} must have two visual positions in bidi text, \
+             got downstream={downstream} upstream={upstream}"
+        );
+    }
+
+    /// …and the reason a caret can ship without the bit and look correct: in
+    /// pure left-to-right text the same two queries name one point. This is the
+    /// regression guard on the 99% case — if it ever fails, the affinity work
+    /// has moved the caret in ordinary Latin text.
+    #[test]
+    fn the_two_affinities_agree_in_ltr_text() {
+        let l = layout("abcdef");
+        for i in 1..6u32 {
+            let ((downstream, _), _) = l.caret_at(i, false).unwrap();
+            let ((upstream, _), _) = l.caret_at(i - 1, true).unwrap();
+            assert!(
+                (downstream - upstream).abs() < 0.01,
+                "LTR index {i}: downstream={downstream} upstream={upstream} must coincide"
+            );
+        }
+    }
+
+    /// Each affinity must land on the run it claims to belong to — it is not
+    /// enough that they differ. Upstream at the boundary belongs to `c`, so it
+    /// sits at the LTR run's trailing edge; downstream belongs to `א`, which is
+    /// in the RTL run and therefore further right, past the whole Hebrew word.
+    #[test]
+    fn each_affinity_sits_on_its_own_run() {
+        let l = layout(MIXED);
+        let ((upstream, _), up_hit) = l.caret_at(BOUNDARY - 1, true).unwrap();
+        let ((downstream, _), down_hit) = l.caret_at(BOUNDARY, false).unwrap();
+
+        assert!(!up_hit.is_rtl(), "index 2 is `c`, a left-to-right character");
+        assert!(down_hit.is_rtl(), "index 3 is Hebrew, a right-to-left character");
+        assert!(
+            downstream > upstream,
+            "the RTL run renders to the right of `abc`, so its leading edge \
+             ({downstream}) must be past `c`'s trailing edge ({upstream})"
+        );
+    }
+
+    /// `bidi_level` is the field that says whether affinity is observable at
+    /// all, so it must actually be populated rather than defaulted to zero.
+    #[test]
+    fn bidi_level_is_reported_per_run() {
+        let l = layout(MIXED);
+        let ltr = l.caret_at(0, false).unwrap().1;
+        let rtl = l.caret_at(4, false).unwrap().1;
+        assert_eq!(ltr.bidi_level % 2, 0, "`a` is in a left-to-right run");
+        assert_eq!(rtl.bidi_level % 2, 1, "`ב` is in a right-to-left run");
+        assert!(!ltr.is_rtl() && rtl.is_rtl());
+    }
+
+    /// A hit test must report the cluster's true length, not an assumed 1.
+    /// Stepping past a trailing hit by one code unit lands the caret inside a
+    /// surrogate pair — a position that does not exist.
+    #[test]
+    fn a_surrogate_pair_is_one_cluster_of_two_units() {
+        // U+1D400 MATHEMATICAL BOLD CAPITAL A — one character, two UTF-16 units.
+        let l = layout("a\u{1D400}b");
+        let hit = l.caret_at(1, false).unwrap().1;
+        assert_eq!(
+            hit.length, 2,
+            "a surrogate pair is one indivisible caret stop spanning two units"
+        );
+    }
+
+    /// A selection crossing a direction boundary is one logical range but two
+    /// visual runs, and `hit_test_range` must return both rather than a single
+    /// interval spanning the gap between them.
+    #[test]
+    fn a_bidi_range_hit_tests_into_several_rects() {
+        let l = layout(MIXED);
+        // `c` plus the first Hebrew letter: contiguous logically, split visually.
+        let rects = l.hit_test_range(2, 2, 0.0, 0.0).unwrap();
+        assert!(
+            rects.len() >= 2,
+            "a range crossing a direction boundary must produce one rect per \
+             visual run, got {rects:?}"
+        );
+    }
 }

@@ -30,7 +30,7 @@ mod color_out;
 pub(crate) mod controls;
 mod dispatch;
 mod display_change;
-mod editor;
+pub(crate) mod editor;
 mod glyph_atlas;
 mod glyph_text;
 mod host;

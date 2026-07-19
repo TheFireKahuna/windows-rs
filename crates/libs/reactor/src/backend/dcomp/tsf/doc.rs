@@ -67,7 +67,7 @@ impl TsfDocument for DCompBackend {
             return DocSelection::caret(0);
         };
         let (start, end) = e.sel();
-        DocSelection { start, end, reversed: e.caret < e.anchor }
+        DocSelection { start, end, reversed: e.caret() < e.anchor }
     }
 
     fn set_selection(&mut self, sel: DocSelection) {
@@ -80,8 +80,13 @@ impl TsfDocument for DCompBackend {
             } else {
                 (sel.start, sel.end)
             };
+            // ACP has no affinity concept — a TSF selection is two integers —
+            // so the store has to choose one, and the choice is arbitrary rather
+            // than considered. Downstream is the safe pick: it is the edge that
+            // exists at every index including 0, and it matches what a TIP
+            // setting a fresh selection means by "here".
+            e.set_caret(caret.min(e.buf.len()), editor::Affinity::Downstream, true);
             e.anchor = anchor.min(e.buf.len());
-            e.caret = caret.min(e.buf.len());
         });
         bridge::note_store_edit();
         self.editor_caret_moved(id);
@@ -112,19 +117,37 @@ impl TsfDocument for DCompBackend {
         // wrong place for the whole composition.
         let layout = ed.layout.as_ref()?;
         let band = editor::TextBand::of(n)?;
-        let x_at = |i: usize| {
-            layout
-                .caret_at(i as u32, false)
-                .map(|((x, _), _)| x)
-                .unwrap_or(0.0)
-        };
         let x0 = n.rect.x + band.origin_x;
-        self.to_screen(
-            x0 + x_at(start),
-            n.rect.y + band.origin_y,
-            x0 + x_at(end.max(start)),
-            n.rect.y + band.origin_y + band.text_h,
-        )
+        let y0 = n.rect.y + band.origin_y;
+        let end = end.max(start);
+
+        // A range is not two caret points. Asking for the x of `start` and the
+        // x of `end` and treating the pair as an interval assumes the range runs
+        // left-to-right on screen, which a range crossing a direction boundary
+        // does not: its endpoints can come back in either order, and the text
+        // between them can sit outside both. `HitTestTextRange` answers the
+        // question actually being asked — it returns one rect per visual run —
+        // and their union is the region the TIP should park its candidate list
+        // beside.
+        let rects = layout
+            .hit_test_range(start as u32, (end - start) as u32, 0.0, 0.0)
+            .ok()?;
+        let (left, right) = rects
+            .iter()
+            .filter(|(_, _, w, _)| w.is_finite())
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, r), &(x, _, w, _)| {
+                (l.min(x), r.max(x + w))
+            });
+        // A collapsed or unrenderable range yields no rects; the caret's own
+        // point is the right degenerate answer, not a zero-width box at the
+        // field's left edge.
+        let (left, right) = if left.is_finite() && right >= left {
+            (left, right)
+        } else {
+            let x = ed.caret_geom().map_or(0.0, |g| g.x);
+            (x, x)
+        };
+        self.to_screen(x0 + left, y0, x0 + right, y0 + band.text_h)
     }
 
     fn screen_rect(&self) -> Option<DocRect> {

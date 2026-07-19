@@ -772,14 +772,13 @@ impl ArenaHarness {
     pub fn editor_caret(&self, id: ControlId) -> Option<(usize, usize)> {
         self.arena
             .get(id)
-            .and_then(|n| n.editor.as_ref().map(|e| (e.anchor, e.caret)))
+            .and_then(|n| n.editor.as_ref().map(|e| (e.anchor, e.caret())))
     }
 
     /// Place the editor caret (collapsed selection) at a code-unit index.
     pub fn set_editor_caret(&mut self, id: ControlId, caret: usize) {
         if let Some(e) = self.arena.get_mut(id).and_then(|n| n.editor.as_mut()) {
-            e.caret = caret;
-            e.anchor = caret;
+            e.set_caret(caret, crate::backend::dcomp::editor::Affinity::Downstream, false);
         }
     }
 

@@ -2382,8 +2382,9 @@ impl DCompBackend {
 
     // ── Editor pointer + clipboard ───────────────────────────────────────────
 
-    /// The caret index for an absolute-DIP x over editable node `id`.
-    fn caret_index_at(&self, id: ControlId, x: f32) -> Option<usize> {
+    /// The caret index — and the affinity the click implies — for an
+    /// absolute-DIP x over editable node `id`.
+    fn caret_index_at(&self, id: ControlId, x: f32) -> Option<(usize, editor::Affinity)> {
         let n = self.node(id)?;
         let ed = n.editor.as_ref()?;
         let (pad_left, _w) = editor::editor_content(n.kind, n.rect.w);
@@ -2397,8 +2398,7 @@ impl DCompBackend {
         };
         if let Some(n) = self.node_mut(id) {
             if let Some(e) = &mut n.editor {
-                e.caret = idx;
-                e.anchor = idx;
+                e.set_caret(idx.0, idx.1, false);
                 e.caret_moved = true;
             }
             n.mark_dirty();
@@ -2413,7 +2413,7 @@ impl DCompBackend {
         };
         if let Some(n) = self.node_mut(id) {
             if let Some(e) = &mut n.editor {
-                e.caret = idx;
+                e.set_caret(idx.0, idx.1, true);
                 e.caret_moved = true;
             }
             n.mark_dirty();

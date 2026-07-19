@@ -1346,8 +1346,11 @@ impl DCompBackend {
             return;
         };
         let len = ed.buf.len();
+        // A UIA `Select` names two offsets and nothing about direction, so the
+        // affinity is the store's to pick. The caret sits at the range's logical
+        // end, which is the far side of the selected run — upstream of it.
+        ed.set_caret(b.min(len), super::editor::Affinity::Upstream, true);
         ed.anchor = a.min(len);
-        ed.caret = b.min(len);
         // Restart the compositor caret blink solid-first, exactly as a keyboard
         // caret move does.
         ed.caret_moved = true;
@@ -1423,7 +1426,10 @@ impl DCompBackend {
             let _ = ScreenToClient(self.hwnd as HWND, &mut pt);
         }
         let (ox, _) = self.uia_text_origin(id)?;
-        Some(ed.index_at_x(pt.x as f32 / scale - n.rect.x, ox))
+        // A document index is a position, not a caret: which side of a wrap
+        // the caret would sit on says nothing about which character is under
+        // the pointer, so the affinity is dropped here rather than plumbed.
+        Some(ed.index_at_x(pt.x as f32 / scale - n.rect.x, ox).0)
     }
 
     /// Raise an `AutomationFocusChanged` event for `id` — deferred onto the pump
