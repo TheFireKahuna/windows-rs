@@ -10,6 +10,9 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+mod canvas_spring;
+mod canvas_surface;
+mod canvas_virtual;
 mod device;
 mod shell;
 mod surface_image_source;
