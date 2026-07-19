@@ -281,5 +281,8 @@ mod Windows {
             uiNumerator: u32,
             uiDenominator: u32,
         }
+        const c_DwmMaxAdapters: u32 = 16;
+        const c_DwmMaxMonitors: u32 = 16;
+        const c_DwmMaxQueuedBuffers: u32 = 8;
     }
 }

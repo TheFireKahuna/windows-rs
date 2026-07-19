@@ -2566,6 +2566,7 @@ mod Windows {
         const SpUnCompressedLexicon: GUID = 0xc9e37c15_df92_4727_85d6_72e5eeb6995a;
         const SpVoice: GUID = 0x96749377_3391_11d2_9ee3_00c04f797396;
         const SpWaveFormatEx: GUID = 0xc79a574c_63be_44b9_801f_283f87f898be;
+        const SpeechAllElements: i32 = -1;
         #[repr(i32)]
         enum SpeechAudioFormatType {
             SAFTDefault = -1,
@@ -2937,6 +2938,10 @@ mod Windows {
             SWTDeleted = 2,
         }
         const Speech_Default_Weight: f32 = 1.0;
+        const Speech_Max_Pron_Length: i32 = 384;
+        const Speech_Max_Word_Length: i32 = 128;
+        const Speech_StreamPos_Asap: i32 = 0;
+        const Speech_StreamPos_RealTime: i32 = -1;
         #[guid(0x7b8fcb42_0e9d_4f00_a048_7b04d6179d3d)]
         interface _ISpeechRecoContextEvents: IDispatch {}
         #[guid(0xa372acd1_3bef_4bbd_8ffb_cb3e2b416af8)]

@@ -1439,6 +1439,8 @@ mod Windows {
             ICM_InkAndGesture = 2,
         }
         const InkCollector: GUID = 0x43fb1553_ad74_4ee8_88e4_3e6daac915db;
+        const InkCollectorClipInkToMargin: i32 = 0;
+        const InkCollectorDefaultMargin: i32 = -2147483648;
         #[repr(i32)]
         enum InkCollectorEventInterest {
             ICEI_DefaultEvents = -1,
@@ -1474,6 +1476,8 @@ mod Windows {
             IEF_RemoveFromOriginal = 1,
             IEF_Default = 1,
         }
+        const InkMaxTransparencyValue: i32 = 255;
+        const InkMinTransparencyValue: i32 = 0;
         #[repr(i32)]
         enum InkMouseButton {
             IMF_Left = 1,
