@@ -1152,7 +1152,10 @@ pub(crate) fn sync(
 fn ink_radius(node: &Node) -> f32 {
     match node.kind {
         ControlKind::ComboBox | ControlKind::DropDownButton => theme::RADIUS_SM,
-        _ => node.paint.corner_radius.max(theme::RADIUS_MD),
+        // The button family carries its own radius from birth, so the ink
+        // follows it exactly — a wash with a different corner than the fill it
+        // sits on reads as a rendering fault at any radius but the default.
+        _ => node.paint.corner_radius,
     }
 }
 

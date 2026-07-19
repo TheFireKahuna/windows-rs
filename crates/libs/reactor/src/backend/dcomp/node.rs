@@ -1164,10 +1164,34 @@ pub(crate) fn birth_paint(kind: ControlKind) -> Paint {
         font_size: default_font_size(kind),
         font_weight: default_font_weight(kind),
         is_enabled: true,
-        // Buttons draw their own chrome (the WinUI default style is gone here).
-        corner_radius: if kind == ControlKind::Button { 6.0 } else { 0.0 },
+        // The button family draws its own chrome (the WinUI default style is
+        // gone here), so it is born with a radius rather than clamped up to one
+        // at every read site. A floor there would be indistinguishable from a
+        // default until an app authored something SMALLER than it and silently
+        // got the floor back.
+        corner_radius: if is_button_family(kind) {
+            theme::RADIUS_MD
+        } else {
+            0.0
+        },
         ..Paint::default()
     }
+}
+
+/// The kinds that share `controls::paint_button` — one control with four
+/// behaviours, so they share their chrome, their metrics and their defaults.
+///
+/// Deliberately excludes the two that only look related: a HyperlinkButton is
+/// chromeless accent text, and a DropDownButton draws the select chrome
+/// (`paint_select`) at its own smaller type size.
+pub(crate) fn is_button_family(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::Button
+            | ControlKind::ToggleButton
+            | ControlKind::RepeatButton
+            | ControlKind::SplitButton
+    )
 }
 
 fn default_font_size(kind: ControlKind) -> f32 {
@@ -1333,15 +1357,22 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
             s.flex_direction = FlexDirection::Column;
             s.padding.top = length(theme::ROW_H + theme::SPACE_8 + theme::SPACE_4);
         }
-        ControlKind::Button => {
+        // The whole family, not `Button` alone: a ToggleButton and a
+        // RepeatButton are the same control with a different activation, and
+        // keying this on one variant left the other three with no padding and
+        // no minimum height at all.
+        ControlKind::Button
+        | ControlKind::ToggleButton
+        | ControlKind::RepeatButton
+        | ControlKind::SplitButton => {
             s.display = Display::Flex;
             s.align_items = Some(AlignItems::CENTER);
             s.justify_content = Some(JustifyContent::CENTER);
             s.padding = Rect {
-                left: length(12.0),
-                right: length(12.0),
-                top: length(6.0),
-                bottom: length(6.0),
+                left: length(theme::SPACE_12),
+                right: length(theme::SPACE_12),
+                top: length(theme::SPACE_4 + 2.0),
+                bottom: length(theme::SPACE_4 + 2.0),
             };
             s.min_size = Size {
                 width: length(0.0),

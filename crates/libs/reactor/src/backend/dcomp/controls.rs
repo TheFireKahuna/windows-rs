@@ -70,6 +70,11 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         // The accent segmented tray is a stadium — its focus ring follows suit.
         let radius = if node.kind == ControlKind::SelectorBar && node.paint.style_variant == 1 {
             rect.height() / 2.0
+        } else if super::node::is_button_family(node.kind) {
+            // Follow the authored radius, not the kind's nominal one: a ring
+            // whose corners disagree with the button inside it is the most
+            // visible way for a custom radius to look broken.
+            node.paint.corner_radius
         } else {
             focus_radius(node.kind)
         };
@@ -212,8 +217,13 @@ pub(crate) fn button_palette(node: &Node) -> ButtonPalette {
     let checked = node.ctrl().is_checked && node.kind == ControlKind::ToggleButton;
     let lit = accent || checked;
 
+    // An accent button is a SOLID accent field, not an accent wash: it is the
+    // one call-to-action on a surface, and a wash reads as a selected state
+    // rather than a primary action. Its label is therefore the on-accent token
+    // — accent text on an accent fill is the same hue twice and fails contrast
+    // outright.
     let fill = if lit {
-        theme::accent_fill()
+        theme::accent()
     } else if chromeless || matches!(node.kind, ControlKind::Button | ControlKind::RepeatButton) {
         // Chromeless / bare button: transparent at rest, wash appears via ink.
         theme::w(0.0)
@@ -224,14 +234,20 @@ pub(crate) fn button_palette(node: &Node) -> ButtonPalette {
     ButtonPalette {
         fill,
         border: (!lit && !chromeless).then(theme::stroke),
-        // A TextLink reads as an inline accent hyperlink.
-        fg: node.paint.foreground.unwrap_or(if lit || node.paint.style_variant == 3 {
+        fg: node.paint.foreground.unwrap_or(if lit {
+            theme::text_on_accent()
+        } else if node.paint.style_variant == 3 {
+            // A TextLink reads as an inline accent hyperlink: accent type, and
+            // no field behind it to need an on-accent colour.
             theme::accent()
         } else {
             theme::text()
         }),
         weight: if accent { 600 } else { 400 },
-        radius: node.paint.corner_radius.max(theme::RADIUS_MD),
+        // No floor: the family is BORN at `RADIUS_MD` (`node::birth_paint`), so
+        // an authored radius here is one the app asked for — including a
+        // smaller one, which a `.max()` used to swallow.
+        radius: node.paint.corner_radius,
     }
 }
 
