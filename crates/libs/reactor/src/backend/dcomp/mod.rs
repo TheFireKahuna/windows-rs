@@ -55,7 +55,7 @@ pub use dispatch::Win32Dispatcher;
 pub use host::DCompHost;
 pub use display_change::set_display_change_callback;
 pub use visibility::set_window_visibility_callback;
-pub(crate) use pointer::{register_element_pointer, PointerSinks};
+pub(crate) use pointer::{declare, register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
 
 use bootstrap::Compositing;
@@ -124,11 +124,12 @@ pub struct DCompBackend {
     /// The node holding keyboard focus (drives the focus ring + Space/Enter).
     focused_id: Option<ControlId>,
     /// A registered viz pointer surface (knob/slider/EQ canvas) being dragged:
-    /// its node, sinks, and the ancestor scroll offset captured at press time
-    /// (added to raw move/up coords so element-relative positions stay correct
-    /// inside a scrolled chain). Set on down over the surface, cleared on up —
-    /// implicit capture for the drag's duration.
-    pressed_surface: Option<(ControlId, std::rc::Rc<PointerSinks>, f32)>,
+    /// its node and the ancestor scroll offset captured at press time (added to
+    /// raw move/up coords so element-relative positions stay correct inside a
+    /// scrolled chain). Set on down over the surface, cleared on up — implicit
+    /// capture for the drag's duration. The sinks are addressed by id at drain,
+    /// so the backend holds no closure here.
+    pressed_surface: Option<(ControlId, f32)>,
     /// The viz pointer surface currently under the hover, so leaving it can fire
     /// its `exited` sink (there is no per-node exit event otherwise).
     hovered_surface: Option<ControlId>,

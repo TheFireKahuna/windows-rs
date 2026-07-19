@@ -87,8 +87,17 @@ fn dispatch_input<R>(
         let jobs = r.backend.drain_intents();
         (out, jobs)
     });
+    // A viz surface drag/scrub sink drove `drive_frame_ticks()` synchronously
+    // when it ran inline; now that it runs a hop later as a job, the tick moves
+    // here — after the sink has streamed its value, before the message returns —
+    // so the drag preview repaints in the same message instead of waiting for
+    // the next paced frame.
+    let tick = jobs.iter().any(|j| j.drives_frame_tick());
     for job in jobs {
         job.run();
+    }
+    if tick {
+        crate::drive_frame_ticks();
     }
     out
 }
@@ -276,6 +285,11 @@ impl DCompHost {
                 // host mounts finds the control already in the arena; before
                 // layout, so the sprite is parented when sizes are pushed.
                 r.backend.service_surface_ops();
+                // Apply the frame's pointer-surface presence declarations into
+                // the front-side interest map so a bit filled during this render
+                // is visible to the next input message (one frame ahead, by
+                // design — the router routes on these bits, never the closures).
+                pointer::service_ops();
                 r.backend.set_root(root_id);
                 r.backend.relayout_and_paint();
                 // Replay fires no events today, so this is normally empty —

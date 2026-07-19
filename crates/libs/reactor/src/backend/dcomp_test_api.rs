@@ -21,8 +21,11 @@ use crate::backend::{
 };
 use crate::drag::DragHandlers;
 use crate::interaction::Callback;
+use crate::style::PointerEventInfo;
+use crate::widgets::Subscription;
 use dcomp::node::PointerInterest;
-use dcomp::record::{FrontBackend, Intent, IntentPayload, RecordingBackend};
+use dcomp::record::{FrontBackend, Intent, IntentPayload, RecordingBackend, SurfaceIntentKind};
+use dcomp::{register_element_pointer, PointerSinks};
 
 // ── layout.rs ────────────────────────────────────────────────────────────────
 
@@ -354,16 +357,87 @@ impl Recorder {
         self.intents.borrow_mut().push(Intent::Tapped { id });
     }
 
+    /// Stage a viz pointer-surface transition intent, as the input router's
+    /// `queue_surface` would for a drag/scrub/wheel over a registered surface.
+    pub fn queue_surface_down(&mut self, id: ControlId, info: PointerEventInfo) {
+        self.queue_surface(id, SurfaceIntentKind::Down, info);
+    }
+    pub fn queue_surface_move(&mut self, id: ControlId, info: PointerEventInfo) {
+        self.queue_surface(id, SurfaceIntentKind::Move, info);
+    }
+    pub fn queue_surface_up(&mut self, id: ControlId, info: PointerEventInfo) {
+        self.queue_surface(id, SurfaceIntentKind::Up, info);
+    }
+    pub fn queue_surface_wheel(&mut self, id: ControlId, info: PointerEventInfo) {
+        self.queue_surface(id, SurfaceIntentKind::Wheel, info);
+    }
+
+    fn queue_surface(&mut self, id: ControlId, kind: SurfaceIntentKind, info: PointerEventInfo) {
+        self.intents
+            .borrow_mut()
+            .push(Intent::Surface { id, kind, info });
+    }
+
+    /// Stage a surface hover-exit intent, as the router's `queue_surface_exit`
+    /// would when the hover leaves a surface it was tracking.
+    pub fn queue_surface_exit(&mut self, id: ControlId) {
+        self.intents.borrow_mut().push(Intent::SurfaceExit { id });
+    }
+
     /// Drain the staged intents through the recorder's real app-side
     /// resolution and run the resulting handler jobs — the exact sequence the
     /// host performs after an input dispatch. Returns how many handlers ran.
     pub fn drain_and_run(&mut self) -> usize {
+        self.drain_run_report().0
+    }
+
+    /// [`drain_and_run`](Self::drain_and_run), also reporting whether a job that
+    /// ran should drive a prompt frame tick — the drag-preview latency path the
+    /// host takes when a surface drag/scrub sink runs (`IntentJob::drives_frame_tick`).
+    pub fn drain_run_report(&mut self) -> (usize, bool) {
         let jobs = self.inner.drain_intents();
         let n = jobs.len();
+        let drives_tick = jobs.iter().any(|j| j.drives_frame_tick());
         for job in jobs {
             job.run();
         }
-        n
+        (n, drives_tick)
+    }
+}
+
+/// The app-side sink registration a viz surface makes — the half the input
+/// router's `Intent::Surface`/`Intent::SurfaceExit` resolve against at drain.
+///
+/// Registers through the shipping [`register_element_pointer`] and fills cells
+/// with `Rc<dyn Fn>` exactly as the real `PointerSurface` builders do, so a test
+/// exercises the same closures the recorder clones into a deferred job. Dropping
+/// this unregisters (its held [`Subscription`]).
+pub struct SurfaceSinks {
+    sinks: Rc<PointerSinks>,
+    _sub: Subscription,
+}
+
+impl SurfaceSinks {
+    /// Register a fresh surface for `id`.
+    pub fn register(id: ControlId) -> Self {
+        let (sinks, sub) = register_element_pointer(id).expect("register pointer surface");
+        Self { sinks, _sub: sub }
+    }
+
+    pub fn on_down(&self, f: impl Fn(PointerEventInfo) + 'static) {
+        *self.sinks.down.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn on_move(&self, f: impl Fn(PointerEventInfo) + 'static) {
+        *self.sinks.moved.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn on_up(&self, f: impl Fn(PointerEventInfo) + 'static) {
+        *self.sinks.up.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn on_wheel(&self, f: impl Fn(PointerEventInfo) + 'static) {
+        *self.sinks.wheel.borrow_mut() = Some(Rc::new(f));
+    }
+    pub fn on_exit(&self, f: impl Fn() + 'static) {
+        *self.sinks.exited.borrow_mut() = Some(Rc::new(f));
     }
 }
 

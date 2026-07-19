@@ -36,6 +36,18 @@
 //! on the same thread within the same message, so behaviour matches the old
 //! synchronous fire — the queue is the seam that lets the two halves later live
 //! on different threads.
+//!
+//! **Viz pointer surfaces ride the same queue.** A knob/slider/EQ surface's
+//! sinks (`on_down`/`on_move`/`on_up`/`on_wheel`/`on_exit`) are the one place
+//! immediate feedback used to run an app closure inline in the input router.
+//! Now the router routes on plain presence bits (`pointer::SurfaceInterest`) and
+//! queues an [`Intent::Surface`]/[`Intent::SurfaceExit`]; the drain resolves it
+//! against the app-side sink closures (`pointer::sinks_for`) — kept out of the
+//! recorder's own maps only because the surface is registered imperatively from
+//! an effect, not through the [`Backend`] trait, but owned by the same app half.
+//! The drag path's synchronous `drive_frame_ticks()` moves to the host: after
+//! running the jobs, a surface job that ran drives one tick so the drag preview
+//! repaints in the same message ([`IntentJob::drives_frame_tick`]).
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -213,6 +225,16 @@ pub(crate) enum PointerIntentKind {
     Moved,
 }
 
+/// Which viz-surface sink an [`Intent::Surface`] addresses (the drag/scrub/wheel
+/// transitions; hover-exit is [`Intent::SurfaceExit`]).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum SurfaceIntentKind {
+    Down,
+    Move,
+    Up,
+    Wheel,
+}
+
 /// One queued app notification: everything the app needs to run the matching
 /// handler, as plain `Send` data — no fire site's closure reads backend state,
 /// so the payload is complete by construction.
@@ -249,6 +271,20 @@ pub(crate) enum Intent {
     Tapped { id: ControlId },
     /// `on_right_tapped`.
     RightTapped { id: ControlId },
+    /// A viz pointer-surface transition (knob/slider/EQ drag or wheel),
+    /// addressed to the app-side sink map (`pointer::sinks_for`). Rides the same
+    /// FIFO queue as everything else, so a gesture's down → moves → up reach the
+    /// app in that order.
+    Surface {
+        id: ControlId,
+        kind: SurfaceIntentKind,
+        info: PointerEventInfo,
+    },
+    /// A viz surface's hover-exit sink (`on_exit`): the hover left this surface
+    /// for another, for none, or the window edge. Queued where the old
+    /// synchronous `fire_surface_exit` fired, so its order relative to the next
+    /// surface's `Move` is preserved.
+    SurfaceExit { id: ControlId },
 }
 
 /// A handler invocation resolved from an [`Intent`] at drain time: the cloned
@@ -262,6 +298,11 @@ pub(crate) enum IntentJob {
     F64(Callback<f64>, f64),
     I32(Callback<i32>, i32),
     Pointer(Callback<PointerEventInfo>, PointerEventInfo),
+    /// A viz surface sink (`on_down`/`on_move`/`on_up`/`on_wheel`), cloned out of
+    /// the app-side [`PointerSinks`](super::PointerSinks) cell.
+    Surface(Rc<dyn Fn(PointerEventInfo)>, PointerEventInfo),
+    /// A viz surface's hover-exit sink (`on_exit`).
+    SurfaceExit(Rc<dyn Fn()>),
 }
 
 impl IntentJob {
@@ -274,7 +315,18 @@ impl IntentJob {
             Self::F64(cb, v) => cb.invoke(v),
             Self::I32(cb, v) => cb.invoke(v),
             Self::Pointer(cb, info) => cb.invoke(info),
+            Self::Surface(cb, info) => cb(info),
+            Self::SurfaceExit(cb) => cb(),
         }
+    }
+
+    /// Whether running this job should drive a frame tick promptly rather than
+    /// waiting for the next paced `WM_APP_FRAME`. True for a surface drag/scrub
+    /// sink: that is the EQ/knob drag path, whose preview must repaint from the
+    /// value the sink just streamed within this same input message (the tightest
+    /// latency coupling in the backend). Hover-exit alone advances no preview.
+    pub(crate) fn drives_frame_tick(&self) -> bool {
+        matches!(self, Self::Surface(..))
     }
 }
 
@@ -587,6 +639,26 @@ impl<B: FrontBackend> RecordingBackend<B> {
                         self.pointer.get(&id).and_then(|p| p.on_right_tapped.as_ref())
                     {
                         jobs.push(IntentJob::Unit(cb.clone()));
+                    }
+                }
+                Intent::Surface { id, kind, info } => {
+                    if let Some(sinks) = super::pointer::sinks_for(id) {
+                        let cell = match kind {
+                            SurfaceIntentKind::Down => &sinks.down,
+                            SurfaceIntentKind::Move => &sinks.moved,
+                            SurfaceIntentKind::Up => &sinks.up,
+                            SurfaceIntentKind::Wheel => &sinks.wheel,
+                        };
+                        if let Some(cb) = cell.borrow().as_ref() {
+                            jobs.push(IntentJob::Surface(cb.clone(), info));
+                        }
+                    }
+                }
+                Intent::SurfaceExit { id } => {
+                    if let Some(sinks) = super::pointer::sinks_for(id)
+                        && let Some(cb) = sinks.exited.borrow().as_ref()
+                    {
+                        jobs.push(IntentJob::SurfaceExit(cb.clone()));
                     }
                 }
             }

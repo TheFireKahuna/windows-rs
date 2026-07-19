@@ -187,15 +187,16 @@ impl DCompBackend {
     }
 
     /// The deepest registered viz pointer surface (knob/slider/EQ canvas — see
-    /// `pointer.rs`) under the point, with its sinks and the scroll-adjusted
-    /// point for element-relative coordinates. Cheap `None` when nothing is
-    /// registered.
+    /// `pointer.rs`) under the point, with its declared presence bits and the
+    /// scroll-adjusted point for element-relative coordinates. The router reads
+    /// only the bits — the sink closures live app-side. Cheap `None` when nothing
+    /// is registered.
     pub(super) fn surface_at(
         &self,
         x: f32,
         y: f32,
-    ) -> Option<(ControlId, std::rc::Rc<super::PointerSinks>, f32, f32)> {
-        if !super::pointer::has_listeners() {
+    ) -> Option<(ControlId, pointer::SurfaceInterest, f32, f32)> {
+        if !pointer::has_listeners() {
             return None;
         }
         let root = self.root?;
@@ -209,12 +210,12 @@ impl DCompBackend {
         id: ControlId,
         x: f32,
         y: f32,
-        out: &mut Option<(ControlId, std::rc::Rc<super::PointerSinks>, f32, f32)>,
+        out: &mut Option<(ControlId, pointer::SurfaceInterest, f32, f32)>,
     ) {
         let Some(node) = self.node(id) else { return };
         let inside = node.rect.contains(x, y);
-        if inside && let Some(sinks) = super::pointer::sinks_for(id) {
-            *out = Some((id, sinks, x, y));
+        if inside && let Some(interest) = pointer::interest_for(id) {
+            *out = Some((id, interest, x, y));
         }
         // Same clip rule as `hit_walk`: a surface scrolled out of an ancestor
         // viewport is not drawn, so it must not take the pointer either.
@@ -227,33 +228,35 @@ impl DCompBackend {
         }
     }
 
-    /// Deliver a pointer transition to a viz surface's sink with element-relative
+    /// Queue a pointer transition to a viz surface's sink with element-relative
     /// DIP coordinates. `(x, y)` must be in the node's layout space (scroll-
-    /// adjusted, as returned by [`surface_at`](Self::surface_at)).
+    /// adjusted, as returned by [`surface_at`](Self::surface_at)). The closure is
+    /// never invoked here: this pushes an [`Intent::Surface`] the recorder drains
+    /// against the app-side sink map after the input borrow is released.
     ///
     /// Reports the vertical wheel axis — correct for every pointer transition
     /// (which carries `wheel_delta` 0) and for the classic wheel. The
-    /// horizontal tilt goes through [`fire_surface_wheel`](Self::fire_surface_wheel).
-    fn fire_surface(
-        &self,
+    /// horizontal tilt goes through [`queue_surface_wheel`](Self::queue_surface_wheel).
+    fn queue_surface(
+        &mut self,
         id: ControlId,
-        cell: &std::cell::RefCell<Option<Box<dyn Fn(PointerEventInfo)>>>,
+        kind: record::SurfaceIntentKind,
         x: f32,
         y: f32,
         left: bool,
         wheel_delta: i32,
     ) {
-        self.fire_surface_wheel(id, cell, x, y, left, wheel_delta, WheelAxis::Vertical);
+        self.queue_surface_wheel(id, kind, x, y, left, wheel_delta, WheelAxis::Vertical);
     }
 
-    /// [`fire_surface`](Self::fire_surface) with an explicit wheel axis, so a
+    /// [`queue_surface`](Self::queue_surface) with an explicit wheel axis, so a
     /// surface sink can tell a sideways tilt from a wheel turn and opt in to
     /// (or ignore) each independently.
     #[allow(clippy::too_many_arguments)]
-    fn fire_surface_wheel(
-        &self,
+    fn queue_surface_wheel(
+        &mut self,
         id: ControlId,
-        cell: &std::cell::RefCell<Option<Box<dyn Fn(PointerEventInfo)>>>,
+        kind: record::SurfaceIntentKind,
         x: f32,
         y: f32,
         left: bool,
@@ -269,9 +272,7 @@ impl DCompBackend {
             wheel_axis,
             ..PointerEventInfo::default()
         };
-        if let Some(cb) = cell.borrow().as_ref() {
-            cb(info);
-        }
+        self.intents.push(record::Intent::Surface { id, kind, info });
     }
 
     /// Whether `(x, y)` (absolute DIP) lies over scroll container `id`'s thumb.
@@ -426,13 +427,15 @@ impl DCompBackend {
         // A pressed viz pointer surface (knob/slider/EQ drag) receives every
         // move 1:1 — including outside its bounds — until release (capture
         // parity with XAML `CapturePointer`). Hover is frozen for the drag.
-        if let Some((sid, sinks, dy)) = self.pressed_surface.clone() {
-            self.fire_surface(sid, &sinks.moved, x, y + dy, true, 0);
-            // Repaint the dragged surface with THIS move rather than on the next
-            // paced frame message: moves are queue-coalesced, so this self-limits
-            // to the pump's processing rate and shaves up to a frame of latency
-            // off the drag.
-            crate::drive_frame_ticks();
+        //
+        // The move queues a `moved` intent; the host drives one frame tick after
+        // the drained sink runs (`IntentJob::drives_frame_tick`), so the preview
+        // repaints from this move within the same message rather than waiting for
+        // the next paced frame — moves are queue-coalesced, so it self-limits to
+        // the pump's processing rate and shaves up to a frame of latency off the
+        // drag.
+        if let Some((sid, dy)) = self.pressed_surface {
+            self.queue_surface(sid, record::SurfaceIntentKind::Move, x, y + dy, true, 0);
             return;
         }
 
@@ -512,11 +515,13 @@ impl DCompBackend {
         let surf = self.surface_at(x, y);
         let now_surface = surf.as_ref().map(|(sid, ..)| *sid);
         if self.hovered_surface != now_surface {
-            self.fire_surface_exit();
+            self.queue_surface_exit();
             self.hovered_surface = now_surface;
         }
-        if let Some((sid, sinks, ax, ay)) = surf {
-            self.fire_surface(sid, &sinks.moved, ax, ay, false, 0);
+        if let Some((sid, interest, ax, ay)) = surf
+            && interest.moved
+        {
+            self.queue_surface(sid, record::SurfaceIntentKind::Move, ax, ay, false, 0);
         }
 
         if now == self.hovered_id {
@@ -593,15 +598,15 @@ impl DCompBackend {
         redraw
     }
 
-    /// Fire the `exited` sink of the surface that held the hover, if any (and if
-    /// it is still mounted with a live registration).
-    fn fire_surface_exit(&mut self) {
+    /// Queue the `exited` sink of the surface that held the hover, if it is still
+    /// mounted. The exited-sink presence is checked at drain (the closure lives
+    /// app-side); here the router only knows a surface it was tracking is being
+    /// left.
+    fn queue_surface_exit(&mut self) {
         if let Some(old) = self.hovered_surface.take()
             && self.node(old).is_some()
-            && let Some(sinks) = super::pointer::sinks_for(old)
-            && let Some(cb) = sinks.exited.borrow().as_ref()
         {
-            cb();
+            self.intents.push(record::Intent::SurfaceExit { id: old });
         }
     }
 
@@ -613,7 +618,7 @@ impl DCompBackend {
             }
         }
         // A hovered viz pointer surface loses the pointer at the window edge too.
-        self.fire_surface_exit();
+        self.queue_surface_exit();
         // Fade out the scrollbar thumb when the pointer leaves the window.
         self.update_hovered_scroll(None);
     }
@@ -651,11 +656,11 @@ impl DCompBackend {
         // a surface with no `down` sink is hover-only (e.g. a plot that lights up
         // under the pointer), and must stay click-transparent so buttons layered
         // over it keep working.
-        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y)
-            && sinks.down.borrow().is_some()
+        if let Some((sid, interest, ax, ay)) = self.surface_at(x, y)
+            && interest.down
         {
-            self.pressed_surface = Some((sid, std::rc::Rc::clone(&sinks), ay - y));
-            self.fire_surface(sid, &sinks.down, ax, ay, true, 0);
+            self.pressed_surface = Some((sid, ay - y));
+            self.queue_surface(sid, record::SurfaceIntentKind::Down, ax, ay, true, 0);
             return true;
         }
 
@@ -755,8 +760,8 @@ impl DCompBackend {
         // A viz pointer-surface drag: the surface hears its release wherever the
         // pointer was (capture semantics). No value is committed — every value
         // was already streamed by the `moved` sink.
-        if let Some((sid, sinks, dy)) = self.pressed_surface.take() {
-            self.fire_surface(sid, &sinks.up, x, y + dy, false, 0);
+        if let Some((sid, dy)) = self.pressed_surface.take() {
+            self.queue_surface(sid, record::SurfaceIntentKind::Up, x, y + dy, false, 0);
         }
 
         // A scrollbar-thumb drag: `scroll_off` is applied live as the thumb
@@ -805,8 +810,8 @@ impl DCompBackend {
         self.scrubbing = false;
         // End a viz pointer-surface drag: the surface always sees the release
         // (capture semantics), wherever the pointer is.
-        if let Some((sid, sinks, dy)) = self.pressed_surface.take() {
-            self.fire_surface(sid, &sinks.up, x, y + dy, false, 0);
+        if let Some((sid, dy)) = self.pressed_surface.take() {
+            self.queue_surface(sid, record::SurfaceIntentKind::Up, x, y + dy, false, 0);
             return;
         }
 
@@ -1466,10 +1471,10 @@ impl DCompBackend {
     pub(crate) fn on_wheel(&mut self, x: f32, y: f32, delta: i32) {
         // A viz pointer surface that subscribed the wheel (EQ Q-adjust) consumes
         // it; surfaces without a wheel sink fall through to scrolling.
-        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y)
-            && sinks.wheel.borrow().is_some()
+        if let Some((sid, interest, ax, ay)) = self.surface_at(x, y)
+            && interest.wheel
         {
-            self.fire_surface(sid, &sinks.wheel, ax, ay, false, delta);
+            self.queue_surface(sid, record::SurfaceIntentKind::Wheel, ax, ay, false, delta);
             return;
         }
 
@@ -1550,12 +1555,12 @@ impl DCompBackend {
     /// So this returns without touching layout unless a surface takes it, and
     /// never falls through to [`on_wheel`](Self::on_wheel).
     pub(crate) fn on_wheel_h(&mut self, x: f32, y: f32, delta: i32) {
-        if let Some((sid, sinks, ax, ay)) = self.surface_at(x, y)
-            && sinks.wheel.borrow().is_some()
+        if let Some((sid, interest, ax, ay)) = self.surface_at(x, y)
+            && interest.wheel
         {
-            self.fire_surface_wheel(
+            self.queue_surface_wheel(
                 sid,
-                &sinks.wheel,
+                record::SurfaceIntentKind::Wheel,
                 ax,
                 ay,
                 false,

@@ -92,6 +92,7 @@ fn open_pointer_surface(handle: &ElementHandle) -> Result<PointerSurface> {
         let (sinks, revoker) = backend::dcomp::register_element_pointer(handle.id)?;
         return Ok(PointerSurface {
             inner: PointerInner::Dcomp {
+                id: handle.id,
                 sinks,
                 _revoker: revoker,
             },
@@ -257,9 +258,12 @@ enum PointerInner {
     },
     /// DirectComposition: sinks the backend input router delivers to, with
     /// implicit capture for the press-to-release span (see
-    /// `backend::dcomp::pointer`). The revoker unregisters on drop.
+    /// `backend::dcomp::pointer`). The revoker unregisters on drop. `id` is the
+    /// registered node, so each builder can redeclare the surface's presence
+    /// bits to the router as it fills a sink cell.
     #[cfg(feature = "dcomp-backend")]
     Dcomp {
+        id: ControlId,
         sinks: Rc<backend::dcomp::PointerSinks>,
         _revoker: Subscription,
     },
@@ -314,8 +318,9 @@ impl PointerSurface {
     /// subsequent [`capture`](Self::capture) can grab it.
     pub fn on_down(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
         #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
-            *sinks.down.borrow_mut() = Some(Box::new(f));
+        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
+            *sinks.down.borrow_mut() = Some(Rc::new(f));
+            dcomp::declare(*id, sinks);
             return Ok(self);
         }
         self.subscribe_pointer(f, true, |iue, h| iue.PointerPressed(h))?;
@@ -330,8 +335,9 @@ impl PointerSurface {
     /// so there this is identical to [`on_down`](Self::on_down).)
     pub fn on_down_capture(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
         #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
-            *sinks.down.borrow_mut() = Some(Box::new(f));
+        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
+            *sinks.down.borrow_mut() = Some(Rc::new(f));
+            dcomp::declare(*id, sinks);
             return Ok(self);
         }
         let PointerInner::Xaml {
@@ -358,8 +364,9 @@ impl PointerSurface {
     /// Subscribe `PointerMoved`. Also refreshes the active pointer.
     pub fn on_move(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
         #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
-            *sinks.moved.borrow_mut() = Some(Box::new(f));
+        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
+            *sinks.moved.borrow_mut() = Some(Rc::new(f));
+            dcomp::declare(*id, sinks);
             return Ok(self);
         }
         self.subscribe_pointer(f, true, |iue, h| iue.PointerMoved(h))?;
@@ -369,8 +376,9 @@ impl PointerSurface {
     /// Subscribe `PointerReleased`.
     pub fn on_up(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
         #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
-            *sinks.up.borrow_mut() = Some(Box::new(f));
+        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
+            *sinks.up.borrow_mut() = Some(Rc::new(f));
+            dcomp::declare(*id, sinks);
             return Ok(self);
         }
         self.subscribe_pointer(f, false, |iue, h| iue.PointerReleased(h))?;
@@ -384,8 +392,9 @@ impl PointerSurface {
     /// under the pointer.
     pub fn on_exit(&self, f: impl Fn() + 'static) -> Result<&Self> {
         #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
-            *sinks.exited.borrow_mut() = Some(Box::new(f));
+        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
+            *sinks.exited.borrow_mut() = Some(Rc::new(f));
+            dcomp::declare(*id, sinks);
             return Ok(self);
         }
         self.subscribe_pointer(move |_| f(), false, |iue, h| iue.PointerExited(h))?;
@@ -395,8 +404,9 @@ impl PointerSurface {
     /// Subscribe `PointerWheelChanged`; read [`PointerEventInfo::wheel_delta`].
     pub fn on_wheel(&self, f: impl Fn(PointerEventInfo) + 'static) -> Result<&Self> {
         #[cfg(feature = "dcomp-backend")]
-        if let PointerInner::Dcomp { sinks, .. } = &self.inner {
-            *sinks.wheel.borrow_mut() = Some(Box::new(f));
+        if let PointerInner::Dcomp { id, sinks, .. } = &self.inner {
+            *sinks.wheel.borrow_mut() = Some(Rc::new(f));
+            dcomp::declare(*id, sinks);
             return Ok(self);
         }
         self.subscribe_pointer(f, false, |iue, h| iue.PointerWheelChanged(h))?;

@@ -8,10 +8,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use windows_reactor::dcomp_test_api::Recorder;
+use windows_reactor::dcomp_test_api::{Recorder, SurfaceSinks};
 use windows_reactor::{
-    Callback, ControlId, ControlKind, Event, EventHandler, PointerHandlers, Prop, PropValue,
-    Tooltip,
+    Callback, ControlId, ControlKind, Event, EventHandler, PointerEventInfo, PointerHandlers, Prop,
+    PropValue, Tooltip,
 };
 
 fn id(raw: u32) -> ControlId {
@@ -264,6 +264,84 @@ fn empty_flush_is_a_no_op() {
         before,
         "repeated flush replayed the buffer twice"
     );
+}
+
+/// Viz pointer surfaces ride the same intent seam: the router queues a
+/// `Surface`/`SurfaceExit` intent, and the drain resolves it against the
+/// app-side sink closures (`pointer::sinks_for`) — the router never touches a
+/// closure. Each transition addresses its own cell, a gesture stays FIFO
+/// (down → move → up), and a transition whose cell is unfilled resolves to
+/// nothing (the click-transparent case).
+#[test]
+fn surface_sinks_resolve_from_intents_in_gesture_order() {
+    let mut rec = Recorder::new();
+    let surf = SurfaceSinks::register(id(1));
+
+    let log = Rc::new(RefCell::new(Vec::<String>::new()));
+    let l = Rc::clone(&log);
+    surf.on_down(move |info: PointerEventInfo| l.borrow_mut().push(format!("down@{}", info.x)));
+    let l = Rc::clone(&log);
+    surf.on_move(move |info: PointerEventInfo| l.borrow_mut().push(format!("move@{}", info.x)));
+    let l = Rc::clone(&log);
+    surf.on_up(move |info: PointerEventInfo| l.borrow_mut().push(format!("up@{}", info.x)));
+    // Deliberately no `on_wheel`: that transition must resolve to nothing.
+
+    rec.queue_surface_down(id(1), PointerEventInfo { x: 1.0, ..Default::default() });
+    rec.queue_surface_move(id(1), PointerEventInfo { x: 2.0, ..Default::default() });
+    rec.queue_surface_move(id(1), PointerEventInfo { x: 3.0, ..Default::default() });
+    rec.queue_surface_up(id(1), PointerEventInfo { x: 4.0, ..Default::default() });
+    rec.queue_surface_wheel(id(1), PointerEventInfo::default());
+
+    assert_eq!(rec.drain_and_run(), 4, "the wheel had no sink and must not run");
+    assert_eq!(
+        *log.borrow(),
+        vec!["down@1", "move@2", "move@3", "up@4"],
+        "surface transitions must resolve to their own cell, in queue order"
+    );
+}
+
+/// A surface hover-exit intent resolves against the `on_exit` sink, and an
+/// intent for a surface with no live registration resolves to nothing.
+#[test]
+fn surface_exit_resolves_and_unregistration_is_honoured() {
+    let mut rec = Recorder::new();
+
+    let exits = Rc::new(Cell::new(0u32));
+    {
+        let surf = SurfaceSinks::register(id(1));
+        let e = Rc::clone(&exits);
+        surf.on_exit(move || e.set(e.get() + 1));
+
+        rec.queue_surface_exit(id(1));
+        assert_eq!(rec.drain_and_run(), 1);
+        assert_eq!(exits.get(), 1, "the exit sink did not run");
+        // `surf` drops here, unregistering the app-side sinks.
+    }
+
+    rec.queue_surface_exit(id(1));
+    assert_eq!(rec.drain_and_run(), 0, "a dropped surface must resolve to nothing");
+    assert_eq!(exits.get(), 1);
+}
+
+/// The drag-preview latency path: a surface drag/scrub sink that runs asks the
+/// host to drive a frame tick promptly (so the preview repaints in the same
+/// message), while a hover-exit that runs does not.
+#[test]
+fn surface_drag_drives_a_frame_tick_but_exit_does_not() {
+    let mut rec = Recorder::new();
+    let surf = SurfaceSinks::register(id(1));
+    surf.on_move(|_| {});
+    surf.on_exit(|| {});
+
+    rec.queue_surface_move(id(1), PointerEventInfo::default());
+    let (ran, drives_tick) = rec.drain_run_report();
+    assert_eq!(ran, 1);
+    assert!(drives_tick, "a surface drag/scrub sink must drive a prompt tick");
+
+    rec.queue_surface_exit(id(1));
+    let (ran, drives_tick) = rec.drain_run_report();
+    assert_eq!(ran, 1);
+    assert!(!drives_tick, "a hover-exit advances no preview and drives no tick");
 }
 
 /// Nothing thread-affine has leaked into a `Cmd` or `Intent` variant. The lib
