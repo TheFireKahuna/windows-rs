@@ -221,6 +221,41 @@ fn measure_solve(
                     height: known.height.unwrap_or(h),
                 };
             }
+            // The two per-item kinds size from `item_text`, not `text_layout`:
+            // neither owns a single representative run. A SelectorBar's
+            // segments each size to their own label; a ToggleSwitch is the
+            // track plus the gap plus the WIDER of its two state labels — the
+            // wider, not the current one, so flipping it never reflows the row.
+            if let Some(id) = ctx
+                && let Some(node) = arena_ref.get(id)
+                && matches!(node.kind, ControlKind::SelectorBar | ControlKind::ToggleSwitch)
+                && let Some(t) = node.item_text.as_ref()
+            {
+                let (mut widest, mut line_h) = (0.0f32, 0.0f32);
+                for l in t.measurable() {
+                    if let Ok((w, h)) = l.measure() {
+                        widest = widest.max(w);
+                        line_h = line_h.max(h);
+                    }
+                }
+                if node.kind == ControlKind::SelectorBar {
+                    let m = controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
+                    let labels: f32 = node.ctrl().seg_label_w.iter().sum();
+                    let n = node.ctrl().seg_label_w.len().max(1) as f32;
+                    return Size {
+                        width: known.width.unwrap_or(labels + n * 2.0 * m.pad_x + 2.0 * m.tray),
+                        height: known.height.unwrap_or(line_h + 2.0 * (m.pad_y + m.tray)),
+                    };
+                }
+                return Size {
+                    width: known
+                        .width
+                        .unwrap_or(parts::TRACK_W + controls::TOGGLE_LABEL_GAP + widest),
+                    // Taffy clamps to the birth `min_size` (the 40x20 track), so
+                    // the label's line height alone is the right answer here.
+                    height: known.height.unwrap_or(line_h),
+                };
+            }
             if let Some(id) = ctx
                 && let Some(node) = arena_ref.get(id)
                 && let Some(layout) = &node.text_layout
@@ -248,34 +283,6 @@ fn measure_solve(
                     let _ = layout.set_max_width(constraint.unwrap_or(f32::INFINITY));
                 }
                 if let Ok((tw, th)) = layout.measure() {
-                    // A SelectorBar's intrinsic size: each segment is its own
-                    // measured label + padding, side by side inside the tray
-                    // inset. The cached layout supplies the line height.
-                    if node.kind == ControlKind::SelectorBar {
-                        let m = controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
-                        let labels: f32 = node.ctrl().seg_label_w.iter().sum();
-                        let n = node.ctrl().seg_label_w.len().max(1) as f32;
-                        return Size {
-                            width: known
-                                .width
-                                .unwrap_or(labels + n * 2.0 * m.pad_x + 2.0 * m.tray),
-                            height: known.height.unwrap_or(th + 2.0 * (m.pad_y + m.tray)),
-                        };
-                    }
-                    // A ToggleSwitch's label sits AFTER the track, so its
-                    // intrinsic width is the track plus the gap plus the
-                    // (wider) label — without this the row clips the text.
-                    if node.kind == ControlKind::ToggleSwitch {
-                        return Size {
-                            width: known.width.unwrap_or(
-                                parts::TRACK_W + controls::TOGGLE_LABEL_GAP + tw,
-                            ),
-                            // Taffy clamps to the birth `min_size` (the 40x20
-                            // track), so the label's line height alone is the
-                            // right answer here.
-                            height: known.height.unwrap_or(th),
-                        };
-                    }
                     // A hyperlink is its words and nothing else — no ornament
                     // to reserve room for, and no border to inset from. The
                     // generic arm below would run `button_palette` on it to
@@ -497,37 +504,47 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
             n.measure_dirty = true;
         }
     }
-    // A SelectorBar measures every item label (each segment sizes to its own
-    // label) and caches one layout as `text_layout` so the measure callback has
-    // the line height. Measured at the active weight (600) so widths hold when
-    // any segment becomes active.
-    let needs_seg = arena.get(id).is_some_and(|n| {
-        n.text_dirty && n.kind == ControlKind::SelectorBar && !n.ctrl().items.is_empty()
-    });
+    // A SelectorBar shapes every item label TWICE — once at rest weight and
+    // once at the weight a selected segment takes — because a weight is baked
+    // into a layout and selecting a segment does not set `text_dirty`. See
+    // `glyph_text::ItemText`.
+    //
+    // Widths come from the ACTIVE runs, the wider pair, so a segment does not
+    // grow when it is picked.
+    // Deliberately NOT gated on there being any items: a bar whose items are
+    // taken away must have its shaped runs taken away with them, and a pass that
+    // skipped the empty case would leave the departed labels shaped and the sync
+    // would keep placing them.
+    let needs_seg = arena
+        .get(id)
+        .is_some_and(|n| n.text_dirty && n.kind == ControlKind::SelectorBar);
     if needs_seg {
         let (items, size, family) = {
             let n = arena.get(id).unwrap();
             (
                 n.ctrl().items.clone(),
-                n.paint.font_size,
+                controls::seg_font_size(n),
                 n.paint.font_family.clone().unwrap_or_else(|| "Segoe UI".to_string()),
             )
         };
         let mut widths = Vec::with_capacity(items.len());
-        let mut keep: Option<TextLayout> = None;
+        let mut rest = Vec::with_capacity(items.len());
+        let mut strong = Vec::with_capacity(items.len());
         for item in &items {
-            let mut w = 0.0f32;
-            if let Some(l) = build_text_layout(item, size, 600, &family, false) {
-                if let Ok((lw, _)) = l.measure() {
-                    w = lw;
-                }
-                keep = Some(l);
-            }
-            widths.push(w);
+            let a = build_text_layout(item, size, controls::SEG_WEIGHT_ACTIVE, &family, false);
+            widths.push(
+                a.as_ref()
+                    .and_then(|l| l.measure().ok())
+                    .map_or(0.0, |(w, _)| w),
+            );
+            rest.push(build_text_layout(item, size, controls::SEG_WEIGHT, &family, false));
+            strong.push(a);
         }
         if let Some(n) = arena.get_mut(id) {
             n.ctrl_mut().seg_label_w = widths;
-            n.text_layout = keep;
+            let t = n.item_text.get_or_insert_with(Default::default);
+            t.layouts = rest;
+            t.strong = strong;
             n.text_dirty = false;
             n.measure_dirty = true;
         }
@@ -576,14 +593,18 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
             n.measure_dirty = true;
         }
     }
-    // A ToggleSwitch sizes to its track PLUS the wider of its two state
-    // labels. The *wider*, not the current one, so flipping the switch never
-    // reflows the row around it — and so one cached layout is enough.
-    let needs_toggle = arena.get(id).is_some_and(|n| {
-        n.text_dirty
-            && n.kind == ControlKind::ToggleSwitch
-            && !(n.extras().on_content.is_empty() && n.extras().off_content.is_empty())
-    });
+    // A ToggleSwitch shapes BOTH state labels: it is sized to the wider of the
+    // two so flipping it never reflows the row around it, and drawn with
+    // whichever one the state currently names. One cached layout could answer
+    // one of those or the other, so both are kept — index `0` is `off`, `1` is
+    // `on`, which is what `glyph_text::toggle_sync` indexes with `is_on`.
+    //
+    // Not gated on either label being set, for the reason the segment pass is
+    // not gated on having items: a switch that LOSES its labels must lose its
+    // shaped runs, and the empty case already maps to `None` below.
+    let needs_toggle = arena
+        .get(id)
+        .is_some_and(|n| n.text_dirty && n.kind == ControlKind::ToggleSwitch);
     if needs_toggle {
         let (on, off, size, family) = {
             let n = arena.get(id).unwrap();
@@ -594,22 +615,20 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
                 n.paint.font_family.clone().unwrap_or_else(|| "Segoe UI".to_string()),
             )
         };
-        let mut widest: Option<TextLayout> = None;
-        let mut widest_w = -1.0f32;
-        for s in [&on, &off] {
-            if s.is_empty() {
-                continue;
-            }
-            if let Some(l) = build_text_layout(s, size, 400, &family, false)
-                && let Ok((w, _)) = l.measure()
-                && w > widest_w
-            {
-                widest_w = w;
-                widest = Some(l);
-            }
-        }
+        // Positional: a switch with only `OnContent` set must still find that
+        // label at index 1, so an empty side holds its slot as `None`.
+        let built: Vec<Option<TextLayout>> = [&off, &on]
+            .into_iter()
+            .map(|s| {
+                (!s.is_empty())
+                    .then(|| build_text_layout(s, size, 400, &family, false))
+                    .flatten()
+            })
+            .collect();
         if let Some(n) = arena.get_mut(id) {
-            n.text_layout = widest;
+            let t = n.item_text.get_or_insert_with(Default::default);
+            t.layouts = built;
+            t.strong.clear();
             n.text_dirty = false;
             n.measure_dirty = true;
         }

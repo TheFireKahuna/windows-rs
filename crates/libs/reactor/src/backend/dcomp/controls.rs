@@ -48,12 +48,16 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         // (`parts::hyperlink_plan`) and the words are glyph sprites, so there is
         // nothing to draw and `has_chrome` denies it a surface.
         ControlKind::HyperlinkButton => {}
-        // Track, outline, and knob are retained chrome parts (compositor
-        // sprites — see `super::parts`); the state label beside them is static
-        // text, so it paints here on the node's own surface.
-        ControlKind::ToggleSwitch => paint_toggle_label(session, brush, node, rect, dim),
+        // Track, outline, knob and ring are retained chrome parts
+        // (`parts::toggle_plan`); the state label beside them is glyph sprites
+        // (`glyph_text::toggle_sync`). Nothing left to draw, so `has_chrome`
+        // denies it a surface.
+        ControlKind::ToggleSwitch => {}
         ControlKind::CheckBox => paint_check_box(session, brush, node, rect, dim),
-        ControlKind::SelectorBar => paint_segmented(session, brush, node, rect, dim),
+        // The same: tray, sliding pill, hover ink and ring are parts
+        // (`parts::segmented_plan`), the segment labels are sprites
+        // (`glyph_text::segmented_sync`).
+        ControlKind::SelectorBar => {}
         ControlKind::ComboBox | ControlKind::DropDownButton => {
             paint_select(session, brush, node, rect, dim)
         }
@@ -78,13 +82,7 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
     // Kinds whose ring is a retained part are deliberately absent from this
     // shared tail — see `ring_is_retained`.
     if node.focus_ring && !ring_is_retained(node.kind) {
-        // The accent segmented tray is a stadium — its focus ring follows suit.
-        let radius = if node.kind == ControlKind::SelectorBar && node.paint.style_variant == 1 {
-            rect.height() / 2.0
-        } else {
-            focus_radius(node.kind)
-        };
-        draw_focus_ring(session, brush, rect, radius);
+        draw_focus_ring(session, brush, rect, focus_radius(node));
     }
     true
 }
@@ -213,12 +211,25 @@ pub(crate) fn draw_focus_ring(session: &DrawingSession, brush: &Brush, rect: Rec
 /// a border and shrunk). A kind must therefore be on exactly one of them, and
 /// this predicate is the single place that is decided.
 fn ring_is_retained(kind: ControlKind) -> bool {
-    super::node::is_button_family(kind) || kind == ControlKind::HyperlinkButton
+    super::node::is_button_family(kind)
+        || matches!(
+            kind,
+            ControlKind::HyperlinkButton | ControlKind::ToggleSwitch | ControlKind::SelectorBar
+        )
 }
 
-fn focus_radius(kind: ControlKind) -> f32 {
-    match kind {
+/// The corner radius a kind's focus ring follows.
+///
+/// Read by BOTH ring implementations — `draw_focus_ring` here and
+/// `parts::focus_ring_slots` — so a kind keeps its corners across the move from
+/// one to the other. The retained ring grows this by how far out each ring sits;
+/// this is the authored radius, not the ring's own.
+pub(crate) fn focus_radius(node: &Node) -> f32 {
+    match node.kind {
         ControlKind::ToggleSwitch | ControlKind::Slider => theme::RADIUS_PILL,
+        // The accent segmented tray is a stadium, so its ring is one too. The
+        // subtle variant is the dense toolbar tray and keeps square-ish corners.
+        ControlKind::SelectorBar if node.paint.style_variant == 1 => node.rect.h / 2.0,
         ControlKind::ComboBox | ControlKind::DropDownButton | ControlKind::SelectorBar => {
             theme::RADIUS_SM
         }
@@ -533,45 +544,6 @@ pub(crate) fn label_is_retained(node: &Node) -> bool {
 /// Gap between the switch track and its state label (the WinUI metric).
 pub(crate) const TOGGLE_LABEL_GAP: f32 = theme::SPACE_12;
 
-/// The label for the state the switch is currently in. Empty when the app set
-/// neither `OnContent` nor `OffContent`, which is the bare-switch default.
-pub(crate) fn toggle_label(node: &Node) -> &str {
-    let x = node.extras();
-    if node.ctrl().is_on {
-        &x.on_content
-    } else {
-        &x.off_content
-    }
-}
-
-/// The state label beside the track — left-aligned after it, vertically
-/// centred on the track, in the body text style.
-///
-/// Intentionally NOT a retained part: it does not move or fade, it only
-/// changes at the moment the switch flips, which already forces exactly one
-/// repaint of this surface.
-fn paint_toggle_label(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let label = toggle_label(node);
-    if label.is_empty() {
-        return;
-    }
-    let x0 = rect.left + super::parts::TRACK_W + TOGGLE_LABEL_GAP;
-    let box_ = Rect::new(x0, rect.top, rect.right, rect.bottom);
-    text(
-        session,
-        brush,
-        label,
-        box_,
-        "Segoe UI",
-        node.paint.font_size.max(theme::FONT_SIZE_MD),
-        400,
-        node.paint.foreground.unwrap_or(theme::text()),
-        TextAlignment::Leading,
-        ParagraphAlignment::Center,
-        dim,
-    );
-}
-
 // ── CheckBox ─────────────────────────────────────────────────────────────────
 
 fn paint_check_box(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
@@ -661,51 +633,21 @@ pub(crate) fn segment_edges(node: &Node) -> Vec<f32> {
     edges
 }
 
-fn paint_segmented(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let m = seg_metrics(node.paint.style_variant, node.paint.font_size);
-    let h = rect.height();
-
-    // The tray (fill + 1px stroke), the sliding indicator pill, and the hover
-    // ink are retained chrome parts UNDER this surface (`super::parts`) — the
-    // pill glides between segments on the compositor. Only the labels (and the
-    // focus-ring tail) are painted here, so they stay crisp above the pill.
-    let n = node.ctrl().items.len();
-    if n == 0 {
-        return;
-    }
-    let edges = segment_edges(node);
-    let pill_h = h - 2.0 * m.tray;
-    let seg_rect = |i: usize| {
-        Rect::from_xywh(rect.left + edges[i], rect.top + m.tray, edges[i + 1] - edges[i], pill_h)
-    };
-    let hot = node.ctrl().hot_index;
-
-    // Segment labels.
-    for (i, label) in node.ctrl().items.iter().enumerate() {
-        let active = i as i32 == node.ctrl().selected_index;
-        let hovered = node.paint.is_enabled && node.hovered && i as i32 == hot;
-        let color = if active {
-            theme::text()
-        } else if hovered {
-            theme::text_secondary()
-        } else {
-            theme::text_tertiary()
-        };
-        text(
-            session,
-            brush,
-            label,
-            seg_rect(i),
-            "Segoe UI",
-            node.paint.font_size.max(theme::FONT_SIZE_MICRO),
-            if active { 600 } else { 400 },
-            color,
-            TextAlignment::Center,
-            ParagraphAlignment::Center,
-            dim,
-        );
-    }
+/// The size a segment label is shaped and drawn at.
+///
+/// The floor is what makes a bar with no explicit font size legible rather than
+/// hairline. It belongs here, beside the geometry, because the measure pass and
+/// the sprite placement must shape at the SAME size — when the floor lived only
+/// in the draw call, `seg_label_w` was measured at the unfloored size and every
+/// segment was sized to a narrower run than the one that landed in it.
+pub(crate) fn seg_font_size(node: &Node) -> f32 {
+    node.paint.font_size.max(theme::FONT_SIZE_MICRO)
 }
+
+/// The rest and emphasis weights a segment label takes. The selected segment
+/// sets; the rest do not.
+pub(crate) const SEG_WEIGHT: u16 = 400;
+pub(crate) const SEG_WEIGHT_ACTIVE: u16 = 600;
 
 // ── Select / ComboBox / DropDownButton trigger ───────────────────────────────
 

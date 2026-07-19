@@ -48,9 +48,15 @@ fn main() -> windows_reactor::Result<()> {
         let (section, set_section) = cx.use_state::<String>("eq".to_string());
 
         // ── The control cards ────────────────────────────────────────────
+        // State labels, and no explicit width: a labelled switch sizes to its
+        // track plus the gap plus the WIDER of the two words, so pinning a
+        // width here would both hide that arithmetic and clip whichever label
+        // is longer. "Enabled"/"Bypassed" differ in width on purpose — a switch
+        // that reflowed the row when it flipped would be visible immediately.
         let toggle = ToggleSwitch::new(eq_on)
             .on_toggled(move |v| set_eq_on.call(v))
-            .width(44.0)
+            .on_content("Enabled")
+            .off_content("Bypassed")
             .height(24.0)
             .into();
 

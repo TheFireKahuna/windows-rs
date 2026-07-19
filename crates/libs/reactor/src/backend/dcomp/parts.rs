@@ -2190,7 +2190,7 @@ fn outline_rest_factor() -> f32 {
 }
 
 fn toggle_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 3, 0) {
+    if !ensure(comp, node, 3, 2) {
         return;
     }
     let plan = toggle_plan(node, scale);
@@ -2215,6 +2215,13 @@ pub(crate) fn toggle_plan(node: &Node, scale: f32) -> PartPlan {
 
     let track = Some((0.0, cy - TRACK_H / 2.0, TRACK_W, TRACK_H));
     let knob = Some((kx, cy - KNOB_D / 2.0, KNOB_D, KNOB_D));
+    let ring = focus_ring_slots(
+        node.focus_ring,
+        node.rect.w,
+        node.rect.h,
+        super::controls::focus_radius(node),
+        scale,
+    );
 
     PartPlan::new([node.rect.w, node.rect.h, 0.0])
         // The two tracks are stacked and cross-fade in place; only their opacity
@@ -2244,6 +2251,12 @@ pub(crate) fn toggle_plan(node: &Node, scale: f32) -> PartPlan {
             2,
             SlotPlan::glide(AtlasKey::circle(KNOB_D, theme::w(1.0), scale), knob, 1.0),
         )
+        // The ring takes the WHOLE node — track, gap and label — not the track
+        // alone, which is what the painted ring it replaces did and what WinUI's
+        // own switch does. A ring drawn round the track would read as focusing a
+        // different, smaller control than the one the label names.
+        .above(0, ring[0].clone())
+        .above(1, ring[1].clone())
 }
 
 fn knob_xs() -> (f32, f32) {
@@ -2735,7 +2748,7 @@ fn meter_arm_clip(parts: &mut Parts, w: f32) {
 
 /// Below-band roles: `[tray fill, tray stroke, pill, hover ink]`.
 fn segmented_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
-    if !ensure(comp, node, 4, 0) {
+    if !ensure(comp, node, 4, 2) {
         return;
     }
     let plan = segmented_plan(node, scale);
@@ -2773,6 +2786,13 @@ pub(crate) fn segmented_plan(node: &Node, scale: f32) -> PartPlan {
     let pill = seg_rect(sel);
     let k_pill = AtlasKey::hbar(pill_h, seg_radius, 0.0, pill_fill, scale);
     let k_ink = AtlasKey::hbar(pill_h, seg_radius, 0.0, theme::w(1.0), scale);
+    let ring = focus_ring_slots(
+        node.focus_ring,
+        w,
+        h,
+        super::controls::focus_radius(node),
+        scale,
+    );
 
     // Segment boundaries move when a label re-measures, so the edge checksum
     // joins the size: the pill must jump to boundaries that changed under it
@@ -2799,6 +2819,10 @@ pub(crate) fn segmented_plan(node: &Node, scale: f32) -> PartPlan {
             3,
             SlotPlan::snap(k_ink, seg_rect(node.ctrl().hot_index), seg_ink_target(node)).fading(),
         )
+        // The ring rings the TRAY, not the selected segment: focus is on the
+        // bar, and the selection already has the pill to show where it is.
+        .above(0, ring[0].clone())
+        .above(1, ring[1].clone())
 }
 
 fn seg_ink_target(node: &Node) -> f32 {

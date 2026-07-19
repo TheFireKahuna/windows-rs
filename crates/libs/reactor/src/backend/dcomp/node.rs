@@ -634,6 +634,16 @@ pub(crate) struct Node {
     /// composition rule, because both are clipped to the same content column
     /// the run is. See [`glyph_text::editor_sync`](super::glyph_text::editor_sync).
     pub text_part: Option<Box<super::glyph_text::TextPart>>,
+    /// Controls with one run PER ITEM: a `SelectorBar`'s segment labels, a
+    /// `ToggleSwitch`'s two state labels. Holds the shaped runs the layout pass
+    /// builds and the parts that place them.
+    ///
+    /// Separate from `text_part` because neither control has one run, and
+    /// separate from `text_layout` because neither control's items fit in one
+    /// slot: the toggle's two labels are alternatives (it is sized by the wider
+    /// and drawn with the current), and the bar's segments are a list. See
+    /// [`glyph_text::ItemText`](super::glyph_text::ItemText).
+    pub item_text: Option<Box<super::glyph_text::ItemText>>,
     /// Editors only: the caret sprite (topmost child, above the painted text)
     /// whose blink is a compositor-side square-wave opacity animation. Created
     /// lazily on first focused paint; see [`parts::sync_caret`].
@@ -821,6 +831,7 @@ impl Node {
             parts: None,
             button_text: None,
             text_part: None,
+            item_text: None,
             caret: None,
             knob: None,
             scroll_thumb: None,
@@ -1008,6 +1019,14 @@ impl Node {
             // glyph sprites there is likewise nothing left for a surface to
             // hold. Same reasoning as the button family above.
             ControlKind::TextBlock => false,
+            // The track, its outline and the knob have been compositor parts
+            // since before any of this; the state label beside them was the
+            // only thing left drawing, and it is glyph sprites now. Same for
+            // the focus ring, so nothing remains to hold a surface.
+            ControlKind::ToggleSwitch => false,
+            // Likewise: tray, sliding pill and hover ink are parts, the segment
+            // labels are sprites, the ring is a part.
+            ControlKind::SelectorBar => false,
             ControlKind::Line => self.paint.stroke.is_some(),
             ControlKind::Ellipse | ControlKind::Rectangle => {
                 self.paint.fill.is_some()

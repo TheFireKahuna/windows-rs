@@ -645,6 +645,84 @@ pub(crate) struct ButtonText {
     badge: TextPart,
 }
 
+/// The runs a control owns one of PER ITEM, which its single `text_layout` slot
+/// cannot hold: a `SelectorBar`'s segment labels, and a `ToggleSwitch`'s two
+/// state labels.
+///
+/// Both vectors are positional — index `i` is item `i` — so a run that failed to
+/// build holds its slot as `None` rather than shifting every item after it onto
+/// the wrong words.
+///
+/// `strong` exists because a selected segment sets at 600 while its neighbours
+/// stay at 400, and a weight is baked into a layout at construction. Keeping
+/// both weights shaped means **selection is never a rebuild**: the layout pass
+/// only runs on `text_dirty`, which picking a segment does not set, so a sync
+/// that reshaped on selection would either miss the flip entirely or put a
+/// DirectWrite layout build on the click path. A control with no emphasis weight
+/// (the toggle) leaves it empty.
+#[derive(Default)]
+pub(crate) struct ItemText {
+    /// One shaped run per item at the rest weight, rebuilt by the layout pass.
+    pub(crate) layouts: Vec<Option<TextLayout>>,
+    /// The same items at the weight a selected one takes, or empty.
+    pub(crate) strong: Vec<Option<TextLayout>>,
+    /// One placed run per item. Grown on demand and never shrunk — an item count
+    /// that drops usually comes back, and a hidden part costs nothing.
+    parts: Vec<TextPart>,
+}
+
+impl ItemText {
+    /// Every run the control could ever show, for the measure pass.
+    ///
+    /// The emphasis runs when there are any, else the rest ones — the widest
+    /// item at the weight it will be widest at. Sizing a control to the runs it
+    /// happens to be showing right now is what makes a row reflow when a
+    /// selection moves or a switch flips.
+    pub(crate) fn measurable(&self) -> impl Iterator<Item = &TextLayout> {
+        let v = if self.strong.is_empty() {
+            &self.layouts
+        } else {
+            &self.strong
+        };
+        v.iter().flatten()
+    }
+
+    /// Part `part` and the run for item `item`, borrowed together.
+    ///
+    /// One call rather than two accessors because the two live in different
+    /// fields: the part is taken mutably and the run shared, which is a split
+    /// borrow every caller would otherwise have to spell out by hand. The part
+    /// is grown into existence if this is the first sync to reach that far.
+    ///
+    /// The two indices are separate because they are separate questions, and
+    /// only one control makes them the same one. A segment bar places item `i`
+    /// into part `i`; a toggle owns TWO shaped labels and shows ONE of them, so
+    /// it places item `is_on` into part `0` — and if the part index followed the
+    /// item index there, flipping the switch would light a second part and leave
+    /// both words on screen.
+    ///
+    /// `strong` falls back to the rest weight when the control shaped no
+    /// emphasis run — a missing weight must render the words plainly, never
+    /// render nothing.
+    fn slot(&mut self, part: usize, item: usize, strong: bool) -> (&mut TextPart, Option<&TextLayout>) {
+        if self.parts.len() <= part {
+            self.parts.resize_with(part + 1, TextPart::default);
+        }
+        let run = strong
+            .then(|| self.strong.get(item).and_then(Option::as_ref))
+            .flatten()
+            .or_else(|| self.layouts.get(item).and_then(Option::as_ref));
+        (&mut self.parts[part], run)
+    }
+
+    /// Hide every part from `i` on — the items that no longer exist.
+    fn hide_from(&mut self, i: usize) {
+        for p in self.parts.iter_mut().skip(i) {
+            p.hide_all();
+        }
+    }
+}
+
 /// Place a run at the top-left of `b`, without centring it.
 ///
 /// The entry point for text whose own layout already decides where each line
@@ -677,6 +755,34 @@ fn place_leading(
         dim,
         scale,
     );
+}
+
+/// Place one run at the leading edge of `b`, centred on its vertical axis — the
+/// alignment a label beside something else takes.
+///
+/// Expressed as an origin rather than as a text format because a shaped run
+/// carries no alignment of its own once it is placed by hand: `TextAlignment`
+/// and `ParagraphAlignment` are instructions to the drawing call this path no
+/// longer makes.
+#[allow(clippy::too_many_arguments)]
+fn place_leading_centered(
+    part: &mut TextPart,
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    parent: &ContainerVisual,
+    layout: &TextLayout,
+    b: Rect,
+    host_box: Rect,
+    color: crate::Color,
+    dim: f32,
+    scale: f32,
+) {
+    let Ok((_, th)) = layout.measure() else {
+        part.hide_all();
+        return;
+    };
+    let origin = (b.left, b.top + ((b.height() - th) / 2.0).max(0.0));
+    part.sync(comp, atlas, parent, layout, origin, host_box, color, dim, scale);
 }
 
 /// Place one run centred in `b`, or hide it if it cannot be measured.
@@ -773,27 +879,149 @@ pub(crate) fn hyperlink_sync(
     };
 
     let mut part = node.text_part.take().unwrap_or_default();
+    let b = Rect::from_xywh(0.0, 0.0, w, h);
     match node.text_layout.as_ref() {
-        Some(layout) => match layout.measure() {
-            Ok((_, th)) => {
-                let origin = (0.0, ((h - th) / 2.0).max(0.0));
-                part.sync(
-                    comp,
-                    atlas,
-                    &node.container,
-                    layout,
-                    origin,
-                    Rect::from_xywh(0.0, 0.0, w, h),
-                    ink,
-                    dim,
-                    scale,
-                );
-            }
-            Err(_) => part.hide_all(),
-        },
+        Some(layout) => place_leading_centered(
+            &mut part,
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            b,
+            b,
+            ink,
+            dim,
+            scale,
+        ),
         None => part.hide_all(),
     }
     node.text_part = Some(part);
+}
+
+/// Reconcile a `ToggleSwitch`'s state label as retained glyph sprites.
+///
+/// One run, placed after the track — but read out of [`ItemText`] rather than
+/// the node's own `text_layout`, because the two labels are not
+/// interchangeable. The switch is SIZED to the wider of "On" and "Off" so
+/// flipping it never reflows the row around it, and it is DRAWN with whichever
+/// one the state currently names. A single cached layout can answer one of those
+/// questions or the other, and answering the sizing one is what it was there
+/// for; placing sprites from it would have rendered the wrong word whenever the
+/// two labels differed in width.
+///
+/// The host is the region right of the track, so a label wider than the room
+/// left for it loses its tail to the clip rather than overrunning the control.
+pub(crate) fn toggle_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+    if node.kind != crate::backend::ControlKind::ToggleSwitch {
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    let fg = node.paint.foreground.unwrap_or_else(theme::text);
+    let x0 = super::parts::TRACK_W + super::controls::TOGGLE_LABEL_GAP;
+    let b = Rect::from_xywh(x0, 0.0, (w - x0).max(0.0), h);
+    // Index, not a stored string: `layouts` is `[off, on]`, so the state picks
+    // the run and the same single part re-places on every flip.
+    let i = usize::from(node.ctrl().is_on);
+
+    let mut t = node.item_text.take().unwrap_or_default();
+    match t.slot(0, i, false) {
+        (part, Some(layout)) => place_leading_centered(
+            part,
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            b,
+            b,
+            fg,
+            dim,
+            scale,
+        ),
+        (part, None) => part.hide_all(),
+    }
+    node.item_text = Some(t);
+}
+
+/// Reconcile a `SelectorBar`'s segment labels as retained glyph sprites.
+///
+/// N segments are N independent runs — each with its own host, its own colour
+/// and its own centred origin inside its segment — so this is the first site to
+/// need [`ItemText`]'s per-item parts rather than a single [`TextPart`].
+///
+/// The selected segment sets at 600 and the rest at 400, which is a different
+/// SHAPED run and not a property that can be switched at placement time. Both
+/// weights are therefore shaped up front and picked between here; see
+/// [`ItemText::strong`] for why selection must not be allowed to trigger a
+/// rebuild.
+///
+/// Each label's host is its own segment rect, which is what keeps a label too
+/// wide for its share of the tray from bleeding into its neighbour.
+pub(crate) fn segmented_sync(
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    node: &mut Node,
+    scale: f32,
+) {
+    if node.kind != crate::backend::ControlKind::SelectorBar {
+        return;
+    }
+    let n = node.ctrl().items.len();
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    // The same geometry paint, hit-testing and UIA item rects all read, so a
+    // label cannot land anywhere but on the segment the pointer will report.
+    let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
+    let edges = super::controls::segment_edges(node);
+    let pill_h = (node.rect.h - 2.0 * m.tray).max(0.0);
+    let sel = node.ctrl().selected_index;
+    let hot = node.ctrl().hot_index;
+    let hovered = node.paint.is_enabled && node.hovered;
+
+    let mut t = node.item_text.take().unwrap_or_default();
+    for i in 0..n {
+        let Some((&a, &b)) = edges.get(i).zip(edges.get(i + 1)) else {
+            break;
+        };
+        let active = i as i32 == sel;
+        // A recolour is a `SetSource` on the run's shared colour brush, so
+        // hovering a segment re-rasterizes no glyph — it was a full repaint of
+        // the bar's surface when these labels were painted.
+        let color = if active {
+            theme::text()
+        } else if hovered && i as i32 == hot {
+            theme::text_secondary()
+        } else {
+            theme::text_tertiary()
+        };
+        let seg = Rect::from_xywh(a, m.tray, b - a, pill_h);
+        match t.slot(i, i, active) {
+            (part, Some(layout)) => place_centered(
+                part,
+                comp,
+                atlas,
+                &node.container,
+                layout,
+                seg,
+                seg,
+                color,
+                dim,
+                scale,
+            ),
+            (part, None) => part.hide_all(),
+        }
+    }
+    // Items can go away: a bar rebuilt with fewer segments must not leave the
+    // departed ones' words on screen.
+    t.hide_from(n);
+    node.item_text = Some(t);
 }
 
 /// Reconcile an editor's text run, its selection highlight and its IME
@@ -976,4 +1204,88 @@ pub(crate) fn button_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
     }
 
     node.button_text = Some(t);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ItemText` holds only shaped runs and placed parts, and a part with
+    /// nothing placed in it has minted no compositor object — so the indexing
+    /// below is exercisable with no device at all.
+    fn item_text(items: usize) -> ItemText {
+        ItemText {
+            layouts: (0..items).map(|_| None).collect(),
+            strong: Vec::new(),
+            parts: Vec::new(),
+        }
+    }
+
+    /// The part index and the item index are separate questions, and a toggle is
+    /// the control that proves it: two shaped labels, ONE of which is showing.
+    ///
+    /// If `slot` grew a part per ITEM, flipping the switch would place the new
+    /// word into a second part and leave the old one lit — both states visible
+    /// at once, which is exactly the failure the two-index signature exists to
+    /// make unrepresentable.
+    #[test]
+    fn a_toggles_two_labels_share_one_part() {
+        let mut t = item_text(2);
+        // Off, then on: the state picks the ITEM, never the part.
+        t.slot(0, 0, false);
+        assert_eq!(t.parts.len(), 1, "the off label mints exactly one part");
+        t.slot(0, 1, false);
+        assert_eq!(
+            t.parts.len(),
+            1,
+            "flipping to the on label must reuse that part, not grow a second"
+        );
+    }
+
+    /// A segment bar is the other half: N items ARE N parts, because all of them
+    /// are on screen together.
+    #[test]
+    fn a_segment_bar_grows_one_part_per_item() {
+        let mut t = item_text(4);
+        for i in 0..4 {
+            t.slot(i, i, i == 2);
+        }
+        assert_eq!(t.parts.len(), 4);
+    }
+
+    /// Parts are never shrunk, so a bar that loses segments has to hide the
+    /// departed ones explicitly — otherwise their words stay on screen with no
+    /// segment under them.
+    #[test]
+    fn parts_outlive_the_items_that_grew_them() {
+        let mut t = item_text(3);
+        for i in 0..3 {
+            t.slot(i, i, false);
+        }
+        t.layouts.truncate(1);
+        t.hide_from(1);
+        assert_eq!(t.parts.len(), 3, "the parts are retained for reuse…");
+        assert!(
+            t.parts[1..].iter().all(|p| p.host.is_none()),
+            "…but the two beyond the surviving item show nothing"
+        );
+    }
+
+    /// A control that shaped no emphasis weight must still render its words.
+    /// `strong` is empty for every kind but the segment bar, so a `true` here
+    /// asking for a run that was never built has to fall through to the rest
+    /// weight rather than return `None` and hide the label.
+    #[test]
+    fn asking_for_a_weight_that_was_never_shaped_falls_back() {
+        let mut t = item_text(1);
+        // Both vectors hold `None` at index 0 here, so this pins the SELECTION,
+        // not the run: the fallback arm is the one that must be reached.
+        assert!(t.strong.is_empty());
+        let (_, run) = t.slot(0, 0, true);
+        assert!(run.is_none(), "no run was built, so none comes back");
+
+        // And the measure pass reads the rest runs when there are no strong ones
+        // — sizing a control to an empty vector would collapse it to nothing.
+        assert_eq!(t.measurable().count(), 0);
+    }
 }
