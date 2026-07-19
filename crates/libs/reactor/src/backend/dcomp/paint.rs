@@ -75,14 +75,13 @@ fn paint_node(
             if let Some(n) = arena.get_mut(id) {
                 n.surf = Some(surf);
             }
-        } else if let Some(n) = arena.get_mut(id)
+        }
+        // Both writes self-gate, so a surface just minted at (pw, ph) skips the
+        // resize and takes the DIP push once.
+        if let Some(n) = arena.get_mut(id)
             && let Some(s) = &mut n.surf
         {
             let _ = s.resize(pw, ph);
-        }
-        if let Some(n) = arena.get(id)
-            && let Some(s) = &n.surf
-        {
             s.set_dip_size(w, h);
         }
 

@@ -35,6 +35,9 @@ pub(crate) struct NodeSurface {
     pub interop: ICompositionDrawingSurfaceInterop,
     /// Current backing size in physical pixels.
     pub px: (i32, i32),
+    /// Presented size in DIPs, as last pushed to the sprite. Born deliberately
+    /// negative so the first push always lands.
+    dip: (f32, f32),
     // Held so the surface + brush outlive the interop handle and the sprite's
     // brush binding.
     _surface: CompositionDrawingSurface,
@@ -318,6 +321,7 @@ impl Compositing {
             sprite,
             interop,
             px: (px_w, px_h),
+            dip: (-1.0, -1.0),
             _surface: surface,
             _brush: brush,
         })
@@ -343,9 +347,20 @@ impl NodeSurface {
     }
 
     /// Set the sprite's presented (DIP) size.
-    pub fn set_dip_size(&self, w: f32, h: f32) {
+    ///
+    /// Gated on the last value pushed, for the reason [`resize`](Self::resize)
+    /// is: the paint pass reaches every surface-bearing node on every repaint,
+    /// and a node whose size did not change would otherwise pay a `cast` plus a
+    /// cross-process `SetSize` per frame. A DIP size is independent of scale, so
+    /// a DPI change resizes the pixel buffer without touching this.
+    pub fn set_dip_size(&mut self, w: f32, h: f32) {
+        let (w, h) = (w.max(0.0), h.max(0.0));
+        if (w, h) == self.dip {
+            return;
+        }
         if let Ok(v) = self.sprite.cast::<IVisual>() {
-            let _ = v.SetSize(Vector2::new(w.max(0.0), h.max(0.0)));
+            let _ = v.SetSize(Vector2::new(w, h));
+            self.dip = (w, h);
         }
     }
 

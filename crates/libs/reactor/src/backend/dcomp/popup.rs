@@ -97,7 +97,7 @@ impl Popup {
         surf_h: f32,
     ) -> windows_core::Result<(ContainerVisual, NodeSurface)> {
         let scale = comp.scale();
-        let (container, surf) =
+        let (container, mut surf) =
             comp.new_overlay((surf_w * scale).ceil() as i32, (surf_h * scale).ceil() as i32)?;
         surf.set_dip_size(surf_w, surf_h);
         let vis: IVisual = container.cast()?;
