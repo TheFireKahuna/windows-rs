@@ -926,35 +926,30 @@ impl Pen<'_> {
             self.scale,
         );
     }
-}
 
-// ── Pilot scaffolding ────────────────────────────────────────────────────────
-// Temporary shims so the sites not yet moved onto `Pen` keep building. Each is
-// the old signature forwarding to `Pen`; they go away as the remaining
-// `*_sync`s convert.
-macro_rules! shim {
-    ($name:ident, $align:expr) => {
-        #[allow(clippy::too_many_arguments)]
-        fn $name(
-            part: &mut TextPart,
-            comp: &Compositing,
-            atlas: &mut GlyphAtlas,
-            parent: &ContainerVisual,
-            layout: &TextLayout,
-            b: Rect,
-            host_box: Rect,
-            color: crate::Color,
-            dim: f32,
-            scale: f32,
-        ) {
-            Pen { comp, atlas, host: parent.clone(), dim, scale }
-                .place_in(part, Some(layout), b, host_box, $align, color);
-        }
-    };
+    /// Place a run at `(x, y)` after re-pinning its max width to `max_w`.
+    ///
+    /// Re-pinning is what arms `CharacterEllipsis`: the layout is built at its
+    /// natural width and only ellipsizes once narrowed. Skipping it renders a
+    /// title at full length over the window buttons.
+    pub(crate) fn place_trimmed(
+        &mut self,
+        part: &mut TextPart,
+        run: Option<&TextLayout>,
+        at: Option<(f32, f32)>,
+        y: f32,
+        line_h: f32,
+        color: crate::Color,
+    ) {
+        let Some((layout, (x, max_w))) = run.zip(at) else {
+            part.hide_all();
+            return;
+        };
+        let _ = layout.set_max_width(max_w);
+        let b = Rect::from_xywh(x, y, max_w, line_h);
+        self.place_in(part, Some(layout), b, b, Align::Leading, color);
+    }
 }
-shim!(place_leading, Align::Leading);
-shim!(place_leading_centered, Align::LeadingCentered);
-shim!(place_centered, Align::Centered);
 
 /// Reconcile a `TextBlock`'s prose as retained glyph sprites.
 ///
@@ -1087,45 +1082,27 @@ pub(crate) fn caption_sync(
     if node.kind != crate::backend::ControlKind::TitleBar {
         return;
     }
-    let (w, h) = (node.rect.w, node.rect.h);
-    let band = Rect::from_xywh(0.0, 0.0, w, h);
+    let band = Rect::from_xywh(0.0, 0.0, node.rect.w, node.rect.h);
     let back_w = super::caption::back_width(node.extras());
     let back_enabled = node.extras().back_button_enabled;
     let back_box = super::caption::back_rect(node.extras(), band);
     let maximized = super::caption::maximized();
 
-    let Some(t) = node.caption_text.take() else {
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    // The band's ink never dims as a whole; a disabled back arrow greys itself.
+    pen.dim = 1.0;
+    let Some(t) = node.caption_text.as_ref() else {
         return;
     };
-    let mut g = node.caption_glyphs.take().unwrap_or_default();
+    let g = node.caption_glyphs.get_or_insert_default();
 
     // The two titles, placed from one resolved coupling.
-    match super::caption::title_placement(&t, back_w, band, content_left) {
+    match super::caption::title_placement(t, back_w, band, content_left) {
         Some(p) => {
-            place_trimmed(
-                &mut g.title,
-                comp,
-                atlas,
-                &node.container,
-                t.title.as_ref(),
-                p.title,
-                p.y,
-                t.line_h,
-                theme::text(),
-                scale,
-            );
-            place_trimmed(
-                &mut g.subtitle,
-                comp,
-                atlas,
-                &node.container,
-                t.subtitle.as_ref(),
-                p.subtitle,
-                p.y,
-                t.line_h,
-                theme::text_secondary(),
-                scale,
-            );
+            let h = t.line_h;
+            pen.place_trimmed(&mut g.title, t.title.as_ref(), p.title, p.y, h, theme::text());
+            let ink = theme::text_secondary();
+            pen.place_trimmed(&mut g.subtitle, t.subtitle.as_ref(), p.subtitle, p.y, h, ink);
         }
         None => {
             g.title.hide_all();
@@ -1136,77 +1113,17 @@ pub(crate) fn caption_sync(
     // The back chevron, then the window cluster. Disabled greys the arrow
     // rather than hiding it, exactly as WinUI does — hiding it would reflow the
     // whole band every time navigation depth hit zero.
-    let back_ink = if back_enabled {
-        theme::text()
-    } else {
-        theme::text_disabled()
-    };
-    match t.glyphs[super::caption::glyph_slot::BACK].as_ref().zip(back_box) {
-        Some((layout, r)) => place_centered(
-            &mut g.buttons[0],
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            r,
-            r,
-            back_ink,
-            1.0,
-            scale,
-        ),
+    let back_ink = if back_enabled { theme::text() } else { theme::text_disabled() };
+    let back = t.glyphs[super::caption::glyph_slot::BACK].as_ref();
+    match back_box {
+        Some(r) => pen.place(&mut g.buttons[0], back, r, Align::Centered, back_ink),
         None => g.buttons[0].hide_all(),
     }
     for i in 0..3 {
-        let slot = super::caption::window_glyph_slot(i, maximized);
+        let run = t.glyphs[super::caption::window_glyph_slot(i, maximized)].as_ref();
         let r = super::caption::button_rect(i, band);
-        match t.glyphs[slot].as_ref() {
-            Some(layout) => place_centered(
-                &mut g.buttons[1 + i as usize],
-                comp,
-                atlas,
-                &node.container,
-                layout,
-                r,
-                r,
-                theme::text(),
-                1.0,
-                scale,
-            ),
-            None => g.buttons[1 + i as usize].hide_all(),
-        }
+        pen.place(&mut g.buttons[1 + i as usize], run, r, Align::Centered, theme::text());
     }
-
-    node.caption_glyphs = Some(g);
-    node.caption_text = Some(t);
-}
-
-/// Place one caption title run at `(x, max_width)`, or hide it.
-///
-/// Re-pins the run's max width before placing, which is what arms its
-/// `CharacterEllipsis` trimming: the layout is built at natural width and only
-/// ellipsizes once narrowed. The painted path did the same thing on every
-/// repaint; skipping it here would render a title at full length over the
-/// window buttons.
-#[allow(clippy::too_many_arguments)]
-fn place_trimmed(
-    part: &mut TextPart,
-    comp: &Compositing,
-    atlas: &mut GlyphAtlas,
-    parent: &ContainerVisual,
-    layout: Option<&TextLayout>,
-    at: Option<(f32, f32)>,
-    y: f32,
-    line_h: f32,
-    color: crate::Color,
-    scale: f32,
-) {
-    let Some((layout, (x, max_w))) = layout.zip(at) else {
-        part.hide_all();
-        return;
-    };
-    let _ = layout.set_max_width(max_w);
-    let host = Rect::from_xywh(x, y, max_w, line_h);
-    part.sync(comp, atlas, parent, layout, (x, y), host, color, 1.0, scale);
 }
 
 /// The three runs an `InfoBar` places: its severity glyph, its paragraph, and
@@ -1246,64 +1163,37 @@ pub(crate) fn info_bar_sync(
         return;
     }
     let (w, h) = (node.rect.w, node.rect.h);
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
     let closable = node.extras().bar_closable;
     let sev_color = super::info_bar::severity(node.extras()).color();
     let ink = node.paint.foreground.unwrap_or_else(theme::text);
 
-    let Some(t) = node.bar_text.take() else {
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    let Some(t) = node.bar_text.as_ref() else {
         return;
     };
-    let mut g = node.bar_glyphs.take().unwrap_or_default();
+    let g = node.bar_glyphs.get_or_insert_default();
 
     // The severity glyph, centred in its column.
-    match t.icon.as_ref() {
-        Some(layout) => {
-            let cell = super::info_bar::icon_cell(h);
-            place_centered(
-                &mut g.icon, comp, atlas, &node.container, layout, cell, cell, sev_color, dim,
-                scale,
-            );
-        }
-        None => g.icon.hide_all(),
-    }
+    let cell = super::info_bar::icon_cell(h);
+    pen.place(&mut g.icon, t.icon.as_ref(), cell, Align::Centered, sev_color);
 
     // The paragraph, re-pinned to the column it is about to be placed in.
     match t.pinned(w, closable) {
         Some((run, th)) => {
             let b = super::info_bar::text_box(w, h, th, closable);
-            place_leading(&mut g.para, comp, atlas, &node.container, run, b, b, ink, dim, scale);
+            pen.place(&mut g.para, Some(run), b, Align::Leading, ink);
         }
         None => g.para.hide_all(),
     }
 
     // The close glyph, centred in the button box the hit test uses.
-    match t
-        .close
-        .as_ref()
-        .zip(super::info_bar::close_rect(w, h, closable))
-    {
-        Some((layout, r)) => place_centered(
-            &mut g.close,
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            r,
-            r,
-            theme::text_secondary(),
-            dim,
-            scale,
-        ),
+    match super::info_bar::close_rect(w, h, closable) {
+        Some(r) => {
+            let run = t.close.as_ref();
+            pen.place(&mut g.close, run, r, Align::Centered, theme::text_secondary());
+        }
         None => g.close.hide_all(),
     }
-
-    node.bar_glyphs = Some(g);
-    node.bar_text = Some(t);
 }
 
 /// Reconcile an `InfoBadge`'s count as retained glyph sprites.
@@ -1389,11 +1279,6 @@ pub(crate) fn segmented_sync(
         return;
     }
     let n = node.ctrl().items.len();
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
     // The same geometry paint, hit-testing and UIA item rects all read, so a
     // label cannot land anywhere but on the segment the pointer will report.
     let m = super::controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
@@ -1403,7 +1288,8 @@ pub(crate) fn segmented_sync(
     let hot = node.ctrl().hot_index;
     let hovered = node.paint.is_enabled && node.hovered;
 
-    let mut t = node.item_text.take().unwrap_or_default();
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    let t = node.item_text.get_or_insert_default();
     for i in 0..n {
         let Some((&a, &b)) = edges.get(i).zip(edges.get(i + 1)) else {
             break;
@@ -1420,26 +1306,12 @@ pub(crate) fn segmented_sync(
             theme::text_tertiary()
         };
         let seg = Rect::from_xywh(a, m.tray, b - a, pill_h);
-        match t.slot(i, i, active) {
-            (part, Some(layout)) => place_centered(
-                part,
-                comp,
-                atlas,
-                &node.container,
-                layout,
-                seg,
-                seg,
-                color,
-                dim,
-                scale,
-            ),
-            (part, None) => part.hide_all(),
-        }
+        let (part, run) = t.slot(i, i, active);
+        pen.place(part, run, seg, Align::Centered, color);
     }
     // Items can go away: a bar rebuilt with fewer segments must not leave the
     // departed ones' words on screen.
     t.hide_from(n);
-    node.item_text = Some(t);
 }
 
 /// Reconcile a NavigationView pane's every run as retained sprites: its two
@@ -1460,117 +1332,57 @@ pub(crate) fn nav_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut No
     if node.kind != crate::backend::ControlKind::NavigationView {
         return;
     }
+    use super::nav::ChromeRun;
     let (w, h) = (node.rect.w, node.rect.h);
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
     let count = node.ctrl().items.len();
     let sel = node.ctrl().selected_index;
+    let back_enabled = node.extras().back_enabled;
+    let has_title = node.nav_text.as_ref().is_some_and(|t| t.title.is_some());
+    // Resolved before the borrow below: `extras()` takes the whole node.
+    let m = super::nav::metrics(node.extras(), w, has_title);
 
-    // Taken, not borrowed: the placement below needs the node's container at the
-    // same time as the pane's runs, and the two are fields of the same node.
-    let Some(mut t) = node.nav_text.take() else {
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    let Some(t) = node.nav_text.as_mut() else {
         return;
     };
-    let m = super::nav::metrics(node.extras(), w, t.title.is_some());
 
     // ── The pane's own three runs ────────────────────────────────────────────
     // A disabled back arrow is still SHOWN, greyed — hiding it on disable would
     // reflow the pane every time the navigation stack hit depth zero. The grey
     // is the run's colour and not the host's dim, which carries the whole
     // control's enablement and would grey the hamburger beside it too.
-    match (super::nav::back_rect(&m), t.back.take()) {
-        (Some(b), Some(layout)) => {
-            let ink = if node.extras().back_enabled {
-                theme::text()
-            } else {
-                theme::text_disabled()
-            };
-            place_centered(
-                t.chrome(super::nav::ChromeRun::Back),
-                comp,
-                atlas,
-                &node.container,
-                &layout,
-                b,
-                b,
-                ink,
-                dim,
-                scale,
-            );
-            t.back = Some(layout);
-        }
-        (_, layout) => {
-            t.back = layout;
-            t.chrome(super::nav::ChromeRun::Back).hide_all();
-        }
+    let ink = if back_enabled { theme::text() } else { theme::text_disabled() };
+    let (part, run) = t.chrome_slot(ChromeRun::Back);
+    match super::nav::back_rect(&m) {
+        Some(b) => pen.place(part, run, b, Align::Centered, ink),
+        None => part.hide_all(),
     }
-    match (super::nav::toggle_rect(&m), t.toggle.take()) {
-        (Some(b), Some(layout)) => {
-            place_centered(
-                t.chrome(super::nav::ChromeRun::Toggle),
-                comp,
-                atlas,
-                &node.container,
-                &layout,
-                b,
-                b,
-                theme::text(),
-                dim,
-                scale,
-            );
-            t.toggle = Some(layout);
-        }
-        (_, layout) => {
-            t.toggle = layout;
-            t.chrome(super::nav::ChromeRun::Toggle).hide_all();
-        }
+    let (part, run) = t.chrome_slot(ChromeRun::Toggle);
+    match super::nav::toggle_rect(&m) {
+        Some(b) => pen.place(part, run, b, Align::Centered, theme::text()),
+        None => part.hide_all(),
     }
     // The header is clamped to its own natural width before the pane's, so a
     // short title stays short: `set_max_width` is a wrap/trim bound, and handing
     // it the whole column would place an ellipsis budget the title never needs.
-    match (super::nav::title_box(&m), t.title.take()) {
-        (Some(b), Some(layout)) => {
-            let _ = layout.set_max_width(t.title_w.min(b.width()));
-            place_leading_centered(
-                t.chrome(super::nav::ChromeRun::Title),
-                comp,
-                atlas,
-                &node.container,
-                &layout,
-                b,
-                b,
-                theme::text_secondary(),
-                dim,
-                scale,
-            );
-            t.title = Some(layout);
+    let title_w = t.title_w;
+    let (part, run) = t.chrome_slot(ChromeRun::Title);
+    match super::nav::title_box(&m) {
+        Some(b) => {
+            if let Some(l) = run {
+                let _ = l.set_max_width(title_w.min(b.width()));
+            }
+            pen.place(part, run, b, Align::LeadingCentered, theme::text_secondary());
         }
-        (_, layout) => {
-            t.title = layout;
-            t.chrome(super::nav::ChromeRun::Title).hide_all();
-        }
+        None => part.hide_all(),
     }
 
     // ── The rows ─────────────────────────────────────────────────────────────
     let n = super::nav::visible_items(&m, h, count);
     let labels = m.kind.expanded();
     for i in 0..n {
-        nav_row(
-            comp,
-            atlas,
-            &node.container,
-            &mut t.rows,
-            i,
-            super::nav::item_rect(&m, i as i32),
-            &m,
-            i as i32 == sel,
-            labels,
-            dim,
-            scale,
-        );
+        let row = super::nav::item_rect(&m, i as i32);
+        nav_row(&mut pen, &mut t.rows, i, row, &m, i as i32 == sel, labels);
     }
     // Every row past the visible ones — a pane too short for its whole menu must
     // not leave the surplus rows' words floating over the settings row, and a
@@ -1582,22 +1394,9 @@ pub(crate) fn nav_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut No
     // COUNT so that a pane shrinking its visible window never re-points the
     // settings sprites at a menu item's runs.
     if let Some(row) = super::nav::settings_rect(&m, h) {
-        nav_row(
-            comp,
-            atlas,
-            &node.container,
-            &mut t.rows,
-            count,
-            row,
-            &m,
-            sel == super::nav::SETTINGS_INDEX,
-            labels,
-            dim,
-            scale,
-        );
+        let active = sel == super::nav::SETTINGS_INDEX;
+        nav_row(&mut pen, &mut t.rows, count, row, &m, active, labels);
     }
-
-    node.nav_text = Some(t);
 }
 
 /// Place one pane row: its leading glyph in the rail column, and — in an
@@ -1607,66 +1406,33 @@ pub(crate) fn nav_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut No
 /// a row is two runs rather than one shaped string: an active row's glyph goes
 /// accent while its words go primary, which is WinUI's own selected-item
 /// treatment and cannot be expressed by one run with one colour source.
-#[allow(clippy::too_many_arguments)]
 fn nav_row(
-    comp: &Compositing,
-    atlas: &mut GlyphAtlas,
-    parent: &ContainerVisual,
+    pen: &mut Pen,
     rows: &mut RowText,
     i: usize,
     row: Rect,
     m: &super::nav::Metrics,
     active: bool,
     labels: bool,
-    dim: f32,
-    scale: f32,
 ) {
     let slot = rows.row(i);
     let cell = super::nav::icon_cell(row);
-    match slot.leading {
-        (part, Some(layout)) => place_centered(
-            part,
-            comp,
-            atlas,
-            parent,
-            layout,
-            cell,
-            cell,
-            if active {
-                theme::accent()
-            } else {
-                theme::text_tertiary()
-            },
-            dim,
-            scale,
-        ),
-        (part, None) => part.hide_all(),
-    }
+    let glyph_ink = if active { theme::accent() } else { theme::text_tertiary() };
+    let (part, run) = slot.leading;
+    pen.place(part, run, cell, Align::Centered, glyph_ink);
+
     let b = super::nav::label_box(m, row);
-    match slot.label {
-        (part, Some(layout)) if labels && b.width() > 0.0 => {
+    let (part, run) = slot.label;
+    match run.filter(|_| labels && b.width() > 0.0) {
+        Some(layout) => {
             // Narrow the run to the room this pane width leaves, which is what
             // makes labels ellipsize as the pane closes. `sync` re-walks the
             // layout below, so the reshape lands in this same pass.
             let _ = layout.set_max_width(b.width());
-            place_leading_centered(
-                part,
-                comp,
-                atlas,
-                parent,
-                layout,
-                b,
-                b,
-                if active {
-                    theme::text()
-                } else {
-                    theme::text_secondary()
-                },
-                dim,
-                scale,
-            );
+            let ink = if active { theme::text() } else { theme::text_secondary() };
+            pen.place(part, Some(layout), b, Align::LeadingCentered, ink);
         }
-        (part, _) => part.hide_all(),
+        None => part.hide_all(),
     }
 }
 
@@ -1708,15 +1474,18 @@ pub(crate) fn editor_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
     let column = Rect::from_xywh(band.content_x, 0.0, band.content_w, node.rect.h);
     let origin = (band.origin_x, band.origin_y);
 
-    let mut part = node.text_part.take().unwrap_or_default();
+    // Borrowed, not taken: `text_part`, `editor` and `container` are distinct
+    // fields, so the placement below needs no take/put-back dance.
+    let fg = node.paint.foreground.unwrap_or_else(theme::text);
+    let host = &node.container;
     let ed = node.editor.as_ref().expect("checked above");
     let empty = ed.buf.is_empty();
+    let part = node.text_part.get_or_insert_default();
 
     match ed.layout.as_ref().filter(|_| !empty) {
         Some(layout) => {
-            let fg = node.paint.foreground.unwrap_or_else(theme::text);
             let shaped = layout.shape().ok();
-            part.sync(comp, atlas, &node.container, layout, origin, column, fg, dim, scale);
+            part.sync(comp, atlas, host, layout, origin, column, fg, dim, scale);
 
             // Selection sits behind the run, so it is placed after the host
             // exists but lands under every glyph — see `TextPart::sync_fills`.
@@ -1747,8 +1516,6 @@ pub(crate) fn editor_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
         // editor owns no layout for), so there is nothing to place here.
         None => part.hide_all(),
     }
-
-    node.text_part = Some(part);
 }
 
 /// Reconcile a button-family node's label and ornaments as retained glyph
@@ -1772,84 +1539,37 @@ pub(crate) fn button_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
     let pal = super::controls::button_palette(node);
     let fg = pal.fg;
     let badge_ink = super::controls::badge_paint(node, &pal).map(|(_, ink)| ink);
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
+    // Every run is clipped to the whole control, not to its own box: a label too
+    // wide for its column loses its tail at the button's edge, not at the
+    // column's.
+    let clip = Rect::from_xywh(0.0, 0.0, w, h);
+    let retained = super::controls::label_is_retained(node);
 
-    let mut t = node.button_text.take().unwrap_or_default();
-
-    match node
-        .text_layout
-        .as_ref()
-        .filter(|_| super::controls::label_is_retained(node))
-    {
-        Some(layout) => place_centered(
-            &mut t.label,
-            comp,
-            atlas,
-            &node.container,
-            layout,
-            boxes.label,
-            Rect::from_xywh(0.0, 0.0, w, h),
-            fg,
-            dim,
-            scale,
-        ),
-        None => t.label.hide_all(),
-    }
+    let mut pen = Pen::new(comp, atlas, node, scale);
+    let label = node.text_layout.as_ref().filter(|_| retained);
+    let t = node.button_text.get_or_insert_default();
+    pen.place_in(&mut t.label, label, boxes.label, clip, Align::Centered, fg);
 
     // The icon takes the label's ink: it is chrome belonging to the same
     // control, and a glyph that recoloured independently of the words beside it
     // would read as a second, unrelated element.
-    match (boxes.icon, t.icon_layout.take()) {
-        (Some(b), Some(layout)) => {
-            place_centered(
-                &mut t.icon,
-                comp,
-                atlas,
-                &node.container,
-                &layout,
-                b,
-                Rect::from_xywh(0.0, 0.0, w, h),
-                fg,
-                dim,
-                scale,
-            );
-            t.icon_layout = Some(layout);
+    match boxes.icon {
+        Some(b) => {
+            let run = t.icon_layout.as_ref();
+            pen.place_in(&mut t.icon, run, b, clip, Align::Centered, fg);
         }
-        (_, layout) => {
-            t.icon_layout = layout;
-            t.icon.hide_all();
-        }
+        None => t.icon.hide_all(),
     }
 
     // The count sits ON the badge plate, so its ink comes from the same place
     // the plate's fill does — see `controls::badge_paint`.
-    match (boxes.badge.zip(badge_ink), t.badge_layout.take()) {
-        (Some((b, ink)), Some(layout)) => {
-            place_centered(
-                &mut t.badge,
-                comp,
-                atlas,
-                &node.container,
-                &layout,
-                b,
-                Rect::from_xywh(0.0, 0.0, w, h),
-                ink,
-                dim,
-                scale,
-            );
-            t.badge_layout = Some(layout);
+    match boxes.badge.zip(badge_ink) {
+        Some((b, ink)) => {
+            let run = t.badge_layout.as_ref();
+            pen.place_in(&mut t.badge, run, b, clip, Align::Centered, ink);
         }
-        (_, layout) => {
-            t.badge_layout = layout;
-            t.badge.hide_all();
-        }
+        None => t.badge.hide_all(),
     }
-
-    node.button_text = Some(t);
 }
 
 #[cfg(test)]

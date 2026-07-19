@@ -402,6 +402,23 @@ impl NavPaneText {
     pub(crate) fn chrome(&mut self, which: ChromeRun) -> &mut super::glyph_text::TextPart {
         &mut self.chrome[which as usize]
     }
+
+    /// One chrome run and the part that places it, borrowed together.
+    ///
+    /// One call rather than two accessors for the reason [`RowText::row`] is
+    /// one: the part is taken mutably and the run shared, out of fields the
+    /// borrow checker will only let a caller split from inside the type.
+    pub(crate) fn chrome_slot(
+        &mut self,
+        which: ChromeRun,
+    ) -> (&mut super::glyph_text::TextPart, Option<&TextLayout>) {
+        let run = match which {
+            ChromeRun::Back => self.back.as_ref(),
+            ChromeRun::Toggle => self.toggle.as_ref(),
+            ChromeRun::Title => self.title.as_ref(),
+        };
+        (&mut self.chrome[which as usize], run)
+    }
 }
 
 /// Lay out one pane run at its natural width.
