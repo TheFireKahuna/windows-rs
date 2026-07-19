@@ -31,6 +31,7 @@ mod dispatch;
 mod display_change;
 mod editor;
 mod glyph_atlas;
+mod glyph_text;
 mod host;
 pub(crate) mod info_badge;
 pub(crate) mod info_bar;
