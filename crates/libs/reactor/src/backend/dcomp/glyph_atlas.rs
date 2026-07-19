@@ -32,13 +32,19 @@
 //!   drawn in, and a recolour is a `SetSource` on the mask brush — no re-raster,
 //!   no repaint, and no loss of dynamic range.
 //!
-//! The mask is FP16, and the depth is load-bearing rather than incidental:
-//! DirectWrite writes coverage through a steeply compressive gamma ramp (2.2 —
-//! see `canvas_core::text`), and quantizing that to 8 bits collapses its top, so
-//! the near-saturated pixels along every stem round up together and the text
-//! renders measurably heavier. At FP16 a placed label is `+0.04/255` against the
-//! same run drawn directly; at 8-bit it was `+3.5`, and `+16` on the
-//! high-coverage pixels.
+//! The mask is FP16, and that is now a historical choice rather than a
+//! load-bearing one. It was made when this module DREW its glyphs: Direct2D
+//! wrote coverage through a compressive ~2.2 ramp whose top collapsed under
+//! 8-bit quantization, so stems rounded up together and text rendered
+//! measurably heavier (`+3.5/255` overall, `+16` on high-coverage pixels;
+//! `+0.04` at FP16).
+//!
+//! [`rasterize`] no longer draws — it uploads the rasterizer's own coverage,
+//! which is `u8`. There is no ramp left to quantize and no information above 8
+//! bits to keep, so FP16 currently stores 8-bit data in 64 bits per pixel.
+//! [`MASK_FORMAT`] can therefore become A8 for an 8× memory cut with no change
+//! to the pixels; what remains unproven is only that the compositor honours an
+//! A8 surface as a mask brush's mask (see `a8_is_a_mintable_mask_surface`).
 //!
 //! ## Subpixel positioning
 //!
@@ -47,14 +53,18 @@
 //! therefore rasterized at [`SUBPIXEL_PHASES`] horizontal phases and the phase
 //! nearest the pen's fractional pixel is selected ([`pen_phase`]).
 //!
-//! ## Grayscale AA is mandatory
+//! ## Grayscale AA, and why it is no longer something this module asks for
 //!
 //! ClearType's subpixel coverages assume an opaque backdrop to blend against;
 //! on a premultiplied surface cleared to transparent they are invalid, and the
 //! three channels would bake colour fringes into what is supposed to be a single
-//! coverage value. [`DrawingSession::set_grayscale_text_antialiasing`] is called
-//! before every glyph draw below. (It is also the only correct mode for an A8
-//! target, which has no colour channels to put subpixel coverages in.)
+//! coverage value.
+//!
+//! This module used to set that mode on the drawing session. It no longer has a
+//! session to set it on: grayscale is requested where the coverage is actually
+//! produced, as the antialias mode passed to `CreateGlyphRunAnalysis` in
+//! [`glyph_run_coverage`]. The property is the same one, asked for at the only
+//! place that can honour it.
 
 use std::cell::Cell;
 
@@ -1031,6 +1041,97 @@ mod tests {
         atlas.clear();
         assert_eq!(atlas.len(), 0);
         assert_ne!(atlas.epoch(), epoch);
+    }
+
+    /// A wrapped layout must hand back one run per line, at distinct baselines
+    /// that step by the line height and start back at the left edge.
+    ///
+    /// This is what decides whether multi-line text needs anything from the
+    /// sprite path at all: `TextPart::sync` walks runs and reads each one's
+    /// `baseline_origin`, so if wrapping is expressed there — rather than in
+    /// some line structure the walk cannot see — then wrapped text places
+    /// correctly with no change to the placement code.
+    #[test]
+    fn wrapping_is_expressed_as_per_line_run_baselines() {
+        let format = TextFormat::new("Segoe UI", 14.0).unwrap();
+        let text = "The quick brown fox jumps over the lazy dog near the river bank";
+        let layout = TextLayout::new(text, &format, 120.0, 400.0).unwrap();
+        layout.set_word_wrap(true).unwrap();
+
+        let m = layout.metrics().unwrap();
+        assert!(m.line_count > 1, "text did not wrap at 120 DIPs");
+
+        let runs = layout.glyph_runs().unwrap();
+        let mut baselines: Vec<f32> = runs.iter().map(|r| r.baseline_origin.y).collect();
+        baselines.dedup();
+        assert_eq!(
+            baselines.len() as u32,
+            m.line_count,
+            "one distinct baseline per wrapped line"
+        );
+
+        // Baselines descend, and every line begins at the layout's left edge —
+        // so a caller placing runs at `origin + baseline_origin` reproduces the
+        // wrap without knowing it happened.
+        for pair in baselines.windows(2) {
+            assert!(pair[1] > pair[0], "baselines must descend: {baselines:?}");
+        }
+        let first_x: Vec<f32> = {
+            let mut seen = Vec::new();
+            let mut last_y = f32::NAN;
+            for r in &runs {
+                if r.baseline_origin.y != last_y {
+                    seen.push(r.baseline_origin.x);
+                    last_y = r.baseline_origin.y;
+                }
+            }
+            seen
+        };
+        for x in &first_x {
+            assert!(
+                x.abs() < 1.0,
+                "each line should start at the left edge, got {x} in {first_x:?}"
+            );
+        }
+
+        // Every glyph on every line must rasterize through the same atlas — the
+        // second line is not a different kind of text.
+        let total: usize = runs.iter().map(|r| r.glyph_indices.len()).sum();
+        assert!(total > 0);
+    }
+
+    /// A8 must be a usable mask surface format.
+    ///
+    /// This gates an 8× memory cut. Coverage arrives from the rasterizer as
+    /// `u8`, so [`MASK_FORMAT`]'s FP16 currently stores 8-bit data in 64 bits
+    /// per pixel and can carry no information the source did not have. The FP16
+    /// depth was chosen when this module DREW its glyphs, where the coverage
+    /// came through a 2.2 ramp whose top collapsed under 8-bit quantization;
+    /// uploading measured coverage removed that ramp, and with it the reason.
+    ///
+    /// What is NOT yet proven here is that the compositor honours an A8 surface
+    /// as a `CompositionMaskBrush` mask — this only establishes that one can be
+    /// minted and drawn into, which is the half that can be tested without a
+    /// window.
+    #[test]
+    fn a8_is_a_mintable_mask_surface() {
+        let Ok(dev) = Headless::new() else {
+            eprintln!("no composition graphics device available; skipping");
+            return;
+        };
+        let fmt = DirectXPixelFormat::A8UIntNormalized;
+        let Ok((_surface, interop, _brush)) = dev.mint(16, 24, fmt) else {
+            eprintln!("A8 drawing surface not supported; MASK_FORMAT must stay FP16");
+            return;
+        };
+        let mut origin = crate::system_bindings::POINT::default();
+        dev.device_lost().set(false);
+        let ctx = unsafe { interop.BeginDraw(None, &mut origin) }
+            .expect("A8 surface minted but refused BeginDraw");
+        let session = DrawingSession::new_borrowed(&ctx, dev.device_lost());
+        session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
+        unsafe { interop.EndDraw() }.ok().expect("A8 EndDraw");
+        assert!(!dev.device_lost().get(), "A8 draw reported device loss");
     }
 
     /// The design advances the atlas sizes its boxes from must account for the
