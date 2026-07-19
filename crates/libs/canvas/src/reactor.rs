@@ -3,6 +3,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use windows_reactor::*;
 
+/// How [`DrawContext::convert_dips_to_pixels`] rounds a fractional pixel result.
+/// Mirrors Win2D's `CanvasDpiRounding`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DpiRounding {
+    /// Round down to the nearest whole pixel.
+    Floor,
+    /// Round to the nearest whole pixel.
+    Round,
+    /// Round up to the nearest whole pixel.
+    Ceiling,
+}
+
 /// Per-frame draw context.
 pub struct DrawContext<'a> {
     session: DrawingSession<'a>,
@@ -11,7 +23,9 @@ pub struct DrawContext<'a> {
     pub width: f32,
     /// Height of the drawing surface, in device-independent pixels.
     pub height: f32,
+    dpi: f32,
     changed: bool,
+    update: Rect,
 }
 
 impl<'a> DrawContext<'a> {
@@ -20,9 +34,41 @@ impl<'a> DrawContext<'a> {
         self.device
     }
 
+    /// The dots-per-inch the surface renders at (96 = 100%). Mirrors
+    /// `CanvasControl.Dpi`.
+    pub fn dpi(&self) -> f32 {
+        self.dpi
+    }
+
+    /// Converts a length in device-independent pixels (DIPs) to physical pixels
+    /// at this context's DPI, rounded per `rounding`. Mirrors
+    /// `CanvasControl.ConvertDipsToPixels`.
+    pub fn convert_dips_to_pixels(&self, dips: f32, rounding: DpiRounding) -> f32 {
+        let px = dips * self.dpi / 96.0;
+        match rounding {
+            DpiRounding::Floor => px.floor(),
+            DpiRounding::Round => px.round(),
+            DpiRounding::Ceiling => px.ceil(),
+        }
+    }
+
+    /// Converts a length in physical pixels to device-independent pixels (DIPs)
+    /// at this context's DPI. Mirrors `CanvasControl.ConvertPixelsToDips`.
+    pub fn convert_pixels_to_dips(&self, pixels: f32) -> f32 {
+        pixels * 96.0 / self.dpi
+    }
+
     /// Returns `true` on the first frame after device loss or resize.
     pub fn device_changed(&self) -> bool {
         self.changed
+    }
+
+    /// The region being (re)drawn this call, in DIPs (surface-local
+    /// coordinates). For a full redraw this is the whole surface; for a
+    /// dirty-rect update it is just the changed rectangle. Drawing outside it has
+    /// no effect, so callers can clip work to it for performance.
+    pub fn update_rect(&self) -> Rect {
+        self.update
     }
 
     /// Clears the surface to the given color.
@@ -52,6 +98,7 @@ struct RenderState {
 fn surface_pixels(dip: f32, scale: f32) -> u32 {
     ((dip * scale) as u32).max(1)
 }
+
 
 impl RenderState {
     fn rebuild(&mut self, pixel_width: u32, pixel_height: u32) -> bool {
@@ -163,7 +210,9 @@ pub fn animated_canvas(draw: impl Fn(&DrawContext<'_>) + 'static) -> SwapChainPa
                         device: &rs.device,
                         width: w,
                         height: h,
+                        dpi: 96.0 * rs.scale,
                         changed: render_changed.replace(false),
+                        update: Rect::from_xywh(0.0, 0.0, w, h),
                     };
                     render_draw(&ctx);
                     drop(ctx);
@@ -276,7 +325,7 @@ impl CanvasImageSource {
             Err(e) => return Err(e),
         };
 
-        unsafe { context.SetDpi(self.dpi, self.dpi) };
+        set_context_dpi(&context, self.dpi);
 
         // The atlas offset is in physical pixels; the context draws in DIPs, so
         // scale it back into DIP space before using it as the offset translation.
