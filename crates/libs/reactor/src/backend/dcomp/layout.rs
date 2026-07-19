@@ -53,6 +53,47 @@ use windows_core::Interface;
 /// text and hairlines blur. Snapping in DIP space by the physical grid keeps
 /// every surface on integer pixels.
 pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f32, scale: f32) {
+    let lt = arena.layout.take();
+    let lt = compute_in(lt, arena, root, width, height, scale);
+    arena.layout = Some(lt);
+}
+
+/// Lay out the overlay root — a hosted flyout's content — against the space the
+/// popup can offer.
+///
+/// Uses the arena's OWN overlay tree rather than a second root in the window's:
+/// a `LayoutTree` assumes one root, and alternating two through it would
+/// re-parent the synthetic viewport every pass and sweep every pass. See
+/// [`Arena::overlay_layout`](super::node::Arena).
+pub(crate) fn compute_overlay(
+    arena: &mut Arena,
+    root: ControlId,
+    width: f32,
+    height: f32,
+    scale: f32,
+) {
+    let lt = arena.overlay_layout.take();
+    let lt = compute_in(lt, arena, root, width, height, scale);
+    arena.overlay_layout = Some(lt);
+}
+
+/// Drop the overlay tree — its root is gone (the flyout closed or unmounted).
+///
+/// Freeing it rather than keeping it primed is deliberate: a flyout is open for
+/// seconds at a time, its Taffy nodes are dead the moment it closes, and
+/// leaving them owned would make the next pass's sweep walk them for nothing.
+pub(crate) fn drop_overlay(arena: &mut Arena) {
+    arena.overlay_layout = None;
+}
+
+fn compute_in(
+    lt: Option<LayoutTree>,
+    arena: &mut Arena,
+    root: ControlId,
+    width: f32,
+    height: f32,
+    scale: f32,
+) -> LayoutTree {
     let scale = scale.max(0.01);
     // The persistent tree is moved OUT of the arena for the pass: the measure
     // callback below needs `&Arena` while Taffy holds `&mut TaffyTree`, which it
@@ -65,7 +106,7 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
     // fresh `LayoutTree` mints a new generation, every stale stamp mismatches,
     // and the whole tree rebuilds. Without the stamp a stale `NodeId` would
     // index a fresh Taffy slotmap and panic (or, worse, alias a live node).
-    let mut lt = arena.layout.take().unwrap_or_else(LayoutTree::new);
+    let mut lt = lt.unwrap_or_else(LayoutTree::new);
     measure_solve(arena, &mut lt, root, width, height, scale);
     apply(arena, &lt.solved, root, scale);
     // Re-stack composition children before the tree goes home: `sync` borrows
@@ -74,7 +115,7 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
     let mut order = std::mem::take(&mut lt.order);
     sync(arena, root, &mut order);
     lt.order = order;
-    arena.layout = Some(lt);
+    lt
 }
 
 /// The measure + solve half of a pass (see the module docs): text and

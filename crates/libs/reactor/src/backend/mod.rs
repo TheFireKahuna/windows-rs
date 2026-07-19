@@ -523,6 +523,15 @@ pub trait Backend {
     /// Pass `None` to clear a previously set pane element.
     fn set_pane_element(&mut self, _id: ControlId, _pane_id: Option<ControlId>) {}
 
+    /// Set a mounted element tree as the content of `id`'s attached flyout.
+    /// Pass `None` to clear it.
+    ///
+    /// The subtree is mounted but PARENTLESS — it belongs to a popup, not to
+    /// the owner's box, so it must never take part in the owner's layout. A
+    /// backend that shows flyouts is responsible for laying it out and hosting
+    /// it when the flyout opens.
+    fn set_flyout_element(&mut self, _id: ControlId, _content_id: Option<ControlId>) {}
+
     /// W1: scroll a templated list to the specified item index. Default
     /// no-op; the WinUI backend implements this via
     /// `ListViewBase::ScrollIntoView` when `id` resolves to a list/grid/flip

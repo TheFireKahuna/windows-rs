@@ -140,6 +140,18 @@ pub struct DCompBackend {
     hovered_surface: Option<ControlId>,
     /// The live popup overlay (Select/menu dropdown), if one is open.
     popup: Option<popup::Popup>,
+    /// Mounted flyout-content roots, keyed by the owner that declared them.
+    ///
+    /// Each is a PARENTLESS arena root: it belongs to a popup, not to its
+    /// owner's box, so it never appears in the owner's children and never takes
+    /// part in the window's layout pass. It is laid out and painted as its own
+    /// root when the flyout opens (`input::host_flyout_content`).
+    flyout_roots: rustc_hash::FxHashMap<ControlId, ControlId>,
+    /// The flyout-content root currently hosted in the open popup, if any.
+    ///
+    /// Input consults this BEFORE the window root, since the popup is
+    /// z-promoted above the whole tree — see `input::hit_test`.
+    hosted_flyout: Option<ControlId>,
     /// Detached visuals (destroyed subtrees, dismissed popups) playing their
     /// exit fade on the compositor; released by [`Self::release_ghost`] when
     /// their scoped batch completes.
@@ -207,6 +219,8 @@ impl DCompBackend {
             pressed_surface: None,
             hovered_surface: None,
             popup: None,
+            flyout_roots: rustc_hash::FxHashMap::default(),
+            hosted_flyout: None,
             ghosts: Vec::new(),
             next_ghost: 0,
             surfaces: surface::SurfaceHost::default(),
@@ -253,14 +267,46 @@ impl DCompBackend {
             let (w, h) = self.dip_size;
             let scale = self.scale();
             layout::compute(&mut self.arena, root, w, h, scale);
+            // A hosted flyout re-solves against the space the popup offers, not
+            // the window's — it is its own root, and its content may have
+            // changed shape since it opened. Its panel keeps the size it was
+            // measured at: re-sizing an open popup under the pointer would move
+            // the control being clicked.
+            if let Some(fly) = self.hosted_flyout {
+                let (aw, ah) = self.flyout_avail();
+                layout::compute_overlay(&mut self.arena, fly, aw, ah, scale);
+            }
             self.repaint();
         }
     }
 
+    /// The most a flyout's content may occupy before it is asked to fit (DIPs).
+    /// Generous — a flyout is a panel, not a tooltip — but bounded, so a
+    /// subtree that would happily stretch cannot grow past the window.
+    const FLYOUT_MAX: (f32, f32) = (480.0, 560.0);
+
+    /// The space a flyout's content is solved against — its cap, bounded by
+    /// what the window can actually show.
+    pub(crate) fn flyout_avail(&self) -> (f32, f32) {
+        let (max_w, max_h) = Self::FLYOUT_MAX;
+        (
+            max_w.min(self.dip_size.0 - theme::SPACE_32),
+            max_h.min(self.dip_size.1 - theme::SPACE_32),
+        )
+    }
+
     /// Repaint dirty node surfaces (no relayout).
+    ///
+    /// Both roots: the window tree, and a hosted flyout's content when one is
+    /// open. A flyout's subtree is parentless by design, so the window walk
+    /// cannot reach it — without this second call a control inside an open
+    /// flyout would take input and update its state and never redraw. The walk
+    /// is dirty-gated like any other, so an open-but-idle flyout costs the
+    /// visit of one clean root and nothing else.
     pub(crate) fn repaint(&mut self) {
-        if let Some(root) = self.root {
-            let scale = self.scale();
+        let roots = [self.root, self.hosted_flyout];
+        let scale = self.scale();
+        for root in roots.into_iter().flatten() {
             if paint::paint(
                 &self.comp,
                 &mut self.cache,
@@ -276,6 +322,7 @@ impl DCompBackend {
                 // (parts re-bind to freshly rasterized sources by epoch).
                 self.cache.invalidate();
                 self.atlas.clear();
+                return;
             }
         }
     }
@@ -866,6 +913,10 @@ impl Backend for DCompBackend {
         }
     }
 
+    fn set_flyout_element(&mut self, id: ControlId, content_id: Option<ControlId>) {
+        Self::set_flyout_element(self, id, content_id);
+    }
+
 
     // ── Compositor animations (DWM-evaluated; no app ticks, no repaints) ──
 
@@ -1012,6 +1063,27 @@ impl DCompBackend {
             Some(true) if !showing => self.open_popup(id),
             Some(false) if showing => self.close_popup(),
             _ => {}
+        }
+    }
+
+    /// Take the mounted root of an attached flyout's content.
+    ///
+    /// The reconciler already turned the `Element` into real nodes, so this is
+    /// only bookkeeping: the id, and the guarantee that the subtree is not in
+    /// anyone's child list. Nothing is laid out or drawn until the flyout opens.
+    pub(crate) fn set_flyout_element(&mut self, id: ControlId, content_id: Option<ControlId>) {
+        match content_id {
+            Some(c) => {
+                self.flyout_roots.insert(id, c);
+            }
+            None => {
+                self.flyout_roots.remove(&id);
+                // A flyout whose content is being torn down cannot stay on
+                // screen: the popup is about to reference destroyed nodes.
+                if self.popup.as_ref().is_some_and(|p| p.owner == id) {
+                    self.close_popup();
+                }
+            }
         }
     }
 

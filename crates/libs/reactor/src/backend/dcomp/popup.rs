@@ -45,6 +45,9 @@ const TEXT_MAX_W: f32 = 320.0;
 /// Inset around a text flyout's paragraph (DIPs). Wider than `PANEL_PAD`
 /// because nothing here is a row: the padding IS the panel's whole margin.
 const TEXT_PAD: f32 = theme::SPACE_12;
+/// Inset around a rich flyout's hosted subtree (DIPs). The same margin the
+/// paragraph gets, so text and controls sit on the same grid.
+const CONTENT_PAD: f32 = TEXT_PAD;
 
 /// What a popup is showing.
 ///
@@ -54,7 +57,21 @@ const TEXT_PAD: f32 = theme::SPACE_12;
 /// selectable, which is why this is a sum type rather than an empty row list.
 pub(crate) enum PopupBody {
     Menu(Vec<MenuRow>),
-    Text(String),
+    /// A wrapped paragraph, carried as the layout it was MEASURED with.
+    ///
+    /// Not the string: the panel is sized from this run, and `draw_text` would
+    /// build a second, identical layout to draw it. Keeping the one that was
+    /// measured makes the open path build exactly one.
+    Text(windows_canvas_core::TextLayout),
+    /// Live reconciled nodes — the root of a mounted flyout-content subtree,
+    /// with the size its own layout pass measured.
+    ///
+    /// Unlike the other two, this body draws NOTHING on the popup's surface:
+    /// the subtree owns real composition visuals, and the popup hosts them by
+    /// re-parenting the root's container into its own. The panel behind them is
+    /// still the popup's, so a rich flyout gets the same field, hairline and
+    /// shadow as a menu without having to draw any of it.
+    Nodes { root: ControlId, size: (f32, f32) },
 }
 
 impl PopupBody {
@@ -64,7 +81,15 @@ impl PopupBody {
     fn rows(&self) -> &[MenuRow] {
         match self {
             Self::Menu(v) => v,
-            Self::Text(_) => &[],
+            Self::Text(_) | Self::Nodes { .. } => &[],
+        }
+    }
+
+    /// The flyout-content root this body hosts, if it hosts one.
+    pub(crate) fn hosted_root(&self) -> Option<ControlId> {
+        match self {
+            Self::Nodes { root, .. } => Some(*root),
+            _ => None,
         }
     }
 }
@@ -100,18 +125,21 @@ impl Placement {
     }
 }
 
-/// Measure a text flyout's paragraph, and the panel it needs around it.
+/// Lay a text flyout's paragraph out, wrapped into the flyout column.
 ///
-/// Returns `None` when DirectWrite cannot lay the run out, which the caller
-/// treats as "do not open": a flyout panel sized to nothing is a bare shadow
-/// with no way to tell what it failed to say.
-fn measure_text_body(s: &str) -> Option<(f32, f32)> {
-    let fmt = TextFormat::with_weight("Segoe UI", theme::FONT_SIZE_MD, FontWeight(400)).ok()?;
+/// Returns the layout itself, not just its size — it is what the popup will
+/// draw, so measuring and drawing share one run. `None` when DirectWrite cannot
+/// lay it out, which the caller treats as "do not open": a flyout panel sized
+/// to nothing is a bare shadow with no way to tell what it failed to say.
+pub(crate) fn layout_text_body(s: &str) -> Option<windows_canvas_core::TextLayout> {
+    let fmt = TextFormat::with_weight("Segoe UI", theme::FONT_SIZE_MD, FontWeight(400))
+        .ok()?
+        .with_alignment(TextAlignment::Leading)
+        .with_paragraph_alignment(ParagraphAlignment::Top)
+        .with_word_wrap(true);
     let column = TEXT_MAX_W - TEXT_PAD * 2.0;
     let layout = windows_canvas_core::TextLayout::new(s, &fmt, column, 100_000.0).ok()?;
-    let _ = layout.set_word_wrap(true);
-    let (tw, th) = layout.measure().ok()?;
-    Some((tw + TEXT_PAD * 2.0, th + TEXT_PAD * 2.0))
+    Some(layout)
 }
 
 /// Reveal one-shot: a snappy Fluent-style grow-out-of-the-trigger (0.96→1
@@ -171,7 +199,15 @@ impl Popup {
                 // it reads as belonging to it.
                 (anchor.width().max(200.0).min(360.0), h)
             }
-            PopupBody::Text(s) => measure_text_body(s)?,
+            PopupBody::Text(layout) => {
+                let (tw, th) = layout.measure().ok()?;
+                (tw + TEXT_PAD * 2.0, th + TEXT_PAD * 2.0)
+            }
+            // Already measured, by the subtree's own layout pass.
+            PopupBody::Nodes { size, .. } => (
+                size.0 + CONTENT_PAD * 2.0,
+                size.1 + CONTENT_PAD * 2.0,
+            ),
         };
 
         const GAP: f32 = theme::SPACE_4;
@@ -188,7 +224,9 @@ impl Popup {
         let leading_x = anchor.left;
         let x_for_vertical = match body {
             PopupBody::Menu(_) => leading_x,
-            PopupBody::Text(_) => centred_x,
+            // A flyout centres on its trigger, prose or panel alike — that is
+            // what reads as attached to it rather than merely near it.
+            PopupBody::Text(_) | PopupBody::Nodes { .. } => centred_x,
         };
         let centred_y = anchor.top + (anchor.height() - h) * 0.5;
 
@@ -362,6 +400,50 @@ impl Popup {
         }
     }
 
+    /// The flyout-content root this popup shows, if it shows one.
+    pub fn body_root(&self) -> Option<ControlId> {
+        self.body.hosted_root()
+    }
+
+    /// Adopt a flyout-content subtree's container into this popup's overlay,
+    /// placed at the content inset inside the panel.
+    ///
+    /// Re-parenting rather than redrawing is the whole point: the subtree keeps
+    /// the visuals, surfaces and springs it was built with, so the controls in a
+    /// flyout are the same controls they would be anywhere else — not a
+    /// snapshot the popup has to re-interpret.
+    ///
+    /// The offset is panel-local, and the panel sits at `MARGIN` inside the
+    /// shadow-bleed surface, so the content lands at `MARGIN + CONTENT_PAD`.
+    /// Both are applied here rather than baked into the subtree's own layout,
+    /// which is solved at the origin and knows nothing about where it is shown.
+    pub fn adopt(&self, content: &Visual) -> windows_core::Result<()> {
+        content.SetOffset(Vector3::new(
+            MARGIN + CONTENT_PAD,
+            MARGIN + CONTENT_PAD,
+            0.0,
+        ))?;
+        self.container.Children()?.InsertAtTop(content)?;
+        Ok(())
+    }
+
+    /// Hand a hosted subtree's container back out of the overlay.
+    ///
+    /// Called before the popup's own visual is parked as an exit ghost: the
+    /// subtree outlives the popup — its nodes stay mounted, and the same flyout
+    /// may open again — so it must not ride the ghost into release.
+    pub fn release_content(&self, content: &Visual) {
+        if let Ok(children) = self.container.Children() {
+            let _ = children.Remove(content);
+        }
+    }
+
+    /// The content rect a hosted subtree is laid out against: the panel's box
+    /// less the content inset, in window DIPs.
+    pub fn content_origin(&self) -> (f32, f32) {
+        (self.panel.left + CONTENT_PAD, self.panel.top + CONTENT_PAD)
+    }
+
     /// `true` if `(x, y)` window-DIP lies inside the drawn panel.
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.panel.left && x < self.panel.right && y >= self.panel.top && y < self.panel.bottom
@@ -494,25 +576,20 @@ impl Popup {
         // is what a reader expects — a centred paragraph shifts every line
         // when the text changes.
         let rows = match &self.body {
-            PopupBody::Text(s) => {
-                let tr = Rect::new(
-                    p.left + TEXT_PAD,
-                    p.top + TEXT_PAD,
-                    p.right - TEXT_PAD,
-                    p.bottom - TEXT_PAD,
+            // Drawn from the very layout the panel was sized by — no second
+            // run, and no chance of the two disagreeing.
+            PopupBody::Text(layout) => {
+                set(brush, theme::text());
+                session.draw_text_layout(
+                    Vector2::new(p.left + TEXT_PAD, p.top + TEXT_PAD),
+                    layout,
+                    brush,
                 );
-                if let Ok(fmt) =
-                    TextFormat::with_weight("Segoe UI", theme::FONT_SIZE_MD, FontWeight(400))
-                {
-                    let fmt = fmt
-                        .with_alignment(TextAlignment::Leading)
-                        .with_paragraph_alignment(ParagraphAlignment::Top)
-                        .with_word_wrap(true);
-                    set(brush, theme::text());
-                    session.draw_text(s, &fmt, &tr, brush);
-                }
                 return;
             }
+            // Live nodes draw themselves, onto their own visuals. The panel
+            // above is all this surface contributes.
+            PopupBody::Nodes { .. } => return,
             PopupBody::Menu(rows) => rows,
         };
 

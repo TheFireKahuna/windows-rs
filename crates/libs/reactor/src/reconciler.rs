@@ -52,6 +52,10 @@ pub struct Reconciler<B: Backend> {
     pub header_elements: FxHashMap<ControlId, ControlId>,
     /// Tracks pane element control IDs for widgets that use pane_element().
     pub pane_elements: FxHashMap<ControlId, ControlId>,
+    /// Tracks flyout-content control IDs for widgets that use
+    /// [`Widget::flyout_element`]. Parentless roots: they belong to a popup,
+    /// not to the owner's box, so they are never in `children_mirror`.
+    pub flyout_elements: FxHashMap<ControlId, ControlId>,
     /// UI marshaller propagated into every nested component's
     /// [`RenderCx`] for [`RenderCx::use_async_state`].
     pub marshaller: Option<UiMarshaller>,
@@ -94,6 +98,7 @@ impl<B: Backend + 'static> Reconciler<B> {
             unmount_callbacks: FxHashMap::default(),
             header_elements: FxHashMap::default(),
             pane_elements: FxHashMap::default(),
+            flyout_elements: FxHashMap::default(),
             defer_templated_unmounts: false,
             deferred_unmounts: Vec::new(),
             marshaller: None,

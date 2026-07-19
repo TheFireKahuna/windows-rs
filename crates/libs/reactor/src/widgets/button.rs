@@ -69,6 +69,9 @@ impl Widget for Button {
             None => Children::None,
         }
     }
+    fn flyout_element(&self) -> Option<&Element> {
+        self.flyout.as_ref()?.rich.as_deref()
+    }
     fn bindings(&self) -> PropBindings {
         let mut out = generated::button_bindings(self);
         // A rich element child (mounted by the child reconciler into the

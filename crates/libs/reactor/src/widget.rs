@@ -192,6 +192,16 @@ pub trait Widget {
     fn pane_element(&self) -> Option<&Element> {
         None
     }
+    /// Optional element tree for an attached flyout's content.
+    ///
+    /// A slot rather than a child: the content belongs to a popup, not to the
+    /// owner's box, so it must not take part in the owner's layout. Mounting it
+    /// here is what makes a flyout hold real, live controls — reconciled, focus-
+    /// and state-preserving, and identical to any other subtree — instead of a
+    /// snapshot the backend has to re-interpret.
+    fn flyout_element(&self) -> Option<&Element> {
+        None
+    }
     /// Optional post-mount callback. When present, the reconciler invokes it
     /// immediately after creation with the control's [`MountInfo`].
     fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {

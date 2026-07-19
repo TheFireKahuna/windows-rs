@@ -210,6 +210,23 @@ impl DCompBackend {
     /// Returns `None` when the point lands on nothing eligible, or when no tree
     /// is mounted.
     pub(crate) fn hit_test(&self, x: f32, y: f32, kind: HitKind) -> Option<ControlId> {
+        // A hosted flyout subtree is z-promoted above the whole tree, so it is
+        // asked first and wins outright — a control in an open flyout must not
+        // lose to whatever the popup happens to be covering.
+        //
+        // Its rects were solved at the origin (it is its own layout root), so
+        // the point is rebased into content-local space before the walk.
+        if let Some(root) = self.hosted_flyout
+            && let Some(popup) = self.popup.as_ref()
+            && popup.contains(x, y)
+        {
+            let (ox, oy) = popup.content_origin();
+            let mut best = None;
+            self.hit_walk(root, x - ox, y - oy, &mut best, kind);
+            // Inside the panel but on no control: still a hit for the popup, so
+            // the caller must not fall through to the tree underneath it.
+            return best;
+        }
         let root = self.root?;
         let mut best = None;
         self.hit_walk(root, x, y, &mut best, kind);
@@ -1442,16 +1459,30 @@ impl DCompBackend {
         };
         // Menu rows win over an attached flyout: a control carrying both is
         // asking for a menu, and the flyout is the fallback content.
-        let body = if rows.is_empty() {
-            match node.extras().flyout.as_deref() {
-                Some(def) if !def.text.is_empty() => PopupBody::Text(def.text.clone()),
-                _ => return,
-            }
-        } else {
-            PopupBody::Menu(rows)
-        };
+        let rich = node.extras().flyout.as_deref().is_some_and(|f| f.rich);
         let placement = node.extras().flyout_placement;
         let selected = node.ctrl().selected_index;
+
+        let body = if !rows.is_empty() {
+            PopupBody::Menu(rows)
+        } else if rich {
+            // Rich content is measured by its OWN layout pass before the panel
+            // exists — the panel is sized to fit it, not the other way round.
+            let Some(root) = self.flyout_roots.get(&owner).copied() else { return };
+            let Some(size) = self.measure_flyout_content(root) else { return };
+            PopupBody::Nodes { root, size }
+        } else {
+            // Cloned only on the branch that uses it — a menu or a combo opens
+            // without touching the flyout's text at all.
+            match self.node(owner).and_then(|n| n.extras().flyout.as_deref()) {
+                Some(f) if !f.text.is_empty() => match popup::layout_text_body(&f.text) {
+                    Some(layout) => PopupBody::Text(layout),
+                    None => return,
+                },
+                _ => return,
+            }
+        };
+
         if let Ok(p) = Popup::open(
             &self.comp,
             owner,
@@ -1464,8 +1495,59 @@ impl DCompBackend {
             placement,
         ) {
             self.close_popup();
+            let hosted = p.body_root();
             self.popup = Some(p);
+            if let Some(root) = hosted {
+                self.host_flyout_content(root);
+            }
         }
+    }
+
+    /// Lay a flyout-content subtree out as its own root and report the size it
+    /// settled at.
+    ///
+    /// Its own root, not a subtree of the window: the content belongs to a
+    /// popup, so it must be solved against the space the popup can offer rather
+    /// than against wherever its owner happens to sit. `layout::compute` takes
+    /// its root as a parameter and consumes its solved placements within the
+    /// pass, so a second call is simply a second, disjoint tree.
+    fn measure_flyout_content(&mut self, root: ControlId) -> Option<(f32, f32)> {
+        let scale = self.scale();
+        let (avail_w, avail_h) = self.flyout_avail();
+        layout::compute_overlay(&mut self.arena, root, avail_w, avail_h, scale);
+        let n = self.arena.get(root)?;
+        let (w, h) = (n.rect.w, n.rect.h);
+        (w > 0.0 && h > 0.0).then_some((w, h))
+    }
+
+    /// Move a measured flyout subtree into the open popup and paint it.
+    ///
+    /// The subtree's nodes carry rects solved at the origin, so hit-testing has
+    /// to add the popup's content origin — `hosted_flyout` is what tells input
+    /// to do that, and it is set here and cleared in `close_popup`.
+    fn host_flyout_content(&mut self, root: ControlId) {
+        let Some(popup) = self.popup.as_ref() else { return };
+        let Some(vis) = self
+            .arena
+            .get(root)
+            .and_then(|n| n.container.cast::<Visual>().ok())
+        else {
+            return;
+        };
+        if popup.adopt(&vis).is_err() {
+            return;
+        }
+        self.hosted_flyout = Some(root);
+        let scale = self.scale();
+        let _ = paint::paint(
+            &self.comp,
+            &mut self.cache,
+            &mut self.atlas,
+            &mut self.arena,
+            root,
+            scale,
+            self.scrubbing,
+        );
     }
 
     /// Open, refresh, or dismiss the suggestion dropdown for AutoSuggestBox `owner`
@@ -1578,6 +1660,23 @@ impl DCompBackend {
             {
                 self.intents
                     .push(record::Intent::FlyoutClosed { id: p.owner });
+            }
+            // Hand a hosted subtree back BEFORE the overlay becomes a ghost.
+            // Its nodes stay mounted and the same flyout may open again, so it
+            // must not ride the ghost into release. Re-parenting to nothing is
+            // correct: a node's container is only ever attached when it is
+            // being shown, and this one is not shown again until it is adopted.
+            if let Some(root) = self.hosted_flyout.take()
+                && let Some(vis) = self
+                    .arena
+                    .get(root)
+                    .and_then(|n| n.container.cast::<Visual>().ok())
+            {
+                p.release_content(&vis);
+                // The overlay tree's nodes are dead the moment the flyout
+                // closes; keeping them owned would make every later pass sweep
+                // them for nothing.
+                layout::drop_overlay(&mut self.arena);
             }
             let batch = self
                 .comp

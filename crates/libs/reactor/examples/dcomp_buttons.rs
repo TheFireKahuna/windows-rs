@@ -36,6 +36,7 @@ fn main() -> windows_reactor::Result<()> {
         let (clicks, set_clicks) = cx.use_state::<i32>(0);
         let (muted, set_muted) = cx.use_state::<bool>(false);
         let (last, set_last) = cx.use_state::<String>("—".to_string());
+        let (gain, set_gain) = cx.use_state::<f64>(0.0);
 
         // ── The four authored styles ─────────────────────────────────────
         let styles = hstack((
@@ -115,6 +116,36 @@ fn main() -> windows_reactor::Result<()> {
         .spacing(10.0)
         .into();
 
+        // A rich flyout hosts LIVE controls: the slider drags, the toggle
+        // flips, and both drive the same state the rest of the page reads.
+        let rich = hstack((button("Band panel")
+            .accent()
+            .flyout_def(
+                FlyoutDef::rich(
+                    border(
+                        vstack((
+                            text_block("Band 3 — 250 Hz").font_size(13.0).semibold().foreground(TXT),
+                            text_block(format!("Gain {gain:.1} dB"))
+                                .font_size(12.0)
+                                .foreground(TXT2),
+                            Slider::new(gain)
+                                .range(-12.0, 12.0)
+                                .on_value_changed(move |v| set_gain.call(v))
+                                .width(240.0),
+                            ToggleSwitch::new(muted)
+                                .on_toggled(move |v| set_muted.call(v))
+                                .width(44.0)
+                                .height(24.0),
+                        ))
+                        .spacing(8.0),
+                    )
+                    .padding(Thickness::uniform(4.0)),
+                )
+                .placement(FlyoutPlacementMode::Bottom),
+            ),))
+        .spacing(10.0)
+        .into();
+
         let cards = vec![
             group("Styles", styles),
             group("Disabled", disabled),
@@ -122,6 +153,7 @@ fn main() -> windows_reactor::Result<()> {
             group("Corner radius", radii),
             group("Toggle · Repeat", family),
             group("Flyouts", flyouts),
+            group("Rich flyout — live controls", rich),
         ];
 
         let content = grid((
@@ -130,7 +162,7 @@ fn main() -> windows_reactor::Result<()> {
                 .semibold()
                 .foreground(TXT)
                 .grid_row(0),
-            text_block(format!("clicks {clicks} · muted {muted} · menu {last}"))
+            text_block(format!("clicks {clicks} · muted {muted} · menu {last} · gain {gain:.1}"))
                 .font_size(12.0)
                 .foreground(TXT2)
                 .grid_row(1),

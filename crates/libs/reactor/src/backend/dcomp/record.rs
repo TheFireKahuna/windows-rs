@@ -563,6 +563,13 @@ pub(crate) enum Cmd {
         id: ControlId,
         pane_id: Option<ControlId>,
     },
+    /// The mounted (and PARENTLESS) root of an attached flyout's content. Only
+    /// the id crosses — the `Element` became real nodes in the reconciler, so
+    /// there is nothing thread-affine left to carry.
+    SetFlyoutElement {
+        id: ControlId,
+        content_id: Option<ControlId>,
+    },
     ScrollTemplatedToIndex {
         id: ControlId,
         index: i32,
@@ -961,6 +968,7 @@ fn apply<B: FrontBackend>(backend: &mut B, cmd: Cmd) {
         Cmd::SetTemplatedAllowDrop { id, value } => backend.set_templated_allow_drop(id, value),
         Cmd::SetHeaderElement { id, header_id } => backend.set_header_element(id, header_id),
         Cmd::SetPaneElement { id, pane_id } => backend.set_pane_element(id, pane_id),
+        Cmd::SetFlyoutElement { id, content_id } => backend.set_flyout_element(id, content_id),
         Cmd::ScrollTemplatedToIndex { id, index } => backend.scroll_templated_to_index(id, index),
         // Declarations whose closures live in the recorder's maps and whose
         // features the DComp backend has not grown yet: nothing consumes them
@@ -1208,6 +1216,10 @@ impl Backend for RecordingBackend {
 
     fn set_header_element(&mut self, id: ControlId, header_id: Option<ControlId>) {
         self.push(Cmd::SetHeaderElement { id, header_id });
+    }
+
+    fn set_flyout_element(&mut self, id: ControlId, content_id: Option<ControlId>) {
+        self.push(Cmd::SetFlyoutElement { id, content_id });
     }
 
     fn set_pane_element(&mut self, id: ControlId, pane_id: Option<ControlId>) {

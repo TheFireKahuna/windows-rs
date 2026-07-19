@@ -1541,6 +1541,22 @@ pub(crate) struct Arena {
     /// duration of a pass (the measure callback needs `&Arena` while Taffy
     /// holds `&mut TaffyTree`) and puts it back at the end.
     pub(crate) layout: Option<layout::LayoutTree>,
+    /// The layout tree for the overlay root — a hosted flyout's content.
+    ///
+    /// Its OWN tree, not a second root in `layout`. A `LayoutTree` is built
+    /// around having exactly one root: it wraps that root in a synthetic
+    /// viewport and re-parents on any change, and it decides whether to sweep
+    /// dead Taffy nodes by comparing the nodes visited against every node it
+    /// owns. Two roots alternating through one tree would re-parent the
+    /// viewport on every pass — structurally dirtying Taffy's cache for the
+    /// whole window tree each time a flyout lays out — and would make the
+    /// visited count permanently disagree, so every pass swept.
+    ///
+    /// Nothing is shared and nothing can alias: a node is only ever reached
+    /// from one of the two roots, and `taffy_id` is generation-stamped, so a
+    /// node that somehow changed trees rebuilds rather than indexing the wrong
+    /// slotmap.
+    pub(crate) overlay_layout: Option<layout::LayoutTree>,
 }
 
 impl Arena {
