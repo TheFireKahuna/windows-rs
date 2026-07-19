@@ -73,6 +73,17 @@ pub(crate) struct TsfActivation {
     focused: Cell<bool>,
 }
 
+/// Name the step a failure came from. TSF activation is a six-call chain whose
+/// steps fail with overlapping `HRESULT`s (`TS_E_*` and `TF_E_*` share a
+/// facility), so a bare code is not diagnosable — and the failure is invisible
+/// in use, since the app runs fine with no IME. The step name is what turns a
+/// bug report into a fix.
+fn step<T>(what: &'static str, r: Result<T>) -> Result<T> {
+    r.map_err(|e| {
+        windows_core::Error::new(e.code(), format!("{what} failed: {:#010x}", e.code().0))
+    })
+}
+
 impl TsfActivation {
     /// Create the thread manager, activate it, push `store` into a fresh
     /// context, and advise the composition sink on it. Must run on the front
@@ -85,7 +96,7 @@ impl TsfActivation {
         // Create the thread manager.
         let mut raw = core::ptr::null_mut();
         // SAFETY: standard CoCreateInstance out-parameter protocol.
-        unsafe {
+        step("CoCreateInstance(CLSID_TF_ThreadMgr)", unsafe {
             CoCreateInstance(
                 &CLSID_TF_THREAD_MGR,
                 core::ptr::null_mut(),
@@ -93,36 +104,38 @@ impl TsfActivation {
                 &ITfThreadMgr2::IID,
                 &mut raw,
             )
-            .ok()?;
-        }
+            .ok()
+        })?;
         // SAFETY: `raw` is a valid `ITfThreadMgr2` on success.
         let thread_mgr = unsafe { ITfThreadMgr2::from_raw(raw) };
 
         // SAFETY: interface calls on live COM objects; out-parameters are valid.
-        let client_id = unsafe { thread_mgr.Activate()? };
-        let doc_mgr = unsafe { thread_mgr.CreateDocumentMgr()? };
+        let client_id = step("ITfThreadMgr2::Activate", unsafe { thread_mgr.Activate() })?;
+        let doc_mgr = step("ITfThreadMgr2::CreateDocumentMgr", unsafe {
+            thread_mgr.CreateDocumentMgr()
+        })?;
 
         let mut context: Option<ITfContext> = None;
         let mut edit_cookie: u32 = 0;
         // SAFETY: `&store_acp` is a live `Param<IUnknown>`; out-params are valid.
-        unsafe {
+        step("ITfDocumentMgr::CreateContext", unsafe {
             doc_mgr
                 .CreateContext(client_id, 0, &store_acp, &mut context, &mut edit_cookie)
-                .ok()?;
-        }
+                .ok()
+        })?;
         let context = context.ok_or_else(|| windows_core::Error::from_hresult(E_FAIL))?;
         // SAFETY: push the context onto the document manager's stack.
-        unsafe { doc_mgr.Push(&context).ok()? };
+        step("ITfDocumentMgr::Push", unsafe { doc_mgr.Push(&context).ok() })?;
 
         // Composition boundaries. Without this advise a composition would still
         // edit the document, but with no underline and no §7.2 guard — so a
         // failure here is a real degradation and is reported, not swallowed.
         let sink: ITfContextOwnerCompositionSink = CompositionSink::new(input.clone()).into();
-        let source: ITfSource = context.cast()?;
+        let source: ITfSource = step("ITfContext::cast::<ITfSource>", context.cast())?;
         // SAFETY: live interfaces; the sink is kept alive by TSF until unadvise.
-        let comp_cookie = unsafe {
-            source.AdviseSink(&ITfContextOwnerCompositionSink::IID, &sink)?
-        };
+        let comp_cookie = step("ITfSource::AdviseSink(CompositionSink)", unsafe {
+            source.AdviseSink(&ITfContextOwnerCompositionSink::IID, &sink)
+        })?;
 
         let keystroke: Option<ITfKeystrokeMgr> = thread_mgr.cast().ok();
 

@@ -1379,6 +1379,25 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
                 height: length(30.0),
             };
         }
+        // The select triggers had no arm at all, so they inherited a bare
+        // `Style::default()`: no padding, no minimum height, and a label drawn
+        // into a box that measured nothing. The insets mirror exactly what
+        // `paint_select` reserves — a leading gap for the label and a wider
+        // trailing one for the chevron.
+        ControlKind::ComboBox | ControlKind::DropDownButton => {
+            s.display = Display::Flex;
+            s.align_items = Some(AlignItems::CENTER);
+            s.padding = Rect {
+                left: length(theme::SPACE_8),
+                right: length(theme::SPACE_24),
+                top: length(theme::SPACE_4),
+                bottom: length(theme::SPACE_4),
+            };
+            s.min_size = Size {
+                width: length(0.0),
+                height: length(theme::ROW_H),
+            };
+        }
         ControlKind::NumberBox
         | ControlKind::TextBox
         | ControlKind::PasswordBox

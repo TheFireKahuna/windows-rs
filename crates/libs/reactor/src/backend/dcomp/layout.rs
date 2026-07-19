@@ -331,10 +331,23 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
     if needs {
         let (text, size, weight, family, wrap) = {
             let n = arena.get(id).unwrap();
+            // A button is measured exactly as it is painted. `paint_button`
+            // floors the size at `FONT_SIZE_MD` and takes the weight from the
+            // palette — an accent button draws at 600 — so reading the raw
+            // `paint` values here measured a lighter, smaller run than the one
+            // that actually lands, and the label crowded its padding.
+            let (size, weight) = if super::node::is_button_family(n.kind) {
+                (
+                    n.paint.font_size.max(theme::FONT_SIZE_MD),
+                    super::controls::button_palette(n).weight,
+                )
+            } else {
+                (n.paint.font_size, n.paint.font_weight)
+            };
             (
                 n.paint.text.clone(),
-                n.paint.font_size,
-                n.paint.font_weight,
+                size,
+                weight,
                 n.paint.font_family.clone().unwrap_or_else(|| "Segoe UI".to_string()),
                 n.paint.wrap,
             )
@@ -379,6 +392,50 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
         if let Some(n) = arena.get_mut(id) {
             n.ctrl_mut().seg_label_w = widths;
             n.text_layout = keep;
+            n.text_dirty = false;
+            n.measure_dirty = true;
+        }
+    }
+    // A select trigger draws a label its node's `paint.text` does not hold: a
+    // ComboBox shows the selected item (or the placeholder), a DropDownButton
+    // its own content. Neither had a measure prep, so `text_layout` stayed
+    // empty, the generic callback fell through to 0×0, and both collapsed to
+    // the padding alone.
+    //
+    // The ComboBox measures the WIDEST item, not the selected one, for the same
+    // reason the ToggleSwitch measures the wider of its two labels: picking a
+    // different item must not reflow the row around the control.
+    let needs_select = arena.get(id).is_some_and(|n| {
+        n.text_dirty && matches!(n.kind, ControlKind::ComboBox | ControlKind::DropDownButton)
+    });
+    if needs_select {
+        let (candidates, family) = {
+            let n = arena.get(id).unwrap();
+            let family = n.paint.font_family.clone().unwrap_or_else(|| "Segoe UI".to_string());
+            let candidates = if n.kind == ControlKind::ComboBox {
+                let mut v = n.ctrl().items.clone();
+                v.push(n.ctrl().placeholder.clone());
+                v
+            } else {
+                vec![n.paint.text.clone()]
+            };
+            (candidates, family)
+        };
+        // `paint_select` draws at `FONT_SIZE_SM`/400 regardless of the node's
+        // own text style, so the measurement matches that and not `paint`.
+        let mut widest: Option<TextLayout> = None;
+        let mut widest_w = -1.0f32;
+        for s in &candidates {
+            if let Some(l) = build_text_layout(s, theme::FONT_SIZE_SM, 400, &family, false)
+                && let Ok((w, _)) = l.measure()
+                && w > widest_w
+            {
+                widest_w = w;
+                widest = Some(l);
+            }
+        }
+        if let Some(n) = arena.get_mut(id) {
+            n.text_layout = widest;
             n.text_dirty = false;
             n.measure_dirty = true;
         }

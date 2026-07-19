@@ -1199,12 +1199,32 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 }
 
 fn ensure_dispatcher_queue() -> windows_core::Result<()> {
-    // The system Compositor needs a DispatcherQueue on the calling thread.
-    // DQTYPE_THREAD_CURRENT = 2, DQTAT_COM_ASTA = 1.
+    // This thread must be a **classic STA**, and must already be one before the
+    // dispatcher queue is created.
+    //
+    // The tempting configuration is `DQTAT_COM_ASTA` (1), which is what the
+    // "Using the Visual Layer with Win32" sample uses and what this did
+    // originally. It works for the Compositor and silently breaks TSF:
+    // `ITfThreadMgr2::Activate` fails in an ASTA, so the app comes up with no
+    // IME, no dictation and no handwriting, and nothing else misbehaves to give
+    // it away. An ASTA is a WinRT apartment with re-entrancy restrictions, not
+    // the classic STA that cicero requires.
+    //
+    // So: initialise the apartment ourselves, then pass `DQTAT_COM_NONE` (0) —
+    // "COM is already set up on this thread, do not touch it". The Compositor is
+    // satisfied by the queue and is happy in a classic STA.
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    unsafe {
+        // An already-initialised apartment returns `S_FALSE` / `RPC_E_CHANGED_MODE`.
+        // The former is fine; the latter means someone made this thread an MTA
+        // before us, which is a caller bug we cannot repair here.
+        let _ = crate::bindings::CoInitializeEx(core::ptr::null(), COINIT_APARTMENTTHREADED);
+    }
+    // DQTYPE_THREAD_CURRENT = 2, DQTAT_COM_NONE = 0.
     let options = DispatcherQueueOptions {
         dwSize: size_of::<DispatcherQueueOptions>() as u32,
         threadType: 2,
-        apartmentType: 1,
+        apartmentType: 0,
     };
     let mut controller = core::ptr::null_mut();
     unsafe {
