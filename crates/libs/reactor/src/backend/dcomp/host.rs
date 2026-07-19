@@ -721,7 +721,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             let Some(s) = shared() else {
                 return HTCLIENT as LRESULT;
             };
-            if let Some((cx, cy, cw, ch)) = s.backend.borrow_mut().caption_rect()
+            // Each backend read is hoisted into its own `let` so the RefCell
+            // borrow ends at that statement: a borrow left live in an
+            // `if`/let-chain condition lasts through the whole body, and the
+            // next read panics the front thread ("already borrowed").
+            let caption = s.backend.borrow_mut().caption_rect();
+            if let Some((cx, cy, cw, ch)) = caption
                 && x >= cx
                 && x < cx + cw
                 && y >= cy
@@ -733,8 +738,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // hover/press pipeline the window buttons already use — see
                 // `caption::index_for_hit` for the double-click hazard it
                 // brings and the `WM_NCLBUTTONDBLCLK` arm that defuses it.
-                if s.backend.borrow_mut().back_button_active()
-                    && let Some((bx, by, bw, bh)) = s.backend.borrow_mut().back_button_rect()
+                let back_active = s.backend.borrow_mut().back_button_active();
+                let back_rect = s.backend.borrow_mut().back_button_rect();
+                if back_active
+                    && let Some((bx, by, bw, bh)) = back_rect
                     && x >= bx
                     && x < bx + bw
                     && y >= by
@@ -880,10 +887,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         // provider. Any other object id (MSAA client, etc.) falls through to the
         // default handler.
         WM_GETOBJECT => {
-            if lparam as i32 == UIA_ROOT_OBJECT_ID
-                && let Some(s) = shared()
-                && let Some(root) = s.backend.borrow_mut().uia_root()
-            {
+            // The borrow ends inside the closure — it must not be live while
+            // `UiaReturnRawElementProvider` runs, which can call straight
+            // back into providers that reach for the backend.
+            let root = if lparam as i32 == UIA_ROOT_OBJECT_ID {
+                shared().and_then(|s| s.backend.borrow_mut().uia_root())
+            } else {
+                None
+            };
+            if let Some(root) = root {
                 let provider = uia::root_provider(hwnd as isize, root);
                 return unsafe {
                     UiaReturnRawElementProvider(hwnd, wparam, lparam, provider.as_raw())
@@ -1063,8 +1075,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
 
         WM_IME_COMPOSITION => {
+            // Hoisted read: the borrow must end before `dispatch_input`
+            // borrows the backend again below.
+            let focused = shared().map(|s| s.backend.borrow_mut().has_text_focus());
             if let Some(s) = shared()
-                && s.backend.borrow_mut().has_text_focus()
+                && focused == Some(true)
             {
                 let himc = unsafe { ImmGetContext(hwnd) };
                 if !himc.is_null() {
@@ -1088,8 +1103,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
 
         WM_IME_ENDCOMPOSITION => {
+            // Hoisted read — same double-borrow hazard as WM_IME_COMPOSITION.
+            let focused = shared().map(|s| s.backend.borrow_mut().has_text_focus());
             if let Some(s) = shared()
-                && s.backend.borrow_mut().has_text_focus()
+                && focused == Some(true)
             {
                 dispatch_input(&s, |b| b.ime_end());
                 return 0;
