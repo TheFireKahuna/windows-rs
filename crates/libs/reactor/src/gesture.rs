@@ -179,11 +179,28 @@ impl<A> ActionSlot<A> {
 
     /// Post the newest action, replacing any not yet drained.
     ///
+    /// Correct when an action is an **idempotent statement of where the gesture
+    /// now is** — "this band is at 4 kHz" — because superseding one loses
+    /// nothing. It is *not* correct for a discrete event like "add a band",
+    /// which must not be dropped; merge those with
+    /// [`post_with`](Self::post_with) instead.
+    ///
     /// Returns the [`GestureOutcome`] to return from the gesture: `Notify` on
     /// the empty→full edge, `Handled` when a wake is already in flight.
     pub fn post(&self, action: A) -> GestureOutcome {
+        self.post_with(|slot| *slot = Some(action))
+    }
+
+    /// Merge into the pending action rather than replacing it, so one payload
+    /// can carry both kinds of change: continuous fields overwrite, discrete
+    /// ones accumulate.
+    ///
+    /// `f` sees `None` when nothing is pending and the previous action when a
+    /// burst is still undrained — which is exactly the distinction a caller
+    /// needs to decide between overwriting and appending.
+    pub fn post_with(&self, f: impl FnOnce(&mut Option<A>)) -> GestureOutcome {
         if let Ok(mut g) = self.slot.lock() {
-            *g = Some(action);
+            f(&mut g);
         }
         if self.pending.swap(true, Ordering::AcqRel) {
             GestureOutcome::Handled
@@ -263,6 +280,42 @@ mod tests {
         assert_eq!(s.post(2), GestureOutcome::Notify);
         // ...and the drain reads whatever is newest.
         assert_eq!(s.slot.lock().unwrap().take(), Some(2));
+    }
+
+    /// A discrete event must survive a burst that also carries continuous
+    /// change — the failure `post` alone would cause, and the reason
+    /// `post_with` exists.
+    #[test]
+    fn a_merge_keeps_discrete_events_a_replace_would_drop() {
+        #[derive(Default)]
+        struct Pending {
+            /// Continuous: overwritten freely.
+            at: Option<f64>,
+            /// Discrete: appended, never lost.
+            adds: Vec<u32>,
+        }
+
+        let s = ActionSlot::<Pending>::new();
+        let merge = |at: Option<f64>, add: Option<u32>| {
+            s.post_with(|slot| {
+                let p = slot.get_or_insert_with(Pending::default);
+                if let Some(at) = at {
+                    p.at = Some(at);
+                }
+                if let Some(a) = add {
+                    p.adds.push(a);
+                }
+            })
+        };
+
+        assert_eq!(merge(None, Some(7)), GestureOutcome::Notify);
+        assert_eq!(merge(Some(1.0), None), GestureOutcome::Handled);
+        assert_eq!(merge(Some(2.0), None), GestureOutcome::Handled);
+        assert_eq!(merge(None, Some(9)), GestureOutcome::Handled);
+
+        let p = s.take().expect("a merged burst must drain");
+        assert_eq!(p.at, Some(2.0), "the continuous field keeps only the newest");
+        assert_eq!(p.adds, vec![7, 9], "no discrete event may be dropped");
     }
 
     /// `Exit` is the one transition with no position.
