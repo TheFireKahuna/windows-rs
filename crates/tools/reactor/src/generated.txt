@@ -23,7 +23,6 @@ Microsoft::UI::Xaml::Controls::IComboBox::{put_Header, put_IsEditable, put_Place
 Microsoft::UI::Xaml::Controls::ICommandBar::put_DefaultLabelPosition
 Microsoft::UI::Xaml::Controls::IContentControl::put_Content
 Microsoft::UI::Xaml::Controls::IContentDialog::{put_CloseButtonText, put_IsPrimaryButtonEnabled, put_IsSecondaryButtonEnabled, put_PrimaryButtonText, put_SecondaryButtonText, put_Title}
-Microsoft::UI::Xaml::Controls::IControl::put_IsEnabled
 Microsoft::UI::Xaml::Controls::IDatePicker::{put_DayVisible, put_Header, put_MonthVisible, put_YearVisible}
 Microsoft::UI::Xaml::Controls::IExpander::put_IsExpanded
 Microsoft::UI::Xaml::Controls::IGrid::{put_ColumnSpacing, put_RowSpacing}
