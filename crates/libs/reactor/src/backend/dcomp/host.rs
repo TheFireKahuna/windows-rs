@@ -345,18 +345,20 @@ impl DCompHost {
         });
 
         // Route `set_requested_theme` into this host. The setter typically fires
-        // from inside event dispatch, where the reconciler borrow is still held —
-        // so the apply is deferred through the message pump rather than run
+        // from inside event dispatch, where a backend borrow is still held — so
+        // the apply is deferred through the message pump rather than run
         // synchronously (the hook only pokes; `requested_theme()` is re-read at
-        // apply time, so coalesced posts are harmless).
-        set_theme_applier(Some(Rc::new(|_| {
-            if let Some(s) = shared() {
-                post_ui(s.hwnd, || {
-                    if let Some(s) = shared() {
-                        apply_effective_theme(&s);
-                    }
-                });
-            }
+        // apply time, so coalesced posts are harmless). The hwnd is captured by
+        // value, not read from this thread's host state: the hook must keep
+        // working when the setter fires on the app thread, where `shared()` has
+        // nothing — the posted job re-resolves everything on the pump thread.
+        let theme_hwnd = hwnd as isize;
+        set_theme_applier(Some(std::sync::Arc::new(move |_| {
+            post_ui(theme_hwnd, || {
+                if let Some(s) = shared() {
+                    apply_effective_theme(&s);
+                }
+            });
         })));
 
         // Frame-tick pump: when a canvas/viz subscriber appears (via

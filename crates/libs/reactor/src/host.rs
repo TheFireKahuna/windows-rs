@@ -256,7 +256,7 @@ impl ReactorHost {
         });
 
         // Route `set_requested_theme` to XAML for the lifetime of this host.
-        set_theme_applier(Some(Rc::new(apply_requested_theme_xaml)));
+        set_theme_applier(Some(std::sync::Arc::new(apply_requested_theme_xaml)));
 
         render_host.kick();
 

@@ -1,9 +1,8 @@
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::HashMap,
-    rc::Rc,
     sync::OnceLock,
     time::Duration,
 };
@@ -313,19 +312,33 @@ pub enum ColorScheme {
     Dark,
 }
 
-thread_local! {
-    static CURRENT_COLOR_SCHEME: Cell<ColorScheme> = const { Cell::new(ColorScheme::Light) };
+/// Process-global, not thread-local: the effective scheme is a fact about the
+/// process — app-side hooks (`use_color_scheme`) and front-side chrome paint
+/// both read it, and under the render-thread split those sit on different
+/// threads. One atomic serves both; a thread-local here would leave whichever
+/// side didn't get the push painting the old palette.
+static CURRENT_COLOR_SCHEME: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+fn scheme_from_u8(v: u8) -> ColorScheme {
+    if v == 1 { ColorScheme::Dark } else { ColorScheme::Light }
 }
 
-/// Read the host's last-known [`ColorScheme`] for the current UI thread.
+/// Read the host's last-known effective [`ColorScheme`].
 pub fn current_color_scheme() -> ColorScheme {
-    CURRENT_COLOR_SCHEME.with(|c| c.get())
+    scheme_from_u8(CURRENT_COLOR_SCHEME.load(std::sync::atomic::Ordering::Acquire))
 }
 
-/// Update the per-thread [`ColorScheme`]; called by the host when the effective
-/// theme changes (and once during startup/attach).
+/// Update the effective [`ColorScheme`]; called by the host when the effective
+/// theme changes (and once during startup/attach). Release-ordered so the
+/// invalidation fan-out that follows a theme flip observes the new value on
+/// every thread it reaches.
 pub fn set_current_color_scheme(scheme: ColorScheme) {
-    CURRENT_COLOR_SCHEME.with(|c| c.set(scheme));
+    let v = match scheme {
+        ColorScheme::Light => 0,
+        ColorScheme::Dark => 1,
+    };
+    CURRENT_COLOR_SCHEME.store(v, std::sync::atomic::Ordering::Release);
 }
 
 /// Requested application theme: an app-level override of the OS light/dark
@@ -341,37 +354,58 @@ pub enum RequestedTheme {
     Dark,
 }
 
-thread_local! {
-    /// The app's requested theme override for this UI thread — the single source
-    /// of truth both hosts resolve against. Holding it here (rather than in
-    /// host-specific state) makes a call before the host exists naturally
-    /// pending: the host reads it at startup/attach.
-    static REQUESTED_THEME: Cell<RequestedTheme> = const { Cell::new(RequestedTheme::Default) };
-    /// Host-installed hook that applies a theme change to the live window.
-    /// Absent until a host runs on this thread (the stored request applies then).
-    static THEME_APPLIER: RefCell<Option<Rc<dyn Fn(RequestedTheme)>>> = const { RefCell::new(None) };
-}
+/// The app's requested theme override — the single source of truth both hosts
+/// resolve against. Process-global for the same reason as the scheme: the
+/// setter fires from app code and the host resolves it at apply time, and
+/// under the render-thread split those are different threads. Holding it here
+/// (rather than in host-specific state) also makes a call before the host
+/// exists naturally pending: the host reads it at startup/attach.
+static REQUESTED_THEME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Host-installed hook that applies a theme change to the live window. Absent
+/// until a host runs (the stored request applies then). `Send + Sync` is part
+/// of the contract: the setter may fire on a thread that is not the one the
+/// host pumps on, so the hook must carry the change over itself (post to the
+/// window, never touch host state directly).
+static THEME_APPLIER: std::sync::Mutex<
+    Option<std::sync::Arc<dyn Fn(RequestedTheme) + Send + Sync>>,
+> = std::sync::Mutex::new(None);
 
 /// Set the application theme override. Takes effect immediately when a host is
-/// live on this thread; otherwise it is applied when one starts.
+/// live; otherwise it is applied when one starts.
 pub fn set_requested_theme(theme: RequestedTheme) {
-    REQUESTED_THEME.with(|c| c.set(theme));
-    if let Some(applier) = THEME_APPLIER.with(|a| a.borrow().clone()) {
+    let v = match theme {
+        RequestedTheme::Default => 0,
+        RequestedTheme::Light => 1,
+        RequestedTheme::Dark => 2,
+    };
+    REQUESTED_THEME.store(v, std::sync::atomic::Ordering::Release);
+    let applier = THEME_APPLIER.lock().ok().and_then(|a| a.clone());
+    if let Some(applier) = applier {
         applier(theme);
     }
 }
 
-/// Read the app's requested theme override for the current UI thread.
+/// Read the app's requested theme override.
 pub fn requested_theme() -> RequestedTheme {
-    REQUESTED_THEME.with(|c| c.get())
+    match REQUESTED_THEME.load(std::sync::atomic::Ordering::Acquire) {
+        1 => RequestedTheme::Light,
+        2 => RequestedTheme::Dark,
+        _ => RequestedTheme::Default,
+    }
 }
 
 /// Install (or clear) the host hook [`set_requested_theme`] routes through. The
-/// hook may fire from inside event dispatch — a host whose apply path needs the
-/// reconciler must defer (e.g. post through its message pump) rather than borrow
-/// synchronously.
-pub(crate) fn set_theme_applier(applier: Option<Rc<dyn Fn(RequestedTheme)>>) {
-    THEME_APPLIER.with(|a| *a.borrow_mut() = applier);
+/// hook may fire from inside event dispatch, and — under the render-thread
+/// split — from a thread that is not the host's: it must defer by carrying the
+/// change to the host's own thread (post through its message pump), never by
+/// borrowing host state synchronously.
+pub(crate) fn set_theme_applier(
+    applier: Option<std::sync::Arc<dyn Fn(RequestedTheme) + Send + Sync>>,
+) {
+    if let Ok(mut slot) = THEME_APPLIER.lock() {
+        *slot = applier;
+    }
 }
 
 // ── URI launch ───────────────────────────────────────────────────────────────
