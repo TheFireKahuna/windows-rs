@@ -69,10 +69,9 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         ControlKind::ProgressBar => {}
         ControlKind::ProgressRing => paint_progress_ring(session, brush, node, rect, dim),
         ControlKind::NavigationView => super::nav::paint(session, brush, node, rect, dim),
-        // Both draw everything they have on their own surface: nothing on
-        // either control moves, so neither owns a retained chrome part.
+        // Draws everything it has on its own surface: nothing on the bar moves,
+        // so it owns no retained chrome part.
         ControlKind::InfoBar => super::info_bar::paint(session, brush, node, rect, dim),
-        ControlKind::InfoBadge => super::info_badge::paint(session, brush, node, rect, dim),
         ControlKind::Expander => paint_expander(session, brush, node, rect, dim),
         // The custom caption band: only the min/max/close cluster is drawn
         // here (the band itself is transparent; slot children are real nodes).

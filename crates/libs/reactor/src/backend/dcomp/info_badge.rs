@@ -1,15 +1,22 @@
 //! The InfoBadge: a small status dot, or a pill carrying a count.
 //!
-//! The simplest drawn control in the library — no state of its own beyond the
+//! The simplest control in the library — no state of its own beyond the
 //! optional value, no interaction, and no motion, so it is a geometry table and
-//! a paint. It lives in its own module rather than inside
+//! nothing else. It lives in its own module rather than inside
 //! [`controls`](super::controls) for the reason [`nav`](super::nav) and
-//! [`info_bar`](super::info_bar) do: its metrics are read by three consumers
-//! (the birth style, the layout measure, and the paint) and must agree exactly.
+//! [`info_bar`](super::info_bar) do: its metrics are read by several consumers
+//! (the birth style, the layout measure, the retained plate and the count's
+//! sprites) and must agree exactly.
+//!
+//! It owns no surface. The plate is one retained part
+//! ([`parts::badge_plan`](super::parts::badge_plan)) and the count is glyph
+//! sprites above it ([`glyph_text::info_badge_sync`](super::glyph_text::info_badge_sync)),
+//! so recolouring a badge re-binds a source and a new count re-places sprites —
+//! neither reaches a `BeginDraw`.
 
-use windows_canvas_core::{Brush, DrawingSession, Ellipse, Rect, Vector2};
+use windows_canvas_core::Rect;
 
-use super::node::{linear, Node};
+use super::node::Node;
 use super::theme;
 
 /// The dot form's diameter — Fluent's `InfoBadgeDotStyle` size.
@@ -59,55 +66,21 @@ pub(crate) fn measure(node: &Node) -> (f32, f32) {
     ((text_w + 2.0 * PILL_PAD_X).max(PILL_H), PILL_H)
 }
 
-/// Paint the badge into its own surface.
+/// The plate's box within a badge of size `(w, h)`.
 ///
-/// The fill is the accent role unless the app set an explicit `Background`,
-/// which is what lets a host colour a badge by meaning (an error count in the
-/// danger role) without this control modelling severity the way the InfoBar
-/// does — a badge carries a number, not a status.
-pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let fill = node.paint.background.unwrap_or_else(theme::accent);
-    let (w, h) = (rect.width(), rect.height());
-
-    // The dot form: a circle centred in whatever box layout gave it, and sized
-    // to that box — so a host that asks for a larger badge gets one.
-    let Some(layout) = node.text_layout.as_ref().filter(|_| node.ctrl().badge_value.is_some())
-    else {
-        let d = w.min(h);
-        let c = Vector2::new(rect.left + w / 2.0, rect.top + h / 2.0);
-        super::controls::put(brush, fill, dim);
-        session.fill_ellipse(&Ellipse::new(c, d / 2.0, d / 2.0), brush);
-        return;
-    };
-
-    // The numeric form: a stadium (radius = half the height, so it stays round
-    // at any width) carrying the count.
-    super::controls::fill_rr(session, brush, rect, h / 2.0, fill, dim);
-
-    let Ok((text_w, text_h)) = layout.measure() else {
-        return;
-    };
-    // The count sits ON the fill, so its default is the on-accent ink rather
-    // than the body-text token — which is near-invisible against a light-theme
-    // accent.
-    //
-    // An explicit `Foreground` wins, and has to: the ink that reads on a badge
-    // is a property of the FILL, and the fill is app-supplied (`Background`).
-    // A host colouring badges by meaning — a per-band accent, a danger count —
-    // picks the fill and therefore owns the contrast decision; deriving the ink
-    // from the theme's accent would be answering a question about a colour the
-    // theme never saw.
-    let mut c = linear(node.paint.foreground.unwrap_or_else(theme::text_on_accent));
-    c.a *= dim;
-    brush.set_color(c);
-    // Centred by hand from the measured run: `draw_text_layout` places by
-    // origin, and the cached layout is built unaligned in a max-content box.
-    session.draw_text_layout(
-        Vector2 {
-            x: rect.left + (w - text_w) / 2.0,
-            y: rect.top + (h - text_h) / 2.0,
-        },
-        layout,
-        brush,
-    );
+/// The fourth consumer of this module's metrics, and the reason the dot's
+/// `min(w, h)` lives here rather than at the call site: layout can hand a badge
+/// a box of any shape, and the dot has to stay round inside whatever it gets.
+///
+/// Keyed on the VALUE, exactly as [`measure`] is. Keying on the cached run
+/// instead — "no run, so draw the dot" — would let a numeric badge whose text
+/// failed to shape draw itself as a dot in a box that was measured for a pill,
+/// which is the one disagreement between these two functions that layout cannot
+/// absorb.
+pub(crate) fn plate_box(node: &Node, w: f32, h: f32) -> Rect {
+    if node.ctrl().badge_value.is_some() {
+        return Rect::from_xywh(0.0, 0.0, w, h);
+    }
+    let d = w.min(h);
+    Rect::from_xywh((w - d) / 2.0, (h - d) / 2.0, d, d)
 }

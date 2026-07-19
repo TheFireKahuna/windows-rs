@@ -1027,6 +1027,10 @@ impl Node {
             // Likewise: tray, sliding pill and hover ink are parts, the segment
             // labels are sprites, the ring is a part.
             ControlKind::SelectorBar => false,
+            // A badge is a plate and a count: the plate is a part, the count is
+            // sprites, and it has neither ring nor ink because it is neither
+            // focusable nor interactive. The whole control, retained.
+            ControlKind::InfoBadge => false,
             ControlKind::Line => self.paint.stroke.is_some(),
             ControlKind::Ellipse | ControlKind::Rectangle => {
                 self.paint.fill.is_some()
@@ -1333,7 +1337,6 @@ fn draws_own_chrome(kind: ControlKind) -> bool {
                 | ControlKind::ProgressRing
                 | ControlKind::TitleBar
                 | ControlKind::Meter
-                | ControlKind::InfoBadge
         )
 }
 

@@ -129,6 +129,8 @@ fn paint_node(
                 // one per node: a switch's state label, a bar's segment labels.
                 super::glyph_text::toggle_sync(comp, glyphs, n, scale);
                 super::glyph_text::segmented_sync(comp, glyphs, n, scale);
+                // …and the count on a badge's plate.
+                super::glyph_text::info_badge_sync(comp, glyphs, n, scale);
                 // Editors: the text run, its selection and its composition rule
                 // as sprites, then the caret sprite. Both are placed from the
                 // same `editor::TextBand`, so they cannot disagree.

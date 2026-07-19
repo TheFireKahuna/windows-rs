@@ -1771,6 +1771,7 @@ pub(crate) fn converted(kind: ControlKind) -> bool {
             | ControlKind::ProgressBar
             | ControlKind::ProgressRing
             | ControlKind::Meter
+            | ControlKind::InfoBadge
     )
 }
 
@@ -1870,6 +1871,8 @@ pub(crate) fn sync(
         // The link is fully retained: its ring is these parts and its words are
         // glyph sprites, so it owns no surface at all.
         ControlKind::HyperlinkButton => hyperlink_sync(comp, atlas, node, scale),
+        // Also fully retained: a plate below, its count's sprites above.
+        ControlKind::InfoBadge => badge_sync(comp, atlas, node, scale),
         _ => {}
     }
 }
@@ -2072,6 +2075,45 @@ pub(crate) fn focus_ring_slots(
             1.0,
         )
     })
+}
+
+/// An `InfoBadge`'s whole appearance: one plate, and nothing else.
+///
+/// Both forms are the same stadium — the dot is the case where the box is
+/// square, which is how the in-button badge plate (`button_plan`) has always
+/// treated it — so one shape key serves both and there is no second branch to
+/// keep in step with `info_badge::measure`. The count rides above as glyph
+/// sprites, which leaves the badge with no surface at all.
+///
+/// No ring and no ink: a badge is not focusable and not interactive. It reports
+/// a number, and the only thing that can change about it is that number and its
+/// colour.
+pub(crate) fn badge_plan(node: &Node, scale: f32) -> PartPlan {
+    let (w, h) = (node.rect.w, node.rect.h);
+    // The accent role unless the app set an explicit `Background` — what lets a
+    // host colour a badge by meaning (an error count in the danger role)
+    // without this control modelling severity the way the InfoBar does. A badge
+    // carries a number, not a status.
+    let fill = node.paint.background.unwrap_or_else(theme::accent);
+    let b = super::info_badge::plate_box(node, w, h);
+    let bh = b.height();
+    PartPlan::new([w, h, 0.0]).below(
+        0,
+        SlotPlan::snap(
+            // Radius half the height, so it stays round at any width.
+            AtlasKey::hbar(bh, bh / 2.0, 0.0, fill, scale),
+            Some((b.left, b.top, b.width(), bh)),
+            dim_of(node),
+        ),
+    )
+}
+
+fn badge_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+    if !ensure(comp, node, 1, 0) {
+        return;
+    }
+    let plan = badge_plan(node, scale);
+    apply(comp, atlas, node, &plan);
 }
 
 /// A `HyperlinkButton`'s whole appearance: the focus ring, and nothing else.

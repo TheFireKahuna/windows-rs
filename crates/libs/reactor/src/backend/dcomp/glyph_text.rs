@@ -898,6 +898,58 @@ pub(crate) fn hyperlink_sync(
     node.text_part = Some(part);
 }
 
+/// Reconcile an `InfoBadge`'s count as retained glyph sprites.
+///
+/// Centred in the node rather than in the plate, which is what the painted
+/// version did and what the numeric form makes correct anyway: for a pill the
+/// plate IS the node, and the dot form carries no count to place.
+pub(crate) fn info_badge_sync(
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    node: &mut Node,
+    scale: f32,
+) {
+    if node.kind != crate::backend::ControlKind::InfoBadge {
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    // The count sits ON the fill, so its default is the on-accent ink rather
+    // than the body-text token — which is near-invisible against a light-theme
+    // accent.
+    //
+    // An explicit `Foreground` wins, and has to: the ink that reads on a badge
+    // is a property of the FILL, and the fill is app-supplied (`Background`). A
+    // host colouring badges by meaning — a per-band accent, a danger count —
+    // picks the fill and therefore owns the contrast decision; deriving the ink
+    // from the theme's accent would be answering a question about a colour the
+    // theme never saw.
+    let ink = node.paint.foreground.unwrap_or_else(theme::text_on_accent);
+
+    let mut part = node.text_part.take().unwrap_or_default();
+    let b = Rect::from_xywh(0.0, 0.0, w, h);
+    match node.text_layout.as_ref() {
+        Some(layout) => place_centered(
+            &mut part,
+            comp,
+            atlas,
+            &node.container,
+            layout,
+            b,
+            b,
+            ink,
+            dim,
+            scale,
+        ),
+        None => part.hide_all(),
+    }
+    node.text_part = Some(part);
+}
+
 /// Reconcile a `ToggleSwitch`'s state label as retained glyph sprites.
 ///
 /// One run, placed after the track — but read out of [`ItemText`] rather than

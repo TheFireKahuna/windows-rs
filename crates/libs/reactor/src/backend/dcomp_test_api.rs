@@ -972,6 +972,7 @@ impl ArenaHarness {
             ControlKind::ProgressBar => dcomp::parts::progress_plan(n, scale),
             ControlKind::Expander => dcomp::parts::expander_plan(n, scale),
             ControlKind::ComboBox | ControlKind::DropDownButton => dcomp::parts::ink_plan(n, scale),
+            ControlKind::InfoBadge => dcomp::parts::badge_plan(n, scale),
             ControlKind::Button
             | ControlKind::ToggleButton
             | ControlKind::RepeatButton

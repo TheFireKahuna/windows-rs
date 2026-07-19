@@ -397,3 +397,79 @@ fn the_pane_signature_tracks_height_not_width() {
         "a height change is a resize — it must snap",
     );
 }
+
+/// An InfoBadge laid out at `w` x `h`, carrying `count` (or the bare dot).
+fn badge(a: &mut ArenaHarness, w: f32, h: f32, count: Option<i32>) -> PartPlanProbe {
+    let id = a.insert(K::InfoBadge).unwrap();
+    if let Some(c) = count {
+        a.apply_prop(id, Prop::Value, &V::I32(c));
+    }
+    a.set_rect(id, w, h);
+    a.part_plan(id, 1.0).unwrap()
+}
+
+/// The plate fills the pill, and the dot is a CENTRED SQUARE inside whatever box
+/// it was given.
+///
+/// The dot's `min(w, h)` is the whole reason `info_badge::plate_box` exists: a
+/// badge in a flex row can be handed a box of any shape, and a dot stretched to
+/// it stops being a dot. Asserting the rect is the only way to see that — the
+/// plate is a retained sprite, so nothing about it appears in a repaint.
+#[test]
+fn the_plate_fills_a_count_and_stays_round_for_a_dot() {
+    let mut a = harness();
+
+    let pill = badge(&mut a, 40.0, 16.0, Some(128));
+    assert_eq!(
+        pill.below[0].as_ref().unwrap().rect,
+        Some((0.0, 0.0, 40.0, 16.0)),
+        "a numeric badge's plate is its whole box",
+    );
+
+    // Deliberately oblong: the dot must not take the width.
+    let dot = badge(&mut a, 40.0, 16.0, None);
+    assert_eq!(
+        dot.below[0].as_ref().unwrap().rect,
+        Some((12.0, 0.0, 16.0, 16.0)),
+        "a dot is a centred square, not a stretched pill",
+    );
+}
+
+/// A badge is neither focusable nor interactive, so its plan carries nothing
+/// above it — no ring, no hover ink.
+///
+/// Worth stating because every other converted kind DOES have an upper band, and
+/// copying one of them is how a badge would quietly acquire a focus ring it can
+/// never legitimately show.
+#[test]
+fn a_badge_has_no_ring_and_no_ink() {
+    let mut a = harness();
+    let p = badge(&mut a, 40.0, 16.0, Some(3));
+    assert!(
+        p.above.iter().all(|s| s.is_none()),
+        "a badge takes no focus ring and no hover wash",
+    );
+}
+
+/// The badge reaches no `BeginDraw` at all: plate below, count as glyph sprites
+/// above, and nothing left for a surface to hold.
+///
+/// This is the claim the whole conversion is FOR, and it is one boolean — so
+/// without it, the badge could regress to allocating a surface per instance and
+/// every other test here would still pass.
+#[test]
+fn a_badge_owns_no_surface() {
+    let mut a = harness();
+    for count in [None, Some(3)] {
+        let id = a.insert(K::InfoBadge).unwrap();
+        if let Some(c) = count {
+            a.apply_prop(id, Prop::Value, &V::I32(c));
+        }
+        a.set_rect(id, 40.0, 16.0);
+        assert_eq!(
+            a.has_chrome(id),
+            Some(false),
+            "an InfoBadge ({count:?}) must never be given a paint surface",
+        );
+    }
+}
