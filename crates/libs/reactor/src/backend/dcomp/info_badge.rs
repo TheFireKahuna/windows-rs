@@ -19,9 +19,14 @@ pub(crate) const PILL_H: f32 = 16.0;
 /// Horizontal padding either side of the count inside the pill.
 const PILL_PAD_X: f32 = theme::SPACE_4;
 
-/// The count's type size and weight. Read by the layout pass that builds the
-/// cached run *and* by nothing else — stated once so what is measured and what
-/// is drawn cannot disagree.
+/// The count's type size and weight — the values a badge is BORN with.
+///
+/// Consumed by [`birth_paint`](super::node::birth_paint) rather than read at
+/// paint time, which is what makes them overridable: the layout pass builds the
+/// cached run from `node.paint`, so `.font_size(..)` / `.bold()` reach the badge
+/// like they reach any other text-bearing control, and an untouched badge still
+/// measures and draws at exactly these. Same single-definition discipline as
+/// `caption::band_height(&Extras::DEFAULT)` backing a TitleBar's birth style.
 pub(crate) const FONT_SIZE: f32 = theme::FONT_SIZE_MICRO;
 pub(crate) const FONT_WEIGHT: u16 = 600;
 

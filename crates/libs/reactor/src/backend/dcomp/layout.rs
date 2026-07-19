@@ -481,15 +481,15 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
             .get(id)
             .and_then(|n| n.paint.font_family.clone())
             .unwrap_or_else(|| "Segoe UI".to_string());
-        let built = label.and_then(|s| {
-            build_text_layout(
-                &s,
-                info_badge::FONT_SIZE,
-                info_badge::FONT_WEIGHT,
-                &family,
-                false,
-            )
-        });
+        // Size and weight come from `paint`, not from the badge constants: a
+        // node is BORN carrying those constants (`birth_paint`), so an
+        // untouched badge is unchanged while `.font_size(..)` / `.bold()` now
+        // reach it like any other text-bearing control.
+        let (size, weight) = arena
+            .get(id)
+            .map(|n| (n.paint.font_size, n.paint.font_weight))
+            .unwrap_or((info_badge::FONT_SIZE, info_badge::FONT_WEIGHT));
+        let built = label.and_then(|s| build_text_layout(&s, size, weight, &family, false));
         if let Some(n) = arena.get_mut(id) {
             n.text_layout = built;
             n.text_dirty = false;

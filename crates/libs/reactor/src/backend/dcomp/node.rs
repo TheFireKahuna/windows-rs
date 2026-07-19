@@ -1162,7 +1162,7 @@ pub(crate) const ALIGN_UNSET: i32 = -1;
 pub(crate) fn birth_paint(kind: ControlKind) -> Paint {
     Paint {
         font_size: default_font_size(kind),
-        font_weight: 400,
+        font_weight: default_font_weight(kind),
         is_enabled: true,
         // Buttons draw their own chrome (the WinUI default style is gone here).
         corner_radius: if kind == ControlKind::Button { 6.0 } else { 0.0 },
@@ -1178,7 +1178,20 @@ fn default_font_size(kind: ControlKind) -> f32 {
         | ControlKind::ComboBox
         | ControlKind::DropDownButton
         | ControlKind::SplitButton => theme::FONT_SIZE_SM,
+        // A badge's count is the smallest annotation in the ramp — a 16 DIP
+        // pill has room for nothing larger.
+        ControlKind::InfoBadge => info_badge::FONT_SIZE,
         _ => 14.0,
+    }
+}
+
+/// The weight a kind is born at. Regular for everything whose type is body
+/// text; a badge's count is set heavier because it is a dense numeral on a
+/// saturated fill, where regular reads as thin.
+fn default_font_weight(kind: ControlKind) -> u16 {
+    match kind {
+        ControlKind::InfoBadge => info_badge::FONT_WEIGHT,
+        _ => 400,
     }
 }
 
