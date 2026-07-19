@@ -57,6 +57,15 @@
 //! one run whose order against a sibling matters: its plate is a chrome part
 //! *below* the surface band, so the count lands above it whichever order the
 //! three runs happen to mint their hosts in.
+//!
+//! WITHIN a host the ordering is declared rather than positional, because one
+//! case genuinely needs it: an editor's selection wash must sit under the very
+//! glyphs it highlights. Fills therefore hang in their own container at the
+//! bottom of the host, so a fill minted after a glyph still lands below it.
+//! Relying on insertion order there would mean text disappearing behind its own
+//! highlight — a bug that stays invisible until a selection happens to grow.
+//! Decoration rules take the run's own ink and so need no such ordering against
+//! it.
 
 use windows_canvas_core::{Rect, TextDecoration, TextLayout};
 use windows_core::Interface;
@@ -137,17 +146,9 @@ impl GlyphSprite {
 /// A solid rectangle inside a text host: a decoration rule, or a selection
 /// fill.
 ///
-/// Currently unconsumed. Both users are the editor — its selection highlight
-/// and its IME composition underline — and the editor cannot move to sprites
-/// until its placement rule stops existing in four separate copies
-/// (`controls::paint_editor`, `controls::editor_caret_box`, `tsf::doc::text_band`
-/// and `uia::uia_text_origin`), because a fifth copy is what would let the
-/// caret, the candidate window and the screen-reader rects drift apart.
-///
 /// Not a glyph and not a mask — a rule has no outline and no coverage, so it is
 /// a sprite painted with a colour source directly rather than one cut by an
 /// atlas entry.
-#[allow(dead_code)]
 struct RectSprite {
     vis: IVisual,
     sprite: SpriteVisual,
@@ -212,8 +213,15 @@ pub(crate) struct TextPart {
     /// glyphs or the colour.
     host: Option<ContainerVisual>,
     host_vis: Option<IVisual>,
-    /// Last size pushed to the host (which is what its zero inset clip cuts to).
-    host_size: Option<(f32, f32)>,
+    /// Last box pushed to the host: its offset, and the size its zero inset
+    /// clip cuts to.
+    ///
+    /// It is a full rect rather than a size because an editor's text is clipped
+    /// to its CONTENT COLUMN, not to its box — a scrolled field would otherwise
+    /// spill its run over the spin buttons and out through the border. A
+    /// painted run got that clip for free from `push_clip`; sprites are clipped
+    /// by nothing, so the host has to be the column.
+    host_box: Option<Rect>,
     /// Last dim pushed to the host's opacity.
     host_dim: Option<f32>,
     glyphs: Vec<GlyphSprite>,
@@ -287,17 +295,26 @@ impl TextPart {
         }
     }
 
-    /// Size the host to the control's box (what the clip cuts to) and carry the
-    /// disabled dim on its opacity. Both self-gate.
-    fn place_host(&mut self, size: (f32, f32), dim: f32) {
+    /// Place and size the host to the box its clip cuts to, and carry the
+    /// disabled dim on its opacity. All three self-gate.
+    fn place_host(&mut self, box_: Rect, dim: f32) {
         let Some(vis) = self.host_vis.as_ref() else { return };
-        if self.host_size != Some(size) {
-            let _ = vis.SetSize(Vector2::new(size.0, size.1));
-            self.host_size = Some(size);
+        if self.host_box != Some(box_) {
+            let _ = vis.SetOffset(Vector3::new(box_.left, box_.top, 0.0));
+            let _ = vis.SetSize(Vector2::new(box_.width(), box_.height()));
+            self.host_box = Some(box_);
         }
         if self.host_dim != Some(dim) {
             let _ = vis.SetOpacity(dim);
             self.host_dim = Some(dim);
+        }
+    }
+
+    /// Node-local point → host-local, which is what every sprite offset is in.
+    fn to_host(&self, p: (f32, f32)) -> (f32, f32) {
+        match self.host_box {
+            Some(b) => (p.0 - b.left, p.1 - b.top),
+            None => p,
         }
     }
 
@@ -346,7 +363,7 @@ impl TextPart {
         parent: &ContainerVisual,
         layout: &TextLayout,
         origin: (f32, f32),
-        box_size: (f32, f32),
+        host_box: Rect,
         color: crate::Color,
         dim: f32,
         scale: f32,
@@ -354,7 +371,10 @@ impl TextPart {
         if !self.ensure_host(comp, parent) {
             return;
         }
-        self.place_host(box_size, dim);
+        self.place_host(host_box, dim);
+        // Everything below is host-local: the host is no longer necessarily at
+        // the node's origin (an editor's is its content column).
+        let origin = self.to_host(origin);
         // One AddRef per dirty sync, so the placement loop can grow sprites into
         // the host while `self.glyphs` is mutably borrowed.
         let Some(host) = self.host.clone() else { return };
@@ -452,7 +472,6 @@ impl TextPart {
     ///
     /// `origin` must be the same one `sync` was given: a decoration's baseline
     /// origin is reported in the layout's space exactly as a run's is.
-    #[allow(dead_code)]
     pub(crate) fn sync_rules(
         &mut self,
         comp: &Compositing,
@@ -469,6 +488,7 @@ impl TextPart {
             return;
         };
 
+        let origin = self.to_host(origin);
         let mut slot = 0usize;
         for d in decorations {
             let (x, y, w, h) = d.rect(false);
@@ -499,7 +519,6 @@ impl TextPart {
     ///
     /// `rects` are layout-relative, as [`TextLayout::hit_test_range`] returns
     /// them; `origin` is the same one [`sync`](Self::sync) was given.
-    #[allow(dead_code)]
     pub(crate) fn sync_fills(
         &mut self,
         comp: &Compositing,
@@ -559,6 +578,7 @@ impl TextPart {
             return;
         };
 
+        let origin = self.to_host(origin);
         let mut slot = 0usize;
         for &(x, y, w, h) in rects {
             if !(w > 0.0 && h > 0.0) {
@@ -641,7 +661,7 @@ fn place_leading(
     parent: &ContainerVisual,
     layout: &TextLayout,
     b: Rect,
-    box_size: (f32, f32),
+    host_box: Rect,
     color: crate::Color,
     dim: f32,
     scale: f32,
@@ -652,7 +672,7 @@ fn place_leading(
         parent,
         layout,
         (b.left, b.top),
-        box_size,
+        host_box,
         color,
         dim,
         scale,
@@ -671,7 +691,7 @@ fn place_centered(
     parent: &ContainerVisual,
     layout: &TextLayout,
     b: Rect,
-    box_size: (f32, f32),
+    host_box: Rect,
     color: crate::Color,
     dim: f32,
     scale: f32,
@@ -684,7 +704,7 @@ fn place_centered(
         b.left + ((b.width() - tw) / 2.0).max(0.0),
         b.top + ((b.height() - th) / 2.0).max(0.0),
     );
-    part.sync(comp, atlas, parent, layout, origin, box_size, color, dim, scale);
+    part.sync(comp, atlas, parent, layout, origin, host_box, color, dim, scale);
 }
 
 /// Reconcile a `TextBlock`'s prose as retained glyph sprites.
@@ -711,7 +731,7 @@ pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut N
                 &node.container,
                 layout,
                 Rect::from_xywh(0.0, 0.0, w, h),
-                (w, h),
+                Rect::from_xywh(0.0, 0.0, w, h),
                 fg,
                 1.0,
                 scale,
@@ -719,6 +739,87 @@ pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut N
         }
         None => part.hide_all(),
     }
+    node.text_part = Some(part);
+}
+
+/// Reconcile an editor's text run, its selection highlight and its IME
+/// composition rule as retained sprites.
+///
+/// The box fill, the border and the spin chevrons stay painted — an editor,
+/// unlike a button or a TextBlock, genuinely does draw things that are not
+/// text, so it keeps its surface and only the text leaves it.
+///
+/// Three things here are not optional:
+///
+/// - The host is the CONTENT COLUMN, not the node box. The painted run was
+///   confined by a `push_clip`; sprites are clipped by nothing, so a scrolled
+///   field would otherwise spill its text across the spin buttons and out
+///   through the border.
+/// - The run is read with [`TextLayout::shape`] rather than `glyph_runs`,
+///   because the layout carries an underline over the active composition span
+///   and `glyph_runs` drops it. `draw_text_layout` used to render that rule for
+///   free; losing it would mean a user could not see what they were composing,
+///   with nothing else about the text looking wrong.
+/// - Every origin comes from [`editor::TextBand`], the same one the caret
+///   sprite, the IME candidate window and UIA are placed by — which is what
+///   keeps the sprites from drifting away from all three.
+pub(crate) fn editor_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+    if node.editor.is_none() {
+        return;
+    }
+    let Some(band) = super::editor::TextBand::of(node) else {
+        return;
+    };
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    // The clip column, in node-local DIPs. Full height: the run is centred
+    // within it, and a descender must not be cut.
+    let column = Rect::from_xywh(band.content_x, 0.0, band.content_w, node.rect.h);
+    let origin = (band.origin_x, band.origin_y);
+
+    let mut part = node.text_part.take().unwrap_or_default();
+    let ed = node.editor.as_ref().expect("checked above");
+    let empty = ed.buf.is_empty();
+
+    match ed.layout.as_ref().filter(|_| !empty) {
+        Some(layout) => {
+            let fg = node.paint.foreground.unwrap_or_else(theme::text);
+            let shaped = layout.shape().ok();
+            part.sync(comp, atlas, &node.container, layout, origin, column, fg, dim, scale);
+
+            // Selection sits behind the run, so it is placed after the host
+            // exists but lands under every glyph — see `TextPart::sync_fills`.
+            let sel = if node.focused && ed.has_selection() {
+                let (a, b) = ed.sel();
+                layout
+                    .hit_test_range(a as u32, (b - a) as u32, origin.0, origin.1)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            part.sync_fills(
+                comp,
+                &sel,
+                (0.0, 0.0),
+                theme::with_alpha(theme::accent(), 0.32),
+                scale,
+            );
+
+            // The composition rule takes the text's own ink, as it did when
+            // DirectWrite drew it.
+            match shaped {
+                Some(s) => part.sync_rules(comp, &s.decorations, origin, scale),
+                None => part.sync_rules(comp, &[], origin, scale),
+            }
+        }
+        // Empty field: the placeholder is still painted (it is tertiary ink the
+        // editor owns no layout for), so there is nothing to place here.
+        None => part.hide_all(),
+    }
+
     node.text_part = Some(part);
 }
 
@@ -763,7 +864,7 @@ pub(crate) fn button_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
             &node.container,
             layout,
             boxes.label,
-            (w, h),
+            Rect::from_xywh(0.0, 0.0, w, h),
             fg,
             dim,
             scale,
@@ -783,7 +884,7 @@ pub(crate) fn button_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
                 &node.container,
                 &layout,
                 b,
-                (w, h),
+                Rect::from_xywh(0.0, 0.0, w, h),
                 fg,
                 dim,
                 scale,
@@ -807,7 +908,7 @@ pub(crate) fn button_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
                 &node.container,
                 &layout,
                 b,
-                (w, h),
+                Rect::from_xywh(0.0, 0.0, w, h),
                 ink,
                 dim,
                 scale,

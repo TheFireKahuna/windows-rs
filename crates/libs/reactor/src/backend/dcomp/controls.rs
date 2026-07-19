@@ -1000,18 +1000,15 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
     let cx0 = rect.left + band.content_x;
     let font_size = node.paint.font_size;
 
-    // The band is node-local; this surface's rect is where the node starts.
-    // Left-aligned fields scroll; centered/right fields keep `scroll_x == 0` and
-    // let DWrite position the run within `content_w`.
-    let origin_x = rect.left + band.origin_x;
-    let origin_y = rect.top + band.origin_y;
-
-    // Confine drawing to the content column (clip overflow / spin area).
+    // Only the placeholder is still drawn in this column; the run itself is
+    // sprites, clipped by their own host.
     let clip = Rect::from_xywh(cx0, rect.top, content_w, rect.height());
     session.push_clip(&clip);
 
     if ed.buf.is_empty() {
-        // Placeholder.
+        // The placeholder is still painted: it is not the editor's text, it has
+        // no layout of its own, and it is drawn by whole-string alignment rather
+        // than from a shaped run.
         text(
             session,
             brush,
@@ -1025,31 +1022,12 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
             ParagraphAlignment::Center,
             dim,
         );
-    } else {
-        // Selection highlight (accent wash) behind the text.
-        if node.focused
-            && ed.has_selection()
-            && let Some(layout) = &ed.layout
-        {
-            let (a, b) = ed.sel();
-            if let Ok(rects) =
-                layout.hit_test_range(a as u32, (b - a) as u32, origin_x, origin_y)
-            {
-                put(brush, theme::with_alpha(theme::accent(), 0.32), dim);
-                for (x, y, w, h) in rects {
-                    session.fill_rect(&Rect::from_xywh(x, y, w, h), brush);
-                }
-            }
-        }
-        // The text run.
-        if let Some(layout) = &ed.layout {
-            put(brush, node.paint.foreground.unwrap_or(theme::text()), dim);
-            session.draw_text_layout(Vector2::new(origin_x, origin_y), layout, brush);
-        }
     }
 
-    // The caret is NOT drawn here: it is a compositor sprite whose blink plays
-    // DWM-side (see `parts::sync_caret` and [`editor_caret_box`]).
+    // The text run, its selection wash and its composition rule are NOT drawn
+    // here — they are retained sprites (`glyph_text::editor_sync`), clipped by
+    // their host rather than by this `push_clip`. Nor is the caret, whose blink
+    // plays DWM-side (`parts::sync_caret`, [`editor_caret_box`]).
 
     session.pop_clip();
 

@@ -621,13 +621,18 @@ pub(crate) struct Node {
     /// Rebuilt by the layout pass on `text_dirty`; see
     /// [`glyph_text::button_sync`](super::glyph_text::button_sync).
     pub button_text: Option<Box<super::glyph_text::ButtonText>>,
-    /// `TextBlock` only: its prose as retained per-glyph sprites.
+    /// A `TextBlock`'s prose, or an editor's run — as retained per-glyph
+    /// sprites.
     ///
     /// One run, not three, so it is a bare [`TextPart`] rather than a
-    /// [`ButtonText`](super::glyph_text::ButtonText) — a TextBlock has no icon
-    /// and no badge. Wrapped text needs nothing extra: DirectWrite reports each
-    /// wrapped line as its own glyph run at its own baseline, and the placement
-    /// walk honours those already.
+    /// [`ButtonText`](super::glyph_text::ButtonText): neither kind has an icon
+    /// or a badge, and a node is never both. Wrapped text needs nothing extra —
+    /// DirectWrite reports each wrapped line as its own glyph run at its own
+    /// baseline, and the placement walk honours those already.
+    ///
+    /// For an editor the part also carries the selection fill and the IME
+    /// composition rule, because both are clipped to the same content column
+    /// the run is. See [`glyph_text::editor_sync`](super::glyph_text::editor_sync).
     pub text_part: Option<Box<super::glyph_text::TextPart>>,
     /// Editors only: the caret sprite (topmost child, above the painted text)
     /// whose blink is a compositor-side square-wave opacity animation. Created
