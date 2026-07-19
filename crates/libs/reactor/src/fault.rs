@@ -94,7 +94,10 @@ fn deliver(fault: &Fault) {
     }
 }
 
-#[cfg(test)]
+// Gated to match `set_handler` above, which these tests install through: without
+// the `winui-backend` feature there is no handler seam to test, and an ungated
+// module makes `cargo test --lib` fail to COMPILE on a dcomp-only build.
+#[cfg(all(test, feature = "winui-backend"))]
 mod tests {
     use super::*;
     use std::cell::RefCell;

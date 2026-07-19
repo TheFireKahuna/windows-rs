@@ -250,12 +250,32 @@ impl Compositing {
         ICompositionDrawingSurfaceInterop,
         CompositionSurfaceBrush,
     )> {
+        self.new_surface_with_format(px_w, px_h, DirectXPixelFormat::R16G16B16A16Float)
+    }
+
+    /// [`new_source_surface`](Self::new_source_surface) at an explicit pixel
+    /// format. FP16 is right for anything whose COLOUR the surface carries; a
+    /// pure alpha MASK (the glyph atlas) carries no colour at all and asks for
+    /// `A8UIntNormalized` here instead — an 8× cut in bytes per glyph. The
+    /// caller owns the fallback: `CreateDrawingSurface` fails for a format the
+    /// composition device will not accept, and that failure is the only reliable
+    /// probe (see `glyph_atlas::GlyphAtlas::format`).
+    pub fn new_surface_with_format(
+        &self,
+        px_w: i32,
+        px_h: i32,
+        format: DirectXPixelFormat,
+    ) -> windows_core::Result<(
+        CompositionDrawingSurface,
+        ICompositionDrawingSurfaceInterop,
+        CompositionSurfaceBrush,
+    )> {
         let surface = self.graphics.CreateDrawingSurface(
             Size {
                 width: px_w.max(1) as f32,
                 height: px_h.max(1) as f32,
             },
-            DirectXPixelFormat::R16G16B16A16Float,
+            format,
             DirectXAlphaMode::Premultiplied,
         )?;
         let brush = self
