@@ -80,9 +80,17 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
     let Ok((text_w, text_h)) = layout.measure() else {
         return;
     };
-    // The count sits ON the fill, so it takes the on-accent ink rather than the
-    // body-text token — which is near-invisible against a light-theme accent.
-    let mut c = linear(theme::text_on_accent());
+    // The count sits ON the fill, so its default is the on-accent ink rather
+    // than the body-text token — which is near-invisible against a light-theme
+    // accent.
+    //
+    // An explicit `Foreground` wins, and has to: the ink that reads on a badge
+    // is a property of the FILL, and the fill is app-supplied (`Background`).
+    // A host colouring badges by meaning — a per-band accent, a danger count —
+    // picks the fill and therefore owns the contrast decision; deriving the ink
+    // from the theme's accent would be answering a question about a colour the
+    // theme never saw.
+    let mut c = linear(node.paint.foreground.unwrap_or_else(theme::text_on_accent));
     c.a *= dim;
     brush.set_color(c);
     // Centred by hand from the measured run: `draw_text_layout` places by

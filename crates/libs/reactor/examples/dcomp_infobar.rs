@@ -108,6 +108,25 @@ fn main() -> windows_reactor::Result<()> {
             ))
             .spacing(10.0)
             .vertical_alignment(VerticalAlignment::Center),
+            // An app-coloured badge picks its own fill AND its own ink — the
+            // pair a host controls together. The last one is the EQ band-badge
+            // shape: a fixed square, so the stadium resolves to a circle.
+            hstack((
+                text_block("themed").font_size(12.0).foreground(TXT2).width(60.0),
+                InfoBadge::numeric(7)
+                    .background(Color::rgb(0xf1, 0x52, 0x52))
+                    .foreground(Color::rgb(0xff, 0xff, 0xff)),
+                InfoBadge::numeric(3)
+                    .background(Color::rgb(0x41, 0xd9, 0xa4))
+                    .foreground(Color::rgb(0x00, 0x00, 0x00)),
+                InfoBadge::numeric(4)
+                    .background(Color::rgb(0xf6, 0xa9, 0x11))
+                    .foreground(Color::rgb(0x00, 0x00, 0x00))
+                    .width(18.0)
+                    .height(18.0),
+            ))
+            .spacing(10.0)
+            .vertical_alignment(VerticalAlignment::Center),
         ))
         .spacing(10.0);
 
