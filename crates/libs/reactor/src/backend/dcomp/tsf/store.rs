@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
-use super::{lock, Composition, DocSelection, InputScope};
+use super::{lock, DocSelection};
 
 /// What the store needs from the backend's editor. Every offset is an ACP
 /// position — a UTF-16 code-unit index, identical to `editor::Editor::buf`
@@ -45,7 +45,6 @@ pub trait TsfDocument {
     /// The focused field rejects edits (rare — e.g. a disabled field that keeps
     /// focus). Write locks are still granted; the writes fail `TS_E_READONLY`.
     fn is_read_only(&self) -> bool;
-    fn input_scope(&self) -> InputScope;
 
     // ── geometry (screen pixels) ─────────────────────────────────────────────
     /// Bounding rect of ACP `[start, end)` in screen pixels, or `None` if the
@@ -56,15 +55,15 @@ pub trait TsfDocument {
     fn screen_rect(&self) -> Option<super::DocRect>;
 
     // ── composition (store → editor) ─────────────────────────────────────────
-    /// A composition began: drop any selection and anchor an empty composing run
-    /// at the caret (`editor::Editor::ime_begin`).
-    fn composition_begin(&mut self);
-    /// The composing run changed — text and/or underline. The editor stores the
-    /// span for the underline paint (`editor::Editor::ime_replace(_, true)`).
-    fn composition_update(&mut self, comp: Composition);
-    /// The composition ended (committed or cancelled): clear the composing span
-    /// (`editor::Editor::ime_end`). The committed text, if any, arrived through
-    /// `replace` before this call.
+    //
+    // Composing *text* is not passed here: it arrives through `replace` like any
+    // other TSF edit. These carry only the composing **span**, which is what the
+    // underline paints over and what the §7.2 guard reads.
+    /// The composing run now covers `[start, start + len)`. Called at the
+    /// composition's start and on every subsequent range change.
+    fn composition_update(&mut self, start: usize, len: usize);
+    /// The composition ended (committed or cancelled): clear the composing span.
+    /// The committed text, if any, arrived through `replace` before this call.
     fn composition_end(&mut self);
 }
 
@@ -150,10 +149,6 @@ pub struct TextStoreCore {
     /// moved — emit one `OnLayoutChange` after release so the TIP repositions its
     /// candidate UI. Set by TIP-originated edits only.
     edit_during_lock: bool,
-    /// A composition is active. The §7.2 guard reads this so the backend parks
-    /// forced `SetText`s until it clears. Driven by the context-owner composition
-    /// sink (see `thread_mgr`), not by text edits.
-    comp_active: bool,
 }
 
 impl TextStoreCore {
@@ -163,7 +158,6 @@ impl TextStoreCore {
             lock_queue: VecDeque::new(),
             pending: Vec::new(),
             edit_during_lock: false,
-            comp_active: false,
         }
     }
 
@@ -173,15 +167,6 @@ impl TextStoreCore {
 
     pub fn has_write_lock(&self) -> bool {
         lock::is_write(self.lock)
-    }
-
-    pub fn composition_active(&self) -> bool {
-        self.comp_active
-    }
-
-    /// Set by the composition sink at `OnStartComposition`/`OnEndComposition`.
-    pub fn set_composition_active(&mut self, active: bool) {
-        self.comp_active = active;
     }
 
     /// Decide whether a lock may begin now, mutating lock state for the grant /

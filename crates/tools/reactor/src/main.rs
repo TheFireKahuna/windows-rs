@@ -157,6 +157,9 @@ fn generate_reactor_bindings() {
         "Windows.Win32.ITextRangeProvider",
         "Windows.Win32.IRawElementProviderAdviseEvents",
         "Windows.Win32.ITextStoreACP",
+        // Composition boundaries: TSF calls this back on the front thread when a
+        // TIP opens / closes a composition (the §7.2 guard signal).
+        "Windows.Win32.ITfContextOwnerCompositionSink",
         // The backend implements these to hand a D2D path geometry to the
         // compositor (Knob value arc → CompositionPath): the WinRT marker the
         // CompositionPath factory accepts + the interop that yields the D2D geometry.

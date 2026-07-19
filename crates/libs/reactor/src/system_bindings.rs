@@ -39,12 +39,6 @@ windows_core::link!("kernel32.dll" "system" fn GlobalAlloc(uflags : u32, dwbytes
 windows_core::link!("kernel32.dll" "system" fn GlobalFree(hmem : HGLOBAL) -> HGLOBAL);
 windows_core::link!("kernel32.dll" "system" fn GlobalLock(hmem : HGLOBAL) -> *mut core::ffi::c_void);
 windows_core::link!("kernel32.dll" "system" fn GlobalUnlock(hmem : HGLOBAL) -> windows_core::BOOL);
-windows_core::link!("imm32.dll" "system" fn ImmGetCompositionStringW(param0 : HIMC, param1 : u32, lpbuf : *mut core::ffi::c_void, dwbuflen : u32) -> i32);
-windows_core::link!("imm32.dll" "system" fn ImmGetContext(param0 : HWND) -> HIMC);
-windows_core::link!("imm32.dll" "system" fn ImmGetDefaultIMEWnd(param0 : HWND) -> HWND);
-windows_core::link!("imm32.dll" "system" fn ImmNotifyIME(param0 : HIMC, dwaction : u32, dwindex : u32, dwvalue : u32) -> windows_core::BOOL);
-windows_core::link!("imm32.dll" "system" fn ImmReleaseContext(param0 : HWND, param1 : HIMC) -> windows_core::BOOL);
-windows_core::link!("imm32.dll" "system" fn ImmSetCompositionWindow(param0 : HIMC, lpcompform : *const COMPOSITIONFORM) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn IsZoomed(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn LoadCursorW(hinstance : HINSTANCE, lpcursorname : windows_core::PCWSTR) -> HCURSOR);
 windows_core::link!("user32.dll" "system" fn MonitorFromPoint(pt : POINT, dwflags : u32) -> HMONITOR);
@@ -105,13 +99,6 @@ impl windows_core::RuntimeType for AnimationIterationBehavior {
 pub const CF_UNICODETEXT: u32 = 13;
 pub type CLIPFORMAT = u16;
 pub type COLORREF = u32;
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct COMPOSITIONFORM {
-    pub dwStyle: u32,
-    pub ptCurrentPos: POINT,
-    pub rcArea: RECT,
-}
 pub type CONTROLTYPEID = i32;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1602,8 +1589,6 @@ impl Default for FORMATETC {
         unsafe { core::mem::zeroed() }
     }
 }
-pub const GCS_COMPSTR: u32 = 8;
-pub const GCS_RESULTSTR: u32 = 2048;
 pub const GMEM_MOVEABLE: u32 = 2;
 pub const GMEM_ZEROINIT: u32 = 64;
 pub const GWLP_USERDATA: i32 = -21;
@@ -1614,7 +1599,6 @@ pub type HCURSOR = HICON;
 pub type HDC = *mut core::ffi::c_void;
 pub type HGLOBAL = HANDLE;
 pub type HICON = *mut core::ffi::c_void;
-pub type HIMC = *mut core::ffi::c_void;
 pub type HINSTANCE = *mut core::ffi::c_void;
 pub type HMENU = *mut core::ffi::c_void;
 pub type HMODULE = HINSTANCE;
@@ -7716,6 +7700,33 @@ pub struct ITextStoreACPSink_Vtbl {
         unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    ITfCompositionView,
+    ITfCompositionView_Vtbl,
+    0xd7540241_f9a1_4364_befc_dbcd2c4395b7
+);
+windows_core::imp::interface_hierarchy!(ITfCompositionView, windows_core::IUnknown);
+impl ITfCompositionView {
+    pub(crate) unsafe fn GetRange(&self) -> windows_core::Result<ITfRange> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetRange)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct ITfCompositionView_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetOwnerClsid: usize,
+    pub GetRange: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     ITfContext,
     ITfContext_Vtbl,
     0xaa80e7fd_2021_11d2_93e0_0060b067b86e
@@ -8013,6 +8024,118 @@ pub struct ITfContext_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
+windows_core::imp::define_interface!(
+    ITfContextOwnerCompositionSink,
+    ITfContextOwnerCompositionSink_Vtbl,
+    0x5f20aa40_b57a_4f34_96ab_3576f377cc79
+);
+windows_core::imp::interface_hierarchy!(ITfContextOwnerCompositionSink, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITfContextOwnerCompositionSink_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub OnStartComposition: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
+    pub OnUpdateComposition: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub OnEndComposition: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+pub trait ITfContextOwnerCompositionSink_Impl: windows_core::IUnknownImpl {
+    fn OnStartComposition(
+        &self,
+        pcomposition: windows_core::Ref<ITfCompositionView>,
+    ) -> windows_core::Result<windows_core::BOOL>;
+    fn OnUpdateComposition(
+        &self,
+        pcomposition: windows_core::Ref<ITfCompositionView>,
+        prangenew: windows_core::Ref<ITfRange>,
+    ) -> windows_core::Result<()>;
+    fn OnEndComposition(
+        &self,
+        pcomposition: windows_core::Ref<ITfCompositionView>,
+    ) -> windows_core::Result<()>;
+}
+impl ITfContextOwnerCompositionSink_Vtbl {
+    pub const fn new<Identity: ITfContextOwnerCompositionSink_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn OnStartComposition<
+            Identity: ITfContextOwnerCompositionSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pcomposition: *mut core::ffi::c_void,
+            pfok: *mut windows_core::BOOL,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITfContextOwnerCompositionSink_Impl::OnStartComposition(
+                    this,
+                    core::mem::transmute_copy(&pcomposition),
+                ) {
+                    Ok(ok__) => {
+                        pfok.write(ok__);
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn OnUpdateComposition<
+            Identity: ITfContextOwnerCompositionSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pcomposition: *mut core::ffi::c_void,
+            prangenew: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITfContextOwnerCompositionSink_Impl::OnUpdateComposition(
+                    this,
+                    core::mem::transmute_copy(&pcomposition),
+                    core::mem::transmute_copy(&prangenew),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn OnEndComposition<
+            Identity: ITfContextOwnerCompositionSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pcomposition: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITfContextOwnerCompositionSink_Impl::OnEndComposition(
+                    this,
+                    core::mem::transmute_copy(&pcomposition),
+                )
+                .into()
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            OnStartComposition: OnStartComposition::<Identity, OFFSET>,
+            OnUpdateComposition: OnUpdateComposition::<Identity, OFFSET>,
+            OnEndComposition: OnEndComposition::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<ITfContextOwnerCompositionSink as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for ITfContextOwnerCompositionSink {}
 windows_core::imp::define_interface!(
     ITfContextView,
     ITfContextView_Vtbl,
@@ -8685,6 +8808,53 @@ pub struct ITfRange_Vtbl {
     SetGravity: usize,
     Clone: usize,
     GetContext: usize,
+}
+windows_core::imp::define_interface!(
+    ITfRangeACP,
+    ITfRangeACP_Vtbl,
+    0x057a6296_029b_4154_b79a_0d461d4ea94c
+);
+impl core::ops::Deref for ITfRangeACP {
+    type Target = ITfRange;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(ITfRangeACP, windows_core::IUnknown, ITfRange);
+impl ITfRangeACP {
+    pub(crate) unsafe fn GetExtent(
+        &self,
+        pacpanchor: *mut i32,
+        pcch: *mut i32,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetExtent)(
+                windows_core::Interface::as_raw(self),
+                pacpanchor as _,
+                pcch as _,
+            )
+        }
+    }
+    pub(crate) unsafe fn SetExtent(&self, acpanchor: i32, cch: i32) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetExtent)(
+                windows_core::Interface::as_raw(self),
+                acpanchor,
+                cch,
+            )
+        }
+    }
+}
+#[repr(C)]
+pub struct ITfRangeACP_Vtbl {
+    pub base__: ITfRange_Vtbl,
+    pub GetExtent: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut i32,
+        *mut i32,
+    ) -> windows_core::HRESULT,
+    pub SetExtent:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i32, i32) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ITfRangeBackup,
@@ -10922,12 +11092,6 @@ pub const WM_DPICHANGED: u32 = 736;
 pub const WM_ERASEBKGND: u32 = 20;
 pub const WM_GETMINMAXINFO: u32 = 36;
 pub const WM_GETOBJECT: u32 = 61;
-pub const WM_IME_CHAR: u32 = 646;
-pub const WM_IME_COMPOSITION: u32 = 271;
-pub const WM_IME_ENDCOMPOSITION: u32 = 270;
-pub const WM_IME_NOTIFY: u32 = 642;
-pub const WM_IME_SETCONTEXT: u32 = 641;
-pub const WM_IME_STARTCOMPOSITION: u32 = 269;
 pub const WM_KEYDOWN: u32 = 256;
 pub const WM_KEYUP: u32 = 257;
 pub const WM_KILLFOCUS: u32 = 8;

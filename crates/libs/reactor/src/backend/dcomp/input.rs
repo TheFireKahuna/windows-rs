@@ -1850,8 +1850,9 @@ impl DCompBackend {
 
     // ── Text editor ────────────────────────────────────────────────────────
 
-    /// The focused node, if it is an editable text field.
-    fn focused_editable(&self) -> Option<ControlId> {
+    /// The focused node, if it is an editable text field. Also what "the
+    /// document" means to the TSF text store (`tsf::doc`).
+    pub(crate) fn focused_editable(&self) -> Option<ControlId> {
         let id = self.focused_id?;
         self.node(id)
             .is_some_and(|n| n.editor.is_some())
@@ -1896,7 +1897,11 @@ impl DCompBackend {
         }
     }
 
-    fn with_editor<R>(&mut self, id: ControlId, f: impl FnOnce(&mut editor::Editor) -> R) -> Option<R> {
+    pub(crate) fn with_editor<R>(
+        &mut self,
+        id: ControlId,
+        f: impl FnOnce(&mut editor::Editor) -> R,
+    ) -> Option<R> {
         self.node_mut(id).and_then(|n| n.editor.as_mut()).map(f)
     }
 
@@ -2036,43 +2041,8 @@ impl DCompBackend {
         self.repaint();
     }
 
-    /// IME composition started (IMM32 fallback): anchor the composition span.
-    /// Returns `true` if a focused editor will handle composition (so the host
-    /// can suppress the default IME composition window).
-    pub(crate) fn ime_begin(&mut self) -> bool {
-        if let Some(id) = self.focused_editable() {
-            self.with_editor(id, |e| e.ime_begin());
-            true
-        } else {
-            false
-        }
-    }
-
-    /// IME composition update (the in-progress, underlined run).
-    pub(crate) fn ime_update(&mut self, s: &str) {
-        if let Some(id) = self.focused_editable() {
-            self.with_editor(id, |e| e.ime_replace(s, true));
-            self.editor_caret_moved(id);
-        }
-    }
-
-    /// IME committed a result string into the field.
-    pub(crate) fn ime_commit(&mut self, s: &str) {
-        if let Some(id) = self.focused_editable() {
-            self.with_editor(id, |e| e.ime_replace(s, false));
-            self.editor_after_edit(id);
-        }
-    }
-
-    /// IME composition ended (cancelled / finished).
-    pub(crate) fn ime_end(&mut self) {
-        if let Some(id) = self.focused_editable() {
-            self.with_editor(id, |e| e.ime_end());
-            self.editor_caret_moved(id);
-        }
-    }
-
-    /// Whether a text field currently has keyboard focus (host gates IME).
+    /// Whether a text field currently has keyboard focus — the pump's gate on
+    /// offering keys to a TIP (see `tsf::bridge::filter_key`).
     pub(crate) fn has_text_focus(&self) -> bool {
         self.focused_editable().is_some()
     }
@@ -2104,7 +2074,7 @@ impl DCompBackend {
     }
 
     /// Caret moved (no text change): reset blink, repaint the field.
-    fn editor_caret_moved(&mut self, id: ControlId) {
+    pub(crate) fn editor_caret_moved(&mut self, id: ControlId) {
         if let Some(n) = self.node_mut(id) {
             if let Some(e) = &mut n.editor {
                 e.caret_moved = true;
@@ -2119,7 +2089,7 @@ impl DCompBackend {
     /// funnels through here (keystroke, backspace, paste, IME commit, UIA
     /// SetValue), so this is where the editor's §7.2 text revision bumps —
     /// the fired intent carries the new revision out to the app.
-    fn editor_after_edit(&mut self, id: ControlId) {
+    pub(crate) fn editor_after_edit(&mut self, id: ControlId) {
         let (kind, text) = match self.node_mut(id) {
             Some(n) => {
                 let kind = n.kind;

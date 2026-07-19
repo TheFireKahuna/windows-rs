@@ -305,6 +305,10 @@ impl DCompHost {
         // writes and re-renders land app-side, and kicks the first render;
         // the resulting commit is replayed by the pump once [`run`] starts.
         let backend = Rc::new(RefCell::new(backend));
+        // Text input. The store reflects whichever editor has focus by reading
+        // this very backend, so TSF must be handed the same `Rc` the host keeps
+        // — and may only ever be entered with no borrow on it (see `tsf::bridge`).
+        tsf::bridge::activate(Rc::clone(&backend), hwnd as isize);
         let (app, app_join) = dispatch::spawn_app_thread(
             hwnd as isize,
             root,
@@ -369,8 +373,18 @@ impl DCompHost {
         let mut msg: MSG = unsafe { core::mem::zeroed() };
         unsafe {
             while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+                // Text input is offered every key *before* translation: a TIP
+                // that claims a composition key must claim it before it becomes
+                // a `WM_CHAR`. An eaten key is neither translated nor dispatched.
+                if !tsf::bridge::filter_key(&msg) {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                // …and told what the message changed, once the WndProc's backend
+                // borrow is long gone. One site: every path that can move focus
+                // or edit text ends here (input, UIA, an app commit replay), so
+                // none of them has to remember to announce itself.
+                tsf::bridge::flush();
             }
         }
         // Quit and join the app thread before tearing down front state, so no
@@ -579,23 +593,6 @@ fn is_immersive_color_set(lparam: LPARAM) -> bool {
     }
     let s = unsafe { wide_str(lparam as *const u16) };
     s == "ImmersiveColorSet"
-}
-
-/// Read an IMM composition string (`GCS_COMPSTR` / `GCS_RESULTSTR`) into a
-/// `String`. Two calls: size probe, then fetch.
-unsafe fn imm_string(himc: HIMC, gcs: u32) -> Option<String> {
-    let bytes = unsafe { ImmGetCompositionStringW(himc, gcs, core::ptr::null_mut(), 0) };
-    if bytes <= 0 {
-        return None;
-    }
-    let mut buf = vec![0u16; (bytes as usize).div_ceil(2)];
-    let got = unsafe {
-        ImmGetCompositionStringW(himc, gcs, buf.as_mut_ptr().cast(), bytes as u32)
-    };
-    if got <= 0 {
-        return None;
-    }
-    Some(String::from_utf16_lossy(&buf[..(got as usize) / 2]))
 }
 
 /// Read a NUL-terminated UTF-16 string at `ptr` (bounded) into a `String`.
@@ -1063,57 +1060,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             0
         }
 
-        // ── IME (IMM32 composition fallback) ─────────────────────────────
-        WM_IME_STARTCOMPOSITION => {
-            if let Some(s) = shared()
-                && dispatch_input(&s, |b| b.ime_begin())
-            {
-                // A text field owns composition: suppress the default IME window.
-                return 0;
-            }
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-
-        WM_IME_COMPOSITION => {
-            // Hoisted read: the borrow must end before `dispatch_input`
-            // borrows the backend again below.
-            let focused = shared().map(|s| s.backend.borrow_mut().has_text_focus());
-            if let Some(s) = shared()
-                && focused == Some(true)
-            {
-                let himc = unsafe { ImmGetContext(hwnd) };
-                if !himc.is_null() {
-                    let flags = lparam as u32;
-                    if flags & GCS_RESULTSTR != 0
-                        && let Some(res) = unsafe { imm_string(himc, GCS_RESULTSTR) }
-                    {
-                        dispatch_input(&s, |b| b.ime_commit(&res));
-                    }
-                    if flags & GCS_COMPSTR != 0 {
-                        let comp = unsafe { imm_string(himc, GCS_COMPSTR) }.unwrap_or_default();
-                        dispatch_input(&s, |b| b.ime_update(&comp));
-                    }
-                    unsafe {
-                        let _ = ImmReleaseContext(hwnd, himc);
-                    }
-                }
-                return 0;
-            }
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-
-        WM_IME_ENDCOMPOSITION => {
-            // Hoisted read — same double-borrow hazard as WM_IME_COMPOSITION.
-            let focused = shared().map(|s| s.backend.borrow_mut().has_text_focus());
-            if let Some(s) = shared()
-                && focused == Some(true)
-            {
-                dispatch_input(&s, |b| b.ime_end());
-                return 0;
-            }
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-
+        // No `WM_IME_*` arms: composition is owned end-to-end by the TSF text
+        // store (`tsf::bridge`), which sees it through the store's own document
+        // protocol and the composition sink. There is deliberately no IMM32
+        // path — see `tsf::mod`.
         WM_SETFOCUS => {
             if let Some(s) = shared() {
                 dispatch_input(&s, |b| b.window_focus_changed(true));
@@ -1235,6 +1185,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
 
         WM_DESTROY => {
+            // Before the window goes: pop the TSF context and deactivate the
+            // thread manager while the HWND the store reports is still valid.
+            tsf::bridge::shutdown();
             unsafe {
                 PostQuitMessage(0);
             }

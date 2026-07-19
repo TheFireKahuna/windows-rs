@@ -53,9 +53,6 @@ struct StoreState {
     doc: Rc<RefCell<dyn TsfDocument>>,
     /// The owning window, returned from `GetWnd`.
     hwnd: HWND,
-    /// Invoked when a composition ends — the §7.2 "composition ended" signal the
-    /// backend registers so it can flush any parked forced `SetText`.
-    on_comp_end: RefCell<Option<Box<dyn FnMut()>>>,
 }
 
 impl StoreState {
@@ -140,7 +137,6 @@ impl TextStore {
             sink: RefCell::new(None),
             doc,
             hwnd: hwnd as HWND,
-            on_comp_end: RefCell::new(None),
         }))
     }
 
@@ -419,11 +415,11 @@ impl ITextStoreACP_Impl for TextStore_Impl {
         Ok(())
     }
 
-    // ── Attributes: input scope is the only one we model, at the protocol level.
-    //    A TIP asks which attrs we support, then retrieves them. Populating the
-    //    input-scope VARIANT with an `ITfInputScope` object is the documented
-    //    refinement (see the WndProc hook list); the request/retrieve handshake
-    //    is honoured so a TIP never blocks waiting on it. ──────────────────────
+    // ── Attributes: none are modelled. A TIP asks which attrs we support, then
+    //    retrieves them; the handshake is honoured (and answers "none") so a TIP
+    //    never blocks waiting on it. Advertising the focused field's input scope
+    //    — so a touch keyboard opens numeric for a NumberBox — means implementing
+    //    `ITfInputScope` on the store, and is the natural next refinement. ──────
     fn RequestSupportedAttrs(
         &self,
         _dwflags: u32,
@@ -590,33 +586,19 @@ impl TextInput {
         self.0.sink.borrow().is_some()
     }
 
-    /// The §7.2 composition guard read: true while a composition is active. The
-    /// backend parks forced `SetText`s while this holds.
-    pub(crate) fn composition_active(&self) -> bool {
-        self.0.core.borrow().composition_active()
+    /// The composing run moved or resized (from the context-owner composition
+    /// sink — see `comp_sink`). Marks the span on the focused editor: the
+    /// underline paints over it and the §7.2 guard refuses programmatic writes
+    /// while it is non-empty.
+    pub(crate) fn on_composition_update(&self, start: usize, len: usize) {
+        self.0.doc.borrow_mut().composition_update(start, len);
     }
 
-    /// Register the "composition ended" callback (§7.2) — the backend uses it to
-    /// flush a parked forced write once the guard clears.
-    pub(crate) fn set_composition_end_hook(&self, f: Box<dyn FnMut()>) {
-        *self.0.on_comp_end.borrow_mut() = Some(f);
-    }
-
-    /// Composition boundary from the context-owner composition sink (see
-    /// `thread_mgr`): raise the guard and tell the editor to anchor a run.
-    pub(crate) fn on_composition_started(&self) {
-        self.0.core.borrow_mut().set_composition_active(true);
-        self.0.doc.borrow_mut().composition_begin();
-    }
-
-    /// Composition ended: lower the guard, tell the editor, then fire the hook so
-    /// the backend can apply a parked write.
-    pub(crate) fn on_composition_ended(&self) {
-        self.0.core.borrow_mut().set_composition_active(false);
+    /// The composition ended (committed or cancelled): clear the span, which
+    /// also lowers the §7.2 guard. Any committed text already arrived as an
+    /// ordinary store edit.
+    pub(crate) fn on_composition_end(&self) {
         self.0.doc.borrow_mut().composition_end();
-        if let Some(f) = self.0.on_comp_end.borrow_mut().as_mut() {
-            f();
-        }
     }
 
     /// Report an app-originated text change to the TIP (deferred if a lock is

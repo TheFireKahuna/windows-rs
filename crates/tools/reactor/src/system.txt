@@ -531,8 +531,11 @@ Windows::Win32::UIA_StructureChangedEventId
 Windows::Win32::UIA_LiveRegionChangedEventId
 
 // ════════════════════════════════════════════════════════════════════════════
-// Text input: TSF (Text Services Framework) + IMM32 fallback
+// Text input: TSF (Text Services Framework)
 // ════════════════════════════════════════════════════════════════════════════
+// TSF is the ONLY text-input path. There is deliberately no IMM32 fallback:
+// imm32.dll is unavailable to a packaged/Store app, and a second composition
+// path that only some fields take is how IME bugs get shipped.
 // ── TSF client interfaces (the backend calls these) ──
 Windows::Win32::ITfThreadMgr::{Activate, Deactivate, CreateDocumentMgr, GetFocus, SetFocus}
 Windows::Win32::ITfThreadMgr2::{Activate, Deactivate, CreateDocumentMgr, GetFocus, SetFocus}
@@ -540,6 +543,11 @@ Windows::Win32::ITfDocumentMgr::{CreateContext, Push, Pop, GetTop, GetBase}
 Windows::Win32::ITfContext
 Windows::Win32::ITfKeystrokeMgr
 Windows::Win32::ITfSource::{AdviseSink, UnadviseSink}
+// ── Composition boundaries: the context-owner sink is IMPLEMENTED; its
+//    `ITfCompositionView` yields the composing range, read as ACP offsets ──
+Windows::Win32::ITfContextOwnerCompositionSink
+Windows::Win32::ITfCompositionView::{GetRange}
+Windows::Win32::ITfRangeACP::{GetExtent, SetExtent}
 // ── TSF text store: ACP sink is called by the backend; ACP store is IMPLEMENTED ──
 Windows::Win32::ITextStoreACPSink
 Windows::Win32::ITextStoreACP
@@ -557,21 +565,3 @@ Windows::Win32::TF_ES_READ
 Windows::Win32::TF_ES_READWRITE
 Windows::Win32::TF_ES_ASYNCDONTCARE
 Windows::Win32::TF_ES_SYNC
-// ── IMM32 composition fallback ──
-Windows::Win32::ImmGetContext
-Windows::Win32::ImmReleaseContext
-Windows::Win32::ImmGetCompositionStringW
-Windows::Win32::ImmSetCompositionWindow
-Windows::Win32::ImmGetDefaultIMEWnd
-Windows::Win32::ImmNotifyIME
-Windows::Win32::HIMC
-Windows::Win32::COMPOSITIONFORM
-Windows::Win32::GCS_RESULTSTR
-Windows::Win32::GCS_COMPSTR
-// ── WM_IME_* messages ──
-Windows::Win32::WM_IME_STARTCOMPOSITION
-Windows::Win32::WM_IME_COMPOSITION
-Windows::Win32::WM_IME_ENDCOMPOSITION
-Windows::Win32::WM_IME_SETCONTEXT
-Windows::Win32::WM_IME_NOTIFY
-Windows::Win32::WM_IME_CHAR

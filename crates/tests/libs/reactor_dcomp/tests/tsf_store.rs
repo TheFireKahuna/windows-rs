@@ -11,10 +11,8 @@ use std::rc::Rc;
 
 use windows_reactor::dcomp_test_api::tsf::{
     get_selection, get_text, insert, insert_at_selection, lock, notify_app_selection_change,
-    notify_app_text_change, run_request_lock, set_selection, set_text, underline_from_fields,
-    AcpError, Composition, DocRect, DocSelection, InputScope, LockResult, StoreSink, TextChange,
-    TextStoreCore, TsfDocument, UnderlineStyle, TF_LS_DASH, TF_LS_DOT, TF_LS_NONE, TF_LS_SOLID,
-    TF_LS_SQUIGGLE,
+    notify_app_text_change, run_request_lock, set_selection, set_text, AcpError, DocRect,
+    DocSelection, LockResult, StoreSink, TextChange, TextStoreCore, TsfDocument,
 };
 
 // ── A minimal in-memory document ─────────────────────────────────────────────
@@ -60,17 +58,13 @@ impl TsfDocument for MockDoc {
     fn is_read_only(&self) -> bool {
         self.read_only
     }
-    fn input_scope(&self) -> InputScope {
-        InputScope::Default
-    }
     fn range_rect(&self, _start: usize, _end: usize) -> Option<DocRect> {
         self.laid_out.then_some(DocRect { left: 0, top: 0, right: 8, bottom: 16 })
     }
     fn screen_rect(&self) -> Option<DocRect> {
         self.laid_out.then_some(DocRect { left: 0, top: 0, right: 100, bottom: 20 })
     }
-    fn composition_begin(&mut self) {}
-    fn composition_update(&mut self, _comp: Composition) {}
+    fn composition_update(&mut self, _start: usize, _len: usize) {}
     fn composition_end(&mut self) {}
 }
 
@@ -308,36 +302,3 @@ fn set_text_on_read_only_field_errors() {
     assert_eq!(set_text(&core, &mut doc, 0, 1, &text), Err(AcpError::ReadOnly));
 }
 
-// ── Composition guard + underline resolution ─────────────────────────────────
-
-#[test]
-fn composition_active_flag_tracks_the_guard() {
-    let mut c = TextStoreCore::new();
-    assert!(!c.composition_active());
-    c.set_composition_active(true);
-    assert!(c.composition_active(), "the §7.2 guard reads this while composing");
-    c.set_composition_active(false);
-    assert!(!c.composition_active());
-}
-
-#[test]
-fn line_styles_map_to_underline_enum() {
-    assert_eq!(underline_from_fields(TF_LS_SOLID, false, None).style, UnderlineStyle::Solid);
-    assert_eq!(underline_from_fields(TF_LS_DOT, false, None).style, UnderlineStyle::Dotted);
-    assert_eq!(underline_from_fields(TF_LS_DASH, false, None).style, UnderlineStyle::Dashed);
-    assert_eq!(underline_from_fields(TF_LS_SQUIGGLE, false, None).style, UnderlineStyle::Squiggly);
-    assert_eq!(underline_from_fields(TF_LS_NONE, false, None).style, UnderlineStyle::None);
-}
-
-#[test]
-fn unknown_line_style_falls_back_to_solid() {
-    assert_eq!(underline_from_fields(999, false, None).style, UnderlineStyle::Solid);
-}
-
-#[test]
-fn underline_carries_bold_and_masks_colour() {
-    let u = underline_from_fields(TF_LS_SOLID, true, Some(0xFFAB_CDEF));
-    assert!(u.bold);
-    assert_eq!(u.color, Some(0x00AB_CDEF), "only the low 24 bits are the RGB");
-    assert_eq!(underline_from_fields(TF_LS_SOLID, false, None).color, None);
-}

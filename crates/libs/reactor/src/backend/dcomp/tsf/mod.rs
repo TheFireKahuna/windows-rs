@@ -1,20 +1,35 @@
-//! Raw Text Services Framework (TSF) text store for the front (HWND) thread.
+//! Raw Text Services Framework (TSF) text store for the front (HWND) thread —
+//! **the only text-input path there is**.
 //!
-//! Replaces the IMM32 composition path (`host.rs` `WM_IME_*`, `editor.rs`
-//! `ime_*`) with a real `ITfThreadMgr2` + hand-implemented `ITextStoreACP`
-//! document. The IMM32 path silently drops Win+H voice typing / dictation and
-//! several non-CJK TIP features; TSF is the only in-box API that carries the
-//! full composition / speech / handwriting surface. See
+//! A real `ITfThreadMgr2` + hand-implemented `ITextStoreACP` document. There is
+//! deliberately no IMM32 fallback: `imm32.dll` is unavailable to a packaged /
+//! Store app, the IMM32 path silently drops Win+H voice typing, dictation and
+//! several non-CJK TIP features, and a second composition path that only some
+//! fields take is exactly how IME bugs get shipped. See
 //! `docs/INPUT-OFFTHREAD-DESIGN.md` §7.1 (text detail) and §7.2 (the text
 //! authority model + composition guard).
 //!
-//! ## What this module is (and is not)
+//! ## Shape of the wiring
 //!
-//! This is a **self-contained, integration-ready** text store: it owns the TSF
-//! protocol state machine and speaks to the backend's editor only through the
-//! [`TsfDocument`] trait. It is deliberately **not wired** into the WndProc /
-//! focus path here — that wiring is a later step and is enumerated at the end of
-//! this doc so it stays thin.
+//! The document the store reflects is **the backend itself**: `DCompBackend`
+//! implements [`TsfDocument`] over whichever editor currently has focus (see
+//! [`doc`]), and the host hands the store its own `Rc<RefCell<DCompBackend>>`.
+//! No mirror, no second copy of the text.
+//!
+//! That makes re-entrancy the load-bearing rule: a TIP call-out borrows the
+//! backend, so **TSF may only ever be entered with no backend borrow held**.
+//! Every entry point in [`bridge`] is called from an unborrowed context (the
+//! pump, or straight after a dispatch's borrow scope ends), and everything the
+//! backend wants to tell TSF is *pulled* by [`bridge::flush`] rather than pushed
+//! from inside a borrow.
+//!
+//! ## Display attributes
+//!
+//! A TIP can request a styled clause underline (squiggly, coloured) through
+//! `ITfDisplayAttributeMgr`. The text layout underneath exposes only a boolean
+//! underline, so resolving those attributes would produce data nothing could
+//! draw: the composing run gets one plain underline and the display-attribute
+//! walk is left unwritten until the paint side can honour it.
 //!
 //! ## `ITextStoreACP` vs `ITextStoreACP2`
 //!
@@ -43,24 +58,22 @@
 //! * [`acp`] — the `#[implement]`'d `ITextStoreACP` COM object, a thin translator
 //!   between the ACP vtable and [`store`], plus the `ITextStoreACPSink` adapter.
 //! * [`thread_mgr`] — `ITfThreadMgr2` activation, document-manager / context
-//!   creation + push, and focus association.
-//! * [`display_attr`] — `ITfDisplayAttributeProvider` / `ITfDisplayAttributeInfo`
-//!   consumption: resolve a composition range's display attribute to a plain
-//!   [`CompositionUnderline`] the paint side reads back through [`TsfDocument`].
-
-// Integration-ready but not yet wired into the WndProc / focus path (that is a
-// later step — see the hook list in `thread_mgr`). Until then the store's public
-// surface (and the re-exports that name the integration contract) is
-// legitimately unreferenced by shipping code; the tests exercise it.
-#![allow(dead_code, unused_imports)]
+//!   creation + push, the composition-sink advise, and focus association.
+//! * [`comp_sink`] — the `#[implement]`'d `ITfContextOwnerCompositionSink`:
+//!   composition boundaries and the composing range, in ACP offsets.
+//! * [`doc`] — `impl TsfDocument for DCompBackend`: the focused editor as a TSF
+//!   document (text, selection, geometry, composition span).
+//! * [`bridge`] — the front-thread glue: activation lifetime, keystroke
+//!   pre-emption from the pump, and the pull-based change flush.
 
 pub(crate) mod acp;
-pub(crate) mod display_attr;
+pub(crate) mod bridge;
+pub(crate) mod comp_sink;
+pub(crate) mod doc;
 pub(crate) mod store;
 pub(crate) mod thread_mgr;
 
-pub(crate) use acp::{TextInput, TextStore};
-pub(crate) use display_attr::{resolve_display_attribute, CompositionUnderline, UnderlineStyle};
+pub(crate) use acp::TextInput;
 pub(crate) use store::TsfDocument;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,36 +110,6 @@ pub struct DocRect {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
-}
-
-/// The input-scope class the focused field advertises, surfaced through
-/// `RequestSupportedAttrs`/`RetrieveRequestedAttrs` so a TIP can adapt (a number
-/// field suppresses full IME, a password field disables prediction, …). Kept as
-/// a small enum rather than raw `InputScope` ids so the backend maps its own
-/// `ControlKind` without importing TSF types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InputScope {
-    /// Free text (`TextBox`, `AutoSuggestBox`).
-    Default,
-    /// Digits + arithmetic (`NumberBox`) — `IS_NUMBER`.
-    Number,
-    /// Masked entry (`PasswordBox`) — `IS_PASSWORD`.
-    Password,
-    /// Search field — `IS_SEARCH`.
-    Search,
-}
-
-/// An active composition span plus the underline the TIP asked for, resolved to
-/// a paint-ready [`CompositionUnderline`]. Handed to [`TsfDocument::composition_update`]
-/// on every composition edit; the editor stores it for the caret/underline paint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Composition {
-    /// ACP start of the composing run.
-    pub start: usize,
-    /// Length in UTF-16 code units.
-    pub len: usize,
-    /// Underline style resolved from the range's display attribute.
-    pub underline: CompositionUnderline,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

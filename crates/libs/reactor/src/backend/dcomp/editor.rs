@@ -59,7 +59,9 @@ pub(crate) struct Editor {
     /// revision protocol, text half (the control-value twin is
     /// `Node::value_rev`).
     pub text_rev: u64,
-    /// Active IME composition span `[comp_start, comp_start + comp_len)`.
+    /// Active composition span `[comp_start, comp_start + comp_len)`, marked by
+    /// the TSF composition sink. Non-empty means a TIP is composing here: the
+    /// run is underlined, and the §7.2 guard refuses every programmatic write.
     pub comp_start: usize,
     pub comp_len: usize,
     /// Render glyphs masked (`PasswordBox`).
@@ -351,7 +353,10 @@ impl Editor {
             .ok();
         if let Some(l) = &layout {
             let _ = l.set_word_wrap(false);
-            // Underline the active IME composition span.
+            // Underline the active composition span. DWrite exposes only a
+            // boolean underline here, so a TIP's display attribute (squiggly /
+            // coloured clause styles) is deliberately not resolved — see
+            // `tsf::mod`.
             if self.comp_len > 0 {
                 let _ = l.set_underline(true, self.comp_start as u32, self.comp_len as u32);
             }
@@ -400,34 +405,38 @@ impl Editor {
         self.scroll_to_caret(content_w, aligned);
     }
 
-    // ── IME composition (IMM32 fallback) ──────────────────────────────────
+    // ── TSF document edits ────────────────────────────────────────────────
+    //
+    // The text store owns composition end-to-end: composing text arrives as
+    // ordinary range replacements, and the composing *span* is marked
+    // separately by the composition sink. There is no second (IMM32) path —
+    // see `tsf::mod`.
 
-    /// Begin an IME composition: drop any selection and anchor the (empty)
-    /// composition span at the caret.
-    pub fn ime_begin(&mut self) {
-        self.delete_selection();
-        self.comp_start = self.caret.min(self.buf.len());
-        self.comp_len = 0;
-    }
-
-    /// Replace the current composition span with `s`. When `composing`, the run
-    /// stays the (underlined) active composition; otherwise it is committed
-    /// (the span is cleared).
-    pub fn ime_replace(&mut self, s: &str, composing: bool) {
-        let start = self.comp_start.min(self.buf.len());
-        let end = (self.comp_start + self.comp_len).min(self.buf.len());
-        let units: Vec<u16> = s.encode_utf16().collect();
+    /// Replace the ACP range `[start, end)` with `units`, collapsing the caret
+    /// to the end of the inserted run. Offsets are UTF-16 code-unit indices
+    /// (the ACP space is exactly this buffer's indexing) and are clamped, so a
+    /// misbehaving TIP can never index out of bounds.
+    pub fn replace_range(&mut self, start: usize, end: usize, units: &[u16]) {
+        let start = start.min(self.buf.len());
+        let end = end.clamp(start, self.buf.len());
         self.buf.splice(start..end, units.iter().copied());
         self.caret = start + units.len();
         self.anchor = self.caret;
-        self.comp_start = start;
-        self.comp_len = if composing { units.len() } else { 0 };
         self.mark_dirty();
     }
 
-    /// Cancel/end composition without committing more text.
-    pub fn ime_end(&mut self) {
-        self.comp_len = 0;
+    /// Mark the active composing run, or clear it with `len == 0`. Only the
+    /// span is stored — the composing text itself arrives through
+    /// [`replace_range`](Self::replace_range) like any other TSF edit. This is
+    /// what the underline paints over and what the §7.2 composition guard reads.
+    pub fn set_composition_span(&mut self, start: usize, len: usize) {
+        let start = start.min(self.buf.len());
+        let len = len.min(self.buf.len() - start);
+        if (self.comp_start, self.comp_len) == (start, len) {
+            return;
+        }
+        self.comp_start = start;
+        self.comp_len = len;
         self.mark_dirty();
     }
 

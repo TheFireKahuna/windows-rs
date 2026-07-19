@@ -950,9 +950,9 @@ pub struct CtrlProbe {
 // ── backend/dcomp/tsf ────────────────────────────────────────────────────────
 
 /// The raw TSF text store's binding-independent core, re-published for the
-/// headless protocol tests (the lock state machine, the ACP text/selection ops,
-/// and the composition-underline resolver). TSF itself cannot run headless; this
-/// surface is exactly the part that can, and the part that historically breaks.
+/// headless protocol tests (the lock state machine and the ACP text/selection
+/// ops). TSF itself cannot run headless; this surface is exactly the part that
+/// can, and the part that historically breaks.
 pub mod tsf {
     use crate::backend::dcomp::tsf;
 
@@ -962,15 +962,9 @@ pub mod tsf {
         notify_app_text_change, run_request_lock, set_selection, set_text, AcpError, LockResult,
         StoreSink, TextChange, TextStoreCore, TsfDocument,
     };
-    pub use tsf::{Composition, DocRect, DocSelection, InputScope};
+    pub use tsf::{DocRect, DocSelection};
 
-    // Composition-underline resolution.
-    pub use tsf::display_attr::{underline_from_fields, CompositionUnderline, UnderlineStyle};
-
-    // Lock / insert flag words, and the `TF_LS_*` line-style values, so a test
-    // names the same constants the shipping code does.
-    pub use crate::system_bindings::{
-        TF_LS_DASH, TF_LS_DOT, TF_LS_NONE, TF_LS_SOLID, TF_LS_SQUIGGLE,
-    };
+    // Lock / insert flag words, so a test names the same constants the shipping
+    // code does.
     pub use tsf::{insert, lock};
 }
