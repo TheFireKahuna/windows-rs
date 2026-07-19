@@ -73,6 +73,9 @@ fn paint_node(
             // this it would never be visited and its glyph sprites would never
             // be placed — the node would simply render nothing.
             || n.kind == ControlKind::TextBlock
+            // Same for a path: its curve is retained sprite shapes, so it owns
+            // no surface and must be visited on its own account.
+            || n.kind == ControlKind::Path
     });
     if needs {
         let (w, h) = arena.get(id).map(|n| (n.rect.w, n.rect.h)).unwrap_or((0.0, 0.0));
@@ -172,6 +175,11 @@ fn paint_node(
                 if n.kind == crate::backend::ControlKind::Knob {
                     super::knob::sync_knob(comp, n, atlas.epoch(), scale, scrubbing);
                     super::glyph_text::knob_sync(comp, glyphs, n, scale);
+                }
+                // Path: reconcile the retained curve layers. Same shape as the
+                // knob's — vector chrome outside the flat `Part` model.
+                if n.kind == crate::backend::ControlKind::Path {
+                    super::path_shape::sync_path(comp, n, atlas.epoch(), scale);
                 }
             }
         }
@@ -423,6 +431,10 @@ fn paint_chrome(
         }
         ControlKind::Ellipse => paint_ellipse(session, brush, node, rect),
         ControlKind::Line => paint_line(session, brush, node, rect),
+        // Nothing: a path's geometry is a retained compositor sprite shape
+        // (`CompositionPath` + `CompositionSpriteShape` masked over an FP16
+        // source), never rasterized here. It owns no surface at all.
+        ControlKind::Path => {}
         _ => {
             // StackPanel / Grid / Canvas / ScrollViewer: bg + border box.
             fill_and_stroke(session, brush, node, rect, node.paint.corner_radius)

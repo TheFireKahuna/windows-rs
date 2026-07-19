@@ -70,7 +70,7 @@ use super::node::PointerInterest;
 use crate::backend::{
     AccessibilityModifiers, AnimationConfig, Backend, Badge, Color, CommandBarCommandDef, ControlId,
     ControlKind, Event, EventHandler, GridLength, ImplicitTransitions, KeyboardAccelerator,
-    LayoutAnimationConfig, LineEndpoints, MenuBarItemDef, MenuItemDef, NavViewItem,
+    LayoutAnimationConfig, LineEndpoints, MenuBarItemDef, MenuItemDef, NavViewItem, PathGeometry,
     PointerHandlers, Prop, PropValue, RichTextParagraph, SelectionMode, SelectorBarItemDef,
     Thickness, ThemeRef, Tooltip, TreeNodeDef,
 };
@@ -111,6 +111,9 @@ pub(crate) enum SendValue {
     SelectorBarItems(Vec<SelectorBarItemDef>),
     Resources(HashMap<String, String>),
     GradientStops(Vec<(f64, Color)>),
+    /// Rides the buffer: [`PathGeometry`] is plain coordinates behind an `Arc`,
+    /// so it is `Send` and the hop costs a refcount bump.
+    Path(PathGeometry),
     F64List(Vec<f64>),
     ValueLabels(Vec<(f64, String)>),
     Badge(Badge),
@@ -149,6 +152,7 @@ impl SendValue {
             PropValue::SelectorBarItems(v) => Self::SelectorBarItems(v.clone()),
             PropValue::Resources(v) => Self::Resources(v.clone()),
             PropValue::GradientStops(v) => Self::GradientStops(v.clone()),
+            PropValue::Path(v) => Self::Path(v.clone()),
             PropValue::F64List(v) => Self::F64List(v.clone()),
             PropValue::ValueLabels(v) => Self::ValueLabels(v.clone()),
             PropValue::Badge(v) => Self::Badge(*v),
@@ -190,6 +194,7 @@ impl SendValue {
             Self::SelectorBarItems(v) => PropValue::SelectorBarItems(v),
             Self::Resources(v) => PropValue::Resources(v),
             Self::GradientStops(v) => PropValue::GradientStops(v),
+            Self::Path(v) => PropValue::Path(v),
             Self::F64List(v) => PropValue::F64List(v),
             Self::ValueLabels(v) => PropValue::ValueLabels(v),
             Self::Badge(v) => PropValue::Badge(v),

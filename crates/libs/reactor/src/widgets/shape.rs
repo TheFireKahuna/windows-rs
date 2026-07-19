@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -5,7 +7,349 @@ pub enum ShapeKind {
     Rectangle,
     Ellipse,
     Line,
+    /// Arbitrary geometry carried in [`Shape::geometry`] — splines, polylines,
+    /// beziers, closed areas. The other three kinds derive their geometry from
+    /// the node's box; this one is the only kind that transports it.
+    Path,
 }
+
+/// One segment verb in a [`PathData`] figure.
+///
+/// Stored apart from the points so the geometry is two flat, contiguous arrays
+/// rather than a `Vec` of fat enums — a 512-point spline is 4KB of coordinates
+/// and 512 bytes of verbs, and comparing two of them for the no-op gate is two
+/// `memcmp`s.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PathVerb {
+    /// Begin a new figure at the next point.
+    Move,
+    /// Straight segment to the next point.
+    Line,
+    /// Cubic bezier through the next THREE points — `c1`, `c2`, `end`.
+    Cubic,
+    /// Close the current figure back to its start point. Consumes no points.
+    Close,
+}
+
+impl PathVerb {
+    /// How many points this verb consumes from the point stream.
+    #[must_use]
+    pub const fn arity(self) -> usize {
+        match self {
+            Self::Move | Self::Line => 1,
+            Self::Cubic => 3,
+            Self::Close => 0,
+        }
+    }
+}
+
+/// Resolution-independent path geometry in the node's **local DIP space** —
+/// `(0, 0)` is the shape's top-left corner, not the window's.
+///
+/// Local coordinates are what let the same geometry survive a move: a node that
+/// slides across the window repaints nothing, because nothing in here changed.
+/// A node that *resizes* does need new geometry, which is the honest cost — a
+/// curve sampled for one width is not the curve for another.
+/// The fields are crate-visible rather than public so `points.len() == 2 * Σ
+/// verb.arity()` holds **by construction**: [`ShapePath`] is the only thing that
+/// can append, and it always appends a verb with its points together. Outside
+/// the crate the geometry is read through the accessors.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PathData {
+    pub(crate) verbs: Vec<PathVerb>,
+    /// `x, y` pairs, flat.
+    pub(crate) points: Vec<f32>,
+}
+
+impl PathData {
+    #[must_use]
+    pub fn verbs(&self) -> &[PathVerb] {
+        &self.verbs
+    }
+    /// Flat `x, y` pairs, indexed by the running sum of [`PathVerb::arity`].
+    #[must_use]
+    pub fn points(&self) -> &[f32] {
+        &self.points
+    }
+}
+
+/// A built, immutable [`PathData`] behind a shared pointer.
+///
+/// Shared because the diff carries it by value through the prop pipeline and
+/// across the reconciler→backend command buffer; `Arc` makes each of those hops
+/// a refcount bump rather than a copy of every coordinate.
+#[derive(Clone, Debug)]
+pub struct PathGeometry(Arc<PathData>);
+
+impl PathGeometry {
+    #[must_use]
+    pub fn data(&self) -> &PathData {
+        &self.0
+    }
+    /// Whether the geometry would draw nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.verbs.is_empty()
+    }
+}
+
+/// Equality is what gates the repaint, so it takes the cheap answer first: an
+/// app that hands back the SAME `Arc` (a cached curve) settles in one pointer
+/// compare. An app that rebuilt an identical curve falls through to the content
+/// compare and still correctly repaints nothing — geometry is content-addressed
+/// here, not identity-addressed.
+impl PartialEq for PathGeometry {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+/// Builder for [`PathGeometry`].
+///
+/// Named for the shape widget rather than `PathBuilder` so it cannot collide
+/// with `windows_canvas::PathBuilder` — apps that draw on a canvas *and* mount
+/// path shapes import both.
+///
+/// Non-finite coordinates are dropped at the verb that carries them: a `NaN`
+/// reaching the point array would make the geometry unequal to itself and
+/// repaint forever, so the gate is here, at the one place points are admitted.
+#[derive(Clone, Debug, Default)]
+pub struct ShapePath {
+    data: PathData,
+}
+
+impl ShapePath {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserve room for `verbs` verbs and their points — worth calling when
+    /// sampling a curve of known length.
+    #[must_use]
+    pub fn with_capacity(verbs: usize) -> Self {
+        Self {
+            data: PathData {
+                verbs: Vec::with_capacity(verbs),
+                points: Vec::with_capacity(verbs * 2),
+            },
+        }
+    }
+
+    fn push(mut self, verb: PathVerb, pts: &[f32]) -> Self {
+        debug_assert_eq!(verb.arity() * 2, pts.len());
+        if pts.iter().any(|v| !v.is_finite()) {
+            return self;
+        }
+        self.data.verbs.push(verb);
+        self.data.points.extend_from_slice(pts);
+        self
+    }
+
+    #[must_use]
+    pub fn move_to(self, x: f64, y: f64) -> Self {
+        self.push(PathVerb::Move, &[x as f32, y as f32])
+    }
+
+    #[must_use]
+    pub fn line_to(self, x: f64, y: f64) -> Self {
+        self.push(PathVerb::Line, &[x as f32, y as f32])
+    }
+
+    #[must_use]
+    pub fn cubic_to(self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) -> Self {
+        self.push(
+            PathVerb::Cubic,
+            &[c1x as f32, c1y as f32, c2x as f32, c2y as f32, x as f32, y as f32],
+        )
+    }
+
+    /// Close the current figure. A closed figure is what an area fill wants; an
+    /// open one is what a stroked curve wants.
+    #[must_use]
+    pub fn close(mut self) -> Self {
+        // A leading or doubled `Close` has no figure to close and would desync
+        // nothing but still emit a stray verb — drop it here.
+        if matches!(self.data.verbs.last(), None | Some(PathVerb::Close)) {
+            return self;
+        }
+        self.data.verbs.push(PathVerb::Close);
+        self
+    }
+
+    /// Append a whole polyline: `move_to` the first point, `line_to` the rest.
+    /// The wavelet, the spectrum chord run and the waveform envelope are all
+    /// this one call.
+    #[must_use]
+    pub fn polyline(mut self, points: impl IntoIterator<Item = (f64, f64)>) -> Self {
+        let mut first = true;
+        for (x, y) in points {
+            self = if first { self.move_to(x, y) } else { self.line_to(x, y) };
+            // Only a point that was actually admitted opens the figure — if the
+            // first point was non-finite the next finite one must still `Move`.
+            first = self.data.verbs.is_empty();
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> PathGeometry {
+        PathGeometry(Arc::new(self.data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Total points the verb stream claims, which is what the backend's replay
+    /// walks. If this ever disagrees with `points.len()`, the replay reads off
+    /// the end of the array — so it is the invariant worth asserting directly.
+    fn claimed(d: &PathData) -> usize {
+        d.verbs().iter().map(|v| v.arity() * 2).sum()
+    }
+
+    #[test]
+    fn verb_stream_and_points_stay_in_lockstep() {
+        let g = ShapePath::new()
+            .move_to(0.0, 0.0)
+            .line_to(1.0, 2.0)
+            .cubic_to(3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+            .close()
+            .build();
+        let d = g.data();
+        assert_eq!(d.verbs(), &[PathVerb::Move, PathVerb::Line, PathVerb::Cubic, PathVerb::Close]);
+        assert_eq!(claimed(d), d.points().len());
+        assert_eq!(d.points(), &[0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn non_finite_points_are_dropped_whole_verb_at_a_time() {
+        let g = ShapePath::new()
+            .move_to(0.0, 0.0)
+            .line_to(f64::NAN, 1.0)
+            .cubic_to(0.0, 0.0, f64::INFINITY, 0.0, 1.0, 1.0)
+            .line_to(2.0, 2.0)
+            .build();
+        let d = g.data();
+        // The NaN line and the infinite cubic are gone; nothing partial remains.
+        assert_eq!(d.verbs(), &[PathVerb::Move, PathVerb::Line]);
+        assert_eq!(claimed(d), d.points().len());
+        assert_eq!(d.points(), &[0.0, 0.0, 2.0, 2.0]);
+    }
+
+    /// A `NaN` in the point array would make the geometry unequal to itself,
+    /// and an always-unequal prop repaints on every single reconcile forever.
+    #[test]
+    fn geometry_is_equal_to_itself_even_when_fed_garbage() {
+        let g = ShapePath::new().move_to(f64::NAN, 0.0).line_to(1.0, 1.0).build();
+        assert_eq!(g, g.clone());
+    }
+
+    #[test]
+    fn identical_content_compares_equal_so_a_rebuilt_curve_does_not_repaint() {
+        let build = || ShapePath::new().move_to(0.0, 0.0).line_to(10.0, 5.0).build();
+        let (a, b) = (build(), build());
+        // Distinct allocations — this is the content path, not the pointer one.
+        assert!(!Arc::ptr_eq(&a.0, &b.0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn differing_content_compares_unequal_so_a_changed_curve_does_repaint() {
+        let a = ShapePath::new().move_to(0.0, 0.0).line_to(10.0, 5.0).build();
+        let b = ShapePath::new().move_to(0.0, 0.0).line_to(10.0, 6.0).build();
+        assert_ne!(a, b);
+        // Same points, different verbs, must still differ.
+        let c = ShapePath::new().move_to(0.0, 0.0).move_to(10.0, 5.0).build();
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn polyline_opens_one_figure_and_lines_the_rest() {
+        let g = ShapePath::new().polyline([(0.0, 0.0), (1.0, 1.0), (2.0, 4.0)]).build();
+        assert_eq!(g.data().verbs(), &[PathVerb::Move, PathVerb::Line, PathVerb::Line]);
+    }
+
+    /// If the first point is unusable the figure is not open yet, so the next
+    /// usable point must still `Move` — a `Line` here would be a segment with
+    /// no figure, which the backend refuses to draw at all.
+    #[test]
+    fn polyline_still_opens_a_figure_when_its_first_point_is_dropped() {
+        let g = ShapePath::new().polyline([(f64::NAN, 0.0), (1.0, 1.0), (2.0, 4.0)]).build();
+        assert_eq!(g.data().verbs(), &[PathVerb::Move, PathVerb::Line]);
+        assert_eq!(g.data().points(), &[1.0, 1.0, 2.0, 4.0]);
+    }
+
+    #[test]
+    fn a_close_with_no_open_figure_is_dropped() {
+        assert!(ShapePath::new().close().build().is_empty());
+        let g = ShapePath::new().move_to(0.0, 0.0).line_to(1.0, 1.0).close().close().build();
+        assert_eq!(g.data().verbs().iter().filter(|v| **v == PathVerb::Close).count(), 1);
+    }
+
+    #[test]
+    fn path_shape_transports_its_geometry_as_a_prop() {
+        let g = ShapePath::new().move_to(0.0, 0.0).line_to(1.0, 1.0).build();
+        let shape = Shape::path(g.clone()).stroke(Color::rgb(255, 0, 0)).stroke_thickness(2.0);
+        assert_eq!(shape.kind(), ControlKind::Path);
+        assert!(shape
+            .bindings()
+            .iter()
+            .any(|b| matches!(b, Binding::Prop(Prop::PathGeometry, PropValue::Path(p)) if *p == g)));
+    }
+
+    #[test]
+    fn a_gradient_fill_rides_the_shared_stops_prop() {
+        let stops = vec![(0.0, Color::rgb(255, 0, 0)), (1.0, Color::rgb(0, 0, 255))];
+        let shape = Shape::path(ShapePath::new().move_to(0.0, 0.0).line_to(1.0, 1.0).build())
+            .fill_gradient(stops.clone());
+        assert!(shape.bindings().iter().any(|b| matches!(
+            b,
+            Binding::Prop(Prop::GradientStops, PropValue::GradientStops(s)) if *s == stops
+        )));
+    }
+
+    /// Both ends must be emitted together: the backend springs `TrimEnd` and
+    /// snaps `TrimStart`, and a half-specified window would animate against a
+    /// stale crop.
+    #[test]
+    fn trim_emits_both_ends() {
+        let shape = Shape::path(ShapePath::new().move_to(0.0, 0.0).line_to(1.0, 1.0).build())
+            .trim(0.25, 0.75);
+        let b = shape.bindings();
+        assert!(b.iter().any(
+            |b| matches!(b, Binding::Prop(Prop::TrimStart, PropValue::F64(v)) if *v == 0.25)
+        ));
+        assert!(b.iter().any(
+            |b| matches!(b, Binding::Prop(Prop::TrimEnd, PropValue::F64(v)) if *v == 0.75)
+        ));
+    }
+
+    /// An untrimmed path must emit NO trim props, so it takes the backend's
+    /// born-at-full-extent default rather than being pinned to one here.
+    #[test]
+    fn an_untrimmed_path_emits_no_trim() {
+        let shape = Shape::path(ShapePath::new().move_to(0.0, 0.0).line_to(1.0, 1.0).build());
+        assert!(!shape
+            .bindings()
+            .iter()
+            .any(|b| matches!(b, Binding::Prop(Prop::TrimStart | Prop::TrimEnd, _))));
+    }
+
+    /// The box-derived kinds must not start transporting an empty geometry —
+    /// that would put a prop on every rectangle in a tree.
+    #[test]
+    fn box_kinds_transport_no_geometry() {
+        for shape in [Shape::rectangle(), Shape::ellipse(), Shape::line(0.0, 0.0, 1.0, 1.0)] {
+            assert!(!shape
+                .bindings()
+                .iter()
+                .any(|b| matches!(b, Binding::Prop(Prop::PathGeometry, _))));
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shape {
     pub key: Option<String>,
@@ -16,6 +360,16 @@ pub struct Shape {
     pub stroke_thickness: Option<f64>,
     pub corner_radius: Option<f64>,
     pub line: LineEndpoints,
+    /// Set only by [`ShapeKind::Path`]; `None` for the box-derived kinds.
+    pub geometry: Option<PathGeometry>,
+    /// Gradient ramp for a path's FILL, `(position 0..1, linear-scRGB colour)`.
+    /// Overrides [`Self::fill`]'s flat colour when present. The stroke keeps its
+    /// own flat colour — a ramp shared by both would stop reading as two layers.
+    pub fill_gradient: Option<Vec<(f64, Color)>>,
+    /// `(start, end)` fraction of the geometry's length to draw, `0..1`.
+    /// `end` animates on the compositor, so a curve can draw itself on with no
+    /// app frame. `None` leaves the path at full extent.
+    pub trim: Option<(f64, f64)>,
 }
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub struct LineEndpoints {
@@ -35,6 +389,9 @@ impl Default for Shape {
             stroke_thickness: None,
             corner_radius: None,
             line: LineEndpoints::default(),
+            geometry: None,
+            fill_gradient: None,
+            trim: None,
         }
     }
 }
@@ -58,6 +415,19 @@ impl Shape {
             ..Default::default()
         }
     }
+    /// A shape drawing `geometry`, in the node's own local DIP space.
+    ///
+    /// The node still gets its box from layout as any other shape does — the
+    /// geometry is drawn into that box, unscaled and unclipped, so a caller
+    /// that sampled a curve for a different width will see it overflow. Sample
+    /// against the size you laid out.
+    pub fn path(geometry: PathGeometry) -> Self {
+        Self {
+            kind: ShapeKind::Path,
+            geometry: Some(geometry),
+            ..Default::default()
+        }
+    }
     pub fn fill(mut self, v: Color) -> Self {
         self.fill = Some(v);
         self
@@ -78,6 +448,16 @@ impl Shape {
         self.corner_radius = Some(v);
         self
     }
+    /// Fill a path with a gradient ramp instead of a flat colour.
+    pub fn fill_gradient(mut self, stops: Vec<(f64, Color)>) -> Self {
+        self.fill_gradient = Some(stops);
+        self
+    }
+    /// Draw only `start..end` of the path's length (fractions of `0..1`).
+    pub fn trim(mut self, start: f64, end: f64) -> Self {
+        self.trim = Some((start, end));
+        self
+    }
 }
 
 impl Widget for Shape {
@@ -86,6 +466,7 @@ impl Widget for Shape {
             ShapeKind::Rectangle => ControlKind::Rectangle,
             ShapeKind::Ellipse => ControlKind::Ellipse,
             ShapeKind::Line => ControlKind::Line,
+            ShapeKind::Path => ControlKind::Path,
         }
     }
     fn key(&self) -> Option<&str> {
@@ -117,6 +498,22 @@ impl Widget for Shape {
                 Prop::LineEndpoints,
                 PropValue::LineEndpoints(self.line),
             ));
+        }
+        if let Some(g) = &self.geometry {
+            out.push(Binding::Prop(
+                Prop::PathGeometry,
+                PropValue::Path(g.clone()),
+            ));
+        }
+        if let Some(stops) = &self.fill_gradient {
+            out.push(Binding::Prop(
+                Prop::GradientStops,
+                PropValue::GradientStops(stops.clone()),
+            ));
+        }
+        if let Some((start, end)) = self.trim {
+            out.push(Binding::Prop(Prop::TrimStart, PropValue::F64(start)));
+            out.push(Binding::Prop(Prop::TrimEnd, PropValue::F64(end)));
         }
         out
     }

@@ -88,6 +88,8 @@ pub enum ControlKind {
     Rectangle,
     Ellipse,
     Line,
+    /// A shape drawing transported [`PropValue::Path`] geometry.
+    Path,
     RichTextBlock,
     ListView,
     GridView,
@@ -253,6 +255,7 @@ pub enum Prop {
     PaneDisplayMode,
     PaneTitle,
     PasswordRevealMode,
+    PathGeometry,
     PlaceholderText,
     Precision,
     PlaceholderValue,
@@ -286,6 +289,10 @@ pub enum Prop {
     TextWrapping,
     TextWrappingWrap,
     Title,
+    /// Path draw-on window: the fraction of the geometry's length at which the
+    /// stroke/fill starts and ends. `TrimEnd` springs on the compositor.
+    TrimStart,
+    TrimEnd,
     Value,
     VerticalAlignment,
     VerticalScrollBarVisibility,
@@ -330,6 +337,9 @@ pub enum PropValue {
     /// value-ramp fill (Meter bar / Knob arc). The backend display-maps each
     /// stop at its draw choke like every other chrome color.
     GradientStops(Vec<(f64, Color)>),
+    /// Shape geometry in the node's local DIP space (curves, polylines, closed
+    /// areas). Shared, so this hop is a refcount bump and not a coordinate copy.
+    Path(PathGeometry),
     /// Plain value list (Knob tick marks, in value units).
     F64List(Vec<f64>),
     /// `(value, label)` pairs (Knob scale labels — formatted by the app).

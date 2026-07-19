@@ -43,6 +43,7 @@ pub(crate) mod nav;
 pub(crate) mod node;
 mod pacer;
 mod paint;
+pub(crate) mod path_shape;
 pub(crate) mod parts;
 mod pointer;
 mod popup;
@@ -1309,6 +1310,21 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.paint.line = *l;
             node.mark_dirty();
         }
+        // The prop pipeline already dropped this write if the geometry compared
+        // equal, so arriving here means the curve genuinely changed — the only
+        // thing that can dirty a path node, and the reason an idle one is free.
+        (Prop::PathGeometry, PropValue::Path(g)) => {
+            node.paint.path = Some(g.clone());
+            node.mark_dirty();
+        }
+        (Prop::TrimStart, PropValue::F64(v)) => {
+            node.paint.path_trim.0 = (*v as f32).clamp(0.0, 1.0);
+            node.mark_dirty();
+        }
+        (Prop::TrimEnd, PropValue::F64(v)) => {
+            node.paint.path_trim.1 = (*v as f32).clamp(0.0, 1.0);
+            node.mark_dirty();
+        }
         (Prop::StyleVariant, PropValue::I32(v)) => {
             node.paint.style_variant = *v;
             node.mark_dirty();
@@ -1960,6 +1976,12 @@ prop_contract! {
             n.mark_dirty();
         }
         LineEndpoints => |n| { n.paint.line = n.birth_paint().line; n.mark_dirty(); }
+        // Clears to "no geometry", which `has_visual` reads as "no surface" —
+        // an unset path releases its surface rather than keeping a blank one.
+        PathGeometry => |n| { n.paint.path = None; n.mark_dirty(); }
+        // Back to FULL extent, not zero — see `Paint::default`.
+        TrimStart => |n| { n.paint.path_trim.0 = 0.0; n.mark_dirty(); }
+        TrimEnd => |n| { n.paint.path_trim.1 = 1.0; n.mark_dirty(); }
         StyleVariant => |n| {
             n.paint.style_variant = n.birth_paint().style_variant;
             n.mark_dirty();
@@ -2568,6 +2590,7 @@ mod unhandled {
             | K::Rectangle
             | K::Ellipse
             | K::Line
+            | K::Path
             // Drawn controls.
             | K::TextBlock
             | K::Button
@@ -2645,6 +2668,7 @@ mod unhandled {
             PropValue::SurfaceImageSource(_) => "SurfaceImageSource",
             PropValue::VirtualSurfaceImageSource(_) => "VirtualSurfaceImageSource",
             PropValue::LineEndpoints(_) => "LineEndpoints",
+            PropValue::Path(_) => "Path",
             PropValue::NavMenuItems(_) => "NavMenuItems",
             PropValue::StrList(_) => "StrList",
             PropValue::MenuBarItems(_) => "MenuBarItems",
