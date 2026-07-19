@@ -114,8 +114,46 @@ fn measure_solve(
             if let (Some(w), Some(h)) = (known.width, known.height) {
                 return Size { width: w, height: h };
             }
+            // Taffy hands the context by `&mut`; copy the id out once so the
+            // per-kind arms below can each test it without contending over the
+            // borrow.
+            let ctx = ctx.map(|id| *id);
+            // An InfoBar's height is a function of its width — its paragraph
+            // wraps inside a text column narrower than the band — so it
+            // answers from its own cached run rather than the generic
+            // `text_layout` slot below. Its `None` (max-content) case measures
+            // the paragraph on one line, exactly as the generic wrap path's
+            // does.
             if let Some(id) = ctx
-                && let Some(node) = arena_ref.get(*id)
+                && let Some(node) = arena_ref.get(id)
+                && node.kind == ControlKind::InfoBar
+            {
+                let avail = known.width.or(match available.width {
+                    AvailableSpace::Definite(w) => Some(w),
+                    AvailableSpace::MinContent => Some(0.0),
+                    AvailableSpace::MaxContent => None,
+                });
+                let (w, h) = info_bar::measure(node, avail);
+                return Size {
+                    width: known.width.unwrap_or(w),
+                    height: known.height.unwrap_or(h),
+                };
+            }
+            // An InfoBadge sizes to its count (or to the bare dot). Both come
+            // from `info_badge`, which is also what `birth_style` floors it
+            // with, so the two cannot disagree.
+            if let Some(id) = ctx
+                && let Some(node) = arena_ref.get(id)
+                && node.kind == ControlKind::InfoBadge
+            {
+                let (w, h) = info_badge::measure(node);
+                return Size {
+                    width: known.width.unwrap_or(w),
+                    height: known.height.unwrap_or(h),
+                };
+            }
+            if let Some(id) = ctx
+                && let Some(node) = arena_ref.get(id)
                 && let Some(layout) = &node.text_layout
             {
                 // A wrapping run reflows against whatever width Taffy is asking
@@ -413,6 +451,49 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
             n.text_dirty = false;
             n.measure_dirty = true;
             apply_nav_metrics(n);
+        }
+    }
+    // The InfoBar draws a title + message paragraph of its own, so it lays it
+    // out here too. Unlike the caption and the pane this run WRAPS, and its
+    // wrapped height is the band's height — so the rebuild also has to
+    // invalidate the measure, which `measure_dirty` below does.
+    let needs_bar = arena
+        .get(id)
+        .is_some_and(|n| n.text_dirty && n.kind == ControlKind::InfoBar);
+    if needs_bar {
+        let built = arena.get(id).map(|n| info_bar::build_text(n.extras()));
+        if let Some(n) = arena.get_mut(id) {
+            n.bar_text = built.flatten();
+            n.text_dirty = false;
+            n.measure_dirty = true;
+        }
+    }
+    // A numeric InfoBadge measures its count. The run is a single short label,
+    // so it lives in the generic `text_layout` slot — the same place a
+    // ToggleSwitch parks the wider of its two state labels, and for the same
+    // reason: one cached run is all the control has.
+    let needs_badge = arena
+        .get(id)
+        .is_some_and(|n| n.text_dirty && n.kind == ControlKind::InfoBadge);
+    if needs_badge {
+        let label = arena.get(id).and_then(info_badge::label);
+        let family = arena
+            .get(id)
+            .and_then(|n| n.paint.font_family.clone())
+            .unwrap_or_else(|| "Segoe UI".to_string());
+        let built = label.and_then(|s| {
+            build_text_layout(
+                &s,
+                info_badge::FONT_SIZE,
+                info_badge::FONT_WEIGHT,
+                &family,
+                false,
+            )
+        });
+        if let Some(n) = arena.get_mut(id) {
+            n.text_layout = built;
+            n.text_dirty = false;
+            n.measure_dirty = true;
         }
     }
     let mut i = 0;
@@ -745,6 +826,15 @@ fn viewport_style(width: f32, height: f32) -> Style {
 fn finalize_style(node: &Node, hidden: bool) -> Style {
     let mut s = node.style.clone();
     if hidden {
+        s.display = Display::None;
+    }
+    // A closed InfoBar reclaims its space rather than merely painting nothing:
+    // WinUI's `IsOpen=false` removes the band from layout, and a bar that left
+    // a 40-DIP hole behind would push the content it sits above off-centre for
+    // the whole time it is dismissed. Applied here, not in `default_style`, so
+    // it re-derives on every pass from the live flag — the style comparison in
+    // `walk` then picks the flip up as an ordinary style change.
+    if node.kind == ControlKind::InfoBar && !node.extras().bar_open {
         s.display = Display::None;
     }
     if node.kind == ControlKind::Grid {

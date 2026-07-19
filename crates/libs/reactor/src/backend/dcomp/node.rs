@@ -162,8 +162,12 @@ pub(crate) struct MenuRow {
 /// side can be written against a node that already holds the right value.
 #[derive(Clone, Debug)]
 pub(crate) struct Extras {
-    // ── TitleBar ─────────────────────────────────────────────────────────
-    /// Caption title text (`Prop::Title`).
+    // ── TitleBar / InfoBar ───────────────────────────────────────────────
+    /// Title text (`Prop::Title`) — the caption band's, or the InfoBar's.
+    ///
+    /// One field for both because a node is exactly one `ControlKind` for its
+    /// whole life, so the two readings can never be live at once; splitting it
+    /// would only widen every `Extras` that carries neither.
     pub title: String,
     /// Caption subtitle, drawn after the title in a dimmer style.
     pub subtitle: String,
@@ -235,6 +239,23 @@ pub(crate) struct Extras {
     /// Milliseconds before the first repeat, then between repeats.
     pub repeat_delay: i32,
     pub repeat_interval: i32,
+
+    // ── InfoBar ──────────────────────────────────────────────────────────
+    /// The body text drawn after the title (`Prop::Message`).
+    pub message: String,
+    /// `InfoBarSeverity` as delivered (WinRT discriminant) — resolved through
+    /// [`info_bar::Severity::of`](super::info_bar::Severity::of), which treats
+    /// an unrecognised value as informational rather than dropping the bar.
+    pub severity: i32,
+    /// The bar is shown. A closed bar collapses out of layout entirely
+    /// (`Display::None`, applied in `layout::finalize_style`) rather than
+    /// merely painting nothing, so it reclaims its space like WinUI's.
+    ///
+    /// Named apart from the pane's `pane_open` because they are different
+    /// controls' states that would otherwise both want `open`.
+    pub bar_open: bool,
+    /// The bar offers its built-in close button (`Prop::IsClosable`).
+    pub bar_closable: bool,
 }
 
 impl Extras {
@@ -251,8 +272,10 @@ impl Extras {
     /// `is_pane_toggle_button_visible: true`, `is_settings_visible: true`,
     /// `is_pane_open: true` and `open_pane_length: 320.0`;
     /// `PasswordBox::default()` has `is_password_reveal_button_enabled: true`;
-    /// `RepeatButton::default()` has `delay: 500, interval: 33`. The enum
-    /// fields take the WinRT enumerator the unset state means, by name.
+    /// `RepeatButton::default()` has `delay: 500, interval: 33`;
+    /// `InfoBar::default()` has `is_closable: true` (and `is_open: false` —
+    /// `InfoBar::new` is what opens one). The enum fields take the WinRT
+    /// enumerator the unset state means, by name.
     pub const DEFAULT: Extras = Extras {
         title: String::new(),
         subtitle: String::new(),
@@ -284,6 +307,10 @@ impl Extras {
         text_selectable: false,
         repeat_delay: 500,
         repeat_interval: 33,
+        message: String::new(),
+        severity: 0,
+        bar_open: false,
+        bar_closable: true,
     };
 }
 
@@ -410,6 +437,11 @@ pub(crate) struct Ctrl {
     pub unit: String,
     /// Knob: optional sub-line under the unit (e.g. a linear multiplier).
     pub sub_text: String,
+    /// InfoBadge: the count it carries, or `None` for the bare status dot.
+    /// An `Option` rather than a sentinel because `0` is a legitimate count
+    /// and must not be indistinguishable from "no value" — the widget's two
+    /// constructors (`InfoBadge::dot` / `::numeric`) are exactly this choice.
+    pub badge_value: Option<i32>,
     /// The chrome-heavy state of the caption / nav-pane / flyout / editor-policy
     /// props, allocated on the first write of any of them. Absent on every node
     /// that carries none — which is nearly every node that carries a `Ctrl` at
@@ -465,6 +497,7 @@ impl Ctrl {
         accent: None,
         unit: String::new(),
         sub_text: String::new(),
+        badge_value: None,
         extras: LazyExtras(None),
     };
 
@@ -715,6 +748,12 @@ pub(crate) struct Node {
     /// weight. Rebuilt by the layout pass on `text_dirty`; `None` when the pane
     /// has no text at all (a glyph-only rail).
     pub nav_text: Option<Box<nav::NavPaneText>>,
+
+    // ── InfoBar ──────────────────────────────────────────────────────────
+    /// InfoBar only: the band's cached title + message paragraph. Boxed and
+    /// lazy for the reason [`Extras`] is. Rebuilt by the layout pass on
+    /// `text_dirty`; `None` when the bar carries no text at all.
+    pub bar_text: Option<Box<info_bar::InfoBarText>>,
 }
 
 impl Node {
@@ -782,6 +821,7 @@ impl Node {
             title_footer: None,
             caption_text: None,
             nav_text: None,
+            bar_text: None,
         }
     }
 
@@ -1161,6 +1201,12 @@ pub(crate) fn is_interactive_kind(kind: ControlKind) -> bool {
             | ControlKind::SplitButton
             | ControlKind::NavigationView
             | ControlKind::Expander
+            // The band itself is inert, but its drawn close button is not, and
+            // a node has to be hit-testable as a whole before any part of it
+            // can be. It takes no ink and no focus ring: `parts::converted`
+            // excludes it, and it is deliberately absent from the Tab ring
+            // (see `is_focusable_kind`).
+            | ControlKind::InfoBar
     )
 }
 
@@ -1174,6 +1220,7 @@ fn draws_own_chrome(kind: ControlKind) -> bool {
                 | ControlKind::ProgressRing
                 | ControlKind::TitleBar
                 | ControlKind::Meter
+                | ControlKind::InfoBadge
         )
 }
 
@@ -1189,6 +1236,13 @@ pub(crate) fn is_text_editable(kind: ControlKind) -> bool {
 }
 
 /// Kinds that take keyboard focus in the Tab ring.
+///
+/// `InfoBar` is deliberately absent even though it is interactive. Focus here
+/// is per NODE, so focusing a bar would ring the whole band and put a large
+/// informational strip — one that is very often not closable, and then has no
+/// action at all — into the Tab order. Its close button is instead reachable
+/// the way the caption cluster's is: as an invokable accessibility element
+/// (see `uia::INFOBAR_CLOSE_ITEM`).
 fn is_focusable_kind(kind: ControlKind) -> bool {
     matches!(
         kind,
@@ -1328,6 +1382,27 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
             s.min_size = Size {
                 width: length(theme::KNOB_D),
                 height: length(theme::KNOB_D),
+            };
+        }
+        ControlKind::InfoBar => {
+            // The whole band — card, icon, paragraph and close button — is
+            // drawn on the node's own surface; the control takes no children.
+            // Its HEIGHT is a function of its width (the paragraph wraps), so
+            // unlike every other drawn control it cannot state one here: the
+            // measure callback asks `info_bar::measure` per pass, and this
+            // minimum is only the single-line floor that keeps a bar with no
+            // text yet from measuring zero.
+            s.display = Display::Block;
+            s.min_size.height = length(info_bar::MIN_H);
+        }
+        ControlKind::InfoBadge => {
+            // A dot or a small numeric pill, drawn with no children. Both axes
+            // need an intrinsic size or it vanishes in a flex row; the numeric
+            // form widens past this from its own measure.
+            s.display = Display::Flex;
+            s.min_size = Size {
+                width: length(info_badge::DOT_D),
+                height: length(info_badge::DOT_D),
             };
         }
         ControlKind::TitleBar => {

@@ -379,6 +379,23 @@ impl TextLayout {
             .collect())
     }
 
+    /// Re-weight the code-unit range `[start, start + length)`.
+    ///
+    /// The layout is built from a single [`TextFormat`], so its weight applies
+    /// to the whole run; this overrides it for one span. That is what lets one
+    /// layout carry mixed emphasis — a bold lead-in followed by body text —
+    /// and still wrap and measure as **one paragraph**, which two separately
+    /// laid-out runs cannot do (each would wrap inside its own box, and the
+    /// caller would have to re-implement line breaking to flow the second
+    /// after the first).
+    pub fn set_font_weight(&self, weight: FontWeight, start: u32, length: u32) -> Result<()> {
+        let range = DWRITE_TEXT_RANGE {
+            startPosition: start,
+            length,
+        };
+        unsafe { self.raw.SetFontWeight(weight.0, range).ok() }
+    }
+
     /// Toggle an underline over the code-unit range `[start, start + length)`.
     /// Used to mark the active IME composition span.
     pub fn set_underline(&self, has_underline: bool, start: u32, length: u32) -> Result<()> {

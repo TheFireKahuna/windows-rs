@@ -37,6 +37,46 @@ const VK_A: u32 = 0x41;
 const VK_C: u32 = 0x43;
 const VK_V: u32 = 0x56;
 const VK_X: u32 = 0x58;
+const VK_F1: u32 = 0x70;
+const VK_F24: u32 = 0x87;
+
+/// An F1..F24 function key — never a printable/editing key, so it is never
+/// claimed by a focused editor and always available to an accelerator (§7.3).
+pub(crate) fn is_function_key(vk: u32) -> bool {
+    (VK_F1..=VK_F24).contains(&vk)
+}
+
+/// The §7.3 fixed conflict policy, editor half: whether a **focused** editor
+/// legitimately claims this key, so an accelerator must NOT pre-empt it.
+///
+/// The editor keeps its own `Ctrl+A`/`C`/`X`/`V` (select-all / clipboard) and
+/// every *unmodified* printable/editing key. A modifier-chorded binding (any
+/// other `Ctrl`-chord, any `Alt`-chord) and every F-key win over the editor.
+/// Tab is not decided here — it always traverses and is never an accelerator.
+pub(crate) fn editor_claims_key(vk: u32, ctrl: bool, alt: bool) -> bool {
+    if is_function_key(vk) {
+        return false;
+    }
+    if ctrl {
+        // Only the editor's own clipboard/select chords; other Ctrl-chords
+        // (Ctrl+S, Ctrl+Z, …) are the app's to bind.
+        return matches!(vk, VK_A | VK_C | VK_X | VK_V);
+    }
+    if alt {
+        return false;
+    }
+    // Unmodified: the editor owns it (typing, arrows, Home/End, Backspace, …).
+    true
+}
+
+/// The sys-key half of §7.3's "return-0 vs `DefWindowProc`" decision, which
+/// must stay synchronous. A `WM_SYSKEYDOWN`/`WM_SYSKEYUP` the backend did not
+/// consume must fall through to `DefWindowProcW` so Alt+F4, F10 and Alt+Space
+/// reach the system; a consumed one (an accelerator match, an editor claim)
+/// stays swallowed. Regular (`WM_KEYDOWN`) messages never fall through.
+pub(crate) fn sys_key_falls_through(is_sys: bool, consumed: bool) -> bool {
+    is_sys && !consumed
+}
 
 // ── Host-thread input state ─────────────────────────────────────────────────
 //
@@ -483,6 +523,33 @@ impl DCompBackend {
         // the two chrome buttons repaint their flat wash — both keyed on this
         // one index (see `nav::HOT_BACK` and friends for why chrome sits at
         // sentinel values rather than in the item range).
+        // An InfoBar's close button, tracked for the same reason and before the
+        // same early-out: the pointer crosses onto the button while staying on
+        // the one InfoBar node, so the node-level hover flip below never sees
+        // it. Its wash is a flat state fill, so recording the hot slot and
+        // marking dirty IS the whole affordance — no sprite, no tick.
+        if let Some(id) = now
+            && self
+                .node(id)
+                .is_some_and(|n| n.kind == ControlKind::InfoBar && n.paint.is_enabled)
+        {
+            let hot = if self
+                .node(id)
+                .is_some_and(|n| info_bar::hit_close(n, x - n.rect.x, y - n.rect.y))
+            {
+                info_bar::HOT_CLOSE
+            } else {
+                -1
+            };
+            if self.node(id).is_some_and(|n| n.ctrl().hot_index != hot)
+                && let Some(n) = self.node_mut(id)
+            {
+                n.ctrl_mut().hot_index = hot;
+                n.mark_dirty();
+                self.repaint();
+            }
+        }
+
         let mut nav_hot_moved = false;
         if let Some(id) = now
             && self
@@ -573,7 +640,12 @@ impl DCompBackend {
                 // Both track a hot child index the node-level hover does not
                 // capture: leaving the node clears it, entering keeps whatever
                 // the caller just recorded.
-                ControlKind::SelectorBar | ControlKind::NavigationView => {
+                // All three track a hot sub-element the node-level hover does
+                // not capture: leaving the node clears it, entering keeps
+                // whatever the caller just recorded.
+                ControlKind::SelectorBar
+                | ControlKind::NavigationView
+                | ControlKind::InfoBar => {
                     if !hovered {
                         n.ctrl_mut().hot_index = -1;
                     }
@@ -930,8 +1002,53 @@ impl DCompBackend {
                     self.nav_act(id, hit);
                 }
             }
+            // Only the close button acts. The rest of the band is inert
+            // chrome, so a click on the message must NOT dismiss the bar —
+            // which is why this resolves the position instead of falling
+            // through to the position-free `activate`.
+            Some(ControlKind::InfoBar) => {
+                if self
+                    .node(id)
+                    .is_some_and(|n| info_bar::hit_close(n, x - n.rect.x, y - n.rect.y))
+                {
+                    self.close_info_bar(id);
+                }
+            }
             _ => self.activate(id),
         }
+    }
+
+    /// Dismiss an InfoBar: collapse the band and tell the app.
+    ///
+    /// The bar's `IsOpen` is an app-controlled prop, so this is the same
+    /// two-step a ToggleSwitch flip makes — drive the local state so the
+    /// chrome responds to the click immediately, then fire the event the app
+    /// converges through. A host that keeps `is_open` true simply re-opens it
+    /// on the next reconcile, which is the controlled-prop contract working,
+    /// not a glitch.
+    ///
+    /// The close button of a non-closable bar is not drawn and not hit-tested,
+    /// so reaching here with `bar_closable` false is impossible from the
+    /// pointer; the guard covers the accessibility path, which addresses the
+    /// element by name rather than by position.
+    pub(crate) fn close_info_bar(&mut self, id: ControlId) {
+        if !self
+            .node(id)
+            .is_some_and(|n| n.kind == ControlKind::InfoBar && n.extras().bar_closable)
+        {
+            return;
+        }
+        if let Some(n) = self.node_mut(id) {
+            n.extras_mut().bar_open = false;
+            // The pointer is left hovering a button that no longer exists.
+            n.ctrl_mut().hot_index = -1;
+            n.mark_dirty();
+        }
+        self.fire_unit(id, Event::Closed);
+        // A closed bar leaves layout entirely (`layout::finalize_style`), so
+        // the siblings below it have to be re-placed — the same reason a
+        // collapsing Expander relays out rather than merely repainting.
+        self.relayout_and_paint();
     }
 
     /// Activate a control with no position dependency (keyboard or button).
@@ -1574,13 +1691,22 @@ impl DCompBackend {
 
     /// A key was released. Ends the held/auto-repeat state started by the
     /// matching [`on_key`](Self::on_key); nothing else keys off a key-up.
-    pub(crate) fn on_key_up(&mut self, vk: u32) {
+    /// Returns `false` — no key-up is ever consumed — so a `WM_SYSKEYUP` falls
+    /// through to `DefWindowProc` (Alt-tap-to-menu, F10 release; §7.3).
+    pub(crate) fn on_key_up(&mut self, vk: u32) -> bool {
         key_release(vk);
+        false
     }
 
-    /// A key was pressed (`shift` / `ctrl` held?). Returns `true` if a
-    /// spring/timer should run.
-    pub(crate) fn on_key(&mut self, vk: u32, shift: bool, ctrl: bool) {
+    /// A key was pressed, with the full modifier set held. Returns whether the
+    /// backend **consumed** the key — the signal the WndProc needs for the
+    /// sys-key `return-0`-vs-`DefWindowProc` decision (§7.3): an unconsumed
+    /// sys-key falls through to the system so Alt+F4 / F10 / Alt+Space work.
+    pub(crate) fn on_key(&mut self, vk: u32, mods: crate::VirtualKeyModifiers) -> bool {
+        let ctrl = mods.contains(crate::VirtualKeyModifiers::Control);
+        let shift = mods.contains(crate::VirtualKeyModifiers::Shift);
+        let alt = mods.contains(crate::VirtualKeyModifiers::Menu);
+
         // The keyboard repeats a held key at the system rate. Record the press
         // and find out whether this is a fresh one or the repeat.
         let repeat = key_press(vk);
@@ -1599,14 +1725,30 @@ impl DCompBackend {
                 .and_then(|id| self.node(id).map(|n| n.kind))
                 != Some(ControlKind::RepeatButton)
         {
-            return;
+            // Swallowed (a held activation key), so the sys-key path treats it
+            // as consumed.
+            return true;
+        }
+
+        // §7.3 fixed conflict policy: a modifier-chorded binding or F-key wins
+        // over a focused editor, *except* the editor's own Ctrl+A/C/X/V and its
+        // unmodified printable/editing keys. Match accelerators before the
+        // editor unless the editor claims this key; a match consumes it and
+        // never also reaches the editor / traversal below.
+        let editor_claims =
+            self.focused_editable().is_some() && editor_claims_key(vk, ctrl, alt);
+        if !editor_claims
+            && let Some((id, index)) = self.match_accelerator(vk, mods)
+        {
+            self.fire_accelerator(id, index);
+            return true;
         }
 
         // A focused text editor consumes editing keys before the generic ring.
         if let Some(id) = self.focused_editable()
             && self.editor_key(id, vk, shift, ctrl).is_some()
         {
-            return;
+            return true;
         }
 
         // Popup keyboard navigation takes priority.
@@ -1633,20 +1775,62 @@ impl DCompBackend {
                 }
                 _ => {}
             }
-            return;
+            return true;
         }
 
         match vk {
-            VK_TAB => self.move_focus(if shift { -1 } else { 1 }),
+            VK_TAB => {
+                self.move_focus(if shift { -1 } else { 1 });
+                true
+            }
             VK_SPACE | VK_RETURN => {
                 if let Some(id) = self.focused_id {
                     self.activate(id);
                 }
+                true
             }
-            VK_LEFT | VK_UP => self.focus_arrow(-1),
-            VK_RIGHT | VK_DOWN => self.focus_arrow(1),
-            _ => {}
+            VK_LEFT | VK_UP => {
+                self.focus_arrow(-1);
+                true
+            }
+            VK_RIGHT | VK_DOWN => {
+                self.focus_arrow(1);
+                true
+            }
+            // Not a key the backend routes: leave it unconsumed so a sys-key
+            // reaches DefWindowProc (Alt+F4, F10, Alt+Space).
+            _ => false,
         }
+    }
+
+    /// Match a keydown against the front-resident accelerator table (§7.3):
+    /// the first node whose declared list holds this exact `(key, mods)` chord,
+    /// with its index into that list so the app half can address the right
+    /// callback. Tab always traverses, so it is never an accelerator. The
+    /// modifier set must match exactly, mirroring WinUI's accelerator dispatch.
+    fn match_accelerator(
+        &self,
+        vk: u32,
+        mods: crate::VirtualKeyModifiers,
+    ) -> Option<(ControlId, usize)> {
+        if vk == VK_TAB {
+            return None;
+        }
+        let key = crate::VirtualKey(vk as i32);
+        self.keybindings.iter().find_map(|(id, list)| {
+            list.iter()
+                .position(|(k, m)| *k == key && *m == mods)
+                .map(|i| (*id, i))
+        })
+    }
+
+    /// Queue a matched accelerator to fire app-side. Accelerators are app
+    /// commands, not control-state changes, so there is no UIA notification —
+    /// only the [`record::Intent::Accelerator`] the recorder resolves against
+    /// its `accels` map by index.
+    fn fire_accelerator(&mut self, id: ControlId, index: usize) {
+        self.intents
+            .push(record::Intent::Accelerator { id, index });
     }
 
     // ── Text editor ────────────────────────────────────────────────────────
@@ -1816,9 +2000,25 @@ impl DCompBackend {
             VK_DOWN if kind == ControlKind::NumberBox => self.number_step(id, -1.0, false),
             VK_PRIOR if kind == ControlKind::NumberBox => self.number_step(id, 1.0, true),
             VK_NEXT if kind == ControlKind::NumberBox => self.number_step(id, -1.0, true),
+            // Escape reverts the in-progress edit to the last committed value
+            // (§7.3), matching WinUI — focus is retained and no `ValueChanged`
+            // fires (the committed value never changed, only the discarded
+            // text did). Other editors keep Escape as a consumed no-op.
+            VK_ESCAPE if kind == ControlKind::NumberBox => self.revert_number(id),
             _ => {} // consume; printable input arrives via WM_CHAR
         }
         Some(())
+    }
+
+    /// Escape in a `NumberBox`: discard the in-progress text edit and restore
+    /// the last committed value into the buffer, keeping focus and firing no
+    /// `ValueChanged` (§7.3). The revert reformats `ctrl().value` — the pre-edit
+    /// value, since a NumberBox commits only on Enter/blur.
+    fn revert_number(&mut self, id: ControlId) {
+        if let Some(n) = self.node_mut(id) {
+            super::revert_number_text(n);
+        }
+        self.repaint();
     }
 
     /// IME composition started (IMM32 fallback): anchor the composition span.
@@ -2281,6 +2481,11 @@ impl DCompBackend {
     /// click toggles it, not by a parallel implementation that can drift.
     pub(crate) fn uia_select_item(&mut self, id: ControlId, i: i32) {
         match self.node(id).map(|n| n.kind) {
+            // The bar's one synthetic child is its close button, and invoking
+            // it takes exactly the path a click on it takes.
+            Some(ControlKind::InfoBar) if i == uia::INFOBAR_CLOSE_ITEM => {
+                self.close_info_bar(id)
+            }
             Some(ControlKind::SelectorBar) => self.set_segment(id, i),
             Some(ControlKind::NavigationView) => match uia::nav_chrome_of(i) {
                 Some(hit) => self.nav_act(id, hit),

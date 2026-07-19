@@ -480,6 +480,7 @@ Windows::Win32::UIA_ToggleToggleStatePropertyId
 Windows::Win32::UIA_ExpandCollapseExpandCollapseStatePropertyId
 Windows::Win32::UIA_IsOffscreenPropertyId
 Windows::Win32::UIA_IsPasswordPropertyId
+Windows::Win32::UIA_LiveSettingPropertyId
 // ── Pattern ids ──
 Windows::Win32::UIA_InvokePatternId
 Windows::Win32::UIA_TextPatternId
@@ -515,6 +516,7 @@ Windows::Win32::UIA_HyperlinkControlTypeId
 Windows::Win32::UIA_ProgressBarControlTypeId
 Windows::Win32::UIA_RadioButtonControlTypeId
 Windows::Win32::UIA_TitleBarControlTypeId
+Windows::Win32::UIA_StatusBarControlTypeId
 // ── Event ids ──
 Windows::Win32::UIA_AutomationPropertyChangedEventId
 Windows::Win32::UIA_Invoke_InvokedEventId

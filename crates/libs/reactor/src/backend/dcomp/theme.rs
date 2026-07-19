@@ -63,6 +63,12 @@ pub struct HostTokens {
     pub accent_light: Color,
     /// `AccentFillColorTertiary` (pressed accent).
     pub accent_dark: Color,
+    /// `TextOnAccentFillColorPrimary` — ink for text sitting ON a solid accent
+    /// fill. NOT the inverse of [`Self::text`]: the dark theme fills with the
+    /// accent's LIGHT shades and so wants black on them, the light theme fills
+    /// with the dark shades and wants white, so both tables invert their own
+    /// ink rather than sharing one rule.
+    pub text_on_accent: Color,
     /// `SystemFillColorSuccess`.
     pub ok: Color,
     /// `SystemFillColorCaution`.
@@ -99,6 +105,8 @@ const FLUENT_DARK: HostTokens = HostTokens {
         rgb(0x4c, 0xc2, 0xff).b,
         dark_wash_alpha(0.8),
     ),
+    // `TextOnAccentFillColorPrimary` dark (#FF000000) — the accent is Light2.
+    text_on_accent: rgb(0x00, 0x00, 0x00),
     ok: rgb(0x6c, 0xcb, 0x5f),
     warn: rgb(0xfc, 0xe1, 0x00),
     bad: rgb(0xff, 0x99, 0xa4),
@@ -131,6 +139,8 @@ const FLUENT_LIGHT: HostTokens = HostTokens {
         rgb(0x00, 0x5f, 0xb8).b,
         0.8,
     ),
+    // `TextOnAccentFillColorPrimary` light (#FFFFFFFF) — the accent is Dark1.
+    text_on_accent: rgb(0xff, 0xff, 0xff),
     // `SystemFillColor{Success,Caution,Critical}` light.
     ok: rgb(0x0f, 0x7b, 0x0f),
     warn: rgb(0x9d, 0x5d, 0x00),
@@ -300,6 +310,10 @@ pub fn accent_light() -> Color {
 /// `AccentFillColorTertiary` — Fluent's pressed accent is Light2 at 0.8 opacity.
 pub fn accent_dark() -> Color {
     host().accent_dark
+}
+/// `TextOnAccentFillColorPrimary` — ink for text drawn on a solid accent fill.
+pub fn text_on_accent() -> Color {
+    host().text_on_accent
 }
 /// Accent washes (no Fluent equivalent — this library's drawn selection/glow
 /// affordances; derived from the active accent so a host override tints them).

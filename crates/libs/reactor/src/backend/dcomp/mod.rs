@@ -31,6 +31,8 @@ mod dispatch;
 mod display_change;
 mod editor;
 mod host;
+pub(crate) mod info_badge;
+pub(crate) mod info_bar;
 mod input;
 mod knob;
 pub(crate) mod layout;
@@ -47,6 +49,7 @@ mod size;
 mod surface;
 pub(crate) mod theme;
 pub use theme::{set_host_tokens, HostTokens};
+pub(crate) mod tsf;
 mod uia;
 pub(crate) mod visibility;
 
@@ -57,6 +60,9 @@ pub use display_change::set_display_change_callback;
 pub use visibility::set_window_visibility_callback;
 pub(crate) use pointer::{declare, register_element_pointer, PointerSinks};
 pub(crate) use size::register_element_size;
+// The §7.3 keyboard conflict-policy predicates, pure and front-decidable, so
+// the headless test seam can exercise the decision without a WndProc.
+pub(crate) use input::{editor_claims_key, is_function_key, sys_key_falls_through};
 
 use bootstrap::Compositing;
 use node::{Arena, Ctrl, Extras, MenuRow, Node};
@@ -171,6 +177,14 @@ pub struct DCompBackend {
     /// invokes an app closure: this queue is the seam that keeps handlers on
     /// the app side.
     intents: Vec<record::Intent>,
+    /// The §7.3 accelerator table: per node, the declared `(key, mods)` chords
+    /// input matches a keydown against. Only the chords live here — the
+    /// `on_invoked` callbacks stay in the recorder's app-side `accels` map,
+    /// addressed by the matched index via [`record::Intent::Accelerator`]. Fed
+    /// by [`record::Cmd::SetKeybindings`] replay; entries die with the node in
+    /// [`Backend::destroy`], and ids are never reused so a stale chord could not
+    /// re-address a later node.
+    keybindings: rustc_hash::FxHashMap<ControlId, Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>>,
 }
 
 impl DCompBackend {
@@ -200,6 +214,7 @@ impl DCompBackend {
             titlebars: Vec::new(),
             hwnd,
             intents: Vec::new(),
+            keybindings: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -689,11 +704,25 @@ impl Backend for DCompBackend {
         // Any prop write can move a value the UIA property snapshot caches
         // (Name, IsEnabled, ToggleState, …), so retire the snapshots first.
         uia::note_state_change();
+        // An InfoBar that is about to OPEN must announce itself (it appeared
+        // without the user asking, so nothing else would mention it). Sampled
+        // before the write and compared after, because the opening EDGE is what
+        // announces — a bar already on screen must not interrupt the user again
+        // every time an unrelated prop of it changes.
+        let was_open = self
+            .node(id)
+            .filter(|n| n.kind == ControlKind::InfoBar)
+            .map(|n| n.extras().bar_open);
         let Some(node) = self.node_mut(id) else { return };
         // A focused AutoSuggestBox whose filtered list just changed refreshes
         // its open dropdown in place (deferred until the node borrow ends).
         if apply_prop(node, prop, value) {
             self.refresh_suggest(id);
+        }
+        if was_open == Some(false)
+            && self.node(id).is_some_and(|n| n.extras().bar_open)
+        {
+            self.uia_announce_live_region(id);
         }
     }
 
@@ -762,6 +791,9 @@ impl Backend for DCompBackend {
         pointer::forget(id);
         self.surfaces.forget(id);
         uia::forget(self.hwnd, id);
+        // Accelerator chords are scoped to the node's lifetime — drop them so a
+        // keydown can never match a chord for a node that no longer exists.
+        self.keybindings.remove(&id);
         // Drop the caption cache entry in lock-step with the arena entry: a
         // cached id naming a destroyed node would hand the host a stale (or
         // absent) non-client region for the rest of the window's life.
@@ -935,6 +967,22 @@ impl DCompBackend {
         Backend::set_prop(self, id, Prop::Value, &PropValue::F64(value));
     }
 
+    /// Record the node's declared accelerator chords (§7.3). An empty list
+    /// clears the entry; input matches keydowns against this table
+    /// ([`input`]'s `match_accelerator`) and fires the app callback through
+    /// [`record::Intent::Accelerator`], keeping the closure app-side.
+    pub(crate) fn set_keybindings(
+        &mut self,
+        id: ControlId,
+        keys: Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>,
+    ) {
+        if keys.is_empty() {
+            self.keybindings.remove(&id);
+        } else {
+            self.keybindings.insert(id, keys);
+        }
+    }
+
 }
 
 impl record::FrontBackend for DCompBackend {
@@ -948,6 +996,14 @@ impl record::FrontBackend for DCompBackend {
 
     fn set_value_stamped(&mut self, id: ControlId, value: f64, based_on: u64) {
         Self::set_value_stamped(self, id, value, based_on);
+    }
+
+    fn set_keybindings(
+        &mut self,
+        id: ControlId,
+        keys: Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>,
+    ) {
+        Self::set_keybindings(self, id, keys);
     }
 
     /// Hand the queued intents to the host, in fire order, for the recorder's
@@ -1278,6 +1334,40 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
         }
         (Prop::SubText, PropValue::Str(s)) => {
             node.ctrl_mut().sub_text = s.clone();
+            node.mark_dirty();
+        }
+        // An InfoBadge's count. The `Value` prop is `F64` everywhere else (it
+        // is the range controls' slot), so without this arm the badge's write
+        // fell through to the terminal `_` and was dropped — as a *reported*
+        // defect, since `Value` classifies as consumed.
+        (Prop::Value, PropValue::I32(v)) => {
+            node.ctrl_mut().badge_value = Some(*v);
+            // The count is the drawn label; a new one has to be re-laid-out
+            // before the badge can measure to it.
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::Message, PropValue::Str(s)) => {
+            node.extras_mut().message = s.clone();
+            node.text_dirty = true;
+            node.mark_dirty();
+        }
+        (Prop::Severity, PropValue::I32(v)) => {
+            node.extras_mut().severity = *v;
+            node.mark_dirty();
+        }
+        (Prop::IsOpen, PropValue::Bool(v)) => {
+            node.extras_mut().bar_open = *v;
+            // The flip changes whether the band occupies layout at all
+            // (`layout::finalize_style`), which the reconcile's own relayout
+            // picks up — the style comparison sees the new `Display`.
+            node.mark_dirty();
+        }
+        (Prop::IsClosable, PropValue::Bool(v)) => {
+            node.extras_mut().bar_closable = *v;
+            // The close button's column is part of the text budget, so losing
+            // or gaining it re-wraps the paragraph.
+            node.measure_dirty = true;
             node.mark_dirty();
         }
         (Prop::IsIndeterminate, PropValue::Bool(v)) => {
@@ -1713,11 +1803,18 @@ prop_contract! {
         // and several of its fields are pointedly not zero.
         IsOn => |n| { n.ctrl_reset(|c| c.is_on = Ctrl::DEFAULT.is_on); }
         IsChecked => |n| { n.ctrl_reset(|c| c.is_checked = Ctrl::DEFAULT.is_checked); }
+        // One prop, three carriers: the range controls' number, an editor's
+        // buffer, and an InfoBadge's count. All three restore here, because a
+        // node is one kind and only its own arm can have stored anything.
         Value => |n| {
             n.ctrl_reset(|c| c.value = Ctrl::DEFAULT.value);
             // An editor's buffer is the value for the text kinds; a node born
             // without one shows an empty, UNSEEDED field.
             clear_editor_text(n);
+            // Back to the bare status dot — `InfoBadge::dot()` is the no-value
+            // form, which is what an `Unset` on a badge means.
+            n.ctrl_reset(|c| c.badge_value = Ctrl::DEFAULT.badge_value);
+            n.text_dirty = true;
             n.mark_dirty();
         }
         Minimum => |n| { n.ctrl_reset(|c| c.min = Ctrl::DEFAULT.min); }
@@ -1846,11 +1943,31 @@ prop_contract! {
         // The titles are drawn from cached layouts the text pass owns, so a
         // reset drops the state and re-flags it; the pass then rebuilds (to
         // `None`, here) and re-derives the band's leading inset with it.
+        // Shared by the caption band and the InfoBar — one `Extras` field, so
+        // one reset (see `Extras::title`).
         Title => |n| { n.extras_reset(|x| x.title = Extras::DEFAULT.title); n.text_dirty = true; }
         Subtitle => |n| {
             n.extras_reset(|x| x.subtitle = Extras::DEFAULT.subtitle);
             n.text_dirty = true;
         }
+
+        // ── InfoBar ──────────────────────────────────────────────────────
+        Message => |n| {
+            n.extras_reset(|x| x.message = Extras::DEFAULT.message);
+            n.text_dirty = true;
+        }
+        Severity => |n| { n.extras_reset(|x| x.severity = Extras::DEFAULT.severity); }
+        // Born CLOSED: `InfoBar::default()` is `is_open: false` — it is
+        // `InfoBar::new` that opens one — so an unset bar is a dismissed bar,
+        // and dismissed means out of layout, not merely unpainted.
+        IsOpen => |n| { n.extras_reset(|x| x.bar_open = Extras::DEFAULT.bar_open); }
+        // Born CLOSABLE, matching `InfoBar::default()`. The close button's
+        // column comes out of the text budget, so restoring it re-wraps.
+        IsClosable => |n| {
+            n.extras_reset(|x| x.bar_closable = Extras::DEFAULT.bar_closable);
+            n.measure_dirty = true;
+        }
+
         // Band height and back-button inset are derived geometry, so each of
         // these restores the state and immediately re-derives — the same call
         // `apply_prop` makes, so set and unset cannot fall out of step.
@@ -2024,7 +2141,7 @@ prop_contract! {
         AlignBottomWithPanel, AlignHCenterWithPanel, AlignLeftWithPanel,
         AlignRightWithPanel, AlignTopWithPanel, AlignVCenterWithPanel;
         // TabView / TabViewItem / Pivot.
-        CanReorderTabs, IsAddTabButtonVisible, IsClosable, ItemKey, ItemHeader;
+        CanReorderTabs, IsAddTabButtonVisible, ItemKey, ItemHeader;
         // ColorPicker.
         ColorValue, IsAlphaEnabled, IsColorChannelTextInputVisible,
         IsColorSliderVisible, IsHexInputVisible;
@@ -2034,10 +2151,11 @@ prop_contract! {
         // ContentDialog.
         PrimaryButtonText, SecondaryButtonText, CloseButtonText,
         IsPrimaryButtonEnabled, IsSecondaryButtonEnabled;
-        // InfoBar / TeachingTip (`IsOpen` is carried only by these two and
-        // ContentDialog — all three unrendered).
-        Message, Severity, ActionButton, ActionButtonText, CloseButton,
-        PreferredPlacement, IsLightDismissEnabled, IsOpen;
+        // TeachingTip. `Message`, `Severity`, `IsOpen` and `IsClosable` moved
+        // to `consumed` when the InfoBar gained its chrome; the remainder here
+        // are carried only by controls this backend does not render.
+        ActionButton, ActionButtonText, CloseButton,
+        PreferredPlacement, IsLightDismissEnabled;
         // CommandBar / TreeView / SplitView-only / PersonPicture / Image /
         // Viewbox / RatingControl / RadioButton(s). `CompactPaneLength` is
         // SplitView's alone — the NavigationView bindings never emit it, so
@@ -2197,13 +2315,13 @@ mod unhandled {
             | K::ComboBox
             | K::SelectorBar
             | K::NavigationView
+            | K::InfoBar
+            | K::InfoBadge
             | K::TitleBar => true,
 
             // Not rendered: no drawn chrome and no behaviour of their own.
             K::RadioButton
             | K::RadioButtons
-            | K::InfoBar
-            | K::InfoBadge
             | K::PersonPicture
             | K::Image
             | K::TabView
@@ -2296,6 +2414,28 @@ fn seed_number_text(node: &mut Node, v: f64) {
         ed.set_text(&format!("{v:.digits$}"));
         ed.seeded = true;
     }
+}
+
+/// Revert a `NumberBox`'s in-progress edit to its last committed value (§7.3
+/// Escape-revert): reformat `ctrl().value` — the pre-edit value, since a
+/// NumberBox commits only on Enter/blur — back into the buffer and select it,
+/// exactly as WinUI does. Unlike [`seed_number_text`] this applies even while
+/// focused (Escape is the one place the user asks to discard their own edit),
+/// and the caller retains focus. No `ValueChanged` fires: only the discarded
+/// text changed, never the committed value. A no-op for a node with no editor.
+pub(crate) fn revert_number_text(node: &mut Node) {
+    let (min, max, precision, value) = {
+        let c = node.ctrl();
+        (c.min, c.max, c.precision, c.value)
+    };
+    let (_, s) = editor::commit_format(value, min, max, precision);
+    if let Some(ed) = &mut node.editor {
+        ed.set_text(&s);
+        ed.select_all();
+        ed.seeded = true;
+        ed.caret_moved = true;
+    }
+    node.mark_dirty();
 }
 
 /// The control's value as a 0..1 fraction of its `[min, max]` range.

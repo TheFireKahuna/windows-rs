@@ -77,12 +77,13 @@ use crate::system_bindings::{
     UIA_IsContentElementPropertyId,
     UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
     UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
+    UIA_LiveRegionChangedEventId, UIA_LiveSettingPropertyId,
     UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_NamePropertyId, UIA_PaneControlTypeId,
     PATTERNID, PROPERTYID, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
     UIA_RangeValuePatternId, UIA_RangeValueValuePropertyId,
     UIA_ScrollItemPatternId, UIA_ScrollPatternId, UIA_SelectionItemPatternId,
     UIA_SelectionItem_ElementSelectedEventId, UIA_SelectionPatternId,
-    UIA_SliderControlTypeId, UIA_TabControlTypeId, UIA_TextPatternId,
+    UIA_SliderControlTypeId, UIA_StatusBarControlTypeId, UIA_TabControlTypeId, UIA_TextPatternId,
     UIA_TabItemControlTypeId, UIA_TextControlTypeId, UIA_TogglePatternId,
     UIA_ToggleToggleStatePropertyId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
 };
@@ -131,6 +132,19 @@ const NAV_CHROME_BASE: i32 = 1 << 16;
 fn is_nav_chrome(item: i32) -> bool {
     (NAV_CHROME_BASE..CAPTION_ITEM_BASE).contains(&item)
 }
+
+/// An InfoBar's drawn close button, as its one synthetic child.
+///
+/// It shares the nav pane's chrome index space — the two are never on the same
+/// node, and a second base would buy nothing but a second range to keep
+/// disjoint from the caption's. `is_nav_chrome` therefore also answers for this
+/// item; the two are told apart by the owning node's `ControlKind`, which every
+/// consumer already has in hand.
+///
+/// The bar itself is not in the Tab ring (see `node::is_focusable_kind`), so
+/// this element is how a keyboard-only or screen-reader user dismisses a bar at
+/// all — the same arrangement the caption cluster has.
+pub(crate) const INFOBAR_CLOSE_ITEM: i32 = NAV_CHROME_BASE;
 
 /// The pane element a chrome item names, and the inverse. Both directions are
 /// needed and a wrong pairing would put a screen reader's invoke on the wrong
@@ -263,6 +277,12 @@ fn control_type(kind: ControlKind) -> i32 {
         SelectorBar | TabView | Pivot => UIA_TabControlTypeId,
         NavigationView => UIA_ListControlTypeId,
         Expander => UIA_GroupControlTypeId,
+        // A status band, which is what a screen reader should call it — and
+        // what pairs with the `LiveSetting` it advertises.
+        InfoBar => UIA_StatusBarControlTypeId,
+        // A badge is a short readable annotation, not a control: it has no
+        // action and no value pattern, so `Text` is the honest type.
+        InfoBadge => UIA_TextControlTypeId,
         TextBlock | RichTextBlock => UIA_TextControlTypeId,
         Image | PersonPicture | Ellipse | Rectangle | Line => UIA_ImageControlTypeId,
         ScrollViewer | ScrollView | Canvas | SwapChainPanel => UIA_PaneControlTypeId,
@@ -287,6 +307,14 @@ fn is_item_container(kind: ControlKind) -> bool {
 
 fn pattern_supported(kind: ControlKind, item: i32, pid: PATTERNID) -> bool {
     use ControlKind::*;
+    // The InfoBar's close button shares the nav pane's chrome index space, so
+    // it is answered by kind BEFORE that branch — which would otherwise read
+    // the same index as the pane's back arrow. Both happen to resolve to
+    // Invoke-only today; stating it here means a later edit to the pane's
+    // chrome patterns cannot silently change the bar's.
+    if kind == InfoBar {
+        return item == INFOBAR_CLOSE_ITEM && pid == UIA_InvokePatternId;
+    }
     if is_nav_chrome(item) {
         // Pane chrome invokes. The settings row is also a selectable page, so
         // it carries SelectionItem alongside Invoke; the back arrow and the
@@ -418,29 +446,48 @@ impl DCompBackend {
     /// being the same number and the three `syn_*` helpers become the only
     /// thing the tree walk below may reason about.
     fn syn_len(&self, id: ControlId) -> i32 {
-        if self.uia_kind(id) == Some(ControlKind::NavigationView) {
-            self.nav_seq_len(id)
-        } else {
-            self.uia_item_count(id)
+        match self.uia_kind(id) {
+            Some(ControlKind::NavigationView) => self.nav_seq_len(id),
+            Some(ControlKind::InfoBar) => i32::from(self.infobar_close_present(id)),
+            _ => self.uia_item_count(id),
         }
     }
 
     /// The synthetic item at reading position `pos`.
     fn syn_at(&self, id: ControlId, pos: i32) -> Option<i32> {
-        if self.uia_kind(id) == Some(ControlKind::NavigationView) {
-            self.nav_seq_at(id, pos)
-        } else {
-            (0..self.uia_item_count(id)).contains(&pos).then_some(pos)
+        match self.uia_kind(id) {
+            Some(ControlKind::NavigationView) => self.nav_seq_at(id, pos),
+            Some(ControlKind::InfoBar) => {
+                (pos == 0 && self.infobar_close_present(id)).then_some(INFOBAR_CLOSE_ITEM)
+            }
+            _ => (0..self.uia_item_count(id)).contains(&pos).then_some(pos),
         }
     }
 
     /// The reading position of synthetic item `item`.
     fn syn_pos(&self, id: ControlId, item: i32) -> Option<i32> {
-        if self.uia_kind(id) == Some(ControlKind::NavigationView) {
-            self.nav_seq_pos(id, item)
-        } else {
-            (0..self.uia_item_count(id)).contains(&item).then_some(item)
+        match self.uia_kind(id) {
+            Some(ControlKind::NavigationView) => self.nav_seq_pos(id, item),
+            Some(ControlKind::InfoBar) => {
+                (item == INFOBAR_CLOSE_ITEM && self.infobar_close_present(id)).then_some(0)
+            }
+            _ => (0..self.uia_item_count(id)).contains(&item).then_some(item),
         }
+    }
+
+    /// Whether an InfoBar currently offers its close button — the bound
+    /// [`syn_len`](Self::syn_len) and friends share, so nothing is announced
+    /// that is not on screen and cannot be clicked.
+    ///
+    /// A CLOSED bar has no children of any kind: it is out of layout entirely,
+    /// and exposing an invokable button inside an invisible band would let a
+    /// screen reader dismiss a bar the user cannot see.
+    fn infobar_close_present(&self, id: ControlId) -> bool {
+        self.arena.get(id).is_some_and(|n| {
+            n.kind == ControlKind::InfoBar
+                && n.extras().bar_open
+                && info_bar::close_rect(n.rect.w, n.rect.h, n.extras().bar_closable).is_some()
+        })
     }
 
     /// Reading position of a synthetic item — the inverse of
@@ -649,6 +696,13 @@ impl DCompBackend {
             }
             .to_string();
         }
+        // The InfoBar's close button shares the chrome index space, so the
+        // owning kind is what tells the two apart — see `INFOBAR_CLOSE_ITEM`.
+        if item == INFOBAR_CLOSE_ITEM
+            && self.uia_kind(id) == Some(ControlKind::InfoBar)
+        {
+            return info_bar::CLOSE_LABEL.to_string();
+        }
         if is_nav_chrome(item)
             && let Some(hit) = nav_chrome_hit(item)
         {
@@ -659,6 +713,32 @@ impl DCompBackend {
         };
         if item >= 0 {
             return n.ctrl().items.get(item as usize).cloned().unwrap_or_default();
+        }
+        // An explicit AutomationName still wins (checked below); absent one,
+        // the bar names itself from its severity plus the text as drawn, so a
+        // screen reader is told what the status ICON conveys visually.
+        let authored = n
+            .accessibility
+            .as_ref()
+            .and_then(|a| a.automation_name.as_ref())
+            .is_some_and(|s| !s.is_empty());
+        if !authored {
+            match n.kind {
+                // The bar names itself from its severity plus the text as
+                // drawn, so a screen reader is told what the status ICON
+                // conveys visually.
+                ControlKind::InfoBar => return info_bar::accessible_name(n),
+                // A badge draws a bare number with no label of its own, so
+                // without this it reaches an assistive client as an unnamed
+                // element and its whole content — the count — is lost. The dot
+                // form genuinely has no text; a host that means something by it
+                // says so with an `automation_name`, which is why this only
+                // fills in when none was authored.
+                ControlKind::InfoBadge => {
+                    return info_badge::label(n).unwrap_or_default();
+                }
+                _ => {}
+            }
         }
         if let Some(a) = &n.accessibility
             && let Some(name) = &a.automation_name
@@ -983,6 +1063,19 @@ impl DCompBackend {
                         w = r - l;
                     }
                 }
+                // The close button's box, from the one geometry the paint used.
+                ControlKind::InfoBar => {
+                    if let Some(r) = info_bar::close_rect(
+                        n.rect.w,
+                        n.rect.h,
+                        n.extras().bar_closable,
+                    ) {
+                        x = n.rect.x + r.left;
+                        y = n.rect.y + r.top;
+                        w = r.width();
+                        h = r.height();
+                    }
+                }
                 ControlKind::NavigationView => {
                     // Every pane box — rows and chrome alike — comes from the
                     // one geometry the paint used.
@@ -1074,6 +1167,13 @@ impl DCompBackend {
         // Window-space → the container's unscrolled layout space.
         let py = py + self.uia_scroll_adjust(id);
         let n = self.arena.get(id)?;
+        // The InfoBar subdivides into exactly one element, and it has no items
+        // — so it is resolved before the item-count guard below.
+        if n.kind == ControlKind::InfoBar {
+            return (self.infobar_close_present(id)
+                && info_bar::hit_close(n, px - n.rect.x, py - n.rect.y))
+            .then_some(INFOBAR_CLOSE_ITEM);
+        }
         let count = n.ctrl().items.len();
         if count == 0 {
             return None;
@@ -1344,6 +1444,31 @@ impl DCompBackend {
         }
     }
 
+    /// Announce that an InfoBar has opened, by raising `LiveRegionChanged` on
+    /// it — deferred onto the pump like every other raise.
+    ///
+    /// This is the entire reason an InfoBar exists for a non-visual user: the
+    /// bar appears without being asked for, so nothing else in the
+    /// accessibility model would ever mention it. A client reads the band's
+    /// `Name` (its severity plus its text) and its
+    /// [`LiveSetting`](Self::uia_live_setting) to decide how to say it.
+    ///
+    /// Raised on the OPENING edge only. Re-announcing on every prop write would
+    /// interrupt the user each time an unrelated property of a bar that is
+    /// already on screen changed.
+    pub(crate) fn uia_announce_live_region(&self, id: ControlId) {
+        if !clients_listening() {
+            return;
+        }
+        let hwnd = self.hwnd;
+        host::post_ui(hwnd, move || {
+            let p = stable_provider(ElementProvider::element(hwnd, id));
+            unsafe {
+                let _ = UiaRaiseAutomationEvent(p.as_raw(), UIA_LiveRegionChangedEventId);
+            }
+        });
+    }
+
     /// Raise `SelectionItem::ElementSelected` for `id`'s currently selected
     /// synthetic item — deferred onto the pump like every other raise.
     fn uia_raise_selection(&self, id: ControlId) {
@@ -1427,6 +1552,7 @@ struct PropSnapshot {
     focusable: bool,
     has_focus: bool,
     is_password: bool,
+    live_setting: i32,
 }
 
 impl DCompBackend {
@@ -1444,9 +1570,44 @@ impl DCompBackend {
             focusable: self.uia_focusable(id, item),
             has_focus: self.uia_has_focus(id, item),
             is_password: self.uia_kind(id) == Some(ControlKind::PasswordBox),
+            live_setting: self.uia_live_setting(id, item),
+        }
+    }
+
+    /// `LiveSetting` — how urgently a client should announce this element when
+    /// its content changes (`Off` / `Polite` / `Assertive`).
+    ///
+    /// Only the InfoBar is a live region: it is the one control here whose
+    /// whole purpose is to say something the user did not ask to hear. The
+    /// severity picks the urgency, because that is the difference between "the
+    /// preset saved" and "the audio device disappeared" — the first should wait
+    /// for a pause in speech, the second should interrupt.
+    ///
+    /// Paired with the [`UIA_LiveRegionChangedEventId`] raised when a bar opens
+    /// (`announce_live_region`): the property tells a client HOW to announce,
+    /// the event tells it WHEN, and neither works alone.
+    fn uia_live_setting(&self, id: ControlId, item: i32) -> i32 {
+        use info_bar::Severity;
+        if item >= 0 {
+            return LIVE_OFF;
+        }
+        match self.arena.get(id) {
+            Some(n) if n.kind == ControlKind::InfoBar && n.extras().bar_open => {
+                match info_bar::severity(n.extras()) {
+                    Severity::Warning | Severity::Error => LIVE_ASSERTIVE,
+                    _ => LIVE_POLITE,
+                }
+            }
+            _ => LIVE_OFF,
         }
     }
 }
+
+// `LiveSetting` values (uiautomationcore.h). Not in the generated set — the
+// enum carries no constants of its own there, only the property id does.
+const LIVE_OFF: i32 = 0;
+const LIVE_POLITE: i32 = 1;
+const LIVE_ASSERTIVE: i32 = 2;
 
 thread_local! {
     /// One cached element per UIA worker thread: `(key, generation, snapshot)`.
@@ -1740,6 +1901,8 @@ impl ElementProvider {
             v_r8(s.range_value)
         } else if pid == UIA_ValueValuePropertyId {
             v_bstr(s.value)
+        } else if pid == UIA_LiveSettingPropertyId {
+            v_i4(s.live_setting)
         } else {
             VARIANT::default()
         }

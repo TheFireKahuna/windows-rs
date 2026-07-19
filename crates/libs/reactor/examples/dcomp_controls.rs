@@ -135,6 +135,47 @@ fn main() -> windows_reactor::Result<()> {
         .header("Advanced")
         .into();
 
+        // Badges: the bare status dot and a count pill, inline with a label.
+        let badges = hstack((
+            InfoBadge::dot(),
+            InfoBadge::numeric(3),
+            InfoBadge::numeric(128),
+        ))
+        .spacing(10.0)
+        .vertical_alignment(VerticalAlignment::Center)
+        .into();
+
+        // One InfoBar per severity. The last is closable and carries a long
+        // message, so it wraps to a second line and the band grows with it —
+        // the height-follows-width path the layout measure exists for.
+        let (bar_open, set_bar_open) = cx.use_state::<bool>(true);
+        let bars: Vec<Element> = vec![
+            InfoBar::new("Profile loaded")
+                .message("Living room · 48 kHz")
+                .informational()
+                .is_closable(false)
+                .into(),
+            InfoBar::new("Calibration complete")
+                .message("Applied 12 corrections.")
+                .success()
+                .is_closable(false)
+                .into(),
+            InfoBar::new("Clipping detected")
+                .message("Output exceeded 0 dBFS on the left channel.")
+                .warning()
+                .is_closable(false)
+                .into(),
+            InfoBar::new("Device unavailable")
+                .message(
+                    "The configured output device was disconnected, so processing is \
+                     bypassed until it returns or another device is selected.",
+                )
+                .error()
+                .is_open(bar_open)
+                .on_closed(move || set_bar_open.call(false))
+                .into(),
+        ];
+
         // A tall stack so the ScrollViewer overflows and scrolls.
         let mut cards: Vec<Element> = vec![
             card(&format!("EQ Active  ({})", if eq_on { "on" } else { "off" }), toggle),
@@ -147,9 +188,12 @@ fn main() -> windows_reactor::Result<()> {
             card("Analyzing…", busy),
             card("Loading", ring),
             card("Dynamics", check),
+            card("Unread", badges),
             card("About", link),
             advanced,
         ];
+        // Full-bleed, not in a card: an InfoBar is its own card.
+        cards.extend(bars);
         for i in 1..=8 {
             cards.push(card(
                 &format!("Band {i}"),
