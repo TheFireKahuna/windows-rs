@@ -413,18 +413,20 @@ impl Popup {
     /// flyout are the same controls they would be anywhere else — not a
     /// snapshot the popup has to re-interpret.
     ///
-    /// The offset is panel-local, and the panel sits at `MARGIN` inside the
-    /// shadow-bleed surface, so the content lands at `MARGIN + CONTENT_PAD`.
-    /// Both are applied here rather than baked into the subtree's own layout,
-    /// which is solved at the origin and knows nothing about where it is shown.
+    /// The offset is NOT set here: the subtree's own layout pass writes it, so
+    /// that one place decides where the content sits and a later re-layout
+    /// cannot silently disagree with an offset stamped at adoption time. See
+    /// [`Self::content_inset`].
     pub fn adopt(&self, content: &Visual) -> windows_core::Result<()> {
-        content.SetOffset(Vector3::new(
-            MARGIN + CONTENT_PAD,
-            MARGIN + CONTENT_PAD,
-            0.0,
-        ))?;
         self.container.Children()?.InsertAtTop(content)?;
         Ok(())
+    }
+
+    /// Where hosted content sits inside this popup's own container: the panel
+    /// is inset by `MARGIN` in the shadow-bleed surface, and the content by
+    /// `CONTENT_PAD` inside the panel.
+    pub fn content_inset() -> (f32, f32) {
+        (MARGIN + CONTENT_PAD, MARGIN + CONTENT_PAD)
     }
 
     /// Hand a hosted subtree's container back out of the overlay.

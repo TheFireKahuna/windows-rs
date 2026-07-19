@@ -86,7 +86,10 @@ fn main() -> windows_reactor::Result<()> {
 
         // ── Toggle / repeat ──────────────────────────────────────────────
         let family = hstack((
-            ToggleButton::new("Mute", muted).on_checked(move |v| set_muted.call(v)),
+            ToggleButton::new("Mute", muted).on_checked({
+                let s = set_muted.clone();
+                move |v| s.call(v)
+            }),
             RepeatButton::new("Nudge −").on_click({
                 let s = set_clicks.clone();
                 move || s.call(clicks - 1)

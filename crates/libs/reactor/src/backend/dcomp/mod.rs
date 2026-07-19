@@ -272,9 +272,19 @@ impl DCompBackend {
             // changed shape since it opened. Its panel keeps the size it was
             // measured at: re-sizing an open popup under the pointer would move
             // the control being clicked.
-            if let Some(fly) = self.hosted_flyout {
+            if let Some(fly) = self.hosted_flyout
+                && let Some(origin) = self.popup.as_ref().map(|p| p.content_origin())
+            {
                 let (aw, ah) = self.flyout_avail();
-                layout::compute_overlay(&mut self.arena, fly, aw, ah, scale);
+                layout::compute_overlay(
+                    &mut self.arena,
+                    fly,
+                    aw,
+                    ah,
+                    scale,
+                    origin,
+                    popup::Popup::content_inset(),
+                );
             }
             self.repaint();
         }

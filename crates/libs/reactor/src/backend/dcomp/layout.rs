@@ -54,7 +54,7 @@ use windows_core::Interface;
 /// every surface on integer pixels.
 pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f32, scale: f32) {
     let lt = arena.layout.take();
-    let lt = compute_in(lt, arena, root, width, height, scale);
+    let lt = compute_in(lt, arena, root, width, height, scale, false, (0.0, 0.0), (0.0, 0.0));
     arena.layout = Some(lt);
 }
 
@@ -65,15 +65,26 @@ pub(crate) fn compute(arena: &mut Arena, root: ControlId, width: f32, height: f3
 /// a `LayoutTree` assumes one root, and alternating two through it would
 /// re-parent the synthetic viewport every pass and sweep every pass. See
 /// [`Arena::overlay_layout`](super::node::Arena).
+/// `origin` is where the content sits in WINDOW DIPs, and `inset` is where it
+/// sits inside the popup's own container. Both are needed and they are not the
+/// same number: every node's `rect` must be in window space, because that is
+/// what the entire input pipeline hit-tests and scrubs against, while the
+/// root's visual offset must be relative to the container it was adopted into.
+/// `solve_walk` already carries the two separately, so this is a matter of
+/// seeding it correctly rather than rebasing anything afterwards.
 pub(crate) fn compute_overlay(
     arena: &mut Arena,
     root: ControlId,
     width: f32,
     height: f32,
     scale: f32,
+    origin: (f32, f32),
+    inset: (f32, f32),
 ) {
+    // `hug`: a flyout panel is sized BY its content, so `width`/`height` are a
+    // ceiling rather than the box to fill.
     let lt = arena.overlay_layout.take();
-    let lt = compute_in(lt, arena, root, width, height, scale);
+    let lt = compute_in(lt, arena, root, width, height, scale, true, origin, inset);
     arena.overlay_layout = Some(lt);
 }
 
@@ -93,6 +104,9 @@ fn compute_in(
     width: f32,
     height: f32,
     scale: f32,
+    hug: bool,
+    origin: (f32, f32),
+    inset: (f32, f32),
 ) -> LayoutTree {
     let scale = scale.max(0.01);
     // The persistent tree is moved OUT of the arena for the pass: the measure
@@ -107,7 +121,7 @@ fn compute_in(
     // and the whole tree rebuilds. Without the stamp a stale `NodeId` would
     // index a fresh Taffy slotmap and panic (or, worse, alias a live node).
     let mut lt = lt.unwrap_or_else(LayoutTree::new);
-    measure_solve(arena, &mut lt, root, width, height, scale);
+    measure_solve(arena, &mut lt, root, width, height, scale, hug, origin, inset);
     apply(arena, &lt.solved, root, scale);
     // Re-stack composition children before the tree goes home: `sync` borrows
     // the arena mutably and `lt`'s scratch buffer mutably, which is only two
@@ -131,6 +145,9 @@ fn measure_solve(
     width: f32,
     height: f32,
     scale: f32,
+    hug: bool,
+    origin: (f32, f32),
+    inset: (f32, f32),
 ) {
     rebuild_text(arena, root);
     resolve_align(arena, root, false, false);
@@ -139,18 +156,29 @@ fn measure_solve(
     let Some(root_taffy) = lt.walk_root(arena, root) else {
         return;
     };
-    let Some(viewport) = lt.viewport(width, height, root_taffy) else {
+    let Some(viewport) = lt.viewport(width, height, root_taffy, hug) else {
         return;
     };
     let tree = &mut lt.tree;
 
     let arena_ref = &*arena;
-    let _ = tree.compute_layout_with_measure(
-        viewport,
+    // A hugging viewport is offered MAX-CONTENT: a definite box is what makes
+    // Star tracks and stretched children expand to fill, which is exactly what
+    // an overlay must not do. Its `max_size` still clamps the result.
+    let offered = if hug {
+        Size {
+            width: AvailableSpace::MaxContent,
+            height: AvailableSpace::MaxContent,
+        }
+    } else {
         Size {
             width: AvailableSpace::Definite(width),
             height: AvailableSpace::Definite(height),
-        },
+        }
+    };
+    let _ = tree.compute_layout_with_measure(
+        viewport,
+        offered,
         |known, available, _node_id, ctx, _style| {
             if let (Some(w), Some(h)) = (known.width, known.height) {
                 return Size { width: w, height: h };
@@ -274,7 +302,23 @@ fn measure_solve(
         },
     );
 
-    solve_walk(arena, &lt.tree, &mut lt.solved, root, 0.0, 0.0, 0.0, 0.0, scale);
+    // `ox/oy` accumulate into the absolute rect; `sox/soy` are the snapped
+    // parent origin the relative offset is measured from. Seeding the second as
+    // `origin - inset` makes the root's `rel` come out as exactly `inset` — the
+    // offset it needs inside the container it was adopted into — while its rect
+    // lands at `origin` in window space. The window root passes zeros for both
+    // and is unaffected.
+    solve_walk(
+        arena,
+        &lt.tree,
+        &mut lt.solved,
+        root,
+        origin.0,
+        origin.1,
+        origin.0 - inset.0,
+        origin.1 - inset.1,
+        scale,
+    );
 }
 
 /// One node's placement, as the measure + solve half hands it to [`apply`]:
@@ -707,6 +751,10 @@ pub(crate) struct LayoutTree {
     viewport: Option<NodeId>,
     vp_size: (f32, f32),
     vp_child: Option<NodeId>,
+    /// Whether this tree's viewport sizes to its content (an overlay) rather
+    /// than filling the space given (the window). Part of the viewport's style
+    /// identity, so a change re-pushes it.
+    vp_hug: bool,
     /// Reused stack of child ids, so a pass allocates nothing: each `walk`
     /// frame pushes its children's ids above `base` and truncates back on exit.
     scratch: Vec<NodeId>,
@@ -729,6 +777,7 @@ impl LayoutTree {
             viewport: None,
             vp_size: (f32::NAN, f32::NAN),
             vp_child: None,
+            vp_hug: false,
             scratch: Vec::new(),
             order: Vec::new(),
             solved: rustc_hash::FxHashMap::default(),
@@ -888,19 +937,21 @@ impl LayoutTree {
     /// Star then resolves against the inflated height and inner ScrollViewers
     /// never receive a bounded extent. The zero-floor cell clamps the root to
     /// the window; overflow scrolls.
-    fn viewport(&mut self, width: f32, height: f32, root: NodeId) -> Option<NodeId> {
+    fn viewport(&mut self, width: f32, height: f32, root: NodeId, hug: bool) -> Option<NodeId> {
         let vp = match self.viewport {
             Some(v) => v,
             None => {
-                let v = self.tree.new_leaf(viewport_style(width, height)).ok()?;
+                let v = self.tree.new_leaf(viewport_style(width, height, hug)).ok()?;
                 self.viewport = Some(v);
                 self.vp_size = (width, height);
+                self.vp_hug = hug;
                 v
             }
         };
-        if self.vp_size != (width, height) {
-            let _ = self.tree.set_style(vp, viewport_style(width, height));
+        if self.vp_size != (width, height) || self.vp_hug != hug {
+            let _ = self.tree.set_style(vp, viewport_style(width, height, hug));
             self.vp_size = (width, height);
+            self.vp_hug = hug;
         }
         if self.vp_child != Some(root) {
             let _ = self.tree.set_children(vp, &[root]);
@@ -910,7 +961,27 @@ impl LayoutTree {
     }
 }
 
-fn viewport_style(width: f32, height: f32) -> Style {
+fn viewport_style(width: f32, height: f32, hug: bool) -> Style {
+    // An OVERLAY viewport hugs: a flyout panel is sized BY its content, so the
+    // cell is auto and the given extent is only a ceiling. Filling it — which
+    // is exactly what the window viewport must do — gave a 250x90 band panel a
+    // 480x560 box, because the root stretched into every pixel it was offered.
+    if hug {
+        let mut s = Style {
+            display: Display::Grid,
+            max_size: Size {
+                width: length(width),
+                height: length(height),
+            },
+            ..Style::default()
+        };
+        s.grid_template_columns = vec![auto()];
+        s.grid_template_rows = vec![auto()];
+        // The cell hugs, so the item must not stretch into it either.
+        s.justify_items = Some(AlignItems::START);
+        s.align_items = Some(AlignItems::START);
+        return s;
+    }
     let mut s = Style {
         display: Display::Grid,
         size: Size {

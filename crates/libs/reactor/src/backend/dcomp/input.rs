@@ -214,15 +214,14 @@ impl DCompBackend {
         // asked first and wins outright — a control in an open flyout must not
         // lose to whatever the popup happens to be covering.
         //
-        // Its rects were solved at the origin (it is its own layout root), so
-        // the point is rebased into content-local space before the walk.
+        // No rebasing: the subtree is solved at its place in window space
+        // (`host_flyout_content`), so its rects are directly comparable.
         if let Some(root) = self.hosted_flyout
             && let Some(popup) = self.popup.as_ref()
             && popup.contains(x, y)
         {
-            let (ox, oy) = popup.content_origin();
             let mut best = None;
-            self.hit_walk(root, x - ox, y - oy, &mut best, kind);
+            self.hit_walk(root, x, y, &mut best, kind);
             // Inside the panel but on no control: still a hit for the popup, so
             // the caller must not fall through to the tree underneath it.
             return best;
@@ -440,8 +439,11 @@ impl DCompBackend {
     /// Pointer moved to (x, y) DIPs.
     pub(crate) fn on_pointer_move(&mut self, x: f32, y: f32) {
         set_last_pointer(x, y);
-        // While a popup is open, the move only re-highlights its rows.
-        if self.popup.is_some() {
+        // While a MENU popup is open, the move only re-highlights its rows. A
+        // popup hosting live controls falls through to ordinary routing — its
+        // subtree is in the hit-test above everything else, so the controls
+        // inside it hover and drag exactly as they would anywhere.
+        if self.popup.is_some() && self.hosted_flyout.is_none() {
             let hit = self.popup.as_ref().and_then(|p| p.hit(x, y));
             if let Some(p) = &mut self.popup {
                 p.set_hovered(hit, &self.comp);
@@ -718,13 +720,18 @@ impl DCompBackend {
     /// Left button down. Returns whether the pointer should be captured.
     pub(crate) fn on_pointer_down(&mut self, x: f32, y: f32) -> bool {
         set_last_pointer(x, y);
-        // Popup open: outside-click light-dismisses; inside is handled on up.
+        // Popup open: outside-click light-dismisses. For a menu, inside is
+        // handled on up; for a popup hosting live controls, inside falls
+        // through so the press reaches the control under it.
         if self.popup.is_some() {
             let inside = self.popup.as_ref().is_some_and(|p| p.contains(x, y));
             if !inside {
                 self.close_popup();
+                return false;
             }
-            return false;
+            if self.hosted_flyout.is_none() {
+                return false;
+            }
         }
 
         // Pressing the overlay scrollbar thumb starts a drag-to-scroll (the thumb
@@ -917,8 +924,10 @@ impl DCompBackend {
             return;
         }
 
-        // Popup open: a click on a row selects it, then dismisses.
-        if self.popup.is_some() {
+        // Popup open: a click on a row selects it, then dismisses. A popup
+        // hosting live controls has no rows to commit and must NOT dismiss on
+        // release — releasing a slider drag inside it is not a selection.
+        if self.popup.is_some() && self.hosted_flyout.is_none() {
             let hit = self.popup.as_ref().and_then(|p| p.hit(x, y));
             if let Some(idx) = hit {
                 self.commit_popup(idx);
@@ -1514,7 +1523,18 @@ impl DCompBackend {
     fn measure_flyout_content(&mut self, root: ControlId) -> Option<(f32, f32)> {
         let scale = self.scale();
         let (avail_w, avail_h) = self.flyout_avail();
-        layout::compute_overlay(&mut self.arena, root, avail_w, avail_h, scale);
+        // Solved at the origin: this pass exists only to learn the size the
+        // panel must be built to. `host_flyout_content` re-solves at the
+        // content's real place once the panel exists.
+        layout::compute_overlay(
+            &mut self.arena,
+            root,
+            avail_w,
+            avail_h,
+            scale,
+            (0.0, 0.0),
+            (0.0, 0.0),
+        );
         let n = self.arena.get(root)?;
         let (w, h) = (n.rect.w, n.rect.h);
         (w > 0.0 && h > 0.0).then_some((w, h))
@@ -1537,8 +1557,24 @@ impl DCompBackend {
         if popup.adopt(&vis).is_err() {
             return;
         }
+        let origin = popup.content_origin();
         self.hosted_flyout = Some(root);
         let scale = self.scale();
+        // Re-solve now that the panel is placed, so every node's rect is in
+        // WINDOW space. The whole input pipeline — hit-testing, slider
+        // scrubbing, pointer capture — reads `node.rect` as window
+        // coordinates; content-local rects would hit-test against the wrong
+        // point and scrub from the wrong origin.
+        let (aw, ah) = self.flyout_avail();
+        layout::compute_overlay(
+            &mut self.arena,
+            root,
+            aw,
+            ah,
+            scale,
+            origin,
+            Popup::content_inset(),
+        );
         let _ = paint::paint(
             &self.comp,
             &mut self.cache,
