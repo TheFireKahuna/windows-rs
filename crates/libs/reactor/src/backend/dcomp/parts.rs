@@ -1707,6 +1707,26 @@ impl PartPlan {
         self
     }
 
+    /// The focus ring's two rungs, at `base` (inner) and `base + 1` (outer).
+    ///
+    /// One call because the two are one thing: a ring is a light stroke inside a
+    /// dark one, and a plan that placed only one rung would render a ring that
+    /// reads correctly against exactly one backdrop.
+    fn focus_ring(self, base: usize, focused: bool, w: f32, h: f32, r: f32, scale: f32) -> Self {
+        let [inner, outer] = focus_ring_slots(focused, w, h, r, scale);
+        self.above(base, inner).above(base + 1, outer)
+    }
+
+    /// The ring a self-sized control takes: the whole node, at its own radius.
+    ///
+    /// The four kinds that spell it this way are the four whose focus target IS
+    /// the control. Expander and Hyperlink pass their own box instead — an
+    /// expander rings its header strip, not the expanded body under it.
+    fn node_focus_ring(self, base: usize, node: &Node, scale: f32) -> Self {
+        let r = super::controls::focus_radius(node);
+        self.focus_ring(base, node.focus_ring, node.rect.w, node.rect.h, r, scale)
+    }
+
     /// The slot plans, for tests asserting where a control decided its chrome
     /// belongs.
     pub(crate) fn slots(&self) -> (&[Option<SlotPlan>], &[Option<SlotPlan>]) {
@@ -2063,8 +2083,6 @@ pub(crate) fn button_plan(node: &Node, scale: f32) -> PartPlan {
         })
         .unwrap_or_else(SlotPlan::hidden);
 
-    let ring = focus_ring_slots(node.focus_ring, w, h, radius, scale);
-
     PartPlan::new([w, h, 0.0])
         .below(slot::FILL, fill)
         .below(slot::BORDER, border)
@@ -2075,8 +2093,7 @@ pub(crate) fn button_plan(node: &Node, scale: f32) -> PartPlan {
                 .snap_at(box_rect, ink_target(node))
             .fading(),
         )
-        .above(slot::RING_INNER, ring[0].clone())
-        .above(slot::RING_OUTER, ring[1].clone())
+        .focus_ring(slot::RING_INNER, node.focus_ring, w, h, radius, scale)
 }
 
 /// The focus visual as two parts rather than a draw, for any control that owns
@@ -2218,12 +2235,9 @@ pub(crate) fn badge_plan(node: &Node, scale: f32) -> PartPlan {
 /// affordance is the colour change, not a plate behind it.
 pub(crate) fn hyperlink_plan(node: &Node, scale: f32) -> PartPlan {
     let (w, h) = (node.rect.w, node.rect.h);
-    let ring = focus_ring_slots(node.focus_ring, w, h, theme::RADIUS_SM, scale);
     PartPlan::new([w, h, 0.0])
-        .above(0, ring[0].clone())
-        .above(1, ring[1].clone())
+        .focus_ring(0, node.focus_ring, w, h, theme::RADIUS_SM, scale)
 }
-
 
 
 /// Above: `[hover/press wash]`. The select triggers paint their own fill and
@@ -2327,13 +2341,6 @@ pub(crate) fn toggle_plan(node: &Node, scale: f32) -> PartPlan {
 
     let track = Some((0.0, cy - TRACK_H / 2.0, TRACK_W, TRACK_H));
     let knob = Some((kx, cy - KNOB_D / 2.0, KNOB_D, KNOB_D));
-    let ring = focus_ring_slots(
-        node.focus_ring,
-        node.rect.w,
-        node.rect.h,
-        super::controls::focus_radius(node),
-        scale,
-    );
 
     PartPlan::new([node.rect.w, node.rect.h, 0.0])
         // The two tracks are stacked and cross-fade in place; only their opacity
@@ -2360,8 +2367,7 @@ pub(crate) fn toggle_plan(node: &Node, scale: f32) -> PartPlan {
         // alone, which is what the painted ring it replaces did and what WinUI's
         // own switch does. A ring drawn round the track would read as focusing a
         // different, smaller control than the one the label names.
-        .above(0, ring[0].clone())
-        .above(1, ring[1].clone())
+        .node_focus_ring(0, node, scale)
 }
 
 fn knob_xs() -> (f32, f32) {
@@ -2420,13 +2426,6 @@ pub(crate) fn check_plan(node: &Node, scale: f32) -> PartPlan {
 
     // The ring takes the WHOLE node — box, gap and label — as WinUI's does, and
     // as the painted ring this replaces did.
-    let ring = focus_ring_slots(
-        node.focus_ring,
-        node.rect.w,
-        node.rect.h,
-        super::controls::focus_radius(node),
-        scale,
-    );
 
     PartPlan::new([node.rect.w, node.rect.h, 0.0])
         .below(
@@ -2440,8 +2439,7 @@ pub(crate) fn check_plan(node: &Node, scale: f32) -> PartPlan {
             0,
             AtlasKey::check(CHECK_BOX_D, theme::w(1.0), scale).snap_at(box_rect, t).fading(),
         )
-        .above(1, ring[0].clone())
-        .above(2, ring[1].clone())
+        .node_focus_ring(1, node, scale)
 }
 
 // ── Slider ───────────────────────────────────────────────────────────────────
@@ -2895,13 +2893,6 @@ pub(crate) fn segmented_plan(node: &Node, scale: f32) -> PartPlan {
     let pill = seg_rect(sel);
     let k_pill = AtlasKey::hbar(pill_h, seg_radius, 0.0, pill_fill, scale);
     let k_ink = AtlasKey::hbar(pill_h, seg_radius, 0.0, theme::w(1.0), scale);
-    let ring = focus_ring_slots(
-        node.focus_ring,
-        w,
-        h,
-        super::controls::focus_radius(node),
-        scale,
-    );
 
     // Segment boundaries move when a label re-measures, so the edge checksum
     // joins the size: the pill must jump to boundaries that changed under it
@@ -2927,8 +2918,7 @@ pub(crate) fn segmented_plan(node: &Node, scale: f32) -> PartPlan {
         )
         // The ring rings the TRAY, not the selected segment: focus is on the
         // bar, and the selection already has the pill to show where it is.
-        .above(0, ring[0].clone())
-        .above(1, ring[1].clone())
+        .node_focus_ring(0, node, scale)
 }
 
 fn seg_ink_target(node: &Node) -> f32 {
@@ -3211,8 +3201,6 @@ pub(crate) fn expander_plan(node: &Node, scale: f32) -> PartPlan {
     let r = theme::RADIUS_MD;
     let strip = Some((0.0, 0.0, w, header_h));
 
-    let ring = focus_ring_slots(node.focus_ring, w, header_h, r, scale);
-
     PartPlan::new([w, node.rect.h, 0.0])
         .below(
             0,
@@ -3225,11 +3213,13 @@ pub(crate) fn expander_plan(node: &Node, scale: f32) -> PartPlan {
         )
         .above(
             0,
-            AtlasKey::hbar(header_h, r, 0.0, theme::w(1.0), scale).snap_at(strip, ink_target(node))
-            .fading(),
+            AtlasKey::hbar(header_h, r, 0.0, theme::w(1.0), scale)
+                .snap_at(strip, ink_target(node))
+                .fading(),
         )
-        .above(1, ring[0].clone())
-        .above(2, ring[1].clone())
+        // The header strip, not the node: a ring around an expanded body would
+        // ring content the expander does not own.
+        .focus_ring(1, node.focus_ring, w, header_h, r, scale)
 }
 
 // ── Progress (bar + ring) ────────────────────────────────────────────────────
