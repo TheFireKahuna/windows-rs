@@ -83,6 +83,34 @@ windows_core::link!("user32.dll" "system" fn ValidateRect(hwnd : HWND, lprect : 
 windows_core::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u32, lphandles : *const HANDLE, bwaitall : windows_core::BOOL, dwmilliseconds : u32) -> u32);
 pub type ATOM = u16;
 #[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnimationController(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    AnimationController,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(AnimationController, CompositionObject);
+impl windows_core::RuntimeType for AnimationController {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IAnimationController>();
+}
+unsafe impl windows_core::Interface for AnimationController {
+    type Vtable = <IAnimationController as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IAnimationController as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for AnimationController {
+    type Target = IAnimationController;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for AnimationController {
+    const NAME: &'static str = "Windows.UI.Composition.AnimationController";
+}
+unsafe impl Send for AnimationController {}
+unsafe impl Sync for AnimationController {}
+#[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AnimationIterationBehavior(pub i32);
 impl AnimationIterationBehavior {
@@ -1621,6 +1649,19 @@ pub const HTTOPRIGHT: u32 = 14;
 pub const HTTRANSPARENT: i32 = -1;
 pub type HWND = *mut core::ffi::c_void;
 windows_core::imp::define_interface!(
+    IAnimationController,
+    IAnimationController_Vtbl,
+    0xc934efd2_0722_4f5f_a4e2_9510f3d43bf7
+);
+impl windows_core::RuntimeType for IAnimationController {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IAnimationController_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
     ICompositionAnimation,
     ICompositionAnimation_Vtbl,
     0x464c4c2c_1caa_4061_9b40_e13fde1503ca
@@ -2526,6 +2567,40 @@ pub struct ICompositionObject2_Vtbl {
     pub SetImplicitAnimations: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionObject4,
+    ICompositionObject4_Vtbl,
+    0x0bb3784c_346b_4a7c_966b_7310966553d5
+);
+impl windows_core::RuntimeType for ICompositionObject4 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionObject4 {
+    pub(crate) fn TryGetAnimationController(
+        &self,
+        propertyname: &str,
+    ) -> windows_core::Result<AnimationController> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TryGetAnimationController)(
+                windows_core::Interface::as_raw(self),
+                core::mem::transmute_copy(&windows_core::HSTRING::from(propertyname)),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionObject4_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub TryGetAnimationController: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
@@ -10131,6 +10206,7 @@ pub const SIZE_MAXIMIZED: u32 = 2;
 pub const SIZE_MINIMIZED: u32 = 1;
 pub const SM_CXPADDEDBORDER: u32 = 92;
 pub const SM_CYFRAME: u32 = 33;
+pub const SPI_GETCARETWIDTH: u32 = 8198;
 pub const SPI_GETCLIENTAREAANIMATION: u32 = 4162;
 pub const SWP_FRAMECHANGED: u32 = 32;
 pub const SWP_NOACTIVATE: u32 = 16;

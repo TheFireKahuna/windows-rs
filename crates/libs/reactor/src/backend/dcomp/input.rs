@@ -2553,8 +2553,12 @@ impl DCompBackend {
     /// Set keyboard focus. `visible` shows the focus ring (keyboard) vs. not
     /// (pointer). Repaints the old + new node.
     fn set_focus(&mut self, id: Option<ControlId>, visible: bool) {
+        // Re-entering with the same target is still work when the RING changes
+        // (click a field that Tab already reached: focus stands, the ring goes).
         if self.focused_id == id
-            && self.focused_id.is_some_and(|f| self.node(f).is_some_and(|n| n.focused == visible))
+            && self
+                .focused_id
+                .is_some_and(|f| self.node(f).is_some_and(|n| n.focused && n.focus_ring == visible))
         {
             return;
         }
@@ -2579,13 +2583,18 @@ impl DCompBackend {
             && let Some(n) = self.node_mut(old)
         {
             n.focused = false;
+            n.focus_ring = false;
             n.mark_dirty();
         }
         self.focused_id = id;
         if let Some(new) = id
             && let Some(n) = self.node_mut(new)
         {
-            n.focused = visible;
+            // Focus is focus however it was reached; only the RING distinguishes
+            // a click from a Tab. Conflating them is what left a clicked field
+            // with no caret and no visible selection.
+            n.focused = true;
+            n.focus_ring = visible;
             // Keyboard focus (Tab) selects the whole field for quick replace.
             if visible
                 && let Some(e) = &mut n.editor

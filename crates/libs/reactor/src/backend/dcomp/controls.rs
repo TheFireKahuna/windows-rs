@@ -1039,22 +1039,74 @@ fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect
 /// painted text clips to. `None` when the node is not an editor. Consumed by
 /// `parts::sync_caret` to place the caret sprite.
 ///
-/// Takes its origin and line height from [`editor::TextBand`], which is the
-/// same answer the painter draws the run at — so the caret cannot drift from
-/// the text it sits in.
-pub(crate) fn editor_caret_box(node: &Node) -> Option<Rect> {
+/// Vertical extent comes from DirectWrite ([`editor::Editor::caret_geom`]) once
+/// a layout exists, and from [`editor::TextBand`]'s fallback before that — the
+/// same band the painter draws the run at, so the caret cannot drift from the
+/// text it sits in either way.
+pub(crate) fn editor_caret_box(node: &Node, scale: f32) -> Option<Rect> {
     let ed = node.editor.as_ref()?;
     let band = editor::TextBand::of(node)?;
-    let caret_x = band.origin_x + ed.caret_x();
-    // A 1-DIP bar centred on the caret position, kept inside the clip column.
+    // Before the first layout there is nothing to ask, so the band answers.
+    // Its fallback line height is what the caret is placed by for that whole
+    // window, which is why `TextBand` refuses to let it collapse.
+    let geom = ed.caret_geom();
+    let caret_x = band.origin_x + geom.map_or_else(|| ed.caret_x(), |g| g.x);
+    let (top, height) = match geom {
+        Some(g) => (band.origin_y + g.top, g.height),
+        None => (band.origin_y, band.text_h),
+    };
+    Some(caret_box(&band, caret_x, top, height, editor::caret_width(), scale))
+}
+
+/// The caret rect from scalars alone — no node, no layout, no device, so the
+/// arithmetic every caret inherits is exhaustively testable. Same split
+/// [`editor::TextBand::compute`] uses, and for the same reason.
+///
+/// # Why the bar straddles the insertion point
+///
+/// It is centred on `caret_x`, not started there. That is what Microsoft's own
+/// DirectWrite editor sample does (PadWrite `GetCaretRect`:
+/// `rect.left = caretX - caretThickness / 2`), and the reason is only visible
+/// once the thickness is not 1: the caret marks a *boundary between* two
+/// characters, so a wide one must grow into both sides. Started at the boundary
+/// instead, a 10-DIP accessibility caret would sit entirely on top of the
+/// character after it and hide it — the thickness setting exists to make the
+/// caret easier to see, and that arrangement makes it eat the text.
+///
+/// # Why every edge is snapped
+///
+/// A bar at a fractional pixel offset is resolved as two partly-lit columns:
+/// dimmer, wider, and smeared toward whichever side got the larger fraction.
+/// The caret is the thinnest thing on screen and so the most sensitive to it.
+/// Snapping happens AFTER centring, so the half-thickness offset can never
+/// reintroduce a fraction.
+fn caret_box(
+    band: &editor::TextBand,
+    caret_x: f32,
+    top: f32,
+    height: f32,
+    width_dip: f32,
+    scale: f32,
+) -> Rect {
+    // A non-finite scale would poison every coordinate through `snap`; a
+    // non-finite position or height would reach a visual's Offset/Size, where
+    // the failure is not a misplaced caret but one that stops compositing.
+    let px = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let snap = |dip: f32| (dip * px).round() / px;
+    let finite = |v: f32, fallback: f32| if v.is_finite() { v } else { fallback };
+
+    // Whole physical pixels, never zero — the bar is exactly as wide as it is lit.
+    let w = (finite(width_dip, 1.0).max(0.0) * px).round().max(1.0) / px;
+    let h = snap(finite(height, 0.0).max(1.0 / px));
+
     let lo = band.content_x;
-    let x = (caret_x - 0.5).clamp(lo, (lo + band.content_w - 1.0).max(lo));
-    Some(Rect::from_xywh(
-        x,
-        band.origin_y + 1.0,
-        1.0,
-        (band.text_h - 2.0).max(1.0),
-    ))
+    // The column the painted run is clipped to. A caret at the very end of a
+    // full field would otherwise sit past the clip, drawing over the border or
+    // the spin buttons — the one place the sprite has no clip of its own to
+    // stop it, since it is a sibling of the text host rather than a child.
+    let hi = (lo + band.content_w - w).max(lo);
+    let x = snap(finite(caret_x, lo) - w / 2.0).clamp(snap(lo), snap(hi));
+    Rect::from_xywh(x, snap(finite(top, 0.0)), w, h)
 }
 
 /// Two stacked up/down chevrons on the trailing edge of a wide `NumberBox`.
@@ -1128,8 +1180,112 @@ fn paint_expander(session: &DrawingSession, brush: &Brush, node: &Node, rect: Re
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_radius;
+    use super::{caret_box, editor::TextBand, resolve_radius};
+    use crate::backend::ControlKind;
     use crate::PILL_RADIUS;
+
+    // ── Caret geometry ───────────────────────────────────────────────────────
+    //
+    // `caret_box` is the whole of the caret's arithmetic, and none of it needs a
+    // device. What these pin is not "the numbers are these numbers" but the four
+    // properties a caret is wrong without: it lands on the pixel grid, it
+    // straddles the insertion point, it stays inside the clip, and no input can
+    // make it uncompositable.
+
+    /// A 200×32 left-aligned TextBox band, scrolled to the origin.
+    fn band() -> TextBand {
+        TextBand::compute(ControlKind::TextBox, 200.0, 32.0, 14.0, Some(19.0), 0.0)
+    }
+
+    /// Every edge on a whole physical pixel, at every scale a display reports.
+    /// A fractional edge is what makes a 1-DIP bar render as two dim columns.
+    #[test]
+    fn every_edge_lands_on_the_physical_pixel_grid() {
+        let b = band();
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            // A deliberately awkward sub-pixel caret position.
+            let r = caret_box(&b, 51.337, 6.5, 19.0, 1.0, scale);
+            for (name, v) in [("x", r.left), ("y", r.top), ("w", r.width()), ("h", r.height())] {
+                let px = v * scale;
+                assert!(
+                    (px - px.round()).abs() < 1e-3,
+                    "{name}={v} is {px} physical px at scale {scale} — not a whole pixel"
+                );
+            }
+        }
+    }
+
+    /// Centred on the insertion point, as PadWrite's `GetCaretRect` does. At the
+    /// default thickness this is half a pixel; at an accessibility thickness it
+    /// is the difference between marking the boundary and covering the glyph
+    /// after it.
+    #[test]
+    fn the_bar_straddles_the_insertion_point() {
+        let b = band();
+        for width in [1.0, 2.0, 5.0, 10.0] {
+            let r = caret_box(&b, 80.0, 6.0, 19.0, width, 1.0);
+            let centre = r.left + r.width() / 2.0;
+            assert!(
+                (centre - 80.0).abs() <= 0.5,
+                "a {width}-DIP caret centred at {centre}, not on the insertion point 80"
+            );
+        }
+    }
+
+    /// The sprite is a sibling of the text host, not a child, so it inherits no
+    /// clip — this clamp is the only thing keeping a caret at the end of a full
+    /// field off the border and the spin column.
+    #[test]
+    fn the_bar_stays_inside_the_content_column() {
+        let b = band();
+        let lo = b.content_x;
+        let hi = b.content_x + b.content_w;
+        for x in [-500.0, -1.0, 0.0, 95.0, 1000.0] {
+            let r = caret_box(&b, x, 6.0, 19.0, 3.0, 1.5);
+            assert!(r.left >= lo - 0.01, "caret at x={x} escaped left ({} < {lo})", r.left);
+            assert!(r.right <= hi + 0.01, "caret at x={x} escaped right ({} > {hi})", r.right);
+        }
+    }
+
+    /// A NaN reaching a visual's Offset or Size does not misplace the caret —
+    /// it stops the caret compositing at all, silently. Nothing may propagate.
+    #[test]
+    fn no_input_can_produce_a_non_finite_or_empty_box() {
+        let b = band();
+        let bad = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.0];
+        for v in bad {
+            for r in [
+                caret_box(&b, v, 6.0, 19.0, 1.0, 1.0),
+                caret_box(&b, 50.0, v, 19.0, 1.0, 1.0),
+                caret_box(&b, 50.0, 6.0, v, 1.0, 1.0),
+                caret_box(&b, 50.0, 6.0, 19.0, v, 1.0),
+                caret_box(&b, 50.0, 6.0, 19.0, 1.0, v),
+            ] {
+                assert!(
+                    r.left.is_finite() && r.top.is_finite(),
+                    "{v} produced a non-finite origin: {r:?}"
+                );
+                assert!(
+                    r.width() > 0.0 && r.height() > 0.0,
+                    "{v} produced an invisible caret: {r:?}"
+                );
+            }
+        }
+    }
+
+    /// The thickness setting must actually reach the pixels — this is the whole
+    /// point of reading `SPI_GETCARETWIDTH`, and a caret that ignores it is
+    /// invisible to the user who turned it up because they could not see it.
+    #[test]
+    fn the_thickness_setting_widens_the_bar() {
+        let b = band();
+        let w1 = caret_box(&b, 50.0, 6.0, 19.0, 1.0, 1.0).width();
+        let w5 = caret_box(&b, 50.0, 6.0, 19.0, 5.0, 1.0).width();
+        assert_eq!(w1, 1.0);
+        assert_eq!(w5, 5.0);
+        // And it scales with the display, rather than shrinking as density rises.
+        assert_eq!(caret_box(&b, 50.0, 6.0, 19.0, 5.0, 2.0).width(), 5.0);
+    }
 
     #[test]
     fn pill_radius_resolves_to_half_the_height() {

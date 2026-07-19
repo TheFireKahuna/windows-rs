@@ -322,9 +322,10 @@ fn indeterminate_yields_the_lane_to_the_sweep() {
 // ── Button family ────────────────────────────────────────────────────────────
 
 /// Focus rings sit OUTSIDE the control's bounds — an inset ring eats into the
-/// button's own face — and they exist only while focused.
+/// button's own face — and they exist only while the focus VISUAL is asked for,
+/// which is not the same as having focus (a pointer press focuses silently).
 #[test]
-fn focus_rings_sit_outside_the_button_and_only_when_focused() {
+fn focus_rings_sit_outside_the_button_and_only_when_ringed() {
     let mut a = harness();
     let id = a.insert(K::Button).unwrap();
     a.set_rect(id, 120.0, 32.0);
@@ -333,7 +334,7 @@ fn focus_rings_sit_outside_the_button_and_only_when_focused() {
     assert_eq!(blurred.above[1].unwrap().rect, None, "no ring while blurred");
     assert_eq!(blurred.above[1].unwrap().opacity, 0.0);
 
-    a.set_focused(id, true);
+    a.set_focus_ring(id, true);
     let focused = a.part_plan(id, 1.0).unwrap();
     let inner = focused.above[1].unwrap().rect.expect("focused places the inner ring");
     let outer = focused.above[2].unwrap().rect.expect("focused places the outer ring");

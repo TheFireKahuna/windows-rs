@@ -55,7 +55,7 @@ use crate::system_bindings::{
     AnimationIterationBehavior, CompositionAnimation, CompositionBrush, CompositionClip,
     CompositionDrawingSurface, CompositionEasingFunction, CompositionNineGridBrush,
     CompositionObject, CompositionSurfaceBrush, ICompositionAnimation, ICompositionObject,
-    ICompositor2, ICompositor4, IKeyFrameAnimation,
+    ICompositionObject4, ICompositor4, IKeyFrameAnimation,
     CompositionBatchTypes, CompositionScopedBatch, ISpringVector2NaturalMotionAnimation,
     ISpringVector3NaturalMotionAnimation, IVector2NaturalMotionAnimation,
     IVector3NaturalMotionAnimation, IVisual, InsetClip, SpringVector2NaturalMotionAnimation,
@@ -649,41 +649,148 @@ fn draw_shape(session: &DrawingSession, brush: &Brush, shape: &ShapeKey, w: f32,
 /// believed it owned. There is now no way to express that halfway state: every
 /// transition is one call, named for what actually happened to the property.
 mod channel {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     /// The property token an animation was started on (`"Offset"`, `"Offset.X"`,
     /// …) — the exact token a snap has to `StopAnimation`.
     pub(super) type Prop = &'static str;
 
+    /// What this channel actually KNOWS about the property.
+    ///
+    /// The distinction this enum exists to force is between a value that
+    /// LANDED and a value that was merely ASKED for. Both used to be one
+    /// `Option<(f32, f32)>`, and a gate that cannot tell them apart will
+    /// suppress the very write that would repair a sprite whose animation was
+    /// accepted and then never ran.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Known {
+        /// Nothing. The next write must be unconditional.
+        Nothing,
+        /// A plain write of this value was accepted by the compositor and no
+        /// animation stands between it and the visual. The ONLY state that is
+        /// evidence of a position.
+        Verified((f32, f32)),
+        /// An animation this part owns was accepted and is driving `prop`
+        /// toward this DESTINATION. It says where the sprite is going, never
+        /// where it is.
+        ///
+        /// `from` is where the motion BEGAN — the last verified point before
+        /// the sprite left it — and it survives retargeting. It is the only
+        /// honest figure to measure a move against while one is in flight: the
+        /// sprite is somewhere between `from` and `to`, so measuring the next
+        /// move from `to` would size it against a distance the sprite has not
+        /// travelled yet.
+        Animating {
+            prop: Prop,
+            from: (f32, f32),
+            to: (f32, f32),
+            flight: u32,
+        },
+        /// An out-of-band animation owns `prop` and this channel does not track
+        /// its value at all — the progress sweep, the slider fill derivation.
+        Ceded(Prop),
+    }
+
     pub(super) struct Channel {
-        /// The last target REQUESTED, not where the visual is: while `animated`
-        /// is set this is not evidence of anything (see [`super::Part::place`]).
-        target: Option<(f32, f32)>,
-        /// The property an animation may currently hold.
-        animated: Option<Prop>,
+        known: Known,
+        /// Bumped per glide. The completion callback reports the generation it
+        /// was armed for, so a stale completion cannot verify a destination
+        /// that has since been superseded.
+        flight: u32,
+        /// The generation the compositor last reported COMPLETE. Written by a
+        /// callback that outlives the borrow which armed it, hence the `Rc`.
+        settled: Rc<Cell<u32>>,
     }
 
     impl Channel {
-        pub(super) const fn new() -> Self {
-            Self { target: None, animated: None }
+        pub(super) fn new() -> Self {
+            Self { known: Known::Nothing, flight: 0, settled: Rc::new(Cell::new(0)) }
+        }
+
+        /// Fold in a completion the compositor has reported: an animation that
+        /// RAN to its destination has proven the position, so the destination
+        /// it was heading to becomes verified.
+        ///
+        /// This is the whole of why `Animating` is allowed to suppress a
+        /// retarget at all — the claim expires by being confirmed.
+        fn absorb(&mut self) {
+            if let Known::Animating { to, flight, .. } = self.known
+                && self.settled.get() == flight
+            {
+                self.known = Known::Verified(to);
+            }
         }
 
         /// Has this channel ever been written? A first write must snap —
         /// mounting must never fly in from the visual's zeroed defaults.
         pub(super) fn placed(&self) -> bool {
-            self.target.is_some()
+            self.known != Known::Nothing
         }
 
-        /// The last requested target, if one is still meaningful.
-        pub(super) fn target(&self) -> Option<(f32, f32)> {
-            self.target
+        /// The value is KNOWN to be `t`. The only state that may suppress a
+        /// plain write of the same value.
+        pub(super) fn verified_at(&mut self, t: (f32, f32)) -> bool {
+            self.absorb();
+            matches!(self.known, Known::Verified(v) if v == t)
+        }
+
+        /// Whether the CACHE claims a spring is flying to `t`.
+        ///
+        /// A claim, not a fact — the spring may have died. Its only job is to
+        /// decide whether asking the compositor for the truth could change
+        /// anything, so the query stays off the common path.
+        pub(super) fn claims_flight_to(&mut self, t: (f32, f32)) -> bool {
+            self.absorb();
+            matches!(self.known, Known::Animating { to, .. } if to == t)
+        }
+
+        /// Whether a retarget to `t` must be issued, GIVEN whether the
+        /// compositor still has an animation on this property.
+        ///
+        /// `live` is an OBSERVATION, passed in rather than assumed, which is the
+        /// whole point: the policy stays a pure function of state plus one fact,
+        /// and the only impure part of the decision is the single query that
+        /// answers it. A bound on how long a claim may suppress would have been
+        /// approximating this fact with a clock — early for a long flight, late
+        /// for a dead one, and arbitrary in both directions.
+        ///
+        /// Discovering `live == false` under a flight claim also RETIRES the
+        /// claim: it has been proven false, so it must not go on suppressing
+        /// anything, including a later snap.
+        pub(super) fn needs_retarget(&mut self, t: (f32, f32), live: bool) -> bool {
+            self.absorb();
+            match self.known {
+                // Already there, verifiably.
+                Known::Verified(v) if v == t => false,
+                Known::Animating { to, .. } if to == t => {
+                    if live {
+                        // Genuinely in flight: re-issuing would restart the
+                        // spring from zero velocity and leave it crawling.
+                        false
+                    } else {
+                        self.known = Known::Nothing;
+                        true
+                    }
+                }
+                _ => true,
+            }
         }
 
         /// Begin an authoritative snap: yields the property token the caller
-        /// MUST stop (if any) and leaves the channel un-animated. A `Some`
-        /// result also means the cached target is stale, so the caller must
-        /// write unconditionally.
+        /// MUST stop (if any) and drops every claim. A `Some` result means the
+        /// value left behind is unknown, so the caller must write
+        /// unconditionally.
         #[must_use]
         pub(super) fn begin_snap(&mut self) -> Option<Prop> {
-            self.animated.take()
+            let held = match self.known {
+                Known::Animating { prop, .. } | Known::Ceded(prop) => Some(prop),
+                Known::Nothing | Known::Verified(_) => None,
+            };
+            if held.is_some() {
+                self.known = Known::Nothing;
+            }
+            held
         }
 
         /// Record a plain property write of `t`, given the RESULT of the COM
@@ -695,18 +802,57 @@ mod channel {
         /// the cache claims `t` arrived, and every later request for `t` is then
         /// dropped as redundant.
         pub(super) fn wrote(&mut self, t: (f32, f32), write: windows_core::Result<()>) {
-            match write {
-                Ok(()) => self.target = Some(t),
+            self.known = match write {
+                Ok(()) => Known::Verified(t),
                 // An unknown value is left behind, so the next write must be
-                // unconditional — which is exactly what `reclaimed` says.
-                Err(_) => self.reclaimed(),
+                // unconditional.
+                Err(_) => Known::Nothing,
+            };
+        }
+
+        /// Arm a glide, yielding the generation its completion must report.
+        pub(super) fn arming(&mut self) -> u32 {
+            self.flight = self.flight.wrapping_add(1);
+            self.flight
+        }
+
+        /// The cell a completion callback reports its flight number into.
+        pub(super) fn settle_cell(&self) -> Rc<Cell<u32>> {
+            self.settled.clone()
+        }
+
+        /// The point a move should be MEASURED from: where the sprite verifiably
+        /// is, or — while it is in flight — where that flight began.
+        ///
+        /// Never the in-flight destination. The sprite has not arrived there, so
+        /// sizing the next move against it under-measures by exactly the
+        /// distance still to be covered, and an under-measured move is given a
+        /// duration far too short for the ground it has to make up.
+        ///
+        /// Not evidence of a position, which is why it is separate from
+        /// [`verified_at`](Self::verified_at).
+        pub(super) fn travel_origin(&self) -> Option<(f32, f32)> {
+            match self.known {
+                Known::Verified(v) => Some(v),
+                Known::Animating { from, .. } => Some(from),
+                Known::Nothing | Known::Ceded(_) => None,
             }
         }
 
-        /// A spring this `Part` owns now drives `prop` toward `t`.
-        pub(super) fn animating(&mut self, prop: Prop, t: (f32, f32)) {
-            self.target = Some(t);
-            self.animated = Some(prop);
+        /// A spring this `Part` owns, armed at `flight`, now drives `prop` to `t`.
+        ///
+        /// A RETARGET keeps the origin of the flight already in progress. The
+        /// sprite has not reached the old destination, so the new move is still
+        /// the same journey from the same place, and sizing it from the
+        /// abandoned destination would pick a duration for a sliver of travel
+        /// while the sprite crosses the whole span — which is a jump.
+        pub(super) fn animating(&mut self, prop: Prop, t: (f32, f32), flight: u32) {
+            let from = match self.known {
+                Known::Verified(v) => v,
+                Known::Animating { from, .. } => from,
+                Known::Nothing | Known::Ceded(_) => t,
+            };
+            self.known = Known::Animating { prop, from, to: t, flight };
         }
 
         /// Hand `prop` to an OUT-OF-BAND animation whose value this part does
@@ -715,16 +861,229 @@ mod channel {
         /// the cached target no longer describes the visual (so it must not
         /// suppress a later write) AND a snap must stop `prop`.
         pub(super) fn ceded(&mut self, prop: Prop) {
-            self.target = None;
-            self.animated = Some(prop);
+            self.known = Known::Ceded(prop);
         }
 
         /// The caller has ALREADY stopped whatever held the property. Nothing
         /// animates it now, but the value it left behind is unknown, so the next
         /// write must be unconditional.
         pub(super) fn reclaimed(&mut self) {
-            self.target = None;
-            self.animated = None;
+            self.known = Known::Nothing;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const A: (f32, f32) = (1.0, 2.0);
+        const B: (f32, f32) = (30.0, 4.0);
+
+        fn ok() -> windows_core::Result<()> {
+            Ok(())
+        }
+        fn err() -> windows_core::Result<()> {
+            Err(windows_core::Error::from_hresult(windows_core::HRESULT(-1)))
+        }
+
+        /// THE invariant. A channel may suppress a write of `t` only when it has
+        /// evidence for `t` — a write that landed, or an animation confirmed to
+        /// have reached it. Every other state must let the write through, because
+        /// the write is the only thing that can repair a stranded sprite.
+        #[test]
+        fn only_evidence_suppresses_a_write() {
+            let mut c = Channel::new();
+            assert!(!c.verified_at(A), "a fresh channel knows nothing");
+
+            c.wrote(A, ok());
+            assert!(c.verified_at(A), "a landed write is evidence");
+            assert!(!c.verified_at(B), "and only of the value it landed");
+
+            c.wrote(B, err());
+            assert!(!c.verified_at(B), "a FAILED write is never evidence");
+            assert!(!c.verified_at(A), "and it invalidates what came before");
+        }
+
+        /// An accepted animation is a destination, not a position: it may hold
+        /// off a duplicate retarget, but it must never pass as proof the sprite
+        /// arrived.
+        #[test]
+        fn an_accepted_animation_is_not_a_position() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            let flight = c.arming();
+            c.animating("Offset", B, flight);
+
+            assert!(c.claims_flight_to(B), "a retarget to the same destination is redundant");
+            assert!(!c.verified_at(B), "but the sprite is NOT known to be there");
+            assert!(!c.verified_at(A), "nor still where it started");
+        }
+
+        /// The claim expires by being confirmed: a completion for the live
+        /// generation promotes the destination to evidence.
+        #[test]
+        fn a_completed_animation_becomes_evidence() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            let flight = c.arming();
+            let cell = c.settle_cell();
+            c.animating("Offset", B, flight);
+
+            cell.set(flight);
+            assert!(c.verified_at(B), "an animation that ran proves the position");
+        }
+
+        /// A completion for a superseded flight must not verify anything — the
+        /// sprite is on its way somewhere else entirely.
+        #[test]
+        fn a_stale_completion_verifies_nothing() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            let stale = c.arming();
+            let cell = c.settle_cell();
+            let live = c.arming();
+            c.animating("Offset", B, live);
+
+            cell.set(stale);
+            assert!(!c.verified_at(B), "a stale completion is not evidence");
+            assert!(c.claims_flight_to(B), "and the live flight is untouched");
+        }
+
+        /// A snap drops every claim and reports what it must stop. Crucially an
+        /// animating channel yields its property AND stops being evidence, so
+        /// the caller writes unconditionally.
+        #[test]
+        fn a_snap_drops_every_claim() {
+            let mut c = Channel::new();
+            let flight = c.arming();
+            c.animating("Offset", B, flight);
+            assert_eq!(c.begin_snap(), Some("Offset"));
+            assert!(!c.verified_at(B) && !c.claims_flight_to(B), "nothing survives a snap");
+
+            // A verified channel has nothing to stop, and stays evidence: a
+            // redundant snap to the same value really is redundant.
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            assert_eq!(c.begin_snap(), None);
+            assert!(c.verified_at(A));
+        }
+
+        /// Ceded and reclaimed both mean "the value here is unknown", so neither
+        /// may suppress. Ceded additionally names a property a snap must stop.
+        #[test]
+        fn ceded_and_reclaimed_are_never_evidence() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            c.ceded("Offset.X");
+            assert!(!c.verified_at(A), "a ceded channel tracks nothing");
+            assert_eq!(c.begin_snap(), Some("Offset.X"), "but a snap must stop it");
+
+            c.wrote(A, ok());
+            c.reclaimed();
+            assert!(!c.verified_at(A));
+            assert_eq!(c.begin_snap(), None, "already stopped by the caller");
+        }
+
+        /// A LIVE flight to the same destination suppresses the retarget —
+        /// re-issuing would restart the spring from zero velocity.
+        #[test]
+        fn a_live_flight_suppresses_a_duplicate_retarget() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            let f = c.arming();
+            c.animating("Offset", B, f);
+
+            assert!(!c.needs_retarget(B, true), "still flying there; leave it alone");
+            assert!(c.needs_retarget(A, true), "a DIFFERENT destination always retargets");
+        }
+
+        /// THE case a bound would only have approximated. The claim says a
+        /// spring is flying to `B`; the compositor says nothing animates the
+        /// property. The claim is false, so the retarget must be issued — now,
+        /// not after some number of syncs — and the false claim must be retired
+        /// so it cannot suppress a later snap either.
+        #[test]
+        fn a_dead_flight_is_retired_the_moment_it_is_observed_dead() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            let f = c.arming();
+            c.animating("Offset", B, f);
+
+            assert!(c.needs_retarget(B, false), "a dead spring must not suppress");
+            assert!(!c.verified_at(B), "and it never became evidence");
+            assert!(
+                !c.claims_flight_to(B),
+                "the disproven claim is retired, so it cannot suppress a snap either",
+            );
+        }
+
+        /// The observation is only consulted where it can change the answer:
+        /// a channel with no flight claim to `t` retargets regardless of it.
+        #[test]
+        fn liveness_is_irrelevant_without_a_matching_claim() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            assert!(c.needs_retarget(B, true));
+            assert!(c.needs_retarget(B, false));
+            assert!(!c.claims_flight_to(B), "nothing to ask the compositor about");
+        }
+
+        /// A completed flight outranks liveness: the animation is gone precisely
+        /// BECAUSE it arrived, and that must read as evidence, not as death.
+        #[test]
+        fn a_completed_flight_is_evidence_not_a_dead_one() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+            let f = c.arming();
+            let cell = c.settle_cell();
+            c.animating("Offset", B, f);
+            cell.set(f);
+
+            assert!(!c.needs_retarget(B, false), "it arrived; do not move it again");
+            assert!(c.verified_at(B));
+        }
+
+        /// Clicking again while the sprite is still travelling must not resize
+        /// the move down to the sliver between the abandoned destination and the
+        /// new one — the sprite is still back near where it started, and a
+        /// duration picked for a sliver makes it cross the whole span at once.
+        /// That is the second-click jump.
+        #[test]
+        fn a_mid_flight_retarget_measures_from_where_the_motion_began() {
+            let mut c = Channel::new();
+            c.wrote(A, ok());
+
+            let f1 = c.arming();
+            c.animating("Offset", B, f1);
+            assert_eq!(c.travel_origin(), Some(A), "the flight began at A");
+
+            // Retarget mid-flight to a point just past B.
+            let past_b = (B.0 + 1.0, B.1);
+            let f2 = c.arming();
+            c.animating("Offset", past_b, f2);
+            assert_eq!(
+                c.travel_origin(),
+                Some(A),
+                "still the same journey from A — NOT the abandoned destination B",
+            );
+
+            // Only arrival re-bases it.
+            let cell = c.settle_cell();
+            cell.set(f2);
+            assert!(c.verified_at(past_b));
+            assert_eq!(c.travel_origin(), Some(past_b), "arrival re-bases the origin");
+        }
+
+        /// `placed` gates the first-write snap, so it must be true for every
+        /// state that has touched the property and false only at birth.
+        #[test]
+        fn placed_is_false_only_at_birth() {
+            let mut c = Channel::new();
+            assert!(!c.placed());
+            c.wrote(A, ok());
+            assert!(c.placed());
+            c.reclaimed();
+            assert!(!c.placed(), "a reclaimed channel must snap again");
         }
     }
 }
@@ -752,6 +1111,10 @@ pub(crate) struct Part {
     // Cached retargetable motion springs, built on first glide.
     s_off: Option<SpringVector3NaturalMotionAnimation>,
     s_size: Option<SpringVector2NaturalMotionAnimation>,
+    /// Keep the settle subscriptions alive: an `EventRevoker` revokes its
+    /// handler on drop, so a dropped one is a completion that never arrives —
+    /// and a destination that never becomes evidence.
+    _settle: [Option<windows_core::EventRevoker>; 2],
 }
 
 impl Part {
@@ -772,6 +1135,51 @@ impl Part {
             op_gliding: false,
             s_off: None,
             s_size: None,
+            _settle: [None, None],
+        })
+    }
+
+    /// Scope `start` in a batch and report its completion back into `settled` as
+    /// `flight`, so an animation that RAN can promote its destination to evidence.
+    ///
+    /// Without this, `Channel::animating` would be a claim nothing could ever
+    /// confirm, and a spring that was accepted but never ran would suppress the
+    /// retarget that would have repaired it — forever, for that destination.
+    /// Whether the compositor still has an animation driving `prop`.
+    ///
+    /// The authoritative answer to "is my claim still true", asked instead of
+    /// guessed: `TryGetAnimationController` fails once nothing animates the
+    /// property. A timeout would only ever have been approximating this — never
+    /// exactly at the moment the flight ended, and arbitrary in how far off it
+    /// was — whereas this is neither early nor late.
+    fn animation_live(&self, prop: &str) -> bool {
+        self.obj
+            .cast::<ICompositionObject4>()
+            .and_then(|o| o.TryGetAnimationController(prop))
+            .is_ok()
+    }
+
+    fn open_batch(&self) -> Option<CompositionScopedBatch> {
+        self.obj
+            .Compositor()
+            .ok()
+            .and_then(|c| c.CreateScopedBatch(CompositionBatchTypes::Animation).ok())
+    }
+
+    /// Close the batch opened around a glide, reporting its completion back as
+    /// `flight`. Associated rather than a method so it does not contend with the
+    /// `&mut self` the glide itself needs.
+    fn close_batch(
+        batch: Option<CompositionScopedBatch>,
+        settled: std::rc::Rc<std::cell::Cell<u32>>,
+        flight: u32,
+    ) -> Option<windows_core::EventRevoker> {
+        batch.and_then(|b| {
+            b.Completed(move |_, _| {
+                settled.set(flight);
+            })
+            .ok()
+            .filter(|_| b.End().is_ok())
         })
     }
 
@@ -839,7 +1247,7 @@ impl Part {
         if let Some(prop) = off_held {
             let _ = self.obj.StopAnimation(prop);
         }
-        if off_held.is_some() || self.off.target() != Some((x, y)) {
+        if off_held.is_some() || !self.off.verified_at((x, y)) {
             let wrote = self.vis.SetOffset(Vector3::new(x, y, 0.0));
             self.off.wrote((x, y), wrote);
         }
@@ -847,7 +1255,7 @@ impl Part {
         if let Some(prop) = size_held {
             let _ = self.obj.StopAnimation(prop);
         }
-        if size_held.is_some() || self.size.target() != Some((w, h)) {
+        if size_held.is_some() || !self.size.verified_at((w, h)) {
             let wrote = self.vis.SetSize(Vector2::new(w, h));
             self.size.wrote((w, h), wrote);
         }
@@ -860,28 +1268,43 @@ impl Part {
             self.place(x, y, w, h);
             return;
         }
-        if self.off.target() != Some((x, y)) {
-            // Measured from the last target rather than from the visual: while a
-            // glide is in flight the visual is somewhere between the two, and the
-            // target is the only figure this side actually knows.
-            let dist = self
-                .off
-                .target()
-                .map_or(0.0, |(px, py)| (x - px).hypot(y - py));
-            if self.glide_offset(x, y, dist).is_some() {
-                self.off.animating("Offset", (x, y));
+        // Suppress only on EVIDENCE (already there) or on a live flight to the
+        // same destination (re-issuing would reset the spring's velocity and
+        // leave the sprite crawling). A destination merely claimed by an
+        // animation that never ran is neither, so it lets the retarget through
+        // — which is what repairs it.
+        // The compositor is asked whether the claimed flight is still real, and
+        // only when that answer can change the decision — everywhere else the
+        // retarget is unconditional and the query never happens.
+        let live = self.off.claims_flight_to((x, y)) && self.animation_live("Offset");
+        if self.off.needs_retarget((x, y), live) {
+            // Measured from where the motion BEGAN, not from the destination
+            // it is still on its way to — see `travel_origin`.
+            let dist = self.off.travel_origin().map_or(0.0, |(px, py)| (x - px).hypot(y - py));
+            let flight = self.off.arming();
+            let cell = self.off.settle_cell();
+            let batch = self.open_batch();
+            let started = self.glide_offset(x, y, dist);
+            let rev = Self::close_batch(batch, cell, flight);
+            if started.is_some() {
+                self.off.animating("Offset", (x, y), flight);
+                self._settle[0] = rev;
             } else {
                 self.place(x, y, w, h);
                 return;
             }
         }
-        if self.size.target() != Some((w, h)) {
-            let dist = self
-                .size
-                .target()
-                .map_or(0.0, |(pw, ph)| (w - pw).hypot(h - ph));
-            if self.glide_size(w, h, dist).is_some() {
-                self.size.animating("Size", (w, h));
+        let live = self.size.claims_flight_to((w, h)) && self.animation_live("Size");
+        if self.size.needs_retarget((w, h), live) {
+            let dist = self.size.travel_origin().map_or(0.0, |(pw, ph)| (w - pw).hypot(h - ph));
+            let flight = self.size.arming();
+            let cell = self.size.settle_cell();
+            let batch = self.open_batch();
+            let started = self.glide_size(w, h, dist);
+            let rev = Self::close_batch(batch, cell, flight);
+            if started.is_some() {
+                self.size.animating("Size", (w, h), flight);
+                self._settle[1] = rev;
             } else {
                 self.place(x, y, w, h);
             }
@@ -2834,24 +3257,42 @@ impl Caret {
     }
 
     /// A square wave on Opacity: solid for `interval_ms`, hidden for
-    /// `interval_ms`, repeated forever — steps(1) easing holds each level and
-    /// jumps at the segment boundary. Runs entirely on the DWM.
+    /// `interval_ms`, repeated forever, evaluated entirely on the DWM. That is
+    /// the Windows caret exactly — `GetCaretBlinkTime` is the time to *invert*
+    /// the caret, i.e. the half period, so the cycle is twice it (530 ms on,
+    /// 530 ms off on a default system).
+    ///
+    /// # Why the level is held by keyframes and not by a step easing
+    ///
+    /// This used to place two keyframes and let a `CreateStepEasingFunction()`
+    /// hold each level between them. It does the opposite: the segment takes
+    /// its END value immediately, so `[0, ½)` — the half that is supposed to be
+    /// the solid one — was already 0. The only frame that ever showed the caret
+    /// was the cycle's first, which is why it read as a single-frame flash once
+    /// per second rather than a blink.
+    ///
+    /// The defaults that decide this (`StepCount`, `InitialStep`, `FinalStep`,
+    /// `IsFinalStepSingleFrame`) are not reachable through the generated
+    /// bindings, so there is nothing to pin them to. Holding each level with a
+    /// keyframe of its own needs none of them: the wave is stated in the values,
+    /// the fall is one duration-ratio wide, and the shape cannot be changed by
+    /// an interpolation default we do not set.
     fn blink(&self, comp: &Compositing, interval_ms: u32) -> Option<()> {
         let compositor = comp.compositor();
         let a = compositor.CreateScalarKeyFrameAnimation().ok()?;
         let kf: IKeyFrameAnimation = a.cast().ok()?;
-        kf.SetDuration(ts_secs(interval_ms as f32 * 2.0 / 1000.0)).ok()?;
+        let cycle_s = interval_ms as f32 * 2.0 / 1000.0;
+        kf.SetDuration(ts_secs(cycle_s)).ok()?;
         kf.SetIterationBehavior(AnimationIterationBehavior::Forever).ok()?;
-        let step: CompositionEasingFunction = compositor
-            .cast::<ICompositor2>()
-            .ok()?
-            .CreateStepEasingFunction()
-            .ok()?
-            .cast()
-            .ok()?;
+        // The edge, as a fraction of the cycle: one composition frame at 120 Hz
+        // is ~8 ms, so an eighth of that is far below anything that can be
+        // sampled — the fall is a jump in every frame the compositor draws, and
+        // stays one even if the blink rate is set to something very fast.
+        let edge = (0.001 / cycle_s.max(0.001)).min(0.01);
         a.InsertKeyFrame(0.0, 1.0).ok()?;
-        a.InsertKeyFrameWithEasingFunction(0.5, 0.0, &step).ok()?;
-        a.InsertKeyFrameWithEasingFunction(1.0, 0.0, &step).ok()?;
+        a.InsertKeyFrame(0.5 - edge, 1.0).ok()?;
+        a.InsertKeyFrame(0.5, 0.0).ok()?;
+        a.InsertKeyFrame(1.0, 0.0).ok()?;
         self.obj
             .StartAnimation("Opacity", &a.cast::<CompositionAnimation>().ok()?)
             .ok()
@@ -2867,24 +3308,20 @@ pub(crate) fn sync_caret(comp: &Compositing, atlas: &mut Atlas, node: &mut Node,
     let show = node.focused
         && node.paint.is_enabled
         && node.editor.as_ref().is_some_and(|e| e.caret_shown);
-    eprintln!("CARETDBG: sync focused={} enabled={} shown_flag={:?}", node.focused, node.paint.is_enabled, node.editor.as_ref().map(|e| e.caret_shown));
     if !show {
         if let Some(c) = &mut node.caret {
             c.hide();
         }
         return;
     }
-    let Some(bx) = super::controls::editor_caret_box(node) else { eprintln!("CARETDBG: no box"); return };
-    eprintln!("CARETDBG: show box={:?} had={}", (bx.left,bx.top,bx.width(),bx.height()), node.caret.is_some());
+    let Some(bx) = super::controls::editor_caret_box(node, scale) else { return };
     if node.caret.is_none() {
         node.caret = Caret::new(comp, node);
-        eprintln!("CARETDBG: created={}", node.caret.is_some());
     }
-    let Some(mut caret) = node.caret.take() else { eprintln!("CARETDBG: take failed"); return };
+    let Some(mut caret) = node.caret.take() else { return };
     caret.bind(comp, atlas, AtlasKey::solid(theme::text(), scale));
     caret.place(bx.left, bx.top, bx.width(), bx.height());
     let moved = node.editor.as_ref().is_some_and(|e| e.caret_moved);
-    eprintln!("CARETDBG: bound={} rect={:?} moved={} shown={}", caret.key.is_some(), caret.rect, moved, caret.shown);
     if moved || !caret.shown {
         caret.start_blink(comp);
     }

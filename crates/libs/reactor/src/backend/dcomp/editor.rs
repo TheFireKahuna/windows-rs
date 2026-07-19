@@ -23,6 +23,63 @@ pub(crate) const SPIN_W: f32 = 18.0;
 /// EQ-band value tiles) — arrow keys / wheel still adjust the value.
 pub(crate) const SPIN_MIN_BOX_W: f32 = 72.0;
 
+/// Where the caret sits inside its layout, as DirectWrite reports it.
+/// Layout-relative DIP; the caller adds the band's origin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CaretGeom {
+    /// The insertion point. The bar straddles this, it does not start at it.
+    pub x: f32,
+    /// Top of the region enclosing the text position.
+    pub top: f32,
+    /// Height of that region — the line height at the caret.
+    pub height: f32,
+}
+
+// ── Caret width (Settings → Accessibility → Text cursor → thickness) ─────────
+
+/// The widest the Settings slider goes. Clamped rather than trusted: this is a
+/// registry-backed value, and a caret wider than the field it sits in would
+/// cover the text it exists to point at.
+const CARET_W_MAX: u32 = 20;
+
+/// Cached `SPI_GETCARETWIDTH`. Read once at host creation and on the
+/// `WM_SETTINGCHANGE` that the thickness slider broadcasts, because
+/// [`caret_width`] is called from the paint path.
+static CARET_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The user's caret thickness, in DIP.
+///
+/// Treated as a LOGICAL width, not physical pixels. The setting exists so a
+/// caret can be *found*, and a fixed pixel count shrinks with display density —
+/// exactly backwards for its purpose. A DIP width is the same apparent size on
+/// every monitor, and at the default of 1 the two readings coincide anyway.
+pub(crate) fn caret_width() -> f32 {
+    CARET_WIDTH.load(std::sync::atomic::Ordering::Relaxed) as f32
+}
+
+/// Re-read the thickness into the cache.
+///
+/// No change signal, unlike [`crate::motion::refresh_reduced_motion`]: the only
+/// caller pairs this with `refresh_caret_blink`, which repaints the focused
+/// field on every `WM_SETTINGCHANGE` regardless, so a "did it change" answer
+/// would gate nothing. A store of the same value is the whole cost.
+///
+/// **Fails open** to 1, the Windows default: a preference that cannot be read
+/// should leave a working caret, not a missing one.
+pub(crate) fn refresh_caret_width() {
+    let mut px: u32 = 1;
+    let ok = unsafe {
+        crate::system_bindings::SystemParametersInfoW(
+            crate::system_bindings::SPI_GETCARETWIDTH,
+            0,
+            (&raw mut px).cast(),
+            0,
+        )
+    };
+    let now = if ok.as_bool() { px.clamp(1, CARET_W_MAX) } else { 1 };
+    CARET_WIDTH.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Per-node editable text state.
 pub(crate) struct Editor {
     /// Document, in UTF-16 code units.
@@ -369,13 +426,31 @@ impl Editor {
 
     /// Caret x within the layout (DIP), via `caret_at`.
     pub fn caret_x(&self) -> f32 {
-        match &self.layout {
-            Some(l) => l
-                .caret_at(self.caret as u32, false)
-                .map(|((x, _), _)| x)
-                .unwrap_or(0.0),
-            None => 0.0,
-        }
+        self.caret_geom().map_or(0.0, |g| g.x)
+    }
+
+    /// The caret's geometry at the insertion point, straight out of DirectWrite
+    /// — `HitTestTextPosition`'s point plus the enclosing region's height.
+    ///
+    /// `None` before the first layout exists, which the caller must answer from
+    /// [`TextBand`]'s fallback rather than by guessing a height here: this
+    /// function's whole value is that it does not guess.
+    ///
+    /// The height is the one DirectWrite reports for the region enclosing the
+    /// text position, which is the line height at that position — the same field
+    /// Microsoft's own DirectWrite editor sample (PadWrite `GetCaretRect`) sizes
+    /// its caret from. Deriving it from the font size instead is what makes a
+    /// caret disagree with the line it sits on the moment anything about the
+    /// run's metrics is not what the derivation assumed.
+    ///
+    /// A non-finite or non-positive height is rejected rather than propagated: a
+    /// NaN reaching a visual's Size is not a wrong caret, it is a caret that
+    /// silently stops being composited.
+    pub fn caret_geom(&self) -> Option<CaretGeom> {
+        let ((x, y), hit) = self.layout.as_ref()?.caret_at(self.caret as u32, false).ok()?;
+        let h = hit.glyph_rect.3;
+        (x.is_finite() && y.is_finite() && h.is_finite() && h > 0.0)
+            .then_some(CaretGeom { x, top: y, height: h })
     }
 
     /// Keep the caret inside the visible content width by adjusting `scroll_x`

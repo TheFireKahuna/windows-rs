@@ -75,6 +75,7 @@ Windows::UI::Composition::ICompositor6::{CreateGeometricClip, CreateGeometricCli
 // ── CompositionObject (animation host) ──
 Windows::UI::Composition::ICompositionObject::{get_Compositor, StartAnimation, StopAnimation}
 Windows::UI::Composition::ICompositionObject2::put_ImplicitAnimations
+Windows::UI::Composition::ICompositionObject4::TryGetAnimationController
 // ── Visual setters ──
 Windows::UI::Composition::IVisual::{put_Size, get_Size, put_Offset, get_Offset, get_Parent, put_Opacity, get_Opacity, put_AnchorPoint, put_CenterPoint, put_Scale, get_Scale, put_RotationAngle, put_IsVisible, put_Clip}
 Windows::UI::Composition::IContainerVisual::get_Children
@@ -205,6 +206,7 @@ Windows::Win32::MINMAXINFO
 Windows::Win32::LoadCursorW
 Windows::Win32::SetCursor
 Windows::Win32::GetCaretBlinkTime
+Windows::Win32::SPI_GETCARETWIDTH
 // ── Motion preference (Accessibility → Visual effects → Animation effects) ──
 Windows::Win32::SystemParametersInfoW
 Windows::Win32::SPI_GETCLIENTAREAANIMATION

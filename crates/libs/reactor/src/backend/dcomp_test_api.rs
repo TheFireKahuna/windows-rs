@@ -995,12 +995,13 @@ impl ArenaHarness {
         })
     }
 
-    /// Stamp the keyboard-focus flag a real focus move would have written.
-    /// Chrome that exists only while focused — the button family's rings — is
-    /// testing the blurred case and nothing else until this has run.
-    pub fn set_focused(&mut self, id: ControlId, focused: bool) {
+    /// Stamp the flag that actually gates the focus VISUAL, which is not the
+    /// same as having focus — a pointer press focuses without ringing.
+    /// The button family's rings test the blurred case and nothing else until
+    /// this has run.
+    pub fn set_focus_ring(&mut self, id: ControlId, on: bool) {
         if let Some(n) = self.arena.get_mut(id) {
-            n.focused = focused;
+            n.focus_ring = on;
         }
     }
 

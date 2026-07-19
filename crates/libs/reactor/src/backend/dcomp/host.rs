@@ -281,6 +281,9 @@ impl DCompHost {
         // Seed the motion preference before anything can animate, so the very
         // first enter transition already honours it.
         crate::motion::refresh_reduced_motion();
+        // The same, for the caret thickness: a field can be focused on the
+        // first frame, and it should be the user's width from the start.
+        editor::refresh_caret_width();
         ensure_dispatcher_queue()?;
 
         let (hwnd, dpi, (pw, ph)) = create_window(title.as_ref(), client_dip)?;
@@ -1140,7 +1143,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             // A caret blink-rate change also broadcasts WM_SETTINGCHANGE:
             // restart the focused field's compositor blink with the new period
-            // (a no-op when no text field is focused).
+            // (a no-op when no text field is focused). The thickness slider is
+            // re-read on the same message; both land through one repaint, and
+            // the width is refreshed FIRST so that repaint already carries it.
+            editor::refresh_caret_width();
             if let Some(s) = shared() {
                 s.backend.borrow_mut().refresh_caret_blink();
             }

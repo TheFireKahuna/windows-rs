@@ -749,8 +749,20 @@ pub(crate) struct Node {
     pub scroll_off: f32,
     /// This node accepts keyboard focus (Tab) + Space/Enter activation.
     pub focusable: bool,
-    /// This node currently holds keyboard focus (draws the focus ring).
+    /// This node currently holds keyboard focus — however it was reached.
+    /// Everything that belongs to *editing* keys off this: the caret sprite,
+    /// the selection wash, the field's accent border, and the guards that stop
+    /// a programmatic write from seeding the buffer out from under the user.
     pub focused: bool,
+    /// Whether the focus is drawn as a ring. Pointer focus is silent (Windows
+    /// shows no ring for a click); keyboard and programmatic focus is not.
+    ///
+    /// This is a strictly narrower thing than [`focused`](Self::focused), and
+    /// the two were one flag until a click-focused field was found to have no
+    /// caret and no visible selection: `focused` was really "ring visible", so
+    /// a mouse click — which suppresses the ring — suppressed the caret with
+    /// it. Only the ring may read this.
+    pub focus_ring: bool,
 
     /// Text-editor state for the editable text kinds (NumberBox / TextBox /
     /// PasswordBox / AutoSuggestBox); `None` for every other kind.
@@ -845,6 +857,7 @@ impl Node {
             scroll_off: 0.0,
             focusable,
             focused: false,
+            focus_ring: false,
             editor: is_text_editable(kind).then(|| Editor::new(kind)),
             title_content: None,
             title_footer: None,
@@ -1007,7 +1020,9 @@ impl Node {
             _ => {
                 self.paint.background.is_some()
                     || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
-                    || self.focused
+                    // A surface bought purely to paint the ring on, so it is
+                    // the ring's flag that buys it — not focus in general.
+                    || self.focus_ring
             }
         }
     }
