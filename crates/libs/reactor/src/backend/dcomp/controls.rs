@@ -389,47 +389,71 @@ pub(crate) fn button_boxes(node: &Node, rect: Rect) -> ButtonBoxes {
     // pair: the badge first when it leads, then the icon. A leading badge is a
     // status lamp for the whole control — "● Live" — so it belongs at the head
     // of the row rather than between the icon and the words it qualifies.
-    let mut x = rect.left + ORNAMENT_INSET;
+    let mut cursor = rect.left + ORNAMENT_INSET;
     let mut placed = 0;
-    let mut advance = |w: f32, x: &mut f32, placed: &mut i32| {
+    let mut advance = |w: f32, cursor: &mut f32, placed: &mut i32| {
         if *placed > 0 {
-            *x += ORNAMENT_GAP;
+            *cursor += ORNAMENT_GAP;
         }
         *placed += 1;
-        let at = *x;
-        *x += w;
+        let at = *cursor;
+        *cursor += w;
         at
     };
 
     let lead_badge = badge_sz
         .filter(|_| leads)
-        .map(|sz| plate(advance(sz.0, &mut x, &mut placed), sz));
+        .map(|sz| plate(advance(sz.0, &mut cursor, &mut placed), sz));
     let icon = has_leading_icon(node)
-        .then(|| advance(ICON_SIZE, &mut x, &mut placed))
+        .then(|| advance(ICON_SIZE, &mut cursor, &mut placed))
         .map(|at| Rect::new(at, rect.top, at + ICON_SIZE, rect.bottom));
-    // One more gap only if a label follows the cluster.
-    if has_label && placed > 0 {
-        x += ORNAMENT_GAP;
-    }
 
     let mut right = rect.right;
     let trail_badge = badge_sz.filter(|_| !leads).map(|sz| {
         let x0 = right - ORNAMENT_INSET - sz.0;
-        right = x0 - if has_label { ORNAMENT_GAP } else { 0.0 };
+        right = x0 - ORNAMENT_GAP;
         plate(x0, sz)
     });
 
-    // An ornament-only button keeps the full box, so a lone icon or badge reads
-    // as centred chrome rather than pinned to one side.
+    // What the ornaments left. The inset above is where an ORNAMENT starts, not
+    // a margin every label pays: a button carrying none keeps its whole box, so
+    // its centred label stays centred on the control rather than drifting by
+    // half the inset.
     let label = if has_label {
-        Rect::new(x, rect.top, right.max(x), rect.bottom)
+        let left = if placed > 0 {
+            cursor + ORNAMENT_GAP
+        } else {
+            rect.left
+        };
+        Rect::new(left, rect.top, right.max(left), rect.bottom)
     } else {
+        // An ornament-only button keeps the full box, so a lone icon or badge
+        // reads as centred chrome rather than pinned to one side.
         rect
     };
     ButtonBoxes {
         icon,
         badge: lead_badge.or(trail_badge),
         label,
+    }
+}
+
+/// What a button's own outline takes out of its box, on each axis.
+///
+/// The stroke is drawn INSIDE the border box — a nine-grid part cut to the full
+/// rect — so a button that draws one has to measure room for it, exactly as CSS
+/// `border-box` reserves a border. Without this an outlined button comes out two
+/// strokes smaller than the same control composed from a `Border` with the same
+/// padding, which is the difference every pill lost on being migrated onto the
+/// family.
+///
+/// Zero for the variants that draw no outline, so a chromeless chip is not
+/// charged for a stroke it never renders.
+pub(crate) fn chrome_inset(node: &Node) -> f32 {
+    if button_palette(node).border.is_some() {
+        2.0 * theme::BORDER_W
+    } else {
+        0.0
     }
 }
 

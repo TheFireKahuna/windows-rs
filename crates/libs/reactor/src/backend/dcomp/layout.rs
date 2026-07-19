@@ -279,10 +279,14 @@ fn measure_solve(
                     // The ornaments widen the button by exactly what
                     // `button_boxes` reserves for them — without this an
                     // adorned button sizes to its label alone and the ornament
-                    // overlaps the text.
+                    // overlaps the text — and the outline takes its own room on
+                    // both axes.
+                    let chrome = controls::chrome_inset(node);
                     return Size {
-                        width: known.width.unwrap_or(tw + controls::ornament_width(node)),
-                        height: known.height.unwrap_or(th),
+                        width: known
+                            .width
+                            .unwrap_or(tw + controls::ornament_width(node) + chrome),
+                        height: known.height.unwrap_or(th + chrome),
                     };
                 }
             }
@@ -446,16 +450,17 @@ fn rebuild_text(arena: &mut Arena, id: ControlId) {
     if needs {
         let (text, size, weight, family, wrap) = {
             let n = arena.get(id).unwrap();
-            // A button is measured exactly as it is drawn: the size floors at
-            // `FONT_SIZE_MD` and the weight comes from the palette — an accent
-            // button sets at 600 — so reading the raw `paint` values here
-            // measured a lighter, smaller run than the one that actually lands,
-            // and the label crowded its padding.
+            // A button's WEIGHT comes from the palette — an accent button sets
+            // at 600 — so reading the raw `paint` value here measured a lighter
+            // run than the one that lands, and the label crowded its padding.
+            //
+            // Its size does not: the family is born at `FONT_SIZE_MD` already,
+            // so a floor here could only ever discard a SMALLER size the app
+            // asked for, which is how `.font_size(..)` came to be silently
+            // inert on the one control most likely to want a small one — a
+            // pill, a chip, a compact toolbar button.
             let (size, weight) = if super::node::is_button_family(n.kind) {
-                (
-                    n.paint.font_size.max(theme::FONT_SIZE_MD),
-                    super::controls::button_palette(n).weight,
-                )
+                (n.paint.font_size, super::controls::button_palette(n).weight)
             } else {
                 (n.paint.font_size, n.paint.font_weight)
             };

@@ -56,6 +56,42 @@ fn no_button_in_the_family_ever_wants_a_surface() {
 
 // ── The badge's own size ─────────────────────────────────────────────────────
 
+/// A plain button's label box is its WHOLE box.
+///
+/// The ornament inset is where an ornament starts, not a margin every label
+/// pays. Charging it unconditionally leaves the box asymmetric, and since the
+/// label is centred *within* it, every unadorned button in the tree renders its
+/// text half an inset off centre — a defect that is obvious once seen and
+/// invisible while reading the code that causes it.
+#[test]
+fn a_button_with_no_ornaments_centres_on_its_whole_box() {
+    let mut a = harness();
+    for kind in [K::Button, K::ToggleButton, K::RepeatButton, K::SplitButton] {
+        let id = a.insert(kind).unwrap();
+        a.apply_prop(id, Prop::Content, &V::Str("Apply".into()));
+        a.set_rect(id, 200.0, 32.0);
+        assert_eq!(
+            a.button_boxes(id).unwrap().label,
+            (0.0, 0.0, 200.0, 32.0),
+            "{kind:?}: the label box is not the whole control"
+        );
+    }
+}
+
+/// Symmetry, stated directly: with one trailing ornament the label box loses
+/// room on the trailing side ONLY. A leading inset creeping in here is the same
+/// off-centre bug wearing a badge.
+#[test]
+fn a_trailing_badge_only_eats_the_trailing_edge() {
+    let mut a = harness();
+    let id = button(&mut a, "Inbox");
+    a.apply_prop(id, Prop::Badge, &V::Badge(Badge::count(4)));
+
+    let b = a.button_boxes(id).unwrap();
+    assert_eq!(b.label.0, 0.0, "the label box lost its leading edge");
+    assert!(b.label.2 < 200.0, "the label box kept its trailing edge");
+}
+
 /// A button with no badge has no badge box — absence is absence, not a
 /// zero-sized plate that later divides by its own height.
 #[test]
