@@ -742,6 +742,60 @@ pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut N
     node.text_part = Some(part);
 }
 
+/// Reconcile a `HyperlinkButton`'s words as retained glyph sprites.
+///
+/// Leading horizontally, centred vertically — the alignment the painted link
+/// used, expressed as an origin rather than as a text format, because a shaped
+/// run carries no alignment of its own once it is placed by hand.
+///
+/// The hover recolour that used to be a repaint is now a `SetSource` on the
+/// shared colour brush: the glyph masks are colourless, so switching a link
+/// from accent to accent-light re-rasterizes nothing.
+pub(crate) fn hyperlink_sync(
+    comp: &Compositing,
+    atlas: &mut GlyphAtlas,
+    node: &mut Node,
+    scale: f32,
+) {
+    if node.kind != crate::backend::ControlKind::HyperlinkButton {
+        return;
+    }
+    let (w, h) = (node.rect.w, node.rect.h);
+    let dim = if node.paint.is_enabled {
+        1.0
+    } else {
+        theme::disabled_opacity()
+    };
+    let ink = if node.hovered {
+        theme::accent_light()
+    } else {
+        theme::accent()
+    };
+
+    let mut part = node.text_part.take().unwrap_or_default();
+    match node.text_layout.as_ref() {
+        Some(layout) => match layout.measure() {
+            Ok((_, th)) => {
+                let origin = (0.0, ((h - th) / 2.0).max(0.0));
+                part.sync(
+                    comp,
+                    atlas,
+                    &node.container,
+                    layout,
+                    origin,
+                    Rect::from_xywh(0.0, 0.0, w, h),
+                    ink,
+                    dim,
+                    scale,
+                );
+            }
+            Err(_) => part.hide_all(),
+        },
+        None => part.hide_all(),
+    }
+    node.text_part = Some(part);
+}
+
 /// Reconcile an editor's text run, its selection highlight and its IME
 /// composition rule as retained sprites.
 ///

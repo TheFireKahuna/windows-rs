@@ -44,7 +44,10 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         | ControlKind::ToggleButton
         | ControlKind::RepeatButton
         | ControlKind::SplitButton => {}
-        ControlKind::HyperlinkButton => paint_hyperlink(session, brush, node, rect, dim),
+        // Fully retained, like the button family: the ring is a part
+        // (`parts::hyperlink_plan`) and the words are glyph sprites, so there is
+        // nothing to draw and `has_chrome` denies it a surface.
+        ControlKind::HyperlinkButton => {}
         // Track, outline, and knob are retained chrome parts (compositor
         // sprites — see `super::parts`); the state label beside them is static
         // text, so it paints here on the node's own surface.
@@ -72,9 +75,9 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         ControlKind::TitleBar => super::caption::paint(session, brush, node, rect),
         _ => return false,
     }
-    // The button family's ring is a retained part, so it is deliberately absent
-    // from this shared tail — see `parts::focus_ring_key`.
-    if node.focused && !super::node::is_button_family(node.kind) {
+    // Kinds whose ring is a retained part are deliberately absent from this
+    // shared tail — see `ring_is_retained`.
+    if node.focus_ring && !ring_is_retained(node.kind) {
         // The accent segmented tray is a stadium — its focus ring follows suit.
         let radius = if node.kind == ControlKind::SelectorBar && node.paint.style_variant == 1 {
             rect.height() / 2.0
@@ -199,6 +202,18 @@ pub(crate) const FOCUS_RING_W: f32 = 2.0;
 pub(crate) fn draw_focus_ring(session: &DrawingSession, brush: &Brush, rect: Rect, radius: f32) {
     let r = Rect::new(rect.left + 1.0, rect.top + 1.0, rect.right - 1.0, rect.bottom - 1.0);
     stroke_rr(session, brush, r, radius, theme::stroke_strong(), FOCUS_RING_W, 1.0);
+}
+
+/// Whether this kind's focus ring is a retained part rather than a draw.
+///
+/// The two rings are NOT the same visual — `draw_focus_ring` strokes once,
+/// INSET into the control; `parts::focus_ring_slots` lays two rings just
+/// outside it, which is the shape `parts::focus_rings` argues for (an inset
+/// ring eats the control's own fill, so a focused control reads as having grown
+/// a border and shrunk). A kind must therefore be on exactly one of them, and
+/// this predicate is the single place that is decided.
+fn ring_is_retained(kind: ControlKind) -> bool {
+    super::node::is_button_family(kind) || kind == ControlKind::HyperlinkButton
 }
 
 fn focus_radius(kind: ControlKind) -> f32 {
@@ -555,24 +570,6 @@ fn paint_toggle_label(session: &DrawingSession, brush: &Brush, node: &Node, rect
         ParagraphAlignment::Center,
         dim,
     );
-}
-
-fn paint_hyperlink(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    // Hover recolor is event-driven (one repaint per flip, no tick) — links
-    // switch colour instantly, as native hyperlinks do.
-    let c = if node.hovered { theme::accent_light() } else { theme::accent() };
-    put(brush, c, dim);
-    let Ok(fmt) = TextFormat::with_weight(
-        "Segoe UI",
-        node.paint.font_size.max(theme::FONT_SIZE_MD),
-        FontWeight(400),
-    ) else {
-        return;
-    };
-    let fmt = fmt
-        .with_alignment(TextAlignment::Leading)
-        .with_paragraph_alignment(ParagraphAlignment::Center);
-    session.draw_text(&node.paint.text, &fmt, &rect, brush);
 }
 
 // ── CheckBox ─────────────────────────────────────────────────────────────────

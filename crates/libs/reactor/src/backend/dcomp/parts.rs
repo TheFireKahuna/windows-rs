@@ -1444,7 +1444,9 @@ pub(crate) fn sync(
         ControlKind::ComboBox | ControlKind::DropDownButton => {
             ink_sync(comp, atlas, node, scale)
         }
-        // HyperlinkButton: painted only (hover recolor is an event repaint).
+        // The link is fully retained: its ring is these parts and its words are
+        // glyph sprites, so it owns no surface at all.
+        ControlKind::HyperlinkButton => hyperlink_sync(comp, atlas, node, scale),
         _ => {}
     }
 }
@@ -1596,21 +1598,7 @@ pub(crate) fn button_plan(node: &Node, scale: f32) -> PartPlan {
         })
         .unwrap_or_else(SlotPlan::hidden);
 
-    // The focus visual as parts rather than a draw: the family owns no surface
-    // to paint one on. Each ring's radius follows the AUTHORED one, grown by
-    // how far out it sits — a ring whose corners disagree with the button
-    // inside it is the most visible way for a custom radius to look broken.
-    let ring = |i: usize| match node.focused.then(|| focus_rings(scale)) {
-        Some(rings) => {
-            let (out, sw, c) = rings[i];
-            SlotPlan::snap(
-                AtlasKey::hbar((h + 2.0 * out).max(0.0), radius + out, sw, c, scale),
-                Some((-out, -out, w + 2.0 * out, h + 2.0 * out)),
-                1.0,
-            )
-        }
-        None => SlotPlan::hidden(),
-    };
+    let ring = focus_ring_slots(node.focus_ring, w, h, radius, scale);
 
     PartPlan::new([w, h, 0.0])
         .below(slot::FILL, fill)
@@ -1625,8 +1613,64 @@ pub(crate) fn button_plan(node: &Node, scale: f32) -> PartPlan {
             )
             .fading(),
         )
-        .above(slot::RING_INNER, ring(0))
-        .above(slot::RING_OUTER, ring(1))
+        .above(slot::RING_INNER, ring[0].clone())
+        .above(slot::RING_OUTER, ring[1].clone())
+}
+
+/// The focus visual as two parts rather than a draw, for any control that owns
+/// no surface to paint one on.
+///
+/// Each ring's radius follows the control's AUTHORED one, grown by how far out
+/// the ring sits — a ring whose corners disagree with the control inside it is
+/// the most visible way for a custom radius to look broken.
+///
+/// This is deliberately the ONLY focus geometry. The painted
+/// `controls::draw_focus_ring` it replaces drew a different visual — a single
+/// stroke INSET into the control — and the inset is what
+/// [`focus_rings`] exists to argue against: it eats the control's own fill, so
+/// a focused control reads as having grown a border and shrunk. Moving a
+/// control to retained chrome therefore also moves it onto the correct ring,
+/// and the two must not be allowed to coexist per-kind.
+pub(crate) fn focus_ring_slots(
+    focused: bool,
+    w: f32,
+    h: f32,
+    radius: f32,
+    scale: f32,
+) -> [SlotPlan; 2] {
+    let Some(rings) = focused.then(|| focus_rings(scale)) else {
+        return [SlotPlan::hidden(), SlotPlan::hidden()];
+    };
+    std::array::from_fn(|i| {
+        let (out, sw, c) = rings[i];
+        SlotPlan::snap(
+            AtlasKey::hbar((h + 2.0 * out).max(0.0), radius + out, sw, c, scale),
+            Some((-out, -out, w + 2.0 * out, h + 2.0 * out)),
+            1.0,
+        )
+    })
+}
+
+/// A `HyperlinkButton`'s whole appearance: the focus ring, and nothing else.
+///
+/// The link's words are glyph sprites and its hover recolour is a `SetSource`
+/// on them, so once the ring is retained there is nothing left for a surface to
+/// hold — which is the point. It takes no ink wash: a hyperlink's hover
+/// affordance is the colour change, not a plate behind it.
+pub(crate) fn hyperlink_plan(node: &Node, scale: f32) -> PartPlan {
+    let (w, h) = (node.rect.w, node.rect.h);
+    let ring = focus_ring_slots(node.focus_ring, w, h, theme::RADIUS_SM, scale);
+    PartPlan::new([w, h, 0.0])
+        .above(0, ring[0].clone())
+        .above(1, ring[1].clone())
+}
+
+fn hyperlink_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {
+    if !ensure(comp, node, 0, 2) {
+        return;
+    }
+    let plan = hyperlink_plan(node, scale);
+    apply(comp, atlas, node, &plan);
 }
 
 fn ink_sync(comp: &Compositing, atlas: &mut Atlas, node: &mut Node, scale: f32) {

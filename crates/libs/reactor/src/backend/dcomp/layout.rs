@@ -276,6 +276,17 @@ fn measure_solve(
                             height: known.height.unwrap_or(th),
                         };
                     }
+                    // A hyperlink is its words and nothing else — no ornament
+                    // to reserve room for, and no border to inset from. The
+                    // generic arm below would run `button_palette` on it to
+                    // decide the latter, which is a question about a control
+                    // this is not.
+                    if node.kind == ControlKind::HyperlinkButton {
+                        return Size {
+                            width: known.width.unwrap_or(tw),
+                            height: known.height.unwrap_or(th),
+                        };
+                    }
                     // The ornaments widen the button by exactly what
                     // `button_boxes` reserves for them — without this an
                     // adorned button sizes to its label alone and the ornament
@@ -461,6 +472,11 @@ pub(crate) fn rebuild_text(arena: &mut Arena, id: ControlId) {
             // pill, a chip, a compact toolbar button.
             let (size, weight) = if super::node::is_button_family(n.kind) {
                 (n.paint.font_size, super::controls::button_palette(n).weight)
+            } else if n.kind == ControlKind::HyperlinkButton {
+                // The floor the painted link applied. Unlike the button family
+                // a hyperlink is NOT born at `FONT_SIZE_MD`, so dropping it
+                // here would shrink every default link.
+                (n.paint.font_size.max(theme::FONT_SIZE_MD), 400)
             } else {
                 (n.paint.font_size, n.paint.font_weight)
             };
@@ -740,6 +756,11 @@ fn is_text(n: &Node) -> bool {
         k if super::node::is_button_family(k) => {
             !n.paint.text.is_empty() || n.extras().icon != 0
         }
+        // A hyperlink's words are glyph sprites, and sprites are placed from a
+        // shaped run — so it needs a layout where the painted link needed only
+        // a string. Without one it renders nothing at all, silently: the sync
+        // has no run to walk and simply hides.
+        ControlKind::HyperlinkButton => !n.paint.text.is_empty(),
         _ => false,
     }
 }

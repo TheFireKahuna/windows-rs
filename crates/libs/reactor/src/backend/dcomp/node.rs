@@ -986,6 +986,10 @@ impl Node {
             // it one is what turns "draws nothing" into "allocates nothing and
             // never enters `BeginDraw`". See `controls::paint`.
             k if is_button_family(k) => false,
+            // A hyperlink is words plus a focus ring, and both are now retained
+            // — the ring as a part, the words as glyph sprites. Same reasoning
+            // as the family above, and it is the whole of the control.
+            ControlKind::HyperlinkButton => false,
             // A TextBlock is its text and nothing else — its paint arm never
             // filled a background or stroked a border — so once the text is
             // glyph sprites there is likewise nothing left for a surface to

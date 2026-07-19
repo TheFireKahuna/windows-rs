@@ -123,6 +123,8 @@ fn paint_node(
                 super::glyph_text::button_sync(comp, glyphs, n, scale);
                 // The same, for the one control that is only text.
                 super::glyph_text::text_sync(comp, glyphs, n, scale);
+                // …and for the one that is only text plus a focus ring.
+                super::glyph_text::hyperlink_sync(comp, glyphs, n, scale);
                 // Editors: the text run, its selection and its composition rule
                 // as sprites, then the caret sprite. Both are placed from the
                 // same `editor::TextBand`, so they cannot disagree.
