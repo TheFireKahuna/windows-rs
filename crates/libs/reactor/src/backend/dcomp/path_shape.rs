@@ -40,23 +40,25 @@
 //!
 //! [mask-docs]: https://learn.microsoft.com/en-us/uwp/api/windows.ui.composition.compositionmaskbrush
 
-use windows_canvas_core::{GpuDevice, PathBuilder, PathFigure, Vector2 as CVec2};
+use windows_canvas_core::{
+    ColorF, DrawingSession, GpuDevice, Matrix3x2, Path, PathBuilder, PathFigure, Vector2 as CVec2,
+};
 use windows_core::{implement_decl, Interface, Ref, Result};
 use windows_numerics::Vector2;
 
 use super::bootstrap::Compositing;
-use super::node::Node;
+use super::node::{linear, Node};
 use crate::system_bindings::{
-    Color as UiColor, CompositionAnimation, CompositionBrush, CompositionMaskBrush,
-    CompositionObject, CompositionPath, CompositionPathGeometry, CompositionShape,
-    CompositionStrokeCap, CompositionSurfaceBrush, CompositionVisualSurface, ICompositionGeometry,
-    ICompositionObject, ICompositionSpriteShape, ICompositionSurface, ICompositor2, ICompositor4,
-    ICompositor5, ICompositorWithVisualSurface, ID2D1Factory, ID2D1Geometry, IGeometrySource2D,
-    IGeometrySource2DInterop, IGeometrySource2DInterop_Impl, IGeometrySource2D_Impl,
-    IScalarNaturalMotionAnimation, ISpringScalarNaturalMotionAnimation, IVisual, ShapeVisual,
-    SpringScalarNaturalMotionAnimation, SpriteVisual, TimeSpan, Visual,
+    Color as UiColor, CompositionAnimation, CompositionBrush, CompositionDrawingSurface,
+    CompositionMaskBrush, CompositionObject, CompositionPath, CompositionPathGeometry,
+    CompositionShape, CompositionStrokeCap, CompositionSurfaceBrush, CompositionVisualSurface,
+    ICompositionGeometry, ICompositionObject, ICompositionSpriteShape, ICompositionSurface,
+    ICompositor2, ICompositor4, ICompositor5, ICompositorWithVisualSurface, ID2D1Factory,
+    ID2D1Geometry, IGeometrySource2D, IGeometrySource2DInterop, IGeometrySource2DInterop_Impl,
+    IGeometrySource2D_Impl, IScalarNaturalMotionAnimation, ISpringScalarNaturalMotionAnimation,
+    IVisual, ShapeVisual, SpringScalarNaturalMotionAnimation, SpriteVisual, TimeSpan, Visual, POINT,
 };
-use crate::{PathData, PathGeometry, PathVerb};
+use crate::{Color, PathData, PathGeometry, PathVerb};
 
 /// Spring tuning for a trim change. Matches the knob's arc so a curve drawing
 /// itself on reads as the same motion system as every other value chrome.
@@ -100,8 +102,7 @@ impl IGeometrySource2DInterop_Impl for PathGeometrySource_Impl {
     }
 }
 
-/// Replay a transported verb stream into a D2D geometry, then wrap it as a
-/// composition path.
+/// Replay a transported verb stream into a D2D [`Path`].
 ///
 /// Returns `None` on a malformed stream (a segment verb with no open figure, or
 /// points exhausted mid-verb) rather than a partial path — a half-drawn curve
@@ -110,11 +111,11 @@ impl IGeometrySource2DInterop_Impl for PathGeometrySource_Impl {
 ///
 /// `filled` picks the figure begin mode, so a filled layer's open figures close
 /// implicitly and a stroked layer's stay open.
-fn build_composition_path(
-    gpu: &GpuDevice,
-    data: &PathData,
-    filled: bool,
-) -> Option<CompositionPath> {
+///
+/// The `Path` is kept, not just its composition wrapper: the glow bake strokes
+/// it into an off-screen bitmap ([`GlowLayer::bake`]), so both consumers replay
+/// the verbs once.
+fn build_d2d_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Option<Path> {
     let pts = data.points();
     let mut builder = Some(PathBuilder::new(gpu).ok()?);
     let mut figure: Option<PathFigure> = None;
@@ -158,10 +159,20 @@ fn build_composition_path(
     if let Some(f) = figure.take() {
         builder = Some(f.end_open());
     }
-    let path = builder.take()?.build().ok()?;
+    builder.take()?.build().ok()
+}
+
+/// Wrap a D2D [`Path`] as a composition path via the one-geometry source.
+fn to_composition_path(path: &Path) -> Option<CompositionPath> {
     let geometry: ID2D1Geometry = path.raw().cast().ok()?;
     let source: IGeometrySource2D = PathGeometrySource { geometry }.into();
     CompositionPath::Create(&source).ok()
+}
+
+/// Replay the verbs and wrap the result as a composition path — the mask
+/// layers' input. See [`build_d2d_path`].
+fn build_composition_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Option<CompositionPath> {
+    to_composition_path(&build_d2d_path(gpu, data, filled)?)
 }
 
 // ── One fill-or-stroke layer ─────────────────────────────────────────────────
@@ -372,10 +383,13 @@ impl PathLayer {
         if unchanged {
             return;
         }
+        // A stop list only ever reaches the FILL layer (the stroke passes `&[]`),
+        // and a curve underfill fades DOWN the plot — so gradients here are
+        // vertical. The flat branch serves the stroke's solid colour.
         let src = if stops.is_empty() {
             super::parts::build_solid_surface(comp, color, scale)
         } else {
-            super::parts::build_gradient_surface(comp, stops, scale)
+            super::parts::build_vgradient_surface(comp, stops, scale)
         };
         let Some(s) = src else { return };
         let Ok(cb) = s.cast::<CompositionBrush>() else { return };
@@ -430,14 +444,169 @@ impl PathLayer {
     }
 }
 
+// ── The glow layer: a pre-blurred FP16 halo ──────────────────────────────────
+
+/// What a baked glow surface currently reflects — its whole rebuild gate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GlowBake {
+    px: (i32, i32),
+    color: [u32; 4],
+    blur: u32,
+    thickness: u32,
+}
+
+fn glow_bits(c: Color) -> [u32; 4] {
+    [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()]
+}
+
+/// A soft glow behind the stroke, as a single **pre-blurred FP16 surface**.
+///
+/// Unlike the mask layers this is not a mask-over-source: the surface already
+/// carries the blurred, tinted halo — colour and alpha both — so it composites
+/// as a plain surface brush. The blur cannot run on the compositor (see the
+/// module header), so it is baked once per geometry / size / colour / thickness
+/// change with the same `D2D1Shadow` primitive the painted glow used: an alpha
+/// blur of the stroke, tinted with the glow colour.
+///
+/// It sits at the BOTTOM of the node's container, so both mask layers draw over
+/// it regardless of creation order.
+struct GlowLayer {
+    display: SpriteVisual,
+    display_vis: IVisual,
+    _surface: Option<CompositionDrawingSurface>,
+    _brush: Option<CompositionSurfaceBrush>,
+    baked: Option<GlowBake>,
+    size: Option<(f32, f32)>,
+}
+
+impl GlowLayer {
+    fn new(comp: &Compositing, node: &Node) -> Option<Self> {
+        let display = comp.new_sprite().ok()?;
+        let display_vis: IVisual = display.cast().ok()?;
+        node.container
+            .Children()
+            .ok()?
+            .InsertAtBottom(&display.cast::<Visual>().ok()?)
+            .ok()?;
+        Some(Self {
+            display,
+            display_vis,
+            _surface: None,
+            _brush: None,
+            baked: None,
+            size: None,
+        })
+    }
+
+    fn resize(&mut self, w: f32, h: f32) {
+        if self.size != Some((w, h)) {
+            let _ = self.display_vis.SetSize(Vector2::new(w, h));
+            self.size = Some((w, h));
+        }
+    }
+
+    /// Bake (or rebake) the halo. Self-gates on the geometry epoch plus every
+    /// input the raster depends on, so a static curve pays once.
+    #[allow(clippy::too_many_arguments)]
+    fn sync(
+        &mut self,
+        comp: &Compositing,
+        path: &Path,
+        geometry_changed: bool,
+        color: Color,
+        blur: f32,
+        thickness: f32,
+        w: f32,
+        h: f32,
+        scale: f32,
+    ) {
+        self.resize(w, h);
+        let px = (((w * scale).round() as i32).max(1), ((h * scale).round() as i32).max(1));
+        let want = GlowBake {
+            px,
+            color: glow_bits(color),
+            blur: blur.to_bits(),
+            thickness: thickness.to_bits(),
+        };
+        if !geometry_changed && self.baked == Some(want) {
+            return;
+        }
+        let Some((surface, brush)) = bake_glow(comp, path, px, color, blur, thickness, scale) else {
+            return;
+        };
+        let Ok(cb) = brush.cast::<CompositionBrush>() else { return };
+        if self.display.SetBrush(&cb).is_ok() {
+            self._surface = Some(surface);
+            self._brush = Some(brush);
+            self.baked = Some(want);
+        }
+    }
+}
+
+/// Draw the stroke into an off-screen FP16 bitmap, blur + tint its alpha, and
+/// composite that halo into a source surface — the retained equivalent of the
+/// painted `effects::glow`, baked once instead of redrawn each frame.
+#[allow(clippy::too_many_arguments)]
+fn bake_glow(
+    comp: &Compositing,
+    path: &Path,
+    px: (i32, i32),
+    color: Color,
+    blur: f32,
+    thickness: f32,
+    scale: f32,
+) -> Option<(CompositionDrawingSurface, CompositionSurfaceBrush)> {
+    let (surface, interop, brush) = comp.new_source_surface(px.0, px.1).ok()?;
+    let mut origin = POINT::default();
+    comp.device_lost.set(false);
+    let ctx = unsafe { interop.BeginDraw(None, &mut origin).ok()? };
+    let session = DrawingSession::from_borrowed_context(
+        &ctx,
+        Matrix3x2::translation(origin.x as f32, origin.y as f32),
+    );
+    let ok = (|| -> Option<()> {
+        // Render the sharp stroke under the pixel scale into a transparent
+        // bitmap; only its alpha feeds the shadow, so WHITE keeps that alpha at
+        // full strength whatever the eventual tint.
+        let scaled =
+            Matrix3x2 { m11: scale, m12: 0.0, m21: 0.0, m22: scale, m31: 0.0, m32: 0.0 };
+        session.set_transform(&scaled);
+        session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
+        let shape = session.create_bitmap_target().ok()?;
+        let white = session.create_solid_brush(ColorF::new(1.0, 1.0, 1.0, 1.0)).ok()?;
+        session.with_target(&shape, || {
+            session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
+            session.draw_path(path, &white, thickness.max(0.5));
+        });
+        // Canvas `shadowBlur` is 2σ (the value the mockups author), so σ = blur/2
+        // — the same halving the painted glow applied. The tint rides the output
+        // colour map like every solid.
+        let halo = session.create_shadow(&shape, blur * 0.5, linear(color)).ok()?;
+        // The shape bitmap already holds scaled pixels: composite it 1:1.
+        session.set_transform(&Matrix3x2 {
+            m11: 1.0,
+            m12: 0.0,
+            m21: 0.0,
+            m22: 1.0,
+            m31: 0.0,
+            m32: 0.0,
+        });
+        session.draw_effect(&halo);
+        Some(())
+    })();
+    unsafe { interop.EndDraw() }.ok().ok()?;
+    ok.map(|()| (surface, brush))
+}
+
 // ── The node's path parts ────────────────────────────────────────────────────
 
-/// A path node's retained chrome: up to two layers, and the geometry they were
-/// built for.
+/// A path node's retained chrome: up to two mask layers, an optional glow, and
+/// the geometry they were built for.
 pub(crate) struct PathParts {
     fill: Option<PathLayer>,
     stroke: Option<PathLayer>,
-    /// The geometry both layers currently hold. Compared by the transported
+    glow: Option<GlowLayer>,
+    /// The geometry all layers currently hold. Compared by the transported
     /// value's own equality, which is pointer-first — an unchanged curve
     /// settles the whole sync in one compare.
     geometry_seen: Option<PathGeometry>,
@@ -448,6 +617,7 @@ impl PathParts {
         Self {
             fill: None,
             stroke: None,
+            glow: None,
             geometry_seen: None,
         }
     }
@@ -537,6 +707,33 @@ fn sync_parts(
             },
         }
     }
+    // ── Glow: a baked FP16 halo BELOW the stroke ──
+    // Follows the stroke — a glow with no line to sit under reads as a smudge —
+    // and needs the stroke's own hollow `Path` to raster, built once here.
+    let want_glow = want_stroke && node.paint.path_glow.is_some();
+    if !want_glow {
+        parts.glow = None;
+    } else {
+        if parts.glow.is_none() {
+            parts.glow = GlowLayer::new(comp, node);
+        }
+        if let (Some(g), Some((color, blur))) = (parts.glow.as_mut(), node.paint.path_glow)
+            && let Some(path) = build_d2d_path(&comp.gpu, geometry.data(), false)
+        {
+            g.sync(
+                comp,
+                &path,
+                geometry_changed,
+                color,
+                blur,
+                node.paint.stroke_thickness,
+                w,
+                h,
+                scale,
+            );
+        }
+    }
+
     parts.geometry_seen = Some(geometry);
 
     // Non-allocating: a node that never had control state reads `EMPTY_CTRL`.

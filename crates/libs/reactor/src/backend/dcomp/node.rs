@@ -127,6 +127,10 @@ pub(crate) struct Paint {
     /// `(TrimStart, TrimEnd)` on that geometry — the draw-on window. Born at
     /// full extent so a path that never mentions trim renders whole.
     pub path_trim: (f32, f32),
+    /// `(colour, blur σ in DIPs)` for a pre-blurred glow behind the stroke, or
+    /// `None`. The glow layer bakes a soft halo of this colour once per geometry
+    /// change; see [`super::path_shape`].
+    pub path_glow: Option<(Color, f32)>,
     /// Text content (TextBlock text or Button label).
     pub text: String,
     pub font_size: f32,
@@ -155,6 +159,7 @@ impl Default for Paint {
             line: LineEndpoints::default(),
             path: None,
             path_trim: (0.0, 1.0),
+            path_glow: None,
             text: String::new(),
             font_size: 0.0,
             font_weight: 0,

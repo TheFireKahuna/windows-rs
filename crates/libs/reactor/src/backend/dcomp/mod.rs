@@ -1325,6 +1325,24 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.paint.path_trim.1 = (*v as f32).clamp(0.0, 1.0);
             node.mark_dirty();
         }
+        // Colour and blur arrive as two writes; keep the other component so the
+        // first of the pair does not bake a halo against a stale partner.
+        (Prop::GlowColor, PropValue::Color(c)) => {
+            let blur = node.paint.path_glow.map_or(0.0, |(_, b)| b);
+            node.paint.path_glow = Some((*c, blur));
+            node.mark_dirty();
+        }
+        (Prop::GlowBlur, PropValue::F64(v)) => {
+            // Colour and blur are emitted as a pair, colour first, so this
+            // partner is normally already present; the transparent fallback only
+            // guards a blur that somehow arrived alone (it bakes nothing).
+            let color = node
+                .paint
+                .path_glow
+                .map_or(crate::Color::new(0.0, 0.0, 0.0, 0.0), |(c, _)| c);
+            node.paint.path_glow = Some((color, *v as f32));
+            node.mark_dirty();
+        }
         (Prop::StyleVariant, PropValue::I32(v)) => {
             node.paint.style_variant = *v;
             node.mark_dirty();
@@ -1982,6 +2000,10 @@ prop_contract! {
         // Back to FULL extent, not zero — see `Paint::default`.
         TrimStart => |n| { n.paint.path_trim.0 = 0.0; n.mark_dirty(); }
         TrimEnd => |n| { n.paint.path_trim.1 = 1.0; n.mark_dirty(); }
+        // Either half unset drops the whole glow — a lone colour or blur is not
+        // a halo, and the baked surface should go with it.
+        GlowColor => |n| { n.paint.path_glow = None; n.mark_dirty(); }
+        GlowBlur => |n| { n.paint.path_glow = None; n.mark_dirty(); }
         StyleVariant => |n| {
             n.paint.style_variant = n.birth_paint().style_variant;
             n.mark_dirty();

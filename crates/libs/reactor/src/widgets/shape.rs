@@ -326,6 +326,32 @@ mod tests {
         ));
     }
 
+    /// A glow emits its colour and blur together — the backend needs both to
+    /// bake the halo, and a colour with no blur (or the reverse) is not a glow.
+    #[test]
+    fn glow_emits_colour_and_blur() {
+        let shape = Shape::path(ShapePath::new().move_to(0.0, 0.0).line_to(1.0, 1.0).build())
+            .glow(Color::rgb(0, 200, 255), 6.0);
+        let b = shape.bindings();
+        assert!(b.iter().any(
+            |b| matches!(b, Binding::Prop(Prop::GlowColor, PropValue::Color(c)) if *c == Color::rgb(0, 200, 255))
+        ));
+        assert!(b.iter().any(
+            |b| matches!(b, Binding::Prop(Prop::GlowBlur, PropValue::F64(v)) if *v == 6.0)
+        ));
+    }
+
+    /// A path with no glow must emit no glow props — an unasked-for halo costs
+    /// a baked FP16 surface, so the default is genuinely nothing.
+    #[test]
+    fn an_unglowed_path_emits_no_glow() {
+        let shape = Shape::path(ShapePath::new().move_to(0.0, 0.0).line_to(1.0, 1.0).build());
+        assert!(!shape
+            .bindings()
+            .iter()
+            .any(|b| matches!(b, Binding::Prop(Prop::GlowColor | Prop::GlowBlur, _))));
+    }
+
     /// An untrimmed path must emit NO trim props, so it takes the backend's
     /// born-at-full-extent default rather than being pinned to one here.
     #[test]
@@ -370,6 +396,11 @@ pub struct Shape {
     /// `end` animates on the compositor, so a curve can draw itself on with no
     /// app frame. `None` leaves the path at full extent.
     pub trim: Option<(f64, f64)>,
+    /// A pre-blurred FP16 glow behind the stroke: `(colour, blur σ in DIPs)`.
+    /// The backend bakes a soft halo of `colour` once per geometry change and
+    /// composites it under the stroke — the FabFilter bloom, retained rather
+    /// than repainted. `None` draws no glow. Only a stroked path glows.
+    pub glow: Option<(Color, f64)>,
 }
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub struct LineEndpoints {
@@ -392,6 +423,7 @@ impl Default for Shape {
             geometry: None,
             fill_gradient: None,
             trim: None,
+            glow: None,
         }
     }
 }
@@ -458,6 +490,11 @@ impl Shape {
         self.trim = Some((start, end));
         self
     }
+    /// Bake a soft glow of `color` (blur σ `blur` DIPs) behind the stroke.
+    pub fn glow(mut self, color: Color, blur: f64) -> Self {
+        self.glow = Some((color, blur));
+        self
+    }
 }
 
 impl Widget for Shape {
@@ -514,6 +551,10 @@ impl Widget for Shape {
         if let Some((start, end)) = self.trim {
             out.push(Binding::Prop(Prop::TrimStart, PropValue::F64(start)));
             out.push(Binding::Prop(Prop::TrimEnd, PropValue::F64(end)));
+        }
+        if let Some((color, blur)) = self.glow {
+            out.push(Binding::Prop(Prop::GlowColor, PropValue::Color(color)));
+            out.push(Binding::Prop(Prop::GlowBlur, PropValue::F64(blur)));
         }
         out
     }
