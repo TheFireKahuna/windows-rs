@@ -180,6 +180,11 @@ pub enum Prop {
     FontSize,
     FontWeight,
     Foreground,
+    /// Pre-blurred FP16 glow behind a path's stroke: the blur standard deviation
+    /// in DIPs. Paired with [`Prop::GlowColor`]; a path with a glow bakes a soft
+    /// halo surface once per geometry change and composites it under the stroke.
+    GlowBlur,
+    GlowColor,
     GradientStops,
     GridColumns,
     GridRows,
