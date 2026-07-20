@@ -404,16 +404,19 @@ impl<B: Backend + 'static> Reconciler<B> {
     }
 
     fn apply_canvas_position(&mut self, id: ControlId, p: CanvasPosition) {
-        // Canvas defaults are 0.0 — only emit when non-zero on mount;
-        // the diff path always emits to overwrite the previous value.
-        if p.left != 0.0 {
-            self.backend
-                .set_prop(id, Prop::AttachedCanvasLeft, &PropValue::F64(p.left));
-        }
-        if p.top != 0.0 {
-            self.backend
-                .set_prop(id, Prop::AttachedCanvasTop, &PropValue::F64(p.top));
-        }
+        // Emit left AND top unconditionally, even at 0.0. This method runs only
+        // when the element actually set a `CanvasPosition` (it is gated on the
+        // attached prop being present), and either prop is what flips the child
+        // to `Position::Absolute` in the backend. A Canvas is a `Display::Block`
+        // panel, so a child that stays relative BLOCK-FLOWS — stacking under its
+        // siblings — instead of pinning to (0,0). Skipping the 0.0 emit left a
+        // child explicitly placed at the origin flowing; a zero-size sibling hid
+        // it (the flow cursor never moved), but a sized one (a filled area)
+        // pushed every later child down by its height.
+        self.backend
+            .set_prop(id, Prop::AttachedCanvasLeft, &PropValue::F64(p.left));
+        self.backend
+            .set_prop(id, Prop::AttachedCanvasTop, &PropValue::F64(p.top));
         if p.z_index != 0 {
             self.backend
                 .set_prop(id, Prop::AttachedCanvasZIndex, &PropValue::I32(p.z_index));
