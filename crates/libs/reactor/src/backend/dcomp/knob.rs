@@ -68,6 +68,17 @@ const NEEDLE_FRAC: f32 = 0.7;
 /// Arc tessellation chord count over the full sweep.
 const ARC_SEGMENTS: u32 = 96;
 
+/// The background groove, wider than the value arc it sits under.
+const RING_WIDTH: f32 = 10.0;
+const TICK_MAJOR_LEN: f32 = 8.0;
+const TICK_MINOR_LEN: f32 = 5.0;
+/// How far inside the arc radius the ticks' outer ends stop.
+const TICK_INSET: f32 = 4.0;
+const TICK_MAJOR_W: f32 = 1.5;
+const TICK_MINOR_W: f32 = 1.0;
+/// Centre hub DIAMETER (the painter drew radius 4.0).
+const HUB_D: f32 = 8.0;
+
 fn ts_secs(s: f32) -> TimeSpan {
     TimeSpan { duration: (s.max(0.001) * 1.0e7) as i64 }
 }
@@ -283,6 +294,240 @@ fn build_arc_path(
     CompositionPath::Create(&source).ok()
 }
 
+/// Tessellate one tick CLASS as a single geometry of N two-point figures.
+///
+/// One geometry rather than one per tick because a tick is two points and a
+/// sprite visual is not: N ticks as N sprites would be N visuals to place and
+/// rotate, and a rotated axis-aligned sprite resamples where a stroked path
+/// rasterizes at the angle it is drawn. Two geometries rather than one because
+/// a sprite shape carries one `StrokeThickness` and a mask layer carries one
+/// colour, and the two classes differ in both.
+///
+/// `None` when the class is empty — a dial with no `major_every` builds only
+/// the minor layer, and a dial with no ticks builds neither.
+fn build_tick_path(
+    gpu: &GpuDevice,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    node: &Node,
+    major: bool,
+) -> Option<CompositionPath> {
+    let ctrl = node.ctrl();
+    let (min, max) = (ctrl.min, ctrl.max);
+    let (start, end) = (ctrl.start_angle, ctrl.end_angle);
+    let is_major = |tv: f64| {
+        ctrl.major_every
+            .filter(|m| *m != 0.0)
+            .is_some_and(|m| (tv % m).abs() < 1e-9)
+    };
+
+    let len = if major { TICK_MAJOR_LEN } else { TICK_MINOR_LEN };
+    let inner = radius - len - TICK_INSET;
+    let outer = radius - TICK_INSET;
+
+    let mut b = PathBuilder::new(gpu).ok()?;
+    let mut any = false;
+    for &tv in ctrl.ticks.iter().filter(|&&tv| is_major(tv) == major) {
+        let a = value_to_angle(tv, min, max, start, end);
+        let (ca, sa) = (a.cos(), a.sin());
+        b = b
+            .begin_hollow(CVec2::new(cx + ca * inner, cy + sa * inner))
+            .line_to(CVec2::new(cx + ca * outer, cy + sa * outer))
+            .end_open();
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    let path = b.build().ok()?;
+    let geometry: ID2D1Geometry = path.raw().cast().ok()?;
+    let source: IGeometrySource2D = ArcGeometrySource { geometry }.into();
+    CompositionPath::Create(&source).ok()
+}
+
+/// A rounded rectangle as a closed path, corners as cubic Béziers.
+///
+/// The knob's focus ring, and the reason it is a path rather than the nine-grid
+/// bar every other control's ring uses: the knob owns no `Parts` band, so it has
+/// no `Part::bind` to set up the grid for it. It does have `ChromeLayer`, which
+/// strokes an arbitrary path — and a ring is one.
+fn build_ring_path(
+    gpu: &GpuDevice,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+) -> Option<CompositionPath> {
+    // Circular-arc control-point ratio: a quarter turn's Bézier handle length.
+    const K: f32 = 0.552_284_75;
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let (x1, y1) = (x + w, y + h);
+    let k = K * r;
+    let path = PathBuilder::new(gpu)
+        .ok()?
+        .begin_hollow(CVec2::new(x + r, y))
+        .line_to(CVec2::new(x1 - r, y))
+        .bezier_to(
+            CVec2::new(x1 - r + k, y),
+            CVec2::new(x1, y + r - k),
+            CVec2::new(x1, y + r),
+        )
+        .line_to(CVec2::new(x1, y1 - r))
+        .bezier_to(
+            CVec2::new(x1, y1 - r + k),
+            CVec2::new(x1 - r + k, y1),
+            CVec2::new(x1 - r, y1),
+        )
+        .line_to(CVec2::new(x + r, y1))
+        .bezier_to(
+            CVec2::new(x + r - k, y1),
+            CVec2::new(x, y1 - r + k),
+            CVec2::new(x, y1 - r),
+        )
+        .line_to(CVec2::new(x, y + r))
+        .bezier_to(
+            CVec2::new(x, y + r - k),
+            CVec2::new(x + r - k, y),
+            CVec2::new(x + r, y),
+        )
+        .close()
+        .build()
+        .ok()?;
+    let geometry: ID2D1Geometry = path.raw().cast().ok()?;
+    let source: IGeometrySource2D = ArcGeometrySource { geometry }.into();
+    CompositionPath::Create(&source).ok()
+}
+
+/// One retained chrome layer: a path stroked opaque white into an off-tree
+/// `ShapeVisual`, snapshotted by a `CompositionVisualSurface`, and used as the
+/// MASK of a `CompositionMaskBrush` whose SOURCE is an FP16 colour surface.
+///
+/// The value arc's chain minus the trim. It is a separate layer per colour
+/// rather than more shapes in the arc's own mask shape, for three reasons, any
+/// one of which is fatal: that mask feeds one `MaskBrush` with one source, so a
+/// ring appended there would render in the ACCENT colour; an untrimmed 10-DIP
+/// band composited into the same mask alpha would swallow the arc's trim
+/// entirely; and the arc's geometry is the trim spring's target, so sharing the
+/// object would trim the ring by the value.
+///
+/// What IS shared is the tessellated `CompositionPath` — the expensive half —
+/// exactly as the thumb already shares it.
+struct ChromeLayer {
+    shape: ICompositionSpriteShape,
+    mask_shape: ShapeVisual,
+    visual_surface: CompositionVisualSurface,
+    mask_brush: CompositionMaskBrush,
+    display_vis: IVisual,
+    _display: SpriteVisual,
+    /// How far outside the node's rect this layer is allowed to paint.
+    ///
+    /// A `ShapeVisual` clips to its own size and a `CompositionVisualSurface`
+    /// captures only the region it is told to, so a layer whose geometry leaves
+    /// the node's bounds is cut at them — which is every focus ring, since a
+    /// ring sits OUTSIDE the control it rings. The layer is therefore grown by
+    /// `bleed` on all four sides and its sprite offset back by the same, and
+    /// callers author such a path already shifted into positive space.
+    ///
+    /// Zero for the dial's own chrome, all of which is inside the bounds.
+    bleed: f32,
+}
+
+impl ChromeLayer {
+    fn new(
+        comp: &Compositing,
+        node: &Node,
+        path: &CompositionPath,
+        width: f32,
+        round_caps: bool,
+        bleed: f32,
+    ) -> Option<Self> {
+        let (w, h) = (node.rect.w + 2.0 * bleed, node.rect.h + 2.0 * bleed);
+        let display = comp.new_sprite().ok()?;
+        let display_vis: IVisual = display.cast().ok()?;
+        let compositor = display.cast::<ICompositionObject>().ok()?.Compositor().ok()?;
+        let c5 = compositor.cast::<ICompositor5>().ok()?;
+        let c2 = compositor.cast::<ICompositor2>().ok()?;
+        let cvs = compositor.cast::<ICompositorWithVisualSurface>().ok()?;
+
+        let geo = c5.CreatePathGeometryWithPath(path).ok()?;
+        let shape_c = c5.CreateSpriteShapeWithGeometry(&geo).ok()?;
+        let shape: ICompositionSpriteShape = shape_c.cast().ok()?;
+        shape.SetStrokeThickness(width).ok()?;
+        if round_caps {
+            shape.SetStrokeStartCap(CompositionStrokeCap::Round).ok()?;
+            shape.SetStrokeEndCap(CompositionStrokeCap::Round).ok()?;
+        }
+        // Opaque white — the mask reads only the alpha channel.
+        let white = compositor
+            .CreateColorBrushWithColor(UiColor { a: 255, r: 255, g: 255, b: 255 })
+            .ok()?;
+        shape.SetStrokeBrush(&white.cast::<CompositionBrush>().ok()?).ok()?;
+
+        let mask_shape = c5.CreateShapeVisual().ok()?;
+        mask_shape.cast::<IVisual>().ok()?.SetSize(Vector2::new(w, h)).ok()?;
+        mask_shape.Shapes().ok()?.Append(&shape_c.cast::<CompositionShape>().ok()?).ok()?;
+
+        let visual_surface = cvs.CreateVisualSurface().ok()?;
+        visual_surface.SetSourceVisual(&mask_shape.cast::<Visual>().ok()?).ok()?;
+        visual_surface.SetSourceOffset(Vector2::new(0.0, 0.0)).ok()?;
+        visual_surface.SetSourceSize(Vector2::new(w, h)).ok()?;
+        let mask_surf = compositor
+            .CreateSurfaceBrushWithSurface(&visual_surface.cast::<ICompositionSurface>().ok()?)
+            .ok()?;
+
+        let mask_brush = c2.CreateMaskBrush().ok()?;
+        mask_brush.SetMask(&mask_surf.cast::<CompositionBrush>().ok()?).ok()?;
+
+        display_vis.SetSize(Vector2::new(w, h)).ok()?;
+        display_vis.SetOffset(Vector3::new(-bleed, -bleed, 0.0)).ok()?;
+        display.SetBrush(&mask_brush.cast::<CompositionBrush>().ok()?).ok()?;
+        node.container
+            .Children()
+            .ok()?
+            .InsertAtTop(&display.cast::<Visual>().ok()?)
+            .ok()?;
+
+        Some(Self {
+            shape,
+            mask_shape,
+            visual_surface,
+            mask_brush,
+            display_vis,
+            _display: display,
+            bleed,
+        })
+    }
+
+    /// Re-point the layer at a freshly tessellated path (a resize, or a tick
+    /// list that changed under it).
+    fn set_path(&mut self, c5: &ICompositor5, path: &CompositionPath) {
+        if let Ok(geo) = c5.CreatePathGeometryWithPath(path) {
+            let _ = self.shape.SetGeometry(&geo);
+        }
+    }
+
+    fn resize(&self, w: f32, h: f32) {
+        let (w, h) = (w + 2.0 * self.bleed, h + 2.0 * self.bleed);
+        let _ = self.mask_shape.cast::<IVisual>().map(|v| v.SetSize(Vector2::new(w, h)));
+        let _ = self.display_vis.SetSize(Vector2::new(w, h));
+        let _ = self.visual_surface.SetSourceSize(Vector2::new(w, h));
+    }
+
+    fn set_color(&self, comp: &Compositing, color: crate::Color, scale: f32) {
+        if let Some(s) = super::parts::build_solid_surface(comp, color, scale)
+            && let Ok(cb) = s.cast::<CompositionBrush>()
+        {
+            let _ = self.mask_brush.SetSource(&cb);
+        }
+    }
+
+    fn set_opacity(&self, a: f32) {
+        let _ = self.display_vis.SetOpacity(a);
+    }
+}
+
 /// Build the thumb's geometry + thick round-capped stroke over `path`. The
 /// trims are driven by expressions bound to the arc's `TrimEnd`
 /// ([`KnobParts::bind_thumb`]); this only establishes the stroke.
@@ -356,6 +601,30 @@ pub(crate) struct KnobParts {
     visual_surface: CompositionVisualSurface,
     needle: SpriteVisual,
     needle_vis: IVisual,
+    /// The untrimmed background groove — the SAME tessellated path the value arc
+    /// rides, stroked wider and in its own mask layer because a mask brush
+    /// carries one colour and the arc's is the accent.
+    ring: Option<ChromeLayer>,
+    ticks_minor: Option<ChromeLayer>,
+    ticks_major: Option<ChromeLayer>,
+    /// The centre hub: a plain disc, so a sprite over an FP16 circle rather than
+    /// a mask layer — three COM objects and a surface capture would be a lot for
+    /// one 8-DIP circle.
+    hub: SpriteVisual,
+    hub_vis: IVisual,
+    /// The focus ring, as the same two concentric strokes every other converted
+    /// control gets — outside the bounds rather than inset into them. Kept at
+    /// zero opacity until focused, so focus is one property write and never a
+    /// rebuild.
+    focus_rings: [Option<ChromeLayer>; 2],
+    /// `(w, h, scale)` the rings were built for. Deliberately NOT `geom`: the
+    /// rings follow the node's full rect and the display scale, where the dial
+    /// follows its own centre and radius, and the two move independently.
+    rings_geom: (f32, f32, f32),
+    /// The tick list and `major_every` the two tick layers were tessellated for.
+    /// Not covered by `geom`, and both are live props, so a tick change with no
+    /// resize would otherwise leave the old tessellation on screen.
+    ticks_seen: (Vec<f64>, Option<f64>),
     grad_epoch: u32,
     /// The ramp the gradient source was last built for, stored EXACTLY.
     ///
@@ -449,11 +718,38 @@ impl KnobParts {
         display_vis.SetSize(Vector2::new(w, h)).ok()?;
         display.SetBrush(&mask_brush.cast::<CompositionBrush>().ok()?).ok()?;
 
+        // Bottom-up: ring, ticks, hub, then the arc and the needle. The painted
+        // chrome used to sit UNDER everything because `new_surface` inserts at
+        // the bottom, so this order reproduces it. Glyph hosts insert at the top
+        // afterwards, which keeps the readout above the hub.
+        let ring = ChromeLayer::new(comp, node, &path, RING_WIDTH, false, 0.0);
+        let ticks_minor = build_tick_path(&comp.gpu, cx, cy, radius, node, false)
+            .and_then(|p| ChromeLayer::new(comp, node, &p, TICK_MINOR_W, false, 0.0));
+        let ticks_major = build_tick_path(&comp.gpu, cx, cy, radius, node, true)
+            .and_then(|p| ChromeLayer::new(comp, node, &p, TICK_MAJOR_W, false, 0.0));
+
+        let hub = comp.new_sprite().ok()?;
+        let hub_vis: IVisual = hub.cast().ok()?;
+        hub_vis.SetSize(Vector2::new(HUB_D, HUB_D)).ok()?;
+        hub_vis.SetOffset(Vector3::new(cx - HUB_D / 2.0, cy - HUB_D / 2.0, 0.0)).ok()?;
+
         let children = node.container.Children().ok()?;
+        children.InsertAtTop(&hub.cast::<Visual>().ok()?).ok()?;
         children.InsertAtTop(&display.cast::<Visual>().ok()?).ok()?;
         children.InsertAtTop(&needle.cast::<Visual>().ok()?).ok()?;
 
         Some(Self {
+            ring,
+            ticks_minor,
+            ticks_major,
+            hub,
+            hub_vis,
+            // Built on first sync, which is where `scale` reaches us — and the
+            // ring's whole geometry is snapped to whole physical pixels, so it
+            // cannot be derived without it.
+            focus_rings: [None, None],
+            rings_geom: (0.0, 0.0, 0.0),
+            ticks_seen: (node.ctrl().ticks.clone(), node.ctrl().major_every),
             mask_shape,
             geo,
             geo_obj,
@@ -494,6 +790,30 @@ impl KnobParts {
         let end = node.ctrl().end_angle;
 
         let resized = self.geom != (cx, cy, radius);
+        // `geom` cannot see this: both are live props, and a dial that gains a
+        // tick without changing size would keep the old tessellation.
+        let ticks_changed = self.ticks_seen.0 != node.ctrl().ticks
+            || self.ticks_seen.1 != node.ctrl().major_every;
+        if resized || ticks_changed {
+            if let Ok(c5) = self
+                .needle
+                .cast::<ICompositionObject>()
+                .and_then(|o| o.Compositor())
+                .and_then(|c| c.cast::<ICompositor5>())
+            {
+                for (layer, major) in [(&mut self.ticks_minor, false), (&mut self.ticks_major, true)]
+                {
+                    if let Some(p) = build_tick_path(&comp.gpu, cx, cy, radius, node, major)
+                        && let Some(l) = layer.as_mut()
+                    {
+                        l.set_path(&c5, &p);
+                    }
+                }
+            }
+            self.ticks_seen.0.clear();
+            self.ticks_seen.0.extend_from_slice(&node.ctrl().ticks);
+            self.ticks_seen.1 = node.ctrl().major_every;
+        }
         if resized {
             if let Some(path) = build_arc_path(&comp.gpu, cx, cy, radius, start, end) {
                 if let Ok(c5) = self
@@ -523,12 +843,76 @@ impl KnobParts {
                     }
                     self.thumb_bound = false;
                 }
+                // The groove rides the very same tessellation.
+                if let Ok(c5) = self
+                    .needle
+                    .cast::<ICompositionObject>()
+                    .and_then(|o| o.Compositor())
+                    .and_then(|c| c.cast::<ICompositor5>())
+                    && let Some(r) = self.ring.as_mut()
+                {
+                    r.set_path(&c5, &path);
+                }
             }
             let _ = self.mask_shape.cast::<IVisual>().map(|v| v.SetSize(Vector2::new(w, h)));
             let _ = self.display_vis.SetSize(Vector2::new(w, h));
             let _ = self.visual_surface.SetSourceSize(Vector2::new(w, h));
+            for l in [self.ring.as_ref(), self.ticks_minor.as_ref(), self.ticks_major.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                l.resize(w, h);
+            }
+            let _ = self
+                .hub_vis
+                .SetOffset(Vector3::new(cx - HUB_D / 2.0, cy - HUB_D / 2.0, 0.0));
             self.place_needle(cx, cy, radius);
             self.geom = (cx, cy, radius);
+        }
+
+        // The focus ring follows the node's full rect and the display scale, not
+        // the dial's centre and radius, so it gets its own gate. Built once and
+        // then held at zero opacity — focus must be a property write, because it
+        // arrives on a Tab and a rebuild there would be visible.
+        if self.rings_geom != (w, h, scale) {
+            let radius = super::controls::focus_radius(node);
+            let rings = super::parts::focus_rings(scale);
+            // One bleed for both, taken from the OUTER ring, so the two layers
+            // share a coordinate origin and cannot drift apart by a half pixel.
+            let bleed = rings[1].0.max(rings[0].0);
+            for (i, (out, sw, _)) in rings.into_iter().enumerate() {
+                // The bounds grown by `out`, then inset by half the stroke —
+                // `ShapeKey::HBar` strokes inset the same way, and this ring has
+                // to agree with every other control's. Shifted by `bleed` so the
+                // whole path sits in positive space: a `ShapeVisual` clips to its
+                // own size, so a ring authored at negative coordinates is cut
+                // away before the surface ever captures it.
+                let (rx, ry) = (bleed - out + sw / 2.0, bleed - out + sw / 2.0);
+                let (rw, rh) = (w + 2.0 * out - sw, h + 2.0 * out - sw);
+                let Some(path) = build_ring_path(&comp.gpu, rx, ry, rw, rh, radius + out) else {
+                    continue;
+                };
+                match self.focus_rings[i].as_mut() {
+                    Some(l) => {
+                        if let Ok(c5) = self
+                            .needle
+                            .cast::<ICompositionObject>()
+                            .and_then(|o| o.Compositor())
+                            .and_then(|c| c.cast::<ICompositor5>())
+                        {
+                            l.set_path(&c5, &path);
+                        }
+                        l.resize(w, h);
+                    }
+                    None => {
+                        if let Some(l) = ChromeLayer::new(comp, node, &path, sw, false, bleed) {
+                            l.set_opacity(0.0);
+                            self.focus_rings[i] = Some(l);
+                        }
+                    }
+                }
+            }
+            self.rings_geom = (w, h, scale);
         }
 
         // FP16 gradient SOURCE (display-mapped) + needle colour: rebind on a
@@ -551,6 +935,26 @@ impl KnobParts {
                 && let Ok(cb) = nb.cast::<CompositionBrush>()
             {
                 let _ = self.needle.SetBrush(&cb);
+            }
+            // The static dial, in the painter's own tokens.
+            if let Some(r) = self.ring.as_ref() {
+                r.set_color(comp, theme::w(0.06), scale);
+            }
+            if let Some(t) = self.ticks_minor.as_ref() {
+                t.set_color(comp, theme::w(0.14), scale);
+            }
+            if let Some(t) = self.ticks_major.as_ref() {
+                t.set_color(comp, theme::w(0.28), scale);
+            }
+            if let Some(hb) = super::parts::build_circle_surface(comp, HUB_D, theme::w(1.0), scale)
+                && let Ok(cb) = hb.cast::<CompositionBrush>()
+            {
+                let _ = self.hub.SetBrush(&cb);
+            }
+            for (i, (_, _, c)) in super::parts::focus_rings(scale).into_iter().enumerate() {
+                if let Some(l) = self.focus_rings[i].as_ref() {
+                    l.set_color(comp, c, scale);
+                }
             }
             self.grad_epoch = atlas_epoch;
             self.stops_seen.clear();
@@ -610,6 +1014,20 @@ impl KnobParts {
         let dim = if node.paint.is_enabled { 1.0 } else { theme::disabled_opacity() };
         let _ = self.display_vis.SetOpacity(dim);
         let _ = self.needle_vis.SetOpacity(dim);
+        for l in [self.ring.as_ref(), self.ticks_minor.as_ref(), self.ticks_major.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            l.set_opacity(dim);
+        }
+        let _ = self.hub_vis.SetOpacity(dim);
+        // Focus is one opacity write on a ring that already exists. Unlike the
+        // dial, it does NOT take `dim`: a disabled control cannot be focused, so
+        // a dimmed ring would only ever be a half-drawn one.
+        let ring_a = if node.focus_ring { 1.0 } else { 0.0 };
+        for l in self.focus_rings.iter().flatten() {
+            l.set_opacity(ring_a);
+        }
     }
 
     fn place_needle(&self, cx: f32, cy: f32, radius: f32) {
