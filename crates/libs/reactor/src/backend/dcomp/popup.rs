@@ -478,6 +478,50 @@ impl Popup {
         None
     }
 
+    /// Whether this popup is a COMMAND menu — the one body shape whose rows are
+    /// exposed to UI Automation as `MenuItem` elements.
+    ///
+    /// A combo's list and a suggestion list are drawn from the same
+    /// [`PopupBody::Menu`] rows, but neither is a menu: a combo's items are
+    /// already exposed as synthetic children of the field itself (they exist
+    /// whether or not the list is open, which is what lets a client read the
+    /// selection without opening anything), and a suggestion list is a
+    /// transient completion over an edit field, not a command surface. Exposing
+    /// either here would give a client the same items twice under two different
+    /// control types.
+    pub(crate) fn is_command_menu(&self) -> bool {
+        matches!(self.body, PopupBody::Menu(_)) && !self.combo && !self.suggest
+    }
+
+    /// The command rows, or nothing at all when this popup is not a command
+    /// menu — so a caller cannot enumerate a combo's list through the menu door.
+    pub(crate) fn menu_rows(&self) -> &[MenuRow] {
+        if self.is_command_menu() { self.body.rows() } else { &[] }
+    }
+
+    /// The drawn panel's rect in window DIPs (excludes the shadow margin) — the
+    /// bounding box of the menu element itself.
+    pub(crate) fn panel_rect(&self) -> Rect {
+        self.panel
+    }
+
+    /// Row `index`'s box in window DIPs, from the one vertical rhythm the paint,
+    /// the sprite placement and the hit test all read ([`rows_laid`]) — so a
+    /// screen reader's rectangle and a click can never disagree about where a
+    /// row is.
+    ///
+    /// A separator reports its own (short) band rather than a full row height:
+    /// it is exposed as a `Separator` element, and a rect that overlapped its
+    /// neighbours would make `ElementProviderFromPoint` ambiguous.
+    pub(crate) fn row_bounds(&self, index: usize) -> Option<Rect> {
+        let (_, row, y, h) = rows_laid(self.menu_rows(), self.panel.top).nth(index)?;
+        Some(if row.separator {
+            Rect::from_xywh(self.panel.left + PANEL_PAD, y, self.panel.width() - PANEL_PAD * 2.0, h)
+        } else {
+            row_rect(self.panel, y)
+        })
+    }
+
     /// The tag/text the row at `index` reports on selection.
     pub fn row_tag(&self, index: usize) -> Option<String> {
         self.body.rows().get(index).map(|r| {

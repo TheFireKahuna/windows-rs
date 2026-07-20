@@ -473,9 +473,14 @@ impl DCompBackend {
         // inside it hover and drag exactly as they would anywhere.
         if self.popup.is_some() && self.hosted_flyout.is_none() {
             let hit = self.popup.as_ref().and_then(|p| p.hit(x, y));
+            let before = self.popup.as_ref().map(|p| p.hovered);
             if let Some(p) = &mut self.popup {
                 p.set_hovered(hit, &self.comp, &mut self.glyphs);
             }
+            // Hovering a menu row moves focus to it, exactly as arrowing onto
+            // it does — the highlight is one state with one meaning, however it
+            // got there, so a client tracking focus follows the pointer too.
+            self.uia_announce_menu_highlight(before);
             return;
         }
 
@@ -1533,10 +1538,15 @@ impl DCompBackend {
         ) {
             self.close_popup();
             let hosted = p.body_root();
+            let is_menu = p.is_command_menu();
             self.popup = Some(p);
             if let Some(root) = hosted {
                 self.host_flyout_content(root);
             }
+            // After the popup is installed, never before: the announcement is
+            // derived from `self.popup` (expanded state, the menu's rows), so
+            // raising it earlier would describe the state we are leaving.
+            self.uia_notify_popup(owner, is_menu, true);
         }
     }
 
@@ -1715,6 +1725,10 @@ impl DCompBackend {
     /// wrapping its fade completes — no app frames, no timer.
     pub(crate) fn close_popup(&mut self) {
         if let Some(p) = self.popup.take() {
+            // Taken from `self.popup` first, so the state the announcement
+            // describes — collapsed, rows gone — is already true when a client
+            // responds to it by re-reading.
+            self.uia_notify_popup(p.owner, p.is_command_menu(), false);
             // A popup that came from an attached flyout reports its dismissal,
             // whatever dismissed it — light-dismiss, Escape, or a selection.
             // This is the ONE close path, so `on_closed` cannot be missed by a
@@ -1771,6 +1785,18 @@ impl DCompBackend {
             self.commit_number(id);
         }
         self.close_popup();
+    }
+
+    /// Step the open popup's highlight, announcing the row it lands on.
+    ///
+    /// The one place an arrow key moves a popup highlight, so the announcement
+    /// cannot be missed by a key route that forgot to make it.
+    fn move_popup_highlight(&mut self, delta: i32) {
+        let before = self.popup.as_ref().map(|p| p.hovered);
+        if let Some(p) = &mut self.popup {
+            p.move_highlight(delta, &self.comp, &mut self.glyphs);
+        }
+        self.uia_announce_menu_highlight(before);
     }
 
     /// Commit the selected popup row to its owner and close.
@@ -1970,16 +1996,8 @@ impl DCompBackend {
         if self.popup.is_some() {
             match vk {
                 VK_ESCAPE => self.close_popup(),
-                VK_DOWN => {
-                    if let Some(p) = &mut self.popup {
-                        p.move_highlight(1, &self.comp, &mut self.glyphs);
-                    }
-                }
-                VK_UP => {
-                    if let Some(p) = &mut self.popup {
-                        p.move_highlight(-1, &self.comp, &mut self.glyphs);
-                    }
-                }
+                VK_DOWN => self.move_popup_highlight(1),
+                VK_UP => self.move_popup_highlight(-1),
                 VK_RETURN | VK_SPACE => {
                     let h = self.popup.as_ref().map(|p| p.hovered);
                     if let Some(i) = h
@@ -2693,6 +2711,16 @@ impl DCompBackend {
     /// client invoking the hamburger must toggle the pane by exactly the path a
     /// click toggles it, not by a parallel implementation that can drift.
     pub(crate) fn uia_select_item(&mut self, id: ControlId, i: i32) {
+        // A menu row commits through `commit_popup` — the exact function a
+        // pointer release and the Enter key call. Invoking a command must close
+        // the menu and fire `ItemClicked` with the row's tag by the one path
+        // that already does both; a parallel implementation here is how a
+        // client's invoke would drift from a click (leaving the popup open, or
+        // reporting the row's text where a click reports its tag).
+        if let Some(row) = self.uia_menu_row_invoked(id, i) {
+            self.commit_popup(row);
+            return;
+        }
         match self.node(id).map(|n| n.kind) {
             // The bar's one synthetic child is its close button, and invoking
             // it takes exactly the path a click on it takes.
@@ -2720,6 +2748,18 @@ impl DCompBackend {
                 }
             }
             Some(ControlKind::ComboBox | ControlKind::DropDownButton | ControlKind::SplitButton) => {
+                if want {
+                    self.open_popup(id);
+                } else {
+                    self.close_popup();
+                }
+            }
+            // A plain Button carrying a MenuFlyout advertises ExpandCollapse
+            // (see `uia_pattern_supported`) and reports its state, so it has to
+            // honour the actions too — without this arm a client could read
+            // "collapsed" off the Add Processor button and be unable to expand
+            // it, which is the pattern advertised but not implemented.
+            _ if self.opens_a_menu(id) => {
                 if want {
                     self.open_popup(id);
                 } else {

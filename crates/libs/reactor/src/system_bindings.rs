@@ -76,6 +76,7 @@ windows_core::link!("uiautomationcore.dll" "system" fn UiaDisconnectProvider(ppr
 windows_core::link!("uiautomationcore.dll" "system" fn UiaHostProviderFromHwnd(hwnd : HWND, ppprovider : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseAutomationEvent(pprovider : *mut core::ffi::c_void, id : EVENTID) -> windows_core::HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseAutomationPropertyChangedEvent(pprovider : *mut core::ffi::c_void, id : PROPERTYID, oldvalue : VARIANT, newvalue : VARIANT) -> windows_core::HRESULT);
+windows_core::link!("uiautomationcore.dll" "system" fn UiaRaiseStructureChangedEvent(pprovider : *mut core::ffi::c_void, structurechangetype : StructureChangeType, pruntimeid : *mut i32, cruntimeidlen : i32) -> windows_core::HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaReturnRawElementProvider(hwnd : HWND, wparam : WPARAM, lparam : LPARAM, el : *mut core::ffi::c_void) -> LRESULT);
 windows_core::link!("user32.dll" "system" fn UnregisterClassW(lpclassname : windows_core::PCWSTR, hinstance : HINSTANCE) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn UpdateWindow(hwnd : HWND) -> windows_core::BOOL);
@@ -10517,6 +10518,13 @@ impl windows_core::RuntimeName for StepEasingFunction {
 }
 unsafe impl Send for StepEasingFunction {}
 unsafe impl Sync for StepEasingFunction {}
+pub type StructureChangeType = i32;
+pub const StructureChangeType_ChildAdded: StructureChangeType = 0;
+pub const StructureChangeType_ChildRemoved: StructureChangeType = 1;
+pub const StructureChangeType_ChildrenBulkAdded: StructureChangeType = 3;
+pub const StructureChangeType_ChildrenBulkRemoved: StructureChangeType = 4;
+pub const StructureChangeType_ChildrenInvalidated: StructureChangeType = 2;
+pub const StructureChangeType_ChildrenReordered: StructureChangeType = 5;
 pub type SupportedTextSelection = i32;
 pub const SupportedTextSelection_Multiple: SupportedTextSelection = 2;
 pub const SupportedTextSelection_None: SupportedTextSelection = 0;
@@ -10770,6 +10778,7 @@ impl<
         }
     }
 }
+pub const UIA_AcceleratorKeyPropertyId: i32 = 30006;
 pub const UIA_AutomationFocusChangedEventId: i32 = 20005;
 pub const UIA_AutomationIdPropertyId: i32 = 30011;
 pub const UIA_AutomationPropertyChangedEventId: i32 = 20004;
@@ -10800,8 +10809,10 @@ pub const UIA_ListControlTypeId: i32 = 50008;
 pub const UIA_ListItemControlTypeId: i32 = 50007;
 pub const UIA_LiveRegionChangedEventId: i32 = 20024;
 pub const UIA_LiveSettingPropertyId: i32 = 30135;
+pub const UIA_MenuClosedEventId: i32 = 20007;
 pub const UIA_MenuControlTypeId: i32 = 50009;
 pub const UIA_MenuItemControlTypeId: i32 = 50011;
+pub const UIA_MenuOpenedEventId: i32 = 20003;
 pub const UIA_NamePropertyId: i32 = 30005;
 pub const UIA_PaneControlTypeId: i32 = 50033;
 pub const UIA_ProgressBarControlTypeId: i32 = 50012;
@@ -10815,6 +10826,7 @@ pub const UIA_ScrollPatternId: i32 = 10004;
 pub const UIA_SelectionItemPatternId: i32 = 10010;
 pub const UIA_SelectionItem_ElementSelectedEventId: i32 = 20012;
 pub const UIA_SelectionPatternId: i32 = 10001;
+pub const UIA_SeparatorControlTypeId: i32 = 50038;
 pub const UIA_SliderControlTypeId: i32 = 50015;
 pub const UIA_StatusBarControlTypeId: i32 = 50017;
 pub const UIA_StructureChangedEventId: i32 = 20002;

@@ -455,6 +455,7 @@ Windows::Win32::UiaReturnRawElementProvider
 Windows::Win32::UiaHostProviderFromHwnd
 Windows::Win32::UiaRaiseAutomationEvent
 Windows::Win32::UiaRaiseAutomationPropertyChangedEvent
+Windows::Win32::UiaRaiseStructureChangedEvent
 Windows::Win32::UiaDisconnectProvider
 // ── Structs / enums ──
 Windows::Win32::UiaRect
@@ -466,6 +467,7 @@ Windows::Win32::ScrollAmount
 Windows::Win32::SupportedTextSelection
 Windows::Win32::TextUnit
 Windows::Win32::TextPatternRangeEndpoint
+Windows::Win32::StructureChangeType
 // ── Id newtypes (carry the UIA_* consts' types) ──
 Windows::Win32::PROPERTYID
 Windows::Win32::PATTERNID
@@ -490,6 +492,7 @@ Windows::Win32::UIA_ExpandCollapseExpandCollapseStatePropertyId
 Windows::Win32::UIA_IsOffscreenPropertyId
 Windows::Win32::UIA_IsPasswordPropertyId
 Windows::Win32::UIA_LiveSettingPropertyId
+Windows::Win32::UIA_AcceleratorKeyPropertyId
 // ── Pattern ids ──
 Windows::Win32::UIA_InvokePatternId
 Windows::Win32::UIA_TextPatternId
@@ -518,6 +521,7 @@ Windows::Win32::UIA_PaneControlTypeId
 Windows::Win32::UIA_WindowControlTypeId
 Windows::Win32::UIA_MenuControlTypeId
 Windows::Win32::UIA_MenuItemControlTypeId
+Windows::Win32::UIA_SeparatorControlTypeId
 Windows::Win32::UIA_ScrollBarControlTypeId
 Windows::Win32::UIA_ImageControlTypeId
 Windows::Win32::UIA_CustomControlTypeId
@@ -533,6 +537,8 @@ Windows::Win32::UIA_AutomationFocusChangedEventId
 Windows::Win32::UIA_SelectionItem_ElementSelectedEventId
 Windows::Win32::UIA_StructureChangedEventId
 Windows::Win32::UIA_LiveRegionChangedEventId
+Windows::Win32::UIA_MenuOpenedEventId
+Windows::Win32::UIA_MenuClosedEventId
 
 // ════════════════════════════════════════════════════════════════════════════
 // Text input: TSF (Text Services Framework)

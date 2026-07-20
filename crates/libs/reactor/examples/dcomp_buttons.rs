@@ -142,6 +142,7 @@ fn main() -> windows_reactor::Result<()> {
                 .menu_flyout(vec![
                     menu_item("Copy").shortcut("Ctrl+C"),
                     menu_item("Paste").shortcut("Ctrl+V"),
+                    menu_item("Paste Special").disabled(),
                     MenuItemDef::Separator,
                     menu_item("Reset").danger(),
                 ])
