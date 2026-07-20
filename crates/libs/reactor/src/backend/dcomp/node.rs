@@ -733,6 +733,10 @@ pub(crate) struct Node {
     /// ([`path_shape::PathParts`](super::path_shape::PathParts)). Boxed and
     /// lazy, like the knob's: only a `ControlKind::Path` ever allocates one.
     pub path: Option<Box<super::path_shape::PathParts>>,
+    /// `ProgressRing` only: its track circle and value arc as two retained mask
+    /// layers ([`ring_shape::RingParts`](super::ring_shape::RingParts)). Boxed
+    /// and lazy, like the knob's.
+    pub ring: Option<Box<super::ring_shape::RingParts>>,
     /// Knob only: its readout, unit, sub-line and tick labels as retained glyph
     /// sprites, each carrying the string and em it was shaped from.
     ///
@@ -945,6 +949,7 @@ impl Node {
             caret: None,
             knob: None,
             path: None,
+            ring: None,
             scroll_thumb: None,
             scroll_content: None,
             scroll_spring: None,
@@ -1228,7 +1233,17 @@ impl Node {
             // So the bar was minting an FP16 surface and clearing it on every
             // dirty pass to draw nothing at all: it has no label, no ring and
             // no ink, so the surface held literally nothing.
+            // Box fill, outline and spin divider are parts (`parts::editor_plan`);
+            // the run, placeholder, selection, composition rule, chevrons and
+            // caret were already sprites. Focus is the border re-keyed to the
+            // accent, not a ring. Nothing is left to draw.
+            k if is_text_editable(k) => false,
             ControlKind::ProgressBar => false,
+            // Track circle and value arc are two retained mask layers over one
+            // tessellated path (`ring_shape`), and the indeterminate revolve is
+            // a forever `RotationAngle` keyframe on the arc's own sprite rather
+            // than on a surface sprite. Nothing is left to draw.
+            ControlKind::ProgressRing => false,
             // Groove, fill, reference marker and needle are all parts
             // (`parts::meter_sync`). The groove was the last thing drawing, and
             // it was the worst kind of draw: value-INDEPENDENT chrome on a
@@ -1587,8 +1602,6 @@ pub(crate) fn is_interactive_kind(kind: ControlKind) -> bool {
 /// Kinds that always own a paint surface (they draw chrome unconditionally).
 fn draws_own_chrome(kind: ControlKind) -> bool {
     is_interactive_kind(kind)
-        || is_text_editable(kind)
-        || matches!(kind, ControlKind::ProgressRing)
 }
 
 /// The editable text kinds, each backed by a shared [`Editor`].

@@ -125,6 +125,11 @@ fn main() -> windows_reactor::Result<()> {
         let progress = ProgressBar::new(gain).height(8.0).width(200.0).into();
         let busy = ProgressBar::indeterminate().height(8.0).width(200.0).into();
         let ring = ProgressRing::indeterminate().width(28.0).height(28.0).into();
+        // The determinate ring, tracking the same signal the bar and meter do.
+        // It is here because nothing else instantiates one: the widget's
+        // determinate branch draws a different arc from the indeterminate one
+        // and had no on-screen coverage anywhere in the workspace.
+        let ring_value = ProgressRing::new(gain).width(28.0).height(28.0).into();
         let link = HyperlinkButton::new("Release notes")
             .navigate_uri("https://example.com")
             .height(24.0)
@@ -193,6 +198,7 @@ fn main() -> windows_reactor::Result<()> {
             card("Level", progress),
             card("Analyzing…", busy),
             card("Loading", ring),
+            card("Progress (ring)", ring_value),
             card("Dynamics", check),
             card("Unread", badges),
             card("About", link),

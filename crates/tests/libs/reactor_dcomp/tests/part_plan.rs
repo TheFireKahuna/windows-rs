@@ -393,9 +393,21 @@ fn the_progress_fill_grows_with_the_value_and_glides() {
     assert!(!half.below[0].unwrap().glides, "the track never travels");
 }
 
-/// Indeterminate hands the lane to the sweep. The sweep slot is deliberately
-/// ABSENT from the plan while it runs — it is a forever animation, not a
-/// placement — and the determinate fill hides without being moved.
+/// Indeterminate hands the lane to the sweep: the plan BINDS the sweep's source
+/// but does not place it, and the determinate fill hides without being moved.
+///
+/// The two halves used to be conflated. This test asserted the sweep slot was
+/// absent from the plan entirely — "it is a forever animation, not a
+/// placement" — which is right about the POSITION and wrong about the BRUSH. An
+/// unplanned slot is one `apply_band` never binds a source to, so the sweep
+/// sprite had nothing to draw: `progress_sweep` placed it and looped it
+/// perfectly and invisibly, and an indeterminate bar showed an empty lane for as
+/// long as it had been indeterminate. Only a bar that had been determinate
+/// first — and so had been given a source by the fill's branch — ever showed a
+/// travelling segment at all.
+///
+/// So: the slot is planned, with `rect: None`, which binds the source while
+/// leaving `Offset.X` to the loop that owns it.
 #[test]
 fn indeterminate_yields_the_lane_to_the_sweep() {
     let mut a = harness();
@@ -404,9 +416,18 @@ fn indeterminate_yields_the_lane_to_the_sweep() {
     let fill = ind.below[1].unwrap();
     assert_eq!(fill.rect, None, "the determinate fill must not be placed");
     assert_eq!(fill.opacity, 0.0, "the determinate fill must be hidden");
+
+    let sweep = ind.below[2].expect(
+        "the sweep slot must be PLANNED so a source is bound to it — an unplanned \
+         slot is a sprite with no brush, which loops invisibly",
+    );
     assert!(
-        ind.below[2].is_none(),
-        "the sweep slot must be left alone while the loop owns it",
+        sweep.key_fingerprint.is_some(),
+        "the sweep must bind an atlas source, or there is nothing to see travel",
+    );
+    assert_eq!(
+        sweep.rect, None,
+        "the sweep must not be placed by the plan — the forever loop owns Offset.X",
     );
 
     // ...and a determinate bar claims it back, hidden and not moved.
@@ -779,4 +800,134 @@ fn a_border_relayouts_on_resize() {
         small.layout_sig, large.layout_sig,
         "a size change must read as a re-layout",
     );
+}
+
+// ── Text editors ─────────────────────────────────────────────────────────────
+//
+// The editor was the last kind painting its own box. Its run, placeholder,
+// selection wash, composition rule, spin chevrons and caret were already
+// sprites; the fill, the outline and the spin column's hairline were not, and
+// they are what kept an FP16 surface open for every field in the tree.
+//
+// These assert the three decisions that conversion turns on, none of which a
+// screenshot can settle reliably: a field with no spin column must HIDE that
+// slot rather than leave it showing, focus must re-key the border rather than
+// add a ring, and the whole family must stop asking for a surface at all.
+
+/// An editor's below-band slots, mirroring `parts::editor_slot`.
+const ED_FILL: usize = 0;
+const ED_BORDER: usize = 1;
+const ED_DIVIDER: usize = 2;
+
+/// `editor::SPIN_MIN_BOX_W` — the width at which a NumberBox grows a spin column.
+const SPIN_MIN_BOX_W: f32 = 72.0;
+
+fn editor(a: &mut ArenaHarness, kind: K, w: f32, focused: bool) -> PartPlanProbe {
+    let id = a.insert(kind).unwrap();
+    a.set_rect(id, w, 32.0);
+    a.set_focused(id, focused);
+    a.part_plan(id, 1.0).unwrap()
+}
+
+/// The point of the whole change: no editor kind reaches a `BeginDraw`.
+#[test]
+fn no_editor_kind_asks_for_a_surface() {
+    let mut a = harness();
+    for kind in [K::NumberBox, K::TextBox, K::PasswordBox, K::AutoSuggestBox] {
+        let id = a.insert(kind).unwrap();
+        a.set_rect(id, 120.0, 32.0);
+        assert_eq!(
+            a.has_chrome(id),
+            Some(false),
+            "{kind:?} still owns a paint surface after its chrome was retained",
+        );
+    }
+}
+
+/// A wide NumberBox places the spin divider; a narrow one HIDES it.
+///
+/// Hidden, not omitted. A slot the plan does not mention keeps showing whatever
+/// it last showed, so a field dragged below the threshold would keep a hairline
+/// with no chevrons beside it. The GUI's parametric-EQ rows are all narrow
+/// centred fields, so the hidden case is the common one, not the edge.
+#[test]
+fn the_spin_divider_appears_only_with_the_spin_column() {
+    let mut a = harness();
+
+    let wide = editor(&mut a, K::NumberBox, SPIN_MIN_BOX_W + 48.0, false);
+    let divider = wide.below[ED_DIVIDER]
+        .expect("a wide NumberBox must plan its divider slot")
+        .rect
+        .expect("a wide NumberBox must PLACE its divider");
+    let box_rect = wide.below[ED_FILL].unwrap().rect.unwrap();
+    assert!(
+        divider.0 > box_rect.0 && divider.0 + divider.2 <= box_rect.0 + box_rect.2 + 0.5,
+        "divider {divider:?} escapes the box {box_rect:?}",
+    );
+    assert!(divider.2 <= 2.0, "the divider is a hairline, got width {}", divider.2);
+
+    let narrow = editor(&mut a, K::NumberBox, SPIN_MIN_BOX_W - 12.0, false);
+    assert!(
+        narrow.below[ED_DIVIDER].is_none_or(|s| s.rect.is_none()),
+        "a NumberBox below the spin threshold must hide its divider, got {:?}",
+        narrow.below[ED_DIVIDER],
+    );
+}
+
+/// Only a NumberBox has a spin column at all — a TextBox that wide must not
+/// grow a hairline down its trailing edge.
+#[test]
+fn only_the_number_box_gets_a_divider() {
+    let mut a = harness();
+    for kind in [K::TextBox, K::PasswordBox, K::AutoSuggestBox] {
+        let plan = editor(&mut a, kind, SPIN_MIN_BOX_W + 48.0, false);
+        assert!(
+            plan.below[ED_DIVIDER].is_none_or(|s| s.rect.is_none()),
+            "{kind:?} has no spin column and must not plan a divider",
+        );
+    }
+}
+
+/// Focus RE-KEYS the border — it does not add a ring.
+///
+/// An editor is the one converted kind whose focus affordance is not the
+/// retained double-ring: it thickens its outline to the accent, which is WinUI's
+/// own TextBox visual and what the painter drew. Both halves matter. If the
+/// border stopped re-keying, a focused field would look unfocused; if a ring
+/// slot appeared, it would show two focus signals at once.
+#[test]
+fn focus_rekeys_the_border_and_adds_no_ring() {
+    let mut a = harness();
+    let rest = editor(&mut a, K::TextBox, 160.0, false);
+    let focused = editor(&mut a, K::TextBox, 160.0, true);
+
+    let (r, f) = (rest.below[ED_BORDER].unwrap(), focused.below[ED_BORDER].unwrap());
+    assert!(
+        r.key_fingerprint.is_some() && f.key_fingerprint.is_some(),
+        "the border slot must bind a source in both states",
+    );
+    assert_ne!(
+        r.key_fingerprint, f.key_fingerprint,
+        "focus must re-key the border (accent, thicker); it did not change",
+    );
+    assert_eq!(
+        r.rect, f.rect,
+        "focus is a re-bind, not a move — the border box must not shift",
+    );
+
+    // The fill is state-independent: only the outline reacts to focus.
+    assert_eq!(
+        rest.below[ED_FILL].unwrap().key_fingerprint,
+        focused.below[ED_FILL].unwrap().key_fingerprint,
+        "focus must not disturb the box fill",
+    );
+
+    for plan in [&rest, &focused] {
+        assert!(
+            plan.above.iter().all(|s| s.is_none()),
+            "an editor plans NO above-band slots — the caret is inserted at the \
+             top of the container after `parts::sync`, so an above slot minted \
+             later would hide it",
+        );
+    }
 }

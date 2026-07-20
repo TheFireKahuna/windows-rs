@@ -1467,9 +1467,9 @@ const KNOB_READOUT_WEIGHT: u16 = 200;
 /// wants holds the WIDEST candidate, and the slot the draw wants holds the
 /// CURRENT one. They are the same run only by coincidence.
 ///
-/// The trigger keeps its surface — the box fill and its focus-accented border
-/// are genuinely non-text drawing — so this is the editor pattern rather than
-/// the button one: the sprites land above a surface that still paints.
+/// The trigger's box fill and border are retained parts (`parts::select_plan`),
+/// so these sprites land above parts rather than above a painted surface — the
+/// trigger owns none.
 ///
 /// Each run's host is its own column, which is what stops a selected item too
 /// long for the trigger from running out under the chevron. The label loses its
@@ -1898,9 +1898,11 @@ fn nav_row(
 /// Reconcile an editor's text run, its selection highlight and its IME
 /// composition rule as retained sprites.
 ///
-/// The box fill, the border and the spin chevrons stay painted — an editor,
-/// unlike a button or a TextBlock, genuinely does draw things that are not
-/// text, so it keeps its surface and only the text leaves it.
+/// The box fill, the border and the spin column's hairline are retained parts
+/// (`parts::editor_plan`) and the chevrons are sprites placed here, so an editor
+/// owns no surface at all. That is also why this function opens by building the
+/// DirectWrite layout: `prepare` used to run inside the surface's `BeginDraw`
+/// bracket, and with the surface gone this is the one place that still runs.
 ///
 /// Three things here are not optional:
 ///
@@ -1919,6 +1921,30 @@ fn nav_row(
 pub(crate) fn editor_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
     if node.editor.is_none() {
         return;
+    }
+    // Build the DirectWrite layout and re-scroll the caret into view BEFORE
+    // anything reads it — `TextBand::of` immediately below is the first reader,
+    // and the caret sprite, the IME candidate window and UIA all measure from
+    // the same band.
+    //
+    // This used to run inside `draw_surface`'s `BeginDraw` bracket, which was
+    // the editor's one real tie to owning a surface: it needs no device context
+    // (only `TextFormat`/`TextLayout`), but it was reached only when there was
+    // a surface to draw into. Left there, taking the surface away would have
+    // stopped the layout ever being rebuilt — chrome intact, text frozen. It
+    // belongs to the run's shaper, which is here.
+    {
+        let (kind, w, fs, weight, align) = (
+            node.kind,
+            node.rect.w,
+            node.paint.font_size,
+            node.paint.font_weight,
+            node.ctrl().content_align,
+        );
+        let (_, content_w) = super::editor::editor_content(kind, w);
+        if let Some(ed) = &mut node.editor {
+            ed.prepare(fs, weight, content_w, align);
+        }
     }
     let Some(band) = super::editor::TextBand::of(node) else {
         return;

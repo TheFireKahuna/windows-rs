@@ -3,10 +3,12 @@
 //! editable node holds a UTF-16 document buffer, a caret + selection, a cached
 //! `IDWriteTextLayout` (rebuilt only when the text or box changes), single-line
 //! horizontal scroll, and the editing / clipboard / numeric-commit operations
-//! every text control reuses. Interaction routing lives in `input.rs`; the
-//! chrome + caret + selection are painted in `controls.rs`. This is the single
-//! DRY editor used by all four text `ControlKind`s — there is no native
-//! HWND/edit-control island.
+//! every text control reuses. Interaction routing lives in `input.rs`. Nothing
+//! about an editor is painted: the box fill, border and spin divider are
+//! retained parts (`parts::editor_plan`), and the run, placeholder, selection,
+//! composition rule, chevrons and caret are sprites (`glyph_text::editor_sync`,
+//! `parts::sync_caret`). This is the single DRY editor used by all four text
+//! `ControlKind`s — there is no native HWND/edit-control island.
 
 use super::theme;
 use crate::backend::ControlKind;
@@ -814,7 +816,7 @@ pub(crate) fn editor_content(kind: ControlKind, box_w: f32) -> (f32, f32) {
 /// Where an editor's text run sits inside its box, in NODE-LOCAL DIPs.
 ///
 /// The one definition of that geometry. It used to exist in four:
-/// `controls::paint_editor` (which drew the run), `controls::editor_caret_box`
+/// `controls::paint_editor` (which drew the run, now retired), `controls::editor_caret_box`
 /// (which placed the caret sprite), `tsf::doc::text_band` (which parked the IME
 /// candidate window) and `uia::uia_text_origin` (which answered screen readers).
 /// Each recomputed the same fallback line height and the same vertical centring,
