@@ -672,6 +672,36 @@ pub(crate) struct Node {
     /// composition rule, because both are clipped to the same content column
     /// the run is. See [`glyph_text::editor_sync`](super::glyph_text::editor_sync).
     pub text_part: Option<Box<super::glyph_text::TextPart>>,
+    /// Words a producer thread published for this control, standing in for the
+    /// ones the layout pass shaped.
+    ///
+    /// A live readout's value never passes through a reconcile — it arrives on
+    /// the pump that computed it — so it cannot travel as a prop and cannot use
+    /// `text_layout`, which only rebuilds when the layout pass runs on a
+    /// `text_dirty` node. It lands here instead and is shaped at PLACEMENT time.
+    ///
+    /// The node keeps its layout-pass run untouched underneath: a control that
+    /// stops receiving live values falls back to the words it was rendered with,
+    /// rather than to nothing.
+    pub live_words: Option<String>,
+    /// The run [`live_words`](Self::live_words) shapes into, and the part that
+    /// places it.
+    ///
+    /// A [`Shaped`](super::glyph_text::Shaped) for the reason the editor's
+    /// placeholder is one: its only inputs are the words and the em, and it
+    /// compares both before building a layout — so a value republished unchanged
+    /// costs a comparison and places the run it already had.
+    ///
+    /// Its own part rather than `text_part`, so that a control switching between
+    /// live and rendered words never places one run through the other's sprites.
+    ///
+    /// The corollary, which separate parts do NOT give for free: at most one of
+    /// the two may be *visible*. A block that mounts with words and then takes a
+    /// live value crosses from one to the other, and the source left behind keeps
+    /// its sprites on screen unless it is retired — the two readings then
+    /// interleave into a number that was never published. `glyph_text::text_sync`
+    /// owns that crossing and hides whichever source it did not choose.
+    pub live_run: Option<Box<super::glyph_text::Shaped>>,
     /// Controls with one run PER ITEM: a `SelectorBar`'s segment labels, a
     /// `ToggleSwitch`'s two state labels. Holds the shaped runs the layout pass
     /// builds and the parts that place them.
@@ -906,6 +936,8 @@ impl Node {
             parts: None,
             button_text: None,
             text_part: None,
+            live_words: None,
+            live_run: None,
             item_text: None,
             select_text: None,
             knob_text: None,
@@ -1196,6 +1228,22 @@ impl Node {
     /// Mark this node's surface for repaint.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Adopt words published by a producer thread, reporting whether anything
+    /// moved.
+    ///
+    /// A value republished unchanged returns `false` and dirties nothing, so a
+    /// steady readout costs no paint walk at all. The dedupe lives here rather
+    /// than only at the producer because several producers can share a control
+    /// and none of them can see what it currently shows.
+    pub fn set_live_text(&mut self, text: String) -> bool {
+        if self.live_words.as_deref() == Some(text.as_str()) {
+            return false;
+        }
+        self.live_words = Some(text);
+        self.mark_dirty();
+        true
     }
 
     /// Push the visual's parent-relative offset, skipping the COM write when

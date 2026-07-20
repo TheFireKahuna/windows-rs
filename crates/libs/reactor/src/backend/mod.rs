@@ -24,7 +24,7 @@ pub mod dcomp_test_api;
 
 #[cfg(feature = "dcomp-backend")]
 pub use dcomp::{
-    pointer_capture_active, set_display_change_callback, set_host_tokens,
+    live_text::LiveText, pointer_capture_active, set_display_change_callback, set_host_tokens,
     set_output_color_transform, set_root_backdrop_provider, set_window_visibility_callback,
     BackdropDither, BackdropGlow, BackdropSpec, DCompBackend, DCompHost, GlowDrift, HostTokens,
 };
