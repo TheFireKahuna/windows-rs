@@ -72,10 +72,16 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
             paint_select(session, brush, rect, dim)
         }
         ControlKind::Slider => paint_slider(session, brush, node, rect, dim),
-        ControlKind::Meter => paint_meter(session, brush, node, rect, dim),
+        // Groove, gradient fill, reference marker and needle are all retained
+        // chrome parts (`super::parts::meter_sync`). The groove was the last
+        // thing drawn here and it did not depend on the level, so every level
+        // change was re-rastering a constant; `has_chrome` denies it a surface.
+        ControlKind::Meter => {}
         ControlKind::Knob => paint_knob(session, brush, node, rect, dim),
-        // Track, fill, and indeterminate sweep are retained chrome parts
-        // (`super::parts::progress_sync`) — the sweep loops on the compositor.
+        // Track, fill and indeterminate sweep are retained chrome parts
+        // (`super::parts::progress_plan`; the sweep is armed by
+        // `progress_sweep` and loops on the compositor), so `has_chrome`
+        // denies it a surface.
         ControlKind::ProgressBar => {}
         ControlKind::ProgressRing => paint_progress_ring(session, brush, node, rect, dim),
         // Fully retained: background, divider, selection tile, accent bar and
@@ -715,19 +721,6 @@ pub(crate) fn meter_marker_frac(node: &Node) -> Option<f32> {
     } else {
         Some(((m - node.ctrl().min) / span).clamp(0.0, 1.0) as f32)
     }
-}
-
-/// Only the static groove paints here; the gradient fill, reference marker,
-/// and position needle are retained chrome parts above this surface
-/// (`super::parts::meter_sync` — the marker rides above the fill so it stays
-/// visible when the level passes it) — a level change is a compositor spring
-/// retarget, no repaint.
-fn paint_meter(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let _ = node;
-    let top = theme::METER_INSET;
-    let bot = (rect.height() - theme::METER_INSET).max(top + 1.0);
-    let groove = Rect::new(0.0, top, rect.width(), bot);
-    fill_rr(session, brush, groove, theme::METER_RADIUS, theme::w(0.06), dim);
 }
 
 // ── Knob ─────────────────────────────────────────────────────────────────────

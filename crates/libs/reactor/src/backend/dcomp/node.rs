@@ -1192,6 +1192,21 @@ impl Node {
             // Header fill, border, wash and ring are parts; the header label
             // and its chevron are sprites. Only the header was ever chrome.
             ControlKind::Expander => false,
+            // Track, determinate fill and the travelling indeterminate segment
+            // are all parts (`parts::progress_plan`, with the sweep armed by
+            // `parts::progress_sweep`), and the sweep loops on the compositor.
+            // So the bar was minting an FP16 surface and clearing it on every
+            // dirty pass to draw nothing at all: it has no label, no ring and
+            // no ink, so the surface held literally nothing.
+            ControlKind::ProgressBar => false,
+            // Groove, fill, reference marker and needle are all parts
+            // (`parts::meter_sync`). The groove was the last thing drawing, and
+            // it was the worst kind of draw: value-INDEPENDENT chrome on a
+            // surface that `Prop::Value` marked dirty at level rate, so a 60 Hz
+            // meter re-rasterized a constant rounded rect sixty times a second.
+            // As a part it is one cached raster shared by every meter in the
+            // window, and a level change stays a compositor retarget.
+            ControlKind::Meter => false,
             // A Border is a fill and an outline cut to one radius, and both are
             // parts now (`parts::box_plan`). It was the last primitive in the
             // library still rasterizing a rounded rect, and the most numerous —
@@ -1208,14 +1223,35 @@ impl Node {
                     || (self.paint.stroke.is_some() && self.paint.stroke_thickness > 0.0)
                     || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
             }
+            // Every other container, for the Border's reason and no other. A
+            // StackPanel, a Grid, a Canvas, a ScrollViewer and the pickers,
+            // shells and host surfaces beside them are one box each — a
+            // background and maybe an outline, cut to one radius — and they are
+            // parts now (`parts::box_plan`, via `parts::plain_box`). This was
+            // the last catch-all in the file and the widest: a surface the size
+            // of the node's FULL rect, re-entered on every resize, for two
+            // sprites the atlas hands out. Children are unaffected — both slots
+            // are BELOW-band, strictly under `Band::Content` — and a scroll
+            // container's thumb is a separate surface on its own path
+            // (`paint::update_scroll_thumb`), so it neither loses nor gains.
+            k if parts::plain_box(k) => false,
             // Every drawn control owns a surface (it always paints its chrome).
             _ if draws_own_chrome(self.kind) => true,
+            // Unreachable today: the arms above cover every variant, and this
+            // stays only because a `match` on guards cannot say so. A NEW
+            // `ControlKind` lands here and keeps a surface, which is the safe
+            // direction — an unlisted kind that draws nothing wastes one
+            // allocation, where an unlisted kind that draws something and is
+            // denied a surface renders nothing at all.
+            //
+            // The `|| self.focus_ring` clause that used to sit here was dead.
+            // The ring is drawn by the shared tail of `controls::paint`, which
+            // every kind reaching this arm short-circuits at its own
+            // `_ => return false`, and none of them is in `is_focusable_kind`
+            // regardless. It bought a surface to paint a ring never painted.
             _ => {
                 self.paint.background.is_some()
                     || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
-                    // A surface bought purely to paint the ring on, so it is
-                    // the ring's flag that buys it — not focus in general.
-                    || self.focus_ring
             }
         }
     }
@@ -1522,10 +1558,7 @@ pub(crate) fn is_interactive_kind(kind: ControlKind) -> bool {
 fn draws_own_chrome(kind: ControlKind) -> bool {
     is_interactive_kind(kind)
         || is_text_editable(kind)
-        || matches!(
-            kind,
-            ControlKind::ProgressBar | ControlKind::ProgressRing | ControlKind::Meter
-        )
+        || matches!(kind, ControlKind::ProgressRing)
 }
 
 /// The editable text kinds, each backed by a shared [`Editor`].

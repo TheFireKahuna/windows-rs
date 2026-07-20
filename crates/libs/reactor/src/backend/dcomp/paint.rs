@@ -435,10 +435,14 @@ fn paint_chrome(
         // (`CompositionPath` + `CompositionSpriteShape` masked over an FP16
         // source), never rasterized here. It owns no surface at all.
         ControlKind::Path => {}
-        _ => {
-            // StackPanel / Grid / Canvas / ScrollViewer: bg + border box.
-            fill_and_stroke(session, brush, node, rect, node.paint.corner_radius)
-        }
+        // Reached only by a `ControlKind` not yet listed in `parts::plain_box`.
+        // Every container that IS listed draws its fill and outline as retained
+        // parts and owns no surface, so painting here would put a second copy of
+        // the box directly under the sprites drawing it — the same reason the
+        // `Border` arm above is empty. An unlisted kind still gets a surface
+        // from `has_chrome`'s backstop, and this draws the plain box it is
+        // probably meant to be.
+        _ => fill_and_stroke(session, brush, node, rect, node.paint.corner_radius),
     }
 }
 
