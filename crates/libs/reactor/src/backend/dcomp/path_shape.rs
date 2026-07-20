@@ -44,7 +44,7 @@ use windows_canvas_core::{
     ColorF, DrawingSession, GpuDevice, Matrix3x2, Path, PathBuilder, PathFigure, Vector2 as CVec2,
 };
 use windows_core::{implement_decl, Interface, Ref, Result};
-use windows_numerics::Vector2;
+use windows_numerics::{Vector2, Vector3};
 
 use super::bootstrap::Compositing;
 use super::node::{linear, Node};
@@ -207,7 +207,8 @@ struct PathLayer {
     stops_seen: Vec<(f64, crate::Color)>,
     grad_epoch: u32,
     // ── change gates ──
-    size: Option<(f32, f32)>,
+    // Carries the DIP→px scale too, so a display move re-rasterizes the mask.
+    size: Option<(f32, f32, f32)>,
     thickness: Option<f32>,
     trim: (f32, f32),
     trim_spring: Option<SpringScalarNaturalMotionAnimation>,
@@ -341,17 +342,28 @@ impl PathLayer {
         Some(())
     }
 
-    fn resize(&mut self, w: f32, h: f32) {
-        if self.size == Some((w, h)) {
+    fn resize(&mut self, w: f32, h: f32, scale: f32) {
+        if self.size == Some((w, h, scale)) {
             return;
         }
-        let v = Vector2::new(w, h);
-        // The three must agree or the mask samples the wrong region and the
-        // curve clips against a stale extent.
-        let _ = self.mask_vis.SetSize(v);
-        let _ = self.visual_surface.SetSourceSize(v);
-        let _ = self.display_vis.SetSize(v);
-        self.size = Some((w, h));
+        // The mask ShapeVisual is OFF-TREE (only this layer's VisualSurface
+        // source), so it never inherits the root DIP→px scale the rest of the
+        // tree rasterizes under (see bootstrap's one root `SetScale`). Left at
+        // 1×, the stroke is rasterized at 1 px per DIP and the in-tree display
+        // sprite — composited at `scale`× — upsamples that bitmap, softening
+        // every line on a HiDPI display. So give the mask subtree the scale
+        // itself and capture the enlarged extent: the stroke then rasterizes at
+        // physical resolution and the display samples it 1:1. At scale 1.0 this
+        // is identical to the old DIP sizing.
+        let phys = Vector2::new(w * scale, h * scale);
+        // The mask extent, its scale and the captured region must agree or the
+        // mask samples the wrong area and the curve clips against a stale extent.
+        let _ = self.mask_vis.SetSize(phys);
+        let _ = self.mask_vis.SetScale(Vector3::new(scale, scale, 1.0));
+        let _ = self.visual_surface.SetSourceSize(phys);
+        // The display sprite stays in DIPs — it IS under the root scale.
+        let _ = self.display_vis.SetSize(Vector2::new(w, h));
+        self.size = Some((w, h, scale));
     }
 
     fn set_thickness(&mut self, t: f32) {
@@ -739,12 +751,12 @@ fn sync_parts(
     // Non-allocating: a node that never had control state reads `EMPTY_CTRL`.
     let stops = node.ctrl().stops.as_slice();
     if let Some(l) = &mut parts.fill {
-        l.resize(w, h);
+        l.resize(w, h, scale);
         l.set_source(comp, node.paint.fill.unwrap_or_default(), stops, atlas_epoch, scale);
         l.set_trim(node.paint.path_trim.0, node.paint.path_trim.1);
     }
     if let Some(l) = &mut parts.stroke {
-        l.resize(w, h);
+        l.resize(w, h, scale);
         l.set_thickness(node.paint.stroke_thickness);
         // A stroke takes the flat stroke colour; the stop list is the FILL's
         // ramp, so handing it here would recolour the outline with the area's
