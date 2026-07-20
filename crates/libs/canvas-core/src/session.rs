@@ -84,6 +84,14 @@ impl<'a> DrawingSession<'a> {
         self
     }
 
+    /// Whether this session encodes linear→sRGB on the way out, i.e. whether its
+    /// target is an 8-bit sRGB surface rather than a linear FP16 one. An off-screen
+    /// layer rendered for this target must match, or it composites with the wrong
+    /// transfer function.
+    pub fn encodes_srgb(&self) -> bool {
+        self.encode_srgb
+    }
+
     /// Prepare a linear color for this session's target: linear→sRGB encoded on an
     /// 8-bit sRGB surface, passed through raw on a linear FP16 one. (The display
     /// SDR-white adjustment is NOT applied here — it lives compositor-side as a
@@ -690,24 +698,24 @@ impl<'a> DrawingSession<'a> {
     /// back to an approximate shadow.
     pub fn drop_shadow(
         &self,
+        renderer: &LayerRenderer,
+        size_px: (u32, u32),
         blur_standard_deviation: f32,
         color: ColorF,
         offset: (f32, f32),
-        draw_shape: impl FnOnce(),
+        draw_shape: impl FnOnce(&DrawingSession<'_>),
     ) -> bool {
-        let Ok(shape) = self.create_bitmap_target() else {
+        let live = self.get_transform();
+        // Render the silhouette on the caller's OFF-SCREEN renderer, never by
+        // retargeting this session. Retargeting mid-`BeginDraw` makes Direct2D
+        // resolve the batched work against the current target first, which on a
+        // presented surface publishes a half-drawn frame the compositor can sample —
+        // a popup whose shadow flickers as it opens. A scratch context also carries
+        // no atlas translation, so the silhouette cannot bake in an offset that the
+        // composite below would then apply a second time.
+        let Ok(shape) = renderer.render(size_px, live.m11, !self.encode_srgb, draw_shape) else {
             return false;
         };
-        // Render the silhouette at scale only — strip the translation so it is not
-        // baked into the bitmap and then re-applied at composite (double-offset).
-        let live = self.get_transform();
-        let scale_only = Matrix3x2 { m31: 0.0, m32: 0.0, ..live };
-        self.with_target(&shape, || {
-            self.with_transform(&scale_only, || {
-                self.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
-                draw_shape();
-            });
-        });
         let Ok(shadow) = self.create_shadow(&shape, blur_standard_deviation, color) else {
             return false;
         };

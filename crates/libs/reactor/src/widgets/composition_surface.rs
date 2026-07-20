@@ -97,8 +97,10 @@ impl CompositionSurfaceFactory {
     ///
     /// Returns a [`CompositionChildVisual`] (drop removes the sprite from `parent`)
     /// and a [`CompositionDrawSurface`] that draws the content (move it to a worker
-    /// thread when the factory's device is multi-threaded). The pixel size is fixed
-    /// for the surface's lifetime — drop both and call `create_under` again to resize.
+    /// thread when the factory's device is multi-threaded). The surface resizes in
+    /// place: call [`CompositionDrawSurface::resize`] on the drawing side to grow the
+    /// backing and [`CompositionChildVisual::set_dip_size`] on the hosting side to
+    /// grow the presented sprite — no need to drop and recreate.
     pub fn create_under(
         &self,
         parent: &sys::ContainerVisual,
@@ -165,6 +167,19 @@ pub struct CompositionChildVisual {
     visual: sys::Visual,
 }
 
+impl CompositionChildVisual {
+    /// Resize the presented sprite to `dip` DIPs, in place. Paired with
+    /// [`CompositionDrawSurface::resize`] (which grows the backing on the drawing
+    /// side): the brush stretches its surface to the sprite, so both must move for a
+    /// crisp result, but neither requires re-parenting or recreating the visual.
+    /// Runs on the UI thread, which owns the visual tree.
+    pub fn set_dip_size(&self, dip: (f32, f32)) {
+        if let Ok(v) = self.visual.cast::<sys::IVisual>() {
+            let _ = v.SetSize(windows_numerics::Vector2 { x: dip.0, y: dip.1 });
+        }
+    }
+}
+
 impl Drop for CompositionChildVisual {
     fn drop(&mut self) {
         if let Ok(children) = self.parent.Children() {
@@ -214,5 +229,20 @@ impl CompositionDrawSurface {
     /// Finish drawing and commit the surface contents to the compositor.
     pub fn end_draw(&self) -> Result<()> {
         unsafe { self.interop.EndDraw().ok() }
+    }
+
+    /// Resize the backing surface in place to `pixel` physical pixels, keeping the
+    /// same visual, brush and atlas — no re-parenting and no fresh
+    /// [`create_under`](CompositionSurfaceFactory::create_under). The next
+    /// [`begin_draw`](Self::begin_draw) fills the new extent. Pair with
+    /// [`CompositionChildVisual::set_dip_size`] so the presented sprite matches.
+    /// `ICompositionDrawingSurfaceInterop::Resize` is internally synchronized, so
+    /// this is safe from the drawing thread between frames.
+    pub fn resize(&self, pixel: (i32, i32)) -> Result<()> {
+        unsafe {
+            self.interop
+                .Resize(sys::SIZE { cx: pixel.0.max(1), cy: pixel.1.max(1) })
+                .ok()
+        }
     }
 }

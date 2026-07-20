@@ -41,7 +41,8 @@
 //! [mask-docs]: https://learn.microsoft.com/en-us/uwp/api/windows.ui.composition.compositionmaskbrush
 
 use windows_canvas_core::{
-    ColorF, DrawingSession, GpuDevice, Matrix3x2, Path, PathBuilder, PathFigure, Vector2 as CVec2,
+    ColorF, DrawingSession, GpuDevice, LayerRenderer, Matrix3x2, Path, PathBuilder, PathFigure,
+    Vector2 as CVec2,
 };
 use windows_core::{implement_decl, Interface, Ref, Result};
 use windows_numerics::{Vector2, Vector3};
@@ -577,19 +578,33 @@ fn bake_glow(
         Matrix3x2::translation(origin.x as f32, origin.y as f32),
     );
     let ok = (|| -> Option<()> {
-        // Render the sharp stroke under the pixel scale into a transparent
-        // bitmap; only its alpha feeds the shadow, so WHITE keeps that alpha at
-        // full strength whatever the eventual tint.
-        let scaled =
-            Matrix3x2 { m11: scale, m12: 0.0, m21: 0.0, m22: scale, m31: 0.0, m32: 0.0 };
-        session.set_transform(&scaled);
         session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
-        let shape = session.create_bitmap_target().ok()?;
-        let white = session.create_solid_brush(ColorF::new(1.0, 1.0, 1.0, 1.0)).ok()?;
-        session.with_target(&shape, || {
-            session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
-            session.draw_path(path, &white, thickness.max(0.5));
-        });
+        // Render the sharp stroke on a SCRATCH context rather than by retargeting
+        // this surface's own. Two bugs die with the retarget:
+        //
+        //  1. Direct2D must resolve the batched work against the current target
+        //     before it can switch, so a `with_target` inside this `BeginDraw`
+        //     published a half-drawn surface that the compositor could sample — a
+        //     flickering shadow.
+        //  2. This session carries the surface's ATLAS OFFSET, so the shape was
+        //     drawn at `origin` INSIDE the bitmap and the composite below then
+        //     applied `origin` a second time — a double offset that slid a baked
+        //     shadow off position whenever the surface landed on a non-zero atlas
+        //     slot. A scratch context has no atlas offset at all, so that is now
+        //     unrepresentable rather than merely corrected.
+        //
+        // Only the stroke's alpha feeds the shadow, so WHITE keeps that alpha at
+        // full strength whatever the eventual tint. The bitmap is the SURFACE's
+        // size, not the shared atlas's (which is what `create_bitmap_target` would
+        // have handed back).
+        let renderer = LayerRenderer::new(&comp.gpu).ok()?;
+        let shape = renderer
+            .render((px.0.max(1) as u32, px.1.max(1) as u32), scale, true, |s| {
+                if let Ok(white) = s.create_solid_brush(ColorF::new(1.0, 1.0, 1.0, 1.0)) {
+                    s.draw_path(path, &white, thickness.max(0.5));
+                }
+            })
+            .ok()?;
         // Canvas `shadowBlur` is 2σ (the value the mockups author), so σ = blur/2
         // — the same halving the painted glow applied. The tint rides the output
         // colour map like every solid.

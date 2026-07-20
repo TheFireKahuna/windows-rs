@@ -21,8 +21,8 @@ use crate::style::{AnimationConfig, Easing};
 use crate::backend::ControlId;
 use crate::system_bindings::{ContainerVisual, IVisual, Visual, POINT};
 use windows_canvas_core::{
-    bindings::ID2D1DeviceContext, Brush, ColorF, DrawingSession, FontWeight, ParagraphAlignment,
-    Rect, RoundedRect, TextAlignment, TextFormat, Vector2,
+    bindings::ID2D1DeviceContext, Brush, ColorF, DrawingSession, FontWeight, LayerRenderer,
+    ParagraphAlignment, Rect, RoundedRect, TextAlignment, TextFormat, Vector2,
 };
 use windows_core::Interface;
 use windows_numerics::{Matrix3x2, Vector3};
@@ -604,13 +604,28 @@ impl Popup {
         });
         session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
 
+        // The shadow's silhouette renders off-screen on its own context (see
+        // `DrawingSession::drop_shadow`): retargeting THIS session mid-`BeginDraw`
+        // would publish a half-drawn popup for the compositor to sample, which is a
+        // shadow that flickers as the popup opens.
+        let renderer = LayerRenderer::new(&comp.gpu).ok();
+        let size_px = (
+            ((self.panel.width() + MARGIN * 2.0) * self.px).round().max(1.0) as u32,
+            ((self.panel.height() + MARGIN * 2.0) * self.px).round().max(1.0) as u32,
+        );
         if let Ok(brush) = session.create_solid_brush(ColorF::BLACK) {
-            self.paint_panel(&session, &brush);
+            self.paint_panel(&session, &brush, renderer.as_ref(), size_px);
         }
         let _ = unsafe { self.surf.interop.EndDraw() };
     }
 
-    fn paint_panel(&self, session: &DrawingSession, brush: &Brush) {
+    fn paint_panel(
+        &self,
+        session: &DrawingSession,
+        brush: &Brush,
+        renderer: Option<&LayerRenderer>,
+        size_px: (u32, u32),
+    ) {
         // Panel-local origin: the panel sits at (MARGIN, MARGIN) in the surface.
         let p = Rect::from_xywh(MARGIN, MARGIN, self.panel.width(), self.panel.height());
 
@@ -620,9 +635,21 @@ impl Popup {
         // redraws the surface), so the blur is never a per-frame cost. Falls back to
         // a layered approximation if the off-screen path fails (device loss).
         let panel_rr = RoundedRect::uniform(p, theme::RADIUS_MD);
-        let real = session.drop_shadow(SHADOW_BLUR, linear(theme::b(0.6)), (0.0, SHADOW_DROP), || {
-            set(brush, theme::b(1.0));
-            session.fill_rounded_rect(&panel_rr, brush);
+        // Only the silhouette's ALPHA feeds the blur, so it is filled opaque white on
+        // the off-screen target whatever the eventual tint.
+        let real = renderer.is_some_and(|r| {
+            session.drop_shadow(
+                r,
+                size_px,
+                SHADOW_BLUR,
+                linear(theme::b(0.6)),
+                (0.0, SHADOW_DROP),
+                |s| {
+                    if let Ok(white) = s.create_solid_brush(ColorF::new(1.0, 1.0, 1.0, 1.0)) {
+                        s.fill_rounded_rect(&panel_rr, &white);
+                    }
+                },
+            )
         });
         if !real {
             for (i, a) in [(6.0_f32, 0.10_f32), (3.0, 0.16), (1.0, 0.24)] {

@@ -43,6 +43,21 @@ static UI_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 windows_core::link!("kernel32.dll" "system" fn GetCurrentThreadId() -> u32);
 
 /// Whether the caller is already running on the UI thread.
+/// True while a pointer capture (a drag/gesture) is held.
+///
+/// Readable from any thread so app-thread render code can tell a gesture is in
+/// flight. Settled-state UI — a config read-out, a serialized view, anything the
+/// user cannot meaningfully read mid-drag — should hold still while this is set
+/// instead of re-deriving itself on every pointer move: each such re-derivation
+/// records a real command, and a non-empty buffer commits, relayouts, repaints
+/// and recomposites the window, which tears the off-thread live surfaces.
+static POINTER_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+/// See [`POINTER_CAPTURE`]. `true` between a capturing press and its release.
+pub fn pointer_capture_active() -> bool {
+    POINTER_CAPTURE.load(Ordering::Relaxed)
+}
+
 pub(crate) fn on_ui_thread() -> bool {
     UI_THREAD_ID.load(Ordering::Relaxed) == unsafe { GetCurrentThreadId() }
 }
@@ -109,28 +124,37 @@ fn run_intents(s: &HostShared, intents: Vec<record::Intent>) {
 pub(crate) fn post_commit(hwnd: isize, cmds: Vec<record::Cmd>, root_id: Option<ControlId>) {
     post_ui(hwnd, move || {
         let Some(s) = shared() else { return };
-        let intents = {
-            let mut b = s.backend.borrow_mut();
-            // Replay before anything reads the arena: `set_root` looks the
-            // new root up and silently no-ops if it is absent, and layout
-            // walks the whole tree.
-            record::replay(&mut *b, cmds);
-            // After the buffer, so a surface requested in the same frame its
-            // host mounts finds the control already in the arena; before
-            // layout, so the sprite is parented when sizes are pushed.
-            b.service_surface_ops();
-            // Apply the frame's pointer-surface presence declarations into
-            // the front-side interest map so a bit filled during this render
-            // is visible to the next input message (one frame ahead, by
-            // design — the router routes on these bits, never the closures).
-            pointer::service_ops();
-            b.set_root(root_id);
-            b.relayout_and_paint();
-            b.take_intents()
-        };
-        run_intents(&s, intents);
+        apply_commit(&s, cmds, root_id);
     });
 }
+
+/// Replay one command buffer into the front backend, service the queued surface-
+/// and pointer-interest declarations, re-lay-out and paint, then ship any intents
+/// the replay raised back to the app thread (today replay fires no events; taken
+/// anyway so one can never sit in the queue until the next input message). Used by
+/// the eager [`post_commit`] path and by the on-release [`end_capture`] flush.
+fn apply_commit(s: &HostShared, cmds: Vec<record::Cmd>, root_id: Option<ControlId>) {
+    let intents = {
+        let mut b = s.backend.borrow_mut();
+        // Replay before anything reads the arena: `set_root` looks the new root up
+        // and silently no-ops if it is absent, and layout walks the whole tree.
+        record::replay(&mut *b, cmds);
+        // After the buffer, so a surface requested in the same frame its host mounts
+        // finds the control already in the arena; before layout, so the sprite is
+        // parented when sizes are pushed.
+        b.service_surface_ops();
+        // Apply the frame's pointer-surface presence declarations into the front-side
+        // interest map so a bit filled during this render is visible to the next input
+        // message (one frame ahead, by design — the router routes on these bits, never
+        // the closures).
+        pointer::service_ops();
+        b.set_root(root_id);
+        b.relayout_and_paint();
+        b.take_intents()
+    };
+    run_intents(s, intents);
+}
+
 
 /// Marshal `f` onto the UI thread and block until it completes, returning its
 /// result. When already on the UI thread it runs inline (re-entrancy-safe — a
@@ -924,6 +948,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     unsafe {
                         SetCapture(hwnd);
                     }
+                    POINTER_CAPTURE.store(true, Ordering::Relaxed);
                 }
             }
             0
@@ -933,6 +958,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Some(s) = shared() {
                 let (x, y) = dip_xy(hwnd, lparam);
                 release_capture_self();
+                POINTER_CAPTURE.store(false, Ordering::Relaxed);
                 dispatch_input(&s, |b| b.on_pointer_up(x, y));
             }
             0
@@ -948,6 +974,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         // button-up arm above); `release_capture_self` marks those so a normal
         // click is not cancelled out from under itself.
         WM_CAPTURECHANGED => {
+            // Whoever took it, we no longer hold capture — clear the gate on both
+            // the stolen and the self-release path, so settled-state UI can never
+            // be left frozen by a gesture that ended without a button-up.
+            POINTER_CAPTURE.store(false, Ordering::Relaxed);
             if !RELEASING_CAPTURE.with(|c| c.get())
                 && let Some(s) = shared()
             {

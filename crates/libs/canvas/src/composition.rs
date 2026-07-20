@@ -21,7 +21,8 @@ use windows_reactor::CompositionDrawSurface;
 /// Draws frames into a composition child-visual surface. Construct from a
 /// [`CompositionDrawSurface`] obtained via
 /// [`windows_reactor::CompositionSurfaceFactory::create`], then call
-/// [`draw`](Self::draw) per frame. Recreate the surface (and this target) to resize.
+/// [`draw`](Self::draw) per frame. Call [`resize`](Self::resize) to grow the backing
+/// in place — no need to recreate the surface or this target.
 pub struct CompositionDrawTarget {
     surface: CompositionDrawSurface,
     // Set by an adopted [`DrawingSession`] when a draw call reports device loss, so
@@ -71,5 +72,12 @@ impl CompositionDrawTarget {
         drop(session);
         self.surface.end_draw()?;
         Ok(out)
+    }
+
+    /// Resize the backing surface in place to `pixel` physical pixels — forwards to
+    /// [`CompositionDrawSurface::resize`]. The next [`draw`](Self::draw) fills the new
+    /// extent; the presented sprite is resized separately on the hosting thread.
+    pub fn resize(&self, pixel: (i32, i32)) -> Result<()> {
+        self.surface.resize(pixel)
     }
 }

@@ -106,6 +106,16 @@ impl PendingSurface {
     pub fn take(&self) -> Option<CompositionDrawSurface> {
         self.slot.lock().ok()?.take()
     }
+
+    /// Resize the presented sprite to `dip` DIPs, in place. Queues a resize of the
+    /// child visual the backend holds for this surface (applied on the backend's
+    /// thread next drain) — the backing pixels are resized separately by the drawing
+    /// side (`CompositionDrawSurface::resize`). A no-op if the surface was never
+    /// serviced. This is the resize path that replaces dropping and re-requesting:
+    /// the visual is never unparented, so the surface never blanks.
+    pub fn resize_visual(&self, dip: (f32, f32)) {
+        push(Op::Resize(self.token, dip));
+    }
 }
 
 impl Drop for PendingSurface {
@@ -129,6 +139,8 @@ pub(crate) struct Request {
 
 pub(crate) enum Op {
     Create(Box<Request>),
+    /// Resize a hosted surface's child visual to the given DIP size, in place.
+    Resize(SurfaceToken, (f32, f32)),
     Release(SurfaceToken),
 }
 
@@ -151,8 +163,9 @@ fn push(op: Op) {
 /// [`PendingSurface::take`] then yields the drawing side.
 ///
 /// `pixel` is the backing size in physical pixels and `dip` the size it is
-/// presented at. The pixel size is fixed for the surface's lifetime — to resize,
-/// drop the [`PendingSurface`] and request another.
+/// presented at. To resize later, use [`PendingSurface::resize_visual`] together
+/// with [`CompositionDrawSurface::resize`] on the drawing side — the surface
+/// resizes in place, so there is no need to drop it and request another.
 pub fn request_surface(
     host: ControlId,
     device: SurfaceDevice,
