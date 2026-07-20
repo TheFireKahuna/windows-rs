@@ -76,6 +76,12 @@ fn paint_node(
             // Same for a path: its curve is retained sprite shapes, so it owns
             // no surface and must be visited on its own account.
             || n.kind == ControlKind::Path
+            // And a knob: groove, ticks, hub, arc and needle are all retained
+            // compositor chrome and its words are sprites, so an UNFOCUSED one
+            // reports no chrome and owns no surface. Without this it would never
+            // be visited, `sync_knob` and `knob_sync` would never run, and the
+            // dial would render nothing at all.
+            || n.kind == ControlKind::Knob
     });
     if needs {
         let (w, h) = arena.get(id).map(|n| (n.rect.w, n.rect.h)).unwrap_or((0.0, 0.0));

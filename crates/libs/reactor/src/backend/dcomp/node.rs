@@ -1192,6 +1192,36 @@ impl Node {
             // Header fill, border, wash and ring are parts; the header label
             // and its chevron are sprites. Only the header was ever chrome.
             ControlKind::Expander => false,
+            // Box fill, border, hover/press wash and focus ring are parts
+            // (`parts::select_plan`); the current label and the trailing
+            // chevron are sprites. `paint_select` was two statements — a
+            // rounded fill and a rounded stroke — and it held a surface the
+            // full size of the control open for every ComboBox in the tree.
+            ControlKind::ComboBox | ControlKind::DropDownButton => false,
+            // Groove and origin notch are parts in the below band; the accent
+            // fill, hover halo and thumb have been parts above it since before
+            // any of this, and the ring joins them. The groove was the last
+            // thing drawing, and it was rasterizing a static track on every
+            // origin crossing — a repaint whose only real work was rebinding
+            // the fill's atlas source, which `parts::sync` does without a
+            // surface.
+            ControlKind::Slider => false,
+            // The dial is retained end to end: groove ring and both tick classes
+            // are mask layers over the very path the value arc rides, the hub is
+            // an FP16 circle sprite, arc / thumb / needle were compositor chrome
+            // already, and its four runs are glyph sprites. What made this worth
+            // doing is that a knob DRAGS — every pointer move calls
+            // `mark_dirty`, so the ring, every tick and the hub were being
+            // re-tessellated and re-rastered once per move, for chrome that does
+            // not depend on the value at all.
+            //
+            // The ring is retained too, as the same two concentric strokes every
+            // other converted control gets. It is a stroked rounded-rect PATH
+            // rather than the nine-grid bar they use, because the knob owns no
+            // `Parts` band and so has no `Part::bind` to set the grid up — but
+            // it does have `ChromeLayer`, and a ring is a path like any other.
+            // With that, nothing is left to draw at any focus state.
+            ControlKind::Knob => false,
             // Track, determinate fill and the travelling indeterminate segment
             // are all parts (`parts::progress_plan`, with the sweep armed by
             // `parts::progress_sweep`), and the sweep loops on the compositor.

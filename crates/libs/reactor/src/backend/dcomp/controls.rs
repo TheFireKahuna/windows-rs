@@ -65,19 +65,29 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         // (`parts::segmented_plan`), the segment labels are sprites
         // (`glyph_text::segmented_sync`).
         ControlKind::SelectorBar => {}
-        // Box fill and border only: the current label and the trailing chevron
-        // are retained glyph sprites (`glyph_text::select_sync`) above this
-        // surface.
-        ControlKind::ComboBox | ControlKind::DropDownButton => {
-            paint_select(session, brush, rect, dim)
-        }
-        ControlKind::Slider => paint_slider(session, brush, node, rect, dim),
+        // Fully retained, like the button family: box fill, border, hover/press
+        // wash and focus ring are parts (`parts::select_plan`), and the current
+        // label and trailing chevron are glyph sprites
+        // (`glyph_text::select_sync`). The two-statement `paint_select` this
+        // replaced was the last thing holding the surface open.
+        ControlKind::ComboBox | ControlKind::DropDownButton => {}
+        // Track, origin notch, accent fill, hover halo, thumb and focus ring
+        // are all retained parts (`parts::slider_sync`) — groove and notch in
+        // the below band, the rest above — so `has_chrome` denies it a surface
+        // and a scrub stays pure compositor property sets.
+        ControlKind::Slider => {}
         // Groove, gradient fill, reference marker and needle are all retained
         // chrome parts (`super::parts::meter_sync`). The groove was the last
         // thing drawn here and it did not depend on the level, so every level
         // change was re-rastering a constant; `has_chrome` denies it a surface.
         ControlKind::Meter => {}
-        ControlKind::Knob => paint_knob(session, brush, node, rect, dim),
+        // The dial is retained end to end: the groove ring and both tick classes
+        // are mask layers over the very path the value arc rides, the hub is an
+        // FP16 circle sprite, the arc, thumb and needle were compositor chrome
+        // already, and all four runs are glyph sprites
+        // (`glyph_text::knob_sync`). Only the focus ring is left, and only while
+        // the knob is keyboard-focused — see `Node::has_chrome`.
+        ControlKind::Knob => {}
         // Track, fill and indeterminate sweep are retained chrome parts
         // (`super::parts::progress_plan`; the sweep is armed by
         // `progress_sweep` and loops on the compositor), so `has_chrome`
@@ -212,6 +222,10 @@ fn ring_is_retained(kind: ControlKind) -> bool {
                 | ControlKind::SelectorBar
                 | ControlKind::CheckBox
                 | ControlKind::Expander
+                | ControlKind::ComboBox
+                | ControlKind::DropDownButton
+                | ControlKind::Slider
+                | ControlKind::Knob
         )
 }
 
@@ -668,47 +682,6 @@ pub(crate) fn select_chevron_box(node: &Node) -> Rect {
     Rect::new(left, 0.0, (node.rect.w - theme::SPACE_4).max(left), node.rect.h)
 }
 
-/// The trigger's box and border. Its label and chevron are retained glyph
-/// sprites (`glyph_text::select_sync`) placed above this surface — the editor
-/// pattern, because the fill and the focus-accented border are real drawing that
-/// no part expresses.
-fn paint_select(session: &DrawingSession, brush: &Brush, rect: Rect, dim: f32) {
-    let radius = theme::RADIUS_SM;
-    fill_rr(session, brush, rect, radius, theme::surface_raised(), dim);
-    stroke_rr(session, brush, rect, radius, theme::stroke(), theme::BORDER_W, dim);
-    // Hover/press wash: a retained ink part above this surface.
-}
-
-// ── Slider (native) ──────────────────────────────────────────────────────────
-
-fn paint_slider(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let cy = rect.height() / 2.0;
-    let inset = theme::SLIDER_THUMB / 2.0;
-    let x0 = inset;
-    let x1 = rect.width() - inset;
-
-    // Only the static groove paints here; the accent fill, hover halo, and
-    // thumb are retained chrome parts above this surface (`super::parts`) —
-    // a drag is pure compositor property sets, no repaint.
-    let groove = Rect::from_xywh(x0, cy - theme::SLIDER_TRACK / 2.0, x1 - x0, theme::SLIDER_TRACK);
-    fill_rr(session, brush, groove, theme::SLIDER_TRACK / 2.0, theme::w(0.06), dim);
-
-    // A fill origin strictly inside the range (a bidirectional gain-style
-    // slider) gets a notch standing proud of the track — brighter than the
-    // groove, dimmer than the thumb — so "where is neutral?" is answerable at
-    // rest. Origins at (or clamped to) an endpoint are just the track end.
-    if let Some(o) = node.ctrl().fill_origin
-        && o > node.ctrl().min.min(node.ctrl().max)
-        && o < node.ctrl().min.max(node.ctrl().max)
-    {
-        let ofrac = super::parts::slider_origin_frac(node);
-        let ox = x0 + (x1 - x0).max(0.0) * ofrac;
-        let tick_h = theme::SLIDER_TRACK + 4.0;
-        let tick = Rect::from_xywh(ox - 0.5, cy - tick_h / 2.0, 1.0, tick_h);
-        fill_rr(session, brush, tick, 0.5, theme::w(0.15), dim);
-    }
-}
-
 // ── Meter ────────────────────────────────────────────────────────────────────
 
 /// The meter's track fraction for its reference marker (`ctrl.marker` clamped
@@ -724,51 +697,6 @@ pub(crate) fn meter_marker_frac(node: &Node) -> Option<f32> {
 }
 
 // ── Knob ─────────────────────────────────────────────────────────────────────
-
-/// Static dial chrome: background track ring, ticks, numeric labels, center hub,
-/// and the center readout. The gradient value arc + needle are retained
-/// compositor vector chrome above this surface (`super::knob`) — the arc grows
-/// on a `TrimEnd` spring, so a value change repaints only the readout here.
-fn paint_knob(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    use super::knob::{dial_geom, value_to_angle};
-    let (cx, cy, radius) = dial_geom(node);
-    let (min, max) = (node.ctrl().min, node.ctrl().max);
-    let (start, end) = (node.ctrl().start_angle, node.ctrl().end_angle);
-    let _ = rect;
-
-    // Background track (full sweep), a wide soft groove under the value arc.
-    arc(session, brush, cx, cy, radius, 10.0, start, end, theme::w(0.06), dim);
-
-    // Ticks: minor + major (longer/brighter on an exact `major_every` multiple).
-    for &tv in &node.ctrl().ticks {
-        let a = value_to_angle(tv, min, max, start, end);
-        let major = node
-            .ctrl()
-            .major_every
-            .filter(|m| *m != 0.0)
-            .is_some_and(|m| (tv % m).abs() < 1e-9);
-        let tick_len = if major { 8.0 } else { 5.0 };
-        let inner = radius - tick_len - 4.0;
-        let outer = radius - 4.0;
-        let (ca, sa) = (a.cos(), a.sin());
-        put(brush, theme::w(if major { 0.28 } else { 0.14 }), dim);
-        session.draw_line(
-            Vector2::new(cx + ca * inner, cy + sa * inner),
-            Vector2::new(cx + ca * outer, cy + sa * outer),
-            brush,
-            if major { 1.5 } else { 1.0 },
-        );
-    }
-
-    // The numeric tick labels, the centre readout, the unit and the sub-line are
-    // all retained glyph sprites (`glyph_text::knob_sync`) — the one converted
-    // site that shapes its own runs, because all four of its type sizes derive
-    // from the radius `dial_geom` just fitted.
-
-    // Center hub.
-    put(brush, theme::w(1.0), dim);
-    session.fill_ellipse(&Ellipse::new(Vector2::new(cx, cy), 4.0, 4.0), brush);
-}
 
 // ── Progress ─────────────────────────────────────────────────────────────────
 

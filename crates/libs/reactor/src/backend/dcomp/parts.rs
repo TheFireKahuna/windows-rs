@@ -638,6 +638,19 @@ pub(crate) fn build_solid_surface(
     rasterize(comp, &AtlasKey::solid(color, scale)).map(|e| e.brush)
 }
 
+/// A standalone FP16 circle surface brush (display-mapped), for the Knob's
+/// centre hub — the one piece of its dial that is a plain disc rather than a
+/// stroked path, and so wants a sprite rather than a mask layer. See
+/// [`build_solid_surface`].
+pub(crate) fn build_circle_surface(
+    comp: &Compositing,
+    d: f32,
+    color: crate::Color,
+    scale: f32,
+) -> Option<CompositionSurfaceBrush> {
+    rasterize(comp, &AtlasKey::circle(d, color, scale)).map(|e| e.brush)
+}
+
 
 fn draw_shape(session: &DrawingSession, brush: &Brush, shape: &ShapeKey, w: f32, h: f32) {
     match shape {
@@ -1868,10 +1881,12 @@ fn look(kind: ControlKind) -> Option<Look> {
             (slot::N_BELOW, slot::N_ABOVE, button_plan)
         }
         K::HyperlinkButton => (0, 2, hyperlink_plan),
-        // The select triggers paint their own fill + border (`paint_select`), so
-        // they take the ink wash alone — a second retained fill under a painted
-        // one would double the chrome.
-        K::ComboBox | K::DropDownButton => (0, 1, ink_plan),
+        // Fill, border, wash and ring, like the Expander's header. The painted
+        // fill they used to sit on is gone, so the plan carries the whole
+        // control and `has_chrome` denies it a surface.
+        K::ComboBox | K::DropDownButton => {
+            (select_slot::N_BELOW, select_slot::N_ABOVE, select_plan)
+        }
         K::ToggleSwitch => (3, 2, toggle_plan),
         K::CheckBox => (2, 3, check_plan),
         K::SelectorBar => (4, 2, segmented_plan),
@@ -2156,7 +2171,7 @@ mod slot {
 /// Snapping the OFFSET matters as much as the width: it is what puts the ring's
 /// outer face on a pixel boundary in the first place, and a crisp width at a
 /// half-pixel offset is just as soft.
-fn focus_rings(scale: f32) -> [(f32, f32, crate::Color); 2] {
+pub(crate) fn focus_rings(scale: f32) -> [(f32, f32, crate::Color); 2] {
     // At least one physical pixel — a ring rounded away is worse than a thin one.
     let px = |v: f32| ((v * scale).round().max(1.0)) / scale;
     let inner = px(super::controls::FOCUS_RING_INNER_W);
@@ -2436,16 +2451,65 @@ pub(crate) fn hyperlink_plan(node: &Node, scale: f32) -> PartPlan {
 }
 
 
-/// Above: `[hover/press wash]`. The select triggers paint their own fill and
-/// border, so the ink is the whole of their retained chrome.
-pub(crate) fn ink_plan(node: &Node, scale: f32) -> PartPlan {
+/// A select trigger's part slots. Its own names, for the reason `box_slot` has
+/// its own: the band happens to open with a fill and an outline, but a trigger
+/// also carries a wash and a ring that a container has no use for, and a shared
+/// literal outlives the reason the two agreed.
+mod select_slot {
+    pub const FILL: usize = 0;
+    pub const BORDER: usize = 1;
+    pub const N_BELOW: usize = BORDER + 1;
+
+    pub const INK: usize = 0;
+    pub const RING_INNER: usize = 1;
+    pub const RING_OUTER: usize = 2;
+    pub const N_ABOVE: usize = RING_OUTER + 1;
+}
+
+/// A select trigger's whole appearance. Below: `[fill, border]`; above:
+/// `[hover/press wash, focus ring ×2]`.
+///
+/// This is `expander_plan`'s shape taken over the whole node instead of a header
+/// strip. It replaces `controls::paint_select`, which was two statements — a
+/// rounded fill and a rounded stroke — holding an FP16 surface the size of the
+/// control open for the life of every ComboBox in the tree. The reasoning that
+/// kept it there was circular: the trigger took the ink wash ALONE because a
+/// retained fill under a painted one would double the chrome, and the fill
+/// stayed painted because the retained one had been withheld.
+///
+/// It cannot be `box_plan`, which is the tempting answer. That plan reads the
+/// three generic paint props, and a select trigger is born with none of them —
+/// `node::birth_paint` gives a non-button-family kind no background, no border
+/// brush and a zero radius — so the generic plan would bind two hidden slots and
+/// render an invisible control. The colours here are theme ROLES, read live,
+/// which is equally why they cannot just be seeded into `birth_paint`: a birth
+/// value is captured once and would not survive a runtime theme switch.
+///
+/// The wash is `above[0]` deliberately. `ink_state_changed`'s default arm fades
+/// `above[0]` on a hover or press flip, so a wash at any other index would leave
+/// hover quietly fading a focus ring.
+pub(crate) fn select_plan(node: &Node, scale: f32) -> PartPlan {
     let (w, h) = (node.rect.w, node.rect.h);
-    PartPlan::new([w, h, 0.0]).above(
-        0,
-        AtlasKey::hbar(h, ink_radius(node), 0.0, theme::w(1.0), scale)
-            .snap_at(Some((0.0, 0.0, w, h)), ink_target(node))
-        .fading(),
-    )
+    let dim = dim_of(node);
+    let r = theme::RADIUS_SM;
+    let box_rect = Some((0.0, 0.0, w, h));
+
+    PartPlan::new([w, h, 0.0])
+        .below(
+            select_slot::FILL,
+            AtlasKey::hbar(h, r, 0.0, theme::surface_raised(), scale).snap_at(box_rect, dim),
+        )
+        .below(
+            select_slot::BORDER,
+            AtlasKey::hbar(h, r, theme::BORDER_W, theme::stroke(), scale).snap_at(box_rect, dim),
+        )
+        .above(
+            select_slot::INK,
+            AtlasKey::hbar(h, ink_radius(node), 0.0, theme::w(1.0), scale)
+                .snap_at(box_rect, ink_target(node))
+                .fading(),
+        )
+        .focus_ring(select_slot::RING_INNER, node.focus_ring, w, h, r, scale)
 }
 
 /// The combined hover + press wash target (endpoint parity with the painted
@@ -2670,7 +2734,36 @@ fn slider_fill_color(node: &Node, vfrac: f32, ofrac: f32) -> crate::Color {
     }
 }
 
-/// Above-band roles: `[fill, halo, thumb]`.
+/// The slider's part slots. Same reasoning as `mod slot`: the counts handed to
+/// `ensure` and the indices used to reach the parts have to agree, and
+/// `slider_drag`'s length guard is a third literal that has to agree with both.
+/// That guard is the dangerous one — it sits on the per-pointer-move path, and
+/// a stale `!= 3` there would send every move through `mark_dirty` instead of a
+/// property set, quietly turning the one control that already avoided repaints
+/// into the one that repaints most.
+mod slider_slot {
+    /// The static track, at the floor — the accent fill lies over it.
+    pub const GROOVE: usize = 0;
+    /// The bidirectional origin notch, over the groove and under the fill,
+    /// which is exactly where the surface used to put it.
+    pub const NOTCH: usize = 1;
+    pub const N_BELOW: usize = NOTCH + 1;
+
+    pub const FILL: usize = 0;
+    pub const HALO: usize = 1;
+    pub const THUMB: usize = 2;
+    pub const RING_INNER: usize = 3;
+    pub const N_ABOVE: usize = RING_INNER + 2;
+}
+
+/// Below-band roles: `[groove, origin notch]`. Above-band roles:
+/// `[fill, halo, thumb, focus ring ×2]`.
+///
+/// The groove and the notch were the last things painting here, and neither
+/// depends on the value: the surface existed to redraw a static track. The ring
+/// moves with them, because `controls::paint`'s shared tail draws it onto the
+/// surface — a surfaceless kind left off `ring_is_retained` loses its focus ring
+/// silently.
 fn slider_sync(
     comp: &Compositing,
     atlas: &mut Atlas,
@@ -2678,7 +2771,7 @@ fn slider_sync(
     scale: f32,
     scrubbing: bool,
 ) {
-    if !ensure(comp, node, 0, 3) {
+    if !ensure(comp, node, slider_slot::N_BELOW, slider_slot::N_ABOVE) {
         return;
     }
     let frac = super::ctrl_value_frac(node) as f32;
@@ -2687,8 +2780,27 @@ fn slider_sync(
     let halo_t = halo_target(node);
     let fill_c = slider_fill_color(node, frac, ofrac);
     let k_fill = AtlasKey::hbar(theme::SLIDER_TRACK, theme::SLIDER_TRACK / 2.0, 0.0, fill_c, scale);
+    let k_groove =
+        AtlasKey::hbar(theme::SLIDER_TRACK, theme::SLIDER_TRACK / 2.0, 0.0, theme::w(0.06), scale);
+    // A solid, like the meter's reference marker: a 1-DIP tick whose nine-grid
+    // insets would meet in the middle and leave no centre column to stretch.
+    let k_notch = AtlasKey::solid(theme::w(0.15), scale);
     let k_halo = AtlasKey::circle(theme::SLIDER_THUMB + 6.0, theme::w(1.0), scale);
     let k_thumb = AtlasKey::circle(theme::SLIDER_THUMB, theme::w(1.0), scale);
+
+    // Strictly INSIDE the range, matching what the painter tested: an origin at
+    // or past an endpoint is just the track end, and `slider_origin_frac` will
+    // not answer this — it clamps, and returns 0.0 for no origin at all.
+    let notch_on = node.ctrl().fill_origin.is_some_and(|o| {
+        o > node.ctrl().min.min(node.ctrl().max) && o < node.ctrl().min.max(node.ctrl().max)
+    });
+    let rings = focus_ring_slots(
+        node.focus_ring,
+        node.rect.w,
+        node.rect.h,
+        super::controls::focus_radius(node),
+        scale,
+    );
 
     let g = slider_geom(node.rect.w, node.rect.h, frac, ofrac);
     let geom = (node.rect.w, node.rect.h);
@@ -2699,14 +2811,42 @@ fn slider_sync(
     // A discrete change still glides.
     let snap = !parts.init || parts.geom != geom || node.pressed || scrubbing;
 
-    parts.above[0].bind(comp, atlas, k_fill);
-    parts.above[1].bind(comp, atlas, k_halo);
-    parts.above[2].bind(comp, atlas, k_thumb);
+    parts.below[slider_slot::GROOVE].bind(comp, atlas, k_groove);
+    parts.below[slider_slot::NOTCH].bind(comp, atlas, k_notch);
+    parts.above[slider_slot::FILL].bind(comp, atlas, k_fill);
+    parts.above[slider_slot::HALO].bind(comp, atlas, k_halo);
+    parts.above[slider_slot::THUMB].bind(comp, atlas, k_thumb);
+
+    // Both are pure functions of the rect and the origin prop, so they always
+    // snap: nothing here travels, and a prop write already re-syncs.
+    let (gx, gy, gw, gh) = g.groove;
+    parts.below[slider_slot::GROOVE].place(gx, gy, gw, gh);
+    let (nx, ny, nw, nh) = g.notch;
+    parts.below[slider_slot::NOTCH].place(nx, ny, nw, nh);
 
     slider_apply(parts, &g, snap);
-    parts.above[0].set_opacity(dim);
-    parts.above[1].fade_to(halo_t);
-    parts.above[2].set_opacity(dim);
+    parts.below[slider_slot::GROOVE].set_opacity(dim);
+    parts.below[slider_slot::NOTCH].set_opacity(if notch_on { dim } else { 0.0 });
+    parts.above[slider_slot::FILL].set_opacity(dim);
+    parts.above[slider_slot::HALO].fade_to(halo_t);
+    parts.above[slider_slot::THUMB].set_opacity(dim);
+
+    // Unpacked by hand: this sync does not run `apply_band`. Every slot
+    // `focus_ring_slots` returns is Snap/Snap, so `place` and `set_opacity` are
+    // the whole of it.
+    for (i, slot) in rings.iter().enumerate() {
+        let Some(part) = parts.above.get_mut(slider_slot::RING_INNER + i) else {
+            continue;
+        };
+        if let Some(k) = &slot.key {
+            part.bind(comp, atlas, k.clone());
+        }
+        if let Some(r) = slot.rect {
+            part.place(r.0, r.1, r.2, r.3);
+        }
+        part.set_opacity(slot.opacity);
+    }
+
     parts.geom = geom;
     parts.init = true;
 }
@@ -2714,6 +2854,12 @@ fn slider_sync(
 struct SliderGeom {
     /// The static full-track fill sprite.
     fill: (f32, f32, f32, f32),
+    /// The backing track, spanning the whole usable span.
+    groove: (f32, f32, f32, f32),
+    /// The origin notch, standing proud of the track. Always derived; WHETHER
+    /// it shows is a control-state question the caller answers, because the
+    /// predicate reads `fill_origin` against `min`/`max` and this takes neither.
+    notch: (f32, f32, f32, f32),
     /// `(x0, x1, origin_x)` in node coords — the constants the fill
     /// derivation is written against.
     anchor: (f32, f32, f32),
@@ -2740,6 +2886,10 @@ fn slider_geom(w: f32, h: f32, frac: f32, ofrac: f32) -> SliderGeom {
         // ends. Its left edge and width are derived from the thumb while it
         // glides (see `slider_fill_follow`) rather than sprung independently.
         fill: (fill_lo, cy - tr / 2.0, fill_hi - fill_lo, tr),
+        groove: (x0, cy - tr / 2.0, (x1 - x0).max(0.0), tr),
+        // Taller than the track by 4 DIP so it stands proud at both edges, and
+        // one DIP wide centred on the origin — the painter's `tick` rect.
+        notch: (origin_x - 0.5, cy - (tr + 4.0) / 2.0, 1.0, tr + 4.0),
         anchor: (x0, x1, origin_x),
         halo: (thumb_x - halo_d / 2.0, cy - halo_d / 2.0, halo_d, halo_d),
         thumb: (
@@ -2922,7 +3072,11 @@ pub(crate) fn slider_drag(node: &mut Node, frac: f32) -> bool {
     let ofrac = slider_origin_frac(node);
     let g = slider_geom(node.rect.w, node.rect.h, frac, ofrac);
     let Some(parts) = node.parts.as_mut() else { return false };
-    if parts.above.len() != 3 {
+    // `<`, not `!=`. This runs per pointer move, and `input::slider_to` calls
+    // `mark_dirty` when it returns false — so an exact count that fell out of
+    // step with the band would put a full repaint on every move of the one
+    // control that had already escaped them.
+    if parts.above.len() < slider_slot::N_ABOVE {
         return false;
     }
     slider_apply(parts, &g, true);
