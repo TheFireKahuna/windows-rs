@@ -66,9 +66,13 @@ use crate::system_bindings::{
     TEXTATTRIBUTEID, TextPatternRangeEndpoint, TextPatternRangeEndpoint_Start, TextUnit,
     TextUnit_Character, TextUnit_Format, TextUnit_Word, ToggleState, UiaPoint, UiaRect,
     UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent,
+    UiaRaiseStructureChangedEvent, StructureChangeType_ChildrenBulkAdded,
+    StructureChangeType_ChildrenBulkRemoved,
     HWND, LPARAM, POINT, SAFEARRAY, VARIANT, VARIANT_0,
     VARIANT_0_0, VARIANT_0_0_0, WM_SYSCOMMAND, WPARAM, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
-    SC_RESTORE, UIA_AutomationFocusChangedEventId, UIA_AutomationIdPropertyId,
+    SC_RESTORE, UIA_AcceleratorKeyPropertyId, UIA_AutomationFocusChangedEventId,
+    UIA_AutomationIdPropertyId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId,
+    UIA_MenuOpenedEventId, UIA_MenuClosedEventId, UIA_SeparatorControlTypeId,
     UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
     UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_ExpandCollapsePatternId,
     UIA_ExpandCollapseExpandCollapseStatePropertyId, UIA_GroupControlTypeId,
@@ -113,7 +117,43 @@ const UIA_APPEND_RUNTIME_ID: i32 = 3;
 const CAPTION_ITEM_BASE: i32 = 1 << 20;
 
 fn is_caption(item: i32) -> bool {
-    item >= CAPTION_ITEM_BASE
+    (CAPTION_ITEM_BASE..MENU_BASE).contains(&item)
+}
+
+/// An open command menu's own elements: the `Menu` popup at `MENU_BASE`, and its
+/// rows at `MENU_BASE + 1 + i`.
+///
+/// A fourth disjoint space, for the same reason the other three are disjoint —
+/// but this one differs from them in a way worth stating: the caption cluster
+/// and the nav pane's chrome are *permanent* children of the node that owns
+/// them, whereas these exist only while the popup is open (see
+/// [`menu_popup`](DCompBackend::menu_popup)). The owner is a Button, which has
+/// no natural item space of its own, so the base is not what keeps these apart
+/// from anything — it is what keeps the two LEVELS apart from each other, since
+/// the menu and its rows are both synthetic items of the same node.
+///
+/// Two levels under one node is what makes the menu a real `Menu` element with
+/// `MenuItem` children rather than a flat run of items hung off a Button. That
+/// nesting is the documented UIA menu shape, and it is what gives a client the
+/// containment it counts positions within.
+const MENU_BASE: i32 = 1 << 24;
+
+fn is_menu(item: i32) -> bool {
+    item >= MENU_BASE
+}
+
+fn is_menu_root(item: i32) -> bool {
+    item == MENU_BASE
+}
+
+/// The row a menu item names, or `None` for the menu element itself. Bounds
+/// against the live row count are the caller's — this is pure arithmetic.
+fn menu_row_of(item: i32) -> Option<usize> {
+    (item > MENU_BASE).then(|| (item - MENU_BASE - 1) as usize)
+}
+
+fn menu_row_item(index: usize) -> i32 {
+    MENU_BASE + 1 + index as i32
 }
 
 /// A NavigationView pane's own chrome — the back arrow, the hamburger and the
@@ -388,6 +428,44 @@ impl DCompBackend {
         self.arena.get(id).map(|n| n.kind)
     }
 
+    /// `id`'s open command menu, when it has one.
+    ///
+    /// The single gate every menu-facing helper below reads, so the rule that a
+    /// menu's elements exist only while it is on screen is stated once. It is
+    /// the same rule [`infobar_close_present`](Self::infobar_close_present)
+    /// enforces and for the same reason: a menu row that a client can find and
+    /// invoke while nothing is drawn would let a screen reader user pick a
+    /// command out of a menu they never opened.
+    ///
+    /// The backend owns at most one popup, so "is it mine, and is it a menu?"
+    /// answers this completely.
+    fn menu_popup(&self, id: ControlId) -> Option<&super::popup::Popup> {
+        self.popup
+            .as_ref()
+            .filter(|p| p.owner == id && p.is_command_menu())
+    }
+
+    /// Rows in `id`'s open command menu (0 when it has none open).
+    fn menu_row_count(&self, id: ControlId) -> usize {
+        self.menu_popup(id).map_or(0, |p| p.menu_rows().len())
+    }
+
+    /// The row a menu item names, bounded against the live row list.
+    fn menu_row(&self, id: ControlId, item: i32) -> Option<&super::node::MenuRow> {
+        self.menu_popup(id)?.menu_rows().get(menu_row_of(item)?)
+    }
+
+    /// Whether a menu item is a row a user can actually pick — enabled, and not
+    /// a separator.
+    ///
+    /// The one predicate behind the Invoke pattern, keyboard focusability and
+    /// the arrow-key walk, so the set of rows a screen reader can reach is by
+    /// construction the set [`Popup::move_highlight`] steps through.
+    fn menu_row_invokable(&self, id: ControlId, item: i32) -> bool {
+        self.menu_row(id, item)
+            .is_some_and(|r| r.enabled && !r.separator)
+    }
+
     /// The container's selectable items.
     ///
     /// For a nav pane this is the rows that FIT, not the rows that exist: a
@@ -455,6 +533,15 @@ impl DCompBackend {
     /// being the same number and the three `syn_*` helpers become the only
     /// thing the tree walk below may reason about.
     fn syn_len(&self, id: ControlId) -> i32 {
+        // An open command menu is its owner's ONE synthetic child — the rows
+        // hang off the menu, not off the owner. Answered before the kind table
+        // because a menu is not a property of the kind: any button can carry
+        // one. It cannot displace a container's items either, since the kinds
+        // that have items (ComboBox, SelectorBar, NavigationView) are exactly
+        // the kinds `is_command_menu` refuses.
+        if self.menu_popup(id).is_some() {
+            return 1;
+        }
         match self.uia_kind(id) {
             Some(ControlKind::NavigationView) => self.nav_seq_len(id),
             Some(ControlKind::InfoBar) => i32::from(self.infobar_close_present(id)),
@@ -464,6 +551,9 @@ impl DCompBackend {
 
     /// The synthetic item at reading position `pos`.
     fn syn_at(&self, id: ControlId, pos: i32) -> Option<i32> {
+        if self.menu_popup(id).is_some() {
+            return (pos == 0).then_some(MENU_BASE);
+        }
         match self.uia_kind(id) {
             Some(ControlKind::NavigationView) => self.nav_seq_at(id, pos),
             Some(ControlKind::InfoBar) => {
@@ -475,6 +565,9 @@ impl DCompBackend {
 
     /// The reading position of synthetic item `item`.
     fn syn_pos(&self, id: ControlId, item: i32) -> Option<i32> {
+        if self.menu_popup(id).is_some() {
+            return is_menu_root(item).then_some(0);
+        }
         match self.uia_kind(id) {
             Some(ControlKind::NavigationView) => self.nav_seq_pos(id, item),
             Some(ControlKind::InfoBar) => {
@@ -587,6 +680,45 @@ impl DCompBackend {
                         None => UiaNav::None,
                     },
                 },
+                _ => UiaNav::None,
+            };
+        }
+
+        // The one place in this walk where a synthetic item has synthetic
+        // CHILDREN. `syn_*` describes a single level — the items directly under
+        // a node — and a menu is two: the `Menu` element sits in that level,
+        // and its rows hang beneath it. Rather than teach `syn_*` about depth
+        // (which would put a menu's rows into the reading order of every
+        // container that has none), the menu's two levels are walked here.
+        if is_menu(item) {
+            let rows = self.menu_row_count(id) as i32;
+            if is_menu_root(item) {
+                return match dir {
+                    NAV_PARENT if self.root == Some(id) => UiaNav::Root,
+                    NAV_PARENT => UiaNav::Node(id),
+                    NAV_FIRST if rows > 0 => UiaNav::Item(id, menu_row_item(0)),
+                    NAV_LAST if rows > 0 => UiaNav::Item(id, menu_row_item(rows as usize - 1)),
+                    // The menu is its owner's only synthetic child and sits
+                    // ahead of the owner's real content, so the sibling after
+                    // it is the owner's first real child — the same prefix rule
+                    // a container's items follow.
+                    NAV_NEXT => match node.children.first() {
+                        Some(c) => UiaNav::Node(*c),
+                        None => UiaNav::None,
+                    },
+                    _ => UiaNav::None,
+                };
+            }
+            // A row whose index no longer exists (the menu closed or changed
+            // under a client holding a provider) navigates nowhere rather than
+            // to a neighbour that is not the one it asked about.
+            let Some(i) = menu_row_of(item).map(|i| i as i32).filter(|i| *i < rows) else {
+                return UiaNav::None;
+            };
+            return match dir {
+                NAV_PARENT => UiaNav::Item(id, MENU_BASE),
+                NAV_NEXT if i + 1 < rows => UiaNav::Item(id, menu_row_item(i as usize + 1)),
+                NAV_PREV if i > 0 => UiaNav::Item(id, menu_row_item(i as usize - 1)),
                 _ => UiaNav::None,
             };
         }
@@ -705,6 +837,22 @@ impl DCompBackend {
             }
             .to_string();
         }
+        // A menu names itself after the control it dropped from, so a client
+        // that lands on the popup is told which button opened it — "Add
+        // Processor menu" rather than a bare, unnamed Menu. A row names itself
+        // with the text it draws; the shortcut hint beside it is NOT part of
+        // the name, it is the `AcceleratorKey` property (see
+        // `uia_accelerator`), which is where a client expects to find it and
+        // how it avoids being read as part of the command.
+        if is_menu(item) {
+            return match menu_row_of(item) {
+                None => self.uia_name(id, -1),
+                Some(_) => self
+                    .menu_row(id, item)
+                    .map(|r| r.text.clone())
+                    .unwrap_or_default(),
+            };
+        }
         // The InfoBar's close button shares the chrome index space, so the
         // owning kind is what tells the two apart — see `INFOBAR_CLOSE_ITEM`.
         if item == INFOBAR_CLOSE_ITEM
@@ -807,20 +955,26 @@ impl DCompBackend {
             .find_map(|&c| self.descendant_text(c, depth + 1))
     }
 
-    fn uia_automation_id(&self, id: ControlId) -> String {
-        self.arena
-            .get(id)
-            .and_then(|n| n.accessibility.as_ref())
-            .and_then(|a| a.automation_id.clone())
-            .unwrap_or_default()
-    }
-
-    fn uia_help_text(&self, id: ControlId) -> String {
-        self.arena
-            .get(id)
-            .and_then(|n| n.accessibility.as_ref())
-            .and_then(|a| a.help_text.clone())
-            .unwrap_or_default()
+    /// `AutomationId` / `HelpText` — both authored on a node, and therefore both
+    /// the NODE's and not its synthetic items'.
+    ///
+    /// A synthetic item reports neither. Handing an item the owner's values
+    /// would give every row of a menu, every page of a nav pane and every
+    /// segment of a bar the same `AutomationId` — which is precisely the one
+    /// thing an id must not be, since a client uses it to tell siblings apart
+    /// — and would have each of them claim the container's help text as its
+    /// own description.
+    fn uia_authored(&self, id: ControlId, item: i32) -> (String, String) {
+        if item >= 0 {
+            return (String::new(), String::new());
+        }
+        let Some(a) = self.arena.get(id).and_then(|n| n.accessibility.as_ref()) else {
+            return (String::new(), String::new());
+        };
+        (
+            a.automation_id.clone().unwrap_or_default(),
+            a.help_text.clone().unwrap_or_default(),
+        )
     }
 
     fn uia_control_type(&self, id: ControlId, item: i32) -> i32 {
@@ -830,6 +984,17 @@ impl DCompBackend {
         if is_caption(item) || is_nav_chrome(item) {
             return UIA_ButtonControlTypeId;
         }
+        // A separator is drawn as a rule between groups of commands, and that
+        // is exactly what it is to a client: structure, not a command. Typing
+        // it `MenuItem` would put an unnamed, uninvokable entry into the run a
+        // screen reader counts and reads through.
+        if is_menu(item) {
+            return match self.menu_row(id, item) {
+                None => UIA_MenuControlTypeId,
+                Some(r) if r.separator => UIA_SeparatorControlTypeId,
+                Some(_) => UIA_MenuItemControlTypeId,
+            };
+        }
         match self.arena.get(id) {
             Some(n) if item >= 0 => item_control_type(n.kind),
             Some(n) => control_type(n.kind),
@@ -837,11 +1002,25 @@ impl DCompBackend {
         }
     }
 
-    fn uia_is_enabled(&self, id: ControlId) -> bool {
+    fn uia_is_enabled(&self, id: ControlId, item: i32) -> bool {
+        // A menu row carries its OWN enabled flag — a disabled command sits in
+        // an enabled menu under an enabled button, so the owner's flag says
+        // nothing about it. The menu element and separators are inert chrome,
+        // which reads as enabled: `IsEnabled=false` means "this would act but
+        // currently cannot", and neither would ever act.
+        if is_menu(item) {
+            return self.menu_row(id, item).is_none_or(|r| r.enabled || r.separator);
+        }
         self.arena.get(id).map_or(true, |n| n.paint.is_enabled)
     }
 
     fn uia_focusable(&self, id: ControlId, item: i32) -> bool {
+        // Exactly the rows the arrow keys stop on — separators and disabled
+        // commands are skipped by `move_highlight`, so advertising them as
+        // focusable would promise a landing place the keyboard never offers.
+        if is_menu(item) {
+            return self.menu_row_invokable(id, item);
+        }
         if item >= 0 {
             // Caption buttons are pointer-only (Alt+Space serves the keyboard).
             return !is_caption(item);
@@ -850,7 +1029,33 @@ impl DCompBackend {
     }
 
     fn uia_has_focus(&self, id: ControlId, item: i32) -> bool {
+        // While a command menu is open the keyboard drives its rows and nothing
+        // else: `input`'s popup key ring swallows the Tab ring whole, so the
+        // arrow keys move the highlight and Enter commits it. The highlighted
+        // row IS the focused element for that whole time, and its owner is not
+        // — even though `focused_id` still names the owner, because that is
+        // where focus returns when the menu closes.
+        //
+        // Reporting the owner instead is what makes a screen reader re-read
+        // "Add Processor button" on every arrow key while never saying which
+        // command the user has landed on.
+        if let Some(p) = self.menu_popup(id) {
+            return match p.hovered {
+                // Nothing highlighted yet — the menu itself holds focus, which
+                // is what a client reads on the opening edge.
+                usize::MAX => is_menu_root(item),
+                h => item == menu_row_item(h),
+            };
+        }
         item < 0 && self.focused_id == Some(id)
+    }
+
+    /// `AcceleratorKey` — a menu row's shortcut hint, as the property a client
+    /// expects it in rather than smuggled into the row's name.
+    fn uia_accelerator(&self, id: ControlId, item: i32) -> String {
+        self.menu_row(id, item)
+            .map(|r| r.shortcut.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn uia_pattern_supported(
@@ -861,6 +1066,13 @@ impl DCompBackend {
     ) -> bool {
         if is_caption(item) {
             return pid == UIA_InvokePatternId; // caption buttons only invoke
+        }
+        // A menu row invokes and does nothing else — a command menu carries no
+        // selection, so `SelectionItem` (which the generic item branch below
+        // would hand it) would advertise a "selected" state no row can ever
+        // hold. The Menu element itself is pure containment: no pattern at all.
+        if is_menu(item) {
+            return pid == UIA_InvokePatternId && self.menu_row_invokable(id, item);
         }
         if pid == UIA_ScrollItemPatternId {
             return self.uia_scroll_ancestor(id).is_some();
@@ -881,8 +1093,21 @@ impl DCompBackend {
             .is_some_and(|k| pattern_supported(k, item, pid))
     }
 
+    /// The row a UIA `Invoke` on synthetic item `item` should commit, when
+    /// `item` names a pickable row of `id`'s open command menu.
+    ///
+    /// `None` for a separator, a disabled command, an index the menu no longer
+    /// has, or any item that is not a menu item at all — so an invoke that
+    /// races the menu closing does nothing rather than committing whatever row
+    /// now sits at that index.
+    pub(crate) fn uia_menu_row_invoked(&self, id: ControlId, item: i32) -> Option<usize> {
+        self.menu_row_invokable(id, item)
+            .then(|| menu_row_of(item))
+            .flatten()
+    }
+
     /// Whether this node activates by opening the menu popup.
-    fn opens_a_menu(&self, id: ControlId) -> bool {
+    pub(crate) fn opens_a_menu(&self, id: ControlId) -> bool {
         self.arena.get(id).is_some_and(|n| {
             matches!(
                 n.kind,
@@ -1121,6 +1346,18 @@ impl DCompBackend {
 
     /// The fragment with keyboard focus, for the fragment root's `GetFocus`.
     pub(crate) fn uia_focus(&self) -> UiaNav {
+        // An open command menu owns the keyboard outright, so it owns focus —
+        // the same answer `uia_has_focus` gives per element, given here as the
+        // single element a client asks the fragment root for. The two must
+        // agree: a `GetFocus` that named the owner while the owner reported
+        // `HasKeyboardFocus=false` would leave a client with no focused element
+        // at all.
+        if let Some(p) = self.popup.as_ref().filter(|p| p.is_command_menu()) {
+            return match p.hovered {
+                usize::MAX => UiaNav::Item(p.owner, MENU_BASE),
+                h => UiaNav::Item(p.owner, menu_row_item(h)),
+            };
+        }
         match self.focused_id {
             Some(id) if self.root == Some(id) => UiaNav::Root,
             Some(id) => UiaNav::Node(id),
@@ -1133,6 +1370,18 @@ impl DCompBackend {
         if is_caption(item) {
             let (bx, by, bw, bh) = self.uia_caption_button(item - CAPTION_ITEM_BASE)?;
             return Some(self.uia_screen_rect(bx, by, bw, bh));
+        }
+        // A popup is z-promoted above the whole tree and lives outside every
+        // scroll viewport, so its boxes are already window-space and return
+        // BEFORE the scroll adjustment below — subtracting an ancestor's scroll
+        // offset would slide a menu that does not move with it.
+        if is_menu(item) {
+            let p = self.menu_popup(id)?;
+            let r = match menu_row_of(item) {
+                None => p.panel_rect(),
+                Some(i) => p.row_bounds(i)?,
+            };
+            return Some(self.uia_screen_rect(r.left, r.top, r.width(), r.height()));
         }
         let n = self.arena.get(id)?;
         let (mut x, mut y, mut w, mut h) = (n.rect.x, n.rect.y, n.rect.w, n.rect.h);
@@ -1222,6 +1471,23 @@ impl DCompBackend {
             let _ = ScreenToClient(self.hwnd as HWND, &mut pt);
         }
         let (px, py) = (pt.x as f32 / scale, pt.y as f32 / scale);
+        // An open popup is promoted above the entire tree — including the
+        // caption strip — so it is tested before anything beneath it, for the
+        // same reason the caption cluster is tested before the arena walk. The
+        // panel is opaque: a point inside it belongs to the menu even where no
+        // row does (the padding, a separator's gutter), which is why the miss
+        // resolves to the menu element rather than falling through to whatever
+        // the popup happens to be covering.
+        if let Some(p) = self.popup.as_ref().filter(|p| p.is_command_menu()) {
+            let panel = p.panel_rect();
+            if (panel.left..panel.right).contains(&px) && (panel.top..panel.bottom).contains(&py) {
+                let row = (0..p.menu_rows().len()).find(|&i| {
+                    p.row_bounds(i)
+                        .is_some_and(|r| (r.top..r.bottom).contains(&py))
+                });
+                return UiaNav::Item(p.owner, row.map_or(MENU_BASE, menu_row_item));
+            }
+        }
         // The caption cluster overlays the content; test its buttons first.
         if let (Some(root), Some((bx0, cy, _, ch))) = (self.root, self.uia_caption_button(0))
             && py >= cy
@@ -1443,6 +1709,17 @@ impl DCompBackend {
     /// so it never runs inside an input borrow, and a no-op when no client is
     /// listening (idle cost stays zero). Called on the UI thread from `set_focus`.
     pub(crate) fn uia_raise_focus(&self, id: ControlId) {
+        self.uia_raise_focus_item(id, -1);
+    }
+
+    /// The same raise for a synthetic item — how a menu announces the row the
+    /// arrow keys just moved to.
+    ///
+    /// Focus inside a menu never touches `focused_id` (the popup key ring keeps
+    /// the owner focused so focus has somewhere to return), so nothing on the
+    /// ordinary focus path would ever fire for it. Without this a screen reader
+    /// user arrowing through the menu hears nothing at all.
+    pub(crate) fn uia_raise_focus_item(&self, id: ControlId, item: i32) {
         // The state this describes just changed — retire the property snapshots
         // before the (client-gated) event raise.
         note_state_change();
@@ -1451,10 +1728,90 @@ impl DCompBackend {
         }
         let hwnd = self.hwnd;
         host::post_ui(hwnd, move || {
-            let provider = stable_provider(ElementProvider::element(hwnd, id));
+            let provider = stable_provider(ElementProvider::item(hwnd, id, item));
             unsafe {
                 let _ = UiaRaiseAutomationEvent(provider.as_raw(), UIA_AutomationFocusChangedEventId);
             }
+        });
+    }
+
+    /// Announce the command-menu row the highlight has just moved to.
+    ///
+    /// The highlight IS focus while a menu is open (see
+    /// [`uia_has_focus`](Self::uia_has_focus)), so moving it is a focus change
+    /// — but one that never touches `focused_id`, which is why nothing on the
+    /// ordinary focus path fires for it.
+    ///
+    /// `before` is the highlight as it stood prior to the move. A move that
+    /// lands where it started — an arrow key in a menu with one pickable row,
+    /// a pointer crossing within the same row — announces nothing, so a screen
+    /// reader does not repeat the command the user is already on.
+    pub(crate) fn uia_announce_menu_highlight(&self, before: Option<usize>) {
+        let Some(p) = self.popup.as_ref().filter(|p| p.is_command_menu()) else {
+            return;
+        };
+        let (owner, now) = (p.owner, p.hovered);
+        if before == Some(now) || now == usize::MAX {
+            return;
+        }
+        self.uia_raise_focus_item(owner, menu_row_item(now));
+    }
+
+    /// Announce that `owner`'s popup just opened or closed.
+    ///
+    /// Called from the two popup lifecycle choke points in `input`, so every
+    /// route that opens or dismisses one — pointer, Escape, light-dismiss,
+    /// commit, window deactivation, or a client's own `ExpandCollapse` call —
+    /// announces identically.
+    ///
+    /// Three things change at once and a client needs all three:
+    ///
+    /// * **`ExpandCollapseState`** on the owner. It is derived from popup
+    ///   ownership ([`uia_expand_state`]), so it changes exactly here and
+    ///   nowhere else — including for a ComboBox or DropDownButton, whose state
+    ///   flip nothing announced before this.
+    /// * **Structure-changed** on the owner. The menu and its rows appear and
+    ///   vanish as a block, which is precisely what the bulk variants describe.
+    ///   A client that cached the owner's children must be told to re-walk them
+    ///   or it will keep handing out providers for rows that are gone.
+    /// * **`MenuOpened` / `MenuClosed`** on the menu element. The events a
+    ///   screen reader listens for to switch into and out of menu mode.
+    ///
+    /// [`uia_expand_state`]: Self::uia_expand_state
+    pub(crate) fn uia_notify_popup(&self, owner: ControlId, is_menu_popup: bool, opened: bool) {
+        note_tree_change();
+        if !clients_listening() {
+            return;
+        }
+        raise_property_changed(
+            self.hwnd,
+            owner,
+            UIA_ExpandCollapseExpandCollapseStatePropertyId,
+            PropVal::I4(i32::from(opened)),
+        );
+        if !is_menu_popup {
+            return;
+        }
+        let hwnd = self.hwnd;
+        host::post_ui(hwnd, move || unsafe {
+            let owner_p = stable_provider(ElementProvider::element(hwnd, owner));
+            // The bulk forms take no runtime id: they name the parent whose
+            // children changed, which is the provider itself.
+            let _ = UiaRaiseStructureChangedEvent(
+                owner_p.as_raw(),
+                if opened {
+                    StructureChangeType_ChildrenBulkAdded
+                } else {
+                    StructureChangeType_ChildrenBulkRemoved
+                },
+                core::ptr::null_mut(),
+                0,
+            );
+            let menu_p = stable_provider(ElementProvider::item(hwnd, owner, MENU_BASE));
+            let _ = UiaRaiseAutomationEvent(
+                menu_p.as_raw(),
+                if opened { UIA_MenuOpenedEventId } else { UIA_MenuClosedEventId },
+            );
         });
     }
 
@@ -1672,24 +2029,27 @@ struct PropSnapshot {
     has_focus: bool,
     is_password: bool,
     live_setting: i32,
+    accelerator: String,
 }
 
 impl DCompBackend {
     /// Collect every cacheable property of `(id, item)` in one pass.
     fn uia_snapshot(&self, id: ControlId, item: i32) -> PropSnapshot {
+        let (automation_id, help_text) = self.uia_authored(id, item);
         PropSnapshot {
             name: self.uia_name(id, item),
-            automation_id: self.uia_automation_id(id),
-            help_text: self.uia_help_text(id),
+            automation_id,
+            help_text,
             control_type: self.uia_control_type(id, item),
             value: self.uia_value_string(id),
             toggle_state: self.uia_toggle_state(id),
             range_value: self.uia_range(id).map_or(0.0, |r| r.0),
-            is_enabled: self.uia_is_enabled(id),
+            is_enabled: self.uia_is_enabled(id, item),
             focusable: self.uia_focusable(id, item),
             has_focus: self.uia_has_focus(id, item),
             is_password: self.uia_kind(id) == Some(ControlKind::PasswordBox),
             live_setting: self.uia_live_setting(id, item),
+            accelerator: self.uia_accelerator(id, item),
         }
     }
 
@@ -2022,6 +2382,8 @@ impl ElementProvider {
             v_bstr(s.value)
         } else if pid == UIA_LiveSettingPropertyId {
             v_i4(s.live_setting)
+        } else if pid == UIA_AcceleratorKeyPropertyId {
+            v_bstr(s.accelerator)
         } else {
             VARIANT::default()
         }
