@@ -24,9 +24,9 @@ pub mod dcomp_test_api;
 
 #[cfg(feature = "dcomp-backend")]
 pub use dcomp::{
-    set_display_change_callback, set_host_tokens, set_output_color_transform,
-    set_root_backdrop_provider, set_window_visibility_callback, BackdropDither, BackdropGlow,
-    BackdropSpec, DCompBackend, DCompHost, GlowDrift, HostTokens,
+    pointer_capture_active, set_display_change_callback, set_host_tokens,
+    set_output_color_transform, set_root_backdrop_provider, set_window_visibility_callback,
+    BackdropDither, BackdropGlow, BackdropSpec, DCompBackend, DCompHost, GlowDrift, HostTokens,
 };
 
 /// Opaque, non-zero handle the backend assigns to every live control.

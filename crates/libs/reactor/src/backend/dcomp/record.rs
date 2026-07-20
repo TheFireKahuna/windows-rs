@@ -737,6 +737,14 @@ pub(crate) struct RecordingBackend {
     /// `Prop::Text` on anything else is a plain label and stays on the
     /// ordinary prop path.
     text_prop: FxHashMap<ControlId, Prop>,
+    /// Per control, the last [`PointerInterest`] declared to the front. The
+    /// reconciler re-emits the pointer binding every render (fresh closures), but
+    /// the derived bitset rarely changes — this is what keeps that re-emission out
+    /// of the buffer, so a render that changed nothing records nothing.
+    pointer_view: FxHashMap<ControlId, PointerInterest>,
+    /// Per control, the last flyout [`FlyoutDecl`] declared to the front, for the
+    /// same reason as [`Self::pointer_view`].
+    flyout_view: FxHashMap<ControlId, Option<FlyoutDecl>>,
 }
 
 impl RecordingBackend {
@@ -756,6 +764,8 @@ impl RecordingBackend {
             delivered_text_rev: FxHashMap::default(),
             text_view: FxHashMap::default(),
             text_prop: FxHashMap::default(),
+            pointer_view: FxHashMap::default(),
+            flyout_view: FxHashMap::default(),
         }
     }
 
@@ -1079,6 +1089,15 @@ impl Backend for RecordingBackend {
                     None
                 }
             };
+            // Only the plain DECL crosses; the Element tree and `on_closed` stay
+            // app-side (kept above, always — a re-render rebuilds them). The decl is
+            // derived from the definition, so it is identical across renders that
+            // changed nothing, and re-emitting it would make every no-op re-render a
+            // non-empty commit. Absorb the re-emission (cf. `text_view`).
+            if self.flyout_view.get(&id) == Some(&decl) {
+                return;
+            }
+            self.flyout_view.insert(id, decl.clone());
             self.push(Cmd::SetFlyout { id, decl });
             return;
         }
@@ -1135,14 +1154,28 @@ impl Backend for RecordingBackend {
         self.delivered_text_rev.remove(&id);
         self.text_view.remove(&id);
         self.text_prop.remove(&id);
+        // Drop the declaration views too: a later control reusing this id must
+        // re-declare from scratch rather than be mistaken for an unchanged one.
+        self.pointer_view.remove(&id);
+        self.flyout_view.remove(&id);
         self.push(Cmd::Destroy { id });
     }
 
     fn attach_event(&mut self, id: ControlId, event: Event, handler: EventHandler) {
         let slot = self.handlers.entry(id).or_default();
+        // Was this event already declared to the front for this control?
+        let declared = slot.iter().any(|(e, _)| *e == event);
         slot.retain(|(e, _)| *e != event);
         slot.push((event, handler));
-        self.push(Cmd::AttachEvent { id, event });
+        // The buffer carries only the DECLARATION that the event exists (the handler
+        // itself stays app-side, keyed above). The reconciler re-attaches every
+        // binding on every render — closures are rebuilt each time — so re-emitting
+        // an already-declared event would make *every* no-op re-render a non-empty
+        // commit, and a non-empty commit relayouts, repaints and recomposites the
+        // window. Same discipline as `text_view` below: absorb the re-emission here.
+        if !declared {
+            self.push(Cmd::AttachEvent { id, event });
+        }
     }
 
     fn detach_event(&mut self, id: ControlId, event: Event) {
@@ -1308,6 +1341,15 @@ impl Backend for RecordingBackend {
                 PointerInterest::default()
             }
         };
+        // Only the interest BITSET crosses; the callbacks stay app-side (kept above,
+        // always, since each render brings fresh closures). The bitset is derived from
+        // which callbacks exist, so it is identical across renders that changed
+        // nothing — re-emitting it would make every no-op re-render a non-empty
+        // commit. Absorb the re-emission, exactly as `text_view` does for text.
+        if self.pointer_view.get(&id) == Some(&interest) {
+            return;
+        }
+        self.pointer_view.insert(id, interest);
         self.push(Cmd::SetPointerInterest { id, interest });
     }
 

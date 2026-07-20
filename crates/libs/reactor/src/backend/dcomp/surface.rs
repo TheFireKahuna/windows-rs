@@ -44,6 +44,15 @@ impl SurfaceHost {
         self.live.retain(|(t, _, _)| *t != token);
     }
 
+    /// Resize the child visual hosting `token` to `dip` DIPs, in place. A no-op if
+    /// the surface is gone (released between the resize request and this drain) — the
+    /// drawing side's backing resize is likewise harmless in that case.
+    fn resize(&mut self, token: SurfaceToken, dip: (f32, f32)) {
+        if let Some((_, _, visual)) = self.live.iter().find(|(t, _, _)| *t == token) {
+            visual.set_dip_size(dip);
+        }
+    }
+
     fn factory_for(
         &mut self,
         compositor: &crate::system_bindings::Compositor,
@@ -86,6 +95,7 @@ impl super::DCompBackend {
             match op {
                 Op::Release(token) => self.surfaces.release(token),
                 Op::Create(req) => self.host_surface(*req),
+                Op::Resize(token, dip) => self.surfaces.resize(token, dip),
             }
         }
     }

@@ -62,7 +62,7 @@ pub use backdrop::{
     set_root_backdrop_provider, BackdropDither, BackdropGlow, BackdropSpec, GlowDrift,
 };
 pub use color_out::set_output_color_transform;
-pub use host::DCompHost;
+pub use host::{pointer_capture_active, DCompHost};
 pub use display_change::set_display_change_callback;
 pub use visibility::set_window_visibility_callback;
 pub(crate) use pointer::{
