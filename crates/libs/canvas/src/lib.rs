@@ -3,8 +3,7 @@
 //! `windows-canvas` is a thin wrapper over [`windows-canvas-core`](windows_canvas_core)
 //! (the reactor-free drawing primitives — re-exported below, so every
 //! `windows_canvas::*` path is unchanged) plus the reactor-coupled helpers
-//! (`surface_painter`, `animated_canvas`, `surface_image`, composition surfaces)
-//! gated behind the `reactor` feature.
+//! (`animated_canvas`, composition surfaces) gated behind the `reactor` feature.
 
 // Re-export the entire reactor-free drawing core. Keeps `windows_canvas::GpuDevice`,
 // `windows_canvas::DrawingSession`, `windows_canvas::ColorF`, `windows_canvas::Rect`,
@@ -34,21 +33,10 @@ use windows_core::*;
 mod composition;
 #[cfg(feature = "reactor")]
 mod reactor;
-#[cfg(feature = "reactor")]
-mod surface_image;
-#[cfg(feature = "reactor")]
-mod virtual_surface_image;
 
 #[cfg(feature = "reactor")]
 pub use composition::CompositionDrawTarget;
 #[cfg(feature = "reactor")]
 pub use reactor::{
-    CanvasImageSource, CreateReason, DeviceSource, DpiRounding, DrawContext, FrameTiming, PumpHold,
-    ResourceCx, ResourcePainterBuilder, Step, SurfacePainter, SurfacePainterBuilder,
-    animated_canvas, invalidate_all_painters, surface_image, surface_painter,
-    virtual_surface_image,
+    CanvasImageSource, DpiRounding, DrawContext, animated_canvas,
 };
-#[cfg(feature = "reactor")]
-pub use surface_image::SurfaceImage;
-#[cfg(feature = "reactor")]
-pub use virtual_surface_image::VirtualSurfaceImage;
