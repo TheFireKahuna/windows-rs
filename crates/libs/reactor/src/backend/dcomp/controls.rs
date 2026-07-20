@@ -16,7 +16,7 @@ use super::node::{is_text_editable, linear, Node};
 use super::theme;
 use crate::backend::ControlKind;
 use crate::Color;
-use windows_canvas_core::{Brush, DrawingSession, Ellipse, Rect, RoundedRect, Vector2};
+use windows_canvas_core::{Brush, DrawingSession, Rect, RoundedRect};
 
 // Fluent-icon glyph codepoints (rendered in `theme::FONT_ICON`).
 const GLYPH_CHEVRON_DOWN: u32 = 0xE70D;
@@ -26,18 +26,16 @@ const GLYPH_CHEVRON_RIGHT: u32 = 0xE76C;
 /// Returns `true` if it handled the kind (so `paint_chrome` skips the generic
 /// fill/border path).
 pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect) -> bool {
-    let dim = if node.paint.is_enabled {
-        1.0
-    } else {
-        theme::disabled_opacity()
-    };
-    // The editable text kinds draw their own box + caret + selection (and their
-    // own focus affordance), so they bypass the shared focus-ring tail below.
-    if is_text_editable(node.kind) {
-        paint_editor(session, brush, node, rect, dim);
-        return true;
-    }
     match node.kind {
+        // The box fill, the outline and the spin column's hairline are parts
+        // (`parts::editor_plan`); the run, placeholder, selection wash,
+        // composition rule, spin chevrons and caret were already sprites. Focus
+        // is the border slot re-keyed to the accent rather than a ring, which is
+        // why `ring_is_retained` claims these kinds — see the note there.
+        ControlKind::NumberBox
+        | ControlKind::TextBox
+        | ControlKind::PasswordBox
+        | ControlKind::AutoSuggestBox => {}
         // The button family draws nothing. Its fill, border, hover/press ink,
         // badge plate and focus ring are all retained compositor parts
         // (`parts::button_sync`), and its label, icon and badge count are
@@ -93,7 +91,11 @@ pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: 
         // `progress_sweep` and loops on the compositor), so `has_chrome`
         // denies it a surface.
         ControlKind::ProgressBar => {}
-        ControlKind::ProgressRing => paint_progress_ring(session, brush, node, rect, dim),
+        // Track circle and value arc are two retained mask layers over one
+        // tessellated path (`super::ring_shape`), and the indeterminate revolve
+        // is a forever `RotationAngle` keyframe on the arc's sprite, so
+        // `has_chrome` denies the ring a surface and this never runs.
+        ControlKind::ProgressRing => {}
         // Fully retained: background, divider, selection tile, accent bar and
         // both washes are parts (`parts::nav_plan`), every run is sprites
         // (`glyph_text::nav_sync`), and `has_chrome` denies it a surface.
@@ -211,10 +213,16 @@ pub(crate) fn draw_focus_ring(session: &DrawingSession, brush: &Brush, rect: Rec
 /// INSET into the control; `parts::focus_ring_slots` lays two rings just
 /// outside it, which is the shape `parts::focus_rings` argues for (an inset
 /// ring eats the control's own fill, so a focused control reads as having grown
-/// a border and shrunk). A kind must therefore be on exactly one of them, and
-/// this predicate is the single place that is decided.
+/// a border and shrunk). This predicate is the single place that is decided.
+///
+/// Read it as "not painted by the tail below", which is what it actually gates.
+/// Most kinds that answer `true` are on the retained ring; the text editors are
+/// on NEITHER, because an editor's focus affordance is its border re-keyed to
+/// the accent (`parts::editor_plan`). They are claimed here so the shared tail
+/// does not add an inset ring on top of a control that already shows focus.
 fn ring_is_retained(kind: ControlKind) -> bool {
     super::node::is_button_family(kind)
+        || is_text_editable(kind)
         || matches!(
             kind,
             ControlKind::HyperlinkButton
@@ -700,85 +708,10 @@ pub(crate) fn meter_marker_frac(node: &Node) -> Option<f32> {
 
 // ── Progress ─────────────────────────────────────────────────────────────────
 
-fn paint_progress_ring(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let cx = rect.width() / 2.0;
-    let cy = rect.height() / 2.0;
-    let r = (cx.min(cy) - 3.0).max(2.0);
-    let thick = (r * 0.18).clamp(2.0, 5.0);
-
-    // Track ring.
-    put(brush, theme::w(0.08), dim);
-    session.draw_ellipse(&Ellipse::new(Vector2::new(cx, cy), r, r), brush, thick);
-
-    // Indeterminate: paint the arc ONCE at a fixed angle — the revolve is a
-    // forever-looping RotationAngle animation on this surface's sprite
-    // (`super::parts::ring_sync`; the track circle is rotation-invariant).
-    let (a0, a1) = if node.ctrl().indeterminate {
-        let s = -std::f32::consts::FRAC_PI_2;
-        (s, s + std::f32::consts::FRAC_PI_2 * 2.4)
-    } else {
-        let frac = super::ctrl_value_frac(node) as f32;
-        (-std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2 + frac * std::f32::consts::TAU)
-    };
-    arc(session, brush, cx, cy, r, thick, a0, a1, theme::accent(), dim);
-}
-
-/// Tessellate an arc as short chords (PathBuilder has no arc; the surface only
-/// repaints on change, so a per-paint loop is fine).
-#[allow(clippy::too_many_arguments)]
-fn arc(
-    session: &DrawingSession,
-    brush: &Brush,
-    cx: f32,
-    cy: f32,
-    r: f32,
-    width: f32,
-    a0: f32,
-    a1: f32,
-    c: Color,
-    dim: f32,
-) {
-    put(brush, c, dim);
-    let steps = (((a1 - a0).abs() / 0.20).ceil() as i32).max(1);
-    let mut prev = Vector2::new(cx + r * a0.cos(), cy + r * a0.sin());
-    for i in 1..=steps {
-        let a = a0 + (a1 - a0) * (i as f32 / steps as f32);
-        let p = Vector2::new(cx + r * a.cos(), cy + r * a.sin());
-        session.draw_line(prev, p, brush, width);
-        prev = p;
-    }
-}
-
 // ── Text editor (NumberBox / TextBox / PasswordBox / AutoSuggestBox) ─────────
 
 const GLYPH_CHEVRON_UP: u32 = 0xE70E;
 
-
-fn paint_editor(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect, dim: f32) {
-    let radius = theme::RADIUS_SM;
-    // Box: raised surface fill + a border that turns accent on focus.
-    fill_rr(session, brush, rect, radius, theme::surface_raised(), dim);
-    let border_c = if node.focused {
-        theme::accent()
-    } else {
-        theme::stroke()
-    };
-    let border_w = if node.focused { 1.5 } else { theme::BORDER_W };
-    stroke_rr(session, brush, rect, radius, border_c, border_w, dim);
-
-    // Nothing in the content column is drawn here any more. The text run, the
-    // placeholder that stands in for it, the selection wash and the composition
-    // rule are all retained sprites (`glyph_text::editor_sync`), clipped by
-    // their own host rather than by a `push_clip`. Nor is the caret, whose blink
-    // plays DWM-side (`parts::sync_caret`, [`editor_caret_box`]).
-
-    // The spin column's divider (wide NumberBox only). Its two chevrons are
-    // sprites, placed by `glyph_text::editor_sync` from the same
-    // `editor::spin_boxes` the press reads.
-    if node.kind == ControlKind::NumberBox && rect.width() >= editor::SPIN_MIN_BOX_W {
-        draw_spin(session, brush, rect, dim);
-    }
-}
 
 /// The caret's box in node-local DIPs, clamped into the content column the
 /// painted text clips to. `None` when the node is not an editor. Consumed by
@@ -869,17 +802,6 @@ pub(crate) fn spin_ink(hover: bool) -> Color {
 
 /// The hairline before the spin column. The two chevrons beyond it are retained
 /// glyph sprites (`glyph_text::editor_sync`).
-fn draw_spin(session: &DrawingSession, brush: &Brush, rect: Rect, dim: f32) {
-    let col_x = rect.right - editor::SPIN_W;
-    put(brush, theme::stroke(), dim);
-    session.draw_line(
-        Vector2::new(col_x, rect.top + theme::SPACE_4),
-        Vector2::new(col_x, rect.bottom - theme::SPACE_4),
-        brush,
-        theme::BORDER_W,
-    );
-}
-
 // ── Expander ─────────────────────────────────────────────────────────────────
 
 /// The header strip's height — the only part of an Expander that is chrome; the

@@ -74,14 +74,13 @@ fn ts_secs(s: f64) -> TimeSpan {
 
 // ── D2D geometry → composition path bridge ───────────────────────────────────
 
-/// A one-geometry [`IGeometrySource2D`] over an arbitrary D2D geometry.
+/// A one-geometry [`IGeometrySource2D`] over an arbitrary D2D geometry — the
+/// backend's single bridge from a tessellated D2D path to a `CompositionPath`.
 ///
-/// The generalization of the knob's `ArcGeometrySource`; the factory-affinity
-/// argument in [`super::knob`] applies here **verbatim and for the same
-/// reasons** — one `GpuDevice` in the process, and the composition graphics
-/// device is created from it, so the factory the compositor passes to
-/// `TryGetGeometryUsingFactory` is the one this geometry already belongs to.
-/// Read that comment before changing either.
+/// Every retained vector thing goes through here: the app's transported curves,
+/// the knob's value arc, ticks and focus ring, and the progress ring's track and
+/// arc. There was briefly a second, identical implementation living in
+/// [`super::knob`]; the two differed in nothing but name.
 struct PathGeometrySource {
     geometry: ID2D1Geometry,
 }
@@ -96,8 +95,32 @@ impl IGeometrySource2DInterop_Impl for PathGeometrySource_Impl {
     fn GetGeometry(&self) -> Result<ID2D1Geometry> {
         Ok(self.geometry.clone())
     }
-    /// Returns the one cached geometry, IGNORING `factory` — sound only under
-    /// the single-factory invariant documented on `knob::ArcGeometrySource`.
+
+    /// Returns the one cached geometry, IGNORING `factory`.
+    ///
+    /// D2D resources are factory-affine, so handing back a geometry built on a
+    /// different factory than the caller asked for would be a real contract
+    /// violation — this is sound only because there is exactly ONE D2D factory
+    /// in the process, and the caller cannot be holding another one:
+    ///
+    /// - every geometry reaching this type is tessellated on `comp.gpu`, the
+    ///   single [`GpuDevice`] owned by `Compositing`;
+    /// - the only caller of this interface is the composition graphics device,
+    ///   and `Compositing::new` creates that device *from* `comp.gpu` — see the
+    ///   `CreateGraphicsDevice(gpu.d2d_device())` there. A D2D device's factory
+    ///   is the factory it was created on, so the factory the compositor passes
+    ///   here IS `comp.gpu`'s factory, the one the geometry already belongs to.
+    ///
+    /// Both facts hold by construction, not by luck, but neither is checkable
+    /// from inside this method: `ID2D1Resource::GetFactory` is not scraped into
+    /// `system_bindings`, so the two factories cannot be compared here.
+    ///
+    /// What would break it: a second `GpuDevice`/D2D factory anywhere in the
+    /// backend, or a `CompositionGraphicsDevice` created from a device other
+    /// than `comp.gpu`. Either change must also make this method honour
+    /// `factory` — re-tessellating the geometry on the factory it is handed
+    /// (the path parameters are all that is needed) rather than returning a
+    /// resource from a foreign one.
     fn TryGetGeometryUsingFactory(&self, _factory: Ref<ID2D1Factory>) -> Result<ID2D1Geometry> {
         Ok(self.geometry.clone())
     }
@@ -164,10 +187,42 @@ fn build_d2d_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Option<Path
 }
 
 /// Wrap a D2D [`Path`] as a composition path via the one-geometry source.
-fn to_composition_path(path: &Path) -> Option<CompositionPath> {
+pub(crate) fn to_composition_path(path: &Path) -> Option<CompositionPath> {
     let geometry: ID2D1Geometry = path.raw().cast().ok()?;
     let source: IGeometrySource2D = PathGeometrySource { geometry }.into();
     CompositionPath::Create(&source).ok()
+}
+
+/// How finely a circular arc is chorded. One value, because the two consumers
+/// ([`super::knob`]'s value arc and [`super::ring_shape`]'s track and arc) sit
+/// side by side on screen and a difference would read as one of them being
+/// lower quality.
+const ARC_SEGMENTS: u32 = 96;
+
+/// Tessellate a circular arc centreline (`start → end`, radians) and wrap it as
+/// a composition path.
+///
+/// Chords rather than Béziers: the result is stroked, never filled, and at 96
+/// segments over a full turn the chord error is far below a physical pixel at
+/// any dial or ring size the layout produces. It is tessellated ONCE per
+/// geometry change — the value is expressed by trimming this path, not by
+/// rebuilding it (see [`PathLayer::set_trim`]).
+pub(crate) fn arc_path(
+    gpu: &GpuDevice,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start: f32,
+    end: f32,
+) -> Option<CompositionPath> {
+    let mut fig = PathBuilder::new(gpu)
+        .ok()?
+        .begin_hollow(CVec2::new(cx + radius * start.cos(), cy + radius * start.sin()));
+    for i in 1..=ARC_SEGMENTS {
+        let a = start + (end - start) * (i as f32 / ARC_SEGMENTS as f32);
+        fig = fig.line_to(CVec2::new(cx + radius * a.cos(), cy + radius * a.sin()));
+    }
+    to_composition_path(&fig.end_open().build().ok()?)
 }
 
 /// Replay the verbs and wrap the result as a composition path — the mask
@@ -182,14 +237,20 @@ fn build_composition_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Opt
 /// paints. A layer is one or the other for its whole life — the app changing a
 /// curve from filled to stroked rebuilds the layer rather than re-roling it.
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum Role {
+pub(crate) enum Role {
     Fill,
     Stroke,
 }
 
 /// One retained layer: geometry → white mask shape → visual surface → mask
 /// brush over an FP16 source → visible sprite.
-struct PathLayer {
+///
+/// Named for the app-authored curve it was written to draw, but nothing in it
+/// is curve-specific — it takes a `CompositionPath` and asks no questions. The
+/// `ProgressRing` builds its track and value arc on it too ([`super::ring_shape`]),
+/// which is why the type and the methods below are `pub(crate)` rather than
+/// private to this module.
+pub(crate) struct PathLayer {
     role: Role,
     geo: CompositionPathGeometry,
     /// The geometry as a `CompositionObject`, for springing `TrimEnd`.
@@ -232,7 +293,7 @@ fn stops_eq(a: &[(f64, crate::Color)], b: &[(f64, crate::Color)]) -> bool {
 }
 
 impl PathLayer {
-    fn new(comp: &Compositing, node: &Node, path: &CompositionPath, role: Role) -> Option<Self> {
+    pub(crate) fn new(comp: &Compositing, node: &Node, path: &CompositionPath, role: Role) -> Option<Self> {
         let display = comp.new_sprite().ok()?;
         let display_vis: IVisual = display.cast().ok()?;
         let compositor = display.cast::<ICompositionObject>().ok()?.Compositor().ok()?;
@@ -322,7 +383,7 @@ impl PathLayer {
     /// composition path is immutable once created, so this is the only way, and
     /// it drops the trim spring because a spring bound to the retired object
     /// would keep animating something no longer on screen.
-    fn set_path(&mut self, path: &CompositionPath) -> Option<()> {
+    pub(crate) fn set_path(&mut self, path: &CompositionPath) -> Option<()> {
         let c5 = self
             .display
             .cast::<ICompositionObject>()
@@ -343,7 +404,7 @@ impl PathLayer {
         Some(())
     }
 
-    fn resize(&mut self, w: f32, h: f32, scale: f32) {
+    pub(crate) fn resize(&mut self, w: f32, h: f32, scale: f32) {
         if self.size == Some((w, h, scale)) {
             return;
         }
@@ -367,7 +428,7 @@ impl PathLayer {
         self.size = Some((w, h, scale));
     }
 
-    fn set_thickness(&mut self, t: f32) {
+    pub(crate) fn set_thickness(&mut self, t: f32) {
         if self.role != Role::Stroke || self.thickness == Some(t) {
             return;
         }
@@ -378,7 +439,7 @@ impl PathLayer {
     /// Bind the FP16 colour source — a gradient when the app supplied stops,
     /// otherwise the flat colour. Rebuilds only on a real change or a display
     /// epoch bump, so a recolour is one call and a no-op sync is none.
-    fn set_source(
+    pub(crate) fn set_source(
         &mut self,
         comp: &Compositing,
         color: crate::Color,
@@ -422,7 +483,7 @@ impl PathLayer {
     /// Retarget the draw-on trim. `TrimStart` snaps (it is a static crop);
     /// `TrimEnd` springs, so a curve revealing itself does so DWM-side with no
     /// app frame — the payoff the retained path exists for.
-    fn set_trim(&mut self, start: f32, end: f32) {
+    pub(crate) fn set_trim(&mut self, start: f32, end: f32) {
         if self.trim == (start, end) {
             return;
         }
@@ -454,6 +515,39 @@ impl PathLayer {
         a.cast::<IScalarNaturalMotionAnimation>().ok()?.SetFinalValue(Some(target)).ok()?;
         let anim: CompositionAnimation = a.cast().ok()?;
         self.geo_obj.StartAnimation("TrimEnd", &anim).ok()
+    }
+
+    /// Jump the trim to `end` with no motion, cancelling any spring in flight.
+    ///
+    /// [`Self::set_trim`] springs, which is right for a value that CHANGED and
+    /// wrong for one that was REDEFINED — a progress ring flipping between its
+    /// indeterminate sweep and its value arc is a mode change, and springing it
+    /// reads as the ring unwinding. The `StopAnimation` is the load-bearing
+    /// half: without it an in-flight spring keeps driving `TrimEnd` past the
+    /// value just written, and the `self.trim` gate then suppresses every later
+    /// correction, so the arc is stranded for good.
+    pub(crate) fn snap_trim(&mut self, start: f32, end: f32) {
+        let _ = self.geo_obj.StopAnimation("TrimEnd");
+        if let Ok(ig) = self.geo.cast::<ICompositionGeometry>() {
+            let _ = ig.SetTrimStart(start);
+            let _ = ig.SetTrimEnd(end);
+        }
+        self.trim = (start, end);
+    }
+
+    pub(crate) fn set_opacity(&self, a: f32) {
+        let _ = self.display_vis.SetOpacity(a);
+    }
+
+    /// The in-tree sprite, for a caller that animates the layer as a whole.
+    ///
+    /// Handed out rather than wrapping each transform property, because the one
+    /// caller ([`super::ring_shape`]) drives `RotationAngle` on the composited
+    /// layer — one cheap transform on an already-rasterized mask, as against
+    /// rotating the off-tree mask visual and re-rasterizing its alpha every
+    /// frame.
+    pub(crate) fn display(&self) -> (&SpriteVisual, &IVisual) {
+        (&self.display, &self.display_vis)
     }
 }
 

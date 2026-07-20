@@ -1887,6 +1887,12 @@ fn look(kind: ControlKind) -> Option<Look> {
         K::ComboBox | K::DropDownButton => {
             (select_slot::N_BELOW, select_slot::N_ABOVE, select_plan)
         }
+        // Box fill, outline and the spin column's hairline. The rest of an
+        // editor — run, placeholder, selection, composition rule, chevrons and
+        // caret — was already retained, so this is what lets the surface go.
+        K::NumberBox | K::TextBox | K::PasswordBox | K::AutoSuggestBox => {
+            (editor_slot::N_BELOW, editor_slot::N_ABOVE, editor_plan)
+        }
         K::ToggleSwitch => (3, 2, toggle_plan),
         K::CheckBox => (2, 3, check_plan),
         K::SelectorBar => (4, 2, segmented_plan),
@@ -1911,8 +1917,14 @@ fn look(kind: ControlKind) -> Option<Look> {
 ///
 /// Each is bound to something a plan cannot describe — an `ExpressionAnimation`
 /// following a sibling sprite (the slider's fill, the meter's clip) or a forever
-/// keyframe on the surface sprite (the ring) — so each keeps a hand-written
+/// keyframe revolving a whole layer (the ring) — so each keeps a hand-written
 /// sync. A plan says where a sprite comes to REST, and none of these three does.
+///
+/// The ring's sync lives in [`super::ring_shape`], not here, but the kind must
+/// STAY in this list: [`super::paint::needs`] admits a node via `converted`,
+/// which is `look(kind).is_some() || plan_less(kind)`. Drop the ring from here
+/// and the paint walk stops visiting it, `sync_ring` never runs, and the ring
+/// renders nothing at all — silently, with no compiler error.
 fn plan_less(kind: ControlKind) -> bool {
     matches!(
         kind,
@@ -2045,7 +2057,7 @@ fn wash(authored: f32) -> f32 {
 }
 
 /// The uniform disabled dim, as the paint path applies it.
-fn dim_of(node: &Node) -> f32 {
+pub(crate) fn dim_of(node: &Node) -> f32 {
     if node.paint.is_enabled {
         1.0
     } else {
@@ -2085,7 +2097,7 @@ pub(crate) fn sync(
     match node.kind {
         ControlKind::Slider => slider_sync(comp, atlas, node, scale, scrubbing),
         ControlKind::Meter => meter_sync(comp, atlas, node, scale, scrubbing),
-        ControlKind::ProgressRing => ring_sync(comp, node),
+        ControlKind::ProgressRing => super::ring_shape::sync_ring(comp, node, atlas.epoch(), scale),
         _ => {}
     }
 }
@@ -2510,6 +2522,98 @@ pub(crate) fn select_plan(node: &Node, scale: f32) -> PartPlan {
                 .fading(),
         )
         .focus_ring(select_slot::RING_INNER, node.focus_ring, w, h, r, scale)
+}
+
+/// A text editor's part slots. Its own names, for the reason `select_slot` has
+/// its own: the band opens with a fill and an outline like every other, but an
+/// editor's third slot is a spin-column hairline no other control has.
+mod editor_slot {
+    pub const FILL: usize = 0;
+    pub const BORDER: usize = 1;
+    pub const DIVIDER: usize = 2;
+    pub const N_BELOW: usize = DIVIDER + 1;
+
+    /// Deliberately empty, and load-bearing. Two reasons:
+    ///
+    /// `ink_state_changed`'s default arm fades `above[0]` on a hover or press
+    /// flip, and editors ARE hovered (a wide `NumberBox` brightens its chevrons
+    /// on hover). An empty band makes that arm a provable no-op rather than
+    /// something to reason about.
+    ///
+    /// And the caret is inserted at the TOP of the node's container, lazily,
+    /// AFTER `parts::sync` has run. An above-band slot minted on a later sync
+    /// would insert over the caret and hide it until the next restack — which,
+    /// since a mint dirties nothing, can be never. Anything added here must
+    /// re-order the caret or add it to `layout::collect` first.
+    pub const N_ABOVE: usize = 0;
+}
+
+/// The 1.5-DIP accent outline a focused editor wears in place of a ring.
+const EDITOR_FOCUS_BORDER_W: f32 = 1.5;
+
+/// A text editor's whole box: `[fill, border, spin divider]`, all below the
+/// content. Everything above the box — the run, the placeholder, the selection
+/// wash, the composition rule, the two spin chevrons and the caret — was already
+/// retained; this is the last of it.
+///
+/// Focus is the BORDER slot re-keyed to the accent at 1.5 DIP, not a focus ring,
+/// and that is the one place an editor departs from every other converted kind.
+/// The retained double-ring is deliberately the only focus geometry elsewhere,
+/// but an editor's focus affordance has always been a thickened accent outline —
+/// WinUI's own `TextBox` visual, and what `controls::paint_editor` drew. Giving
+/// it a ring as well would show two focus signals at once. A colour-and-width
+/// swap inside one slot is `check_plan`'s mechanism, and it costs one re-bind:
+/// no rect moves, no sprite is created.
+///
+/// It reads `node.focused`, not `node.focus_ring`. They differ — `focus_ring` is
+/// "focus visuals are showing", which a click does not set — and the painter
+/// read `focused`, so a clicked field has always shown the accent border.
+pub(crate) fn editor_plan(node: &Node, scale: f32) -> PartPlan {
+    let (w, h) = (node.rect.w, node.rect.h);
+    let dim = dim_of(node);
+    let r = theme::RADIUS_SM;
+    let box_rect = Some((0.0, 0.0, w, h));
+
+    let (border_c, border_w) = if node.focused {
+        (theme::accent(), EDITOR_FOCUS_BORDER_W)
+    } else {
+        (theme::stroke(), theme::BORDER_W)
+    };
+
+    // The spin column's divider, on a wide NumberBox only. Derived from
+    // `editor::spin_boxes` rather than re-testing the width threshold, so the
+    // hairline and the two chevrons it separates can never disagree about
+    // whether the column exists.
+    //
+    // `hidden()` rather than omission: a slot the plan does not mention keeps
+    // showing whatever it last showed, so a field dragged narrower would keep
+    // its divider.
+    let divider = match (node.kind, super::editor::spin_boxes(w, h)) {
+        (ControlKind::NumberBox, Some((up, _))) => {
+            // The painter STROKED a line at `up.left`, and a stroke is centred
+            // on its coordinate; a sprite's rect starts at its left edge. Half
+            // the width back, or the hairline lands half a pixel off and reads
+            // as soft.
+            let x = up.left - theme::BORDER_W / 2.0;
+            let y = theme::SPACE_4;
+            AtlasKey::solid(theme::stroke(), scale).snap_at(
+                Some((x, y, theme::BORDER_W, (h - 2.0 * theme::SPACE_4).max(0.0))),
+                dim,
+            )
+        }
+        _ => SlotPlan::hidden(),
+    };
+
+    PartPlan::new([w, h, 0.0])
+        .below(
+            editor_slot::FILL,
+            AtlasKey::hbar(h, r, 0.0, theme::surface_raised(), scale).snap_at(box_rect, dim),
+        )
+        .below(
+            editor_slot::BORDER,
+            AtlasKey::hbar(h, r, border_w, border_c, scale).snap_at(box_rect, dim),
+        )
+        .below(editor_slot::DIVIDER, divider)
 }
 
 /// The combined hover + press wash target (endpoint parity with the painted
@@ -3600,7 +3704,15 @@ pub(crate) fn expander_plan(node: &Node, scale: f32) -> PartPlan {
 
 /// One indeterminate sweep / revolution, matching the retired tick's
 /// `phase += dt · 0.6` advance (a full cycle per `1 / 0.6` seconds).
+///
+/// The bar's travelling segment and the ring's revolve share it so the two read
+/// as one system when they sit next to each other.
 const PROGRESS_CYCLE_SECS: f32 = 1.0 / 0.6;
+
+/// [`PROGRESS_CYCLE_SECS`] as a `TimeSpan`, for [`super::ring_shape`].
+pub(crate) fn progress_cycle() -> TimeSpan {
+    ts_secs(PROGRESS_CYCLE_SECS)
+}
 
 /// The bar's lane height, mirroring the retired `paint_progress_bar`.
 fn progress_bar_h(node_h: f32) -> f32 {
@@ -3695,54 +3807,6 @@ fn progress_sweep(node: &mut Node, relaid: bool) {
         parts.below[2].stop_loop_x();
         parts.looping = false;
     }
-}
-
-/// The ring has no sprite parts — its track + arc stay painted (drawn once).
-/// Indeterminate spin is a forever-looping `RotationAngle` animation on the
-/// painted surface sprite itself: the track ring is rotation-invariant, so
-/// only the arc appears to revolve, and the app never ticks.
-fn ring_sync(comp: &Compositing, node: &mut Node) {
-    if !ensure(comp, node, 0, 0) {
-        return;
-    }
-    let (w, h) = (node.rect.w, node.rect.h);
-    let ind = node.ctrl().indeterminate;
-    let Some(surf) = node.surf.as_ref() else { return };
-    let (Ok(vis), Ok(obj)) = (
-        surf.sprite.cast::<IVisual>(),
-        surf.sprite.cast::<ICompositionObject>(),
-    ) else {
-        return;
-    };
-    let Some(parts) = node.parts.as_mut() else { return };
-
-    if ind {
-        if !parts.looping || parts.geom != (w, h) {
-            let _ = vis.SetCenterPoint(Vector3::new(w / 2.0, h / 2.0, 0.0));
-            let run = || -> Option<()> {
-                let c = obj.Compositor().ok()?;
-                let lin: CompositionEasingFunction =
-                    c.CreateLinearEasingFunction().ok()?.cast().ok()?;
-                let a = c.CreateScalarKeyFrameAnimation().ok()?;
-                a.InsertKeyFrameWithEasingFunction(0.0, 0.0, &lin).ok()?;
-                a.InsertKeyFrameWithEasingFunction(1.0, std::f32::consts::TAU, &lin)
-                    .ok()?;
-                let kf: IKeyFrameAnimation = a.cast().ok()?;
-                kf.SetDuration(ts_secs(PROGRESS_CYCLE_SECS)).ok()?;
-                kf.SetIterationBehavior(AnimationIterationBehavior::Forever).ok()?;
-                let _ = obj.StopAnimation("RotationAngle");
-                obj.StartAnimation("RotationAngle", &a.cast::<CompositionAnimation>().ok()?)
-                    .ok()
-            };
-            parts.looping = run().is_some();
-        }
-    } else if parts.looping {
-        let _ = obj.StopAnimation("RotationAngle");
-        let _ = vis.SetRotationAngle(0.0);
-        parts.looping = false;
-    }
-    parts.geom = (w, h);
-    parts.init = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -45,6 +45,7 @@ pub(crate) mod node;
 mod pacer;
 mod paint;
 pub(crate) mod path_shape;
+pub(crate) mod ring_shape;
 pub(crate) mod parts;
 mod pointer;
 mod popup;
@@ -2396,7 +2397,7 @@ prop_contract! {
         // cannot satisfy:
         //
         // * **Geometry.** `Editor` has no box of its own. `caret_index_at`,
-        //   `editor_caret_box` and `paint_editor` all take the field's box to
+        //   `editor_caret_box` and `editor_plan` all take the field's box to
         //   BE `node.rect` (see `editor::editor_content(kind, rect.w)`). An
         //   editor hosted at some sub-rect of a nav pane would map pointer x to
         //   a caret index across the whole pane and hang its caret sprite off

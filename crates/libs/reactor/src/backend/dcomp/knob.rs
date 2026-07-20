@@ -22,14 +22,15 @@
 //!   expression — that would lock it to the bar and destroy exactly the
 //!   click-to-position feel the separation buys. See [`KnobParts`].
 //!
-//! The track ring, ticks, labels, hub, and readout paint on the node surface
-//! (dirty-only) — see `controls::paint_knob`.
+//! The track ring, ticks and hub are retained too — each a [`ChromeLayer`], the
+//! arc's chain minus the trim. Nothing here paints; the knob owns no surface.
 //!
-//! The D2D arc geometry reaches the compositor through a small
-//! [`IGeometrySource2DInterop`] implementation (`ArcGeometrySource`).
+//! The D2D geometry reaches the compositor through [`super::path_shape`]'s
+//! one-geometry [`IGeometrySource2DInterop`] bridge, which also tessellates the
+//! arcs ([`super::path_shape::arc_path`]).
 
 use windows_canvas_core::{GpuDevice, PathBuilder, Rect, Vector2 as CVec2};
-use windows_core::{implement_decl, Interface, Ref, Result};
+use windows_core::Interface;
 use windows_numerics::{Vector2, Vector3};
 
 use super::bootstrap::Compositing;
@@ -40,10 +41,8 @@ use crate::system_bindings::{
     CompositionObject, CompositionPath, CompositionPathGeometry, CompositionShape,
     CompositionStrokeCap, CompositionVisualSurface, ExpressionAnimation, ICompositionAnimation,
     ICompositionGeometry, ICompositionObject, ICompositionSpriteShape, ICompositionSurface,
-    ICompositor2, ICompositor4, ICompositor5,
-    ICompositorWithVisualSurface, IGeometrySource2D, IGeometrySource2DInterop,
-    IGeometrySource2D_Impl, IGeometrySource2DInterop_Impl, IScalarNaturalMotionAnimation,
-    ISpringScalarNaturalMotionAnimation, IVisual, ID2D1Factory, ID2D1Geometry, ShapeVisual,
+    ICompositor2, ICompositor4, ICompositor5, ICompositorWithVisualSurface,
+    IScalarNaturalMotionAnimation, ISpringScalarNaturalMotionAnimation, IVisual, ShapeVisual,
     SpringScalarNaturalMotionAnimation, SpriteVisual, TimeSpan, Visual,
 };
 
@@ -65,9 +64,6 @@ const THUMB_D: f32 = 15.0;
 const THUMB_EPS: f32 = 0.004;
 /// Needle length as a fraction of the track radius (atom `radius * 0.7`).
 const NEEDLE_FRAC: f32 = 0.7;
-/// Arc tessellation chord count over the full sweep.
-const ARC_SEGMENTS: u32 = 96;
-
 /// The background groove, wider than the value arc it sits under.
 const RING_WIDTH: f32 = 10.0;
 const TICK_MAJOR_LEN: f32 = 8.0;
@@ -87,8 +83,8 @@ fn ts_secs(s: f32) -> TimeSpan {
 pub(crate) const LABEL_OFFSET: f32 = 14.0;
 
 /// The dial geometry (center + label-fitted track radius) derived from the node
-/// — the single source both `controls::paint_knob` and the arc geometry use, so
-/// the painted ring/labels and the compositor arc/needle share one radius.
+/// — the single source the groove, ticks, hub, arc, needle and the tick-label
+/// runs all measure from, so every part of the dial shares one radius.
 pub(crate) fn dial_geom(node: &Node) -> (f32, f32, f32) {
     let (w, h) = (node.rect.w, node.rect.h);
     let (cx, cy) = (w * 0.5, h * 0.56);
@@ -222,78 +218,6 @@ pub(crate) fn value_to_angle(value: f64, min: f64, max: f64, start: f32, end: f3
     start + (end - start) * t as f32
 }
 
-// ── D2D arc geometry → composition path bridge ───────────────────────────────
-
-/// A one-geometry [`IGeometrySource2D`]: hands the compositor the D2D arc
-/// geometry the mask arc was tessellated into.
-struct ArcGeometrySource {
-    geometry: ID2D1Geometry,
-}
-
-implement_decl! {
-    impl ArcGeometrySource as ArcGeometrySource_Impl: [IGeometrySource2D, IGeometrySource2DInterop]
-}
-
-impl IGeometrySource2D_Impl for ArcGeometrySource_Impl {}
-
-impl IGeometrySource2DInterop_Impl for ArcGeometrySource_Impl {
-    fn GetGeometry(&self) -> Result<ID2D1Geometry> {
-        Ok(self.geometry.clone())
-    }
-
-    /// Returns the one cached geometry, IGNORING `factory`.
-    ///
-    /// D2D resources are factory-affine, so handing back a geometry built on a
-    /// different factory than the caller asked for would be a real contract
-    /// violation — this is sound only because there is exactly ONE D2D factory
-    /// in the process, and the caller cannot be holding another one:
-    ///
-    /// - the geometry is tessellated by [`build_arc_path`] on `comp.gpu`, the
-    ///   single [`GpuDevice`] owned by `Compositing`;
-    /// - the only caller of this interface is the composition graphics device,
-    ///   and `Compositing::new` creates that device *from* `comp.gpu` — see the
-    ///   `CreateGraphicsDevice(gpu.d2d_device())` there. A D2D device's factory
-    ///   is the factory it was created on, so the factory the compositor passes
-    ///   here IS `comp.gpu`'s factory, the one the geometry already belongs to.
-    ///
-    /// Both facts hold by construction, not by luck, but neither is checkable
-    /// from inside this method: `ID2D1Resource::GetFactory` is not scraped into
-    /// `system_bindings`, so the two factories cannot be compared here.
-    ///
-    /// What would break it: a second `GpuDevice`/D2D factory anywhere in the
-    /// backend, or a `CompositionGraphicsDevice` created from a device other
-    /// than `comp.gpu`. Either change must also make this method honour
-    /// `factory` — re-tessellating the arc on the factory it is handed (the
-    /// path parameters are all that is needed) rather than returning a resource
-    /// from a foreign one.
-    fn TryGetGeometryUsingFactory(&self, _factory: Ref<ID2D1Factory>) -> Result<ID2D1Geometry> {
-        Ok(self.geometry.clone())
-    }
-}
-
-/// Tessellate the full value-arc centerline (`start → end`) and wrap it as a
-/// composition path.
-fn build_arc_path(
-    gpu: &GpuDevice,
-    cx: f32,
-    cy: f32,
-    radius: f32,
-    start: f32,
-    end: f32,
-) -> Option<CompositionPath> {
-    let mut fig = PathBuilder::new(gpu)
-        .ok()?
-        .begin_hollow(CVec2::new(cx + radius * start.cos(), cy + radius * start.sin()));
-    for i in 1..=ARC_SEGMENTS {
-        let a = start + (end - start) * (i as f32 / ARC_SEGMENTS as f32);
-        fig = fig.line_to(CVec2::new(cx + radius * a.cos(), cy + radius * a.sin()));
-    }
-    let path = fig.end_open().build().ok()?;
-    let geometry: ID2D1Geometry = path.raw().cast().ok()?;
-    let source: IGeometrySource2D = ArcGeometrySource { geometry }.into();
-    CompositionPath::Create(&source).ok()
-}
-
 /// Tessellate one tick CLASS as a single geometry of N two-point figures.
 ///
 /// One geometry rather than one per tick because a tick is two points and a
@@ -341,9 +265,7 @@ fn build_tick_path(
         return None;
     }
     let path = b.build().ok()?;
-    let geometry: ID2D1Geometry = path.raw().cast().ok()?;
-    let source: IGeometrySource2D = ArcGeometrySource { geometry }.into();
-    CompositionPath::Create(&source).ok()
+    super::path_shape::to_composition_path(&path)
 }
 
 /// A rounded rectangle as a closed path, corners as cubic Béziers.
@@ -395,9 +317,7 @@ fn build_ring_path(
         .close()
         .build()
         .ok()?;
-    let geometry: ID2D1Geometry = path.raw().cast().ok()?;
-    let source: IGeometrySource2D = ArcGeometrySource { geometry }.into();
-    CompositionPath::Create(&source).ok()
+    super::path_shape::to_composition_path(&path)
 }
 
 /// One retained chrome layer: a path stroked opaque white into an off-tree
@@ -661,7 +581,7 @@ impl KnobParts {
     fn new(comp: &Compositing, node: &Node) -> Option<Self> {
         let (w, h) = (node.rect.w, node.rect.h);
         let (cx, cy, radius) = dial_geom(node);
-        let path = build_arc_path(&comp.gpu, cx, cy, radius, node.ctrl().start_angle, node.ctrl().end_angle)?;
+        let path = super::path_shape::arc_path(&comp.gpu, cx, cy, radius, node.ctrl().start_angle, node.ctrl().end_angle)?;
 
         let needle = comp.new_sprite().ok()?;
         let needle_vis: IVisual = needle.cast().ok()?;
@@ -815,7 +735,7 @@ impl KnobParts {
             self.ticks_seen.1 = node.ctrl().major_every;
         }
         if resized {
-            if let Some(path) = build_arc_path(&comp.gpu, cx, cy, radius, start, end) {
+            if let Some(path) = super::path_shape::arc_path(&comp.gpu, cx, cy, radius, start, end) {
                 if let Ok(c5) = self
                     .needle
                     .cast::<ICompositionObject>()

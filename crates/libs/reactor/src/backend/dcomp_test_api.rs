@@ -914,6 +914,12 @@ pub struct SlotProbe {
     pub glides: bool,
     /// Opacity changes fade rather than jump.
     pub fades: bool,
+    /// A fingerprint of the atlas source this slot binds, or `None` when the
+    /// slot binds nothing. Only equality is meaningful — it exists so a test can
+    /// assert that a state change RE-KEYS a slot (a focused editor's border, a
+    /// hovered checkbox's outline) without this seam having to mirror every
+    /// field of an `AtlasKey`.
+    pub key_fingerprint: Option<u64>,
 }
 
 /// Where a control decided every one of its retained parts belongs.
@@ -980,6 +986,10 @@ impl ArenaHarness {
             | ControlKind::RepeatButton
             | ControlKind::SplitButton => dcomp::parts::button_plan(n, scale),
             ControlKind::Border => dcomp::parts::box_plan(n, scale),
+            ControlKind::NumberBox
+            | ControlKind::TextBox
+            | ControlKind::PasswordBox
+            | ControlKind::AutoSuggestBox => dcomp::parts::editor_plan(n, scale),
             _ => return None,
         };
         let (below, above) = plan.slots();
@@ -989,6 +999,12 @@ impl ArenaHarness {
                 opacity: s.opacity,
                 glides: s.motion == dcomp::parts::Motion::Glide,
                 fades: s.fade == dcomp::parts::Fade::Fade,
+                key_fingerprint: s.key.as_ref().map(|k| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    k.hash(&mut h);
+                    h.finish()
+                }),
             })
         };
         Some(PartPlanProbe {
@@ -1005,6 +1021,16 @@ impl ArenaHarness {
     pub fn set_focus_ring(&mut self, id: ControlId, on: bool) {
         if let Some(n) = self.arena.get_mut(id) {
             n.focus_ring = on;
+        }
+    }
+
+    /// Stamp focus itself, which is NOT the same flag as the focus VISUAL: a
+    /// pointer press focuses without ringing. A text editor's chrome reads this
+    /// one — its focus affordance is an accent border, not a ring — so it is the
+    /// only way to test a focused editor's box.
+    pub fn set_focused(&mut self, id: ControlId, on: bool) {
+        if let Some(n) = self.arena.get_mut(id) {
+            n.focused = on;
         }
     }
 
