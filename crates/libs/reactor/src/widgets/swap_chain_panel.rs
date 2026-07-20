@@ -154,6 +154,25 @@ pub struct ElementHandle {
     pub(crate) native: Option<windows_core::IInspectable>,
 }
 
+#[cfg(feature = "dcomp-backend")]
+impl ElementHandle {
+    /// A `Send` handle for replacing this control's text from any thread,
+    /// without a reconcile.
+    ///
+    /// For values a render pump owns — a level readout, a transport clock —
+    /// which change at display rate and never travel as props. The words are
+    /// queued, coalesced per control, and applied on the compositor thread,
+    /// where they shape at placement time; see
+    /// [`live_text`](crate::backend::dcomp::live_text).
+    ///
+    /// Only meaningful on a `TextBlock`: any other control ignores the words.
+    /// Keeping a handle past the control's unmount is safe — updates to an id
+    /// that no longer resolves are dropped.
+    pub fn live_text(&self) -> crate::backend::dcomp::live_text::LiveText {
+        crate::backend::dcomp::live_text::LiveText::new(self.id)
+    }
+}
+
 impl From<MountInfo> for ElementHandle {
     fn from(info: MountInfo) -> Self {
         Self {

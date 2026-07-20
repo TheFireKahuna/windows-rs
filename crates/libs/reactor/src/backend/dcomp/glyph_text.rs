@@ -1038,7 +1038,7 @@ impl RowText {
 /// none of its own once it is placed by hand: `TextAlignment` and
 /// `ParagraphAlignment` are instructions to the drawing call this path no longer
 /// makes.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Align {
     /// Top-left, unmeasured — for text whose own layout already decides where
     /// each line goes: wrapped prose, and anything leading-aligned. Wrapping
@@ -1217,6 +1217,26 @@ impl Pen<'_> {
     }
 }
 
+/// Where a LIVE run sits inside its (oversized) box, from the block's requested
+/// `HorizontalAlignment` — 0 Left, 1 Center, 2 Right, anything else leading.
+///
+/// A live readout's box is sized for the widest value it can ever hold, so a
+/// shorter value leaves slack. Centred is what a column of numbers under a
+/// heading wants; trailing is what a right-aligned readout wants, and is the one
+/// that keeps a decimal point still while the digits before it change. Leading
+/// would let both wander.
+///
+/// The centred variants also centre VERTICALLY, where leading pins the top. A
+/// live box is sized to one line — it holds a readout, not prose — so the two
+/// coincide and only the horizontal choice is doing any work here.
+fn live_text_align(h_align: i32) -> Align {
+    match h_align {
+        1 => Align::Centered,
+        2 => Align::TrailingCentered,
+        _ => Align::Leading,
+    }
+}
+
 /// Reconcile a `TextBlock`'s prose as retained glyph sprites.
 ///
 /// The counterpart to [`button_sync`] for the one control that is nothing but
@@ -1231,10 +1251,75 @@ pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut N
     // Un-styled text takes the themable primary text token — never a literal —
     // so a host token table restyles default text too.
     let fg = node.paint.foreground.unwrap_or_else(theme::text);
+
+    // Read the type before anything borrows a run out of the node: the family is
+    // owned by `paint` and the run by `live_run`, and shaping needs both.
+    let live = node.live_words.clone();
+    let em = node.paint.font_size;
+    let weight = node.paint.font_weight;
+    let family = node
+        .paint
+        .font_family
+        .clone()
+        .unwrap_or_else(|| "Segoe UI".to_string());
+    // Only a LIVE run needs this. A rendered block's box is measured from its own
+    // words, so it has no slack to align within and leading is already right; a
+    // live block's box is deliberately oversized — it has to hold the widest value
+    // its producer can send — so where the run sits inside that slack is a real
+    // choice, and it is the one the block asked for.
+    let live_align = live_text_align(node.h_align);
+
     let mut pen = Pen::new(comp, atlas, node, scale);
     pen.dim = 1.0; // A TextBlock is not interactive; it never dims.
-    let part = node.text_part.get_or_insert_default();
-    pen.place(part, node.text_layout.as_ref(), b, Align::Leading, fg);
+
+    // A block has two possible sources of words and exactly one may be on screen.
+    // They own SEPARATE sprites, so the source that is not chosen has to be
+    // retired rather than merely skipped: left standing, its glyphs stay visible
+    // under the ones placed here and the two readings interleave into a number
+    // that was never published. Every block takes this path — the first live
+    // value on a block that mounted with text is precisely the crossing.
+    match live {
+        // Words a producer thread published: shaped HERE, at placement, because
+        // the value never passed through a reconcile and so the layout pass
+        // never ran on it. `Shaped::pin` compares the string and the em first,
+        // so a republished-unchanged value reshapes nothing.
+        Some(words) => {
+            if let Some(part) = node.text_part.as_mut() {
+                part.hide_all();
+            }
+            let run = node.live_run.get_or_insert_default();
+            let (part, layout) = run.pin(&words, em, weight, &family);
+            // A live value cannot resize its own box: the layout pass measured
+            // this node from the words it was RENDERED with, and a value that
+            // arrives without a render never re-runs it. The host's `InsetClip`
+            // then cuts anything wider at the edge — silently, and for a numeric
+            // readout that is worse than a visible failure, because `-14.2`
+            // clipped to `-14` still reads as a real number. Loud in dev, so the
+            // box gets sized for the widest value the producer can send (see
+            // `newapo_viz::draw::measure::widest`) rather than for whatever it
+            // happened to mount with.
+            debug_assert!(
+                layout
+                    .and_then(|l| l.measure().ok())
+                    .is_none_or(|(w, _)| w <= b.width() + 0.5),
+                "live text {words:?} is wider than its box ({:.1} DIP) on {:?}; \
+                 size the node for the widest value it can hold — a clipped \
+                 readout shows a plausible wrong number",
+                b.width(),
+                node.kind,
+            );
+            pen.place(part, layout, b, live_align, fg);
+        }
+        // The ordinary path: the run the layout pass shaped, placed through the
+        // node's own part.
+        None => {
+            if let Some(run) = node.live_run.as_mut() {
+                run.hide();
+            }
+            let part = node.text_part.get_or_insert_default();
+            pen.place(part, node.text_layout.as_ref(), b, Align::Leading, fg);
+        }
+    }
 }
 
 /// Reconcile a `HyperlinkButton`'s words as retained glyph sprites.
@@ -2010,6 +2095,25 @@ pub(crate) fn button_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A live readout must honour the alignment its block asked for, because its
+    /// box is sized for the widest value it can hold and every shorter value has
+    /// slack to sit in. Left-aligning a centred column of numbers, or a
+    /// right-aligned readout, puts the value somewhere its own layout never would.
+    #[test]
+    fn a_live_run_takes_the_blocks_own_alignment() {
+        assert_eq!(live_text_align(1), Align::Centered);
+        assert_eq!(live_text_align(2), Align::TrailingCentered);
+        assert_eq!(live_text_align(0), Align::Leading);
+    }
+
+    /// Unset alignment must lead, not centre — a block that asked for nothing
+    /// reads the same live as it does rendered.
+    #[test]
+    fn an_unaligned_live_run_leads() {
+        assert_eq!(live_text_align(super::super::node::ALIGN_UNSET), Align::Leading);
+        assert_eq!(live_text_align(3), Align::Leading, "Stretch is not a text alignment");
+    }
 
     /// `ItemText` holds only shaped runs and placed parts, and a part with
     /// nothing placed in it has minted no compositor object — so the indexing

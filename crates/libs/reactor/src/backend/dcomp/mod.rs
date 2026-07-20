@@ -39,6 +39,7 @@ pub(crate) mod info_bar;
 pub(crate) mod input;
 mod knob;
 pub(crate) mod layout;
+pub(crate) mod live_text;
 pub(crate) mod nav;
 pub(crate) mod node;
 mod pacer;
@@ -578,6 +579,33 @@ impl DCompBackend {
     /// caption drag region from swallowing the titlebar's own controls.
     pub(crate) fn wants_client_at(&self, x: f32, y: f32) -> bool {
         self.interactive_at(x, y).is_some() || self.surface_at(x, y).is_some()
+    }
+
+    /// Apply the text a producer thread published, and repaint what changed.
+    ///
+    /// The same shape as [`repaint_caption`](Self::repaint_caption) — set state,
+    /// mark dirty, repaint — and deliberately so: this is a paint-time update,
+    /// not a reconcile. The words go onto the node as a live run, which
+    /// `text_sync` shapes at placement; nothing here touches the layout pass, so
+    /// a readout changing every frame never re-solves a box.
+    ///
+    /// An id that no longer resolves is skipped rather than treated as an error:
+    /// a producer holding a handle to an unmounted control is expected, and its
+    /// updates are simply dropped.
+    pub(crate) fn service_live_text(&mut self) {
+        let mut any = false;
+        for (id, text) in live_text::drain() {
+            if let Some(n) = self.arena.get_mut(id) {
+                if n.set_live_text(text) {
+                    any = true;
+                }
+            }
+        }
+        // Only when something actually moved — a batch whose every value matched
+        // what the node already showed must not cost a paint walk.
+        if any {
+            self.repaint();
+        }
     }
 
     /// Repaint the caption band (hover / maximized state changed).

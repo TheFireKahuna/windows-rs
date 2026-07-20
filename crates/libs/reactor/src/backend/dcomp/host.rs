@@ -209,12 +209,12 @@ pub(crate) fn post_ui(hwnd: isize, f: impl FnOnce() + Send + 'static) {
 }
 
 /// Per-thread state the front WndProc reaches into.
-struct HostShared {
+pub(crate) struct HostShared {
     /// The front half of the record seam: the real backend, owned by the host
     /// — not by the reconciler. Input, UIA, caption and resize paths borrow it
     /// here directly; the app thread's reconciler reaches it only through the
     /// command buffers [`post_commit`] replays.
-    backend: Rc<RefCell<DCompBackend>>,
+    pub(crate) backend: Rc<RefCell<DCompBackend>>,
     /// The app thread's run loop: intents, size/theme notifications and frame
     /// ticks post here. Fire-and-forget — the front never blocks on it.
     app: Arc<AppQueue>,
@@ -474,7 +474,7 @@ impl DCompHost {
     }
 }
 
-fn shared() -> Option<Rc<HostShared>> {
+pub(crate) fn shared() -> Option<Rc<HostShared>> {
     DCOMP.with(|c| c.borrow().clone())
 }
 
@@ -1311,6 +1311,11 @@ fn create_window(
     if hwnd.is_null() {
         return Err(windows_core::Error::empty());
     }
+    // Publish the window before anything can mount, so a producer thread holding
+    // a `LiveText` always has somewhere to post its wake. Until this runs a
+    // publish still queues — it simply has no one to tell, and the next publish
+    // carries the batch.
+    super::live_text::set_front_hwnd(hwnd as isize);
 
     let dpi = effective_dpi(hwnd);
     let scale = dpi as f64 / 96.0;
