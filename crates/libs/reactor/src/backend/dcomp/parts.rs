@@ -1881,12 +1881,12 @@ fn look(kind: ControlKind) -> Option<Look> {
         K::InfoBadge => (1, 0, badge_plan),
         K::InfoBar => (3, 1, bar_plan),
         K::TitleBar => (0, 1, caption_plan),
-        // The one container converted so far. `box_plan` reads nothing but the
-        // three generic paint props, so the other kinds still on
-        // `fill_and_stroke`'s catch-all arm — StackPanel, Grid, Canvas — would
-        // take it unchanged; they are left painted only because nothing has
-        // needed them converted yet, not because they differ.
-        K::Border => (box_slot::N_BELOW, 0, box_plan),
+        // Every container in the library. A Border, a StackPanel, a Grid, a
+        // ScrollViewer and a picker shell differ in layout and in nothing else:
+        // `controls::paint` returns false for all of them, so the only thing any
+        // of them has ever drawn is a filled rounded box with an outline — which
+        // is the two sprites `box_plan` binds. See `plain_box`.
+        k if k == K::Border || plain_box(k) => (box_slot::N_BELOW, 0, box_plan),
         _ => return None,
     };
     Some(Look { below, above, plan })
@@ -1902,6 +1902,64 @@ fn plan_less(kind: ControlKind) -> bool {
     matches!(
         kind,
         ControlKind::Slider | ControlKind::Meter | ControlKind::ProgressRing
+    )
+}
+
+/// Every kind whose entire appearance is the three generic paint props — a
+/// background, a border brush and a thickness — cut to one corner radius.
+///
+/// This is the whole of what `paint::fill_and_stroke`'s catch-all arm used to
+/// draw. It is a broad list not because these kinds are alike but because they
+/// are all equally FEATURELESS: `controls::paint` returns false for every one of
+/// them, so none has ever drawn anything but the box, and `box_plan` reads
+/// nothing else. The unimplemented shells — the pickers, `WebView2`,
+/// `RichEditBox` — belong here for exactly that reason.
+///
+/// The list is explicit rather than derived so that it fails CLOSED: a new
+/// `ControlKind` is absent from it, keeps its surface, and is drawn by the
+/// backstop arm. Deriving it (say, as "not `draws_own_chrome` and not otherwise
+/// in `look`") would silently convert a new control that does draw something,
+/// and denying a surface to something that draws renders nothing at all.
+pub(crate) fn plain_box(kind: ControlKind) -> bool {
+    use ControlKind as K;
+    matches!(
+        kind,
+        K::StackPanel
+            | K::Grid
+            | K::Canvas
+            | K::RelativePanel
+            | K::Viewbox
+            | K::ScrollViewer
+            | K::ScrollView
+            | K::ListView
+            | K::GridView
+            | K::FlipView
+            | K::ListBox
+            | K::TreeView
+            | K::TabView
+            | K::TabViewItem
+            | K::Pivot
+            | K::PivotItem
+            | K::RadioButton
+            | K::RadioButtons
+            | K::RatingControl
+            | K::BreadcrumbBar
+            | K::MenuBar
+            | K::CommandBar
+            | K::SplitView
+            | K::ColorPicker
+            | K::DatePicker
+            | K::TimePicker
+            | K::CalendarDatePicker
+            | K::CalendarView
+            | K::ContentDialog
+            | K::TeachingTip
+            | K::Image
+            | K::PersonPicture
+            | K::SwapChainPanel
+            | K::WebView2
+            | K::RichTextBlock
+            | K::RichEditBox
     )
 }
 
@@ -2873,7 +2931,15 @@ pub(crate) fn slider_drag(node: &mut Node, frac: f32) -> bool {
 
 // ── Meter ────────────────────────────────────────────────────────────────────
 
-/// Above-band roles: `[fill, marker, halo, needle]`.
+/// Below-band roles: `[groove]`. Above-band roles: `[fill, marker, halo,
+/// needle]`.
+///
+/// The groove is the static backing track. It was the meter's only draw, and so
+/// the only reason the control owned a surface — and it was the worst kind of
+/// draw, being value-INDEPENDENT chrome on a surface that `Prop::Value` marked
+/// dirty at level rate. A 60 Hz meter re-rasterized a constant rounded rect
+/// sixty times a second. As a part it is one cached raster shared by every meter
+/// of the same height.
 ///
 /// The fill is a full-track gradient raster revealed by an `InsetClip` whose
 /// `RightInset` FOLLOWS the needle sprite's animated `Offset.X` through an
@@ -2887,7 +2953,7 @@ fn meter_sync(
     scale: f32,
     scrubbing: bool,
 ) {
-    if !ensure(comp, node, 0, 4) {
+    if !ensure(comp, node, 1, 4) {
         return;
     }
     let frac = (super::ctrl_value_frac(node) as f32).clamp(0.0, 1.0);
@@ -2900,6 +2966,10 @@ fn meter_sync(
 
     let k_marker = AtlasKey::solid(marker_c, scale);
     let k_white = AtlasKey::solid(theme::w(1.0), scale);
+    // The same rect the fill is placed at: the fill lies directly over the
+    // groove and the reveal clip trims it back, which is what makes the
+    // unfilled remainder read as track.
+    let k_groove = AtlasKey::hbar(bar_h, theme::METER_RADIUS, 0.0, theme::w(0.06), scale);
 
     let geom = (w, h);
     let gradient = !node.ctrl().stops.is_empty();
@@ -2917,11 +2987,15 @@ fn meter_sync(
     // spring every frame and leave the level pinned until the pointer stopped.
     let snap = !parts.init || parts.geom != geom || scrubbing;
 
+    parts.below[0].bind(comp, atlas, k_groove);
     parts.above[0].bind(comp, atlas, k_fill);
     parts.above[1].bind(comp, atlas, k_marker);
     parts.above[2].bind(comp, atlas, k_white.clone());
     parts.above[3].bind(comp, atlas, k_white);
 
+    // Static geometry, so it always snaps: nothing here travels, and `place`
+    // is authoritative where `glide` would leave a spring to settle.
+    parts.below[0].place(0.0, top, w, bar_h);
     parts.above[0].place(0.0, top, w, bar_h);
     if let Some(mx) = marker_x {
         parts.above[1].place(mx - 0.5, 0.0, 1.0, h);
@@ -2936,6 +3010,7 @@ fn meter_sync(
         parts.above[2].glide(nx - 2.0, 0.0, 4.0, h);
         parts.above[3].glide(nx - 1.0, 0.0, 2.0, h);
     }
+    parts.below[0].set_opacity(dim);
     parts.above[0].set_opacity(dim);
     parts.above[1].set_opacity(if marker_x.is_some() { dim } else { 0.0 });
     parts.above[2].set_opacity(0.25 * dim);
@@ -3386,10 +3461,15 @@ fn progress_bar_h(node_h: f32) -> f32 {
 /// InsetClip (set at create) so the sweep slides in and out at the track edges
 /// instead of overhanging them.
 ///
-/// The sweep is deliberately absent from this plan while it is running: it is a
-/// FOREVER animation, not a placement, and a plan describes where a sprite comes
-/// to rest. `progress_sweep` owns it, and the slot the plan does not mention is
-/// the slot `apply` leaves alone.
+/// The sweep's PLACEMENT is deliberately absent from this plan: it is a FOREVER
+/// animation, and a plan describes where a sprite comes to rest. `progress_sweep`
+/// owns it, and a `None` rect is how a slot says so.
+///
+/// Its BIND is not absent, and the distinction is load-bearing. A slot the plan
+/// never mentions is a slot `apply` never brushes, so a bar born indeterminate
+/// used to loop a sourceless sprite forever — the animation was always running,
+/// there was simply nothing to see. Only a bar that had been determinate first
+/// ever showed a sweep, because that pass is what bound the brush.
 pub(crate) fn progress_plan(node: &Node, scale: f32) -> PartPlan {
     let (w, h) = (node.rect.w, node.rect.h);
     let bar_h = progress_bar_h(h);
@@ -3404,7 +3484,17 @@ pub(crate) fn progress_plan(node: &Node, scale: f32) -> PartPlan {
 
     if node.ctrl().indeterminate {
         // The sweep owns the lane; the determinate fill hides without moving.
-        return plan.below(1, SlotPlan::snap(k_fill, None, 0.0));
+        //
+        // The sweep's slot is bound here even though `progress_sweep` owns
+        // where it goes. A plan describes where a sprite comes to REST and the
+        // sweep never rests — but a BIND is not a placement, and a slot the
+        // plan never mentions is a slot `apply` never brushes. A bar born
+        // indeterminate would otherwise loop a sourceless sprite forever:
+        // perfectly, and invisibly. A `None` rect leaves placement to the
+        // sweep, which is the part the plan genuinely cannot describe.
+        return plan
+            .below(1, SlotPlan::snap(k_fill.clone(), None, 0.0))
+            .below(2, SlotPlan::snap(k_fill, None, 0.0));
     }
 
     // Floor the fill at one full pill so the nine-grid corners never degenerate
