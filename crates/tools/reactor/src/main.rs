@@ -313,6 +313,7 @@ fn generate_reactor_bindings() {
         "--implement",
         "Microsoft.UI.Xaml.IApplicationOverrides",
         "Microsoft.UI.Xaml.Markup.IXamlMetadataProvider",
+        "extras.IVirtualSurfaceUpdatesCallbackNative",
         "--minimal",
         "--dead-code",
         "--flat",
@@ -340,6 +341,60 @@ fn generate_reactor_bindings() {
         "crates/tools/reactor/src/test.txt",
     ];
     windows_bindgen::bindgen(test_args);
+
+    // System (Windows.UI.Composition) bindings for the self-hosted
+    // DirectComposition HDR backend. Generated into a SEPARATE module
+    // (`system_bindings.rs`) because the reactor's main `bindings.rs` already
+    // binds the LIFTED `Microsoft.UI.Composition` types under the same flat
+    // short names (Compositor, Visual, DispatcherQueue, …). Keeping the system
+    // compositor in its own module avoids the flat-namespace collision while
+    // the XAML/lifted path still exists. UIA + TSF provider interfaces are
+    // server-implemented, so they are emitted with `_Impl` scaffolding.
+    let system_args = [
+        "--in",
+        "crates/libs/bindgen/default/Windows.winmd",
+        "crates/libs/bindgen/default/Windows.Win32.winmd",
+        "crates/tools/reactor/winmd/extras.winmd",
+        "--out",
+        "crates/libs/reactor/src/system_bindings.rs",
+        "--implement",
+        // The canonical Win32 metadata is a flat `Windows.Win32` namespace (the
+        // per-header partition is synthesised only for the published package
+        // crates), so these name the interface directly under it — matching how
+        // `system.txt` lists them. A stale sub-namespace here silently matches
+        // nothing and the `_Impl` scaffolding is simply not emitted.
+        "Windows.Win32.IRawElementProviderSimple",
+        "Windows.Win32.IRawElementProviderFragment",
+        "Windows.Win32.IRawElementProviderFragmentRoot",
+        "Windows.Win32.IInvokeProvider",
+        "Windows.Win32.IToggleProvider",
+        "Windows.Win32.IValueProvider",
+        "Windows.Win32.IRangeValueProvider",
+        "Windows.Win32.ISelectionProvider",
+        "Windows.Win32.ISelectionItemProvider",
+        "Windows.Win32.IExpandCollapseProvider",
+        "Windows.Win32.IScrollProvider",
+        "Windows.Win32.IScrollItemProvider",
+        "Windows.Win32.ITextProvider",
+        "Windows.Win32.ITextRangeProvider",
+        "Windows.Win32.IRawElementProviderAdviseEvents",
+        "Windows.Win32.ITextStoreACP",
+        // Composition boundaries: TSF calls this back on the front thread when a
+        // TIP opens / closes a composition (the §7.2 guard signal).
+        "Windows.Win32.ITfContextOwnerCompositionSink",
+        // The backend implements these to hand a D2D path geometry to the
+        // compositor (Knob value arc → CompositionPath): the WinRT marker the
+        // CompositionPath factory accepts + the interop that yields the D2D geometry.
+        "Windows.Graphics.IGeometrySource2D",
+        "extras.IGeometrySource2DInterop",
+        "--minimal",
+        "--dead-code",
+        "--flat",
+        "--filter",
+        "--etc",
+        "crates/tools/reactor/src/system.txt",
+    ];
+    windows_bindgen::bindgen(system_args);
 }
 
 /// Write `content` to `path` if changed. Runs `rustfmt` when `format` is true.

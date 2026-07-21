@@ -22,6 +22,77 @@ mod extras {
         fn ResumeDraw(&self) -> HRESULT;
     }
 
+    // VirtualSurfaceImageSource interop (Microsoft.UI.Xaml WinUI 3 variant).
+    //
+    // `IVirtualSurfaceImageSourceNative` inherits `ISurfaceImageSourceNative`, so
+    // the latter must be declared to lay out the vtable correctly; drawing itself
+    // still goes through `ISurfaceImageSourceNativeWithD2D` (cast from the same
+    // object), exactly as for the non-virtual surface.
+    //
+    // GUIDs are the WinUI 3 (microsoft.ui.xaml.media.dxinterop.h) IIDs, which
+    // differ from the system (windows.ui.xaml) ones — just as
+    // `ISurfaceImageSourceNativeWithD2D` above is `cb833102…` (WinUI 3), not the
+    // system `54298223…`.
+    #[guid(0xe4cecd6c_f14b_4f46_83c3_8bbda27c6504)]
+    interface ISurfaceImageSourceNative : Windows::Win32::IUnknown {
+        fn SetDevice(&self, device: *mut void) -> HRESULT;
+        fn BeginDraw(&self, updateRect: Windows::Win32::RECT, surface: *mut *mut void, offset: *mut Windows::Win32::POINT) -> HRESULT;
+        fn EndDraw(&self) -> HRESULT;
+    }
+
+    #[guid(0x9e43c18e_7816_474c_840f_5c9c8b0e2207)]
+    interface IVirtualSurfaceImageSourceNative : ISurfaceImageSourceNative {
+        fn Invalidate(&self, updateRect: Windows::Win32::RECT) -> HRESULT;
+        fn GetUpdateRectCount(&self, count: *mut u32) -> HRESULT;
+        fn GetUpdateRects(&self, updates: *mut Windows::Win32::RECT, count: u32) -> HRESULT;
+        fn GetVisibleBounds(&self, bounds: *mut Windows::Win32::RECT) -> HRESULT;
+        fn RegisterForUpdatesNeeded(&self, callback: *mut void) -> HRESULT;
+        fn Resize(&self, newWidth: i32, newHeight: i32) -> HRESULT;
+    }
+
+    #[guid(0xe8e84ac7_b7b8_40f4_b033_f877a756c52b)]
+    interface IVirtualSurfaceUpdatesCallbackNative : Windows::Win32::IUnknown {
+        fn UpdatesNeeded(&self) -> HRESULT;
+    }
+
+    // Lifted Microsoft.UI.Composition interop (WinAppSDK 2.1). These are the WinUI 3
+    // (microsoft.ui.composition.interop.h) variants — their IIDs differ from the system
+    // ABI::Windows::UI::Composition interop interfaces, exactly as
+    // ISurfaceImageSourceNativeWithD2D (cb833102…) above is the WinUI 3 IID, not the
+    // system 54298223… one. The lifted ICompositorInterop carries ONLY
+    // CreateGraphicsDevice (the swap-chain surface factories sit on a separate
+    // ICompositorSwapChainInterop), so its vtable is a single method — do NOT copy the
+    // system 3-method shape. Used to host an off-XAML-tree, off-thread D2D-drawn
+    // composition surface as a child visual of a XAML element.
+    #[guid(0xfab19398_6d19_4d8a_b752_8f096c396069)]
+    interface ICompositorInterop : Windows::Win32::IUnknown {
+        // renderingDevice: an ID2D1Device (for D2D-drawn surfaces) passed as IUnknown*.
+        // result: ICompositionGraphicsDevice** (opaque WinRT object) -> *mut *mut void.
+        fn CreateGraphicsDevice(&self, renderingDevice: *mut void, result: *mut *mut void) -> HRESULT;
+    }
+
+    // Bridges a D2D path geometry into a CompositionPath (the Knob value arc
+    // implements this alongside IGeometrySource2D so the compositor can consume
+    // its arc). The Win32 metadata generated from the SDK headers does not carry
+    // this interop — unlike ICompositorInterop below — so it is declared here.
+    #[guid(0x0657af73_53fd_47cf_84ff_c8492d2a80a3)]
+    interface IGeometrySource2DInterop : Windows::Win32::IUnknown {
+        fn GetGeometry(&self, value: *mut Windows::Win32::ID2D1Geometry) -> HRESULT;
+        fn TryGetGeometryUsingFactory(&self, factory: Windows::Win32::ID2D1Factory, value: *mut Windows::Win32::ID2D1Geometry) -> HRESULT;
+    }
+
+    #[guid(0x2d6355c2_ad57_4eae_92e4_4c3eff65d578)]
+    interface ICompositionDrawingSurfaceInterop : Windows::Win32::IUnknown {
+        // BeginDraw hands back an ID2D1DeviceContext (pass its IID) already inside a
+        // native BeginDraw/EndDraw bracket, plus the atlas offset to translate drawing by.
+        fn BeginDraw(&self, updateRect: *const Windows::Win32::RECT, iid: *const GUID, updateObject: *mut *mut void, updateOffset: *mut Windows::Win32::POINT) -> HRESULT;
+        fn EndDraw(&self) -> HRESULT;
+        fn Resize(&self, sizePixels: Windows::Win32::SIZE) -> HRESULT;
+        fn Scroll(&self, scrollRect: *const Windows::Win32::RECT, clipRect: *const Windows::Win32::RECT, offsetX: i32, offsetY: i32) -> HRESULT;
+        fn ResumeDraw(&self) -> HRESULT;
+        fn SuspendDraw(&self) -> HRESULT;
+    }
+
     // Sourced from Microsoft.WindowsAppSDK.Runtime 2.0.1
 
     #[library("Microsoft.WindowsAppRuntime.Bootstrap.dll")]
