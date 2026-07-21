@@ -106,12 +106,7 @@ pub fn pointer_injection_gesture(h: Harness) -> FixtureFuture {
             vstack((text_block("pointer target"),))
                 .width(6000.0)
                 .height(6000.0)
-                .background(Color {
-                    a: 255,
-                    r: 32,
-                    g: 32,
-                    b: 40,
-                })
+                .background(Color::rgba(32, 32, 40, 255))
                 .on_pointer_entered(move |_| {
                     le.borrow_mut().entered += 1;
                 })

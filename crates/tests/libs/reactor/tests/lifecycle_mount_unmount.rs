@@ -3,24 +3,24 @@ use std::rc::Rc;
 
 use test_reactor::{Op, RecordingBackend};
 use windows_reactor::{
-    Backend, Callback, ControlId, ControlKind, Event, EventHandler, Modifiers, Prop, PropBindings,
-    PropValue, Reconciler, Widget,
+    Backend, Callback, ControlId, ControlKind, Event, EventHandler, Modifiers, MountInfo, Prop,
+    PropBindings, PropValue, Reconciler, Widget,
 };
 
 type Log = Rc<RefCell<Vec<(&'static str, bool)>>>;
 
 struct ProbeWidget {
     modifiers: Modifiers,
-    mounted: Option<Callback<Option<windows_core::IInspectable>>>,
-    unmounted: Option<Callback<Option<windows_core::IInspectable>>>,
+    mounted: Option<Callback<MountInfo>>,
+    unmounted: Option<Callback<MountInfo>>,
 }
 
 impl ProbeWidget {
     fn new(log: &Log, with_mount: bool, with_unmount: bool) -> Self {
         let mk = |tag: &'static str| {
             let log = Rc::clone(log);
-            Callback::new(move |native: Option<windows_core::IInspectable>| {
-                log.borrow_mut().push((tag, native.is_some()));
+            Callback::new(move |info: MountInfo| {
+                log.borrow_mut().push((tag, info.native.is_some()));
             })
         };
 
@@ -49,26 +49,22 @@ impl Widget for ProbeWidget {
         Vec::new()
     }
 
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.mounted.as_ref()
     }
 
-    fn on_unmounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_unmounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.unmounted.as_ref()
     }
 }
 
 #[derive(Default)]
 struct NoNativeBackend {
-    next_id: u32,
     destroyed: Vec<ControlId>,
 }
 
 impl Backend for NoNativeBackend {
-    fn create(&mut self, _kind: ControlKind) -> ControlId {
-        self.next_id += 1;
-        ControlId::new(self.next_id)
-    }
+    fn create(&mut self, _id: ControlId, _kind: ControlKind) {}
 
     fn set_prop(&mut self, _id: ControlId, _prop: Prop, _value: &PropValue) {}
 

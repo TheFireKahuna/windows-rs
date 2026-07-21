@@ -132,18 +132,8 @@ pub fn background_foreground_padding_transition(h: Harness) -> FixtureFuture {
             let (styled, set) = cx.use_state(true);
             let btn = if styled {
                 button("styled")
-                    .background(Color {
-                        a: 255,
-                        r: 200,
-                        g: 0,
-                        b: 0,
-                    })
-                    .foreground(Color {
-                        a: 255,
-                        r: 255,
-                        g: 255,
-                        b: 255,
-                    })
+                    .background(Color::rgba(200, 0, 0, 255))
+                    .foreground(Color::rgba(255, 255, 255, 255))
                     .padding(10.0)
             } else {
                 button("plain")

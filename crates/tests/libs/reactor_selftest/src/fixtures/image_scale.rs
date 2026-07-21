@@ -11,7 +11,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use windows_reactor::{ElementExt, Image};
+use windows_reactor::{ElementExt, Image, ImageHandle};
 
 use crate::fixtures::reconciler::{FixtureFuture, cc};
 use crate::harness::Harness;
@@ -36,9 +36,13 @@ pub fn rasterization_scale_delivered(h: Harness) -> FixtureFuture {
                 Image::new_with_uri("ms-appx:///Assets/none.png")
                     .width(64.0)
                     .height(64.0)
-                    .on_mounted(move |handle| {
+                    .on_mounted(move |element| {
                         mounted.set(true);
                         let scale = scale.clone();
+                        // This fixture runs against a live WinUI window, so the
+                        // element always has a native XAML object behind it.
+                        let handle = ImageHandle::from_element(&element)
+                            .expect("WinUI-backed Image must expose a native element");
                         match handle.on_rasterization_scale_changed(move |s| scale.set(s)) {
                             Ok(r) => {
                                 wired.set(true);

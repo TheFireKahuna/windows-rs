@@ -42,6 +42,7 @@ features = ["std"]
 
 [dependencies.windows-reactor]
 workspace = true
+features = ["winui-backend"]
 
 [dependencies.windows-reference]
 workspace = true
