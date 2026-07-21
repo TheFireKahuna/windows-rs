@@ -4,12 +4,21 @@ use super::*;
 /// and the menu flyout modifier on buttons).
 #[derive(Clone, Debug, PartialEq)]
 pub enum MenuItemDef {
-    /// A clickable menu item with a text label.
+    /// A clickable menu item with a text label, plus optional per-item
+    /// decoration (leading glyph icon, destructive styling, disabled state,
+    /// trailing keyboard-shortcut text).
     Item {
         text: String,
-        /// Whether the item is interactive. Disabled items are greyed out
-        /// and do not raise click events.
-        is_enabled: bool,
+        /// Optional leading glyph (a `Symbol`), rendered as the item's icon.
+        icon: Option<Symbol>,
+        /// Destructive / dangerous action — rendered with error-red foreground.
+        danger: bool,
+        /// When `false`, the item is greyed out and not clickable.
+        enabled: bool,
+        /// Trailing accelerator hint text (e.g. `"Ctrl+Z"`). Display-only —
+        /// this does NOT register a live keyboard accelerator, it overrides the
+        /// shortcut text shown on the right of the item.
+        shortcut: Option<String>,
     },
     /// A visual separator line.
     Separator,
@@ -20,19 +29,53 @@ pub enum MenuItemDef {
     },
 }
 
-/// Builder for an enabled [`MenuItemDef::Item`].
-pub fn menu_item(text: impl Into<String>) -> MenuItemDef {
-    MenuItemDef::Item {
-        text: text.into(),
-        is_enabled: true,
+impl MenuItemDef {
+    /// Set a leading glyph icon on an [`MenuItemDef::Item`] (no-op on other
+    /// variants).
+    pub fn icon(mut self, sym: Symbol) -> Self {
+        if let Self::Item { icon, .. } = &mut self {
+            *icon = Some(sym);
+        }
+        self
+    }
+
+    /// Mark an [`MenuItemDef::Item`] as a destructive action (error-red text).
+    pub fn danger(mut self) -> Self {
+        if let Self::Item { danger, .. } = &mut self {
+            *danger = true;
+        }
+        self
+    }
+
+    /// Disable an [`MenuItemDef::Item`] (greyed out, not clickable).
+    pub fn disabled(mut self) -> Self {
+        if let Self::Item { enabled, .. } = &mut self {
+            *enabled = false;
+        }
+        self
+    }
+
+    /// Set the trailing keyboard-shortcut hint text on an
+    /// [`MenuItemDef::Item`] (display-only).
+    pub fn shortcut(mut self, text: impl Into<String>) -> Self {
+        if let Self::Item { shortcut, .. } = &mut self {
+            *shortcut = Some(text.into());
+        }
+        self
     }
 }
 
-/// Builder for a disabled (greyed-out) [`MenuItemDef::Item`].
-pub fn menu_item_disabled(text: impl Into<String>) -> MenuItemDef {
+/// Builder for a [`MenuItemDef::Item`]. Decorate with the chainable
+/// [`icon`](MenuItemDef::icon) / [`danger`](MenuItemDef::danger) /
+/// [`disabled`](MenuItemDef::disabled) / [`shortcut`](MenuItemDef::shortcut)
+/// methods.
+pub fn menu_item(text: impl Into<String>) -> MenuItemDef {
     MenuItemDef::Item {
         text: text.into(),
-        is_enabled: false,
+        icon: None,
+        danger: false,
+        enabled: true,
+        shortcut: None,
     }
 }
 

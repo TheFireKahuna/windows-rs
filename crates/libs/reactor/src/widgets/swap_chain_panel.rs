@@ -64,6 +64,20 @@ impl SwapChainPanelHandle {
             }
         })
     }
+
+    /// Open a live [`PointerSurface`] over this panel's native `UIElement`.
+    ///
+    /// Unlike the declarative [`on_pointer_moved`](crate::ElementExt::on_pointer_moved)
+    /// / [`on_pointer_wheel`](crate::ElementExt::on_pointer_wheel) modifiers, this
+    /// imperative surface also supports **pointer capture** — the piece a knob /
+    /// slider / EQ-node drag needs so moves keep arriving when the pointer leaves
+    /// the element bounds. Subscribe down / move / up / wheel via the returned
+    /// surface's builder methods; the registrations (and any held capture) are
+    /// revoked on `Drop`. Coordinates in every [`PointerEventInfo`] are
+    /// element-relative DIPs.
+    pub fn pointer_surface(&self) -> Result<PointerSurface> {
+        xaml_pointer_surface(&self.0).ok_or_else(Error::empty)
+    }
 }
 
 /// Built-in widget for `Microsoft.UI.Xaml.Controls.SwapChainPanel` — hosts
@@ -75,8 +89,8 @@ impl SwapChainPanelHandle {
 pub struct SwapChainPanel {
     pub key: Option<String>,
     pub modifiers: Modifiers,
-    pub mounted: Option<Callback<Option<windows_core::IInspectable>>>,
-    pub unmounted: Option<Callback<Option<windows_core::IInspectable>>>,
+    pub mounted: Option<Callback<MountInfo>>,
+    pub unmounted: Option<Callback<MountInfo>>,
 }
 
 impl Default for SwapChainPanel {
@@ -99,8 +113,8 @@ impl SwapChainPanel {
     pub fn on_mounted(mut self, f: impl Fn(SwapChainPanelHandle) + 'static) -> Self {
         // A `SwapChainPanel` always has a native control in practice; the
         // handle is only built when one is present.
-        self.mounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            if let Some(native) = info.native {
                 f(SwapChainPanelHandle(native));
             }
         }));
@@ -112,8 +126,8 @@ impl SwapChainPanel {
     /// example, stop and join a render thread that presents into its swap
     /// chain) before the panel — and its swap chain — go away.
     pub fn on_unmounted(mut self, f: impl Fn(SwapChainPanelHandle) + 'static) -> Self {
-        self.unmounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
+        self.unmounted = Some(Callback::new(move |info: MountInfo| {
+            if let Some(native) = info.native {
                 f(SwapChainPanelHandle(native));
             }
         }));
@@ -126,11 +140,11 @@ impl SwapChainPanel {
     pub fn on_resize(mut self, f: impl Fn(f64, f64) + 'static) -> Self {
         let f = Rc::new(f);
         let prev = self.mounted.take();
-        self.mounted = Some(Callback::new(move |native: Option<windows_core::IInspectable>| {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
             if let Some(ref cb) = prev {
-                cb.invoke(native.clone());
+                cb.invoke(info.clone());
             }
-            let Some(native) = native else {
+            let Some(native) = info.native else {
                 return;
             };
             // Subscribe to SizeChanged on the FrameworkElement.
@@ -160,10 +174,10 @@ impl Widget for SwapChainPanel {
     fn bindings(&self) -> PropBindings {
         Vec::new()
     }
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.mounted.as_ref()
     }
-    fn on_unmounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_unmounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.unmounted.as_ref()
     }
 }

@@ -18,14 +18,89 @@ impl ButtonStyle {
     pub const TextLink: Self = Self(3);
 }
 
+/// The [`Button::pill`] radius: "as round as the box allows".
+///
+/// A corner radius is clamped to half the shorter side — a rounded rectangle
+/// cannot curve further than that without its corners overlapping — so an
+/// unbounded radius resolves to exactly the fully-rounded end, whatever the
+/// button's measured height turns out to be. Naming the intent instead of a
+/// number is what keeps a pill round across font sizes and display scales.
+pub const PILL_RADIUS: f64 = f64::INFINITY;
+
+/// The badge a [`Button`] carries beside its label — the two forms an
+/// [`InfoBadge`](super::InfoBadge) takes, hosted inside the button's own box
+/// instead of beside it.
+///
+/// A button with no badge holds no `Badge` at all, so the absent case is
+/// absence rather than a value: `count: None` is unambiguously the dot form,
+/// and no count is reserved to mean "nothing here".
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Badge {
+    /// The count, or `None` for the bare status dot.
+    pub count: Option<i32>,
+    /// Plate fill. `None` takes the accent role — what a standalone
+    /// `InfoBadge` uses, and what makes an untinted badge match one.
+    pub tint: Option<Color>,
+    /// Sit before the label rather than after it.
+    ///
+    /// Trailing is the default because a count annotates the label it follows
+    /// ("Inbox 12"); a dot placed leading reads instead as a status lamp on the
+    /// thing the label names.
+    pub leading: bool,
+}
+
+impl Badge {
+    /// A bare status dot.
+    pub fn dot() -> Self {
+        Self {
+            count: None,
+            tint: None,
+            leading: false,
+        }
+    }
+    /// A count, in a stadium plate that floors at a circle for one digit.
+    pub fn count(n: i32) -> Self {
+        Self {
+            count: Some(n),
+            tint: None,
+            leading: false,
+        }
+    }
+    /// Fill the plate with `c` instead of the accent role.
+    pub fn tint(mut self, c: Color) -> Self {
+        self.tint = Some(c);
+        self
+    }
+    /// Place the badge before the label.
+    pub fn leading(mut self) -> Self {
+        self.leading = true;
+        self
+    }
+}
+
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Button {
     pub key: Option<String>,
     pub modifiers: Modifiers,
     pub content: String,
+    /// Optional rich element content, mounted via the child reconciler into the
+    /// button's `ContentControl` slot. When set, `content` (text) is ignored.
+    /// The element is `None` for the common text-button case, so this stays a
+    /// zero-cost addition for existing call sites.
+    pub content_element: Option<Box<Element>>,
     pub is_enabled: bool,
     pub style: ButtonStyle,
+    /// Uniform corner radius in DIPs. `None` leaves the button at the radius
+    /// its kind is born with, which is the framework default for a button.
+    pub corner_radius: Option<f64>,
+    /// Outline colour. `None` leaves the variant's own decision — an outline on
+    /// a Default button, none on Accent or Subtle. The *width* stays the
+    /// family's, so a chip authors the colour that frames it without being able
+    /// to draw a heavier border than any other button on the surface.
+    pub border_brush: Option<Color>,
     pub icon: Option<Symbol>,
+    /// The badge beside the label; `None` for a button that carries none.
+    pub badge: Option<Badge>,
     pub on_click: Option<Callback<()>>,
     pub flyout: Option<FlyoutDef>,
     pub menu_flyout_items: Option<Vec<MenuItemDef>>,
@@ -46,14 +121,31 @@ impl Button {
 
 impl Widget for Button {
     widget_header!(ControlKind::Button);
+    fn children(&self) -> Children<'_> {
+        match &self.content_element {
+            Some(el) => Children::PositionalSingle(el),
+            None => Children::None,
+        }
+    }
+    fn flyout_element(&self) -> Option<&Element> {
+        self.flyout.as_ref()?.rich.as_deref()
+    }
     fn bindings(&self) -> PropBindings {
         let mut out = generated::button_bindings(self);
-        out.push(Binding::Prop(
-            Prop::Content,
-            PropValue::Str(self.content.clone()),
-        ));
+        // A rich element child (mounted by the child reconciler into the
+        // ContentControl slot) owns the Content; binding the text Content too
+        // would clobber it on the next prop-apply. Bind text only without a child.
+        if self.content_element.is_none() {
+            out.push(Binding::Prop(
+                Prop::Content,
+                PropValue::Str(self.content.clone()),
+            ));
+        }
         if let Some(v) = self.icon {
             out.push(Binding::Prop(Prop::Icon, PropValue::I32(v.0)));
+        }
+        if let Some(v) = self.badge {
+            out.push(Binding::Prop(Prop::Badge, PropValue::Badge(v)));
         }
         if let Some(v) = &self.menu_flyout_items {
             out.push(Binding::Prop(
@@ -64,11 +156,17 @@ impl Widget for Button {
         if self.style != ButtonStyle::Default {
             out.push(Binding::Prop(Prop::StyleVariant, PropValue::I32(self.style.0)));
         }
+        if let Some(v) = self.corner_radius {
+            out.push(Binding::Prop(Prop::CornerRadius, PropValue::F64(v)));
+        }
+        if let Some(v) = self.border_brush {
+            out.push(Binding::Prop(Prop::BorderBrush, PropValue::Color(v)));
+        }
         // Flyout and CommandBarFlyout are compound types not in TOML.
         if let Some(ref fly) = self.flyout {
             out.push(Binding::Prop(
                 Prop::FlyoutContent,
-                PropValue::Str(fly.text.clone()),
+                PropValue::FlyoutDef(fly.clone()),
             ));
             if fly.placement != FlyoutPlacementMode::default() {
                 out.push(Binding::Prop(
@@ -99,6 +197,18 @@ impl Button {
         self
     }
 
+    /// Host a rich element tree as the button's content instead of the `content`
+    /// text. The button stays a real WinUI `Button`, so it keeps its
+    /// `InvokePattern` automation peer, keyboard activation (Space/Enter), and
+    /// accessibility — while rendering arbitrary visuals. When set, the text
+    /// `content` is ignored. Pair with [`Button::subtle`] (or a chromeless style)
+    /// plus zeroed `padding`/`min_width`/`min_height` to use the button as a
+    /// tappable, automatable wrapper around custom-drawn or composed visuals.
+    pub fn content_element(mut self, element: impl Into<Element>) -> Self {
+        self.content_element = Some(Box::new(element.into()));
+        self
+    }
+
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.is_enabled = enabled;
         self
@@ -124,11 +234,37 @@ impl Button {
         self
     }
 
+    /// Carry a [`Badge`] beside the label — `Badge::dot()` or
+    /// `Badge::count(n)`, optionally tinted and optionally leading.
+    pub fn badge(mut self, b: Badge) -> Self {
+        self.badge = Some(b);
+        self
+    }
+
+    /// Override the corner radius, in DIPs. `0.0` squares the corners.
+    pub fn corner_radius(mut self, v: f64) -> Self {
+        self.corner_radius = Some(v);
+        self
+    }
+
+    /// Outline the button in `c` instead of leaving the outline to its variant.
+    pub fn border_brush(mut self, c: Color) -> Self {
+        self.border_brush = Some(c);
+        self
+    }
+
+    /// Fully rounded ends — the shape a status pill or a filter chip wants.
+    ///
+    /// The radius is resolved against the button's measured height at paint
+    /// time rather than fixed here, so a pill stays a pill when its font size,
+    /// padding or the display scale changes.
+    pub fn pill(mut self) -> Self {
+        self.corner_radius = Some(PILL_RADIUS);
+        self
+    }
+
     pub fn flyout(mut self, text: impl Into<String>) -> Self {
-        self.flyout = Some(FlyoutDef {
-            text: text.into(),
-            placement: FlyoutPlacementMode::default(),
-        });
+        self.flyout = Some(FlyoutDef::text(text));
         self
     }
 
@@ -137,10 +273,20 @@ impl Button {
         text: impl Into<String>,
         placement: FlyoutPlacementMode,
     ) -> Self {
-        self.flyout = Some(FlyoutDef {
-            text: text.into(),
-            placement,
-        });
+        self.flyout = Some(FlyoutDef::text(text).placement(placement));
+        self
+    }
+
+    /// Attach a rich element-tree flyout (band panel, color picker, …).
+    pub fn flyout_element(mut self, element: impl Into<Element>) -> Self {
+        self.flyout = Some(FlyoutDef::rich(element));
+        self
+    }
+
+    /// Attach a fully-specified [`FlyoutDef`] (text/rich content + placement +
+    /// open + on_closed).
+    pub fn flyout_def(mut self, def: FlyoutDef) -> Self {
+        self.flyout = Some(def);
         self
     }
 

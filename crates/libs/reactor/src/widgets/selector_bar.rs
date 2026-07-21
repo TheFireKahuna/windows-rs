@@ -28,12 +28,19 @@ pub fn selector_bar_item(text: impl Into<String>) -> SelectorBarItemDef {
     SelectorBarItemDef::new(text)
 }
 
-/// `Microsoft.UI.Xaml.Controls.SelectorBar`. A horizontal tab-like selector.
+/// `Microsoft.UI.Xaml.Controls.SelectorBar`. A horizontal segmented selector.
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct SelectorBar {
     pub key: Option<String>,
     pub modifiers: Modifiers,
     pub items: Vec<SelectorBarItemDef>,
+    /// Controlled selection. `None` leaves the control uncontrolled (the
+    /// backend keeps its own selection, defaulting to the first item).
+    pub selected_index: Option<i32>,
+    /// Accent variant: a filled accent pill in a fully-rounded tray, instead of
+    /// the default subtle grey-fill segments.
+    pub accent: bool,
+    pub disabled: bool,
     pub on_selection_changed: Option<Callback<String>>,
 }
 
@@ -43,6 +50,24 @@ impl SelectorBar {
             items,
             ..Default::default()
         }
+    }
+
+    /// Set the controlled selected index.
+    pub fn selected_index(mut self, i: i32) -> Self {
+        self.selected_index = Some(i);
+        self
+    }
+
+    /// Use the accent-pill visual variant.
+    pub fn accent(mut self) -> Self {
+        self.accent = true;
+        self
+    }
+
+    /// Dim and disable interaction.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
     }
 
     pub fn on_selection_changed(mut self, f: impl IntoCallback<String>) -> Self {
@@ -59,6 +84,14 @@ impl Widget for SelectorBar {
             Prop::Items,
             PropValue::SelectorBarItems(self.items.clone()),
         ));
+        if let Some(i) = self.selected_index {
+            out.push(Binding::Prop(Prop::SelectedIndex, PropValue::I32(i)));
+        }
+        out.push(Binding::Prop(
+            Prop::StyleVariant,
+            PropValue::I32(if self.accent { 1 } else { 0 }),
+        ));
+        out.push(Binding::Prop(Prop::IsEnabled, PropValue::Bool(!self.disabled)));
         out
     }
 }

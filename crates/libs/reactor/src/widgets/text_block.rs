@@ -9,6 +9,12 @@ pub struct TextBlock {
     pub font_weight: Option<u16>,
     pub text_wrapping: TextWrapping,
     pub is_text_selection_enabled: bool,
+    /// Post-mount callback, for taking an [`ElementHandle`] to this block.
+    ///
+    /// The one reason a `TextBlock` needs a handle is
+    /// [`ElementHandle::live_text`]: a readout whose value a render pump owns
+    /// cannot arrive as `text`, because it never passes through a render.
+    pub mounted: Option<Callback<MountInfo>>,
 }
 impl TextBlock {
     pub fn new(content: impl Into<String>) -> Self {
@@ -21,6 +27,9 @@ impl TextBlock {
 
 impl Widget for TextBlock {
     widget_header!(ControlKind::TextBlock);
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
+        self.mounted.as_ref()
+    }
     fn bindings(&self) -> PropBindings {
         let mut out = generated::text_block_bindings(self);
         if let Some(v) = self.font_size {
@@ -34,6 +43,20 @@ impl Widget for TextBlock {
 }
 
 impl TextBlock {
+    /// Callback invoked once after the control is created, handed an
+    /// [`ElementHandle`] for it.
+    ///
+    /// Take [`ElementHandle::live_text`] here and give it to whichever thread
+    /// produces this block's value; the text passed to
+    /// [`text_block`](fn@super::text_block) is then only the initial word, and
+    /// everything after it arrives without a render.
+    pub fn on_mounted(mut self, f: impl Fn(ElementHandle) + 'static) -> Self {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            f(ElementHandle::from(info));
+        }));
+        self
+    }
+
     pub fn bold(mut self) -> Self {
         self.font_weight = Some(700);
         self

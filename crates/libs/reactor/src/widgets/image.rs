@@ -2,12 +2,23 @@ use super::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Opaque handle to the native `Image` control, passed to the
-/// [`on_mounted`](Image::on_mounted) callback.
+/// Opaque handle to the native `Image` control, promoted from the
+/// [`ElementHandle`] that [`on_mounted`](Image::on_mounted) delivers.
 #[derive(Clone)]
 pub struct ImageHandle(windows_core::IInspectable);
 
 impl ImageHandle {
+    /// Promote the [`ElementHandle`] handed to [`Image::on_mounted`] into an
+    /// `ImageHandle`.
+    ///
+    /// Returns `None` when the element has no native XAML object behind it —
+    /// i.e. under the self-hosted DirectComposition backend, which has no
+    /// `XamlRoot` to report a rasterization scale. There, take the scale from
+    /// [`RenderCx::use_dpi`](crate::RenderCx::use_dpi) instead.
+    pub fn from_element(element: &ElementHandle) -> Option<Self> {
+        element.native().cloned().map(Self)
+    }
+
     /// Deliver the host's rasterization (DPI) scale to `f`: once the control is
     /// loaded into the tree, and again whenever the scale changes (for example the
     /// window moves to a monitor with different scaling).
@@ -60,7 +71,7 @@ pub struct Image {
     pub modifiers: Modifiers,
     pub source: ImageSource,
     pub stretch: Stretch,
-    pub mounted: Option<Callback<Option<windows_core::IInspectable>>>,
+    pub mounted: Option<Callback<MountInfo>>,
 }
 impl Default for Image {
     fn default() -> Self {
@@ -107,15 +118,19 @@ impl Image {
         self
     }
 
-    /// Callback invoked once after the native control is created, receiving an
-    /// [`ImageHandle`]. Use it to observe the host rasterization (DPI) scale via
-    /// [`ImageHandle::on_rasterization_scale_changed`] so an on-demand surface can
-    /// be sized for crisp rendering.
-    pub fn on_mounted(mut self, f: impl Fn(ImageHandle) + 'static) -> Self {
-        self.mounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
-                f(ImageHandle(native));
-            }
+    /// Callback invoked once after the native control is created, handed an
+    /// [`ElementHandle`] for the native `Image` element. Use it to open a
+    /// capture-capable [`PointerSurface`](crate::PointerSurface) over an
+    /// `Image` that hosts a custom-drawn [`SurfaceImageSource`] — so a knob /
+    /// slider / node drag keeps tracking past the element bounds — and to
+    /// subscribe [`ElementHandle::on_size_changed`](crate::ElementHandle::on_size_changed)
+    /// to recreate a fixed-size `SurfaceImageSource` when the layout resizes.
+    ///
+    /// On the WinUI backend, [`ImageHandle::from_element`] promotes the handle to
+    /// an [`ImageHandle`] to observe the host rasterization (DPI) scale.
+    pub fn on_mounted(mut self, f: impl Fn(ElementHandle) + 'static) -> Self {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            f(ElementHandle::from(info));
         }));
         self
     }
@@ -123,6 +138,9 @@ impl Image {
 
 impl Widget for Image {
     widget_header!(ControlKind::Image);
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
+        self.mounted.as_ref()
+    }
     fn bindings(&self) -> PropBindings {
         let mut out = generated::image_bindings(self);
         // ImageSource is a compound type not expressible in TOML.
@@ -139,8 +157,5 @@ impl Widget for Image {
             ImageSource::None => {}
         }
         out
-    }
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
-        self.mounted.as_ref()
     }
 }

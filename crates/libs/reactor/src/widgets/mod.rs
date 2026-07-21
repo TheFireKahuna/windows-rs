@@ -44,7 +44,6 @@ widget_modules! {
     color_picker,
     combo_box,
     command_bar,
-    composition_host,
     content_dialog,
     date_picker,
     drop_down_button,
@@ -55,8 +54,10 @@ widget_modules! {
     image,
     info_badge,
     info_bar,
+    knob,
     list_box,
     menu_bar,
+    meter,
     navigation_view,
     number_box,
     password_box,
@@ -78,6 +79,9 @@ widget_modules! {
     split_button,
     split_view,
     stack_panel,
+    element_handle,
+    pointer,
+    subscription,
     surface_image_source,
     swap_chain_panel,
     tab_view,
@@ -92,3 +96,23 @@ widget_modules! {
     viewbox,
     web_view2,
 }
+
+// Declared outside `widget_modules!` because it is the one widget that is not
+// backend-agnostic: it hosts a lifted `Microsoft.UI.Composition` visual tree in
+// a XAML element (`ElementCompositionPreview`, `XamlRoot`), so it exists only
+// when the WinUI backend does. It is also the sole consumer of the lifted
+// `windows-composition` stack outside `backend/winui`, and gating it is what
+// lets that dependency be optional — a DComp-only build hosts the system stack
+// instead, and the two stacks cannot coexist in one build.
+#[cfg(feature = "winui-backend")]
+pub mod composition_host;
+#[cfg(feature = "winui-backend")]
+pub use composition_host::*;
+
+// The system-stack counterpart, and likewise not backend-agnostic: it hosts a
+// host-owned `Windows.UI.Composition` drawing surface under a DComp node, so it
+// exists only when the DComp backend does.
+#[cfg(feature = "dcomp-backend")]
+pub mod composition_surface;
+#[cfg(feature = "dcomp-backend")]
+pub use composition_surface::*;

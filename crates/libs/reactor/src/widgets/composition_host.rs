@@ -93,8 +93,8 @@ impl CompositionHostHandle {
 pub struct CompositionHost {
     pub key: Option<String>,
     pub modifiers: Modifiers,
-    pub mounted: Option<Callback<Option<windows_core::IInspectable>>>,
-    pub unmounted: Option<Callback<Option<windows_core::IInspectable>>>,
+    pub mounted: Option<Callback<MountInfo>>,
+    pub unmounted: Option<Callback<MountInfo>>,
 }
 
 impl Default for CompositionHost {
@@ -116,8 +116,8 @@ impl CompositionHost {
     /// Callback invoked once after the native host is created, with a
     /// [`CompositionHostHandle`] for wiring up composition content.
     pub fn on_mounted(mut self, f: impl Fn(CompositionHostHandle) + 'static) -> Self {
-        self.mounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            if let Some(native) = info.native {
                 f(CompositionHostHandle(native));
             }
         }));
@@ -128,8 +128,8 @@ impl CompositionHost {
     /// exists. Use this to tear down composition resources bound to the host
     /// (for example detach the child visual) before it goes away.
     pub fn on_unmounted(mut self, f: impl Fn(CompositionHostHandle) + 'static) -> Self {
-        self.unmounted = Some(Callback::new(move |native: Option<_>| {
-            if let Some(native) = native {
+        self.unmounted = Some(Callback::new(move |info: MountInfo| {
+            if let Some(native) = info.native {
                 f(CompositionHostHandle(native));
             }
         }));
@@ -142,11 +142,11 @@ impl CompositionHost {
     pub fn on_resize(mut self, f: impl Fn(f64, f64) + 'static) -> Self {
         let f = Rc::new(f);
         let prev = self.mounted.take();
-        self.mounted = Some(Callback::new(move |native: Option<windows_core::IInspectable>| {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
             if let Some(ref cb) = prev {
-                cb.invoke(native.clone());
+                cb.invoke(info.clone());
             }
-            let Some(native) = native else {
+            let Some(native) = info.native else {
                 return;
             };
             if let Ok(fe) = native.cast::<bindings::IFrameworkElement>() {
@@ -177,10 +177,10 @@ impl Widget for CompositionHost {
     fn bindings(&self) -> PropBindings {
         Vec::new()
     }
-    fn on_mounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.mounted.as_ref()
     }
-    fn on_unmounted_callback(&self) -> Option<&Callback<Option<windows_core::IInspectable>>> {
+    fn on_unmounted_callback(&self) -> Option<&Callback<MountInfo>> {
         self.unmounted.as_ref()
     }
 }
