@@ -19,15 +19,14 @@ fn key(slot: Slot, band: Band, z: i32, doc: usize) -> StackKey {
     StackKey { slot, band, z, doc }
 }
 
-/// The band declaration order IS the z-order: chrome under the node's painted
-/// surface, then the surface, then content, then chrome over it, then the
-/// overlay scroll thumb. `restack` lays the sorted stack down bottom → top, so
-/// a band that sorts earlier paints lower.
+/// The band declaration order IS the z-order: chrome under the node's content,
+/// then the content, then chrome over it, then the overlay scroll thumb.
+/// `restack` lays the sorted stack down bottom → top, so a band that sorts
+/// earlier composites lower.
 #[test]
 fn bands_stack_bottom_to_top_in_declaration_order() {
     let ladder = [
         Band::BelowChrome,
-        Band::Surface,
         Band::Content,
         Band::AboveChrome,
         Band::Overlay,
@@ -62,7 +61,7 @@ fn content_sorts_by_z_then_document_order() {
 
 /// A child's `z_index` can never lift it out of its band: a z far above
 /// anything the chrome uses still leaves the child under the above-band parts
-/// and the scroll thumb, and above the node's own surface. True by construction
+/// and the scroll thumb, and above the below-band ones. True by construction
 /// while the band is the outer key — pinned because flattening the key into a
 /// single number would silently break it.
 #[test]
@@ -70,7 +69,7 @@ fn a_high_z_child_still_sorts_below_the_chrome_above_it() {
     let loud = key(Slot::Container, Band::Content, i32::MAX, 0);
     assert!(loud < key(Slot::Container, Band::AboveChrome, i32::MIN, 0));
     assert!(loud < key(Slot::Container, Band::Overlay, i32::MIN, 0));
-    assert!(loud > key(Slot::Container, Band::Surface, i32::MAX, usize::MAX));
+    assert!(loud > key(Slot::Container, Band::BelowChrome, i32::MAX, usize::MAX));
 }
 
 /// The two collections under a node (its container, and a scroll container's

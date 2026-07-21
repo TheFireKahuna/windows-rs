@@ -40,7 +40,8 @@ use crate::system_bindings::{
     Color as UiColor, CompositionAnimation, CompositionBrush, CompositionMaskBrush,
     CompositionObject, CompositionPath, CompositionPathGeometry, CompositionShape,
     CompositionStrokeCap, CompositionVisualSurface, ExpressionAnimation, ICompositionAnimation,
-    ICompositionGeometry, ICompositionObject, ICompositionSpriteShape, ICompositionSurface,
+    ICompositionGeometry, ICompositionObject, ICompositionShape, ICompositionSpriteShape,
+    ICompositionSurface,
     ICompositor2, ICompositor4, ICompositor5, ICompositorWithVisualSurface,
     IScalarNaturalMotionAnimation, ISpringScalarNaturalMotionAnimation, IVisual, ShapeVisual,
     SpringScalarNaturalMotionAnimation, SpriteVisual, TimeSpan, Visual,
@@ -354,7 +355,62 @@ struct ChromeLayer {
     bleed: f32,
 }
 
+/// Size a mask subtree and its capture for `scale`, and put that scale on the
+/// shape so the geometry inside it lands on the physical pixel grid.
+///
+/// Shared by both of this file's mask layers — the [`ChromeLayer`] the ring,
+/// ticks and focus rings use, and the arc-plus-thumb layer [`KnobParts`] builds
+/// inline. The dial keeps its own layer type only because
+/// `path_shape::PathLayer` carries a trim and this has a `bleed` instead; the
+/// SIZING rule is the same one, and is stated once here so the two cannot drift.
+///
+/// # The rule
+///
+/// The captured extent and the geometry inside it must be in the SAME space. A
+/// `CompositionVisualSurface` stretches what it captured onto the display
+/// sprite, so a shape covering only part of the captured extent renders
+/// proportionally small — which is exactly how every app-transported curve came
+/// to be cut off at two thirds of its host box at 150%.
+///
+/// The scale goes on the SHAPE, never on the mask visual. A visual surface
+/// captures its source visual's CONTENT, and that visual's own transform is not
+/// part of what it captures — `mask_vis.SetScale` looks like it does this job
+/// and does nothing at all. A shape's transform IS content, so it survives.
+///
+/// # Why physical rather than DIPs
+///
+/// Not for sharpness. DIP sourcing renders identically today — this exact
+/// change was measured against the previous DIP-sized layers at 150% and moved
+/// ZERO pixels, because DWM rasterizes captured vector content at the device
+/// resolution it composites at, whatever `SourceSize` says.
+///
+/// It is physical because [`super::path_shape::PathLayer`] is, and one rule
+/// across every mask layer in the backend is worth more than the property sets
+/// it costs: the alternative is a reader having to know which of two
+/// conventions a given layer follows, and the failure mode for guessing wrong
+/// is silent mis-sizing rather than a compile error. Sourcing at the physical
+/// extent also means the capture can never be the thing that caps the raster,
+/// if that ever stops being DWM's choice to make.
+fn size_mask(
+    mask_shape: &ShapeVisual,
+    visual_surface: &CompositionVisualSurface,
+    shapes: &[&ICompositionSpriteShape],
+    w: f32,
+    h: f32,
+    scale: f32,
+) {
+    let phys = Vector2::new(w * scale, h * scale);
+    let _ = mask_shape.cast::<IVisual>().map(|v| v.SetSize(phys));
+    let _ = visual_surface.SetSourceSize(phys);
+    for shape in shapes {
+        if let Ok(sh) = shape.cast::<ICompositionShape>() {
+            let _ = sh.SetScale(Vector2::new(scale, scale));
+        }
+    }
+}
+
 impl ChromeLayer {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         comp: &Compositing,
         node: &Node,
@@ -362,6 +418,7 @@ impl ChromeLayer {
         width: f32,
         round_caps: bool,
         bleed: f32,
+        scale: f32,
     ) -> Option<Self> {
         let (w, h) = (node.rect.w + 2.0 * bleed, node.rect.h + 2.0 * bleed);
         let display = comp.new_sprite().ok()?;
@@ -386,13 +443,12 @@ impl ChromeLayer {
         shape.SetStrokeBrush(&white.cast::<CompositionBrush>().ok()?).ok()?;
 
         let mask_shape = c5.CreateShapeVisual().ok()?;
-        mask_shape.cast::<IVisual>().ok()?.SetSize(Vector2::new(w, h)).ok()?;
         mask_shape.Shapes().ok()?.Append(&shape_c.cast::<CompositionShape>().ok()?).ok()?;
 
         let visual_surface = cvs.CreateVisualSurface().ok()?;
         visual_surface.SetSourceVisual(&mask_shape.cast::<Visual>().ok()?).ok()?;
         visual_surface.SetSourceOffset(Vector2::new(0.0, 0.0)).ok()?;
-        visual_surface.SetSourceSize(Vector2::new(w, h)).ok()?;
+        size_mask(&mask_shape, &visual_surface, &[&shape], w, h, scale);
         let mask_surf = compositor
             .CreateSurfaceBrushWithSurface(&visual_surface.cast::<ICompositionSurface>().ok()?)
             .ok()?;
@@ -428,11 +484,11 @@ impl ChromeLayer {
         }
     }
 
-    fn resize(&self, w: f32, h: f32) {
+    fn resize(&self, w: f32, h: f32, scale: f32) {
         let (w, h) = (w + 2.0 * self.bleed, h + 2.0 * self.bleed);
-        let _ = self.mask_shape.cast::<IVisual>().map(|v| v.SetSize(Vector2::new(w, h)));
+        // The visible sprite stays in DIPs — it IS under the root scale.
         let _ = self.display_vis.SetSize(Vector2::new(w, h));
-        let _ = self.visual_surface.SetSourceSize(Vector2::new(w, h));
+        size_mask(&self.mask_shape, &self.visual_surface, &[&self.shape], w, h, scale);
     }
 
     fn set_color(&self, comp: &Compositing, color: crate::Color, scale: f32) {
@@ -556,7 +612,11 @@ pub(crate) struct KnobParts {
     /// themselves cannot be wrong, and only reallocates when the ramp really
     /// changes — a sync that finds them equal allocates nothing.
     stops_seen: Vec<(f64, crate::Color)>,
-    geom: (f32, f32, f32),
+    /// `(cx, cy, radius, scale)` the dial's layers were built for. The scale is
+    /// in the gate because it is an input to the mask raster (`size_mask`), so a
+    /// display change has to re-size the masks even though the dial itself —
+    /// authored in DIPs — has not moved.
+    geom: (f32, f32, f32, f32),
     init: bool,
     frac: f32,
     /// Last needle angle written (radians), so an unchanged value costs nothing.
@@ -578,7 +638,7 @@ fn stops_eq(a: &[(f64, crate::Color)], b: &[(f64, crate::Color)]) -> bool {
 }
 
 impl KnobParts {
-    fn new(comp: &Compositing, node: &Node) -> Option<Self> {
+    fn new(comp: &Compositing, node: &Node, scale: f32) -> Option<Self> {
         let (w, h) = (node.rect.w, node.rect.h);
         let (cx, cy, radius) = dial_geom(node);
         let path = super::path_shape::arc_path(&comp.gpu, cx, cy, radius, node.ctrl().start_angle, node.ctrl().end_angle)?;
@@ -614,7 +674,6 @@ impl KnobParts {
             build_thumb(&c5, &path, &white_cb)?;
 
         let mask_shape = c5.CreateShapeVisual().ok()?;
-        mask_shape.cast::<IVisual>().ok()?.SetSize(Vector2::new(w, h)).ok()?;
         let shapes = mask_shape.Shapes().ok()?;
         shapes.Append(&sprite_shape_c.cast::<CompositionShape>().ok()?).ok()?;
         shapes.Append(&thumb_shape_c).ok()?;
@@ -623,7 +682,16 @@ impl KnobParts {
         let visual_surface = cvs.CreateVisualSurface().ok()?;
         visual_surface.SetSourceVisual(&mask_shape.cast::<Visual>().ok()?).ok()?;
         visual_surface.SetSourceOffset(Vector2::new(0.0, 0.0)).ok()?;
-        visual_surface.SetSourceSize(Vector2::new(w, h)).ok()?;
+        // BOTH shapes: the arc and the thumb share this one mask, so a scale on
+        // only one of them would slide the thumb off the arc it rides.
+        size_mask(
+            &mask_shape,
+            &visual_surface,
+            &[&sprite_shape, &thumb_shape],
+            w,
+            h,
+            scale,
+        );
         let mask_surf = compositor
             .CreateSurfaceBrushWithSurface(&visual_surface.cast::<ICompositionSurface>().ok()?)
             .ok()?;
@@ -642,11 +710,11 @@ impl KnobParts {
         // chrome used to sit UNDER everything because `new_surface` inserts at
         // the bottom, so this order reproduces it. Glyph hosts insert at the top
         // afterwards, which keeps the readout above the hub.
-        let ring = ChromeLayer::new(comp, node, &path, RING_WIDTH, false, 0.0);
+        let ring = ChromeLayer::new(comp, node, &path, RING_WIDTH, false, 0.0, scale);
         let ticks_minor = build_tick_path(&comp.gpu, cx, cy, radius, node, false)
-            .and_then(|p| ChromeLayer::new(comp, node, &p, TICK_MINOR_W, false, 0.0));
+            .and_then(|p| ChromeLayer::new(comp, node, &p, TICK_MINOR_W, false, 0.0, scale));
         let ticks_major = build_tick_path(&comp.gpu, cx, cy, radius, node, true)
-            .and_then(|p| ChromeLayer::new(comp, node, &p, TICK_MAJOR_W, false, 0.0));
+            .and_then(|p| ChromeLayer::new(comp, node, &p, TICK_MAJOR_W, false, 0.0, scale));
 
         let hub = comp.new_sprite().ok()?;
         let hub_vis: IVisual = hub.cast().ok()?;
@@ -689,7 +757,7 @@ impl KnobParts {
             needle_vis,
             grad_epoch: u32::MAX,
             stops_seen: Vec::new(),
-            geom: (0.0, 0.0, 0.0),
+            geom: (0.0, 0.0, 0.0, 0.0),
             init: false,
             frac: -1.0,
             angle: f32::NAN,
@@ -709,7 +777,7 @@ impl KnobParts {
         let start = node.ctrl().start_angle;
         let end = node.ctrl().end_angle;
 
-        let resized = self.geom != (cx, cy, radius);
+        let resized = self.geom != (cx, cy, radius, scale);
         // `geom` cannot see this: both are live props, and a dial that gains a
         // tick without changing size would keep the old tessellation.
         let ticks_changed = self.ticks_seen.0 != node.ctrl().ticks
@@ -774,20 +842,26 @@ impl KnobParts {
                     r.set_path(&c5, &path);
                 }
             }
-            let _ = self.mask_shape.cast::<IVisual>().map(|v| v.SetSize(Vector2::new(w, h)));
             let _ = self.display_vis.SetSize(Vector2::new(w, h));
-            let _ = self.visual_surface.SetSourceSize(Vector2::new(w, h));
+            size_mask(
+                &self.mask_shape,
+                &self.visual_surface,
+                &[&self.sprite_shape, &self.thumb_shape],
+                w,
+                h,
+                scale,
+            );
             for l in [self.ring.as_ref(), self.ticks_minor.as_ref(), self.ticks_major.as_ref()]
                 .into_iter()
                 .flatten()
             {
-                l.resize(w, h);
+                l.resize(w, h, scale);
             }
             let _ = self
                 .hub_vis
                 .SetOffset(Vector3::new(cx - HUB_D / 2.0, cy - HUB_D / 2.0, 0.0));
             self.place_needle(cx, cy, radius);
-            self.geom = (cx, cy, radius);
+            self.geom = (cx, cy, radius, scale);
         }
 
         // The focus ring follows the node's full rect and the display scale, not
@@ -822,10 +896,11 @@ impl KnobParts {
                         {
                             l.set_path(&c5, &path);
                         }
-                        l.resize(w, h);
+                        l.resize(w, h, scale);
                     }
                     None => {
-                        if let Some(l) = ChromeLayer::new(comp, node, &path, sw, false, bleed) {
+                        if let Some(l) = ChromeLayer::new(comp, node, &path, sw, false, bleed, scale)
+                        {
                             l.set_opacity(0.0);
                             self.focus_rings[i] = Some(l);
                         }
@@ -1079,7 +1154,7 @@ pub(crate) fn sync_knob(
     scrubbing: bool,
 ) {
     if node.knob.is_none() {
-        node.knob = KnobParts::new(comp, node).map(Box::new);
+        node.knob = KnobParts::new(comp, node, scale).map(Box::new);
     }
     if let Some(mut kp) = node.knob.take() {
         kp.sync(comp, node, atlas_epoch, scale, scrubbing);

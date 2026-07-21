@@ -584,8 +584,8 @@ fn a_badge_owns_no_surface() {
         }
         a.set_rect(id, 40.0, 16.0);
         assert_eq!(
-            a.has_chrome(id),
-            Some(false),
+            a.renders_via(id),
+            Some("parts"),
             "an InfoBadge ({count:?}) must never be given a paint surface",
         );
     }
@@ -633,7 +633,7 @@ fn a_checkbox_owns_no_surface() {
     let mut a = harness();
     let id = a.insert(K::CheckBox).unwrap();
     a.set_rect(id, 180.0, 24.0);
-    assert_eq!(a.has_chrome(id), Some(false));
+    assert_eq!(a.renders_via(id), Some("parts"));
 }
 
 /// The Expander's ring encloses the HEADER STRIP, not the expanded node.
@@ -672,7 +672,7 @@ fn an_expander_owns_no_surface() {
     let mut a = harness();
     let id = a.insert(K::Expander).unwrap();
     a.set_rect(id, 300.0, 40.0);
-    assert_eq!(a.has_chrome(id), Some(false));
+    assert_eq!(a.renders_via(id), Some("parts"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -701,8 +701,8 @@ fn a_border_owns_no_surface() {
     a.apply_prop(id, Prop::Background, &V::Color(Color::rgb(30, 30, 30)));
     a.set_rect(id, 200.0, 40.0);
     assert_eq!(
-        a.has_chrome(id),
-        Some(false),
+        a.renders_via(id),
+        Some("parts"),
         "a filled Border must bind its fill as a part, not buy a surface for it",
     );
 }
@@ -837,8 +837,8 @@ fn no_editor_kind_asks_for_a_surface() {
         let id = a.insert(kind).unwrap();
         a.set_rect(id, 120.0, 32.0);
         assert_eq!(
-            a.has_chrome(id),
-            Some(false),
+            a.renders_via(id),
+            Some("parts"),
             "{kind:?} still owns a paint surface after its chrome was retained",
         );
     }
@@ -928,6 +928,122 @@ fn focus_rekeys_the_border_and_adds_no_ring() {
             "an editor plans NO above-band slots — the caret is inserted at the \
              top of the container after `parts::sync`, so an above slot minted \
              later would hide it",
+        );
+    }
+}
+
+// ── Shapes ───────────────────────────────────────────────────────────────────
+//
+// `ShapeKind` has four variants and its own doc states the split they render
+// by: "the other three kinds derive their geometry from the node's box; this
+// one is the only kind that transports it." A `Path`, an `Ellipse` and a `Line`
+// are one retained implementation (`path_shape`) over derived-or-transported
+// verbs; a `Rectangle` derives a BOX, which the nine-grid atlas already hands
+// out, so it takes `box_plan` instead.
+//
+// Before this, all three derived kinds were immediate-mode painters.
+
+fn rect(a: &mut ArenaHarness, props: &[(Prop, V)]) -> PartPlanProbe {
+    let id = a.insert(K::Rectangle).unwrap();
+    for (p, v) in props {
+        a.apply_prop(id, *p, v);
+    }
+    a.set_rect(id, 120.0, 40.0);
+    a.part_plan(id, 1.0).unwrap()
+}
+
+/// `Shape::rectangle().fill(c)` must actually fill.
+///
+/// It did not. `Prop::Fill` writes `paint.fill`, but the painter's `Rectangle`
+/// arm called `fill_and_stroke`, which read only `paint.background` — so the
+/// node bought itself a surface (its `has_chrome` DID test `fill`) and then
+/// drew nothing on it. The shape and container spellings resolve to one box now.
+#[test]
+fn a_rectangles_shape_props_and_container_props_both_reach_the_box() {
+    let mut a = harness();
+    let via_shape = rect(
+        &mut a,
+        &[
+            (Prop::Fill, V::Color(Color::rgb(30, 30, 30))),
+            (Prop::Stroke, V::Color(Color::rgb(90, 90, 90))),
+            (Prop::StrokeThickness, V::F64(1.0)),
+        ],
+    );
+    let via_container = rect(
+        &mut a,
+        &[
+            (Prop::Background, V::Color(Color::rgb(30, 30, 30))),
+            (Prop::BorderBrush, V::Color(Color::rgb(90, 90, 90))),
+            (Prop::BorderThickness, V::Thickness(Thickness::uniform(1.0))),
+        ],
+    );
+
+    for (name, plan) in [("fill/stroke", &via_shape), ("background/border", &via_container)] {
+        assert!(
+            plan.below[BOX_FILL].is_some_and(|s| s.key_fingerprint.is_some()),
+            "a Rectangle authored with {name} must bind a fill source",
+        );
+        assert!(
+            plan.below[BOX_BORDER].is_some_and(|s| s.key_fingerprint.is_some()),
+            "a Rectangle authored with {name} must bind a border source",
+        );
+    }
+
+    // Same colours through either spelling means the SAME cached raster — the
+    // point of resolving both pairs into one plan rather than two.
+    assert_eq!(
+        via_shape.below[BOX_FILL].unwrap().key_fingerprint,
+        via_container.below[BOX_FILL].unwrap().key_fingerprint,
+        "the two spellings of one box must land on one atlas key",
+    );
+}
+
+/// A stroke with no width draws nothing, exactly as the painted `draw_rect` did.
+#[test]
+fn a_rectangle_with_no_stroke_width_binds_no_border() {
+    let mut a = harness();
+    let plan = rect(&mut a, &[(Prop::Stroke, V::Color(Color::rgb(90, 90, 90)))]);
+    assert!(
+        plan.below[BOX_BORDER].is_none_or(|s| s.key_fingerprint.is_none()),
+        "a zero-width stroke must bind no source — it has no pixels to paint",
+    );
+}
+
+/// Every kind is claimed by exactly one renderer.
+///
+/// This is what replaced the old "does it get a surface" predicate. A kind the
+/// sync walk does not admit renders NOTHING — silently, with no compiler error
+/// — which is the failure `plain_box`'s hand-maintained allowlist existed to
+/// prevent and, once the painter's catch-all was gone, would itself have caused.
+#[test]
+fn every_kind_is_claimed_by_a_renderer() {
+    let mut a = harness();
+    let expected = [
+        (K::TextBlock, "text"),
+        (K::Path, "shape"),
+        (K::Ellipse, "shape"),
+        (K::Line, "shape"),
+        (K::Knob, "knob"),
+        // Plan-driven and plan-less kinds alike.
+        (K::Button, "parts"),
+        (K::Slider, "parts"),
+        (K::Meter, "parts"),
+        (K::ProgressRing, "parts"),
+        (K::Rectangle, "parts"),
+        (K::Border, "parts"),
+        // Containers and unimplemented shells: the fallback, not a list.
+        (K::StackPanel, "parts"),
+        (K::Grid, "parts"),
+        (K::ScrollViewer, "parts"),
+        (K::WebView2, "parts"),
+        (K::CalendarView, "parts"),
+    ];
+    for (kind, via) in expected {
+        let id = a.insert(kind).unwrap();
+        assert_eq!(
+            a.renders_via(id),
+            Some(via),
+            "{kind:?} must be rendered by {via}",
         );
     }
 }

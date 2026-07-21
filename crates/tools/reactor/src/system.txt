@@ -98,6 +98,7 @@ Windows::UI::Composition::ShapeVisual
 Windows::UI::Composition::IShapeVisual::get_Shapes
 Windows::UI::Composition::CompositionShapeCollection
 Windows::UI::Composition::CompositionShape
+Windows::UI::Composition::ICompositionShape
 Windows::UI::Composition::CompositionSpriteShape
 Windows::UI::Composition::ICompositionSpriteShape::{put_Geometry, put_FillBrush, put_StrokeBrush, put_StrokeThickness, put_StrokeStartCap, put_StrokeEndCap}
 Windows::UI::Composition::CompositionStrokeCap

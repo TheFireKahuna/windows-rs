@@ -309,20 +309,6 @@ pub(crate) fn fade_opacity(
     }
 }
 
-/// Overlay-scrollbar thumb auto-hide fade: a quick reveal, a gentler conceal —
-/// both played on the system compositor, so the auto-hide costs zero app
-/// frames (the tick loop only edge-triggers it).
-pub(crate) fn fade_thumb(comp: &Compositor, surf: &super::bootstrap::NodeSurface, shown: bool) {
-    let (to, dur) = if shown {
-        (1.0, Duration::from_millis(100))
-    } else {
-        (0.0, Duration::from_millis(300))
-    };
-    if let Ok(v) = surf.sprite.cast::<Visual>() {
-        fade_opacity(comp, &v, to, dur, Easing::EaseOut);
-    }
-}
-
 /// Drive a visual's Offset to a known destination with a TRUE compositor
 /// spring (`SpringVector3NaturalMotionAnimation`), started explicitly with the
 /// destination as `FinalValue`.

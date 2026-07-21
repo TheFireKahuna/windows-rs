@@ -1237,7 +1237,7 @@ impl DCompBackend {
         n.scroll_glide(target);
         let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, target);
         let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
-        n.thumb_glide(tx, g.thumb_y);
+        n.thumb_glide(tx, g.thumb_y, g.thumb_h);
     }
 
     /// Ancestors of `target`, nearest-first (root last); empty when `target`

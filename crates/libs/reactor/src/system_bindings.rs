@@ -2791,9 +2791,171 @@ impl windows_core::RuntimeType for ICompositionShape {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
+impl ICompositionShape {
+    pub(crate) fn CenterPoint(&self) -> windows_core::Result<windows_numerics::Vector2> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CenterPoint)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SetCenterPoint(
+        &self,
+        value: windows_numerics::Vector2,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetCenterPoint)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn Offset(&self) -> windows_core::Result<windows_numerics::Vector2> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Offset)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SetOffset(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetOffset)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn RotationAngle(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RotationAngle)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SetRotationAngle(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetRotationAngle)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn RotationAngleInDegrees(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RotationAngleInDegrees)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SetRotationAngleInDegrees(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetRotationAngleInDegrees)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn Scale(&self) -> windows_core::Result<windows_numerics::Vector2> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Scale)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SetScale(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetScale)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn TransformMatrix(&self) -> windows_core::Result<windows_numerics::Matrix3x2> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TransformMatrix)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SetTransformMatrix(
+        &self,
+        value: windows_numerics::Matrix3x2,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetTransformMatrix)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
 #[repr(C)]
 pub struct ICompositionShape_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
+    pub CenterPoint: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    pub SetCenterPoint: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    pub Offset: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    pub SetOffset: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    pub RotationAngle:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
+    pub SetRotationAngle:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
+    pub RotationAngleInDegrees:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
+    pub SetRotationAngleInDegrees:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
+    pub Scale: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    pub SetScale: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    pub TransformMatrix: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut windows_numerics::Matrix3x2,
+    ) -> windows_core::HRESULT,
+    pub SetTransformMatrix: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Matrix3x2,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ICompositionSpriteShape,

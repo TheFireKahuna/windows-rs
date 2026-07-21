@@ -3,7 +3,8 @@
 //! `ToggleSwitch`, a `SelectorBar` (segmented), a `ComboBox`/Select with a
 //! light-dismissed popup, a `CheckBox`, a `Slider`, determinate and
 //! indeterminate progress (bar + ring, looping on the compositor), a
-//! `HyperlinkButton`, an `Expander`, and a
+//! `HyperlinkButton`, an `Expander`, the three box-derived `Shape` kinds
+//! (rectangle / ellipse / line), and a
 //! `ScrollViewer` whose content overflows and scrolls on the compositor — all
 //! reacting to pointer + keyboard (Tab focus ring, Space/Enter, arrows) and
 //! idling at true zero CPU (blocking `GetMessageW` pump; springs self-stop).
@@ -187,8 +188,33 @@ fn main() -> windows_reactor::Result<()> {
                 .into(),
         ];
 
+        // The three shape kinds that derive their geometry from the node box —
+        // a filled+stroked rounded rect, an ellipse, and a bare line. All three
+        // were immediate-mode painters and none of them was exercised by any
+        // example, which is how a Rectangle's `.fill()` came to be silently
+        // inert. Here so the conversion has a witness.
+        let shapes: Element = hstack((
+            Shape::rectangle()
+                .fill(Color::rgb(0x3a, 0x7a, 0xd0))
+                .stroke(Color::rgb(0xdd, 0xdd, 0xdd))
+                .stroke_thickness(1.0)
+                .corner_radius(6.0)
+                .width(56.0)
+                .height(32.0),
+            Shape::ellipse()
+                .fill(Color::rgb(0xd0, 0x7a, 0x3a))
+                .stroke(Color::rgb(0xdd, 0xdd, 0xdd))
+                .stroke_thickness(1.5)
+                .width(48.0)
+                .height(32.0),
+            Shape::line(0.0, 16.0, 56.0, 16.0).width(56.0).height(32.0),
+        ))
+        .spacing(12.0)
+        .into();
+
         // A tall stack so the ScrollViewer overflows and scrolls.
         let mut cards: Vec<Element> = vec![
+            card("Shapes", shapes),
             card(&format!("EQ Active  ({})", if eq_on { "on" } else { "off" }), toggle),
             card(&format!("Analyzer  ({analyzer})"), segmented),
             card("Filter type", select),
@@ -226,7 +252,13 @@ fn main() -> windows_reactor::Result<()> {
                 .font_size(12.0)
                 .foreground(TXT2)
                 .grid_row(1),
-            scroll_viewer(vstack(cards).spacing(12.0)).grid_row(2),
+            // The overlay thumb is pinned VISIBLE rather than left on its
+            // auto-hide default: it is retained chrome like everything else
+            // here, and a demo that conceals it the moment the pointer leaves
+            // gives a screenshot no way to show it at all.
+            scroll_viewer(vstack(cards).spacing(12.0))
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Visible)
+                .grid_row(2),
         ))
         .rows([GridLength::Auto, GridLength::Auto, GridLength::STAR])
         .row_spacing(12.0);

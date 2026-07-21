@@ -10,7 +10,7 @@
 //! ## Colour stays FP16; the shape carries only alpha
 //!
 //! The rule the whole backend follows (see [`super::backdrop`] and
-//! [`super::shape`]): a sprite shape's only brush is a
+//! [`super::knob`]): a sprite shape's only brush is a
 //! `CompositionColorBrush`, which is an 8-bit `Windows.UI.Color` and cannot
 //! carry this palette's above-paper-white values. So the shape is drawn opaque
 //! **white** and used as a MASK, an FP16 surface is the COLOUR, and a
@@ -45,7 +45,7 @@ use windows_canvas_core::{
     Vector2 as CVec2,
 };
 use windows_core::{implement_decl, Interface, Ref, Result};
-use windows_numerics::{Vector2, Vector3};
+use windows_numerics::Vector2;
 
 use super::bootstrap::Compositing;
 use super::node::{linear, Node};
@@ -53,12 +53,14 @@ use crate::system_bindings::{
     Color as UiColor, CompositionAnimation, CompositionBrush, CompositionDrawingSurface,
     CompositionMaskBrush, CompositionObject, CompositionPath, CompositionPathGeometry,
     CompositionShape, CompositionStrokeCap, CompositionSurfaceBrush, CompositionVisualSurface,
-    ICompositionGeometry, ICompositionObject, ICompositionSpriteShape, ICompositionSurface,
+    ICompositionGeometry, ICompositionObject, ICompositionShape, ICompositionSpriteShape,
+    ICompositionSurface,
     ICompositor2, ICompositor4, ICompositor5, ICompositorWithVisualSurface, ID2D1Factory,
     ID2D1Geometry, IGeometrySource2D, IGeometrySource2DInterop, IGeometrySource2DInterop_Impl,
     IGeometrySource2D_Impl, IScalarNaturalMotionAnimation, ISpringScalarNaturalMotionAnimation,
     IVisual, ShapeVisual, SpringScalarNaturalMotionAnimation, SpriteVisual, TimeSpan, Visual, POINT,
 };
+use crate::backend::ControlKind;
 use crate::{Color, PathData, PathGeometry, PathVerb};
 
 /// Spring tuning for a trim change. Matches the knob's arc so a curve drawing
@@ -139,6 +141,10 @@ impl IGeometrySource2DInterop_Impl for PathGeometrySource_Impl {
 /// The `Path` is kept, not just its composition wrapper: the glow bake strokes
 /// it into an off-screen bitmap ([`GlowLayer::bake`]), so both consumers replay
 /// the verbs once.
+///
+/// Coordinates are replayed in the DIPs they were authored in. Getting them onto
+/// the physical pixel grid is [`PathLayer::resize`]'s job, as one transform on
+/// the shape.
 fn build_d2d_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Option<Path> {
     let pts = data.points();
     let mut builder = Some(PathBuilder::new(gpu).ok()?);
@@ -411,18 +417,31 @@ impl PathLayer {
         // The mask ShapeVisual is OFF-TREE (only this layer's VisualSurface
         // source), so it never inherits the root DIP→px scale the rest of the
         // tree rasterizes under (see bootstrap's one root `SetScale`). Left at
-        // 1×, the stroke is rasterized at 1 px per DIP and the in-tree display
+        // 1×, the stroke rasterizes at 1 px per DIP and the in-tree display
         // sprite — composited at `scale`× — upsamples that bitmap, softening
-        // every line on a HiDPI display. So give the mask subtree the scale
-        // itself and capture the enlarged extent: the stroke then rasterizes at
-        // physical resolution and the display samples it 1:1. At scale 1.0 this
-        // is identical to the old DIP sizing.
+        // every line on a HiDPI display.
+        //
+        // The scale therefore goes on the SHAPE, not on the visual.
+        //
+        // A `CompositionVisualSurface` captures a region of its source visual's
+        // CONTENT, and the source visual's own transform is not part of what it
+        // captures — so `mask_vis.SetScale` cannot do this, and for a long time
+        // the geometry silently rendered `scale`× too small: at 150% a 48-DIP
+        // ellipse came out 46 px where it should be 70, and every app curve was
+        // cut off at two thirds of its host box. A shape's transform IS content,
+        // so it survives the capture.
+        //
+        // Putting it here rather than in the geometry is what keeps DIPs the
+        // only space anyone authors in: a display change is one property set,
+        // not a re-tessellation of every curve in the tree.
         let phys = Vector2::new(w * scale, h * scale);
-        // The mask extent, its scale and the captured region must agree or the
-        // mask samples the wrong area and the curve clips against a stale extent.
+        // The mask extent and the captured region must agree, or the mask
+        // samples the wrong area and the curve clips against a stale extent.
         let _ = self.mask_vis.SetSize(phys);
-        let _ = self.mask_vis.SetScale(Vector3::new(scale, scale, 1.0));
         let _ = self.visual_surface.SetSourceSize(phys);
+        if let Ok(shape) = self.shape.cast::<ICompositionShape>() {
+            let _ = shape.SetScale(Vector2::new(scale, scale));
+        }
         // The display sprite stays in DIPs — it IS under the root scale.
         let _ = self.display_vis.SetSize(Vector2::new(w, h));
         self.size = Some((w, h, scale));
@@ -665,8 +684,13 @@ fn bake_glow(
 ) -> Option<(CompositionDrawingSurface, CompositionSurfaceBrush)> {
     let (surface, interop, brush) = comp.new_source_surface(px.0, px.1).ok()?;
     let mut origin = POINT::default();
-    comp.device_lost.set(false);
-    let ctx = unsafe { interop.BeginDraw(None, &mut origin).ok()? };
+    let ctx = match unsafe { interop.BeginDraw(None, &mut origin) } {
+        Ok(c) => c,
+        Err(e) => {
+            comp.note_error(&e);
+            return None;
+        }
+    };
     let session = DrawingSession::from_borrowed_context(
         &ctx,
         Matrix3x2::translation(origin.x as f32, origin.y as f32),
@@ -715,7 +739,10 @@ fn bake_glow(
         session.draw_effect(&halo);
         Some(())
     })();
-    unsafe { interop.EndDraw() }.ok().ok()?;
+    if let Err(e) = unsafe { interop.EndDraw() }.ok() {
+        comp.note_error(&e);
+        return None;
+    }
     ok.map(|()| (surface, brush))
 }
 
@@ -744,13 +771,99 @@ impl PathParts {
     }
 }
 
-/// Reconcile a path node's retained sprites against its current props.
+/// The magic constant for approximating a quarter circle with a cubic Bézier.
 ///
-/// Called from the paint walk in place of a surface draw — a path node has no
+/// `4/3 · (√2 − 1)`. The classic value: it places the control points so the
+/// curve's midpoint lands exactly on the arc, leaving a maximum radial error of
+/// about 0.027% of the radius — far under a physical pixel at any size a layout
+/// produces, and the reason an ellipse needs four segments rather than the 96
+/// chords [`arc_path`] spends on a stroked dial.
+const KAPPA: f64 = 0.552_284_749_83;
+
+/// The geometry a shape node draws, derived from its box when it does not
+/// transport one.
+///
+/// [`crate::ShapeKind`] already states this split — *"the other three kinds
+/// derive their geometry from the node's box; this one is the only kind that
+/// transports it"* — and this is where the deriving happens. It is what lets an
+/// `Ellipse` and a `Line` be the `Path` they always were: one retained
+/// implementation instead of three immediate-mode painters, and they gain trim,
+/// gradient fill and glow by arriving through the same door.
+///
+/// A `Rectangle` is deliberately absent. It derives a box, and a box is the
+/// nine-grid atlas's job (`parts::box_plan`), not a tessellation's.
+fn derived_geometry(node: &Node) -> Option<PathGeometry> {
+    let (w, h) = (node.rect.w as f64, node.rect.h as f64);
+    match node.kind {
+        ControlKind::Path => node.paint.path.clone(),
+        // Four Béziers from the box's inscribed ellipse. Closed, so a filled
+        // layer has an area and a stroked one has no seam at the start point.
+        ControlKind::Ellipse => {
+            let (rx, ry) = (w / 2.0, h / 2.0);
+            if rx <= 0.0 || ry <= 0.0 {
+                return None;
+            }
+            let (cx, cy) = (rx, ry);
+            let (ox, oy) = (rx * KAPPA, ry * KAPPA);
+            Some(
+                crate::ShapePath::with_capacity(6)
+                    .move_to(cx, cy - ry)
+                    .cubic_to(cx + ox, cy - ry, cx + rx, cy - oy, cx + rx, cy)
+                    .cubic_to(cx + rx, cy + oy, cx + ox, cy + ry, cx, cy + ry)
+                    .cubic_to(cx - ox, cy + ry, cx - rx, cy + oy, cx - rx, cy)
+                    .cubic_to(cx - rx, cy - oy, cx - ox, cy - ry, cx, cy - ry)
+                    .close()
+                    .build(),
+            )
+        }
+        // Two points in the node's own space, exactly as the painted line read
+        // them: `LineEndpoints` are node-local offsets, and the rect's origin is
+        // the sprite's origin, so no translation is needed here.
+        ControlKind::Line => {
+            let l = node.paint.line;
+            Some(
+                crate::ShapePath::with_capacity(2)
+                    .move_to(l.x1, l.y1)
+                    .line_to(l.x2, l.y2)
+                    .build(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// A shape node's stroke colour and width, with the `Line` defaults applied.
+///
+/// A `Line` is the one shape that draws with no styling at all: the painter it
+/// replaces defaulted an unstyled line to the themable strong stroke at 1 DIP,
+/// and the `Shape` widget emits neither prop unless the app sets it. Without
+/// this the commonest divider in the library — `Shape::line()` with nothing on
+/// it — would silently stop rendering.
+///
+/// Every other kind answers its props verbatim, so a curve with no stroke still
+/// builds no stroke layer.
+fn stroke_of(node: &Node) -> (Option<Color>, f32) {
+    if node.kind == ControlKind::Line {
+        let w = if node.paint.stroke_thickness > 0.0 { node.paint.stroke_thickness } else { 1.0 };
+        return (Some(node.paint.stroke.unwrap_or_else(super::theme::stroke_strong)), w);
+    }
+    (node.paint.stroke, node.paint.stroke_thickness)
+}
+
+/// Reconcile a shape node's retained sprites against its current props.
+///
+/// Called from the sync walk in place of a surface draw — a shape node has no
 /// surface to draw. Everything here self-gates, so a sync that finds nothing
 /// changed issues no COM calls at all.
+///
+/// The derived kinds re-derive their geometry on every visit rather than
+/// caching it, and that is deliberate: this runs only for a node the walk found
+/// DIRTY, the two allocations are a handful of verbs and points, and
+/// `geometry_seen` still compares the result by value — so a dirty ellipse whose
+/// box did not change rebuilds no composition path and issues no COM call. A
+/// cache here would gate the same work behind a second copy of the inputs.
 pub(crate) fn sync_path(comp: &Compositing, node: &mut Node, atlas_epoch: u32, scale: f32) {
-    let Some(geometry) = node.paint.path.clone() else {
+    let Some(geometry) = derived_geometry(node) else {
         // Geometry withdrawn: drop the layers so the sprites leave the tree.
         node.path = None;
         return;
@@ -778,7 +891,8 @@ fn sync_parts(
 ) {
     let (w, h) = (node.rect.w, node.rect.h);
     let want_fill = node.paint.fill.is_some();
-    let want_stroke = node.paint.stroke.is_some() && node.paint.stroke_thickness > 0.0;
+    let (stroke_color, stroke_w) = stroke_of(node);
+    let want_stroke = stroke_color.is_some() && stroke_w > 0.0;
 
     // A layer whose role the app stopped asking for goes away entirely, rather
     // than lingering at zero alpha: an unasked-for layer should cost nothing.
@@ -847,7 +961,7 @@ fn sync_parts(
                 geometry_changed,
                 color,
                 blur,
-                node.paint.stroke_thickness,
+                stroke_w,
                 w,
                 h,
                 scale,
@@ -866,11 +980,13 @@ fn sync_parts(
     }
     if let Some(l) = &mut parts.stroke {
         l.resize(w, h, scale);
-        l.set_thickness(node.paint.stroke_thickness);
+        // DIPs, like the geometry it strokes — the shape's own scale takes both
+        // to physical pixels together.
+        l.set_thickness(stroke_w);
         // A stroke takes the flat stroke colour; the stop list is the FILL's
         // ramp, so handing it here would recolour the outline with the area's
         // gradient and the two would stop reading as separate layers.
-        l.set_source(comp, node.paint.stroke.unwrap_or_default(), &[], atlas_epoch, scale);
+        l.set_source(comp, stroke_color.unwrap_or_default(), &[], atlas_epoch, scale);
         l.set_trim(node.paint.path_trim.0, node.paint.path_trim.1);
     }
 }

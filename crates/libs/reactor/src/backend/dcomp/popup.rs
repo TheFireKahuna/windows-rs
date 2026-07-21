@@ -583,11 +583,13 @@ impl Popup {
 
     fn paint_surface(&self, comp: &Compositing) {
         let mut offset = POINT::default();
-        comp.device_lost.set(false);
         let ctx: ID2D1DeviceContext = match unsafe { self.surf.interop.BeginDraw(None, &mut offset) }
         {
             Ok(c) => c,
-            Err(_) => return,
+            Err(e) => {
+                comp.note_error(&e);
+                return;
+            }
         };
         let session = DrawingSession::from_borrowed_context(
             &ctx,
@@ -616,7 +618,9 @@ impl Popup {
         if let Ok(brush) = session.create_solid_brush(ColorF::BLACK) {
             self.paint_panel(&session, &brush, renderer.as_ref(), size_px);
         }
-        let _ = unsafe { self.surf.interop.EndDraw() };
+        if let Err(e) = unsafe { self.surf.interop.EndDraw() }.ok() {
+            comp.note_error(&e);
+        }
     }
 
     fn paint_panel(

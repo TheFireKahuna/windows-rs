@@ -10,7 +10,6 @@
 //! offset/size/opacity/clip onto its container, and paint redraws a node's
 //! surface only when its own content or size changed.
 
-use super::bootstrap::NodeSurface;
 use super::editor::Editor;
 use super::*;
 use crate::backend::{ControlKind, Event};
@@ -642,8 +641,6 @@ pub(crate) struct Node {
     pub container: ContainerVisual,
     /// Cached `IVisual` view of `container` for frequent offset/size/opacity ops.
     pub vis: IVisual,
-    /// Painted-chrome surface — created lazily for nodes that draw something.
-    pub surf: Option<NodeSurface>,
     /// Retained chrome parts (indicator pill / toggle knob / slider fill /
     /// hover ink) for the converted control kinds — compositor sprites whose
     /// motion runs DWM-side. Created lazily by the parts sync; `None` for
@@ -756,7 +753,14 @@ pub(crate) struct Node {
     pub placeholder: Option<Box<super::glyph_text::Shaped>>,
     /// ScrollViewer only: the auto-hiding overlay scrollbar thumb sprite (a top
     /// child of the container, above the scrolled content), created lazily.
-    pub scroll_thumb: Option<NodeSurface>,
+    ///
+    /// A [`Part`](super::parts::Part) rather than a private drawing surface: the
+    /// thumb is a vertical rounded pill, which is one nine-grid source shared
+    /// with every other thumb in the window. Routing it through `Part` also
+    /// makes the sprite's own `Channel` the single arbiter of `Offset` — the
+    /// scroll writers below and the sync walk used to write that property
+    /// independently of each other.
+    pub scroll_thumb: Option<Box<super::parts::Part>>,
     /// ScrollViewer only: the content **carrier** visual all scrolled children
     /// parent into (created with the node). Scrolling animates this ONE
     /// visual's Offset with a compositor spring — no per-frame tick, no
@@ -765,19 +769,14 @@ pub(crate) struct Node {
     /// Cached retargetable compositor spring driving `scroll_content`'s Offset
     /// (built on first glide; a wheel retarget is `SetFinalValue` + start).
     pub scroll_spring: Option<crate::system_bindings::SpringVector3NaturalMotionAnimation>,
-    /// Cached spring for the thumb sprite's Offset (same tuning, so the thumb
-    /// tracks the content glide proportionally).
-    pub thumb_spring: Option<crate::system_bindings::SpringVector3NaturalMotionAnimation>,
     /// Last scroll offset written/targeted on the carrier (gates no-op writes;
     /// `None` until first placement).
     pub last_scroll: Option<f32>,
     /// Whether the thumb is currently revealed (hover/drag/scroll-in-flight).
     /// The show/hide fade itself plays on the system compositor
-    /// ([`animate::fade_thumb`](super::animate::fade_thumb)) — this is only the
-    /// edge detector that triggers it, never a per-frame value.
+    /// (`parts::sync_scroll_thumb`) — this is only the edge detector that
+    /// triggers it, never a per-frame value.
     pub thumb_shown: bool,
-    /// Thumb height (DIP) the thumb surface was last drawn at (redraw on change).
-    pub thumb_drawn_h: f32,
     /// While dragging the thumb: the pointer-to-thumb-top offset captured at press.
     pub thumb_drag: Option<f32>,
     /// Bounds clip (ScrollViewer/overflow); tracks the container's own size.
@@ -936,7 +935,6 @@ impl Node {
             accessibility: None,
             container,
             vis,
-            surf: None,
             parts: None,
             button_text: None,
             text_part: None,
@@ -953,10 +951,8 @@ impl Node {
             scroll_thumb: None,
             scroll_content: None,
             scroll_spring: None,
-            thumb_spring: None,
             last_scroll: None,
             thumb_shown: false,
-            thumb_drawn_h: 0.0,
             thumb_drag: None,
             clip: None,
             transitions: None,
@@ -1146,161 +1142,6 @@ impl Node {
             || self.pointer.pressed
     }
 
-    /// Whether this node draws any chrome (and therefore needs a surface).
-    pub fn has_chrome(&self) -> bool {
-        match self.kind {
-            // The button family is fully retained: chrome, ink, badge plate and
-            // focus ring are compositor parts, label and ornaments are glyph
-            // sprites. There is nothing left for a surface to hold, so denying
-            // it one is what turns "draws nothing" into "allocates nothing and
-            // never enters `BeginDraw`". See `controls::paint`.
-            k if is_button_family(k) => false,
-            // A hyperlink is words plus a focus ring, and both are now retained
-            // — the ring as a part, the words as glyph sprites. Same reasoning
-            // as the family above, and it is the whole of the control.
-            ControlKind::HyperlinkButton => false,
-            // A TextBlock is its text and nothing else — its paint arm never
-            // filled a background or stroked a border — so once the text is
-            // glyph sprites there is likewise nothing left for a surface to
-            // hold. Same reasoning as the button family above.
-            ControlKind::TextBlock => false,
-            // The track, its outline and the knob have been compositor parts
-            // since before any of this; the state label beside them was the
-            // only thing left drawing, and it is glyph sprites now. Same for
-            // the focus ring, so nothing remains to hold a surface.
-            ControlKind::ToggleSwitch => false,
-            // Likewise: tray, sliding pill and hover ink are parts, the segment
-            // labels are sprites, the ring is a part.
-            ControlKind::SelectorBar => false,
-            // A badge is a plate and a count: the plate is a part, the count is
-            // sprites, and it has neither ring nor ink because it is neither
-            // focusable nor interactive. The whole control, retained.
-            ControlKind::InfoBadge => false,
-            // The pane background, the divider, the selection tile and its
-            // accent bar, the row ink and the chrome-button wash are all parts;
-            // the two chrome glyphs, the header and every row's glyph-plus-label
-            // are sprites. The divider was the last thing it drew.
-            ControlKind::NavigationView => false,
-            // The band's card, tint, border and close wash are parts; its
-            // paragraph and its two icon glyphs are sprites. Nothing is left to
-            // draw, which is what takes the largest run in the library — a
-            // wrapped paragraph — off the raster path for good.
-            ControlKind::InfoBar => false,
-            // The caption band is transparent, its one hover wash is a part and
-            // its six runs are sprites. It never drew a background of its own,
-            // so denying it a surface removes the last thing it had.
-            ControlKind::TitleBar => false,
-            // Box fill, outline, checkmark and ring are parts; the trailing
-            // label is sprites. The outline was the last thing drawing, and it
-            // was redrawing the label with it on every hover.
-            ControlKind::CheckBox => false,
-            // Header fill, border, wash and ring are parts; the header label
-            // and its chevron are sprites. Only the header was ever chrome.
-            ControlKind::Expander => false,
-            // Box fill, border, hover/press wash and focus ring are parts
-            // (`parts::select_plan`); the current label and the trailing
-            // chevron are sprites. `paint_select` was two statements — a
-            // rounded fill and a rounded stroke — and it held a surface the
-            // full size of the control open for every ComboBox in the tree.
-            ControlKind::ComboBox | ControlKind::DropDownButton => false,
-            // Groove and origin notch are parts in the below band; the accent
-            // fill, hover halo and thumb have been parts above it since before
-            // any of this, and the ring joins them. The groove was the last
-            // thing drawing, and it was rasterizing a static track on every
-            // origin crossing — a repaint whose only real work was rebinding
-            // the fill's atlas source, which `parts::sync` does without a
-            // surface.
-            ControlKind::Slider => false,
-            // The dial is retained end to end: groove ring and both tick classes
-            // are mask layers over the very path the value arc rides, the hub is
-            // an FP16 circle sprite, arc / thumb / needle were compositor chrome
-            // already, and its four runs are glyph sprites. What made this worth
-            // doing is that a knob DRAGS — every pointer move calls
-            // `mark_dirty`, so the ring, every tick and the hub were being
-            // re-tessellated and re-rastered once per move, for chrome that does
-            // not depend on the value at all.
-            //
-            // The ring is retained too, as the same two concentric strokes every
-            // other converted control gets. It is a stroked rounded-rect PATH
-            // rather than the nine-grid bar they use, because the knob owns no
-            // `Parts` band and so has no `Part::bind` to set the grid up — but
-            // it does have `ChromeLayer`, and a ring is a path like any other.
-            // With that, nothing is left to draw at any focus state.
-            ControlKind::Knob => false,
-            // Track, determinate fill and the travelling indeterminate segment
-            // are all parts (`parts::progress_plan`, with the sweep armed by
-            // `parts::progress_sweep`), and the sweep loops on the compositor.
-            // So the bar was minting an FP16 surface and clearing it on every
-            // dirty pass to draw nothing at all: it has no label, no ring and
-            // no ink, so the surface held literally nothing.
-            // Box fill, outline and spin divider are parts (`parts::editor_plan`);
-            // the run, placeholder, selection, composition rule, chevrons and
-            // caret were already sprites. Focus is the border re-keyed to the
-            // accent, not a ring. Nothing is left to draw.
-            k if is_text_editable(k) => false,
-            ControlKind::ProgressBar => false,
-            // Track circle and value arc are two retained mask layers over one
-            // tessellated path (`ring_shape`), and the indeterminate revolve is
-            // a forever `RotationAngle` keyframe on the arc's own sprite rather
-            // than on a surface sprite. Nothing is left to draw.
-            ControlKind::ProgressRing => false,
-            // Groove, fill, reference marker and needle are all parts
-            // (`parts::meter_sync`). The groove was the last thing drawing, and
-            // it was the worst kind of draw: value-INDEPENDENT chrome on a
-            // surface that `Prop::Value` marked dirty at level rate, so a 60 Hz
-            // meter re-rasterized a constant rounded rect sixty times a second.
-            // As a part it is one cached raster shared by every meter in the
-            // window, and a level change stays a compositor retarget.
-            ControlKind::Meter => false,
-            // A Border is a fill and an outline cut to one radius, and both are
-            // parts now (`parts::box_plan`). It was the last primitive in the
-            // library still rasterizing a rounded rect, and the most numerous —
-            // every card, panel and chip in a tree is one of these.
-            ControlKind::Border => false,
-            ControlKind::Line => self.paint.stroke.is_some(),
-            // A path's geometry is retained compositor sprite shapes
-            // (`path_shape::PathParts`), never rasterized — so it owns no
-            // surface at all, exactly like the Border and TextBlock above.
-            ControlKind::Path => false,
-            ControlKind::Ellipse | ControlKind::Rectangle => {
-                self.paint.fill.is_some()
-                    || self.paint.background.is_some()
-                    || (self.paint.stroke.is_some() && self.paint.stroke_thickness > 0.0)
-                    || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
-            }
-            // Every other container, for the Border's reason and no other. A
-            // StackPanel, a Grid, a Canvas, a ScrollViewer and the pickers,
-            // shells and host surfaces beside them are one box each — a
-            // background and maybe an outline, cut to one radius — and they are
-            // parts now (`parts::box_plan`, via `parts::plain_box`). This was
-            // the last catch-all in the file and the widest: a surface the size
-            // of the node's FULL rect, re-entered on every resize, for two
-            // sprites the atlas hands out. Children are unaffected — both slots
-            // are BELOW-band, strictly under `Band::Content` — and a scroll
-            // container's thumb is a separate surface on its own path
-            // (`paint::update_scroll_thumb`), so it neither loses nor gains.
-            k if parts::plain_box(k) => false,
-            // Every drawn control owns a surface (it always paints its chrome).
-            _ if draws_own_chrome(self.kind) => true,
-            // Unreachable today: the arms above cover every variant, and this
-            // stays only because a `match` on guards cannot say so. A NEW
-            // `ControlKind` lands here and keeps a surface, which is the safe
-            // direction — an unlisted kind that draws nothing wastes one
-            // allocation, where an unlisted kind that draws something and is
-            // denied a surface renders nothing at all.
-            //
-            // The `|| self.focus_ring` clause that used to sit here was dead.
-            // The ring is drawn by the shared tail of `controls::paint`, which
-            // every kind reaching this arm short-circuits at its own
-            // `_ => return false`, and none of them is in `is_focusable_kind`
-            // regardless. It bought a surface to paint a ring never painted.
-            _ => {
-                self.paint.background.is_some()
-                    || (self.paint.border_brush.is_some() && self.paint.border_thickness > 0.0)
-            }
-        }
-    }
-
     /// Whether the node should consume vertical mouse-wheel input (scrolling).
     pub fn is_scroll(&self) -> bool {
         matches!(self.kind, ControlKind::ScrollViewer | ControlKind::ScrollView)
@@ -1431,32 +1272,24 @@ impl Node {
         self.scroll_snap(offset);
     }
 
-    /// Spring-glide the overlay thumb sprite to `(x, y)` — same tuning as the
-    /// carrier, so the thumb rides the content glide.
-    pub fn thumb_glide(&mut self, x: f32, y: f32) {
-        if let Some(t) = &self.scroll_thumb
-            && let Ok(o) = t.sprite.cast::<ICompositionObject>()
-        {
-            let _ = animate::spring_offset(
-                &o,
-                &mut self.thumb_spring,
-                x,
-                y,
-                parts::SPRING_DAMPING,
-                parts::SPRING_PERIOD,
-            );
+    /// Spring-glide the overlay thumb sprite to `(x, y, h)` — the same spring
+    /// the carrier rides, so the thumb tracks the content glide.
+    ///
+    /// The height travels with the offset because a scroll can change both at
+    /// once (content growing under a wheel), and `Part` owns Offset and Size as
+    /// one placement.
+    pub fn thumb_glide(&mut self, x: f32, y: f32, h: f32) {
+        if let Some(t) = &mut self.scroll_thumb {
+            t.glide(x, y, super::scroll::THUMB_W, h);
         }
     }
 
-    /// Snap the thumb sprite to `(x, y)` (1:1 drag tracking), stopping any
-    /// in-flight glide first — a plain set while an animation holds the
-    /// property would be ignored.
-    pub fn thumb_snap(&mut self, x: f32, y: f32) {
-        if let Some(t) = &self.scroll_thumb {
-            if let Ok(o) = t.sprite.cast::<ICompositionObject>() {
-                let _ = o.StopAnimation("Offset");
-            }
-            t.set_offset(x, y);
+    /// Snap the thumb sprite to `(x, y, h)` — 1:1 drag tracking. `Part::place`
+    /// stops any in-flight glide first; a plain set while an animation holds
+    /// the property would be ignored.
+    pub fn thumb_snap(&mut self, x: f32, y: f32, h: f32) {
+        if let Some(t) = &mut self.scroll_thumb {
+            t.place(x, y, super::scroll::THUMB_W, h);
         }
     }
 
@@ -1525,7 +1358,7 @@ pub(crate) fn birth_paint(kind: ControlKind) -> Paint {
     }
 }
 
-/// The kinds that share `controls::paint_button` — one control with four
+/// The kinds that share the button family's chrome — one control with four
 /// behaviours, so they share their chrome, their metrics and their defaults.
 ///
 /// Deliberately excludes the two that only look related: a HyperlinkButton is
@@ -1597,11 +1430,6 @@ pub(crate) fn is_interactive_kind(kind: ControlKind) -> bool {
             // (see `is_focusable_kind`).
             | ControlKind::InfoBar
     )
-}
-
-/// Kinds that always own a paint surface (they draw chrome unconditionally).
-fn draws_own_chrome(kind: ControlKind) -> bool {
-    is_interactive_kind(kind)
 }
 
 /// The editable text kinds, each backed by a shared [`Editor`].
