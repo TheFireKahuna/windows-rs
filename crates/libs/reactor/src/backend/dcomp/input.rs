@@ -2525,7 +2525,55 @@ impl DCompBackend {
                     self.set_segment(id, (cur + dir).clamp(0, n - 1));
                 }
             }
+            Some(ControlKind::NavigationView) => self.nav_arrow(id, dir),
             _ => {}
+        }
+    }
+
+    /// Move the nav pane's selection one row.
+    ///
+    /// The same shape as the SelectorBar arm above, and for the same reason: the
+    /// pane's rows ARE its selection, so an arrow selects outright rather than
+    /// moving a highlight that a second key would have to commit. That is what
+    /// makes one Tab stop enough for the whole rail — the pattern a radio group
+    /// and a segmented bar already use here, since focus in this backend is per
+    /// NODE and cannot land on a row of its own.
+    ///
+    /// The rows are `[item 0 … item n-1, settings?]`: the settings row selects
+    /// like any other page (it just lives at a sentinel index — see
+    /// [`select_nav_settings`](Self::select_nav_settings)), so it is folded onto
+    /// the end of the run rather than left out. Omitting it would make the row a
+    /// pointer reaches most easily the one row the keyboard cannot reach at all.
+    /// It is skipped when the pane is not showing it (`Metrics::settings` is
+    /// false for a closed pane), so an arrow never selects a row that is not
+    /// there.
+    fn nav_arrow(&mut self, id: ControlId, dir: i32) {
+        let Some((m, _, count)) = self.nav_metrics(id) else { return };
+        let count = count as i32;
+        // The last position in the run, settings included when it is showing.
+        let last = if m.settings { count } else { count - 1 };
+        if last < 0 {
+            return; // no rows at all
+        }
+        let cur = match self.node(id).map(|n| n.ctrl().selected_index) {
+            Some(i) if i == nav::SETTINGS_INDEX => count,
+            Some(i) if (0..count).contains(&i) => i,
+            // Nothing selected (or a stale index): enter from the end the arrow
+            // travels FROM, so the first press lands on the first/last row
+            // rather than skipping one.
+            _ => {
+                if dir > 0 {
+                    -1
+                } else {
+                    last + 1
+                }
+            }
+        };
+        let next = (cur + dir).clamp(0, last);
+        if next == count {
+            self.select_nav_settings(id);
+        } else {
+            self.set_nav_index(id, next);
         }
     }
 
@@ -2636,8 +2684,21 @@ impl DCompBackend {
 
     /// `IRawElementProviderFragment::SetFocus`: give the control keyboard focus
     /// (with the visible ring), the same as Tabbing to it.
-    pub(crate) fn uia_focus_node(&mut self, id: ControlId) {
-        if self.node(id).is_some_and(|n| n.focusable) {
+    /// A synthetic item is never a focus target — it is selected, not focused
+    /// (see `uia::uia_focusable`) — so `item >= 0` does nothing rather than
+    /// quietly focusing the container the client did not ask for.
+    ///
+    /// The enabled check matches the one behind `IsKeyboardFocusable`, so a
+    /// client cannot land focus somewhere the Tab ring (`focus_collect`, which
+    /// requires the same flag) refuses to stop.
+    pub(crate) fn uia_focus_node(&mut self, id: ControlId, item: i32) {
+        if item >= 0 {
+            return;
+        }
+        if self
+            .node(id)
+            .is_some_and(|n| n.focusable && n.paint.is_enabled)
+        {
             self.set_focus(Some(id), true);
         }
     }

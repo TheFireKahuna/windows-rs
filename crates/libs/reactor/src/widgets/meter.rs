@@ -23,6 +23,10 @@ pub struct Meter {
     /// Fill gradient stops `(position 0..1 across the full range, color)`.
     /// Empty = a solid theme-accent fill.
     pub stops: Vec<(f64, Color)>,
+    /// The level's unit ("dBFS", "LUFS"), announced after the value by an
+    /// assistive client. Not drawn — the meter is a bare groove, so this is the
+    /// only place the dimension it displays can be stated.
+    pub unit: Option<String>,
 }
 
 impl Default for Meter {
@@ -36,6 +40,7 @@ impl Default for Meter {
             marker: None,
             marker_color: None,
             stops: Vec::new(),
+            unit: None,
         }
     }
 }
@@ -56,6 +61,12 @@ impl Meter {
     /// Place a reference marker hairline at `v` (value units).
     pub fn marker(mut self, v: f64) -> Self {
         self.marker = Some(v);
+        self
+    }
+    /// The level's unit ("dBFS", "LUFS"), announced after the value by an
+    /// assistive client. Purely an accessibility affordance: nothing draws it.
+    pub fn unit(mut self, s: impl Into<String>) -> Self {
+        self.unit = Some(s.into());
         self
     }
     /// Tint the marker hairline (authored linear scRGB; alpha honored).
@@ -89,6 +100,9 @@ impl Widget for Meter {
                 Prop::GradientStops,
                 PropValue::GradientStops(self.stops.clone()),
             ));
+        }
+        if let Some(u) = &self.unit {
+            out.push(Binding::Prop(Prop::Unit, PropValue::Str(u.clone())));
         }
         out
     }

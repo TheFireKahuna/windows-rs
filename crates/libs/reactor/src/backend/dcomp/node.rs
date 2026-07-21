@@ -180,6 +180,14 @@ pub(crate) struct MenuRow {
     pub enabled: bool,
     pub danger: bool,
     pub separator: bool,
+    /// Check state for a *checkable* row: `None` = an ordinary command (no
+    /// check gutter, no Toggle pattern), `Some(false)` = checkable and off,
+    /// `Some(true)` = checked and drawn with a tick.
+    ///
+    /// Three-valued rather than a bare `bool` because "checkable but off" has to
+    /// reserve the gutter — otherwise a menu's labels would shift sideways as
+    /// the user toggles a row.
+    pub checked: Option<bool>,
 }
 
 /// The chrome-heavy control state only a handful of kinds ever carry: the
@@ -1490,6 +1498,11 @@ fn is_focusable_kind(kind: ControlKind) -> bool {
             | ControlKind::DropDownButton
             | ControlKind::SplitButton
             | ControlKind::Expander
+            // One Tab stop for the whole rail, with the arrows moving the
+            // selection inside it (`nav_arrow`) — the composite pattern a
+            // SelectorBar already uses, because focus here is per NODE and
+            // cannot land on an individual row.
+            | ControlKind::NavigationView
             | ControlKind::NumberBox
             | ControlKind::TextBox
             | ControlKind::PasswordBox

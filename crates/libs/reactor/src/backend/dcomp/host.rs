@@ -154,6 +154,9 @@ fn apply_commit(s: &HostShared, cmds: Vec<record::Cmd>, root_id: Option<ControlI
         pointer::service_ops();
         b.set_root(root_id);
         b.relayout_and_paint();
+        // After layout, so a client that reacts by re-reading the subtree finds
+        // the geometry it will be told about rather than the previous frame's.
+        b.flush_structure_changes();
         b.take_intents()
     };
     run_intents(s, intents);

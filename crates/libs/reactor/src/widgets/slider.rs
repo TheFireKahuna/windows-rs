@@ -27,6 +27,10 @@ pub struct Slider {
     /// release — for hosts that highlight *what is being touched* beyond the
     /// per-value `on_value_changed` stream (which cannot see the release).
     pub on_drag_changed: Option<Callback<bool>>,
+    /// The value's unit ("dB", "ms", "Hz"), announced after the value by an
+    /// assistive client. Not drawn — the slider has no read-out of its own; this
+    /// is the dimension a listener cannot infer from the number alone.
+    pub unit: Option<String>,
 }
 impl Default for Slider {
     fn default() -> Self {
@@ -45,6 +49,7 @@ impl Default for Slider {
             fill_color: None,
             fill_color_alt: None,
             on_drag_changed: None,
+            unit: None,
         }
     }
 }
@@ -111,6 +116,12 @@ impl Slider {
         self.on_drag_changed = Some(f.into_callback());
         self
     }
+    /// The value's unit ("dB", "ms"), announced after the value by an assistive
+    /// client. Purely an accessibility affordance: nothing draws it.
+    pub fn unit(mut self, s: impl Into<String>) -> Self {
+        self.unit = Some(s.into());
+        self
+    }
 }
 
 impl Widget for Slider {
@@ -130,6 +141,9 @@ impl Widget for Slider {
         }
         if let Some(c) = self.fill_color_alt {
             out.push(Binding::Prop(Prop::FillColorAlt, PropValue::Color(c)));
+        }
+        if let Some(u) = &self.unit {
+            out.push(Binding::Prop(Prop::Unit, PropValue::Str(u.clone())));
         }
         out.push(Binding::Event(
             Event::DragStateChanged,

@@ -751,6 +751,7 @@ impl<B: Backend + 'static> Reconciler<B> {
                 help_text: None,
                 live_setting: None,
                 heading_level: None,
+                accessibility_view: None,
             };
             let new_acc = new_acc.unwrap_or(&EMPTY);
             self.backend.set_accessibility(id, new_acc);

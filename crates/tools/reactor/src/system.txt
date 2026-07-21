@@ -312,6 +312,13 @@ Windows::Win32::UIA_IsOffscreenPropertyId
 Windows::Win32::UIA_IsPasswordPropertyId
 Windows::Win32::UIA_LiveSettingPropertyId
 Windows::Win32::UIA_AcceleratorKeyPropertyId
+Windows::Win32::UIA_PositionInSetPropertyId
+Windows::Win32::UIA_SizeOfSetPropertyId
+Windows::Win32::UIA_HeadingLevelPropertyId
+// The raw-UIA heading scale. XAML's AutomationHeadingLevel is 0..9 (None,
+// Level1..Level9); UIA's is this base plus the level, so the two need mapping.
+Windows::Win32::HeadingLevel_None
+Windows::Win32::UIA_LocalizedControlTypePropertyId
 // ── Pattern ids ──
 Windows::Win32::UIA_InvokePatternId
 Windows::Win32::UIA_TextPatternId
@@ -344,6 +351,7 @@ Windows::Win32::UIA_HyperlinkControlTypeId
 Windows::Win32::UIA_ProgressBarControlTypeId
 Windows::Win32::UIA_RadioButtonControlTypeId
 Windows::Win32::UIA_StatusBarControlTypeId
+Windows::Win32::UIA_TitleBarControlTypeId
 // ── Event ids ──
 Windows::Win32::UIA_Invoke_InvokedEventId
 Windows::Win32::UIA_AutomationFocusChangedEventId

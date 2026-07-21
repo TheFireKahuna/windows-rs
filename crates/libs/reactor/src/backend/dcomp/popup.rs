@@ -739,6 +739,13 @@ impl Popup {
         };
         text.para.hide_all();
 
+        // One gutter decision for the whole menu, not per row: a row's label
+        // must sit at the same x whether or not THAT row currently shows a tick
+        // or an icon, or toggling one would shove its text sideways.
+        let gutter = rows
+            .iter()
+            .any(|r| r.icon != 0 || r.checked.is_some());
+
         let mut count = 0usize;
         for (i, row, y, _) in rows_laid(rows, p.top) {
             count = i + 1;
@@ -750,15 +757,21 @@ impl Popup {
                 continue;
             }
             let rr = row_rect(p, y);
-            let has_icon = row.icon != 0;
             let ink = fg(row);
 
             // Alloc-free: the codepoint is encoded into a caller-owned buffer
-            // rather than a fresh `String` per row per repaint. An icon-less row
-            // pins the empty string, which shapes nothing and hides the slot.
+            // rather than a fresh `String` per row per repaint. A row with
+            // nothing in the gutter pins the empty string, which shapes nothing
+            // and hides the slot.
+            //
+            // A checkable row draws the tick in the same cell an icon would
+            // take: the two are alternatives, and a menu that mixed them per row
+            // would have no consistent gutter to align labels against.
             let mut buf = [0u8; 4];
-            let glyph = if has_icon {
+            let glyph = if row.icon != 0 {
                 super::controls::glyph_into(row.icon, &mut buf).unwrap_or("")
+            } else if row.checked == Some(true) {
+                CHECK_GLYPH
             } else {
                 ""
             };
@@ -769,7 +782,7 @@ impl Popup {
             // alignment alone — which is what `TrailingCentered` is for. Placing
             // them by hand would otherwise mean computing two origins where the
             // painted row computed none.
-            let col = label_col(rr, has_icon);
+            let col = label_col(rr, gutter);
             let (part, run) = slot[1].pin(&row.text, theme::FONT_SIZE_MD, 400, MENU_FACE);
             pen.place(part, run, col, Align::LeadingCentered, ink);
 
@@ -811,12 +824,16 @@ fn icon_cell(rr: Rect) -> Rect {
 /// The column the label and the shortcut hint SHARE — the two are kept apart by
 /// alignment, not by separate boxes, so there is one column and not two.
 ///
-/// It starts after the icon on a row that has one, which is what keeps a label
-/// from running underneath its own glyph.
-fn label_col(rr: Rect, has_icon: bool) -> Rect {
-    let left = rr.left + if has_icon { theme::SPACE_32 } else { theme::SPACE_12 };
+/// It starts after the leading gutter in a menu that HAS one (any row with an
+/// icon or a check state), which is what keeps a label from running underneath
+/// its own glyph — and keeps every label in the menu on one x.
+fn label_col(rr: Rect, gutter: bool) -> Rect {
+    let left = rr.left + if gutter { theme::SPACE_32 } else { theme::SPACE_12 };
     Rect::new(left, rr.top, rr.right - theme::SPACE_12, rr.bottom)
 }
+
+/// The tick a checked menu row draws in its gutter (Segoe Fluent `CheckMark`).
+const CHECK_GLYPH: &str = "\u{E73E}";
 
 /// The em a menu row's leading icon is set at. The label and the hint take the
 /// text ramp's own sizes.

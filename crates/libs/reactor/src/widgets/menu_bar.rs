@@ -19,6 +19,15 @@ pub enum MenuItemDef {
         /// this does NOT register a live keyboard accelerator, it overrides the
         /// shortcut text shown on the right of the item.
         shortcut: Option<String>,
+        /// Check state, for a menu used as a value picker or a set of options.
+        /// `None` is an ordinary command; `Some` makes the row checkable — it
+        /// draws a tick when on, reserves the tick's gutter when off, and
+        /// reports the Toggle pattern to an assistive client either way.
+        ///
+        /// The state is the app's: clicking a checked row fires
+        /// `on_item_clicked` exactly as any other row does, and the next render
+        /// is what flips it.
+        checked: Option<bool>,
     },
     /// A visual separator line.
     Separator,
@@ -63,6 +72,20 @@ impl MenuItemDef {
         }
         self
     }
+
+    /// Make an [`MenuItemDef::Item`] checkable and set its state — for a menu
+    /// used as a value picker ("which filter type?") or a set of options.
+    ///
+    /// A checkable row draws a tick when `on`, keeps the tick's gutter when
+    /// off so labels do not shift as it toggles, and carries the Toggle pattern
+    /// so an assistive client can report WHICH row is current. Without this a
+    /// menu's rows are indistinguishable commands.
+    pub fn checked(mut self, on: bool) -> Self {
+        if let Self::Item { checked, .. } = &mut self {
+            *checked = Some(on);
+        }
+        self
+    }
 }
 
 /// Builder for a [`MenuItemDef::Item`]. Decorate with the chainable
@@ -76,6 +99,7 @@ pub fn menu_item(text: impl Into<String>) -> MenuItemDef {
         danger: false,
         enabled: true,
         shortcut: None,
+        checked: None,
     }
 }
 

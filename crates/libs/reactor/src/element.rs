@@ -584,6 +584,16 @@ impl Element {
         }
         self
     }
+    /// Force which UI Automation views this element appears in, overriding the
+    /// backend's own reading of it. [`AccessibilityView::Raw`] takes a purely
+    /// decorative element out of the tree a screen reader walks; `Content`
+    /// keeps one in that the backend would otherwise read as scaffolding.
+    pub fn accessibility_view(mut self, view: AccessibilityView) -> Self {
+        if let Some(a) = self.accessibility_mut() {
+            a.accessibility_view = Some(view);
+        }
+        self
+    }
     pub fn keyboard_accelerator(mut self, accel: KeyboardAccelerator) -> Self {
         if let Some(m) = self.modifiers_mut() {
             m.keyboard_accelerators.push(accel);
@@ -945,6 +955,15 @@ pub trait ElementExt: Sized {
     fn heading_level(mut self, level: AutomationHeadingLevel) -> Self {
         if let Some(m) = self.modifiers_mut() {
             ensure_accessibility(m).heading_level = Some(level);
+        }
+        self
+    }
+
+    /// Force which UI Automation views this widget appears in, overriding the
+    /// backend's own reading of it. See [`ElementExt::accessibility_view`].
+    fn accessibility_view(mut self, view: AccessibilityView) -> Self {
+        if let Some(m) = self.modifiers_mut() {
+            ensure_accessibility(m).accessibility_view = Some(view);
         }
         self
     }

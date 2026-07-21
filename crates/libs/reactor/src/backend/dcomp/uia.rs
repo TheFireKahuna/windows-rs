@@ -50,6 +50,7 @@ use super::{caption, controls};
 use super::{layout, scroll};
 use super::*;
 use crate::backend::{ControlKind, Event};
+use crate::AccessibilityView;
 use crate::system_bindings::{
     ClientToScreen, ExpandCollapseState, IExpandCollapseProvider, IExpandCollapseProvider_Impl,
     IInvokeProvider, IInvokeProvider_Impl, IRangeValueProvider, IRangeValueProvider_Impl,
@@ -67,7 +68,7 @@ use crate::system_bindings::{
     TextUnit_Character, TextUnit_Format, TextUnit_Word, ToggleState, UiaPoint, UiaRect,
     UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, UiaRaiseAutomationPropertyChangedEvent,
     UiaRaiseStructureChangedEvent, StructureChangeType_ChildrenBulkAdded,
-    StructureChangeType_ChildrenBulkRemoved,
+    StructureChangeType_ChildrenBulkRemoved, StructureChangeType_ChildrenInvalidated,
     HWND, LPARAM, POINT, SAFEARRAY, VARIANT, VARIANT_0,
     VARIANT_0_0, VARIANT_0_0_0, WM_SYSCOMMAND, WPARAM, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE,
     SC_RESTORE, UIA_AcceleratorKeyPropertyId, UIA_AutomationFocusChangedEventId,
@@ -81,6 +82,8 @@ use crate::system_bindings::{
     UIA_IsContentElementPropertyId,
     UIA_IsControlElementPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
     UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId,
+    HeadingLevel_None, UIA_HeadingLevelPropertyId, UIA_LocalizedControlTypePropertyId,
+    UIA_PositionInSetPropertyId, UIA_SizeOfSetPropertyId, UIA_TitleBarControlTypeId,
     UIA_LiveRegionChangedEventId, UIA_LiveSettingPropertyId,
     UIA_ListControlTypeId, UIA_ListItemControlTypeId, UIA_NamePropertyId, UIA_PaneControlTypeId,
     PATTERNID, PROPERTYID, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
@@ -318,10 +321,82 @@ fn control_type(kind: ControlKind) -> i32 {
         // A badge is a short readable annotation, not a control: it has no
         // action and no value pattern, so `Text` is the honest type.
         InfoBadge => UIA_TextControlTypeId,
+        TitleBar => UIA_TitleBarControlTypeId,
         TextBlock | RichTextBlock => UIA_TextControlTypeId,
-        Image | PersonPicture | Ellipse | Rectangle | Line => UIA_ImageControlTypeId,
+        Image | PersonPicture | Ellipse | Rectangle | Line | Path => UIA_ImageControlTypeId,
         ScrollViewer | ScrollView | Canvas | SwapChainPanel => UIA_PaneControlTypeId,
         _ => UIA_GroupControlTypeId,
+    }
+}
+
+/// The noun a client should SAY for this kind, when the control type it maps to
+/// would understate it.
+///
+/// Left empty for everything else on purpose: absent this property a client
+/// speaks the control type's own localized name, which is already right for a
+/// Button or an Edit. Supplying one there would replace a string the client has
+/// translated with an English one this crate hardcodes. These four are the kinds
+/// whose mapped type is a genuine approximation — a Knob is not a slider to
+/// anyone looking at it, and a level Meter is not a progress bar.
+fn localized_control_type(kind: ControlKind) -> &'static str {
+    match kind {
+        ControlKind::Knob => "knob",
+        ControlKind::Meter => "meter",
+        ControlKind::Expander => "expander",
+        ControlKind::NavigationView => "navigation",
+        _ => "",
+    }
+}
+
+/// Kinds that are pure layout or decoration — they carry meaning only when the
+/// app gives them some (a name, a handler, an authored view).
+///
+/// A reactor tree is mostly these: a card is a Border wrapping a Grid wrapping
+/// StackPanels, and every measurement wrapper and spacer is another. Left in
+/// the Control view they are hundreds of unnamed "group" and "image" elements a
+/// screen reader user has to walk THROUGH to reach anything, and the reason a
+/// tree walk of this app returned ~160 elements to describe ~26 controls.
+fn is_presentational_kind(kind: ControlKind) -> bool {
+    use ControlKind::*;
+    matches!(
+        kind,
+        StackPanel | Border | Grid | RelativePanel | Viewbox | Canvas | Rectangle | Ellipse
+            | Line | Path
+            // A text block's NAME is its text, so one that reaches the rule
+            // below unnamed is one drawing nothing — a placeholder holding
+            // layout space, or a live read-out with no reading yet.
+            | TextBlock | RichTextBlock
+    )
+}
+
+/// Range kinds that also answer the Value pattern with a readable string.
+///
+/// `RangeValue` alone hands a client a bare number, so a gain knob reads as
+/// "minus six" with nothing saying decibels — the one thing a listener cannot
+/// infer. These carry a domain value the app can name a unit for; a generic
+/// ProgressBar/ProgressRing is deliberately absent, since a progress ratio has
+/// no unit to add and `RangeValue`'s percentage is what a client expects to
+/// read from one.
+fn value_string_kind(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        ControlKind::Slider | ControlKind::Knob | ControlKind::Meter
+    )
+}
+
+/// Decimals to print a range value at, taken from the control's own step: a
+/// `0.1` step means one decimal, `0.01` two, an integer step none.
+///
+/// The step is the app's own statement of how finely the value is meaningful,
+/// which makes it the honest precision to announce — printing more would invent
+/// resolution the control does not have, and printing fewer would round away
+/// changes the user can actually make.
+fn decimals_for(step: Option<f64>) -> usize {
+    match step {
+        Some(s) if s.is_finite() && s > 0.0 => (-s.log10().floor()).clamp(0.0, 6.0) as usize,
+        // No declared step: one decimal, which is what the value ladders in
+        // this set (dB, ms, ratios) read as.
+        _ => 1,
     }
 }
 
@@ -383,6 +458,7 @@ fn pattern_supported(kind: ControlKind, item: i32, pid: PATTERNID) -> bool {
         matches!(kind, ToggleSwitch | CheckBox | ToggleButton | RadioButton)
     } else if pid == UIA_ValuePatternId {
         matches!(kind, TextBox | NumberBox | PasswordBox | AutoSuggestBox)
+            || value_string_kind(kind)
     } else if pid == UIA_RangeValuePatternId {
         matches!(kind, Slider | Knob | NumberBox | ProgressBar | ProgressRing | Meter)
     } else if pid == UIA_ExpandCollapsePatternId {
@@ -448,6 +524,40 @@ impl DCompBackend {
     /// Rows in `id`'s open command menu (0 when it has none open).
     fn menu_row_count(&self, id: ControlId) -> usize {
         self.menu_popup(id).map_or(0, |p| p.menu_rows().len())
+    }
+
+    /// The flyout-content subtree `id` currently hosts, if its rich flyout is
+    /// open.
+    ///
+    /// A rich flyout's content is reconciled into REAL nodes that are
+    /// deliberately absent from every child list — `set_flyout_element` keeps
+    /// the subtree detached so nothing lays it out or draws it until the flyout
+    /// opens. That is why the walk cannot reach it the way it reaches a menu's
+    /// rows (which are synthetic items of the owner): there is no link to
+    /// follow, in either direction. While the popup is open the subtree is on
+    /// screen and interactive, so it is walked as the owner's last child, and
+    /// this pair is the only place that edge exists.
+    ///
+    /// Read off [`hosted_flyout`](super::DCompBackend::hosted_flyout), the same
+    /// field [`hit_test`] promotes above the tree, so a `FindAll` walk and an
+    /// `ElementProviderFromPoint` cannot disagree about whether the content is
+    /// there — the invariant the caption and menu paths above hold to as well.
+    /// It is set only while the subtree is actually hosted, which is also what
+    /// keeps a client from finding and invoking content behind a flyout the
+    /// user never opened.
+    fn flyout_child(&self, id: ControlId) -> Option<ControlId> {
+        self.hosted_flyout
+            .filter(|_| self.popup.as_ref().is_some_and(|p| p.owner == id))
+            .filter(|r| self.arena.get(*r).is_some())
+    }
+
+    /// The owner hosting `target` as its open flyout's content root — the
+    /// reverse edge, which stands in for the `parent` link the subtree lacks.
+    fn flyout_host_of(&self, target: ControlId) -> Option<ControlId> {
+        self.hosted_flyout
+            .filter(|r| *r == target)
+            .and_then(|_| self.popup.as_ref().map(|p| p.owner))
+            .filter(|o| self.arena.get(*o).is_some())
     }
 
     /// The row a menu item names, bounded against the live row list.
@@ -672,8 +782,9 @@ impl DCompBackend {
                     UiaNav::Item(id, CAPTION_ITEM_BASE + i + 1)
                 }
                 NAV_PREV if i > 0 => UiaNav::Item(id, CAPTION_ITEM_BASE + i - 1),
-                NAV_PREV => match node.children.last() {
-                    Some(c) => UiaNav::Node(*c),
+                NAV_PREV => match self.flyout_child(id).or_else(|| node.children.last().copied())
+                {
+                    Some(c) => UiaNav::Node(c),
                     None => match self.syn_at(id, self.syn_len(id) - 1) {
                         Some(last) => UiaNav::Item(id, last),
                         None => UiaNav::None,
@@ -734,8 +845,13 @@ impl DCompBackend {
                 NAV_PARENT => UiaNav::Node(id),
                 NAV_NEXT => match pos.and_then(|p| self.syn_at(id, p + 1)) {
                     Some(next) => UiaNav::Item(id, next),
-                    None => match node.children.first() {
-                        Some(c) => UiaNav::Node(*c),
+                    None => match node
+                        .children
+                        .first()
+                        .copied()
+                        .or_else(|| self.flyout_child(id))
+                    {
+                        Some(c) => UiaNav::Node(c),
                         None if self.root == Some(id) && self.uia_caption_count() > 0 => {
                             UiaNav::Item(id, CAPTION_ITEM_BASE)
                         }
@@ -755,12 +871,21 @@ impl DCompBackend {
 
         let syn_count = self.syn_len(id);
         let caption_count = if self.root == Some(id) { self.uia_caption_count() } else { 0 };
+        // The subtree an open rich flyout hosts, walked as this node's last real
+        // child (see `flyout_child`) — after its own children, before the
+        // root's caption suffix.
+        let flyout = self.flyout_child(id);
+        // Set when THIS node is such a subtree's root, which is the only way it
+        // has a parent at all: it is in no child list.
+        let flyout_owner = self.flyout_host_of(id);
         match dir {
             NAV_FIRST => {
                 if let Some(first) = (syn_count > 0).then(|| self.syn_at(id, 0)).flatten() {
                     UiaNav::Item(id, first)
                 } else if let Some(c) = node.children.first() {
                     UiaNav::Node(*c)
+                } else if let Some(f) = flyout {
+                    UiaNav::Node(f)
                 } else if caption_count > 0 {
                     UiaNav::Item(id, CAPTION_ITEM_BASE)
                 } else {
@@ -771,8 +896,8 @@ impl DCompBackend {
                 if caption_count > 0 {
                     UiaNav::Item(id, CAPTION_ITEM_BASE + caption_count - 1)
                 } else {
-                    match node.children.last() {
-                        Some(c) => UiaNav::Node(*c),
+                    match flyout.or_else(|| node.children.last().copied()) {
+                        Some(c) => UiaNav::Node(c),
                         None => match self.syn_at(id, syn_count - 1) {
                             Some(last) => UiaNav::Item(id, last),
                             None => UiaNav::None,
@@ -783,12 +908,35 @@ impl DCompBackend {
             NAV_PARENT => {
                 if self.root == Some(id) {
                     UiaNav::None // the host (window frame) provides the parent
+                } else if let Some(o) = flyout_owner {
+                    if self.root == Some(o) { UiaNav::Root } else { UiaNav::Node(o) }
                 } else {
                     match self.uia_parent(id) {
                         Some(p) if self.root == Some(p) => UiaNav::Root,
                         Some(p) => UiaNav::Node(p),
                         None => UiaNav::None,
                     }
+                }
+            }
+            // A hosted flyout root sits after the owner's last real child, so it
+            // is walked against the OWNER's child list rather than looked up in
+            // it — it is not there to be found. Forward of it is whatever
+            // follows the owner's children (the root's caption suffix, or
+            // nothing); back of it is that last child, or the owner's last item.
+            NAV_NEXT if let Some(o) = flyout_owner => {
+                if self.root == Some(o) && self.uia_caption_count() > 0 {
+                    UiaNav::Item(o, CAPTION_ITEM_BASE)
+                } else {
+                    UiaNav::None
+                }
+            }
+            NAV_PREV if let Some(o) = flyout_owner => {
+                match self.arena.get(o).and_then(|n| n.children.last().copied()) {
+                    Some(c) => UiaNav::Node(c),
+                    None => match self.uia_item_count(o) {
+                        0 => UiaNav::None,
+                        n => UiaNav::Item(o, n - 1),
+                    },
                 }
             }
             NAV_NEXT | NAV_PREV => {
@@ -802,8 +950,13 @@ impl DCompBackend {
                     return UiaNav::None;
                 };
                 if dir == NAV_NEXT {
-                    match pn.children.get(idx + 1) {
-                        Some(c) => UiaNav::Node(*c),
+                    match pn
+                        .children
+                        .get(idx + 1)
+                        .copied()
+                        .or_else(|| self.flyout_child(p))
+                    {
+                        Some(c) => UiaNav::Node(c),
                         // Last real child of the root: the caption suffix follows.
                         None if self.root == Some(p) && self.uia_caption_count() > 0 => {
                             UiaNav::Item(p, CAPTION_ITEM_BASE)
@@ -916,7 +1069,20 @@ impl DCompBackend {
         {
             return name.clone();
         }
-        if !n.paint.text.is_empty() {
+        // A live run is what the block currently DRAWS: `set_live_text` writes
+        // `live_words` and never touches `paint.text`, which stays frozen at the
+        // last reconcile. Reading `paint.text` here is what left every
+        // display-rate read-out — level meters, loudness numerals — reporting a
+        // stale value to a client while the glyphs on screen said otherwise.
+        if let Some(live) = n.live_words.as_ref().filter(|s| !s.is_empty()) {
+            return live.clone();
+        }
+        // Checked here rather than only in `descendant_text`: an icon glyph sitting
+        // on the node's OWN text is exactly as meaningless as one a level down (see
+        // `is_icon_text`), and letting it through named every un-tooltipped icon
+        // button after a private-use code point. Falling through instead lets an
+        // icon button with a real label child be named by that label.
+        if !n.paint.text.is_empty() && !is_icon_text(&n.paint.text) {
             return n.paint.text.clone();
         }
         // A Button given rich element content carries no text of its OWN — the
@@ -1021,10 +1187,26 @@ impl DCompBackend {
             return self.menu_row_invokable(id, item);
         }
         if item >= 0 {
-            // Caption buttons are pointer-only (Alt+Space serves the keyboard).
-            return !is_caption(item);
+            // No synthetic item takes focus. Caption buttons are pointer-only
+            // (Alt+Space serves the keyboard); a container's items are SELECTED
+            // rather than focused — focus is per node, so a SelectorBar segment
+            // or a nav row can never be what `uia_has_focus` names, and
+            // `set_focus` has no per-item state to move. Menu rows, the one
+            // exception, answered above off the live highlight.
+            //
+            // Reporting them focusable promised a Tab stop that does not exist
+            // and a `SetFocus` target that silently focused something else.
+            return false;
         }
-        self.arena.get(id).is_some_and(|n| n.focusable)
+        // A disabled control is skipped by the Tab ring (`focus_collect` requires
+        // `paint.is_enabled`), so reporting it as focusable promises the same
+        // landing place the keyboard never offers that the menu-row branch above
+        // refuses to promise. Both flags are reported: a client reads
+        // `IsEnabled=false` for "would act but currently cannot", and
+        // `IsKeyboardFocusable=false` for "Tab will not stop here".
+        self.arena
+            .get(id)
+            .is_some_and(|n| n.focusable && n.paint.is_enabled)
     }
 
     fn uia_has_focus(&self, id: ControlId, item: i32) -> bool {
@@ -1049,6 +1231,179 @@ impl DCompBackend {
         item < 0 && self.focused_id == Some(id)
     }
 
+    /// Raise one `StructureChanged` per parent whose child list changed this
+    /// frame, then forget them.
+    ///
+    /// Called once at the end of a command replay, not from the mutators: a
+    /// reconcile rebuilding a panel unlinks and relinks many children of the
+    /// same parent, and a client only needs to be told once, after the tree has
+    /// settled. Raising per mutation would also announce the buffer's transient
+    /// states — a child destroyed before it is unparented, and the reversed
+    /// tab/pivot order — which are not states the tree is ever actually in.
+    ///
+    /// Menu popups keep their own `ChildrenBulkAdded`/`Removed` raise: those
+    /// name a real add/remove of a known set, where this path deliberately says
+    /// only "re-examine", because after a reconcile that is the honest claim.
+    pub(crate) fn flush_structure_changes(&mut self) {
+        if self.structure_dirty.is_empty() {
+            return;
+        }
+        // Drained even with nobody listening — otherwise the set grows for the
+        // life of the window.
+        let dirty = std::mem::take(&mut self.structure_dirty);
+        if !clients_listening() {
+            return;
+        }
+        let Some(root) = self.root else { return };
+        // Anchor each change on the nearest ancestor a client's Control view
+        // actually contains. Most parents in a reactor tree are the layout
+        // scaffolding `uia_view_flags` now keeps OUT of that view, and an event
+        // raised on an element the client filters away is one it never sees.
+        let mut anchors: Vec<ControlId> = Vec::new();
+        for id in dirty {
+            if self.arena.get(id).is_none() {
+                continue; // the parent itself went away
+            }
+            let anchor = self.control_view_anchor(id);
+            if !anchors.contains(&anchor) {
+                anchors.push(anchor);
+            }
+        }
+        if anchors.len() > STRUCTURE_BULK_THRESHOLD {
+            anchors.clear();
+            anchors.push(root);
+        }
+        let hwnd = self.hwnd;
+        for id in anchors {
+            let is_root = self.root == Some(id);
+            host::post_ui(hwnd, move || unsafe {
+                // The root must be raised on its ROOT provider — the same object
+                // identity a client holds for the fragment root, or the event
+                // names an element it does not recognise as the one it cached.
+                let p = match is_root {
+                    true => stable_provider(ElementProvider::root(hwnd, id)),
+                    false => stable_provider(ElementProvider::element(hwnd, id)),
+                };
+                // The non-bulk `ChildAdded`/`ChildRemoved` forms take the runtime
+                // id of the child that moved; `ChildrenInvalidated` names the
+                // parent, which is the provider itself, so it takes none.
+                let _ = UiaRaiseStructureChangedEvent(
+                    p.as_raw(),
+                    StructureChangeType_ChildrenInvalidated,
+                    core::ptr::null_mut(),
+                    0,
+                );
+            });
+        }
+    }
+
+    /// The nearest ancestor of `id` (itself included) that a Control-view walk
+    /// contains. Terminates: the root is always in every view.
+    fn control_view_anchor(&self, id: ControlId) -> ControlId {
+        let mut cur = id;
+        loop {
+            if self.root == Some(cur) || self.uia_view_flags(cur, -1).0 {
+                return cur;
+            }
+            match self.uia_parent(cur) {
+                Some(p) => cur = p,
+                None => return cur,
+            }
+        }
+    }
+
+    /// `(IsControlElement, IsContentElement)` — which views this element is in.
+    ///
+    /// An authored `accessibility_view` always wins. Absent one this reads the
+    /// element: a presentational kind that has nothing to say — no accessible
+    /// name, no authored id or help text, nothing to press, nowhere for focus
+    /// to land — is scaffolding, and drops to the Raw view.
+    ///
+    /// Excluding it costs nothing structurally: a client's view walker hoists
+    /// an excluded element's children onto the nearest ancestor still in the
+    /// view, so a card's contents stay reachable while the four nested
+    /// wrappers around them stop being stops on the way. Nothing here changes
+    /// what `uia_navigate` returns — the provider always reports the raw tree,
+    /// and the client does the filtering.
+    ///
+    /// Synthetic items are never scaffolding: a segment, a nav row and a menu
+    /// row are the content.
+    fn uia_view_flags(&self, id: ControlId, item: i32) -> (bool, bool) {
+        if item >= 0 {
+            return (true, true);
+        }
+        let Some(n) = self.arena.get(id) else {
+            return (true, true);
+        };
+        if let Some(v) = n.accessibility.as_ref().and_then(|a| a.accessibility_view) {
+            return v.flags();
+        }
+        // The root is the fragment root a client attaches to; it is in every
+        // view whatever kind it happens to be.
+        if self.root == Some(id) || !is_presentational_kind(n.kind) {
+            return (true, true);
+        }
+        let authored = n.accessibility.as_ref().is_some_and(|a| {
+            a.automation_id.as_ref().is_some_and(|s| !s.is_empty())
+                || a.help_text.as_ref().is_some_and(|s| !s.is_empty())
+        });
+        let speaks = authored
+            || n.focusable
+            || n.is_clickable()
+            || !self.uia_name(id, item).is_empty();
+        if speaks {
+            (true, true)
+        } else {
+            AccessibilityView::Raw.flags()
+        }
+    }
+
+    /// `PositionInSet` / `SizeOfSet` — where a synthetic item sits in its
+    /// container's run, 1-based, as a client announces it ("3 of 5").
+    ///
+    /// Read off the SAME `syn_pos`/`syn_len` the tree walk uses, so what a
+    /// screen reader counts is the order it would reach by stepping — a nav
+    /// pane's chrome rows included, since those share the sequence. Menu rows
+    /// are counted against the row list instead: they hang off the Menu element
+    /// rather than the owner, whose one synthetic child is that menu.
+    ///
+    /// `None` for a real node and for the caption cluster — a window's buttons
+    /// are chrome, not a set the reading order passes through.
+    fn uia_set_position(&self, id: ControlId, item: i32) -> Option<(i32, i32)> {
+        if item < 0 || is_caption(item) {
+            return None;
+        }
+        if is_menu(item) {
+            let rows = self.menu_row_count(id) as i32;
+            let i = menu_row_of(item)? as i32;
+            return (i < rows).then_some((i + 1, rows));
+        }
+        let pos = self.syn_pos(id, item)?;
+        let len = self.syn_len(id);
+        (len > 0).then_some((pos + 1, len))
+    }
+
+    /// `HeadingLevel` — the authored [`AutomationHeadingLevel`] on the raw-UIA
+    /// scale.
+    ///
+    /// The two scales differ: XAML's is `0..9` (None, Level1..Level9), UIA's is
+    /// `HeadingLevel_None` plus the level. The WinUI backend hands its enum
+    /// straight to `AutomationProperties::SetHeadingLevel` and the framework
+    /// does this conversion; here the provider IS the framework, so it converts.
+    /// Only on real nodes — a synthetic item carries no authored accessibility.
+    fn uia_heading_level(&self, id: ControlId, item: i32) -> i32 {
+        if item >= 0 {
+            return HeadingLevel_None;
+        }
+        let level = self
+            .arena
+            .get(id)
+            .and_then(|n| n.accessibility.as_ref())
+            .and_then(|a| a.heading_level)
+            .map_or(0, |h| h.0.clamp(0, 9));
+        HeadingLevel_None + level
+    }
+
     /// `AcceleratorKey` — a menu row's shortcut hint, as the property a client
     /// expects it in rather than smuggled into the row's name.
     fn uia_accelerator(&self, id: ControlId, item: i32) -> String {
@@ -1066,12 +1421,20 @@ impl DCompBackend {
         if is_caption(item) {
             return pid == UIA_InvokePatternId; // caption buttons only invoke
         }
-        // A menu row invokes and does nothing else — a command menu carries no
-        // selection, so `SelectionItem` (which the generic item branch below
-        // would hand it) would advertise a "selected" state no row can ever
-        // hold. The Menu element itself is pure containment: no pattern at all.
+        // A menu row invokes, and toggles when it is checkable. `SelectionItem`
+        // is still refused: selection belongs to a container that owns one
+        // (`ISelectionProvider`), and a command menu owns none — a checkable row
+        // reports its own state through Toggle instead, which is also the
+        // pattern a client expects a checked menu item to carry. A row with no
+        // check state keeps the Invoke-only contract it always had. The Menu
+        // element itself is pure containment: no pattern at all.
         if is_menu(item) {
-            return pid == UIA_InvokePatternId && self.menu_row_invokable(id, item);
+            if !self.menu_row_invokable(id, item) {
+                return false;
+            }
+            return pid == UIA_InvokePatternId
+                || (pid == UIA_TogglePatternId
+                    && self.menu_row(id, item).is_some_and(|r| r.checked.is_some()));
         }
         if pid == UIA_ScrollItemPatternId {
             return self.uia_scroll_ancestor(id).is_some();
@@ -1115,7 +1478,12 @@ impl DCompBackend {
         })
     }
 
-    fn uia_toggle_state(&self, id: ControlId) -> i32 {
+    fn uia_toggle_state(&self, id: ControlId, item: i32) -> i32 {
+        // A checkable menu row carries its OWN state — the owning button's
+        // toggle flags say nothing about which row is current.
+        if is_menu(item) {
+            return i32::from(self.menu_row(id, item).and_then(|r| r.checked) == Some(true));
+        }
         match self.arena.get(id) {
             Some(n) if n.ctrl().indeterminate => 2,
             Some(n) if n.ctrl().is_on || n.ctrl().is_checked => 1,
@@ -1124,11 +1492,43 @@ impl DCompBackend {
     }
 
     fn uia_value_string(&self, id: ControlId) -> String {
-        match self.arena.get(id) {
-            // Never surface a password's contents.
-            Some(n) if n.kind == ControlKind::PasswordBox => String::new(),
-            Some(n) => n.editor.as_ref().map(|e| e.text()).unwrap_or_default(),
-            None => String::new(),
+        let Some(n) = self.arena.get(id) else {
+            return String::new();
+        };
+        // Never surface a password's contents.
+        if n.kind == ControlKind::PasswordBox {
+            return String::new();
+        }
+        // An editable field's value IS its buffer, and `Value::SetValue` writes
+        // straight back into it — so it stays the raw text. Appending a unit
+        // here would hand a client a string its own Get/Set round-trip could no
+        // longer parse; the field's NAME is where the dimension belongs.
+        if let Some(e) = &n.editor {
+            return e.text();
+        }
+        if !value_string_kind(n.kind) {
+            return String::new();
+        }
+        // Prefer the string the control DRAWS. A Knob is handed its readout
+        // already formatted by the app that owns the domain ("-6.0", and the
+        // unit separately); re-deriving one here would announce a precision
+        // nobody chose. Only with no such text does this format the raw value,
+        // and then at the decimals the control's own `step` implies.
+        let shown = match n.paint.text.is_empty() {
+            false => n.paint.text.clone(),
+            true => format!(
+                "{:.*}",
+                decimals_for(n.ctrl().step),
+                n.ctrl().value
+            ),
+        };
+        let unit = n.ctrl().unit.as_str();
+        // An app that formatted the unit into the text itself must not get it
+        // twice ("-6.0 dB dB").
+        if unit.is_empty() || shown.ends_with(unit) {
+            shown
+        } else {
+            format!("{shown} {unit}")
         }
     }
 
@@ -2005,6 +2405,17 @@ pub(crate) fn note_tree_change() {
     bump_gen();
 }
 
+/// Above this many distinct changed parents in one frame, the whole frame is
+/// reported as one `ChildrenInvalidated` on the root instead.
+///
+/// Not a cap that drops anything: `ChildrenInvalidated` says "re-examine this
+/// element's children", and saying it about the root is strictly a superset of
+/// saying it about any set of its descendants. It is a rate limit on the
+/// EVENTS, not on the information — a mode switch that rebuilds the page would
+/// otherwise raise one per rebuilt container, which is a storm the client has to
+/// process one cross-process call at a time.
+const STRUCTURE_BULK_THRESHOLD: usize = 16;
+
 /// A node's observable state changed (a prop write, an interactive edit).
 pub(crate) fn note_state_change() {
     bump_gen();
@@ -2026,6 +2437,14 @@ struct PropSnapshot {
     is_password: bool,
     live_setting: i32,
     accelerator: String,
+    localized_control_type: &'static str,
+    heading_level: i32,
+    /// `(IsControlElement, IsContentElement)` — see `uia_view_flags`. Node
+    /// state, so it rides the snapshot rather than being answered as a constant.
+    view_flags: (bool, bool),
+    /// `(PositionInSet, SizeOfSet)`, or `None` when the element is not part of
+    /// a counted run — see [`uia_set_position`](DCompBackend::uia_set_position).
+    set_position: Option<(i32, i32)>,
 }
 
 impl DCompBackend {
@@ -2038,7 +2457,7 @@ impl DCompBackend {
             help_text,
             control_type: self.uia_control_type(id, item),
             value: self.uia_value_string(id),
-            toggle_state: self.uia_toggle_state(id),
+            toggle_state: self.uia_toggle_state(id, item),
             range_value: self.uia_range(id).map_or(0.0, |r| r.0),
             is_enabled: self.uia_is_enabled(id, item),
             focusable: self.uia_focusable(id, item),
@@ -2046,6 +2465,15 @@ impl DCompBackend {
             is_password: self.uia_kind(id) == Some(ControlKind::PasswordBox),
             live_setting: self.uia_live_setting(id, item),
             accelerator: self.uia_accelerator(id, item),
+            // A synthetic item is a row of its container, not a control of its
+            // own kind, so it never inherits the container's localized noun.
+            localized_control_type: match item {
+                i if i < 0 => self.uia_kind(id).map_or("", localized_control_type),
+                _ => "",
+            },
+            heading_level: self.uia_heading_level(id, item),
+            view_flags: self.uia_view_flags(id, item),
+            set_position: self.uia_set_position(id, item),
         }
     }
 
@@ -2343,9 +2771,6 @@ impl ElementProvider {
     /// property-batching notes above.
     fn property(&self, pid: PROPERTYID) -> VARIANT {
         let (hwnd, id, item) = (self.hwnd, self.id, self.item);
-        if pid == UIA_IsControlElementPropertyId || pid == UIA_IsContentElementPropertyId {
-            return v_bool(true);
-        }
         // Excluded from the snapshot: moves with scroll glide / layout, neither
         // of which passes a generation bump.
         if pid == UIA_IsOffscreenPropertyId {
@@ -2354,7 +2779,11 @@ impl ElementProvider {
         let Some(s) = snapshot(hwnd, id, item) else {
             return VARIANT::default();
         };
-        if pid == UIA_NamePropertyId {
+        if pid == UIA_IsControlElementPropertyId {
+            v_bool(s.view_flags.0)
+        } else if pid == UIA_IsContentElementPropertyId {
+            v_bool(s.view_flags.1)
+        } else if pid == UIA_NamePropertyId {
             v_bstr(s.name)
         } else if pid == UIA_AutomationIdPropertyId {
             v_bstr(s.automation_id)
@@ -2380,6 +2809,16 @@ impl ElementProvider {
             v_i4(s.live_setting)
         } else if pid == UIA_AcceleratorKeyPropertyId {
             v_bstr(s.accelerator)
+        } else if pid == UIA_LocalizedControlTypePropertyId && !s.localized_control_type.is_empty() {
+            v_bstr(s.localized_control_type.to_string())
+        } else if pid == UIA_HeadingLevelPropertyId {
+            v_i4(s.heading_level)
+        } else if let Some((pos, len)) = s.set_position
+            && (pid == UIA_PositionInSetPropertyId || pid == UIA_SizeOfSetPropertyId)
+        {
+            // Reported as a PAIR or not at all: a position without the size it
+            // counts against is what makes a client announce "item 3 of 0".
+            v_i4(if pid == UIA_PositionInSetPropertyId { pos } else { len })
         } else {
             VARIANT::default()
         }
@@ -2515,7 +2954,7 @@ macro_rules! forward_provider {
                 self.inner().value_get()
             }
             fn IsReadOnly(&self) -> Result<BOOL> {
-                Ok(false.into())
+                self.inner().value_readonly()
             }
         }
         impl IRangeValueProvider_Impl for $imp {
@@ -2696,8 +3135,8 @@ impl ElementProvider {
     }
 
     fn set_focus_node(&self) -> Result<()> {
-        let id = self.id;
-        act(self.hwnd, move |b| b.uia_focus_node(id));
+        let (id, item) = (self.id, self.item);
+        act(self.hwnd, move |b| b.uia_focus_node(id, item));
         Ok(())
     }
 
@@ -2760,14 +3199,23 @@ impl ElementProvider {
 
 impl ElementProvider {
     fn toggle(&self) -> Result<()> {
-        let id = self.id;
-        act(self.hwnd, move |b| b.uia_activate(id));
+        let (id, item) = (self.id, self.item);
+        if item >= 0 {
+            // A checkable menu row toggles by being PICKED — the same commit a
+            // click or an Invoke makes, since the app owns the state and the
+            // next render is what flips the tick. Falling through to
+            // `uia_activate` would act on the owning BUTTON instead, reopening
+            // the very menu the row lives in.
+            act(self.hwnd, move |b| b.uia_select_item(id, item));
+        } else {
+            act(self.hwnd, move |b| b.uia_activate(id));
+        }
         Ok(())
     }
 
     fn toggle_state(&self) -> Result<ToggleState> {
-        let id = self.id;
-        get(self.hwnd, move |b| Some(b.uia_toggle_state(id)))
+        let (id, item) = (self.id, self.item);
+        get(self.hwnd, move |b| Some(b.uia_toggle_state(id, item)))
     }
 
     fn value_set(&self, val: &PCWSTR) -> Result<()> {
@@ -2780,6 +3228,20 @@ impl ElementProvider {
     fn value_get(&self) -> Result<BSTR> {
         let id = self.id;
         Ok(BSTR::from(get(self.hwnd, move |b| Some(b.uia_value_string(id)))?))
+    }
+
+    /// A range control's value STRING is a read-out, not an input: it is
+    /// produced by formatting, and `value_set` writes through an editor these
+    /// kinds do not have — so a `SetValue` on one would silently do nothing.
+    /// Reporting read-only is what stops a client from trying; the value is
+    /// still settable, through `RangeValue::SetValue`, which is the pattern
+    /// that actually carries it.
+    fn value_readonly(&self) -> Result<BOOL> {
+        let id = self.id;
+        Ok(get(self.hwnd, move |b| {
+            Some(b.uia_kind(id).is_none_or(|k| !node::is_text_editable(k)))
+        })?
+        .into())
     }
 
     fn range_set(&self, val: f64) -> Result<()> {

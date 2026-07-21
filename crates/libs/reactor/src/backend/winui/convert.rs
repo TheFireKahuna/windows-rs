@@ -223,6 +223,15 @@ pub(super) fn build_menu_flyout_item_base(
             danger,
             enabled,
             shortcut,
+            // NOT SUPPORTED on this backend, and deliberately not faked: a
+            // checkable row is a `ToggleMenuFlyoutItem`, a different XAML type
+            // that is absent from the generated bindings. Drawing a checkmark
+            // SymbolIcon on a plain `MenuFlyoutItem` would look right and still
+            // report no check state to UI Automation, which is the half of the
+            // feature that matters. The dcomp backend implements it fully; this
+            // one renders a checkable row as an ordinary command until the
+            // binding is generated.
+            checked: _,
         } => {
             let item = bindings::MenuFlyoutItem::new()?;
             item.SetText(text)?;

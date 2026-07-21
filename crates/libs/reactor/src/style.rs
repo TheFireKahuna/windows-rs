@@ -1062,6 +1062,36 @@ impl PointerEventInfo {
 
 // --- Accessibility ---
 
+/// Which UI Automation views an element appears in.
+///
+/// A client walks one of three trees over the same structure. Excluding an
+/// element does NOT hide its children: a view walker hoists them onto the
+/// nearest ancestor that is still in the view, which is exactly what makes a
+/// layout wrapper disappear without taking its content with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccessibilityView {
+    /// In the Content and Control views — anything a user reads or operates.
+    #[default]
+    Content,
+    /// In the Control view only: structure a client can walk to, but nothing to
+    /// read out. For a container that groups controls without labelling them.
+    Control,
+    /// In neither — reachable only by a Raw walk. Pure presentation: spacing
+    /// borders, layout grids, decorative rules and dots.
+    Raw,
+}
+
+impl AccessibilityView {
+    /// `(IsControlElement, IsContentElement)`.
+    pub(crate) fn flags(self) -> (bool, bool) {
+        match self {
+            Self::Content => (true, true),
+            Self::Control => (true, false),
+            Self::Raw => (false, false),
+        }
+    }
+}
+
 /// UI Automation properties applied to every widget kind via
 /// [`Modifiers::accessibility`].
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -1071,6 +1101,11 @@ pub struct AccessibilityModifiers {
     pub help_text: Option<String>,
     pub live_setting: Option<AutomationLiveSetting>,
     pub heading_level: Option<AutomationHeadingLevel>,
+    /// Overrides the view a backend would otherwise derive. `None` lets the
+    /// backend decide — which for pure layout scaffolding means [`Raw`].
+    ///
+    /// [`Raw`]: AccessibilityView::Raw
+    pub accessibility_view: Option<AccessibilityView>,
 }
 
 impl AccessibilityModifiers {
@@ -1080,6 +1115,7 @@ impl AccessibilityModifiers {
             && self.help_text.is_none()
             && self.live_setting.is_none()
             && self.heading_level.is_none()
+            && self.accessibility_view.is_none()
     }
 }
 

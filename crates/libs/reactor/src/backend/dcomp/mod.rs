@@ -170,6 +170,9 @@ pub struct DCompBackend {
     /// Input consults this BEFORE the window root, since the popup is
     /// z-promoted above the whole tree — see `input::hit_test`.
     hosted_flyout: Option<ControlId>,
+    /// Parents whose child list changed since the last replay flush — drained
+    /// by `uia::flush_structure_changes` into one StructureChanged apiece.
+    structure_dirty: rustc_hash::FxHashSet<ControlId>,
     /// Detached visuals (destroyed subtrees, dismissed popups) playing their
     /// exit fade on the compositor; released by [`Self::release_ghost`] when
     /// their scoped batch completes.
@@ -239,6 +242,7 @@ impl DCompBackend {
             popup: None,
             flyout_roots: rustc_hash::FxHashMap::default(),
             hosted_flyout: None,
+            structure_dirty: rustc_hash::FxHashSet::default(),
             ghosts: Vec::new(),
             next_ghost: 0,
             surfaces: surface::SurfaceHost::default(),
@@ -403,6 +407,7 @@ impl DCompBackend {
         if let Some(c) = self.node_mut(child) {
             c.parent = Some(parent);
         }
+        self.structure_dirty.insert(parent);
         uia::note_tree_change();
     }
 
@@ -417,6 +422,7 @@ impl DCompBackend {
         {
             c.parent = None;
         }
+        self.structure_dirty.insert(parent);
         uia::note_tree_change();
     }
 
@@ -2816,6 +2822,7 @@ fn menu_row(def: &crate::MenuItemDef) -> MenuRow {
             danger,
             enabled,
             shortcut,
+            checked,
         } => MenuRow {
             text: text.clone(),
             tag: text.clone(),
@@ -2824,6 +2831,7 @@ fn menu_row(def: &crate::MenuItemDef) -> MenuRow {
             enabled: *enabled,
             danger: *danger,
             separator: false,
+            checked: *checked,
         },
     }
 }
