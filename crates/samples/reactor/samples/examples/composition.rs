@@ -54,10 +54,9 @@ impl CustomElement for BadgeButton {
     fn clone_dyn(&self) -> Box<dyn CustomElement> {
         Box::new(self.clone())
     }
-    fn mount(&self, backend: &mut dyn Backend) -> ControlId {
-        let id = backend.create(ControlKind::Button);
+    fn mount(&self, id: ControlId, backend: &mut dyn Backend) {
+        backend.create(id, ControlKind::Button);
         backend.set_prop(id, Prop::Content, &PropValue::Str(self.rendered()));
-        id
     }
     fn update(&self, prev: &dyn CustomElement, id: ControlId, backend: &mut dyn Backend) {
         let prev = prev.as_any().downcast_ref::<Self>().unwrap();

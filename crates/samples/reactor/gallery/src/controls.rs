@@ -108,12 +108,7 @@ pub fn card_grid(items: &[CardItem], on_click: impl Fn(String) + 'static) -> Ele
             .spacing(12.0),
         )
         .background(ThemeRef::CardBackground)
-        .border_brush(Color {
-            a: 15,
-            r: 0,
-            g: 0,
-            b: 0,
-        })
+        .border_brush(Color::rgba(0, 0, 0, 15))
         .border_thickness(Thickness::uniform(1.0))
         .padding(Thickness::uniform(16.0))
         .corner_radius(8.0)

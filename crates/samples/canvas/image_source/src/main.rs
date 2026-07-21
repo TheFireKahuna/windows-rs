@@ -92,8 +92,9 @@ fn app(cx: &mut RenderCx) -> Element {
                 // window moves to a monitor with different scaling. The revoker is
                 // kept in hook state so the subscription lives with the control.
                 let set_scale = set_scale.clone();
-                if let Ok(revoker) =
-                    handle.on_rasterization_scale_changed(move |s| set_scale.call(s))
+                if let Some(image) = ImageHandle::from_element(&handle)
+                    && let Ok(revoker) =
+                        image.on_rasterization_scale_changed(move |s| set_scale.call(s))
                 {
                     scale_sub.set(Some(revoker));
                 }

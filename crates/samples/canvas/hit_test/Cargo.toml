@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 windows-canvas = { workspace = true }
-windows-reactor = { workspace = true, features = ["canvas"] }
+windows-reactor = { workspace = true, features = ["winui-backend"] }
 
 [build-dependencies]
 windows-reactor-setup = { workspace = true }

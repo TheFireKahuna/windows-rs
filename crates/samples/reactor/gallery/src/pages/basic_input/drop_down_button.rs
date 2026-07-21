@@ -15,7 +15,7 @@ pub fn drop_down_button_page(_: &(), cx: &mut RenderCx) -> Element {
                         .menu_flyout(vec![
                             menu_item("Open"),
                             menu_item("Save"),
-                            MenuItemDef::Separator,
+                            menu_separator(),
                             menu_item("Exit"),
                         ])
                         .on_item_clicked(set_selected),

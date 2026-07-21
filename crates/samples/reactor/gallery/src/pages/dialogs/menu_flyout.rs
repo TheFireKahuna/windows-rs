@@ -37,7 +37,7 @@ pub fn menu_flyout_page(_: &(), cx: &mut RenderCx) -> Element {
                         .menu_flyout(vec![
                             menu_item("Bold"),
                             menu_item("Italic"),
-                            MenuItemDef::Separator,
+                            menu_separator(),
                             menu_item("Underline"),
                             menu_item("Strikethrough"),
                         ])
@@ -47,7 +47,7 @@ pub fn menu_flyout_page(_: &(), cx: &mut RenderCx) -> Element {
                 .spacing(8.0),
                 r#"drop_down_button("Format").menu_flyout(vec![
     menu_item("Bold"),
-    MenuItemDef::Separator,
+    menu_separator(),
     menu_item("Underline"),
 ])"#,
             ),

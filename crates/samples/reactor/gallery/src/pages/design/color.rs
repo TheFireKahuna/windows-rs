@@ -18,7 +18,10 @@ pub fn color_page(_: &(), _cx: &mut RenderCx) -> Element {
         let card = border(
             vstack((
                 text_block(*name).font_size(12.0).bold(),
-                text_block(format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b))
+                text_block({
+                    let (r, g, b, _) = color.to_srgb8();
+                    format!("#{r:02X}{g:02X}{b:02X}")
+                })
                     .font_size(11.0)
                     .opacity(0.7),
             ))
