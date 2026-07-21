@@ -10,13 +10,34 @@ categories = ["os::windows-apis"]
 readme = "readme.md"
 
 [features]
+# Exactly one backend per build. Each selects a composition stack, and
+# `windows-composition` hosts exactly one stack per build (its `system` and
+# `lifted` features are mutually exclusive), so the two backends inherit that
+# exclusion. Enabling both, or neither, is a `compile_error!` in lib.rs.
+#
+# There is deliberately no default backend. A default is additive with anything
+# named on the command line, so `--features dcomp-backend` would request the
+# default *and* DComp — both stacks — and fail inside windows-composition rather
+# than here. Naming the backend costs one word and makes the wrong build
+# impossible to express:
+#
+#   cargo build -p windows-reactor --features dcomp-backend
+#   cargo build -p windows-reactor --features winui-backend
+#
+# The generated `bindings` module stays compiled either way — its plain
+# structs/enums (`Thickness`, alignment enums, virtual keys, …) are the shared
+# vocabulary of the widget layer, and carry no stack of their own.
 default = []
 test = []
-# Optional typed bridge to windows-canvas, pulled in only when enabled to keep
-# the default reactor build lean. windows-composition is a required dependency
-# (the transition/animation engine is composition-based), always in its `lifted`
-# stack — the only stack reactor can host.
-canvas = ["dep:windows-canvas"]
+# The WinUI 3 (Windows App SDK XAML) backend: `WinUIBackend`, `App`, the XAML
+# host, `bootstrap()`, and `WinUIDispatcher`. Lifted composition is reachable
+# only through XAML, so `backend/winui` and the `composition_host` widget are the
+# only consumers of that stack.
+winui-backend = ["windows-composition/lifted"]
+# The self-hosted DirectComposition + Direct2D 1.3 backend (`DCompBackend` /
+# `DCompHost`), which hosts a visual tree in a plain HWND with no Windows App SDK
+# dependency. Selects the system stack.
+dcomp-backend = ["windows-composition/system"]
 
 [dependencies]
 rustc-hash = { workspace = true }
@@ -27,11 +48,57 @@ windows-future = { workspace = true }
 windows-reference = { workspace = true, features = ["std"] }
 windows-threading = { workspace = true }
 windows-time = { workspace = true }
-windows-composition = { workspace = true, default-features = false, features = ["lifted"] }
-
-[dependencies.windows-canvas]
-workspace = true
-optional = true
+# Required, not optional: both backends are composition-based, and the selected
+# backend feature turns on the matching stack. Taken with default features off so
+# neither stack is implied here — `winui-backend` / `dcomp-backend` choose it.
+windows-composition = { workspace = true, default-features = false }
+# The canvas drawing primitives and Taffy are required rather than optional: the
+# DComp backend draws through them, and `canvas_bridge` is compiled either way.
+# `windows-canvas` no longer depends on `windows-reactor` — upstream moved that
+# bridge here — so there is no package cycle to avoid and no need to take canvas
+# with default features off.
+windows-canvas = { workspace = true }
+windows-window = { workspace = true }
+taffy = "0.11"
 
 [lints]
 workspace = true
+
+# Every example hosts the self-hosted DirectComposition backend, so each needs
+# that backend selected. Without this a default (`winui-backend`) build tries to
+# compile them and fails on the missing `DCompHost`.
+[[example]]
+name = "dcomp_animations"
+required-features = ["dcomp-backend"]
+
+[[example]]
+name = "dcomp_buttons"
+required-features = ["dcomp-backend"]
+
+[[example]]
+name = "dcomp_caption"
+required-features = ["dcomp-backend"]
+
+[[example]]
+name = "dcomp_controls"
+required-features = ["dcomp-backend"]
+
+[[example]]
+name = "dcomp_edit"
+required-features = ["dcomp-backend"]
+
+[[example]]
+name = "dcomp_hello"
+required-features = ["dcomp-backend"]
+
+[[example]]
+name = "dcomp_infobar"
+required-features = ["dcomp-backend"]
+
+[[example]]
+name = "dcomp_layout"
+required-features = ["dcomp-backend"]
+
+[[example]]
+name = "dcomp_live_text"
+required-features = ["dcomp-backend"]

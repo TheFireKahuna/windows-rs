@@ -7,9 +7,27 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 
+#[cfg(feature = "winui-backend")]
 mod winui;
 
+#[cfg(feature = "winui-backend")]
 pub use winui::WinUIBackend;
+
+#[cfg(feature = "dcomp-backend")]
+pub(crate) mod dcomp;
+
+/// Narrow, purpose-built test surface over the DComp backend's `pub(crate)`
+/// internals. Compiled only for `test`; never in a shipping
+/// build.
+#[cfg(all(feature = "test", feature = "dcomp-backend"))]
+pub mod dcomp_test_api;
+
+#[cfg(feature = "dcomp-backend")]
+pub use dcomp::{
+    live_text::LiveText, pointer_capture_active, set_display_change_callback, set_host_tokens,
+    set_output_color_transform, set_root_backdrop_provider, set_window_visibility_callback,
+    BackdropDither, BackdropGlow, BackdropSpec, DCompBackend, DCompHost, GlowDrift, HostTokens,
+};
 
 /// Opaque, non-zero handle the backend assigns to every live control.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -70,6 +88,8 @@ pub enum ControlKind {
     Rectangle,
     Ellipse,
     Line,
+    /// A shape drawing transported [`PropValue::Path`] geometry.
+    Path,
     RichTextBlock,
     ListView,
     GridView,
@@ -99,6 +119,8 @@ pub enum ControlKind {
     ToggleButton,
     SwapChainPanel,
     WebView2,
+    Meter,
+    Knob,
 }
 
 /// Closed enum of every property that can be set on a control. Each
@@ -106,6 +128,7 @@ pub enum ControlKind {
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Prop {
     AcceptsReturn,
+    Accent,
     ActionButton,
     ActionButtonText,
     AlignBottomWithPanel,
@@ -126,6 +149,7 @@ pub enum Prop {
     AutoSuggestItems,
     AutoSuggestPlaceholder,
     Background,
+    Badge,
     BorderBrush,
     BorderThickness,
     CanReorderTabs,
@@ -145,19 +169,30 @@ pub enum Prop {
     Delay,
     DisplayMode,
     DisplayName,
+    EndAngle,
     Fill,
+    FillColor,
+    FillColorAlt,
+    FillOrigin,
     FlyoutContent,
     FlyoutPlacement,
     FontFamily,
     FontSize,
     FontWeight,
     Foreground,
+    /// Pre-blurred FP16 glow behind a path's stroke: the blur standard deviation
+    /// in DIPs. Paired with [`Prop::GlowColor`]; a path with a glow bakes a soft
+    /// halo surface once per geometry change and composites it under the stroke.
+    GlowBlur,
+    GlowColor,
+    GradientStops,
     GridColumns,
     GridRows,
     GroupName,
     Header,
     Height,
     HorizontalAlignment,
+    HorizontalContentAlignment,
     HorizontalScrollBarVisibility,
     Icon,
     ImageSource,
@@ -195,8 +230,12 @@ pub enum Prop {
     ItemHeader,
     ItemKey,
     Items,
+    LargeChange,
     LineEndpoints,
+    MajorEvery,
     Margin,
+    Marker,
+    MarkerColor,
     MaxColumns,
     MaxHeight,
     Maximum,
@@ -221,7 +260,9 @@ pub enum Prop {
     PaneDisplayMode,
     PaneTitle,
     PasswordRevealMode,
+    PathGeometry,
     PlaceholderText,
+    Precision,
     PlaceholderValue,
     PreferredPlacement,
     PrimaryButtonText,
@@ -236,18 +277,27 @@ pub enum Prop {
     SelectionMode,
     Severity,
     Spacing,
+    StartAngle,
     Step,
     Stretch,
     Stroke,
     StrokeThickness,
     Style,
+    Ticks,
+    TickLabels,
+    Unit,
     StyleVariant,
     Subtitle,
+    SubText,
     Tall,
     Text,
     TextWrapping,
     TextWrappingWrap,
     Title,
+    /// Path draw-on window: the fraction of the geometry's length at which the
+    /// stroke/fill starts and ends. `TrimEnd` springs on the compositor.
+    TrimStart,
+    TrimEnd,
     Value,
     VerticalAlignment,
     VerticalScrollBarVisibility,
@@ -278,6 +328,7 @@ pub enum PropValue {
     StrList(Vec<String>),
     MenuBarItems(Vec<MenuBarItemDef>),
     MenuFlyoutItems(Vec<MenuItemDef>),
+    FlyoutDef(FlyoutDef),
     TreeViewNodes(Vec<TreeNodeDef>),
     CommandBarCommands(Vec<CommandBarCommandDef>),
     CommandBarFlyoutDef {
@@ -286,6 +337,21 @@ pub enum PropValue {
     },
     SelectorBarItems(Vec<SelectorBarItemDef>),
     Resources(HashMap<String, String>),
+    /// Gradient stops `(position 0..1, authored linear-scRGB color)` for a
+    /// value-ramp fill (Meter bar / Knob arc). The backend display-maps each
+    /// stop at its draw choke like every other chrome color.
+    GradientStops(Vec<(f64, Color)>),
+    /// Shape geometry in the node's local DIP space (curves, polylines, closed
+    /// areas). Shared, so this hop is a refcount bump and not a coordinate copy.
+    Path(PathGeometry),
+    /// Plain value list (Knob tick marks, in value units).
+    F64List(Vec<f64>),
+    /// `(value, label)` pairs (Knob scale labels — formatted by the app).
+    ValueLabels(Vec<(f64, String)>),
+    /// A button's in-box badge — the count-or-dot form, its tint and its side.
+    /// One value rather than a prop each, so the parts cannot contradict one
+    /// another and "no badge" stays `Unset` rather than a reserved count.
+    Badge(Badge),
 }
 
 /// Closed enum of every backend-observable input event.
@@ -296,6 +362,7 @@ pub enum Event {
     BackRequested,
     DateChanged,
     Checked,
+    DragStateChanged,
     Click,
     Closed,
     CloseRequested,
@@ -394,6 +461,7 @@ impl EventHandler {
         }
     }
 
+    #[cfg(feature = "winui-backend")]
     fn invoke_color(&self, argb: (u8, u8, u8, u8)) {
         match self {
             Self::Color(cb) => cb.invoke(argb),
@@ -420,7 +488,14 @@ impl EventHandler {
 /// for tests and by `WinUIBackend` for production. New methods must have
 /// default implementations so existing backends keep compiling.
 pub trait Backend {
-    fn create(&mut self, kind: ControlKind) -> ControlId;
+    /// Create a control at `id`, which the reconciler has minted.
+    ///
+    /// Ids arrive monotonically and are never reused, so a destroyed control's
+    /// id can never alias a live one — the reconciler's graft check compares
+    /// raw ids, and a recycled one would silently fail to graft a remounted
+    /// subtree. Implementations must accept the id as given rather than
+    /// assigning their own.
+    fn create(&mut self, id: ControlId, kind: ControlKind);
 
     fn set_prop(&mut self, id: ControlId, prop: Prop, value: &PropValue);
 
@@ -468,6 +543,15 @@ pub trait Backend {
     /// Pass `None` to clear a previously set pane element.
     fn set_pane_element(&mut self, _id: ControlId, _pane_id: Option<ControlId>) {}
 
+    /// Set a mounted element tree as the content of `id`'s attached flyout.
+    /// Pass `None` to clear it.
+    ///
+    /// The subtree is mounted but PARENTLESS — it belongs to a popup, not to
+    /// the owner's box, so it must never take part in the owner's layout. A
+    /// backend that shows flyouts is responsible for laying it out and hosting
+    /// it when the flyout opens.
+    fn set_flyout_element(&mut self, _id: ControlId, _content_id: Option<ControlId>) {}
+
     /// W1: scroll a templated list to the specified item index. Default
     /// no-op; the WinUI backend implements this via
     /// `ListViewBase::ScrollIntoView` when `id` resolves to a list/grid/flip
@@ -502,6 +586,14 @@ pub trait Backend {
     fn set_layout_animation(&mut self, _id: ControlId, _config: Option<LayoutAnimationConfig>) {}
 
     fn run_property_animation(&mut self, _id: ControlId, _config: Option<AnimationConfig>) {}
+
+    /// Register (or clear) the exit transition to play when this control is
+    /// destroyed. A backend that supports it detaches the control's visual on
+    /// `destroy`, plays the animation on the orphaned "ghost", and releases it
+    /// on completion; the default is a no-op (the control disappears
+    /// immediately, which is also the fallback for a control destroyed before
+    /// it was ever laid out).
+    fn set_exit_transition(&mut self, _id: ControlId, _config: Option<AnimationConfig>) {}
 
     fn set_rich_text_paragraphs(&mut self, _id: ControlId, _paragraphs: &[RichTextParagraph]) {}
 
@@ -790,15 +882,18 @@ impl Dispatcher for RunOnDemandDispatcher {
 
 // -- WinUI Dispatcher -----------------------------------------------------------
 
+#[cfg(feature = "winui-backend")]
 use bindings::{DispatcherQueue, DispatcherQueueHandler};
 
 /// [`Dispatcher`] backed by the WinUI thread's `DispatcherQueue`.
+#[cfg(feature = "winui-backend")]
 pub struct WinUIDispatcher {
     queue: DispatcherQueue,
     /// Agile handle used to satisfy [`SendDispatcher`] from any thread.
     send_handle: Arc<AgileDispatcherQueue>,
 }
 
+#[cfg(feature = "winui-backend")]
 impl WinUIDispatcher {
     pub fn for_current_thread() -> Result<Self> {
         let queue = DispatcherQueue::GetForCurrentThread()?;
@@ -823,6 +918,7 @@ impl WinUIDispatcher {
     }
 }
 
+#[cfg(feature = "winui-backend")]
 impl Dispatcher for WinUIDispatcher {
     fn enqueue(&self, priority: DispatcherQueuePriority, f: Box<dyn FnOnce()>) -> bool {
         let slot = RefCell::new(Some(f));
@@ -840,15 +936,19 @@ impl Dispatcher for WinUIDispatcher {
 /// Wrapper around an agile `DispatcherQueue` so closures can be posted
 /// across threads. `DispatcherQueue` implements `IAgileObject`; its
 /// `TryEnqueue` is callable from any thread.
+#[cfg(feature = "winui-backend")]
 struct AgileDispatcherQueue {
     queue: DispatcherQueue,
 }
 
 // SAFETY: DispatcherQueue is an agile COM object and TryEnqueue is
 // documented as callable from any thread.
+#[cfg(feature = "winui-backend")]
 unsafe impl Send for AgileDispatcherQueue {}
+#[cfg(feature = "winui-backend")]
 unsafe impl Sync for AgileDispatcherQueue {}
 
+#[cfg(feature = "winui-backend")]
 impl SendDispatcher for AgileDispatcherQueue {
     fn enqueue_send(
         &self,
