@@ -1924,6 +1924,7 @@ impl Default for DML_MEAN_VARIANCE_NORMALIZATION_OPERATOR_DESC {
         unsafe { core::mem::zeroed() }
     }
 }
+pub const DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT: u32 = 16;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DML_NONZERO_COORDINATES_OPERATOR_DESC {
@@ -2181,6 +2182,7 @@ impl Default for DML_PADDING_OPERATOR_DESC {
         unsafe { core::mem::zeroed() }
     }
 }
+pub const DML_PERSISTENT_BUFFER_ALIGNMENT: u32 = 256;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DML_QUANTIZED_LINEAR_CONVOLUTION_OPERATOR_DESC {
@@ -2579,6 +2581,7 @@ impl Default for DML_SPLIT_OPERATOR_DESC {
     }
 }
 pub const DML_TARGET_VERSION: u32 = 20480;
+pub const DML_TEMPORARY_BUFFER_ALIGNMENT: u32 = 256;
 pub type DML_TENSOR_DATA_TYPE = i32;
 pub const DML_TENSOR_DATA_TYPE_FLOAT16: DML_TENSOR_DATA_TYPE = 2;
 pub const DML_TENSOR_DATA_TYPE_FLOAT32: DML_TENSOR_DATA_TYPE = 1;
@@ -2603,6 +2606,8 @@ impl Default for DML_TENSOR_DESC {
         unsafe { core::mem::zeroed() }
     }
 }
+pub const DML_TENSOR_DIMENSION_COUNT_MAX: u32 = 5;
+pub const DML_TENSOR_DIMENSION_COUNT_MAX1: u32 = 8;
 pub type DML_TENSOR_FLAGS = u32;
 pub const DML_TENSOR_FLAG_NONE: DML_TENSOR_FLAGS = 0;
 pub const DML_TENSOR_FLAG_OWNED_BY_DML: DML_TENSOR_FLAGS = 1;
