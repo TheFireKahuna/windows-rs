@@ -980,6 +980,7 @@ mod Windows {
             Epsilon: f32,
             FusedActivation: *const DML_OPERATOR_DESC,
         }
+        const DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT: u32 = 16;
         struct DML_NONZERO_COORDINATES_OPERATOR_DESC {
             InputTensor: *const DML_TENSOR_DESC,
             OutputCountTensor: *const DML_TENSOR_DESC,
@@ -1192,6 +1193,7 @@ mod Windows {
             StartPadding: *const u32,
             EndPadding: *const u32,
         }
+        const DML_PERSISTENT_BUFFER_ALIGNMENT: u32 = 256;
         struct DML_QUANTIZED_LINEAR_CONVOLUTION_OPERATOR_DESC {
             InputTensor: *const DML_TENSOR_DESC,
             InputScaleTensor: *const DML_TENSOR_DESC,
@@ -1440,6 +1442,7 @@ mod Windows {
             Axis: u32,
         }
         const DML_TARGET_VERSION: u32 = 20480;
+        const DML_TEMPORARY_BUFFER_ALIGNMENT: u32 = 256;
         #[repr(i32)]
         enum DML_TENSOR_DATA_TYPE {
             DML_TENSOR_DATA_TYPE_UNKNOWN = 0,
@@ -1459,6 +1462,8 @@ mod Windows {
             Type: DML_TENSOR_TYPE,
             Desc: *const void,
         }
+        const DML_TENSOR_DIMENSION_COUNT_MAX: u32 = 5;
+        const DML_TENSOR_DIMENSION_COUNT_MAX1: u32 = 8;
         #[repr(u32)]
         #[flags]
         enum DML_TENSOR_FLAGS {

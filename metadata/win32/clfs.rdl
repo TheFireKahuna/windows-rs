@@ -56,6 +56,7 @@ mod Windows {
         type CLFS_LSN = CLS_LSN;
         const CLFS_MARSHALLING_FLAG_DISABLE_BUFF_INIT: u32 = 1;
         const CLFS_MARSHALLING_FLAG_NONE: u32 = 0;
+        const CLFS_MAX_CONTAINER_INFO: u32 = 256;
         struct CLFS_NODE_ID {
             cType: u32,
             cbNode: u32,
@@ -66,7 +67,13 @@ mod Windows {
             PhysicalLsn: CLFS_LSN,
         }
         type CLFS_RECORD_TYPE = CLS_RECORD_TYPE;
+        const CLFS_SCAN_BACKWARD: u8 = 4;
+        const CLFS_SCAN_BUFFERED: u8 = 32;
+        const CLFS_SCAN_CLOSE: u8 = 8;
         type CLFS_SCAN_CONTEXT = CLS_SCAN_CONTEXT;
+        const CLFS_SCAN_FORWARD: u8 = 2;
+        const CLFS_SCAN_INIT: u8 = 1;
+        const CLFS_SCAN_INITIALIZED: u8 = 16;
         type CLFS_SCAN_MODE = u8;
         struct CLFS_STREAM_ID_INFORMATION {
             StreamIdentifier: u8,
@@ -174,6 +181,14 @@ mod Windows {
             Buffer: *mut void,
             ByteLength: u32,
         }
+        const ClfsClientRecord: u8 = 3;
+        const ClfsContainerActive: u32 = 4;
+        const ClfsContainerActivePendingDelete: u32 = 8;
+        const ClfsContainerInactive: u32 = 2;
+        const ClfsContainerInitializing: u32 = 1;
+        const ClfsContainerPendingArchive: u32 = 16;
+        const ClfsContainerPendingArchiveAndDelete: u32 = 32;
+        const ClfsDataRecord: u8 = 1;
         #[library("clfsw32.dll", import = "LsnBlockOffset")]
         extern fn ClfsLsnBlockOffset(plsn: *const CLFS_LSN) -> u32;
         #[library("clfsw32.dll", import = "LsnContainer")]
@@ -194,6 +209,14 @@ mod Windows {
         extern fn ClfsLsnNull(plsn: *const CLFS_LSN) -> BOOLEAN;
         #[library("clfsw32.dll", import = "LsnRecordSequence")]
         extern fn ClfsLsnRecordSequence(plsn: *const CLFS_LSN) -> u32;
+        const ClfsNullRecord: u8 = 0;
+        const ClfsRestartRecord: u8 = 2;
+        const ClsContainerActive: u32 = 4;
+        const ClsContainerActivePendingDelete: u32 = 8;
+        const ClsContainerInactive: u32 = 2;
+        const ClsContainerInitializing: u32 = 1;
+        const ClsContainerPendingArchive: u32 = 16;
+        const ClsContainerPendingArchiveAndDelete: u32 = 32;
         #[encoding("ansi")]
         const EA_CONTAINER_NAME: String = "ContainerName";
         #[encoding("ansi")]

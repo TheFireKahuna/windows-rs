@@ -1314,5 +1314,8 @@ mod Windows {
             dwTotalSampleDropsInCodec: u32,
             dwTotalSampleDropsInMultiplexer: u32,
         }
+        const g_dwWMContentAttributes: u32 = 5;
+        const g_dwWMNSCAttributes: u32 = 5;
+        const g_dwWMSpecialAttributes: u32 = 20;
     }
 }
