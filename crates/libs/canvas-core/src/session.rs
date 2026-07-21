@@ -599,13 +599,26 @@ impl<'a> DrawingSession<'a> {
         }
     }
 
+    /// Creates a Gaussian shadow effect from `source` with Direct2D's default blur
+    /// standard deviation and tint (3 DIPs, opaque black). Draw its output with
+    /// [`draw_effect`](Self::draw_effect). Use
+    /// [`create_shadow_tinted`](Self::create_shadow_tinted) to choose the blur and
+    /// color.
+    pub fn create_shadow(&self, source: &Bitmap) -> Result<Effect> {
+        unsafe {
+            let effect = self.context.CreateEffect(&CLSID_D2D1Shadow)?;
+            effect.SetInput(0, &source.0, true);
+            Ok(Effect(effect))
+        }
+    }
+
     /// Creates a Gaussian shadow/glow effect from `source`: the source's alpha channel
     /// is blurred by `blur_standard_deviation` (DIPs) and tinted with `color`. Draw its
     /// output with [`draw_effect`](Self::draw_effect) — at the identity transform it
     /// reads as a centered glow; under a translation, a drop shadow. `source` must be an
     /// effect-readable image (e.g. a [`create_bitmap_target`](Self::create_bitmap_target)
     /// bitmap that has been drawn into and is not the current target).
-    pub fn create_shadow(
+    pub fn create_shadow_tinted(
         &self,
         source: &Bitmap,
         blur_standard_deviation: f32,
@@ -637,12 +650,12 @@ impl<'a> DrawingSession<'a> {
 
     /// Creates a **color-preserving** Gaussian blur effect from `source`: every
     /// channel is blurred by `blur_standard_deviation` (DIPs) — unlike
-    /// [`create_shadow`](Self::create_shadow), which blurs only the alpha channel and
-    /// re-tints it with a single color. Draw its output with
+    /// [`create_shadow_tinted`](Self::create_shadow_tinted), which blurs only the
+    /// alpha channel and re-tints it with a single color. Draw its output with
     /// [`draw_effect`](Self::draw_effect). Use it for a bloom that must keep a
     /// multi-colored source's own hues (e.g. a gradient-stroked line glowing in its
     /// own colors along its length). `source` must be an effect-readable image (see
-    /// [`create_shadow`](Self::create_shadow)).
+    /// [`create_shadow_tinted`](Self::create_shadow_tinted)).
     pub fn create_blur(&self, source: &Bitmap, blur_standard_deviation: f32) -> Result<Effect> {
         unsafe {
             let effect = self.context.CreateEffect(&CLSID_D2D1GaussianBlur)?;
@@ -716,7 +729,7 @@ impl<'a> DrawingSession<'a> {
         let Ok(shape) = renderer.render(size_px, live.m11, !self.encode_srgb, draw_shape) else {
             return false;
         };
-        let Ok(shadow) = self.create_shadow(&shape, blur_standard_deviation, color) else {
+        let Ok(shadow) = self.create_shadow_tinted(&shape, blur_standard_deviation, color) else {
             return false;
         };
         // Composite the blurred shadow at the live translation plus the drop offset

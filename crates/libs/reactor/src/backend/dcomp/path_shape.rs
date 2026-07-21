@@ -726,7 +726,7 @@ fn bake_glow(
         // Canvas `shadowBlur` is 2σ (the value the mockups author), so σ = blur/2
         // — the same halving the painted glow applied. The tint rides the output
         // colour map like every solid.
-        let halo = session.create_shadow(&shape, blur * 0.5, linear(color)).ok()?;
+        let halo = session.create_shadow_tinted(&shape, blur * 0.5, linear(color)).ok()?;
         // The shape bitmap already holds scaled pixels: composite it 1:1.
         session.set_transform(&Matrix3x2 {
             m11: 1.0,

@@ -554,7 +554,7 @@ mod tests {
         });
 
         let shadow = session
-            .create_shadow(&target, 3.0, ColorF::BLACK)
+            .create_shadow_tinted(&target, 3.0, ColorF::BLACK)
             .unwrap();
         session.draw_effect(&shadow);
         session.draw_image(&target);
