@@ -131,6 +131,122 @@ Windows.Graphics.DirectX.DirectXPixelFormat
 Windows.Graphics.DirectX.DirectXAlphaMode
 Windows.Win32.ICompositorInterop::{CreateGraphicsDevice}
 Windows.Win32.ICompositionDrawingSurfaceInterop::{BeginDraw, EndDraw, Resize}
+// Integer-pixel drawing surfaces. A surface sized in DIPs cannot be made exactly
+// N pixels wide, which is what a content-addressed raster cache needs.
+Windows.UI.Composition.ICompositionGraphicsDevice2::{CreateDrawingSurface2}
+Windows.Graphics.SizeInt32
+// How a surface brush maps its surface onto the visual it paints. The default is
+// Uniform; content-addressed atlases and gradient ramps need Fill.
+Windows.UI.Composition.CompositionStretch
+Windows.UI.Composition.ICompositionSurfaceBrush::{put_Stretch}
 // endregion
+
+// The base every composition object derives from. StopAnimation belongs here
+// alongside StartAnimation, and the base type is what an expression animation
+// takes as a reference parameter — so a property set, a clip or an interaction
+// tracker can be referenced, not only a visual.
+Windows.UI.Composition.ICompositionObject::{StopAnimation}
+Windows.UI.Composition.ICompositionObject4::{TryGetAnimationController}
+Windows.UI.Composition.AnimationController
+
+// Property sets: the CPU-to-compositor frontier. The app writes named values when
+// they change; an expression animation referencing the set re-reads them every
+// vblank without waking the writing thread.
+Windows.UI.Composition.CompositionPropertySet
+Windows.UI.Composition.ICompositionPropertySet::{InsertScalar, InsertVector2, InsertVector3, TryGetScalar, TryGetVector2, TryGetVector3}
+Windows.UI.Composition.CompositionGetValueStatus
+Windows.UI.Composition.ICompositor::{CreatePropertySet}
+
+// Expression animations: a compositor-evaluated expression over referenced
+// objects, re-evaluated every frame. Unlike a key-frame animation, its text is
+// validated only when the animation starts.
+Windows.UI.Composition.ExpressionAnimation
+Windows.UI.Composition.IExpressionAnimation::{put_Expression}
+Windows.UI.Composition.ICompositionAnimation::{SetReferenceParameter, SetScalarParameter, SetVector2Parameter, SetVector3Parameter}
+Windows.UI.Composition.ICompositor::{CreateExpressionAnimationWithExpression}
+
+// Vector2 key frames complete the scalar/Vector2/Vector3 set, so a size or a
+// two-axis offset can be animated without decomposing it.
+Windows.UI.Composition.Vector2KeyFrameAnimation
+Windows.UI.Composition.IVector2KeyFrameAnimation::{InsertKeyFrame, InsertKeyFrameWithEasingFunction}
+Windows.UI.Composition.ICompositor::{CreateVector2KeyFrameAnimation}
+Windows.UI.Composition.IScalarKeyFrameAnimation::{InsertKeyFrame}
+
+// Natural-motion (spring) animations. A spring retargets mid-flight by having its
+// final value reassigned, which is what lets a gesture redirect without the
+// discontinuity a restarted key-frame animation would show.
+Windows.UI.Composition.NaturalMotionAnimation
+Windows.UI.Composition.ScalarNaturalMotionAnimation
+Windows.UI.Composition.Vector2NaturalMotionAnimation
+Windows.UI.Composition.Vector3NaturalMotionAnimation
+Windows.UI.Composition.SpringScalarNaturalMotionAnimation
+Windows.UI.Composition.SpringVector2NaturalMotionAnimation
+Windows.UI.Composition.SpringVector3NaturalMotionAnimation
+Windows.UI.Composition.IScalarNaturalMotionAnimation::{put_FinalValue}
+Windows.UI.Composition.IVector2NaturalMotionAnimation::{put_FinalValue}
+Windows.UI.Composition.IVector3NaturalMotionAnimation::{put_FinalValue}
+Windows.UI.Composition.ISpringScalarNaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows.UI.Composition.ISpringVector2NaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows.UI.Composition.ISpringVector3NaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows.UI.Composition.ICompositor4::{CreateSpringScalarAnimation, CreateSpringVector2Animation, CreateSpringVector3Animation}
+
+// Clips: an inset rectangle applied to a visual's subtree. Its insets are
+// animatable, so a clip is an animation target in its own right — a reveal is a
+// clip whose inset animates, not a visual whose size does.
+Windows.UI.Composition.CompositionClip
+Windows.UI.Composition.InsetClip
+Windows.UI.Composition.IInsetClip::{put_LeftInset, put_TopInset, put_RightInset, put_BottomInset}
+Windows.UI.Composition.ICompositor::{CreateInsetClip}
+Windows.UI.Composition.IVisual::{put_Clip, put_RotationAngle}
+
+// Paths and stroked shapes. A composition path is immutable, so changing a shape
+// means re-pointing its geometry; trimming exposes a fraction of the path, which
+// is how an arc sweeps without regenerating geometry.
+Windows.UI.Composition.CompositionPath
+Windows.UI.Composition.ICompositionPathFactory::{Create}
+Windows.UI.Composition.CompositionPathGeometry
+Windows.UI.Composition.ICompositor5::{CreatePathGeometryWithPath, CreateRoundedRectangleGeometry}
+Windows.UI.Composition.CompositionRoundedRectangleGeometry
+Windows.UI.Composition.ICompositionRoundedRectangleGeometry::{put_CornerRadius, put_Offset, put_Size}
+Windows.UI.Composition.ICompositionGeometry::{put_TrimStart, put_TrimEnd}
+Windows.UI.Composition.ICompositionSpriteShape::{put_Geometry, put_StrokeBrush, put_StrokeThickness, put_StrokeStartCap, put_StrokeEndCap}
+Windows.UI.Composition.CompositionStrokeCap
+Windows.UI.Composition.ICompositionShape::{put_Scale}
+
+// Mask brushes and visual surfaces. A visual surface captures a live subtree as a
+// surface; masking a wide-gamut source with it keeps colour in the source brush
+// and coverage in the mask, which an 8-bit colour brush could not carry.
+Windows.UI.Composition.CompositionMaskBrush
+Windows.UI.Composition.ICompositionMaskBrush::{put_Mask, put_Source}
+Windows.UI.Composition.ICompositor2::{CreateMaskBrush}
+// region: system-only
+// The visual-surface wrapper lives in surface.rs alongside the D2D bridge, which
+// is system-only, so the lifted stack has no consumer for these. The type itself
+// exists on both stacks — move this out of the region if a lifted caller appears.
+Windows.UI.Composition.CompositionVisualSurface
+Windows.UI.Composition.ICompositorWithVisualSurface::{CreateVisualSurface}
+Windows.UI.Composition.ICompositionVisualSurface::{put_SourceVisual, put_SourceOffset, put_SourceSize}
+// endregion
+// Drop shadows. A compositor-side Gaussian applied to a sprite, with an
+// arbitrary brush as its alpha mask — a shadow at zero offset IS a glow, and
+// unlike an effect graph it needs no D2D interop at all. `SourcePolicy` selects
+// whether the shadow tints with its own (8-bit) Color or derives from the
+// visual's own content.
+Windows.UI.Composition.CompositionShadow
+Windows.UI.Composition.DropShadow
+Windows.UI.Composition.ICompositor2::{CreateDropShadow}
+Windows.UI.Composition.IDropShadow::{put_BlurRadius, put_Color, put_Mask, put_Offset, put_Opacity}
+Windows.UI.Composition.IDropShadow2::{put_SourcePolicy}
+Windows.UI.Composition.CompositionDropShadowSourcePolicy
+Windows.UI.Composition.ISpriteVisual2::{put_Shadow}
+
+Windows.UI.Composition.ICompositionNineGridBrush::{SetInsetScales}
+Windows.UI.Composition.IVisualCollection::{InsertAbove}
+
+// Scoped-batch completion: the only signal that a batch's animations have all
+// finished. Without it a visual retained for an exit transition has no defined
+// moment of release.
+Windows.UI.Composition.ICompositionScopedBatch::{add_Completed, remove_Completed}
+Windows.UI.Composition.CompositionBatchCompletedEventArgs
 
 Windows.UI.Color
