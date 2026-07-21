@@ -4,13 +4,16 @@
 //! `CreateDesktopWindowTarget`, a shared multi-threaded canvas [`GpuDevice`] is
 //! exposed to it as a `CompositionGraphicsDevice`, and a **retained per-node
 //! composition tree** is built under the root: every reactor node owns a
-//! `ContainerVisual` (offset/size/opacity/clip set by layout), and every node
-//! with painted chrome additionally owns a `SpriteVisual` backed by an FP16
-//! (`R16G16B16A16Float`) `CompositionDrawingSurface` drawn **once** and redrawn
-//! only when its own content or size changes. The system compositor composites
-//! scRGB FP16 straight to DWM without clamping — whole-window HDR comes free, and
-//! moving / fading / clipping a node is a compositor offset/opacity/clip change
-//! with no repaint.
+//! `ContainerVisual` (offset/size/opacity/clip set by layout) whose chrome is
+//! retained compositor objects — nine-grid sprites, vector sprite shapes and
+//! glyph sprites — sourced from shared, cached FP16 (`R16G16B16A16Float`)
+//! rasters. The system compositor composites scRGB FP16 straight to DWM without
+//! clamping, so whole-window HDR comes free, and moving / fading / clipping a
+//! node is a compositor offset/opacity/clip change with no repaint at all.
+//!
+//! Nodes used to own a drawing surface each, redrawn whenever their content or
+//! size changed. [`NodeSurface`] is what remains of that, and only the popup
+//! still mints one.
 
 use std::cell::Cell;
 
@@ -18,25 +21,27 @@ use super::backdrop::{self, Backdrop};
 use crate::system_bindings::{
     Color, CompositionColorBrush, CompositionDrawingSurface, CompositionGraphicsDevice,
     CompositionStretch, CompositionSurfaceBrush, Compositor, ContainerVisual, DesktopWindowTarget,
-    DirectXAlphaMode, DirectXPixelFormat, ICompositionDrawingSurface2,
-    ICompositionDrawingSurfaceInterop, ICompositionSurface, ICompositionTarget,
-    ICompositorDesktopInterop, ICompositorInterop, IVisual, InsetClip, Size, SizeInt32,
-    SpriteVisual, Visual, GetMonitorInfoW, MonitorFromWindow, HWND, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST,
+    DirectXAlphaMode, DirectXPixelFormat, ICompositionDrawingSurfaceInterop,
+    ICompositionSurface, ICompositionTarget, ICompositorDesktopInterop, ICompositorInterop,
+    IVisual, InsetClip, Size, SpriteVisual, Visual, GetMonitorInfoW, MonitorFromWindow, HWND,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows_canvas_core::GpuDevice;
 use windows_core::Interface;
 use windows_numerics::{Vector2, Vector3};
 
-/// A node's painted chrome: a `SpriteVisual` filled by an FP16 surface brush.
-/// Created lazily for nodes that actually draw something; pure layout containers
-/// never allocate one (a texture+visual per *painted* node, far cheaper than a
-/// WinUI `UIElement`, and drawn once).
+/// A drawn surface: a `SpriteVisual` filled by an FP16 surface brush.
+///
+/// The library's one remaining immediate-mode surface, and it belongs to the
+/// popup ([`super::popup`]) — a flyout's list is drawn in one pass because its
+/// rows are transient, unparented content rather than arena nodes with retained
+/// chrome of their own.
+///
+/// Every OTHER control's appearance is compositor objects. This type used to be
+/// per-node chrome, minted for anything that drew; nothing else draws now.
 pub(crate) struct NodeSurface {
     pub sprite: SpriteVisual,
     pub interop: ICompositionDrawingSurfaceInterop,
-    /// Current backing size in physical pixels.
-    pub px: (i32, i32),
     /// Presented size in DIPs, as last pushed to the sprite. Born deliberately
     /// negative so the first push always lands.
     dip: (f32, f32),
@@ -53,6 +58,16 @@ pub(crate) struct Compositing {
     // Held so the shared D3D/D2D device outlives the graphics device and surfaces.
     #[allow(dead_code)]
     pub gpu: GpuDevice,
+    /// Latched when any rasterizer sees a device-loss HRESULT, and cleared only
+    /// by the frame that acts on it ([`Self::took_device_loss`]).
+    ///
+    /// It LATCHES rather than being reset before each draw, which is what it
+    /// used to do: several sources can rasterize in one frame, and clearing the
+    /// flag at the top of each one meant a loss reported by the first was erased
+    /// by the second. Nothing raised it at all until the node painter was
+    /// retired — loss was noticed only because that painter propagated its
+    /// `BeginDraw` error out of the walk, so the flag beside it was dead. Every
+    /// raster path reports here now.
     pub device_lost: Cell<bool>,
     compositor: Compositor,
     graphics: CompositionGraphicsDevice,
@@ -76,7 +91,33 @@ pub(crate) struct Compositing {
     scale: f32,
 }
 
+/// Whether an HRESULT means the GPU device is gone and every resource built on
+/// it has to be rebuilt.
+///
+/// `D2DERR_RECREATE_TARGET` is the one Direct2D reports from `EndDraw`;
+/// `DXGI_ERROR_DEVICE_REMOVED` / `_RESET` come from the layer below when the
+/// adapter itself was lost (a driver reset, a TDR, an external GPU unplugged).
+/// Any other failure is a bad call, not a lost device, and must NOT trigger a
+/// rebuild — the rebuild would fail identically and the frame would loop.
+pub(crate) fn is_device_loss(e: &windows_core::Error) -> bool {
+    matches!(e.code().0 as u32, 0x8899_000C | 0x887A_0005 | 0x887A_0007)
+}
+
 impl Compositing {
+    /// Latch a rasterizer's failure if it was a device loss. Every `BeginDraw` /
+    /// `EndDraw` failure path calls this; the ones that are not device loss fall
+    /// through and the caller's own `None` handles them.
+    pub(crate) fn note_error(&self, e: &windows_core::Error) {
+        if is_device_loss(e) {
+            self.device_lost.set(true);
+        }
+    }
+
+    /// Consume the latch: `true` once per loss, for the frame that rebuilds.
+    pub(crate) fn took_device_loss(&self) -> bool {
+        self.device_lost.replace(false)
+    }
+
     pub fn new(hwnd: HWND, pixel_w: i32, pixel_h: i32, dpi: f32) -> windows_core::Result<Self> {
         let gpu = GpuDevice::new_multi_threaded()?;
 
@@ -438,7 +479,6 @@ impl Compositing {
         Ok(NodeSurface {
             sprite,
             interop,
-            px: (px_w, px_h),
             dip: (-1.0, -1.0),
             _surface: surface,
             _brush: brush,
@@ -447,30 +487,11 @@ impl Compositing {
 }
 
 impl NodeSurface {
-    /// Resize the backing surface in place when the node's size changes, reusing
-    /// the sprite/brush/visual (avoids churn). The sprite's DIP size is set by
-    /// layout; this only matches the pixel buffer to it.
-    pub fn resize(&mut self, px_w: i32, px_h: i32) -> windows_core::Result<()> {
-        let (px_w, px_h) = (px_w.max(1), px_h.max(1));
-        if (px_w, px_h) == self.px {
-            return Ok(());
-        }
-        let surface2: ICompositionDrawingSurface2 = self.interop.cast()?;
-        surface2.Resize(SizeInt32 {
-            width: px_w,
-            height: px_h,
-        })?;
-        self.px = (px_w, px_h);
-        Ok(())
-    }
-
     /// Set the sprite's presented (DIP) size.
     ///
-    /// Gated on the last value pushed, for the reason [`resize`](Self::resize)
-    /// is: the paint pass reaches every surface-bearing node on every repaint,
-    /// and a node whose size did not change would otherwise pay a `cast` plus a
-    /// cross-process `SetSize` per frame. A DIP size is independent of scale, so
-    /// a DPI change resizes the pixel buffer without touching this.
+    /// Gated on the last value pushed: a popup reaching this with an unchanged
+    /// size would otherwise pay a `cast` plus a cross-process `SetSize` for
+    /// nothing.
     pub fn set_dip_size(&mut self, w: f32, h: f32) {
         let (w, h) = (w.max(0.0), h.max(0.0));
         if (w, h) == self.dip {
@@ -482,29 +503,6 @@ impl NodeSurface {
         }
     }
 
-    /// Set the sprite's offset (DIP) within its parent container.
-    pub fn set_offset(&self, x: f32, y: f32) {
-        if let Ok(v) = self.sprite.cast::<IVisual>() {
-            let _ = v.SetOffset(Vector3::new(x, y, 0.0));
-        }
-    }
-
-    /// Set the sprite's opacity (used to fade the scroll thumb in/out).
-    pub fn set_opacity(&self, a: f32) {
-        if let Ok(v) = self.sprite.cast::<IVisual>() {
-            let _ = v.SetOpacity(a.clamp(0.0, 1.0));
-        }
-    }
-
-    /// Snap the sprite's opacity to `a`, first stopping any in-flight
-    /// compositor fade on it — a plain property set while an animation holds
-    /// the property would otherwise be ignored.
-    pub fn snap_opacity(&self, a: f32) {
-        if let Ok(o) = self.sprite.cast::<crate::system_bindings::ICompositionObject>() {
-            let _ = o.StopAnimation("Opacity");
-        }
-        self.set_opacity(a);
-    }
 }
 
 /// The opaque window background (dark), composited beneath the reactor tree. This is

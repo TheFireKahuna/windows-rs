@@ -65,7 +65,7 @@ pub(crate) struct RingParts {
     track: PathLayer,
     /// Top: the value arc, trimmed, and revolved while indeterminate.
     arc: PathLayer,
-    /// `(cx, cy, r)` — gates re-tessellating the shared path.
+    /// `(cx, cy, r)` in DIPs — gates re-tessellating the shared path.
     geom: (f32, f32, f32),
     /// `(w, h, scale)` — gates the layer resize. `scale` is in the gate because
     /// it is an input to the mask raster, so a display move with an unchanged
@@ -105,39 +105,33 @@ impl RingParts {
 
         // ── Geometry ──
         //
-        // Tessellated in PHYSICAL pixels, not DIPs, and the stroke with it.
-        //
-        // A `CompositionVisualSurface` captures a region of its source visual's
-        // content, and the source visual's OWN transform is not part of what it
-        // captures — so `PathLayer::resize`'s `SetScale` on the off-tree mask
-        // visual does not scale what lands in the surface. What DOES define the
-        // mapping is the captured extent (`SourceSize = w·scale × h·scale`)
-        // against the display sprite's DIP size, which is a 1:1 physical
-        // mapping. Geometry authored in DIPs therefore renders `scale`× too
-        // small — measurably: at 150% a 28-DIP ring came out 24 px where it
-        // should be 36.
-        let resized = self.geom != (cx * scale, cy * scale, r * scale);
+        // Authored in DIPs, like every other consumer of `PathLayer`: the layer
+        // puts the DIP→px scale on its shape (see `PathLayer::resize`), so a
+        // display change is a property set rather than a re-tessellation. This
+        // used to bake `scale` into every coordinate here, back when the layer
+        // could not carry it.
+        let resized = self.geom != (cx, cy, r);
         if resized
             && let Some(path) = arc_path(
                 &comp.gpu,
-                cx * scale,
-                cy * scale,
-                r * scale,
+                cx,
+                cy,
+                r,
                 START_ANGLE,
                 START_ANGLE + std::f32::consts::TAU,
             )
         {
             self.track.set_path(&path);
             self.arc.set_path(&path);
-            self.geom = (cx * scale, cy * scale, r * scale);
+            self.geom = (cx, cy, r);
         }
         if self.size != (w, h, scale) {
             self.track.resize(w, h, scale);
             self.arc.resize(w, h, scale);
             self.size = (w, h, scale);
         }
-        self.track.set_thickness(thick * scale);
-        self.arc.set_thickness(thick * scale);
+        self.track.set_thickness(thick);
+        self.arc.set_thickness(thick);
         self.track.set_source(comp, theme::w(0.08), &[], atlas_epoch, scale);
         self.arc.set_source(comp, theme::accent(), &[], atlas_epoch, scale);
         self.track.set_opacity(dim);

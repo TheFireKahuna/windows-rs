@@ -985,7 +985,11 @@ impl ArenaHarness {
             | ControlKind::ToggleButton
             | ControlKind::RepeatButton
             | ControlKind::SplitButton => dcomp::parts::button_plan(n, scale),
-            ControlKind::Border => dcomp::parts::box_plan(n, scale),
+            // Every box-drawn kind resolves through the same plan, so the
+            // fallback is asked rather than the handful of names that used to
+            // be listed — a `Rectangle`, a `StackPanel` and a picker shell are
+            // one control here.
+            ControlKind::Border | ControlKind::Rectangle => dcomp::parts::box_plan(n, scale),
             ControlKind::NumberBox
             | ControlKind::TextBox
             | ControlKind::PasswordBox
@@ -1034,10 +1038,26 @@ impl ArenaHarness {
         }
     }
 
-    /// Whether this node would be given a paint surface — the test-visible form
-    /// of "does it ever reach a `BeginDraw`".
-    pub fn has_chrome(&self, id: ControlId) -> Option<bool> {
-        Some(self.arena.get(id)?.has_chrome())
+    /// Which renderer owns this node's appearance, or `None` if NOTHING does.
+    ///
+    /// The successor to a `has_chrome` predicate that asked whether a node would
+    /// be given a drawing surface. No node is: there is no painter, so that
+    /// question now has one answer for every kind and tests nothing.
+    ///
+    /// What replaced it as the thing worth asserting is total coverage. A kind
+    /// the sync walk does not admit renders nothing at all — silently, with no
+    /// compiler error — so `None` here is the failure that predicate used to
+    /// stand in for.
+    pub fn renders_via(&self, id: ControlId) -> Option<&'static str> {
+        let kind = self.arena.get(id)?.kind;
+        use crate::backend::ControlKind as K;
+        Some(match kind {
+            K::TextBlock => "text",
+            K::Path | K::Ellipse | K::Line => "shape",
+            K::Knob => "knob",
+            _ if dcomp::parts::converted(kind) => "parts",
+            _ => return None,
+        })
     }
 
     /// Stamp the laid-out rect a real layout pass would have written. The pane

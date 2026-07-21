@@ -398,7 +398,6 @@ impl DCompBackend {
     /// Edge-trigger the thumb reveal/conceal fade (played on the system
     /// compositor). A reveal only happens while the content actually overflows.
     fn set_thumb_shown(&mut self, id: ControlId, shown: bool) {
-        let compositor = self.comp.compositor().clone();
         if let Some(n) = self.node_mut(id) {
             let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, n.scroll_off);
             // The app's visibility policy overrides the hover edge — an
@@ -413,8 +412,8 @@ impl DCompBackend {
                 };
             if show != n.thumb_shown {
                 n.thumb_shown = show;
-                if let Some(t) = &n.scroll_thumb {
-                    animate::fade_thumb(&compositor, t, show);
+                if let Some(t) = &mut n.scroll_thumb {
+                    t.fade_thumb(show);
                 }
             }
         }
@@ -434,7 +433,7 @@ impl DCompBackend {
             n.scroll_snap(scroll);
             let g = scroll::thumb_geom(vh, content_h, scroll);
             let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
-            n.thumb_snap(tx, g.thumb_y);
+            n.thumb_snap(tx, g.thumb_y, g.thumb_h);
         }
     }
 
@@ -1613,9 +1612,8 @@ impl DCompBackend {
             origin,
             Popup::content_inset(),
         );
-        let _ = paint::paint(
+        sync::sync_tree(
             &self.comp,
-            &mut self.cache,
             &mut self.atlas,
             &mut self.glyphs,
             &mut self.arena,
@@ -1870,7 +1868,7 @@ impl DCompBackend {
                 n.scroll_glide(target);
                 let g = scroll::thumb_geom(n.rect.h, n.ctrl().content_h, target);
                 let tx = n.rect.w - scroll::THUMB_W - scroll::THUMB_MARGIN;
-                n.thumb_glide(tx, g.thumb_y);
+                n.thumb_glide(tx, g.thumb_y, g.thumb_h);
             }
             // Reveal the thumb while scrolling (it conceals when the pointer
             // leaves the container).

@@ -40,7 +40,7 @@
 //! fill + thumb over the painted groove).
 //!
 //! A node with **no** surface has no band to straddle — the button family draws
-//! nothing at all (`Node::has_chrome`). The two groups then keep their relative
+//! nothing at all. The two groups then keep their relative
 //! order simply by being created in it, which is the same z-order the banded
 //! case produces; see [`ensure`].
 
@@ -267,7 +267,16 @@ enum ShapeKey {
     /// A horizontally stretchable rounded bar of fixed DIP height `h` and
     /// corner radius `r`; filled when `stroke_w == 0`, stroked otherwise.
     /// Served through a per-part nine-grid brush.
-    HBar { h: u32, r: u32, stroke_w: u32 },
+    /// A rounded bar with a FIXED cross-axis extent (`thick`) and a stretchable
+    /// length, served through a nine-grid so its rounded ends survive the
+    /// stretch. `vertical` picks which axis is which: a horizontal bar is
+    /// `thick` tall and stretches across, a vertical one is `thick` wide and
+    /// stretches down.
+    ///
+    /// One shape rather than two because the raster is identical up to a
+    /// transpose — only the source extent and the nine-grid's inset axis differ,
+    /// and both are derived from this flag rather than restated.
+    Bar { thick: u32, r: u32, stroke_w: u32, vertical: bool },
     /// An exact circle of DIP diameter `d` (drawn 1:1, no stretch).
     Circle { d: u32 },
     /// A checkmark glyph (two strokes) in a `d`×`d` DIP box (drawn 1:1).
@@ -314,12 +323,22 @@ impl AtlasKey {
         Self { shape: ShapeKey::Solid, color: color_bits(c), scale: scale.to_bits() }
     }
     fn hbar(h: f32, r: f32, stroke_w: f32, c: crate::Color, scale: f32) -> Self {
+        Self::bar(h, r, stroke_w, c, scale, false)
+    }
+
+    /// A vertical rounded bar: `w` wide, stretching down. The scroll thumb.
+    fn vbar(w: f32, r: f32, c: crate::Color, scale: f32) -> Self {
+        Self::bar(w, r, 0.0, c, scale, true)
+    }
+
+    fn bar(thick: f32, r: f32, stroke_w: f32, c: crate::Color, scale: f32, vertical: bool) -> Self {
         let scale = snap_scale(scale);
         Self {
-            shape: ShapeKey::HBar {
-                h: snap_extent(h, scale).to_bits(),
+            shape: ShapeKey::Bar {
+                thick: snap_extent(thick, scale).to_bits(),
                 r: snap_len(r, scale, DETAIL_STEPS_PER_PX).to_bits(),
                 stroke_w: snap_len(stroke_w, scale, DETAIL_STEPS_PER_PX).to_bits(),
+                vertical,
             },
             color: color_bits(c),
             scale: scale.to_bits(),
@@ -393,18 +412,25 @@ impl AtlasKey {
     fn inset_px(&self) -> f32 {
         let scale = f32::from_bits(self.scale);
         match &self.shape {
-            ShapeKey::HBar { r, .. } | ShapeKey::GradBar { r, .. } => f32::from_bits(*r) * scale,
+            ShapeKey::Bar { r, .. } | ShapeKey::GradBar { r, .. } => f32::from_bits(*r) * scale,
             _ => 0.0,
         }
     }
-    /// Whether this source is served through a horizontal nine-grid brush
-    /// (rounded ends preserved, middle stretched) rather than a plain stretch.
+    /// Whether this source is served through a nine-grid brush (rounded ends
+    /// preserved, middle stretched) rather than a plain stretch.
     fn uses_nine_grid(&self) -> bool {
         match &self.shape {
-            ShapeKey::HBar { .. } => true,
+            ShapeKey::Bar { .. } => true,
             ShapeKey::GradBar { r, .. } => f32::from_bits(*r) > 0.0,
             _ => false,
         }
+    }
+    /// Which axis the nine-grid's insets sit on. A bar's rounded ends are on
+    /// its LENGTH axis, so a vertical bar insets top/bottom where a horizontal
+    /// one insets left/right; every other source stretches uniformly and the
+    /// answer is unused.
+    fn nine_grid_vertical(&self) -> bool {
+        matches!(&self.shape, ShapeKey::Bar { vertical: true, .. })
     }
 }
 
@@ -530,8 +556,11 @@ fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
     // DIP geometry of the source.
     let (dip_w, dip_h) = match &key.shape {
         ShapeKey::Solid => (4.0 / scale, 4.0 / scale),
-        // Corners plus a 2-DIP stretchable centre column.
-        ShapeKey::HBar { h, r, .. } => (2.0 * f32::from_bits(*r) + 2.0, f32::from_bits(*h)),
+        // Corners plus a 2-DIP stretchable centre band, along the length axis.
+        ShapeKey::Bar { thick, r, vertical, .. } => {
+            let (len, thick) = (2.0 * f32::from_bits(*r) + 2.0, f32::from_bits(*thick));
+            if *vertical { (thick, len) } else { (len, thick) }
+        }
         ShapeKey::Circle { d } | ShapeKey::Check { d } => {
             (f32::from_bits(*d), f32::from_bits(*d))
         }
@@ -554,8 +583,13 @@ fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
 
     let (surface, interop, brush) = comp.new_source_surface(px_w, px_h).ok()?;
     let mut origin = crate::system_bindings::POINT::default();
-    comp.device_lost.set(false);
-    let ctx = unsafe { interop.BeginDraw(None, &mut origin).ok()? };
+    let ctx = match unsafe { interop.BeginDraw(None, &mut origin) } {
+        Ok(c) => c,
+        Err(e) => {
+            comp.note_error(&e);
+            return None;
+        }
+    };
     let session = DrawingSession::from_borrowed_context(
         &ctx,
         Matrix3x2::translation(origin.x as f32, origin.y as f32),
@@ -655,14 +689,16 @@ pub(crate) fn build_circle_surface(
 fn draw_shape(session: &DrawingSession, brush: &Brush, shape: &ShapeKey, w: f32, h: f32) {
     match shape {
         ShapeKey::Solid => session.fill_rect(&Rect::from_xywh(0.0, 0.0, w, h), brush),
-        ShapeKey::HBar { r, stroke_w, .. } => {
+        ShapeKey::Bar { r, stroke_w, .. } => {
             let radius = f32::from_bits(*r);
             let sw = f32::from_bits(*stroke_w);
             let rect = Rect::from_xywh(0.0, 0.0, w, h);
             if sw <= 0.0 {
                 session.fill_rounded_rect(&RoundedRect::uniform(rect, radius), brush);
             } else {
-                // Stroke drawn inset by half its width, like `controls::stroke_rr`.
+                // Stroke drawn INSIDE the box, inset by half its width — the
+                // same arrangement CSS `border-box` describes, and what the
+                // painted `draw_rounded_rect` this replaces did.
                 let inset =
                     Rect::new(sw / 2.0, sw / 2.0, w - sw / 2.0, h - sw / 2.0);
                 session.draw_rounded_rect(&RoundedRect::uniform(inset, radius), brush, sw);
@@ -1182,7 +1218,7 @@ pub(crate) struct Part {
 }
 
 impl Part {
-    fn new(comp: &Compositing) -> Option<Self> {
+    pub(crate) fn new(comp: &Compositing) -> Option<Self> {
         let sprite = comp.new_sprite().ok()?;
         let vis: IVisual = sprite.cast().ok()?;
         let obj: ICompositionObject = sprite.cast().ok()?;
@@ -1255,7 +1291,7 @@ impl Part {
     /// Bind (or re-bind) this part's brush to the atlas source for `key`.
     /// No-op while the key and atlas epoch are unchanged. A gradient bar's key
     /// carries its own stop list, so there is nothing to supply alongside it.
-    fn bind(&mut self, comp: &Compositing, atlas: &mut Atlas, key: AtlasKey) {
+    pub(crate) fn bind(&mut self, comp: &Compositing, atlas: &mut Atlas, key: AtlasKey) {
         if self.key.as_ref() == Some(&key) && self.epoch == atlas.epoch {
             return;
         }
@@ -1276,7 +1312,12 @@ impl Part {
             };
             let inset = key.inset_px();
             let scale = f32::from_bits(key.scale).max(0.01);
-            let ok = nine.SetInsetsWithValues(inset, 0.0, inset, 0.0).is_ok()
+            // Insets go on the LENGTH axis — the one that stretches — so the
+            // rounded ends are the fixed corner cells and the middle band is
+            // what grows. Put them on the wrong axis and a stretched bar
+            // smears its ends instead of preserving them.
+            let (l, t) = if key.nine_grid_vertical() { (0.0, inset) } else { (inset, 0.0) };
+            let ok = nine.SetInsetsWithValues(l, t, l, t).is_ok()
                 && nine.SetInsetScales(1.0 / scale).is_ok()
                 && entry
                     .brush
@@ -1306,7 +1347,7 @@ impl Part {
     /// and the visual strands, and since the cache still reads "already at T"
     /// every later request for T is dropped as redundant, wedging the part
     /// until some different target happens to arrive.
-    fn place(&mut self, x: f32, y: f32, w: f32, h: f32) {
+    pub(crate) fn place(&mut self, x: f32, y: f32, w: f32, h: f32) {
         let off_held = self.off.begin_snap();
         if let Some(prop) = off_held {
             let _ = self.obj.StopAnimation(prop);
@@ -1327,7 +1368,7 @@ impl Part {
 
     /// Spring-glide position + size to a new target. First placement snaps
     /// (mounting must never fly in from the visual's zeroed defaults).
-    fn glide(&mut self, x: f32, y: f32, w: f32, h: f32) {
+    pub(crate) fn glide(&mut self, x: f32, y: f32, w: f32, h: f32) {
         if !self.off.placed() || !self.size.placed() {
             self.place(x, y, w, h);
             return;
@@ -1422,7 +1463,7 @@ impl Part {
     }
 
     /// Snap opacity (stopping any in-flight fade first).
-    fn set_opacity(&mut self, a: f32) {
+    pub(crate) fn set_opacity(&mut self, a: f32) {
         if self.opacity == Some(a) {
             return;
         }
@@ -1442,6 +1483,17 @@ impl Part {
     /// opacity). Quick in, gentler out, retargeting smoothly mid-flight.
     /// First write snaps.
     fn fade_to(&mut self, a: f32) {
+        self.fade_to_over(a, FADE_IN_MS, FADE_OUT_MS);
+    }
+
+    /// [`Self::fade_to`] at a caller's own pace.
+    ///
+    /// The overlay scroll thumb conceals over 300 ms where an ink washes out
+    /// over 220: an auto-hiding indicator that has just told you where you are
+    /// should linger, and one that snaps away reads as a glitch. That is a
+    /// different intent from a hover wash, not a different tuning of the same
+    /// one, so it is passed rather than folded into the shared constants.
+    pub(crate) fn fade_to_over(&mut self, a: f32, in_ms: u64, out_ms: u64) {
         if self.opacity == Some(a) {
             return;
         }
@@ -1452,7 +1504,7 @@ impl Part {
         let run = || -> Option<()> {
             let comp = self.obj.Compositor().ok()?;
             let v = self.sprite.cast::<Visual>().ok()?;
-            let ms = if a > prev { FADE_IN_MS } else { FADE_OUT_MS };
+            let ms = if a > prev { in_ms } else { out_ms };
             super::animate::fade_opacity(
                 &comp,
                 &v,
@@ -1883,7 +1935,7 @@ fn look(kind: ControlKind) -> Option<Look> {
         K::HyperlinkButton => (0, 2, hyperlink_plan),
         // Fill, border, wash and ring, like the Expander's header. The painted
         // fill they used to sit on is gone, so the plan carries the whole
-        // control and `has_chrome` denies it a surface.
+        // control.
         K::ComboBox | K::DropDownButton => {
             (select_slot::N_BELOW, select_slot::N_ABOVE, select_plan)
         }
@@ -1902,13 +1954,42 @@ fn look(kind: ControlKind) -> Option<Look> {
         K::InfoBadge => (1, 0, badge_plan),
         K::InfoBar => (3, 1, bar_plan),
         K::TitleBar => (0, 1, caption_plan),
-        // Every container in the library. A Border, a StackPanel, a Grid, a
-        // ScrollViewer and a picker shell differ in layout and in nothing else:
-        // `controls::paint` returns false for all of them, so the only thing any
-        // of them has ever drawn is a filled rounded box with an outline — which
-        // is the two sprites `box_plan` binds. See `plain_box`.
-        k if k == K::Border || plain_box(k) => (box_slot::N_BELOW, 0, box_plan),
-        _ => return None,
+        // ── The kinds that render themselves ──
+        //
+        // Each of these owns a module that draws its whole appearance, and none
+        // of them has a box behind it, so a plan here would be two sprites that
+        // never bind a source. They are listed BEFORE the fallback because the
+        // fallback is what everything else gets.
+        //
+        // Prose (`glyph_text::text_sync`); geometry (`path_shape::sync_path`);
+        // the dial (`knob::sync_knob`); and the three `plan_less` kinds, whose
+        // chrome is bound to something a plan cannot describe.
+        K::TextBlock | K::Path | K::Ellipse | K::Line | K::Knob => return None,
+        k if plan_less(k) => return None,
+
+        // ── Everything else is a box ──
+        //
+        // A Border, a StackPanel, a Grid, a ScrollViewer, a picker shell and a
+        // `Rectangle` differ in layout and in nothing else: the whole of any of
+        // their appearances is a filled rounded box with an outline, which is
+        // the two sprites `box_plan` binds.
+        //
+        // This is a FALLBACK rather than the 36-name allowlist it replaced.
+        // That list was explicit so it would fail closed — a kind missing from
+        // it kept its drawing surface and was rendered by the painter's
+        // catch-all. There is no painter and no surface now, so an unlisted
+        // kind would have rendered NOTHING, which is the failure the list was
+        // written to prevent. Inverting it restores that intent: a new
+        // `ControlKind` gets the generic box until someone gives it chrome of
+        // its own, and the only way to render nothing is to say so above.
+        //
+        // A `Rectangle` lands here rather than on the path layers its three
+        // sibling shapes use because a rounded box is exactly what the nine-grid
+        // atlas exists to hand out: one cached raster shared with every other
+        // box of the same height and radius, against a per-node tessellation,
+        // visual surface and mask brush. Only genuinely curved geometry earns
+        // those.
+        _ => (box_slot::N_BELOW, 0, box_plan),
     };
     Some(Look { below, above, plan })
 }
@@ -1921,7 +2002,7 @@ fn look(kind: ControlKind) -> Option<Look> {
 /// sync. A plan says where a sprite comes to REST, and none of these three does.
 ///
 /// The ring's sync lives in [`super::ring_shape`], not here, but the kind must
-/// STAY in this list: [`super::paint::needs`] admits a node via `converted`,
+/// STAY in this list: [`super::sync`] admits a node via `converted`,
 /// which is `look(kind).is_some() || plan_less(kind)`. Drop the ring from here
 /// and the paint walk stops visiting it, `sync_ring` never runs, and the ring
 /// renders nothing at all — silently, with no compiler error.
@@ -1932,64 +2013,13 @@ fn plan_less(kind: ControlKind) -> bool {
     )
 }
 
-/// Every kind whose entire appearance is the three generic paint props — a
-/// background, a border brush and a thickness — cut to one corner radius.
+/// Whether a kind's chrome is reconciled by this module at all — the sync
+/// walk's admission test.
 ///
-/// This is the whole of what `paint::fill_and_stroke`'s catch-all arm used to
-/// draw. It is a broad list not because these kinds are alike but because they
-/// are all equally FEATURELESS: `controls::paint` returns false for every one of
-/// them, so none has ever drawn anything but the box, and `box_plan` reads
-/// nothing else. The unimplemented shells — the pickers, `WebView2`,
-/// `RichEditBox` — belong here for exactly that reason.
-///
-/// The list is explicit rather than derived so that it fails CLOSED: a new
-/// `ControlKind` is absent from it, keeps its surface, and is drawn by the
-/// backstop arm. Deriving it (say, as "not `draws_own_chrome` and not otherwise
-/// in `look`") would silently convert a new control that does draw something,
-/// and denying a surface to something that draws renders nothing at all.
-pub(crate) fn plain_box(kind: ControlKind) -> bool {
-    use ControlKind as K;
-    matches!(
-        kind,
-        K::StackPanel
-            | K::Grid
-            | K::Canvas
-            | K::RelativePanel
-            | K::Viewbox
-            | K::ScrollViewer
-            | K::ScrollView
-            | K::ListView
-            | K::GridView
-            | K::FlipView
-            | K::ListBox
-            | K::TreeView
-            | K::TabView
-            | K::TabViewItem
-            | K::Pivot
-            | K::PivotItem
-            | K::RadioButton
-            | K::RadioButtons
-            | K::RatingControl
-            | K::BreadcrumbBar
-            | K::MenuBar
-            | K::CommandBar
-            | K::SplitView
-            | K::ColorPicker
-            | K::DatePicker
-            | K::TimePicker
-            | K::CalendarDatePicker
-            | K::CalendarView
-            | K::ContentDialog
-            | K::TeachingTip
-            | K::Image
-            | K::PersonPicture
-            | K::SwapChainPanel
-            | K::WebView2
-            | K::RichTextBlock
-            | K::RichEditBox
-    )
-}
-
+/// `look` now answers `Some` for everything except the handful of kinds that
+/// render themselves, so this is close to "not one of those". It is still
+/// phrased as the union with [`plan_less`] because the two answer for different
+/// reasons and a future kind could be plan-less without being self-rendering.
 pub(crate) fn converted(kind: ControlKind) -> bool {
     look(kind).is_some() || plan_less(kind)
 }
@@ -2001,36 +2031,28 @@ fn ensure(comp: &Compositing, node: &mut Node, n_below: usize, n_above: usize) -
         return true;
     }
     let Ok(children) = node.container.Children() else { return false };
-    // Absent for a node that draws nothing (the button family, the Border).
-    // The `below` group then stacks from the bottom in creation order instead
-    // of under the surface — "below" only ever meant "below the surface", and
-    // with none the floor of the collection is the same place.
-    let surf_vis = node
-        .surf
-        .as_ref()
-        .and_then(|s| s.sprite.cast::<Visual>().ok());
 
     let mut parts = Box::new(Parts::new());
-    // Creation order = bottom→top within the band: each `InsertBelow(surface)`
-    // lands directly under the surface, pushing earlier parts further down.
+    // Creation order = bottom→top within the band: the first part lands on the
+    // floor of the collection and each later one goes directly above it.
     //
-    // A surfaceless kind stacks from the BOTTOM instead, not the top. For the
-    // button family the two are indistinguishable — the collection is empty
-    // this early, and the glyph hosts that follow insert above regardless. For
-    // a CONTAINER they are not: a Border's children are already parented by the
-    // time the paint pass mints its parts, so `InsertAtTop` would lay the fill
-    // over the very content it exists to sit behind. `restack` would put it
-    // right on the next pass that touches the child list — but a mint dirties
-    // nothing, so "the next pass" can be never, and the box reads as a solid
-    // slab with its label lost underneath.
+    // The floor, specifically — NOT the top. A node's children are already
+    // parented by the time the sync pass mints its parts, so `InsertAtTop`
+    // would lay a container's fill over the very content it exists to sit
+    // behind. `restack` would put it right on the next pass that touches the
+    // child list — but a mint dirties nothing, so "the next pass" can be never,
+    // and the box reads as a solid slab with its label lost underneath.
+    //
+    // This used to insert relative to the node's painted surface sprite, which
+    // is what "below" originally meant. With no surfaces left, the floor of the
+    // collection is that same place.
     let mut prev: Option<Visual> = None;
     for _ in 0..n_below {
         let Some(p) = Part::new(comp) else { return false };
         let Some(v) = p.visual() else { return false };
-        let placed = match (surf_vis.as_ref(), prev.as_ref()) {
-            (Some(sv), _) => children.InsertBelow(&v, sv),
-            (None, Some(pv)) => children.InsertAbove(&v, pv),
-            (None, None) => children.InsertAtBottom(&v),
+        let placed = match prev.as_ref() {
+            Some(pv) => children.InsertAbove(&v, pv),
+            None => children.InsertAtBottom(&v),
         };
         if placed.is_err() {
             return false;
@@ -2288,12 +2310,30 @@ pub(crate) fn box_plan(node: &Node, scale: f32) -> PartPlan {
     let dim = dim_of(node);
     let box_rect = Some((0.0, 0.0, w, h));
 
+    // Both prop pairs, because a box can be authored either way and they mean
+    // the same thing. `background`/`border_brush` are the container modifiers;
+    // `fill`/`stroke` are what the `Shape` widget emits, and a `Rectangle` is a
+    // container that happens to be spelled as a shape.
+    //
+    // This is also a fix, not just a merge: `Rectangle` reached the painter's
+    // `fill_and_stroke`, which read ONLY the container pair — so
+    // `Shape::rectangle().fill(c)` bought itself a surface via `has_chrome` and
+    // then drew nothing on it. The shape pair loses ties on the reasoning that
+    // an explicit container modifier is the more specific authoring.
+    let bg = node.paint.background.or(node.paint.fill);
+    let stroke = node.paint.border_brush.or(node.paint.stroke);
+    // Likewise for the width: whichever pair supplied the colour is the one
+    // that supplied its thickness.
+    let t = if node.paint.border_brush.is_some() {
+        node.paint.border_thickness
+    } else {
+        node.paint.stroke_thickness
+    };
+
     // A fully transparent fill binds nothing: an atlas source that paints no
     // pixels is a wasted raster and a wasted cache slot. Same rule as the
     // button family's chromeless variants.
-    let fill = match node
-        .paint
-        .background
+    let fill = match bg
         .filter(|c| c.a > 0.0)
         .map(|c| AtlasKey::hbar(h, radius, 0.0, c, scale))
     {
@@ -2303,10 +2343,7 @@ pub(crate) fn box_plan(node: &Node, scale: f32) -> PartPlan {
 
     // Thickness gates the outline the same way it gated the painted `draw_rect`
     // — a brush with no width drew nothing there either.
-    let t = node.paint.border_thickness;
-    let border = match node
-        .paint
-        .border_brush
+    let border = match stroke
         .filter(|c| c.a > 0.0 && t > 0.0)
         .map(|c| AtlasKey::hbar(h, radius, t, c, scale))
     {
@@ -2865,9 +2902,8 @@ mod slider_slot {
 ///
 /// The groove and the notch were the last things painting here, and neither
 /// depends on the value: the surface existed to redraw a static track. The ring
-/// moves with them, because `controls::paint`'s shared tail draws it onto the
-/// surface — a surfaceless kind left off `ring_is_retained` loses its focus ring
-/// silently.
+/// is here with them for the same reason — with no surface to draw one on, a
+/// focus ring is two more parts like any other chrome.
 fn slider_sync(
     comp: &Compositing,
     atlas: &mut Atlas,
@@ -3807,6 +3843,76 @@ fn progress_sweep(node: &mut Node, relaid: bool) {
         parts.below[2].stop_loop_x();
         parts.looping = false;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scroll thumb — the auto-hiding overlay scrollbar
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The thumb's reveal and conceal, in ms. See [`Part::fade_to_over`].
+const THUMB_FADE_IN_MS: u64 = 100;
+const THUMB_FADE_OUT_MS: u64 = 300;
+
+impl Part {
+    /// Reveal or conceal an overlay scroll thumb at its own pace.
+    ///
+    /// Named for the one caller rather than left as a bare `fade_to_over` at
+    /// each site, so the thumb's timing is stated once — the hover edge in
+    /// `input` and the policy resolve in `paint` are two triggers for one
+    /// behaviour, and they drifted apart when each spelled it out.
+    pub(crate) fn fade_thumb(&mut self, shown: bool) {
+        self.fade_to_over(
+            if shown { 1.0 } else { 0.0 },
+            THUMB_FADE_IN_MS,
+            THUMB_FADE_OUT_MS,
+        );
+    }
+}
+
+/// Reconcile a scroll container's overlay thumb: a vertical rounded pill above
+/// the scrolled content, revealed and concealed on the compositor.
+///
+/// The last thing in the library to own a private drawing surface. It was a
+/// solid rounded pill re-entering `BeginDraw` whenever its height changed —
+/// which is whenever the content resized — to raster what the nine-grid atlas
+/// hands out for free, shared with every other thumb in the window.
+///
+/// The pill is a VERTICAL bar ([`AtlasKey::vbar`]): its rounded ends are on the
+/// axis that stretches, which is what the nine-grid's inset axis now follows.
+pub(crate) fn sync_scroll_thumb(
+    comp: &Compositing,
+    atlas: &mut Atlas,
+    node: &mut Node,
+    scale: f32,
+    geom: &super::scroll::ThumbGeom,
+    shown: bool,
+) {
+    use super::scroll::{THUMB_MARGIN, THUMB_W};
+    if node.scroll_thumb.is_none() {
+        let Some(part) = Part::new(comp) else { return };
+        let Ok(children) = node.container.Children() else { return };
+        let Ok(v) = part.sprite.cast::<Visual>() else { return };
+        // Topmost: the thumb is an OVERLAY, so it sits above the scrolled
+        // children rather than under them.
+        if children.InsertAtTop(&v).is_err() {
+            return;
+        }
+        node.scroll_thumb = Some(Box::new(part));
+        // Born hidden, so a reveal always plays from zero rather than snapping
+        // in at full strength on the first frame it is warranted.
+        if let Some(t) = &mut node.scroll_thumb {
+            t.set_opacity(0.0);
+        }
+    }
+    let Some(mut thumb) = node.scroll_thumb.take() else { return };
+    thumb.bind(
+        comp,
+        atlas,
+        AtlasKey::vbar(THUMB_W, THUMB_W / 2.0, theme::stroke_strong(), scale),
+    );
+    thumb.place(node.rect.w - THUMB_W - THUMB_MARGIN, geom.thumb_y, THUMB_W, geom.thumb_h);
+    thumb.fade_thumb(shown);
+    node.scroll_thumb = Some(thumb);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

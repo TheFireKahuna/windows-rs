@@ -1416,14 +1416,13 @@ fn apply(
 /// it is collected, and it slots in at the right depth by construction.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Band {
-    /// Chrome parts painted under the node's own surface (ink washes, tracks).
+    /// Retained chrome parts beneath the node's content (ink washes, tracks,
+    /// a container's fill and outline).
     BelowChrome,
-    /// The node's own painted-chrome surface.
-    Surface,
     /// Arena children — or, for a scroll container, the carrier they ride in.
     /// Ordered among themselves by `(z_index, document order)`.
     Content,
-    /// Chrome parts painted over the surface (pills, thumbs, indicators).
+    /// Retained chrome parts above the content (pills, thumbs, indicators).
     AboveChrome,
     /// The auto-hiding overlay scrollbar thumb.
     Overlay,
@@ -1542,9 +1541,6 @@ fn collect(arena: &Arena, id: ControlId, out: &mut Stack) {
             push(out, Container, BelowChrome, v);
         }
     }
-    if let Some(v) = n.surf.as_ref().and_then(|s| s.sprite.cast::<Visual>().ok()) {
-        push(out, Container, Surface, v);
-    }
     // A scroll container's children ride the content CARRIER visual (whose
     // Offset is the animated scroll translation), so the carrier is what
     // occupies the content band and the children stack inside it; every other
@@ -1567,11 +1563,7 @@ fn collect(arena: &Arena, id: ControlId, out: &mut Stack) {
             push(out, Container, AboveChrome, v);
         }
     }
-    if let Some(v) = n
-        .scroll_thumb
-        .as_ref()
-        .and_then(|s| s.sprite.cast::<Visual>().ok())
-    {
+    if let Some(v) = n.scroll_thumb.as_ref().and_then(|s| s.visual()) {
         push(out, Container, Overlay, v);
     }
 }

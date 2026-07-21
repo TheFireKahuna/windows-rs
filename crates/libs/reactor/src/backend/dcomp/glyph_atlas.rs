@@ -14,7 +14,8 @@
 //! colour. Colour arrives later, when a caller pairs this mask with an FP16
 //! scRGB source ([`parts::build_solid_surface`](super::parts::build_solid_surface))
 //! through a `CompositionMaskBrush` — exactly the construction
-//! [`shape::ShapePart`](super::shape::ShapePart) and the knob arc already use.
+//! [`path_shape::PathLayer`](super::path_shape::PathLayer) and the knob arc
+//! already use.
 //!
 //! So the HDR pipe is untouched, and in fact strictly better preserved than a
 //! coloured raster would leave it:
@@ -565,8 +566,15 @@ fn rasterize(
 
     let (surface, interop, brush) = dev.mint(geom.px_w, geom.px_h, MASK_FORMAT).ok()?;
     let mut origin = crate::system_bindings::POINT::default();
-    dev.device_lost().set(false);
-    let ctx = unsafe { interop.BeginDraw(None, &mut origin).ok()? };
+    let ctx = match unsafe { interop.BeginDraw(None, &mut origin) } {
+        Ok(c) => c,
+        Err(e) => {
+            if super::bootstrap::is_device_loss(&e) {
+                dev.device_lost().set(true);
+            }
+            return None;
+        }
+    };
     // No scale anywhere: coverage is already rasterized at `scale`, and its bounds
     // are physical pixels. Only the surface's place in its atlas, which the session
     // carries so a caller's own transform composes with it.

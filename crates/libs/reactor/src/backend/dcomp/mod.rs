@@ -43,7 +43,7 @@ pub(crate) mod live_text;
 pub(crate) mod nav;
 pub(crate) mod node;
 mod pacer;
-mod paint;
+mod sync;
 pub(crate) mod path_shape;
 pub(crate) mod ring_shape;
 pub(crate) mod parts;
@@ -51,7 +51,6 @@ mod pointer;
 mod popup;
 pub(crate) mod record;
 mod scroll;
-mod shape;
 mod size;
 mod surface;
 pub(crate) mod theme;
@@ -82,7 +81,6 @@ pub(crate) use size::register_element_size;
 
 use bootstrap::Compositing;
 use node::{Arena, Ctrl, Extras, MenuRow, Node};
-use paint::PaintCache;
 
 use crate::backend::{Backend, ControlKind, Event, EventHandler, Prop, PropValue};
 use crate::style::{
@@ -112,7 +110,6 @@ struct Ghost {
 pub struct DCompBackend {
     arena: Arena,
     comp: Compositing,
-    cache: PaintCache,
     /// Shared rasterized chrome-part sources (see [`parts::Atlas`]).
     atlas: parts::Atlas,
     /// Shared rasterized glyph masks, behind every retained label (see
@@ -226,7 +223,6 @@ impl DCompBackend {
         Self {
             arena: Arena::default(),
             comp,
-            cache: PaintCache::default(),
             atlas: parts::Atlas::default(),
             glyphs: glyph_atlas::GlyphAtlas::default(),
             root: None,
@@ -341,22 +337,24 @@ impl DCompBackend {
         let roots = [self.root, self.hosted_flyout];
         let scale = self.scale();
         for root in roots.into_iter().flatten() {
-            if paint::paint(
+            sync::sync_tree(
                 &self.comp,
-                &mut self.cache,
                 &mut self.atlas,
                 &mut self.glyphs,
                 &mut self.arena,
                 root,
                 scale,
                 self.scrubbing,
-            )
-            .is_err()
-            {
-                // Device loss: drop cached resources; next paint rebuilds them
-                // (parts and glyph sprites re-bind to freshly rasterized sources
-                // by epoch).
-                self.cache.invalidate();
+            );
+            // Device loss, reported by whichever rasterizer hit it during the
+            // walk (`Compositing::note_error`). Every GPU-backed cache is
+            // dropped so the next pass rebuilds against the new device.
+            //
+            // The walk no longer returns `Err` for this — it no longer draws —
+            // so the latch is what carries the news out. Consuming it here also
+            // keeps the recovery to ONE rebuild per loss, however many sources
+            // reported it.
+            if self.comp.took_device_loss() {
                 self.atlas.clear();
                 self.glyphs.clear();
                 // Brushes re-bind by epoch, but a part's cached OFFSET, SIZE and

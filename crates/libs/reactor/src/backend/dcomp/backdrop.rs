@@ -209,8 +209,13 @@ fn draw_into(
     f: impl FnOnce(&DrawingSession),
 ) -> Option<()> {
     let mut origin = POINT::default();
-    comp.device_lost.set(false);
-    let ctx = unsafe { interop.BeginDraw(None, &mut origin) }.ok()?;
+    let ctx = match unsafe { interop.BeginDraw(None, &mut origin) } {
+        Ok(c) => c,
+        Err(e) => {
+            comp.note_error(&e);
+            return None;
+        }
+    };
     // The atlas origin rides on the session, so a caller's own `set_transform`
     // composes with it instead of dropping it.
     let session = DrawingSession::from_borrowed_context(
@@ -218,7 +223,10 @@ fn draw_into(
         Matrix3x2::translation(origin.x as f32, origin.y as f32),
     );
     f(&session);
-    unsafe { interop.EndDraw() }.ok().ok()?;
+    if let Err(e) = unsafe { interop.EndDraw() }.ok() {
+        comp.note_error(&e);
+        return None;
+    }
     Some(())
 }
 

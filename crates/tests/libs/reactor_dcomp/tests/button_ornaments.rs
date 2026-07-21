@@ -55,13 +55,13 @@ fn no_button_in_the_family_ever_wants_a_surface() {
         let id = a.insert(kind).unwrap();
         a.apply_prop(id, Prop::Content, &V::Str("Apply".into()));
         a.set_rect(id, 200.0, 32.0);
-        assert_eq!(a.has_chrome(id), Some(false), "{kind:?} bare");
+        assert_eq!(a.renders_via(id), Some("parts"), "{kind:?} bare");
 
         // The three things that used to force a draw: an icon, a badge, and
         // focus (which the shared painted focus ring needed a surface for).
         a.apply_prop(id, Prop::Icon, &V::I32(ICON));
         a.apply_prop(id, Prop::Badge, &V::Badge(Badge::count(3)));
-        assert_eq!(a.has_chrome(id), Some(false), "{kind:?} adorned");
+        assert_eq!(a.renders_via(id), Some("parts"), "{kind:?} adorned");
     }
 }
 

@@ -1,171 +1,32 @@
-//! The drawn control library: per-`ControlKind` chrome painters plus the shared
-//! ink (hover/press wash), focus-ring, and small shape helpers every control
-//! reuses. Pure rendering — interaction lives in `input.rs`, state in
-//! `node::Ctrl`. All colours/metrics come from [`theme`]; nothing here is a raw
-//! literal except geometric ratios and glyph codepoints.
+//! The control library's **geometry and metrics**: where each `ControlKind`
+//! puts its parts, which glyphs it shows, and the palettes and measurements
+//! those depend on. Interaction lives in `input.rs`, state in `node::Ctrl`.
+//! All colours/metrics come from [`theme`]; nothing here is a raw literal
+//! except geometric ratios and glyph codepoints.
 //!
-//! **Nothing here draws text.** Every run a control shows is a retained glyph
-//! sprite placed by [`glyph_text`](super::glyph_text) above whatever this module
-//! paints, so this file imports no DirectWrite type and the geometry it exports
-//! — the boxes runs are placed into, the codepoints they are shaped from — is
-//! consumed by that module rather than used here. What remains is fills,
-//! strokes, arcs and rings.
+//! **Nothing here renders.** This module was the drawn control library — a
+//! painter per kind, plus a shared ink wash and focus ring — and every one of
+//! those is now a retained compositor object built by
+//! [`parts`](super::parts), [`path_shape`](super::path_shape) or
+//! [`glyph_text`](super::glyph_text). What survived the move is the arithmetic
+//! those three ask for, which is why this file imports no drawing type at all:
+//! the boxes runs are placed into, the codepoints they are shaped from, the
+//! palettes that colour them.
+//!
+//! It is stated once here rather than inside each renderer because most of it
+//! has several consumers that must not disagree — a measure pass and a sprite
+//! placement reading different answers is a label that overflows its box.
 
 use super::editor;
-use super::node::{is_text_editable, linear, Node};
+use super::node::Node;
 use super::theme;
 use crate::backend::ControlKind;
 use crate::Color;
-use windows_canvas_core::{Brush, DrawingSession, Rect, RoundedRect};
+use windows_canvas_core::Rect;
 
 // Fluent-icon glyph codepoints (rendered in `theme::FONT_ICON`).
 const GLYPH_CHEVRON_DOWN: u32 = 0xE70D;
 const GLYPH_CHEVRON_RIGHT: u32 = 0xE76C;
-
-/// Draw a stateful/drawn control's chrome into its surface-local `rect`.
-/// Returns `true` if it handled the kind (so `paint_chrome` skips the generic
-/// fill/border path).
-pub(crate) fn paint(session: &DrawingSession, brush: &Brush, node: &Node, rect: Rect) -> bool {
-    match node.kind {
-        // The box fill, the outline and the spin column's hairline are parts
-        // (`parts::editor_plan`); the run, placeholder, selection wash,
-        // composition rule, spin chevrons and caret were already sprites. Focus
-        // is the border slot re-keyed to the accent rather than a ring, which is
-        // why `ring_is_retained` claims these kinds — see the note there.
-        ControlKind::NumberBox
-        | ControlKind::TextBox
-        | ControlKind::PasswordBox
-        | ControlKind::AutoSuggestBox => {}
-        // The button family draws nothing. Its fill, border, hover/press ink,
-        // badge plate and focus ring are all retained compositor parts
-        // (`parts::button_sync`), and its label, icon and badge count are
-        // retained glyph sprites (`glyph_text::button_sync`) — so `has_chrome`
-        // denies the family a surface entirely and this arm is what makes the
-        // generic fill/border path skip it on the way there.
-        ControlKind::Button
-        | ControlKind::ToggleButton
-        | ControlKind::RepeatButton
-        | ControlKind::SplitButton => {}
-        // Fully retained, like the button family: the ring is a part
-        // (`parts::hyperlink_plan`) and the words are glyph sprites, so there is
-        // nothing to draw and `has_chrome` denies it a surface.
-        ControlKind::HyperlinkButton => {}
-        // Track, outline, knob and ring are retained chrome parts
-        // (`parts::toggle_plan`); the state label beside them is glyph sprites
-        // (`glyph_text::toggle_sync`). Nothing left to draw, so `has_chrome`
-        // denies it a surface.
-        ControlKind::ToggleSwitch => {}
-        // Box fill, outline, checkmark and ring are parts
-        // (`parts::check_plan`); the trailing label is glyph sprites
-        // (`glyph_text::check_sync`).
-        ControlKind::CheckBox => {}
-        // The same: tray, sliding pill, hover ink and ring are parts
-        // (`parts::segmented_plan`), the segment labels are sprites
-        // (`glyph_text::segmented_sync`).
-        ControlKind::SelectorBar => {}
-        // Fully retained, like the button family: box fill, border, hover/press
-        // wash and focus ring are parts (`parts::select_plan`), and the current
-        // label and trailing chevron are glyph sprites
-        // (`glyph_text::select_sync`). The two-statement `paint_select` this
-        // replaced was the last thing holding the surface open.
-        ControlKind::ComboBox | ControlKind::DropDownButton => {}
-        // Track, origin notch, accent fill, hover halo, thumb and focus ring
-        // are all retained parts (`parts::slider_sync`) — groove and notch in
-        // the below band, the rest above — so `has_chrome` denies it a surface
-        // and a scrub stays pure compositor property sets.
-        ControlKind::Slider => {}
-        // Groove, gradient fill, reference marker and needle are all retained
-        // chrome parts (`super::parts::meter_sync`). The groove was the last
-        // thing drawn here and it did not depend on the level, so every level
-        // change was re-rastering a constant; `has_chrome` denies it a surface.
-        ControlKind::Meter => {}
-        // The dial is retained end to end: the groove ring and both tick classes
-        // are mask layers over the very path the value arc rides, the hub is an
-        // FP16 circle sprite, the arc, thumb and needle were compositor chrome
-        // already, and all four runs are glyph sprites
-        // (`glyph_text::knob_sync`). Only the focus ring is left, and only while
-        // the knob is keyboard-focused — see `Node::has_chrome`.
-        ControlKind::Knob => {}
-        // Track, fill and indeterminate sweep are retained chrome parts
-        // (`super::parts::progress_plan`; the sweep is armed by
-        // `progress_sweep` and loops on the compositor), so `has_chrome`
-        // denies it a surface.
-        ControlKind::ProgressBar => {}
-        // Track circle and value arc are two retained mask layers over one
-        // tessellated path (`super::ring_shape`), and the indeterminate revolve
-        // is a forever `RotationAngle` keyframe on the arc's sprite, so
-        // `has_chrome` denies the ring a surface and this never runs.
-        ControlKind::ProgressRing => {}
-        // Fully retained: background, divider, selection tile, accent bar and
-        // both washes are parts (`parts::nav_plan`), every run is sprites
-        // (`glyph_text::nav_sync`), and `has_chrome` denies it a surface.
-        ControlKind::NavigationView => {}
-        // Header fill, border, hover wash and ring are parts
-        // (`parts::expander_plan`); the header label and its chevron are glyph
-        // sprites (`glyph_text::expander_sync`).
-        ControlKind::Expander => {}
-        // The custom caption band draws nothing either: it is transparent, its
-        // one hover wash is a part (`parts::caption_plan`), and its two titles
-        // and four button glyphs are sprites (`glyph_text::caption_sync`).
-        ControlKind::TitleBar => {}
-        _ => return false,
-    }
-    // Kinds whose ring is a retained part are deliberately absent from this
-    // shared tail — see `ring_is_retained`.
-    if node.focus_ring && !ring_is_retained(node.kind) {
-        draw_focus_ring(session, brush, rect, focus_radius(node));
-    }
-    true
-}
-
-// ── Shared helpers ───────────────────────────────────────────────────────────
-
-/// Set the recolorable brush to a token colour, scaled by `dim` (disabled fade).
-pub(crate) fn put(brush: &Brush, c: Color, dim: f32) {
-    let mut l = linear(c);
-    l.a *= dim;
-    brush.set_color(l);
-}
-
-pub(crate) fn fill_rr(
-    session: &DrawingSession,
-    brush: &Brush,
-    r: Rect,
-    radius: f32,
-    c: Color,
-    dim: f32,
-) {
-    put(brush, c, dim);
-    if radius > 0.0 {
-        session.fill_rounded_rect(&RoundedRect::uniform(r, radius), brush);
-    } else {
-        session.fill_rect(&r, brush);
-    }
-}
-
-pub(crate) fn stroke_rr(
-    session: &DrawingSession,
-    brush: &Brush,
-    r: Rect,
-    radius: f32,
-    c: Color,
-    width: f32,
-    dim: f32,
-) {
-    put(brush, c, dim);
-    let inset = Rect::new(
-        r.left + width / 2.0,
-        r.top + width / 2.0,
-        r.right - width / 2.0,
-        r.bottom - width / 2.0,
-    );
-    if radius > 0.0 {
-        session.draw_rounded_rect(&RoundedRect::uniform(inset, radius), brush, width);
-    } else {
-        session.draw_rect(&inset, brush, width);
-    }
-}
-
 
 pub(crate) fn glyph_str(cp: u32) -> Option<String> {
     char::from_u32(cp).map(|c| c.to_string())
@@ -200,49 +61,12 @@ pub(crate) const FOCUS_RING_INNER_W: f32 = 1.0;
 /// both softer and fatter than the number it was given.
 pub(crate) const FOCUS_RING_W: f32 = 2.0;
 
-/// A focus ring: a [`FOCUS_RING_W`] `STROKE_STRONG` rounded outline inset 1px
-/// from the edge.
-pub(crate) fn draw_focus_ring(session: &DrawingSession, brush: &Brush, rect: Rect, radius: f32) {
-    let r = Rect::new(rect.left + 1.0, rect.top + 1.0, rect.right - 1.0, rect.bottom - 1.0);
-    stroke_rr(session, brush, r, radius, theme::stroke_strong(), FOCUS_RING_W, 1.0);
-}
-
-/// Whether this kind's focus ring is a retained part rather than a draw.
-///
-/// The two rings are NOT the same visual — `draw_focus_ring` strokes once,
-/// INSET into the control; `parts::focus_ring_slots` lays two rings just
-/// outside it, which is the shape `parts::focus_rings` argues for (an inset
-/// ring eats the control's own fill, so a focused control reads as having grown
-/// a border and shrunk). This predicate is the single place that is decided.
-///
-/// Read it as "not painted by the tail below", which is what it actually gates.
-/// Most kinds that answer `true` are on the retained ring; the text editors are
-/// on NEITHER, because an editor's focus affordance is its border re-keyed to
-/// the accent (`parts::editor_plan`). They are claimed here so the shared tail
-/// does not add an inset ring on top of a control that already shows focus.
-fn ring_is_retained(kind: ControlKind) -> bool {
-    super::node::is_button_family(kind)
-        || is_text_editable(kind)
-        || matches!(
-            kind,
-            ControlKind::HyperlinkButton
-                | ControlKind::ToggleSwitch
-                | ControlKind::SelectorBar
-                | ControlKind::CheckBox
-                | ControlKind::Expander
-                | ControlKind::ComboBox
-                | ControlKind::DropDownButton
-                | ControlKind::Slider
-                | ControlKind::Knob
-        )
-}
-
 /// The corner radius a kind's focus ring follows.
 ///
-/// Read by BOTH ring implementations — `draw_focus_ring` here and
-/// `parts::focus_ring_slots` — so a kind keeps its corners across the move from
-/// one to the other. The retained ring grows this by how far out each ring sits;
-/// this is the authored radius, not the ring's own.
+/// Read by `parts::focus_ring_slots`, which grows it by how far out each ring
+/// sits — so this is the control's AUTHORED radius, not the ring's own. A ring
+/// whose corners disagree with the control inside it is the most visible way for
+/// a custom radius to look broken.
 pub(crate) fn focus_radius(node: &Node) -> f32 {
     match node.kind {
         ControlKind::ToggleSwitch | ControlKind::Slider => theme::RADIUS_PILL,
