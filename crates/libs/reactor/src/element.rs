@@ -32,8 +32,12 @@ pub trait CustomElement: 'static {
     /// Boxed clone so [`Element`] stays `Clone`.
     fn clone_dyn(&self) -> Box<dyn CustomElement>;
 
-    /// Create the underlying control via `backend` and return its id.
-    fn mount(&self, backend: &mut dyn Backend) -> ControlId;
+    /// Create the underlying control at `id` via `backend`.
+    ///
+    /// The id is minted by the reconciler — implementations pass it straight to
+    /// [`Backend::create`] rather than assigning their own, so every control in
+    /// the tree comes from one monotonic, never-reused source.
+    fn mount(&self, id: ControlId, backend: &mut dyn Backend);
 
     /// Apply the diff from `prev` (same `type_id`) to the live control `id`.
     fn update(&self, prev: &dyn CustomElement, id: ControlId, backend: &mut dyn Backend);
@@ -226,14 +230,18 @@ pub fn group(children: Vec<Element>) -> Element {
 /// `core/backend.rs`, and add the matching row in
 /// `winui/backend.rs::define_handles!`.
 macro_rules! define_element {
-    ( $( $variant:ident ),* $(,)? ) => {
+    // Variants accept outer attributes so a widget that exists only under a
+    // feature (`CompositionHost`, which is XAML-only) can carry its `#[cfg]`
+    // here and drop out of the enum, the `From` impls, and every match arm
+    // together.
+    ( $( $(#[$attr:meta])* $variant:ident ),* $(,)? ) => {
         /// Sum type of every element kind the reconciler can mount; widget
         /// variants each correspond to a backend control, plus a few
         /// non-widget variants for composition (`Component`, `Group`,
         /// `Custom`, …).
         #[derive(Clone, Debug, PartialEq, Default)]
         pub enum Element {
-            $( $variant($variant), )*
+            $( $(#[$attr])* $variant($variant), )*
             Component(ComponentElement),
             ErrorBoundary(ErrorBoundaryElement),
             Provider(ProviderElement),
@@ -245,6 +253,7 @@ macro_rules! define_element {
         }
 
         $(
+            $(#[$attr])*
             impl From<$variant> for Element {
                 fn from(v: $variant) -> Self {
                     Element::$variant(v)
@@ -255,7 +264,7 @@ macro_rules! define_element {
         impl Element {
             pub fn as_widget(&self) -> Option<&dyn Widget> {
                 Some(match self {
-                    $( Element::$variant(v) => v, )*
+                    $( $(#[$attr])* Element::$variant(v) => v, )*
                     Element::Component(_)
                     | Element::ErrorBoundary(_)
                     | Element::Provider(_)
@@ -267,7 +276,7 @@ macro_rules! define_element {
             }
             fn modifiers_mut(&mut self) -> Option<&mut Modifiers> {
                 match self {
-                    $( Element::$variant(v) => Some(&mut v.modifiers), )*
+                    $( $(#[$attr])* Element::$variant(v) => Some(&mut v.modifiers), )*
                     Element::TemplatedList(tl) => Some(&mut tl.modifiers),
                     Element::Component(_)
                     | Element::ErrorBoundary(_)
@@ -279,7 +288,7 @@ macro_rules! define_element {
             }
             pub fn kind_name(&self) -> &'static str {
                 match self {
-                    $( Element::$variant(_) => stringify!($variant), )*
+                    $( $(#[$attr])* Element::$variant(_) => stringify!($variant), )*
                     Element::Component(_) => "Component",
                     Element::ErrorBoundary(_) => "ErrorBoundary",
                     Element::Provider(_) => "Provider",
@@ -349,8 +358,11 @@ define_element! {
     RelativePanel,
     ToggleButton,
     SwapChainPanel,
+    #[cfg(feature = "winui-backend")]
     CompositionHost,
     WebView2,
+    Meter,
+    Knob,
 }
 
 macro_rules! non_widget_from_table {
@@ -897,6 +909,16 @@ pub trait ElementExt: Sized {
         self
     }
 
+    /// Register a `PointerWheelChanged` handler; the callback receives the
+    /// element-relative position and the signed wheel delta
+    /// ([`PointerEventInfo::wheel_delta`], 120 per detent).
+    fn on_pointer_wheel(mut self, f: impl IntoCallback<PointerEventInfo>) -> Self {
+        if let Some(m) = self.modifiers_mut() {
+            ensure_pointer_handlers(m).on_pointer_wheel = Some(f.into_callback());
+        }
+        self
+    }
+
     // ── Accessibility modifiers ──────────────────────────────────────────
 
     fn automation_name(mut self, name: impl Into<String>) -> Self {
@@ -1167,8 +1189,9 @@ fn with_implicit_transition(m: &mut Modifiers, f: impl FnOnce(&mut ImplicitTrans
 }
 
 macro_rules! impl_element_ext {
-    ($($ty:ident),* $(,)?) => {
+    ($( $(#[$attr:meta])* $ty:ident),* $(,)?) => {
         $(
+            $(#[$attr])*
             impl ElementExt for widgets::$ty {
                 fn modifiers_mut(&mut self) -> Option<&mut Modifiers> {
                     Some(&mut self.modifiers)
@@ -1223,8 +1246,11 @@ impl_element_ext!(
     RelativePanel,
     ToggleButton,
     SwapChainPanel,
+    #[cfg(feature = "winui-backend")]
     CompositionHost,
     WebView2,
+    Meter,
+    Knob,
 );
 
 impl ElementExt for RichTextBlock {

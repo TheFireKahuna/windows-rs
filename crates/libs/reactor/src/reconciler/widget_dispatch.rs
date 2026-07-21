@@ -19,8 +19,17 @@ impl<B: Backend + 'static> Reconciler<B> {
             self.backend.set_pane_element(id, Some(pane_id));
             self.pane_elements.insert(id, pane_id);
         }
+        // Mounted, never appended: a flyout's content belongs to a popup, so
+        // its subtree is a parentless root the backend lays out separately.
+        if let Some(fly) = w.flyout_element()
+            && let Some(fly_id) = self.mount(fly)
+        {
+            self.backend.set_flyout_element(id, Some(fly_id));
+            self.flyout_elements.insert(id, fly_id);
+        }
         if let Some(cb) = w.on_mounted_callback() {
-            cb.invoke(self.backend.get_native_element(id));
+            let native = self.backend.get_native_element(id);
+            cb.invoke(MountInfo { id, native });
         }
         if let Some(cb) = w.on_unmounted_callback() {
             self.unmount_callbacks.insert(id, cb.clone());
@@ -29,12 +38,13 @@ impl<B: Backend + 'static> Reconciler<B> {
     }
 
     pub fn update_widget(&mut self, old: &dyn Widget, new: &dyn Widget, id: ControlId) {
-        self.diff_props(id, &old.bindings(), &new.bindings());
+        self.diff_props(id, new.kind(), &old.bindings(), &new.bindings());
         self.diff_modifiers(id, old.modifiers(), new.modifiers());
         self.diff_attached(id, old.attached(), new.attached());
         self.update_widget_children(id, old.children(), new.children());
         self.update_header_element(id, old.header_element(), new.header_element());
         self.update_pane_element(id, old.pane_element(), new.pane_element());
+        self.update_flyout_element(id, old.flyout_element(), new.flyout_element());
         if let Some(cb) = new.on_unmounted_callback() {
             self.unmount_callbacks.insert(id, cb.clone());
         } else {
@@ -186,6 +196,53 @@ impl<B: Backend + 'static> Reconciler<B> {
                 if let Some(pane_id) = self.mount(new_el) {
                     self.backend.set_pane_element(id, Some(pane_id));
                     self.pane_elements.insert(id, pane_id);
+                }
+            }
+        }
+    }
+
+    /// The flyout-content slot, reconciled exactly as the header and pane
+    /// slots are — in place when the element kind matches, so a flyout that
+    /// is open while its owner re-renders keeps its focus and its state.
+    fn update_flyout_element(&mut self, id: ControlId, old: Option<&Element>, new: Option<&Element>) {
+        match (old, new) {
+            (None, None) => {}
+            (None, Some(fly)) => {
+                if let Some(fly_id) = self.mount(fly) {
+                    self.backend.set_flyout_element(id, Some(fly_id));
+                    self.flyout_elements.insert(id, fly_id);
+                }
+            }
+            (Some(_), None) => {
+                if let Some(fly_id) = self.flyout_elements.remove(&id) {
+                    self.backend.set_flyout_element(id, Option::<ControlId>::None);
+                    self.unmount(fly_id);
+                }
+            }
+            (Some(old_el), Some(new_el)) => {
+                // Reconcile in-place when possible to preserve focus/state.
+                if let Some(fly_id) = self.flyout_elements.get(&id).copied() {
+                    if old_el.kind_matches(new_el) {
+                        let new_id = self.update(old_el, new_el, fly_id);
+                        match new_id {
+                            Some(nid) if nid != fly_id => {
+                                self.backend.set_flyout_element(id, Some(nid));
+                                self.flyout_elements.insert(id, nid);
+                            }
+                            None => {
+                                self.backend.set_flyout_element(id, Option::<ControlId>::None);
+                                self.flyout_elements.remove(&id);
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+                    self.flyout_elements.remove(&id);
+                    self.unmount(fly_id);
+                }
+                if let Some(fly_id) = self.mount(new_el) {
+                    self.backend.set_flyout_element(id, Some(fly_id));
+                    self.flyout_elements.insert(id, fly_id);
                 }
             }
         }
@@ -347,16 +404,19 @@ impl<B: Backend + 'static> Reconciler<B> {
     }
 
     fn apply_canvas_position(&mut self, id: ControlId, p: CanvasPosition) {
-        // Canvas defaults are 0.0 — only emit when non-zero on mount;
-        // the diff path always emits to overwrite the previous value.
-        if p.left != 0.0 {
-            self.backend
-                .set_prop(id, Prop::AttachedCanvasLeft, &PropValue::F64(p.left));
-        }
-        if p.top != 0.0 {
-            self.backend
-                .set_prop(id, Prop::AttachedCanvasTop, &PropValue::F64(p.top));
-        }
+        // Emit left AND top unconditionally, even at 0.0. This method runs only
+        // when the element actually set a `CanvasPosition` (it is gated on the
+        // attached prop being present), and either prop is what flips the child
+        // to `Position::Absolute` in the backend. A Canvas is a `Display::Block`
+        // panel, so a child that stays relative BLOCK-FLOWS — stacking under its
+        // siblings — instead of pinning to (0,0). Skipping the 0.0 emit left a
+        // child explicitly placed at the origin flowing; a zero-size sibling hid
+        // it (the flow cursor never moved), but a sized one (a filled area)
+        // pushed every later child down by its height.
+        self.backend
+            .set_prop(id, Prop::AttachedCanvasLeft, &PropValue::F64(p.left));
+        self.backend
+            .set_prop(id, Prop::AttachedCanvasTop, &PropValue::F64(p.top));
         if p.z_index != 0 {
             self.backend
                 .set_prop(id, Prop::AttachedCanvasZIndex, &PropValue::I32(p.z_index));

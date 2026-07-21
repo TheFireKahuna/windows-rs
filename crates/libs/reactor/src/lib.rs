@@ -1,41 +1,87 @@
 #![doc = include_str!("../readme.md")]
 #![allow(missing_docs)]
 
+// One backend per build. Each selects a composition stack, and
+// `windows-composition` hosts exactly one stack per build, so the two backends
+// inherit that crate's mutual exclusion rather than working around it.
+#[cfg(all(not(feature = "winui-backend"), not(feature = "dcomp-backend")))]
+compile_error!(
+    "enable exactly one backend: the `winui-backend` feature (default) or the `dcomp-backend` feature"
+);
+#[cfg(all(feature = "winui-backend", feature = "dcomp-backend"))]
+compile_error!(
+    "the `winui-backend` and `dcomp-backend` backends are mutually exclusive; enable only one"
+);
+
 #[allow(
     non_snake_case,
     non_upper_case_globals,
     non_camel_case_types,
+    // Whole WinRT enums are pulled by value (e.g. only one `DirectXPixelFormat`
+    // variant of ~190 is used), so generated bindings always carry unused variants.
     dead_code,
     clippy::upper_case_acronyms,
     clippy::missing_transmute_annotations
 )]
 mod bindings;
 
+// System (Windows.UI.Composition) bindings for the self-hosted DirectComposition
+// HDR backend. Separate module so its flat short names don't collide with the
+// lifted Microsoft.UI.Composition types in `bindings`.
+#[allow(
+    non_snake_case,
+    non_upper_case_globals,
+    non_camel_case_types,
+    dead_code,
+    clippy::upper_case_acronyms,
+    clippy::missing_transmute_annotations,
+    clippy::useless_transmute,
+    clippy::too_many_arguments
+)]
+mod system_bindings;
+
+#[cfg(feature = "winui-backend")]
 mod app;
+#[cfg(feature = "winui-backend")]
 mod app_shim;
 mod backend;
+#[cfg(feature = "winui-backend")]
 mod bootstrap;
-#[cfg(feature = "canvas")]
 mod canvas_bridge;
+// Host-owned composition surfaces and the Direct2D target that draws into them.
+// Both are built on the system composition stack, which only the DComp backend
+// hosts — a WinUI build has no host to service a surface request.
+#[cfg(feature = "dcomp-backend")]
+mod composition_draw;
+mod color;
 mod diagnostics;
 mod drag;
 mod element;
 mod engine;
 mod fault;
 mod generated;
+mod gesture;
 mod hooks;
 mod host;
 mod interaction;
+mod motion;
 mod reconciler;
 mod style;
+#[cfg(feature = "dcomp-backend")]
+mod surface;
 mod widget;
 mod widgets;
 
+#[cfg(feature = "winui-backend")]
 pub use app::*;
 pub use backend::*;
+#[cfg(feature = "dcomp-backend")]
+pub use surface::{request_surface, PendingSurface, SurfaceDevice, SurfaceToken};
+pub use gesture::{ActionSlot, GestureEvent, GestureInterest, GestureOutcome};
+pub use motion::reduced_motion;
+pub use color::Color;
 pub use bindings::AutomationHeadingLevel;
 pub use bindings::AutomationLiveSetting;
-pub use bindings::Color;
 pub use bindings::CommandBarDefaultLabelPosition;
 pub use bindings::DispatcherQueuePriority;
 pub use bindings::FlyoutPlacementMode;
@@ -55,11 +101,14 @@ pub use bindings::TreeViewSelectionMode;
 pub use bindings::VerticalAlignment;
 pub use bindings::VirtualKey;
 pub use bindings::VirtualKeyModifiers;
+#[cfg(feature = "winui-backend")]
 pub use bootstrap::*;
 #[cfg(feature = "canvas")]
 pub use canvas_bridge::{
     CanvasImageSource, CanvasSwapChain, DrawContext, animated_canvas, animated_canvas_with_device,
 };
+#[cfg(feature = "dcomp-backend")]
+pub use composition_draw::CompositionDrawTarget;
 pub use drag::*;
 pub use element::*;
 pub use engine::*;

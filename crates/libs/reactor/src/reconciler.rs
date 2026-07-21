@@ -21,6 +21,10 @@ pub use self::templated::{RealizationQueue, RealizationRequest, new_realization_
 /// handles, templated-list state, …).
 pub struct Reconciler<B: Backend> {
     pub backend: B,
+    /// Source of control ids. Monotonic and never reused: the graft check at
+    /// `child.rs` compares raw ids, so recycling one would alias a destroyed
+    /// node onto a live one and silently skip grafting the remount.
+    next_control_id: u32,
     pub debug_elements_skipped: u64,
     pub debug_elements_diffed: u64,
     pub debug_ui_elements_created: u64,
@@ -43,11 +47,15 @@ pub struct Reconciler<B: Backend> {
     /// Pre-unmount callbacks keyed by control id, invoked with the native
     /// element (or `None`) just before the control is destroyed (see
     /// [`Widget::on_unmounted_callback`]).
-    pub unmount_callbacks: FxHashMap<ControlId, Callback<Option<windows_core::IInspectable>>>,
+    pub unmount_callbacks: FxHashMap<ControlId, Callback<MountInfo>>,
     /// Tracks header element control IDs for widgets that use header_element().
     pub header_elements: FxHashMap<ControlId, ControlId>,
     /// Tracks pane element control IDs for widgets that use pane_element().
     pub pane_elements: FxHashMap<ControlId, ControlId>,
+    /// Tracks flyout-content control IDs for widgets that use
+    /// [`Widget::flyout_element`]. Parentless roots: they belong to a popup,
+    /// not to the owner's box, so they are never in `children_mirror`.
+    pub flyout_elements: FxHashMap<ControlId, ControlId>,
     /// UI marshaller propagated into every nested component's
     /// [`RenderCx`] for [`RenderCx::use_async_state`].
     pub marshaller: Option<UiMarshaller>,
@@ -69,6 +77,7 @@ impl<B: Backend + 'static> Reconciler<B> {
     pub fn new(backend: B) -> Self {
         Self {
             backend,
+            next_control_id: 0,
             debug_elements_skipped: 0,
             debug_elements_diffed: 0,
             debug_ui_elements_created: 0,
@@ -89,6 +98,7 @@ impl<B: Backend + 'static> Reconciler<B> {
             unmount_callbacks: FxHashMap::default(),
             header_elements: FxHashMap::default(),
             pane_elements: FxHashMap::default(),
+            flyout_elements: FxHashMap::default(),
             defer_templated_unmounts: false,
             deferred_unmounts: Vec::new(),
             marshaller: None,
@@ -137,9 +147,17 @@ impl<B: Backend + 'static> Reconciler<B> {
         self.forced_components.len()
     }
 
+    /// Next control id. The sole source for the whole tree — see
+    /// [`next_control_id`](Self::next_control_id) for why it must never be reused.
+    pub(crate) fn mint_control_id(&mut self) -> ControlId {
+        self.next_control_id += 1;
+        ControlId::new(self.next_control_id)
+    }
+
     pub fn acquire_control(&mut self, kind: ControlKind) -> ControlId {
         self.debug_ui_elements_created += 1;
-        let id = self.backend.create(kind);
+        let id = self.mint_control_id();
+        self.backend.create(id, kind);
 
         if let Some(stale) = self.component_instances.remove(&id) {
             self.unregister_component_listeners(&stale);
@@ -364,7 +382,8 @@ impl<B: Backend + 'static> Reconciler<B> {
             // is destroyed. The callback always runs when registered; the
             // native element is passed when available, else `None`.
             if let Some(cb) = self.unmount_callbacks.remove(&node) {
-                cb.invoke(self.backend.get_native_element(node));
+                let native = self.backend.get_native_element(node);
+                cb.invoke(MountInfo { id: node, native });
             }
 
             self.error_boundary_fallbacks.remove(&node);
@@ -595,6 +614,9 @@ impl<B: Backend + 'static> Reconciler<B> {
         } else if let Some(enter) = anim.enter_transition {
             self.backend.run_property_animation(id, Some(enter));
         }
+        if let Some(exit) = anim.exit_transition {
+            self.backend.set_exit_transition(id, Some(exit));
+        }
     }
 
     fn diff_animations_for(
@@ -619,6 +641,12 @@ impl<B: Backend + 'static> Reconciler<B> {
         let new_pa = new.and_then(|a| a.property_animation);
         if old_pa != new_pa {
             self.backend.run_property_animation(id, new_pa);
+        }
+
+        let old_exit = old.and_then(|a| a.exit_transition);
+        let new_exit = new.and_then(|a| a.exit_transition);
+        if old_exit != new_exit {
+            self.backend.set_exit_transition(id, new_exit);
         }
     }
 
@@ -847,6 +875,18 @@ impl<B: Backend + 'static> Reconciler<B> {
     pub fn clear_forced_component_rerender(&mut self) {
         self.force_component_rerender = false;
         self.forced_components.clear();
+    }
+
+    /// Seed the next pass to re-render EVERY mounted component and re-diff every
+    /// element, bypassing `can_skip_update` and component memoisation — for a
+    /// global render input no prop or state tracks (the color-scheme flip:
+    /// value-color props are recomputed only inside render functions, so a
+    /// memoised component with unchanged props would otherwise keep its old
+    /// palette). One pass only: the flags clear at the end of the pass as usual.
+    pub fn invalidate_all_components(&mut self) {
+        self.force_component_rerender = true;
+        self.forced_components
+            .extend(self.component_instances.keys().copied());
     }
 }
 
