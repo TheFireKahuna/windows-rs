@@ -1,5 +1,17 @@
---out crates/libs/canvas/src/bindings.rs
+--out crates/libs/canvas-core/src/bindings.rs
 --flat --minimal --dead-code
+
+// The glyph-run walker implements a DirectWrite text renderer so that a shaped
+// `IDWriteTextLayout` can be replayed as individual glyph runs (the input a
+// glyph-atlas text renderer needs). `IDWriteTextRenderer` derives from
+// `IDWritePixelSnapping`, so both need `_Impl` scaffolding for the callback
+// object to be constructible. The canonical Win32 metadata is a flat
+// `Windows.Win32` namespace, so these name the interface directly under it —
+// a stale sub-namespace here silently matches nothing and the `_Impl`
+// scaffolding is simply not emitted.
+--implement
+    Windows.Win32.IDWriteTextRenderer
+    Windows.Win32.IDWritePixelSnapping
 
 --filter
     D2DERR_RECREATE_TARGET
@@ -19,6 +31,7 @@
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW
     D2D1_BITMAP_OPTIONS_CPU_READ
     D2D1_BITMAP_OPTIONS_TARGET
+    D2D1_BITMAP_OPTIONS_CPU_READ
     D2D1_BITMAP_PROPERTIES1
     D2D1_CAP_STYLE_FLAT
     D2D1_CAP_STYLE_ROUND
@@ -32,29 +45,42 @@
     D2D1_DRAW_TEXT_OPTIONS_NONE
     D2D1_ELLIPSE
     D2D1_EXTEND_MODE_CLAMP
+    D2D1_EXTEND_MODE_WRAP
+    D2D1_FACTORY_TYPE_MULTI_THREADED
     D2D1_FACTORY_TYPE_SINGLE_THREADED
     D2D1_GAMMA_2_2
     D2D1_INTERPOLATION_MODE_LINEAR
+    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
     D2D1_LINE_JOIN_BEVEL
     D2D1_LINE_JOIN_MITER
     D2D1_LINE_JOIN_ROUND
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES
     D2D1_MAP_OPTIONS_READ
     D2D1_MAPPED_RECT
+    D2D1_PROPERTY_TYPE_FLOAT
+    D2D1_PROPERTY_TYPE_VECTOR4
     D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES
     D2D1_ROUNDED_RECT
+    D2D1_SHADOW_PROP
+    D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION
+    D2D1_SHADOW_PROP_COLOR
     D2D1CreateFactory
     ID2D1Bitmap::{GetSize, CopyFromBitmap}
     ID2D1Bitmap1::{Map, Unmap}
     ID2D1Device::CreateDeviceContext
-    ID2D1DeviceContext::{CreateBitmap, CreateBitmapFromDxgiSurface, CreateBitmapFromWicBitmap, CreateEffect, SetTarget, GetTarget, DrawBitmap, DrawImage}
+    ID2D1DeviceContext::{CreateBitmap, CreateBitmapFromDxgiSurface, CreateBitmapFromWicBitmap, CreateEffect, SetTarget, GetTarget, DrawBitmap, DrawImage, CreateBitmapBrush, CreateGradientStopCollection, SetPrimitiveBlend}
+    ID2D1Brush::SetOpacity
+    ID2D1BitmapBrush1
+    ID2D1GradientStopCollection1
     ID2D1Effect::{SetInput, GetOutput}
     ID2D1Factory1::{CreateDevice, CreateStrokeStyle}
     ID2D1Factory1::CreatePathGeometry
     ID2D1Geometry::{GetBounds, FillContainsPoint, StrokeContainsPoint}
     ID2D1GeometrySink::{AddLine, AddBezier}
+    ID2D1Multithread::{Enter, Leave}
     ID2D1PathGeometry::Open
-    ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize}
+    ID2D1Properties::SetValue
+    ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawTextLayout, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, SetTextRenderingParams}
     ID2D1SolidColorBrush::SetColor
     D3D_DRIVER_TYPE_HARDWARE
     D3D_DRIVER_TYPE_WARP
@@ -72,8 +98,17 @@
     DWRITE_TEXT_ALIGNMENT_LEADING
     DWRITE_TEXT_ALIGNMENT_TRAILING
     DWriteCreateFactory
-    IDWriteFactory::CreateTextFormat
-    IDWriteTextFormat::{SetTextAlignment, SetParagraphAlignment}
+    DWRITE_HIT_TEST_METRICS
+    DWRITE_TEXT_METRICS
+    DWRITE_TRIMMING
+    DWRITE_TRIMMING_GRANULARITY_NONE
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER
+    DWRITE_TRIMMING_GRANULARITY_WORD
+    DWRITE_WORD_WRAPPING_NO_WRAP
+    DWRITE_WORD_WRAPPING_WRAP
+    IDWriteFactory::{CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign, CreateCustomRenderingParams}
+    IDWriteTextFormat::{SetTextAlignment, SetParagraphAlignment, SetWordWrapping, SetTrimming}
+    IDWriteTextLayout::{SetMaxWidth, SetMaxHeight, GetMetrics, HitTestPoint, HitTestTextPosition}
     DXGI_ALPHA_MODE_PREMULTIPLIED
     DXGI_FORMAT_B8G8R8A8_UNORM
     DXGI_FORMAT_UNKNOWN
@@ -82,13 +117,14 @@
     DXGI_ERROR_DEVICE_RESET
     DXGI_ERROR_DRIVER_INTERNAL_ERROR
     DXGI_SWAP_CHAIN_DESC1
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
     DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
     DXGI_USAGE_RENDER_TARGET_OUTPUT
     IDXGIDevice::GetAdapter
     IDXGIFactory2::{CreateSwapChainForComposition, CreateSwapChainForHwnd}
     IDXGIObject::GetParent
     IDXGISwapChain::{Present, GetBuffer, ResizeBuffers}
-    IDXGISwapChain2::SetMatrixTransform
+    IDXGISwapChain2::{SetMatrixTransform, GetFrameLatencyWaitableObject, SetMaximumFrameLatency}
     CLSID_WICImagingFactory
     GUID_WICPixelFormat32bppPBGRA
     IWICBitmapDecoder::GetFrame
@@ -99,3 +135,99 @@
     WICDecodeMetadataCacheOnDemand
     CLSCTX_INPROC_SERVER
     CoCreateInstance
+    WaitForSingleObjectEx
+    ID2D1Factory2
+    ID2D1Factory3
+    ID2D1Factory4
+    ID2D1Factory5
+    ID2D1Factory6
+    ID2D1Factory7
+    ID2D1Device1
+    ID2D1Device2
+    ID2D1Device3
+    ID2D1Device4
+    ID2D1Device5
+    ID2D1Device6
+    ID2D1DeviceContext::CreateCommandList
+    ID2D1DeviceContext1::{CreateFilledGeometryRealization, CreateStrokedGeometryRealization, DrawGeometryRealization}
+    ID2D1DeviceContext2
+    ID2D1DeviceContext3
+    ID2D1DeviceContext4
+    ID2D1DeviceContext5::CreateColorContextFromDxgiColorSpace
+    ID2D1DeviceContext6
+    ID2D1RenderTarget::{PushAxisAlignedClip, PopAxisAlignedClip, SetTextAntialiasMode}
+    ID2D1CommandList
+    ID2D1GeometryRealization
+    ID2D1ColorContext1
+    CLSID_D2D1ColorManagement
+    D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS
+    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
+    D2D1_BITMAP_OPTIONS_NONE
+    D2D1_GAMMA_1_0
+    CLSID_D2D1GaussianBlur
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION
+    D2D1_BITMAP_BRUSH_PROPERTIES1
+    D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT
+    D2D1_MAPPED_RECT
+    D2D1_MAP_OPTIONS_READ
+    D2D1_PRIMITIVE_BLEND_ADD
+    D2D1_PRIMITIVE_BLEND_SOURCE_OVER
+    D2D1_PROPERTY_TYPE_ENUM
+    D2D_POINT_2U
+    D2D_RECT_U
+    DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE
+    D2D1_COLOR_SPACE
+    D2D1_BUFFER_PRECISION
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+    IDWriteTextLayout::{SetFontWeight, SetFontStyle, SetFontStretch, SetUnderline, SetStrikethrough, SetDrawingEffect, HitTestTextRange}
+    IDWriteTextLayout1::SetCharacterSpacing
+    IDWriteTextLayout2
+    IDWriteTextLayout3
+    IDWriteTextLayout4
+    IDWriteTextFormat1
+    IDWriteTextFormat2
+    IDWriteTextFormat3::{SetFontAxisValues, SetAutomaticFontAxes}
+    IDWriteFactory1
+    IDWriteFactory2::{TranslateColorGlyphRun, CreateGlyphRunAnalysis}
+// Rasterizes a glyph run to a CPU alpha texture. The only way to observe what
+// the rasterizer actually produced: a composition surface has no read path, so
+// without this "the glyph landed where we asked" is unfalsifiable.
+    IDWriteGlyphRunAnalysis::{GetAlphaTextureBounds, CreateAlphaTexture}
+    DWRITE_TEXTURE_TYPE
+    DWRITE_TEXTURE_ALIASED_1x1
+    DWRITE_TEXTURE_CLEARTYPE_3x1
+    DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC
+    DWRITE_GRID_FIT_MODE_DEFAULT
+    DWRITE_GRID_FIT_MODE_DISABLED
+    DWRITE_GRID_FIT_MODE_ENABLED
+    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE
+    IDWriteFactory3
+    IDWriteFactory4
+    IDWriteFactory5
+    IDWriteFactory6
+    IDWriteFactory7
+    IDWriteColorGlyphRunEnumerator::{MoveNext, GetCurrentRun}
+    DWRITE_COLOR_GLYPH_RUN
+    DWRITE_FONT_AXIS_VALUE
+    IDXGISwapChain3::{SetColorSpace1, CheckColorSpaceSupport}
+    IDXGIOutput1
+    IDXGIOutput2
+    IDXGIOutput3
+    IDXGIOutput4
+    IDXGIOutput5
+    IDXGIOutput6::GetDesc1
+    DXGI_OUTPUT_DESC1
+    DXGI_FORMAT_R16G16B16A16_FLOAT
+    DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    ID2D1DeviceContext::DrawGlyphRun
+    IDWriteTextLayout::Draw
+    IDWriteTextRenderer
+    IDWritePixelSnapping
+    IDWriteInlineObject::Draw
+    DWRITE_GLYPH_RUN
+    DWRITE_GLYPH_RUN_DESCRIPTION
+    DWRITE_GLYPH_OFFSET
+    DWRITE_MEASURING_MODE_NATURAL
+    DWRITE_MATRIX
+    IDWriteFontFace::{GetMetrics, GetDesignGlyphMetrics, GetGlyphIndices}
