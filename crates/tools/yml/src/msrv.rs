@@ -36,6 +36,22 @@ pub fn yml() {
                 continue;
             }
 
+            if name == "windows-reactor" {
+                // The `winui-backend` and `dcomp-backend` backends are mutually
+                // exclusive — each selects one of windows-composition's two
+                // stacks — so `--all-features` won't compile; check each backend
+                // on its own.
+                writeln!(
+                    yml,
+                    r"      - name: Check {name} (winui)
+        run:  cargo check -p {name} --features winui-backend,test
+      - name: Check {name} (dcomp)
+        run:  cargo check -p {name} --features dcomp-backend,test"
+                )
+                .unwrap();
+                continue;
+            }
+
             writeln!(
                 yml,
                 r"      - name: Check {name}

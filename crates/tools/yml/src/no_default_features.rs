@@ -16,6 +16,20 @@ pub fn yml() {
                 .unwrap();
                 continue;
             }
+            if name == "windows-reactor" {
+                // No backend-free build exists: exactly one of the mutually
+                // exclusive `winui-backend`/`dcomp-backend` backends must be
+                // selected, and the crate defaults to neither. `--no-default-
+                // features` is therefore already the normal way to build it —
+                // what varies is which backend is named.
+                writeln!(
+                    yml,
+                    r"      - name: Check {name}
+        run:  cargo check -p {name} --no-default-features --features dcomp-backend"
+                )
+                .unwrap();
+                continue;
+            }
             writeln!(
                 yml,
                 r"      - name: Check {name}

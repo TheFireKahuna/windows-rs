@@ -19,6 +19,9 @@ windows-window = { workspace = true }
 [dependencies.windows-reactor]
 workspace = true
 optional = true
+# The webview bridge hosts a WebView2 in a XAML element, so it is the WinUI
+# backend's to serve; reactor names no default backend.
+features = ["winui-backend"]
 
 [dependencies.windows-future]
 workspace = true
