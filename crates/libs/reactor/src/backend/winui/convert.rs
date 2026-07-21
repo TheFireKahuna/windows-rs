@@ -24,9 +24,18 @@ pub(super) fn to_xaml_gridlength(v: GridLength) -> Result<bindings::GridLength> 
     }
 }
 
+/// Encode a reactor [`Color`] (linear scRGB) into a WinRT `Windows.UI.Color`
+/// (8-bit sRGB, the ABI `Microsoft.UI.Xaml` consumes). This is the SDR-fallback
+/// boundary: the linear channels are clamped to `[0, 1]` and sRGB-encoded so the
+/// WinUI backend renders visually identical to the FP16 path's SDR appearance.
+pub(super) fn to_winrt(c: Color) -> bindings::Color {
+    let (r, g, b, a) = c.to_srgb8();
+    bindings::Color { a, r, g, b }
+}
+
 pub(super) fn solid_brush(c: Color) -> Result<bindings::SolidColorBrush> {
     let brush = bindings::SolidColorBrush::new()?;
-    brush.SetColor(c)?;
+    brush.SetColor(to_winrt(c))?;
     Ok(brush)
 }
 
@@ -34,6 +43,102 @@ pub(super) fn string_as_textblock(s: &str) -> Result<bindings::TextBlock> {
     let tb = bindings::TextBlock::new()?;
     tb.SetText(s)?;
     Ok(tb)
+}
+
+/// A button's content row, decomposed into the pieces its ornament props own.
+///
+/// The row is a flat horizontal `StackPanel` holding, in visual order, the
+/// badge (on whichever side it was asked for), the leading `SymbolIcon`, and
+/// the label. Decomposing and rebuilding — rather than patching a child by
+/// index, which is what `Content` and `Icon` used to do — is what lets the
+/// three props be applied in any order, any number of times, without one
+/// clobbering another and without the row nesting a panel inside itself.
+pub(super) struct ButtonRow {
+    pub icon: Option<bindings::UIElement>,
+    pub badge: Option<bindings::UIElement>,
+    /// Everything that is neither, in order: the label.
+    pub rest: Vec<bindings::UIElement>,
+    pub badge_leading: bool,
+}
+
+/// Read the row apart, **detaching** its children from the panel that held
+/// them. Detaching is not optional: XAML refuses to parent an element that
+/// still belongs to another, so the pieces must be free before [`write_row`]
+/// can put them back in a new order.
+pub(super) fn take_row(cc: &bindings::IContentControl) -> ButtonRow {
+    let mut row = ButtonRow {
+        icon: None,
+        badge: None,
+        rest: Vec::new(),
+        badge_leading: false,
+    };
+    let Ok(content) = cc.Content() else { return row };
+    let sort = |row: &mut ButtonRow, ui: bindings::UIElement| {
+        if ui.cast::<bindings::ISymbolIcon>().is_ok() {
+            row.icon = Some(ui);
+        } else if ui.cast::<bindings::IInfoBadge>().is_ok() {
+            // Leading exactly when nothing else has been seen yet.
+            row.badge_leading = row.rest.is_empty() && row.icon.is_none();
+            row.badge = Some(ui);
+        } else if ui
+            .cast::<bindings::ITextBlock>()
+            .ok()
+            .and_then(|tb| tb.Text().ok())
+            .is_some_and(|t| t.is_empty())
+        {
+            // An empty label is not content. Keeping it would leave a phantom
+            // gap in the row's spacing on an icon-only button.
+        } else {
+            row.rest.push(ui);
+        }
+    };
+    if let Ok(panel) = content.cast::<bindings::IPanel>() {
+        if let Ok(children) = panel.Children() {
+            for i in 0..children.Size().unwrap_or(0) {
+                if let Ok(ui) = children.GetAt(i) {
+                    sort(&mut row, ui);
+                }
+            }
+            let _ = children.Clear();
+        }
+    } else {
+        if let Ok(ui) = content.cast::<bindings::UIElement>() {
+            sort(&mut row, ui);
+        }
+        let _ = cc.SetContent(None::<&windows_core::IInspectable>);
+    }
+    row
+}
+
+/// Rebuild the row from its pieces. A single piece needs no panel — a bare
+/// `SymbolIcon` content is what an icon-only button has always been.
+pub(super) fn write_row(cc: &bindings::IContentControl, row: &ButtonRow) -> Result<()> {
+    let mut order: Vec<&bindings::UIElement> = Vec::new();
+    if row.badge_leading && let Some(b) = &row.badge {
+        order.push(b);
+    }
+    if let Some(i) = &row.icon {
+        order.push(i);
+    }
+    order.extend(row.rest.iter());
+    if !row.badge_leading && let Some(b) = &row.badge {
+        order.push(b);
+    }
+
+    match order.len() {
+        0 => Ok(()),
+        1 => cc.SetContent(order[0]),
+        _ => {
+            let panel = bindings::StackPanel::new()?;
+            panel.SetOrientation(Orientation::Horizontal)?;
+            panel.SetSpacing(8.0)?;
+            let children = panel.cast::<bindings::IPanel>()?.Children()?;
+            for ui in order {
+                children.Append(ui)?;
+            }
+            cc.SetContent(&panel)
+        }
+    }
 }
 
 pub(super) fn build_nav_view_item(item: &NavViewItem) -> Result<windows_core::IInspectable> {
@@ -112,11 +217,36 @@ pub(super) fn build_menu_flyout_item_base(
     def: &MenuItemDef,
 ) -> Result<bindings::MenuFlyoutItemBase> {
     match def {
-        MenuItemDef::Item { text, is_enabled } => {
+        MenuItemDef::Item {
+            text,
+            icon,
+            danger,
+            enabled,
+            shortcut,
+        } => {
             let item = bindings::MenuFlyoutItem::new()?;
             item.SetText(text)?;
-            item.cast::<bindings::IControl>()?
-                .SetIsEnabled(*is_enabled)?;
+            if let Some(sym) = icon {
+                let icon_elem = bindings::SymbolIcon::CreateInstanceWithSymbol(*sym)?;
+                let icon_elem: bindings::IconElement = icon_elem.cast()?;
+                item.SetIcon(&icon_elem)?;
+            }
+            if let Some(s) = shortcut {
+                item.SetKeyboardAcceleratorTextOverride(s)?;
+            }
+            // `IsEnabled` / `Foreground` live on `Control`.
+            if !*enabled || *danger {
+                let ctl: bindings::IControl = item.cast()?;
+                if !*enabled {
+                    ctl.SetIsEnabled(false)?;
+                }
+                if *danger {
+                    // Destructive actions: error-red text (matches the WinUI
+                    // SystemFillColorCritical accent used for danger affordances).
+                    let brush = solid_brush(Color::rgb(196, 43, 28))?;
+                    ctl.SetForeground(&brush)?;
+                }
+            }
             item.cast()
         }
         MenuItemDef::Separator => {
