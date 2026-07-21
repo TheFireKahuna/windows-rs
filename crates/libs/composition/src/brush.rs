@@ -54,6 +54,18 @@ impl CompositionNineGridBrush {
             .unwrap();
     }
 
+    /// Sets a single scale factor applied to all four [insets](Self::set_insets).
+    ///
+    /// The insets are expressed in the source surface's pixels, but the brush
+    /// stretches the grid across a destination measured in DIPs. When the source
+    /// is rasterized at a display scale other than `1.0`, an inset of `r` DIPs is
+    /// `r * scale` pixels in the source, and this factor is what maps it back:
+    /// without it the corners of a nine-grid are sampled at the wrong radius and
+    /// smear as the bar stretches.
+    pub fn set_inset_scale(&self, scale: f32) {
+        self.0.SetInsetScales(scale).unwrap();
+    }
+
     /// Sets whether the center of the grid is left unpainted (hollow).
     pub fn set_center_hollow(&self, hollow: bool) {
         self.0.SetIsCenterHollow(hollow).unwrap();
@@ -70,5 +82,55 @@ impl Sealed for CompositionNineGridBrush {}
 impl Brush for CompositionNineGridBrush {
     fn as_brush(&self) -> CompositionBrush {
         CompositionBrush(self.0.cast().unwrap())
+    }
+}
+
+/// A brush that paints its [source](Self::set_source) through the alpha channel
+/// of its [mask](Self::set_mask): the source supplies the color, the mask
+/// supplies the coverage.
+///
+/// The split matters because the two halves are not interchangeable. Coverage is
+/// a single channel that a rasterizer can produce cheaply, while color may be
+/// wide-gamut — outside what a [`CompositionColorBrush`] can express, since that
+/// carries an 8-bit-per-channel color. Painting a shape in a color the color
+/// brush cannot hold therefore means rasterizing the shape's *coverage* into the
+/// mask and putting the color in the source, rather than rasterizing a colored
+/// shape directly.
+#[derive(Clone)]
+pub struct CompositionMaskBrush(pub(crate) bindings::CompositionMaskBrush);
+
+impl CompositionMaskBrush {
+    /// Sets the brush whose alpha channel is used as the coverage mask.
+    pub fn set_mask(&self, brush: &impl Brush) {
+        self.0.SetMask(&brush.as_brush().0).unwrap();
+    }
+
+    /// Sets the brush supplying the color that the mask reveals.
+    pub fn set_source(&self, brush: &impl Brush) {
+        self.0.SetSource(&brush.as_brush().0).unwrap();
+    }
+}
+
+impl Sealed for CompositionMaskBrush {}
+
+impl Brush for CompositionMaskBrush {
+    fn as_brush(&self) -> CompositionBrush {
+        CompositionBrush(self.0.cast().unwrap())
+    }
+}
+
+impl PartialEq for CompositionMaskBrush {
+    fn eq(&self, other: &Self) -> bool {
+        canonical(&self.0) == canonical(&other.0)
+    }
+}
+
+impl Eq for CompositionMaskBrush {}
+
+impl Compositor {
+    /// Creates a brush that paints one brush through the alpha of another.
+    pub fn create_mask_brush(&self) -> CompositionMaskBrush {
+        let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
+        CompositionMaskBrush(compositor.CreateMaskBrush().unwrap())
     }
 }

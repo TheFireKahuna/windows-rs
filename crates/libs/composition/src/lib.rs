@@ -24,7 +24,10 @@ compile_error!(
 )]
 #[path = "bindings.rs"]
 mod bindings;
-#[cfg(feature = "lifted")]
+// `not(system)` as well as `lifted`, so enabling both stacks by mistake leaves
+// exactly one `bindings` module and the reader sees the `compile_error!` above
+// rather than a redefinition error stacked on top of it.
+#[cfg(all(feature = "lifted", not(feature = "system")))]
 #[allow(
     non_snake_case,
     non_upper_case_globals,
@@ -37,8 +40,12 @@ mod bindings;
 mod animation;
 mod batch;
 mod brush;
+mod clip;
 mod color;
 mod compositor;
+mod object;
+mod property_set;
+mod shadow;
 mod shape;
 mod visual;
 
@@ -55,34 +62,50 @@ mod target;
 mod sealed {
     /// Prevents downstream crates from implementing this crate's marker traits
     /// ([`Brush`](crate::Brush), [`Shape`](crate::Shape),
-    /// [`Animation`](crate::Animation)).
+    /// [`Geometry`](crate::Geometry), [`Animation`](crate::Animation),
+    /// [`Object`](crate::Object)).
     pub trait Sealed {}
 }
 
 // Re-exported crate-wide so every wrapper module can `use super::*;` instead of
 // naming these explicitly. `Sealed` and `Interface` stay crate-internal; only
 // the wrapper types and `Result` form the public surface.
+pub(crate) use object::canonical;
 pub(crate) use sealed::Sealed;
 pub(crate) use windows_core::Interface;
 
 pub use animation::{
-    Animation, CompositionAnimation, CompositionEasingFunction, ImplicitAnimationCollection,
-    ScalarKeyFrameAnimation, Vector3KeyFrameAnimation,
+    Animation, CompositionAnimation, CompositionEasingFunction, ExpressionAnimation,
+    ImplicitAnimationCollection, ScalarKeyFrameAnimation, SpringScalarNaturalMotionAnimation,
+    SpringVector2NaturalMotionAnimation, SpringVector3NaturalMotionAnimation,
+    Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
 };
 pub use batch::{BatchKind, CompositionScopedBatch};
-pub use brush::{Brush, CompositionBrush, CompositionColorBrush, CompositionNineGridBrush};
+pub use brush::{
+    Brush, CompositionBrush, CompositionColorBrush, CompositionMaskBrush,
+    CompositionNineGridBrush,
+};
+pub use clip::InsetClip;
 pub use color::Color;
 pub use compositor::Compositor;
+pub use object::{CompositionObject, Object};
+pub use property_set::CompositionPropertySet;
+pub use shadow::{DropShadow, ShadowSource};
 pub use shape::{
-    CompositionContainerShape, CompositionEllipseGeometry, CompositionGeometry, CompositionShape,
-    CompositionShapeCollection, CompositionSpriteShape, Shape, ShapeVisual,
+    CompositionContainerShape, CompositionEllipseGeometry, CompositionGeometry, CompositionPath,
+    CompositionPathGeometry, CompositionRoundedRectangleGeometry, CompositionShape,
+    CompositionShapeCollection, CompositionSpriteShape, Geometry, Shape, ShapeVisual, StrokeCap,
 };
 pub use visual::{BorderMode, ContainerVisual, SpriteVisual, Visual, VisualCollection};
 
 #[cfg(feature = "system")]
 pub use stack::DispatcherQueueController;
 #[cfg(feature = "system")]
-pub use surface::{CompositionDrawingSurface, CompositionGraphicsDevice, CompositionSurfaceBrush};
+pub use surface::{
+    AlphaMode, CompositionDrawHandle, CompositionDrawingSurface, CompositionGraphicsDevice,
+    CompositionSurface, CompositionSurfaceBrush, CompositionVisualSurface, PixelFormat, Stretch,
+    Surface,
+};
 #[cfg(feature = "system")]
 pub use target::DesktopWindowTarget;
 

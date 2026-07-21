@@ -123,6 +123,21 @@ impl Visual {
         self.0.SetBorderMode(mode.into()).unwrap();
     }
 
+    /// Sets the visual's rotation about its [center point](Self::set_center_point),
+    /// in **radians** — the unit of the `RotationAngle` property that animations
+    /// and expressions drive. (Composition also exposes the same rotation in
+    /// degrees as a separate property, which this crate does not surface.)
+    pub fn set_rotation_angle(&self, radians: f32) {
+        self.0.SetRotationAngle(radians).unwrap();
+    }
+
+    /// Sets (or, with `None`, clears) the clip applied to this visual and its
+    /// subtree.
+    pub fn set_clip(&self, clip: Option<&InsetClip>) {
+        let clip: Option<bindings::CompositionClip> = clip.map(|clip| clip.0.cast().unwrap());
+        self.0.SetClip(clip.as_ref()).unwrap();
+    }
+
     /// Returns the visual's parent container, if it has one.
     pub fn parent(&self) -> Option<ContainerVisual> {
         // A root visual has no parent: the WinRT getter yields a null reference
@@ -163,6 +178,32 @@ impl Visual {
             .unwrap();
     }
 
+    /// Stops any animation on the named property, leaving the property at the
+    /// value it had reached.
+    ///
+    /// Unlike this type's other operations, a failure here is discarded rather
+    /// than panicked on. Stopping a property that nothing is animating is the
+    /// ordinary case, not an exceptional one: a caller that wants to take a
+    /// property back under manual control stops it unconditionally and then sets
+    /// it, without first having to know whether an animation was ever started.
+    /// Panicking would make that correct sequence depend on animation state the
+    /// caller does not otherwise track — so the inconsistency with the `unwrap`
+    /// elsewhere is deliberate, and must stay.
+    pub fn stop_animation(&self, property: &str) {
+        let object: bindings::ICompositionObject = self.0.cast().unwrap();
+        let _ = object.StopAnimation(property);
+    }
+
+    /// Returns whether an animation is currently running on the named property.
+    ///
+    /// This distinguishes a property already animating toward its target from
+    /// one that has stopped short of it, so a caller can leave a live animation
+    /// alone instead of restarting it.
+    pub fn is_animating(&self, property: &str) -> bool {
+        let object: bindings::ICompositionObject4 = self.0.cast().unwrap();
+        object.TryGetAnimationController(property).is_ok()
+    }
+
     /// Attaches (or, with `None`, clears) the [`ImplicitAnimationCollection`]
     /// that animates this visual's properties automatically when they change.
     pub fn set_implicit_animations(&self, animations: Option<&ImplicitAnimationCollection>) {
@@ -172,6 +213,22 @@ impl Visual {
             .unwrap();
     }
 }
+
+impl Sealed for Visual {}
+
+impl Object for Visual {
+    fn as_object(&self) -> CompositionObject {
+        CompositionObject(self.0.cast().unwrap())
+    }
+}
+
+impl PartialEq for Visual {
+    fn eq(&self, other: &Self) -> bool {
+        canonical(&self.0) == canonical(&other.0)
+    }
+}
+
+impl Eq for Visual {}
 
 /// A visual that hosts a child visual tree via its [`children`](Self::children).
 #[derive(Clone)]
@@ -222,6 +279,13 @@ impl SpriteVisual {
     pub fn set_brush(&self, brush: &impl Brush) {
         self.sprite.SetBrush(&brush.as_brush().0).unwrap();
     }
+
+    /// Casts `shadow` behind this visual. The compositor renders and blurs it,
+    /// so it costs no app rasterization.
+    pub fn set_shadow(&self, shadow: &DropShadow) {
+        let sprite2: bindings::ISpriteVisual2 = self.sprite.cast().unwrap();
+        sprite2.SetShadow(&shadow.0).unwrap();
+    }
 }
 
 impl core::ops::Deref for SpriteVisual {
@@ -251,9 +315,31 @@ impl VisualCollection {
         self.0.InsertAtBottom(&visual.0).unwrap();
     }
 
+    /// Inserts a visual directly above `sibling` in the z-order (drawn after it,
+    /// in front of it). `sibling` must already be in the collection.
+    pub fn insert_above(&self, visual: &Visual, sibling: &Visual) {
+        self.0.InsertAbove(&visual.0, &sibling.0).unwrap();
+    }
+
     /// Removes a visual from the collection.
+    ///
+    /// Panics if `visual` is not in this collection. Use
+    /// [`try_remove`](Self::try_remove) where that is a state the caller can
+    /// legitimately reach.
     pub fn remove(&self, visual: &Visual) {
         self.0.Remove(&visual.0).unwrap();
+    }
+
+    /// Removes a visual from the collection, reporting rather than panicking
+    /// when it is not there.
+    ///
+    /// A caller that tracks children of its own can hold a visual that has since
+    /// been detached — a parent torn down between the two operations, say. For
+    /// that caller "already gone" is the goal state rather than an error, so the
+    /// removal is fallible instead of a panic. Prefer [`remove`](Self::remove)
+    /// when the visual's membership is known.
+    pub fn try_remove(&self, visual: &Visual) -> Result<()> {
+        self.0.Remove(&visual.0)
     }
 
     /// Removes every visual from the collection.

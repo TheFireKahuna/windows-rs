@@ -26,6 +26,11 @@ windows-core = { workspace = true }
 windows-collections = { workspace = true }
 windows-numerics = { workspace = true }
 windows-time = { workspace = true }
+# A natural-motion animation's `FinalValue` is nullable (`IReference<T>`): unset
+# means "keep the value the animation was last given". Referenced from
+# windows-reference rather than re-generated here, exactly as the collection and
+# numerics types are.
+windows-reference = { workspace = true, features = ["std"] }
 
 [dependencies.windows-window]
 workspace = true
