@@ -661,6 +661,28 @@ impl Cursor {
     }
 
     /// Evaluate this cursor as a compile-time constant expression and return the
+    /// signed integer result, or `None` if evaluation fails or the result is not
+    /// an integer. Use this rather than [`evaluate_unsigned`](Self::evaluate_unsigned)
+    /// when the declared type is signed, so negative initializers keep their sign
+    /// instead of wrapping.
+    pub fn evaluate_signed(&self) -> Option<i64> {
+        unsafe {
+            let result = clang_Cursor_Evaluate(self.0);
+            if result.is_null() {
+                return None;
+            }
+            let kind = clang_EvalResult_getKind(result);
+            let value = if kind == CXEval_Int {
+                Some(clang_EvalResult_getAsLongLong(result))
+            } else {
+                None
+            };
+            clang_EvalResult_dispose(result);
+            value
+        }
+    }
+
+    /// Evaluate this cursor as a compile-time constant expression and return the
     /// floating-point result, or `None` if evaluation fails or the result is not a
     /// float. Integer results are *not* coerced — callers that want an integer use
     /// [`evaluate_unsigned`](Self::evaluate_unsigned).
