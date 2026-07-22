@@ -18,6 +18,9 @@ pub struct LayerRenderer {
     context: ID2D1DeviceContext,
     /// Device-loss flag for the owned `BeginDraw`/`EndDraw` bracket below.
     device_lost: Cell<bool>,
+    /// The bitmap the last `render` handed back, kept — with the `(size, format)` it
+    /// was made for — so the next call can draw into it again. See `render`.
+    bitmap: Cell<Option<(D2D_SIZE_U, DXGI_FORMAT, ID2D1Bitmap1)>>,
 }
 
 impl LayerRenderer {
@@ -35,10 +38,11 @@ impl LayerRenderer {
         Ok(Self {
             context,
             device_lost: Cell::new(false),
+            bitmap: Cell::new(None),
         })
     }
 
-    /// Render `f` into a fresh `size_px` (physical pixels) bitmap and return it.
+    /// Render `f` into a `size_px` (physical pixels) bitmap and return it.
     ///
     /// `scale` is the DIP→pixel factor: `f` draws in DIPs exactly as it would on the
     /// live surface, and the result holds already-scaled pixels — which is what the
@@ -46,6 +50,9 @@ impl LayerRenderer {
     /// composition surface) over 8-bit sRGB. The bitmap is stamped at 96 DPI so one
     /// unit is one pixel and the scale lives purely in the transform, mirroring how
     /// the live surface is set up.
+    ///
+    /// The bitmap handed back may be the very one an earlier call returned, redrawn —
+    /// but only once you have dropped that one, so a layer you keep stays untouched.
     pub fn render(
         &self,
         size_px: (u32, u32),
@@ -73,7 +80,22 @@ impl LayerRenderer {
                 width: size_px.0.max(1),
                 height: size_px.1.max(1),
             };
-            let bitmap = self.context.CreateBitmap(size, None, 0, &properties)?;
+            // A render-target bitmap is a D3D texture, and creating — then destroying
+            // — one per call is real driver-side work on a path that runs once per
+            // layer per frame. Draw into the last one again when it was made for this
+            // same `(size, format)` and nothing else still holds it. A caller that
+            // *caches* its layer keeps a reference to the bitmap it was handed, so its
+            // pixels can never be overwritten by a later render: that call finds a
+            // shared bitmap and creates a new one, exactly as before. The draw below
+            // clears the target, so a reused bitmap starts as blank as a fresh one.
+            let bitmap = match self.bitmap.take() {
+                Some((cached_size, cached_format, bitmap))
+                    if (cached_size, cached_format) == (size, format) && is_sole_ref(&bitmap) =>
+                {
+                    bitmap
+                }
+                _ => self.context.CreateBitmap(size, None, 0, &properties)?,
+            };
 
             self.context.SetDpi(96.0, 96.0);
             self.context.SetTarget(&bitmap);
@@ -99,7 +121,23 @@ impl LayerRenderer {
                 self.device_lost.set(false);
                 return Err(Error::from(DXGI_ERROR_DEVICE_REMOVED));
             }
+            // Kept for the next call to draw into again. Nothing is kept from a failed
+            // or device-lost render — the `take` above already dropped what there was —
+            // so a bitmap belonging to a dead device is never handed back.
+            self.bitmap.set(Some((size, format, bitmap.clone())));
             Ok(Bitmap(bitmap))
         }
+    }
+}
+
+/// `true` if nothing besides `bitmap` itself holds a reference to the underlying COM
+/// object, sampled by an `AddRef`/`Release` pair — `Release` returns the count that
+/// survives it. Direct2D takes a reference of its own while a bitmap sits in an
+/// unflushed batch, so this reads as *shared* whenever there is any doubt.
+fn is_sole_ref(bitmap: &ID2D1Bitmap1) -> bool {
+    let unknown: &IUnknown = bitmap.into();
+    unsafe {
+        (Interface::vtable(unknown).AddRef)(Interface::as_raw(unknown));
+        (Interface::vtable(unknown).Release)(Interface::as_raw(unknown)) == 1
     }
 }
