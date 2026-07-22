@@ -28,8 +28,67 @@
 
 use std::sync::{Arc, Mutex};
 
+use windows_canvas::GpuDevice;
+
 use crate::backend::ControlId;
 use crate::widgets::CompositionDrawSurface;
+
+/// The backend's own Direct2D/Direct3D device, published when the compositor is
+/// bootstrapped so a surface host can draw through it instead of standing up a
+/// second one.
+///
+/// A `GpuDevice` clone is a COM `AddRef` of the *same* device, and the backend
+/// builds its device with a multi-threaded Direct2D factory — the constructor
+/// whose purpose is one device driven from several threads, with Direct2D
+/// serializing them. A host that draws its surface on a worker thread therefore
+/// wants this device, not one of its own: a second `D3D11CreateDevice` brings a
+/// whole second display-driver worker pool and its heaps with it.
+///
+/// `generation` changes whenever the backend publishes a different device, so a
+/// requester can tell a replacement from the device it was already using.
+struct BackendDevice {
+    device: GpuDevice,
+    generation: u64,
+}
+
+// SAFETY: the device is built by `GpuDevice::new_multi_threaded`, i.e. with a
+// multi-threaded Direct2D factory, which serializes access across threads —
+// exactly the contract [`SurfaceDevice`] documents. Handing a clone (a COM
+// `AddRef`, itself thread-safe) to another thread is the designed use.
+unsafe impl Send for BackendDevice {}
+
+static BACKEND_DEVICE: Mutex<Option<BackendDevice>> = Mutex::new(None);
+static NEXT_DEVICE_GEN: Mutex<u64> = Mutex::new(0);
+
+/// Publish the backend's device. Called once as the compositor is created; a
+/// second call (a replacement device) supersedes the first under a new
+/// generation.
+pub(crate) fn publish_backend_device(device: &GpuDevice) {
+    let generation = {
+        let mut next = NEXT_DEVICE_GEN.lock().expect("backend device generation");
+        *next += 1;
+        *next
+    };
+    if let Ok(mut slot) = BACKEND_DEVICE.lock() {
+        *slot = Some(BackendDevice {
+            device: device.clone(),
+            generation,
+        });
+    }
+}
+
+/// The backend's Direct2D/Direct3D device and its generation, or `None` before
+/// the compositor exists.
+///
+/// Callable from any thread. The device it returns is `!Send` once unwrapped —
+/// see [`SurfaceDevice`] for the contract a second thread drawing through it
+/// takes on: the device tolerates concurrent use, and all draws through *one*
+/// `CompositionGraphicsDevice` are serialized by whoever owns it.
+pub fn backend_gpu_device() -> Option<(GpuDevice, u64)> {
+    let slot = BACKEND_DEVICE.lock().ok()?;
+    let d = slot.as_ref()?;
+    Some((d.device.clone(), d.generation))
+}
 
 /// Identifies one hosted surface, so it can be released without naming the
 /// visual the backend holds for it.

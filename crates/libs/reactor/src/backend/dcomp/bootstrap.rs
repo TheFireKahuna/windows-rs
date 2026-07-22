@@ -124,6 +124,11 @@ impl Compositing {
 
     pub fn new(hwnd: HWND, pixel_w: i32, pixel_h: i32, dpi: f32) -> windows_core::Result<Self> {
         let gpu = GpuDevice::new_multi_threaded()?;
+        // Offer it to surface hosts before anything can ask: a host that draws
+        // its own surface on a worker thread shares this device rather than
+        // paying for a second D3D11/D2D/DXGI/DWrite stack (and the display
+        // driver's worker pool and heaps that come with it).
+        crate::surface::publish_backend_device(&gpu);
 
         let compositor = Compositor::new()?;
         // The canvas device is the accepting seam: the wrapper does the

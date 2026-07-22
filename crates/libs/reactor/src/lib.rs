@@ -76,7 +76,9 @@ mod widgets;
 pub use app::*;
 pub use backend::*;
 #[cfg(feature = "dcomp-backend")]
-pub use surface::{request_surface, PendingSurface, SurfaceDevice, SurfaceToken};
+pub use surface::{
+    backend_gpu_device, request_surface, PendingSurface, SurfaceDevice, SurfaceToken,
+};
 pub use gesture::{ActionSlot, GestureEvent, GestureInterest, GestureOutcome};
 pub use motion::reduced_motion;
 pub use color::Color;
