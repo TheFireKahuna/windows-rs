@@ -443,6 +443,13 @@ pub(crate) struct Ctrl {
     /// Per-item icon glyph codepoint (NavigationView), 0 = none.
     pub icons: Vec<u32>,
     pub expanded: bool,
+    /// Expander: the header strip's height in DIPs, written by the layout pass
+    /// when (and only when) an element header is mounted — it is that child's
+    /// solved height, so a rich header sizes the strip it sits in. `0.0` means
+    /// no element header, and the chrome falls back to the intrinsic band
+    /// height. Read through [`super::controls::expander_header_h`], never here:
+    /// the fallback is the whole point and every consumer needs it.
+    pub header_h: f32,
     /// Selected tag requested via `Prop::SelectedTag` before items arrived.
     pub selected_tag: Option<String>,
     /// Menu rows for DropDownButton / SplitButton / MenuFlyout popups.
@@ -527,6 +534,7 @@ impl Ctrl {
         tags: Vec::new(),
         icons: Vec::new(),
         expanded: false,
+        header_h: 0.0,
         selected_tag: None,
         menu: Vec::new(),
         placeholder: String::new(),
@@ -888,12 +896,17 @@ pub(crate) struct Node {
     /// PasswordBox / AutoSuggestBox); `None` for every other kind.
     pub editor: Option<Editor>,
 
-    // ── TitleBar caption slots ───────────────────────────────────────────
-    /// TitleBar only: the mounted `Content` (centered) slot child, if any.
-    /// Tracked so a slot swap/clear can detach the right child from `children`.
-    pub title_content: Option<ControlId>,
+    // ── Chrome element slots ─────────────────────────────────────────────
+    /// The element mounted in this control's HEADER slot, if any — a TitleBar's
+    /// centered `Content`, or an Expander's header content. Tracked so a slot
+    /// swap/clear can detach the right child from `children`.
+    ///
+    /// One field for both because it is one concept: a child the control hosts
+    /// inside chrome it draws itself, placed by the control rather than by the
+    /// ordinary child flow. Only the placement differs per kind.
+    pub header_slot: Option<ControlId>,
     /// TitleBar only: the mounted `RightHeader`/footer (trailing) slot child.
-    pub title_footer: Option<ControlId>,
+    pub footer_slot: Option<ControlId>,
     /// TitleBar only: the band's own cached title/subtitle layouts. Boxed and
     /// lazy for the same reason [`Extras`] is — a tree holds at most one or two
     /// TitleBars, and every other node would carry the dead weight. Rebuilt by
@@ -989,14 +1002,32 @@ impl Node {
             focused: false,
             focus_ring: false,
             editor: is_text_editable(kind).then(|| Editor::new(kind)),
-            title_content: None,
-            title_footer: None,
+            header_slot: None,
+            footer_slot: None,
             caption_text: None,
             caption_glyphs: None,
             nav_text: None,
             bar_text: None,
             bar_glyphs: None,
         }
+    }
+
+    /// Where this node's CHROME SLOT children begin in [`Self::children`], and so
+    /// how many positional children it has.
+    ///
+    /// The whole of the invariant that keeps the reconciler and the backend
+    /// talking about the same children: positional children are the PREFIX of the
+    /// list and slot children (a TitleBar's caption content and footer, an
+    /// Expander's header) are the suffix. The reconciler indexes only positional
+    /// children — it never learns a slot child exists — so an index it hands the
+    /// backend is meaningful only under that invariant, and every index-taking
+    /// child op is bounded by this rather than by `children.len()`.
+    ///
+    /// Counted rather than stored because the count is at most two and the list is
+    /// short; a cached one is a third thing to keep in agreement.
+    pub fn slot_floor(&self) -> usize {
+        let slots = usize::from(self.header_slot.is_some()) + usize::from(self.footer_slot.is_some());
+        self.children.len().saturating_sub(slots)
     }
 
     /// Parent a visual that [`layout::collect`](super::layout) claims as this
@@ -1510,6 +1541,14 @@ fn is_focusable_kind(kind: ControlKind) -> bool {
     )
 }
 
+/// The leading padding an `Expander` with a PAINTED header reserves for its band:
+/// the strip itself plus the gap between it and the content below.
+///
+/// Named because two places must agree on it — the birth style that reserves it
+/// and [`super::Backend::set_expander_header`], which clears and restores it as an
+/// element header is mounted and unmounted.
+pub(crate) const EXPANDER_BAND_PAD: f32 = theme::ROW_H + theme::SPACE_8 + theme::SPACE_4;
+
 /// Per-kind default Taffy style (display mode + the small intrinsic defaults a
 /// drawn control needs, e.g. button padding so its label isn't cramped).
 ///
@@ -1560,9 +1599,14 @@ pub(crate) fn default_style(kind: ControlKind) -> taffy::Style {
         }
         ControlKind::Expander => {
             // A header band is drawn on the node's surface; content sits below.
+            // The band is reserved as leading padding because it is painted, not
+            // laid out — an Expander carrying an ELEMENT header instead lays that
+            // child out as its first row and clears this padding, since a strip
+            // that is a real child no longer needs space held open for it (see
+            // `Backend::set_expander_header`).
             s.display = Display::Flex;
             s.flex_direction = FlexDirection::Column;
-            s.padding.top = length(theme::ROW_H + theme::SPACE_8 + theme::SPACE_4);
+            s.padding.top = length(EXPANDER_BAND_PAD);
         }
         // The whole family, not `Button` alone: a ToggleButton and a
         // RepeatButton are the same control with a different activation, and

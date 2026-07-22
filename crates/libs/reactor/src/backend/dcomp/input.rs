@@ -1073,6 +1073,22 @@ impl DCompBackend {
                     self.close_info_bar(id);
                 }
             }
+            // Only the HEADER strip toggles, as WinUI's Expander does. The body is
+            // the app's content, and a press that lands on an inert part of it —
+            // a label, a plot, the padding between two rows — reaches the Expander
+            // because nothing nearer was interactive. Falling through to the
+            // position-free `activate` collapsed the control out from under
+            // whatever the user was actually pointing at.
+            //
+            // Keyboard activation stays position-free: Space on a focused Expander
+            // is unambiguous, and there is no pointer to ask.
+            Some(ControlKind::Expander) => {
+                if self.node(id).is_some_and(|n| {
+                    y - n.rect.y < controls::expander_header_h(n)
+                }) {
+                    self.activate(id);
+                }
+            }
             _ => self.activate(id),
         }
     }

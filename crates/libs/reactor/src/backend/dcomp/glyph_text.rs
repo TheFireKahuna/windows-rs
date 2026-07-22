@@ -1323,8 +1323,15 @@ pub(crate) fn expander_sync(
 
     // The header label lives in the generic single-run slot — the Expander has
     // one run of its own, and the chevron is not one of its words.
+    //
+    // An ELEMENT header replaces that run rather than sitting behind it: the app's
+    // subtree is the header, and a `Prop::Header` string left over from before it
+    // was mounted would otherwise print underneath it. Placing an empty layout is
+    // what retires the sprites — dropping the call would leave the last ones up.
+    let has_element_header = node.header_slot.is_some();
     let label = node.text_part.get_or_insert_default();
-    pen.place(label, node.text_layout.as_ref(), label_box, Align::LeadingCentered, ink);
+    let run = (!has_element_header).then_some(node.text_layout.as_ref()).flatten();
+    pen.place(label, run, label_box, Align::LeadingCentered, ink);
 
     let (chev, run) = node.item_text.get_or_insert_default().slot(0, i, false);
     pen.place(chev, run, chev_box, Align::Centered, theme::text_secondary());

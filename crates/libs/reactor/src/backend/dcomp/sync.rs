@@ -76,7 +76,7 @@ fn sync_node(
         let caption_content_left = arena
             .get(id)
             .filter(|n| n.kind == ControlKind::TitleBar)
-            .and_then(|n| n.title_content.map(|c| (n.rect.x, c)))
+            .and_then(|n| n.header_slot.map(|c| (n.rect.x, c)))
             .and_then(|(bx, c)| arena.get(c).map(|c| c.rect.x - bx));
 
         let dirty = arena.get(id).is_some_and(|n| n.dirty);

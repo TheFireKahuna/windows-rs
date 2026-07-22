@@ -1030,11 +1030,13 @@ impl LayoutTree {
         hidden: bool,
         visited: &mut usize,
     ) -> Option<NodeId> {
-        // A collapsed Expander hides its body children (the header is drawn on
-        // the node's own surface, so every child is body content).
-        let collapse = arena
-            .get(id)
-            .is_some_and(|n| n.kind == ControlKind::Expander && !n.ctrl().expanded);
+        // A collapsed Expander hides its body children. With a PAINTED header
+        // every child is body content; with an ELEMENT header the header is a
+        // child too, and it is the one child that must survive the collapse —
+        // hiding it would collapse the strip you click to expand again.
+        let expander = arena.get(id).filter(|n| n.kind == ControlKind::Expander);
+        let collapse = expander.is_some_and(|n| !n.ctrl().expanded);
+        let header_child = expander.and_then(|n| n.header_slot);
         let child_hidden = hidden || collapse;
 
         // Children first — their Taffy nodes must exist before `set_children`.
@@ -1043,7 +1045,24 @@ impl LayoutTree {
         let base = self.scratch.len();
         let mut i = 0;
         while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
-            if let Some(cid) = self.walk(arena, c, child_hidden, visited) {
+            // An Expander hosting an element header is a two-row grid, and BOTH
+            // rows are stated. Auto-placing the body was not enough: the header
+            // is appended last (so the reconciler's positional indices for the
+            // body keep meaning what they did), and an auto-placed body took the
+            // header's row and drew straight through it. Re-stated every pass
+            // rather than once at attach, because the body child is the
+            // reconciler's to replace and a fresh one arrives unplaced.
+            if header_child.is_some()
+                && let Some(child) = arena.get_mut(c)
+            {
+                let row = if Some(c) == header_child { 1 } else { 2 };
+                child.style.grid_row = Line {
+                    start: GridPlacement::from_line_index(row),
+                    end: GridPlacement::Span(1),
+                };
+            }
+            let c_hidden = child_hidden && Some(c) != header_child;
+            if let Some(cid) = self.walk(arena, c, c_hidden, visited) {
                 self.scratch.push(cid);
             }
             i += 1;
@@ -1378,6 +1397,25 @@ fn apply(
     while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
         apply(arena, solved, c, scale);
         i += 1;
+    }
+
+    // An Expander with an element header adopts that child's solved height as its
+    // strip height, so the chrome (fill, border, wash, ring, chevron) sizes to the
+    // header the app actually mounted. Written after the child walk, which is what
+    // gives the child a solved rect to read. A change repaints: the strip's parts
+    // are placed from this, and nothing else would tell them it moved.
+    let header_h = arena
+        .get(id)
+        .filter(|n| n.kind == ControlKind::Expander)
+        .and_then(|n| n.header_slot)
+        .and_then(|hid| arena.get(hid))
+        .map(|h| h.rect.h);
+    if let Some(hh) = header_h
+        && let Some(n) = arena.get_mut(id)
+        && n.ctrl().header_h != hh
+    {
+        n.ctrl_mut().header_h = hh;
+        n.mark_dirty();
     }
 
     // Scroll containers: adopt the solved content extent, clamp the offset, and

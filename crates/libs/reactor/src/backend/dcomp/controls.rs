@@ -633,23 +633,60 @@ pub(crate) fn spin_ink(hover: bool) -> Color {
 /// and the chevron. It was previously written twice — here and in
 /// `parts::expander_plan` — which is two places to change a strip that has to
 /// stay one strip.
-pub(crate) fn expander_header_h() -> f32 {
+///
+/// An Expander carrying an ELEMENT header has no intrinsic band: the strip is
+/// whatever that child measured, so the chrome tracks a rich header instead of
+/// clipping it or floating above it. `Ctrl::header_h` is `0.0` for a painted
+/// header, which is what selects the intrinsic band here.
+pub(crate) fn expander_header_h(node: &Node) -> f32 {
+    expander_strip_h(node.ctrl().header_h)
+}
+
+/// The band an Expander with a PAINTED header draws: one text row plus its
+/// breathing room.
+pub(crate) fn expander_band_h() -> f32 {
     theme::ROW_H + theme::SPACE_8
+}
+
+/// Resolve the strip height from a measured element-header height.
+///
+/// Split out of [`expander_header_h`] so the rule is testable without a device:
+/// a `Node` cannot be built without a real `ContainerVisual`, and the rule is
+/// the part that can be silently wrong. Anything that is not a usable positive
+/// measurement — no element header (`0.0`), a header that has not been solved
+/// yet, or a non-finite height — falls back to the intrinsic band, because every
+/// consumer of this places geometry with it and a `NaN` strip would put the fill,
+/// the border and the chevron nowhere at all.
+pub(crate) fn expander_strip_h(measured: f32) -> f32 {
+    if measured.is_finite() && measured > 0.0 {
+        measured
+    } else {
+        expander_band_h()
+    }
+}
+
+/// The width the chevron column reserves at the header's trailing edge — the
+/// glyph's box plus the gap that keeps a label off it.
+///
+/// An element header is given this as a trailing margin, so app content and the
+/// control's own affordance cannot overlap however wide the header grows.
+pub(crate) fn expander_chevron_gutter() -> f32 {
+    theme::SPACE_32
 }
 
 /// The header label's box: leading inset to the chevron column.
 pub(crate) fn expander_label_box(node: &Node) -> Rect {
-    let right = (node.rect.w - theme::SPACE_32).max(theme::SPACE_12);
-    Rect::new(theme::SPACE_12, 0.0, right, expander_header_h())
+    let right = (node.rect.w - expander_chevron_gutter()).max(theme::SPACE_12);
+    Rect::new(theme::SPACE_12, 0.0, right, expander_header_h(node))
 }
 
 /// The chevron's box at the header's trailing edge.
 pub(crate) fn expander_chevron_box(node: &Node) -> Rect {
     Rect::new(
-        (node.rect.w - theme::SPACE_32).max(0.0),
+        (node.rect.w - expander_chevron_gutter()).max(0.0),
         0.0,
         (node.rect.w - theme::SPACE_8).max(0.0),
-        expander_header_h(),
+        expander_header_h(node),
     )
 }
 
@@ -663,9 +700,46 @@ pub(crate) const EXPANDER_GLYPH_EXPANDED: u32 = GLYPH_CHEVRON_DOWN;
 
 #[cfg(test)]
 mod tests {
-    use super::{caret_box, editor::TextBand, resolve_radius};
+    use super::{caret_box, editor::TextBand, expander_band_h, expander_strip_h, resolve_radius};
     use crate::backend::ControlKind;
     use crate::PILL_RADIUS;
+
+    // ── Expander header strip ────────────────────────────────────────────────
+    //
+    // The strip's height is where a painted header and an element header part
+    // company, and every piece of the control's chrome is placed with it — the
+    // fill, the outline, the hover wash, the focus ring and the chevron. A wrong
+    // answer here is not a wrong number, it is chrome drawn off the header.
+
+    /// A mounted element header owns the strip: the chrome tracks the header the
+    /// app actually gave, rather than clipping it to a constant it never saw.
+    #[test]
+    fn a_measured_element_header_sizes_the_strip() {
+        for h in [12.0, 41.0, 200.0] {
+            assert_eq!(expander_strip_h(h), h, "a solved header of {h} should be the strip");
+        }
+    }
+
+    /// `0.0` is how "no element header" is spelled — a painted header must get
+    /// the intrinsic band, not a zero-height strip that draws nothing.
+    #[test]
+    fn a_painted_header_falls_back_to_the_intrinsic_band() {
+        assert_eq!(expander_strip_h(0.0), expander_band_h());
+    }
+
+    /// Nothing an unsolved or degenerate child can report may reach the geometry.
+    /// A NaN strip would place every part of the chrome nowhere at all, and a
+    /// negative one would invert the boxes the label and chevron are laid in.
+    #[test]
+    fn no_unusable_measurement_reaches_the_geometry() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, -0.0] {
+            assert_eq!(
+                expander_strip_h(bad),
+                expander_band_h(),
+                "{bad} must not become a strip height"
+            );
+        }
+    }
 
     // ── Caret geometry ───────────────────────────────────────────────────────
     //

@@ -1707,6 +1707,23 @@ impl DCompBackend {
 
     /// UIA `ScrollIntoView`: scroll the nearest scroll ancestor the minimum
     /// distance that brings `id` (or its item) fully into the viewport.
+    /// The scroll offset that brings a target into view, given its offset within
+    /// the scrolled content (`y`), its height, the current offset and the
+    /// viewport height. The caller has already established that it is not fully
+    /// visible.
+    ///
+    /// Align the LEADING edge when the target is above the viewport — or when it
+    /// simply does not fit in one. Bringing a too-tall node into view by its
+    /// bottom edge scrolls its top out, and the top is the edge that identifies
+    /// it: an expanded processor card is far taller than the chain viewport, and
+    /// focusing one scrolled its header — the badge, the title, the enable
+    /// switch, the chevron — off the top of the panel. Both CSS `scrollIntoView`
+    /// and WinUI's `BringIntoView` align the start edge for a target that cannot
+    /// be shown whole.
+    fn scroll_target(y: f32, h: f32, off: f32, vh: f32) -> f32 {
+        if y < off || h > vh { y } else { y + h - vh }
+    }
+
     fn uia_scroll_into_view(&mut self, id: ControlId, item: i32) {
         let Some(sv) = self.uia_scroll_ancestor(id) else {
             return;
@@ -1736,8 +1753,7 @@ impl DCompBackend {
         if content_y >= off && content_y + nh <= off + vh {
             return; // already fully visible
         }
-        let target = if content_y < off { content_y } else { content_y + nh - vh };
-        self.uia_scroll_to(sv, target);
+        self.uia_scroll_to(sv, Self::scroll_target(content_y, nh, off, vh));
     }
 
     /// The fragment with keyboard focus, for the fragment root's `GetFocus`.
@@ -3852,6 +3868,39 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
 #[cfg(test)]
 mod tests {
     use super::is_icon_text;
+    use super::DCompBackend;
+
+    // ── Scroll-into-view alignment ───────────────────────────────────────────
+    //
+    // `scroll_target` only ever runs on a target the caller has established is
+    // NOT fully visible, so every case here is one of those.
+
+    /// A target above the viewport comes into view by its top edge.
+    #[test]
+    fn a_target_above_the_viewport_aligns_its_top() {
+        assert_eq!(DCompBackend::scroll_target(40.0, 60.0, 200.0, 300.0), 40.0);
+    }
+
+    /// A target below the viewport that FITS comes into view by its bottom edge —
+    /// the least scrolling that reveals it whole.
+    #[test]
+    fn a_target_below_the_viewport_aligns_its_bottom() {
+        // Bottom at 500 into a 300-tall viewport → offset 200.
+        assert_eq!(DCompBackend::scroll_target(440.0, 60.0, 0.0, 300.0), 200.0);
+    }
+
+    /// A target TALLER than the viewport aligns its top instead: it cannot be
+    /// shown whole, and its top edge is the one that identifies it. Aligning the
+    /// bottom is what scrolled an expanded processor card's header — badge,
+    /// title, enable switch, chevron — off the top of the chain panel.
+    #[test]
+    fn a_target_taller_than_the_viewport_aligns_its_top() {
+        let (y, h, vh) = (100.0, 900.0, 300.0);
+        assert_eq!(DCompBackend::scroll_target(y, h, 0.0, vh), y);
+        // Including when it is already scrolled past — the top still wins over
+        // the bottom-alignment that put it there.
+        assert_eq!(DCompBackend::scroll_target(y, h, 50.0, vh), y);
+    }
 
     /// The name fallback must not announce icon-font code points.
     ///

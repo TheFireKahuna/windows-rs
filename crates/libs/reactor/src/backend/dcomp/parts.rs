@@ -3673,21 +3673,25 @@ pub(crate) fn nav_hot_changed(node: &mut Node) {
 /// the header strip rather than the whole node: a ring around an expanded
 /// Expander would enclose its content and read as a group box.
 pub(crate) fn expander_plan(node: &Node, scale: f32) -> PartPlan {
-    let header_h = super::controls::expander_header_h();
+    let header_h = super::controls::expander_header_h(node);
     let w = node.rect.w;
     let dim = dim_of(node);
     let r = theme::RADIUS_MD;
     let strip = Some((0.0, 0.0, w, header_h));
 
+    // Authored colours win over the theme's, the way the box kinds' do. A header
+    // strip is very often the one part of a host's chrome that carries the host's
+    // own identity — a per-processor accent wash, a status tint — and a strip that
+    // could only ever be `surface_raised` forced that host to draw a second,
+    // redundant band of its own on top just to colour it.
+    let fill = node.paint.background.unwrap_or_else(theme::surface_raised);
+    let edge = node.paint.border_brush.unwrap_or_else(theme::stroke);
+
     PartPlan::new([w, node.rect.h, 0.0])
-        .below(
-            0,
-            AtlasKey::hbar(header_h, r, 0.0, theme::surface_raised(), scale).snap_at(strip, dim),
-        )
+        .below(0, AtlasKey::hbar(header_h, r, 0.0, fill, scale).snap_at(strip, dim))
         .below(
             1,
-            AtlasKey::hbar(header_h, r, theme::BORDER_W, theme::stroke(), scale)
-                .snap_at(strip, dim),
+            AtlasKey::hbar(header_h, r, theme::BORDER_W, edge, scale).snap_at(strip, dim),
         )
         .above(
             0,

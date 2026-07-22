@@ -128,7 +128,14 @@ impl RingParts {
         self.track.set_thickness(thick);
         self.arc.set_thickness(thick);
         self.track.set_source(comp, theme::w(0.08), &[], atlas_epoch, scale);
-        self.arc.set_source(comp, theme::accent(), &[], atlas_epoch, scale);
+        // The arc takes an authored `Foreground` when the app set one, exactly as
+        // WinUI's `ProgressRing.Foreground` does. A ring is often shown INSIDE
+        // something that already has an accent of its own — a category tile, a
+        // per-processor card — and a ring that ignored it was a second, contradicting
+        // accent in the same box. The theme accent stays the default, so nothing that
+        // authored no colour changes.
+        let arc_ink = node.paint.foreground.unwrap_or_else(theme::accent);
+        self.arc.set_source(comp, arc_ink, &[], atlas_epoch, scale);
         self.track.set_opacity(dim);
         self.arc.set_opacity(dim);
 

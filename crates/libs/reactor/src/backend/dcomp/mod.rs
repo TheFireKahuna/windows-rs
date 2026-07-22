@@ -442,9 +442,9 @@ impl DCompBackend {
         let mut detached = None;
         if let Some(tb) = self.node_mut(id) {
             let prev = if footer {
-                tb.title_footer.take()
+                tb.footer_slot.take()
             } else {
-                tb.title_content.take()
+                tb.header_slot.take()
             };
             if let Some(prev) = prev {
                 tb.children.retain(|c| *c != prev);
@@ -455,9 +455,9 @@ impl DCompBackend {
                 tb.children.push(new);
                 tb.children_dirty = true;
                 if footer {
-                    tb.title_footer = Some(new);
+                    tb.footer_slot = Some(new);
                 } else {
-                    tb.title_content = Some(new);
+                    tb.header_slot = Some(new);
                 }
             }
         }
@@ -501,6 +501,79 @@ impl DCompBackend {
                 child.style.grid_column.end = span(1);
                 child.h_align = 3;
                 child.v_align = 1;
+            }
+        }
+    }
+
+    /// Attach (or clear) an `Expander`'s header-content child (WinUI
+    /// `Expander.Header` taking an element rather than a string).
+    ///
+    /// A painted header is reserved as the node's leading PADDING and drawn on its
+    /// surface. An element header cannot be: it is a real subtree that has to be
+    /// measured, hit-tested and reached by an assistive client. So the node becomes
+    /// a two-row GRID — header row, body row — and the reserved padding goes away,
+    /// because a strip that lays itself out no longer needs space held open for it.
+    ///
+    /// Grid rather than the flex column it otherwise is, for the reason the TitleBar
+    /// places its slots the same way: the header is APPENDED, like every slot child
+    /// here, so that the reconciler's positional indices for the control's own child
+    /// keep meaning what they did. Order therefore cannot express "header first" —
+    /// placement has to. Prepending instead is what made a collapse delete the
+    /// header: the reconciler removed its body by index and index 0 was no longer
+    /// the body.
+    ///
+    /// Both rows are stated, by the layout pass rather than here: the body child is
+    /// the reconciler's to replace and a fresh one would arrive unplaced. The control
+    /// owns those rows — an Expander child that placed itself on a grid row would be
+    /// placing itself on one of these.
+    ///
+    /// Two overrides on the header child, both things the control knows and the app
+    /// cannot: a trailing margin clearing the chevron column (the app has no way to
+    /// know where the affordance sits), and no shrink, so a tall header is never
+    /// squeezed by the body below it.
+    ///
+    /// The strip's HEIGHT then follows the child (`Ctrl::header_h`, written by the
+    /// layout pass), so the fill, border, hover wash, focus ring and chevron all
+    /// size to the header the app actually gave rather than to a constant it has
+    /// never heard of.
+    fn set_expander_header(&mut self, id: ControlId, slot: Option<ControlId>) {
+        use taffy::prelude::*;
+        let mut detached = None;
+        if let Some(ex) = self.node_mut(id) {
+            if let Some(prev) = ex.header_slot.take() {
+                ex.children.retain(|c| *c != prev);
+                ex.children_dirty = true;
+                detached = Some(prev);
+            }
+            if let Some(new) = slot {
+                ex.children.push(new);
+                ex.children_dirty = true;
+                ex.header_slot = Some(new);
+            }
+            // The band is either painted chrome (reserve it as padding, lay the
+            // body out beneath in a flex column) or a laid-out row of its own
+            // (place both in a grid) — never both, which is what leaving the
+            // padding in place would have made it.
+            if slot.is_some() {
+                ex.style.display = Display::Grid;
+                ex.style.grid_template_columns = vec![flex(1.0)];
+                ex.style.grid_template_rows = vec![auto(), auto()];
+                ex.style.padding.top = length(0.0);
+            } else {
+                ex.style = node::default_style(ControlKind::Expander);
+            }
+            ex.ctrl_mut().header_h = 0.0;
+            ex.mark_dirty();
+        }
+        // Keep the parent links the exact inverse of the edited child list.
+        if let Some(prev) = detached {
+            self.unlink_parent(prev, id);
+        }
+        if let Some(new) = slot {
+            self.link_parent(new, id);
+            if let Some(child) = self.node_mut(new) {
+                child.style.margin.right = length(controls::expander_chevron_gutter());
+                child.style.flex_shrink = 0.0;
             }
         }
     }
@@ -859,7 +932,15 @@ impl Backend for DCompBackend {
 
     fn append_child(&mut self, parent: ControlId, child: ControlId) {
         if let Some(p) = self.node_mut(parent) {
-            p.children.push(child);
+            // Before the chrome slots, not after them. The reconciler indexes a
+            // parent's POSITIONAL children, and it has never heard of a slot
+            // child — so the two agree only while the positional children are the
+            // prefix of this list. Pushing past a mounted header broke that the
+            // first time a positional child was replaced: the reconciler removed
+            // "index 0" and index 0 was by then the header, so an Expander lost
+            // the strip you click to expand it.
+            let at = p.slot_floor();
+            p.children.insert(at, child);
             p.children_dirty = true;
         }
         self.link_parent(child, parent);
@@ -867,7 +948,8 @@ impl Backend for DCompBackend {
 
     fn insert_child(&mut self, parent: ControlId, index: usize, child: ControlId) {
         if let Some(p) = self.node_mut(parent) {
-            let i = index.min(p.children.len());
+            // Clamped to the slot floor, not the list length — see `append_child`.
+            let i = index.min(p.slot_floor());
             p.children.insert(i, child);
             p.children_dirty = true;
         }
@@ -877,7 +959,7 @@ impl Backend for DCompBackend {
     fn remove_child(&mut self, parent: ControlId, index: usize) {
         let mut gone = None;
         if let Some(p) = self.node_mut(parent)
-            && index < p.children.len()
+            && index < p.slot_floor()
         {
             gone = Some(p.children.remove(index));
             p.children_dirty = true;
@@ -890,7 +972,7 @@ impl Backend for DCompBackend {
     fn replace_child(&mut self, parent: ControlId, index: usize, new: ControlId) {
         let mut gone = None;
         if let Some(p) = self.node_mut(parent)
-            && index < p.children.len()
+            && index < p.slot_floor()
         {
             gone = Some(std::mem::replace(&mut p.children[index], new));
             p.children_dirty = true;
@@ -905,8 +987,8 @@ impl Backend for DCompBackend {
     /// parent, so no parent link changes.
     fn move_child(&mut self, parent: ControlId, from: usize, to: usize) {
         if let Some(p) = self.node_mut(parent)
-            && from < p.children.len()
-            && to < p.children.len()
+            && from < p.slot_floor()
+            && to < p.slot_floor()
         {
             let c = p.children.remove(from);
             p.children.insert(to, c);
@@ -981,12 +1063,15 @@ impl Backend for DCompBackend {
         }
     }
 
-    /// A `TitleBar`'s centered `Content` slot (WinUI `TitleBar.Content`). Other
-    /// element-header kinds (e.g. Expander) draw their header from props here, so
-    /// only TitleBar consumes an element header.
+    /// The control's header slot: a `TitleBar`'s centered `Content` (WinUI
+    /// `TitleBar.Content`), or an `Expander`'s header content (WinUI
+    /// `Expander.Header`). Both host an app subtree inside chrome the control
+    /// draws itself; only where it lands differs, so each kind places it.
     fn set_header_element(&mut self, id: ControlId, header_id: Option<ControlId>) {
-        if self.node(id).map(|n| n.kind) == Some(ControlKind::TitleBar) {
-            self.set_title_slot(id, header_id, false);
+        match self.node(id).map(|n| n.kind) {
+            Some(ControlKind::TitleBar) => self.set_title_slot(id, header_id, false),
+            Some(ControlKind::Expander) => self.set_expander_header(id, header_id),
+            _ => {}
         }
     }
 
