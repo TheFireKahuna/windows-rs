@@ -25,6 +25,7 @@ use crate::GradientAxis;
 
 pub(crate) mod animate;
 mod backdrop;
+pub(crate) mod bar_field;
 mod bootstrap;
 mod caption;
 mod color_out;
@@ -41,6 +42,7 @@ pub(crate) mod input;
 mod knob;
 pub(crate) mod layout;
 pub(crate) mod live_text;
+pub(crate) mod live_trace;
 pub(crate) mod nav;
 pub(crate) mod node;
 mod pacer;
@@ -218,6 +220,14 @@ pub struct DCompBackend {
     /// [`Backend::destroy`], and ids are never reused so a stale chord could not
     /// re-address a later node.
     keybindings: rustc_hash::FxHashMap<ControlId, Vec<(crate::VirtualKey, crate::VirtualKeyModifiers)>>,
+    /// Reusable drain buffer for [`bar_field`]'s cross-thread queue. Held on the
+    /// backend so a publish-rate producer costs no allocation on this side
+    /// either — the value buffers are swapped with the queue's, never cloned.
+    bar_batch: Vec<bar_field::BarBatch>,
+    /// Reusable drain buffer for [`live_trace`]'s cross-thread queue. Held on
+    /// the backend for [`bar_batch`](Self::bar_batch)'s reason — the geometry
+    /// buffers are swapped with the queue's, never cloned.
+    trace_batch: Vec<live_trace::TraceBatch>,
 }
 
 impl DCompBackend {
@@ -251,6 +261,8 @@ impl DCompBackend {
             hwnd,
             intents: Vec::new(),
             keybindings: rustc_hash::FxHashMap::default(),
+            bar_batch: Vec::new(),
+            trace_batch: Vec::new(),
         }
     }
 
@@ -669,6 +681,69 @@ impl DCompBackend {
     /// An id that no longer resolves is skipped rather than treated as an error:
     /// a producer holding a handle to an unmounted control is expected, and its
     /// updates are simply dropped.
+    /// Apply the bar-field values a producer thread published — the retained
+    /// analyzer's per-publish path.
+    ///
+    /// Deliberately does NOT repaint. A bar's value is a compositor property on
+    /// a sprite that already exists, so the whole update is property sets that
+    /// the thread's implicit commit carries at the end of this message. That is
+    /// the entire point of the retained field: nothing rasterizes, and no
+    /// surface is touched. See [`bar_field`].
+    pub(crate) fn service_live_bars(&mut self) {
+        // Moved out and back rather than borrowed, so the batch (and the value
+        // buffers it swaps with the queue) keeps its capacity across services
+        // while `self.arena` is borrowed mutably below.
+        let mut batch = std::mem::take(&mut self.bar_batch);
+        bar_field::drain_into(&mut batch);
+        let scale = self.scale();
+        let epoch = self.atlas.epoch();
+        for entry in &batch {
+            let Some(n) = self.arena.get_mut(entry.id) else {
+                // The host unmounted. Retire the id on both sides so a
+                // remounting field does not leave a dead entry behind it.
+                bar_field::forget(entry.id);
+                continue;
+            };
+            let field = n
+                .bars
+                .get_or_insert_with(|| Box::new(bar_field::BarField::new()));
+            field.sync(&self.comp, &n.container, entry, epoch, scale);
+        }
+        batch.retain(|e| self.arena.get(e.id).is_some());
+        self.bar_batch = batch;
+    }
+
+    /// Apply the trace geometry a producer thread published — the retained
+    /// analyzer trace's per-publish path.
+    ///
+    /// Deliberately does NOT repaint, for [`service_live_bars`](Self::service_live_bars)'s
+    /// reason: the geometry lives on a `CompositionPathGeometry` the compositor
+    /// already holds, so the whole update is property writes the thread's implicit
+    /// commit carries at the end of this message. Nothing rasterizes and no
+    /// surface is touched. See [`live_trace`].
+    pub(crate) fn service_live_traces(&mut self) {
+        // Moved out and back rather than borrowed, so the batch (and the geometry
+        // buffers it swaps with the queue) keeps its capacity across services.
+        let mut batch = std::mem::take(&mut self.trace_batch);
+        live_trace::drain_into(&mut batch);
+        let scale = self.scale();
+        let epoch = self.atlas.epoch();
+        for entry in &batch {
+            let Some(n) = self.arena.get_mut(entry.id) else {
+                // The host unmounted. Retire the id on both sides so a remounting
+                // trace does not leave a dead entry behind it.
+                live_trace::forget(entry.id);
+                continue;
+            };
+            let field = n
+                .trace
+                .get_or_insert_with(|| Box::new(live_trace::LiveTraceField::new()));
+            field.sync(&self.comp, &n.container, entry, epoch, scale);
+        }
+        batch.retain(|e| self.arena.get(e.id).is_some());
+        self.trace_batch = batch;
+    }
+
     pub(crate) fn service_live_text(&mut self) {
         let mut any = false;
         for (id, text) in live_text::drain() {
@@ -1549,6 +1624,7 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
         (Prop::RowSpacing, PropValue::F64(v)) => node.style.gap.height = length(*v as f32),
         (Prop::GridRows, PropValue::GridLengths(g)) => node.grid_rows = clone_lengths(g),
         (Prop::GridColumns, PropValue::GridLengths(g)) => node.grid_cols = clone_lengths(g),
+        (Prop::GridAutoFlow, PropValue::Bool(v)) => node.grid_auto_flow = *v,
 
         (Prop::AttachedGridRow, PropValue::I32(v)) => {
             node.style.grid_row.start = line((*v + 1) as i16);
@@ -1562,13 +1638,23 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
         (Prop::AttachedGridColumnSpan, PropValue::I32(v)) => {
             node.style.grid_column.end = span((*v).max(1) as u16);
         }
-        (Prop::AttachedCanvasLeft, PropValue::F64(v)) => {
+        (Prop::AttachedCanvasLeft, PropValue::CanvasOffset(v)) => {
             node.style.position = Position::Absolute;
-            node.style.inset.left = length(*v as f32);
+            node.style.inset.left = canvas_inset(*v);
         }
-        (Prop::AttachedCanvasTop, PropValue::F64(v)) => {
+        (Prop::AttachedCanvasTop, PropValue::CanvasOffset(v)) => {
             node.style.position = Position::Absolute;
-            node.style.inset.top = length(*v as f32);
+            node.style.inset.top = canvas_inset(*v);
+        }
+        // With BOTH insets on an axis set and no stated size, layout solves the
+        // size from the pair — so a full-bleed child never has one written to it.
+        (Prop::AttachedCanvasRight, PropValue::CanvasOffset(v)) => {
+            node.style.position = Position::Absolute;
+            node.style.inset.right = canvas_inset(*v);
+        }
+        (Prop::AttachedCanvasBottom, PropValue::CanvasOffset(v)) => {
+            node.style.position = Position::Absolute;
+            node.style.inset.bottom = canvas_inset(*v);
         }
         (Prop::AttachedCanvasZIndex, PropValue::I32(v)) => {
             node.z_index = *v;
@@ -2170,6 +2256,7 @@ prop_contract! {
         RowSpacing => |n| { n.style.gap.height = n.birth_style().gap.height; }
         GridRows => |n| { n.grid_rows.clear(); }
         GridColumns => |n| { n.grid_cols.clear(); }
+        GridAutoFlow => |n| { n.grid_auto_flow = false; }
         // XAML Grid parity: an unplaced child belongs to cell (0, 0), which is
         // Taffy line 1 — not `auto`, which would auto-flow it into the next
         // free cell and un-overlap a deliberately overlapping pair.
@@ -2197,6 +2284,8 @@ prop_contract! {
                 n.style.position = birth.position;
             }
         }
+        AttachedCanvasRight => |n| { n.style.inset.right = n.birth_style().inset.right; }
+        AttachedCanvasBottom => |n| { n.style.inset.bottom = n.birth_style().inset.bottom; }
         AttachedCanvasZIndex => |n| { n.z_index = 0; n.z_dirty = true; }
 
         // ── Control state ────────────────────────────────────────────────
@@ -2787,6 +2876,7 @@ mod unhandled {
             PropValue::Color(_) => "Color",
             PropValue::Unset => "Unset",
             PropValue::GridLengths(_) => "GridLengths",
+            PropValue::CanvasOffset(_) => "CanvasOffset",
             PropValue::SurfaceImageSource(_) => "SurfaceImageSource",
             PropValue::LineEndpoints(_) => "LineEndpoints",
             PropValue::Path(_) => "Path",
@@ -2950,6 +3040,18 @@ fn menu_row(def: &crate::MenuItemDef) -> MenuRow {
 }
 
 /// Apply a StackPanel's spacing to the correct Taffy gap axis for its direction.
+/// A `Canvas` child's offset as a Taffy inset. A fraction becomes a percentage
+/// of the canvas's own extent, which layout resolves — so the app states the
+/// relationship once and never has to measure the canvas to restate it.
+fn canvas_inset(v: crate::CanvasOffset) -> taffy::style::LengthPercentageAuto {
+    use crate::CanvasOffset;
+    use taffy::prelude::*;
+    match v {
+        CanvasOffset::Dip(x) => length(x as f32),
+        CanvasOffset::Fraction(t) => percent(t as f32),
+    }
+}
+
 fn apply_stack_gap(node: &mut Node) {
     use taffy::prelude::*;
     let s = node.spacing;

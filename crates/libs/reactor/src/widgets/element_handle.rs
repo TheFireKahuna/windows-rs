@@ -37,6 +37,44 @@ impl ElementHandle {
     pub fn live_text(&self) -> LiveText {
         LiveText::new(self.id)
     }
+
+    /// A `Send` handle for driving a field of retained bars under this control
+    /// from any thread, without a reconcile.
+    ///
+    /// The analyzer case: values that change every audio publish, computed on
+    /// the thread that reads them. The bars become compositor sprites parented
+    /// under this control, and a push is property sets on sprites that already
+    /// exist — nothing rasterizes and no surface is touched. See
+    /// [`LiveBars`](crate::LiveBars).
+    ///
+    /// Any control can host one; it contributes nothing to layout and the
+    /// sprites fill the host's own box in the geometry the caller states. As
+    /// with [`live_text`](Self::live_text), keeping a handle past the control's
+    /// unmount is safe — the update is dropped when the id no longer resolves.
+    ///
+    /// DComp backend only: retained sprite chrome has no XAML counterpart.
+    #[cfg(feature = "dcomp-backend")]
+    pub fn live_bars(&self) -> LiveBars {
+        LiveBars::new(self.id)
+    }
+
+    /// A `Send` handle for driving a retained polyline under this control from
+    /// any thread, without a reconcile.
+    ///
+    /// The analyzer's other half: a line whose *shape* changes every publish. It
+    /// becomes one compositor sprite parented under this control, and a push
+    /// re-points the geometry it already holds — no surface is repainted. See
+    /// [`LiveTrace`](crate::LiveTrace).
+    ///
+    /// Like [`live_bars`](Self::live_bars), any control can host one, it
+    /// contributes nothing to layout, and keeping the handle past the control's
+    /// unmount is safe.
+    ///
+    /// DComp backend only: retained sprite chrome has no XAML counterpart.
+    #[cfg(feature = "dcomp-backend")]
+    pub fn live_trace(&self) -> LiveTrace {
+        LiveTrace::new(self.id)
+    }
 }
 
 impl From<MountInfo> for ElementHandle {

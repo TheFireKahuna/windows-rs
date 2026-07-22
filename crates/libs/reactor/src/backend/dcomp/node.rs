@@ -642,6 +642,10 @@ pub(crate) struct Node {
     /// Grid track templates (applied at layout time for a `Grid`).
     pub grid_rows: Vec<GridLength>,
     pub grid_cols: Vec<GridLength>,
+    /// This grid places its children itself: they carry no row/column and flow
+    /// across the tracks, wrapping as they fill. Off by default — an unplaced
+    /// child belongs to cell (0, 0) for XAML parity (see the reset table).
+    pub grid_auto_flow: bool,
     /// Cached DWrite layout for text-bearing nodes; rebuilt on text/font change.
     pub text_layout: Option<TextLayout>,
     pub text_dirty: bool,
@@ -677,6 +681,18 @@ pub(crate) struct Node {
     /// motion runs DWM-side. Created lazily by the parts sync; `None` for
     /// every other node. See [`parts`](super::parts).
     pub parts: Option<Box<parts::Parts>>,
+    /// A field of retained bars a producer thread drives — the spectrum
+    /// analyzer's sprites, created and moved entirely outside the reconcile.
+    ///
+    /// Lives on the node so it dies with it: the sprites are children of
+    /// `container`, and an unmount destroys both together. Created lazily by
+    /// the first push (`bar_field::LiveBars`), `None` for every other node —
+    /// the same lazy, boxed shape `parts` takes and for the same reason.
+    pub bars: Option<Box<bar_field::BarField>>,
+    /// A retained polyline a producer thread reshapes — the analyzer's measured
+    /// trace, created and moved entirely outside the reconcile. Same lazy, boxed,
+    /// dies-with-the-node shape as [`bars`](Self::bars), and for the same reason.
+    pub trace: Option<Box<live_trace::LiveTraceField>>,
     /// Button family only: every run the control draws — its label, its leading
     /// icon glyph and its badge's count — as retained per-glyph sprites above
     /// both the chrome parts and the ink, plus the cached layouts the two
@@ -962,6 +978,7 @@ impl Node {
             spacing: 0.0,
             grid_rows: Vec::new(),
             grid_cols: Vec::new(),
+            grid_auto_flow: false,
             text_layout: None,
             text_dirty: true,
             interactivity: Interactivity::default(),
@@ -970,6 +987,8 @@ impl Node {
             accessibility: None,
             container,
             parts: None,
+            bars: None,
+            trace: None,
             button_text: None,
             text_part: None,
             live_words: None,

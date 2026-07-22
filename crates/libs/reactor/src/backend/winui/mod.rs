@@ -965,14 +965,19 @@ fn try_universal_prop(handle: &Handle, prop: Prop, value: &PropValue) -> Result<
             bindings::Grid::SetColumnSpan(&handle.as_framework_element(), *v)?;
             Ok(true)
         }
-        (Prop::AttachedCanvasLeft, PropValue::F64(v)) => {
-            bindings::Canvas::SetLeft(&handle.as_ui_element(), *v)?;
+        // A XAML `Canvas` places children in pixels only, so a fractional offset
+        // has nothing to resolve against here and pins to the leading edge.
+        (Prop::AttachedCanvasLeft, PropValue::CanvasOffset(v)) => {
+            bindings::Canvas::SetLeft(&handle.as_ui_element(), canvas_dips(*v))?;
             Ok(true)
         }
-        (Prop::AttachedCanvasTop, PropValue::F64(v)) => {
-            bindings::Canvas::SetTop(&handle.as_ui_element(), *v)?;
+        (Prop::AttachedCanvasTop, PropValue::CanvasOffset(v)) => {
+            bindings::Canvas::SetTop(&handle.as_ui_element(), canvas_dips(*v))?;
             Ok(true)
         }
+        // A XAML `Canvas` has no trailing attached properties — a child there
+        // always states its own size — so these carry no meaning on this backend.
+        (Prop::AttachedCanvasRight | Prop::AttachedCanvasBottom, _) => Ok(true),
         (Prop::AttachedCanvasZIndex, PropValue::I32(v)) => {
             bindings::Canvas::SetZIndex(&handle.as_ui_element(), *v)?;
             Ok(true)

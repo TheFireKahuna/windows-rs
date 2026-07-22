@@ -80,8 +80,8 @@ impl RingParts {
         let path = arc_path(comp, cx, cy, r, START_ANGLE, START_ANGLE + std::f32::consts::TAU)?;
         // Track first: `PathLayer::new` inserts at the top of the container, so
         // creation order IS z-order and the arc must be built second.
-        let track = PathLayer::new(comp, node, &path, Role::Stroke);
-        let arc = PathLayer::new(comp, node, &path, Role::Stroke);
+        let track = PathLayer::new(comp, &node.container, &path, Role::Stroke);
+        let arc = PathLayer::new(comp, &node.container, &path, Role::Stroke);
         Some(Self {
             track,
             arc,

@@ -186,173 +186,37 @@ fn measure_solve(
             height: AvailableSpace::Definite(height),
         }
     };
-    let _ = tree.compute_layout_with_measure(
-        viewport,
-        offered,
-        |known, available, _node_id, ctx, _style| {
-            if let (Some(w), Some(h)) = (known.width, known.height) {
-                return Size { width: w, height: h };
-            }
-            // Taffy hands the context by `&mut`; copy the id out once so the
-            // per-kind arms below can each test it without contending over the
-            // borrow.
-            let ctx = ctx.map(|id| *id);
-            // An InfoBar's height is a function of its width — its paragraph
-            // wraps inside a text column narrower than the band — so it
-            // answers from its own cached run rather than the generic
-            // `text_layout` slot below. Its `None` (max-content) case measures
-            // the paragraph on one line, exactly as the generic wrap path's
-            // does.
-            if let Some(id) = ctx
-                && let Some(node) = arena_ref.get(id)
-                && node.kind == ControlKind::InfoBar
-            {
-                let avail = known.width.or(match available.width {
-                    AvailableSpace::Definite(w) => Some(w),
-                    AvailableSpace::MinContent => Some(0.0),
-                    AvailableSpace::MaxContent => None,
-                });
-                let (w, h) = info_bar::measure(node, avail);
-                return Size {
-                    width: known.width.unwrap_or(w),
-                    height: known.height.unwrap_or(h),
-                };
-            }
-            // An InfoBadge sizes to its count (or to the bare dot). Both come
-            // from `info_badge`, which is also what `birth_style` floors it
-            // with, so the two cannot disagree.
-            if let Some(id) = ctx
-                && let Some(node) = arena_ref.get(id)
-                && node.kind == ControlKind::InfoBadge
-            {
-                let (w, h) = info_badge::measure(node);
-                return Size {
-                    width: known.width.unwrap_or(w),
-                    height: known.height.unwrap_or(h),
-                };
-            }
-            // The two per-item kinds size from `item_text`, not `text_layout`:
-            // neither owns a single representative run. A SelectorBar's
-            // segments each size to their own label; a ToggleSwitch is the
-            // track plus the gap plus the WIDER of its two state labels — the
-            // wider, not the current one, so flipping it never reflows the row.
-            if let Some(id) = ctx
-                && let Some(node) = arena_ref.get(id)
-                && matches!(node.kind, ControlKind::SelectorBar | ControlKind::ToggleSwitch)
-                && let Some(t) = node.item_text.as_ref()
-            {
-                let (mut widest, mut line_h) = (0.0f32, 0.0f32);
-                for l in t.measurable() {
-                    if let Ok((w, h)) = l.measure() {
-                        widest = widest.max(w);
-                        line_h = line_h.max(h);
-                    }
-                }
-                if node.kind == ControlKind::SelectorBar {
-                    let m = controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
-                    let labels: f32 = node.ctrl().seg_label_w.iter().sum();
-                    let n = node.ctrl().seg_label_w.len().max(1) as f32;
-                    return Size {
-                        width: known.width.unwrap_or(labels + n * 2.0 * m.pad_x + 2.0 * m.tray),
-                        height: known.height.unwrap_or(line_h + 2.0 * (m.pad_y + m.tray)),
-                    };
-                }
-                return Size {
-                    width: known
-                        .width
-                        .unwrap_or(parts::TRACK_W + controls::TOGGLE_LABEL_GAP + widest),
-                    // Taffy clamps to the birth `min_size` (the 40x20 track), so
-                    // the label's line height alone is the right answer here.
-                    height: known.height.unwrap_or(line_h),
-                };
-            }
-            // A select trigger sizes to the WIDEST label it could ever show —
-            // for the reason a ToggleSwitch does, so that picking an item never
-            // reflows the row around it — and its runs live in `select_text`
-            // rather than the generic slot below because that slot cannot hold
-            // both the widest and the current one.
-            //
-            // The formula is the generic arm's, which is where this used to be
-            // answered: the ornaments widen the box by what the content row
-            // reserves for them and the outline takes its own room on both axes.
-            if let Some(id) = ctx
-                && let Some(node) = arena_ref.get(id)
-                && matches!(node.kind, ControlKind::ComboBox | ControlKind::DropDownButton)
-                && let Some(t) = node.select_text.as_ref()
-            {
-                let (mut widest, mut line_h) = (0.0f32, 0.0f32);
-                for l in t.measurable() {
-                    if let Ok((w, h)) = l.measure() {
-                        widest = widest.max(w);
-                        line_h = line_h.max(h);
-                    }
-                }
-                let chrome = controls::chrome_inset(node);
-                return Size {
-                    width: known
-                        .width
-                        .unwrap_or(widest + controls::ornament_width(node) + chrome),
-                    height: known.height.unwrap_or(line_h + chrome),
-                };
-            }
-            if let Some(id) = ctx
-                && let Some(node) = arena_ref.get(id)
-                && let Some(layout) = &node.text_layout
-            {
-                // A wrapping run reflows against whatever width Taffy is asking
-                // about, so `measure()` below reports the WRAPPED height instead of
-                // the one-line height of the layout's construction box. Without
-                // this the box stays as `build_text_layout` made it and
-                // `set_word_wrap` is inert — a `.wrap()` paragraph measures (and so
-                // paints) as one long line and overflows its parent.
-                //
-                // The min-content mapping is exact rather than approximate: wrapping
-                // into a zero-width box breaks at every opportunity, so the reported
-                // width is the longest single word — which is min-content's
-                // definition. Max-content is the unconstrained single line.
-                //
-                // Non-wrapping runs keep the construction box untouched: their
-                // intrinsic width IS the measurement, and pills/labels size to it.
-                if node.paint.wrap {
-                    let constraint = known.width.or(match available.width {
-                        AvailableSpace::Definite(w) => Some(w),
-                        AvailableSpace::MinContent => Some(0.0),
-                        AvailableSpace::MaxContent => None,
-                    });
-                    let _ = layout.set_max_width(constraint.unwrap_or(f32::INFINITY));
-                }
-                if let Ok((tw, th)) = layout.measure() {
-                    // A hyperlink is its words and nothing else — no ornament
-                    // to reserve room for, and no border to inset from. The
-                    // generic arm below would run `button_palette` on it to
-                    // decide the latter, which is a question about a control
-                    // this is not.
-                    if node.kind == ControlKind::HyperlinkButton {
-                        return Size {
-                            width: known.width.unwrap_or(tw),
-                            height: known.height.unwrap_or(th),
-                        };
-                    }
-                    // The ornaments widen the button by exactly what
-                    // `button_boxes` reserves for them — without this an
-                    // adorned button sizes to its label alone and the ornament
-                    // overlaps the text — and the outline takes its own room on
-                    // both axes.
-                    let chrome = controls::chrome_inset(node);
-                    return Size {
-                        width: known
-                            .width
-                            .unwrap_or(tw + controls::ornament_width(node) + chrome),
-                        height: known.height.unwrap_or(th + chrome),
-                    };
-                }
-            }
-            Size {
-                width: known.width.unwrap_or(0.0),
-                height: known.height.unwrap_or(0.0),
-            }
-        },
-    );
+    // ── Skip the whole Taffy entry point when nothing it reads changed ───────
+    //
+    // Taffy already caches the SOLVE: `compute_root_layout` asks for the root
+    // through `compute_cached_layout`, which returns a hit without recursing.
+    // What it does not cache is the pass that follows — `round_layout` recurses
+    // the ENTIRE tree writing `set_final_layout` on every node, dirty or not,
+    // and it runs on every call. That walk is what this skips.
+    //
+    // The gate is `mutated` rather than Taffy's own `TaffyTree::dirty(root)`,
+    // which would otherwise be the authority here, because of one gap:
+    // `TaffyTree::remove` unlinks a node from its parent's child list and never
+    // marks that parent dirty. `sweep` calls exactly that, so a pass whose only
+    // change was a death would report clean and keep the departed child's space.
+    // `mutated` is raised at every site that mutates the tree, including there.
+    //
+    // Worth stating what this is NOT: it is not the fix for a tree that is dirty
+    // every pass. A reconcile that genuinely changes a style pays the solve
+    // either way, and a tree dirtied by something that need not have dirtied it
+    // pays it for nothing — `trace` below is what finds those.
+    //
+    // Everything downstream still runs. `solve_walk` reads the tree's cached
+    // layouts (identical either way), so the wrap pin and the element-size
+    // notifications keep firing every pass exactly as they did — a listener that
+    // registered since the last pass still gets its first delivery.
+    if lt.mutated || !lt.solved_once {
+        let _ = tree.compute_layout_with_measure(viewport, offered, |known, available, _n, ctx, _s| {
+            measure_node(arena_ref, known, available, ctx.map(|id| *id))
+        });
+        lt.solved_once = true;
+    }
+    trace::report(&mut lt.trace);
 
     // `ox/oy` accumulate into the absolute rect; `sox/soy` are the snapped
     // parent origin the relative offset is measured from. Seeding the second as
@@ -371,6 +235,369 @@ fn measure_solve(
         origin.1 - inset.1,
         scale,
     );
+}
+
+/// One node's intrinsic size, as Taffy's measure callback asks for it.
+///
+/// Every arm answers the same question — how big is this control with nothing
+/// constraining it — and differs only in where the control keeps the shaped run
+/// that answers it. A node whose kind is not named here falls through to the
+/// generic `text_layout` slot, and one with no run at all measures zero.
+///
+/// `ctx` is the node Taffy is asking about, copied out of Taffy's `&mut` context
+/// by the caller so the arms below can each test it without contending over the
+/// borrow.
+fn measure_node(
+    arena: &Arena,
+    known: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+    ctx: Option<ControlId>,
+) -> Size<f32> {
+    if let (Some(w), Some(h)) = (known.width, known.height) {
+        return Size { width: w, height: h };
+    }
+    // An InfoBar's height is a function of its width — its paragraph
+    // wraps inside a text column narrower than the band — so it
+    // answers from its own cached run rather than the generic
+    // `text_layout` slot below. Its `None` (max-content) case measures
+    // the paragraph on one line, exactly as the generic wrap path's
+    // does.
+    if let Some(id) = ctx
+        && let Some(node) = arena.get(id)
+        && node.kind == ControlKind::InfoBar
+    {
+        let avail = known.width.or(match available.width {
+            AvailableSpace::Definite(w) => Some(w),
+            AvailableSpace::MinContent => Some(0.0),
+            AvailableSpace::MaxContent => None,
+        });
+        let (w, h) = info_bar::measure(node, avail);
+        return Size {
+            width: known.width.unwrap_or(w),
+            height: known.height.unwrap_or(h),
+        };
+    }
+    // An InfoBadge sizes to its count (or to the bare dot). Both come
+    // from `info_badge`, which is also what `birth_style` floors it
+    // with, so the two cannot disagree.
+    if let Some(id) = ctx
+        && let Some(node) = arena.get(id)
+        && node.kind == ControlKind::InfoBadge
+    {
+        let (w, h) = info_badge::measure(node);
+        return Size {
+            width: known.width.unwrap_or(w),
+            height: known.height.unwrap_or(h),
+        };
+    }
+    // The two per-item kinds size from `item_text`, not `text_layout`:
+    // neither owns a single representative run. A SelectorBar's
+    // segments each size to their own label; a ToggleSwitch is the
+    // track plus the gap plus the WIDER of its two state labels — the
+    // wider, not the current one, so flipping it never reflows the row.
+    if let Some(id) = ctx
+        && let Some(node) = arena.get(id)
+        && matches!(node.kind, ControlKind::SelectorBar | ControlKind::ToggleSwitch)
+        && let Some(t) = node.item_text.as_ref()
+    {
+        let (mut widest, mut line_h) = (0.0f32, 0.0f32);
+        for l in t.measurable() {
+            if let Ok((w, h)) = l.measure() {
+                widest = widest.max(w);
+                line_h = line_h.max(h);
+            }
+        }
+        if node.kind == ControlKind::SelectorBar {
+            let m = controls::seg_metrics(node.paint.style_variant, node.paint.font_size);
+            let labels: f32 = node.ctrl().seg_label_w.iter().sum();
+            let n = node.ctrl().seg_label_w.len().max(1) as f32;
+            return Size {
+                width: known.width.unwrap_or(labels + n * 2.0 * m.pad_x + 2.0 * m.tray),
+                height: known.height.unwrap_or(line_h + 2.0 * (m.pad_y + m.tray)),
+            };
+        }
+        return Size {
+            width: known
+                .width
+                .unwrap_or(parts::TRACK_W + controls::TOGGLE_LABEL_GAP + widest),
+            // Taffy clamps to the birth `min_size` (the 40x20 track), so
+            // the label's line height alone is the right answer here.
+            height: known.height.unwrap_or(line_h),
+        };
+    }
+    // A select trigger sizes to the WIDEST label it could ever show —
+    // for the reason a ToggleSwitch does, so that picking an item never
+    // reflows the row around it — and its runs live in `select_text`
+    // rather than the generic slot below because that slot cannot hold
+    // both the widest and the current one.
+    //
+    // The formula is the generic arm's, which is where this used to be
+    // answered: the ornaments widen the box by what the content row
+    // reserves for them and the outline takes its own room on both axes.
+    if let Some(id) = ctx
+        && let Some(node) = arena.get(id)
+        && matches!(node.kind, ControlKind::ComboBox | ControlKind::DropDownButton)
+        && let Some(t) = node.select_text.as_ref()
+    {
+        let (mut widest, mut line_h) = (0.0f32, 0.0f32);
+        for l in t.measurable() {
+            if let Ok((w, h)) = l.measure() {
+                widest = widest.max(w);
+                line_h = line_h.max(h);
+            }
+        }
+        let chrome = controls::chrome_inset(node);
+        return Size {
+            width: known
+                .width
+                .unwrap_or(widest + controls::ornament_width(node) + chrome),
+            height: known.height.unwrap_or(line_h + chrome),
+        };
+    }
+    if let Some(id) = ctx
+        && let Some(node) = arena.get(id)
+        && let Some(layout) = &node.text_layout
+    {
+        // A wrapping run reflows against whatever width Taffy is asking
+        // about, so `measure()` below reports the WRAPPED height instead of
+        // the one-line height of the layout's construction box. Without
+        // this the box stays as `build_text_layout` made it and
+        // `set_word_wrap` is inert — a `.wrap()` paragraph measures (and so
+        // paints) as one long line and overflows its parent.
+        //
+        // The min-content mapping is exact rather than approximate: wrapping
+        // into a zero-width box breaks at every opportunity, so the reported
+        // width is the longest single word — which is min-content's
+        // definition. Max-content is the unconstrained single line.
+        //
+        // Non-wrapping runs keep the construction box untouched: their
+        // intrinsic width IS the measurement, and pills/labels size to it.
+        if node.paint.wrap {
+            let constraint = known.width.or(match available.width {
+                AvailableSpace::Definite(w) => Some(w),
+                AvailableSpace::MinContent => Some(0.0),
+                AvailableSpace::MaxContent => None,
+            });
+            let _ = layout.set_max_width(constraint.unwrap_or(f32::INFINITY));
+        }
+        if let Ok((tw, th)) = layout.measure() {
+            // A hyperlink is its words and nothing else — no ornament
+            // to reserve room for, and no border to inset from. The
+            // generic arm below would run `button_palette` on it to
+            // decide the latter, which is a question about a control
+            // this is not.
+            if node.kind == ControlKind::HyperlinkButton {
+                return Size {
+                    width: known.width.unwrap_or(tw),
+                    height: known.height.unwrap_or(th),
+                };
+            }
+            // The ornaments widen the button by exactly what
+            // `button_boxes` reserves for them — without this an
+            // adorned button sizes to its label alone and the ornament
+            // overlaps the text — and the outline takes its own room on
+            // both axes.
+            let chrome = controls::chrome_inset(node);
+            return Size {
+                width: known
+                    .width
+                    .unwrap_or(tw + controls::ornament_width(node) + chrome),
+                height: known.height.unwrap_or(th + chrome),
+            };
+        }
+    }
+    Size {
+        width: known.width.unwrap_or(0.0),
+        height: known.height.unwrap_or(0.0),
+    }
+}
+
+/// Why a layout pass could not reuse the last one's answers.
+///
+/// A reconcile that changes only paint props cannot move a box, so it should
+/// find the Taffy tree clean and skip straight past the solve. When it does not,
+/// something wrote a layout input it did not need to — and that costs a full
+/// solve plus a full `round_layout` walk on every frame of a drag.
+///
+/// Finding those is a matter of naming the exact call that dirtied the tree,
+/// which only this module can do: by the time Taffy reports dirty, the node that
+/// caused it is indistinguishable from every ancestor it propagated to. So each
+/// of the five sites that can mutate the tree reports itself here.
+///
+/// Off unless `REACTOR_LAYOUT_TRACE` is set in the environment, and free when
+/// off — [`on`] is read once and every recording site is behind it.
+pub(crate) mod trace {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One tree mutation, as the site that made it saw it.
+    pub(crate) struct Entry {
+        /// The node mutated, or `None` for a mutation of the tree ITSELF — a
+        /// sweep or a viewport re-style, neither of which belongs to any node.
+        pub node: Option<(ControlId, ControlKind)>,
+        /// Which of the five mutating calls ran.
+        pub site: &'static str,
+        /// What specifically differed — a style field name, or the empty string
+        /// where the site has nothing further to say.
+        pub detail: &'static str,
+        /// Something human-readable about the node: its automation name, its
+        /// text, or its nearest labelled ancestor. A node NUMBER says nothing
+        /// about which part of the app is re-styling itself; this is what turns
+        /// the log into an address.
+        pub label: String,
+    }
+
+    /// Whether tracing is on. Read from the environment ONCE: this is consulted
+    /// per node per pass, and an env lookup there would itself be the cost.
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("REACTOR_LAYOUT_TRACE").is_some())
+    }
+
+    pub(crate) fn note(
+        log: &mut Vec<Entry>,
+        id: ControlId,
+        kind: ControlKind,
+        site: &'static str,
+        detail: &'static str,
+    ) {
+        if on() {
+            log.push(Entry { node: Some((id, kind)), site, detail, label: String::new() });
+        }
+    }
+
+    /// As [`note`], with the node's own identity attached. Used where the caller
+    /// holds the `Node` and can afford the lookup — the recording is already
+    /// behind `on()`, so an untraced run builds no strings.
+    pub(crate) fn note_labelled(
+        log: &mut Vec<Entry>,
+        id: ControlId,
+        node: &Node,
+        arena: &Arena,
+        site: &'static str,
+        detail: &'static str,
+    ) {
+        if on() {
+            log.push(Entry { node: Some((id, node.kind)), site, detail, label: label_of(node, arena) });
+        }
+    }
+
+    /// A node's readable identity: its automation name, else its own text, else
+    /// the nearest ancestor that has one — an unnamed `Border` is meaningless
+    /// alone, and the panel it sits in is the answer the reader wants.
+    fn label_of(node: &Node, arena: &Arena) -> String {
+        fn own(n: &Node) -> Option<String> {
+            n.accessibility
+                .as_ref()
+                .and_then(|a| a.automation_name.clone())
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!n.paint.text.is_empty()).then(|| n.paint.text.clone()))
+        }
+        if let Some(s) = own(node) {
+            return s.chars().take(40).collect();
+        }
+        let mut cur = node.parent;
+        for _ in 0..6 {
+            let Some(p) = cur.and_then(|id| arena.get(id)) else { break };
+            if let Some(s) = own(p) {
+                return format!("in {:?} \"{}\"", p.kind, s.chars().take(30).collect::<String>());
+            }
+            cur = p.parent;
+        }
+        String::new()
+    }
+
+    /// A mutation of the tree itself rather than of one node.
+    pub(crate) fn note_tree(log: &mut Vec<Entry>, site: &'static str, detail: &'static str) {
+        if on() {
+            log.push(Entry { node: None, site, detail, label: String::new() });
+        }
+    }
+
+    /// Print this pass's mutations and drain them.
+    ///
+    /// Both halves of the ratio are reported, because a site that fires on a
+    /// tenth of passes and one that fires on every pass are completely different
+    /// findings and the per-pass lines alone do not distinguish them.
+    pub(crate) fn report(log: &mut Vec<Entry>) {
+        if !on() {
+            return;
+        }
+        static PASSES: AtomicU64 = AtomicU64::new(0);
+        static DIRTY: AtomicU64 = AtomicU64::new(0);
+        let passes = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if log.is_empty() {
+            return;
+        }
+        let dirty = DIRTY.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!(
+            "layout: pass {passes} dirty ({dirty}/{passes} passes) — {} mutation(s)",
+            log.len()
+        );
+        for e in log.drain(..) {
+            let detail = if e.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", e.detail)
+            };
+            match e.node {
+                Some((id, kind)) => {
+                    let label = if e.label.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {}", e.label)
+                    };
+                    eprintln!("  {:<14} {kind:?}#{}{detail}{label}", e.site, id.get());
+                }
+                None => eprintln!("  {:<14} <tree>{detail}", e.site),
+            }
+        }
+    }
+
+    /// The first field in which two styles differ, by name.
+    ///
+    /// Only the fields this backend actually writes are named; anything else
+    /// falls through to `"other"`, which is itself a useful answer — it means
+    /// something is reaching Taffy by a route nothing here knows about.
+    pub(crate) fn style_delta(a: &Style, b: &Style) -> &'static str {
+        macro_rules! first_diff {
+            ($($f:ident),* $(,)?) => {
+                $(if a.$f != b.$f { return stringify!($f); })*
+            };
+        }
+        first_diff!(
+            display,
+            position,
+            inset,
+            size,
+            min_size,
+            max_size,
+            aspect_ratio,
+            margin,
+            padding,
+            border,
+            gap,
+            align_items,
+            align_self,
+            justify_items,
+            justify_self,
+            align_content,
+            justify_content,
+            flex_direction,
+            flex_wrap,
+            flex_basis,
+            flex_grow,
+            flex_shrink,
+            grid_row,
+            grid_column,
+            grid_template_rows,
+            grid_template_columns,
+            grid_auto_flow,
+            overflow,
+            scrollbar_width,
+        );
+        "other"
+    }
 }
 
 /// One node's placement, as the measure + solve half hands it to [`apply`]:
@@ -978,6 +1205,22 @@ pub(crate) struct LayoutTree {
     /// state allocates nothing. Post-split this map is what crosses the thread
     /// boundary — everything in it is `Send` by the [`Solved`] assertion.
     solved: rustc_hash::FxHashMap<u32, Solved>,
+    /// Whether anything Taffy's solve reads was written this pass — a style
+    /// pushed, a node created or swept, a child list re-parented, a measure
+    /// cache dropped, or the viewport re-styled.
+    ///
+    /// This is what lets a pass SKIP the solve entirely (see
+    /// [`measure_solve`]). It is set only at the sites that actually mutate the
+    /// tree, so it cannot drift from what Taffy would see: a solve's output is a
+    /// function of styles, children, dirty marks and the viewport, and every one
+    /// of those reaches Taffy through a call that raises this flag.
+    mutated: bool,
+    /// Whether the tree has ever been solved. The first pass must run whatever
+    /// the flag says — there are no cached layouts to reuse yet.
+    solved_once: bool,
+    /// This pass's tree mutations, when `REACTOR_LAYOUT_TRACE` is set. Always
+    /// empty otherwise; drained by [`trace::report`] at the end of the pass.
+    trace: Vec<trace::Entry>,
 }
 
 impl LayoutTree {
@@ -993,6 +1236,9 @@ impl LayoutTree {
             scratch: Vec::new(),
             order: Vec::new(),
             solved: rustc_hash::FxHashMap::default(),
+            mutated: false,
+            solved_once: false,
+            trace: Vec::new(),
         }
     }
 
@@ -1001,7 +1247,8 @@ impl LayoutTree {
     /// root's Taffy node.
     fn walk_root(&mut self, arena: &mut Arena, root: ControlId) -> Option<NodeId> {
         let mut visited = 0usize;
-        let id = self.walk(arena, root, false, &mut visited);
+        self.mutated = false;
+        let id = self.walk(arena, root, false, None, &mut visited);
         // A node can be alive in the arena yet unreachable from the root (the
         // reconciler legitimately parks a subtree mid-diff), so "not visited"
         // does NOT mean "dead" — the sweep re-checks the arena and keeps those.
@@ -1010,6 +1257,26 @@ impl LayoutTree {
             self.sweep(arena);
         }
         id
+    }
+
+    /// Whether [`finalize_style`] would change anything about `node.style` —
+    /// i.e. whether the finalized style has to be MATERIALIZED before it can be
+    /// compared against the one Taffy holds.
+    ///
+    /// Most nodes override nothing, and for those the node's own style IS the
+    /// finalized one, so the comparison can read it in place. That is worth
+    /// asking, because the alternative is a `taffy::Style` copy — several
+    /// hundred bytes, plus a heap allocation for any grid declaring tracks — per
+    /// node per pass, spent almost always to discover that nothing changed.
+    ///
+    /// The three arms mirror [`finalize_style`] exactly and must move with it:
+    /// an override this misses would be built, compared and pushed no longer.
+    fn overrides_style(node: &Node, hidden: bool, place: Option<ChildPlace>) -> bool {
+        place.is_some()
+            || hidden
+            || (node.kind == ControlKind::InfoBar && !node.extras().bar_open)
+            || (node.kind == ControlKind::Grid
+                && (!node.grid_rows.is_empty() || !node.grid_cols.is_empty()))
     }
 
     /// Reconcile one arena node (and its subtree) with its Taffy node: create
@@ -1028,6 +1295,7 @@ impl LayoutTree {
         arena: &mut Arena,
         id: ControlId,
         hidden: bool,
+        place: Option<ChildPlace>,
         visited: &mut usize,
     ) -> Option<NodeId> {
         // A collapsed Expander hides its body children. With a PAINTED header
@@ -1039,6 +1307,24 @@ impl LayoutTree {
         let header_child = expander.and_then(|n| n.header_slot);
         let child_hidden = hidden || collapse;
 
+        // A grid whose track count is solved from its own width has no cells to
+        // hand-place into, so its children auto-flow across and wrap. Handed down
+        // for the same reason the Expander row is: the reconciler resets an
+        // unplaced child to line 1 (XAML parity — see the reset table), which
+        // would stack every one of them in cell (0, 0).
+        let auto_flow = arena
+            .get(id)
+            .is_some_and(|n| {
+                // Either the grid asked for it, or its tracks make hand-placement
+                // impossible: an auto-fill count is not known to the app.
+                n.grid_auto_flow
+                    || n.grid_cols
+                        .iter()
+                        .chain(&n.grid_rows)
+                        .any(|g| matches!(g, GridLength::AutoFill(_)))
+            })
+            .then_some(ChildPlace::AutoFlow);
+
         // Children first — their Taffy nodes must exist before `set_children`.
         // Indexed rather than over a cloned child list: the clone was a heap
         // allocation per node per frame bought purely to dodge `&mut Arena`.
@@ -1049,20 +1335,21 @@ impl LayoutTree {
             // rows are stated. Auto-placing the body was not enough: the header
             // is appended last (so the reconciler's positional indices for the
             // body keep meaning what they did), and an auto-placed body took the
-            // header's row and drew straight through it. Re-stated every pass
-            // rather than once at attach, because the body child is the
-            // reconciler's to replace and a fresh one arrives unplaced.
-            if header_child.is_some()
-                && let Some(child) = arena.get_mut(c)
-            {
-                let row = if Some(c) == header_child { 1 } else { 2 };
-                child.style.grid_row = Line {
-                    start: GridPlacement::from_line_index(row),
-                    end: GridPlacement::Span(1),
-                };
-            }
+            // header's row and drew straight through it.
+            //
+            // Handed DOWN rather than written into the child's own style, which
+            // is what this used to do. That put two writers on one field: the
+            // reconciler emits `AttachedGridRow = Unset` for a child the app
+            // never placed, which resets the row to line 1, and the next layout
+            // pass wrote line 2 back — so the pair oscillated, and every cycle
+            // cost a `set_style`, a full solve and a full `round_layout` walk.
+            // As a derived override the child's style is never touched, so the
+            // finalized style is stable and the second pass finds it unchanged.
+            let c_place = header_child
+                .map(|h| ChildPlace::Row(if c == h { 1 } else { 2 }))
+                .or(auto_flow);
             let c_hidden = child_hidden && Some(c) != header_child;
-            if let Some(cid) = self.walk(arena, c, c_hidden, visited) {
+            if let Some(cid) = self.walk(arena, c, c_hidden, c_place, visited) {
                 self.scratch.push(cid);
             }
             i += 1;
@@ -1073,29 +1360,47 @@ impl LayoutTree {
             return None;
         };
         let existing = n.taffy_id.and_then(|(g, t)| (g == self.generation).then_some(t));
-        // Building the finalized style to compare it is a stack copy (plus a
-        // vec clone only for a Grid that declares tracks) — cheap next to the
-        // full subtree invalidation `set_style` would otherwise trigger every
-        // pass. Comparing the WHOLE style with `==` rather than field by field
-        // is deliberate: a future Taffy field cannot be forgotten here.
-        let want = finalize_style(n, hidden);
+        // Comparing the WHOLE style with `==` rather than field by field is
+        // deliberate: a future Taffy field cannot be forgotten here. What the
+        // comparison reads is chosen per node — the node's own style where that
+        // IS the finalized one, and a materialized copy only for the few kinds
+        // that override something (see `overrides_style`). Pushing is still
+        // gated on a real difference, because `set_style` invalidates the whole
+        // subtree.
+        let overrides = Self::overrides_style(n, hidden, place);
+        let measure_dirty = n.measure_dirty;
         let remeasure = n.measure_dirty
             // `seg_metrics` reads the style variant, which is not a text prop
             // and so does not route through `text_dirty` — a SelectorBar whose
             // chrome changed re-measures with its repaint.
             || (n.kind == ControlKind::SelectorBar && n.dirty);
 
+        let kind = n.kind;
         let tid = if let Some(t) = existing {
-            if self.tree.style(t).is_ok_and(|cur| *cur != want) {
-                let _ = self.tree.set_style(t, want);
+            let want = overrides.then(|| finalize_style(n, hidden, place));
+            let want = want.as_ref().unwrap_or(&n.style);
+            if self.tree.style(t).is_ok_and(|cur| cur != want) {
+                let field = trace::on()
+                    .then(|| self.tree.style(t).ok().map(|cur| trace::style_delta(cur, want)))
+                    .flatten()
+                    .unwrap_or("");
+                let _ = self.tree.set_style(t, want.clone());
+                self.mutated = true;
+                if trace::on()
+                    && let Some(n) = arena.get(id)
+                {
+                    trace::note_labelled(&mut self.trace, id, n, arena, "set_style", field);
+                }
             }
             t
         } else {
-            let Ok(t) = self.tree.new_leaf_with_context(want, id) else {
+            let Ok(t) = self.tree.new_leaf_with_context(finalize_style(n, hidden, place), id) else {
                 self.scratch.truncate(base);
                 return None;
             };
             self.owned.insert(id.get(), t);
+            self.mutated = true;
+            trace::note(&mut self.trace, id, kind, "new_leaf", "");
             t
         };
         if let Some(n) = arena.get_mut(id) {
@@ -1108,6 +1413,14 @@ impl LayoutTree {
         // by hand or a relabelled node keeps its old intrinsic size forever.
         if remeasure {
             let _ = self.tree.mark_dirty(tid);
+            self.mutated = true;
+            trace::note(
+                &mut self.trace,
+                id,
+                kind,
+                "mark_dirty",
+                if measure_dirty { "measure_dirty" } else { "selector_chrome" },
+            );
         }
 
         // Re-parent only on an actual change: `set_children` marks the parent
@@ -1121,6 +1434,8 @@ impl LayoutTree {
             && self.tree.child_at_index(tid, kids.len()).is_err();
         if !same {
             let _ = self.tree.set_children(tid, kids);
+            self.mutated = true;
+            trace::note(&mut self.trace, id, kind, "set_children", "");
         }
         self.scratch.truncate(base);
         *visited += 1;
@@ -1131,6 +1446,7 @@ impl LayoutTree {
     fn sweep(&mut self, arena: &Arena) {
         let tree = &mut self.tree;
         let mut vp_child = self.vp_child;
+        let mut removed = false;
         self.owned.retain(|raw, nid| {
             if arena.get(ControlId::new(*raw)).is_some() {
                 return true;
@@ -1139,9 +1455,14 @@ impl LayoutTree {
                 vp_child = None;
             }
             let _ = tree.remove(*nid);
+            removed = true;
             false
         });
         self.vp_child = vp_child;
+        self.mutated |= removed;
+        if removed {
+            trace::note_tree(&mut self.trace, "sweep", "node died");
+        }
     }
 
     /// The synthetic viewport wrapping the real root, created once and resized
@@ -1171,16 +1492,21 @@ impl LayoutTree {
             self.viewport = Some(v);
             self.vp_size = (width, height);
             self.vp_hug = hug;
+            self.mutated = true;
             v
         };
         if self.vp_size != (width, height) || self.vp_hug != hug {
             let _ = self.tree.set_style(vp, viewport_style(width, height, hug));
             self.vp_size = (width, height);
             self.vp_hug = hug;
+            self.mutated = true;
+            trace::note_tree(&mut self.trace, "viewport", "resized");
         }
         if self.vp_child != Some(root) {
             let _ = self.tree.set_children(vp, &[root]);
             self.vp_child = Some(root);
+            self.mutated = true;
+            trace::note_tree(&mut self.trace, "viewport", "root changed");
         }
         Some(vp)
     }
@@ -1220,13 +1546,41 @@ fn viewport_style(width: f32, height: f32, hug: bool) -> Style {
     s
 }
 
+/// A cell placement a parent derives for its children, applied in
+/// [`finalize_style`] instead of being written into the child's own style —
+/// where the reconciler's placement resets would fight it.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ChildPlace {
+    /// The `Expander` two-row band: this child sits on this grid line.
+    Row(i16),
+    /// The parent solves its own track count, so there are no stated cells to
+    /// place into — flow across the tracks and wrap.
+    AutoFlow,
+}
+
 /// Produce the final Taffy style for a node: its accumulated `style`, the
 /// collapsed-subtree `Display::None` override, plus grid track templates for a
 /// `Grid` (the only style derived lazily from props).
-fn finalize_style(node: &Node, hidden: bool) -> Style {
+fn finalize_style(node: &Node, hidden: bool, place: Option<ChildPlace>) -> Style {
     let mut s = node.style.clone();
     if hidden {
         s.display = Display::None;
+    }
+    // Cell placement a parent imposes on this child. Derived here rather than
+    // stored on the child, so the reconciler's own writes to that child cannot
+    // disagree with it — see the call site in `walk`.
+    match place {
+        Some(ChildPlace::Row(row)) => {
+            s.grid_row = Line {
+                start: GridPlacement::from_line_index(row),
+                end: GridPlacement::Span(1),
+            };
+        }
+        Some(ChildPlace::AutoFlow) => {
+            s.grid_row = Line { start: GridPlacement::Auto, end: GridPlacement::Auto };
+            s.grid_column = Line { start: GridPlacement::Auto, end: GridPlacement::Auto };
+        }
+        None => {}
     }
     // A closed InfoBar reclaims its space rather than merely painting nothing:
     // WinUI's `IsOpen=false` removes the band from layout, and a bar that left
@@ -1249,6 +1603,16 @@ fn finalize_style(node: &Node, hidden: bool) -> Style {
 }
 
 fn track(g: &GridLength) -> GridTemplateComponent<String> {
+    if let GridLength::AutoFill(min) = g {
+        // `minmax(min, 1fr)`, not `minmax(min, auto)`: the tracks stay equal and
+        // absorb the remainder, matching the hand-rolled "N Star columns" this
+        // replaces. Auto-fill (not auto-fit) keeps empty trailing tracks, so a
+        // part-full last row lines its items up with the rows above it.
+        return repeat(
+            RepetitionCount::AutoFill,
+            vec![minmax(length(*min as f32), fr(1.0))],
+        );
+    }
     GridTemplateComponent::Single(match g {
         GridLength::Auto => auto(),
         GridLength::Pixel(p) => length(*p as f32),
@@ -1260,6 +1624,7 @@ fn track(g: &GridLength) -> GridTemplateComponent<String> {
         // (collapsing the analyzer/viz panel above it). `flex()` is `minmax(0, Nfr)`,
         // the exact Star semantics, so equal Star tracks stay equal under overflow.
         GridLength::Star(f) => flex(*f as f32),
+        GridLength::AutoFill(_) => unreachable!("handled above"),
     })
 }
 

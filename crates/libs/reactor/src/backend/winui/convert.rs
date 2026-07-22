@@ -6,6 +6,15 @@
 
 use super::*;
 
+/// A [`CanvasOffset`] in DIPs. `Canvas.Left`/`Top` take pixels, so a fraction
+/// has no containing extent to resolve against and degrades to the edge.
+pub(super) fn canvas_dips(v: CanvasOffset) -> f64 {
+    match v {
+        CanvasOffset::Dip(x) => x,
+        CanvasOffset::Fraction(_) => 0.0,
+    }
+}
+
 pub(super) fn to_xaml_gridlength(v: GridLength) -> Result<bindings::GridLength> {
     use bindings::GridUnitType;
     match v {
@@ -19,6 +28,18 @@ pub(super) fn to_xaml_gridlength(v: GridLength) -> Result<bindings::GridLength> 
         }),
         GridLength::Star(v) => Ok(bindings::GridLength {
             value: v,
+            grid_unit_type: GridUnitType::Star,
+        }),
+        // A XAML `Grid` has a fixed track count — no unit type solves one from
+        // the container's width, and the wrapping panels that come close
+        // (`VariableSizedWrapGrid`, `ItemsWrapGrid`) are uniform-cell, not
+        // content-flow. So this collapses to a single full-width track: the
+        // children fall back on whatever placement they carry. A XAML `Grid`
+        // also has no auto-flow, so the auto-placement `AutoFill` relies on is
+        // DComp-only: a panel that uses it should set explicit rows too if it
+        // must render on this backend.
+        GridLength::AutoFill(_) => Ok(bindings::GridLength {
+            value: 1.0,
             grid_unit_type: GridUnitType::Star,
         }),
     }

@@ -24,7 +24,10 @@ pub mod dcomp_test_api;
 
 #[cfg(feature = "dcomp-backend")]
 pub use dcomp::{
-    live_text::LiveText, pointer_capture_active, set_display_change_callback, set_host_tokens,
+    bar_field::{BarFieldLayout, BarRect, LiveBars},
+    live_text::LiveText,
+    live_trace::{LiveTrace, TraceLayout, TracePath},
+    pointer_capture_active, set_display_change_callback, set_host_tokens,
     set_output_color_transform, set_root_backdrop_provider, set_window_visibility_callback,
     BackdropDither, BackdropGlow, BackdropSpec, DCompBackend, DCompHost, GlowDrift, HostTokens,
 };
@@ -139,6 +142,8 @@ pub enum Prop {
     AlignVCenterWithPanel,
     AllowDrop,
     AttachedCanvasLeft,
+    AttachedCanvasBottom,
+    AttachedCanvasRight,
     AttachedCanvasTop,
     AttachedCanvasZIndex,
     AttachedGridColumn,
@@ -189,6 +194,7 @@ pub enum Prop {
     /// Which way a shape FILL gradient runs across its box (a [`GradientAxis`]
     /// discriminant).
     GradientAxis,
+    GridAutoFlow,
     GridColumns,
     GridRows,
     GroupName,
@@ -330,6 +336,7 @@ pub enum PropValue {
     Color(Color),
     Unset,
     GridLengths(Vec<GridLength>),
+    CanvasOffset(CanvasOffset),
     SurfaceImageSource(SurfaceImageSource),
     LineEndpoints(LineEndpoints),
     NavMenuItems(Vec<NavViewItem>),

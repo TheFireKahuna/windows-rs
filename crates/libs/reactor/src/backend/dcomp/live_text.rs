@@ -60,6 +60,14 @@ pub(crate) fn set_front_hwnd(hwnd: isize) {
     FRONT_HWND.store(hwnd, Ordering::Release);
 }
 
+/// The front window, or `0` before it exists — the wake address every producer
+/// seam shares. Read by [`bar_field`](super::bar_field), which queues from
+/// producer threads on exactly the same terms and has no second window to post
+/// to.
+pub(crate) fn front_hwnd() -> isize {
+    FRONT_HWND.load(Ordering::Acquire)
+}
+
 /// A handle to one control's text, writable from any thread.
 ///
 /// Obtained from a mounted `TextBlock`. Cheap to clone and `Send`, because it

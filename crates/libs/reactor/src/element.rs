@@ -454,7 +454,68 @@ impl Element {
         }
         self
     }
-    pub fn canvas_left(mut self, x: f64) -> Self {
+    pub fn canvas_left(self, x: f64) -> Self {
+        self.canvas_offset_left(CanvasOffset::Dip(x))
+    }
+    pub fn canvas_top(self, y: f64) -> Self {
+        self.canvas_offset_top(CanvasOffset::Dip(y))
+    }
+    /// Place this child a share of the canvas's width along it — see
+    /// [`CanvasOffset::Fraction`].
+    pub fn canvas_left_fraction(self, t: f64) -> Self {
+        self.canvas_offset_left(CanvasOffset::Fraction(t))
+    }
+    /// Place this child a share of the canvas's height down it — see
+    /// [`CanvasOffset::Fraction`].
+    pub fn canvas_top_fraction(self, t: f64) -> Self {
+        self.canvas_offset_top(CanvasOffset::Fraction(t))
+    }
+    /// Pin this child to all four edges of its canvas — see the trait method of
+    /// the same name.
+    pub fn canvas_fill(mut self) -> Self {
+        if let Some(bag) = self.attached_mut() {
+            let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
+            p.left = CanvasOffset::Dip(0.0);
+            p.top = CanvasOffset::Dip(0.0);
+            p.right = Some(CanvasOffset::Dip(0.0));
+            p.bottom = Some(CanvasOffset::Dip(0.0));
+            bag.set(p);
+        }
+        self
+    }
+
+    /// Pin this child's trailing edge, so its size on that axis is SOLVED from the
+    /// pair of insets rather than stated — see [`CanvasPosition::right`].
+    pub fn canvas_right(self, x: f64) -> Self {
+        self.canvas_offset_right(Some(CanvasOffset::Dip(x)))
+    }
+    pub fn canvas_bottom(self, y: f64) -> Self {
+        self.canvas_offset_bottom(Some(CanvasOffset::Dip(y)))
+    }
+    /// Pin the trailing edge a share of the canvas in from it.
+    pub fn canvas_right_fraction(self, t: f64) -> Self {
+        self.canvas_offset_right(Some(CanvasOffset::Fraction(t)))
+    }
+    pub fn canvas_bottom_fraction(self, t: f64) -> Self {
+        self.canvas_offset_bottom(Some(CanvasOffset::Fraction(t)))
+    }
+    fn canvas_offset_right(mut self, x: Option<CanvasOffset>) -> Self {
+        if let Some(bag) = self.attached_mut() {
+            let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
+            p.right = x;
+            bag.set(p);
+        }
+        self
+    }
+    fn canvas_offset_bottom(mut self, y: Option<CanvasOffset>) -> Self {
+        if let Some(bag) = self.attached_mut() {
+            let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
+            p.bottom = y;
+            bag.set(p);
+        }
+        self
+    }
+    fn canvas_offset_left(mut self, x: CanvasOffset) -> Self {
         if let Some(bag) = self.attached_mut() {
             let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
             p.left = x;
@@ -462,7 +523,7 @@ impl Element {
         }
         self
     }
-    pub fn canvas_top(mut self, y: f64) -> Self {
+    fn canvas_offset_top(mut self, y: CanvasOffset) -> Self {
         if let Some(bag) = self.attached_mut() {
             let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
             p.top = y;
@@ -790,7 +851,87 @@ pub trait ElementExt: Sized {
         self
     }
 
-    fn canvas_left(mut self, x: f64) -> Self {
+    fn canvas_left(self, x: f64) -> Self {
+        self.canvas_offset_left(CanvasOffset::Dip(x))
+    }
+
+    fn canvas_top(self, y: f64) -> Self {
+        self.canvas_offset_top(CanvasOffset::Dip(y))
+    }
+
+    /// Place this child a share of the canvas's width along it — see
+    /// [`CanvasOffset::Fraction`].
+    fn canvas_left_fraction(self, t: f64) -> Self {
+        self.canvas_offset_left(CanvasOffset::Fraction(t))
+    }
+
+    /// Place this child a share of the canvas's height down it — see
+    /// [`CanvasOffset::Fraction`].
+    fn canvas_top_fraction(self, t: f64) -> Self {
+        self.canvas_offset_top(CanvasOffset::Fraction(t))
+    }
+
+    /// Pin this child to all four edges of its canvas, so layout SOLVES its size
+    /// from the canvas's own rather than being told it.
+    ///
+    /// This is what a full-bleed drawn layer wants — a curve, a wire, a plot body.
+    /// Stating `.width(measured_w).height(measured_h)` instead makes every resize a
+    /// style write, and a style write invalidates the whole subtree; the geometry
+    /// inside can still be in pixels, because geometry is a paint property and
+    /// costs only a repaint.
+    fn canvas_fill(mut self) -> Self {
+        if let Some(m) = self.modifiers_mut() {
+            let bag = m.attached.get_or_insert_with(AttachedProps::default);
+            let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
+            p.left = CanvasOffset::Dip(0.0);
+            p.top = CanvasOffset::Dip(0.0);
+            p.right = Some(CanvasOffset::Dip(0.0));
+            p.bottom = Some(CanvasOffset::Dip(0.0));
+            bag.set(p);
+        }
+        self
+    }
+
+    /// Pin this child's trailing edge, so its size on that axis is SOLVED from the
+    /// pair of insets rather than stated — see [`CanvasPosition::right`].
+    fn canvas_right(self, x: f64) -> Self {
+        self.canvas_offset_right(Some(CanvasOffset::Dip(x)))
+    }
+
+    fn canvas_bottom(self, y: f64) -> Self {
+        self.canvas_offset_bottom(Some(CanvasOffset::Dip(y)))
+    }
+
+    /// Pin the trailing edge a share of the canvas in from it.
+    fn canvas_right_fraction(self, t: f64) -> Self {
+        self.canvas_offset_right(Some(CanvasOffset::Fraction(t)))
+    }
+
+    fn canvas_bottom_fraction(self, t: f64) -> Self {
+        self.canvas_offset_bottom(Some(CanvasOffset::Fraction(t)))
+    }
+
+    fn canvas_offset_right(mut self, x: Option<CanvasOffset>) -> Self {
+        if let Some(m) = self.modifiers_mut() {
+            let bag = m.attached.get_or_insert_with(AttachedProps::default);
+            let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
+            p.right = x;
+            bag.set(p);
+        }
+        self
+    }
+
+    fn canvas_offset_bottom(mut self, y: Option<CanvasOffset>) -> Self {
+        if let Some(m) = self.modifiers_mut() {
+            let bag = m.attached.get_or_insert_with(AttachedProps::default);
+            let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
+            p.bottom = y;
+            bag.set(p);
+        }
+        self
+    }
+
+    fn canvas_offset_left(mut self, x: CanvasOffset) -> Self {
         if let Some(m) = self.modifiers_mut() {
             let bag = m.attached.get_or_insert_with(AttachedProps::default);
             let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();
@@ -800,7 +941,7 @@ pub trait ElementExt: Sized {
         self
     }
 
-    fn canvas_top(mut self, y: f64) -> Self {
+    fn canvas_offset_top(mut self, y: CanvasOffset) -> Self {
         if let Some(m) = self.modifiers_mut() {
             let bag = m.attached.get_or_insert_with(AttachedProps::default);
             let mut p = bag.get::<CanvasPosition>().copied().unwrap_or_default();

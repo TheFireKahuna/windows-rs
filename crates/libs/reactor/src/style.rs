@@ -41,6 +41,17 @@ pub enum GridLength {
     Auto,
     Pixel(f64),
     Star(f64),
+    /// As many equal tracks as fit, each at least this many DIPs wide, sharing
+    /// the leftover space — CSS `repeat(auto-fill, minmax(N, 1fr))`.
+    ///
+    /// The track *count* is solved from the container's own size, so a panel
+    /// that reflows with its width says so declaratively instead of measuring
+    /// itself, deriving a column count and re-placing every child — which puts
+    /// layout downstream of layout and costs a second full pass every resize.
+    ///
+    /// Meaningful as the sole entry in a track list; children take their cells
+    /// from grid auto-placement, so they carry no row/column of their own.
+    AutoFill(f64),
 }
 
 impl GridLength {

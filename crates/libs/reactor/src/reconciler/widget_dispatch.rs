@@ -1,5 +1,12 @@
 use super::*;
 
+/// A trailing canvas inset as a prop value. `None` means the child never asked to
+/// fill that axis, and must be told so explicitly — a silently-omitted write would
+/// leave the last child's inset in place on a recycled control.
+fn canvas_edge(o: Option<CanvasOffset>) -> PropValue {
+    o.map_or(PropValue::Unset, PropValue::CanvasOffset)
+}
+
 impl<B: Backend + 'static> Reconciler<B> {
     pub fn mount_widget(&mut self, w: &dyn Widget) -> ControlId {
         let id = self.acquire_control(w.kind());
@@ -414,9 +421,13 @@ impl<B: Backend + 'static> Reconciler<B> {
         // it (the flow cursor never moved), but a sized one (a filled area)
         // pushed every later child down by its height.
         self.backend
-            .set_prop(id, Prop::AttachedCanvasLeft, &PropValue::F64(p.left));
+            .set_prop(id, Prop::AttachedCanvasLeft, &PropValue::CanvasOffset(p.left));
         self.backend
-            .set_prop(id, Prop::AttachedCanvasTop, &PropValue::F64(p.top));
+            .set_prop(id, Prop::AttachedCanvasTop, &PropValue::CanvasOffset(p.top));
+        self.backend
+            .set_prop(id, Prop::AttachedCanvasRight, &canvas_edge(p.right));
+        self.backend
+            .set_prop(id, Prop::AttachedCanvasBottom, &canvas_edge(p.bottom));
         if p.z_index != 0 {
             self.backend
                 .set_prop(id, Prop::AttachedCanvasZIndex, &PropValue::I32(p.z_index));
@@ -436,9 +447,16 @@ impl<B: Backend + 'static> Reconciler<B> {
         if old_canvas != new_canvas {
             let p = new_canvas.unwrap_or_default();
             self.backend
-                .set_prop(id, Prop::AttachedCanvasLeft, &PropValue::F64(p.left));
+                .set_prop(id, Prop::AttachedCanvasLeft, &PropValue::CanvasOffset(p.left));
             self.backend
-                .set_prop(id, Prop::AttachedCanvasTop, &PropValue::F64(p.top));
+                .set_prop(id, Prop::AttachedCanvasTop, &PropValue::CanvasOffset(p.top));
+                // Emitted as `Unset` when absent so a child that STOPS filling
+                // returns to stating its own size, rather than keeping a stale
+                // trailing inset.
+                self.backend
+                    .set_prop(id, Prop::AttachedCanvasRight, &canvas_edge(p.right));
+                self.backend
+                    .set_prop(id, Prop::AttachedCanvasBottom, &canvas_edge(p.bottom));
             self.backend
                 .set_prop(id, Prop::AttachedCanvasZIndex, &PropValue::I32(p.z_index));
         }

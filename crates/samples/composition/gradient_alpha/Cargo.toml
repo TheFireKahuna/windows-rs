@@ -1,0 +1,36 @@
+[package]
+name = "composition_gradient_alpha"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+windows-core = { workspace = true }
+windows-numerics = { workspace = true }
+windows-window = { workspace = true }
+
+[dependencies.windows]
+workspace = true
+features = [
+    "std",
+    "Foundation",
+    "Foundation_Numerics",
+    "Graphics",
+    "Graphics_DirectX",
+    "Graphics_Effects",
+    "UI",
+    "UI_Composition",
+    "UI_Composition_Desktop",
+    "UI_Composition_Effects",
+
+    "d2d",
+    "d3d11",
+    "d3dcommon",
+    "dcommon",
+    "dispatcherqueue",
+    "dxgi",
+    "windowsuicompositioninterop",
+]
+
+[lints]
+workspace = true
