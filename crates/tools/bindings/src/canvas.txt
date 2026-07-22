@@ -1,4 +1,4 @@
---out crates/libs/canvas-core/src/bindings.rs
+--out crates/libs/canvas/src/bindings.rs
 --flat --minimal --dead-code
 
 // The glyph-run walker implements a DirectWrite text renderer so that a shaped
@@ -27,7 +27,7 @@
     D2D1_FIGURE_END_CLOSED
     D2D1_FIGURE_END_OPEN
     D2D1_GRADIENT_STOP
-    ID2D1SimplifiedGeometrySink::{BeginFigure, EndFigure, Close}
+    ID2D1SimplifiedGeometrySink::{BeginFigure, AddLines, AddBeziers, EndFigure, Close}
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW
     D2D1_BITMAP_OPTIONS_CPU_READ
     D2D1_BITMAP_OPTIONS_TARGET

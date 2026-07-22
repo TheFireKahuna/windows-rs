@@ -137,11 +137,20 @@ impl IGeometrySource2DInterop_Impl for PathGeometrySource_Impl {
 /// Coordinates are replayed in the DIPs they were authored in. Getting them onto
 /// the physical pixel grid is [`PathLayer::resize`]'s job, as one transform on
 /// the shape.
+/// How many consecutive `verb`s start at `from` — the length of one batchable run.
+///
+/// Always at least 1, since `verbs[from]` is the verb being matched on.
+fn run_len(verbs: &[PathVerb], from: usize, verb: PathVerb) -> usize {
+    verbs[from..].iter().take_while(|&&v| v == verb).count()
+}
+
 fn build_d2d_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Option<Path> {
     let pts = data.points();
+    let verbs = data.verbs();
     let mut builder = Some(PathBuilder::new(gpu).ok()?);
     let mut figure: Option<PathFigure> = None;
     let mut i = 0usize;
+    let mut v = 0usize;
 
     let read = |i: &mut usize, n: usize| -> Option<&[f32]> {
         let s = pts.get(*i..*i + n * 2)?;
@@ -149,8 +158,14 @@ fn build_d2d_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Option<Path
         Some(s)
     };
 
-    for &verb in data.verbs() {
-        match verb {
+    // Walked in RUNS of like verbs rather than one verb at a time. Each segment
+    // call is a COM crossing, and the sampled curves this exists for are one long
+    // run — a 512-point response was 512 crossings to hand over 4KB of
+    // coordinates that were already contiguous and already in D2D's own layout.
+    // A run now goes over in one call, so the cost tracks the number of runs
+    // (normally one per figure) instead of the number of points.
+    while v < verbs.len() {
+        match verbs[v] {
             PathVerb::Move => {
                 // A `Move` starts a new subpath; it does not close the previous
                 // one, so an unterminated figure ends OPEN here.
@@ -161,20 +176,24 @@ fn build_d2d_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Option<Path
                 let b = builder.take()?;
                 let start = CVec2::new(p[0], p[1]);
                 figure = Some(if filled { b.begin(start) } else { b.begin_hollow(start) });
+                v += 1;
             }
             PathVerb::Line => {
-                let p = read(&mut i, 1)?;
-                figure = Some(figure.take()?.line_to(CVec2::new(p[0], p[1])));
+                let n = run_len(verbs, v, PathVerb::Line);
+                let p = read(&mut i, n)?;
+                figure = Some(figure.take()?.line_to_flat(p));
+                v += n;
             }
             PathVerb::Cubic => {
-                let p = read(&mut i, 3)?;
-                figure = Some(figure.take()?.bezier_to(
-                    CVec2::new(p[0], p[1]),
-                    CVec2::new(p[2], p[3]),
-                    CVec2::new(p[4], p[5]),
-                ));
+                let n = run_len(verbs, v, PathVerb::Cubic);
+                let p = read(&mut i, n * 3)?;
+                figure = Some(figure.take()?.bezier_to_flat(p));
+                v += n;
             }
-            PathVerb::Close => builder = Some(figure.take()?.close()),
+            PathVerb::Close => {
+                builder = Some(figure.take()?.close());
+                v += 1;
+            }
         }
     }
     // D2D requires every figure be ended before the sink closes.
@@ -220,14 +239,21 @@ pub(crate) fn arc_path(
     start: f32,
     end: f32,
 ) -> Option<CompositionPath> {
-    let mut fig = PathBuilder::new(&comp.gpu)
+    let fig = PathBuilder::new(&comp.gpu)
         .ok()?
         .begin_hollow(CVec2::new(cx + radius * start.cos(), cy + radius * start.sin()));
-    for i in 1..=ARC_SEGMENTS {
+    // Chorded into a stack buffer and handed over in ONE call, for the reason
+    // the transported curves are (see `build_d2d_path`): a per-chord `AddLine`
+    // was 96 COM crossings to describe an arc, and every Knob and ProgressRing
+    // rebuilds its arc whenever it resizes. The buffer is sized by the same
+    // constant that drives the loop, so the two cannot disagree.
+    let mut xy = [0.0f32; ARC_SEGMENTS as usize * 2];
+    for i in 1..=ARC_SEGMENTS as usize {
         let a = start + (end - start) * (i as f32 / ARC_SEGMENTS as f32);
-        fig = fig.line_to(CVec2::new(cx + radius * a.cos(), cy + radius * a.sin()));
+        xy[(i - 1) * 2] = cx + radius * a.cos();
+        xy[(i - 1) * 2 + 1] = cy + radius * a.sin();
     }
-    to_composition_path(comp, &fig.end_open().build().ok()?)
+    to_composition_path(comp, &fig.line_to_flat(&xy).end_open().build().ok()?)
 }
 
 /// Replay the verbs and wrap the result as a composition path — the mask
@@ -760,10 +786,14 @@ impl GlowLayer {
     /// Sync the halo's inputs. Each is gated separately, so a drag that only
     /// moves geometry writes one property and a recolour rebuilds one surface.
     #[allow(clippy::too_many_arguments)]
+    /// `path` is the freshly tessellated stroke geometry, and is `None` whenever
+    /// the caller had no reason to build one — see the call site. Only a geometry
+    /// change consumes it, so the two travel together: a `None` here means the
+    /// halo keeps the geometry it already holds.
     fn sync(
         &mut self,
         comp: &Compositing,
-        path: &Path,
+        path: Option<&Path>,
         geometry_changed: bool,
         color: Color,
         blur: f32,
@@ -773,8 +803,10 @@ impl GlowLayer {
         scale: f32,
     ) {
         self.resize(w, h, scale);
-        if geometry_changed {
-            self.set_path(comp, path);
+        if geometry_changed
+            && let Some(p) = path
+        {
+            self.set_path(comp, p);
         }
         if self.thickness != Some(thickness) {
             self.shape.set_stroke_thickness(thickness.max(0.5));
@@ -1021,17 +1053,24 @@ fn sync_parts(
     let want_glow = want_stroke && node.paint.path_glow.is_some();
     if !want_glow {
         parts.glow = None;
-    } else if let (Some((color, blur)), Some(path)) = (
-        node.paint.path_glow,
-        build_d2d_path(&comp.gpu, geometry.data(), false),
-    ) {
-        if parts.glow.is_none() {
-            parts.glow = GlowLayer::new(comp, node, &path);
+    } else if let Some((color, blur)) = node.paint.path_glow {
+        // Tessellate ONLY when the halo has a use for the result: its first build,
+        // or a curve that actually moved. This used to run on every visit, so a
+        // recolour, a hover, a theme flip — anything that merely marked the node
+        // dirty — re-walked every point of the geometry to produce a path the
+        // layer then discarded, and the cost scaled with the curve's point count.
+        let path = (parts.glow.is_none() || geometry_changed)
+            .then(|| build_d2d_path(&comp.gpu, geometry.data(), false))
+            .flatten();
+        if parts.glow.is_none()
+            && let Some(p) = &path
+        {
+            parts.glow = GlowLayer::new(comp, node, p);
         }
         if let Some(g) = parts.glow.as_mut() {
             g.sync(
                 comp,
-                &path,
+                path.as_ref(),
                 geometry_changed,
                 color,
                 blur,
@@ -1080,8 +1119,81 @@ fn sync_parts(
 
 #[cfg(test)]
 mod tests {
-    use super::has_colour;
-    use crate::Color;
+    use super::{has_colour, run_len};
+    use crate::{Color, PathVerb};
+
+    // ── Batched replay runs ──────────────────────────────────────────────────
+    //
+    // `run_len` decides how many segments go over in one COM call, and it also
+    // decides how far the point cursor advances. A run that is too LONG reads
+    // points belonging to a later verb; too SHORT and the walk desyncs from the
+    // verb stream. Both corrupt the geometry rather than merely slowing it.
+
+    /// The whole point: one long polyline is ONE run, not N.
+    #[test]
+    fn a_polyline_is_a_single_run() {
+        let verbs = [PathVerb::Line; 512];
+        assert_eq!(run_len(&verbs, 0, PathVerb::Line), 512);
+    }
+
+    /// A run stops at the first verb of a different kind, so the cursor never
+    /// advances past points that belong to the next verb.
+    #[test]
+    fn a_run_stops_at_the_first_different_verb() {
+        let verbs = [
+            PathVerb::Line,
+            PathVerb::Line,
+            PathVerb::Cubic,
+            PathVerb::Line,
+            PathVerb::Close,
+        ];
+        assert_eq!(run_len(&verbs, 0, PathVerb::Line), 2);
+        assert_eq!(run_len(&verbs, 2, PathVerb::Cubic), 1);
+        assert_eq!(run_len(&verbs, 3, PathVerb::Line), 1);
+    }
+
+    /// Never zero — a zero-length run would leave the walk on the same verb and
+    /// spin forever, which is worse than any wrong drawing.
+    #[test]
+    fn a_run_is_never_empty() {
+        for (i, v) in [PathVerb::Move, PathVerb::Line, PathVerb::Cubic, PathVerb::Close]
+            .into_iter()
+            .enumerate()
+        {
+            let verbs = [PathVerb::Move, PathVerb::Line, PathVerb::Cubic, PathVerb::Close];
+            assert!(run_len(&verbs, i, v) >= 1);
+        }
+    }
+
+    /// Runs must partition the verb stream exactly — every verb consumed once —
+    /// or the points cursor and the verbs disagree by the end.
+    #[test]
+    fn runs_partition_the_whole_verb_stream() {
+        let verbs = [
+            PathVerb::Move,
+            PathVerb::Line,
+            PathVerb::Line,
+            PathVerb::Line,
+            PathVerb::Cubic,
+            PathVerb::Cubic,
+            PathVerb::Close,
+            PathVerb::Move,
+            PathVerb::Line,
+        ];
+        let (mut v, mut runs, mut points) = (0usize, 0usize, 0usize);
+        while v < verbs.len() {
+            let n = run_len(&verbs, v, verbs[v]);
+            points += n * verbs[v].arity() * 2;
+            v += n;
+            runs += 1;
+        }
+        assert_eq!(v, verbs.len(), "the walk must land exactly on the end");
+        // Move, Line×3, Cubic×2, Close, Move, Line — seven runs, not nine verbs.
+        assert_eq!(runs, 6);
+        // And the same point total the per-verb walk would have consumed.
+        let claimed: usize = verbs.iter().map(|v| v.arity() * 2).sum();
+        assert_eq!(points, claimed);
+    }
 
     const RED: Color = Color::rgb(0xFF, 0x00, 0x00);
 

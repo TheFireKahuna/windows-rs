@@ -122,11 +122,11 @@ impl PathBuilder {
         let Some(first) = points.next() else {
             return Err(Error::empty());
         };
-        let mut figure = self.begin(first);
-        for point in points {
-            figure = figure.line_to(point);
-        }
-        figure.close().build()
+        // Collected and submitted as ONE run rather than a call per vertex: the
+        // iterator has to be drained either way, and draining it into a buffer
+        // costs one allocation against a COM crossing per point.
+        let rest: Vec<Vector2> = points.collect();
+        self.begin(first).line_to_many(&rest).close().build()
     }
 }
 
@@ -147,6 +147,24 @@ impl PathFigure {
         self
     }
 
+    /// Adds a whole run of straight line segments in ONE call.
+    ///
+    /// The reason to reach for this over [`line_to`](Self::line_to) is that the
+    /// per-segment form is one COM call per point: a 512-point polyline costs 512
+    /// crossings to describe 4KB of coordinates. A sampled curve — a frequency
+    /// response, a waveform envelope, a spectrum trace — is exactly that shape,
+    /// and it is rebuilt whenever the data moves, so the crossings land on the
+    /// interactive path where they are least affordable.
+    ///
+    /// `points` is passed straight through to `AddLines`, so a caller holding its
+    /// coordinates as a flat contiguous array can submit a run without copying.
+    pub fn line_to_many(self, points: &[Vector2]) -> Self {
+        if !points.is_empty() {
+            unsafe { self.sink.AddLines(points) };
+        }
+        self
+    }
+
     /// Adds a cubic Bézier segment with the given control points and end point.
     pub fn bezier_to(self, control1: Vector2, control2: Vector2, end: Vector2) -> Self {
         let segment = D2D1_BEZIER_SEGMENT {
@@ -155,6 +173,52 @@ impl PathFigure {
             point3: end,
         };
         unsafe { self.sink.AddBezier(&segment) };
+        self
+    }
+
+    /// [`line_to_many`](Self::line_to_many) for a caller holding its coordinates
+    /// as flat `x, y` pairs rather than as [`Vector2`]s.
+    ///
+    /// The cast is the point: `Vector2` is `#[repr(C)] { x: f32, y: f32 }`, so a
+    /// flat pair array already IS the array `AddLines` takes, and the run reaches
+    /// D2D without being rebuilt into a second buffer first. Sampled-curve data
+    /// is normally stored exactly this way — two flat arrays are cheaper to
+    /// compare and to keep — so the alternative is a per-frame repack.
+    ///
+    /// A trailing odd coordinate is dropped rather than read past: the caller
+    /// owns pairing its own data, and reading a half point off the end is the one
+    /// failure here that would be memory-unsafe.
+    pub fn line_to_flat(self, xy: &[f32]) -> Self {
+        debug_assert!(xy.len().is_multiple_of(2), "flat point data must be x, y pairs");
+        let n = xy.len() / 2;
+        if n == 0 {
+            return self;
+        }
+        // SAFETY: `Vector2` is `#[repr(C)]` over two `f32`, so `n` of them span
+        // exactly `2 * n` contiguous `f32` with the same alignment (both 4). The
+        // length is floored to whole pairs above, so the range is in bounds.
+        let points = unsafe { core::slice::from_raw_parts(xy.as_ptr().cast::<Vector2>(), n) };
+        unsafe { self.sink.AddLines(points) };
+        self
+    }
+
+    /// The cubic counterpart to [`line_to_flat`](Self::line_to_flat): flat `x, y`
+    /// pairs read as `c1, c2, end` triples, one Bézier per six floats.
+    ///
+    /// Trailing floats that do not complete a segment are dropped, for the reason
+    /// given there.
+    pub fn bezier_to_flat(self, xy: &[f32]) -> Self {
+        debug_assert!(xy.len().is_multiple_of(6), "flat bezier data must be c1, c2, end triples");
+        let n = xy.len() / 6;
+        if n == 0 {
+            return self;
+        }
+        // SAFETY: `D2D1_BEZIER_SEGMENT` is `#[repr(C)]` over three `Vector2`, so
+        // `n` of them span exactly `6 * n` contiguous `f32` at the same alignment
+        // (both 4). The length is floored to whole segments above.
+        let segments =
+            unsafe { core::slice::from_raw_parts(xy.as_ptr().cast::<D2D1_BEZIER_SEGMENT>(), n) };
+        unsafe { self.sink.AddBeziers(segments) };
         self
     }
 

@@ -1740,6 +1740,24 @@ impl ID2D1SimplifiedGeometrySink {
             );
         }
     }
+    pub(crate) unsafe fn AddLines(&self, points: &[windows_numerics::Vector2]) {
+        unsafe {
+            (windows_core::Interface::vtable(self).AddLines)(
+                windows_core::Interface::as_raw(self),
+                points.as_ptr(),
+                points.len().try_into().unwrap(),
+            );
+        }
+    }
+    pub(crate) unsafe fn AddBeziers(&self, beziers: &[D2D1_BEZIER_SEGMENT]) {
+        unsafe {
+            (windows_core::Interface::vtable(self).AddBeziers)(
+                windows_core::Interface::as_raw(self),
+                beziers.as_ptr(),
+                beziers.len().try_into().unwrap(),
+            );
+        }
+    }
     pub(crate) unsafe fn EndFigure(&self, figureend: D2D1_FIGURE_END) {
         unsafe {
             (windows_core::Interface::vtable(self).EndFigure)(
@@ -1764,8 +1782,10 @@ pub struct ID2D1SimplifiedGeometrySink_Vtbl {
         windows_numerics::Vector2,
         D2D1_FIGURE_BEGIN,
     ),
-    AddLines: usize,
-    AddBeziers: usize,
+    pub AddLines:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *const windows_numerics::Vector2, u32),
+    pub AddBeziers:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *const D2D1_BEZIER_SEGMENT, u32),
     pub EndFigure: unsafe extern "system" fn(*mut core::ffi::c_void, D2D1_FIGURE_END),
     pub Close: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
 }
