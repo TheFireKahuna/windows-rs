@@ -52,7 +52,7 @@ use crate::system_bindings::{
     ID2D1Factory, ID2D1Geometry, IGeometrySource2D, IGeometrySource2DInterop,
     IGeometrySource2DInterop_Impl, IGeometrySource2D_Impl,
 };
-use crate::{Color, GradientAxis, PathData, PathGeometry, PathVerb};
+use crate::{Color, GradientAxis, PathGeometry, PathVerb};
 
 /// Spring tuning for a trim change. Matches the knob's arc so a curve drawing
 /// itself on reads as the same motion system as every other value chrome.
@@ -144,9 +144,12 @@ fn run_len(verbs: &[PathVerb], from: usize, verb: PathVerb) -> usize {
     verbs[from..].iter().take_while(|&&v| v == verb).count()
 }
 
-fn build_d2d_path(gpu: &GpuDevice, data: &PathData, filled: bool) -> Option<Path> {
-    let pts = data.points();
-    let verbs = data.verbs();
+fn build_d2d_path(
+    gpu: &GpuDevice,
+    verbs: &[PathVerb],
+    pts: &[f32],
+    filled: bool,
+) -> Option<Path> {
     let mut builder = Some(PathBuilder::new(gpu).ok()?);
     let mut figure: Option<PathFigure> = None;
     let mut i = 0usize;
@@ -258,12 +261,17 @@ pub(crate) fn arc_path(
 
 /// Replay the verbs and wrap the result as a composition path — the mask
 /// layers' input. See [`build_d2d_path`].
-fn build_composition_path(
+///
+/// Takes the two arrays rather than a `PathData` so the transported geometry
+/// and [`live_trace`](super::live_trace)'s reusable buffers reach the same replay
+/// without either of them having to mint the other's type.
+pub(crate) fn build_composition_path(
     comp: &Compositing,
-    data: &PathData,
+    verbs: &[PathVerb],
+    points: &[f32],
     filled: bool,
 ) -> Option<CompositionPath> {
-    to_composition_path(comp, &build_d2d_path(&comp.gpu, data, filled)?)
+    to_composition_path(comp, &build_d2d_path(&comp.gpu, verbs, points, filled)?)
 }
 
 // ── One fill-or-stroke layer ─────────────────────────────────────────────────
@@ -386,9 +394,13 @@ fn stops_eq(a: &[(f64, Color)], b: &[(f64, Color)]) -> bool {
 }
 
 impl PathLayer {
+    /// Builds the layer under `container` — the host node's container visual.
+    /// Taken directly rather than as a `&Node` so a caller holding the node
+    /// mutably (the retained-trace service, whose field lives ON the node) can
+    /// still hand over the one thing this needs.
     pub(crate) fn new(
         comp: &Compositing,
-        node: &Node,
+        container: &windows_composition::ContainerVisual,
         path: &CompositionPath,
         role: Role,
     ) -> Self {
@@ -434,7 +446,7 @@ impl PathLayer {
         mask_brush.set_mask(&mask_surf);
         display.set_brush(&mask_brush);
 
-        node.container.children().insert_at_top(&display);
+        container.children().insert_at_top(&display);
 
         Self {
             role,
@@ -459,19 +471,20 @@ impl PathLayer {
         }
     }
 
-    /// Point every visual at a new geometry — the app's curve changed shape.
+    /// Re-point the geometry at a new path — the app's curve changed shape.
     ///
-    /// The old `CompositionPathGeometry` is replaced rather than mutated: a
-    /// composition path is immutable once created, so this is the only way, and
-    /// it drops the trim spring because a spring bound to the retired object
-    /// would keep animating something no longer on screen.
+    /// ONE property write. The `CompositionPath` is immutable, but the GEOMETRY
+    /// holding it is not, so nothing here is minted or rebound: no new geometry,
+    /// no `set_geometry` on the shape, and no re-writing of a trim the surviving
+    /// object still holds. A reshape drag is the hot case — it lands here on
+    /// every tick — and this is the whole of it.
+    ///
+    /// Keeping the object also keeps the trim spring VALID. This used to replace
+    /// the geometry and therefore had to drop the spring, which is why a curve
+    /// mid draw-on that changed shape snapped to its target instead of
+    /// continuing; the spring is bound to the object, and the object survives.
     pub(crate) fn set_path(&mut self, path: &CompositionPath) {
-        let geo = self.display.compositor().create_path_geometry(path);
-        self.shape.set_geometry(&geo);
-        geo.set_trim_start(self.trim.0.max(0.0));
-        geo.set_trim_end(if self.trim.1.is_nan() { 1.0 } else { self.trim.1 });
-        self.geo = geo;
-        self.trim_spring = None;
+        self.geo.set_path(path);
     }
 
     pub(crate) fn resize(&mut self, w: f32, h: f32, scale: f32) {
@@ -693,10 +706,13 @@ struct GlowLayer {
 }
 
 impl GlowLayer {
-    fn new(comp: &Compositing, node: &Node, path: &Path) -> Option<Self> {
+    /// `path` is the stroke layer's hollow geometry, handed over rather than
+    /// re-tessellated: the halo blurs exactly the line the stroke draws, so the
+    /// two share one walk of the verb stream and one `CompositionPath`.
+    fn new(comp: &Compositing, node: &Node, path: &CompositionPath) -> Option<Self> {
         let compositor = comp.compositor();
 
-        let geo = compositor.create_path_geometry(&to_composition_path(comp, path)?);
+        let geo = compositor.create_path_geometry(path);
         let shape = compositor.create_sprite_shape(&geo);
         shape.set_stroke_brush(&compositor.create_color_brush(UiColor::rgb(255, 255, 255)));
         shape.set_stroke_caps(StrokeCap::Round);
@@ -754,14 +770,9 @@ impl GlowLayer {
     }
 
     /// Re-point the blurred stroke at new geometry. One property write — the
-    /// compositor re-blurs; nothing is rasterized here.
-    fn set_path(&mut self, comp: &Compositing, path: &Path) {
-        let compositor = comp.compositor();
-        let Some(p) = to_composition_path(comp, path) else {
-            return;
-        };
-        self.geo = compositor.create_path_geometry(&p);
-        self.shape.set_geometry(&self.geo);
+    /// compositor re-blurs; nothing is minted or rasterized here.
+    fn set_path(&mut self, path: &CompositionPath) {
+        self.geo.set_path(path);
     }
 
     /// Size every stage. The two off-tree visuals never inherit the root's
@@ -786,14 +797,14 @@ impl GlowLayer {
     /// Sync the halo's inputs. Each is gated separately, so a drag that only
     /// moves geometry writes one property and a recolour rebuilds one surface.
     #[allow(clippy::too_many_arguments)]
-    /// `path` is the freshly tessellated stroke geometry, and is `None` whenever
-    /// the caller had no reason to build one — see the call site. Only a geometry
-    /// change consumes it, so the two travel together: a `None` here means the
-    /// halo keeps the geometry it already holds.
+    /// `path` is the stroke layer's hollow composition path, and is `None`
+    /// whenever the caller had no reason to build one — see the call site. Only a
+    /// geometry change consumes it, so the two travel together: a `None` here
+    /// means the halo keeps the geometry it already holds.
     fn sync(
         &mut self,
         comp: &Compositing,
-        path: Option<&Path>,
+        path: Option<&CompositionPath>,
         geometry_changed: bool,
         color: Color,
         blur: f32,
@@ -806,7 +817,7 @@ impl GlowLayer {
         if geometry_changed
             && let Some(p) = path
         {
-            self.set_path(comp, p);
+            self.set_path(p);
         }
         if self.thickness != Some(thickness) {
             self.shape.set_stroke_thickness(thickness.max(0.5));
@@ -1013,64 +1024,64 @@ fn sync_parts(
     }
 
     let geometry_changed = parts.geometry_seen.as_ref() != Some(&geometry);
+    // The glow follows the stroke — a halo with no line to sit under reads as a
+    // smudge — so it is decided here, before either is tessellated.
+    let want_glow = want_stroke && node.paint.path_glow.is_some();
 
-    // The two roles need DIFFERENT D2D figure-begin modes, so each builds its
-    // own composition path from the same transported verbs.
-    for role in [Role::Fill, Role::Stroke] {
-        let wanted = match role {
-            Role::Fill => want_fill,
-            Role::Stroke => want_stroke,
-        };
-        if !wanted {
-            continue;
-        }
-        let slot_empty = match role {
-            Role::Fill => parts.fill.is_none(),
-            Role::Stroke => parts.stroke.is_none(),
-        };
-        if !slot_empty && !geometry_changed {
-            continue;
-        }
-        let Some(path) = build_composition_path(comp, geometry.data(), role == Role::Fill) else {
-            continue;
-        };
-        match role {
-            Role::Fill => match &mut parts.fill {
-                Some(l) => l.set_path(&path),
-                slot => *slot = Some(PathLayer::new(comp, node, &path, role)),
-            },
-            Role::Stroke => match &mut parts.stroke {
-                Some(l) => l.set_path(&path),
-                slot => *slot = Some(PathLayer::new(comp, node, &path, role)),
-            },
+    // ── Tessellate: at most twice, however many layers consume the result ──
+    //
+    // The two FIGURE MODES are what differ, not the layer count: a filled
+    // layer's open figures close implicitly and a stroked layer's stay open, so
+    // filled and hollow are genuinely two different D2D geometries. But the
+    // STROKE and the GLOW both want the hollow one — the stroke as its mask, the
+    // glow as the alpha a `DropShadow` blurs — and they used to build it
+    // separately, walking the same verb stream twice per tick to produce two
+    // identical geometries. One walk now serves both.
+    //
+    // Each is built ONLY when something has a use for the result: a layer's first
+    // build, or a curve that actually moved. Anything that merely marks the node
+    // dirty — a recolour, a hover, a theme flip — re-tessellates nothing.
+    let need = |want: bool, slot_empty: bool| want && (slot_empty || geometry_changed);
+    let fill_needs = need(want_fill, parts.fill.is_none());
+    let stroke_needs = need(want_stroke, parts.stroke.is_none());
+    let filled = fill_needs
+        .then(|| build_composition_path(comp, geometry.data().verbs(), geometry.data().points(), true))
+        .flatten();
+    let hollow = (stroke_needs || need(want_glow, parts.glow.is_none()))
+        .then(|| build_composition_path(comp, geometry.data().verbs(), geometry.data().points(), false))
+        .flatten();
+
+    if let Some(path) = &filled {
+        match &mut parts.fill {
+            Some(l) => l.set_path(path),
+            slot => *slot = Some(PathLayer::new(comp, &node.container, path, Role::Fill)),
         }
     }
+    // Gated on the STROKE's own need, not merely on a path existing: the glow's
+    // first build tessellates a hollow path the stroke may already be holding,
+    // and re-pointing it at an identical geometry is a wasted write.
+    if stroke_needs
+        && let Some(path) = &hollow
+    {
+        match &mut parts.stroke {
+            Some(l) => l.set_path(path),
+            slot => *slot = Some(PathLayer::new(comp, &node.container, path, Role::Stroke)),
+        }
+    }
+
     // ── Glow: a compositor-blurred halo BELOW the stroke ──
-    // Follows the stroke — a glow with no line to sit under reads as a smudge —
-    // and needs the stroke's own hollow `Path`, built once here. The layer keeps
-    // that path as a composition geometry the compositor blurs, so this is the
-    // only place it is tessellated.
-    let want_glow = want_stroke && node.paint.path_glow.is_some();
     if !want_glow {
         parts.glow = None;
     } else if let Some((color, blur)) = node.paint.path_glow {
-        // Tessellate ONLY when the halo has a use for the result: its first build,
-        // or a curve that actually moved. This used to run on every visit, so a
-        // recolour, a hover, a theme flip — anything that merely marked the node
-        // dirty — re-walked every point of the geometry to produce a path the
-        // layer then discarded, and the cost scaled with the curve's point count.
-        let path = (parts.glow.is_none() || geometry_changed)
-            .then(|| build_d2d_path(&comp.gpu, geometry.data(), false))
-            .flatten();
         if parts.glow.is_none()
-            && let Some(p) = &path
+            && let Some(p) = &hollow
         {
             parts.glow = GlowLayer::new(comp, node, p);
         }
         if let Some(g) = parts.glow.as_mut() {
             g.sync(
                 comp,
-                path.as_ref(),
+                hollow.as_ref(),
                 geometry_changed,
                 color,
                 blur,

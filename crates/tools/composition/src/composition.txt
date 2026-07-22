@@ -199,12 +199,15 @@ Windows.UI.Composition.IInsetClip::{put_LeftInset, put_TopInset, put_RightInset,
 Windows.UI.Composition.ICompositor::{CreateInsetClip}
 Windows.UI.Composition.IVisual::{put_Clip, put_RotationAngle}
 
-// Paths and stroked shapes. A composition path is immutable, so changing a shape
-// means re-pointing its geometry; trimming exposes a fraction of the path, which
-// is how an arc sweeps without regenerating geometry.
+// Paths and stroked shapes. A composition PATH is immutable, but the GEOMETRY
+// holding it is not: `put_Path` re-points an existing geometry at new vectors,
+// so a curve that reshapes keeps its object — and with it any trim animation
+// already running on it. Trimming exposes a fraction of the path, which is how
+// an arc sweeps without regenerating geometry.
 Windows.UI.Composition.CompositionPath
 Windows.UI.Composition.ICompositionPathFactory::{Create}
 Windows.UI.Composition.CompositionPathGeometry
+Windows.UI.Composition.ICompositionPathGeometry::{put_Path}
 Windows.UI.Composition.ICompositor5::{CreatePathGeometryWithPath, CreateRoundedRectangleGeometry}
 Windows.UI.Composition.CompositionRoundedRectangleGeometry
 Windows.UI.Composition.ICompositionRoundedRectangleGeometry::{put_CornerRadius, put_Offset, put_Size}

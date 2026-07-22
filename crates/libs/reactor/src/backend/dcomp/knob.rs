@@ -334,6 +334,9 @@ fn build_ring_path(
 /// What IS shared is the tessellated `CompositionPath` — the expensive half —
 /// exactly as the thumb already shares it.
 struct ChromeLayer {
+    /// The layer's own geometry, kept so a re-tessellation can be written INTO
+    /// it ([`Self::set_path`]) rather than minting a replacement.
+    geo: CompositionPathGeometry,
     shape: CompositionSpriteShape,
     mask_shape: ShapeVisual,
     visual_surface: CompositionVisualSurface,
@@ -404,6 +407,7 @@ impl ChromeLayer {
         node.container.children().insert_at_top(&display);
 
         Self {
+            geo,
             shape,
             mask_shape,
             visual_surface,
@@ -415,8 +419,12 @@ impl ChromeLayer {
 
     /// Re-point the layer at a freshly tessellated path (a resize, or a tick
     /// list that changed under it).
-    fn set_path(&mut self, compositor: &Compositor, path: &CompositionPath) {
-        self.shape.set_geometry(&compositor.create_path_geometry(path));
+    ///
+    /// The geometry is re-pathed rather than replaced, so the shape keeps
+    /// pointing at the object it already has — one property write, and no
+    /// `set_geometry` rebind.
+    fn set_path(&mut self, path: &CompositionPath) {
+        self.geo.set_path(path);
     }
 
     fn resize(&self, w: f32, h: f32, scale: f32) {
@@ -693,12 +701,11 @@ impl KnobParts {
         let ticks_changed = self.ticks_seen.0 != node.ctrl().ticks
             || self.ticks_seen.1 != node.ctrl().major_every;
         if resized || ticks_changed {
-            let compositor = comp.compositor();
             for (layer, major) in [(&mut self.ticks_minor, false), (&mut self.ticks_major, true)] {
                 if let Some(p) = build_tick_path(comp, cx, cy, radius, node, major)
                     && let Some(l) = layer.as_mut()
                 {
-                    l.set_path(compositor, &p);
+                    l.set_path(&p);
                 }
             }
             self.ticks_seen.0.clear();
@@ -707,21 +714,18 @@ impl KnobParts {
         }
         if resized {
             if let Some(path) = super::path_shape::arc_path(comp, cx, cy, radius, start, end) {
-                let compositor = comp.compositor();
-                let geo = compositor.create_path_geometry(&path);
-                self.sprite_shape.set_geometry(&geo);
-                geo.set_trim_start(0.0);
-                self.geo = geo;
-                self.trim_spring = None;
-                // The thumb rides the same path — rebuild it too, then let
-                // both re-bind against the new geometry below.
-                let tgeo = compositor.create_path_geometry(&path);
-                self.thumb_shape.set_geometry(&tgeo);
-                self.thumb_geo = tgeo;
-                self.thumb_bound = false;
+                // Both geometries are re-pathed in place, so a resize costs two
+                // property writes and nothing else. It used to mint two
+                // replacements and rebind two shapes, which meant dropping the
+                // trim spring and re-binding the thumb's expression — a dial
+                // resized mid-motion therefore lost its animation and had to be
+                // wired back up. The objects now survive the resize, and with
+                // them everything already animating them.
+                self.geo.set_path(&path);
+                self.thumb_geo.set_path(&path);
                 // The groove rides the very same tessellation.
                 if let Some(r) = self.ring.as_mut() {
-                    r.set_path(compositor, &path);
+                    r.set_path(&path);
                 }
             }
             self.display.set_size(w, h);
@@ -768,7 +772,7 @@ impl KnobParts {
                 };
                 match self.focus_rings[i].as_mut() {
                     Some(l) => {
-                        l.set_path(comp.compositor(), &path);
+                        l.set_path(&path);
                         l.resize(w, h, scale);
                     }
                     None => {

@@ -65,6 +65,20 @@ pub struct CompositionPath(pub(crate) bindings::CompositionPath);
 pub struct CompositionPathGeometry(pub(crate) bindings::CompositionPathGeometry);
 
 impl CompositionPathGeometry {
+    /// Re-points this geometry at a new [path](CompositionPath).
+    ///
+    /// The path itself is immutable, but the geometry holding it is not — so a
+    /// shape whose vectors change every frame (a curve being dragged) keeps ONE
+    /// geometry object and writes one property, instead of minting a geometry
+    /// and re-pointing every shape that references it.
+    ///
+    /// It also keeps whatever is animating this geometry alive. A trim spring in
+    /// flight is bound to the OBJECT: replacing the geometry strands the spring
+    /// on a retired one and the sweep snaps; re-pathing leaves it running.
+    pub fn set_path(&self, path: &CompositionPath) {
+        self.0.SetPath(&path.0).unwrap();
+    }
+
     /// Sets where along the path drawing begins, as a fraction in `0.0..=1.0`.
     pub fn set_trim_start(&self, start: f32) {
         let geometry: bindings::ICompositionGeometry = self.0.cast().unwrap();
