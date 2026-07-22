@@ -319,6 +319,8 @@ pub enum DashStyle {
     Dot,
     /// Repeating dash-dot pattern.
     DashDot,
+    /// The explicit run lengths given to [`StrokeStyleBuilder::dashes`].
+    Custom,
 }
 
 impl DashStyle {
@@ -328,6 +330,7 @@ impl DashStyle {
             Self::Dash => D2D1_DASH_STYLE_DASH,
             Self::Dot => D2D1_DASH_STYLE_DOT,
             Self::DashDot => D2D1_DASH_STYLE_DASH_DOT,
+            Self::Custom => D2D1_DASH_STYLE_CUSTOM,
         }
     }
 }
@@ -356,6 +359,9 @@ pub struct StrokeStyleBuilder {
     pub(crate) miter_limit: f32,
     pub(crate) dash_style: DashStyle,
     pub(crate) dash_offset: f32,
+    /// Custom on/off run lengths, in multiples of the stroke width. Empty unless
+    /// [`StrokeStyleBuilder::dashes`] was called.
+    pub(crate) dashes: Vec<f32>,
 }
 
 impl StrokeStyleBuilder {
@@ -407,6 +413,20 @@ impl StrokeStyleBuilder {
     /// Sets the dash pattern.
     pub fn dash_style(mut self, style: DashStyle) -> Self {
         self.dash_style = style;
+        self
+    }
+
+    /// Sets an explicit dash pattern: alternating on/off run lengths, each a
+    /// MULTIPLE OF THE STROKE WIDTH rather than a length in DIPs.
+    ///
+    /// The preset [`DashStyle`]s are fixed proportions, so a design that calls
+    /// for particular run lengths — a `4 on, 4 off` reference rule — cannot be
+    /// spelled with them, and the alternative is drawing every dash as its own
+    /// line. Supplying a pattern selects [`DashStyle::Custom`], since Direct2D
+    /// only reads the array when the style says to.
+    pub fn dashes(mut self, dashes: &[f32]) -> Self {
+        self.dashes = dashes.to_vec();
+        self.dash_style = DashStyle::Custom;
         self
     }
 
