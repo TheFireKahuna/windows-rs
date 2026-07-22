@@ -21,6 +21,7 @@
 //! no timer. Always compiled — the backend is not feature-gated.
 
 use crate::backend::ControlId;
+use crate::GradientAxis;
 
 pub(crate) mod animate;
 mod backdrop;
@@ -1646,6 +1647,18 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.ctrl_mut().stops.clone_from(stops);
             node.mark_dirty();
         }
+        (Prop::StrokeGradientStops, PropValue::GradientStops(stops)) => {
+            node.paint.path_stroke_stops.clone_from(stops);
+            node.mark_dirty();
+        }
+        (Prop::GradientAxis, PropValue::I32(v)) => {
+            node.paint.path_fill_grad_axis = GradientAxis::from_i32(*v);
+            node.mark_dirty();
+        }
+        (Prop::StrokeGradientAxis, PropValue::I32(v)) => {
+            node.paint.path_stroke_grad_axis = GradientAxis::from_i32(*v);
+            node.mark_dirty();
+        }
         (Prop::StartAngle, PropValue::F64(v)) => {
             node.ctrl_mut().start_angle = *v as f32;
             node.mark_dirty();
@@ -2076,6 +2089,21 @@ prop_contract! {
         // a halo, and the baked surface should go with it.
         GlowColor => |n| { n.paint.path_glow = None; n.mark_dirty(); }
         GlowBlur => |n| { n.paint.path_glow = None; n.mark_dirty(); }
+        // Each ramp resets to no ramp and its birth axis, so a shape that drops
+        // its gradient falls back to the flat colour of that layer rather than
+        // keeping a ramp the widget no longer describes.
+        StrokeGradientStops => |n| {
+            n.paint.path_stroke_stops.clear();
+            n.mark_dirty();
+        }
+        GradientAxis => |n| {
+            n.paint.path_fill_grad_axis = n.birth_paint().path_fill_grad_axis;
+            n.mark_dirty();
+        }
+        StrokeGradientAxis => |n| {
+            n.paint.path_stroke_grad_axis = n.birth_paint().path_stroke_grad_axis;
+            n.mark_dirty();
+        }
         StyleVariant => |n| {
             n.paint.style_variant = n.birth_paint().style_variant;
             n.mark_dirty();

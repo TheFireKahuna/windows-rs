@@ -28,6 +28,7 @@ use super::bootstrap::Compositing;
 use super::node::Node;
 use super::path_shape::{arc_path, PathLayer, Role};
 use super::theme;
+use crate::GradientAxis;
 
 /// How far inside the node's half-extent the track centreline sits. Leaves room
 /// for the stroke, which is clamped to at most 5 DIP and so reaches at most 2.5
@@ -127,7 +128,7 @@ impl RingParts {
         }
         self.track.set_thickness(thick);
         self.arc.set_thickness(thick);
-        self.track.set_source(comp, theme::w(0.08), &[], atlas_epoch, scale);
+        self.track.set_source(comp, theme::w(0.08), &[], GradientAxis::Vertical, atlas_epoch, scale);
         // The arc takes an authored `Foreground` when the app set one, exactly as
         // WinUI's `ProgressRing.Foreground` does. A ring is often shown INSIDE
         // something that already has an accent of its own — a category tile, a
@@ -135,7 +136,7 @@ impl RingParts {
         // accent in the same box. The theme accent stays the default, so nothing that
         // authored no colour changes.
         let arc_ink = node.paint.foreground.unwrap_or_else(theme::accent);
-        self.arc.set_source(comp, arc_ink, &[], atlas_epoch, scale);
+        self.arc.set_source(comp, arc_ink, &[], GradientAxis::Vertical, atlas_epoch, scale);
         self.track.set_opacity(dim);
         self.arc.set_opacity(dim);
 

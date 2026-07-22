@@ -186,6 +186,9 @@ pub enum Prop {
     GlowBlur,
     GlowColor,
     GradientStops,
+    /// Which way a shape FILL gradient runs across its box (a [`GradientAxis`]
+    /// discriminant).
+    GradientAxis,
     GridColumns,
     GridRows,
     GroupName,
@@ -281,6 +284,11 @@ pub enum Prop {
     Step,
     Stretch,
     Stroke,
+    /// A shape STROKE gradient ramp — the outline's own colour along the box,
+    /// distinct from the fill's [`Prop::GradientStops`].
+    StrokeGradientStops,
+    /// Which way that stroke gradient runs (a [`GradientAxis`] discriminant).
+    StrokeGradientAxis,
     StrokeThickness,
     Style,
     Ticks,

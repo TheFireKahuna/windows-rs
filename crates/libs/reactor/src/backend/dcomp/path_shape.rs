@@ -52,7 +52,7 @@ use crate::system_bindings::{
     ID2D1Factory, ID2D1Geometry, IGeometrySource2D, IGeometrySource2DInterop,
     IGeometrySource2DInterop_Impl, IGeometrySource2D_Impl,
 };
-use crate::{Color, PathData, PathGeometry, PathVerb};
+use crate::{Color, GradientAxis, PathData, PathGeometry, PathVerb};
 
 /// Spring tuning for a trim change. Matches the knob's arc so a curve drawing
 /// itself on reads as the same motion system as every other value chrome.
@@ -331,6 +331,9 @@ pub(crate) struct PathLayer {
     _source: Option<CompositionSurfaceBrush>,
     solid_for: Option<([u32; 4], u32)>,
     stops_seen: Vec<(f64, Color)>,
+    /// The axis that stop list was rasterized on. `None` while the layer is on a
+    /// flat colour, so a first gradient always builds.
+    axis_seen: Option<GradientAxis>,
     grad_epoch: u32,
     // ── change gates ──
     // Carries the DIP→px scale too, so a display move re-rasterizes the mask.
@@ -418,6 +421,7 @@ impl PathLayer {
             _source: None,
             solid_for: None,
             stops_seen: Vec::new(),
+            axis_seen: None,
             grad_epoch: u32::MAX,
             size: None,
             thickness: None,
@@ -490,26 +494,33 @@ impl PathLayer {
         comp: &Compositing,
         color: Color,
         stops: &[(f64, Color)],
+        axis: GradientAxis,
         atlas_epoch: u32,
         scale: f32,
     ) {
         let want_solid = (color_bits(color), scale.to_bits());
+        // The axis is in the gate, not just the stops: the same ramp turned on
+        // its side is a different raster, and a layer that compared only stops
+        // would keep serving the old orientation for the life of the shape.
         let unchanged = self.grad_epoch == atlas_epoch
             && if stops.is_empty() {
                 self.solid_for == Some(want_solid) && self.stops_seen.is_empty()
             } else {
-                stops_eq(&self.stops_seen, stops)
+                stops_eq(&self.stops_seen, stops) && self.axis_seen == Some(axis)
             };
         if unchanged {
             return;
         }
-        // A stop list only ever reaches the FILL layer (the stroke passes `&[]`),
-        // and a curve underfill fades DOWN the plot — so gradients here are
-        // vertical. The flat branch serves the stroke's solid colour.
+        // Both ramps are rasters stretched over the node's box and masked by the
+        // shape, so the axis picks which raster — not how the path is walked.
+        // The flat branch serves a layer the app gave no ramp at all.
         let src = if stops.is_empty() {
             super::parts::build_solid_surface(comp, color, scale)
         } else {
-            super::parts::build_vgradient_surface(comp, stops, scale)
+            match axis {
+                GradientAxis::Horizontal => super::parts::build_gradient_surface(comp, stops, scale),
+                GradientAxis::Vertical => super::parts::build_vgradient_surface(comp, stops, scale),
+            }
         };
         let Some(s) = src else { return };
         self.mask_brush.set_source(&s);
@@ -518,9 +529,11 @@ impl PathLayer {
         if stops.is_empty() {
             self.solid_for = Some(want_solid);
             self.stops_seen.clear();
+            self.axis_seen = None;
         } else {
             self.solid_for = None;
             self.stops_seen = stops.to_vec();
+            self.axis_seen = Some(axis);
         }
     }
 
@@ -891,6 +904,17 @@ fn derived_geometry(node: &Node) -> Option<PathGeometry> {
 ///
 /// Every other kind answers its props verbatim, so a curve with no stroke still
 /// builds no stroke layer.
+/// Whether a layer was given a colour source of EITHER kind — a flat colour or a
+/// ramp.
+///
+/// A ramp is a colour source in its own right. Asking only whether the flat
+/// colour was set made a gradient-only layer silently draw nothing: the app
+/// authored stops, the layer was never created, and there was no error to see —
+/// the shape simply had no fill.
+fn has_colour(flat: Option<Color>, stops: &[(f64, Color)]) -> bool {
+    flat.is_some() || !stops.is_empty()
+}
+
 fn stroke_of(node: &Node) -> (Option<Color>, f32) {
     if node.kind == ControlKind::Line {
         let w = if node.paint.stroke_thickness > 0.0 { node.paint.stroke_thickness } else { 1.0 };
@@ -939,9 +963,13 @@ fn sync_parts(
     scale: f32,
 ) {
     let (w, h) = (node.rect.w, node.rect.h);
-    let want_fill = node.paint.fill.is_some();
+    let fill_stops = node.ctrl().stops.as_slice();
+    let want_fill = has_colour(node.paint.fill, fill_stops);
     let (stroke_color, stroke_w) = stroke_of(node);
-    let want_stroke = stroke_color.is_some() && stroke_w > 0.0;
+    let stroke_stops = node.paint.path_stroke_stops.as_slice();
+    // Thickness still gates the stroke either way: a zero-width outline is not a
+    // line however it is coloured.
+    let want_stroke = has_colour(stroke_color, stroke_stops) && stroke_w > 0.0;
 
     // A layer whose role the app stopped asking for goes away entirely, rather
     // than lingering at zero alpha: an unasked-for layer should cost nothing.
@@ -1017,11 +1045,16 @@ fn sync_parts(
 
     parts.geometry_seen = Some(geometry);
 
-    // Non-allocating: a node that never had control state reads `EMPTY_CTRL`.
-    let stops = node.ctrl().stops.as_slice();
     if let Some(l) = &mut parts.fill {
         l.resize(w, h, scale);
-        l.set_source(comp, node.paint.fill.unwrap_or_default(), stops, atlas_epoch, scale);
+        l.set_source(
+            comp,
+            node.paint.fill.unwrap_or_default(),
+            fill_stops,
+            node.paint.path_fill_grad_axis,
+            atlas_epoch,
+            scale,
+        );
         l.set_trim(node.paint.path_trim.0, node.paint.path_trim.1);
     }
     if let Some(l) = &mut parts.stroke {
@@ -1029,10 +1062,63 @@ fn sync_parts(
         // DIPs, like the geometry it strokes — the shape's own scale takes both
         // to physical pixels together.
         l.set_thickness(stroke_w);
-        // A stroke takes the flat stroke colour; the stop list is the FILL's
-        // ramp, so handing it here would recolour the outline with the area's
-        // gradient and the two would stop reading as separate layers.
-        l.set_source(comp, stroke_color.unwrap_or_default(), &[], atlas_epoch, scale);
+        // The stroke takes its OWN ramp, never the fill's: the fill's describes
+        // an area fading away from the line and reusing it here would paint the
+        // outline in the area's colours, so the two would stop reading as two
+        // layers. An empty list leaves the outline on its flat colour.
+        l.set_source(
+            comp,
+            stroke_color.unwrap_or_default(),
+            stroke_stops,
+            node.paint.path_stroke_grad_axis,
+            atlas_epoch,
+            scale,
+        );
         l.set_trim(node.paint.path_trim.0, node.paint.path_trim.1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_colour;
+    use crate::Color;
+
+    const RED: Color = Color::rgb(0xFF, 0x00, 0x00);
+
+    fn ramp() -> Vec<(f64, Color)> {
+        vec![(0.0, RED), (1.0, Color::rgb(0x00, 0x00, 0xFF))]
+    }
+
+    // ── Which layers a shape asks for ────────────────────────────────────────
+    //
+    // A path's fill and stroke layers are built only for a role the app actually
+    // coloured, so this predicate decides whether a layer exists at all. Getting
+    // it wrong is silent in the worst way: no error, no warning, just a shape
+    // that draws nothing where the app authored a gradient.
+
+    /// A ramp alone is enough. This is the case that was broken — `fill_gradient`
+    /// with no flat `fill` beneath it created no layer and drew nothing.
+    #[test]
+    fn a_ramp_alone_asks_for_a_layer() {
+        assert!(has_colour(None, &ramp()));
+    }
+
+    /// A flat colour alone is still enough — the case that always worked.
+    #[test]
+    fn a_flat_colour_alone_asks_for_a_layer() {
+        assert!(has_colour(Some(RED), &[]));
+    }
+
+    /// Both together, the ordinary authored shape.
+    #[test]
+    fn both_together_ask_for_a_layer() {
+        assert!(has_colour(Some(RED), &ramp()));
+    }
+
+    /// Neither asks for nothing: an unasked-for layer must cost nothing rather
+    /// than linger as a transparent sprite.
+    #[test]
+    fn no_colour_at_all_asks_for_no_layer() {
+        assert!(!has_colour(None, &[]));
     }
 }

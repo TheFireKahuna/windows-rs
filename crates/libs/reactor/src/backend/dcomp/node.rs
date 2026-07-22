@@ -23,7 +23,7 @@ use windows_composition::{
 };
 use crate::Badge;
 use crate::Color;
-use crate::{LineEndpoints, PathGeometry};
+use crate::{GradientAxis, LineEndpoints, PathGeometry};
 use super::record::FlyoutDecl;
 use crate::{
     FlyoutPlacementMode, NavigationViewPaneDisplayMode, PasswordRevealMode, ScrollBarVisibility,
@@ -129,6 +129,17 @@ pub(crate) struct Paint {
     /// `None`. The glow layer bakes a soft halo of this colour once per geometry
     /// change; see [`super::path_shape`].
     pub path_glow: Option<(Color, f32)>,
+    /// Which way the FILL gradient ([`Ctrl::stops`]) runs across the box.
+    pub path_fill_grad_axis: GradientAxis,
+    /// The STROKE's own gradient ramp, `(position 0..1, authored colour)`, and
+    /// the axis it runs along. Empty leaves the outline on its flat
+    /// [`Self::stroke`] colour.
+    ///
+    /// Held here rather than beside the fill's stops in [`Ctrl`] because it is a
+    /// path's alone: `Ctrl::stops` is shared with the Meter fill and the Knob
+    /// arc, neither of which has a second ramp to describe.
+    pub path_stroke_stops: Vec<(f64, Color)>,
+    pub path_stroke_grad_axis: GradientAxis,
     /// Text content (TextBlock text or Button label).
     pub text: String,
     pub font_size: f32,
@@ -158,6 +169,9 @@ impl Default for Paint {
             path: None,
             path_trim: (0.0, 1.0),
             path_glow: None,
+            path_fill_grad_axis: GradientAxis::Vertical,
+            path_stroke_grad_axis: GradientAxis::Horizontal,
+            path_stroke_stops: Vec::new(),
             text: String::new(),
             font_size: 0.0,
             font_weight: 0,

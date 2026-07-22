@@ -389,9 +389,21 @@ pub struct Shape {
     /// Set only by [`ShapeKind::Path`]; `None` for the box-derived kinds.
     pub geometry: Option<PathGeometry>,
     /// Gradient ramp for a path's FILL, `(position 0..1, linear-scRGB colour)`.
-    /// Overrides [`Self::fill`]'s flat colour when present. The stroke keeps its
-    /// own flat colour — a ramp shared by both would stop reading as two layers.
+    /// Overrides [`Self::fill`]'s flat colour when present.
     pub fill_gradient: Option<Vec<(f64, Color)>>,
+    /// Which way [`Self::fill_gradient`] runs across the shape's box.
+    pub fill_gradient_axis: GradientAxis,
+    /// Gradient ramp for a path's STROKE, `(position 0..1, linear-scRGB colour)`.
+    /// Overrides [`Self::stroke`]'s flat colour when present.
+    ///
+    /// Separate from [`Self::fill_gradient`], and with its own axis, because the
+    /// two ramps describe different things: an area fill under a curve fades
+    /// DOWN the plot, while a line's own ramp runs ALONG the line. A single
+    /// shared ramp would force one reading on both and the layers would stop
+    /// reading as two.
+    pub stroke_gradient: Option<Vec<(f64, Color)>>,
+    /// Which way [`Self::stroke_gradient`] runs across the shape's box.
+    pub stroke_gradient_axis: GradientAxis,
     /// `(start, end)` fraction of the geometry's length to draw, `0..1`.
     /// `end` animates on the compositor, so a curve can draw itself on with no
     /// app frame. `None` leaves the path at full extent.
@@ -402,6 +414,39 @@ pub struct Shape {
     /// than repainted. `None` draws no glow. Only a stroked path glows.
     pub glow: Option<(Color, f64)>,
 }
+/// The axis a gradient ramp runs along, in the shape's own local box: stop `0.0`
+/// sits at the leading edge of that axis and stop `1.0` at the trailing one.
+///
+/// The ramp is a raster stretched over the whole box and masked by the shape, so
+/// the axis is a property of the BOX, not of the path's direction of travel — a
+/// horizontal ramp under a curve that doubles back still reads left-to-right.
+/// For a plot whose x is frequency, that is exactly what "colour by frequency"
+/// means.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[repr(i32)]
+pub enum GradientAxis {
+    /// Left to right across the box.
+    Horizontal = 0,
+    /// Top to bottom down the box. The default: the ramp that existed before
+    /// this axis did was the curve underfill, which fades down the plot.
+    #[default]
+    Vertical = 1,
+}
+
+impl GradientAxis {
+    /// Reconstruct from the transported discriminant, defaulting to the variant
+    /// a shape is born with rather than failing — an unknown axis is a newer
+    /// widget talking to an older backend, and a gradient drawn the wrong way is
+    /// a better answer than no gradient at all.
+    #[must_use]
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => Self::Horizontal,
+            _ => Self::Vertical,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub struct LineEndpoints {
     pub x1: f64,
@@ -422,6 +467,9 @@ impl Default for Shape {
             line: LineEndpoints::default(),
             geometry: None,
             fill_gradient: None,
+            fill_gradient_axis: GradientAxis::Vertical,
+            stroke_gradient: None,
+            stroke_gradient_axis: GradientAxis::Horizontal,
             trim: None,
             glow: None,
         }
@@ -480,9 +528,35 @@ impl Shape {
         self.corner_radius = Some(v);
         self
     }
-    /// Fill a path with a gradient ramp instead of a flat colour.
+    /// Fill a path with a gradient ramp instead of a flat colour, running DOWN
+    /// the shape's box — the curve underfill, which fades away from the line.
+    /// Use [`Self::fill_gradient_along`] for any other axis.
     pub fn fill_gradient(mut self, stops: Vec<(f64, Color)>) -> Self {
         self.fill_gradient = Some(stops);
+        self.fill_gradient_axis = GradientAxis::Vertical;
+        self
+    }
+    /// [`Self::fill_gradient`] on a stated axis.
+    pub fn fill_gradient_along(mut self, axis: GradientAxis, stops: Vec<(f64, Color)>) -> Self {
+        self.fill_gradient = Some(stops);
+        self.fill_gradient_axis = axis;
+        self
+    }
+    /// Stroke a path with a gradient ramp instead of a flat colour, running
+    /// ACROSS the shape's box — a response curve coloured by frequency, a trace
+    /// coloured by time. Use [`Self::stroke_gradient_along`] for any other axis.
+    ///
+    /// The fill keeps its own ramp and its own axis: the two describe different
+    /// things and a shared one would force one reading on both.
+    pub fn stroke_gradient(mut self, stops: Vec<(f64, Color)>) -> Self {
+        self.stroke_gradient = Some(stops);
+        self.stroke_gradient_axis = GradientAxis::Horizontal;
+        self
+    }
+    /// [`Self::stroke_gradient`] on a stated axis.
+    pub fn stroke_gradient_along(mut self, axis: GradientAxis, stops: Vec<(f64, Color)>) -> Self {
+        self.stroke_gradient = Some(stops);
+        self.stroke_gradient_axis = axis;
         self
     }
     /// Draw only `start..end` of the path's length (fractions of `0..1`).
@@ -542,10 +616,27 @@ impl Widget for Shape {
                 PropValue::Path(g.clone()),
             ));
         }
+        // Each ramp carries its axis beside it rather than the two sharing one:
+        // the motivating shape is a curve whose underfill fades DOWN while its
+        // line colours ALONG the plot, so the axes genuinely differ per layer.
         if let Some(stops) = &self.fill_gradient {
             out.push(Binding::Prop(
                 Prop::GradientStops,
                 PropValue::GradientStops(stops.clone()),
+            ));
+            out.push(Binding::Prop(
+                Prop::GradientAxis,
+                PropValue::I32(self.fill_gradient_axis as i32),
+            ));
+        }
+        if let Some(stops) = &self.stroke_gradient {
+            out.push(Binding::Prop(
+                Prop::StrokeGradientStops,
+                PropValue::GradientStops(stops.clone()),
+            ));
+            out.push(Binding::Prop(
+                Prop::StrokeGradientAxis,
+                PropValue::I32(self.stroke_gradient_axis as i32),
             ));
         }
         if let Some((start, end)) = self.trim {
@@ -557,5 +648,110 @@ impl Widget for Shape {
             out.push(Binding::Prop(Prop::GlowBlur, PropValue::F64(blur)));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+    use crate::backend::{Prop, PropValue};
+    use crate::widget::Binding;
+
+    fn ramp() -> Vec<(f64, Color)> {
+        vec![
+            (0.0, Color::rgb(0x00, 0xFF, 0x00)),
+            (1.0, Color::rgb(0xFF, 0x00, 0x00)),
+        ]
+    }
+
+    fn geometry() -> PathGeometry {
+        ShapePath::new().move_to(0.0, 0.0).line_to(10.0, 10.0).build()
+    }
+
+    /// The axis a transported discriminant resolves to.
+    fn axis_of(bindings: &[Binding], prop: Prop) -> Option<GradientAxis> {
+        bindings.iter().find_map(|b| match b {
+            Binding::Prop(p, PropValue::I32(v)) if *p == prop => Some(GradientAxis::from_i32(*v)),
+            _ => None,
+        })
+    }
+
+    fn has_stops(bindings: &[Binding], prop: Prop) -> bool {
+        bindings
+            .iter()
+            .any(|b| matches!(b, Binding::Prop(p, PropValue::GradientStops(_)) if *p == prop))
+    }
+
+    // ── Each ramp carries its own axis ───────────────────────────────────────
+    //
+    // The motivating shape is a response curve: the area under it fades DOWN the
+    // plot while the line itself colours ACROSS it. The two axes must therefore
+    // be able to differ on one shape, which is the whole reason they are two
+    // props rather than one.
+
+    /// The defaults encode the physical meaning of each layer, so the common
+    /// case needs no axis stated at all.
+    #[test]
+    fn each_layer_defaults_to_the_axis_its_job_implies() {
+        let b = Shape::path(geometry())
+            .fill_gradient(ramp())
+            .stroke_gradient(ramp())
+            .bindings();
+        assert_eq!(axis_of(&b, Prop::GradientAxis), Some(GradientAxis::Vertical));
+        assert_eq!(
+            axis_of(&b, Prop::StrokeGradientAxis),
+            Some(GradientAxis::Horizontal)
+        );
+    }
+
+    /// And they are genuinely independent — a shape can state both, differently.
+    #[test]
+    fn the_two_axes_are_independent() {
+        let b = Shape::path(geometry())
+            .fill_gradient_along(GradientAxis::Horizontal, ramp())
+            .stroke_gradient_along(GradientAxis::Vertical, ramp())
+            .bindings();
+        assert_eq!(
+            axis_of(&b, Prop::GradientAxis),
+            Some(GradientAxis::Horizontal)
+        );
+        assert_eq!(
+            axis_of(&b, Prop::StrokeGradientAxis),
+            Some(GradientAxis::Vertical)
+        );
+    }
+
+    /// The ramps travel on separate props: handing the fill's stops to the
+    /// stroke would paint the outline in the area's colours and the two layers
+    /// would stop reading as two.
+    #[test]
+    fn a_fill_ramp_never_reaches_the_stroke() {
+        let b = Shape::path(geometry()).fill_gradient(ramp()).bindings();
+        assert!(has_stops(&b, Prop::GradientStops));
+        assert!(!has_stops(&b, Prop::StrokeGradientStops));
+        assert!(axis_of(&b, Prop::StrokeGradientAxis).is_none());
+    }
+
+    /// A shape with no ramp transports neither stops nor an axis — an unset
+    /// gradient must not pin a layer to an axis it never asked for.
+    #[test]
+    fn no_ramp_transports_no_gradient_props() {
+        let b = Shape::path(geometry()).stroke(Color::rgb(1, 2, 3)).bindings();
+        assert!(!has_stops(&b, Prop::GradientStops));
+        assert!(!has_stops(&b, Prop::StrokeGradientStops));
+        assert!(axis_of(&b, Prop::GradientAxis).is_none());
+        assert!(axis_of(&b, Prop::StrokeGradientAxis).is_none());
+    }
+
+    /// An axis the backend does not know resolves to the born-with variant
+    /// rather than panicking: a newer widget against an older backend should
+    /// draw the gradient the wrong way round, not fail to draw it.
+    #[test]
+    fn an_unknown_axis_falls_back_rather_than_failing() {
+        assert_eq!(GradientAxis::from_i32(0), GradientAxis::Horizontal);
+        assert_eq!(GradientAxis::from_i32(1), GradientAxis::Vertical);
+        for junk in [-1, 2, 99, i32::MIN, i32::MAX] {
+            assert_eq!(GradientAxis::from_i32(junk), GradientAxis::Vertical);
+        }
     }
 }

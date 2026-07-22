@@ -88,6 +88,10 @@ name = "dcomp_edit"
 required-features = ["dcomp-backend"]
 
 [[example]]
+name = "dcomp_gradient_path"
+required-features = ["dcomp-backend"]
+
+[[example]]
 name = "dcomp_hello"
 required-features = ["dcomp-backend"]
 
