@@ -75,6 +75,21 @@ impl ElementHandle {
     pub fn live_trace(&self) -> LiveTrace {
         LiveTrace::new(self.id)
     }
+
+    /// A `Send` handle for easing this node's OPACITY from any thread, without a
+    /// reconcile — the thinnest live facet.
+    ///
+    /// For a declarative node whose SHAPE is reconciled normally (so it can never
+    /// diverge from its siblings) but whose opacity moves at display cadence — the
+    /// Simple preview's lit spans, which share the response stroke's geometry and only
+    /// brighten under the pointer. A push is one `SetOpacity` on the node's container.
+    /// See [`LiveOpacity`](crate::LiveOpacity).
+    ///
+    /// DComp backend only: retained sprite chrome has no XAML counterpart.
+    #[cfg(feature = "dcomp-backend")]
+    pub fn live_opacity(&self) -> LiveOpacity {
+        LiveOpacity::new(self.id)
+    }
 }
 
 impl From<MountInfo> for ElementHandle {

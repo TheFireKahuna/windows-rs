@@ -748,8 +748,19 @@ struct GlowLayer {
     mask_brush: CompositionMaskBrush,
     display: SpriteVisual,
     _source: Option<CompositionSurfaceBrush>,
+    /// The multi-hue FP16 colour source, when the glow carries a ramp. Its
+    /// `colour()` is bound as the mask brush's SOURCE (the halo alpha is the mask),
+    /// so the bloom is coloured along the box while the blur still carries only
+    /// alpha. Held because nothing else keeps its brushes alive and it needs the
+    /// layer's extent.
+    ramp: Option<super::gradient::RampSource>,
     // ── change gates ──
     solid_for: Option<([u32; 4], u32)>,
+    /// The stop list + axis the ramp source was built for, so a recolour rebuilds
+    /// it and a steady glow rebinds nothing.
+    stops_seen: Vec<(f64, Color)>,
+    grad_axis_seen: Option<GradientAxis>,
+    grad_epoch: u32,
     size: Option<(f32, f32, f32)>,
     thickness: Option<f32>,
     blur: Option<u32>,
@@ -814,7 +825,11 @@ impl GlowLayer {
             mask_brush,
             display,
             _source: None,
+            ramp: None,
             solid_for: None,
+            stops_seen: Vec::new(),
+            grad_axis_seen: None,
+            grad_epoch: u32::MAX,
             size: None,
             thickness: None,
             blur: None,
@@ -843,6 +858,12 @@ impl GlowLayer {
         self.halo_surface.set_source_size(phys);
         // The display sprite stays in DIPs — it IS under the root scale.
         self.display.set_size(w, h);
+        // A multi-hue ramp source is a real visual tree measured against this
+        // extent; a single-hue one is `MappingMode::Relative` and ignores it.
+        // Either way nothing re-rasterizes here.
+        if let Some(r) = self.ramp.as_ref() {
+            r.resize(w, h, scale);
+        }
         self.size = Some((w, h, scale));
     }
 
@@ -859,8 +880,11 @@ impl GlowLayer {
         path: Option<&CompositionPath>,
         geometry_changed: bool,
         color: Color,
+        stops: &[(f64, Color)],
+        axis: GradientAxis,
         blur: f32,
         thickness: f32,
+        atlas_epoch: u32,
         w: f32,
         h: f32,
         scale: f32,
@@ -893,16 +917,41 @@ impl GlowLayer {
             self.shadow.set_blur_radius(radius);
             self.blur = Some(radius.to_bits());
         }
-        // The FP16 colour the halo is masked against — the same solid-source
-        // builder the stroke and fill layers bind, so a glow tint and a stroke
-        // tint travel one colour path.
-        let want_solid = (glow_bits(color), scale.to_bits());
-        if self.solid_for != Some(want_solid)
-            && let Some(src) = super::parts::build_solid_surface(comp, color, scale)
-        {
-            self.mask_brush.set_source(&src);
-            self._source = Some(src);
-            self.solid_for = Some(want_solid);
+        // The FP16 colour the halo is masked against. A flat glow takes the same
+        // solid-source builder the stroke and fill layers bind, so a glow tint and
+        // a stroke tint travel one colour path. A gradient glow takes a
+        // [`RampSource`](super::gradient::RampSource) instead — the halo's blurred
+        // white supplies the alpha, so only the source's COLOUR (its captured,
+        // opaque, unclamped FP16 field) is read, and the bloom is coloured along
+        // the box while nothing about the blur changes.
+        if stops.is_empty() {
+            let want_solid = (glow_bits(color), scale.to_bits());
+            if self.solid_for != Some(want_solid)
+                && let Some(src) = super::parts::build_solid_surface(comp, color, scale)
+            {
+                self.mask_brush.set_source(&src);
+                self._source = Some(src);
+                self.solid_for = Some(want_solid);
+                self.ramp = None;
+                self.stops_seen.clear();
+                self.grad_axis_seen = None;
+            }
+        } else {
+            let unchanged = self.grad_epoch == atlas_epoch
+                && stops_eq(&self.stops_seen, stops)
+                && self.grad_axis_seen == Some(axis);
+            if !unchanged
+                && let Some(r) = super::gradient::RampSource::build(comp, stops, axis, scale)
+            {
+                r.resize(w, h, scale);
+                self.mask_brush.set_source(r.colour());
+                self.ramp = Some(r);
+                self._source = None;
+                self.solid_for = None;
+                self.stops_seen = stops.to_vec();
+                self.grad_axis_seen = Some(axis);
+                self.grad_epoch = atlas_epoch;
+            }
         }
     }
 }
@@ -1145,8 +1194,11 @@ fn sync_parts(
                 hollow.as_ref(),
                 geometry_changed,
                 color,
+                node.paint.path_glow_stops.as_slice(),
+                node.paint.path_glow_grad_axis,
                 blur,
                 stroke_w,
+                atlas_epoch,
                 w,
                 h,
                 scale,

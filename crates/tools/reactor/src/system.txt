@@ -38,6 +38,19 @@
 // ::* so the generated _Impl trait covers the full vtable, like the UIA providers)
 Windows::Graphics::IGeometrySource2D
 extras::IGeometrySource2DInterop
+// ── Display HDR/WCG/SDR capability ──
+// The dcomp backend obtains a DisplayInformation for its HWND via the interop
+// factory (extras, above — not in the Win32 metadata), subscribes to
+// AdvancedColorInfoChanged (one WinRT event covering HDR toggle, SDR-white-level
+// change, and monitor hops), and reads GetAdvancedColorInfo to hand the app a
+// plain capability snapshot. Class + AdvancedColorInfo are member-scoped to just
+// what that read needs; AdvancedColorKind (the SDR/WCG/HDR discriminant) and
+// Foundation::Point (each primary's chromaticity) come along as field types.
+Windows::Graphics::Display::DisplayInformation::{AdvancedColorInfoChanged, GetAdvancedColorInfo}
+Windows::Graphics::Display::AdvancedColorInfo::{CurrentAdvancedColorKind, RedPrimary, GreenPrimary, BluePrimary, WhitePoint, MaxLuminanceInNits, MinLuminanceInNits, MaxAverageFullFrameLuminanceInNits, SdrWhiteLevelInNits}
+Windows::Graphics::Display::AdvancedColorKind
+Windows::Foundation::Point
+extras::IDisplayInformationStaticsInterop
 // ── Animation parameters / keyframes ──
 // ── Desktop window target (composition on an HWND) ──
 // ── DispatcherQueue (required to create a system Compositor on a thread) ──
@@ -51,13 +64,14 @@ Windows::Graphics::DirectX::DirectXAlphaMode
 Windows::Graphics::SizeInt32
 Windows::Foundation::Size
 Windows::Foundation::TimeSpan
-// ── Composition interop (Win32, system IIDs from Windows.Win32.winmd) ──
-Windows::Win32::CreateDispatcherQueueController
-Windows::Win32::DispatcherQueueOptions
+// ── DispatcherQueue creation (re-authored in extras.rdl — dropped from both
+//    winmds in an upstream metadata rebase; see that file). ──
+extras::CreateDispatcherQueueController
+extras::DispatcherQueueOptions
 // Referenced only through their variant constants (DQTYPE_THREAD_CURRENT,
 // DQTAT_COM_ASTA), which share no prefix with the enum type names.
-Windows::Win32::DISPATCHERQUEUE_THREAD_TYPE
-Windows::Win32::DISPATCHERQUEUE_THREAD_APARTMENTTYPE
+extras::DISPATCHERQUEUE_THREAD_TYPE
+extras::DISPATCHERQUEUE_THREAD_APARTMENTTYPE
 
 // ════════════════════════════════════════════════════════════════════════════
 // Win32 windowing + message loop + input (self-hosted top-level window)

@@ -81,6 +81,22 @@ mod extras {
         fn TryGetGeometryUsingFactory(&self, factory: Windows::Win32::ID2D1Factory, value: *mut Windows::Win32::ID2D1Geometry) -> HRESULT;
     }
 
+    // Desktop bridge to Windows.Graphics.Display.DisplayInformation — the WinRT
+    // HDR/WCG/SDR capability object. Its public static (GetForCurrentView) needs a
+    // UWP CoreWindow this app has none of; the interop factory is the Win32 way in.
+    // Not carried by the Win32 metadata this fork bundles (as with
+    // IGeometrySource2DInterop above), so it is hand-authored here. It is
+    // IInspectable-derived (a WinRT activation-factory interface), not a plain COM
+    // interop, so it derives from IInspectable to lay out the three IInspectable
+    // slots ahead of its own. GetForWindow/GetForMonitor return a DisplayInformation
+    // for a real HWND/HMONITOR, whose AdvancedColorInfoChanged event the dcomp
+    // backend subscribes to as the single display-capability-changed signal.
+    #[guid(0x7449121c_382b_4705_8da7_a795ba482013)]
+    interface IDisplayInformationStaticsInterop : Windows::Win32::IInspectable {
+        fn GetForWindow(&self, window: Windows::Win32::HWND, riid: *const GUID, #[iid_is] displayInfo: *mut *mut void) -> HRESULT;
+        fn GetForMonitor(&self, monitor: Windows::Win32::HMONITOR, riid: *const GUID, #[iid_is] displayInfo: *mut *mut void) -> HRESULT;
+    }
+
     #[guid(0x2d6355c2_ad57_4eae_92e4_4c3eff65d578)]
     interface ICompositionDrawingSurfaceInterop : Windows::Win32::IUnknown {
         // BeginDraw hands back an ID2D1DeviceContext (pass its IID) already inside a
@@ -92,6 +108,40 @@ mod extras {
         fn ResumeDraw(&self) -> HRESULT;
         fn SuspendDraw(&self) -> HRESULT;
     }
+
+    // ── Dispatcher-queue creation, re-authored ──
+    // These four (CreateDispatcherQueueController + DispatcherQueueOptions + the two
+    // thread/apartment enums) live in coremessaging.dll and were carried by the Win32
+    // metadata, but an upstream metadata rebase dropped them from BOTH winmds this
+    // fork bundles. The dcomp host still needs them to stand up the UI-thread
+    // DispatcherQueue that backs the Compositor (and now the DisplayInformation
+    // interop), so they are re-authored here. Enum members are bare (no type prefix),
+    // matching the Win32 metadata convention, so the generated flat consts stay
+    // DQTYPE_THREAD_CURRENT / DQTAT_COM_NONE / … exactly as the host imports them.
+    #[repr(i32)]
+    enum DISPATCHERQUEUE_THREAD_TYPE {
+        DQTYPE_THREAD_DEDICATED = 1,
+        DQTYPE_THREAD_CURRENT = 2,
+    }
+
+    #[repr(i32)]
+    enum DISPATCHERQUEUE_THREAD_APARTMENTTYPE {
+        DQTAT_COM_NONE = 0,
+        DQTAT_COM_ASTA = 1,
+        DQTAT_COM_STA = 2,
+    }
+
+    struct DispatcherQueueOptions {
+        dwSize: u32,
+        threadType: DISPATCHERQUEUE_THREAD_TYPE,
+        apartmentType: DISPATCHERQUEUE_THREAD_APARTMENTTYPE,
+    }
+
+    #[library("coremessaging.dll")]
+    extern fn CreateDispatcherQueueController(
+        options: DispatcherQueueOptions,
+        dispatcherQueueController: *mut *mut void,
+    ) -> HRESULT;
 
     // Sourced from Microsoft.WindowsAppSDK.Runtime 2.0.1
 

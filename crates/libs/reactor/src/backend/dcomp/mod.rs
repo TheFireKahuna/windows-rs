@@ -42,6 +42,7 @@ pub(crate) mod info_bar;
 pub(crate) mod input;
 mod knob;
 pub(crate) mod layout;
+pub(crate) mod live_opacity;
 pub(crate) mod live_text;
 pub(crate) mod live_trace;
 pub(crate) mod nav;
@@ -68,7 +69,7 @@ pub use backdrop::{
 };
 pub use color_out::set_output_color_transform;
 pub use host::{pointer_capture_active, DCompHost};
-pub use display_change::set_display_change_callback;
+pub use display_change::{set_display_change_callback, AdvancedColor};
 pub use visibility::set_window_visibility_callback;
 pub(crate) use pointer::{
     declare as declare_gesture, forget as forget_gesture, register_action as register_gesture_action,
@@ -229,6 +230,8 @@ pub struct DCompBackend {
     /// the backend for [`bar_batch`](Self::bar_batch)'s reason — the geometry
     /// buffers are swapped with the queue's, never cloned.
     trace_batch: Vec<live_trace::TraceBatch>,
+    /// Reusable drain buffer for [`live_opacity`]'s cross-thread queue.
+    opacity_batch: Vec<(ControlId, f32)>,
 }
 
 impl DCompBackend {
@@ -264,6 +267,7 @@ impl DCompBackend {
             keybindings: rustc_hash::FxHashMap::default(),
             bar_batch: Vec::new(),
             trace_batch: Vec::new(),
+            opacity_batch: Vec::new(),
         }
     }
 
@@ -743,6 +747,24 @@ impl DCompBackend {
         }
         batch.retain(|e| self.arena.get(e.id).is_some());
         self.trace_batch = batch;
+    }
+
+    /// Apply the node opacities a producer thread eased — the Simple preview's lit
+    /// spans, whose GEOMETRY is declarative (shared with the response stroke) and whose
+    /// only live property is opacity.
+    ///
+    /// Deliberately does NOT repaint: opacity is a compositor property on a container
+    /// that already exists, so the write is carried by this message's implicit commit.
+    /// Nothing rasterizes and the visual tree's shape is untouched. See [`live_opacity`].
+    pub(crate) fn service_live_opacity(&mut self) {
+        let mut batch = std::mem::take(&mut self.opacity_batch);
+        live_opacity::drain_into(&mut batch);
+        for &(id, opacity) in &batch {
+            if let Some(n) = self.arena.get(id) {
+                n.container.set_opacity(opacity);
+            }
+        }
+        self.opacity_batch = batch;
     }
 
     pub(crate) fn service_live_text(&mut self) {
@@ -1746,6 +1768,14 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.paint.path_stroke_grad_axis = GradientAxis::from_i32(*v);
             node.mark_dirty();
         }
+        (Prop::GlowStops, PropValue::GradientStops(stops)) => {
+            node.paint.path_glow_stops.clone_from(stops);
+            node.mark_dirty();
+        }
+        (Prop::GlowGradientAxis, PropValue::I32(v)) => {
+            node.paint.path_glow_grad_axis = GradientAxis::from_i32(*v);
+            node.mark_dirty();
+        }
         (Prop::StartAngle, PropValue::F64(v)) => {
             node.ctrl_mut().start_angle = *v as f32;
             node.mark_dirty();
@@ -2181,6 +2211,14 @@ prop_contract! {
         // keeping a ramp the widget no longer describes.
         StrokeGradientStops => |n| {
             n.paint.path_stroke_stops.clear();
+            n.mark_dirty();
+        }
+        GlowStops => |n| {
+            n.paint.path_glow_stops.clear();
+            n.mark_dirty();
+        }
+        GlowGradientAxis => |n| {
+            n.paint.path_glow_grad_axis = n.birth_paint().path_glow_grad_axis;
             n.mark_dirty();
         }
         GradientAxis => |n| {

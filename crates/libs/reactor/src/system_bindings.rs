@@ -83,6 +83,49 @@ windows_core::link!("user32.dll" "system" fn UpdateWindow(hwnd : HWND) -> window
 windows_core::link!("user32.dll" "system" fn ValidateRect(hwnd : HWND, lprect : *const RECT) -> windows_core::BOOL);
 windows_core::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u32, lphandles : *const HANDLE, bwaitall : windows_core::BOOL, dwmilliseconds : u32) -> u32);
 pub type ATOM = u16;
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvancedColorInfo(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    AdvancedColorInfo,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for AdvancedColorInfo {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IAdvancedColorInfo>();
+}
+unsafe impl windows_core::Interface for AdvancedColorInfo {
+    type Vtable = <IAdvancedColorInfo as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IAdvancedColorInfo as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for AdvancedColorInfo {
+    type Target = IAdvancedColorInfo;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for AdvancedColorInfo {
+    const NAME: &'static str = "Windows.Graphics.Display.AdvancedColorInfo";
+}
+unsafe impl Send for AdvancedColorInfo {}
+unsafe impl Sync for AdvancedColorInfo {}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdvancedColorKind(pub i32);
+impl AdvancedColorKind {
+    pub const StandardDynamicRange: Self = Self(0);
+    pub const WideColorGamut: Self = Self(1);
+    pub const HighDynamicRange: Self = Self(2);
+}
+impl windows_core::TypeKind for AdvancedColorKind {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for AdvancedColorKind {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"enum(Windows.Graphics.Display.AdvancedColorKind;i4)",
+    );
+}
 pub const CF_UNICODETEXT: u32 = 13;
 pub type CLIPFORMAT = u16;
 pub type COLORREF = u32;
@@ -404,6 +447,33 @@ pub struct DispatcherQueueOptions {
     pub threadType: DISPATCHERQUEUE_THREAD_TYPE,
     pub apartmentType: DISPATCHERQUEUE_THREAD_APARTMENTTYPE,
 }
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisplayInformation(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    DisplayInformation,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for DisplayInformation {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IDisplayInformation>();
+}
+unsafe impl windows_core::Interface for DisplayInformation {
+    type Vtable = <IDisplayInformation as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IDisplayInformation as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for DisplayInformation {
+    type Target = IDisplayInformation;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for DisplayInformation {
+    const NAME: &'static str = "Windows.Graphics.Display.DisplayInformation";
+}
+unsafe impl Send for DisplayInformation {}
+unsafe impl Sync for DisplayInformation {}
 pub type EVENTID = i32;
 pub type ExpandCollapseState = i32;
 pub const ExpandCollapseState_Collapsed: ExpandCollapseState = 0;
@@ -443,6 +513,131 @@ pub const HTMINBUTTON: u32 = 8;
 pub const HTTOP: u32 = 12;
 pub type HWND = *mut core::ffi::c_void;
 pub const HeadingLevel_None: i32 = 80050;
+windows_core::imp::define_interface!(
+    IAdvancedColorInfo,
+    IAdvancedColorInfo_Vtbl,
+    0x8797dcfb_b229_4081_ae9a_2cc85e34ad6a
+);
+impl windows_core::RuntimeType for IAdvancedColorInfo {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl IAdvancedColorInfo {
+    pub(crate) fn CurrentAdvancedColorKind(&self) -> windows_core::Result<AdvancedColorKind> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CurrentAdvancedColorKind)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn RedPrimary(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RedPrimary)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GreenPrimary(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GreenPrimary)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn BluePrimary(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).BluePrimary)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn WhitePoint(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).WhitePoint)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn MaxLuminanceInNits(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).MaxLuminanceInNits)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn MinLuminanceInNits(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).MinLuminanceInNits)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn MaxAverageFullFrameLuminanceInNits(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).MaxAverageFullFrameLuminanceInNits)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SdrWhiteLevelInNits(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).SdrWhiteLevelInNits)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct IAdvancedColorInfo_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub CurrentAdvancedColorKind: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut AdvancedColorKind,
+    ) -> windows_core::HRESULT,
+    pub RedPrimary:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub GreenPrimary:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub BluePrimary:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub WhitePoint:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub MaxLuminanceInNits:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
+    pub MinLuminanceInNits:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
+    pub MaxAverageFullFrameLuminanceInNits:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
+    pub SdrWhiteLevelInNits:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
+}
 windows_core::imp::define_interface!(
     ID2D1Factory,
     ID2D1Factory_Vtbl,
@@ -602,6 +797,146 @@ pub struct IDispatcherQueueController_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
     pub DispatcherQueue: unsafe extern "system" fn(
         *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IDisplayInformation,
+    IDisplayInformation_Vtbl,
+    0xbed112ae_adc3_4dc9_ae65_851f4d7d4799
+);
+impl windows_core::RuntimeType for IDisplayInformation {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IDisplayInformation_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    IDisplayInformation5,
+    IDisplayInformation5_Vtbl,
+    0x3a5442dc_2cde_4a8d_80d1_21dc5adcc1aa
+);
+impl windows_core::RuntimeType for IDisplayInformation5 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl IDisplayInformation5 {
+    pub(crate) fn GetAdvancedColorInfo(&self) -> windows_core::Result<AdvancedColorInfo> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetAdvancedColorInfo)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn AdvancedColorInfoChanged<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(windows_core::Ref<DisplayInformation>, windows_core::Ref<windows_core::IInspectable>)
+            + 'static,
+    {
+        let handler: TypedEventHandler<DisplayInformation, windows_core::IInspectable> = {
+            let com = windows_core::imp::DelegateBox::<
+                TypedEventHandler<DisplayInformation, windows_core::IInspectable>,
+                F,
+            >::new(
+                &TypedEventHandlerBox::<DisplayInformation, windows_core::IInspectable, F>::VTABLE,
+                handler,
+            );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).AdvancedColorInfoChanged)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemoveAdvancedColorInfoChanged,
+            ))
+        }
+    }
+}
+#[repr(C)]
+pub struct IDisplayInformation5_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub GetAdvancedColorInfo: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub AdvancedColorInfoChanged: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveAdvancedColorInfoChanged:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IDisplayInformationStaticsInterop,
+    IDisplayInformationStaticsInterop_Vtbl,
+    0x7449121c_382b_4705_8da7_a795ba482013
+);
+windows_core::imp::interface_hierarchy!(
+    IDisplayInformationStaticsInterop,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl IDisplayInformationStaticsInterop {
+    pub(crate) unsafe fn GetForWindow<T>(&self, window: HWND) -> windows_core::Result<T>
+    where
+        T: windows_core::Interface,
+    {
+        let mut result__ = core::ptr::null_mut();
+        unsafe {
+            (windows_core::Interface::vtable(self).GetForWindow)(
+                windows_core::Interface::as_raw(self),
+                window,
+                &T::IID,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) unsafe fn GetForMonitor<T>(&self, monitor: HMONITOR) -> windows_core::Result<T>
+    where
+        T: windows_core::Interface,
+    {
+        let mut result__ = core::ptr::null_mut();
+        unsafe {
+            (windows_core::Interface::vtable(self).GetForMonitor)(
+                windows_core::Interface::as_raw(self),
+                monitor,
+                &T::IID,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct IDisplayInformationStaticsInterop_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub GetForWindow: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        HWND,
+        *const windows_core::GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetForMonitor: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        HMONITOR,
+        *const windows_core::GUID,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
@@ -5399,6 +5734,19 @@ pub type PTIMERAPCROUTINE = Option<
     ),
 >;
 pub type PWINDOWPOS = *mut WINDOWPOS;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+impl windows_core::TypeKind for Point {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for Point {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.Foundation.Point;f4;f4)");
+}
 pub type ProviderOptions = u32;
 pub const ProviderOptions_ClientSideProvider: ProviderOptions = 1;
 pub const ProviderOptions_HasNativeIAccessible: ProviderOptions = 128;
@@ -5704,6 +6052,82 @@ pub type TsActiveSelEnd = i32;
 pub type TsLayoutCode = i32;
 pub type TsRunType = i32;
 pub type TsViewCookie = u32;
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedEventHandler<TSender, TResult>(
+    windows_core::IUnknown,
+    core::marker::PhantomData<TSender>,
+    core::marker::PhantomData<TResult>,
+)
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static;
+unsafe impl<
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+> windows_core::Interface for TypedEventHandler<TSender, TResult>
+{
+    type Vtable = TypedEventHandler_Vtbl<TSender, TResult>;
+    const IID: windows_core::GUID =
+        windows_core::GUID::from_signature(<Self as windows_core::RuntimeType>::SIGNATURE);
+}
+impl<TSender: windows_core::RuntimeType + 'static, TResult: windows_core::RuntimeType + 'static>
+    windows_core::RuntimeType for TypedEventHandler<TSender, TResult>
+{
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::new()
+        .push_slice(b"pinterface({9de1c534-6ae1-11e0-84e1-18a905bcc53f}")
+        .push_slice(b";")
+        .push_other(TSender::SIGNATURE)
+        .push_slice(b";")
+        .push_other(TResult::SIGNATURE)
+        .push_slice(b")");
+}
+#[repr(C)]
+pub struct TypedEventHandler_Vtbl<TSender, TResult>
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+{
+    base__: windows_core::IUnknown_Vtbl,
+    Invoke: unsafe extern "system" fn(
+        this: *mut core::ffi::c_void,
+        sender: windows_core::AbiType<TSender>,
+        args: windows_core::AbiType<TResult>,
+    ) -> windows_core::HRESULT,
+    TSender: core::marker::PhantomData<TSender>,
+    TResult: core::marker::PhantomData<TResult>,
+}
+struct TypedEventHandlerBox<
+    TSender,
+    TResult,
+    F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static,
+>(core::marker::PhantomData<(TSender, TResult, fn() -> F)>)
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static;
+impl<
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+    F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static,
+> TypedEventHandlerBox<TSender, TResult, F>
+{
+    const VTABLE : TypedEventHandler_Vtbl < TSender , TResult , > = TypedEventHandler_Vtbl::< TSender , TResult , > { base__ : windows_core::IUnknown_Vtbl { QueryInterface : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::QueryInterface , AddRef : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::AddRef , Release : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::Release , } , Invoke : Self::Invoke , TSender : core::marker::PhantomData::< TSender > , TResult : core::marker::PhantomData::< TResult > } ;
+    unsafe extern "system" fn Invoke(
+        this: *mut core::ffi::c_void,
+        sender: windows_core::AbiType<TSender>,
+        args: windows_core::AbiType<TResult>,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            let this = &mut *(this as *mut *mut core::ffi::c_void
+                as *mut windows_core::imp::DelegateBox<TypedEventHandler<TSender, TResult>, F>);
+            (this.invoke)(
+                core::mem::transmute_copy(&sender),
+                core::mem::transmute_copy(&args),
+            );
+            windows_core::HRESULT(0)
+        }
+    }
+}
 pub const UIA_AcceleratorKeyPropertyId: i32 = 30006;
 pub const UIA_AutomationFocusChangedEventId: i32 = 20005;
 pub const UIA_AutomationIdPropertyId: i32 = 30011;

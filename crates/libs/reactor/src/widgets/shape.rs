@@ -413,6 +413,19 @@ pub struct Shape {
     /// composites it under the stroke — the FabFilter bloom, retained rather
     /// than repainted. `None` draws no glow. Only a stroked path glows.
     pub glow: Option<(Color, f64)>,
+    /// A multi-hue ramp for the glow, running ALONG the box like the stroke's — the
+    /// bloom coloured by frequency instead of a single tint. `None` (the default)
+    /// leaves the glow on its flat [`glow`](Self::glow) colour; a non-empty ramp
+    /// makes the halo carry each stop's hue, its magnitude free to run above paper
+    /// white (the FP16 source is unclamped). The blur σ still comes from
+    /// [`glow`](Self::glow), so a gradient glow states both.
+    pub glow_gradient: Option<Vec<(f64, Color)>>,
+    /// Which way the glow ramp runs (defaults to horizontal, matching the stroke).
+    pub glow_gradient_axis: GradientAxis,
+    /// Post-mount callback, for taking an [`ElementHandle`] to this shape — its one
+    /// use is [`ElementHandle::live_opacity`], for a shape whose geometry reconciles
+    /// normally but whose opacity a render pump eases (the Simple preview's lit spans).
+    pub mounted: Option<Callback<MountInfo>>,
 }
 /// The axis a gradient ramp runs along, in the shape's own local box: stop `0.0`
 /// sits at the leading edge of that axis and stop `1.0` at the trailing one.
@@ -472,6 +485,9 @@ impl Default for Shape {
             stroke_gradient_axis: GradientAxis::Horizontal,
             trim: None,
             glow: None,
+            glow_gradient: None,
+            glow_gradient_axis: GradientAxis::Horizontal,
+            mounted: None,
         }
     }
 }
@@ -569,6 +585,31 @@ impl Shape {
         self.glow = Some((color, blur));
         self
     }
+    /// Give the glow a multi-hue ramp instead of the flat [`glow`](Self::glow)
+    /// colour — the halo coloured ALONG the box, running with the stroke. Still
+    /// needs [`glow`](Self::glow) for the blur σ (its colour then serves only as the
+    /// fallback if the ramp cannot be built). Use [`glow_gradient_along`](Self::glow_gradient_along)
+    /// for any other axis.
+    pub fn glow_gradient(mut self, stops: Vec<(f64, Color)>) -> Self {
+        self.glow_gradient = Some(stops);
+        self.glow_gradient_axis = GradientAxis::Horizontal;
+        self
+    }
+    /// [`glow_gradient`](Self::glow_gradient) on a stated axis.
+    pub fn glow_gradient_along(mut self, axis: GradientAxis, stops: Vec<(f64, Color)>) -> Self {
+        self.glow_gradient = Some(stops);
+        self.glow_gradient_axis = axis;
+        self
+    }
+    /// Callback invoked once after the shape is created, handed an [`ElementHandle`]
+    /// for it. Take [`ElementHandle::live_opacity`] here to ease this shape's opacity
+    /// from a producer thread while its geometry keeps reconciling normally.
+    pub fn on_mounted(mut self, f: impl Fn(ElementHandle) + 'static) -> Self {
+        self.mounted = Some(Callback::new(move |info: MountInfo| {
+            f(ElementHandle::from(info));
+        }));
+        self
+    }
 }
 
 impl Widget for Shape {
@@ -585,6 +626,9 @@ impl Widget for Shape {
     }
     fn modifiers(&self) -> &Modifiers {
         &self.modifiers
+    }
+    fn on_mounted_callback(&self) -> Option<&Callback<MountInfo>> {
+        self.mounted.as_ref()
     }
     fn bindings(&self) -> PropBindings {
         let mut out = Vec::with_capacity(5);
@@ -646,6 +690,16 @@ impl Widget for Shape {
         if let Some((color, blur)) = self.glow {
             out.push(Binding::Prop(Prop::GlowColor, PropValue::Color(color)));
             out.push(Binding::Prop(Prop::GlowBlur, PropValue::F64(blur)));
+        }
+        if let Some(stops) = &self.glow_gradient {
+            out.push(Binding::Prop(
+                Prop::GlowStops,
+                PropValue::GradientStops(stops.clone()),
+            ));
+            out.push(Binding::Prop(
+                Prop::GlowGradientAxis,
+                PropValue::I32(self.glow_gradient_axis as i32),
+            ));
         }
         out
     }

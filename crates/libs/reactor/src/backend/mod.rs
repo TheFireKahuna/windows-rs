@@ -25,9 +25,10 @@ pub mod dcomp_test_api;
 #[cfg(feature = "dcomp-backend")]
 pub use dcomp::{
     bar_field::{BarFieldLayout, BarRect, LiveBars},
+    live_opacity::LiveOpacity,
     live_text::LiveText,
     live_trace::{FillAnchor, FillMotion, LiveTrace, TraceLayout, TracePath},
-    pointer_capture_active, set_display_change_callback, set_host_tokens,
+    pointer_capture_active, set_display_change_callback, set_host_tokens, AdvancedColor,
     set_output_color_transform, set_root_backdrop_provider, set_window_visibility_callback,
     BackdropDither, BackdropGlow, BackdropSpec, DCompBackend, DCompHost, GlowDrift, HostTokens,
 };
@@ -190,6 +191,12 @@ pub enum Prop {
     /// halo surface once per geometry change and composites it under the stroke.
     GlowBlur,
     GlowColor,
+    /// A multi-hue ramp for a path's glow — the halo coloured along its box instead
+    /// of a single [`Prop::GlowColor`] tint. Its magnitude is unclamped (an FP16
+    /// source), so a bloom can run above paper white per stop.
+    GlowStops,
+    /// Which way that glow gradient runs (a [`GradientAxis`] discriminant).
+    GlowGradientAxis,
     GradientStops,
     /// Which way a shape FILL gradient runs across its box (a [`GradientAxis`]
     /// discriminant).

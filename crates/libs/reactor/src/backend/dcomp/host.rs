@@ -1152,31 +1152,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             0
         }
 
-        // The display mode / topology changed — HDR toggled, the SDR white level or
-        // panel changed. Let the app re-fit its colour map (it owns colour policy via
-        // the callback), then repaint all chrome so already-painted surfaces pick up
-        // the new draw-time map. Viz surfaces repaint every frame, so only static
-        // chrome needs the nudge.
-        WM_DISPLAYCHANGE => {
-            display_change::note_display_change(hwnd);
-            if let Some(s) = shared() {
-                s.backend.borrow_mut().mark_all_dirty_and_repaint();
-            }
-            0
-        }
-
-        // The window moved/resized: re-fit only when it landed on a different
-        // monitor, then fall through to DefWindowProc (which synthesizes WM_SIZE /
-        // WM_MOVE from WM_WINDOWPOSCHANGED).
-        WM_WINDOWPOSCHANGED => {
-            display_change::note_possible_monitor_change(hwnd);
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-
+        // The display's colour capability (HDR toggle, SDR white level, panel /
+        // monitor change) is no longer chased through WM_DISPLAYCHANGE or a
+        // WM_WINDOWPOSCHANGED monitor-diff: `display_change::attach` subscribes the
+        // window's DisplayInformation to AdvancedColorInfoChanged, one WinRT signal
+        // that covers all of them (and tracks the window's current monitor), and
+        // re-fits + repaints from there. So both of those arms are gone; WM_SIZE /
+        // WM_MOVE are still synthesised by DefWindowProc via the default arm.
         WM_SETTINGCHANGE => {
-            // The OS "SDR content brightness" slider and auto-colour / HDR-mode
-            // toggles broadcast a plain WM_SETTINGCHANGE, so re-fit the colour map.
-            display_change::note_display_change(hwnd);
             // An "ImmersiveColorSet" change flips the system light/dark theme.
             // Routed through the effective-theme resolver, so an app-forced
             // Light/Dark override ignores the system flip.
@@ -1246,6 +1229,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
 
         WM_DESTROY => {
+            // Drop the DisplayInformation + its AdvancedColorInfoChanged
+            // subscription while the HWND it hooked is still valid.
+            display_change::detach();
             // Before the window goes: pop the TSF context and deactivate the
             // thread manager while the HWND the store reports is still valid.
             tsf::bridge::shutdown();
@@ -1386,5 +1372,13 @@ fn create_window(
     }
     let pw = (rc.right - rc.left).max(1);
     let ph = (rc.bottom - rc.top).max(1);
+
+    // Subscribe the display-capability signal now the window exists and the UI
+    // thread already has its DispatcherQueue (both `GetForWindow` requirements).
+    // This also fires the initial fit synchronously — before the first paint —
+    // so frame one is already mapped to the display, and there is no pre-window
+    // fit to get wrong.
+    display_change::attach(hwnd);
+
     Ok((hwnd, dpi, (pw, ph)))
 }

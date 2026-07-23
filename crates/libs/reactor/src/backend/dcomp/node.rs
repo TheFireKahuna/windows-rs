@@ -140,6 +140,12 @@ pub(crate) struct Paint {
     /// arc, neither of which has a second ramp to describe.
     pub path_stroke_stops: Vec<(f64, Color)>,
     pub path_stroke_grad_axis: GradientAxis,
+    /// The GLOW's own multi-hue ramp, `(position 0..1, authored colour)`, and the
+    /// axis it runs along. Empty leaves the halo on its flat [`Self::path_glow`]
+    /// colour; non-empty makes the blurred halo carry each stop's (unclamped) hue —
+    /// the bloom coloured along the box like the stroke. See [`super::path_shape`].
+    pub path_glow_stops: Vec<(f64, Color)>,
+    pub path_glow_grad_axis: GradientAxis,
     /// Text content (TextBlock text or Button label).
     pub text: String,
     pub font_size: f32,
@@ -172,6 +178,8 @@ impl Default for Paint {
             path_fill_grad_axis: GradientAxis::Vertical,
             path_stroke_grad_axis: GradientAxis::Horizontal,
             path_stroke_stops: Vec::new(),
+            path_glow_grad_axis: GradientAxis::Horizontal,
+            path_glow_stops: Vec::new(),
             text: String::new(),
             font_size: 0.0,
             font_weight: 0,
