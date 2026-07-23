@@ -246,6 +246,39 @@ Windows.UI.Composition.ISpriteVisual2::{put_Shadow}
 Windows.UI.Composition.ICompositionNineGridBrush::{SetInsetScales}
 Windows.UI.Composition.IVisualCollection::{InsertAbove}
 
+// Linear gradient brushes. Not a colour carrier — a `Windows.UI.Color` stop is
+// 8-bit and clamps below paper white on an HDR desktop — but a legal MASK: a
+// gradient brush bound as `CompositionMaskBrush.Mask` supplies an alpha ramp the
+// compositor evaluates per pixel, with an app-allocated FP16 surface still
+// supplying the colour. `MappingMode::Relative` makes the ramp follow the sprite,
+// so a resize costs no raster at all.
+Windows.UI.Composition.CompositionGradientBrush
+Windows.UI.Composition.CompositionLinearGradientBrush
+Windows.UI.Composition.ICompositionGradientBrush::{get_ColorStops}
+Windows.UI.Composition.ICompositionGradientBrush2::{put_MappingMode}
+Windows.UI.Composition.ICompositionLinearGradientBrush::{put_StartPoint, put_EndPoint}
+Windows.UI.Composition.CompositionColorGradientStop
+Windows.UI.Composition.CompositionColorGradientStopCollection
+Windows.UI.Composition.CompositionMappingMode
+Windows.UI.Composition.ICompositor4::{CreateLinearGradientBrush, CreateColorGradientStopWithOffsetAndColor}
+
+// A stroke's corner treatment. The painted `DrawKit` round style joins with
+// `LineJoin::Round`, and a retained trace has to agree with it or a sampled
+// spline's steep segments show mitre spikes the painted one never had.
+Windows.UI.Composition.ICompositionSpriteShape::{put_StrokeLineJoin}
+Windows.UI.Composition.CompositionStrokeLineJoin
+
+// The rest of a stroke's style, so a retained sprite can express everything the
+// painted `StrokeStyleBuilder` could and no shape has to keep a drawing surface
+// alive for a dash alone. The dash array is a live `IVector<f32>` hanging off the
+// shape rather than a property to assign, and its runs — like Direct2D's — are
+// multiples of the stroke thickness, not DIPs. The mitre limit is what makes
+// `MiterOrBevel` a distinct join rather than a plain mitre, and a non-scaling
+// stroke keeps its thickness when the shape is scaled, which is the only way a
+// hairline rule survives a `set_scale`.
+Windows.UI.Composition.ICompositionSpriteShape::{get_StrokeDashArray, put_StrokeDashCap, put_StrokeDashOffset, put_StrokeMiterLimit, put_IsStrokeNonScaling}
+Windows.UI.Composition.CompositionStrokeDashArray
+
 // Scoped-batch completion: the only signal that a batch's animations have all
 // finished. Without it a visual retained for an exit transition has no defined
 // moment of release.

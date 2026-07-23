@@ -189,6 +189,30 @@ impl From<StrokeCap> for bindings::CompositionStrokeCap {
     }
 }
 
+/// How a stroke turns a corner between two segments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StrokeJoin {
+    /// Extend both edges until they meet in a point.
+    Miter,
+    /// Cut the corner off with a straight edge.
+    Bevel,
+    /// Round the corner with an arc of the stroke's half-thickness.
+    Round,
+    /// Mitre the corner, falling back to a bevel past the mitre limit.
+    MiterOrBevel,
+}
+
+impl From<StrokeJoin> for bindings::CompositionStrokeLineJoin {
+    fn from(join: StrokeJoin) -> Self {
+        match join {
+            StrokeJoin::Miter => Self::Miter,
+            StrokeJoin::Bevel => Self::Bevel,
+            StrokeJoin::Round => Self::Round,
+            StrokeJoin::MiterOrBevel => Self::MiterOrBevel,
+        }
+    }
+}
+
 /// A shape that fills a geometry with a [`Brush`].
 #[derive(Clone)]
 pub struct CompositionSpriteShape(pub(crate) bindings::CompositionSpriteShape);
@@ -234,6 +258,69 @@ impl CompositionSpriteShape {
         let cap: bindings::CompositionStrokeCap = cap.into();
         self.0.SetStrokeStartCap(cap).unwrap();
         self.0.SetStrokeEndCap(cap).unwrap();
+    }
+
+    /// Sets how the stroke turns each corner of its geometry.
+    ///
+    /// The compositor's default is a mitre, which spikes wherever a sampled
+    /// spline turns sharply — an artifact a painted trace of the same curve does
+    /// not have, because the D2D stroke style behind it joins round.
+    pub fn set_stroke_join(&self, join: StrokeJoin) {
+        self.0.SetStrokeLineJoin(join.into()).unwrap();
+    }
+
+    /// Sets how far a mitred corner may extend, as a multiple of the stroke's
+    /// thickness, before it is drawn as a bevel instead.
+    ///
+    /// This is the only thing that separates [`StrokeJoin::MiterOrBevel`] from a
+    /// plain [`StrokeJoin::Miter`]: without a limit there is no angle at which
+    /// the fallback engages.
+    pub fn set_stroke_miter_limit(&self, limit: f32) {
+        self.0.SetStrokeMiterLimit(limit).unwrap();
+    }
+
+    /// Replaces the dash pattern with alternating on/off run lengths, each a
+    /// MULTIPLE OF THE STROKE THICKNESS rather than a length in DIPs. An empty
+    /// slice draws the stroke solid.
+    ///
+    /// The dash array is a live collection owned by the shape, not a property to
+    /// assign, so re-dashing rewrites it in place and the shape keeps its object
+    /// — the same reason a geometry is re-pathed rather than replaced.
+    pub fn set_stroke_dashes(&self, dashes: &[f32]) {
+        let array = self.0.StrokeDashArray().unwrap();
+        array.Clear().unwrap();
+        for &run in dashes {
+            array.Append(run).unwrap();
+        }
+    }
+
+    /// Sets how the two ends of each dash are drawn.
+    ///
+    /// Distinct from [`Self::set_stroke_caps`], which caps the whole path: a
+    /// dashed rule reads as a row of pills or a row of bars depending on this
+    /// alone, and the path's own caps never show once it is dashed.
+    pub fn set_stroke_dash_cap(&self, cap: StrokeCap) {
+        let cap: bindings::CompositionStrokeCap = cap.into();
+        self.0.SetStrokeDashCap(cap).unwrap();
+    }
+
+    /// Sets how far into the dash pattern the stroke starts, in the same units
+    /// as [`Self::set_stroke_dashes`].
+    ///
+    /// Phase is what centres a pattern on a rule of arbitrary length, and it is
+    /// animatable, so a marching-ants dash costs no app frame at all.
+    pub fn set_stroke_dash_offset(&self, offset: f32) {
+        self.0.SetStrokeDashOffset(offset).unwrap();
+    }
+
+    /// Sets whether the stroke keeps its thickness when the shape is scaled.
+    ///
+    /// [`Self::set_scale`] scales the stroke along with the geometry, so a
+    /// hairline rule on a scaled shape thickens with it. A non-scaling stroke is
+    /// measured after the transform instead, which is the only way a one-DIP
+    /// rule stays one DIP.
+    pub fn set_stroke_non_scaling(&self, non_scaling: bool) {
+        self.0.SetIsStrokeNonScaling(non_scaling).unwrap();
     }
 
     /// Sets the shape's scale factor about its origin.

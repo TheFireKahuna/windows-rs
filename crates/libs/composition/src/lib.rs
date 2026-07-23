@@ -82,8 +82,8 @@ pub use animation::{
 };
 pub use batch::{BatchKind, CompositionScopedBatch};
 pub use brush::{
-    Brush, CompositionBrush, CompositionColorBrush, CompositionMaskBrush,
-    CompositionNineGridBrush,
+    Brush, CompositionBrush, CompositionColorBrush, CompositionLinearGradientBrush,
+    CompositionMaskBrush, CompositionNineGridBrush, MappingMode,
 };
 pub use clip::InsetClip;
 pub use color::Color;
@@ -95,6 +95,7 @@ pub use shape::{
     CompositionContainerShape, CompositionEllipseGeometry, CompositionGeometry, CompositionPath,
     CompositionPathGeometry, CompositionRoundedRectangleGeometry, CompositionShape,
     CompositionShapeCollection, CompositionSpriteShape, Geometry, Shape, ShapeVisual, StrokeCap,
+    StrokeJoin,
 };
 pub use visual::{BorderMode, ContainerVisual, SpriteVisual, Visual, VisualCollection};
 

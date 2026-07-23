@@ -81,9 +81,14 @@
 //! two rows tall. That is `mask-grad-norm`, and it is what makes the route a win
 //! rather than a regression.
 //!
-//! The one thing a mask cannot carry is a ramp whose HUE varies: a mask is a
-//! single alpha channel over a single source colour. Multi-hue stops still need
-//! a rasterized source.
+//! The one thing a mask cannot carry on its own is a ramp whose HUE varies: a
+//! mask is a single alpha channel over a single source colour. A multi-hue ramp
+//! is instead a STAIRCASE of constant-colour layers whose masks partition the
+//! alpha range — source-over between them is exactly the piecewise-linear
+//! interpolation a multi-stop gradient describes — composited into a container
+//! and captured once. That capture is safe only because what crosses it is
+//! COLOUR: a capture carries colour bit-accurately and mangles a ramp carried as
+//! alpha. See reactor's backend::dcomp::gradient.
 
 use windows::Win32::{
     D2D1CreateDevice, D2D_COLOR_F, D2D_RECT_F, D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -157,7 +162,7 @@ const RAMP_B: Ramp = Ramp { y: ROW_B_Y, h: ROW_B_H, src: SRC_B, top: B_TOP, bot:
 /// baseline and a known-bad one, so a run that fails to reproduce them is a
 /// broken harness rather than a finding.
 const ROUTES: &[(&str, &str)] = &[
-    ("raster-fp16", "CONTROL/shipping: app-rasterized FP16 ramp (build_vgradient_surface)"),
+    ("raster-fp16", "CONTROL: app-rasterized FP16 ramp (what reactor shipped before this probe)"),
     ("grad-direct", "CONTROL/expect-clamp: gradient brush painted straight onto the sprite"),
     ("mask-grad", "MaskBrush{mask: linear gradient (white, alpha ramp), source: FP16 solid}"),
     ("mask-grad-capture", "glow pattern: gradient sprite -> VisualSurface -> mask; source FP16"),

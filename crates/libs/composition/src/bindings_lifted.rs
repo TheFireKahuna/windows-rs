@@ -270,6 +270,63 @@ unsafe impl Send for CompositionColorBrush {}
 unsafe impl Sync for CompositionColorBrush {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionColorGradientStop(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionColorGradientStop,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(CompositionColorGradientStop, CompositionObject);
+impl windows_core::RuntimeType for CompositionColorGradientStop {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionColorGradientStop>();
+}
+unsafe impl windows_core::Interface for CompositionColorGradientStop {
+    type Vtable = <ICompositionColorGradientStop as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionColorGradientStop as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionColorGradientStop {
+    type Target = ICompositionColorGradientStop;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionColorGradientStop {
+    const NAME: &'static str = "Microsoft.UI.Composition.CompositionColorGradientStop";
+}
+unsafe impl Send for CompositionColorGradientStop {}
+unsafe impl Sync for CompositionColorGradientStop {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionColorGradientStopCollection(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionColorGradientStopCollection,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for CompositionColorGradientStopCollection {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionColorGradientStopCollection>(
+        );
+}
+unsafe impl windows_core::Interface for CompositionColorGradientStopCollection {
+    type Vtable = <ICompositionColorGradientStopCollection as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICompositionColorGradientStopCollection as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionColorGradientStopCollection {
+    type Target = ICompositionColorGradientStopCollection;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionColorGradientStopCollection {
+    const NAME: &'static str = "Microsoft.UI.Composition.CompositionColorGradientStopCollection";
+}
+unsafe impl Send for CompositionColorGradientStopCollection {}
+unsafe impl Sync for CompositionColorGradientStopCollection {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionContainerShape(windows_core::IUnknown);
 windows_core::imp::interface_hierarchy!(
     CompositionContainerShape,
@@ -417,6 +474,87 @@ impl windows_core::TypeKind for CompositionGetValueStatus {
 impl windows_core::RuntimeType for CompositionGetValueStatus {
     const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
         b"enum(Microsoft.UI.Composition.CompositionGetValueStatus;i4)",
+    );
+}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionGradientBrush(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionGradientBrush,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    CompositionGradientBrush,
+    CompositionBrush,
+    CompositionObject
+);
+impl windows_core::RuntimeType for CompositionGradientBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionGradientBrush>();
+}
+unsafe impl windows_core::Interface for CompositionGradientBrush {
+    type Vtable = <ICompositionGradientBrush as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionGradientBrush as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionGradientBrush {
+    type Target = ICompositionGradientBrush;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionGradientBrush {
+    const NAME: &'static str = "Microsoft.UI.Composition.CompositionGradientBrush";
+}
+unsafe impl Send for CompositionGradientBrush {}
+unsafe impl Sync for CompositionGradientBrush {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionLinearGradientBrush(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionLinearGradientBrush,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    CompositionLinearGradientBrush,
+    CompositionGradientBrush,
+    CompositionBrush,
+    CompositionObject
+);
+impl windows_core::RuntimeType for CompositionLinearGradientBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionLinearGradientBrush>();
+}
+unsafe impl windows_core::Interface for CompositionLinearGradientBrush {
+    type Vtable = <ICompositionLinearGradientBrush as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICompositionLinearGradientBrush as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionLinearGradientBrush {
+    type Target = ICompositionLinearGradientBrush;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionLinearGradientBrush {
+    const NAME: &'static str = "Microsoft.UI.Composition.CompositionLinearGradientBrush";
+}
+unsafe impl Send for CompositionLinearGradientBrush {}
+unsafe impl Sync for CompositionLinearGradientBrush {}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompositionMappingMode(pub i32);
+impl CompositionMappingMode {
+    pub const Absolute: Self = Self(0);
+    pub const Relative: Self = Self(1);
+}
+impl windows_core::TypeKind for CompositionMappingMode {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for CompositionMappingMode {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"enum(Microsoft.UI.Composition.CompositionMappingMode;i4)",
     );
 }
 #[repr(transparent)]
@@ -813,6 +951,53 @@ impl windows_core::TypeKind for CompositionStrokeCap {
 impl windows_core::RuntimeType for CompositionStrokeCap {
     const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
         b"enum(Microsoft.UI.Composition.CompositionStrokeCap;i4)",
+    );
+}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionStrokeDashArray(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionStrokeDashArray,
+    windows_core::IUnknown,
+    windows_core::IInspectable,
+    windows_collections::IVector<f32>
+);
+windows_core::imp::required_hierarchy!(CompositionStrokeDashArray, CompositionObject);
+impl windows_core::RuntimeType for CompositionStrokeDashArray {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, windows_collections::IVector<f32>>();
+}
+unsafe impl windows_core::Interface for CompositionStrokeDashArray {
+    type Vtable = <windows_collections::IVector<f32> as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <windows_collections::IVector<f32> as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionStrokeDashArray {
+    type Target = windows_collections::IVector<f32>;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionStrokeDashArray {
+    const NAME: &'static str = "Microsoft.UI.Composition.CompositionStrokeDashArray";
+}
+unsafe impl Send for CompositionStrokeDashArray {}
+unsafe impl Sync for CompositionStrokeDashArray {}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompositionStrokeLineJoin(pub i32);
+impl CompositionStrokeLineJoin {
+    pub const Miter: Self = Self(0);
+    pub const Bevel: Self = Self(1);
+    pub const Round: Self = Self(2);
+    pub const MiterOrBevel: Self = Self(3);
+}
+impl windows_core::TypeKind for CompositionStrokeLineJoin {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for CompositionStrokeLineJoin {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"enum(Microsoft.UI.Composition.CompositionStrokeLineJoin;i4)",
     );
 }
 #[repr(transparent)]
@@ -1215,6 +1400,32 @@ pub struct ICompositionColorBrush_Vtbl {
     pub SetColor: unsafe extern "system" fn(*mut core::ffi::c_void, Color) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    ICompositionColorGradientStop,
+    ICompositionColorGradientStop_Vtbl,
+    0x868030d8_c5c0_5dd8_a765_e32cd3497aa9
+);
+impl windows_core::RuntimeType for ICompositionColorGradientStop {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionColorGradientStop_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    ICompositionColorGradientStopCollection,
+    ICompositionColorGradientStopCollection_Vtbl,
+    0x4794cb29_ce9d_5837_9fc9_847df3e197de
+);
+impl windows_core::RuntimeType for ICompositionColorGradientStopCollection {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionColorGradientStopCollection_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
     ICompositionContainerShape,
     ICompositionContainerShape_Vtbl,
     0x064aabd5_2dab_52d3_824b_c72456540f29
@@ -1326,6 +1537,116 @@ pub struct ICompositionGeometry_Vtbl {
     TrimStart: usize,
     pub SetTrimStart:
         unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionGradientBrush,
+    ICompositionGradientBrush_Vtbl,
+    0x9165d1fb_c738_5f44_addc_309ee071d588
+);
+impl windows_core::RuntimeType for ICompositionGradientBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionGradientBrush {
+    pub(crate) fn ColorStops(
+        &self,
+    ) -> windows_core::Result<CompositionColorGradientStopCollection> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).ColorStops)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionGradientBrush_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    AnchorPoint: usize,
+    SetAnchorPoint: usize,
+    CenterPoint: usize,
+    SetCenterPoint: usize,
+    pub ColorStops: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionGradientBrush2,
+    ICompositionGradientBrush2_Vtbl,
+    0x03e9edf3_ee3d_58fc_8c0b_95e4b6060a94
+);
+impl windows_core::RuntimeType for ICompositionGradientBrush2 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionGradientBrush2 {
+    pub(crate) fn SetMappingMode(&self, value: CompositionMappingMode) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetMappingMode)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionGradientBrush2_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    MappingMode: usize,
+    pub SetMappingMode: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        CompositionMappingMode,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionLinearGradientBrush,
+    ICompositionLinearGradientBrush_Vtbl,
+    0xf726fb52_270c_58b1_a902_89576772dedc
+);
+impl windows_core::RuntimeType for ICompositionLinearGradientBrush {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionLinearGradientBrush {
+    pub(crate) fn SetEndPoint(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetEndPoint)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetStartPoint(
+        &self,
+        value: windows_numerics::Vector2,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetStartPoint)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionLinearGradientBrush_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    EndPoint: usize,
+    pub SetEndPoint: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    StartPoint: usize,
+    pub SetStartPoint: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ICompositionMaskBrush,
@@ -2042,6 +2363,15 @@ impl ICompositionSpriteShape {
             .ok()
         }
     }
+    pub(crate) fn SetIsStrokeNonScaling(&self, value: bool) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetIsStrokeNonScaling)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetStrokeBrush<P0>(&self, value: P0) -> windows_core::Result<()>
     where
         P0: windows_core::Param<CompositionBrush>,
@@ -2054,9 +2384,58 @@ impl ICompositionSpriteShape {
             .ok()
         }
     }
+    pub(crate) fn StrokeDashArray(&self) -> windows_core::Result<CompositionStrokeDashArray> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).StrokeDashArray)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn SetStrokeDashCap(&self, value: CompositionStrokeCap) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetStrokeDashCap)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetStrokeDashOffset(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetStrokeDashOffset)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetStrokeEndCap(&self, value: CompositionStrokeCap) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetStrokeEndCap)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetStrokeLineJoin(
+        &self,
+        value: CompositionStrokeLineJoin,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetStrokeLineJoin)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetStrokeMiterLimit(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetStrokeMiterLimit)(
                 windows_core::Interface::as_raw(self),
                 value,
             )
@@ -2099,26 +2478,38 @@ pub struct ICompositionSpriteShape_Vtbl {
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
     IsStrokeNonScaling: usize,
-    SetIsStrokeNonScaling: usize,
+    pub SetIsStrokeNonScaling:
+        unsafe extern "system" fn(*mut core::ffi::c_void, bool) -> windows_core::HRESULT,
     StrokeBrush: usize,
     pub SetStrokeBrush: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    StrokeDashArray: usize,
+    pub StrokeDashArray: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     StrokeDashCap: usize,
-    SetStrokeDashCap: usize,
+    pub SetStrokeDashCap: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        CompositionStrokeCap,
+    ) -> windows_core::HRESULT,
     StrokeDashOffset: usize,
-    SetStrokeDashOffset: usize,
+    pub SetStrokeDashOffset:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
     StrokeEndCap: usize,
     pub SetStrokeEndCap: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         CompositionStrokeCap,
     ) -> windows_core::HRESULT,
     StrokeLineJoin: usize,
-    SetStrokeLineJoin: usize,
+    pub SetStrokeLineJoin: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        CompositionStrokeLineJoin,
+    ) -> windows_core::HRESULT,
     StrokeMiterLimit: usize,
-    SetStrokeMiterLimit: usize,
+    pub SetStrokeMiterLimit:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
     StrokeStartCap: usize,
     pub SetStrokeStartCap: unsafe extern "system" fn(
         *mut core::ffi::c_void,
@@ -2438,6 +2829,34 @@ impl windows_core::RuntimeType for ICompositor4 {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl ICompositor4 {
+    pub(crate) fn CreateColorGradientStopWithOffsetAndColor(
+        &self,
+        offset: f32,
+        color: Color,
+    ) -> windows_core::Result<CompositionColorGradientStop> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateColorGradientStopWithOffsetAndColor)(
+                windows_core::Interface::as_raw(self),
+                offset,
+                color,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn CreateLinearGradientBrush(
+        &self,
+    ) -> windows_core::Result<CompositionLinearGradientBrush> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateLinearGradientBrush)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
     pub(crate) fn CreateSpringScalarAnimation(
         &self,
     ) -> windows_core::Result<SpringScalarNaturalMotionAnimation> {
@@ -2479,8 +2898,17 @@ impl ICompositor4 {
 pub struct ICompositor4_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
     CreateColorGradientStop: usize,
-    CreateColorGradientStopWithOffsetAndColor: usize,
-    CreateLinearGradientBrush: usize,
+    pub CreateColorGradientStopWithOffsetAndColor:
+        unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            f32,
+            Color,
+            *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT,
+    pub CreateLinearGradientBrush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub CreateSpringScalarAnimation: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,

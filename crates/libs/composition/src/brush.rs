@@ -127,10 +127,108 @@ impl PartialEq for CompositionMaskBrush {
 
 impl Eq for CompositionMaskBrush {}
 
+/// Where a gradient's start and end points are measured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingMode {
+    /// Points are DIPs in the painted visual's own space.
+    Absolute,
+    /// Points are fractions of the painted visual's size, so the ramp follows a
+    /// resize with no property write at all.
+    Relative,
+}
+
+impl From<MappingMode> for bindings::CompositionMappingMode {
+    fn from(mode: MappingMode) -> Self {
+        match mode {
+            MappingMode::Absolute => Self::Absolute,
+            MappingMode::Relative => Self::Relative,
+        }
+    }
+}
+
+/// A brush that interpolates linearly between colour stops along a line.
+///
+/// **Not a colour carrier.** A stop is a `Windows.UI.Color` — 8 bits a channel,
+/// `0..1` — so a gradient bound as a visual's or a shape's own brush clamps at
+/// paper white on a wide-gamut display, and distorts the transfer function on
+/// the way. Bound as a [`CompositionMaskBrush::set_mask`] it is a different
+/// thing entirely: the compositor evaluates it per pixel and reads only its
+/// ALPHA, which is the one quantity `0..1` describes exactly, while colour stays
+/// in an app-allocated wide-gamut source. That is the only use this wrapper is
+/// for, and why the stops it takes are alphas.
+///
+/// A radial gradient is deliberately absent: as a mask it binds, throws nothing,
+/// and silently paints itself as colour instead of masking.
+#[derive(Clone)]
+pub struct CompositionLinearGradientBrush(pub(crate) bindings::CompositionLinearGradientBrush);
+
+impl CompositionLinearGradientBrush {
+    /// Sets the line the ramp runs along, in the units [`Self::set_mapping_mode`]
+    /// selects.
+    pub fn set_line(&self, start: Vector2, end: Vector2) {
+        let brush: bindings::ICompositionLinearGradientBrush = self.0.cast().unwrap();
+        brush.SetStartPoint(start).unwrap();
+        brush.SetEndPoint(end).unwrap();
+    }
+
+    /// Sets whether [`Self::set_line`]'s points are DIPs or fractions of the
+    /// painted visual.
+    pub fn set_mapping_mode(&self, mode: MappingMode) {
+        let brush: bindings::ICompositionGradientBrush2 = self.0.cast().unwrap();
+        brush.SetMappingMode(mode.into()).unwrap();
+    }
+
+    /// Replaces the stop list with `stops`, each an `(offset, alpha)` pair.
+    ///
+    /// The colour written is white, since only the alpha is ever read — see the
+    /// type's own documentation.
+    pub fn set_alpha_stops(&self, compositor: &Compositor, stops: &[(f32, f32)]) {
+        let factory: bindings::ICompositor4 = compositor.0.cast().unwrap();
+        let brush: bindings::ICompositionGradientBrush = self.0.cast().unwrap();
+        let collection: windows_collections::IVector<bindings::CompositionColorGradientStop> =
+            brush.ColorStops().unwrap().cast().unwrap();
+        collection.Clear().unwrap();
+        for &(offset, alpha) in stops {
+            let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let stop = factory
+                .CreateColorGradientStopWithOffsetAndColor(
+                    offset,
+                    Color::rgba(255, 255, 255, a).0,
+                )
+                .unwrap();
+            collection.Append(&stop).unwrap();
+        }
+    }
+}
+
+impl Sealed for CompositionLinearGradientBrush {}
+
+impl Brush for CompositionLinearGradientBrush {
+    fn as_brush(&self) -> CompositionBrush {
+        CompositionBrush(self.0.cast().unwrap())
+    }
+}
+
+impl Sealed for CompositionBrush {}
+
+/// The base type is itself a brush, so a caller that has erased which kind of
+/// brush it built — a solid source, a mask, a gradient — can still bind it.
+impl Brush for CompositionBrush {
+    fn as_brush(&self) -> CompositionBrush {
+        self.clone()
+    }
+}
+
 impl Compositor {
     /// Creates a brush that paints one brush through the alpha of another.
     pub fn create_mask_brush(&self) -> CompositionMaskBrush {
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         CompositionMaskBrush(compositor.CreateMaskBrush().unwrap())
+    }
+
+    /// Creates a linear gradient brush, for use as a mask's alpha ramp.
+    pub fn create_linear_gradient_brush(&self) -> CompositionLinearGradientBrush {
+        let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
+        CompositionLinearGradientBrush(compositor.CreateLinearGradientBrush().unwrap())
     }
 }
