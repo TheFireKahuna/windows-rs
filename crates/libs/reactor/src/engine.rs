@@ -978,6 +978,16 @@ impl RenderCx {
         self.dpi = cell;
     }
 
+    /// Adopt the owning host's id, overriding the fresh id minted in
+    /// [`RenderCx::new`]. The reconciler stamps every nested component's cx
+    /// with the host id so off-thread [`AsyncSetState`] writes route their
+    /// rerender request to the host's registered `UI_RERENDER` hook — a
+    /// nested component's own minted id is never registered, so without this
+    /// its async writes set the dirty flag but schedule no render.
+    pub fn set_host_id(&mut self, id: HostId) {
+        self.host_id = id;
+    }
+
     fn state_slot<T>(&mut self, initial: T) -> (T, Rc<RefCell<Box<dyn Any>>>, usize)
     where
         T: 'static + Clone,
@@ -1311,6 +1321,9 @@ impl<B: Backend + 'static, D: Dispatcher + 'static> RenderHost<B, D> {
         render_cx.set_dpi_cell(Rc::clone(&dpi));
         reconciler.set_inner_size_cell(Rc::clone(&inner_size));
         reconciler.set_dpi_cell(Rc::clone(&dpi));
+        // Every nested component cx adopts the host id so off-thread
+        // `AsyncSetState` writes route their rerender to this host's hook.
+        reconciler.set_host_id(host_id);
 
         Self {
             inner: Rc::new(RenderHostInner {

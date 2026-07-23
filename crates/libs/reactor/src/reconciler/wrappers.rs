@@ -11,6 +11,7 @@ impl<B: Backend + 'static> Reconciler<B> {
         cx.set_marshaller(self.marshaller.clone());
         cx.set_inner_size_cell(Rc::clone(&self.inner_size));
         cx.set_dpi_cell(Rc::clone(&self.dpi));
+        cx.set_host_id(self.host_id);
         cx.begin_render();
         let rendered = ce.obj.render(&mut cx);
         cx.flush_effects();
@@ -69,6 +70,7 @@ impl<B: Backend + 'static> Reconciler<B> {
         inst.render_cx
             .set_inner_size_cell(Rc::clone(&self.inner_size));
         inst.render_cx.set_dpi_cell(Rc::clone(&self.dpi));
+        inst.render_cx.set_host_id(self.host_id);
         inst.render_cx.begin_render();
         let rendered = new.obj.render(&mut inst.render_cx);
         inst.render_cx.flush_effects();

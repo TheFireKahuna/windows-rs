@@ -64,6 +64,12 @@ pub struct Reconciler<B: Backend> {
     /// Rerender hook propagated from the render host; child components
     /// clone this into their `RenderCx` so `SetState` triggers re-render.
     pub request_rerender: Rc<dyn Fn()>,
+    /// Owning host id, stamped onto every nested component's `RenderCx` so
+    /// off-thread `AsyncSetState` writes route their rerender request to the
+    /// host's registered `UI_RERENDER` hook (keyed by this id). Without it a
+    /// nested component keeps the fresh id `RenderCx::new` mints — which is
+    /// never registered — so its async writes schedule no render.
+    pub host_id: HostId,
 }
 
 pub struct ComponentInstance {
@@ -105,6 +111,7 @@ impl<B: Backend + 'static> Reconciler<B> {
             inner_size: Rc::new(Cell::new(WindowSize::default())),
             dpi: Rc::new(Cell::new(96_u32)),
             request_rerender: Rc::new(|| {}),
+            host_id: HostId::next(),
         }
     }
 
@@ -112,6 +119,12 @@ impl<B: Backend + 'static> Reconciler<B> {
     /// [`RenderCx`] instances.
     pub fn set_marshaller(&mut self, marshaller: Option<UiMarshaller>) {
         self.marshaller = marshaller;
+    }
+
+    /// Adopt the owning host's id (see [`Reconciler::host_id`]). Called by the
+    /// render host so nested component cxes route async rerenders correctly.
+    pub fn set_host_id(&mut self, id: HostId) {
+        self.host_id = id;
     }
 
     #[cfg(feature = "test")]
