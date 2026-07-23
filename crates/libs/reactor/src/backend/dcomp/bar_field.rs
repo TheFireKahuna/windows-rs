@@ -14,8 +14,8 @@
 //! retained profile rather than merely smaller.
 //!
 //! So the bars become what the knob's value arc and the curve layers already
-//! are: retained sprites the compositor owns, coloured by an FP16 source, moved
-//! DWM-side. Between publishes the app does nothing at all.
+//! are: retained sprites the compositor owns, coloured by an FP16 source and
+//! moved by property writes. Between publishes the app does nothing at all.
 //!
 //! ## The seam
 //!
@@ -28,55 +28,61 @@
 //!
 //! ## What one publish costs
 //!
-//! Two `InsertKeyFrame`s and two `StartAnimation`s per bar — the body's extent
-//! and the cap that rides its top edge — on two animation objects shared by the
-//! whole field. No visual, brush, animation or easing
-//! function is created per publish — those are built once per *layout*, and a
-//! layout changes only on a resize, a DPI move, a bar-count change or a
-//! recolour. There is no per-publish allocation on either side of the queue:
-//! the pending value buffer is swapped with the front thread's, so both keep
-//! their capacity.
+//! Two property writes per bar — the body's extent and the cap that rides its
+//! top edge. No visual, brush or surface is created per publish: those are
+//! built once per *layout*, and a layout changes only on a resize, a DPI move,
+//! a bar-count change or a recolour. There is no per-publish allocation on
+//! either side of the queue: the pending value buffer is swapped with the front
+//! thread's, so both keep their capacity.
 //!
 //! ## How a bar moves
 //!
 //! A bar is two sprites — a body and the brighter cap that gives it a defined
-//! top edge — and each is one animated scalar. The body is a full-height sprite
-//! whose `CenterPoint` sits on its bottom edge, so its whole extent is `Scale.Y`
-//! in `0..=1` and no offset has to move with it. The cap is a fixed-height strip
-//! whose `Offset.Y` is the body's top edge.
+//! top edge — and each is one scalar. The body is a full-height sprite whose
+//! `CenterPoint` sits on its bottom edge, so its whole extent is `Scale.Y` in
+//! `0..=1` and no offset has to move with it. The cap is a fixed-height strip
+//! whose `Offset.Y` is the body's top edge. Both are written from the same
+//! stepped value in the same commit, which is what pins the cap to the body:
+//! `offset = top + (1 - scale) * height` holds at every frame by construction
+//! rather than by two curves agreeing.
 //!
-//! The two are retargeted together, from the same value, with the same duration
-//! and the same easing, in the same commit — and that is what pins the cap to
-//! the body. Both curves are affine in the value, so interpolating each from its
-//! own start under one shared curve keeps `offset = top + (1 - scale) * height`
-//! true at every instant of the flight, not merely at the ends.
-//!
-//! An earlier version instead tied the cap to `body.Scale.Y` through an
-//! [`ExpressionAnimation`](windows_composition::ExpressionAnimation), started
-//! once at layout time — one retarget per bar per publish rather than two, and
-//! the cap free. On screen the cap did NOT stay on the body: it ran ahead of it
-//! during an attack by several dB, which is what an expression reading the
-//! animation's destination rather than its current value looks like. Two
-//! explicit animations are correct by construction and cost one extra property
-//! set per bar, so that is what ships.
-//!
-//! ## Ballistics
+//! ## Ballistics — stepped here, not scheduled DWM-side
 //!
 //! An analyzer that rises and falls at the same rate reads as jitter, so the
 //! caller states an asymmetric pair ([`BarFieldLayout::rise`] /
 //! [`BarFieldLayout::fall`]) and each bar picks one per push from its own
-//! direction of travel. See [`BarFieldLayout::rise`] for how a duration maps
-//! onto the one-pole envelope this replaces.
+//! direction of travel. The envelope is a one-pole stepped **on this thread**,
+//! from the wall clock, as each push is applied.
+//!
+//! It used to be scheduled instead: each push retargeted a shared
+//! `ScalarKeyFrameAnimation` per sprite and let DWM interpolate. That is the
+//! cheaper shape on paper and it is why the field was built that way — but it
+//! does not survive. Measured with a frame-differ against a live analyzer, a
+//! field driven that way animates for **≈50 seconds after its sprites are
+//! created and then stops for good**: `StartAnimation` keeps succeeding and the
+//! targets keep arriving, but nothing on screen moves again until the sprites
+//! themselves are rebuilt (a remount revives it, for another ≈50 s). Direct
+//! property writes on the very same sprites, in the very same commit, never
+//! stop — which is how the two were told apart. Stopping the animation before
+//! restarting it, halving the number of animated properties, quartering the
+//! push rate and rebuilding the animation objects periodically all left the
+//! onset exactly where it was, so it is neither a leak nor a quota: DWM simply
+//! stops advancing key-frame animations on those sprites. A visualization whose
+//! whole point is that it moves cannot be scheduled on a clock that quits after
+//! a minute, so the envelope is stepped here and written directly.
+//!
+//! The bars are still retained sprites and nothing rasterizes — the cost this
+//! module exists to avoid is untouched. What changed is only *who* interpolates
+//! between two published values, and the producer already ticks at the rate its
+//! data changes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use windows_composition::{
-    CompositionEasingFunction, CompositionSurfaceBrush, ScalarKeyFrameAnimation, SpriteVisual,
-};
-use windows_numerics::{Vector2, Vector3};
+use windows_composition::{CompositionSurfaceBrush, SpriteVisual};
+use windows_numerics::Vector3;
 
 use super::bootstrap::Compositing;
 use crate::backend::ControlId;
@@ -128,14 +134,12 @@ pub struct BarFieldLayout {
     pub cap_h: f32,
     /// How long a bar takes to reach a target ABOVE where it is — the attack.
     ///
-    /// The envelope this replaces is a one-pole stepped per display frame with
-    /// a time constant `τ`, and the retargeting here reproduces it: each publish
-    /// starts a fresh ease-out from wherever the bar currently is, so the gap
-    /// closes by a fixed fraction per publish exactly as the one-pole's does,
-    /// and the two agree when the fraction agrees. Over a 10 ms publish
-    /// interval a `2τ` ease-out covers within a couple of percent of what
-    /// `1 - e^(-Δ/τ)` does, so a caller porting from a one-pole should pass
-    /// twice its time constant.
+    /// The envelope is a one-pole, `1 - e^(-Δ/τ)` per push against the wall
+    /// clock, and this duration is `2τ` — the settling time an ease-out of the
+    /// same feel would be given, which is the unit every caller already passes.
+    /// Stating it as a duration rather than a bare time constant also keeps the
+    /// asymmetry readable at the call site: `rise: 24ms, fall: 100ms` says what
+    /// an analyzer does; two time constants do not.
     pub rise: Duration,
     /// The same, for a target BELOW where the bar is — the release. Longer than
     /// [`rise`](Self::rise) in every analyzer worth looking at.
@@ -318,11 +322,12 @@ const CHANGE_EPS: f32 = 0.0005;
 /// analyzer, which drew no bar whose top had reached the baseline.
 const FLOOR_EPS: f32 = 0.0005;
 
-/// The ease-out the retargeting plays. `cubic-bezier(0, 0, 0.58, 1)` — the same
-/// curve the backend's implicit transitions use, and the one whose shape a
-/// one-pole's decay is being matched against (see [`BarFieldLayout::rise`]).
-const EASE_C1: (f32, f32) = (0.0, 0.0);
-const EASE_C2: (f32, f32) = (0.58, 1.0);
+/// Longest step the envelope will honour, in seconds. A push that arrives after
+/// a stall (the producer blocked, the window was minimized) must not be
+/// integrated as one enormous `Δ` — clamping it makes the bar arrive at its
+/// target in one frame, which is what a resumed analyzer should look like,
+/// instead of some interpolated state that was never true.
+const MAX_STEP_SECS: f32 = 0.25;
 
 /// Where a bar's cap sits for value `t` — the body's top edge, which is
 /// `top + height` at the floor and `top` at full scale. The body expresses the
@@ -337,8 +342,8 @@ fn cap_y(layout: &BarFieldLayout, t: f32) -> f32 {
 struct Bar {
     body: SpriteVisual,
     cap: SpriteVisual,
-    /// The last value pushed — the retarget gate, and the direction of travel
-    /// the next push picks its duration from.
+    /// The value currently on screen — the write gate, the envelope's state,
+    /// and the direction of travel the next push picks its time constant from.
     shown: f32,
     /// Whether the cap is currently on screen.
     cap_visible: bool,
@@ -355,17 +360,16 @@ pub(crate) struct BarField {
     /// changes the scale — either rebuilds the sources, exactly as
     /// [`Part::bind`](super::parts::Part::bind) does.
     sources: Option<(u32, u32)>,
-    /// Kept alive for the sprites that reference them.
-    _body_brush: Option<CompositionSurfaceBrush>,
+    /// Kept alive for the sprites that reference them. The body's ramp is a
+    /// compositor gradient masking one flat FP16 source, and `MappingMode::Relative`
+    /// measures it against each bar's own sprite — so one brush serves every bar
+    /// whatever its height, and a bar growing under its `Scale.Y` animation does
+    /// not disturb the fade.
+    _body_brush: Option<super::gradient::RampSource>,
     _cap_brush: Option<CompositionSurfaceBrush>,
-    /// The two retarget animations, one per direction of travel, SHARED by
-    /// every bar in the field. A composition animation's configuration is
-    /// captured when it is started, so restating the key frame for the next bar
-    /// cannot disturb one already in flight — which is what lets a whole field
-    /// retarget through two objects instead of one per bar.
-    rise: Option<ScalarKeyFrameAnimation>,
-    fall: Option<ScalarKeyFrameAnimation>,
-    easing: Option<CompositionEasingFunction>,
+    /// When the last value push was applied, so the envelope integrates real
+    /// elapsed time rather than assuming a cadence. `None` until the first one.
+    last_push: Option<Instant>,
     /// True until the first value push has landed. The first frame SNAPS: a
     /// field mounting must not play its opening spectrum as a rise from the
     /// floor.
@@ -380,9 +384,7 @@ impl BarField {
             sources: None,
             _body_brush: None,
             _cap_brush: None,
-            rise: None,
-            fall: None,
-            easing: None,
+            last_push: None,
             priming: true,
         }
     }
@@ -450,10 +452,6 @@ impl BarField {
         for (bar, rect) in self.bars.iter_mut().zip(&layout.bars) {
             let w = rect.w.max(0.0);
             let h = layout.height.max(0.0);
-            // A fresh geometry restates both properties, so any animation
-            // holding one must be stopped or the write is ignored.
-            bar.body.stop_animation("Scale.Y");
-            bar.cap.stop_animation("Offset.Y");
             bar.body.set_offset(rect.x, layout.top, 0.0);
             bar.body.set_size(w, h);
             // The pivot is the bar's BOTTOM edge, so `Scale.Y` grows it upward
@@ -492,16 +490,19 @@ impl BarField {
         if self.sources == Some(want) {
             return;
         }
-        // The same display-mapped FP16 rasters every other sprite in the backend
-        // takes — a colour brush is 8-bit and cannot carry this palette's
-        // above-paper-white values, and its stops would posterize a fade this
-        // faint. The body's is the VERTICAL ramp (the curve underfill's source
-        // builder), stretched down the sprite so the fade lands on the bar rather
-        // than on the plot.
+        // Colour is a display-mapped FP16 source, as everywhere else in the
+        // backend — a colour brush is 8-bit and cannot carry this palette's
+        // above-paper-white values. The body's FADE is a compositor gradient
+        // masking that source, running down each bar's own sprite so it lands on
+        // the bar rather than on the plot. Its stops are NORMALIZED to the full
+        // alpha range with the peak folded into the source's brightness: the
+        // compositor's alpha intermediate is 8-bit, and a fade authored across
+        // the 0.15 the tokens actually span would posterize into ~37 steps.
         let (Some(body), Some(cap)) = (
-            super::parts::build_vgradient_surface(
+            super::gradient::RampSource::build(
                 comp,
                 &[(0.0, layout.body_top), (1.0, layout.body_bottom)],
+                crate::GradientAxis::Vertical,
                 scale,
             ),
             super::parts::build_solid_surface(comp, layout.cap, scale),
@@ -509,7 +510,7 @@ impl BarField {
             return;
         };
         for bar in &self.bars {
-            bar.body.set_brush(&body);
+            bar.body.set_brush(body.brush());
             bar.cap.set_brush(&cap);
         }
         self._body_brush = Some(body);
@@ -517,35 +518,44 @@ impl BarField {
         self.sources = Some(want);
     }
 
-    /// Retarget every bar that moved. One `InsertKeyFrame` + one
-    /// `StartAnimation` each, on the field's two shared animations.
+    /// Step every bar's envelope by the real elapsed time and write the two
+    /// sprites that moved. Two property writes per moved bar, nothing else.
     fn push(&mut self, values: &[f32], layout: &BarFieldLayout) {
-        let compositor = match self.bars.first() {
-            Some(b) => b.body.compositor(),
-            None => return,
+        if self.bars.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let dt = self
+            .last_push
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f32())
+            .min(MAX_STEP_SECS);
+        self.last_push = Some(now);
+        // The fraction of the remaining gap each direction closes over `dt`.
+        // `1 - e^(-Δ/τ)`, with `τ` half the stated settling duration (see
+        // [`BarFieldLayout::rise`]); a zero or absurd duration degenerates to a
+        // snap, which is the honest reading of "no ballistics".
+        let closing = |d: Duration| -> f32 {
+            let tau = d.as_secs_f32() * 0.5;
+            if tau <= 0.0 || dt <= 0.0 {
+                return 1.0;
+            }
+            (1.0 - (-dt / tau).exp()).clamp(0.0, 1.0)
         };
-        let easing = self.easing.get_or_insert_with(|| {
-            compositor.create_cubic_bezier_easing_function(
-                Vector2::new(EASE_C1.0, EASE_C1.1),
-                Vector2::new(EASE_C2.0, EASE_C2.1),
-            )
-        });
-        let rise = self.rise.get_or_insert_with(|| {
-            let a = compositor.create_scalar_key_frame_animation();
-            a.set_duration(layout.rise);
-            a
-        });
-        rise.set_duration(layout.rise);
-        let fall = self.fall.get_or_insert_with(|| {
-            let a = compositor.create_scalar_key_frame_animation();
-            a.set_duration(layout.fall);
-            a
-        });
-        fall.set_duration(layout.fall);
+        let (k_rise, k_fall) = (closing(layout.rise), closing(layout.fall));
 
         let priming = self.priming;
         for (bar, &raw) in self.bars.iter_mut().zip(values) {
-            let t = if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 };
+            let target = if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 };
+            // The opening frame is not a change; it is where the analyzer
+            // starts. Snap, and let the next publish be the first motion.
+            let t = if priming {
+                target
+            } else {
+                let k = if target > bar.shown { k_rise } else { k_fall };
+                bar.shown + (target - bar.shown) * k
+            };
+            // The cap follows the DRAWN value, not the target: a bar still on
+            // its way down to the floor keeps its top edge until it gets there.
             let cap_visible = t > FLOOR_EPS;
             if bar.cap_visible != cap_visible {
                 bar.cap.set_visible(cap_visible);
@@ -554,24 +564,11 @@ impl BarField {
             if !priming && (t - bar.shown).abs() < CHANGE_EPS {
                 continue;
             }
-            let y = cap_y(layout, t);
-            if priming {
-                // The opening frame is not a change; it is where the analyzer
-                // starts. Snap, and let the next publish be the first motion.
-                bar.body.stop_animation("Scale.Y");
-                bar.cap.stop_animation("Offset.Y");
-                bar.body.set_scale(Vector3::new(1.0, t, 1.0));
-                bar.cap.set_offset(bar.cap.offset().x, y, 0.0);
-            } else {
-                // ONE direction for the pair — the cap is not moving
-                // independently, it is the body's top edge — and one duration,
-                // so the two stay welded for the whole flight.
-                let a = if t > bar.shown { &*rise } else { &*fall };
-                a.insert_key_frame_with_easing(1.0, t, easing);
-                bar.body.start_animation("Scale.Y", a);
-                a.insert_key_frame_with_easing(1.0, y, easing);
-                bar.cap.start_animation("Offset.Y", a);
-            }
+            // One value, two writes, one commit — which is what welds the cap
+            // to the body's top edge at every frame rather than only at the
+            // ends of a flight.
+            bar.body.set_scale(Vector3::new(1.0, t, 1.0));
+            bar.cap.set_offset(bar.cap.offset().x, cap_y(layout, t), 0.0);
             bar.shown = t;
         }
         self.priming = false;

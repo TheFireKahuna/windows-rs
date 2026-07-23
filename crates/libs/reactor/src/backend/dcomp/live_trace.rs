@@ -43,10 +43,40 @@
 //! style. So the whole trace is one sprite whose figure count changes freely from
 //! publish to publish, never a sprite per run: nothing is created or destroyed when
 //! the gate carves the line differently.
+//!
+//! ## The optional underfill
+//!
+//! A trace may also carry a FILLED companion — the closed region under the line
+//! that an area plot washes in. It is a second [`PathLayer`] at
+//! [`Role::Fill`](super::path_shape::Role::Fill), stated and fed by
+//! [`LiveTrace::set_fill_path`], and it exists
+//! for the same reason the stroke does: an area whose shape changes every publish
+//! is a geometry write, not a surface repaint. It is created before the stroke so
+//! the line always composites over its own wash, and a trace that never calls
+//! [`LiveTrace::set_fill_path`] never builds one.
+//!
+//! Its ink rides with its geometry rather than sitting in [`TraceLayout`]: an
+//! underfill is optional, so putting it there would make every caller that has
+//! none say so, and the two are pushed together anyway.
+//!
+//! ## The fill as a METER
+//!
+//! A second use of the same underfill: a bar meter whose shape never changes and
+//! whose *extent* does. [`LiveTrace::set_fill_extent`] states the fill geometry
+//! once — the whole track — and then moves only a scalar, so the level travels
+//! DWM-side under [`bar_field`](super::bar_field)'s ballistics
+//! ([`LiveTrace::set_fill_motion`]) instead of arriving as a new path per publish.
+//! It scales the composited sprite about the anchored edge, which carries the
+//! colour source with it: a ramp under a meter is therefore FILL-relative, the
+//! same thing a CSS gradient on the fill element means.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
+
+use windows_composition::{CompositionEasingFunction, ScalarKeyFrameAnimation};
+use windows_numerics::{Vector2, Vector3};
 
 use super::bootstrap::Compositing;
 use super::path_shape::{PathLayer, Role};
@@ -134,6 +164,32 @@ pub struct TraceLayout {
     pub thickness: f32,
 }
 
+/// Which edge of its own box a metered fill grows from.
+///
+/// A level meter is anchored: a true-peak bar grows rightward off its floor, and
+/// a gain-reduction bar grows leftward off zero (the mastering convention). The
+/// anchor IS the scale pivot, so this is the whole of the difference between the
+/// two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillAnchor {
+    /// Grows rightward; the left edge is pinned.
+    Left,
+    /// Grows leftward; the right edge is pinned.
+    Right,
+}
+
+/// The ballistics a metered fill travels under — [`BarFieldLayout`](super::bar_field::BarFieldLayout)'s
+/// asymmetric pair, for the same reason: a meter that rises and falls at one rate
+/// reads as jitter. Each retarget picks one from its own direction of travel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillMotion {
+    pub anchor: FillAnchor,
+    /// Time to reach a level ABOVE the one shown — the attack.
+    pub rise: Duration,
+    /// Time to reach a level BELOW it — the release.
+    pub fall: Duration,
+}
+
 // ── The cross-thread queue ───────────────────────────────────────────────────
 
 /// One trace's pending update. The geometry buffers are retained (and swapped,
@@ -143,6 +199,38 @@ struct Pending {
     verbs: Vec<PathVerb>,
     points: Vec<f32>,
     geometry_dirty: bool,
+    fill_ink: Option<Color>,
+    fill_verbs: Vec<PathVerb>,
+    fill_points: Vec<f32>,
+    fill_dirty: bool,
+    /// The underfill's colour ramp, and whether it moved. Retained across pushes
+    /// so a producer restating one allocates nothing after the first.
+    fill_stops: Vec<(f64, Color)>,
+    fill_axis: GradientAxis,
+    fill_ramp_dirty: bool,
+    fill_motion: Option<FillMotion>,
+    /// The metered fill's extent, `0.0..=1.0` of its own box.
+    fill_extent: Option<f32>,
+}
+
+impl Pending {
+    const fn new() -> Self {
+        Self {
+            layout: None,
+            verbs: Vec::new(),
+            points: Vec::new(),
+            geometry_dirty: false,
+            fill_ink: None,
+            fill_verbs: Vec::new(),
+            fill_points: Vec::new(),
+            fill_dirty: false,
+            fill_stops: Vec::new(),
+            fill_axis: GradientAxis::Vertical,
+            fill_ramp_dirty: false,
+            fill_motion: None,
+            fill_extent: None,
+        }
+    }
 }
 
 /// Pending updates per control. A `Mutex` rather than a thread-local for
@@ -192,16 +280,62 @@ impl LiveTrace {
         });
     }
 
+    /// Push one frame of the filled companion's geometry, in the same DIPs
+    /// [`set_path`](Self::set_path) uses, washed in `ink`. Every figure is closed
+    /// and filled; the first such push is what builds the fill layer at all.
+    ///
+    /// Allocation-free after the first call: the pending buffers are reused.
+    pub fn set_fill_path(&self, ink: Color, path: &TracePath) {
+        self.enqueue(|p| {
+            p.fill_ink = Some(ink);
+            p.fill_verbs.clear();
+            p.fill_verbs.extend_from_slice(&path.verbs);
+            p.fill_points.clear();
+            p.fill_points.extend_from_slice(&path.points);
+            p.fill_dirty = true;
+        });
+    }
+
+    /// Give the underfill a colour RAMP instead of the flat ink
+    /// [`set_fill_path`](Self::set_fill_path) carries. Empty `stops` restores the
+    /// flat fill.
+    ///
+    /// The ramp is measured across the fill sprite's own box — so under a metered
+    /// fill ([`set_fill_extent`](Self::set_fill_extent)) it rides the level and is
+    /// fill-relative, and under a free-form area plot it spans the plot. Pushed on
+    /// a theme flip or a threshold recolour, never per publish.
+    pub fn set_fill_ramp(&self, stops: &[(f64, Color)], axis: GradientAxis) {
+        self.enqueue(|p| {
+            p.fill_stops.clear();
+            p.fill_stops.extend_from_slice(stops);
+            p.fill_axis = axis;
+            p.fill_ramp_dirty = true;
+        });
+    }
+
+    /// Declare the underfill a METER: which edge it grows from and how fast it
+    /// travels each way. Push before the first [`set_fill_extent`](Self::set_fill_extent);
+    /// restating it is one comparison.
+    pub fn set_fill_motion(&self, motion: FillMotion) {
+        self.enqueue(|p| p.fill_motion = Some(motion));
+    }
+
+    /// Retarget the metered fill to `frac` of its own box (`0.0..=1.0`).
+    ///
+    /// The geometry is whatever [`set_fill_path`](Self::set_fill_path) last stated —
+    /// the WHOLE track, pushed once — so this is one `InsertKeyFrame` and one
+    /// `StartAnimation` on a cached animation, and the level then travels on the
+    /// compositor with no further app frame. A publish that lands mid-flight
+    /// redirects it; a publish stream that stops lets it finish.
+    pub fn set_fill_extent(&self, frac: f32) {
+        self.enqueue(|p| p.fill_extent = Some(frac));
+    }
+
     fn enqueue(&self, edit: impl FnOnce(&mut Pending)) {
         {
             let Ok(mut q) = PENDING.lock() else { return };
             let map = q.get_or_insert_with(HashMap::new);
-            let entry = map.entry(self.id).or_insert_with(|| Pending {
-                layout: None,
-                verbs: Vec::new(),
-                points: Vec::new(),
-                geometry_dirty: false,
-            });
+            let entry = map.entry(self.id).or_insert_with(Pending::new);
             edit(entry);
         }
         // One wake in flight, and the claim is the WHOLE gate — see the same
@@ -236,6 +370,39 @@ pub(crate) struct TraceBatch {
     /// Whether the buffers are this service's frame rather than the previous one's
     /// leftovers — a layout-only push carries no geometry.
     pub has_geometry: bool,
+    pub fill_ink: Option<Color>,
+    pub fill_verbs: Vec<PathVerb>,
+    pub fill_points: Vec<f32>,
+    /// [`has_geometry`](Self::has_geometry) for the filled companion. Separate
+    /// because the two are pushed independently — a caller may reshape the line
+    /// alone.
+    pub has_fill: bool,
+    pub fill_stops: Vec<(f64, Color)>,
+    pub fill_axis: GradientAxis,
+    pub has_fill_ramp: bool,
+    pub fill_motion: Option<FillMotion>,
+    pub fill_extent: Option<f32>,
+}
+
+impl TraceBatch {
+    fn new(id: ControlId) -> Self {
+        Self {
+            id,
+            layout: None,
+            verbs: Vec::new(),
+            points: Vec::new(),
+            has_geometry: false,
+            fill_ink: None,
+            fill_verbs: Vec::new(),
+            fill_points: Vec::new(),
+            has_fill: false,
+            fill_stops: Vec::new(),
+            fill_axis: GradientAxis::Vertical,
+            has_fill_ramp: false,
+            fill_motion: None,
+            fill_extent: None,
+        }
+    }
 }
 
 /// Drop a control's queue entry — the front thread found no node behind the id, so
@@ -259,6 +426,10 @@ pub(crate) fn drain_into(out: &mut Vec<TraceBatch>) {
     for e in out.iter_mut() {
         e.layout = None;
         e.has_geometry = false;
+        e.has_fill = false;
+        e.has_fill_ramp = false;
+        e.fill_motion = None;
+        e.fill_extent = None;
     }
     let Ok(mut q) = PENDING.lock() else { return };
     let Some(map) = q.as_mut() else { return };
@@ -266,13 +437,7 @@ pub(crate) fn drain_into(out: &mut Vec<TraceBatch>) {
         let slot = match out.iter_mut().position(|e| e.id == *id) {
             Some(i) => &mut out[i],
             None => {
-                out.push(TraceBatch {
-                    id: *id,
-                    layout: None,
-                    verbs: Vec::new(),
-                    points: Vec::new(),
-                    has_geometry: false,
-                });
+                out.push(TraceBatch::new(*id));
                 out.last_mut().expect("just pushed")
             }
         };
@@ -283,27 +448,92 @@ pub(crate) fn drain_into(out: &mut Vec<TraceBatch>) {
             p.geometry_dirty = false;
             slot.has_geometry = true;
         }
+        if p.fill_dirty {
+            slot.fill_ink = p.fill_ink;
+            std::mem::swap(&mut slot.fill_verbs, &mut p.fill_verbs);
+            std::mem::swap(&mut slot.fill_points, &mut p.fill_points);
+            p.fill_dirty = false;
+            slot.has_fill = true;
+        }
+        if p.fill_ramp_dirty {
+            std::mem::swap(&mut slot.fill_stops, &mut p.fill_stops);
+            // The producer's buffer keeps the previous frame's stops, so it is
+            // cleared rather than left describing a ramp it no longer owns.
+            p.fill_stops.clear();
+            slot.fill_axis = p.fill_axis;
+            p.fill_ramp_dirty = false;
+            slot.has_fill_ramp = true;
+        }
+        slot.fill_motion = p.fill_motion.take();
+        slot.fill_extent = p.fill_extent.take();
     }
 }
 
 // ── The front-thread trace ───────────────────────────────────────────────────
 
-/// A node's retained trace: one stroked mask layer over an FP16 colour source.
+/// Extent movement below this is not worth a retarget — well under a pixel on any
+/// meter this drives.
+const EXTENT_EPS: f32 = 0.0005;
+
+/// The retarget easing: a decelerating ramp, so a level arrives rather than
+/// stopping dead. [`bar_field`](super::bar_field)'s, so a meter and an analyzer
+/// bar in the same panel move alike.
+const EASE_C1: (f32, f32) = (0.0, 0.0);
+const EASE_C2: (f32, f32) = (0.58, 1.0);
+
+/// A node's retained trace: one stroked mask layer over an FP16 colour source,
+/// and — when the layout names a fill — the filled companion beneath it.
 ///
-/// No glow and no fill. This draws a plain hairline — the halo on an analyzer
-/// belongs to the modelled response, which is not the thing moving.
+/// No glow: the halo on an analyzer belongs to the modelled response, which is
+/// not the thing moving.
 pub(crate) struct LiveTraceField {
+    /// The filled companion. Declared FIRST so that when a publish carrying both
+    /// geometries builds both layers, the fill's sprite is parented before the
+    /// stroke's and the line composites over its own wash.
+    fill: Option<PathLayer>,
+    /// The wash's ink, carried by whichever push last brought fill geometry.
+    fill_ink: Option<Color>,
+    /// The wash's ramp, when it has one. Empty means the flat `fill_ink`.
+    fill_stops: Vec<(f64, Color)>,
+    fill_axis: GradientAxis,
+    /// The metered fill's ballistics and pivot, once a producer declares them.
+    motion: Option<FillMotion>,
+    /// The extent currently shown, and the pivot the sprite is scaled about — so
+    /// a retarget that changes neither costs nothing.
+    extent: Option<f32>,
+    pivot: Option<f32>,
+    /// The two cached retarget animations and their easing, built on first use.
+    /// One per direction, because their durations differ.
+    rise: Option<ScalarKeyFrameAnimation>,
+    fall: Option<ScalarKeyFrameAnimation>,
+    easing: Option<CompositionEasingFunction>,
     layer: Option<PathLayer>,
-    /// The layout the layer was bound for; `None` until the first push.
+    /// The layout the layers were bound for; `None` until the first push.
     layout: Option<TraceLayout>,
-    /// Whether the sprite currently has geometry to show. A trace whose every run
-    /// was gated away hides rather than lingering as an empty shape.
+    /// Whether each sprite currently has geometry to show. A trace whose every
+    /// run was gated away hides rather than lingering as an empty shape.
     visible: bool,
+    fill_visible: bool,
 }
 
 impl LiveTraceField {
     pub(crate) fn new() -> Self {
-        Self { layer: None, layout: None, visible: true }
+        Self {
+            fill: None,
+            fill_ink: None,
+            fill_stops: Vec::new(),
+            fill_axis: GradientAxis::Vertical,
+            motion: None,
+            extent: None,
+            pivot: None,
+            rise: None,
+            fall: None,
+            easing: None,
+            layer: None,
+            layout: None,
+            visible: true,
+            fill_visible: true,
+        }
     }
 
     /// Reconcile the trace against one drained batch. Everything self-gates: a
@@ -322,32 +552,140 @@ impl LiveTraceField {
         }
         let Some(layout) = self.layout else { return };
 
+        // The fill first, so a first publish carrying both parents it below the
+        // line (both layers insert at the top of the container's children).
+        if batch.has_fill {
+            self.fill_ink = batch.fill_ink;
+            Self::reshape(
+                comp,
+                container,
+                &mut self.fill,
+                &mut self.fill_visible,
+                &batch.fill_verbs,
+                &batch.fill_points,
+                Role::Fill,
+            );
+        }
         if batch.has_geometry {
-            let empty = batch.verbs.is_empty();
-            // A path is minted only for geometry there is something to draw; an
-            // emptied trace hides the sprite it already has.
-            if !empty
-                && let Some(path) =
-                    super::path_shape::build_composition_path(comp, &batch.verbs, &batch.points, false)
-            {
-                match &mut self.layer {
-                    Some(l) => l.set_path(&path),
-                    slot => *slot = Some(PathLayer::new(comp, container, &path, Role::Stroke)),
-                }
-            }
-            if let Some(l) = &self.layer
-                && self.visible == empty
-            {
-                l.display().set_visible(!empty);
-                self.visible = !empty;
-            }
+            Self::reshape(
+                comp,
+                container,
+                &mut self.layer,
+                &mut self.visible,
+                &batch.verbs,
+                &batch.points,
+                Role::Stroke,
+            );
         }
 
+        if batch.has_fill_ramp {
+            self.fill_stops.clear();
+            self.fill_stops.extend_from_slice(&batch.fill_stops);
+            self.fill_axis = batch.fill_axis;
+        }
+        if let Some(m) = batch.fill_motion {
+            self.motion = Some(m);
+        }
+
+        if let (Some(fill), Some(ink)) = (self.fill.as_mut(), self.fill_ink) {
+            fill.resize(layout.width, layout.height, scale);
+            fill.set_source(comp, ink, &self.fill_stops, self.fill_axis, atlas_epoch, scale);
+        }
+        self.meter(layout, batch.fill_extent);
         let Some(layer) = self.layer.as_mut() else { return };
         layer.resize(layout.width, layout.height, scale);
         layer.set_thickness(layout.thickness);
         // A flat colour, so the axis is inert — the source is a solid FP16 raster
         // stretched under the mask, exactly as a bar body's is.
         layer.set_source(comp, layout.color, &[], GradientAxis::Vertical, atlas_epoch, scale);
+    }
+
+    /// Move the metered fill to this publish's extent.
+    ///
+    /// The geometry does not move: the fill sprite spans the whole track and its
+    /// `Scale.X` about the anchored edge IS the level, so one retarget hands the
+    /// whole flight to DWM. The colour source is composited into that same sprite,
+    /// which is what makes a ramp under a meter fill-relative.
+    fn meter(&mut self, layout: TraceLayout, extent: Option<f32>) {
+        let Some(motion) = self.motion else { return };
+        let Some(fill) = self.fill.as_ref() else { return };
+        let sprite = fill.display();
+
+        // The pivot is the anchored edge, in the sprite's own DIPs. It moves only
+        // with the box.
+        let pivot = match motion.anchor {
+            FillAnchor::Left => 0.0,
+            FillAnchor::Right => layout.width,
+        };
+        if self.pivot != Some(pivot) {
+            sprite.set_center_point(Vector3::new(pivot, 0.0, 0.0));
+            self.pivot = Some(pivot);
+        }
+
+        let Some(raw) = extent else { return };
+        let t = if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 };
+        let Some(shown) = self.extent else {
+            // The opening frame is where the meter starts, not a change. The
+            // sprite is born at full extent, so easing down from it would read as
+            // a level that was there and fell.
+            sprite.stop_animation("Scale.X");
+            sprite.set_scale(Vector3::new(t, 1.0, 1.0));
+            self.extent = Some(t);
+            return;
+        };
+        if (t - shown).abs() < EXTENT_EPS {
+            return;
+        }
+        let compositor = sprite.compositor();
+        let easing = self.easing.get_or_insert_with(|| {
+            compositor.create_cubic_bezier_easing_function(
+                Vector2::new(EASE_C1.0, EASE_C1.1),
+                Vector2::new(EASE_C2.0, EASE_C2.1),
+            )
+        });
+        let a = if t > shown {
+            let a = self.rise.get_or_insert_with(|| compositor.create_scalar_key_frame_animation());
+            a.set_duration(motion.rise);
+            &*a
+        } else {
+            let a = self.fall.get_or_insert_with(|| compositor.create_scalar_key_frame_animation());
+            a.set_duration(motion.fall);
+            &*a
+        };
+        a.insert_key_frame_with_easing(1.0, t, easing);
+        sprite.start_animation("Scale.X", a);
+        self.extent = Some(t);
+    }
+
+    /// Re-point one layer at this publish's geometry, building it on first use and
+    /// hiding it when the geometry empties. Shared by the stroke and its fill so
+    /// the two cannot drift in how an emptied frame is handled.
+    fn reshape(
+        comp: &Compositing,
+        container: &windows_composition::ContainerVisual,
+        slot: &mut Option<PathLayer>,
+        visible: &mut bool,
+        verbs: &[PathVerb],
+        points: &[f32],
+        role: Role,
+    ) {
+        let empty = verbs.is_empty();
+        // A path is minted only for geometry there is something to draw; an
+        // emptied trace hides the sprite it already has.
+        if !empty
+            && let Some(path) =
+                super::path_shape::build_composition_path(comp, verbs, points, role == Role::Fill)
+        {
+            match slot.as_mut() {
+                Some(l) => l.set_path(&path),
+                None => *slot = Some(PathLayer::new(comp, container, &path, role)),
+            }
+        }
+        if let Some(l) = slot.as_ref()
+            && *visible == empty
+        {
+            l.display().set_visible(!empty);
+            *visible = !empty;
+        }
     }
 }
