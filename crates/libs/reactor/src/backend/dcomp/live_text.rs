@@ -8,11 +8,11 @@
 //! thing in the app that rasterizes text.
 //!
 //! The visual tree is thread-affine — creating, parenting and placing sprites is
-//! COM work on the compositor's thread, and `crate::surface`'s module doc is
-//! explicit that no thread-affine object ever reaches a requester. So this does
-//! not hand the producer any part of the tree. It does what the surface queue
-//! does: **queue from any thread, apply on the front thread.** A [`LiveText`]
-//! carries nothing but a window handle and a control id, both plain integers.
+//! COM work on the compositor's thread, so no thread-affine object ever reaches a
+//! producer. This does not hand the producer any part of the tree. It follows the
+//! same rule the other front-serviced op queues do: **queue from any thread, apply
+//! on the front thread.** A [`LiveText`] carries nothing but a window handle and a
+//! control id, both plain integers.
 //!
 //! Two properties make it cheap enough to sit under a display-rate producer:
 //!

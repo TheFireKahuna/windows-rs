@@ -48,11 +48,6 @@ mod backend;
 #[cfg(feature = "winui-backend")]
 mod bootstrap;
 mod canvas_bridge;
-// Host-owned composition surfaces and the Direct2D target that draws into them.
-// Both are built on the system composition stack, which only the DComp backend
-// hosts — a WinUI build has no host to service a surface request.
-#[cfg(feature = "dcomp-backend")]
-mod composition_draw;
 mod color;
 mod diagnostics;
 mod drag;
@@ -67,18 +62,12 @@ mod interaction;
 mod motion;
 mod reconciler;
 mod style;
-#[cfg(feature = "dcomp-backend")]
-mod surface;
 mod widget;
 mod widgets;
 
 #[cfg(feature = "winui-backend")]
 pub use app::*;
 pub use backend::*;
-#[cfg(feature = "dcomp-backend")]
-pub use surface::{
-    backend_gpu_device, request_surface, PendingSurface, SurfaceDevice, SurfaceToken,
-};
 pub use gesture::{ActionSlot, GestureEvent, GestureInterest, GestureOutcome};
 pub use motion::reduced_motion;
 pub use color::Color;
@@ -108,8 +97,6 @@ pub use bootstrap::*;
 pub use canvas_bridge::{
     CanvasImageSource, CanvasSwapChain, DrawContext, animated_canvas, animated_canvas_with_device,
 };
-#[cfg(feature = "dcomp-backend")]
-pub use composition_draw::CompositionDrawTarget;
 pub use drag::*;
 pub use element::*;
 pub use engine::*;

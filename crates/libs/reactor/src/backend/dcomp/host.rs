@@ -143,10 +143,6 @@ fn apply_commit(s: &HostShared, cmds: Vec<record::Cmd>, root_id: Option<ControlI
         // Replay before anything reads the arena: `set_root` looks the new root up
         // and silently no-ops if it is absent, and layout walks the whole tree.
         record::replay(&mut *b, cmds);
-        // After the buffer, so a surface requested in the same frame its host mounts
-        // finds the control already in the arena; before layout, so the sprite is
-        // parented when sizes are pushed.
-        b.service_surface_ops();
         // Apply the frame's pointer-surface presence declarations into the front-side
         // interest map so a bit filled during this render is visible to the next input
         // message (one frame ahead, by design — the router routes on these bits, never

@@ -13,7 +13,7 @@
 //! (COM is initialized MTA for incidental free-threaded use — Direct2D
 //! devices, WIC). It must never touch the Compositor, TSF, or any other
 //! STA-affine object — those live front, reached only through the command
-//! buffer and the surface-request protocol (`crate::surface`).
+//! buffer and the front-serviced op queues (e.g. `super::pointer`).
 //!
 //! Two queues, mirroring the old pump-thread dispatcher exactly:
 //! - a **`Send` queue** ([`AppQueue`]) any thread posts to — marshalled state

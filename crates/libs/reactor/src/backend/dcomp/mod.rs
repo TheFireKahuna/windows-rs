@@ -57,7 +57,6 @@ mod popup;
 pub(crate) mod record;
 mod scroll;
 mod size;
-mod surface;
 pub(crate) mod theme;
 pub use theme::{set_host_tokens, HostTokens};
 pub(crate) mod tsf;
@@ -184,9 +183,6 @@ pub struct DCompBackend {
     ghosts: Vec<Ghost>,
     /// Monotonic id source for [`Ghost`]s (keys the batch-completed callback).
     next_ghost: u64,
-    /// Composition surfaces hosted under controls on behalf of viz hosts
-    /// (see [`surface`]).
-    surfaces: surface::SurfaceHost,
     /// Live `TitleBar` node ids in mount order — the caption-geometry cache.
     ///
     /// `WM_NCHITTEST` asks for [`Self::caption_rect`] on every non-client mouse
@@ -260,7 +256,6 @@ impl DCompBackend {
             structure_dirty: rustc_hash::FxHashSet::default(),
             ghosts: Vec::new(),
             next_ghost: 0,
-            surfaces: surface::SurfaceHost::default(),
             titlebars: Vec::new(),
             hwnd,
             intents: Vec::new(),
@@ -1101,7 +1096,6 @@ impl Backend for DCompBackend {
         // bounded when a subscriber leaks its `Subscription`.
         size::forget(id);
         pointer::forget(id);
-        self.surfaces.forget(id);
         uia::forget(self.hwnd, id);
         // Accelerator chords are scoped to the node's lifetime — drop them so a
         // keydown can never match a chord for a node that no longer exists.

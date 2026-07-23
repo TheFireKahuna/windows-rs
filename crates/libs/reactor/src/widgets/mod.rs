@@ -108,11 +108,3 @@ widget_modules! {
 pub mod composition_host;
 #[cfg(feature = "winui-backend")]
 pub use composition_host::*;
-
-// The system-stack counterpart, and likewise not backend-agnostic: it hosts a
-// host-owned `Windows.UI.Composition` drawing surface under a DComp node, so it
-// exists only when the DComp backend does.
-#[cfg(feature = "dcomp-backend")]
-pub mod composition_surface;
-#[cfg(feature = "dcomp-backend")]
-pub use composition_surface::*;

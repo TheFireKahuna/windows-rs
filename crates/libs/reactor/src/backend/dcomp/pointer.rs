@@ -26,9 +26,8 @@
 //!
 //! A gesture is declared where its element mounts — an effect on the app thread
 //! — and consumed by the router on the front thread. So declarations ride a
-//! `Send` [`OPS`] queue that the front services once per frame, exactly as
-//! `crate::surface` does for surface requests. A gesture declared during a
-//! render is therefore routed from the next input message: one frame of
+//! `Send` [`OPS`] queue that the front services once per frame. A gesture declared
+//! during a render is therefore routed from the next input message: one frame of
 //! registration latency, by design, and unchanged from the sink model.
 //!
 //! What *did* change is that a declaration is now atomic. The old sinks filled
