@@ -448,7 +448,9 @@ impl SwapChainState {
             device: &self.device,
             width: self.width,
             height: self.height,
+            dpi: 96.0 * self.scale,
             changed: false,
+            update: Rect::from_xywh(0.0, 0.0, self.width, self.height),
         };
         f(&ctx);
         drop(ctx);

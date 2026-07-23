@@ -29,6 +29,11 @@ readme = "readme.md"
 # vocabulary of the widget layer, and carry no stack of their own.
 default = []
 test = []
+# Compatibility shim: `windows-canvas` is a REQUIRED dependency here (our DComp
+# backend draws through it and `canvas_bridge` compiles unconditionally), so this
+# feature turns nothing on. It exists only so consumers/samples that still name
+# `windows-reactor/canvas` (upstream's optional-canvas model) resolve.
+canvas = []
 # The WinUI 3 (Windows App SDK XAML) backend: `WinUIBackend`, `App`, the XAML
 # host, `bootstrap()`, and `WinUIDispatcher`. Lifted composition is reachable
 # only through XAML, so `backend/winui` and the `composition_host` widget are the

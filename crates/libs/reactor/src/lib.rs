@@ -105,7 +105,6 @@ pub use bindings::VirtualKey;
 pub use bindings::VirtualKeyModifiers;
 #[cfg(feature = "winui-backend")]
 pub use bootstrap::*;
-#[cfg(feature = "canvas")]
 pub use canvas_bridge::{
     CanvasImageSource, CanvasSwapChain, DrawContext, animated_canvas, animated_canvas_with_device,
 };
