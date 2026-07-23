@@ -417,8 +417,8 @@ pub struct Shape {
 /// The axis a gradient ramp runs along, in the shape's own local box: stop `0.0`
 /// sits at the leading edge of that axis and stop `1.0` at the trailing one.
 ///
-/// The ramp is a raster stretched over the whole box and masked by the shape, so
-/// the axis is a property of the BOX, not of the path's direction of travel — a
+/// The ramp is measured across the whole box and masked by the shape, so the
+/// axis is a property of the BOX, not of the path's direction of travel — a
 /// horizontal ramp under a curve that doubles back still reads left-to-right.
 /// For a plot whose x is frequency, that is exactly what "colour by frequency"
 /// means.

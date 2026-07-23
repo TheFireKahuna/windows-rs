@@ -534,6 +534,13 @@ pub(crate) struct KnobParts {
     /// resize would otherwise leave the old tessellation on screen.
     ticks_seen: (Vec<f64>, Option<f64>),
     grad_epoch: u32,
+    /// The compositor-side ramp behind the arc, when the app supplied stops.
+    /// Held because a multi-hue staircase needs the arc sprite's extent and
+    /// because nothing else keeps its brushes alive.
+    arc_ramp: Option<super::gradient::RampSource>,
+    /// The capture + gradient mask the arc's ramp is applied through. Built the
+    /// first time a knob shows stops and kept thereafter.
+    arc_stage: Option<super::gradient::RampStage>,
     /// The ramp the gradient source was last built for, stored EXACTLY.
     ///
     /// This was a truncated `FxHash` digest. A digest is smaller, but `FxHash`
@@ -674,6 +681,8 @@ impl KnobParts {
             visual_surface,
             needle,
             grad_epoch: u32::MAX,
+            arc_ramp: None,
+            arc_stage: None,
             stops_seen: Vec::new(),
             geom: (0.0, 0.0, 0.0, 0.0),
             init: false,
@@ -743,6 +752,12 @@ impl KnobParts {
             {
                 l.resize(w, h, scale);
             }
+            if let Some(r) = self.arc_ramp.as_ref() {
+                r.resize(w, h, scale);
+            }
+            if let Some(st) = self.arc_stage.as_ref() {
+                st.resize(w, h, scale);
+            }
             self.hub.set_offset(cx - HUB_D / 2.0, cy - HUB_D / 2.0, 0.0);
             self.place_needle(cx, cy, radius);
             self.geom = (cx, cy, radius, scale);
@@ -791,13 +806,43 @@ impl KnobParts {
             || !stops_eq(&self.stops_seen, &node.ctrl().stops)
             || resized
         {
-            let src = if node.ctrl().stops.is_empty() {
-                super::parts::build_solid_surface(comp, node.ctrl().accent.unwrap_or_else(theme::accent), scale)
-            } else {
-                super::parts::build_gradient_surface(comp, &node.ctrl().stops, scale)
-            };
-            if let Some(s) = src {
-                self.mask_brush.set_source(&s);
+            // The arc's colour: a flat FP16 source, or — when the app supplied
+            // stops — a compositor ramp nested under the arc's own mask, so the
+            // `TrimEnd` sweep that reveals it is untouched. The ramp runs across
+            // the knob's box, which is what colours the arc by where it sits.
+            if node.ctrl().stops.is_empty() {
+                if let Some(s) = super::parts::build_solid_surface(
+                    comp,
+                    node.ctrl().accent.unwrap_or_else(theme::accent),
+                    scale,
+                ) {
+                    self.mask_brush.set_source(&s);
+                }
+                self.display.set_brush(&self.mask_brush);
+                self.arc_ramp = None;
+            } else if let Some(r) = super::gradient::RampSource::build(
+                comp,
+                &node.ctrl().stops,
+                crate::GradientAxis::Horizontal,
+                scale,
+            ) {
+                r.resize(w, h, scale);
+                // Colour on the mask brush, exactly as a flat accent rides it.
+                // The ramp goes on top of a capture of that — never inside one,
+                // which is what a capture does to an alpha ramp
+                // (`gradient::RampStage`). The trim sweeping the arc is below
+                // all of this and untouched.
+                self.mask_brush.set_source(r.colour());
+                if self.arc_stage.is_none() {
+                    self.arc_stage =
+                        Some(super::gradient::RampStage::new(comp, &self.mask_brush));
+                }
+                if let Some(stage) = self.arc_stage.as_ref() {
+                    stage.resize(w, h, scale);
+                    stage.set_ramp(r.ramp());
+                    self.display.set_brush(stage.brush());
+                }
+                self.arc_ramp = Some(r);
             }
             if let Some(nb) = super::parts::build_solid_surface(comp, theme::w(1.0), scale) {
                 self.needle.set_brush(&nb);

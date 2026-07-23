@@ -6,10 +6,13 @@
 //! axis — an area fading away from the line, and a line coloured by where it sits
 //! on the x axis. Sharing one ramp would force one reading on both.
 //!
-//! Everything here is retained: the geometry is a `CompositionPathGeometry` and
-//! both ramps are FP16 rasters the compositor masks with the shape. Nothing
-//! rasterizes per frame and the app is idle at rest — the same path the knob's
-//! value arc and the progress ring's track already take.
+//! Everything here is retained, and nothing about either ramp is rasterized: the
+//! geometry is a `CompositionPathGeometry`, and each ramp lives in compositor
+//! gradient brushes carrying ALPHA over flat FP16 colour sources. The underfill
+//! is one hue fading, so it is one gradient mask over one FP16 cell; the line
+//! changes hue, so it is a staircase of constant-colour layers whose alphas
+//! partition — source-over between them IS the interpolation. The app is idle at
+//! rest and a resize costs no draw at all.
 //!
 //! Run with:
 //!   cargo run -p windows-reactor --example dcomp_gradient_path

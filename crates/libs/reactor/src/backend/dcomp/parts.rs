@@ -291,11 +291,6 @@ enum ShapeKey {
     /// (the meter fill); `r == 0` is a plain full-bleed stretch (the knob arc
     /// stroke brush).
     ///
-    /// `vertical` runs the ramp top-to-bottom instead of left-to-right — the
-    /// same lossless stretch, just along the other axis. It is the curve
-    /// UNDERFILL source (colour deepest at the curve, fading to the baseline),
-    /// always `r == 0` full-bleed, so it stretches freely in both axes.
-    ///
     /// The key carries the QUANTIZED STOP LIST ITSELF, not a digest of it. A
     /// digest is not injective: `FxHash` is a fast, non-cryptographic mixer, so
     /// two different ramps can collide, and a collision on a cache key means the
@@ -304,7 +299,7 @@ enum ShapeKey {
     /// map resolves a bucket collision with `Eq`, and `Eq` now compares the
     /// stops. The list is `Rc`-shared, so the common case is a pointer compare
     /// and the worst case a walk of a handful of stops.
-    GradBar { stops: std::rc::Rc<[QStop]>, r: u32, h: u32, vertical: bool },
+    GradBar { stops: std::rc::Rc<[QStop]>, r: u32, h: u32 },
 }
 
 /// Atlas cache key: shape + the *authored* token colour (the display colour
@@ -369,37 +364,19 @@ impl AtlasKey {
                 stops: stops.iter().map(QStop::of).collect(),
                 r: snap_len(r, scale, DETAIL_STEPS_PER_PX).to_bits(),
                 h: snap_extent(h, scale).to_bits(),
-                vertical: false,
             },
             color: [0; 4],
             scale: scale.to_bits(),
         }
     }
 
-    /// A VERTICAL full-bleed gradient bar — the curve underfill source. No
-    /// radius (its ends are the plot edges, not rounded), no fixed height (it
-    /// stretches to the fill's box), so the only thing that keys it is the stop
-    /// list and the scale.
-    fn vgrad_bar(stops: &[(f64, crate::Color)], scale: f32) -> Self {
-        let scale = snap_scale(scale);
-        Self {
-            shape: ShapeKey::GradBar {
-                stops: stops.iter().map(QStop::of).collect(),
-                r: 0.0f32.to_bits(),
-                h: 0.0f32.to_bits(),
-                vertical: true,
-            },
-            color: [0; 4],
-            scale: scale.to_bits(),
-        }
-    }
 
     /// Whether this key is exactly the gradient bar `stops` / `r` / `h` / `scale`
     /// describe. Allocation-free, so a steady repaint can reuse a cached key
     /// (see [`grad_bar_key`]) instead of building a fresh stop list each frame.
     fn is_grad_bar(&self, stops: &[(f64, crate::Color)], r: f32, h: f32, scale: f32) -> bool {
         let scale = snap_scale(scale);
-        let ShapeKey::GradBar { stops: have, r: kr, h: kh, vertical: false } = &self.shape else {
+        let ShapeKey::GradBar { stops: have, r: kr, h: kh } = &self.shape else {
             return false;
         };
         self.scale == scale.to_bits()
@@ -569,15 +546,9 @@ fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
         // Wide source for gradient resolution; rasterized at the bar's actual
         // DIP height so a rounded end's corner is circular (never vertically
         // stretched by the nine-grid, whose insets are horizontal only).
-        // A vertical bar swaps the axes: the ramp resolution runs down `y`, and
-        // `x` is a narrow uniform strip.
-        ShapeKey::GradBar { h, vertical, .. } => {
+        ShapeKey::GradBar { h, .. } => {
             let hh = f32::from_bits(*h);
-            if *vertical {
-                (GRAD_SRC_H / scale, GRAD_SRC_W / scale)
-            } else {
-                (GRAD_SRC_W / scale, if hh > 0.0 { hh } else { GRAD_SRC_H / scale })
-            }
+            (GRAD_SRC_W / scale, if hh > 0.0 { hh } else { GRAD_SRC_H / scale })
         }
     };
     let px_w = ((dip_w * scale).round() as i32).max(1);
@@ -607,22 +578,16 @@ fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
         m32: 0.0,
     });
     session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
-    if let ShapeKey::GradBar { r, stops, vertical, .. } = &key.shape {
+    if let ShapeKey::GradBar { r, stops, .. } = &key.shape {
         // Each stop rides the same output colour map as every solid; the
         // FP16 stop collection keeps subtle ramps from posterizing.
         let mapped: Vec<GradientStop> = stops
             .iter()
             .map(|s| GradientStop::new(s.position(), linear(s.color())))
             .collect();
-        // Horizontal ramp along `x`, or — for the underfill — down `y`.
-        let end = if *vertical {
-            CVec2::new(0.0, dip_h)
-        } else {
-            CVec2::new(dip_w, 0.0)
-        };
         if let Ok(g) = session.create_linear_gradient(
             CVec2::new(0.0, 0.0),
-            end,
+            CVec2::new(dip_w, 0.0),
             &mapped,
         ) {
             let rect = Rect::from_xywh(0.0, 0.0, dip_w, dip_h);
@@ -640,34 +605,9 @@ fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
     Some(AtlasEntry { brush, _surface: surface, used: 0 })
 }
 
-/// A standalone FP16 gradient-bar surface brush (the same display-mapped raster
-/// the meter fill uses), for callers outside the `Part` model — the Knob strokes
-/// its value arc with this so the arc stays HDR-mapped like all chrome. Not
-/// atlas-cached; the caller holds it and rebuilds on an epoch/stops change.
-pub(crate) fn build_gradient_surface(
-    comp: &Compositing,
-    stops: &[(f64, crate::Color)],
-    scale: f32,
-) -> Option<CompositionSurfaceBrush> {
-    // Plain full-bleed stretch (r = 0): the knob strokes an arc SHAPE with this
-    // as a Fill surface brush, so it must have no rounded (transparent) ends.
-    rasterize(comp, &AtlasKey::grad_bar(stops, 0.0, GRAD_SRC_H, scale)).map(|e| e.brush)
-}
-
-/// A standalone FP16 **vertical** gradient surface brush — the curve underfill
-/// source (`super::path_shape`). The ramp runs top-to-bottom and stretches to
-/// any box, so one raster fills the whole area under a spline. Not atlas-cached;
-/// the caller (the fill layer) holds it and rebuilds on an epoch/stops change.
-pub(crate) fn build_vgradient_surface(
-    comp: &Compositing,
-    stops: &[(f64, crate::Color)],
-    scale: f32,
-) -> Option<CompositionSurfaceBrush> {
-    rasterize(comp, &AtlasKey::vgrad_bar(stops, scale)).map(|e| e.brush)
-}
-
 /// A standalone FP16 solid-color surface brush (display-mapped), for the Knob's
-/// needle. See [`build_gradient_surface`].
+/// needle — and, since ramps moved onto the compositor
+/// ([`super::gradient`]), for every flat colour a gradient is built out of.
 pub(crate) fn build_solid_surface(
     comp: &Compositing,
     color: crate::Color,

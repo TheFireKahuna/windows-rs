@@ -14,8 +14,10 @@
 //! `CompositionColorBrush`, which is an 8-bit `Windows.UI.Color` and cannot
 //! carry this palette's above-paper-white values. So the shape is drawn opaque
 //! **white** and used as a MASK, an FP16 surface is the COLOUR, and a
-//! [`CompositionMaskBrush`] combines them — solid or gradient, both built by
-//! [`super::parts`] as display-mapped rasters.
+//! [`CompositionMaskBrush`] combines them. A flat colour is one display-mapped
+//! FP16 cell from [`super::parts`]; a RAMP is a second mask brush nested inside
+//! this one ([`super::gradient`]), so the two alphas multiply and no ramp is
+//! ever rasterized.
 //!
 //! ## Why fill and stroke are separate layers
 //!
@@ -41,6 +43,7 @@ use windows_composition::{
     Color as UiColor, CompositionMaskBrush, CompositionPath, CompositionPathGeometry,
     CompositionSpriteShape, CompositionSurfaceBrush, BorderMode, CompositionVisualSurface, DropShadow,
     ShadowSource, ShapeVisual, SpringScalarNaturalMotionAnimation, SpriteVisual, StrokeCap,
+    StrokeJoin,
 };
 use windows_core::{implement_decl, Interface, Ref, Result};
 use windows_numerics::Vector2;
@@ -363,6 +366,14 @@ pub(crate) struct PathLayer {
     /// The bound FP16 source and what it was built for — a solid colour's raw
     /// bits, or the exact stop list. Rebuilt only when one really changes.
     _source: Option<CompositionSurfaceBrush>,
+    /// The compositor-side ramp, when the layer is on a gradient. Held because
+    /// it needs the layer's extent (see [`super::gradient::RampSource::resize`])
+    /// and because nothing else keeps its brushes alive.
+    ramp: Option<super::gradient::RampSource>,
+    /// The capture + gradient mask a ramp is applied through. Built the first
+    /// time this layer shows one and kept thereafter, so a curve that toggles
+    /// between a flat colour and a ramp rebinds one brush and mints nothing.
+    ramp_stage: Option<super::gradient::RampStage>,
     solid_for: Option<([u32; 4], u32)>,
     stops_seen: Vec<(f64, Color)>,
     /// The axis that stop list was rasterized on. `None` while the layer is on a
@@ -424,6 +435,11 @@ impl PathLayer {
                 // Both caps in one call — the wrapper sets start and end
                 // together, which is the only combination that has a use here.
                 shape.set_stroke_caps(StrokeCap::Round);
+                // The join has to be stated as well: the compositor mitres by
+                // default, where the painted trace this replaces joins round
+                // (`DrawKit`'s round style), so a retained curve and a painted
+                // one of the same points disagreed at every sharp turn.
+                shape.set_stroke_join(StrokeJoin::Round);
             }
         }
 
@@ -457,6 +473,8 @@ impl PathLayer {
             mask_brush,
             display,
             _source: None,
+            ramp: None,
+            ramp_stage: None,
             solid_for: None,
             stops_seen: Vec::new(),
             axis_seen: None,
@@ -514,6 +532,15 @@ impl PathLayer {
         size_mask(&self.mask_shape, &self.visual_surface, &[&self.shape], w, h, scale);
         // The display sprite stays in DIPs — it IS under the root scale.
         self.display.set_size(w, h);
+        // A single-hue ramp is `MappingMode::Relative` and follows the sprite by
+        // itself; a multi-hue staircase is a real visual tree and takes the
+        // extent. Either way nothing is re-rasterized here.
+        if let Some(r) = self.ramp.as_ref() {
+            r.resize(w, h, scale);
+        }
+        if let Some(st) = self.ramp_stage.as_ref() {
+            st.resize(w, h, scale);
+        }
         self.size = Some((w, h, scale));
     }
 
@@ -550,30 +577,53 @@ impl PathLayer {
         if unchanged {
             return;
         }
-        // Both ramps are rasters stretched over the node's box and masked by the
-        // shape, so the axis picks which raster — not how the path is walked.
+        // A ramp is a compositor brush, not a raster: its shape lives in a
+        // gradient brush's alpha and its colour in flat FP16 sources, so the
+        // axis picks the gradient's direction rather than which bitmap to
+        // stretch. Nesting it under this layer's shape mask multiplies the two
+        // alphas — coverage from the shape, ramp from the gradient — and leaves
+        // the trim, the geometry and the capture above it untouched.
         // The flat branch serves a layer the app gave no ramp at all.
-        let src = if stops.is_empty() {
-            super::parts::build_solid_surface(comp, color, scale)
-        } else {
-            match axis {
-                GradientAxis::Horizontal => super::parts::build_gradient_surface(comp, stops, scale),
-                GradientAxis::Vertical => super::parts::build_vgradient_surface(comp, stops, scale),
-            }
-        };
-        let Some(s) = src else { return };
-        self.mask_brush.set_source(&s);
-        self._source = Some(s);
-        self.grad_epoch = atlas_epoch;
         if stops.is_empty() {
+            let Some(s) = super::parts::build_solid_surface(comp, color, scale) else {
+                return;
+            };
+            self.mask_brush.set_source(&s);
+            // Straight back onto the shape mask: no capture, no ramp.
+            self.display.set_brush(&self.mask_brush);
+            self._source = Some(s);
+            self.ramp = None;
             self.solid_for = Some(want_solid);
             self.stops_seen.clear();
             self.axis_seen = None;
         } else {
+            let Some(r) = super::gradient::RampSource::build(comp, stops, axis, scale) else {
+                return;
+            };
+            if let Some((w, h, s)) = self.size {
+                r.resize(w, h, s);
+            }
+            // The colour rides the mask brush exactly as a flat one does. The
+            // RAMP goes on top of a capture of that, never inside one — see
+            // `gradient::RampStage` for the two routes that measured wrong.
+            self.mask_brush.set_source(r.colour());
+            if self.ramp_stage.is_none() {
+                let st = super::gradient::RampStage::new(comp, &self.mask_brush);
+                if let Some((w, h, s)) = self.size {
+                    st.resize(w, h, s);
+                }
+                self.ramp_stage = Some(st);
+            }
+            let Some(stage) = self.ramp_stage.as_ref() else { return };
+            stage.set_ramp(r.ramp());
+            self.display.set_brush(stage.brush());
+            self.ramp = Some(r);
+            self._source = None;
             self.solid_for = None;
             self.stops_seen = stops.to_vec();
             self.axis_seen = Some(axis);
         }
+        self.grad_epoch = atlas_epoch;
     }
 
     /// Retarget the draw-on trim. `TrimStart` snaps (it is a static crop);
@@ -716,6 +766,8 @@ impl GlowLayer {
         let shape = compositor.create_sprite_shape(&geo);
         shape.set_stroke_brush(&compositor.create_color_brush(UiColor::rgb(255, 255, 255)));
         shape.set_stroke_caps(StrokeCap::Round);
+        // The halo blurs exactly the line the stroke draws, joins included.
+        shape.set_stroke_join(StrokeJoin::Round);
 
         let stroke_shape = compositor.create_shape_visual();
         stroke_shape.shapes().append(&shape);
@@ -823,14 +875,23 @@ impl GlowLayer {
             self.shape.set_stroke_thickness(thickness.max(0.5));
             self.thickness = Some(thickness);
         }
-        // Canvas `shadowBlur` is 2σ (the value the mockups author), so σ = blur/2
-        // — the same halving the baked glow applied, kept so a mockup constant
-        // still means what it did. The radius is physical because the alpha it
-        // blurs was captured at physical size.
-        let sigma = blur * 0.5 * scale;
-        if self.blur != Some(sigma.to_bits()) {
-            self.shadow.set_blur_radius(sigma);
-            self.blur = Some(sigma.to_bits());
+        // `DropShadow.BlurRadius` is **not** a standard deviation — like CSS
+        // `box-shadow`, it is 2σ, the same convention canvas `shadowBlur` uses.
+        // So the authored value passes straight through and a mockup constant
+        // means exactly what it did on a canvas.
+        //
+        // Measured, not assumed. Halving it here (on the theory that the property
+        // was σ) rendered every halo at half its spread: against the D2D
+        // `D2D1Shadow` glow it replaces, the analyzer response curve's halo fell
+        // to half strength 2.4 px off the stroke where the painted one took 4.7 —
+        // a ratio of 2.0 across the whole falloff, which is what a σ off by two
+        // looks like. Passing the value through puts the two on top of each other.
+        //
+        // Physical, because the alpha it blurs was captured at physical size.
+        let radius = blur * scale;
+        if self.blur != Some(radius.to_bits()) {
+            self.shadow.set_blur_radius(radius);
+            self.blur = Some(radius.to_bits());
         }
         // The FP16 colour the halo is masked against — the same solid-source
         // builder the stroke and fill layers bind, so a glow tint and a stroke
