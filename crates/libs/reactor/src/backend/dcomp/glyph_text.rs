@@ -74,9 +74,67 @@ use windows_composition::{
 
 use super::bootstrap::Compositing;
 use super::glyph_atlas::{pen_phase, GlyphAtlas};
+use super::mask_cache::Raster;
 use super::node::Node;
 use super::parts::build_solid_surface;
+use super::run_atlas::RunAtlas;
 use super::theme;
+
+/// The two grains a run can be placed at.
+///
+/// The choice is a property of the text's UPDATE CADENCE, not its content, and it
+/// maps onto the lanes the backend already separates:
+///
+/// - [`Glyphs`](TextMode::Glyphs) — one masked sprite per glyph, from the
+///   [`GlyphAtlas`]. A content change re-places cached glyph masks and rasterizes
+///   nothing, so this is what LIVE text (a ticking readout, the editor, the knob)
+///   is drawn in.
+/// - [`Runs`](TextMode::Runs) — one masked sprite per line, from the [`RunAtlas`].
+///   One sprite instead of N, at the cost of a re-raster when the shaped run
+///   changes — so this is what STATIC text (labels, prose, chrome) is drawn in,
+///   which is the overwhelming majority of the tree.
+///
+/// A recolour is a `SetSource` and a move is a `set_offset` in EITHER mode — the
+/// mask-and-shared-source model is the same at both grains — so the split costs
+/// nothing but the one re-raster, and only on the text that never pays it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum TextMode {
+    /// One sprite per glyph — LIVE text. The default a `TextPart` mints at, so a
+    /// part that is never told otherwise behaves exactly as before this split.
+    #[default]
+    Glyphs,
+    /// One sprite per run — STATIC text.
+    Runs,
+}
+
+/// The two text mask caches, threaded together wherever one used to be.
+///
+/// Bundled rather than passed as two arguments because every sync site needs
+/// whichever the node's [`TextMode`] selects, and the pair share a lifetime and a
+/// clearing edge (device loss / DPI both drop both). A [`TextPart`] reads the
+/// [`epoch`](Atlases::epoch) of the one its mode draws from.
+#[derive(Default)]
+pub(crate) struct Atlases {
+    pub(crate) glyph: GlyphAtlas,
+    pub(crate) run: RunAtlas,
+}
+
+impl Atlases {
+    /// Drop every cached raster in both caches (display / DPI / device edge).
+    pub(crate) fn clear(&mut self) {
+        self.glyph.clear();
+        self.run.clear();
+    }
+
+    /// The epoch of the cache `mode` draws from — a bump invalidates the bound
+    /// masks of every part in that mode.
+    fn epoch(&self, mode: TextMode) -> u32 {
+        match mode {
+            TextMode::Glyphs => self.glyph.epoch(),
+            TextMode::Runs => self.run.epoch(),
+        }
+    }
+}
 
 /// One glyph's sprite and the mask brush that colours it.
 ///
@@ -86,7 +144,7 @@ use super::theme;
 struct GlyphSprite {
     vis: Visual,
     mask: CompositionMaskBrush,
-    /// [`GlyphRaster::id`](super::glyph_atlas::GlyphRaster::id) of the atlas
+    /// [`Raster::id`](super::mask_cache::Raster::id) of the atlas
     /// mask currently bound. Identity is the right test here: the atlas hands
     /// back the same raster for a cache hit, so an unchanged glyph compares
     /// equal and re-binds nothing — which is what makes a recolour or a
@@ -248,6 +306,11 @@ pub(crate) struct TextPart {
     fill_source_for: Option<([u32; 4], u32)>,
     /// The atlas epoch the bound masks came from; a bump invalidates them all.
     epoch: u32,
+    /// The grain the pooled sprites were last placed at. A part is synced in one
+    /// mode by construction (its node's kind fixes it), but a flip is handled
+    /// defensively: it invalidates every bound mask, exactly as an epoch bump
+    /// does, so the pool re-binds at the new grain instead of surfacing the old.
+    mode: TextMode,
 }
 
 fn color_bits(c: crate::Color) -> [u32; 4] {
@@ -323,20 +386,65 @@ impl TextPart {
         self.source.clone()
     }
 
-    /// Place the label's glyphs.
+    /// Bind one mask to the next pooled sprite and place it on the pixel grid.
     ///
-    /// `origin` is the top-left of the text box in node-local DIPs; the run's
-    /// own baseline origin is added to it. `scale` is DIP→px.
+    /// The one operation both grains share: [`TextMode::Glyphs`] calls it once per
+    /// glyph, [`TextMode::Runs`] once per run. It grows the pool on demand,
+    /// re-binds only when the mask identity moved (an integer compare), and lands
+    /// the sprite at `(pen_px - origin_px) / scale` — both subtrahends integers,
+    /// so the mask stays a 1:1 blit rather than a bilinear resample.
     ///
-    /// Placement uses the SHAPED advances from the run, not the design advances
-    /// the atlas reports — kerning and other GPOS positioning live in the
-    /// former, and using the latter would space text correctly only for pairs
-    /// the font does not kern.
+    /// An associated function, not a method, so it can take `self.glyphs` mutably
+    /// while the caller still holds `self` for the placement walk.
+    #[allow(clippy::too_many_arguments)]
+    fn place_mask(
+        glyphs: &mut Vec<GlyphSprite>,
+        slot: &mut usize,
+        comp: &Compositing,
+        host: &ContainerVisual,
+        source: &CompositionSurfaceBrush,
+        raster: &Raster,
+        whole_px: i32,
+        baseline_py: i32,
+        scale: f32,
+    ) {
+        // Grow on demand; a label only pays for the sprites it has.
+        if *slot == glyphs.len() {
+            glyphs.push(GlyphSprite::new(comp, host));
+        }
+        let g = &mut glyphs[*slot];
+        // An integer compare, and nothing else, on the re-place path.
+        if g.bound != Some(raster.id) {
+            g.mask.set_mask(&raster.brush);
+            g.mask.set_source(source);
+            g.bound = Some(raster.id);
+        }
+        let (w, h) = raster.geom.size_dip;
+        let (ox, oy) = raster.geom.origin_px;
+        g.place(
+            (whole_px - ox) as f32 / scale,
+            (baseline_py - oy) as f32 / scale,
+            w,
+            h,
+        );
+        g.show(true);
+        *slot += 1;
+    }
+
+    /// Place the label at `mode`'s grain — one sprite per glyph, or one per run.
+    ///
+    /// `origin` is the top-left of the text box in node-local DIPs; each run's own
+    /// baseline origin is added to it. `scale` is DIP→px.
+    ///
+    /// Glyph placement uses the SHAPED advances from the run, not design advances —
+    /// kerning and other GPOS positioning live in the former. Run placement bakes
+    /// all of that into the coverage and steps nothing, so the two grains are the
+    /// same loop with the inner step removed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn sync(
         &mut self,
         comp: &Compositing,
-        atlas: &mut GlyphAtlas,
+        atlas: &mut Atlases,
         parent: &ContainerVisual,
         layout: &TextLayout,
         origin: (f32, f32),
@@ -344,6 +452,7 @@ impl TextPart {
         color: crate::Color,
         dim: f32,
         scale: f32,
+        mode: TextMode,
     ) {
         self.ensure_host(comp, parent);
         self.place_host(host_box, dim);
@@ -357,13 +466,16 @@ impl TextPart {
             self.hide_from(0);
             return;
         };
-        if atlas.epoch() != self.epoch {
-            // The atlas was cleared (device loss, DPI, theme): every bound mask
-            // is stale, so drop the identity cache and let the walk re-bind.
+        // A cleared atlas (device loss, DPI, theme) stales every bound mask; a
+        // mode flip re-grains the pool. Either drops the identity cache so the
+        // walk re-binds.
+        let epoch = atlas.epoch(mode);
+        if self.mode != mode || self.epoch != epoch {
             for g in &mut self.glyphs {
                 g.bound = None;
             }
-            self.epoch = atlas.epoch();
+            self.mode = mode;
+            self.epoch = epoch;
         }
         let Some(source) = self.ensure_source(comp, color, scale) else {
             self.hide_from(0);
@@ -372,61 +484,68 @@ impl TextPart {
 
         let mut slot = 0usize;
         for run in &runs {
-            // The baseline row is snapped to a whole physical pixel, once per
-            // run. There is no vertical subpixel phase (glyphs are rasterized at
-            // horizontal phases only), so an unsnapped baseline would put every
-            // sprite in the run between two pixel rows and the compositor would
-            // resample all of them.
+            // The baseline row is snapped to a whole physical pixel, once per run.
+            // There is no vertical subpixel phase, so an unsnapped baseline would
+            // put every sprite between two pixel rows and resample it.
             let baseline_py = ((origin.1 + run.baseline_origin.y) * scale).round() as i32;
-            let mut pen_x = origin.0 + run.baseline_origin.x;
-            for (i, &glyph) in run.glyph_indices.iter().enumerate() {
-                // A glyph offset DISPLACES this one glyph; it does not move the
-                // pen. GPOS mark positioning is expressed entirely through it —
-                // an acute accent is a glyph at the pen of the letter it sits on,
-                // nudged up and sideways — so folding it into the pen would both
-                // drop the vertical half and smear the horizontal half across
-                // every glyph after it.
-                let (off_x, off_y) = run
-                    .glyph_offsets
-                    .get(i)
-                    .map_or((0.0, 0.0), |o| (o.advance_offset, o.ascender_offset));
-                let (whole_px, phase) = pen_phase(pen_x + off_x, scale);
-                // `ascender_offset` points toward the ascender, i.e. up the
-                // screen, which is the negative y direction.
-                let glyph_py = baseline_py - (off_y * scale).round() as i32;
-                if let Some(raster) =
-                    atlas.get(comp, &run.font_face, glyph, run.font_em_size, scale, phase)
-                {
-                    // Grow on demand; a label only pays for the glyphs it has.
-                    if slot == self.glyphs.len() {
-                        self.glyphs.push(GlyphSprite::new(comp, &host));
+            match mode {
+                TextMode::Glyphs => {
+                    let mut pen_x = origin.0 + run.baseline_origin.x;
+                    for (i, &glyph) in run.glyph_indices.iter().enumerate() {
+                        // A glyph offset DISPLACES this one glyph; it does not move
+                        // the pen. GPOS mark positioning is expressed entirely
+                        // through it, so folding it into the pen would drop the
+                        // vertical half and smear the horizontal half.
+                        let (off_x, off_y) = run
+                            .glyph_offsets
+                            .get(i)
+                            .map_or((0.0, 0.0), |o| (o.advance_offset, o.ascender_offset));
+                        let (whole_px, phase) = pen_phase(pen_x + off_x, scale);
+                        // `ascender_offset` points up the screen, negative y.
+                        let glyph_py = baseline_py - (off_y * scale).round() as i32;
+                        if let Some(raster) = atlas.glyph.get(
+                            comp,
+                            &run.font_face,
+                            glyph,
+                            run.font_em_size,
+                            scale,
+                            phase,
+                        ) {
+                            Self::place_mask(
+                                &mut self.glyphs,
+                                &mut slot,
+                                comp,
+                                &host,
+                                &source,
+                                &raster,
+                                whole_px,
+                                glyph_py,
+                                scale,
+                            );
+                        }
+                        // The pen moves by the SHAPED advance alone.
+                        pen_x += run.glyph_advances.get(i).copied().unwrap_or(0.0);
                     }
-                    let g = &mut self.glyphs[slot];
-                    // An integer compare, and nothing else, on the path every
-                    // glyph of every label takes on every sync.
-                    if g.bound != Some(raster.id) {
-                        g.mask.set_mask(&raster.brush);
-                        g.mask.set_source(&source);
-                        g.bound = Some(raster.id);
-                    }
-                    // Integer minus integer, then one divide: the sprite lands
-                    // exactly on the pixel grid, which is what keeps the mask a
-                    // 1:1 blit instead of a bilinear resample.
-                    let (w, h) = raster.geom.size_dip;
-                    let (ox, oy) = raster.geom.origin_px;
-                    g.place(
-                        (whole_px - ox) as f32 / scale,
-                        (glyph_py - oy) as f32 / scale,
-                        w,
-                        h,
-                    );
-                    g.show(true);
-                    slot += 1;
                 }
-                // The pen moves by the SHAPED advance alone — kerning and other
-                // GPOS positioning are already in it, and the per-glyph offset
-                // above is not part of it.
-                pen_x += run.glyph_advances.get(i).copied().unwrap_or(0.0);
+                TextMode::Runs => {
+                    // One sprite for the whole run. The run is rasterized at a zero
+                    // baseline, so its internal glyph fractions are baked into the
+                    // mask; only its WHOLE origin is snapped here.
+                    let (whole_px, _phase) = pen_phase(origin.0 + run.baseline_origin.x, scale);
+                    if let Some(raster) = atlas.run.get(comp, run, scale) {
+                        Self::place_mask(
+                            &mut self.glyphs,
+                            &mut slot,
+                            comp,
+                            &host,
+                            &source,
+                            &raster,
+                            whole_px,
+                            baseline_py,
+                            scale,
+                        );
+                    }
+                }
             }
         }
         self.live = slot;
@@ -1019,7 +1138,7 @@ pub(crate) enum Align {
 /// beside their own geometry instead of here.
 pub(crate) struct Pen<'a> {
     pub(crate) comp: &'a Compositing,
-    pub(crate) atlas: &'a mut GlyphAtlas,
+    pub(crate) atlas: &'a mut Atlases,
     /// The node's container; every run's host parents into it.
     ///
     /// Held **owned** rather than borrowed, which is what lets a run be placed
@@ -1032,13 +1151,18 @@ pub(crate) struct Pen<'a> {
     /// The node's disabled dim, carried on each host's opacity.
     pub(crate) dim: f32,
     pub(crate) scale: f32,
+    /// The grain every run this pen places is drawn at. Defaults to
+    /// [`TextMode::Runs`] — the static majority — and the few live sync functions
+    /// (the knob, the editor, a live block, the nav pane) set it to
+    /// [`TextMode::Glyphs`] just as they set [`dim`](Self::dim).
+    pub(crate) mode: TextMode,
 }
 
 impl<'a> Pen<'a> {
     /// A pen over `node`, taking its enabled state as the dim every run carries.
     pub(crate) fn new(
         comp: &'a Compositing,
-        atlas: &'a mut GlyphAtlas,
+        atlas: &'a mut Atlases,
         node: &Node,
         scale: f32,
     ) -> Self {
@@ -1056,12 +1180,12 @@ impl<'a> Pen<'a> {
     /// a node.
     pub(crate) fn over(
         comp: &'a Compositing,
-        atlas: &'a mut GlyphAtlas,
+        atlas: &'a mut Atlases,
         host: ContainerVisual,
         dim: f32,
         scale: f32,
     ) -> Self {
-        Self { comp, atlas, host, dim, scale }
+        Self { comp, atlas, host, dim, scale, mode: TextMode::Runs }
     }
 }
 
@@ -1136,6 +1260,7 @@ impl Pen<'_> {
             color,
             self.dim,
             self.scale,
+            self.mode,
         );
     }
 
@@ -1194,7 +1319,7 @@ fn live_text_align(h_align: i32) -> Align {
     reason = "the live and ordinary paths are symmetric, and each arm's comment \
               belongs to its own case"
 )]
-pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+pub(crate) fn text_sync(comp: &Compositing, atlas: &mut Atlases, node: &mut Node, scale: f32) {
     if node.kind != crate::backend::ControlKind::TextBlock {
         return;
     }
@@ -1235,6 +1360,11 @@ pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut N
         // never ran on it. `Shaped::pin` compares the string and the em first,
         // so a republished-unchanged value reshapes nothing.
         Some(words) => {
+            // A live value re-shapes and re-places per publish, so it is drawn
+            // per glyph: the glyph atlas re-places cached digit masks and
+            // rasterizes nothing, where a run cache would re-raster the line each
+            // frame. This is the ONE branch of the static/live split inside a kind.
+            pen.mode = TextMode::Glyphs;
             if let Some(part) = node.text_part.as_mut() {
                 part.hide_all();
             }
@@ -1284,7 +1414,7 @@ pub(crate) fn text_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut N
 /// from accent to accent-light re-rasterizes nothing.
 pub(crate) fn hyperlink_sync(
     comp: &Compositing,
-    atlas: &mut GlyphAtlas,
+    atlas: &mut Atlases,
     node: &mut Node,
     scale: f32,
 ) {
@@ -1308,7 +1438,7 @@ pub(crate) fn hyperlink_sync(
 /// way.
 pub(crate) fn expander_sync(
     comp: &Compositing,
-    atlas: &mut GlyphAtlas,
+    atlas: &mut Atlases,
     node: &mut Node,
     scale: f32,
 ) {
@@ -1342,7 +1472,7 @@ pub(crate) fn expander_sync(
 /// Leading horizontally, centred vertically — the alignment the painted label
 /// had, expressed as an origin because a shaped run carries no alignment of its
 /// own once it is placed by hand.
-pub(crate) fn check_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+pub(crate) fn check_sync(comp: &Compositing, atlas: &mut Atlases, node: &mut Node, scale: f32) {
     if node.kind != crate::backend::ControlKind::CheckBox {
         return;
     }
@@ -1368,7 +1498,7 @@ pub(crate) fn check_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut 
 ///
 /// The dial itself — track, ticks, hub — stays painted, and the value arc and
 /// needle stay retained vector chrome (`knob::sync_knob`). Only the words move.
-pub(crate) fn knob_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+pub(crate) fn knob_sync(comp: &Compositing, atlas: &mut Atlases, node: &mut Node, scale: f32) {
     if node.kind != crate::backend::ControlKind::Knob {
         return;
     }
@@ -1383,6 +1513,9 @@ pub(crate) fn knob_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut N
     );
 
     let mut pen = Pen::new(comp, atlas, node, scale);
+    // The readout re-shapes every frame of a value drag; drawn per glyph so a
+    // drag re-places cached masks rather than re-rasterizing the dial's runs.
+    pen.mode = TextMode::Glyphs;
     let (ctrl, readout, t) = node.knob_runs();
 
     let (part, run) = t.readout.pin(readout, readout_em, KNOB_READOUT_WEIGHT, KNOB_FACE);
@@ -1432,7 +1565,7 @@ const KNOB_READOUT_WEIGHT: u16 = 200;
 /// Each run's host is its own column, which is what stops a selected item too
 /// long for the trigger from running out under the chevron. The label loses its
 /// tail to the clip instead.
-pub(crate) fn select_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+pub(crate) fn select_sync(comp: &Compositing, atlas: &mut Atlases, node: &mut Node, scale: f32) {
     if !matches!(
         node.kind,
         crate::backend::ControlKind::ComboBox | crate::backend::ControlKind::DropDownButton
@@ -1491,7 +1624,7 @@ pub(crate) struct CaptionGlyphs {
 /// title block as leading inset precisely so the app's content begins after it.
 pub(crate) fn caption_sync(
     comp: &Compositing,
-    atlas: &mut GlyphAtlas,
+    atlas: &mut Atlases,
     node: &mut Node,
     scale: f32,
     content_left: Option<f32>,
@@ -1569,7 +1702,7 @@ pub(crate) struct BarText {
 /// close button.
 pub(crate) fn info_bar_sync(
     comp: &Compositing,
-    atlas: &mut GlyphAtlas,
+    atlas: &mut Atlases,
     node: &mut Node,
     scale: f32,
 ) {
@@ -1617,7 +1750,7 @@ pub(crate) fn info_bar_sync(
 /// plate IS the node, and the dot form carries no count to place.
 pub(crate) fn info_badge_sync(
     comp: &Compositing,
-    atlas: &mut GlyphAtlas,
+    atlas: &mut Atlases,
     node: &mut Node,
     scale: f32,
 ) {
@@ -1654,7 +1787,7 @@ pub(crate) fn info_badge_sync(
 ///
 /// The host is the region right of the track, so a label wider than the room
 /// left for it loses its tail to the clip rather than overrunning the control.
-pub(crate) fn toggle_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+pub(crate) fn toggle_sync(comp: &Compositing, atlas: &mut Atlases, node: &mut Node, scale: f32) {
     if node.kind != crate::backend::ControlKind::ToggleSwitch {
         return;
     }
@@ -1685,7 +1818,7 @@ pub(crate) fn toggle_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
 /// wide for its share of the tray from bleeding into its neighbour.
 pub(crate) fn segmented_sync(
     comp: &Compositing,
-    atlas: &mut GlyphAtlas,
+    atlas: &mut Atlases,
     node: &mut Node,
     scale: f32,
 ) {
@@ -1742,7 +1875,7 @@ pub(crate) fn segmented_sync(
 /// pane leaves makes DirectWrite re-walk it on this very sync. That is why a
 /// label degrades to "Equalizer…" as the pane closes without anything here
 /// deciding that it should.
-pub(crate) fn nav_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+pub(crate) fn nav_sync(comp: &Compositing, atlas: &mut Atlases, node: &mut Node, scale: f32) {
     if node.kind != crate::backend::ControlKind::NavigationView {
         return;
     }
@@ -1756,6 +1889,12 @@ pub(crate) fn nav_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut No
     let m = super::nav::metrics(node.extras(), w, has_title);
 
     let mut pen = Pen::new(comp, atlas, node, scale);
+    // A pane row's label ellipsizes as the pane opens and closes — the shaped run
+    // changes every frame of that animation — so the rows are drawn per glyph. A
+    // run cache would re-raster each label on every animation frame; when the
+    // pane is at rest the labels are static, which is when a later pass could
+    // reconsider this.
+    pen.mode = TextMode::Glyphs;
     let Some(t) = node.nav_text.as_mut() else {
         return;
     };
@@ -1873,7 +2012,7 @@ fn nav_row(
 /// - Every origin comes from [`editor::TextBand`], the same one the caret
 ///   sprite, the IME candidate window and UIA are placed by — which is what
 ///   keeps the sprites from drifting away from all three.
-pub(crate) fn editor_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+pub(crate) fn editor_sync(comp: &Compositing, atlas: &mut Atlases, node: &mut Node, scale: f32) {
     if node.editor.is_none() {
         return;
     }
@@ -1925,7 +2064,10 @@ pub(crate) fn editor_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut
     match ed.layout.as_ref().filter(|_| !empty) {
         Some(layout) => {
             let shaped = layout.shape().ok();
-            part.sync(comp, atlas, host, layout, origin, column, fg, dim, scale);
+            // An editor's run re-shapes per keystroke and carries a selection and
+            // an IME composition rule that move with the caret, so it is drawn per
+            // glyph — a run cache would re-raster the field on every edit.
+            part.sync(comp, atlas, host, layout, origin, column, fg, dim, scale, TextMode::Glyphs);
 
             // Selection sits behind the run, so it is placed after the host
             // exists but lands under every glyph — see `TextPart::sync_fills`.
@@ -2031,7 +2173,7 @@ fn placeholder_align(content_align: i32) -> Align {
 /// [`controls::button_boxes`](super::controls::button_boxes) is the one
 /// definition of where a button's content sits, and the measure pass sizes the
 /// control from the same answer.
-pub(crate) fn button_sync(comp: &Compositing, atlas: &mut GlyphAtlas, node: &mut Node, scale: f32) {
+pub(crate) fn button_sync(comp: &Compositing, atlas: &mut Atlases, node: &mut Node, scale: f32) {
     if !super::node::is_button_family(node.kind) {
         return;
     }

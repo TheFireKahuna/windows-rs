@@ -34,6 +34,8 @@ mod dispatch;
 mod display_change;
 pub(crate) mod editor;
 mod glyph_atlas;
+mod mask_cache;
+mod run_atlas;
 mod gradient;
 mod glyph_text;
 mod host;
@@ -114,12 +116,14 @@ pub struct DCompBackend {
     comp: Compositing,
     /// Shared rasterized chrome-part sources (see [`parts::Atlas`]).
     atlas: parts::Atlas,
-    /// Shared rasterized glyph masks, behind every retained label (see
-    /// [`glyph_atlas::GlyphAtlas`]). Separate from `atlas` because the
-    /// populations differ by an order of magnitude and because the two are
-    /// invalidated by different things — a glyph mask carries no colour, so a
-    /// theme change leaves every entry valid.
-    glyphs: glyph_atlas::GlyphAtlas,
+    /// Shared rasterized text masks, behind every retained label (see
+    /// [`glyph_text::Atlases`]): the per-glyph [`glyph_atlas::GlyphAtlas`] for
+    /// live text and the per-run [`run_atlas::RunAtlas`] for static text, bundled
+    /// because every sync site needs whichever the node's mode selects. Separate
+    /// from `atlas` because the populations differ by an order of magnitude and
+    /// because the two are invalidated by different things — a text mask carries
+    /// no colour, so a theme change leaves every entry valid.
+    glyphs: glyph_text::Atlases,
     root: Option<ControlId>,
     /// The node whose container is currently attached under the compositor root.
     attached_root: Option<ControlId>,
@@ -236,7 +240,7 @@ impl DCompBackend {
             arena: Arena::default(),
             comp,
             atlas: parts::Atlas::default(),
-            glyphs: glyph_atlas::GlyphAtlas::default(),
+            glyphs: glyph_text::Atlases::default(),
             root: None,
             attached_root: None,
             dip_size,

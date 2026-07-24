@@ -67,17 +67,13 @@
 //! [`glyph_run_coverage`]. The property is the same one, asked for at the only
 //! place that can honour it.
 
-use std::cell::Cell;
-
-use rustc_hash::FxHashMap;
 use windows_canvas::{
     glyph_run_coverage, ColorF, DrawingSession, FontFace, FontMetrics, GlyphMetrics, GlyphRun,
     ID2D1DeviceContext, Rect, Vector2 as CVec2,
 };
-use windows_composition::{CompositionDrawingSurface, CompositionSurfaceBrush, PixelFormat};
 use windows_numerics::Matrix3x2;
 
-use super::bootstrap::Compositing;
+use super::mask_cache::{MaskCache, MaskGeom, MaskSurfaces, Raster, Rasterized, MASK_FORMAT};
 
 /// Horizontal subpixel phases rasterized per glyph.
 ///
@@ -287,7 +283,7 @@ pub(crate) fn pen_phase(pen_x_dip: f32, scale: f32) -> (i32, u32) {
 /// Quantize an em size so float noise in a DPI computation cannot fork the
 /// cache. 1/64 of a physical pixel is DirectWrite's own design-unit resolution
 /// at typical sizes, so two ems that quantize together rasterize identically.
-fn quant_em(em: f32, scale: f32) -> u32 {
+pub(crate) fn quant_em(em: f32, scale: f32) -> u32 {
     if !em.is_finite() || em <= 0.0 {
         return 0;
     }
@@ -297,7 +293,7 @@ fn quant_em(em: f32, scale: f32) -> u32 {
 
 /// Canonical DIP→px scale — the same 1/1000 grid the shape atlas snaps to, so
 /// the two caches agree about what "the current scale" is.
-fn quant_scale(scale: f32) -> u32 {
+pub(crate) fn quant_scale(scale: f32) -> u32 {
     if !scale.is_finite() || scale <= 0.0 {
         return 1.0f32.to_bits();
     }
@@ -355,107 +351,30 @@ impl GlyphKey {
 /// The face's COM identity. `IDWriteFontFace` is not itself `IUnknown`-canonical
 /// across QI, but every face here comes from the same interface pointer DWrite
 /// handed the run collector, so the raw pointer is stable per face object.
-fn face_id(face: &FontFace) -> usize {
+pub(crate) fn face_id(face: &FontFace) -> usize {
     use windows_core::Interface;
     face.raw().as_raw() as usize
 }
 
 // ── The cache ────────────────────────────────────────────────────────────────
 
-struct GlyphEntry {
-    brush: CompositionSurfaceBrush,
-    /// Identity of this raster — see [`GlyphRaster::id`].
-    id: u64,
-    /// Keeps the pixels alive behind the brush.
-    _surface: CompositionDrawingSurface,
-    /// Keeps the KEYED FACE alive, so its pointer cannot be recycled under us.
-    /// See [`GlyphKey`].
-    _face: FontFace,
-    geom: GlyphBox,
-    /// Logical clock reading of the last bind — the LRU ordering.
-    used: u64,
-}
-
-/// One rasterized glyph, handed back to a caller that will place it.
-#[derive(Clone)]
-pub(crate) struct GlyphRaster {
-    /// The mask. Bind it as a `CompositionMaskBrush`'s MASK, with an FP16 solid
-    /// as the source — never as a sprite brush directly, which would paint the
-    /// mask's own (colourless) pixels.
-    pub brush: CompositionSurfaceBrush,
-    /// Which raster this is, from a counter that only ever increases.
-    ///
-    /// It exists so a caller can answer "is this the mask I already bound?"
-    /// with an integer compare. Comparing the BRUSHES would be the obvious
-    /// spelling, and `CompositionSurfaceBrush` implements `PartialEq` for
-    /// exactly that — but that equality is COM identity, so it costs a
-    /// `QueryInterface` per side, and this question is asked once per glyph on
-    /// every re-place. Two `QueryInterface`s per glyph per sync is precisely
-    /// the per-glyph COM traffic the sprite path exists to avoid.
-    ///
-    /// Being minted rather than derived also removes the ABA hazard a pointer
-    /// identity has to argue its way out of: a number is never recycled, so a
-    /// caller's cached id cannot come to mean a different raster no matter what
-    /// the cache evicted in between.
-    pub id: u64,
-    pub geom: GlyphBox,
-}
-
-/// The seam the rasterizer mints surfaces through.
-///
-/// Exists so the rasterization can be exercised against a windowless
-/// composition device in tests: the shipping implementation is [`Compositing`]
-/// and forwards straight to it, so a test that passes here is a statement about
-/// the real surface path, not about a mock of it.
-pub(crate) trait MaskSurfaces {
-    /// Mint a surface of exactly `px_w`×`px_h` pixels in `format`, and a
-    /// Fill-stretch brush over it.
-    ///
-    /// An unsupported format must surface as `Err` rather than a fallback —
-    /// that failure is the only reliable probe for whether a format is usable
-    /// at all (see `a8_is_a_mintable_mask_surface`).
-    fn mint(
-        &self,
-        px_w: i32,
-        px_h: i32,
-        format: PixelFormat,
-    ) -> windows_core::Result<(CompositionDrawingSurface, CompositionSurfaceBrush)>;
-
-    /// The flag a [`DrawingSession`] reports device loss through.
-    fn device_lost(&self) -> &Cell<bool>;
-}
-
-impl MaskSurfaces for Compositing {
-    fn mint(
-        &self,
-        px_w: i32,
-        px_h: i32,
-        format: PixelFormat,
-    ) -> windows_core::Result<(CompositionDrawingSurface, CompositionSurfaceBrush)> {
-        self.new_surface_with_format(px_w, px_h, format)
-    }
-
-    fn device_lost(&self) -> &Cell<bool> {
-        &self.device_lost
-    }
-}
-
-/// The pixel format every glyph mask is rasterized in. See the module header.
-pub(crate) const MASK_FORMAT: PixelFormat = PixelFormat::Rgba16Float;
-
 /// Rasterized glyph masks, shared across every piece of text.
-#[derive(Default)]
+///
+/// A thin keying over the shared [`MaskCache`]: the LRU, the epoch, the id
+/// minting and the surface-mint seam all live there, once, beside the per-run
+/// [`run_atlas`](super::run_atlas) that keys the same machinery differently.
+/// This module owns only what is glyph-specific — the [`GlyphKey`], the box
+/// arithmetic ([`glyph_box`]) and the one-glyph [`rasterize`].
 pub(crate) struct GlyphAtlas {
-    map: FxHashMap<GlyphKey, GlyphEntry>,
-    /// Bumped on [`clear`](Self::clear); callers re-bind when their bound epoch
-    /// no longer matches.
-    epoch: u32,
-    /// Monotonic bind counter driving the LRU ordering.
-    clock: u64,
-    /// Monotonic raster counter — the source of [`GlyphRaster::id`]. Separate
-    /// from `clock`, which is a RECENCY reading and is overwritten on every
-    /// bind; an identity has to be minted once and never move.
-    next_id: u64,
+    cache: MaskCache<GlyphKey>,
+}
+
+impl Default for GlyphAtlas {
+    fn default() -> Self {
+        Self {
+            cache: MaskCache::new(GLYPH_ATLAS_CAP),
+        }
+    }
 }
 
 impl GlyphAtlas {
@@ -463,18 +382,17 @@ impl GlyphAtlas {
     /// does NOT belong here: the masks carry no colour, so a recolour re-binds
     /// the mask brush's source and leaves every raster valid.
     pub(crate) fn clear(&mut self) {
-        self.map.clear();
-        self.epoch = self.epoch.wrapping_add(1);
+        self.cache.clear();
     }
 
     pub(crate) fn epoch(&self) -> u32 {
-        self.epoch
+        self.cache.epoch()
     }
 
     /// Live entry count — the LRU's population.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.map.len()
+        self.cache.len()
     }
 
     /// Fetch (rasterizing on a miss) the mask for one glyph.
@@ -489,47 +407,10 @@ impl GlyphAtlas {
         em: f32,
         scale: f32,
         phase: u32,
-    ) -> Option<GlyphRaster> {
+    ) -> Option<Raster> {
         let key = GlyphKey::new(face, glyph, em, scale, phase);
-        self.clock += 1;
-        let now = self.clock;
-
-        if !self.map.contains_key(&key) {
-            let (brush, surface, geom) =
-                rasterize(dev, face, glyph, em, scale, phase % SUBPIXEL_PHASES)?;
-            if self.map.len() >= GLYPH_ATLAS_CAP {
-                self.evict_lru();
-            }
-            // Never reset, not even by `clear` — an id that came back would let
-            // a caller's cached one match a raster it has never seen.
-            self.next_id += 1;
-            self.map.insert(
-                key,
-                GlyphEntry {
-                    brush,
-                    id: self.next_id,
-                    _surface: surface,
-                    _face: face.clone(),
-                    geom,
-                    used: now,
-                },
-            );
-        }
-
-        let e = self.map.get_mut(&key)?;
-        e.used = now;
-        Some(GlyphRaster {
-            brush: e.brush.clone(),
-            id: e.id,
-            geom: e.geom,
-        })
-    }
-
-    /// Drop the least recently bound raster. Called only on a miss at capacity.
-    fn evict_lru(&mut self) {
-        if let Some(k) = self.map.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| *k) {
-            self.map.remove(&k);
-        }
+        self.cache
+            .get(key, || rasterize(dev, face, glyph, em, scale, phase % SUBPIXEL_PHASES))
     }
 }
 
@@ -564,7 +445,7 @@ fn rasterize(
     em: f32,
     scale: f32,
     phase: u32,
-) -> Option<(CompositionSurfaceBrush, CompositionDrawingSurface, GlyphBox)> {
+) -> Option<Rasterized> {
     let metrics = face.metrics();
     let gm = *face.design_glyph_metrics(&[glyph], false).ok()?.first()?;
     let geom = glyph_box(metrics, gm, em, scale, phase);
@@ -637,15 +518,27 @@ fn rasterize(
     }
 
     surface.end_draw().ok()?;
-    Some((brush, surface, geom))
+    Some(Rasterized {
+        brush,
+        surface,
+        geom: MaskGeom {
+            size_dip: geom.size_dip,
+            origin_px: geom.origin_px,
+        },
+        // Keep the keyed face alive for the entry's lifetime — see [`GlyphKey`].
+        face: face.clone(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
     use windows_canvas::{GpuDevice, TextFormat, TextLayout};
     use windows_composition::{
-        AlphaMode, CompositionGraphicsDevice, Compositor, DispatcherQueueController, Stretch,
+        AlphaMode, CompositionDrawingSurface, CompositionGraphicsDevice, CompositionSurfaceBrush,
+        Compositor, DispatcherQueueController, PixelFormat, Stretch,
     };
 
     // ── Pure geometry ────────────────────────────────────────────────────────

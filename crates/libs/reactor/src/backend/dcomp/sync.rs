@@ -32,7 +32,7 @@ fn is_shape(kind: ControlKind) -> bool {
 pub(crate) fn sync_tree(
     comp: &Compositing,
     atlas: &mut parts::Atlas,
-    glyphs: &mut glyph_atlas::GlyphAtlas,
+    glyphs: &mut glyph_text::Atlases,
     arena: &mut Arena,
     root: ControlId,
     scale: f32,
@@ -45,7 +45,7 @@ pub(crate) fn sync_tree(
 fn sync_node(
     comp: &Compositing,
     atlas: &mut parts::Atlas,
-    glyphs: &mut glyph_atlas::GlyphAtlas,
+    glyphs: &mut glyph_text::Atlases,
     arena: &mut Arena,
     id: ControlId,
     scale: f32,

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::animate;
 use super::bootstrap::{Compositing, NodeSurface};
-use super::glyph_atlas::GlyphAtlas;
+use super::glyph_text::Atlases;
 use super::glyph_text::{Align, Pen, PopupText};
 use super::node::{linear, MenuRow};
 use super::theme;
@@ -285,7 +285,7 @@ impl Popup {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         comp: &Compositing,
-        glyphs: &mut GlyphAtlas,
+        glyphs: &mut Atlases,
         owner: ControlId,
         body: PopupBody,
         anchor: Rect,
@@ -359,7 +359,7 @@ impl Popup {
     /// keystroke; the backing surface is rebuilt only when the row count (and
     /// thus the panel height) changes — the fresh visual mounts at rest
     /// (opacity 1, scale 1).
-    pub fn update_items(&mut self, comp: &Compositing, glyphs: &mut GlyphAtlas, items: Vec<MenuRow>) {
+    pub fn update_items(&mut self, comp: &Compositing, glyphs: &mut Atlases, items: Vec<MenuRow>) {
         let resized = items.len() != self.body.rows().len();
         self.body = PopupBody::Menu(items);
         if self.hovered != usize::MAX && self.hovered >= self.body.rows().len() {
@@ -527,7 +527,7 @@ impl Popup {
     }
 
     /// Move the highlight by `delta`, skipping separators/disabled rows.
-    pub fn move_highlight(&mut self, delta: i32, comp: &Compositing, glyphs: &mut GlyphAtlas) {
+    pub fn move_highlight(&mut self, delta: i32, comp: &Compositing, glyphs: &mut Atlases) {
         let n = self.body.rows().len() as i32;
         if n == 0 {
             return;
@@ -555,7 +555,7 @@ impl Popup {
     }
 
     /// Set the highlighted row (pointer hover) and repaint if it changed.
-    pub fn set_hovered(&mut self, idx: Option<usize>, comp: &Compositing, glyphs: &mut GlyphAtlas) {
+    pub fn set_hovered(&mut self, idx: Option<usize>, comp: &Compositing, glyphs: &mut Atlases) {
         let new = idx.unwrap_or(usize::MAX);
         if new != self.hovered {
             self.hovered = new;
@@ -569,7 +569,7 @@ impl Popup {
     /// The atlas is threaded in rather than reached for because a popup owns no
     /// backend handle — it is held BY the backend, beside the atlas, so the two
     /// arrive together from every call site.
-    fn draw(&mut self, comp: &Compositing, glyphs: &mut GlyphAtlas) {
+    fn draw(&mut self, comp: &Compositing, glyphs: &mut Atlases) {
         self.paint_surface(comp);
         self.sync_text(comp, glyphs);
     }
@@ -704,7 +704,7 @@ impl Popup {
     ///
     /// `dim` is `1.0`: a popup is never disabled as a whole, and a disabled ROW
     /// carries its own greyed ink through [`fg`].
-    fn sync_text(&mut self, comp: &Compositing, glyphs: &mut GlyphAtlas) {
+    fn sync_text(&mut self, comp: &Compositing, glyphs: &mut Atlases) {
         // Split the borrow by field: the body is read while the text beside it
         // is written, and both live on `self`.
         let Self { body, text, container, panel, px, .. } = self;
