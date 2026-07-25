@@ -608,6 +608,15 @@ impl PathLayer {
         // not a re-tessellation of every curve in the tree.
         size_mask(&self.mask_shape, &self.visual_surface, &[&self.shape], w, h, scale);
         // The display sprite stays in DIPs — it IS under the root scale.
+        //
+        // And it stays EXPLICITLY sized. `Visual::fill_parent` would express the
+        // same box in one declaration and survive a resize for free, but only the
+        // sprite can take it: the mask above is an off-tree capture whose extent
+        // is physical and whose source visual has no parent to measure against.
+        // Relative-sizing the sprite alone would leave the two reading different
+        // boxes for a frame whenever they disagree — and they do disagree, since
+        // a live trace's extent arrives from a producer thread (`TraceLayout`)
+        // rather than from the layout pass. One box, one write, both stages.
         self.display.set_size(w, h);
         // A single-hue ramp is `MappingMode::Relative` and follows the sprite by
         // itself; a multi-hue staircase is a real visual tree and takes the
@@ -1043,7 +1052,8 @@ impl GlowLayer {
         // stroke surface), so it takes the extent but no scale of its own.
         self.halo_sprite.set_size(phys.x, phys.y);
         self.halo_surface.set_source_size(phys);
-        // The display sprite stays in DIPs — it IS under the root scale.
+        // In DIPs, and explicitly sized for the same reason as
+        // [`PathLayer::resize`]: it is paired with a capture that cannot be.
         self.display.set_size(w, h);
         // A multi-hue ramp source is a real visual tree measured against this
         // extent; a single-hue one is `MappingMode::Relative` and ignores it.

@@ -63,7 +63,7 @@ use windows_canvas::{
 use windows_composition::{
     CompositionDrawingSurface, CompositionSurfaceBrush, ContainerVisual, SpriteVisual,
 };
-use windows_numerics::Vector3;
+use windows_numerics::{Vector2, Vector3};
 
 // ── The spec: plain data the app hands over ─────────────────────────────────
 
@@ -169,19 +169,26 @@ fn smootherstep(t: f32) -> f32 {
     t * t * t * (t * (6.0 * t - 15.0) + 10.0)
 }
 
-/// The ellipse a glow occupies, in DIPs: `(offset_x, offset_y, width, height)`.
+/// The ellipse a glow occupies, as FRACTIONS of the window:
+/// `(offset_x, offset_y, width, height)`, each to be multiplied by the window's
+/// width or height.
 ///
 /// CSS's default ending shape is `farthest-corner`: the ellipse passes through
 /// the box corner farthest from the centre while keeping the aspect ratio of the
 /// farthest horizontal/vertical edge distances, so for centre `(cx, cy)` with
 /// farthest-edge distances `(fx, fy)` the radii are `(fx*sqrt2, fy*sqrt2)`. The
 /// `transparent stop%` then scales that ray.
-fn glow_rect(dip: (f32, f32), center: (f32, f32), stop: f32) -> (f32, f32, f32, f32) {
-    let (w, h) = dip;
-    let (cx, cy) = (center.0 * w, center.1 * h);
-    let rx = stop * cx.max(w - cx) * std::f32::consts::SQRT_2;
-    let ry = stop * cy.max(h - cy) * std::f32::consts::SQRT_2;
-    (cx - rx, cy - ry, 2.0 * rx, 2.0 * ry)
+///
+/// Every term of that carries exactly one factor of the window extent —
+/// `cx = c·w` and `rx = stop·√2·max(c, 1-c)·w` — so the whole rectangle divides
+/// through by `(w, h)` and what is left depends only on the glow's own spec.
+/// That is why placement can be stated ONCE as a relative size and offset and
+/// never revisited: a resize changes `w` and `h`, and the compositor multiplies.
+fn glow_frac(center: (f32, f32), stop: f32) -> (f32, f32, f32, f32) {
+    // Half-extent of the ellipse along each axis, as a fraction of that axis.
+    let half = |c: f32| stop * c.max(1.0 - c) * std::f32::consts::SQRT_2;
+    let (ax, ay) = (half(center.0), half(center.1));
+    (center.0 - ax, center.1 - ay, 2.0 * ax, 2.0 * ay)
 }
 
 /// `v' = (v - a*m) / (1 - a)` — see the module note. With no dither layer this
@@ -351,22 +358,24 @@ fn start_drift(sprite: &SpriteVisual, base: (f32, f32), d: GlowDrift) {
 
 /// One glow, split across TWO visuals on purpose.
 ///
-/// `host_visual` carries the layer's PLACEMENT (which depends on the window size)
-/// and the sprite carries its MOTION (which does not). A resize therefore only moves
-/// the host, leaving the drift animation on the sprite untouched and running.
+/// The host carries the layer's PLACEMENT (which scales with the window) and the
+/// sprite carries its MOTION (which does not). Both are declared once at build
+/// time — placement as a relative offset and size, so the compositor re-derives
+/// it from the window's own extent — and neither is written again.
 ///
-/// Folding both into one visual is what a resize cannot survive: the animation
-/// owns `Offset`, so re-placing means stopping it, writing the new anchor and
-/// starting a fresh animation — which restarts the path at phase 0. Every
-/// `WM_SIZE` in a drag would snap the glow back to the start of its loop.
+/// Folding both into one visual is what the drift cannot survive: the animation
+/// owns `Offset`, so placing on that same visual would mean stopping it, writing
+/// the new anchor and starting a fresh animation — restarting the path at phase
+/// 0. The split keeps placement and motion on different visuals, and expressing
+/// placement relatively then removes the resize write entirely, so a `WM_SIZE`
+/// storm during a drag touches neither.
 struct Glow {
-    /// Carries the layer's PLACEMENT.
+    /// Carries the layer's PLACEMENT, as fractions of the window — and is
+    /// therefore the sprite's own size anchor. Read once more at teardown.
     host: ContainerVisual,
-    /// Carries its MOTION — and its size, which is placement expressed on the
-    /// one property the drift animation does not own.
-    sprite: SpriteVisual,
-    center: (f32, f32),
-    stop: f32,
+    /// Carries its MOTION. Held only to keep the drift's target alive; its size
+    /// and offset are both stated at build time.
+    _sprite: SpriteVisual,
     _surface: CompositionDrawingSurface,
     _brush: CompositionSurfaceBrush,
 }
@@ -419,7 +428,10 @@ impl Backdrop {
         let (base_surface, base_brush) = paint_base(comp, base_color)?;
         let base_sprite = comp.new_sprite();
         base_sprite.set_brush(&base_brush);
-        base_sprite.set_size(dip.0, dip.1);
+        // A tiny surface stretched over the whole window — so say "the whole
+        // window" once, against the backdrop band, rather than re-stating the
+        // window's size here on every resize.
+        base_sprite.fill_parent();
         comp.attach_backdrop_visual(&base_sprite);
 
         // ── glows ──
@@ -435,8 +447,19 @@ impl Backdrop {
             let host = comp.new_container();
             host.children().insert_at_top(&sprite);
             comp.attach_backdrop_visual(&host);
-            // Motion is anchored at the host's origin and started ONCE. Placement
-            // moves the host underneath it, so the path is never interrupted.
+            // ── Placement, stated once ──
+            // The host carries the ellipse's box as pure fractions of the window
+            // (see `glow_frac`), which makes it a size anchor in its own right;
+            // the sprite then fills it. A resize multiplies both by the new
+            // extent inside the compositor, so this layer has no resize path at
+            // all — which is also what protects the drift below, since re-placing
+            // a running animation's target would have meant stopping it.
+            let (fx, fy, fw, fh) = glow_frac(g.center, g.stop);
+            host.set_relative_offset_adjustment(Vector3::new(fx, fy, 0.0));
+            host.set_relative_size_adjustment(Vector2::new(fw, fh));
+            sprite.fill_parent();
+            // Motion is anchored at the host's origin and started ONCE. The host
+            // carries placement underneath it, so the path is never interrupted.
             match g.drift {
                 Some(d) => start_drift(&sprite, (0.0, 0.0), d),
                 // A pinned layer sits at its host's origin and stays there.
@@ -444,9 +467,7 @@ impl Backdrop {
             }
             glows.push(Glow {
                 host,
-                sprite,
-                center: g.center,
-                stop: g.stop,
+                _sprite: sprite,
                 _surface: surface,
                 _brush: brush,
             });
@@ -483,27 +504,23 @@ impl Backdrop {
             _base_surface: base_surface,
             _base_brush: base_brush,
         };
-        out.place(dip, scale);
+        out.place(scale);
         Some(out)
     }
 
-    /// Size and position every layer for the current window.
+    /// Re-place what the window's SIZE cannot carry.
     ///
-    /// This is the WHOLE cost of a resize: a handful of visual property writes,
-    /// no repaint and no animation restart anywhere. Everything that depends on
-    /// pixels — the glow blobs, the grain — is either resolution-independent or
-    /// over-allocated, precisely so this stays free.
-    pub(crate) fn place(&self, dip: (f32, f32), scale: f32) {
-        self.base.set_size(dip.0, dip.1);
-
-        for g in &self.glows {
-            let (x, y, w, h) = glow_rect(dip, g.center, g.stop);
-            // Size the sprite, move the HOST. The sprite's own offset belongs to
-            // its drift animation and is never written here.
-            g.sprite.set_size(w.max(1.0), h.max(1.0));
-            g.host.set_offset(x, y, 0.0);
-        }
-
+    /// The base and the glows are stated as fractions of the window at build
+    /// time, so a resize re-derives them inside the compositor and this function
+    /// does not touch them — a `WM_SIZE` storm during a drag costs zero writes
+    /// for every layer but one.
+    ///
+    /// The grain is the exception, and not by omission: it is sized to the
+    /// MONITOR in physical pixels so that one texel lands on one physical pixel,
+    /// which is a ratio against `scale`, not against the window. It therefore
+    /// changes on a DPI change and on nothing else — a resize at constant DPI
+    /// writes the same value back.
+    pub(crate) fn place(&self, scale: f32) {
         if let Some(d) = &self.dither {
             // Presented at the surface's own pixel size (converted to DIPs,
             // since the root applies the DPI scale), so texels stay 1:1 with
@@ -523,5 +540,71 @@ impl Backdrop {
             comp.remove_backdrop_visual(&g.host);
         }
         comp.remove_backdrop_visual(&self.base);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glow_frac;
+
+    /// The absolute ellipse, computed the way it was before placement became
+    /// relative: everything in DIPs, from the window's own extent.
+    fn absolute(dip: (f32, f32), center: (f32, f32), stop: f32) -> (f32, f32, f32, f32) {
+        let (w, h) = dip;
+        let (cx, cy) = (center.0 * w, center.1 * h);
+        let rx = stop * cx.max(w - cx) * std::f32::consts::SQRT_2;
+        let ry = stop * cy.max(h - cy) * std::f32::consts::SQRT_2;
+        (cx - rx, cy - ry, 2.0 * rx, 2.0 * ry)
+    }
+
+    /// The compositor multiplies the fractions by the parent's extent, so the
+    /// contract is that doing the same by hand reproduces the absolute rect.
+    ///
+    /// Compared with a tolerance rather than bit-exactly on purpose: factoring
+    /// the extent out of `stop * (c*w).max(w - c*w) * √2` into
+    /// `w * (stop * max(c, 1-c) * √2)` reassociates the multiply, which is a
+    /// legal ULP's worth of difference and not a behavioural one.
+    #[test]
+    fn fractions_scale_back_to_the_absolute_rect() {
+        let dips = [(1280.0, 800.0), (1750.0, 640.0), (320.0, 1200.0), (1.0, 1.0)];
+        let centers = [(0.0, 0.0), (0.5, 0.5), (1.0, 1.0), (0.15, 0.85), (0.72, 0.31)];
+        let stops = [0.05, 0.5, 1.0, 1.6];
+
+        for dip in dips {
+            for center in centers {
+                for stop in stops {
+                    let (fx, fy, fw, fh) = glow_frac(center, stop);
+                    let got = (fx * dip.0, fy * dip.1, fw * dip.0, fh * dip.1);
+                    let want = absolute(dip, center, stop);
+                    // Relative to the extent: these are DIP lengths, so a fixed
+                    // epsilon would be far too strict at 1750 and far too loose at 1.
+                    let tol = dip.0.max(dip.1) * 1e-6;
+                    for (g, w) in [
+                        (got.0, want.0),
+                        (got.1, want.1),
+                        (got.2, want.2),
+                        (got.3, want.3),
+                    ] {
+                        assert!(
+                            (g - w).abs() <= tol,
+                            "dip {dip:?} center {center:?} stop {stop}: got {g} want {w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A glow's box must not depend on the window at all — that independence is
+    /// the whole reason placement can be declared once and never revisited.
+    #[test]
+    fn fractions_are_independent_of_the_window() {
+        assert_eq!(glow_frac((0.3, 0.7), 0.8), glow_frac((0.3, 0.7), 0.8));
+        // A centred, full-stop glow reaches √2 times the half-extent each way,
+        // i.e. it overhangs the box — which is what `farthest-corner` means.
+        let (fx, fy, fw, fh) = glow_frac((0.5, 0.5), 1.0);
+        let half = 0.5 * std::f32::consts::SQRT_2;
+        assert!((fw - 2.0 * half).abs() < 1e-6 && (fh - 2.0 * half).abs() < 1e-6);
+        assert!((fx - (0.5 - half)).abs() < 1e-6 && (fy - (0.5 - half)).abs() < 1e-6);
     }
 }

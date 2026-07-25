@@ -79,7 +79,11 @@ pub(crate) struct Compositing {
     /// The scaled root: a `set_scale(dpi/96)` makes every descendant work in DIPs.
     root: ContainerVisual,
     /// Opaque window background, kept at the bottom of the root (in DIPs).
-    bg: SpriteVisual,
+    ///
+    /// Held, never read: it fills the root by declaration, so a resize does not
+    /// touch it, and a recolour goes through `bg_brush`. The root's children
+    /// keep it alive; this field just keeps it findable.
+    _bg: SpriteVisual,
     bg_brush: CompositionColorBrush,
     /// The band the backdrop's layers live in — above `bg`, below the reactor
     /// tree, rooted once so a rebuild cannot disturb z-order.
@@ -144,6 +148,13 @@ impl Compositing {
         let dip_size = (pixel_w.max(1) as f32 / scale, pixel_h.max(1) as f32 / scale);
         // The whole tree is authored in DIPs; one root scale rasterizes to pixels.
         root.set_scale(Vector3::new(scale, scale, 1.0));
+        // The root is the window's size ANCHOR. A `ContainerVisual`'s size does
+        // not clip and does not draw, so this exists for exactly one reason:
+        // every full-window layer below states its extent as a FRACTION of this
+        // one (`Visual::fill_parent`), and an unsized anchor resolves all of
+        // them to nothing. Written here and in `set_scale_and_pixels`, and
+        // nowhere else — it is the single value a resize has to push.
+        root.set_size(dip_size.0, dip_size.1);
 
         // Opaque window background (bottom-most visual), sized in DIPs. It sits
         // behind the app's own opaque full-window backdrop, so it needs no display
@@ -151,7 +162,9 @@ impl Compositing {
         let bg = compositor.create_sprite_visual();
         let bg_brush = compositor.create_color_brush(WINDOW_BG);
         bg.set_brush(&bg_brush);
-        bg.set_size(dip_size.0, dip_size.1);
+        // Declared once against the root, never written again — see the anchor
+        // note above.
+        bg.fill_parent();
         root.children().insert_at_top(&bg);
 
         // The backdrop's own band, rooted ONCE directly above the window
@@ -160,6 +173,11 @@ impl Compositing {
         // above the reactor tree the way a fresh `insert_at_top` on the root
         // would once content is attached.
         let backdrop_host = compositor.create_container_visual();
+        // Itself an anchor: the backdrop's layers place themselves as fractions
+        // of the window, so this band has to CARRY the window's size rather than
+        // merely contain things that have it. Relative to the root, so the whole
+        // chain — root → band → glow host → glow sprite — follows one write.
+        backdrop_host.fill_parent();
         root.children().insert_at_top(&backdrop_host);
 
         let mut this = Self {
@@ -168,7 +186,7 @@ impl Compositing {
             compositor,
             graphics,
             root,
-            bg,
+            _bg: bg,
             bg_brush,
             backdrop_host,
             hwnd,
@@ -267,11 +285,15 @@ impl Compositing {
         );
         self.root
             .set_scale(Vector3::new(self.scale, self.scale, 1.0));
-        self.bg.set_size(self.dip_size.0, self.dip_size.1);
-        // Cheap by construction: a few visual property writes, no repaint and no
-        // animation restart — see `Backdrop::place`.
+        // ONE size write for the whole window. The background, the backdrop band
+        // and every layer inside it are fractions of the root (see its anchor
+        // note), so they follow this without being touched.
+        self.root.set_size(self.dip_size.0, self.dip_size.1);
+        // Only the grain is left to re-place, and only because it is sized to the
+        // MONITOR in physical pixels rather than to the window — see
+        // `Backdrop::place`. Nothing here repaints or restarts an animation.
         if let Some(b) = &self.backdrop {
-            b.place(self.dip_size, self.scale);
+            b.place(self.scale);
         }
     }
 
