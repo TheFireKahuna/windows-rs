@@ -64,6 +64,26 @@ pub(crate) struct TreeCensus {
     pub max_depth: usize,
     /// The largest single child collection encountered.
     pub widest: usize,
+    /// Visuals that are in the tree but draw nothing — themselves invisible or
+    /// fully transparent, or somewhere beneath one that is.
+    ///
+    /// This is the whole of the pruning opportunity, and the reason to measure
+    /// it rather than assume it. Detaching a subtree, or clearing `IsVisible` on
+    /// its root, can only save the compositor work it is currently doing; a
+    /// visual already outside the tree costs nothing to walk and a hidden
+    /// subtree of one is not worth restructuring for. If this is near zero there
+    /// is nothing here to win, whatever the total says.
+    pub under_hidden: usize,
+    /// Of those, the ones whose own root is the hidden visual — the subtrees a
+    /// single property write could take out.
+    pub hidden_roots: usize,
+    /// How those roots hide, which decides what can be done about them. A
+    /// visual held at zero opacity is the platform's documented anti-pattern and
+    /// wants removing from the tree; one already invisible has taken the only
+    /// step the API offers and still costs a walk, so the lever there is not to
+    /// have the visual at all.
+    pub hidden_by_visibility: usize,
+    pub hidden_by_opacity: usize,
     /// Collections that refused enumeration. Non-zero means the walk is a lower
     /// bound rather than a count, and the rest of the numbers must be read that
     /// way.
@@ -75,12 +95,23 @@ impl TreeCensus {
     /// reference, not content.
     pub(crate) fn walk(root: &Visual) -> Self {
         let mut out = Self::default();
-        descend(root, 0, &mut out);
+        descend(root, 0, false, &mut out);
         out
     }
 }
 
-fn descend(visual: &Visual, depth: usize, out: &mut TreeCensus) {
+/// Whether this visual contributes nothing to the image.
+///
+/// Composition properties are write-only in principle — a getter can be stale
+/// the moment it returns, and reading one is not free — but for a value the app
+/// itself last wrote, on an on-demand diagnostic walk, both caveats are
+/// affordable. Two reads per visual over a few hundred visuals, once, is not a
+/// per-frame cost.
+fn draws_nothing(visual: &Visual) -> bool {
+    !visual.is_visible() || visual.opacity() <= 0.0
+}
+
+fn descend(visual: &Visual, depth: usize, hidden: bool, out: &mut TreeCensus) {
     let Some(container) = visual.as_container() else {
         out.leaves += 1;
         return;
@@ -95,7 +126,26 @@ fn descend(visual: &Visual, depth: usize, out: &mut TreeCensus) {
         count += 1;
         out.visuals += 1;
         out.max_depth = out.max_depth.max(depth + 1);
-        descend(&child, depth + 1, out);
+        // A hidden visual's descendants are hidden too, so the flag only ever
+        // turns on: it is the subtree that is prunable, not the one node.
+        let invisible = !child.is_visible();
+        let transparent = child.opacity() <= 0.0;
+        let child_hidden = hidden || invisible || transparent;
+        if child_hidden {
+            out.under_hidden += 1;
+            if !hidden {
+                out.hidden_roots += 1;
+                // Visibility first: a visual that is both is already pruned as
+                // far as the API allows, and counting it as an opacity hide
+                // would overstate what removing it from the tree could win.
+                if invisible {
+                    out.hidden_by_visibility += 1;
+                } else {
+                    out.hidden_by_opacity += 1;
+                }
+            }
+        }
+        descend(&child, depth + 1, child_hidden, out);
     }
     if count == 0 {
         out.leaves += 1;
@@ -207,6 +257,18 @@ fn render(comp: &Compositing, arena: &Arena, attached: Option<ControlId>) -> Str
         s,
         "                   depth   {:>7}  widest   {:>6}  unwalkable {:>3}",
         tree.max_depth, tree.widest, tree.unwalkable,
+    );
+    let _ = writeln!(
+        s,
+        "                   hidden  {:>7}  roots    {:>6}  drawn  {:>7}",
+        tree.under_hidden,
+        tree.hidden_roots,
+        tree.visuals.saturating_sub(tree.under_hidden),
+    );
+    let _ = writeln!(
+        s,
+        "                   by IsVisible {:>4}  by opacity {:>4}",
+        tree.hidden_by_visibility, tree.hidden_by_opacity,
     );
     let _ = writeln!(
         s,
