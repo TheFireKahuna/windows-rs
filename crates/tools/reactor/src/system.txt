@@ -51,6 +51,14 @@ Windows::Graphics::Display::AdvancedColorInfo::{CurrentAdvancedColorKind, RedPri
 Windows::Graphics::Display::AdvancedColorKind
 Windows::Foundation::Point
 extras::IDisplayInformationStaticsInterop
+// ── User interface preferences (Settings → Accessibility → Visual effects) ──
+// One activated instance behind three properties. Each has its own change
+// signal, measured rather than assumed (see `motion.rs`): AnimationsEnabled
+// rides WM_SETTINGCHANGE, AdvancedEffectsEnabled rides its own WinRT event —
+// hence `AdvancedEffectsEnabledChanged` here, and no subscription to the other
+// two. `::CreateInstance` marks the class activatable so `UISettings::new()` is
+// emitted; the rest are member-scoped.
+Windows::UI::ViewManagement::UISettings::{CreateInstance, AnimationsEnabled, AdvancedEffectsEnabled, AdvancedEffectsEnabledChanged, AutoHideScrollBars}
 // ── Animation parameters / keyframes ──
 // ── Desktop window target (composition on an HWND) ──
 // ── DispatcherQueue (required to create a system Compositor on a thread) ──
@@ -114,10 +122,8 @@ Windows::Win32::MINMAXINFO
 Windows::Win32::LoadCursorW
 Windows::Win32::SetCursor
 Windows::Win32::GetCaretBlinkTime
-Windows::Win32::SPI_GETCARETWIDTH
-// ── Motion preference (Accessibility → Visual effects → Animation effects) ──
 Windows::Win32::SystemParametersInfoW
-Windows::Win32::SPI_GETCLIENTAREAANIMATION
+Windows::Win32::SPI_GETCARETWIDTH
 // ── Frame pacer: DWM compositor-clock wait (vsync-paced canvas frame ticks) ──
 Windows::Win32::DCompositionWaitForCompositorClock
 Windows::Win32::WAIT_FAILED

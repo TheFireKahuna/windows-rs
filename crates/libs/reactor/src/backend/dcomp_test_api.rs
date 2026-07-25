@@ -1071,7 +1071,7 @@ impl ArenaHarness {
 
     /// Override the cached system motion preference.
     ///
-    /// The shipping value comes from `SPI_GETCLIENTAREAANIMATION`, which a test
+    /// The shipping value comes from `UISettings.AnimationsEnabled`, which a test
     /// must not depend on — it is whatever the developer's machine happens to
     /// be set to. Restore it when the test is done; it is process-global.
     pub fn set_reduced_motion(&self, reduced: bool) {

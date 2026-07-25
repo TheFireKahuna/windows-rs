@@ -5549,6 +5549,133 @@ impl IToggleProvider_Vtbl {
 }
 impl windows_core::RuntimeName for IToggleProvider {}
 windows_core::imp::define_interface!(
+    IUISettings,
+    IUISettings_Vtbl,
+    0x85361600_1c63_4627_bcb1_3a89e0bc9c55
+);
+impl windows_core::RuntimeType for IUISettings {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl IUISettings {
+    pub(crate) fn AnimationsEnabled(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).AnimationsEnabled)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct IUISettings_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    HandPreference: usize,
+    CursorSize: usize,
+    ScrollBarSize: usize,
+    ScrollBarArrowSize: usize,
+    ScrollBarThumbBoxSize: usize,
+    MessageDuration: usize,
+    pub AnimationsEnabled:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IUISettings4,
+    IUISettings4_Vtbl,
+    0x52bb3002_919b_4d6b_9b78_8dd66ff4b93b
+);
+impl windows_core::RuntimeType for IUISettings4 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl IUISettings4 {
+    pub(crate) fn AdvancedEffectsEnabled(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).AdvancedEffectsEnabled)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn AdvancedEffectsEnabledChanged<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(windows_core::Ref<UISettings>, windows_core::Ref<windows_core::IInspectable>)
+            + 'static,
+    {
+        let handler: TypedEventHandler<UISettings, windows_core::IInspectable> = {
+            let com = windows_core::imp::DelegateBox::<
+                TypedEventHandler<UISettings, windows_core::IInspectable>,
+                F,
+            >::new(
+                &TypedEventHandlerBox::<UISettings, windows_core::IInspectable, F>::VTABLE,
+                handler,
+            );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).AdvancedEffectsEnabledChanged)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemoveAdvancedEffectsEnabledChanged,
+            ))
+        }
+    }
+}
+#[repr(C)]
+pub struct IUISettings4_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub AdvancedEffectsEnabled:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+    pub AdvancedEffectsEnabledChanged: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveAdvancedEffectsEnabledChanged:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IUISettings5,
+    IUISettings5_Vtbl,
+    0x5349d588_0cb5_5f05_bd34_706b3231f0bd
+);
+impl windows_core::RuntimeType for IUISettings5 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl IUISettings5 {
+    pub(crate) fn AutoHideScrollBars(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).AutoHideScrollBars)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct IUISettings5_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub AutoHideScrollBars:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     IValueProvider,
     IValueProvider_Vtbl,
     0xc7935180_6fb3_4201_b174_7df73adbf64a
@@ -5859,7 +5986,6 @@ pub const SIZE_MINIMIZED: u32 = 1;
 pub const SM_CXPADDEDBORDER: u32 = 92;
 pub const SM_CYFRAME: u32 = 33;
 pub const SPI_GETCARETWIDTH: u32 = 8198;
-pub const SPI_GETCLIENTAREAANIMATION: u32 = 4162;
 pub const SWP_NOACTIVATE: u32 = 16;
 pub const SWP_NOSIZE: u32 = 1;
 pub const SWP_NOZORDER: u32 = 4;
@@ -6196,6 +6322,50 @@ pub const UIA_TogglePatternId: i32 = 10015;
 pub const UIA_ToggleToggleStatePropertyId: i32 = 30086;
 pub const UIA_ValuePatternId: i32 = 10002;
 pub const UIA_ValueValuePropertyId: i32 = 30045;
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UISettings(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    UISettings,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl UISettings {
+    pub(crate) fn new() -> windows_core::Result<Self> {
+        Self::IActivationFactory(|f| f.ActivateInstance::<Self>())
+    }
+    fn IActivationFactory<
+        R,
+        F: FnOnce(&windows_core::imp::IGenericFactory) -> windows_core::Result<R>,
+    >(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<
+            UISettings,
+            windows_core::imp::IGenericFactory,
+        > = windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
+impl windows_core::RuntimeType for UISettings {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IUISettings>();
+}
+unsafe impl windows_core::Interface for UISettings {
+    type Vtable = <IUISettings as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IUISettings as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for UISettings {
+    type Target = IUISettings;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for UISettings {
+    const NAME: &'static str = "Windows.UI.ViewManagement.UISettings";
+}
+unsafe impl Send for UISettings {}
+unsafe impl Sync for UISettings {}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UiaPoint {

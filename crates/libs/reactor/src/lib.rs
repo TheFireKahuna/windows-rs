@@ -69,7 +69,7 @@ mod widgets;
 pub use app::*;
 pub use backend::*;
 pub use gesture::{ActionSlot, GestureEvent, GestureInterest, GestureOutcome};
-pub use motion::reduced_motion;
+pub use motion::{advanced_effects_enabled, auto_hide_scroll_bars, reduced_motion};
 // The composition-object and property-write counters, re-exported so a consumer
 // can read them without taking a direct dependency on the composition crate —
 // they pair with `composition_census`, which prints them alongside a walk of the

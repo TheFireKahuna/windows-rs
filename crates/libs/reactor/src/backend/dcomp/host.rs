@@ -319,9 +319,12 @@ impl DCompHost {
         // Record the UI thread so UIA provider calls can detect the in-thread
         // fast path versus needing to marshal (see `marshal_to_ui`).
         UI_THREAD_ID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
-        // Seed the motion preference before anything can animate, so the very
-        // first enter transition already honours it.
+        // Seed the visual-effects preferences before anything can animate, so
+        // the very first enter transition already honours them. Seeding
+        // transparency also installs its change subscription.
         crate::motion::refresh_reduced_motion();
+        crate::motion::refresh_advanced_effects_enabled();
+        crate::motion::refresh_auto_hide_scroll_bars();
         // The same, for the caret thickness: a field can be focused on the
         // first frame, and it should be the user's width from the start.
         editor::refresh_caret_width();
@@ -1315,6 +1318,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             {
                 s.backend.borrow_mut().refresh_motion();
             }
+            // The scroll-bar preference has no change signal of its own, so
+            // this message is the only thing that refreshes it; nothing rebuilds
+            // on it yet, so the change-only answer is discarded. The
+            // transparency preference is NOT refreshed here — it is the one that
+            // does have a WinRT event, which maintains its cache directly.
+            crate::motion::refresh_auto_hide_scroll_bars();
             0
         }
 
