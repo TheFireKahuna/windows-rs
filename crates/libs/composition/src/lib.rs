@@ -115,8 +115,8 @@ pub use stack::DispatcherQueueController;
 #[cfg(feature = "system")]
 pub use surface::{
     AlphaMode, CompositionDrawHandle, CompositionDrawingSurface, CompositionGraphicsDevice,
-    CompositionSurface, CompositionSurfaceBrush, CompositionVisualSurface, PixelFormat, Stretch,
-    Surface,
+    CompositionSurface, CompositionSurfaceBrush, CompositionVirtualDrawingSurface,
+    CompositionVisualSurface, PixelFormat, Stretch, Surface,
 };
 #[cfg(feature = "system")]
 pub use target::DesktopWindowTarget;

@@ -1139,6 +1139,40 @@ unsafe impl Send for CompositionTarget {}
 unsafe impl Sync for CompositionTarget {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionVirtualDrawingSurface(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionVirtualDrawingSurface,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    CompositionVirtualDrawingSurface,
+    ICompositionSurface,
+    CompositionDrawingSurface,
+    CompositionObject
+);
+impl windows_core::RuntimeType for CompositionVirtualDrawingSurface {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionVirtualDrawingSurface>();
+}
+unsafe impl windows_core::Interface for CompositionVirtualDrawingSurface {
+    type Vtable = <ICompositionVirtualDrawingSurface as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICompositionVirtualDrawingSurface as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionVirtualDrawingSurface {
+    type Target = ICompositionVirtualDrawingSurface;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionVirtualDrawingSurface {
+    const NAME: &'static str = "Windows.UI.Composition.CompositionVirtualDrawingSurface";
+}
+unsafe impl Send for CompositionVirtualDrawingSurface {}
+unsafe impl Sync for CompositionVirtualDrawingSurface {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionVisualSurface(windows_core::IUnknown);
 windows_core::imp::interface_hierarchy!(
     CompositionVisualSurface,
@@ -2135,11 +2169,36 @@ impl ICompositionGraphicsDevice2 {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn CreateVirtualDrawingSurface(
+        &self,
+        sizepixels: SizeInt32,
+        pixelformat: DirectXPixelFormat,
+        alphamode: DirectXAlphaMode,
+    ) -> windows_core::Result<CompositionVirtualDrawingSurface> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateVirtualDrawingSurface)(
+                windows_core::Interface::as_raw(self),
+                sizepixels,
+                pixelformat,
+                alphamode,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
 }
 #[repr(C)]
 pub struct ICompositionGraphicsDevice2_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
     pub CreateDrawingSurface2: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        SizeInt32,
+        DirectXPixelFormat,
+        DirectXAlphaMode,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub CreateVirtualDrawingSurface: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         SizeInt32,
         DirectXPixelFormat,
@@ -3107,9 +3166,27 @@ impl windows_core::RuntimeType for ICompositionSurfaceBrush {
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
 impl ICompositionSurfaceBrush {
+    pub(crate) fn SetHorizontalAlignmentRatio(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetHorizontalAlignmentRatio)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
     pub(crate) fn SetStretch(&self, value: CompositionStretch) -> windows_core::Result<()> {
         unsafe {
             (windows_core::Interface::vtable(self).SetStretch)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetVerticalAlignmentRatio(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetVerticalAlignmentRatio)(
                 windows_core::Interface::as_raw(self),
                 value,
             )
@@ -3123,11 +3200,68 @@ pub struct ICompositionSurfaceBrush_Vtbl {
     BitmapInterpolationMode: usize,
     SetBitmapInterpolationMode: usize,
     HorizontalAlignmentRatio: usize,
-    SetHorizontalAlignmentRatio: usize,
+    pub SetHorizontalAlignmentRatio:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
     Stretch: usize,
     pub SetStretch: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         CompositionStretch,
+    ) -> windows_core::HRESULT,
+    Surface: usize,
+    SetSurface: usize,
+    VerticalAlignmentRatio: usize,
+    pub SetVerticalAlignmentRatio:
+        unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionSurfaceBrush2,
+    ICompositionSurfaceBrush2_Vtbl,
+    0xd27174d5_64f5_4692_9dc7_71b61d7e5880
+);
+impl windows_core::RuntimeType for ICompositionSurfaceBrush2 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionSurfaceBrush2 {
+    pub(crate) fn SetOffset(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetOffset)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetScale(&self, value: windows_numerics::Vector2) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetScale)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionSurfaceBrush2_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    AnchorPoint: usize,
+    SetAnchorPoint: usize,
+    CenterPoint: usize,
+    SetCenterPoint: usize,
+    Offset: usize,
+    pub SetOffset: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    RotationAngle: usize,
+    SetRotationAngle: usize,
+    RotationAngleInDegrees: usize,
+    SetRotationAngleInDegrees: usize,
+    Scale: usize,
+    pub SetScale: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
@@ -3174,6 +3308,19 @@ pub struct ICompositionTarget_Vtbl {
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionVirtualDrawingSurface,
+    ICompositionVirtualDrawingSurface_Vtbl,
+    0xa9c384db_8740_4f94_8b9d_b68521e7863d
+);
+impl windows_core::RuntimeType for ICompositionVirtualDrawingSurface {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICompositionVirtualDrawingSurface_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
     ICompositionVisualSurface,

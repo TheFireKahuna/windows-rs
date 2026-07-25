@@ -139,6 +139,24 @@ Windows.Graphics.SizeInt32
 // Uniform; content-addressed atlases and gradient ramps need Fill.
 Windows.UI.Composition.CompositionStretch
 Windows.UI.Composition.ICompositionSurfaceBrush::{put_Stretch}
+// Sparsely-allocated surfaces, and the brush transform that addresses one tile of
+// one. A raster cache that mints a surface per entry pays a composition object,
+// a texture allocation and the engine's per-surface bookkeeping for every glyph
+// it has ever drawn; a virtual surface holds them all in one object and
+// materializes storage only for the regions actually drawn into. Selecting a
+// tile is a brush transform: `Stretch::None` with both alignment ratios at zero
+// anchors the surface's top-left to the sprite's, and the documented order —
+// stretch and align first, then the custom transform, evaluated in the SPRITE's
+// coordinate space — makes `Scale` the pixel-to-DIP factor and `Offset` the
+// negated tile origin.
+Windows.UI.Composition.CompositionVirtualDrawingSurface
+Windows.UI.Composition.ICompositionGraphicsDevice2::{CreateVirtualDrawingSurface}
+Windows.UI.Composition.ICompositionSurfaceBrush::{put_HorizontalAlignmentRatio, put_VerticalAlignmentRatio}
+Windows.UI.Composition.ICompositionSurfaceBrush2::{put_Offset, put_Scale}
+// No `Trim` here: `ICompositionVirtualDrawingSurfaceInterop` is absent from this
+// repo's Win32 metadata, and the allocator has no use for partial reclaim
+// anyway — it never re-lets a region a sprite may still be bound to, so the only
+// reclaim it performs is dropping a whole page, which releases its tiles with it.
 // endregion
 
 // The base every composition object derives from. StopAnimation belongs here

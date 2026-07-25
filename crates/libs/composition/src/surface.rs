@@ -66,6 +66,38 @@ impl CompositionGraphicsDevice {
         CompositionDrawingSurface::new(surface)
     }
 
+    /// Creates a **sparsely allocated** surface `width`×`height` pixels in size.
+    ///
+    /// Unlike [`create_drawing_surface_with_pixel_size`](Self::create_drawing_surface_with_pixel_size),
+    /// a virtual surface holds no storage when it is created: the composition
+    /// engine materializes a tile only when a [`begin_draw`](CompositionVirtualDrawingSurface::begin_draw)
+    /// names a region inside it. So the declared size is a coordinate space to
+    /// allocate within rather than an allocation, and a caller can declare one
+    /// far larger than it expects to fill.
+    ///
+    /// That is what makes a virtual surface the backing for a raster atlas.
+    /// Minting a surface per cached raster costs a composition object, a texture
+    /// and the engine's per-surface bookkeeping for every entry; packing those
+    /// rasters into regions of one virtual surface costs one of each, and the
+    /// memory still tracks what was actually drawn.
+    ///
+    /// The declared size is capped at 2^24 total pixels by the platform.
+    pub fn create_virtual_drawing_surface(
+        &self,
+        width: i32,
+        height: i32,
+        format: PixelFormat,
+        alpha: AlphaMode,
+    ) -> Result<CompositionVirtualDrawingSurface> {
+        let device: bindings::ICompositionGraphicsDevice2 = self.0.cast()?;
+        let surface = device.CreateVirtualDrawingSurface(
+            bindings::SizeInt32 { width, height },
+            format.into(),
+            alpha.into(),
+        )?;
+        CompositionVirtualDrawingSurface::new(surface)
+    }
+
     /// Creates a drawing surface sized in whole pixels rather than DIPs.
     ///
     /// [`create_drawing_surface_with_format`](Self::create_drawing_surface_with_format)
@@ -202,6 +234,71 @@ impl CompositionDrawingSurface {
 impl Sealed for CompositionDrawingSurface {}
 
 impl Surface for CompositionDrawingSurface {
+    fn as_surface(&self) -> CompositionSurface {
+        CompositionSurface(self.surface.cast().unwrap())
+    }
+}
+
+/// A [`CompositionDrawingSurface`] whose storage is allocated per drawn region
+/// rather than up front — the backing for a raster atlas.
+///
+/// Create one with
+/// [`CompositionGraphicsDevice::create_virtual_drawing_surface`]. Draw into a
+/// region with [`begin_draw`](Self::begin_draw), which both reserves that
+/// region's storage and returns where in the engine's own tile to put the
+/// pixels; pair it with [`end_draw`](Self::end_draw).
+#[derive(Clone)]
+pub struct CompositionVirtualDrawingSurface {
+    surface: bindings::CompositionVirtualDrawingSurface,
+    interop: bindings::ICompositionDrawingSurfaceInterop,
+}
+
+impl CompositionVirtualDrawingSurface {
+    fn new(surface: bindings::CompositionVirtualDrawingSurface) -> Result<Self> {
+        let interop = surface.cast()?;
+        bump_count(Count::DrawingSurface);
+        Ok(Self { surface, interop })
+    }
+
+    /// Begins drawing into the region `(x, y, width, height)` of the surface,
+    /// returning the drawing target `T` and the `(x, y)` pixel offset at which
+    /// to draw it.
+    ///
+    /// The returned offset is where the region landed inside whichever tile the
+    /// engine allocated for it, and bears no relation to the requested origin —
+    /// so a caller translates its drawing by the offset and never by its own
+    /// coordinates. Drawing outside the requested region is undefined, and the
+    /// region's initial contents are undefined too: every pixel in it must be
+    /// written (clear it first if the content does not cover it).
+    pub fn begin_draw<T: Interface>(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Result<(T, (i32, i32))> {
+        bump_count(Count::SurfaceDraw);
+        let rect = bindings::RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        };
+        let mut offset = bindings::POINT::default();
+        let object = unsafe { self.interop.BeginDraw::<T>(Some(&rect), &mut offset)? };
+        Ok((object, (offset.x, offset.y)))
+    }
+
+    /// Finishes drawing begun with [`begin_draw`](Self::begin_draw) and presents
+    /// the region's contents.
+    pub fn end_draw(&self) -> Result<()> {
+        unsafe { self.interop.EndDraw().ok() }
+    }
+}
+
+impl Sealed for CompositionVirtualDrawingSurface {}
+
+impl Surface for CompositionVirtualDrawingSurface {
     fn as_surface(&self) -> CompositionSurface {
         CompositionSurface(self.surface.cast().unwrap())
     }
@@ -367,6 +464,35 @@ impl CompositionSurfaceBrush {
     /// surface maps onto the area one-to-one.
     pub fn set_stretch(&self, stretch: Stretch) {
         self.0.SetStretch(stretch.into()).unwrap();
+    }
+
+    /// Sets where the surface sits within the painted area when it does not fill
+    /// it, as a fraction of the leftover space on each axis.
+    ///
+    /// Composition's default is `0.5` on both — centred — which is rarely what a
+    /// caller wants and is easy to mistake for a placement bug. Anchoring at
+    /// `(0.0, 0.0)` puts the surface's top-left on the painted area's top-left,
+    /// which is the frame [`set_source_transform`](Self::set_source_transform)
+    /// measures its offsets from.
+    pub fn set_alignment_ratio(&self, horizontal: f32, vertical: f32) {
+        self.0.SetHorizontalAlignmentRatio(horizontal).unwrap();
+        self.0.SetVerticalAlignmentRatio(vertical).unwrap();
+    }
+
+    /// Positions and scales the surface within the area this brush paints, so a
+    /// sprite can show one *region* of a larger surface.
+    ///
+    /// Composition applies the stretch and alignment first and this transform
+    /// second, in the painted sprite's own coordinate space. So to show the
+    /// region at `origin` pixels of an atlas at one surface pixel per physical
+    /// pixel, pair [`Stretch::None`] and a `(0.0, 0.0)`
+    /// [alignment ratio](Self::set_alignment_ratio) with a `scale` of one over
+    /// the DIP→pixel factor and an `offset` of the region's origin negated and
+    /// carried through that same scale.
+    pub fn set_source_transform(&self, offset: Vector2, scale: Vector2) {
+        let brush: bindings::ICompositionSurfaceBrush2 = self.0.cast().unwrap();
+        brush.SetScale(scale).unwrap();
+        brush.SetOffset(offset).unwrap();
     }
 }
 
