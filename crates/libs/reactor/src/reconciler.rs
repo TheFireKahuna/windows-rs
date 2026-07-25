@@ -378,13 +378,25 @@ impl<B: Backend + 'static> Reconciler<B> {
                 }
             }
 
-            // Unmount header/pane element subtrees that are tracked outside
-            // children_mirror (mounted via Widget::header_element / pane_element).
+            // Unmount the element subtrees tracked outside children_mirror —
+            // every `Widget` slot that mounts an `Element` of its own
+            // (`header_element`, `pane_element`, `flyout_element`).
+            //
+            // `collect_subtree` only walks `children_mirror`, so a slot root is
+            // unreachable from its owner and has to be torn down by name. A rich
+            // flyout is the easiest one to miss because being parentless is its
+            // documented contract (`set_flyout_element`), not an accident — and
+            // missing it leaks the whole flyout subtree per unmount: the nodes
+            // stay in the arena, their visuals stay alive parented to that root,
+            // and `flyout_elements` keeps an entry whose owner no longer exists.
             if let Some(hdr_id) = self.header_elements.remove(&node) {
                 self.unmount(hdr_id);
             }
             if let Some(pane_id) = self.pane_elements.remove(&node) {
                 self.unmount(pane_id);
+            }
+            if let Some(fly_id) = self.flyout_elements.remove(&node) {
+                self.unmount(fly_id);
             }
 
             self.selection_callbacks.remove(&node);
@@ -987,5 +999,47 @@ fn push_live<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
             }
         }
         other => out.push(other),
+    }
+}
+
+#[cfg(all(test, feature = "dcomp-backend"))]
+mod tests {
+    use super::*;
+    use crate::backend::dcomp::record::{Cmd, RecordingBackend};
+
+    /// A slot's subtree must not outlive its owner.
+    ///
+    /// Flyout content is the case that regressed, and it regressed for a
+    /// structural reason: `set_flyout_element`'s contract is that the subtree sits
+    /// in NO child list, so `collect_subtree` — which walks the child mirror —
+    /// cannot reach it. Teardown has to come from the slot bookkeeping instead, and
+    /// while it didn't, every unmount of a flyout-owning widget leaked the whole
+    /// flyout subtree: nodes left in the arena, visuals left alive under a
+    /// parentless root, for the life of the process.
+    #[test]
+    fn unmounting_an_owner_destroys_its_flyout_content() {
+        let mut r = Reconciler::new(RecordingBackend::new());
+        let el: Element = button("open").flyout_element(body("panel")).into();
+
+        let id = r.mount(&el).expect("the owner mounts");
+        let fly = *r
+            .flyout_elements
+            .get(&id)
+            .expect("mounting an owner with rich flyout content tracks that content's root");
+
+        // Only the teardown commands are of interest.
+        let _ = r.backend.take_cmds();
+        r.unmount(id);
+
+        let cmds = r.backend.take_cmds();
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::Destroy { id } if *id == fly)),
+            "the flyout content subtree was never destroyed — it leaked"
+        );
+        assert!(
+            !r.flyout_elements.contains_key(&id),
+            "the owner is gone but its slot bookkeeping still names a content root"
+        );
     }
 }
