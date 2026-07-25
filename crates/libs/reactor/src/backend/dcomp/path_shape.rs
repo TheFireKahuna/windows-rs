@@ -38,7 +38,12 @@
 //! requires a `CompositionSurfaceBrush` for its mask (an effect brush is not one),
 //! and its buffers clamp far below paper white — both measured, see [`GlowLayer`].
 
-use windows_canvas::{GpuDevice, Path, PathBuilder, PathFigure, Vector2 as CVec2};
+use core::cell::RefCell;
+
+use windows_canvas::{
+    CapStyle, GpuDevice, LineJoin, Path, PathBuilder, PathFigure, StrokeStyle, StrokeStyleBuilder,
+    Vector2 as CVec2,
+};
 use windows_composition::{
     Color as UiColor, CompositionMaskBrush, CompositionPath, CompositionPathGeometry,
     CompositionSpriteShape, CompositionSurfaceBrush, BorderMode, CompositionVisualSurface, DropShadow,
@@ -275,6 +280,47 @@ pub(crate) fn build_composition_path(
     filled: bool,
 ) -> Option<CompositionPath> {
     to_composition_path(comp, &build_d2d_path(&comp.gpu, verbs, points, filled)?)
+}
+
+thread_local! {
+    /// The one stroke style every widened path uses, built on first need.
+    ///
+    /// Round caps and joins, matching what a stroked `CompositionSpriteShape`
+    /// draws when told `StrokeCap::Round` / `StrokeJoin::Round` — so a widened
+    /// outline covers the same pixels the masked route's stroke would have.
+    /// Cached because widening happens per publish and the style never varies;
+    /// minting one per call would put a COM creation on a per-frame path.
+    static ROUND_STROKE: RefCell<Option<StrokeStyle>> = const { RefCell::new(None) };
+}
+
+/// Replay the verbs and wrap the OUTLINE of stroking them at `width`.
+///
+/// The input a [`ClipLayer`] needs for a stroked curve: a clip fills a region,
+/// and a stroke is a centreline plus a width until something converts it into
+/// the shape it covers. See [`Path::widen`] for why the self-overlaps that
+/// produces need no cleanup.
+pub(crate) fn build_widened_path(
+    comp: &Compositing,
+    verbs: &[PathVerb],
+    points: &[f32],
+    width: f32,
+) -> Option<CompositionPath> {
+    let path = build_d2d_path(&comp.gpu, verbs, points, false)?;
+    let widened = ROUND_STROKE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_none() {
+            *s = comp
+                .gpu
+                .create_stroke_style(
+                    &StrokeStyleBuilder::new()
+                        .caps(CapStyle::Round)
+                        .line_join(LineJoin::Round),
+                )
+                .ok();
+        }
+        path.widen(&comp.gpu, width, s.as_ref()?).ok()
+    })?;
+    to_composition_path(comp, &widened)
 }
 
 // ── One fill-or-stroke layer ─────────────────────────────────────────────────
@@ -690,6 +736,116 @@ impl PathLayer {
     /// One handle now, not two: `SpriteVisual` derefs to `Visual`, so the caller
     /// reaches `set_center_point` / `set_rotation_angle` and the animation seam
     /// through the same value.
+    pub(crate) fn display(&self) -> &SpriteVisual {
+        &self.display
+    }
+}
+
+// ── The clip layer: the same picture with nothing for DWM to capture ─────────
+
+/// A path layer that carries its colour DIRECTLY, with the geometry supplied by
+/// a clip instead of a mask.
+///
+/// ## Why this exists next to [`PathLayer`]
+///
+/// `PathLayer` puts the geometry in an off-tree `ShapeVisual`, captures that
+/// through a `CompositionVisualSurface`, and uses the capture as a mask over an
+/// FP16 source. It has to: a `CompositionSpriteShape` rejects a surface brush
+/// outright (`E_INVALIDARG`, "unsupported source brush type"), so a shape can
+/// only be painted with an 8-bit colour or gradient brush — measured at scRGB
+/// 3.0, exactly paper white, against the 4.0 the FP16 source reaches. The mask
+/// indirection is the only route that gets wide-gamut colour onto vector
+/// geometry.
+///
+/// The cost is that DWM services a capture render target per layer, and
+/// re-renders it whenever the captured content changes. For a curve whose
+/// geometry is restated every frame that is a per-frame offscreen pass, and it
+/// dominated the compositor's share of a live analyzer.
+///
+/// A **clip is not a brush**, so it does not compete for the visual's one brush
+/// slot. The sprite keeps the FP16 surface brush — drawn inline, unclamped, no
+/// capture — and a `CompositionGeometricClip` supplies the shape. Measured at
+/// scRGB 4.0 with no offscreen rendering at all
+/// (`crates/samples/composition/shape_brush`).
+///
+/// ## What it gives up
+///
+/// * **Trim.** A geometric clip DOES honour `TrimStart`/`TrimEnd`, but trim
+///   walks the geometry's perimeter, and a widened stroke's perimeter runs down
+///   one flank and back the other — so trimming it is not trimming along the
+///   curve. A layer that animates its draw-on keeps [`PathLayer`].
+/// * **Ramps.** A multi-hue source is a staircase of masked layers composited
+///   through a capture of their own ([`super::gradient::RampStage`]), which puts
+///   the capture straight back. Flat colour only.
+/// * **Strokes are pre-widened by the caller.** A clip fills a region, so a
+///   stroked curve must arrive as the OUTLINE of its stroke ([`Path::widen`]).
+///   This type therefore knows nothing about role or thickness — it fills
+///   whatever geometry it is handed.
+///
+/// Neither restriction binds a live trace, which is flat, never trims, and is
+/// the only thing restating geometry every frame.
+pub(crate) struct ClipLayer {
+    display: SpriteVisual,
+    /// The clip's geometry, repointed in place by [`Self::set_path`] so a
+    /// reshape is one property write rather than a new clip.
+    geo: CompositionPathGeometry,
+    /// Held because the sprite's brush slot is the only other reference.
+    _source: Option<CompositionSurfaceBrush>,
+    // ── change gates ──
+    solid_for: Option<([u32; 4], u32)>,
+    size: Option<(f32, f32)>,
+}
+
+impl ClipLayer {
+    pub(crate) fn new(
+        comp: &Compositing,
+        container: &windows_composition::ContainerVisual,
+        path: &CompositionPath,
+    ) -> Self {
+        let display = comp.new_sprite();
+        let compositor = comp.compositor();
+
+        let geo = compositor.create_path_geometry(path);
+        // The geometry is authored in DIPs and the sprite is IN the tree, under
+        // the root's DIP→px scale — so unlike the mask route there is no scale
+        // to place anywhere. DWM rasterizes the clip at device resolution from
+        // the same geometry.
+        display.set_clip(Some(&compositor.create_geometric_clip(&geo)));
+        // In-tree, so `BorderMode::Inherit` would take whatever the host node
+        // states. A curve's edge is the whole point of it; say so here.
+        display.set_border_mode(BorderMode::Soft);
+        container.children().insert_at_top(&display);
+
+        Self { display, geo, _source: None, solid_for: None, size: None }
+    }
+
+    pub(crate) fn set_path(&mut self, path: &CompositionPath) {
+        self.geo.set_path(path);
+    }
+
+    pub(crate) fn resize(&mut self, w: f32, h: f32) {
+        if self.size == Some((w, h)) {
+            return;
+        }
+        self.display.set_size(w, h);
+        self.size = Some((w, h));
+    }
+
+    /// Bind the flat FP16 colour source. Rebuilds only on a real change or a
+    /// display move, exactly as [`PathLayer::set_source`]'s flat branch does.
+    pub(crate) fn set_source(&mut self, comp: &Compositing, color: Color, scale: f32) {
+        let want = (color_bits(color), scale.to_bits());
+        if self.solid_for == Some(want) {
+            return;
+        }
+        let Some(s) = super::parts::build_solid_surface(comp, color, scale) else {
+            return;
+        };
+        self.display.set_brush(&s);
+        self._source = Some(s);
+        self.solid_for = Some(want);
+    }
+
     pub(crate) fn display(&self) -> &SpriteVisual {
         &self.display
     }

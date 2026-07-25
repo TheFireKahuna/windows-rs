@@ -90,9 +90,60 @@ use super::bar_field::{
     MAX_STEP_SECS,
 };
 use super::bootstrap::Compositing;
-use super::path_shape::{PathLayer, Role};
+use super::path_shape::{ClipLayer, PathLayer, Role};
 use crate::backend::ControlId;
 use crate::{Color, GradientAxis, PathVerb};
+
+/// Which construction one of a trace's two layers is built from.
+///
+/// A trace restates its geometry every publish, and under
+/// [`PathLayer`] each restatement dirties a `CompositionVisualSurface` that DWM
+/// must then re-render into an intermediate — a per-frame offscreen pass per
+/// layer, which measured as the compositor's single largest cost on a live
+/// analyzer. [`ClipLayer`] draws the same picture with the colour bound
+/// straight to the sprite and the geometry supplied by a clip, so there is
+/// nothing to capture.
+///
+/// The clip route cannot carry a RAMP: a multi-hue source is a staircase of
+/// masked layers composited through a capture of its own, which puts back the
+/// thing being removed. So a flat layer is clipped and a ramped one is masked,
+/// and a layer that changes which it is gets rebuilt.
+enum TraceLayer {
+    Clipped(ClipLayer),
+    Masked(PathLayer),
+}
+
+impl TraceLayer {
+    fn set_path(&mut self, path: &windows_composition::CompositionPath) {
+        match self {
+            Self::Clipped(l) => l.set_path(path),
+            Self::Masked(l) => l.set_path(path),
+        }
+    }
+
+    fn resize(&mut self, w: f32, h: f32, scale: f32) {
+        match self {
+            // No scale: the sprite is IN the tree, under the root's DIP→px
+            // scale, so its clip rasterizes at device resolution already. The
+            // masked route needs it because its geometry lives off-tree.
+            Self::Clipped(l) => l.resize(w, h),
+            Self::Masked(l) => l.resize(w, h, scale),
+        }
+    }
+
+    fn display(&self) -> &windows_composition::SpriteVisual {
+        match self {
+            Self::Clipped(l) => l.display(),
+            Self::Masked(l) => l.display(),
+        }
+    }
+
+    /// Whether this layer is the flat, capture-free construction — so a caller
+    /// can notice that the ramp state no longer matches and rebuild.
+    fn is_clipped(&self) -> bool {
+        matches!(self, Self::Clipped(_))
+    }
+}
 
 /// A reusable geometry buffer the producer refills each publish.
 ///
@@ -498,7 +549,7 @@ pub(crate) struct LiveTraceField {
     /// The filled companion. Declared FIRST so that when a publish carrying both
     /// geometries builds both layers, the fill's sprite is parented before the
     /// stroke's and the line composites over its own wash.
-    fill: Option<PathLayer>,
+    fill: Option<TraceLayer>,
     /// The wash's ink, carried by whichever push last brought fill geometry.
     fill_ink: Option<Color>,
     /// The wash's ramp, when it has one. Empty means the flat `fill_ink`.
@@ -527,7 +578,7 @@ pub(crate) struct LiveTraceField {
     rise: Option<ScalarKeyFrameAnimation>,
     fall: Option<ScalarKeyFrameAnimation>,
     easing: Option<CompositionEasingFunction>,
-    layer: Option<PathLayer>,
+    layer: Option<TraceLayer>,
     /// The layout the layers were bound for; `None` until the first push.
     layout: Option<TraceLayout>,
     /// Whether each sprite currently has geometry to show. A trace whose every
@@ -574,6 +625,17 @@ impl LiveTraceField {
         }
         let Some(layout) = self.layout else { return };
 
+        // A flat wash needs no capture; a ramped one has nowhere else to put its
+        // staircase. A trace that gains or loses its ramp therefore rebuilds the
+        // fill rather than trying to re-role a layer built the other way.
+        let flat_fill = self.fill_stops.is_empty() && !batch.has_fill_ramp;
+        if self.fill.as_ref().is_some_and(|f| f.is_clipped() != flat_fill) {
+            if let Some(f) = self.fill.take() {
+                f.display().set_visible(false);
+            }
+            self.fill_visible = true;
+        }
+
         // The fill first, so a first publish carrying both parents it below the
         // line (both layers insert at the top of the container's children).
         if batch.has_fill {
@@ -586,9 +648,13 @@ impl LiveTraceField {
                 &batch.fill_verbs,
                 &batch.fill_points,
                 Role::Fill,
+                flat_fill.then_some(0.0),
             );
         }
         if batch.has_geometry {
+            // The line is flat by construction (see its `set_source` below), so
+            // it is always the capture-free layer — widened to `thickness`,
+            // which is what makes its outline a region a clip can take.
             Self::reshape(
                 comp,
                 container,
@@ -597,6 +663,7 @@ impl LiveTraceField {
                 &batch.verbs,
                 &batch.points,
                 Role::Stroke,
+                Some(layout.thickness),
             );
         }
 
@@ -611,15 +678,25 @@ impl LiveTraceField {
 
         if let (Some(fill), Some(ink)) = (self.fill.as_mut(), self.fill_ink) {
             fill.resize(layout.width, layout.height, scale);
-            fill.set_source(comp, ink, &self.fill_stops, self.fill_axis, atlas_epoch, scale);
+            match fill {
+                TraceLayer::Clipped(l) => l.set_source(comp, ink, scale),
+                TraceLayer::Masked(l) => {
+                    l.set_source(comp, ink, &self.fill_stops, self.fill_axis, atlas_epoch, scale)
+                }
+            }
         }
         self.meter(layout, batch.fill_extent);
         let Some(layer) = self.layer.as_mut() else { return };
         layer.resize(layout.width, layout.height, scale);
-        layer.set_thickness(layout.thickness);
-        // A flat colour, so the axis is inert — the source is a solid FP16 raster
-        // stretched under the mask, exactly as a bar body's is.
-        layer.set_source(comp, layout.color, &[], GradientAxis::Vertical, atlas_epoch, scale);
+        // A flat colour: the source is a solid FP16 raster, exactly as a bar
+        // body's is. The thickness is not set here — it was baked into the
+        // widened outline the clip takes its shape from.
+        match layer {
+            TraceLayer::Clipped(l) => l.set_source(comp, layout.color, scale),
+            TraceLayer::Masked(l) => {
+                l.set_source(comp, layout.color, &[], GradientAxis::Vertical, atlas_epoch, scale)
+            }
+        }
     }
 
     /// Move the metered fill towards this publish's extent.
@@ -722,25 +799,44 @@ impl LiveTraceField {
     /// Re-point one layer at this publish's geometry, building it on first use and
     /// hiding it when the geometry empties. Shared by the stroke and its fill so
     /// the two cannot drift in how an emptied frame is handled.
+    #[allow(clippy::too_many_arguments)]
     fn reshape(
         comp: &Compositing,
         container: &windows_composition::ContainerVisual,
-        slot: &mut Option<PathLayer>,
+        slot: &mut Option<TraceLayer>,
         visible: &mut bool,
         verbs: &[PathVerb],
         points: &[f32],
         role: Role,
+        // `Some(width)` asks for the capture-free construction. A stroke must
+        // arrive WIDENED — a clip fills a region, and a stroke is a line plus a
+        // width until something turns it into one.
+        clipped: Option<f32>,
     ) {
         let empty = verbs.is_empty();
         // A path is minted only for geometry there is something to draw; an
         // emptied trace hides the sprite it already has.
         if !empty
-            && let Some(path) =
-                super::path_shape::build_composition_path(comp, verbs, points, role == Role::Fill)
+            && let Some(path) = match (clipped, role) {
+                (Some(width), Role::Stroke) => {
+                    super::path_shape::build_widened_path(comp, verbs, points, width)
+                }
+                _ => super::path_shape::build_composition_path(
+                    comp,
+                    verbs,
+                    points,
+                    role == Role::Fill,
+                ),
+            }
         {
             match slot.as_mut() {
                 Some(l) => l.set_path(&path),
-                None => *slot = Some(PathLayer::new(comp, container, &path, role)),
+                None => {
+                    *slot = Some(match clipped {
+                        Some(_) => TraceLayer::Clipped(ClipLayer::new(comp, container, &path)),
+                        None => TraceLayer::Masked(PathLayer::new(comp, container, &path, role)),
+                    })
+                }
             }
         }
         if let Some(l) = slot.as_ref()
