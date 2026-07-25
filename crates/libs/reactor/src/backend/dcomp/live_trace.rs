@@ -78,7 +78,7 @@
 //! to schedule.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,58 @@ use crate::{Color, GradientAxis, PathVerb};
 enum TraceLayer {
     Clipped(ClipLayer),
     Masked(PathLayer),
+}
+
+/// The geometry a layer was last given, so a publish restating it costs a
+/// comparison rather than a rebuild.
+///
+/// Retained and refilled rather than replaced, for the reason the producer's own
+/// buffers are: a gate that allocated per publish would cost more than the work
+/// it saves. A 512-point spline is 4 KB of coordinates and 512 bytes of verbs,
+/// and comparing two of them is two `memcmp`s against a walk, a widen and a new
+/// composition path.
+#[derive(Default)]
+struct GeomStamp {
+    verbs: Vec<PathVerb>,
+    points: Vec<f32>,
+    /// The widen inputs, which change the outline WITHOUT changing the points —
+    /// a thickness or DPI move must rebuild from identical geometry. `None` for
+    /// a layer that is not widened.
+    shape: Option<(u32, u32)>,
+}
+
+impl GeomStamp {
+    fn matches(&self, verbs: &[PathVerb], points: &[f32], shape: Option<(u32, u32)>) -> bool {
+        self.shape == shape && self.verbs == verbs && self.points == points
+    }
+
+    fn store(&mut self, verbs: &[PathVerb], points: &[f32], shape: Option<(u32, u32)>) {
+        self.verbs.clear();
+        self.verbs.extend_from_slice(verbs);
+        self.points.clear();
+        self.points.extend_from_slice(points);
+        self.shape = shape;
+    }
+}
+
+static GEOM_APPLIED: AtomicU64 = AtomicU64::new(0);
+static GEOM_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+fn note_geom_applied() {
+    GEOM_APPLIED.fetch_add(1, Ordering::Relaxed);
+}
+
+fn note_geom_skipped() {
+    GEOM_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Geometry publishes applied and skipped since the process started — the gate's
+/// hit rate, which is the only thing that says whether it was worth having.
+pub(crate) fn geom_gate() -> (u64, u64) {
+    (
+        GEOM_APPLIED.load(Ordering::Relaxed),
+        GEOM_SKIPPED.load(Ordering::Relaxed),
+    )
 }
 
 /// Whether traces use the capture-free construction, read ONCE from
@@ -570,6 +622,9 @@ pub(crate) struct LiveTraceField {
     /// geometries builds both layers, the fill's sprite is parented before the
     /// stroke's and the line composites over its own wash.
     fill: Option<TraceLayer>,
+    /// The geometry each layer last applied, for the no-op gate in [`reshape`].
+    fill_geom: GeomStamp,
+    stroke_geom: GeomStamp,
     /// The wash's ink, carried by whichever push last brought fill geometry.
     fill_ink: Option<Color>,
     /// The wash's ramp, when it has one. Empty means the flat `fill_ink`.
@@ -611,6 +666,8 @@ impl LiveTraceField {
     pub(crate) fn new() -> Self {
         Self {
             fill: None,
+            fill_geom: GeomStamp::default(),
+            stroke_geom: GeomStamp::default(),
             fill_ink: None,
             fill_stops: Vec::new(),
             fill_axis: GradientAxis::Vertical,
@@ -653,6 +710,9 @@ impl LiveTraceField {
             if let Some(f) = self.fill.take() {
                 f.display().set_visible(false);
             }
+            // The replacement layer has no geometry yet, so the stamp describing
+            // what the OLD one held must not gate the first path into the new one.
+            self.fill_geom = GeomStamp::default();
             self.fill_visible = true;
         }
 
@@ -670,6 +730,7 @@ impl LiveTraceField {
                 Role::Fill,
                 flat_fill.then_some(0.0),
                 scale,
+                &mut self.fill_geom,
             );
         }
         if batch.has_geometry {
@@ -686,6 +747,7 @@ impl LiveTraceField {
                 Role::Stroke,
                 clipped_traces().then_some(layout.thickness),
                 scale,
+                &mut self.stroke_geom,
             );
         }
 
@@ -837,11 +899,31 @@ impl LiveTraceField {
         // width until something turns it into one.
         clipped: Option<f32>,
         scale: f32,
+        stamp: &mut GeomStamp,
     ) {
         let empty = verbs.is_empty();
+        // What the path about to be built depends on, beyond the points: a
+        // thickness or DPI change alters the OUTLINE from identical input, so
+        // both belong in the gate below.
+        let shape = clipped.map(|w| (w.to_bits(), scale.to_bits()));
+        // A publish that restates the geometry it already applied has nothing to
+        // do. A producer recomputing per compositor tick from a source that
+        // updates more slowly hands over the same points repeatedly, and each one
+        // otherwise costs a path walk, a widen and a new composition path — for a
+        // picture already on screen. Two `memcmp`s decide it, which is what
+        // [`PathVerb`](crate::PathVerb)'s own note about a no-op gate describes.
+        //
+        // It gates the BUILD only, never the visibility below: a trace that
+        // emptied and came back with the shape it had before still has a hidden
+        // sprite to show, and returning early here would leave it hidden.
+        let unchanged = !empty && slot.is_some() && stamp.matches(verbs, points, shape);
+        if unchanged {
+            note_geom_skipped();
+        }
         // A path is minted only for geometry there is something to draw; an
         // emptied trace hides the sprite it already has.
         if !empty
+            && !unchanged
             && let Some(path) = match (clipped, role) {
                 (Some(width), Role::Stroke) => {
                     super::path_shape::build_widened_path(comp, verbs, points, width, scale)
@@ -863,6 +945,11 @@ impl LiveTraceField {
                     })
                 }
             }
+            // Stamped only on the path that was actually applied, so a build that
+            // failed leaves the gate open rather than claiming geometry the layer
+            // never received.
+            stamp.store(verbs, points, shape);
+            note_geom_applied();
         }
         if let Some(l) = slot.as_ref()
             && *visible == empty

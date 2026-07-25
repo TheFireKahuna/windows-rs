@@ -282,6 +282,20 @@ fn render(comp: &Compositing, arena: &Arena, attached: Option<ControlId>) -> Str
         },
     );
     let _ = writeln!(s, "{traffic}");
+    {
+        // The trace geometry gate: how many publishes restated a shape already on
+        // screen, and so cost a comparison instead of a walk, a widen and a new
+        // composition path.
+        let (applied, skipped) = super::live_trace::geom_gate();
+        let total = applied + skipped;
+        let _ = writeln!(
+            s,
+            "  trace geometry   applied {:>7}  skipped {:>6}  gated {:>5.1}%",
+            applied,
+            skipped,
+            if total == 0 { 0.0 } else { skipped as f64 * 100.0 / total as f64 },
+        );
+    }
     let _ = writeln!(s, "  by kind (own visuals, heaviest first)");
     for row in model.rows.iter().take(20) {
         let _ = writeln!(
