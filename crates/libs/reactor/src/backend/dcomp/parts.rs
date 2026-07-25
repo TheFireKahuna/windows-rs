@@ -1209,6 +1209,25 @@ pub(crate) struct Part {
     off: Channel,
     size: Channel,
     opacity: Option<f32>,
+    /// Whether the sprite takes part in the render at all.
+    ///
+    /// `IsVisible` and `Opacity` say different things and this type keeps them
+    /// apart: visibility gates whether the visual is rendered, opacity varies it
+    /// within that. A part resting at zero opacity is still a node the
+    /// compositor walks and still composites as a fully transparent layer, which
+    /// is the case the platform's own guidance says not to express that way — a
+    /// census of this app's tree found a third of its visuals sitting there.
+    ///
+    /// So a snap to zero switches the sprite off outright, and anything raising
+    /// it switches it back on before the value moves. A fade that ENDS at zero
+    /// deliberately does not: the sprite has to stay rendered for the fade to be
+    /// seen, and the only signal that the flight finished is a scoped-batch
+    /// completion, which would then have to be guarded against a retarget
+    /// mid-flight. Parts reach their resting hidden state through the snap path
+    /// anyway — a part's FIRST opacity write always snaps (see
+    /// [`fade_to_over`](Self::fade_to_over)), and a state never entered is a
+    /// part never faded.
+    visible: Option<bool>,
     /// Whether a fade may currently hold Opacity (snap must stop it). Opacity
     /// has no out-of-band writer, so it stays a plain flag.
     op_gliding: bool,
@@ -1237,6 +1256,7 @@ impl Part {
             off: Channel::new(),
             size: Channel::new(),
             opacity: None,
+            visible: None,
             op_gliding: false,
             s_off: None,
             s_size: None,
@@ -1453,6 +1473,22 @@ impl Part {
         // on the same device-loss edge that reclaims the channels.
         self.vis.set_opacity(a);
         self.opacity = Some(a);
+        // Both land in the same commit, so the compositor applies them together
+        // and there is no frame where the two disagree.
+        self.set_rendered(a > 0.0);
+    }
+
+    /// The one writer of `IsVisible` — see [`visible`](Self::visible).
+    ///
+    /// Self-gating, so a part that is off and stays off costs nothing: the
+    /// resting state of most chrome is exactly that, and re-asserting it every
+    /// sync would trade one wasted property write for another.
+    fn set_rendered(&mut self, on: bool) {
+        if self.visible == Some(on) {
+            return;
+        }
+        self.vis.set_visible(on);
+        self.visible = Some(on);
     }
 
     /// Fade opacity to a target — a compositor keyframe glide (the mechanism
@@ -1479,6 +1515,13 @@ impl Part {
             self.set_opacity(a);
             return;
         };
+        // A fade INTO view has to be rendered before it can be watched: a part
+        // switched off by a previous snap to zero would otherwise animate its
+        // opacity invisibly and appear, fully faded, only when something later
+        // happened to switch it back on.
+        if a > 0.0 {
+            self.set_rendered(true);
+        }
         let ms = if a > prev { in_ms } else { out_ms };
         super::animate::fade_opacity(
             &self.vis.compositor(),
@@ -1533,6 +1576,7 @@ impl Part {
         self.off.reclaimed();
         self.size.reclaimed();
         self.opacity = None;
+        self.visible = None;
         self.op_gliding = false;
     }
 }

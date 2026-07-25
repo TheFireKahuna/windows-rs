@@ -100,17 +100,6 @@ impl TreeCensus {
     }
 }
 
-/// Whether this visual contributes nothing to the image.
-///
-/// Composition properties are write-only in principle — a getter can be stale
-/// the moment it returns, and reading one is not free — but for a value the app
-/// itself last wrote, on an on-demand diagnostic walk, both caveats are
-/// affordable. Two reads per visual over a few hundred visuals, once, is not a
-/// per-frame cost.
-fn draws_nothing(visual: &Visual) -> bool {
-    !visual.is_visible() || visual.opacity() <= 0.0
-}
-
 fn descend(visual: &Visual, depth: usize, hidden: bool, out: &mut TreeCensus) {
     let Some(container) = visual.as_container() else {
         out.leaves += 1;
@@ -128,6 +117,10 @@ fn descend(visual: &Visual, depth: usize, hidden: bool, out: &mut TreeCensus) {
         out.max_depth = out.max_depth.max(depth + 1);
         // A hidden visual's descendants are hidden too, so the flag only ever
         // turns on: it is the subtree that is prunable, not the one node.
+        // Composition properties are write-only in principle — a getter can be
+        // stale the moment it returns, and reading one is not free — but for a
+        // value the app itself last wrote, on an on-demand diagnostic walk, both
+        // caveats are affordable.
         let invisible = !child.is_visible();
         let transparent = child.opacity() <= 0.0;
         let child_hidden = hidden || invisible || transparent;
