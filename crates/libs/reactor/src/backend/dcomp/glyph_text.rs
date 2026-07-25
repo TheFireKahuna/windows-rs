@@ -67,6 +67,8 @@
 //! Decoration rules take the run's own ink and so need no such ordering against
 //! it.
 
+use std::rc::Rc;
+
 use windows_canvas::{Rect, TextDecoration, TextLayout};
 use windows_composition::{
     CompositionMaskBrush, CompositionSurfaceBrush, ContainerVisual, SpriteVisual, Visual,
@@ -74,7 +76,7 @@ use windows_composition::{
 
 use super::bootstrap::Compositing;
 use super::glyph_atlas::{pen_phase, GlyphAtlas};
-use super::mask_cache::Raster;
+use super::mask_cache::{Raster, Tile};
 use super::node::Node;
 use super::parts::build_solid_surface;
 use super::run_atlas::RunAtlas;
@@ -155,6 +157,16 @@ struct GlyphSprite {
     /// `QueryInterface` per side — and this compare runs once per glyph on
     /// every sync. See the atlas item for the full argument.
     bound: Option<u64>,
+    /// The atlas region the bound mask is cut from, held for exactly as long as
+    /// the binding stands.
+    ///
+    /// Rasters share pages, so a region is common ground and the atlas may re-let
+    /// one the moment nothing claims it. This sprite is a claim: a label that
+    /// never changes never syncs, never re-binds, and would otherwise be redrawn
+    /// with whatever glyph was packed into its ground next. Holding the tile is
+    /// what makes that impossible, and dropping it — here, by being overwritten
+    /// on a re-bind, or with the sprite itself — is the only release.
+    lease: Option<Rc<Tile>>,
     offset: Option<(f32, f32)>,
     size: Option<(f32, f32)>,
     shown: bool,
@@ -172,6 +184,7 @@ impl GlyphSprite {
             vis: Visual::clone(&sprite),
             mask,
             bound: None,
+            lease: None,
             offset: None,
             size: None,
             shown: false,
@@ -277,6 +290,16 @@ pub(crate) struct TextPart {
     host_box: Option<Rect>,
     /// Last dim pushed to the host's opacity.
     host_dim: Option<f32>,
+    /// Whether the host currently carries a clip, and so whether a change of
+    /// overflow has to write one.
+    ///
+    /// The clip is not standing furniture: the platform's guidance is that a clip
+    /// which does not cut anything is a cost with no effect, and the overwhelming
+    /// majority of labels are laid out to the size of their own text and never
+    /// come near their box's edge. So it is applied only to the runs that
+    /// genuinely overflow — an editor scrolled inside its column, a label squeezed
+    /// by a narrow window — and dropped again when they stop.
+    host_clipped: bool,
     glyphs: Vec<GlyphSprite>,
     /// How many of `glyphs` the last sync actually used. The rest stay
     /// allocated and hidden — a label that shortens will very likely lengthen
@@ -319,18 +342,44 @@ fn color_bits(c: crate::Color) -> [u32; 4] {
 
 impl TextPart {
     /// Mint the host container (once) and hang it at the top of `parent`'s
-    /// children. Its inset clip is all zeros, which cuts to the host's own
-    /// `Size` — pushed per sync by [`place_host`](Self::place_host).
+    /// children.
+    ///
+    /// No clip: see [`host_clipped`](Self::host_clipped) — one is attached by
+    /// [`clip_to_box_if_overflowing`](Self::clip_to_box_if_overflowing) only
+    /// while the run actually needs cutting.
     fn ensure_host(&mut self, comp: &Compositing, parent: &ContainerVisual) {
         if self.host.is_some() {
             return;
         }
         let host = comp.new_container();
-        // All-zero insets, which cuts to the host's own `Size` — pushed per
-        // sync by `place_host`.
-        host.set_clip(Some(&host.compositor().create_inset_clip()));
         parent.children().insert_at_top(&host);
         self.host = Some(host);
+    }
+
+    /// Attach an all-zero inset clip — which cuts to the host's own `Size` —
+    /// while `ink` reaches outside the host box, and drop it again when it does
+    /// not.
+    ///
+    /// `ink` is the run's drawn extent in host-local DIPs. The comparison carries
+    /// a tolerance because a label laid out to its own text lands its ink exactly
+    /// on the box edge, where float arithmetic can put it a hair either side; a
+    /// clip that engages there would cut the antialiased fringe off text that
+    /// overflows nothing, and would flicker in and out as the layout resolved.
+    fn clip_to_box_if_overflowing(&mut self, ink: Rect) {
+        let Some(host) = self.host.as_ref() else { return };
+        let Some(box_) = self.host_box else { return };
+        // Half a DIP: under a whole physical pixel at every scale this runs at,
+        // so nothing that reads as overflow can hide inside it.
+        const SLACK: f32 = 0.5;
+        let overflows = ink.left < -SLACK
+            || ink.top < -SLACK
+            || ink.right > box_.width() + SLACK
+            || ink.bottom > box_.height() + SLACK;
+        if overflows == self.host_clipped {
+            return;
+        }
+        host.set_clip(overflows.then(|| host.compositor().create_inset_clip()).as_ref());
+        self.host_clipped = overflows;
     }
 
     /// Place and size the host to the box its clip cuts to, and carry the
@@ -415,9 +464,14 @@ impl TextPart {
         let g = &mut glyphs[*slot];
         // An integer compare, and nothing else, on the re-place path.
         if g.bound != Some(raster.id) {
-            g.mask.set_mask(&raster.brush);
+            g.mask.set_mask(raster.brush());
             g.mask.set_source(source);
             g.bound = Some(raster.id);
+            // Last, and after the mask is bound: this assignment drops whatever
+            // region the sprite held before, which is the moment that one becomes
+            // re-lettable. Taking the new claim first means the two are never both
+            // released at once.
+            g.lease = Some(raster.tile.clone());
         }
         let (w, h) = raster.geom.size_dip;
         let (ox, oy) = raster.geom.origin_px;
@@ -459,6 +513,18 @@ impl TextPart {
         // Everything below is host-local: the host is no longer necessarily at
         // the node's origin (an editor's is its content column).
         let origin = self.to_host(origin);
+        // The measured ink, placed at the origin the glyphs are about to be laid
+        // against — so the clip decision is made from the same numbers the
+        // placement uses. `width` excludes trailing whitespace, which draws
+        // nothing and so cannot overflow anything.
+        if let Ok(m) = layout.metrics() {
+            self.clip_to_box_if_overflowing(Rect::from_xywh(
+                origin.0 + m.left,
+                origin.1 + m.top,
+                m.width,
+                m.height,
+            ));
+        }
         // One AddRef per dirty sync, so the placement loop can grow sprites into
         // the host while `self.glyphs` is mutably borrowed.
         let Some(host) = self.host.clone() else { return };

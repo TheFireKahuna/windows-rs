@@ -44,7 +44,7 @@ use windows_canvas::{
 use windows_numerics::Matrix3x2;
 
 use super::glyph_atlas::{face_id, quant_em, quant_scale};
-use super::mask_cache::{MaskCache, MaskGeom, MaskSurfaces, Raster, Rasterized, MASK_FORMAT};
+use super::mask_cache::{Atlas, MaskCache, MaskGeom, MaskSurfaces, Raster, Rasterized};
 
 /// Hard cap on live run rasters, enforced by LRU eviction on a miss at capacity.
 ///
@@ -131,7 +131,8 @@ impl RunAtlas {
     /// `(pen_px - origin_px) / scale`.
     pub(crate) fn get(&mut self, dev: &impl MaskSurfaces, run: &GlyphRun, scale: f32) -> Option<Raster> {
         let key = RunKey::new(run, scale);
-        self.cache.get(key, || rasterize_run(dev, run, scale))
+        self.cache
+            .get(key, |atlas| rasterize_run(dev, atlas, run, scale))
     }
 }
 
@@ -142,7 +143,12 @@ impl RunAtlas {
 /// the baseline lands at `(-left, -top)` inside it. Nothing is drawn but the
 /// upload — the coverage is DirectWrite's own, produced on the CPU, so the bytes
 /// do not depend on the surface format (see [`glyph_atlas::rasterize`]'s note).
-fn rasterize_run(dev: &impl MaskSurfaces, run: &GlyphRun, scale: f32) -> Option<Rasterized> {
+fn rasterize_run(
+    dev: &impl MaskSurfaces,
+    atlas: &mut Atlas,
+    run: &GlyphRun,
+    scale: f32,
+) -> Option<Rasterized> {
     let cov = glyph_run_coverage(run, scale, (0.0, 0.0)).ok().flatten();
     // A run that marks no pixels — pure whitespace — keeps a minimal cleared
     // surface rather than failing, so the cache entry stops it being asked again.
@@ -151,8 +157,8 @@ fn rasterize_run(dev: &impl MaskSurfaces, run: &GlyphRun, scale: f32) -> Option<
         None => (1, 1, 0, 0),
     };
 
-    let (surface, brush) = dev.mint(px_w, px_h, MASK_FORMAT).ok()?;
-    let (ctx, (origin_x, origin_y)) = match surface.begin_draw::<ID2D1DeviceContext>() {
+    let tile = atlas.alloc(dev, px_w, px_h, scale)?;
+    let (ctx, (origin_x, origin_y)) = match tile.begin_draw::<ID2D1DeviceContext>() {
         Ok(c) => c,
         Err(e) => {
             if super::bootstrap::is_device_loss(&e) {
@@ -165,6 +171,9 @@ fn rasterize_run(dev: &impl MaskSurfaces, run: &GlyphRun, scale: f32) -> Option<
         &ctx,
         Matrix3x2::translation(origin_x as f32, origin_y as f32),
     );
+    // Everything below is confined to this run's own region — see `Tile::clip`.
+    let (cx, cy, cw, ch) = tile.clip();
+    session.push_clip(&Rect::from_xywh(cx, cy, cw, ch));
     session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
 
     if let Some(c) = &cov {
@@ -189,10 +198,10 @@ fn rasterize_run(dev: &impl MaskSurfaces, run: &GlyphRun, scale: f32) -> Option<
         }
     }
 
-    surface.end_draw().ok()?;
+    session.pop_clip();
+    tile.end_draw().ok()?;
     Some(Rasterized {
-        brush,
-        surface,
+        tile,
         geom: MaskGeom {
             size_dip: (px_w as f32 / scale, px_h as f32 / scale),
             // The baseline origin (0,0) measured from the tight box's top-left.
@@ -209,8 +218,8 @@ mod tests {
 
     use windows_canvas::{GpuDevice, TextFormat, TextLayout};
     use windows_composition::{
-        AlphaMode, CompositionDrawingSurface, CompositionGraphicsDevice, CompositionSurfaceBrush,
-        Compositor, DispatcherQueueController, PixelFormat, Stretch,
+        AlphaMode, CompositionGraphicsDevice, CompositionSurfaceBrush,
+        CompositionVirtualDrawingSurface, Compositor, DispatcherQueueController, PixelFormat,
     };
 
     /// A windowless composition graphics device — the same chain `Compositing::new`
@@ -241,21 +250,21 @@ mod tests {
     }
 
     impl MaskSurfaces for Headless {
-        fn mint(
+        fn mint_page(
             &self,
             px_w: i32,
             px_h: i32,
             format: PixelFormat,
-        ) -> windows_core::Result<(CompositionDrawingSurface, CompositionSurfaceBrush)> {
-            let surface = self.graphics.create_drawing_surface_with_format(
-                px_w.max(1) as f32,
-                px_h.max(1) as f32,
-                format,
-                AlphaMode::Premultiplied,
-            )?;
-            let brush = self.compositor.create_surface_brush(&surface);
-            brush.set_stretch(Stretch::Fill);
-            Ok((surface, brush))
+        ) -> windows_core::Result<CompositionVirtualDrawingSurface> {
+            // The same virtual-surface factory the shipping device uses: the
+            // whole point of the seam is that a test exercises the real surface
+            // path rather than a stand-in for it.
+            self.graphics
+                .create_virtual_drawing_surface(px_w, px_h, format, AlphaMode::Premultiplied)
+        }
+
+        fn page_brush(&self, page: &CompositionVirtualDrawingSurface) -> CompositionSurfaceBrush {
+            self.compositor.create_surface_brush(page)
         }
 
         fn device_lost(&self) -> &Cell<bool> {
@@ -290,7 +299,7 @@ mod tests {
         let again = atlas.get(&dev, &run, 1.0).expect("cache hit");
         assert_eq!(atlas.len(), 1, "a hit must not add an entry");
         assert!(
-            first.brush == again.brush,
+            first.brush() == again.brush(),
             "a hit returns the identical surface brush, not a re-raster"
         );
         assert_eq!(first.id, again.id, "…and the identity a caller compares agrees");

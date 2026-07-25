@@ -29,8 +29,8 @@ use crate::system_bindings::{
 use windows_canvas::GpuDevice;
 use windows_composition::{
     AlphaMode, Color, CompositionColorBrush, CompositionDrawingSurface, CompositionGraphicsDevice,
-    CompositionNineGridBrush, CompositionSurfaceBrush, Compositor, ContainerVisual,
-    DesktopWindowTarget, InsetClip, PixelFormat, SpriteVisual, Stretch, Visual,
+    CompositionNineGridBrush, CompositionSurfaceBrush, CompositionVirtualDrawingSurface, Compositor,
+    ContainerVisual, DesktopWindowTarget, InsetClip, PixelFormat, SpriteVisual, Stretch, Visual,
 };
 use windows_numerics::Vector3;
 
@@ -429,6 +429,22 @@ impl Compositing {
         let brush = self.compositor.create_surface_brush(&surface);
         brush.set_stretch(Stretch::Fill);
         Ok((surface, brush))
+    }
+
+    /// Mint an atlas page: a **virtual** surface `px_w`×`px_h` in declared size,
+    /// which holds no storage until a region of it is drawn into.
+    ///
+    /// The raster caches pack every glyph and run into pages rather than taking a
+    /// surface each; see [`mask_cache`](super::mask_cache)'s header for why the
+    /// population matters more than the pixels.
+    pub fn new_mask_page(
+        &self,
+        px_w: i32,
+        px_h: i32,
+        format: PixelFormat,
+    ) -> windows_core::Result<CompositionVirtualDrawingSurface> {
+        self.graphics
+            .create_virtual_drawing_surface(px_w, px_h, format, AlphaMode::Premultiplied)
     }
 
     /// Create (or recreate) a node's painted-chrome surface at `px` pixels and

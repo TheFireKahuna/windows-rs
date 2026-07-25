@@ -73,7 +73,7 @@ use windows_canvas::{
 };
 use windows_numerics::Matrix3x2;
 
-use super::mask_cache::{MaskCache, MaskGeom, MaskSurfaces, Raster, Rasterized, MASK_FORMAT};
+use super::mask_cache::{Atlas, MaskCache, MaskGeom, MaskSurfaces, Raster, Rasterized};
 
 /// Horizontal subpixel phases rasterized per glyph.
 ///
@@ -115,9 +115,11 @@ const GLYPH_PAD_PX: f32 = 1.0;
 /// 12×22 px, so a full cache is about 4 MB at [`MASK_FORMAT`].
 /// Eviction is an O(n) scan, and only on a miss at capacity.
 ///
-/// Evicting an entry a sprite is still bound to is safe, exactly as in the shape
-/// atlas: the sprite's `CompositionSurfaceBrush` holds its own reference to the
-/// surface and keeps rendering those pixels until it re-binds.
+/// Evicting an entry a sprite is still bound to is safe, but not for the reason
+/// the shape atlas is: these rasters share pages, so holding a reference to the
+/// surface would not stop the region under them being re-let. What stops it is
+/// that the sprite holds the region itself — see
+/// [`mask_cache`](super::mask_cache)'s header.
 const GLYPH_ATLAS_CAP: usize = 2048;
 
 // ── Pure geometry ────────────────────────────────────────────────────────────
@@ -409,8 +411,9 @@ impl GlyphAtlas {
         phase: u32,
     ) -> Option<Raster> {
         let key = GlyphKey::new(face, glyph, em, scale, phase);
-        self.cache
-            .get(key, || rasterize(dev, face, glyph, em, scale, phase % SUBPIXEL_PHASES))
+        self.cache.get(key, |atlas| {
+            rasterize(dev, atlas, face, glyph, em, scale, phase % SUBPIXEL_PHASES)
+        })
     }
 }
 
@@ -440,6 +443,7 @@ impl GlyphAtlas {
 /// own tight bounds and lands at them inside that box.
 fn rasterize(
     dev: &impl MaskSurfaces,
+    atlas: &mut Atlas,
     face: &FontFace,
     glyph: u16,
     em: f32,
@@ -467,8 +471,8 @@ fn rasterize(
         .ok()
         .flatten();
 
-    let (surface, brush) = dev.mint(geom.px_w, geom.px_h, MASK_FORMAT).ok()?;
-    let (ctx, (origin_x, origin_y)) = match surface.begin_draw::<ID2D1DeviceContext>() {
+    let tile = atlas.alloc(dev, geom.px_w, geom.px_h, scale)?;
+    let (ctx, (origin_x, origin_y)) = match tile.begin_draw::<ID2D1DeviceContext>() {
         Ok(c) => c,
         Err(e) => {
             if super::bootstrap::is_device_loss(&e) {
@@ -484,6 +488,9 @@ fn rasterize(
         &ctx,
         Matrix3x2::translation(origin_x as f32, origin_y as f32),
     );
+    // Everything below is confined to this glyph's own region — see `Tile::clip`.
+    let (cx, cy, cw, ch) = tile.clip();
+    session.push_clip(&Rect::from_xywh(cx, cy, cw, ch));
     session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
 
     // A glyph that marks no pixels — a space — keeps its cleared surface rather
@@ -517,10 +524,10 @@ fn rasterize(
         }
     }
 
-    surface.end_draw().ok()?;
+    session.pop_clip();
+    tile.end_draw().ok()?;
     Some(Rasterized {
-        brush,
-        surface,
+        tile,
         geom: MaskGeom {
             size_dip: geom.size_dip,
             origin_px: geom.origin_px,
@@ -537,9 +544,11 @@ mod tests {
 
     use windows_canvas::{GpuDevice, TextFormat, TextLayout};
     use windows_composition::{
-        AlphaMode, CompositionDrawingSurface, CompositionGraphicsDevice, CompositionSurfaceBrush,
-        Compositor, DispatcherQueueController, PixelFormat, Stretch,
+        AlphaMode, CompositionGraphicsDevice, CompositionSurfaceBrush,
+        CompositionVirtualDrawingSurface, Compositor, DispatcherQueueController, PixelFormat,
     };
+
+    use super::super::mask_cache::MASK_FORMAT;
 
     // ── Pure geometry ────────────────────────────────────────────────────────
 
@@ -851,24 +860,21 @@ mod tests {
     }
 
     impl MaskSurfaces for Headless {
-        fn mint(
+        fn mint_page(
             &self,
             px_w: i32,
             px_h: i32,
             format: PixelFormat,
-        ) -> windows_core::Result<(CompositionDrawingSurface, CompositionSurfaceBrush)> {
-            // The DIP-sized factory, not the pixel-sized one: this mirrors what
-            // `Compositing::new_surface_with_format` does, and the whole point
-            // of the seam is that a test exercises the shipping surface path.
-            let surface = self.graphics.create_drawing_surface_with_format(
-                px_w.max(1) as f32,
-                px_h.max(1) as f32,
-                format,
-                AlphaMode::Premultiplied,
-            )?;
-            let brush = self.compositor.create_surface_brush(&surface);
-            brush.set_stretch(Stretch::Fill);
-            Ok((surface, brush))
+        ) -> windows_core::Result<CompositionVirtualDrawingSurface> {
+            // The same virtual-surface factory the shipping device uses: the
+            // whole point of the seam is that a test exercises the real surface
+            // path rather than a stand-in for it.
+            self.graphics
+                .create_virtual_drawing_surface(px_w, px_h, format, AlphaMode::Premultiplied)
+        }
+
+        fn page_brush(&self, page: &CompositionVirtualDrawingSurface) -> CompositionSurfaceBrush {
+            self.compositor.create_surface_brush(page)
         }
 
         fn device_lost(&self) -> &Cell<bool> {
@@ -902,14 +908,14 @@ mod tests {
             .expect("rasterize one glyph");
         assert_eq!(atlas.len(), 1);
 
-        // A hit returns the SAME surface brush, not a re-raster.
+        // A hit returns the SAME region and brush, not a re-raster.
         let again = atlas.get(&dev, face, g, 16.0, 1.0, 0).expect("cache hit");
         assert_eq!(atlas.len(), 1, "a hit must not add an entry");
         // `==` on a brush is COM identity, which is the whole assertion here;
         // `assert!` rather than `assert_eq!` because the wrapper deliberately
         // exposes no `Debug` that could print an interface pointer.
         assert!(
-            first.brush == again.brush,
+            first.brush() == again.brush(),
             "a cache hit must return the identical brush object"
         );
         assert_eq!(
@@ -918,17 +924,18 @@ mod tests {
         );
         assert_eq!(first.geom, again.geom);
 
-        // Each phase is its own entry, and its own surface.
-        let mut brushes = vec![first.brush.clone()];
+        // Each phase is its own entry with its own region of the shared page —
+        // so its own brush, since a brush is what aims at a region.
+        let mut brushes = vec![first.brush().clone()];
         for phase in 1..SUBPIXEL_PHASES {
             let r = atlas
                 .get(&dev, face, g, 16.0, 1.0, phase)
                 .expect("rasterize phase");
             assert!(
-                !brushes.contains(&r.brush),
-                "phase {phase} must have its own surface"
+                !brushes.contains(r.brush()),
+                "phase {phase} must have its own region"
             );
-            brushes.push(r.brush.clone());
+            brushes.push(r.brush().clone());
         }
         assert_eq!(
             atlas.len(),
@@ -1028,22 +1035,85 @@ mod tests {
             return;
         };
         // The probe is the `Err` itself: an unsupported format must fail to
-        // mint rather than fall back, or this test would pass on FP16.
-        let Ok((surface, _brush)) = dev.mint(16, 24, PixelFormat::A8UNorm) else {
+        // mint rather than fall back, or this test would pass on FP16. Probed on
+        // a page, because a page is the only thing `MASK_FORMAT` is ever applied
+        // to now — a format the device accepts for a fixed surface but not for a
+        // virtual one would be a pass here that the atlas could not honour.
+        let mut atlas = Atlas::new(PixelFormat::A8UNorm);
+        let Some(tile) = atlas.alloc(&dev, 16, 24, 1.0) else {
             eprintln!("A8 drawing surface not supported; MASK_FORMAT must stay FP16");
             return;
         };
         dev.device_lost().set(false);
-        let (ctx, (origin_x, origin_y)) = surface
+        let (ctx, (origin_x, origin_y)) = tile
             .begin_draw::<ID2D1DeviceContext>()
             .expect("A8 surface minted but refused BeginDraw");
         let session = DrawingSession::from_borrowed_context(
             &ctx,
             Matrix3x2::translation(origin_x as f32, origin_y as f32),
         );
+        let (cx, cy, cw, ch) = tile.clip();
+        session.push_clip(&Rect::from_xywh(cx, cy, cw, ch));
         session.clear(ColorF::new(0.0, 0.0, 0.0, 0.0));
-        surface.end_draw().expect("A8 EndDraw");
+        session.pop_clip();
+        tile.end_draw().expect("A8 EndDraw");
         assert!(!dev.device_lost().get(), "A8 draw reported device loss");
+    }
+
+    /// Rasters share pages. A cache whose entries each took a surface is the
+    /// thing this replaced, so the population is the assertion.
+    ///
+    /// Lives here rather than in `mask_cache` because `Headless` — a real
+    /// composition device, which is the whole point of the seam — is here.
+    #[test]
+    fn many_rasters_share_one_page() {
+        let Ok(dev) = Headless::new() else {
+            eprintln!("no composition graphics device available; skipping");
+            return;
+        };
+        let mut atlas = Atlas::new(MASK_FORMAT);
+        // Comfortably more than an idle window's whole standing population, at a
+        // typical body-text glyph's size.
+        let tiles: Vec<_> = (0..300)
+            .filter_map(|_| atlas.alloc(&dev, 12, 20, 1.0))
+            .collect();
+        assert_eq!(tiles.len(), 300, "every raster must find room");
+        assert_eq!(atlas.pages(), 1, "300 glyph-sized rasters must fit one page");
+    }
+
+    /// The safety invariant packing introduces: a region is common ground, so it
+    /// may be re-let only once nothing can still be showing it.
+    ///
+    /// Both halves matter and they pull opposite ways — a cache that never re-lets
+    /// leaks ground, and one that re-lets too early redraws a live label with
+    /// another glyph's ink. Neither shows up as a compile error, so both are
+    /// asserted here.
+    #[test]
+    fn a_region_is_re_let_only_once_its_last_holder_drops() {
+        let Ok(dev) = Headless::new() else {
+            eprintln!("no composition graphics device available; skipping");
+            return;
+        };
+        let mut atlas = Atlas::new(MASK_FORMAT);
+        let first = atlas.alloc(&dev, 12, 20, 1.0).expect("alloc");
+        let held = first.origin();
+
+        // Still held: an identically sized request must be given other ground.
+        let second = atlas.alloc(&dev, 12, 20, 1.0).expect("alloc");
+        assert_ne!(
+            held,
+            second.origin(),
+            "a region must not be re-let while it is held"
+        );
+
+        // Released: the same ground comes back, rather than the page creeping.
+        drop(first);
+        let third = atlas.alloc(&dev, 12, 20, 1.0).expect("alloc");
+        assert_eq!(
+            held,
+            third.origin(),
+            "a released region must be offered to the next request of its class"
+        );
     }
 
     /// The design advances the atlas sizes its boxes from must account for the
