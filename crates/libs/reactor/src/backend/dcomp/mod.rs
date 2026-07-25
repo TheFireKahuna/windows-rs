@@ -717,10 +717,20 @@ impl DCompBackend {
                 bar_field::forget(entry.id);
                 continue;
             };
+            // A field arriving on a node that already had a sole shape layer
+            // changes what its opacity may ride, and this service runs outside
+            // the dirty walk that would otherwise notice. Re-placed only on the
+            // push that MINTS the field: the classification cannot change while
+            // a field merely takes new values, so a steady producer pays one
+            // bool per push rather than the walk.
+            let minted = n.bars.is_none();
             let field = n
                 .bars
                 .get_or_insert_with(|| Box::new(bar_field::BarField::new()));
             field.sync(&self.comp, &n.container, entry, epoch, scale);
+            if minted {
+                n.place_opacity();
+            }
         }
         batch.retain(|e| self.arena.get(e.id).is_some());
         self.bar_batch = batch;
@@ -748,10 +758,17 @@ impl DCompBackend {
                 live_trace::forget(entry.id);
                 continue;
             };
+            // Minting a trace on a node changes what its opacity may ride —
+            // see [`service_live_bars`](Self::service_live_bars), same gate for
+            // the same reason.
+            let minted = n.trace.is_none();
             let field = n
                 .trace
                 .get_or_insert_with(|| Box::new(live_trace::LiveTraceField::new()));
             field.sync(&self.comp, &n.container, entry, epoch, scale);
+            if minted {
+                n.place_opacity();
+            }
         }
         batch.retain(|e| self.arena.get(e.id).is_some());
         self.trace_batch = batch;
@@ -761,15 +778,22 @@ impl DCompBackend {
     /// spans, whose GEOMETRY is declarative (shared with the response stroke) and whose
     /// only live property is opacity.
     ///
-    /// Deliberately does NOT repaint: opacity is a compositor property on a container
-    /// that already exists, so the write is carried by this message's implicit commit.
+    /// Deliberately does NOT repaint: opacity is a compositor property on visuals
+    /// that already exist, so the write is carried by this message's implicit commit.
     /// Nothing rasterizes and the visual tree's shape is untouched. See [`live_opacity`].
+    ///
+    /// Placement runs here rather than only in the sync for exactly that reason —
+    /// [`Node::place_opacity`] resolves its target from the layer set the node
+    /// already holds, so it costs the same two writes without a paint walk. A span
+    /// is a stroke-only shape, so it resolves to its own sprite and the eased fade
+    /// pushes no offscreen layer.
     pub(crate) fn service_live_opacity(&mut self) {
         let mut batch = std::mem::take(&mut self.opacity_batch);
         live_opacity::drain_into(&mut batch);
         for &(id, opacity) in &batch {
-            if let Some(n) = self.arena.get(id) {
-                n.container.set_opacity(opacity);
+            if let Some(n) = self.arena.get_mut(id) {
+                n.paint.opacity = opacity;
+                n.place_opacity();
             }
         }
         self.opacity_batch = batch;
@@ -1605,9 +1629,12 @@ pub(crate) fn apply_prop(node: &mut Node, prop: Prop, value: &PropValue) -> bool
             node.mark_dirty();
         }
 
-        // ── Visual prop applied straight onto the container ──────────
+        // Stored rather than written: WHERE an opacity lands depends on what
+        // the node paints, and the layer set is only final once the sync has
+        // run. See [`Node::place_opacity`].
         (Prop::Opacity, PropValue::F64(v)) => {
-            node.container.set_opacity((*v as f32).clamp(0.0, 1.0));
+            node.paint.opacity = (*v as f32).clamp(0.0, 1.0);
+            node.mark_dirty();
         }
 
         // ── Layout props (Taffy inputs; relayout runs each reconcile) ─
@@ -2242,7 +2269,7 @@ prop_contract! {
         }
         // Born ENABLED — resetting this to `false` greys the control out.
         IsEnabled => |n| { n.paint.is_enabled = n.birth_paint().is_enabled; n.mark_dirty(); }
-        Opacity => |n| { n.container.set_opacity(1.0); }
+        Opacity => |n| { n.paint.opacity = 1.0; n.mark_dirty(); }
 
         // ── Text ─────────────────────────────────────────────────────────
         // Mirrors the set: an editable kind carries its text in the editor

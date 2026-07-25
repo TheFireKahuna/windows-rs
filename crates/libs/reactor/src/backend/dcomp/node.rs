@@ -19,7 +19,7 @@ use crate::style::{
 };
 use windows_composition::{
     ContainerVisual, ImplicitAnimationCollection, InsetClip, RectangleClip,
-    SpringVector3NaturalMotionAnimation, Vector2, Visual,
+    SpringVector3NaturalMotionAnimation, SpriteVisual, Vector2, Visual,
 };
 use crate::Badge;
 use crate::Color;
@@ -157,6 +157,15 @@ pub(crate) struct Paint {
     /// `(TrimStart, TrimEnd)` on that geometry — the draw-on window. Born at
     /// full extent so a path that never mentions trim renders whole.
     pub path_trim: (f32, f32),
+    /// The node's declared opacity, `0..=1`.
+    ///
+    /// Held as paint rather than written straight to the compositor, because
+    /// WHERE it is written depends on what the node paints and that is not known
+    /// at prop-set time. Composition properties are also write-only by design
+    /// (see `census`), so a layer minted later cannot read what its siblings
+    /// carry — this field is the only readable record. [`Node::place_opacity`]
+    /// resolves the target once the layer set is final.
+    pub opacity: f32,
     /// `(colour, blur σ in DIPs)` for a pre-blurred glow behind the stroke, or
     /// `None`. The glow layer bakes a soft halo of this colour once per geometry
     /// change; see [`super::path_shape`].
@@ -206,6 +215,7 @@ impl Default for Paint {
             line: LineEndpoints::default(),
             path: None,
             path_trim: (0.0, 1.0),
+            opacity: 1.0,
             path_glow: None,
             path_fill_grad_axis: GradientAxis::Vertical,
             path_stroke_grad_axis: GradientAxis::Horizontal,
@@ -911,6 +921,14 @@ pub(crate) struct Node {
     pub children_dirty: bool,
     /// This node's surface needs a repaint (content/size/state changed).
     pub dirty: bool,
+    /// What [`place_opacity`](Self::place_opacity) last wrote, as
+    /// `(opacity bits, went to a sole layer)`.
+    ///
+    /// Both halves, not just the value: the target moves when the layer set
+    /// changes, and a value that merely stayed put must not be re-written on
+    /// every sync (property traffic is what `census` counts). `None` until the
+    /// first placement, so a node born at 1.0 writes nothing at all.
+    pub opacity_placed: Option<(u32, bool)>,
 
     /// The Taffy node this maps to, PERSISTENT across layout passes, stamped
     /// with the generation of the [`LayoutTree`](super::layout::LayoutTree)
@@ -1083,6 +1101,7 @@ impl Node {
             z_dirty: false,
             children_dirty: false,
             dirty: true,
+            opacity_placed: None,
             taffy_id: None,
             measure_dirty: true,
             stacked: Vec::new(),
@@ -1216,6 +1235,111 @@ impl Node {
     /// radius, a compact kind's smaller font).
     pub fn birth_paint(&self) -> Paint {
         birth_paint(self.kind)
+    }
+
+    /// The single painted visual carrying this node's whole appearance, or
+    /// `None` when what it draws is a group.
+    ///
+    /// Restricted to a shape's own layers on purpose. Every other family's
+    /// sprites have an owner that drives their opacity for its own reasons — a
+    /// `Part`'s reveal, a Knob's disabled dim, a bar cap's gate — and a second
+    /// writer on the same property would fight them. A shape's layers have no
+    /// such owner, so this mechanism is their only writer.
+    ///
+    /// The emptiness check below is what makes "sole" true rather than merely
+    /// likely. A node's slots are independent: nothing stops a producer hanging
+    /// a live trace or a bar field on a node that also transports a path, and a
+    /// classification that only counted `path`'s layers would then scale one of
+    /// them and leave the rest at full strength. Getting this wrong is silent —
+    /// it renders, it just renders the wrong picture — so the test is
+    /// exhaustive over the slots that put sprites under the container, and a
+    /// slot added later must be added here.
+    fn sole_opacity_visual(&self) -> Option<&SpriteVisual> {
+        // Tested FIRST because it is the one that fails for almost every node:
+        // this runs on the live-opacity path at display cadence, and a node
+        // with no shape layers should cost one null check to reject, not
+        // sixteen.
+        let path = self.path.as_ref()?;
+        // Children composite OVER this node's own paint, so a node with any is
+        // a group however few layers it draws itself.
+        if !self.children.is_empty() {
+            return None;
+        }
+        let alone = self.parts.is_none()
+            && self.bars.is_none()
+            && self.trace.is_none()
+            && self.button_text.is_none()
+            && self.text_part.is_none()
+            && self.live_run.is_none()
+            && self.item_text.is_none()
+            && self.select_text.is_none()
+            && self.knob.is_none()
+            && self.knob_text.is_none()
+            && self.ring.is_none()
+            && self.placeholder.is_none()
+            && self.caret.is_none()
+            && self.scroll_thumb.is_none()
+            && self.scroll_content.is_none();
+        if !alone {
+            return None;
+        }
+        path.sole_layer()
+    }
+
+    /// Write [`Paint::opacity`] to whichever visual can carry it.
+    ///
+    /// ## Why this is not simply a write to the container
+    ///
+    /// A `ContainerVisual`'s opacity is GROUP opacity, and group opacity over
+    /// overlapping children is not separable: DWM has to flatten the subtree
+    /// into an offscreen (`PushOffScreenRenderingLayer` /
+    /// `COffScreenRenderTarget`) before it can multiply, because scaling the
+    /// children independently double-blends where they overlap. For an opaque
+    /// stroke over a fill the two routes differ by `α(1−α)·fill` — at `α = 0.5`
+    /// the fill bleeds through the line at a quarter strength. The offscreen is
+    /// the semantics, not an implementation detail, so it cannot be optimized
+    /// away where the layers really do overlap.
+    ///
+    /// What CAN be avoided is needing group semantics at all. With exactly one
+    /// painted layer there is nothing to composite against, the two routes are
+    /// the same number, and the write goes to the sprite — no layer pushed. The
+    /// hover-lit spans of the Simple preview are this case: stroke-only shapes
+    /// whose only live property is opacity, eased at display cadence.
+    ///
+    /// ## Why the write is total
+    ///
+    /// A node's layer set changes under it — a stroke-only shape that gains a
+    /// glow moves from sole to group — and composition properties are
+    /// write-only, so a later placement cannot discover what an earlier one
+    /// left behind. Both targets are therefore always written: the value to the
+    /// one chosen, `1.0` to the other. Without that a shape crossing the
+    /// boundary would carry `α` on its layer AND `α` on its container and render
+    /// at `α²`.
+    ///
+    /// Gated on `(value, target)` so a steady node writes nothing.
+    pub fn place_opacity(&mut self) {
+        let a = self.paint.opacity.clamp(0.0, 1.0);
+        // Born at full opacity and never placed: a fresh visual's opacity is
+        // already 1.0, so writing it would cost exactly the property traffic
+        // this gate exists to avoid — and on the overwhelming majority of
+        // nodes, which never mention opacity at all.
+        if self.opacity_placed.is_none() && a == 1.0 {
+            return;
+        }
+        let want = (a.to_bits(), self.sole_opacity_visual().is_some());
+        if self.opacity_placed == Some(want) {
+            return;
+        }
+        if let Some(v) = self.sole_opacity_visual() {
+            v.set_opacity(a);
+            self.container.set_opacity(1.0);
+        } else {
+            if let Some(p) = &self.path {
+                p.clear_layer_opacity();
+            }
+            self.container.set_opacity(a);
+        }
+        self.opacity_placed = Some(want);
     }
 
     /// The Taffy style this node was born with — likewise the reset target for

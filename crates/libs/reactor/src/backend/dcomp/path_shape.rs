@@ -41,8 +41,8 @@
 use core::cell::RefCell;
 
 use windows_canvas::{
-    CapStyle, GpuDevice, LineJoin, Path, PathBuilder, PathFigure, StrokeStyle, StrokeStyleBuilder,
-    Vector2 as CVec2,
+    CapStyle, CombineMode, GpuDevice, LineJoin, Path, PathBuilder, PathFigure, StrokeStyle,
+    StrokeStyleBuilder, Vector2 as CVec2,
 };
 use windows_composition::{
     Color as UiColor, CompositionMaskBrush, CompositionPath, CompositionPathGeometry,
@@ -352,6 +352,72 @@ fn widen_d2d_path(
         }
         path.widen(&comp.gpu, width, s.as_ref()?, WIDEN_TOLERANCE_PX / scale).ok()
     })
+}
+
+/// How much of a stroke's half-width is antialiased edge rather than opaque
+/// core, in DEVICE pixels. One pixel each side is what Direct2D's analytic
+/// coverage spreads a straight edge over.
+const AA_EDGE_PX: f32 = 1.0;
+
+/// The width to widen the centreline by when excising a stroke's footprint from
+/// the fill beneath it — NARROWER than the stroke by one antialiased edge each
+/// side, or `None` when the stroke has no opaque core to hide the cut in.
+///
+/// Excluding the stroke's TRUE outline would put the boundary exactly where the
+/// stroke's own coverage is partial. There the two layers tile
+/// (`c_stroke + c_fill ≈ 1`), and scaling them separately differs from scaling
+/// their composite by `α²·c_stroke·c_fill·fill` — up to a quarter of the fill
+/// colour on a one-pixel ring at `α = 0.5`. Pulled inside the opaque core the
+/// boundary sits where `c_stroke = 1` and `c_fill = 0`, so that term is
+/// identically zero and the fill is simply hidden, as it already was.
+fn seam_width(stroke_w: f32, scale: f32) -> Option<f32> {
+    let w = stroke_w - 2.0 * AA_EDGE_PX / scale;
+    (w > 0.0).then_some(w)
+}
+
+/// The fill's region with the stroke's opaque footprint cut out of it, as one
+/// composition path.
+///
+/// ## What this buys
+///
+/// A fill and the stroke riding it OVERLAP, and group opacity over overlapping
+/// layers is not separable — DWM has to flatten the subtree into an offscreen
+/// before it can multiply (see [`Node::place_opacity`]). Two DISJOINT layers
+/// have nothing to flatten: at every pixel exactly one of them has coverage, so
+/// scaling each by `α` is the same operation as scaling their composite, and the
+/// node's opacity can go on the sprites where it costs nothing.
+///
+/// The excised part was never visible: it is the area the opaque stroke already
+/// covered.
+///
+/// ## Why it is not the default
+///
+/// `combine` splits both operands at every crossing, so the result is routinely
+/// larger than either input — a widened 511-cubic trace is already ~1032
+/// segments, and the compositor pays to ingest all of them on every geometry
+/// change. That is a bad trade on a curve being dragged. The caller therefore
+/// asks for this only when the node's opacity is actually below 1.0, which is
+/// the only time the overlap costs anything: at full opacity DWM pushes no layer
+/// for a group at all, and the plain fill is both cheaper and identical on
+/// screen.
+fn build_disjoint_fill(
+    comp: &Compositing,
+    verbs: &[PathVerb],
+    points: &[f32],
+    stroke_w: f32,
+    scale: f32,
+) -> Option<CompositionPath> {
+    let filled = build_d2d_path(&comp.gpu, verbs, points, true)?;
+    let seam = widen_d2d_path(comp, verbs, points, seam_width(stroke_w, scale)?, scale)?;
+    let cut = filled
+        .combine(
+            &comp.gpu,
+            &seam,
+            CombineMode::Exclude,
+            WIDEN_TOLERANCE_PX / scale,
+        )
+        .ok()?;
+    to_composition_path(comp, &cut)
 }
 
 // ── One fill-or-stroke layer ─────────────────────────────────────────────────
@@ -1187,6 +1253,16 @@ pub(crate) struct PathParts {
     /// and the stroke width and scale that decided the outline. A thickness or
     /// DPI move changes the region without changing the geometry.
     hit_for: Option<(bool, u32, u32)>,
+    /// Whether the fill currently holds the DISJOINT geometry — its own region
+    /// with the stroke's footprint excised (see [`build_disjoint_fill`]) — and
+    /// the stroke width that excision was cut with.
+    ///
+    /// Its own gate rather than a term folded into `geometry_seen`, because the
+    /// two are invalidated by different things: the fill has to be re-cut when
+    /// the node's opacity crosses 1.0 or its stroke changes thickness, neither
+    /// of which touches the transported geometry, and the STROKE layer must not
+    /// re-tessellate for either.
+    fill_disjoint_for: Option<u32>,
 }
 
 impl PathParts {
@@ -1198,6 +1274,7 @@ impl PathParts {
             geometry_seen: None,
             hit: None,
             hit_for: None,
+            fill_disjoint_for: None,
         }
     }
 
@@ -1207,6 +1284,42 @@ impl PathParts {
     /// did not make clickable; the caller falls back to the node's box.
     pub(crate) fn hit_contains(&self, x: f32, y: f32) -> Option<bool> {
         Some(self.hit.as_ref()?.fill_contains_point(CVec2::new(x, y)))
+    }
+
+    /// The one display sprite carrying this shape's whole appearance, when
+    /// exactly one layer exists.
+    ///
+    /// The condition for opacity to leave the node's container: with a single
+    /// layer there is nothing for a group opacity to composite against, so
+    /// writing the sprite and writing the container are the same number and the
+    /// sprite costs no offscreen. Two layers overlap by construction (a stroke
+    /// rides its own fill, a halo sits under its own stroke), and scaling them
+    /// independently is NOT the same operation — see [`Node::place_opacity`].
+    pub(crate) fn sole_layer(&self) -> Option<&SpriteVisual> {
+        match (&self.fill, &self.stroke, &self.glow) {
+            (Some(l), None, None) | (None, Some(l), None) => Some(&l.display),
+            (None, None, Some(g)) => Some(&g.display),
+            _ => None,
+        }
+    }
+
+    /// Return every layer to full opacity.
+    ///
+    /// The other half of the placement's total write: when a node stops being
+    /// sole-layered, whatever a previous placement left on the layer it chose
+    /// would otherwise multiply with the container's — the value would land
+    /// twice. Composition properties cannot be read back, so clearing all of
+    /// them is the only form that is verifiable from the app side.
+    pub(crate) fn clear_layer_opacity(&self) {
+        if let Some(l) = &self.fill {
+            l.display.set_opacity(1.0);
+        }
+        if let Some(l) = &self.stroke {
+            l.display.set_opacity(1.0);
+        }
+        if let Some(g) = &self.glow {
+            g.display.set_opacity(1.0);
+        }
     }
 }
 
@@ -1417,11 +1530,49 @@ fn sync_parts(
     // build, or a curve that actually moved. Anything that merely marks the node
     // dirty — a recolour, a hover, a theme flip — re-tessellates nothing.
     let need = |want: bool, slot_empty: bool| want && (slot_empty || geometry_changed);
-    let fill_needs = need(want_fill, parts.fill.is_none());
+
+    // ── Should the fill be cut disjoint from the stroke? ──
+    //
+    // Only when the overlap actually costs something. At full opacity DWM
+    // pushes no layer for a group, so the plain (cheaper, smaller) fill is
+    // identical on screen; below it, disjoint layers are what let the opacity
+    // ride the sprites instead of flattening the node. See
+    // [`build_disjoint_fill`] for the cost this avoids paying by default.
+    //
+    // A glow rules it out: its halo is a compositor BLUR of the stroke, so its
+    // overlap lives in a raster and no geometry can excise it. Such a node stays
+    // a group, correctly.
+    //
+    // Full trim rules it in: `TrimStart`/`TrimEnd` are fractions of the path's
+    // own length, so cutting the geometry would move what a trim selects.
+    let disjoint_fill = want_fill
+        && want_stroke
+        && !want_glow
+        && node.paint.opacity < 1.0
+        && node.paint.path_trim == (0.0, 1.0)
+        && seam_width(stroke_w, scale).is_some();
+    // The cut is keyed on the stroke width it was made with, so a thickness
+    // change re-cuts without disturbing the transported geometry.
+    let want_cut = disjoint_fill.then(|| stroke_w.to_bits());
+    let fill_needs =
+        need(want_fill, parts.fill.is_none()) || (want_fill && parts.fill_disjoint_for != want_cut);
     let stroke_needs = need(want_stroke, parts.stroke.is_none());
     let filled = fill_needs
-        .then(|| build_composition_path(comp, geometry.data().verbs(), geometry.data().points(), true))
+        .then(|| {
+            let (verbs, points) = (geometry.data().verbs(), geometry.data().points());
+            if disjoint_fill {
+                build_disjoint_fill(comp, verbs, points, stroke_w, scale)
+            } else {
+                build_composition_path(comp, verbs, points, true)
+            }
+        })
         .flatten();
+    // Recorded from what was actually built: a failed cut (a degenerate widen,
+    // an empty combine) leaves the slot on whatever it held, and claiming the
+    // cut anyway would stop the next sync retrying it.
+    if filled.is_some() {
+        parts.fill_disjoint_for = want_cut;
+    }
     let hollow = (stroke_needs || need(want_glow, parts.glow.is_none()))
         .then(|| build_composition_path(comp, geometry.data().verbs(), geometry.data().points(), false))
         .flatten();

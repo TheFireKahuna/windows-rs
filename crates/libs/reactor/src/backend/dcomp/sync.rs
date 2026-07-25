@@ -144,6 +144,21 @@ fn sync_node(
             }
     }
 
+    // AFTER the block above, because the visual an opacity lands on is decided
+    // by the layer set and that is the first point at which the set is final: a
+    // shape which just gained or lost a layer moves its opacity in the same pass
+    // that moved the layer, so the two can never disagree.
+    //
+    // Outside `needs` and outside the size gate, both deliberately. Neither
+    // condition is about opacity: a plain container has no retained chrome to
+    // reconcile and a zero-sized node paints nothing of its own, yet either can
+    // parent children that a group opacity has to reach. `place_opacity` is
+    // gated on its own value, so a node that has never mentioned opacity costs
+    // one comparison here and writes nothing.
+    if let Some(n) = arena.get_mut(id) {
+        n.place_opacity();
+    }
+
     // Indexed rather than over a cloned child list — the clone was a heap
     // allocation per node per frame bought purely to dodge `&mut Arena`.
     let mut i = 0;
