@@ -145,6 +145,11 @@ const B_BOT: f32 = 0.03;
 /// Steps in the `opacity-stack` route — one sub-visual per step.
 const STACK_STEPS: i32 = 32;
 
+/// Blocks in the `flat-opacity` / `flat-fold` pair. Fewer than [`STACK_STEPS`]
+/// on purpose: these measure one flat scalar per block rather than approximating
+/// a ramp, so each block wants enough rows to probe unambiguously.
+const FLAT_STEPS: i32 = 16;
+
 /// Which row a strip belongs to; only the constants differ.
 #[derive(Clone, Copy)]
 struct Ramp {
@@ -172,6 +177,8 @@ const ROUTES: &[(&str, &str)] = &[
     ("opacity-stack", "32 stacked FP16 sprites, ramp carried by Visual.Opacity"),
     ("mask-grad-linear", "mask-grad with InterpolationSpace = Rgb (linear) — interpolation variant"),
     ("mask-grad-norm", "mask-grad with the mask NORMALIZED to full alpha and the scale in the FP16 source"),
+    ("flat-opacity", "16 flat blocks of the SHIPPING layer structure, scalar on Visual.Opacity"),
+    ("flat-fold", "the same 16 blocks, scalar folded into the FP16 source instead"),
 ];
 
 fn main() -> Result<()> {
@@ -393,6 +400,51 @@ fn build(
             }
         }
 
+        // ── Is a FLAT opacity worth folding into the FP16 source? ──
+        //
+        // A different question from every route above, which all ask how finely
+        // the compositor can carry a RAMP. A node's declared opacity is one
+        // scalar over a whole layer, and the two ways to apply it are
+        // `Visual.Opacity` (one property write, no raster) and authoring it into
+        // the source surface the layer already owns (no compositor property at
+        // all, but a rebuild whenever it changes).
+        //
+        // `opacity-stack` does NOT answer this: its 32 levels are `STACK_STEPS`
+        // by construction, not a measurement, and it paints a bare surface brush
+        // rather than the mask brush a real shape layer is. These two paint the
+        // shipping structure — `MaskBrush{mask: opaque white, source: FP16}` —
+        // and differ ONLY in where the scalar went. Both should read
+        // `src * alpha` at every block; whichever tracks that more closely is
+        // the one worth shipping, and if they agree the fold buys nothing and
+        // should not be built.
+        //
+        // Blocks share the control column's alpha formula, so a horizontal probe
+        // at one y compares all three columns at the same intended value.
+        "flat-opacity" | "flat-fold" => {
+            let fold = route == "flat-fold";
+            let mask = device.solid_brush(compositor, 1.0)?;
+            let step_h = ramp.h as f32 / FLAT_STEPS as f32;
+            for s in 0..FLAT_STEPS {
+                let t = (s as f32 + 0.5) / FLAT_STEPS as f32;
+                let a = ramp.top + (ramp.bot - ramp.top) * t;
+                let brush = compositor.CreateMaskBrush()?;
+                brush.SetMask(&mask)?;
+                brush.SetSource(&device.solid_brush_a(
+                    compositor,
+                    ramp.src,
+                    if fold { a } else { 1.0 },
+                )?)?;
+                let seg = compositor.CreateSpriteVisual()?;
+                seg.SetOffset(Vector3 { x: 0.0, y: s as f32 * step_h, z: 0.0 })?;
+                seg.SetSize(Vector2 { x: COL_W as f32, y: step_h.ceil() })?;
+                seg.SetBrush(&brush)?;
+                if !fold {
+                    seg.SetOpacity(a)?;
+                }
+                host.Children()?.InsertAtTop(&seg)?;
+            }
+        }
+
         other => panic!("unknown route {other}"),
     }
     Ok(host)
@@ -495,9 +547,22 @@ impl GraphicsDevice {
     /// A flat FP16 surface at scRGB `v`, stretched to fill whatever paints with
     /// it. This is the COLOUR half of every mask route.
     fn solid_brush(&self, compositor: &Compositor, v: f32) -> Result<CompositionBrush> {
+        self.solid_brush_a(compositor, v, 1.0)
+    }
+
+    /// A flat FP16 surface at scRGB `v` and alpha `a` — [`solid_brush`] with the
+    /// coverage left to the caller.
+    ///
+    /// The FOLD half of the flat-opacity comparison: authoring `a` here puts the
+    /// fade in the app's own `Rgba16Float` buffer instead of on the visual, so
+    /// nothing about it passes through a compositor property. Written as
+    /// straight alpha exactly as [`ramp_brush`] writes each of its rows — D2D
+    /// premultiplies into the target — so the two are the same construction and
+    /// a difference between them cannot be an authoring difference.
+    fn solid_brush_a(&self, compositor: &Compositor, v: f32, a: f32) -> Result<CompositionBrush> {
         let surface = self.surface(8, 8)?;
         self.draw(&surface, |ctx| unsafe {
-            ctx.Clear(Some(&D2D_COLOR_F { r: v, g: v, b: v, a: 1.0 }));
+            ctx.Clear(Some(&D2D_COLOR_F { r: v, g: v, b: v, a }));
         })?;
         let brush = compositor.CreateSurfaceBrushWithSurface(&surface)?;
         brush.SetStretch(CompositionStretch::Fill)?;
