@@ -79,7 +79,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_composition::{CompositionEasingFunction, ScalarKeyFrameAnimation};
@@ -111,6 +111,26 @@ use crate::{Color, GradientAxis, PathVerb};
 enum TraceLayer {
     Clipped(ClipLayer),
     Masked(PathLayer),
+}
+
+/// Whether traces use the capture-free construction, read ONCE from
+/// `REACTOR_TRACE_LAYER` (`mask` selects the capture route; anything else,
+/// including an unset variable, selects the clip route).
+///
+/// Here so the two constructions can be compared in ONE binary. They differ in
+/// what the compositor does per publish, which means the interesting question —
+/// whether the front thread's share moved because the work changed or because a
+/// window no longer waiting on DWM simply runs more frames — cannot be answered
+/// by profiling two builds against each other. Same binary, same desktop, one
+/// variable.
+fn clipped_traces() -> bool {
+    static CLIPPED: OnceLock<bool> = OnceLock::new();
+    *CLIPPED.get_or_init(|| {
+        !std::env::var_os("REACTOR_TRACE_LAYER")
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("mask"))
+    })
 }
 
 impl TraceLayer {
@@ -628,7 +648,7 @@ impl LiveTraceField {
         // A flat wash needs no capture; a ramped one has nowhere else to put its
         // staircase. A trace that gains or loses its ramp therefore rebuilds the
         // fill rather than trying to re-role a layer built the other way.
-        let flat_fill = self.fill_stops.is_empty() && !batch.has_fill_ramp;
+        let flat_fill = clipped_traces() && self.fill_stops.is_empty() && !batch.has_fill_ramp;
         if self.fill.as_ref().is_some_and(|f| f.is_clipped() != flat_fill) {
             if let Some(f) = self.fill.take() {
                 f.display().set_visible(false);
@@ -664,7 +684,7 @@ impl LiveTraceField {
                 &batch.verbs,
                 &batch.points,
                 Role::Stroke,
-                Some(layout.thickness),
+                clipped_traces().then_some(layout.thickness),
                 scale,
             );
         }
@@ -691,11 +711,13 @@ impl LiveTraceField {
         let Some(layer) = self.layer.as_mut() else { return };
         layer.resize(layout.width, layout.height, scale);
         // A flat colour: the source is a solid FP16 raster, exactly as a bar
-        // body's is. The thickness is not set here — it was baked into the
-        // widened outline the clip takes its shape from.
+        // body's is. A clipped line states no thickness — that was baked into the
+        // widened outline its clip takes its shape from — while a masked one
+        // strokes a shape and must still be told.
         match layer {
             TraceLayer::Clipped(l) => l.set_source(comp, layout.color, scale),
             TraceLayer::Masked(l) => {
+                l.set_thickness(layout.thickness);
                 l.set_source(comp, layout.color, &[], GradientAxis::Vertical, atlas_epoch, scale)
             }
         }
