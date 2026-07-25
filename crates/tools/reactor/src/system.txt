@@ -108,6 +108,14 @@ Windows::Win32::GetClientRect
 Windows::Win32::SetWindowLongPtrW
 Windows::Win32::GetWindowLongPtrW
 Windows::Win32::SetWindowPos
+// ── DWM-owned frame chrome ──
+// The caption strip is drawn in-client, but DWM still owns the frame around it:
+// the theme its border and snap-layout flyout follow, and whether it draws an
+// outer border line at all. Member-scoped to the two attributes actually set —
+// the enum carries ~25 more with no caller here.
+Windows::Win32::DwmSetWindowAttribute
+Windows::Win32::DWMWINDOWATTRIBUTE::{DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_BORDER_COLOR}
+Windows::Win32::DWMWA_COLOR_NONE
 // ── Message loop ──
 Windows::Win32::GetMessageW
 Windows::Win32::PeekMessageW

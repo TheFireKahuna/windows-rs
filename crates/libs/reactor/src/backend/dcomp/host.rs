@@ -347,6 +347,7 @@ impl DCompHost {
         set_current_color_scheme(scheme_for(dark));
         backend.apply_theme(dark);
         apply_frame_dark_mode(hwnd, dark);
+        suppress_frame_border(hwnd);
 
         // The two halves of the record seam, now on two threads: the host owns
         // the real backend outright, and the app thread runs the reconciler
@@ -581,28 +582,45 @@ fn apply_effective_theme(s: &HostShared) {
     }));
 }
 
-windows_core::link!("dwmapi.dll" "system" fn DwmSetWindowAttribute(
-    hwnd: HWND,
-    dwattribute: u32,
-    pvattribute: *const core::ffi::c_void,
-    cbattribute: u32,
-) -> i32);
+/// Set one DWM frame attribute, discarding the result.
+///
+/// Every attribute here is chrome the app can live without: the pre-22000
+/// builds that predate them fail the call and keep the default frame, which is
+/// exactly the wanted fallback, so there is nothing to branch on.
+fn set_frame_attribute<T>(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: &T) {
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            attribute as u32,
+            (value as *const T).cast(),
+            size_of::<T>() as u32,
+        );
+    }
+}
 
 /// Keep the DWM-owned window chrome (frame border, snap-layout flyout) on the
 /// effective theme via `DWMWA_USE_IMMERSIVE_DARK_MODE`. The caption strip is
 /// drawn in-client, but DWM still renders the outer frame around it.
 fn apply_frame_dark_mode(hwnd: HWND, dark: bool) {
-    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
     // The attribute is a Win32 BOOL (4 bytes).
-    let value: i32 = dark as i32;
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            (&value as *const i32).cast(),
-            size_of::<i32>() as u32,
-        );
-    }
+    set_frame_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &(dark as i32));
+}
+
+/// Suppress the outer border line DWM draws around the window.
+///
+/// `DWMWA_COLOR_NONE` is documented as making "it possible to have a rounded
+/// window with no border" — and a border is what this window does not want.
+/// Every pixel inside the frame is composited by us in FP16 and display-mapped;
+/// the border is not, so it lands as an untone-mapped system-coloured line
+/// hairline-adjacent to a dark backdrop. Suppressing it keeps DWM's rounded
+/// corners and the resize frame (the sizing border is geometry, not paint)
+/// while leaving the visible edge entirely to the composition tree.
+///
+/// Set once at creation rather than per theme: unlike a real border colour,
+/// which the docs say the app must maintain "according to state changes, such
+/// as a change in window activation", *absent* has no active/inactive form.
+fn suppress_frame_border(hwnd: HWND) {
+    set_frame_attribute(hwnd, DWMWA_BORDER_COLOR, &DWMWA_COLOR_NONE);
 }
 
 windows_core::link!("advapi32.dll" "system" fn RegGetValueW(

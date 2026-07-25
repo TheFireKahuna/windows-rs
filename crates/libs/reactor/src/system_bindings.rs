@@ -10,6 +10,7 @@ windows_core::link!("dcomp.dll" "system" fn DCompositionWaitForCompositorClock(c
 windows_core::link!("user32.dll" "system" fn DefWindowProcW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
 windows_core::link!("user32.dll" "system" fn DestroyWindow(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn DispatchMessageW(lpmsg : *const MSG) -> LRESULT);
+windows_core::link!("dwmapi.dll" "system" fn DwmSetWindowAttribute(hwnd : HWND, dwattribute : u32, pvattribute : *const core::ffi::c_void, cbattribute : u32) -> windows_core::HRESULT);
 windows_core::link!("user32.dll" "system" fn EmptyClipboard() -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn EnableMouseInPointer(fenable : windows_core::BOOL) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn EndPaint(hwnd : HWND, lppaint : *const PAINTSTRUCT) -> windows_core::BOOL);
@@ -218,6 +219,10 @@ impl Default for DVTARGETDEVICE {
         unsafe { core::mem::zeroed() }
     }
 }
+pub const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = 34;
+pub const DWMWA_COLOR_NONE: u32 = 4294967294;
+pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWMWINDOWATTRIBUTE = 20;
+pub type DWMWINDOWATTRIBUTE = i32;
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DirectXAlphaMode(pub i32);
