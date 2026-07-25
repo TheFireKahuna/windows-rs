@@ -199,6 +199,32 @@ pub(crate) fn resolve_radius(authored: f32, h: f32) -> f32 {
     authored.clamp(0.0, h * 0.5)
 }
 
+/// Whether a kind cuts its whole subtree to its own rounded box.
+///
+/// This is the one table that decides it. Nothing above the backend opts in: a
+/// consumer already declares `corner_radius`, and a kind listed here turns that
+/// same value into a clip as well as a curve on its chrome — so no widget and no
+/// app call site changes to gain rounded content.
+///
+/// Membership is deliberately narrow, because a clip cuts a node's OWN parts too
+/// and several kinds are drawn to overhang their box on purpose: the button
+/// family's ink and focus ring, a Slider or Knob's value chrome, and any glow (a
+/// halo is an unclipped sprite that may sit outside a tight box). Those must stay
+/// off this list. The kinds here are containers whose content genuinely should
+/// not escape the corner.
+pub(crate) fn clips_to_radius(kind: ControlKind) -> bool {
+    matches!(
+        kind,
+        // The card/panel primitive — a Border is what an app reaches for when it
+        // wants a rounded box with content in it.
+        ControlKind::Border
+            // Already clipped to their bounds at birth; a radius upgrades that
+            // same clip rather than adding a second one.
+            | ControlKind::ScrollViewer
+            | ControlKind::ScrollView
+    )
+}
+
 /// Whether a button-family node has a leading icon glyph *and* a label to sit
 /// beside it.
 ///

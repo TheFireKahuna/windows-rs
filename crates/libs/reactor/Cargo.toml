@@ -109,5 +109,9 @@ name = "dcomp_layout"
 required-features = ["dcomp-backend"]
 
 [[example]]
+name = "dcomp_rounded_clip"
+required-features = ["dcomp-backend"]
+
+[[example]]
 name = "dcomp_live_text"
 required-features = ["dcomp-backend"]

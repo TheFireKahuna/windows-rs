@@ -89,7 +89,7 @@ pub(crate) use pointer::{
 pub(crate) use size::register_element_size;
 
 use bootstrap::Compositing;
-use node::{Arena, Ctrl, Extras, MenuRow, Node};
+use node::{Arena, Ctrl, Extras, MenuRow, Node, NodeClip};
 
 use crate::backend::{Backend, ControlKind, Event, EventHandler, Prop, PropValue};
 use crate::style::{
@@ -977,7 +977,7 @@ impl DCompBackend {
         ) {
             let clip = self.comp.new_inset_clip();
             node.container.set_clip(Some(&clip));
-            node.clip = Some(clip);
+            node.clip = Some(NodeClip::Bounds(clip));
         }
         // Scroll containers get a content CARRIER visual their children parent
         // into: scrolling animates this one visual's Offset on the compositor

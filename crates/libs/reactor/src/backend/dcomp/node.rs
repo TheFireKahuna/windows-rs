@@ -18,8 +18,8 @@ use crate::style::{
     PointerHandlers,
 };
 use windows_composition::{
-    ContainerVisual, ImplicitAnimationCollection, InsetClip, SpringVector3NaturalMotionAnimation,
-    Visual,
+    ContainerVisual, ImplicitAnimationCollection, InsetClip, RectangleClip,
+    SpringVector3NaturalMotionAnimation, Vector2, Visual,
 };
 use crate::Badge;
 use crate::Color;
@@ -834,8 +834,13 @@ pub(crate) struct Node {
     pub thumb_shown: bool,
     /// While dragging the thumb: the pointer-to-thumb-top offset captured at press.
     pub thumb_drag: Option<f32>,
-    /// Bounds clip (ScrollViewer/overflow); tracks the container's own size.
-    pub clip: Option<InsetClip>,
+    /// Bounds clip (ScrollViewer/overflow), and the rounded clip that cuts a
+    /// radiused container's subtree to its own corners.
+    pub clip: Option<NodeClip>,
+    /// The `(w, h, radius)` the rounded clip was last written for, so a layout
+    /// pass that changes neither writes nothing. `None` while the clip is an
+    /// inset one, which needs no geometry write at all.
+    last_clip: Option<(f32, f32, f32)>,
 
     // ── Compositor animations (all DWM-evaluated — zero app ticks) ───────
     /// Declared implicit property transitions (opacity/scale/rotation/
@@ -1016,6 +1021,7 @@ impl Node {
             thumb_shown: false,
             thumb_drag: None,
             clip: None,
+            last_clip: None,
             transitions: None,
             layout_anim: None,
             implicit: None,
@@ -1325,15 +1331,62 @@ impl Node {
     /// Push the visual's size, skipping the COM write when unchanged; keeps
     /// the scale pivot centred while any animation wants one.
     pub fn push_size(&mut self, w: f32, h: f32) {
-        if self.last_size == Some((w, h)) {
+        if self.last_size != Some((w, h)) {
+            self.container.set_size(w, h);
+            self.last_size = Some((w, h));
+            if self.wants_center {
+                self.container
+                    .set_center_point(Vector3::new(w / 2.0, h / 2.0, 0.0));
+            }
+        }
+        // Gated separately from the size: a corner radius can change while the
+        // box does not, and the layout pass runs this either way.
+        self.sync_rounded_clip(w, h);
+    }
+
+    /// Cut the node's subtree to its own rounded box, for the kinds that opt in
+    /// (see [`clips_to_radius`](super::controls::clips_to_radius)).
+    ///
+    /// A rounded clip is minted only once a radius actually resolves above zero,
+    /// so a square node of an opted-in kind costs nothing — no clip object, no
+    /// write. Unlike an `InsetClip`, whose zero insets track the visual's bounds
+    /// on their own, a `RectangleClip`'s sides are absolute in the visual's
+    /// space, which is why this runs from the layout pass at all.
+    fn sync_rounded_clip(&mut self, w: f32, h: f32) {
+        if !controls::clips_to_radius(self.kind) {
             return;
         }
-        self.container.set_size(w, h);
-        self.last_size = Some((w, h));
-        if self.wants_center {
-            self.container
-                .set_center_point(Vector3::new(w / 2.0, h / 2.0, 0.0));
+        // Resolved, not authored: the chrome under it was cut to the clamped
+        // radius (`resolve_radius` caps at half the box), and a clip on a
+        // different curve than the fill reads as a rendering fault at the corner.
+        let radius = controls::resolve_radius(self.paint.corner_radius, h);
+        if radius <= 0.0 {
+            // Never rounded, or rounded and then squared off again. Only the
+            // rounded clip is ours to drop — a bounds clip belongs to the kind.
+            if matches!(self.clip, Some(NodeClip::Rounded(_))) {
+                self.container.clear_clip();
+                self.clip = None;
+                self.last_clip = None;
+            }
+            return;
         }
+        if self.last_clip == Some((w, h, radius)) {
+            return;
+        }
+        let clip = match &self.clip {
+            Some(NodeClip::Rounded(clip)) => clip.clone(),
+            // A rectangle clip carries the bounds an inset clip was doing, so a
+            // scroll container that gains a radius upgrades rather than stacks.
+            _ => {
+                let clip = self.container.compositor().create_rectangle_clip();
+                self.container.set_clip(Some(&clip));
+                self.clip = Some(NodeClip::Rounded(clip.clone()));
+                clip
+            }
+        };
+        clip.set_sides(0.0, 0.0, w, h);
+        clip.set_corner_radius(Vector2::new(radius, radius));
+        self.last_clip = Some((w, h, radius));
     }
 
     // ── Scroll carrier (compositor-side scrolling) ───────────────────────
@@ -1467,6 +1520,24 @@ pub(crate) fn birth_paint(kind: ControlKind) -> Paint {
 /// Deliberately excludes the two that only look related: a HyperlinkButton is
 /// chromeless accent text, and a DropDownButton draws the select chrome
 /// (`paint_select`) at its own smaller type size.
+/// The clip on a node's container.
+///
+/// Two kinds, because they cost differently. An [`InsetClip`] at zero insets
+/// tracks the visual's bounds on its own, so a bounds clip is written once when
+/// the node is built and never again. A [`RectangleClip`]'s sides are absolute
+/// in the visual's space, so a rounded clip is rewritten whenever the box or the
+/// radius changes — see [`Node::sync_rounded_clip`].
+#[derive(Clone)]
+pub enum NodeClip {
+    /// The node's own bounds, tracked automatically (ScrollViewer/overflow).
+    ///
+    /// Held rather than read: the visual owns the clip once it is set, so this
+    /// is only the node's record of what it installed.
+    Bounds(#[allow(dead_code)] InsetClip),
+    /// The node's bounds with its resolved corner radius.
+    Rounded(RectangleClip),
+}
+
 pub(crate) fn is_button_family(kind: ControlKind) -> bool {
     matches!(
         kind,
