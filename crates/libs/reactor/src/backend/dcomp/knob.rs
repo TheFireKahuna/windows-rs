@@ -33,7 +33,7 @@ use windows_canvas::{PathBuilder, Rect, Vector2 as CVec2};
 use windows_composition::{
     BorderMode, Color as UiColor, CompositionColorBrush, CompositionMaskBrush, CompositionPath,
     CompositionPathGeometry, CompositionSpriteShape, CompositionVisualSurface, Compositor,
-    ShapeVisual, SpringScalarNaturalMotionAnimation, SpriteVisual, StrokeCap,
+    Geometry, ShapeVisual, SpringScalarNaturalMotionAnimation, SpriteVisual, StrokeCap,
 };
 use windows_numerics::{Vector2, Vector3};
 

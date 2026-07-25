@@ -59,8 +59,9 @@ use windows_canvas::{
     Vector2 as CVec2,
 };
 use windows_composition::{
-    BatchKind, CompositionDrawingSurface, CompositionNineGridBrush, CompositionScopedBatch,
-    CompositionSurfaceBrush, ContainerVisual, InsetClip, SpringVector2NaturalMotionAnimation,
+    BatchKind, BorderMode, CompositionDrawingSurface, CompositionNineGridBrush, CompositionScopedBatch,
+    CompositionSurfaceBrush, ContainerVisual, InsetClip, RectangleClip,
+    SpringScalarNaturalMotionAnimation, SpringVector2NaturalMotionAnimation,
     SpringVector3NaturalMotionAnimation, SpriteVisual, Visual,
 };
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
@@ -406,6 +407,35 @@ impl AtlasKey {
             ShapeKey::GradBar { r, .. } => f32::from_bits(*r) > 0.0,
             _ => false,
         }
+    }
+
+    /// The corner radius, in DIPs, if this source is a FILLED rounded bar — the
+    /// case that needs no raster of its own at all.
+    ///
+    /// A filled rounded bar is a flat colour with rounded corners, and both
+    /// halves of that are things the compositor already does: the colour is the
+    /// shared 4×4 `Solid` FP16 cell every other solid in the backend uses, and
+    /// the rounding is a `RectangleClip`. Routing it that way retires the
+    /// per-look raster **and** the reason its key had to carry a size at all —
+    /// `thick` comes from `node.rect.h`, which is why [`snap_extent`] and
+    /// [`ATLAS_CAP`] exist. A clipped fill is keyed on colour and scale alone,
+    /// so a drag-resize mints nothing however far it travels.
+    ///
+    /// A STROKED bar is not this case: a clip cannot draw a ring, so it keeps a
+    /// geometry (see `path_shape::PathLayer::new_rounded_rect`).
+    fn clip_radius(&self) -> Option<f32> {
+        match &self.shape {
+            ShapeKey::Bar { r, stroke_w, .. } if f32::from_bits(*stroke_w) <= 0.0 => {
+                Some(f32::from_bits(*r))
+            }
+            _ => None,
+        }
+    }
+
+    /// This key's colour and scale as the shared flat source — what a clipped
+    /// fill actually binds.
+    fn as_solid(&self) -> Self {
+        Self { shape: ShapeKey::Solid, color: self.color, scale: self.scale }
     }
     /// Which axis the nine-grid's insets sit on. A bar's rounded ends are on
     /// its LENGTH axis, so a vertical bar insets top/bottom where a horizontal
@@ -962,6 +992,21 @@ mod channel {
             self.known != Known::Nothing
         }
 
+        /// The last target this channel ASKED for, whatever state it is in —
+        /// `None` only before the first write, or while an out-of-band animation
+        /// owns the property and this channel tracks nothing.
+        ///
+        /// For a caller bringing a newly built object into step with a property
+        /// that was written before it existed; it is not evidence of where the
+        /// visual actually is (`verified_at` is).
+        pub(super) fn target(&self) -> Option<(f32, f32)> {
+            match self.known {
+                Known::Nothing | Known::Ceded(_) => None,
+                Known::Verified(v) => Some(v),
+                Known::Animating { to, .. } => Some(to),
+            }
+        }
+
         /// The value is KNOWN to be `t`. The only state that may suppress a
         /// plain write of the same value.
         pub(super) fn verified_at(&mut self, t: (f32, f32)) -> bool {
@@ -1390,8 +1435,22 @@ pub(crate) struct Part {
     /// rather than re-derived through `SpriteVisual`'s deref only because a
     /// settle callback needs an OWNED one to move into the closure.
     vis: Visual,
-    /// Nine-grid wrapper (HBar sources only); built once, re-sourced on re-bind.
+    /// Nine-grid wrapper (stroked-bar sources only); built once, re-sourced on
+    /// re-bind.
     nine: Option<CompositionNineGridBrush>,
+    /// Rounded clip for a FILLED bar, whose colour is the shared flat `Solid`
+    /// cell — see [`AtlasKey::clip_radius`]. Built on first such bind and kept
+    /// thereafter; a re-bind rewrites its radius rather than minting another.
+    ///
+    /// Its sides are in the sprite's own space, so they track `Size`: written
+    /// directly by [`place`](Self::place) and sprung alongside it by
+    /// [`glide_size`](Self::glide_size). Binding them by expression instead
+    /// would be one object fewer and evaluate on every vblank FOREVER, where a
+    /// spring stops costing anything the moment it lands — and most fills snap.
+    clip: Option<RectangleClip>,
+    /// The radius `clip` is currently rounded by, so a re-bind at the same
+    /// radius writes nothing.
+    clip_r: f32,
     /// The atlas source currently bound + the epoch it came from.
     key: Option<AtlasKey>,
     epoch: u32,
@@ -1424,6 +1483,10 @@ pub(crate) struct Part {
     // Cached retargetable motion springs, built on first glide.
     s_off: Option<SpringVector3NaturalMotionAnimation>,
     s_size: Option<SpringVector2NaturalMotionAnimation>,
+    /// A rounded fill's clip sides (`Right`, `Bottom`), carried alongside the
+    /// Size spring — see [`glide_clip_sides`](Self::glide_clip_sides). Built
+    /// only on the first Size glide of a clipped part.
+    s_clip: Option<(SpringScalarNaturalMotionAnimation, SpringScalarNaturalMotionAnimation)>,
     /// Keep the settle subscriptions alive: an `EventRevoker` revokes its
     /// handler on drop, so a dropped one is a completion that never arrives —
     /// and a destination that never becomes evidence.
@@ -1441,6 +1504,8 @@ impl Part {
             sprite,
             vis,
             nine: None,
+            clip: None,
+            clip_r: 0.0,
             key: None,
             epoch: 0,
             off: Channel::new(),
@@ -1450,6 +1515,7 @@ impl Part {
             op_gliding: false,
             s_off: None,
             s_size: None,
+            s_clip: None,
             _settle: [None, None],
         }
     }
@@ -1509,6 +1575,54 @@ impl Part {
             return;
         }
         let epoch = atlas.epoch;
+        // A filled rounded bar binds the SHARED flat cell and rounds itself with
+        // a clip — no rounded raster, and nothing in its source key that a
+        // resize can move. See `AtlasKey::clip_radius`.
+        if let Some(radius) = key.clip_radius() {
+            let Some(entry) = atlas.entry(comp, &key.as_solid()) else { return };
+            let clip = match &self.clip {
+                Some(c) => c.clone(),
+                None => {
+                    let c = self.vis.compositor().create_rectangle_clip();
+                    // Sides start at the size already written, so a part that
+                    // was placed before it was ever clipped is not blanked for
+                    // a frame by a zero-area clip.
+                    let (w, h) = self.size.target().unwrap_or((0.0, 0.0));
+                    c.set_sides(0.0, 0.0, w, h);
+                    // Ask for antialiased edges EXPLICITLY. `BorderMode::Inherit`
+                    // is the default and resolves to hard edges here, so the
+                    // rounded corners came out aliased where the D2D-rasterized
+                    // nine-grid corner they replace was smooth — measured as a
+                    // 90/255 channel delta on every corner pixel in an A/B shot,
+                    // and invisible in a census. Same trap `path_shape` documents
+                    // for its off-tree mask.
+                    self.vis.set_border_mode(BorderMode::Soft);
+                    self.vis.set_clip(Some(&c));
+                    self.clip = Some(c.clone());
+                    self.clip_r = f32::NAN;
+                    c
+                }
+            };
+            if self.clip_r != radius {
+                clip.set_corner_radius(Vector2::new(radius, radius));
+                self.clip_r = radius;
+            }
+            self.sprite.set_brush(&entry.brush);
+            self.key = Some(key);
+            self.epoch = epoch;
+            return;
+        }
+        // Anything else keeps its own raster. A part that WAS a clipped fill and
+        // is now something else drops the clip, or the new source would be cut
+        // to the old rounding.
+        if self.clip.take().is_some() {
+            self.vis.set_clip(None::<&RectangleClip>);
+            // Back to the tree's default: the soft mode above is for the clip's
+            // rounded edge, and leaving it on an unclipped sprite would keep
+            // paying for an antialiasing pass over a rectangle that has none.
+            self.vis.set_border_mode(BorderMode::Inherit);
+            self.clip_r = 0.0;
+        }
         let Some(entry) = atlas.entry(comp, &key) else { return };
         if key.uses_nine_grid() {
             // Corners map 1:1 back to DIPs: source insets are `r * scale` px,
@@ -1572,6 +1686,15 @@ impl Part {
         if size_held.is_some() || !self.size.verified_at((w, h)) {
             self.vis.set_size(w, h);
             self.size.wrote((w, h));
+        }
+        // A rounded fill's clip is in the sprite's own space, so it follows the
+        // size rather than being implied by it. Stop any spring first, for the
+        // same reason the size write above does: a snap is authoritative and an
+        // in-flight side would keep driving past it.
+        if let Some(c) = &self.clip {
+            c.stop_animation("Right");
+            c.stop_animation("Bottom");
+            c.set_sides(0.0, 0.0, w, h);
         }
     }
 
@@ -1647,6 +1770,42 @@ impl Part {
         a.set_period(secs(spring_period(dist)));
         a.set_final_value(Vector2::new(w, h));
         self.vis.start_animation("Size", a);
+        self.glide_clip_sides(w, h, dist);
+    }
+
+    /// Carry a rounded fill's clip along with a Size glide, on springs tuned
+    /// identically to it.
+    ///
+    /// The clip's sides are DIPs in the sprite's own space, so a size that
+    /// springs while the clip jumps would round the WRONG box for the whole
+    /// flight — visible as the corners detaching from the edges mid-move. Two
+    /// scalar springs rather than one `Vector2`: a `RectangleClip` exposes its
+    /// sides as four independent scalars, and only two of them move.
+    ///
+    /// Cached and retargeted like every other spring here, and started only
+    /// while a clip exists — an unclipped part never builds them.
+    fn glide_clip_sides(&mut self, w: f32, h: f32, dist: f32) {
+        if self.clip.is_none() {
+            return;
+        }
+        if self.s_clip.is_none() {
+            let compositor = self.vis.compositor();
+            let right = compositor.create_spring_scalar_animation();
+            right.set_damping_ratio(CHROME_SPRING_DAMPING);
+            let bottom = compositor.create_spring_scalar_animation();
+            bottom.set_damping_ratio(CHROME_SPRING_DAMPING);
+            self.s_clip = Some((right, bottom));
+        }
+        let (Some((right, bottom)), Some(clip)) = (self.s_clip.as_ref(), self.clip.as_ref()) else {
+            return;
+        };
+        let period = secs(spring_period(dist));
+        right.set_period(period);
+        right.set_final_value(w);
+        bottom.set_period(period);
+        bottom.set_final_value(h);
+        clip.start_animation("Right", right);
+        clip.start_animation("Bottom", bottom);
     }
 
     /// Snap opacity (stopping any in-flight fade first).

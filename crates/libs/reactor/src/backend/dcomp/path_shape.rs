@@ -45,9 +45,10 @@ use windows_canvas::{
     StrokeStyleBuilder, Vector2 as CVec2,
 };
 use windows_composition::{
-    Color as UiColor, CompositionMaskBrush, CompositionPath, CompositionPathGeometry,
-    CompositionSpriteShape, CompositionSurfaceBrush, BorderMode, CompositionVisualSurface, DropShadow,
-    ShadowSource, ShapeVisual, SpringScalarNaturalMotionAnimation, SpriteVisual, StrokeCap,
+    Color as UiColor, CompositionGeometry, CompositionMaskBrush, CompositionPath,
+    CompositionPathGeometry, CompositionRoundedRectangleGeometry, CompositionSpriteShape,
+    CompositionSurfaceBrush, BorderMode, CompositionVisualSurface, DropShadow,
+    Geometry, ShadowSource, ShapeVisual, SpringScalarNaturalMotionAnimation, SpriteVisual, StrokeCap,
     StrokeJoin,
 };
 use windows_core::{implement_decl, Interface, Ref, Result};
@@ -485,6 +486,80 @@ pub(crate) fn size_mask(
     }
 }
 
+/// What a [`PathLayer`] draws its outline from.
+///
+/// Both variants are `CompositionGeometry` subclasses, so trimming and
+/// animation are identical across them (they come from the `Geometry` trait);
+/// what differs is how the outline is *defined*, and that difference is the
+/// whole reason the second variant exists.
+///
+/// - [`Path`](Self::Path) takes arbitrary app vectors. Getting them to the
+///   compositor costs a D2D tessellation, a `PathGeometrySource` COM object and
+///   an immutable `CompositionPath` — paid again on every reshape.
+/// - [`RoundedRect`](Self::RoundedRect) is drawn by the compositor from three
+///   properties. A resize or a radius change is a property write: no
+///   tessellation, no interop object, no raster, and no cache keyed on the
+///   size. It is strictly the better route whenever the outline happens to be
+///   a rounded rectangle — which is most chrome.
+pub(crate) enum LayerGeometry {
+    Path(CompositionPathGeometry),
+    RoundedRect(CompositionRoundedRectangleGeometry),
+}
+
+impl LayerGeometry {
+    /// The geometry as the sprite-shape factory wants it.
+    fn as_shape_geometry(&self) -> CompositionGeometry {
+        match self {
+            Self::Path(g) => g.as_geometry(),
+            Self::RoundedRect(g) => g.as_geometry(),
+        }
+    }
+
+    fn set_trim_start(&self, start: f32) {
+        match self {
+            Self::Path(g) => g.set_trim_start(start),
+            Self::RoundedRect(g) => g.set_trim_start(start),
+        }
+    }
+
+    fn set_trim_end(&self, end: f32) {
+        match self {
+            Self::Path(g) => g.set_trim_end(end),
+            Self::RoundedRect(g) => g.set_trim_end(end),
+        }
+    }
+
+    fn start_animation(&self, property: &str, animation: &impl windows_composition::Animation) {
+        match self {
+            Self::Path(g) => g.start_animation(property, animation),
+            Self::RoundedRect(g) => g.start_animation(property, animation),
+        }
+    }
+
+    fn stop_animation(&self, property: &str) {
+        match self {
+            Self::Path(g) => g.stop_animation(property),
+            Self::RoundedRect(g) => g.stop_animation(property),
+        }
+    }
+
+    /// Re-point a path layer at new vectors.
+    ///
+    /// A rounded rectangle has no path to re-point — its outline IS its
+    /// `Size`/`Offset`/`CornerRadius`, written by [`PathLayer::resize`] and
+    /// [`PathLayer::set_corner_radius`]. Reaching here means a caller built the
+    /// layer with one constructor and is feeding it the other's input, which is
+    /// a wiring mistake rather than a state a running app can enter.
+    fn set_path(&self, path: &CompositionPath) {
+        match self {
+            Self::Path(g) => g.set_path(path),
+            Self::RoundedRect(_) => {
+                debug_assert!(false, "set_path on a rounded-rectangle layer")
+            }
+        }
+    }
+}
+
 /// One retained layer: geometry → white mask shape → visual surface → mask
 /// brush over an FP16 source → visible sprite.
 ///
@@ -495,10 +570,14 @@ pub(crate) fn size_mask(
 /// private to this module.
 pub(crate) struct PathLayer {
     role: Role,
-    /// The geometry. It carries its own `set_trim_*` AND its own
-    /// `start_animation` / `stop_animation`, so the separate `CompositionObject`
-    /// face the raw path had to keep alongside it is gone.
-    geo: CompositionPathGeometry,
+    /// The geometry — app vectors or a compositor-drawn rounded rectangle. It
+    /// carries its own `set_trim_*` AND its own `start_animation` /
+    /// `stop_animation`, so the separate `CompositionObject` face the raw path
+    /// had to keep alongside it is gone.
+    geo: LayerGeometry,
+    /// Corner radius in DIPs, for a [`LayerGeometry::RoundedRect`] layer.
+    /// Ignored by a path layer, whose corners are in its vectors.
+    rr_radius: f32,
     shape: CompositionSpriteShape,
     /// The off-tree mask subtree. Held as the `ShapeVisual` itself now rather
     /// than as a widened `IVisual`; it derefs to `Visual` for the sizing write.
@@ -558,16 +637,41 @@ impl PathLayer {
         path: &CompositionPath,
         role: Role,
     ) -> Self {
+        let geo = LayerGeometry::Path(comp.compositor().create_path_geometry(path));
+        Self::build(comp, container, geo, role)
+    }
+
+    /// Builds a layer whose outline is a rounded rectangle the COMPOSITOR draws
+    /// — no D2D tessellation, no `CompositionPath`, and nothing rasterized per
+    /// size.
+    ///
+    /// The geometry is written by [`resize`](Self::resize) and
+    /// [`set_corner_radius`](Self::set_corner_radius) rather than handed in,
+    /// because both are properties the layer already tracks for its mask.
+    pub(crate) fn new_rounded_rect(
+        comp: &Compositing,
+        container: &windows_composition::ContainerVisual,
+        role: Role,
+    ) -> Self {
+        let geo = LayerGeometry::RoundedRect(comp.compositor().create_rounded_rectangle_geometry());
+        Self::build(comp, container, geo, role)
+    }
+
+    fn build(
+        comp: &Compositing,
+        container: &windows_composition::ContainerVisual,
+        geo: LayerGeometry,
+        role: Role,
+    ) -> Self {
         let display = comp.new_sprite();
         let compositor = comp.compositor();
 
-        // ── The mask: an opaque-white shape over the app's geometry ──
-        let geo = compositor.create_path_geometry(path);
+        // ── The mask: an opaque-white shape over the layer's geometry ──
         // Full extent by default; a caller that animates the draw-on retargets
         // `TrimEnd` from here.
         geo.set_trim_start(0.0);
         geo.set_trim_end(1.0);
-        let shape = compositor.create_sprite_shape(&geo);
+        let shape = compositor.create_sprite_shape(&geo.as_shape_geometry());
         let white = compositor.create_color_brush(UiColor::rgb(255, 255, 255));
         match role {
             Role::Fill => shape.set_fill_brush(&white),
@@ -610,6 +714,7 @@ impl PathLayer {
         Self {
             role,
             geo,
+            rr_radius: 0.0,
             shape,
             mask_shape,
             visual_surface,
@@ -694,6 +799,7 @@ impl PathLayer {
             st.resize(w, h, scale);
         }
         self.size = Some((w, h, scale));
+        self.sync_rounded_rect();
     }
 
     pub(crate) fn set_thickness(&mut self, t: f32) {
@@ -702,6 +808,49 @@ impl PathLayer {
         }
         self.shape.set_stroke_thickness(t);
         self.thickness = Some(t);
+        // A stroke sits centred on the outline, so its width moves the outline
+        // — see `sync_rounded_rect`.
+        self.sync_rounded_rect();
+    }
+
+    /// Set a rounded-rect layer's corner radius, in DIPs. No-op on a path layer,
+    /// whose corners live in its vectors.
+    pub(crate) fn set_corner_radius(&mut self, radius: f32) {
+        if self.rr_radius == radius {
+            return;
+        }
+        self.rr_radius = radius;
+        self.sync_rounded_rect();
+    }
+
+    /// Write a rounded-rect layer's geometry from the box it now occupies.
+    ///
+    /// A FILL takes the whole box. A STROKE is drawn CENTRED on the outline, so
+    /// the outline is inset by half the stroke width and its radius shrinks with
+    /// it — the same border-box arrangement the atlas raster this replaces built
+    /// by hand (`Rect::new(sw/2, sw/2, w - sw/2, h - sw/2)` in `parts::draw_shape`).
+    ///
+    /// Everything here is a property write in DIPs. The mask's DIP→px scale is
+    /// on the SHAPE (see `resize`), so a display change re-scales this geometry
+    /// without touching it — which is the whole point of it not being a raster.
+    fn sync_rounded_rect(&self) {
+        let LayerGeometry::RoundedRect(g) = &self.geo else {
+            return;
+        };
+        let Some((w, h, _)) = self.size else {
+            return;
+        };
+        let inset = match self.role {
+            Role::Fill => 0.0,
+            Role::Stroke => self.thickness.unwrap_or(0.0) / 2.0,
+        };
+        g.set_offset(Vector2::new(inset, inset));
+        g.set_size(Vector2::new(
+            (w - 2.0 * inset).max(0.0),
+            (h - 2.0 * inset).max(0.0),
+        ));
+        let r = (self.rr_radius - inset).max(0.0);
+        g.set_corner_radius(Vector2::new(r, r));
     }
 
     /// Bind the FP16 colour source — a gradient when the app supplied stops,

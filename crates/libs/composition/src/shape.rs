@@ -22,10 +22,67 @@ pub struct CompositionGeometry(pub(crate) bindings::CompositionGeometry);
 
 /// A geometry that a [`CompositionSpriteShape`] can fill and stroke.
 ///
+/// Trimming and animation are provided here rather than on each concrete
+/// geometry because they are properties of the shared base: every geometry has
+/// an outline, so every geometry can draw a fraction of one and animate that
+/// fraction. An implementor supplies only [`as_geometry`](Self::as_geometry).
+///
 /// This trait is sealed: only the geometry types in this crate implement it.
 pub trait Geometry: Sealed {
     /// Returns this geometry as the shared [`CompositionGeometry`] base type.
     fn as_geometry(&self) -> CompositionGeometry;
+
+    /// Sets where along the outline drawing begins, as a fraction in `0.0..=1.0`.
+    fn set_trim_start(&self, start: f32) {
+        bump_count(Count::PropertyWrite);
+        let geometry: bindings::ICompositionGeometry = self.as_geometry().0.cast().unwrap();
+        geometry.SetTrimStart(start).unwrap();
+    }
+
+    /// Sets where along the outline drawing ends, as a fraction in `0.0..=1.0`.
+    ///
+    /// This is the property to animate to sweep an arc — or to draw a rounded
+    /// rectangle's border on: the geometry stays fixed and only the drawn
+    /// fraction of it changes.
+    fn set_trim_end(&self, end: f32) {
+        bump_count(Count::PropertyWrite);
+        let geometry: bindings::ICompositionGeometry = self.as_geometry().0.cast().unwrap();
+        geometry.SetTrimEnd(end).unwrap();
+    }
+
+    /// Starts an animation on the named property (for example `"TrimEnd"`, or a
+    /// rounded rectangle's `"CornerRadius"`).
+    fn start_animation(&self, property: &str, animation: &impl Animation) {
+        bump_count(Count::AnimationStart);
+        let object: bindings::ICompositionObject = self.as_geometry().0.cast().unwrap();
+        object
+            .StartAnimation(property, &animation.as_animation().0)
+            .unwrap();
+    }
+
+    /// Stops any animation on the named property, leaving it at its current
+    /// value.
+    ///
+    /// Stopping a property that nothing is animating is the ordinary case — a
+    /// caller that unconditionally cancels before re-targeting — so the call is
+    /// allowed to fail silently rather than panic.
+    fn stop_animation(&self, property: &str) {
+        bump_count(Count::AnimationStop);
+        let object: bindings::ICompositionObject = self.as_geometry().0.cast().unwrap();
+        let _ = object.StopAnimation(property);
+    }
+}
+
+impl Sealed for CompositionGeometry {}
+
+/// The base type satisfies the trait as the identity case, so a caller holding
+/// an erased geometry — one picked at runtime from several concrete kinds — can
+/// still trim it, animate it, and hand it to
+/// [`Compositor::create_sprite_shape`](crate::Compositor::create_sprite_shape).
+impl Geometry for CompositionGeometry {
+    fn as_geometry(&self) -> CompositionGeometry {
+        self.clone()
+    }
 }
 
 /// An ellipse (or circle) geometry, defined by its radii.
@@ -81,43 +138,6 @@ impl CompositionPathGeometry {
         self.0.SetPath(&path.0).unwrap();
     }
 
-    /// Sets where along the path drawing begins, as a fraction in `0.0..=1.0`.
-    pub fn set_trim_start(&self, start: f32) {
-        bump_count(Count::PropertyWrite);
-        let geometry: bindings::ICompositionGeometry = self.0.cast().unwrap();
-        geometry.SetTrimStart(start).unwrap();
-    }
-
-    /// Sets where along the path drawing ends, as a fraction in `0.0..=1.0`.
-    ///
-    /// This is the property to animate to sweep an arc: the path stays fixed and
-    /// only the drawn fraction of it changes.
-    pub fn set_trim_end(&self, end: f32) {
-        bump_count(Count::PropertyWrite);
-        let geometry: bindings::ICompositionGeometry = self.0.cast().unwrap();
-        geometry.SetTrimEnd(end).unwrap();
-    }
-
-    /// Starts an animation on the named property (for example `"TrimEnd"`).
-    pub fn start_animation(&self, property: &str, animation: &impl Animation) {
-        bump_count(Count::AnimationStart);
-        let object: bindings::ICompositionObject = self.0.cast().unwrap();
-        object
-            .StartAnimation(property, &animation.as_animation().0)
-            .unwrap();
-    }
-
-    /// Stops any animation on the named property, leaving it at its current
-    /// value.
-    ///
-    /// Stopping a property that nothing is animating is the ordinary case — a
-    /// caller that unconditionally cancels before re-targeting — so the call is
-    /// allowed to fail silently rather than panic.
-    pub fn stop_animation(&self, property: &str) {
-        bump_count(Count::AnimationStop);
-        let object: bindings::ICompositionObject = self.0.cast().unwrap();
-        let _ = object.StopAnimation(property);
-    }
 }
 
 impl Sealed for CompositionPathGeometry {}
@@ -137,6 +157,13 @@ impl Object for CompositionPathGeometry {
 /// A rectangle geometry with rounded corners, defined by its
 /// [size](Self::set_size), [offset](Self::set_offset), and
 /// [corner radius](Self::set_corner_radius).
+///
+/// Every one of those three is a compositor property, so a rounded box that
+/// resizes or changes radius costs a property write rather than a raster — and
+/// each can be animated by name (`"Size"`, `"Offset"`, `"CornerRadius"`, all
+/// `Vector2`) through [`Geometry::start_animation`]. The
+/// [trim](Geometry::set_trim_end) inherited from [`Geometry`] draws a fraction
+/// of the outline, which is what a border that traces itself on is made of.
 #[derive(Clone)]
 pub struct CompositionRoundedRectangleGeometry(
     pub(crate) bindings::CompositionRoundedRectangleGeometry,
@@ -171,6 +198,12 @@ impl Sealed for CompositionRoundedRectangleGeometry {}
 impl Geometry for CompositionRoundedRectangleGeometry {
     fn as_geometry(&self) -> CompositionGeometry {
         CompositionGeometry(self.0.cast().unwrap())
+    }
+}
+
+impl Object for CompositionRoundedRectangleGeometry {
+    fn as_object(&self) -> CompositionObject {
+        CompositionObject(self.0.cast().unwrap())
     }
 }
 
