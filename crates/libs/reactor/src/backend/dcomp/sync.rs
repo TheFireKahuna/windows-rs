@@ -32,19 +32,21 @@ fn is_shape(kind: ControlKind) -> bool {
 pub(crate) fn sync_tree(
     comp: &Compositing,
     atlas: &mut parts::Atlas,
+    ring: &mut parts::FocusRing,
     glyphs: &mut glyph_text::Atlases,
     arena: &mut Arena,
     root: ControlId,
     scale: f32,
     scrubbing: bool,
 ) {
-    sync_node(comp, atlas, glyphs, arena, root, scale, scrubbing);
+    sync_node(comp, atlas, ring, glyphs, arena, root, scale, scrubbing);
 }
 
 #[allow(clippy::too_many_arguments)]
 fn sync_node(
     comp: &Compositing,
     atlas: &mut parts::Atlas,
+    ring: &mut parts::FocusRing,
     glyphs: &mut glyph_text::Atlases,
     arena: &mut Arena,
     id: ControlId,
@@ -87,7 +89,7 @@ fn sync_node(
                 // knob / fill / ink) against the state just painted: state
                 // changes glide on the compositor, first placement snaps.
                 if parts::converted(n.kind) {
-                    parts::sync(comp, atlas, n, scale, scrubbing);
+                    parts::sync(comp, atlas, ring, id, n, scale, scrubbing);
                 }
                 // The button family's label, icon and badge count: retained
                 // glyph sprites, placed AFTER the parts sync so their hosts land
@@ -146,7 +148,7 @@ fn sync_node(
     // allocation per node per frame bought purely to dodge `&mut Arena`.
     let mut i = 0;
     while let Some(c) = arena.get(id).and_then(|n| n.children.get(i).copied()) {
-        sync_node(comp, atlas, glyphs, arena, c, scale, scrubbing);
+        sync_node(comp, atlas, ring, glyphs, arena, c, scale, scrubbing);
         i += 1;
     }
 

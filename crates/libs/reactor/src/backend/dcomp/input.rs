@@ -1629,6 +1629,7 @@ impl DCompBackend {
         sync::sync_tree(
             &self.comp,
             &mut self.atlas,
+            &mut self.focus_ring,
             &mut self.glyphs,
             &mut self.arena,
             root,
@@ -2670,6 +2671,7 @@ impl DCompBackend {
             // with no caret and no visible selection.
             n.focused = true;
             n.focus_ring = visible;
+            eprintln!("FOCUS set {:?} ring={}", new, visible); // TEMP
             // Keyboard focus (Tab) selects the whole field for quick replace.
             if visible
                 && let Some(e) = &mut n.editor

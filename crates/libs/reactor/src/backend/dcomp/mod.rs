@@ -117,6 +117,10 @@ pub struct DCompBackend {
     comp: Compositing,
     /// Shared rasterized chrome-part sources (see [`parts::Atlas`]).
     atlas: parts::Atlas,
+    /// The window's one focus ring, moved to whichever control holds focus
+    /// rather than reserved twice on every control that could — see
+    /// [`parts::FocusRing`].
+    focus_ring: parts::FocusRing,
     /// Shared rasterized text masks, behind every retained label (see
     /// [`glyph_text::Atlases`]): the per-glyph [`glyph_atlas::GlyphAtlas`] for
     /// live text and the per-run [`run_atlas::RunAtlas`] for static text, bundled
@@ -241,6 +245,7 @@ impl DCompBackend {
             arena: Arena::default(),
             comp,
             atlas: parts::Atlas::default(),
+            focus_ring: parts::FocusRing::default(),
             glyphs: glyph_text::Atlases::default(),
             root: None,
             attached_root: None,
@@ -360,6 +365,7 @@ impl DCompBackend {
             sync::sync_tree(
                 &self.comp,
                 &mut self.atlas,
+                &mut self.focus_ring,
                 &mut self.glyphs,
                 &mut self.arena,
                 root,

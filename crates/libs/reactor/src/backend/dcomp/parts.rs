@@ -53,14 +53,14 @@ use super::bootstrap::Compositing;
 use super::nav;
 use super::node::{linear, Node};
 use super::theme;
-use crate::backend::ControlKind;
+use crate::backend::{ControlId, ControlKind};
 use windows_canvas::{
     Brush, ColorF, DrawingSession, Ellipse, GradientStop, ID2D1DeviceContext, Rect, RoundedRect,
     Vector2 as CVec2,
 };
 use windows_composition::{
     BatchKind, CompositionDrawingSurface, CompositionNineGridBrush, CompositionScopedBatch,
-    CompositionSurfaceBrush, InsetClip, SpringVector2NaturalMotionAnimation,
+    CompositionSurfaceBrush, ContainerVisual, InsetClip, SpringVector2NaturalMotionAnimation,
     SpringVector3NaturalMotionAnimation, SpriteVisual, Visual,
 };
 use windows_numerics::{Matrix3x2, Vector2, Vector3};
@@ -522,6 +522,122 @@ impl Atlas {
             .map(|(k, _)| k.clone())
         {
             self.map.remove(&k);
+        }
+    }
+}
+
+// ── The window's one focus ring ──────────────────────────────────────────────
+
+/// The focus ring, owned once by the window rather than twice by every control
+/// that can take focus.
+///
+/// Exactly one control in a window is focused, so the ring is the one piece of
+/// chrome whose population never needed to scale with the tree. Reserving two
+/// slots per focusable control paid for a pair of sprites on every button,
+/// field, check box and slider in the window so that at most one pair could ever
+/// draw — a census found them making up half of what was left in the tree after
+/// the panels stopped minting chrome they had no use for.
+///
+/// It moves rather than multiplies: on a focus change the pair is re-parented
+/// into the newly focused node's own container, which is also what keeps its
+/// geometry and its clipping exactly what they were. The rects a plan computes
+/// are node-local, so nothing has to be translated; an ancestor that clips (a
+/// scroll viewport) still clips it; and a scroll that animates a carrier's
+/// offset on the compositor still carries the ring with it, without the app
+/// hearing about it.
+///
+/// The pair is parented directly rather than through [`Node::adopt_at_top`],
+/// which would enter it in the node's stacking registry — and a re-stack detaches
+/// exactly that registry and lays back only what `layout::collect` enumerates,
+/// which will never name a visual the window owns. So it is a stray in the same
+/// sense the knob's arc and the editor's caret are, and keeps the position its
+/// creator gave it. That position is the top of the focused node's children,
+/// above its label, which is where a ring belongs and where it cannot be
+/// overdrawn; it never overlaps the label in any case, because the whole of it
+/// lies outside the control's bounds.
+#[derive(Default)]
+pub(crate) struct FocusRing {
+    /// Inner and outer rungs, minted on the first focus this window ever takes.
+    rungs: Option<[Part; 2]>,
+    /// The container the pair currently hangs in, so a move can take it out of
+    /// the old one. Held as the container itself rather than the node's id
+    /// because the node may be gone by the time the ring leaves it — a focused
+    /// control inside a closing flyout — and a stale handle detaches harmlessly
+    /// where a stale id could not be resolved at all.
+    host: Option<ContainerVisual>,
+    /// Which node the pair is currently showing for. `None` while it is hidden.
+    owner: Option<ControlId>,
+}
+
+impl FocusRing {
+    /// Show the ring on `node`, around `rect` at `radius` (both node-local DIPs).
+    fn show(
+        &mut self,
+        comp: &Compositing,
+        atlas: &mut Atlas,
+        id: ControlId,
+        node: &mut Node,
+        rect: Rect4,
+        radius: f32,
+        scale: f32,
+    ) {
+        let rungs = self.rungs.get_or_insert_with(|| [Part::new(comp), Part::new(comp)]);
+        // Re-parent only on a move. A focused control repainting for its own
+        // reasons must not take its ring out of the tree and put it back, which
+        // is a pair of tree edits and a frame of no ring for nothing.
+        if self.owner != Some(id) {
+            if let Some(old) = self.host.take() {
+                for r in rungs.iter() {
+                    let _ = old.children().try_remove(&r.visual());
+                }
+            }
+            let host = node.container.clone();
+            for r in rungs.iter() {
+                host.children().insert_at_top(&r.visual());
+            }
+            self.host = Some(host);
+            self.owner = Some(id);
+        }
+        let (x, y, w, h) = rect;
+        for (i, (out, sw, colour)) in focus_rings(scale).into_iter().enumerate() {
+            let key = AtlasKey::hbar((h + 2.0 * out).max(0.0), radius + out, sw, colour, scale);
+            rungs[i].bind(comp, atlas, key);
+            rungs[i].place(x - out, y - out, w + 2.0 * out, h + 2.0 * out);
+            rungs[i].set_opacity(1.0);
+        }
+    }
+
+    /// Hide the ring if `id` is the node currently showing it.
+    ///
+    /// Left parented where it is rather than detached: the next focus takes it
+    /// away, and a control that regains focus without anything else being
+    /// focused in between then costs no tree edit at all.
+    fn hide_for(&mut self, id: ControlId) {
+        if self.owner != Some(id) {
+            return;
+        }
+        if let Some(rungs) = self.rungs.as_mut() {
+            for r in rungs.iter_mut() {
+                r.set_opacity(0.0);
+            }
+        }
+        self.owner = None;
+    }
+
+    /// Apply whatever `plan` asked for on `node` — the one call the sync walk
+    /// makes, for focused and unfocused nodes alike.
+    fn apply(
+        &mut self,
+        comp: &Compositing,
+        atlas: &mut Atlas,
+        id: ControlId,
+        node: &mut Node,
+        request: Option<(Rect4, f32)>,
+        scale: f32,
+    ) {
+        match request {
+            Some((rect, radius)) => self.show(comp, atlas, id, node, rect, radius, scale),
+            None => self.hide_for(id),
         }
     }
 }
@@ -1899,6 +2015,9 @@ pub(crate) struct PartPlan {
     /// `ScrollViewer` between them holding 106 sprites that had never drawn a
     /// pixel and never would.
     optional: bool,
+    /// Where this node wants the window's focus ring, if it wants it at all —
+    /// its node-local rect and the radius the ring follows. See [`FocusRing`].
+    focus: Option<(Rect4, f32)>,
 }
 
 impl PartPlan {
@@ -1908,6 +2027,7 @@ impl PartPlan {
             below: std::array::from_fn(|_| None),
             above: std::array::from_fn(|_| None),
             optional: false,
+            focus: None,
         }
     }
 
@@ -1950,14 +2070,19 @@ impl PartPlan {
         self
     }
 
-    /// The focus ring's two rungs, at `base` (inner) and `base + 1` (outer).
+    /// Ask for the window's focus ring around `w`×`h` at radius `r`.
     ///
-    /// One call because the two are one thing: a ring is a light stroke inside a
-    /// dark one, and a plan that placed only one rung would render a ring that
-    /// reads correctly against exactly one backdrop.
-    fn focus_ring(self, base: usize, focused: bool, w: f32, h: f32, r: f32, scale: f32) -> Self {
-        let [inner, outer] = focus_ring_slots(focused, w, h, r, scale);
-        self.above(base, inner).above(base + 1, outer)
+    /// A request rather than two slots of this node's own: the ring is owned once
+    /// by the window and moved to whoever holds focus (see [`FocusRing`]). What
+    /// stays here is the only part of it that is per-kind — WHERE it goes, which
+    /// an editor answers with its header rather than its whole box.
+    ///
+    /// `scale` is no longer read; the rungs' widths and colours are resolved
+    /// where they are drawn. It stays in the signature because every caller has
+    /// it and dropping it would make the call sites disagree for no reason.
+    fn focus_ring(mut self, focused: bool, w: f32, h: f32, r: f32, _scale: f32) -> Self {
+        self.focus = focused.then_some(((0.0, 0.0, w, h), r));
+        self
     }
 
     /// The ring a self-sized control takes: the whole node, at its own radius.
@@ -1965,9 +2090,9 @@ impl PartPlan {
     /// The four kinds that spell it this way are the four whose focus target IS
     /// the control. Expander and Hyperlink pass their own box instead — an
     /// expander rings its header strip, not the expanded body under it.
-    fn node_focus_ring(self, base: usize, node: &Node, scale: f32) -> Self {
+    fn node_focus_ring(self, node: &Node, scale: f32) -> Self {
         let r = super::controls::focus_radius(node);
-        self.focus_ring(base, node.focus_ring, node.rect.w, node.rect.h, r, scale)
+        self.focus_ring(node.focus_ring, node.rect.w, node.rect.h, r, scale)
     }
 
     /// The slot plans, for tests asserting where a control decided its chrome
@@ -2270,6 +2395,8 @@ pub(crate) fn dim_of(node: &Node) -> f32 {
 pub(crate) fn sync(
     comp: &Compositing,
     atlas: &mut Atlas,
+    ring: &mut FocusRing,
+    id: ControlId,
     node: &mut Node,
     scale: f32,
     scrubbing: bool,
@@ -2281,6 +2408,7 @@ pub(crate) fn sync(
         let plan = (l.plan)(node, scale);
         let (n_below, n_above) = plan.extents((l.below, l.above));
         ensure(comp, node, n_below, n_above);
+        ring.apply(comp, atlas, id, node, plan.focus, scale);
         let relaid = apply(comp, atlas, node, &plan);
         // The one plan-driven kind with motion its plan cannot hold: an
         // indeterminate bar's sweep is a forever animation, re-armed whenever
@@ -2291,7 +2419,7 @@ pub(crate) fn sync(
         return;
     }
     match node.kind {
-        ControlKind::Slider => slider_sync(comp, atlas, node, scale, scrubbing),
+        ControlKind::Slider => slider_sync(comp, atlas, ring, id, node, scale, scrubbing),
         ControlKind::Meter => meter_sync(comp, atlas, node, scale, scrubbing),
         ControlKind::ProgressRing => super::ring_shape::sync_ring(comp, node, atlas.epoch(), scale),
         _ => {}
@@ -2343,9 +2471,8 @@ mod slot {
     pub const N_BELOW: usize = PLATE + 1;
 
     pub const INK: usize = 0;
-    pub const RING_INNER: usize = 1;
-    pub const RING_OUTER: usize = 2;
-    pub const N_ABOVE: usize = RING_OUTER + 1;
+    // No ring rungs: the window owns one pair and moves it (see `FocusRing`).
+    pub const N_ABOVE: usize = INK + 1;
 }
 
 /// The focus visual, WinUI's shape: a solid outer ring with a hairline of the
@@ -2442,7 +2569,7 @@ pub(crate) fn button_plan(node: &Node, scale: f32) -> PartPlan {
                 .snap_at(box_rect, ink_target(node))
             .fading(),
         )
-        .focus_ring(slot::RING_INNER, node.focus_ring, w, h, radius, scale)
+        .focus_ring(node.focus_ring, w, h, radius, scale)
 }
 
 /// A container's two slots. Deliberately its own names rather than the button
@@ -2532,38 +2659,6 @@ pub(crate) fn box_plan(node: &Node, scale: f32) -> PartPlan {
         .below(box_slot::FILL, fill)
         .below(box_slot::BORDER, border)
         .optional()
-}
-
-/// The focus visual as two parts rather than a draw, for any control that owns
-/// no surface to paint one on.
-///
-/// Each ring's radius follows the control's AUTHORED one, grown by how far out
-/// the ring sits — a ring whose corners disagree with the control inside it is
-/// the most visible way for a custom radius to look broken.
-///
-/// This is deliberately the ONLY focus geometry. The painted
-/// `controls::draw_focus_ring` it replaces drew a different visual — a single
-/// stroke INSET into the control — and the inset is what
-/// [`focus_rings`] exists to argue against: it eats the control's own fill, so
-/// a focused control reads as having grown a border and shrunk. Moving a
-/// control to retained chrome therefore also moves it onto the correct ring,
-/// and the two must not be allowed to coexist per-kind.
-pub(crate) fn focus_ring_slots(
-    focused: bool,
-    w: f32,
-    h: f32,
-    radius: f32,
-    scale: f32,
-) -> [SlotPlan; 2] {
-    let Some(rings) = focused.then(|| focus_rings(scale)) else {
-        return [SlotPlan::hidden(), SlotPlan::hidden()];
-    };
-    std::array::from_fn(|i| {
-        let (out, sw, c) = rings[i];
-        let ring = (-out, -out, w + 2.0 * out, h + 2.0 * out);
-        AtlasKey::hbar((h + 2.0 * out).max(0.0), radius + out, sw, c, scale)
-            .snap_at(Some(ring), 1.0)
-    })
 }
 
 /// The caption band's chrome: one hover wash, and nothing else.
@@ -2670,7 +2765,7 @@ pub(crate) fn badge_plan(node: &Node, scale: f32) -> PartPlan {
 pub(crate) fn hyperlink_plan(node: &Node, scale: f32) -> PartPlan {
     let (w, h) = (node.rect.w, node.rect.h);
     PartPlan::new([w, h, 0.0])
-        .focus_ring(0, node.focus_ring, w, h, theme::RADIUS_SM, scale)
+        .focus_ring(node.focus_ring, w, h, theme::RADIUS_SM, scale)
 }
 
 
@@ -2684,9 +2779,8 @@ mod select_slot {
     pub const N_BELOW: usize = BORDER + 1;
 
     pub const INK: usize = 0;
-    pub const RING_INNER: usize = 1;
-    pub const RING_OUTER: usize = 2;
-    pub const N_ABOVE: usize = RING_OUTER + 1;
+    // No ring rungs: the window owns one pair and moves it (see `FocusRing`).
+    pub const N_ABOVE: usize = INK + 1;
 }
 
 /// A select trigger's whole appearance. Below: `[fill, border]`; above:
@@ -2732,7 +2826,7 @@ pub(crate) fn select_plan(node: &Node, scale: f32) -> PartPlan {
                 .snap_at(box_rect, ink_target(node))
                 .fading(),
         )
-        .focus_ring(select_slot::RING_INNER, node.focus_ring, w, h, r, scale)
+        .focus_ring(node.focus_ring, w, h, r, scale)
 }
 
 /// A text editor's part slots. Its own names, for the reason `select_slot` has
@@ -2942,7 +3036,7 @@ pub(crate) fn toggle_plan(node: &Node, scale: f32) -> PartPlan {
         // alone, which is what the painted ring it replaces did and what WinUI's
         // own switch does. A ring drawn round the track would read as focusing a
         // different, smaller control than the one the label names.
-        .node_focus_ring(0, node, scale)
+        .node_focus_ring(node, scale)
 }
 
 fn knob_xs() -> (f32, f32) {
@@ -3012,7 +3106,7 @@ pub(crate) fn check_plan(node: &Node, scale: f32) -> PartPlan {
             0,
             AtlasKey::check(CHECK_BOX_D, theme::w(1.0), scale).snap_at(box_rect, t).fading(),
         )
-        .node_focus_ring(1, node, scale)
+        .node_focus_ring(node, scale)
 }
 
 // ── Slider ───────────────────────────────────────────────────────────────────
@@ -3067,8 +3161,7 @@ mod slider_slot {
     pub const FILL: usize = 0;
     pub const HALO: usize = 1;
     pub const THUMB: usize = 2;
-    pub const RING_INNER: usize = 3;
-    pub const N_ABOVE: usize = RING_INNER + 2;
+    pub const N_ABOVE: usize = THUMB + 1;
 }
 
 /// Below-band roles: `[groove, origin notch]`. Above-band roles:
@@ -3081,6 +3174,8 @@ mod slider_slot {
 fn slider_sync(
     comp: &Compositing,
     atlas: &mut Atlas,
+    ring: &mut FocusRing,
+    id: ControlId,
     node: &mut Node,
     scale: f32,
     scrubbing: bool,
@@ -3106,14 +3201,14 @@ fn slider_sync(
     let notch_on = node.ctrl().fill_origin.is_some_and(|o| {
         o > node.ctrl().min.min(node.ctrl().max) && o < node.ctrl().min.max(node.ctrl().max)
     });
-    let rings = focus_ring_slots(
-        node.focus_ring,
-        node.rect.w,
-        node.rect.h,
-        super::controls::focus_radius(node),
-        scale,
-    );
+    let ring_request = node.focus_ring.then(|| {
+        (
+            (0.0, 0.0, node.rect.w, node.rect.h),
+            super::controls::focus_radius(node),
+        )
+    });
 
+    ring.apply(comp, atlas, id, node, ring_request, scale);
     let g = slider_geom(node.rect.w, node.rect.h, frac, ofrac);
     let geom = (node.rect.w, node.rect.h);
     let Some(parts) = node.parts.as_mut() else { return };
@@ -3142,22 +3237,6 @@ fn slider_sync(
     parts.above[slider_slot::FILL].set_opacity(dim);
     parts.above[slider_slot::HALO].fade_to(halo_t);
     parts.above[slider_slot::THUMB].set_opacity(dim);
-
-    // Unpacked by hand: this sync does not run `apply_band`. Every slot
-    // `focus_ring_slots` returns is Snap/Snap, so `place` and `set_opacity` are
-    // the whole of it.
-    for (i, slot) in rings.iter().enumerate() {
-        let Some(part) = parts.above.get_mut(slider_slot::RING_INNER + i) else {
-            continue;
-        };
-        if let Some(k) = &slot.key {
-            part.bind(comp, atlas, k.clone());
-        }
-        if let Some(r) = slot.rect {
-            part.place(r.0, r.1, r.2, r.3);
-        }
-        part.set_opacity(slot.opacity);
-    }
 
     parts.geom = geom;
     parts.init = true;
@@ -3570,7 +3649,7 @@ pub(crate) fn segmented_plan(node: &Node, scale: f32) -> PartPlan {
         )
         // The ring rings the TRAY, not the selected segment: focus is on the
         // bar, and the selection already has the pill to show where it is.
-        .node_focus_ring(0, node, scale)
+        .node_focus_ring(node, scale)
 }
 
 fn seg_ink_target(node: &Node) -> f32 {
@@ -3867,7 +3946,7 @@ pub(crate) fn expander_plan(node: &Node, scale: f32) -> PartPlan {
         )
         // The header strip, not the node: a ring around an expanded body would
         // ring content the expander does not own.
-        .focus_ring(1, node.focus_ring, w, header_h, r, scale)
+        .focus_ring(node.focus_ring, w, header_h, r, scale)
 }
 
 // ── Progress (bar + ring) ────────────────────────────────────────────────────
