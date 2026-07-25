@@ -139,6 +139,20 @@ impl Visual {
         self.0.SetRotationAngle(radians).unwrap();
     }
 
+    /// Rounds this visual's composed position to whole device pixels.
+    ///
+    /// This governs where the visual is placed, not what its `Offset` holds: an
+    /// animation driving that offset still evaluates and writes every frame, and
+    /// anything charged per write is charged just the same. Snapping is for
+    /// crispness — content that would otherwise be resampled across a pixel
+    /// boundary — and pairs with a step-eased animation rather than substituting
+    /// for one.
+    pub fn set_pixel_snapping(&self, enabled: bool) {
+        bump_count(Count::PropertyWrite);
+        let visual: bindings::IVisual4 = self.0.cast().unwrap();
+        visual.SetIsPixelSnappingEnabled(enabled).unwrap();
+    }
+
     /// Sets (or, with `None`, clears) the clip applied to this visual and its
     /// subtree.
     ///

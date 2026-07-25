@@ -99,6 +99,28 @@ pub struct GlowDrift {
     pub period_secs: f32,
     /// Starting position along the path, `0.0..1.0`.
     pub phase: f32,
+    /// Advance the glow in discrete jumps of about this many DIPs, instead of
+    /// moving continuously. `None` moves continuously.
+    ///
+    /// A glow sprite is a large fraction of the window, and the compositor
+    /// invalidates a visual's whole bounds — the old ones and the new — whenever
+    /// its offset is written. A continuously-eased drift writes that offset
+    /// every vblank, so the invalidation is charged per FRAME while the motion
+    /// it buys is charged per second: at these amplitudes and periods a glow
+    /// advances well under a tenth of a pixel between frames, and pays a large
+    /// fraction of the window to do it. Quantising the path decouples the two —
+    /// the route, its duration and its phase are untouched; only the number of
+    /// distinct positions along it changes.
+    ///
+    /// The jump is invisible for the reason the glow is soft in the first place:
+    /// a smootherstep falloff spanning most of the window has a slope far below
+    /// one 8-bit LSB per pixel, so shifting it by a pixel or two moves no
+    /// channel by a representable amount — and the backdrop's own dither is
+    /// deliberately larger than that. Sized in DIPs rather than in steps because
+    /// what has to stay below perception is the DISTANCE moved, which no step
+    /// count expresses on its own: the same count is a different jump on a
+    /// different path.
+    pub step_dip: Option<f32>,
 }
 
 /// The blue-noise grain layer.
@@ -332,6 +354,84 @@ fn drift_period(secs: f32) -> Duration {
     Duration::from_secs_f32(if secs.is_finite() { secs.max(0.001) } else { 0.001 })
 }
 
+/// Diagnostic override for every glow's drift (`REACTOR_GLOW_DRIFT`).
+///
+/// `off` pins the glows, `linear` forces continuous motion, and a bare number
+/// forces jumps of that many DIPs. Unset leaves each glow's own spec alone.
+///
+/// Environment-driven for the same reason the census and the heat maps are (see
+/// [`census`](super::census)): a capture harness launches a prebuilt binary and
+/// cannot call into it, and the question this exists to answer — how often a
+/// large drifting sprite invalidates — is only answerable by comparing runs that
+/// differ in exactly this and nothing else. Reading it per glow rather than once
+/// keeps the parse next to its only use; it runs a handful of times at startup.
+fn drift_override(spec: Option<GlowDrift>) -> Option<GlowDrift> {
+    let Ok(raw) = std::env::var("REACTOR_GLOW_DRIFT") else {
+        return spec;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => spec,
+        "off" | "none" => None,
+        "linear" => spec.map(|d| GlowDrift { step_dip: None, ..d }),
+        other => match other.parse::<f32>() {
+            Ok(dip) if dip.is_finite() && dip > 0.0 => {
+                spec.map(|d| GlowDrift { step_dip: Some(dip), ..d })
+            }
+            _ => {
+                eprintln!(
+                    "reactor backdrop: REACTOR_GLOW_DRIFT={raw:?} — expected off, linear, \
+                     or a positive step size in DIPs"
+                );
+                spec
+            }
+        },
+    }
+}
+
+/// Whether to round the glow sprites to whole device pixels
+/// (`REACTOR_GLOW_SNAP=1`).
+///
+/// A separate axis from [`drift_override`], and deliberately so: snapping
+/// governs where a sprite lands, stepping governs how often it is moved at all,
+/// and telling them apart needs each to be selectable without the other.
+fn glow_snap() -> bool {
+    std::env::var("REACTOR_GLOW_SNAP").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on"))
+}
+
+/// How many steps one key-frame segment needs for no jump to exceed `step_dip`.
+///
+/// The drift path is `x = ax·sin θ`, `y = ay·sin 2θ`, so its speed in `t` is
+/// `TAU·hypot(ax·cos θ, 2·ay·cos 2θ)`. Integrating that over a segment gives the
+/// distance the glow actually travels through it, which is what has to be
+/// divided into jumps — the segments are equal in TIME, not in distance.
+///
+/// Sampled rather than solved because the integral has no elementary form and
+/// this runs once per glow at build time. `SAMPLES` per segment is far more than
+/// the answer's precision warrants; it only has to survive a `ceil`.
+fn steps_per_segment(d: GlowDrift, step_dip: f32) -> i32 {
+    const SAMPLES: u32 = 64;
+    let (ax, ay) = (d.amplitude.0.abs(), d.amplitude.1.abs());
+    let speed = |t: f32| {
+        let th = std::f32::consts::TAU * (t + d.phase);
+        std::f32::consts::TAU * (ax * th.cos()).hypot(2.0 * ay * (2.0 * th).cos())
+    };
+    let seg = 1.0 / DRIFT_KEYS as f32;
+    let dt = seg / SAMPLES as f32;
+    let longest = (0..DRIFT_KEYS)
+        .map(|k| {
+            // Trapezoid over one segment; the half-weighted ends matter little
+            // at this sample count but cost nothing to keep honest.
+            let t0 = k as f32 * seg;
+            let mut len = 0.5 * (speed(t0) + speed(t0 + seg));
+            len += (1..SAMPLES).map(|s| speed(t0 + s as f32 * dt)).sum::<f32>();
+            len * dt
+        })
+        .fold(0.0f32, f32::max);
+    // A degenerate path (zero amplitude) still needs a valid step count, and one
+    // step is the correct answer for it: the glow never moves.
+    ((longest / step_dip).ceil() as i32).clamp(1, i32::MAX)
+}
+
 /// Start a glow's endless drift about `base` (its placed offset).
 ///
 /// Keyframes are sampled off a lemniscate and joined with LINEAR easing: the
@@ -341,7 +441,15 @@ fn drift_period(secs: f32) -> Duration {
 fn start_drift(sprite: &SpriteVisual, base: (f32, f32), d: GlowDrift) {
     let compositor = sprite.compositor();
     let anim = compositor.create_vector3_key_frame_animation();
-    let ease = compositor.create_linear_easing_function();
+    // Continuous unless the spec asks for jumps. A step easing applies WITHIN
+    // each segment, so the count is derived from the longest segment rather than
+    // the mean: the parameterisation is not arc-length uniform (the lemniscate
+    // runs fastest through its crossing), and sizing off the average would let
+    // the fast segments overshoot the very distance the spec is bounding.
+    let ease = match d.step_dip.filter(|s| s.is_finite() && *s > 0.0) {
+        Some(step) => compositor.create_step_easing_function(steps_per_segment(d, step)),
+        None => compositor.create_linear_easing_function(),
+    };
     for i in 0..=DRIFT_KEYS {
         let t = i as f32 / DRIFT_KEYS as f32;
         let th = std::f32::consts::TAU * (t + d.phase);
@@ -460,10 +568,13 @@ impl Backdrop {
             sprite.fill_parent();
             // Motion is anchored at the host's origin and started ONCE. The host
             // carries placement underneath it, so the path is never interrupted.
-            match g.drift {
+            match drift_override(g.drift) {
                 Some(d) => start_drift(&sprite, (0.0, 0.0), d),
                 // A pinned layer sits at its host's origin and stays there.
                 None => sprite.set_offset(0.0, 0.0, 0.0),
+            }
+            if glow_snap() {
+                sprite.set_pixel_snapping(true);
             }
             glows.push(Glow {
                 host,

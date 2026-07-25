@@ -169,6 +169,30 @@ impl Compositor {
         CompositionEasingFunction(self.0.CreateLinearEasingFunction().unwrap().cast().unwrap())
     }
 
+    /// Creates a step easing function that advances in `steps` equal jumps
+    /// instead of interpolating continuously.
+    ///
+    /// Applied per key-frame segment, so an animation with `k` segments visits
+    /// `k * steps` distinct values over its duration. The path and the duration
+    /// are exactly those the key frames describe; what changes is how many
+    /// points along the path are ever taken — and therefore how often the
+    /// animated property is written at all. A property whose write invalidates
+    /// something expensive (a visual's bounds, say) is charged per write and not
+    /// per unit of motion, so this is the knob that separates the two.
+    ///
+    /// `steps` must be positive.
+    pub fn create_step_easing_function(&self, steps: i32) -> CompositionEasingFunction {
+        debug_assert!(steps > 0, "a step easing function needs at least one step");
+        let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
+        CompositionEasingFunction(
+            compositor
+                .CreateStepEasingFunctionWithStepCount(steps.max(1))
+                .unwrap()
+                .cast()
+                .unwrap(),
+        )
+    }
+
     /// Creates a cubic-bezier easing function through the two control points
     /// (each in `0.0..=1.0`), matching the CSS `cubic-bezier()` convention.
     pub fn create_cubic_bezier_easing_function(

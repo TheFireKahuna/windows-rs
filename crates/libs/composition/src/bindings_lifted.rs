@@ -2857,6 +2857,20 @@ impl ICompositor2 {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) fn CreateStepEasingFunctionWithStepCount(
+        &self,
+        stepcount: i32,
+    ) -> windows_core::Result<StepEasingFunction> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateStepEasingFunctionWithStepCount)(
+                windows_core::Interface::as_raw(self),
+                stepcount,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
 }
 #[repr(C)]
 pub struct ICompositor2_Vtbl {
@@ -2882,6 +2896,15 @@ pub struct ICompositor2_Vtbl {
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
+    CreatePointLight: usize,
+    CreateSpotLight: usize,
+    CreateStepEasingFunction: usize,
+    pub CreateStepEasingFunctionWithStepCount: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        *mut *mut core::ffi::c_void,
+    )
+        -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ICompositor4,
@@ -4033,6 +4056,19 @@ pub struct ISpriteVisual2_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    IStepEasingFunction,
+    IStepEasingFunction_Vtbl,
+    0xc7b1d4cf_c562_56b3_b4e6_b21326165f71
+);
+impl windows_core::RuntimeType for IStepEasingFunction {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IStepEasingFunction_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
     IVector2KeyFrameAnimation,
     IVector2KeyFrameAnimation_Vtbl,
     0xe9c5e3fd_43b7_526e_9da0_4c3ea96db27d
@@ -4525,6 +4561,33 @@ pub struct IVisual2_Vtbl {
         *mut core::ffi::c_void,
         windows_numerics::Vector2,
     ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IVisual4,
+    IVisual4_Vtbl,
+    0x27cb223f_c431_57ac_b61e_d6b7515d579f
+);
+impl windows_core::RuntimeType for IVisual4 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl IVisual4 {
+    pub(crate) fn SetIsPixelSnappingEnabled(&self, value: bool) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetIsPixelSnappingEnabled)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct IVisual4_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    IsPixelSnappingEnabled: usize,
+    pub SetIsPixelSnappingEnabled:
+        unsafe extern "system" fn(*mut core::ffi::c_void, bool) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IVisualCollection,
@@ -5041,6 +5104,38 @@ impl windows_core::RuntimeName for SpriteVisual {
 }
 unsafe impl Send for SpriteVisual {}
 unsafe impl Sync for SpriteVisual {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StepEasingFunction(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    StepEasingFunction,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    StepEasingFunction,
+    CompositionEasingFunction,
+    CompositionObject
+);
+impl windows_core::RuntimeType for StepEasingFunction {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IStepEasingFunction>();
+}
+unsafe impl windows_core::Interface for StepEasingFunction {
+    type Vtable = <IStepEasingFunction as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IStepEasingFunction as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for StepEasingFunction {
+    type Target = IStepEasingFunction;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for StepEasingFunction {
+    const NAME: &'static str = "Microsoft.UI.Composition.StepEasingFunction";
+}
+unsafe impl Send for StepEasingFunction {}
+unsafe impl Sync for StepEasingFunction {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedEventHandler<TSender, TResult>(

@@ -43,6 +43,12 @@ Windows.System.DispatcherQueueController
 Windows.UI.Composition.Visual
 Windows.UI.Composition.IVisual::{put_Offset, get_Offset, put_Size, get_Size, put_Opacity, get_Opacity, put_IsVisible, get_IsVisible, put_AnchorPoint, put_CenterPoint, put_Scale, get_Scale, put_BorderMode, get_Parent}
 Windows.UI.Composition.IVisual2::{put_RelativeSizeAdjustment, put_RelativeOffsetAdjustment, put_ParentForTransform}
+// Round this visual's composed position to whole device pixels. It governs where
+// the visual LANDS, not what its animated Offset holds, so an animation driving
+// that Offset still produces a fresh value every frame — snapping is a
+// placement rule, not a rate limit, and pairs with (rather than replaces) a
+// step-eased animation.
+Windows.UI.Composition.IVisual4::{put_IsPixelSnappingEnabled}
 Windows.UI.Composition.CompositionBorderMode
 
 Windows.UI.Composition.ContainerVisual
@@ -94,6 +100,20 @@ Windows.UI.Composition.AnimationIterationBehavior
 Windows.UI.Composition.CompositionEasingFunction
 Windows.UI.Composition.LinearEasingFunction
 Windows.UI.Composition.CubicBezierEasingFunction
+
+// A step easing HOLDS its value across a step and jumps, rather than producing a
+// fresh value every vblank. That is a rendering choice for a curve that has to
+// land on discrete positions, but it is also the only lever a key-frame
+// animation has over how OFTEN it writes: a continuously-eased animation on a
+// visual's Offset rewrites that Offset every frame, and the compositor
+// invalidates the visual's whole bounds each time — old bounds and new — however
+// small the delta. For a large, slow-moving sprite the delta can be a fraction of
+// a pixel while the invalidation is a large fraction of the window, so the cost
+// is set by the write RATE and not by the distance travelled. Stepping decouples
+// the two: the path and its duration are unchanged, only the number of distinct
+// positions along it is chosen.
+Windows.UI.Composition.StepEasingFunction
+Windows.UI.Composition.ICompositor2::{CreateStepEasingFunctionWithStepCount}
 
 // Implicit animations: a target-name → animation map applied to a visual so
 // property changes animate automatically. The `IMap` projection it exposes is
