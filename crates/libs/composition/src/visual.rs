@@ -175,13 +175,52 @@ impl Visual {
         self.0.Parent().ok().map(ContainerVisual::new)
     }
 
-    /// Sets the visual's size as a fraction of its parent's size (per axis).
+    /// Adds a fraction of the parent's size to this visual's own [`set_size`],
+    /// per axis, resolved by the compositor rather than by the app.
+    ///
+    /// The two are ADDITIVE — `size + parent.size * adjustment` — which is what
+    /// makes this more than a fill-the-parent switch:
+    ///
+    /// | adjustment | size | result |
+    /// |---|---|---|
+    /// | `(1, 1)` | `(0, 0)` | exactly the parent's box ([`fill_parent`](Self::fill_parent)) |
+    /// | `(1, 0)` | `(-32, 24)` | parent width less 32, fixed height 24 |
+    /// | `(0.5, 1)` | `(0, 0)` | half the parent's width, its full height |
+    ///
+    /// **The parent must carry a real [`set_size`].** For a `SpriteVisual` that
+    /// is automatic — size IS its painted area — but a bare `ContainerVisual`'s
+    /// size is otherwise inert, so one left at its `(0, 0)` default silently
+    /// resolves every child's adjustment to nothing. Nothing throws and nothing
+    /// logs; the subtree simply does not draw. A container that children measure
+    /// against is a size ANCHOR and has to be sized deliberately.
+    ///
+    /// Where it applies, it is strictly better than mirroring the parent's size
+    /// onto each child: it removes the per-child property write from every
+    /// resize, and — because the compositor resolves it against the parent's
+    /// size in the frame being composed — it makes "parent resized, child did
+    /// not" unrepresentable rather than merely unlikely.
     pub fn set_relative_size_adjustment(&self, adjustment: Vector2) {
         let visual: bindings::IVisual2 = self.0.cast().unwrap();
         visual.SetRelativeSizeAdjustment(adjustment).unwrap();
     }
 
-    /// Sets an offset expressed as a fraction of the parent's size (per axis).
+    /// Binds this visual's box to its parent's, now and after every parent
+    /// resize. The common case of [`set_relative_size_adjustment`](Self::set_relative_size_adjustment)
+    /// — and subject to the same anchor rule: the parent must be sized.
+    pub fn fill_parent(&self) {
+        self.set_relative_size_adjustment(Vector2::new(1.0, 1.0));
+    }
+
+    /// Adds a fraction of the parent's size to this visual's own [`set_offset`],
+    /// per axis. Additive in the same way as
+    /// [`set_relative_size_adjustment`](Self::set_relative_size_adjustment), so
+    /// `adjustment = (1, 0, 0)` with `offset = (-w, 0, 0)` pins to the parent's
+    /// right edge for good.
+    ///
+    /// The vector is a `Vector3` for symmetry with `Offset`, but a parent has no
+    /// z extent to scale against — treat `z` as inert and leave it `0.0`.
+    ///
+    /// Same anchor rule: an unsized parent resolves this to zero.
     pub fn set_relative_offset_adjustment(&self, adjustment: Vector3) {
         let visual: bindings::IVisual2 = self.0.cast().unwrap();
         visual.SetRelativeOffsetAdjustment(adjustment).unwrap();
