@@ -151,3 +151,90 @@ fn visual_reports_its_compositor() {
     let from_visual = visual.compositor();
     from_visual.create_container_visual();
 }
+
+#[test]
+fn every_clip_kind_attaches_to_a_visual() {
+    let c = compositor();
+    let visual = c.create_sprite_visual();
+    visual.set_size(120.0, 80.0);
+
+    // Each factory reaches a different versioned interface — CreateInsetClip on
+    // ICompositor, CreateGeometricClipWithGeometry on ICompositor6,
+    // CreateRectangleClip on ICompositor7 — so a cast wired to the wrong one
+    // panics here rather than silently producing a clip that never binds.
+    let inset = c.create_inset_clip();
+    inset.set_insets(1.0, 2.0, 3.0, 4.0);
+    visual.set_clip(Some(&inset));
+
+    let rectangle = c.create_rectangle_clip();
+    rectangle.set_sides(0.0, 0.0, 120.0, 80.0);
+    rectangle.set_corner_radius(Vector2::new(8.0, 8.0));
+    rectangle.set_corner_radii(
+        Vector2::new(1.0, 2.0),
+        Vector2::new(3.0, 4.0),
+        Vector2::new(5.0, 6.0),
+        Vector2::new(7.0, 8.0),
+    );
+    rectangle.set_left(0.0);
+    rectangle.set_top(0.0);
+    rectangle.set_right(120.0);
+    rectangle.set_bottom(80.0);
+    visual.set_clip(Some(&rectangle));
+
+    let geometry = c.create_rounded_rectangle_geometry();
+    geometry.set_size(Vector2::new(120.0, 80.0));
+    geometry.set_corner_radius(Vector2::new(12.0, 12.0));
+    let geometric = c.create_geometric_clip(&geometry);
+    // Re-pointing an attached clip's geometry is how a clipped shape changes
+    // without the clip object being replaced.
+    geometric.set_geometry(&geometry);
+    visual.set_clip(Some(&geometric));
+
+    // `None` has no clip type to infer, so clearing is its own method.
+    visual.clear_clip();
+}
+
+#[test]
+fn clip_properties_animate() {
+    let c = compositor();
+    let animation = c.create_scalar_key_frame_animation();
+    animation.insert_key_frame(0.0, 0.0);
+    animation.insert_key_frame(1.0, 16.0);
+    animation.set_duration(Duration::from_millis(120));
+
+    // A clip is not a visual, so it animates through its own start_animation —
+    // which casts to ICompositionObject. One check per clip kind, since each
+    // wraps a different generated type.
+    let inset = c.create_inset_clip();
+    inset.start_animation("RightInset", &animation);
+    inset.stop_animation("RightInset");
+
+    // Every rectangle-clip target is a SCALAR, sides and radii alike. A radius is
+    // a `Vector2` in the API but is animated per channel under a name that is
+    // neither the property (`"TopLeftRadius"`) nor a subchannel path
+    // (`"TopLeftRadius.X"`) — both are rejected — but the concatenation.
+    let rectangle = c.create_rectangle_clip();
+    for target in [
+        "Left",
+        "Top",
+        "Right",
+        "Bottom",
+        "TopLeftRadiusX",
+        "TopLeftRadiusY",
+        "TopRightRadiusX",
+        "TopRightRadiusY",
+        "BottomRightRadiusX",
+        "BottomRightRadiusY",
+        "BottomLeftRadiusX",
+        "BottomLeftRadiusY",
+    ] {
+        rectangle.start_animation(target, &animation);
+        rectangle.stop_animation(target);
+    }
+
+    let geometry = c.create_rounded_rectangle_geometry();
+    let geometric = c.create_geometric_clip(&geometry);
+    // Stopping a property nothing is animating is the ordinary case and must not
+    // panic — the contract `stop_animation` documents.
+    geometric.stop_animation("Geometry");
+}

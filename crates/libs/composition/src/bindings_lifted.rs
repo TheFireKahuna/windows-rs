@@ -434,6 +434,38 @@ unsafe impl Send for CompositionEllipseGeometry {}
 unsafe impl Sync for CompositionEllipseGeometry {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositionGeometricClip(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CompositionGeometricClip,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(
+    CompositionGeometricClip,
+    CompositionClip,
+    CompositionObject
+);
+impl windows_core::RuntimeType for CompositionGeometricClip {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, ICompositionGeometricClip>();
+}
+unsafe impl windows_core::Interface for CompositionGeometricClip {
+    type Vtable = <ICompositionGeometricClip as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <ICompositionGeometricClip as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CompositionGeometricClip {
+    type Target = ICompositionGeometricClip;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CompositionGeometricClip {
+    const NAME: &'static str = "Microsoft.UI.Composition.CompositionGeometricClip";
+}
+unsafe impl Send for CompositionGeometricClip {}
+unsafe impl Sync for CompositionGeometricClip {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompositionGeometry(windows_core::IUnknown);
 windows_core::imp::interface_hierarchy!(
     CompositionGeometry,
@@ -1496,6 +1528,38 @@ pub struct ICompositionEllipseGeometry_Vtbl {
     pub SetRadius: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositionGeometricClip,
+    ICompositionGeometricClip_Vtbl,
+    0xe3c0a8c5_5297_5d69_8b91_f5330bb1cb27
+);
+impl windows_core::RuntimeType for ICompositionGeometricClip {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositionGeometricClip {
+    pub(crate) fn SetGeometry<P0>(&self, value: P0) -> windows_core::Result<()>
+    where
+        P0: windows_core::Param<CompositionGeometry>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetGeometry)(
+                windows_core::Interface::as_raw(self),
+                value.param().abi(),
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositionGeometricClip_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    Geometry: usize,
+    pub SetGeometry: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
@@ -3052,6 +3116,75 @@ pub struct ICompositor5_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    ICompositor6,
+    ICompositor6_Vtbl,
+    0x5fd20200_c188_5737_b567_5e61741af19c
+);
+impl windows_core::RuntimeType for ICompositor6 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositor6 {
+    pub(crate) fn CreateGeometricClipWithGeometry<P0>(
+        &self,
+        geometry: P0,
+    ) -> windows_core::Result<CompositionGeometricClip>
+    where
+        P0: windows_core::Param<CompositionGeometry>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateGeometricClipWithGeometry)(
+                windows_core::Interface::as_raw(self),
+                geometry.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositor6_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    CreateGeometricClip: usize,
+    pub CreateGeometricClipWithGeometry: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICompositor7,
+    ICompositor7_Vtbl,
+    0x5358b81b_4799_5e7c_906c_e3df3b2e95eb
+);
+impl windows_core::RuntimeType for ICompositor7 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICompositor7 {
+    pub(crate) fn CreateRectangleClip(&self) -> windows_core::Result<RectangleClip> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateRectangleClip)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct ICompositor7_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    DispatcherQueue: usize,
+    CreateAnimationPropertyInfo: usize,
+    pub CreateRectangleClip: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     IContainerVisual,
     IContainerVisual_Vtbl,
     0xc70dbce1_2c2f_5d8e_91a4_aae1121e6186
@@ -3469,6 +3602,133 @@ impl windows_core::RuntimeType for INaturalMotionAnimation {
 #[repr(C)]
 pub struct INaturalMotionAnimation_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    IRectangleClip,
+    IRectangleClip_Vtbl,
+    0xbc261502_2259_5c01_8616_556110a09657
+);
+impl windows_core::RuntimeType for IRectangleClip {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl IRectangleClip {
+    pub(crate) fn SetBottom(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetBottom)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetBottomLeftRadius(
+        &self,
+        value: windows_numerics::Vector2,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetBottomLeftRadius)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetBottomRightRadius(
+        &self,
+        value: windows_numerics::Vector2,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetBottomRightRadius)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetLeft(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetLeft)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetRight(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetRight)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetTop(&self, value: f32) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetTop)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetTopLeftRadius(
+        &self,
+        value: windows_numerics::Vector2,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetTopLeftRadius)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+    pub(crate) fn SetTopRightRadius(
+        &self,
+        value: windows_numerics::Vector2,
+    ) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetTopRightRadius)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct IRectangleClip_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    Bottom: usize,
+    pub SetBottom: unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
+    BottomLeftRadius: usize,
+    pub SetBottomLeftRadius: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    BottomRightRadius: usize,
+    pub SetBottomRightRadius: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    Left: usize,
+    pub SetLeft: unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
+    Right: usize,
+    pub SetRight: unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
+    Top: usize,
+    pub SetTop: unsafe extern "system" fn(*mut core::ffi::c_void, f32) -> windows_core::HRESULT,
+    TopLeftRadius: usize,
+    pub SetTopLeftRadius: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
+    TopRightRadius: usize,
+    pub SetTopRightRadius: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_numerics::Vector2,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IScalarKeyFrameAnimation,
@@ -4521,6 +4781,34 @@ impl windows_core::RuntimeName for NaturalMotionAnimation {
 }
 unsafe impl Send for NaturalMotionAnimation {}
 unsafe impl Sync for NaturalMotionAnimation {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RectangleClip(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    RectangleClip,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+windows_core::imp::required_hierarchy!(RectangleClip, CompositionClip, CompositionObject);
+impl windows_core::RuntimeType for RectangleClip {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IRectangleClip>();
+}
+unsafe impl windows_core::Interface for RectangleClip {
+    type Vtable = <IRectangleClip as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IRectangleClip as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for RectangleClip {
+    type Target = IRectangleClip;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for RectangleClip {
+    const NAME: &'static str = "Microsoft.UI.Composition.RectangleClip";
+}
+unsafe impl Send for RectangleClip {}
+unsafe impl Sync for RectangleClip {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScalarKeyFrameAnimation(windows_core::IUnknown);

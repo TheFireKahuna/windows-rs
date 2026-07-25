@@ -141,10 +141,20 @@ impl Visual {
 
     /// Sets (or, with `None`, clears) the clip applied to this visual and its
     /// subtree.
-    pub fn set_clip(&self, clip: Option<&InsetClip>) {
+    ///
+    /// A bare `None` has no clip type to infer, so use
+    /// [`clear_clip`](Self::clear_clip) to remove a clip unconditionally; `None`
+    /// here is for the conditional case, where the `Some` arm names the type.
+    pub fn set_clip(&self, clip: Option<&impl Clip>) {
         bump_count(Count::PropertyWrite);
-        let clip: Option<bindings::CompositionClip> = clip.map(|clip| clip.0.cast().unwrap());
+        let clip = clip.map(|clip| clip.as_clip().0);
         self.0.SetClip(clip.as_ref()).unwrap();
+    }
+
+    /// Removes any clip from this visual, leaving its subtree unclipped.
+    pub fn clear_clip(&self) {
+        bump_count(Count::PropertyWrite);
+        self.0.SetClip(None).unwrap();
     }
 
     /// Views this visual as a container, if it is one.

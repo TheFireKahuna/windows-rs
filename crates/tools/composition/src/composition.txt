@@ -217,6 +217,23 @@ Windows.UI.Composition.IInsetClip::{put_LeftInset, put_TopInset, put_RightInset,
 Windows.UI.Composition.ICompositor::{CreateInsetClip}
 Windows.UI.Composition.IVisual::{put_Clip, put_RotationAngle}
 
+// A rectangle clip is the same idea carrying per-corner radii, and it is the
+// only way to round a sprite whose one brush slot is already spent on a mask:
+// a clip is not a brush, so rounding costs no second visual and no capture.
+// Its sides are absolute in the clipped visual's own space, not insets from
+// its edges, so a clip that must track the visual's size is written on resize.
+Windows.UI.Composition.RectangleClip
+Windows.UI.Composition.IRectangleClip::{put_Left, put_Top, put_Right, put_Bottom, put_TopLeftRadius, put_TopRightRadius, put_BottomLeftRadius, put_BottomRightRadius}
+Windows.UI.Composition.ICompositor7::{CreateRectangleClip}
+
+// A geometric clip takes any composition geometry, so a path already tessellated
+// for a shape can clip a subtree instead of being rebuilt as one. `ViewBox` is
+// left out: it would pull in CompositionViewBox to express a fit the geometry
+// can already carry itself.
+Windows.UI.Composition.CompositionGeometricClip
+Windows.UI.Composition.ICompositionGeometricClip::{put_Geometry}
+Windows.UI.Composition.ICompositor6::{CreateGeometricClipWithGeometry}
+
 // Paths and stroked shapes. A composition PATH is immutable, but the GEOMETRY
 // holding it is not: `put_Path` re-points an existing geometry at new vectors,
 // so a curve that reshapes keeps its object — and with it any trim animation

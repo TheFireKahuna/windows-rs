@@ -69,8 +69,8 @@ mod target;
 mod sealed {
     /// Prevents downstream crates from implementing this crate's marker traits
     /// ([`Brush`](crate::Brush), [`Shape`](crate::Shape),
-    /// [`Geometry`](crate::Geometry), [`Animation`](crate::Animation),
-    /// [`Object`](crate::Object)).
+    /// [`Geometry`](crate::Geometry), [`Clip`](crate::Clip),
+    /// [`Animation`](crate::Animation), [`Object`](crate::Object)).
     pub trait Sealed {}
 }
 
@@ -94,7 +94,7 @@ pub use brush::{
     Brush, CompositionBrush, CompositionColorBrush, CompositionLinearGradientBrush,
     CompositionMaskBrush, CompositionNineGridBrush, MappingMode,
 };
-pub use clip::InsetClip;
+pub use clip::{Clip, CompositionClip, CompositionGeometricClip, InsetClip, RectangleClip};
 pub use color::Color;
 pub use compositor::Compositor;
 pub use object::{CompositionObject, Object};
