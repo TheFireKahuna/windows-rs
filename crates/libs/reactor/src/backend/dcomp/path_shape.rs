@@ -282,6 +282,22 @@ pub(crate) fn build_composition_path(
     to_composition_path(comp, &build_d2d_path(&comp.gpu, verbs, points, filled)?)
 }
 
+/// How far a widened outline may stray from the true one, in DEVICE pixels.
+///
+/// Stated in device pixels rather than DIPs because that is the space the error
+/// is SEEN in: a fixed DIP tolerance is finer than anyone can resolve at 100%
+/// and coarser than it should be at 200%. The caller divides by the display
+/// scale to reach the geometry's own units.
+///
+/// Set to the conservative end on purpose, because the coarse end buys nothing.
+/// Widening a 511-cubic trace emits ~1032 segments — two per input cubic —
+/// whatever this says, since Direct2D widens into BÉZIER segments rather than a
+/// flattened polyline. The tolerance reaches only the join arcs, worth four
+/// segments across a whole trace, and neither it nor the join style moved the
+/// time outside run-to-run noise. See
+/// `cargo run -p windows-canvas --example widen_cost --release`.
+const WIDEN_TOLERANCE_PX: f32 = 0.25;
+
 thread_local! {
     /// The one stroke style every widened path uses, built on first need.
     ///
@@ -304,6 +320,7 @@ pub(crate) fn build_widened_path(
     verbs: &[PathVerb],
     points: &[f32],
     width: f32,
+    scale: f32,
 ) -> Option<CompositionPath> {
     let path = build_d2d_path(&comp.gpu, verbs, points, false)?;
     let widened = ROUND_STROKE.with(|s| {
@@ -318,7 +335,7 @@ pub(crate) fn build_widened_path(
                 )
                 .ok();
         }
-        path.widen(&comp.gpu, width, s.as_ref()?).ok()
+        path.widen(&comp.gpu, width, s.as_ref()?, WIDEN_TOLERANCE_PX / scale).ok()
     })?;
     to_composition_path(comp, &widened)
 }

@@ -649,6 +649,7 @@ impl LiveTraceField {
                 &batch.fill_points,
                 Role::Fill,
                 flat_fill.then_some(0.0),
+                scale,
             );
         }
         if batch.has_geometry {
@@ -664,6 +665,7 @@ impl LiveTraceField {
                 &batch.points,
                 Role::Stroke,
                 Some(layout.thickness),
+                scale,
             );
         }
 
@@ -812,6 +814,7 @@ impl LiveTraceField {
         // arrive WIDENED — a clip fills a region, and a stroke is a line plus a
         // width until something turns it into one.
         clipped: Option<f32>,
+        scale: f32,
     ) {
         let empty = verbs.is_empty();
         // A path is minted only for geometry there is something to draw; an
@@ -819,7 +822,7 @@ impl LiveTraceField {
         if !empty
             && let Some(path) = match (clipped, role) {
                 (Some(width), Role::Stroke) => {
-                    super::path_shape::build_widened_path(comp, verbs, points, width)
+                    super::path_shape::build_widened_path(comp, verbs, points, width, scale)
                 }
                 _ => super::path_shape::build_composition_path(
                     comp,
