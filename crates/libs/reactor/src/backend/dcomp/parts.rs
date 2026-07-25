@@ -2737,9 +2737,15 @@ pub(crate) fn button_plan(node: &Node, scale: f32) -> PartPlan {
 /// from a longer band is how a shared literal ends up outliving the reason the
 /// two agreed.
 mod box_slot {
-    pub const FILL: usize = 0;
-    pub const BORDER: usize = 1;
-    pub const N_BELOW: usize = BORDER + 1;
+    /// The lower of a box's two sprites.
+    ///
+    /// Which of fill and border that IS depends on how the box is built — see
+    /// [`super::box_plan`]. A stroked box draws its fill here and its outline
+    /// over it; a ring-by-clip box draws the border here and the fill over it.
+    pub const LOWER: usize = 0;
+    /// The upper sprite, composited over [`LOWER`].
+    pub const UPPER: usize = 1;
+    pub const N_BELOW: usize = UPPER + 1;
 }
 
 /// A container's fill and outline: `[fill, border]`, nothing above.
@@ -2791,20 +2797,68 @@ pub(crate) fn box_plan(node: &Node, scale: f32) -> PartPlan {
     // A fully transparent fill binds nothing: an atlas source that paints no
     // pixels is a wasted raster and a wasted cache slot. Same rule as the
     // button family's chromeless variants.
-    let fill = match bg
-        .filter(|c| c.a > 0.0)
-        .map(|c| AtlasKey::hbar(h, radius, 0.0, c, scale))
+    let bg = bg.filter(|c| c.a > 0.0);
+    // Thickness gates the outline the same way it gated the painted `draw_rect`
+    // — a brush with no width drew nothing there either.
+    let stroke = stroke.filter(|c| c.a > 0.0 && t > 0.0);
+
+    // ── A ring built from two clipped solids, when that is exact ──
+    //
+    // A stroked bar is the one box source a clip cannot serve on its own (see
+    // `AtlasKey::clip_radius`), and routing it through a shape mask would cost a
+    // `CompositionVisualSurface` capture per bordered box. It does not have to:
+    // a border is the part of an OUTER rounded rect an INNER one does not cover,
+    // so painting the border colour over the outer and the fill colour over the
+    // inner leaves exactly the ring. Both are clipped solids, so the pair costs
+    // no raster, no capture and no geometry — the same two sprites this plan
+    // already binds.
+    //
+    // The two rects are CONCENTRIC, which is what makes the ring uniform: the
+    // outer corner arc is centred `radius` in from the corner, and the inner one
+    // `t + (radius - t)` — the same point — so the ring is `t` wide through the
+    // corners as well as along the sides. (Both radii are snapped independently
+    // by `AtlasKey::bar`, so the width can differ from `t` by under one detail
+    // step; that grid is sub-pixel.)
+    //
+    // It is exact ONLY where the fill hides the border underneath it, which
+    // takes two things a key cannot report and this plan can:
+    //
+    // - an OPAQUE fill. A translucent one composites over the border rect
+    //   instead of the backdrop, tinting the whole interior with the border
+    //   colour. A chromeless bordered box — a border and no fill at all — is the
+    //   degenerate case: it would render as a solid disc.
+    // - an UNDIMMED box. `dim` lands on each sprite separately, so at `dim < 1`
+    //   the interior composites the fill over a dimmed border over the backdrop
+    //   rather than over the backdrop alone.
+    //
+    // Anything else keeps the stroked raster below.
+    if let (Some(f), Some(s)) = (bg, stroke)
+        && f.a >= 1.0
+        && dim >= 1.0
     {
+        let inner = (t, t, (w - 2.0 * t).max(0.0), (h - 2.0 * t).max(0.0));
+        return PartPlan::new([w, h, 0.0])
+            .below(
+                box_slot::LOWER,
+                SlotPlan::snap(AtlasKey::hbar(h, radius, 0.0, s, scale), box_rect, dim),
+            )
+            .below(
+                box_slot::UPPER,
+                SlotPlan::snap(
+                    AtlasKey::hbar(inner.3, (radius - t).max(0.0), 0.0, f, scale),
+                    Some(inner),
+                    dim,
+                ),
+            )
+            .optional();
+    }
+
+    let fill = match bg.map(|c| AtlasKey::hbar(h, radius, 0.0, c, scale)) {
         Some(k) => SlotPlan::snap(k, box_rect, dim),
         None => SlotPlan::hidden(),
     };
 
-    // Thickness gates the outline the same way it gated the painted `draw_rect`
-    // — a brush with no width drew nothing there either.
-    let border = match stroke
-        .filter(|c| c.a > 0.0 && t > 0.0)
-        .map(|c| AtlasKey::hbar(h, radius, t, c, scale))
-    {
+    let border = match stroke.map(|c| AtlasKey::hbar(h, radius, t, c, scale)) {
         Some(k) => SlotPlan::snap(k, box_rect, dim),
         None => SlotPlan::hidden(),
     };
@@ -2815,8 +2869,8 @@ pub(crate) fn box_plan(node: &Node, scale: f32) -> PartPlan {
     // Grid and StackPanel in a window, is the largest population of visuals in
     // the tree that has never drawn anything.
     PartPlan::new([w, h, 0.0])
-        .below(box_slot::FILL, fill)
-        .below(box_slot::BORDER, border)
+        .below(box_slot::LOWER, fill)
+        .below(box_slot::UPPER, border)
         .optional()
 }
 
