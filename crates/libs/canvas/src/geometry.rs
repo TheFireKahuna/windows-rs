@@ -40,22 +40,66 @@ impl Path {
     /// because a caller widening every frame must not mint a COM object per
     /// frame for a value that never varies — see
     /// [`GpuDevice::create_stroke_style`].
-    pub fn widen(&self, device: &GpuDevice, stroke_width: f32, style: &StrokeStyle) -> Result<Path> {
+    ///
+    /// `tolerance` is the furthest the flattened result may stray from the true
+    /// outline, in the geometry's OWN units. It is a parameter rather than
+    /// Direct2D's fixed default because it decides the cost: a widened spline is
+    /// flattened curve by curve and join by join, so halving the tolerance buys
+    /// accuracy nobody can see and pays for it in vertices the compositor then
+    /// has to carry. A caller drawing in DIPs at a known scale should state what
+    /// it wants in DEVICE pixels and divide.
+    pub fn widen(
+        &self,
+        device: &GpuDevice,
+        stroke_width: f32,
+        style: &StrokeStyle,
+        tolerance: f32,
+    ) -> Result<Path> {
         let raw = unsafe { device.d2d_factory().CreatePathGeometry()? };
         let sink = unsafe { raw.Open()? };
         unsafe {
             self.raw
-                .Widen(
-                    stroke_width,
-                    &style.0,
-                    None,
-                    DEFAULT_FLATTENING_TOLERANCE,
-                    &sink,
-                )
+                .Widen(stroke_width, &style.0, None, tolerance, &sink)
                 .ok()?;
             sink.Close().ok()?;
         }
         Ok(Path { raw })
+    }
+
+    /// This path's OUTLINE: the same region with its self-intersections
+    /// resolved, so the result never overlaps itself and fills identically under
+    /// either winding rule.
+    ///
+    /// The natural follow-on to [`widen`](Self::widen), whose result laps over
+    /// itself wherever the source turned sharply. Both describe the same region,
+    /// so this changes no pixel — what it changes is how much geometry a
+    /// consumer downstream has to carry and rasterize. Whether that is a saving
+    /// depends on the shape: resolving intersections also SPLITS segments at
+    /// every crossing, so a path that crosses itself often can come back larger
+    /// than it went in. Measure before assuming
+    /// (`--example widen_cost`).
+    pub fn outline(&self, device: &GpuDevice, tolerance: f32) -> Result<Path> {
+        let raw = unsafe { device.d2d_factory().CreatePathGeometry()? };
+        let sink = unsafe { raw.Open()? };
+        unsafe {
+            self.raw.Outline(None, tolerance, &sink).ok()?;
+            sink.Close().ok()?;
+        }
+        Ok(Path { raw })
+    }
+
+    /// How many segments this path holds — the size of what a consumer is handed.
+    ///
+    /// Worth knowing after a [`widen`](Self::widen): the outline feeds a
+    /// composition path, and the compositor pays to ingest it in proportion to
+    /// this.
+    pub fn segment_count(&self) -> u32 {
+        unsafe { self.raw.GetSegmentCount().unwrap_or(0) }
+    }
+
+    /// How many figures this path holds.
+    pub fn figure_count(&self) -> u32 {
+        unsafe { self.raw.GetFigureCount().unwrap_or(0) }
     }
 
     /// Returns whether the point lies within the filled area of the path.

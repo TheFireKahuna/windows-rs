@@ -3136,6 +3136,24 @@ impl ID2D1Geometry {
             .map(|| result__)
         }
     }
+    pub(crate) unsafe fn Outline<P2>(
+        &self,
+        worldtransform: Option<*const windows_numerics::Matrix3x2>,
+        flatteningtolerance: f32,
+        geometrysink: P2,
+    ) -> windows_core::HRESULT
+    where
+        P2: windows_core::Param<ID2D1SimplifiedGeometrySink>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).Outline)(
+                windows_core::Interface::as_raw(self),
+                worldtransform.unwrap_or(core::mem::zeroed()) as _,
+                flatteningtolerance,
+                geometrysink.param().abi(),
+            )
+        }
+    }
     pub(crate) unsafe fn Widen<P1, P4>(
         &self,
         strokewidth: f32,
@@ -3189,7 +3207,12 @@ pub struct ID2D1Geometry_Vtbl {
     Simplify: usize,
     Tessellate: usize,
     CombineWithGeometry: usize,
-    Outline: usize,
+    pub Outline: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_numerics::Matrix3x2,
+        f32,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     ComputeArea: usize,
     ComputeLength: usize,
     ComputePointAtLength: usize,
@@ -3582,6 +3605,26 @@ impl ID2D1PathGeometry {
             .and_then(|| windows_core::Type::from_abi(result__))
         }
     }
+    pub(crate) unsafe fn GetSegmentCount(&self) -> windows_core::Result<u32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetSegmentCount)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn GetFigureCount(&self) -> windows_core::Result<u32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFigureCount)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
 }
 #[repr(C)]
 pub struct ID2D1PathGeometry_Vtbl {
@@ -3591,8 +3634,10 @@ pub struct ID2D1PathGeometry_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
     Stream: usize,
-    GetSegmentCount: usize,
-    GetFigureCount: usize,
+    pub GetSegmentCount:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+    pub GetFigureCount:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ID2D1PathGeometry1,
