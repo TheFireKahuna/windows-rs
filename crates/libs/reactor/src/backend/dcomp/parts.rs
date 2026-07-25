@@ -44,6 +44,9 @@
 //! order simply by being created in it, which is the same z-order the banded
 //! case produces; see [`ensure`].
 
+use std::cell::RefCell;
+use std::sync::atomic;
+
 use rustc_hash::FxHashMap;
 
 use super::bootstrap::Compositing;
@@ -481,6 +484,12 @@ impl Atlas {
     pub(crate) fn clear(&mut self) {
         self.map.clear();
         self.epoch = self.epoch.wrapping_add(1);
+        // The standalone sources ([`build_solid_surface`]) are painted through
+        // the same colour map and go stale on exactly the same edges, but they
+        // are reached from call sites with no `Atlas` in hand. Bumping the
+        // generation is what invalidates them without every one of those sites
+        // — or every future one — having to remember a second call.
+        SOURCE_GEN.fetch_add(1, atomic::Ordering::Relaxed);
     }
 
     /// The current cache epoch — non-`Part` chrome (the Knob) reads it to know
@@ -605,15 +614,80 @@ fn rasterize(comp: &Compositing, key: &AtlasKey) -> Option<AtlasEntry> {
     Some(AtlasEntry { brush, _surface: surface, used: 0 })
 }
 
+// ── Standalone sources ───────────────────────────────────────────────────────
+//
+// [`build_solid_surface`] and [`build_circle_surface`] are the two ways a source
+// is reached from outside a `Part` — glyph text's colour source, the knob's
+// needle and hub, a path's fill, a gradient's flat layers. They cannot consult
+// the [`Atlas`] because none of those call sites has one, and rasterizing per
+// call is what that used to mean: a window whose chrome needs FOURTEEN distinct
+// colours was minting a hundred and eight 4×4 surfaces, one per caller per
+// repaint, each a composition object and a texture the engine then has to track.
+//
+// So they get a cache of their own, on the same terms as the atlas: keyed by the
+// same quantized [`AtlasKey`], invalidated by the same edges. Thread-local
+// rather than shared, because sources are built from more than one thread and a
+// cache is not worth making a COM object cross one.
+
+/// Bumped by [`Atlas::clear`]; a generation the cache below does not match is a
+/// cache whose colours were painted through a mapping that no longer applies.
+static SOURCE_GEN: atomic::AtomicU32 = atomic::AtomicU32::new(0);
+
+/// Backstop on the cache's size. The live set is the palette — a dozen or so —
+/// so passing this means a caller is forking keys without bound, and dropping
+/// everything is both the cheapest response and the one that cannot leak.
+const SOURCE_CACHE_CAP: usize = 256;
+
+thread_local! {
+    static SOURCES: RefCell<(u32, FxHashMap<AtlasKey, CompositionSurfaceBrush>)> =
+        RefCell::new((0, FxHashMap::default()));
+}
+
+/// Fetch `key`'s source from the standalone cache, rasterizing on a miss.
+fn cached_source(comp: &Compositing, key: AtlasKey) -> Option<CompositionSurfaceBrush> {
+    let era = SOURCE_GEN.load(atomic::Ordering::Relaxed);
+    // Borrow, look, drop — the rasterize below must not run inside the borrow,
+    // or a source built while building a source would panic rather than merely
+    // miss.
+    let hit = SOURCES.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != era {
+            c.0 = era;
+            c.1.clear();
+        }
+        c.1.get(&key).cloned()
+    });
+    if let Some(brush) = hit {
+        return Some(brush);
+    }
+    let brush = rasterize(comp, &key).map(|e| e.brush)?;
+    SOURCES.with(|c| {
+        let mut c = c.borrow_mut();
+        // Only if the generation still holds: a clear that landed while this was
+        // rasterizing means these pixels are already the wrong ones.
+        if c.0 == era {
+            if c.1.len() >= SOURCE_CACHE_CAP {
+                c.1.clear();
+            }
+            c.1.insert(key, brush.clone());
+        }
+    });
+    Some(brush)
+}
+
 /// A standalone FP16 solid-color surface brush (display-mapped), for the Knob's
 /// needle — and, since ramps moved onto the compositor
 /// ([`super::gradient`]), for every flat colour a gradient is built out of.
+///
+/// Shared, not minted per call: the returned brush is immutable in use (every
+/// caller binds it and none re-stretches it), so one object serves every sprite
+/// painted in that colour.
 pub(crate) fn build_solid_surface(
     comp: &Compositing,
     color: crate::Color,
     scale: f32,
 ) -> Option<CompositionSurfaceBrush> {
-    rasterize(comp, &AtlasKey::solid(color, scale)).map(|e| e.brush)
+    cached_source(comp, AtlasKey::solid(color, scale))
 }
 
 /// A standalone FP16 circle surface brush (display-mapped), for the Knob's
@@ -626,7 +700,7 @@ pub(crate) fn build_circle_surface(
     color: crate::Color,
     scale: f32,
 ) -> Option<CompositionSurfaceBrush> {
-    rasterize(comp, &AtlasKey::circle(d, color, scale)).map(|e| e.brush)
+    cached_source(comp, AtlasKey::circle(d, color, scale))
 }
 
 
