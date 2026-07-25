@@ -282,6 +282,46 @@ pub fn w(alpha: f32) -> Color {
     Color::scrgb(ink.r, ink.g, ink.b, wash_alpha(alpha))
 }
 
+/// Composite a wash over a KNOWN ground and return the opaque result.
+///
+/// A wash is a promise to blend later, and the blend is only as good as the
+/// guess about what it will land on. [`wash_alpha`] has to make that guess: its
+/// cubics are fitted against ONE base per scheme (`#282828` dark, `#f9f9f9`
+/// light), so a wash reproduces its authored appearance exactly over that base
+/// and drifts as the real ground moves away from it. A stroke on a raised card
+/// is not on `#282828`.
+///
+/// Where the ground IS known, that guess is unnecessary and this collapses it:
+/// the caller names the surface, the blend happens once in linear light, and the
+/// result is an ordinary opaque colour. It is then a value rather than a
+/// function of whatever ends up underneath — which is what lets it be fitted,
+/// compared, and moved in z without changing.
+///
+/// This is the same conclusion the window backdrop reached and for the same
+/// reason (see the app-side `backdrop` spec): layer strength is a design
+/// decision to author, not a blend to emulate.
+///
+/// Where the ground is NOT known — a control sitting on arbitrary app content,
+/// a hover wash over anything — a wash is still the only honest encoding, and
+/// those sites keep it.
+///
+/// Full source-over, so a translucent ground composes correctly too; the common
+/// case of an opaque ground reduces to the plain lerp.
+pub fn over(wash: Color, ground: Color) -> Color {
+    let a = wash.a;
+    let out_a = a + ground.a * (1.0 - a);
+    if out_a <= 0.0 {
+        return Color::scrgb(0.0, 0.0, 0.0, 0.0);
+    }
+    let mix = |w: f32, g: f32| (w * a + g * ground.a * (1.0 - a)) / out_a;
+    Color::scrgb(
+        mix(wash.r, ground.r),
+        mix(wash.g, ground.g),
+        mix(wash.b, ground.b),
+        out_a,
+    )
+}
+
 /// Black at `alpha` (insets / scrims / drop shadows — shadows stay dark on both
 /// schemes). Linear black is `0.0`.
 pub const fn b(alpha: f32) -> Color {

@@ -658,7 +658,7 @@ impl Popup {
         // Raised surface + hairline.
         set(brush, theme::surface_raised());
         session.fill_rounded_rect(&RoundedRect::uniform(p, theme::RADIUS_MD), brush);
-        set(brush, theme::stroke());
+        set(brush, theme::over(theme::stroke(), theme::surface_raised()));
         let inset = Rect::new(p.left + 0.5, p.top + 0.5, p.right - 0.5, p.bottom - 0.5);
         session.draw_rounded_rect(&RoundedRect::uniform(inset, theme::RADIUS_MD), brush, theme::BORDER_W);
 
@@ -677,7 +677,7 @@ impl Popup {
 
         for (i, row, y, _) in rows_laid(rows, p.top) {
             if row.separator {
-                set(brush, theme::stroke_divider());
+                set(brush, theme::over(theme::stroke_divider(), theme::surface_raised()));
                 let y = y + SEP / 2.0;
                 session.draw_line(
                     Vector2::new(p.left + theme::SPACE_8, y),
