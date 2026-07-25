@@ -25,6 +25,9 @@ use windows_canvas::*;
 
 /// Sample count of the geometry under test — a full-width analyzer trace.
 const SAMPLES: usize = 512;
+/// Densities to sweep at the chosen style, because every downstream cost here is
+/// linear in this and it is the one input the renderer does not control.
+const SWEEP: &[usize] = &[128, 256, 512, 1024];
 /// Stroke width in DIPs. A trace is thin, which is the whole reason the join
 /// question is interesting: the join arc's radius is half of this.
 const WIDTH: f32 = 1.5;
@@ -84,6 +87,23 @@ fn main() -> Result<()> {
             );
         }
     }
+
+    // What the sample density costs, at round joins and a quarter device pixel.
+    let style = device
+        .create_stroke_style(&StrokeStyleBuilder::new().caps(CapStyle::Round).line_join(LineJoin::Round))?;
+    let tol = 0.25 / SCALE;
+    println!();
+    println!("{:<10} {:>10} {:>10}", "samples", "us/widen", "segments");
+    for &n in SWEEP {
+        let path = trace_path_n(&device, n)?;
+        let segments = path.widen(&device, WIDTH, &style, tol)?.segment_count();
+        let t0 = std::time::Instant::now();
+        for _ in 0..REPS {
+            let _ = path.widen(&device, WIDTH, &style, tol)?;
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(REPS);
+        println!("{n:<10} {us:>10.1} {segments:>10}");
+    }
     Ok(())
 }
 
@@ -91,9 +111,13 @@ fn main() -> Result<()> {
 /// response. The exact values do not matter, but the DENSITY does — that is what
 /// decides how much there is to flatten.
 fn trace_path(device: &GpuDevice) -> Result<Path> {
-    let pts: Vec<(f32, f32)> = (0..SAMPLES)
+    trace_path_n(device, SAMPLES)
+}
+
+fn trace_path_n(device: &GpuDevice, samples: usize) -> Result<Path> {
+    let pts: Vec<(f32, f32)> = (0..samples)
         .map(|i| {
-            let t = i as f32 / SAMPLES as f32;
+            let t = i as f32 / samples as f32;
             let x = t * 1400.0;
             // Something with both smooth sweeps and local roughness, so the
             // flattener meets curvature rather than a straight line.
@@ -106,8 +130,8 @@ fn trace_path(device: &GpuDevice) -> Result<Path> {
         .collect();
 
     let mut fig = PathBuilder::new(device)?.begin_hollow(Vector2::new(pts[0].0, pts[0].1));
-    let at = |i: isize| pts[i.clamp(0, SAMPLES as isize - 1) as usize];
-    for i in 0..SAMPLES as isize - 1 {
+    let at = |i: isize| pts[i.clamp(0, samples as isize - 1) as usize];
+    for i in 0..samples as isize - 1 {
         let (pp, pa, pb, pn) = (at(i - 1), at(i), at(i + 1), at(i + 2));
         fig = fig.bezier_to_flat(&[
             pa.0 + (pb.0 - pp.0) / 6.0,
