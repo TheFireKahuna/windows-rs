@@ -28,6 +28,7 @@ mod backdrop;
 pub(crate) mod bar_field;
 mod bootstrap;
 mod caption;
+pub(crate) mod census;
 mod color_out;
 pub(crate) mod controls;
 mod dispatch;

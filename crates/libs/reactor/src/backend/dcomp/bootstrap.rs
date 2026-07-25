@@ -22,6 +22,7 @@
 use std::cell::Cell;
 
 use super::backdrop::{self, Backdrop};
+use super::census::HeatMap;
 use crate::system_bindings::{
     GetMonitorInfoW, MonitorFromWindow, HWND, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
@@ -303,6 +304,33 @@ impl Compositing {
         // armed, and a visual detached by the first path must not panic the
         // second. "Already gone" is the goal state here.
         let _ = self.root.children().try_remove(v);
+    }
+
+    /// The compositor root, as a plain visual — the starting point for a census
+    /// walk of everything this window has parented, chrome and backdrop
+    /// included rather than just the reactor's own subtree.
+    pub fn root_visual(&self) -> &Visual {
+        &self.root
+    }
+
+    /// Ask the compositor to tint what it is doing over this window's whole
+    /// tree, or stop.
+    ///
+    /// Fails softly on purpose. Heat maps are a diagnostic facility that a given
+    /// system may simply not carry, and a caller reaching for one is by
+    /// definition investigating — the answer "this build cannot show you that"
+    /// belongs in their report, not in a panic.
+    pub fn set_heat_map(&self, map: Option<HeatMap>) -> windows_core::Result<bool> {
+        let Some(maps) = self.compositor.debug_heat_maps()? else {
+            return Ok(false);
+        };
+        match map {
+            None => maps.hide(&self.root)?,
+            Some(HeatMap::Redraw) => maps.show_redraw(&self.root)?,
+            Some(HeatMap::Overdraw(kinds)) => maps.show_overdraw(&self.root, kinds)?,
+            Some(HeatMap::MemoryUsage) => maps.show_memory_usage(&self.root)?,
+        }
+        Ok(true)
     }
 
     /// Whether `visual` IS the compositor root container. Terminates the

@@ -407,6 +407,12 @@ impl DCompHost {
         // the app thread once the reconciler moves off the pump thread.
         crate::set_frame_pump_wake(Some(Arc::new(move || pump_wake.wake())));
 
+        // Opt-in composition diagnostics (`REACTOR_CENSUS=<seconds>`,
+        // `REACTOR_HEATMAP=<name>`). Starts nothing unless a variable is set, and
+        // is deliberately started here — after the window exists — so the first
+        // sample and the heat-map request can both reach it.
+        census::start_from_env();
+
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW as i32);
         }

@@ -70,6 +70,14 @@ pub use app::*;
 pub use backend::*;
 pub use gesture::{ActionSlot, GestureEvent, GestureInterest, GestureOutcome};
 pub use motion::reduced_motion;
+// The composition-object and property-write counters, re-exported so a consumer
+// can read them without taking a direct dependency on the composition crate —
+// they pair with `composition_census`, which prints them alongside a walk of the
+// live visual tree.
+#[cfg(feature = "dcomp-backend")]
+pub use windows_composition::{census as composition_counters, Census, OverdrawKinds};
+#[cfg(feature = "dcomp-backend")]
+pub use windows_composition::reset_census as reset_composition_counters;
 pub use color::Color;
 pub use bindings::AutomationHeadingLevel;
 pub use bindings::AutomationLiveSetting;
