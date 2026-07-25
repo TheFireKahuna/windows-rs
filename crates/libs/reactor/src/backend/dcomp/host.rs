@@ -740,6 +740,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             r
         }
 
+        // ── Size constraints: the app's registered minimum / maximum ──
+        //
+        // The system pre-fills the payload with its own defaults (including the
+        // multi-monitor maximized size and position), so the handler overwrites
+        // only the axes the app actually constrained and leaves the rest alone.
+        // Arrives during CreateWindowExW too, before anything is registered —
+        // `apply` reports that and the message falls through untouched.
+        WM_GETMINMAXINFO => {
+            let mmi = lparam as *mut MINMAXINFO;
+            if mmi.is_null() {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            if constraints::apply(hwnd, dpi_scale(hwnd), unsafe { &mut *mmi }) {
+                0
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+
         // Frame hit-testing: resize borders from DefWindowProc; then the top
         // resize band, the drawn min/max/close cluster (HTMAXBUTTON is what
         // summons Win11 snap layouts), interactive content, and finally the

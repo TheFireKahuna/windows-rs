@@ -5635,6 +5635,15 @@ pub type LPARAM = isize;
 pub type LRESULT = isize;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MINMAXINFO {
+    pub ptReserved: POINT,
+    pub ptMaxSize: POINT,
+    pub ptMaxPosition: POINT,
+    pub ptMinTrackSize: POINT,
+    pub ptMaxTrackSize: POINT,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MONITORINFO {
     pub cbSize: u32,
     pub rcMonitor: RECT,
@@ -6356,6 +6365,7 @@ pub const WM_DESTROY: u32 = 2;
 pub const WM_DISPLAYCHANGE: u32 = 126;
 pub const WM_DPICHANGED: u32 = 736;
 pub const WM_ERASEBKGND: u32 = 20;
+pub const WM_GETMINMAXINFO: u32 = 36;
 pub const WM_GETOBJECT: u32 = 61;
 pub const WM_KEYDOWN: u32 = 256;
 pub const WM_KEYUP: u32 = 257;

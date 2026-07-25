@@ -35,7 +35,8 @@ pub use dcomp::{
     live_text::LiveText,
     live_trace::{FillAnchor, FillMotion, LiveTrace, TraceLayout, TracePath},
     pointer_capture_active, set_display_change_callback, set_host_tokens, AdvancedColor,
-    set_output_color_transform, set_root_backdrop_provider, set_window_visibility_callback,
+    set_inner_constraints, set_output_color_transform, set_root_backdrop_provider,
+    set_window_visibility_callback,
     BackdropDither, BackdropGlow, BackdropSpec, DCompBackend, DCompHost, GlowDrift, HostTokens,
 };
 

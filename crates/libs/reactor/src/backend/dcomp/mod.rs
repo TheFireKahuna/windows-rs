@@ -57,6 +57,7 @@ pub(crate) mod ring_shape;
 pub(crate) mod parts;
 mod pointer;
 mod popup;
+pub(crate) mod constraints;
 pub(crate) mod record;
 mod scroll;
 mod size;
@@ -73,6 +74,7 @@ pub use color_out::set_output_color_transform;
 pub use host::{pointer_capture_active, DCompHost};
 pub use display_change::{set_display_change_callback, AdvancedColor};
 pub use visibility::set_window_visibility_callback;
+pub use constraints::set_inner_constraints;
 pub(crate) use pointer::{
     declare as declare_gesture, forget as forget_gesture, register_action as register_gesture_action,
 };

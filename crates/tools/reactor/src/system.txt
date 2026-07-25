@@ -109,6 +109,7 @@ Windows::Win32::PostMessageW
 Windows::Win32::SendMessageW
 Windows::Win32::MSG
 Windows::Win32::NCCALCSIZE_PARAMS
+Windows::Win32::MINMAXINFO
 // ── Cursor + caret metrics (no timers — blink is compositor-side) ──
 Windows::Win32::LoadCursorW
 Windows::Win32::SetCursor
@@ -137,6 +138,7 @@ Windows::Win32::WM_ERASEBKGND
 Windows::Win32::WM_SIZE
 Windows::Win32::WM_WINDOWPOSCHANGED
 Windows::Win32::WM_NCCALCSIZE
+Windows::Win32::WM_GETMINMAXINFO
 Windows::Win32::WM_NCHITTEST
 Windows::Win32::WM_SETFOCUS
 Windows::Win32::WM_KILLFOCUS
