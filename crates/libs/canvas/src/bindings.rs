@@ -75,6 +75,11 @@ pub const D2D1_COLOR_SPACE_CUSTOM: D2D1_COLOR_SPACE = 0;
 pub const D2D1_COLOR_SPACE_FORCE_DWORD: D2D1_COLOR_SPACE = -1;
 pub const D2D1_COLOR_SPACE_SCRGB: D2D1_COLOR_SPACE = 2;
 pub const D2D1_COLOR_SPACE_SRGB: D2D1_COLOR_SPACE = 1;
+pub type D2D1_COMBINE_MODE = i32;
+pub const D2D1_COMBINE_MODE_EXCLUDE: D2D1_COMBINE_MODE = 3;
+pub const D2D1_COMBINE_MODE_INTERSECT: D2D1_COMBINE_MODE = 1;
+pub const D2D1_COMBINE_MODE_UNION: D2D1_COMBINE_MODE = 0;
+pub const D2D1_COMBINE_MODE_XOR: D2D1_COMBINE_MODE = 2;
 pub type D2D1_COMPOSITE_MODE = i32;
 pub type D2D1_DASH_STYLE = i32;
 pub const D2D1_DASH_STYLE_CUSTOM: D2D1_DASH_STYLE = 5;
@@ -3136,6 +3141,29 @@ impl ID2D1Geometry {
             .map(|| result__)
         }
     }
+    pub(crate) unsafe fn CombineWithGeometry<P0, P4>(
+        &self,
+        inputgeometry: P0,
+        combinemode: D2D1_COMBINE_MODE,
+        inputgeometrytransform: Option<*const windows_numerics::Matrix3x2>,
+        flatteningtolerance: f32,
+        geometrysink: P4,
+    ) -> windows_core::HRESULT
+    where
+        P0: windows_core::Param<Self>,
+        P4: windows_core::Param<ID2D1SimplifiedGeometrySink>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).CombineWithGeometry)(
+                windows_core::Interface::as_raw(self),
+                inputgeometry.param().abi(),
+                combinemode,
+                inputgeometrytransform.unwrap_or(core::mem::zeroed()) as _,
+                flatteningtolerance,
+                geometrysink.param().abi(),
+            )
+        }
+    }
     pub(crate) unsafe fn Outline<P2>(
         &self,
         worldtransform: Option<*const windows_numerics::Matrix3x2>,
@@ -3206,7 +3234,14 @@ pub struct ID2D1Geometry_Vtbl {
     CompareWithGeometry: usize,
     Simplify: usize,
     Tessellate: usize,
-    CombineWithGeometry: usize,
+    pub CombineWithGeometry: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        D2D1_COMBINE_MODE,
+        *const windows_numerics::Matrix3x2,
+        f32,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     pub Outline: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *const windows_numerics::Matrix3x2,

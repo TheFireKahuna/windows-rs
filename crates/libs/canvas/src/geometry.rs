@@ -18,6 +18,32 @@ pub struct Path {
 /// Direct2D's default flattening tolerance for hit-testing and bounds queries.
 const DEFAULT_FLATTENING_TOLERANCE: f32 = 0.25;
 
+/// How [`Path::combine`] resolves the two regions it is given.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CombineMode {
+    /// Everything either region covers.
+    #[default]
+    Union,
+    /// Only what both cover.
+    Intersect,
+    /// What exactly one covers — the union minus the intersection.
+    Xor,
+    /// What the receiver covers and the argument does not. The one asymmetric
+    /// mode: `a.combine(b, Exclude)` and `b.combine(a, Exclude)` differ.
+    Exclude,
+}
+
+impl CombineMode {
+    pub(crate) fn to_abi(self) -> D2D1_COMBINE_MODE {
+        match self {
+            Self::Union => D2D1_COMBINE_MODE_UNION,
+            Self::Intersect => D2D1_COMBINE_MODE_INTERSECT,
+            Self::Xor => D2D1_COMBINE_MODE_XOR,
+            Self::Exclude => D2D1_COMBINE_MODE_EXCLUDE,
+        }
+    }
+}
+
 
 impl Path {
     /// Returns the underlying `ID2D1PathGeometry1`.
@@ -83,6 +109,44 @@ impl Path {
         let sink = unsafe { raw.Open()? };
         unsafe {
             self.raw.Outline(None, tolerance, &sink).ok()?;
+            sink.Close().ok()?;
+        }
+        Ok(Path { raw })
+    }
+
+    /// This path combined with `other` under `mode` — the boolean algebra of
+    /// two regions, as a third region.
+    ///
+    /// What it buys is a shape that would otherwise have to be *expressed* as
+    /// two overlaid layers: a band of a curve is `Intersect` with the band's
+    /// box, and a fill that must not double-blend under its own stroke is
+    /// `Exclude` with the stroke's outline ([`widen`](Self::widen)). Both come
+    /// back as ONE fillable geometry, so the consumer that draws it needs one
+    /// sprite, one brush and no compositing between the two inputs.
+    ///
+    /// Both operands must be in the SAME coordinate space — there is no
+    /// transform parameter here, so a caller combining geometries authored
+    /// against different origins must translate one before building it.
+    ///
+    /// `tolerance` is in the geometries' own units, as
+    /// [`widen`](Self::widen)'s is. Combining has to find where the two inputs
+    /// cross, and it splits segments at every crossing to do so, so the result
+    /// is routinely larger than either input — count it with
+    /// [`segment_count`](Self::segment_count) before putting it on a per-frame
+    /// path.
+    pub fn combine(
+        &self,
+        device: &GpuDevice,
+        other: &Path,
+        mode: CombineMode,
+        tolerance: f32,
+    ) -> Result<Path> {
+        let raw = unsafe { device.d2d_factory().CreatePathGeometry()? };
+        let sink = unsafe { raw.Open()? };
+        unsafe {
+            self.raw
+                .CombineWithGeometry(other.raw(), mode.to_abi(), None, tolerance, &sink)
+                .ok()?;
             sink.Close().ok()?;
         }
         Ok(Path { raw })
@@ -316,5 +380,142 @@ impl PathFigure {
             sink: self.sink,
             geometry: self.geometry,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An axis-aligned rectangle as a closed path.
+    fn rect(device: &GpuDevice, l: f32, t: f32, r: f32, b: f32) -> Path {
+        PathBuilder::new(device)
+            .unwrap()
+            .polygon([
+                Vector2::new(l, t),
+                Vector2::new(r, t),
+                Vector2::new(r, b),
+                Vector2::new(l, b),
+            ])
+            .unwrap()
+    }
+
+    fn approx(a: f32, b: f32, tol: f32) -> bool {
+        (a - b).abs() <= tol
+    }
+
+    /// `Intersect` keeps only the overlap — the case a lit span is: a band of a
+    /// curve, expressed as one region instead of two overlaid layers.
+    ///
+    /// Asserted on BOUNDS rather than a segment count, because how many segments
+    /// Direct2D emits for a rectangle is its business; where the region lies is
+    /// this call's contract.
+    #[test]
+    fn combine_intersect_keeps_only_the_overlap() {
+        let Ok(gpu) = GpuDevice::new_or_warp() else {
+            eprintln!("no D3D device available; skipping");
+            return;
+        };
+        let a = rect(&gpu, 0.0, 0.0, 100.0, 100.0);
+        let b = rect(&gpu, 60.0, 40.0, 200.0, 80.0);
+
+        let hit = a.combine(&gpu, &b, CombineMode::Intersect, 0.25).unwrap();
+        let bounds = hit.compute_bounds();
+
+        assert!(
+            approx(bounds.left, 60.0, 0.5)
+                && approx(bounds.top, 40.0, 0.5)
+                && approx(bounds.right, 100.0, 0.5)
+                && approx(bounds.bottom, 80.0, 0.5),
+            "intersection bounds were {bounds:?}, wanted (60, 40)-(100, 80)"
+        );
+        // A point inside both inputs survives; one inside only `a` does not.
+        assert!(hit.fill_contains_point(Vector2::new(80.0, 60.0)));
+        assert!(!hit.fill_contains_point(Vector2::new(20.0, 60.0)));
+    }
+
+    /// `Exclude` is the asymmetric mode — the receiver minus the argument. This
+    /// is the direction a fill takes to stop double-blending under its own
+    /// stroke, so getting the operand order backwards is a real hazard.
+    #[test]
+    fn combine_exclude_removes_only_the_argument() {
+        let Ok(gpu) = GpuDevice::new_or_warp() else {
+            eprintln!("no D3D device available; skipping");
+            return;
+        };
+        let outer = rect(&gpu, 0.0, 0.0, 100.0, 100.0);
+        let bite = rect(&gpu, 40.0, 40.0, 60.0, 60.0);
+
+        let carved = outer.combine(&gpu, &bite, CombineMode::Exclude, 0.25).unwrap();
+        assert!(
+            carved.fill_contains_point(Vector2::new(10.0, 10.0)),
+            "the receiver's own area must survive"
+        );
+        assert!(
+            !carved.fill_contains_point(Vector2::new(50.0, 50.0)),
+            "the argument's area must be gone"
+        );
+
+        // Reversed, the same pair yields the other difference — nothing of the
+        // small rect is left once the large one is removed from it.
+        let inverse = bite.combine(&gpu, &outer, CombineMode::Exclude, 0.25).unwrap();
+        assert!(!inverse.fill_contains_point(Vector2::new(50.0, 50.0)));
+    }
+
+    /// `Union` covers both, including a point in neither operand alone would not
+    /// reach.
+    #[test]
+    fn combine_union_covers_both() {
+        let Ok(gpu) = GpuDevice::new_or_warp() else {
+            eprintln!("no D3D device available; skipping");
+            return;
+        };
+        let a = rect(&gpu, 0.0, 0.0, 50.0, 50.0);
+        let b = rect(&gpu, 50.0, 0.0, 100.0, 50.0);
+        let both = a.combine(&gpu, &b, CombineMode::Union, 0.25).unwrap();
+
+        assert!(both.fill_contains_point(Vector2::new(25.0, 25.0)));
+        assert!(both.fill_contains_point(Vector2::new(75.0, 25.0)));
+        let bounds = both.compute_bounds();
+        assert!(approx(bounds.right, 100.0, 0.5), "union bounds were {bounds:?}");
+    }
+
+    /// The contract hit-testing a curve rests on: a stroke's WIDENED outline
+    /// discriminates the line from its bounding box.
+    ///
+    /// A diagonal is the case that matters — its box is almost entirely empty,
+    /// which is exactly why box hit-testing hands a curve every pointer in its
+    /// card. The far corner is inside the box and nowhere near the stroke; the
+    /// midpoint is on it.
+    #[test]
+    fn widened_stroke_contains_the_line_not_its_box() {
+        let Ok(gpu) = GpuDevice::new_or_warp() else {
+            eprintln!("no D3D device available; skipping");
+            return;
+        };
+        let line = PathBuilder::new(&gpu)
+            .unwrap()
+            .begin_hollow(Vector2::new(0.0, 0.0))
+            .line_to(Vector2::new(100.0, 100.0))
+            .end_open()
+            .build()
+            .unwrap();
+        let style = gpu
+            .create_stroke_style(&StrokeStyleBuilder::new().caps(CapStyle::Round).line_join(LineJoin::Round))
+            .unwrap();
+        let outline = line.widen(&gpu, 4.0, &style, 0.25).unwrap();
+
+        assert!(
+            outline.fill_contains_point(Vector2::new(50.0, 50.0)),
+            "a point ON the stroke must hit"
+        );
+        assert!(
+            !outline.fill_contains_point(Vector2::new(95.0, 5.0)),
+            "a point inside the BOX but off the stroke must miss"
+        );
+        // The box itself is the whole diagonal's extent, which is what makes the
+        // distinction worth paying for.
+        let bounds = outline.compute_bounds();
+        assert!(bounds.right > 90.0 && bounds.bottom > 90.0, "bounds were {bounds:?}");
     }
 }
