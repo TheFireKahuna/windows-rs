@@ -55,6 +55,38 @@ impl LaidRect {
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
+
+    /// The smallest rect covering both.
+    pub fn union(self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = (self.x + self.w).max(other.x + other.w);
+        let bottom = (self.y + self.h).max(other.y + other.h);
+        Self { x, y, w: right - x, h: bottom - y }
+    }
+}
+
+/// The box outside which nothing in a subtree can be hit, from the node's own
+/// rect and its children's already-folded bounds.
+///
+/// `bounded` says the node confines its own contents — it clips, or it scrolls.
+/// Such a node stops at its rect and its children's bounds are not consulted at
+/// all, which is not merely an optimization: a scroll container places children
+/// UNSCROLLED, so their rects are in a different space from the point the hit
+/// walk carries once it has applied the scroll offset. Unioning them in would
+/// grow the bound by the scroll extent and, worse, in the wrong coordinates.
+///
+/// Split out of [`layout::apply`](super::layout) so the rule can be stated once
+/// and tested without an arena.
+pub(crate) fn subtree_bound(
+    rect: LaidRect,
+    bounded: bool,
+    children: impl Iterator<Item = LaidRect>,
+) -> LaidRect {
+    if bounded {
+        return rect;
+    }
+    children.fold(rect, LaidRect::union)
 }
 
 /// Which events a control has declared a handler for, for the questions input
@@ -899,6 +931,20 @@ pub(crate) struct Node {
     /// needle, an editor's caret) is never torn out from under its owner.
     pub stacked: Vec<(layout::Slot, Visual)>,
     pub rect: LaidRect,
+    /// The union of this node's rect and every descendant's — the box outside
+    /// which nothing in this subtree can be hit.
+    ///
+    /// Folded by [`layout::apply`](super::layout) after the child walk, and read
+    /// only by [`hit_walk`](super::input). A node that CLIPS contributes just
+    /// its own rect, because a clip is exactly the promise that nothing below it
+    /// paints outside — which is what stops a scroll container's unscrolled
+    /// child rects (a different space from the point the walk carries) from
+    /// reaching this union at all.
+    ///
+    /// `None` until layout has solved the node. Hit-testing treats that as "no
+    /// bound known" and walks anyway: an overlay subtree mounted between passes
+    /// must not become unhittable because its bound has not been folded yet.
+    pub hit_bound: Option<LaidRect>,
     pub hovered: bool,
     pub pressed: bool,
 
@@ -1041,6 +1087,7 @@ impl Node {
             measure_dirty: true,
             stacked: Vec::new(),
             rect: LaidRect::default(),
+            hit_bound: None,
             hovered: false,
             pressed: false,
             ctrl: None,
@@ -1978,5 +2025,74 @@ impl Arena {
 
     pub fn remove(&mut self, id: ControlId) -> Option<Node> {
         self.nodes.remove(&id.get())
+    }
+}
+
+#[cfg(test)]
+mod hit_bound_tests {
+    use super::{subtree_bound, LaidRect};
+
+    fn r(x: f32, y: f32, w: f32, h: f32) -> LaidRect {
+        LaidRect { x, y, w, h }
+    }
+
+    /// A leaf answers its own rect — there is nothing below it to cover.
+    #[test]
+    fn a_childless_node_is_its_own_rect() {
+        let own = r(10.0, 20.0, 30.0, 40.0);
+        let got = subtree_bound(own, false, std::iter::empty());
+        assert_eq!((got.x, got.y, got.w, got.h), (10.0, 20.0, 30.0, 40.0));
+    }
+
+    /// The whole point of the fold: a child that paints OUTSIDE its parent still
+    /// has to be reachable, so an unbounded parent grows to cover it. Getting
+    /// this wrong makes a flyout or an overhanging ornament unhittable.
+    #[test]
+    fn an_unbounded_node_grows_to_cover_an_overhanging_child() {
+        let own = r(0.0, 0.0, 100.0, 100.0);
+        let child = r(80.0, 90.0, 60.0, 60.0);
+        let got = subtree_bound(own, false, [child].into_iter());
+        assert_eq!((got.x, got.y), (0.0, 0.0));
+        assert_eq!((got.w, got.h), (140.0, 150.0), "must reach the child's far edge");
+    }
+
+    /// A node that CLIPS or SCROLLS stops at its own rect, however far its
+    /// children reach.
+    ///
+    /// Not an optimization: a scroll container places children UNSCROLLED, so
+    /// their rects are in a different space from the point the walk carries once
+    /// it has applied the scroll offset. Unioning them would grow the bound by
+    /// the scroll extent, in the wrong coordinates — a hit test that then MISSES
+    /// content scrolled above the viewport.
+    #[test]
+    fn a_bounded_node_ignores_its_children_entirely() {
+        let own = r(0.0, 0.0, 100.0, 100.0);
+        let tall_content = r(0.0, 0.0, 100.0, 5_000.0);
+        let got = subtree_bound(own, true, [tall_content].into_iter());
+        assert_eq!((got.w, got.h), (100.0, 100.0), "a clip must not adopt its content's extent");
+    }
+
+    /// Several children fold together, and one that sits entirely inside the
+    /// parent contributes nothing.
+    #[test]
+    fn children_fold_and_an_inner_child_changes_nothing() {
+        let own = r(0.0, 0.0, 100.0, 100.0);
+        let inside = r(10.0, 10.0, 20.0, 20.0);
+        let left = r(-30.0, 0.0, 10.0, 10.0);
+        let got = subtree_bound(own, false, [inside, left].into_iter());
+        assert_eq!(got.x, -30.0, "must reach the leftmost child");
+        assert_eq!(got.w, 130.0);
+        assert_eq!(got.h, 100.0, "a wholly-inside child must not change the bound");
+    }
+
+    /// `contains` is half-open on the far edges, so a bound abutting a sibling
+    /// does not claim the sibling's first pixel column.
+    #[test]
+    fn the_bound_is_half_open() {
+        let b = subtree_bound(r(0.0, 0.0, 10.0, 10.0), false, std::iter::empty());
+        assert!(b.contains(0.0, 0.0));
+        assert!(b.contains(9.9, 9.9));
+        assert!(!b.contains(10.0, 5.0));
+        assert!(!b.contains(5.0, 10.0));
     }
 }

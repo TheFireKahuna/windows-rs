@@ -286,6 +286,11 @@ impl DCompBackend {
         out: &mut Option<(ControlId, GestureInterest, f32, f32)>,
     ) {
         let Some(node) = self.node(id) else { return };
+        // Same subtree bound as `hit_walk` — this walk runs on the same pointer
+        // messages and over the same tree.
+        if node.hit_bound.is_some_and(|b| !b.contains(x, y)) {
+            return;
+        }
         let inside = node.rect.contains(x, y);
         if inside && let Some(interest) = pointer::interest_for(id) {
             *out = Some((id, interest, x, y));
@@ -443,7 +448,26 @@ impl DCompBackend {
     /// `out` accumulates the last (topmost) eligible node seen.
     fn hit_walk(&self, id: ControlId, x: f32, y: f32, out: &mut Option<ControlId>, kind: HitKind) {
         let Some(node) = self.node(id) else { return };
-        let inside = node.rect.contains(x, y);
+        // Nothing in this subtree paints outside its folded bound, so a point
+        // outside it can hit nothing here — skip the branch without descending.
+        // This is what keeps a hover off the whole tree: without it the DFS
+        // visits every node on every pointer message, since a miss on a
+        // NON-clipping node prunes nothing (see below).
+        if node.hit_bound.is_some_and(|b| !b.contains(x, y)) {
+            return;
+        }
+        let in_rect = node.rect.contains(x, y);
+        // A clickable shape answers from its GEOMETRY, not its box — a curve's
+        // box is most of its card while the curve is a thin band. Every other
+        // node, and every shape the app left inert, is its box.
+        let inside = match node
+            .path
+            .as_ref()
+            .and_then(|p| p.hit_contains(x - node.rect.x, y - node.rect.y))
+        {
+            Some(on_shape) => on_shape,
+            None => in_rect,
+        };
         if inside && kind.eligible(node) {
             // Later in the DFS == painted later == on top: overwrite freely.
             *out = Some(id);
@@ -453,7 +477,7 @@ impl DCompBackend {
         // everything below it that falls outside those bounds — so a miss here
         // ends the subtree. A miss on a NON-clipping node prunes nothing: its
         // children may legitimately overhang it.
-        if !inside && node.clip.is_some() {
+        if !in_rect && node.clip.is_some() {
             return;
         }
         let child_y = if node.is_scroll() { y + node.scroll_off } else { y };

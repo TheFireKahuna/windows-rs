@@ -322,8 +322,23 @@ pub(crate) fn build_widened_path(
     width: f32,
     scale: f32,
 ) -> Option<CompositionPath> {
+    to_composition_path(comp, &widen_d2d_path(comp, verbs, points, width, scale)?)
+}
+
+/// The widened outline as a D2D geometry, before any compositor type sees it.
+///
+/// Split out of [`build_widened_path`] for the consumer that wants the region
+/// rather than a shape to draw: hit-testing asks whether a point is INSIDE the
+/// stroke, which is the same question a fill answers about this outline.
+fn widen_d2d_path(
+    comp: &Compositing,
+    verbs: &[PathVerb],
+    points: &[f32],
+    width: f32,
+    scale: f32,
+) -> Option<Path> {
     let path = build_d2d_path(&comp.gpu, verbs, points, false)?;
-    let widened = ROUND_STROKE.with(|s| {
+    ROUND_STROKE.with(|s| {
         let mut s = s.borrow_mut();
         if s.is_none() {
             *s = comp
@@ -336,8 +351,7 @@ pub(crate) fn build_widened_path(
                 .ok();
         }
         path.widen(&comp.gpu, width, s.as_ref()?, WIDEN_TOLERANCE_PX / scale).ok()
-    })?;
-    to_composition_path(comp, &widened)
+    })
 }
 
 // ── One fill-or-stroke layer ─────────────────────────────────────────────────
@@ -1146,6 +1160,23 @@ pub(crate) struct PathParts {
     /// value's own equality, which is pointer-first — an unchanged curve
     /// settles the whole sync in one compare.
     geometry_seen: Option<PathGeometry>,
+    /// The region a pointer must land in for this shape to be hit, in the node's
+    /// own DIP space: the filled path for a filled shape, the stroke's widened
+    /// OUTLINE for a stroked one.
+    ///
+    /// A shape's box is a poor stand-in for the shape — a response curve's box
+    /// is most of the card while the curve is a thin band, so box hit-testing
+    /// hands the curve every hover in the card. This answers from the geometry
+    /// instead.
+    ///
+    /// Built ONLY for a shape the app actually made clickable, because it costs
+    /// a retained D2D geometry per node and the overwhelming majority of shapes
+    /// (grids, curves, dividers) declare no pointer handler at all.
+    hit: Option<Path>,
+    /// The inputs `hit` was widened from — whether the region came from the fill,
+    /// and the stroke width and scale that decided the outline. A thickness or
+    /// DPI move changes the region without changing the geometry.
+    hit_for: Option<(bool, u32, u32)>,
 }
 
 impl PathParts {
@@ -1155,7 +1186,17 @@ impl PathParts {
             stroke: None,
             glow: None,
             geometry_seen: None,
+            hit: None,
+            hit_for: None,
         }
+    }
+
+    /// Whether the point — in the node's own DIP space — lands on the shape.
+    ///
+    /// `None` when this shape holds no hit region, which is every shape the app
+    /// did not make clickable; the caller falls back to the node's box.
+    pub(crate) fn hit_contains(&self, x: f32, y: f32) -> Option<bool> {
+        Some(self.hit.as_ref()?.fill_contains_point(CVec2::new(x, y)))
     }
 }
 
@@ -1280,6 +1321,47 @@ pub(crate) fn sync_path(comp: &Compositing, node: &mut Node, atlas_epoch: u32, s
     node.path = Some(parts);
 }
 
+/// Rebuild the retained hit region when the shape it describes has moved.
+///
+/// Kept off the pointer path entirely: this runs in the sync, so a hover costs
+/// one containment test against a geometry that is already built. A shape the
+/// app never made clickable holds none and pays nothing at all — not the widen,
+/// not the retained geometry, not a branch per pointer message beyond the
+/// `Option` it leaves empty.
+#[allow(clippy::too_many_arguments)]
+fn sync_hit(
+    comp: &Compositing,
+    node: &Node,
+    parts: &mut PathParts,
+    geometry: &PathGeometry,
+    want_fill: bool,
+    stroke_w: f32,
+    geometry_changed: bool,
+    scale: f32,
+) {
+    if !node.is_clickable() {
+        parts.hit = None;
+        parts.hit_for = None;
+        return;
+    }
+    let want = (want_fill, stroke_w.to_bits(), scale.to_bits());
+    if !geometry_changed && parts.hit.is_some() && parts.hit_for == Some(want) {
+        return;
+    }
+    let (verbs, points) = (geometry.data().verbs(), geometry.data().points());
+    // A filled shape is hit over its whole area, so the fill IS the region and
+    // the stroke riding its boundary adds nothing worth a second geometry. A
+    // stroke-only shape has no area until its outline is widened.
+    parts.hit = if want_fill {
+        build_d2d_path(&comp.gpu, verbs, points, true)
+    } else if stroke_w > 0.0 {
+        widen_d2d_path(comp, verbs, points, stroke_w, scale)
+    } else {
+        None
+    };
+    parts.hit_for = parts.hit.is_some().then_some(want);
+}
+
 fn sync_parts(
     comp: &Compositing,
     node: &Node,
@@ -1379,6 +1461,7 @@ fn sync_parts(
         }
     }
 
+    sync_hit(comp, node, parts, &geometry, want_fill, stroke_w, geometry_changed, scale);
     parts.geometry_seen = Some(geometry);
 
     if let Some(l) = &mut parts.fill {

@@ -1764,6 +1764,24 @@ fn apply(
         i += 1;
     }
 
+    // Fold this subtree's hit bound now the children have written theirs. A node
+    // that bounds its own contents — a clip, or a scroll container whose clip is
+    // minted later by the paint sync — stops at its rect; anything else grows to
+    // cover children that overhang it. Indexed for the same reason the walk above
+    // is: reading the child list must not allocate.
+    let bound = arena.get(id).map(|n| {
+        node::subtree_bound(
+            s.rect,
+            n.clip.is_some() || n.is_scroll(),
+            n.children.iter().filter_map(|c| arena.get(*c).and_then(|c| c.hit_bound)),
+        )
+    });
+    if let Some(bound) = bound
+        && let Some(n) = arena.get_mut(id)
+    {
+        n.hit_bound = Some(bound);
+    }
+
     // An Expander with an element header adopts that child's solved height as its
     // strip height, so the chrome (fill, border, wash, ring, chevron) sizes to the
     // header the app actually mounted. Written after the child walk, which is what
