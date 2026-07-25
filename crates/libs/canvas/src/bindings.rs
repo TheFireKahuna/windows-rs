@@ -3136,6 +3136,29 @@ impl ID2D1Geometry {
             .map(|| result__)
         }
     }
+    pub(crate) unsafe fn Widen<P1, P4>(
+        &self,
+        strokewidth: f32,
+        strokestyle: P1,
+        worldtransform: Option<*const windows_numerics::Matrix3x2>,
+        flatteningtolerance: f32,
+        geometrysink: P4,
+    ) -> windows_core::HRESULT
+    where
+        P1: windows_core::Param<ID2D1StrokeStyle>,
+        P4: windows_core::Param<ID2D1SimplifiedGeometrySink>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).Widen)(
+                windows_core::Interface::as_raw(self),
+                strokewidth,
+                strokestyle.param().abi(),
+                worldtransform.unwrap_or(core::mem::zeroed()) as _,
+                flatteningtolerance,
+                geometrysink.param().abi(),
+            )
+        }
+    }
 }
 #[repr(C)]
 pub struct ID2D1Geometry_Vtbl {
@@ -3170,7 +3193,14 @@ pub struct ID2D1Geometry_Vtbl {
     ComputeArea: usize,
     ComputeLength: usize,
     ComputePointAtLength: usize,
-    Widen: usize,
+    pub Widen: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        f32,
+        *mut core::ffi::c_void,
+        *const windows_numerics::Matrix3x2,
+        f32,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ID2D1GeometryRealization,

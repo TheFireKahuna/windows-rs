@@ -76,7 +76,7 @@
     ID2D1Effect::{SetInput, GetOutput}
     ID2D1Factory1::{CreateDevice, CreateStrokeStyle}
     ID2D1Factory1::CreatePathGeometry
-    ID2D1Geometry::{GetBounds, FillContainsPoint, StrokeContainsPoint}
+    ID2D1Geometry::{GetBounds, FillContainsPoint, StrokeContainsPoint, Widen}
     ID2D1GeometrySink::{AddLine, AddBezier}
     ID2D1Multithread::{Enter, Leave}
     ID2D1PathGeometry::Open

@@ -18,10 +18,44 @@ pub struct Path {
 /// Direct2D's default flattening tolerance for hit-testing and bounds queries.
 const DEFAULT_FLATTENING_TOLERANCE: f32 = 0.25;
 
+
 impl Path {
     /// Returns the underlying `ID2D1PathGeometry1`.
     pub fn raw(&self) -> &ID2D1PathGeometry1 {
         &self.raw
+    }
+
+    /// The OUTLINE of stroking this path at `stroke_width` — the region a
+    /// stroke covers, as a fillable geometry.
+    ///
+    /// A stroke is not a region: it is a line plus a width, and only a renderer
+    /// that strokes can draw one. Anything that takes an AREA — a
+    /// `CompositionGeometricClip`, a hit test, a fill — needs the stroke
+    /// converted into the closed shape it covers, which is what widening does.
+    ///
+    /// The result self-overlaps wherever the source turns sharply. That is
+    /// correct and needs no cleanup: Direct2D fills it under the nonzero winding
+    /// rule, so overlapping laps of the outline still describe one region.
+    /// `style` decides the caps and joins, and is taken rather than built here
+    /// because a caller widening every frame must not mint a COM object per
+    /// frame for a value that never varies — see
+    /// [`GpuDevice::create_stroke_style`].
+    pub fn widen(&self, device: &GpuDevice, stroke_width: f32, style: &StrokeStyle) -> Result<Path> {
+        let raw = unsafe { device.d2d_factory().CreatePathGeometry()? };
+        let sink = unsafe { raw.Open()? };
+        unsafe {
+            self.raw
+                .Widen(
+                    stroke_width,
+                    &style.0,
+                    None,
+                    DEFAULT_FLATTENING_TOLERANCE,
+                    &sink,
+                )
+                .ok()?;
+            sink.Close().ok()?;
+        }
+        Ok(Path { raw })
     }
 
     /// Returns whether the point lies within the filled area of the path.
