@@ -413,8 +413,15 @@ impl DCompHost {
         // sample and the heat-map request can both reach it.
         census::start_from_env();
 
+        // `SW_SHOWNOACTIVATE` still RAISES the window — it lands on top of its
+        // monitor exactly as `SW_SHOW` does — it just does not take activation.
+        // For a capture run that is the whole difference: a newly-launched
+        // process is granted foreground rights, so the default show pulls focus
+        // off whatever the machine was doing and can minimize an exclusive
+        // full-screen app on another monitor.
         unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOW as i32);
+            let cmd = if show_without_activating() { SW_SHOWNOACTIVATE } else { SW_SHOW };
+            let _ = ShowWindow(hwnd, cmd as i32);
         }
         Ok(Self {
             hwnd,
@@ -685,7 +692,90 @@ fn dip_xy(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
     (px / scale, py / scale)
 }
 
+/// Whether `REACTOR_NO_MOUSELEAVE` asks this process to stop requesting
+/// `WM_MOUSELEAVE`. Read once — this is consulted on every pointer move.
+///
+/// For a capture tool driving the window with POSTED pointer messages: the
+/// system decides a leave from the REAL cursor, which in that setup is never
+/// over the window, so a synthesized hover is revoked within milliseconds and
+/// every hover-gated visual — the hover ink, the press ink — is gone before a
+/// screenshot can see it. Routing does not need this; only the chrome does.
+///
+/// Deliberately narrow: it withholds the leave REQUEST rather than ignoring the
+/// message, so a genuine `WM_MOUSELEAVE` (from a real cursor, or one already in
+/// flight) still clears hover exactly as it always did. What it cannot do is
+/// invent a leave nobody asked for.
+/// An explicit initial placement from `REACTOR_WINDOW_RECT`.
+#[derive(Copy, Clone)]
+struct Placement {
+    /// Window top-left in PHYSICAL screen coordinates, which is the currency a
+    /// multi-monitor position has to be stated in — a second monitor left of the
+    /// primary starts at a negative x.
+    pos: Option<(i32, i32)>,
+    /// Client size in PHYSICAL pixels — the same currency as `pos`, and as the
+    /// capture tools that set this. Deliberately not DIPs: one variable mixing
+    /// the two units is a unit bug waiting to happen, and a caller that already
+    /// knows the pixel size it wants should not have to undo a scale to say so.
+    size: Option<(i32, i32)>,
+}
+
+/// Parse `REACTOR_WINDOW_RECT` — `x,y` for a position, or `x,y,w,h` to set the
+/// client size with it. All four are PHYSICAL pixels. Read once; the window is
+/// placed once.
+///
+/// This exists because placing the window AFTER it is shown is visible: the
+/// default centering puts it on the monitor nearest the system's default
+/// position, so a capture run targeting a second screen gets a frame or two of
+/// window on the first one, then a jump and a resize. Stating the rect up front
+/// means it is born where it belongs.
+fn env_placement() -> Option<Placement> {
+    static PLACEMENT: std::sync::OnceLock<Option<Placement>> = std::sync::OnceLock::new();
+    *PLACEMENT.get_or_init(|| {
+        let spec = std::env::var("REACTOR_WINDOW_RECT").ok()?;
+        let n: Vec<&str> = spec.split(',').map(str::trim).collect();
+        let num = |s: &str| s.parse::<f64>().ok();
+        match n.as_slice() {
+            [x, y] => Some(Placement {
+                pos: Some((num(x)? as i32, num(y)? as i32)),
+                size: None,
+            }),
+            [x, y, w, h] => Some(Placement {
+                pos: Some((num(x)? as i32, num(y)? as i32)),
+                size: Some((num(w)? as i32, num(h)? as i32)),
+            }),
+            _ => {
+                eprintln!("reactor: REACTOR_WINDOW_RECT={spec:?} — expected x,y or x,y,w,h");
+                None
+            }
+        }
+    })
+}
+
+/// Whether `REACTOR_SHOW_NOACTIVATE` asks the first show to skip activation.
+/// Read once — the window is shown once.
+///
+/// Visibility and z-order are unaffected: the window still comes up on top of
+/// its monitor. Only the focus transfer is withheld, which is what lets a
+/// capture run put a window on a second screen without interrupting whatever is
+/// in front on the first.
+fn show_without_activating() -> bool {
+    static NO_ACTIVATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_ACTIVATE.get_or_init(|| {
+        std::env::var("REACTOR_SHOW_NOACTIVATE").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
+fn suppress_mouse_leave() -> bool {
+    static SUPPRESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPRESS.get_or_init(|| {
+        std::env::var("REACTOR_NO_MOUSELEAVE").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
 fn track_leave(hwnd: HWND) {
+    if suppress_mouse_leave() {
+        return;
+    }
     let mut t = TRACKMOUSEEVENT {
         cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
         dwFlags: TME_LEAVE,
@@ -718,12 +808,31 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         WM_ERASEBKGND => 1, // the compositor owns every pixel; never erase/flash.
 
         // ── Extended frame: remove the native caption, keep resize borders ──
-        WM_NCCALCSIZE if wparam != 0 => {
-            let params = lparam as *mut NCCALCSIZE_PARAMS;
-            if params.is_null() {
-                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-            }
-            let top = unsafe { (*params).rgrc[0].top };
+        WM_NCCALCSIZE => {
+            // Both forms of the message describe the same frame and must answer
+            // the same way. `wparam != 0` carries `NCCALCSIZE_PARAMS`, whose
+            // `rgrc[0]` is the proposed client rect; `wparam == 0` carries a bare
+            // `RECT` serving the identical purpose. Answering only the first left
+            // the window reporting DefWindowProc's frame — caption included — to
+            // everything that asked the second way, and the very first
+            // calculation a window receives, during `CreateWindowExW`, is that
+            // one. Measuring the frame there then over-counted by the caption,
+            // and every client size the app asked for came out that much too
+            // tall.
+            let rect = if wparam != 0 {
+                let params = lparam as *mut NCCALCSIZE_PARAMS;
+                if params.is_null() {
+                    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+                }
+                unsafe { &raw mut (*params).rgrc[0] }
+            } else {
+                let r = lparam as *mut RECT;
+                if r.is_null() {
+                    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+                }
+                r
+            };
+            let top = unsafe { (*rect).top };
             let r = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             // DefWindowProc reserved borders + caption; restore the top so the
             // client extends into the caption (the reactor TitleBar band is the
@@ -735,7 +844,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 0
             };
             unsafe {
-                (*params).rgrc[0].top = top + pad;
+                (*rect).top = top + pad;
             }
             r
         }
@@ -1318,16 +1427,36 @@ fn create_window(
     let mut title_w: Vec<u16> = title.encode_utf16().collect();
     title_w.push(0);
 
-    // Create at a provisional size; we resize to the exact client size below once
-    // we know the window's DPI and non-client metrics.
+    // Create at the target POSITION but a provisional size; the exact client
+    // size is applied below, once the window's own DPI and non-client metrics
+    // can be measured.
+    //
+    // The position has to be right here rather than later, and not for
+    // appearance — nothing is visible until `ShowWindow`, far below. It decides
+    // which MONITOR the window is born on, and therefore which DPI
+    // `GetDpiForWindow` reports and which non-client metrics get measured. Born
+    // on the primary and moved afterwards, a window bound for a differently
+    // scaled second monitor computes its whole geometry at the wrong scale and
+    // then takes a `WM_DPICHANGED` correction.
+    //
+    // The size stays provisional because the frame this window actually gets is
+    // NOT the one `AdjustWindowRectExForDpi` would predict: `WM_NCCALCSIZE`
+    // above restores the top edge so the client extends into the caption. That
+    // contract belongs to the message handler, so the geometry is MEASURED from
+    // the real window rather than derived from a second copy of it here.
+    let placement = env_placement();
+    let (create_x, create_y) = match placement.and_then(|p| p.pos) {
+        Some((x, y)) => (x, y),
+        None => (CW_USEDEFAULT, CW_USEDEFAULT),
+    };
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP,
             PCWSTR(CLASS.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            create_x,
+            create_y,
             1000,
             700,
             core::ptr::null_mut(),
@@ -1366,7 +1495,10 @@ fn create_window(
         // Desired client size in physical pixels: the caller's explicit DIP size,
         // or a display-proportionate default — 80% of the work area, floored to a
         // usable minimum — so a 4K desktop doesn't open a laptop-sized window.
-        let (cw, ch) = if let Some((w, h)) = client_dip { ((w * scale).round() as i32, (h * scale).round() as i32) } else {
+        // An explicit placement states PHYSICAL pixels and so skips the scale;
+        // the app's own `client_dip` is in DIPs and does not.
+        let (cw, ch) = if let Some((w, h)) = placement.and_then(|p| p.size) { (w, h) }
+        else if let Some((w, h)) = client_dip { ((w * scale).round() as i32, (h * scale).round() as i32) } else {
             let min_w = (1200.0 * scale) as i32;
             let min_h = (800.0 * scale) as i32;
             let avail_w = (work_w - nc_w).max(1);
@@ -1384,6 +1516,22 @@ fn create_window(
             x = mi.rcWork.left + (work_w - win_w).max(0) / 2;
             y = mi.rcWork.top + (work_h - win_h).max(0) / 2;
         }
+        // An explicit placement already went to `CreateWindowExW`, so this
+        // re-states the same origin and the call resizes in place — the window
+        // never moves. The centering path is the one that genuinely needs it:
+        // its origin depends on `win_w`/`win_h`, which are not known until the
+        // frame has been measured.
+        if let Some(p) = placement
+            && let Some((px, py)) = p.pos
+        {
+            x = px;
+            y = py;
+        }
+        // One call: `nc_w`/`nc_h` were measured from a window whose frame already
+        // answers as it will for the rest of its life, because `WM_NCCALCSIZE`
+        // handles both forms of the message (see the handler). A correction pass
+        // used to live here to undo the caption the first calculation had
+        // over-counted; making the frame self-consistent removed the need for it.
         let _ = SetWindowPos(hwnd, core::ptr::null_mut(), x, y, win_w, win_h, SWP_NOZORDER);
     }
 

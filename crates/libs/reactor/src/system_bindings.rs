@@ -5864,6 +5864,7 @@ pub const SWP_NOACTIVATE: u32 = 16;
 pub const SWP_NOSIZE: u32 = 1;
 pub const SWP_NOZORDER: u32 = 4;
 pub const SW_SHOW: u32 = 5;
+pub const SW_SHOWNOACTIVATE: u32 = 4;
 pub type ScrollAmount = i32;
 pub const ScrollAmount_LargeDecrement: ScrollAmount = 0;
 pub const ScrollAmount_LargeIncrement: ScrollAmount = 3;

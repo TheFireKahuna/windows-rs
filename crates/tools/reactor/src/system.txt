@@ -236,6 +236,7 @@ Windows::Win32::WS_EX_NOREDIRECTIONBITMAP
 // ── Class-style consts (WNDCLASS_STYLES newtype) ──
 // ── Show-window consts (SHOW_WINDOW_CMD newtype) ──
 Windows::Win32::SW_SHOW
+Windows::Win32::SW_SHOWNOACTIVATE
 // ── SetWindowPos flags (SET_WINDOW_POS_FLAGS newtype) ──
 Windows::Win32::SWP_NOSIZE
 Windows::Win32::SWP_NOZORDER
