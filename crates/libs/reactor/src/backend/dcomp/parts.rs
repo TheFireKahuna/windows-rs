@@ -1884,6 +1884,21 @@ pub(crate) struct PartPlan {
     pub(crate) layout_sig: [f32; 3],
     below: [Option<SlotPlan>; MAX_SLOTS],
     above: [Option<SlotPlan>; MAX_SLOTS],
+    /// Whether a slot this plan leaves quiescent is chrome the node simply does
+    /// not have, rather than chrome it is not showing *yet*.
+    ///
+    /// The difference decides whether the part is worth existing. A button's ink
+    /// rests at zero opacity between hovers and must be there to fade up when one
+    /// arrives — and is reached directly by [`ink_state_changed`], which has no
+    /// compositor to mint one with. A `StackPanel` with no background, on the
+    /// other hand, will not grow one by being pointed at: the slot is empty
+    /// because the node has nothing to put in it.
+    ///
+    /// Only [`box_plan`] sets this today, and that is where the whole of the
+    /// measured win is — a census found a `Grid`, `StackPanel`, `Canvas` and
+    /// `ScrollViewer` between them holding 106 sprites that had never drawn a
+    /// pixel and never would.
+    optional: bool,
 }
 
 impl PartPlan {
@@ -1892,7 +1907,37 @@ impl PartPlan {
             layout_sig,
             below: std::array::from_fn(|_| None),
             above: std::array::from_fn(|_| None),
+            optional: false,
         }
+    }
+
+    /// Mark this plan's quiescent slots as chrome the node does not have — see
+    /// [`optional`](Self::optional).
+    pub(crate) fn optional(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+
+    /// How many parts each band needs to carry this plan: one past the highest
+    /// slot that actually draws, or the whole band where the plan is not
+    /// [`optional`](Self::optional).
+    ///
+    /// Counted to the highest DRAWING slot rather than to the highest occupied
+    /// one, so a band is a contiguous prefix and can only ever grow at its top.
+    /// That is what lets [`ensure`] mint by appending — the same ascending order
+    /// it has always built in, and the order the z-order contract at the top of
+    /// this file rests on.
+    fn extents(&self, full: (usize, usize)) -> (usize, usize) {
+        if !self.optional {
+            return full;
+        }
+        let reach = |slots: &[Option<SlotPlan>; MAX_SLOTS]| {
+            slots
+                .iter()
+                .rposition(|s| s.as_ref().is_some_and(|s| s.opacity > 0.0))
+                .map_or(0, |i| i + 1)
+        };
+        (reach(&self.below).min(full.0), reach(&self.above).min(full.1))
     }
 
     pub(crate) fn below(mut self, i: usize, slot: SlotPlan) -> Self {
@@ -2110,7 +2155,11 @@ pub(crate) fn converted(kind: ControlKind) -> bool {
 /// Ensure `node.parts` exists with `n_below`/`n_above` parts, inserted at the
 /// correct band positions around the painted surface sprite.
 fn ensure(comp: &Compositing, node: &mut Node, n_below: usize, n_above: usize) {
-    if node.parts.is_some() {
+    if let Some(parts) = node.parts.as_deref() {
+        if parts.below.len() >= n_below && parts.above.len() >= n_above {
+            return;
+        }
+        grow(comp, node, n_below, n_above);
         return;
     }
     let mut parts = Box::new(Parts::new());
@@ -2146,6 +2195,55 @@ fn ensure(comp: &Compositing, node: &mut Node, n_below: usize, n_above: usize) {
     node.parts = Some(parts);
 }
 
+/// Extend an existing band to `n_below` / `n_above` parts.
+///
+/// A band an [`optional`](PartPlan::optional) plan sized to what it was drawing
+/// grows when the node acquires chrome it did not have — a panel given a
+/// background, a box given an outline. Growth appends, exactly as [`ensure`]
+/// builds: each new part goes directly above the last, so the band stays in
+/// slot order and stays beneath everything the node parents after it.
+///
+/// The upper band is the one that could go wrong, because "above the last" has
+/// no predecessor for the first part and `InsertAtTop` would put it over the
+/// glyph hosts a node mints later. It cannot arise: only [`box_plan`] is
+/// optional and it declares no upper band at all, so an upper band is either
+/// built whole at birth or never. The branch is written to hold anyway rather
+/// than to assume that stays true.
+fn grow(comp: &Compositing, node: &mut Node, n_below: usize, n_above: usize) {
+    let mut prev = node
+        .parts
+        .as_deref()
+        .and_then(|p| p.below.last().map(Part::visual));
+    while node.parts.as_deref().is_some_and(|p| p.below.len() < n_below) {
+        let part = Part::new(comp);
+        let v = part.visual();
+        match prev.as_ref() {
+            Some(pv) => node.adopt_above(&v, pv),
+            None => node.adopt_at_bottom(&v),
+        }
+        prev = Some(v);
+        if let Some(parts) = node.parts.as_deref_mut() {
+            parts.below.push(part);
+        }
+    }
+    let mut prev = node
+        .parts
+        .as_deref()
+        .and_then(|p| p.above.last().map(Part::visual));
+    while node.parts.as_deref().is_some_and(|p| p.above.len() < n_above) {
+        let part = Part::new(comp);
+        let v = part.visual();
+        match prev.as_ref() {
+            Some(pv) => node.adopt_above(&v, pv),
+            None => node.adopt_at_top(&v),
+        }
+        prev = Some(v);
+        if let Some(parts) = node.parts.as_deref_mut() {
+            parts.above.push(part);
+        }
+    }
+}
+
 /// The ink/halo target opacity for the *converted* alpha of an authored wash
 /// (endpoint-exact with the retired painted `theme::w(wash)`).
 fn wash(authored: f32) -> f32 {
@@ -2177,8 +2275,12 @@ pub(crate) fn sync(
     scrubbing: bool,
 ) {
     if let Some(l) = look(node.kind) {
-        ensure(comp, node, l.below, l.above);
+        // The plan comes first now: it is what says how much of the band is
+        // worth existing (see `PartPlan::extents`). Still ahead of every glyph
+        // host the node mints, which is what the z-order contract needs.
         let plan = (l.plan)(node, scale);
+        let (n_below, n_above) = plan.extents((l.below, l.above));
+        ensure(comp, node, n_below, n_above);
         let relaid = apply(comp, atlas, node, &plan);
         // The one plan-driven kind with motion its plan cannot hold: an
         // indeterminate bar's sweep is a forever animation, re-armed whenever
@@ -2421,9 +2523,15 @@ pub(crate) fn box_plan(node: &Node, scale: f32) -> PartPlan {
         None => SlotPlan::hidden(),
     };
 
+    // Optional, and this is the kind that most needs it: the fallback is what
+    // every layout panel gets, and a panel that is only a box for its children
+    // to sit in has neither a fill nor an outline. Two sprites each, across every
+    // Grid and StackPanel in a window, is the largest population of visuals in
+    // the tree that has never drawn anything.
     PartPlan::new([w, h, 0.0])
         .below(box_slot::FILL, fill)
         .below(box_slot::BORDER, border)
+        .optional()
 }
 
 /// The focus visual as two parts rather than a draw, for any control that owns
