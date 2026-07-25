@@ -40,6 +40,7 @@ mod bindings;
 mod animation;
 mod batch;
 mod brush;
+mod census;
 mod clip;
 mod color;
 mod compositor;
@@ -52,6 +53,12 @@ mod visual;
 // Standalone HWND hosting is a system-stack capability (it also owns the
 // `windows-window` dependency); lifted composition is hosted inside a WinUI
 // element instead.
+// The vtable fields are named for the WinRT methods they dispatch, exactly as
+// the generated bindings name theirs — the ABI order is the contract, and a
+// snake-case rename would make the two impossible to diff against the metadata.
+#[cfg(feature = "system")]
+#[allow(non_snake_case)]
+mod diagnostics;
 #[cfg(feature = "system")]
 mod stack;
 #[cfg(feature = "system")]
@@ -70,6 +77,7 @@ mod sealed {
 // Re-exported crate-wide so every wrapper module can `use super::*;` instead of
 // naming these explicitly. `Sealed` and `Interface` stay crate-internal; only
 // the wrapper types and `Result` form the public surface.
+pub(crate) use census::{add as add_count, bump as bump_count, Count};
 pub(crate) use object::canonical;
 pub(crate) use sealed::Sealed;
 pub(crate) use windows_core::Interface;
@@ -81,6 +89,7 @@ pub use animation::{
     Vector2KeyFrameAnimation, Vector3KeyFrameAnimation,
 };
 pub use batch::{BatchKind, CompositionScopedBatch};
+pub use census::{census, reset_census, Census};
 pub use brush::{
     Brush, CompositionBrush, CompositionColorBrush, CompositionLinearGradientBrush,
     CompositionMaskBrush, CompositionNineGridBrush, MappingMode,
@@ -99,6 +108,8 @@ pub use shape::{
 };
 pub use visual::{BorderMode, ContainerVisual, SpriteVisual, Visual, VisualCollection};
 
+#[cfg(feature = "system")]
+pub use diagnostics::{DebugHeatMaps, OverdrawKinds};
 #[cfg(feature = "system")]
 pub use stack::DispatcherQueueController;
 #[cfg(feature = "system")]

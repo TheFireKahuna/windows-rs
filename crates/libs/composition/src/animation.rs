@@ -513,6 +513,7 @@ impl ImplicitAnimationCollection {
 impl Compositor {
     /// Creates a `Vector2` key-frame animation.
     pub fn create_vector2_key_frame_animation(&self) -> Vector2KeyFrameAnimation {
+        bump_count(Count::Animation);
         Vector2KeyFrameAnimation(self.0.CreateVector2KeyFrameAnimation().unwrap())
     }
 
@@ -521,6 +522,7 @@ impl Compositor {
     /// The expression is not parsed here — see [`ExpressionAnimation`] for where
     /// a malformed one surfaces.
     pub fn create_expression_animation(&self, expression: &str) -> ExpressionAnimation {
+        bump_count(Count::Animation);
         ExpressionAnimation(
             self.0
                 .CreateExpressionAnimationWithExpression(expression)
@@ -530,18 +532,21 @@ impl Compositor {
 
     /// Creates a spring animation for a scalar (`f32`) property.
     pub fn create_spring_scalar_animation(&self) -> SpringScalarNaturalMotionAnimation {
+        bump_count(Count::Animation);
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
         SpringScalarNaturalMotionAnimation(compositor.CreateSpringScalarAnimation().unwrap())
     }
 
     /// Creates a spring animation for a `Vector2` property.
     pub fn create_spring_vector2_animation(&self) -> SpringVector2NaturalMotionAnimation {
+        bump_count(Count::Animation);
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
         SpringVector2NaturalMotionAnimation(compositor.CreateSpringVector2Animation().unwrap())
     }
 
     /// Creates a spring animation for a `Vector3` property.
     pub fn create_spring_vector3_animation(&self) -> SpringVector3NaturalMotionAnimation {
+        bump_count(Count::Animation);
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
         SpringVector3NaturalMotionAnimation(compositor.CreateSpringVector3Animation().unwrap())
     }

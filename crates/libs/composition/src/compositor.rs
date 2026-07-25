@@ -91,45 +91,53 @@ impl Compositor {
 
     /// Creates an empty container visual that hosts a child visual tree.
     pub fn create_container_visual(&self) -> ContainerVisual {
+        bump_count(Count::ContainerVisual);
         ContainerVisual::new(self.0.CreateContainerVisual().unwrap())
     }
 
     /// Creates a sprite visual that paints itself with a brush.
     pub fn create_sprite_visual(&self) -> SpriteVisual {
+        bump_count(Count::SpriteVisual);
         SpriteVisual::new(self.0.CreateSpriteVisual().unwrap())
     }
 
     /// Creates a solid-color brush.
     pub fn create_color_brush(&self, color: Color) -> CompositionColorBrush {
+        bump_count(Count::Brush);
         CompositionColorBrush(self.0.CreateColorBrushWithColor(color.0).unwrap())
     }
 
     /// Creates a nine-grid brush.
     pub fn create_nine_grid_brush(&self) -> CompositionNineGridBrush {
+        bump_count(Count::Brush);
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         CompositionNineGridBrush(compositor.CreateNineGridBrush().unwrap())
     }
 
     /// Creates a shape visual that renders composition shapes.
     pub fn create_shape_visual(&self) -> ShapeVisual {
+        bump_count(Count::ShapeVisual);
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         ShapeVisual::new(compositor.CreateShapeVisual().unwrap())
     }
 
     /// Creates an empty container shape that groups child shapes.
     pub fn create_container_shape(&self) -> CompositionContainerShape {
+        bump_count(Count::ContainerShape);
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionContainerShape(compositor.CreateContainerShape().unwrap())
     }
 
     /// Creates an ellipse geometry.
     pub fn create_ellipse_geometry(&self) -> CompositionEllipseGeometry {
+        bump_count(Count::Geometry);
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionEllipseGeometry(compositor.CreateEllipseGeometry().unwrap())
     }
 
     /// Creates a sprite shape that fills the given geometry with a brush.
     pub fn create_sprite_shape(&self, geometry: &impl Geometry) -> CompositionSpriteShape {
+        bump_count(Count::SpriteShape);
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionSpriteShape(
             compositor
@@ -146,11 +154,13 @@ impl Compositor {
 
     /// Creates a `Vector3` key-frame animation.
     pub fn create_vector3_key_frame_animation(&self) -> Vector3KeyFrameAnimation {
+        bump_count(Count::Animation);
         Vector3KeyFrameAnimation(self.0.CreateVector3KeyFrameAnimation().unwrap())
     }
 
     /// Creates a scalar (`f32`) key-frame animation.
     pub fn create_scalar_key_frame_animation(&self) -> ScalarKeyFrameAnimation {
+        bump_count(Count::Animation);
         ScalarKeyFrameAnimation(self.0.CreateScalarKeyFrameAnimation().unwrap())
     }
 
@@ -204,6 +214,7 @@ impl Compositor {
     /// Creates a brush that paints a visual with a composition drawing surface.
     #[cfg(feature = "system")]
     pub fn create_surface_brush(&self, surface: &impl Surface) -> CompositionSurfaceBrush {
+        bump_count(Count::Brush);
         CompositionSurfaceBrush(
             self.0
                 .CreateSurfaceBrushWithSurface(&surface.as_surface().0)

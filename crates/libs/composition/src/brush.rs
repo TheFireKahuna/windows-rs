@@ -222,12 +222,14 @@ impl Brush for CompositionBrush {
 impl Compositor {
     /// Creates a brush that paints one brush through the alpha of another.
     pub fn create_mask_brush(&self) -> CompositionMaskBrush {
+        bump_count(Count::Brush);
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         CompositionMaskBrush(compositor.CreateMaskBrush().unwrap())
     }
 
     /// Creates a linear gradient brush, for use as a mask's alpha ramp.
     pub fn create_linear_gradient_brush(&self) -> CompositionLinearGradientBrush {
+        bump_count(Count::Brush);
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
         CompositionLinearGradientBrush(compositor.CreateLinearGradientBrush().unwrap())
     }

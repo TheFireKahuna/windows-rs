@@ -35,6 +35,7 @@ pub struct CompositionEllipseGeometry(pub(crate) bindings::CompositionEllipseGeo
 impl CompositionEllipseGeometry {
     /// Sets the geometry's x and y radii, in DIPs.
     pub fn set_radius(&self, radius: Vector2) {
+        bump_count(Count::PropertyWrite);
         self.0.SetRadius(radius).unwrap();
     }
 }
@@ -76,11 +77,13 @@ impl CompositionPathGeometry {
     /// flight is bound to the OBJECT: replacing the geometry strands the spring
     /// on a retired one and the sweep snaps; re-pathing leaves it running.
     pub fn set_path(&self, path: &CompositionPath) {
+        bump_count(Count::PropertyWrite);
         self.0.SetPath(&path.0).unwrap();
     }
 
     /// Sets where along the path drawing begins, as a fraction in `0.0..=1.0`.
     pub fn set_trim_start(&self, start: f32) {
+        bump_count(Count::PropertyWrite);
         let geometry: bindings::ICompositionGeometry = self.0.cast().unwrap();
         geometry.SetTrimStart(start).unwrap();
     }
@@ -90,12 +93,14 @@ impl CompositionPathGeometry {
     /// This is the property to animate to sweep an arc: the path stays fixed and
     /// only the drawn fraction of it changes.
     pub fn set_trim_end(&self, end: f32) {
+        bump_count(Count::PropertyWrite);
         let geometry: bindings::ICompositionGeometry = self.0.cast().unwrap();
         geometry.SetTrimEnd(end).unwrap();
     }
 
     /// Starts an animation on the named property (for example `"TrimEnd"`).
     pub fn start_animation(&self, property: &str, animation: &impl Animation) {
+        bump_count(Count::AnimationStart);
         let object: bindings::ICompositionObject = self.0.cast().unwrap();
         object
             .StartAnimation(property, &animation.as_animation().0)
@@ -109,6 +114,7 @@ impl CompositionPathGeometry {
     /// caller that unconditionally cancels before re-targeting — so the call is
     /// allowed to fail silently rather than panic.
     pub fn stop_animation(&self, property: &str) {
+        bump_count(Count::AnimationStop);
         let object: bindings::ICompositionObject = self.0.cast().unwrap();
         let _ = object.StopAnimation(property);
     }
@@ -139,6 +145,7 @@ pub struct CompositionRoundedRectangleGeometry(
 impl CompositionRoundedRectangleGeometry {
     /// Sets the x and y corner radii, in DIPs.
     pub fn set_corner_radius(&self, radius: Vector2) {
+        bump_count(Count::PropertyWrite);
         let geometry: bindings::ICompositionRoundedRectangleGeometry = self.0.cast().unwrap();
         geometry.SetCornerRadius(radius).unwrap();
     }
@@ -146,12 +153,14 @@ impl CompositionRoundedRectangleGeometry {
     /// Sets the rectangle's top-left corner relative to the shape's origin, in
     /// DIPs.
     pub fn set_offset(&self, offset: Vector2) {
+        bump_count(Count::PropertyWrite);
         let geometry: bindings::ICompositionRoundedRectangleGeometry = self.0.cast().unwrap();
         geometry.SetOffset(offset).unwrap();
     }
 
     /// Sets the rectangle's width and height, in DIPs.
     pub fn set_size(&self, size: Vector2) {
+        bump_count(Count::PropertyWrite);
         let geometry: bindings::ICompositionRoundedRectangleGeometry = self.0.cast().unwrap();
         geometry.SetSize(size).unwrap();
     }
@@ -220,11 +229,13 @@ pub struct CompositionSpriteShape(pub(crate) bindings::CompositionSpriteShape);
 impl CompositionSpriteShape {
     /// Sets the brush used to fill the shape's geometry.
     pub fn set_fill_brush(&self, brush: &impl Brush) {
+        bump_count(Count::PropertyWrite);
         self.0.SetFillBrush(&brush.as_brush().0).unwrap();
     }
 
     /// Sets the shape's offset from its parent, in DIPs.
     pub fn set_offset(&self, offset: Vector2) {
+        bump_count(Count::PropertyWrite);
         let shape: bindings::ICompositionShape = self.0.cast().unwrap();
         shape.SetOffset(offset).unwrap();
     }
@@ -240,11 +251,13 @@ impl CompositionSpriteShape {
 
     /// Sets the brush used to stroke the outline of the shape's geometry.
     pub fn set_stroke_brush(&self, brush: &impl Brush) {
+        bump_count(Count::PropertyWrite);
         self.0.SetStrokeBrush(&brush.as_brush().0).unwrap();
     }
 
     /// Sets the width of the stroked outline, in DIPs.
     pub fn set_stroke_thickness(&self, thickness: f32) {
+        bump_count(Count::PropertyWrite);
         self.0.SetStrokeThickness(thickness).unwrap();
     }
 
@@ -331,6 +344,7 @@ impl CompositionSpriteShape {
     /// instead leaves the captured output at its original size, silently, with
     /// nothing to indicate the transform was dropped.
     pub fn set_scale(&self, scale: Vector2) {
+        bump_count(Count::PropertyWrite);
         let shape: bindings::ICompositionShape = self.0.cast().unwrap();
         shape.SetScale(scale).unwrap();
     }
@@ -431,12 +445,14 @@ impl Compositor {
 
     /// Creates a geometry that draws the given path.
     pub fn create_path_geometry(&self, path: &CompositionPath) -> CompositionPathGeometry {
+        bump_count(Count::Geometry);
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionPathGeometry(compositor.CreatePathGeometryWithPath(&path.0).unwrap())
     }
 
     /// Creates a rounded-rectangle geometry.
     pub fn create_rounded_rectangle_geometry(&self) -> CompositionRoundedRectangleGeometry {
+        bump_count(Count::Geometry);
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionRoundedRectangleGeometry(compositor.CreateRoundedRectangleGeometry().unwrap())
     }

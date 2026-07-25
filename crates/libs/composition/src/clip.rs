@@ -85,6 +85,7 @@ impl Object for InsetClip {
 impl Compositor {
     /// Creates an inset clip, initially clipping nothing (every inset `0.0`).
     pub fn create_inset_clip(&self) -> InsetClip {
+        bump_count(Count::Clip);
         InsetClip(self.0.CreateInsetClip().unwrap())
     }
 }

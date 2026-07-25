@@ -31,6 +31,7 @@ pub struct Visual(pub(crate) bindings::Visual);
 impl Visual {
     /// Sets the visual's offset from its parent, in DIPs.
     pub fn set_offset(&self, x: f32, y: f32, z: f32) {
+        bump_count(Count::PropertyWrite);
         self.0.SetOffset(Vector3 { x, y, z }).unwrap();
     }
 
@@ -41,6 +42,7 @@ impl Visual {
 
     /// Sets the visual's size, in DIPs.
     pub fn set_size(&self, width: f32, height: f32) {
+        bump_count(Count::PropertyWrite);
         self.0
             .SetSize(Vector2 {
                 x: width,
@@ -56,6 +58,7 @@ impl Visual {
 
     /// Sets the visual's opacity in the range `0.0..=1.0`.
     pub fn set_opacity(&self, opacity: f32) {
+        bump_count(Count::PropertyWrite);
         self.0.SetOpacity(opacity).unwrap();
     }
 
@@ -66,6 +69,7 @@ impl Visual {
 
     /// Sets whether the visual (and its subtree) is rendered.
     pub fn set_visible(&self, visible: bool) {
+        bump_count(Count::PropertyWrite);
         self.0.SetIsVisible(visible).unwrap();
     }
 
@@ -99,6 +103,7 @@ impl Visual {
 
     /// Sets the visual's scale factor about its [center point](Self::set_center_point).
     pub fn set_scale(&self, scale: Vector3) {
+        bump_count(Count::PropertyWrite);
         self.0.SetScale(scale).unwrap();
     }
 
@@ -109,12 +114,14 @@ impl Visual {
 
     /// Sets the point, in DIPs, about which rotation and scaling are applied.
     pub fn set_center_point(&self, point: Vector3) {
+        bump_count(Count::PropertyWrite);
         self.0.SetCenterPoint(point).unwrap();
     }
 
     /// Sets the normalized anchor point (`0.0..=1.0` per axis) that the visual's
     /// offset positions.
     pub fn set_anchor_point(&self, point: Vector2) {
+        bump_count(Count::PropertyWrite);
         self.0.SetAnchorPoint(point).unwrap();
     }
 
@@ -128,14 +135,27 @@ impl Visual {
     /// and expressions drive. (Composition also exposes the same rotation in
     /// degrees as a separate property, which this crate does not surface.)
     pub fn set_rotation_angle(&self, radians: f32) {
+        bump_count(Count::PropertyWrite);
         self.0.SetRotationAngle(radians).unwrap();
     }
 
     /// Sets (or, with `None`, clears) the clip applied to this visual and its
     /// subtree.
     pub fn set_clip(&self, clip: Option<&InsetClip>) {
+        bump_count(Count::PropertyWrite);
         let clip: Option<bindings::CompositionClip> = clip.map(|clip| clip.0.cast().unwrap());
         self.0.SetClip(clip.as_ref()).unwrap();
+    }
+
+    /// Views this visual as a container, if it is one.
+    ///
+    /// [`VisualCollection::iter`] hands back the base [`Visual`] type, which has
+    /// no children of its own — so without this a tree walk could only ever see
+    /// one level. Every visual this crate mints except a bare `Visual` is a
+    /// container underneath (sprites and shape visuals both derive from
+    /// `ContainerVisual`), so the cast usually succeeds.
+    pub fn as_container(&self) -> Option<ContainerVisual> {
+        self.0.cast().ok().map(ContainerVisual::new)
     }
 
     /// Returns the visual's parent container, if it has one.
@@ -172,6 +192,7 @@ impl Visual {
 
     /// Starts an animation on the named property (for example `"Scale"`).
     pub fn start_animation(&self, property: &str, animation: &impl Animation) {
+        bump_count(Count::AnimationStart);
         let object: bindings::ICompositionObject = self.0.cast().unwrap();
         object
             .StartAnimation(property, &animation.as_animation().0)
@@ -190,6 +211,7 @@ impl Visual {
     /// caller does not otherwise track — so the inconsistency with the `unwrap`
     /// elsewhere is deliberate, and must stay.
     pub fn stop_animation(&self, property: &str) {
+        bump_count(Count::AnimationStop);
         let object: bindings::ICompositionObject = self.0.cast().unwrap();
         let _ = object.StopAnimation(property);
     }
@@ -277,6 +299,7 @@ impl SpriteVisual {
 
     /// Sets the brush that fills the visual's bounds.
     pub fn set_brush(&self, brush: &impl Brush) {
+        bump_count(Count::PropertyWrite);
         self.sprite.SetBrush(&brush.as_brush().0).unwrap();
     }
 
@@ -305,19 +328,42 @@ impl VisualCollection {
         self.0.Count().unwrap()
     }
 
+    /// Every child, in z-order (bottom first).
+    ///
+    /// Composition properties are write-only, but the child collection is
+    /// genuinely enumerable, which makes the visual tree the one part of the
+    /// composition state an app can read back exactly. That is what a census
+    /// walk needs: a running insert/remove tally can drift, a walk cannot.
+    ///
+    /// Fallible because the enumeration is a QI away — a collection that does
+    /// not answer to `IIterable` cannot be walked, and inventing an empty
+    /// iterator for that case would report a subtree as childless.
+    /// The `use<>` bound is load-bearing: the iterator holds its own reference
+    /// to the collection's WinRT iterator and borrows nothing, so without it
+    /// edition 2024 would capture `&self` and a walk could not enumerate a
+    /// collection it obtained from a temporary — which is every nested level of
+    /// a tree walk.
+    pub fn iter(&self) -> Result<impl Iterator<Item = Visual> + use<>> {
+        let iterable: windows_collections::IIterable<bindings::Visual> = self.0.cast()?;
+        Ok(iterable.into_iter().map(Visual))
+    }
+
     /// Inserts a visual at the top of the z-order (drawn last, on top).
     pub fn insert_at_top(&self, visual: &Visual) {
+        bump_count(Count::TreeInsert);
         self.0.InsertAtTop(&visual.0).unwrap();
     }
 
     /// Inserts a visual at the bottom of the z-order (drawn first, behind).
     pub fn insert_at_bottom(&self, visual: &Visual) {
+        bump_count(Count::TreeInsert);
         self.0.InsertAtBottom(&visual.0).unwrap();
     }
 
     /// Inserts a visual directly above `sibling` in the z-order (drawn after it,
     /// in front of it). `sibling` must already be in the collection.
     pub fn insert_above(&self, visual: &Visual, sibling: &Visual) {
+        bump_count(Count::TreeInsert);
         self.0.InsertAbove(&visual.0, &sibling.0).unwrap();
     }
 
@@ -327,6 +373,7 @@ impl VisualCollection {
     /// [`try_remove`](Self::try_remove) where that is a state the caller can
     /// legitimately reach.
     pub fn remove(&self, visual: &Visual) {
+        bump_count(Count::TreeRemove);
         self.0.Remove(&visual.0).unwrap();
     }
 
@@ -339,11 +386,21 @@ impl VisualCollection {
     /// removal is fallible instead of a panic. Prefer [`remove`](Self::remove)
     /// when the visual's membership is known.
     pub fn try_remove(&self, visual: &Visual) -> Result<()> {
-        self.0.Remove(&visual.0)
+        // Counted only on success: this overload exists precisely because
+        // "already gone" is reachable, and a failed removal detached nothing.
+        let removed = self.0.Remove(&visual.0);
+        if removed.is_ok() {
+            bump_count(Count::TreeRemove);
+        }
+        removed
     }
 
     /// Removes every visual from the collection.
     pub fn remove_all(&self) {
+        // Read the population first: after the call there is nothing left to
+        // count, and a bulk removal that logged one detachment would drift the
+        // parented figure by exactly the number of children it took out.
+        add_count(Count::TreeRemove, self.count().max(0) as u64);
         self.0.RemoveAll().unwrap();
     }
 }

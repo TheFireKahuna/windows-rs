@@ -68,6 +68,7 @@ impl Compositor {
     /// Creates a drop shadow. Attach it with
     /// [`SpriteVisual::set_shadow`](crate::SpriteVisual::set_shadow).
     pub fn create_drop_shadow(&self) -> DropShadow {
+        bump_count(Count::Brush);
         let compositor: bindings::ICompositor2 = self.0.cast().unwrap();
         DropShadow(compositor.CreateDropShadow().unwrap())
     }

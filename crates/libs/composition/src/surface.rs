@@ -149,8 +149,11 @@ pub struct CompositionDrawingSurface {
 }
 
 impl CompositionDrawingSurface {
+    /// The one funnel every allocation reaches, whichever of the device's three
+    /// factories the caller used — so the census counts a surface once.
     fn new(surface: bindings::CompositionDrawingSurface) -> Result<Self> {
         let interop = surface.cast()?;
+        bump_count(Count::DrawingSurface);
         Ok(Self { surface, interop })
     }
 
@@ -163,6 +166,7 @@ impl CompositionDrawingSurface {
     /// This is the interop seam the canvas bridge draws through; most callers use
     /// that bridge instead of calling this directly.
     pub fn begin_draw<T: Interface>(&self) -> Result<(T, (i32, i32))> {
+        bump_count(Count::SurfaceDraw);
         let mut offset = bindings::POINT::default();
         let object = unsafe { self.interop.BeginDraw::<T>(None, &mut offset)? };
         Ok((object, (offset.x, offset.y)))
@@ -249,6 +253,7 @@ impl CompositionDrawHandle {
     /// Mirrors [`CompositionDrawingSurface::begin_draw`]; pair every call with
     /// [`end_draw`](Self::end_draw).
     pub fn begin_draw<T: Interface>(&self) -> Result<(T, (i32, i32))> {
+        bump_count(Count::SurfaceDraw);
         let mut offset = bindings::POINT::default();
         let object = unsafe { self.0.BeginDraw::<T>(None, &mut offset)? };
         Ok((object, (offset.x, offset.y)))
@@ -309,18 +314,21 @@ pub struct CompositionVisualSurface(pub(crate) bindings::CompositionVisualSurfac
 impl CompositionVisualSurface {
     /// Sets the visual whose subtree this surface captures.
     pub fn set_source_visual(&self, visual: &Visual) {
+        bump_count(Count::PropertyWrite);
         self.0.SetSourceVisual(&visual.0).unwrap();
     }
 
     /// Sets the top-left corner of the captured region, in the source visual's
     /// coordinate space.
     pub fn set_source_offset(&self, offset: Vector2) {
+        bump_count(Count::PropertyWrite);
         self.0.SetSourceOffset(offset).unwrap();
     }
 
     /// Sets the size of the captured region, in the source visual's coordinate
     /// space.
     pub fn set_source_size(&self, size: Vector2) {
+        bump_count(Count::PropertyWrite);
         self.0.SetSourceSize(size).unwrap();
     }
 }
@@ -336,6 +344,7 @@ impl Surface for CompositionVisualSurface {
 impl Compositor {
     /// Creates a surface that captures a live visual subtree.
     pub fn create_visual_surface(&self) -> CompositionVisualSurface {
+        bump_count(Count::VisualSurface);
         let compositor: bindings::ICompositorWithVisualSurface = self.0.cast().unwrap();
         CompositionVisualSurface(compositor.CreateVisualSurface().unwrap())
     }
