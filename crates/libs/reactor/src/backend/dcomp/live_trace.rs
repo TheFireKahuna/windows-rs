@@ -64,20 +64,31 @@
 //! A second use of the same underfill: a bar meter whose shape never changes and
 //! whose *extent* does. [`LiveTrace::set_fill_extent`] states the fill geometry
 //! once — the whole track — and then moves only a scalar, so the level travels
-//! DWM-side under [`bar_field`](super::bar_field)'s ballistics
+//! under [`bar_field`](super::bar_field)'s ballistics
 //! ([`LiveTrace::set_fill_motion`]) instead of arriving as a new path per publish.
 //! It scales the composited sprite about the anchored edge, which carries the
 //! colour source with it: a ramp under a meter is therefore FILL-relative, the
 //! same thing a CSS gradient on the fill element means.
+//!
+//! That level is the ONE thing here that is interpolated over time, and it is
+//! interpolated by whichever mechanism [`live_anim`](super::bar_field::live_anim)
+//! names — a retargeted key-frame animation the compositor evaluates, or a
+//! one-pole this thread steps. The geometry is not interpolated by either: a
+//! published path IS the new shape, and there is no motion between two of them
+//! to schedule.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_composition::{CompositionEasingFunction, ScalarKeyFrameAnimation};
-use windows_numerics::{Vector2, Vector3};
+use windows_numerics::Vector3;
 
+use super::bar_field::{
+    closing, live_anim, note_anim_start, note_property_writes, retarget_easing, LiveAnim,
+    MAX_STEP_SECS,
+};
 use super::bootstrap::Compositing;
 use super::path_shape::{PathLayer, Role};
 use crate::backend::ControlId;
@@ -323,10 +334,13 @@ impl LiveTrace {
     /// Retarget the metered fill to `frac` of its own box (`0.0..=1.0`).
     ///
     /// The geometry is whatever [`set_fill_path`](Self::set_fill_path) last stated —
-    /// the WHOLE track, pushed once — so this is one `InsertKeyFrame` and one
-    /// `StartAnimation` on a cached animation, and the level then travels on the
-    /// compositor with no further app frame. A publish that lands mid-flight
-    /// redirects it; a publish stream that stops lets it finish.
+    /// the WHOLE track, pushed once — so this moves one scalar. Under
+    /// [`LiveAnim::Dwm`] that is one `InsertKeyFrame` and one `StartAnimation` on
+    /// a cached animation, and the level then travels on the compositor with no
+    /// further app frame: a publish that lands mid-flight redirects it, and a
+    /// publish stream that stops lets it finish. Under [`LiveAnim::Front`] the
+    /// level advances one one-pole step per publish instead, so a stream that
+    /// stops leaves it where it stood.
     pub fn set_fill_extent(&self, frac: f32) {
         self.enqueue(|p| p.fill_extent = Some(frac));
     }
@@ -475,12 +489,6 @@ pub(crate) fn drain_into(out: &mut Vec<TraceBatch>) {
 /// meter this drives.
 const EXTENT_EPS: f32 = 0.0005;
 
-/// The retarget easing: a decelerating ramp, so a level arrives rather than
-/// stopping dead. [`bar_field`](super::bar_field)'s, so a meter and an analyzer
-/// bar in the same panel move alike.
-const EASE_C1: (f32, f32) = (0.0, 0.0);
-const EASE_C2: (f32, f32) = (0.58, 1.0);
-
 /// A node's retained trace: one stroked mask layer over an FP16 colour source,
 /// and — when the layout names a fill — the filled companion beneath it.
 ///
@@ -498,10 +506,22 @@ pub(crate) struct LiveTraceField {
     fill_axis: GradientAxis,
     /// The metered fill's ballistics and pivot, once a producer declares them.
     motion: Option<FillMotion>,
-    /// The extent currently shown, and the pivot the sprite is scaled about — so
-    /// a retarget that changes neither costs nothing.
+    /// The extent the sprite was last STATED at, and the pivot it is scaled
+    /// about — so a publish that changes neither costs nothing. Under
+    /// [`LiveAnim::Front`] the extent is the level on screen; under
+    /// [`LiveAnim::Dwm`] it is the last retarget's destination, which the
+    /// compositor may still be carrying the sprite towards.
     extent: Option<f32>,
     pivot: Option<f32>,
+    /// The level last PUBLISHED, held separately from [`extent`](Self::extent)
+    /// because the two paths consume it differently: the DWM path hands it over
+    /// once and is done, while the front path has to keep stepping towards it
+    /// on publishes that carry only geometry.
+    target: Option<f32>,
+    /// When the front path last stepped, so it integrates real elapsed time
+    /// rather than assuming a cadence. Untouched by the DWM path, which keeps
+    /// no clock of its own.
+    last_step: Option<Instant>,
     /// The two cached retarget animations and their easing, built on first use.
     /// One per direction, because their durations differ.
     rise: Option<ScalarKeyFrameAnimation>,
@@ -526,6 +546,8 @@ impl LiveTraceField {
             motion: None,
             extent: None,
             pivot: None,
+            target: None,
+            last_step: None,
             rise: None,
             fall: None,
             easing: None,
@@ -600,12 +622,20 @@ impl LiveTraceField {
         layer.set_source(comp, layout.color, &[], GradientAxis::Vertical, atlas_epoch, scale);
     }
 
-    /// Move the metered fill to this publish's extent.
+    /// Move the metered fill towards this publish's extent.
     ///
     /// The geometry does not move: the fill sprite spans the whole track and its
-    /// `Scale.X` about the anchored edge IS the level, so one retarget hands the
-    /// whole flight to DWM. The colour source is composited into that same sprite,
-    /// which is what makes a ramp under a meter fill-relative.
+    /// `Scale.X` about the anchored edge IS the level. The colour source is
+    /// composited into that same sprite, which is what makes a ramp under a
+    /// meter fill-relative.
+    ///
+    /// Which mechanism carries the level is [`live_anim`]'s choice, and the two
+    /// differ in more than who interpolates. The DWM path acts only on a publish
+    /// that CARRIES a level — one retarget hands over the whole flight, and a
+    /// publish carrying only geometry has nothing to say about it. The front
+    /// path has to step on every publish, because a step is the only thing that
+    /// advances it and a producer reshaping a trace without restating its level
+    /// would otherwise freeze the meter mid-travel.
     fn meter(&mut self, layout: TraceLayout, extent: Option<f32>) {
         let Some(motion) = self.motion else { return };
         let Some(fill) = self.fill.as_ref() else { return };
@@ -622,39 +652,71 @@ impl LiveTraceField {
             self.pivot = Some(pivot);
         }
 
-        let Some(raw) = extent else { return };
-        let t = if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 };
+        if let Some(raw) = extent {
+            self.target = Some(if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 });
+        }
+        let Some(target) = self.target else { return };
         let Some(shown) = self.extent else {
             // The opening frame is where the meter starts, not a change. The
             // sprite is born at full extent, so easing down from it would read as
             // a level that was there and fell.
             sprite.stop_animation("Scale.X");
-            sprite.set_scale(Vector3::new(t, 1.0, 1.0));
-            self.extent = Some(t);
+            sprite.set_scale(Vector3::new(target, 1.0, 1.0));
+            note_property_writes(1);
+            self.extent = Some(target);
+            self.last_step = Some(Instant::now());
             return;
         };
-        if (t - shown).abs() < EXTENT_EPS {
-            return;
+
+        match live_anim() {
+            LiveAnim::Front => {
+                let now = Instant::now();
+                let dt = self
+                    .last_step
+                    .map_or(0.0, |t| now.duration_since(t).as_secs_f32())
+                    .min(MAX_STEP_SECS);
+                self.last_step = Some(now);
+                // The direction of travel picks the time constant, and here it
+                // is measured against the level ON SCREEN — the front path knows
+                // it, because it is the one that put it there.
+                let k = closing(dt, if target > shown { motion.rise } else { motion.fall });
+                let t = shown + (target - shown) * k;
+                if (t - shown).abs() < EXTENT_EPS {
+                    return;
+                }
+                sprite.set_scale(Vector3::new(t, 1.0, 1.0));
+                note_property_writes(1);
+                self.extent = Some(t);
+            }
+            LiveAnim::Dwm => {
+                // Nothing to hand over on a publish that restated no level: the
+                // flight already in the air is still the right one.
+                if extent.is_none() || (target - shown).abs() < EXTENT_EPS {
+                    return;
+                }
+                let compositor = sprite.compositor();
+                let easing = self
+                    .easing
+                    .get_or_insert_with(|| retarget_easing(&compositor));
+                let a = if target > shown {
+                    let a = self
+                        .rise
+                        .get_or_insert_with(|| compositor.create_scalar_key_frame_animation());
+                    a.set_duration(motion.rise);
+                    &*a
+                } else {
+                    let a = self
+                        .fall
+                        .get_or_insert_with(|| compositor.create_scalar_key_frame_animation());
+                    a.set_duration(motion.fall);
+                    &*a
+                };
+                a.insert_key_frame_with_easing(1.0, target, easing);
+                sprite.start_animation("Scale.X", a);
+                note_anim_start();
+                self.extent = Some(target);
+            }
         }
-        let compositor = sprite.compositor();
-        let easing = self.easing.get_or_insert_with(|| {
-            compositor.create_cubic_bezier_easing_function(
-                Vector2::new(EASE_C1.0, EASE_C1.1),
-                Vector2::new(EASE_C2.0, EASE_C2.1),
-            )
-        });
-        let a = if t > shown {
-            let a = self.rise.get_or_insert_with(|| compositor.create_scalar_key_frame_animation());
-            a.set_duration(motion.rise);
-            &*a
-        } else {
-            let a = self.fall.get_or_insert_with(|| compositor.create_scalar_key_frame_animation());
-            a.set_duration(motion.fall);
-            &*a
-        };
-        a.insert_key_frame_with_easing(1.0, t, easing);
-        sprite.start_animation("Scale.X", a);
-        self.extent = Some(t);
     }
 
     /// Re-point one layer at this publish's geometry, building it on first use and

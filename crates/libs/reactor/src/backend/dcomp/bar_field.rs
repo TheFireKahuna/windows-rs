@@ -41,52 +41,188 @@
 //! top edge — and each is one scalar. The body is a full-height sprite whose
 //! `CenterPoint` sits on its bottom edge, so its whole extent is `Scale.Y` in
 //! `0..=1` and no offset has to move with it. The cap is a fixed-height strip
-//! whose `Offset.Y` is the body's top edge. Both are written from the same
-//! stepped value in the same commit, which is what pins the cap to the body:
-//! `offset = top + (1 - scale) * height` holds at every frame by construction
-//! rather than by two curves agreeing.
+//! whose `Offset.Y` is the body's top edge: `offset = top + (1 - scale) *
+//! height`, one number seen two ways.
 //!
-//! ## Ballistics — stepped here, not scheduled DWM-side
+//! ## Ballistics — stepped here, or scheduled DWM-side
 //!
 //! An analyzer that rises and falls at the same rate reads as jitter, so the
 //! caller states an asymmetric pair ([`BarFieldLayout::rise`] /
 //! [`BarFieldLayout::fall`]) and each bar picks one per push from its own
-//! direction of travel. The envelope is a one-pole stepped **on this thread**,
-//! from the wall clock, as each push is applied.
+//! direction of travel. WHO evaluates that curve between two published values
+//! is a process-wide choice ([`live_anim`]):
 //!
-//! It used to be scheduled instead: each push retargeted a shared
-//! `ScalarKeyFrameAnimation` per sprite and let DWM interpolate. That is the
-//! cheaper shape on paper and it is why the field was built that way — but it
-//! does not survive. Measured with a frame-differ against a live analyzer, a
-//! field driven that way animates for **≈50 seconds after its sprites are
-//! created and then stops for good**: `StartAnimation` keeps succeeding and the
-//! targets keep arriving, but nothing on screen moves again until the sprites
-//! themselves are rebuilt (a remount revives it, for another ≈50 s). Direct
-//! property writes on the very same sprites, in the very same commit, never
-//! stop — which is how the two were told apart. Stopping the animation before
-//! restarting it, halving the number of animated properties, quartering the
-//! push rate and rebuilding the animation objects periodically all left the
-//! onset exactly where it was, so it is neither a leak nor a quota: DWM simply
-//! stops advancing key-frame animations on those sprites. A visualization whose
-//! whole point is that it moves cannot be scheduled on a clock that quits after
-//! a minute, so the envelope is stepped here and written directly.
+//! - [`LiveAnim::Front`] — the envelope is a one-pole stepped **on this
+//!   thread**, from the wall clock, as each push is applied. Two property
+//!   writes per moved bar, both derived from the same stepped value in the same
+//!   commit, which is what pins the cap to the body.
+//! - [`LiveAnim::Dwm`] — each push retargets a key-frame animation on the
+//!   body's `Scale.Y` and the compositor flies it there. The cap is not
+//!   animated at all: an expression derives its `Offset.Y` from the body's
+//!   *live* `Scale.Y` (see [`bind_cap`]), so the weld is a definition the
+//!   compositor evaluates rather than two curves that have to agree.
 //!
-//! The bars are still retained sprites and nothing rasterizes — the cost this
-//! module exists to avoid is untouched. What changed is only *who* interpolates
-//! between two published values, and the producer already ticks at the rate its
-//! data changes.
+//! Both land in the same place at rest and both leave the sprites retained —
+//! the rasterization this module exists to avoid is untouched either way. They
+//! differ only in who interpolates, which is exactly what the switch is for:
+//! one run can be measured against another without a rebuild.
+//!
+//! The scheduled path was once removed outright. Measured with a frame-differ
+//! against a live analyzer, a field driven that way appeared to animate for
+//! ≈50 seconds after its sprites were created and then stop for good, while
+//! direct property writes on the very same sprites never stopped. That reading
+//! is not safe: a frame-differ cannot tell "DWM stopped evaluating the
+//! animation" from "the composition clock stopped", which is what a locked
+//! session or a powered-down display does — and a value stepped in-process
+//! keeps changing captured frames through both. So the path is back, behind the
+//! switch, alongside counters ([`live_anim_starts`], [`live_anim_property_writes`])
+//! that say what each path actually issued, so a repeat of the measurement can
+//! tell a stalled compositor from a stalled animation.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows_composition::{CompositionSurfaceBrush, SpriteVisual};
-use windows_numerics::Vector3;
+use windows_composition::{
+    CompositionEasingFunction, CompositionSurfaceBrush, Compositor, ScalarKeyFrameAnimation,
+    SpriteVisual,
+};
+use windows_numerics::{Vector2, Vector3};
 
 use super::bootstrap::Compositing;
 use crate::backend::ControlId;
 use crate::Color;
+
+// ── Who interpolates, and what each path costs ───────────────────────────────
+
+/// Which mechanism carries a live field between two published values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveAnim {
+    /// Stepped on the front thread as each push is applied, and written
+    /// straight to the sprite's properties.
+    Front,
+    /// Retargeted onto a compositor animation, and evaluated by DWM.
+    Dwm,
+}
+
+/// The mechanism this process uses, read ONCE from `REACTOR_LIVE_ANIM`
+/// (`dwm` selects [`LiveAnim::Dwm`]; anything else, including an unset
+/// variable, selects [`LiveAnim::Front`]).
+///
+/// Process-wide and fixed for the run rather than per field: the two paths
+/// animate different properties and write different ones, so a field cannot
+/// change mechanism without rebuilding its bindings, and no caller wants two
+/// analyzers in one window moving by different means. It is consulted once per
+/// publish, which is why the environment is read behind a `OnceLock` rather
+/// than each time.
+#[must_use]
+pub fn live_anim() -> LiveAnim {
+    static MODE: OnceLock<LiveAnim> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let dwm = std::env::var_os("REACTOR_LIVE_ANIM")
+            .as_deref()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("dwm"));
+        if dwm { LiveAnim::Dwm } else { LiveAnim::Front }
+    })
+}
+
+// These three are a SCOPED subset of what `windows_composition::census`
+// already counts process-wide. The census bumps a property write for every
+// `set_*` any subsystem makes and an animation start for every
+// `StartAnimation`, which is the authoritative traffic figure — and exactly
+// why it cannot answer the question these are for. The live fields' publishes
+// are a few thousand calls a second inside a stream that also carries chrome,
+// layout and text, so "did the analyzer keep retargeting while the screen
+// stopped moving" is not extractable from a total. These count that one
+// intent and nothing else; when both are reported, the census is the
+// denominator and these are the numerator.
+static ANIM_STARTS: AtomicU64 = AtomicU64::new(0);
+static PROP_WRITES: AtomicU64 = AtomicU64::new(0);
+static EXPR_BINDS: AtomicU64 = AtomicU64::new(0);
+
+/// How many compositor animations the live fields have started: every
+/// `StartAnimation` this module and [`live_trace`](super::live_trace) issue to
+/// move a published value, whether it begins a flight or redirects one already
+/// in the air. Stays at zero under [`LiveAnim::Front`].
+///
+/// Process-wide and monotonic — read it twice and difference it to get a rate.
+/// Together with [`live_anim_property_writes`] it says which mechanism a run
+/// actually used, which is what tells a compositor that stopped evaluating
+/// apart from one that was never asked to.
+#[must_use]
+pub fn live_anim_starts() -> u64 {
+    ANIM_STARTS.load(Ordering::Relaxed)
+}
+
+/// How many property writes the live fields have issued to MOVE a published
+/// value — the front path's two per moved bar, and the opening snap either path
+/// makes on its first frame.
+///
+/// Placement writes are deliberately not counted: a resize or a recolour writes
+/// every sprite's offset, size and pivot, and folding those in would bury the
+/// number this exists to show, which is how much the app does per publish.
+/// Under [`LiveAnim::Dwm`] it must stop climbing once every field has taken its
+/// first frame — a run where it keeps climbing is not running the DWM path.
+#[must_use]
+pub fn live_anim_property_writes() -> u64 {
+    PROP_WRITES.load(Ordering::Relaxed)
+}
+
+/// How many expression animations the live fields have bound to derive one
+/// property from another — the DWM path's cap weld and floor gate. Per layout,
+/// not per publish, so this settles once a field is up and moves again only on
+/// a resize, a DPI change, a bar-count change or a recolour.
+#[must_use]
+pub fn live_anim_expression_binds() -> u64 {
+    EXPR_BINDS.load(Ordering::Relaxed)
+}
+
+/// Record one `StartAnimation` — see [`live_anim_starts`].
+pub(crate) fn note_anim_start() {
+    ANIM_STARTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record `n` value-moving property writes — see [`live_anim_property_writes`].
+pub(crate) fn note_property_writes(n: u64) {
+    PROP_WRITES.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Record `n` expression bindings — see [`live_anim_expression_binds`].
+pub(crate) fn note_expression_binds(n: u64) {
+    EXPR_BINDS.fetch_add(n, Ordering::Relaxed);
+}
+
+/// The retarget easing shared by every live field: a decelerating ramp, so a
+/// value arrives rather than stopping dead. One definition because a meter and
+/// an analyzer bar in the same panel must move alike.
+const EASE_C1: (f32, f32) = (0.0, 0.0);
+const EASE_C2: (f32, f32) = (0.58, 1.0);
+
+/// Mint that easing. Cached by each field — the curve is fixed, so one object
+/// serves every retarget the field ever makes.
+pub(crate) fn retarget_easing(compositor: &Compositor) -> CompositionEasingFunction {
+    compositor.create_cubic_bezier_easing_function(
+        Vector2::new(EASE_C1.0, EASE_C1.1),
+        Vector2::new(EASE_C2.0, EASE_C2.1),
+    )
+}
+
+/// The fraction of the remaining gap a one-pole closes over `dt` seconds for a
+/// stated settling `duration`.
+///
+/// `1 - e^(-Δ/τ)`, with `τ` half that duration (see [`BarFieldLayout::rise`]);
+/// a zero or absurd duration degenerates to a snap, which is the honest reading
+/// of "no ballistics". Shared with [`live_trace`](super::live_trace) so an
+/// analyzer bar and a meter under one pair of durations trace one envelope.
+pub(crate) fn closing(dt: f32, duration: Duration) -> f32 {
+    let tau = duration.as_secs_f32() * 0.5;
+    if tau <= 0.0 || dt <= 0.0 {
+        return 1.0;
+    }
+    (1.0 - (-dt / tau).exp()).clamp(0.0, 1.0)
+}
 
 /// One bar's horizontal placement within the field's host element, in DIPs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -310,7 +446,7 @@ pub(crate) fn drain_into(out: &mut Vec<BarBatch>) {
     }
 }
 
-// ── The front-thread field ───────────────────────────────────────────────────
+// ── The field the front thread owns ──────────────────────────────────────────
 
 /// A value change smaller than this is not worth a retarget: at a 200 DIP plot
 /// it is a twentieth of a pixel, and skipping it is what makes a silent
@@ -327,7 +463,7 @@ const FLOOR_EPS: f32 = 0.0005;
 /// integrated as one enormous `Δ` — clamping it makes the bar arrive at its
 /// target in one frame, which is what a resumed analyzer should look like,
 /// instead of some interpolated state that was never true.
-const MAX_STEP_SECS: f32 = 0.25;
+pub(crate) const MAX_STEP_SECS: f32 = 0.25;
 
 /// Where a bar's cap sits for value `t` — the body's top edge, which is
 /// `top + height` at the floor and `top` at full scale. The body expresses the
@@ -342,10 +478,21 @@ fn cap_y(layout: &BarFieldLayout, t: f32) -> f32 {
 struct Bar {
     body: SpriteVisual,
     cap: SpriteVisual,
-    /// The value currently on screen — the write gate, the envelope's state,
-    /// and the direction of travel the next push picks its time constant from.
+    /// The value this bar was last STATED at — the write gate, and the direction
+    /// of travel the next push picks its time constant from.
+    ///
+    /// Under [`LiveAnim::Front`] that is also the value on screen, because the
+    /// front thread wrote it. Under [`LiveAnim::Dwm`] it is the last retarget's
+    /// destination, and the value on screen is wherever the compositor has
+    /// carried it to — which cannot be read back, so a push landing mid-flight
+    /// picks its direction against the previous TARGET rather than against the
+    /// drawn value. The two disagree only on a reversal inside one flight; the
+    /// flight itself still starts from wherever the property currently is,
+    /// because that is what a retarget does.
     shown: f32,
-    /// Whether the cap is currently on screen.
+    /// Whether the cap is currently on screen. Front-path state: the DWM path
+    /// gates the cap by an expression on its `Opacity` instead (see
+    /// [`bind_cap`]), so nothing here toggles it.
     cap_visible: bool,
 }
 
@@ -367,8 +514,17 @@ pub(crate) struct BarField {
     /// not disturb the fade.
     _body_brush: Option<super::gradient::RampSource>,
     _cap_brush: Option<CompositionSurfaceBrush>,
+    /// The two cached retarget animations and their easing — the DWM path only,
+    /// built on first use and dropped by a [`rebuild`](Self::rebuild) so a
+    /// layout stating different ballistics mints them again. One pair per field
+    /// rather than per bar: `StartAnimation` takes the animation's state as it
+    /// stands, so the same object retargets every bar in turn.
+    rise_anim: Option<ScalarKeyFrameAnimation>,
+    fall_anim: Option<ScalarKeyFrameAnimation>,
+    easing: Option<CompositionEasingFunction>,
     /// When the last value push was applied, so the envelope integrates real
-    /// elapsed time rather than assuming a cadence. `None` until the first one.
+    /// elapsed time rather than assuming a cadence. `None` until the first one,
+    /// and untouched by the DWM path, which keeps no clock of its own.
     last_push: Option<Instant>,
     /// True until the first value push has landed. The first frame SNAPS: a
     /// field mounting must not play its opening spectrum as a rise from the
@@ -384,6 +540,9 @@ impl BarField {
             sources: None,
             _body_brush: None,
             _cap_brush: None,
+            rise_anim: None,
+            fall_anim: None,
+            easing: None,
             last_push: None,
             priming: true,
         }
@@ -467,6 +626,19 @@ impl BarField {
             bar.cap.set_visible(live && bar.cap_visible);
         }
 
+        if live_anim() == LiveAnim::Dwm {
+            // The placement above wrote `Offset` and `Scale` DIRECTLY, and a
+            // direct write disconnects whatever animation held the property —
+            // so the bindings are (re)established here, after those writes, and
+            // the two cached retargets are dropped because the layout may have
+            // restated the durations they were built with.
+            self.rise_anim = None;
+            self.fall_anim = None;
+            for bar in &self.bars {
+                bind_cap(bar, &layout);
+            }
+        }
+
         // The sources are sized against the raster scale, not the layout, but
         // the colours live in the layout — so a recolour must re-rasterize.
         if self.layout.as_ref().map(|l| (l.body_top, l.body_bottom, l.cap))
@@ -518,30 +690,30 @@ impl BarField {
         self.sources = Some(want);
     }
 
-    /// Step every bar's envelope by the real elapsed time and write the two
-    /// sprites that moved. Two property writes per moved bar, nothing else.
+    /// Apply one frame of values by whichever mechanism this process animates
+    /// with. Both are self-gating: a field whose every value has settled issues
+    /// no COM calls at all.
     fn push(&mut self, values: &[f32], layout: &BarFieldLayout) {
         if self.bars.is_empty() {
             return;
         }
+        match live_anim() {
+            LiveAnim::Front => self.push_front(values, layout),
+            LiveAnim::Dwm => self.push_dwm(values, layout),
+        }
+        self.priming = false;
+    }
+
+    /// Step every bar's envelope by the real elapsed time and write the two
+    /// sprites that moved. Two property writes per moved bar, nothing else.
+    fn push_front(&mut self, values: &[f32], layout: &BarFieldLayout) {
         let now = Instant::now();
         let dt = self
             .last_push
             .map_or(0.0, |t| now.duration_since(t).as_secs_f32())
             .min(MAX_STEP_SECS);
         self.last_push = Some(now);
-        // The fraction of the remaining gap each direction closes over `dt`.
-        // `1 - e^(-Δ/τ)`, with `τ` half the stated settling duration (see
-        // [`BarFieldLayout::rise`]); a zero or absurd duration degenerates to a
-        // snap, which is the honest reading of "no ballistics".
-        let closing = |d: Duration| -> f32 {
-            let tau = d.as_secs_f32() * 0.5;
-            if tau <= 0.0 || dt <= 0.0 {
-                return 1.0;
-            }
-            (1.0 - (-dt / tau).exp()).clamp(0.0, 1.0)
-        };
-        let (k_rise, k_fall) = (closing(layout.rise), closing(layout.fall));
+        let (k_rise, k_fall) = (closing(dt, layout.rise), closing(dt, layout.fall));
 
         let priming = self.priming;
         for (bar, &raw) in self.bars.iter_mut().zip(values) {
@@ -569,8 +741,110 @@ impl BarField {
             // ends of a flight.
             bar.body.set_scale(Vector3::new(1.0, t, 1.0));
             bar.cap.set_offset(bar.cap.offset().x, cap_y(layout, t), 0.0);
+            note_property_writes(2);
             bar.shown = t;
         }
-        self.priming = false;
     }
+
+    /// Retarget every bar whose value moved and let the compositor fly it there.
+    ///
+    /// One `InsertKeyFrame` and one `StartAnimation` per moved bar, on a pair of
+    /// animations the field already holds — and NOTHING for the cap, whose
+    /// offset and floor gate are expressions over the body's live `Scale.Y`
+    /// (see [`bind_cap`]). Between publishes this path issues nothing at all.
+    ///
+    /// A key frame rather than a spring, though a spring is the shape that
+    /// "retarget from where you are, with the velocity you have" describes.
+    /// Two reasons. [`BarFieldLayout::rise`] and [`BarFieldLayout::fall`] are
+    /// stated as DURATIONS, which a key frame consumes directly and a spring
+    /// only through an invented damping/period mapping — so this path animates
+    /// on the numbers the caller actually gave, and an A/B against the front
+    /// path measures the mechanism instead of a second set of ballistics. And a
+    /// spring carrying velocity into a reversal overshoots: past `1.0` a bar
+    /// leaves the plot band, and past `0.0` a negative `Scale.Y` flips the
+    /// sprite through its own baseline. Clamping that back would take a per
+    /// frame app-side correction, which is the one thing this path exists not
+    /// to do.
+    fn push_dwm(&mut self, values: &[f32], layout: &BarFieldLayout) {
+        let compositor = self.bars[0].body.compositor();
+        let easing: &CompositionEasingFunction = self
+            .easing
+            .get_or_insert_with(|| retarget_easing(&compositor));
+        // The durations are baked in at construction, not restated per push: a
+        // layout that changes them drops both objects (see
+        // [`rebuild`](Self::rebuild)), so the pair standing here always carries
+        // the ballistics the current layout asked for.
+        let rise: &ScalarKeyFrameAnimation = self.rise_anim.get_or_insert_with(|| {
+            let a = compositor.create_scalar_key_frame_animation();
+            a.set_duration(layout.rise);
+            a
+        });
+        let fall: &ScalarKeyFrameAnimation = self.fall_anim.get_or_insert_with(|| {
+            let a = compositor.create_scalar_key_frame_animation();
+            a.set_duration(layout.fall);
+            a
+        });
+
+        let priming = self.priming;
+        for (bar, &raw) in self.bars.iter_mut().zip(values) {
+            let target = if raw.is_finite() { raw.clamp(0.0, 1.0) } else { 0.0 };
+            if !priming && (target - bar.shown).abs() < CHANGE_EPS {
+                continue;
+            }
+            if priming {
+                // The opening frame is not a change; it is where the analyzer
+                // starts. Written directly — no animation owns the property
+                // yet, and a field mounting must not play its opening spectrum
+                // as a rise from the floor.
+                bar.body.set_scale(Vector3::new(1.0, target, 1.0));
+                note_property_writes(1);
+            } else {
+                // `StartAnimation` on a property that already has one replaces
+                // it and picks up from the value in flight, so a retarget is
+                // this and nothing else — no `StopAnimation` first, which would
+                // strand the bar at wherever it had reached and make the new
+                // flight start from a standstill.
+                let a = if target > bar.shown { rise } else { fall };
+                a.insert_key_frame_with_easing(1.0, target, easing);
+                bar.body.start_animation("Scale.Y", a);
+                note_anim_start();
+            }
+            bar.shown = target;
+        }
+    }
+}
+
+/// Weld one bar's cap to its body, compositor-side, for the whole life of a
+/// layout.
+///
+/// The cap is not animated: its `Offset.Y` is [`cap_y`]'s identity restated as
+/// an expression the compositor evaluates from the body's LIVE `Scale.Y`. Two
+/// independently retargeted animations would meet at the ends of a flight and
+/// could part anywhere in between — a change gate that skips one bar's cap and
+/// not its body is all it takes — whereas a value derived from another cannot
+/// drift from it. It also halves what a publish costs: only the body is
+/// retargeted, and the cap follows for free.
+///
+/// The floor gate rides that same live value. The cap's `Opacity` carries the
+/// [`FLOOR_EPS`] test against the DRAWN height, so a bar on its way down keeps
+/// its top edge until it arrives, rather than shedding it the moment a floor
+/// target is published. The front path hides the sprite outright, which is
+/// cheaper than compositing a transparent one — but `IsVisible` is not an
+/// animatable property, so DWM-side this is what the same rule costs.
+fn bind_cap(bar: &Bar, layout: &BarFieldLayout) {
+    let compositor = bar.body.compositor();
+    let (top, h) = (layout.top, layout.height.max(0.0));
+    let offset =
+        compositor.create_expression_animation(&format!("{top:.3} + {h:.3} * (1.0 - b.Scale.Y)"));
+    offset.set_reference_parameter("b", &**bar.body);
+    bar.cap.start_animation("Offset.Y", &offset);
+    let gate = compositor.create_expression_animation(&format!(
+        "b.Scale.Y > {FLOOR_EPS} ? 1.0 : 0.0"
+    ));
+    gate.set_reference_parameter("b", &**bar.body);
+    bar.cap.start_animation("Opacity", &gate);
+    // Both animations are dropped here: the compositor holds the ones it is
+    // running, and the reference parameter holds the body — the same discipline
+    // every other expression binding in the backend keeps.
+    note_expression_binds(2);
 }

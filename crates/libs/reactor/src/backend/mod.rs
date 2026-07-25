@@ -24,7 +24,13 @@ pub mod dcomp_test_api;
 
 #[cfg(feature = "dcomp-backend")]
 pub use dcomp::{
-    bar_field::{BarFieldLayout, BarRect, LiveBars},
+    bar_field::{
+        live_anim, live_anim_expression_binds, live_anim_property_writes, live_anim_starts,
+        BarFieldLayout, BarRect, LiveAnim, LiveBars,
+    },
+    census::{
+        request as composition_census, request_heat_map as set_composition_heat_map, HeatMap,
+    },
     live_opacity::LiveOpacity,
     live_text::LiveText,
     live_trace::{FillAnchor, FillMotion, LiveTrace, TraceLayout, TracePath},
