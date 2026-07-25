@@ -3,6 +3,45 @@ use std::rc::Rc;
 
 use super::*;
 
+/// A widget slot that mounts an [`Element`] tree of its own, beside its children.
+///
+/// A slot's subtree is a **parentless root**: it belongs to a popup or to a
+/// backend-owned region rather than to the owner's box, so it takes no part in the
+/// owner's layout and appears in no child list. That is what makes slots useful
+/// and also what makes them dangerous — the reconciler's generic subtree walk
+/// follows the child mirror, so it cannot reach a slot root. Slot lifetime has to
+/// be driven from the slot bookkeeping instead.
+///
+/// Hence this enum. Every path that touches slots — mount, reconcile, unmount —
+/// iterates [`ALL`](Self::ALL) rather than naming a slot, so a slot handled by
+/// only some of them is not expressible. The compiler enforces the rest: adding a
+/// variant breaks the exhaustive matches in [`Widget::slot_element`] and in the
+/// reconciler's backend dispatch until the new slot is wired through both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Slot {
+    /// A complex header (e.g. `Expander`'s element header, `TitleBar`'s content).
+    Header,
+    /// A pane beside the content (e.g. `SplitView`'s pane, `NavigationView`'s footer).
+    Pane,
+    /// An attached flyout's content — live controls in a popup, not a snapshot.
+    Flyout,
+}
+
+impl Slot {
+    /// How many slot kinds exist; the width of a node's slot-root array.
+    pub const COUNT: usize = 3;
+
+    /// Every slot, in mount order. Iterated by the reconciler instead of naming
+    /// slots one at a time.
+    pub const ALL: [Slot; Self::COUNT] = [Slot::Header, Slot::Pane, Slot::Flyout];
+
+    /// This slot's index into a node's slot-root array.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// One entry of a widget's flat declarative binding list: either a
 /// property value or an event handler slot.
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +222,21 @@ pub trait Widget {
     fn bindings(&self) -> PropBindings;
     fn children(&self) -> Children<'_> {
         Children::None
+    }
+    /// The element tree this widget puts in `slot`, if any.
+    ///
+    /// The one place the slot kinds are enumerated. The reconciler mounts,
+    /// reconciles and tears down slots by walking [`Slot::ALL`] and asking here,
+    /// so none of those three paths names a slot — which is what stops a new slot
+    /// from being wired into some of them and forgotten in the rest. Adding a
+    /// [`Slot`] variant makes this match non-exhaustive, so the build fails until
+    /// the accessor exists.
+    fn slot_element(&self, slot: Slot) -> Option<&Element> {
+        match slot {
+            Slot::Header => self.header_element(),
+            Slot::Pane => self.pane_element(),
+            Slot::Flyout => self.flyout_element(),
+        }
     }
     /// Optional element tree for a header slot (e.g. Expander complex header).
     fn header_element(&self) -> Option<&Element> {

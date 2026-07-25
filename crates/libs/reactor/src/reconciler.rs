@@ -48,14 +48,15 @@ pub struct Reconciler<B: Backend> {
     /// element (or `None`) just before the control is destroyed (see
     /// [`Widget::on_unmounted_callback`]).
     pub unmount_callbacks: FxHashMap<ControlId, Callback<MountInfo>>,
-    /// Tracks header element control IDs for widgets that use header_element().
-    pub header_elements: FxHashMap<ControlId, ControlId>,
-    /// Tracks pane element control IDs for widgets that use pane_element().
-    pub pane_elements: FxHashMap<ControlId, ControlId>,
-    /// Tracks flyout-content control IDs for widgets that use
-    /// [`Widget::flyout_element`]. Parentless roots: they belong to a popup,
-    /// not to the owner's box, so they are never in `children_mirror`.
-    pub flyout_elements: FxHashMap<ControlId, ControlId>,
+    /// The root each node has mounted per [`Slot`], indexed by [`Slot::index`].
+    ///
+    /// One array per node rather than one map per slot kind, because that is what
+    /// lets teardown enumerate a node's slots without naming any: a map per kind
+    /// has to be visited by name, and the slot whose name is missing from that
+    /// list is a subtree that outlives its owner forever. Slot roots are
+    /// deliberately absent from `children_mirror` (see [`Slot`]), so this is the
+    /// only record that they exist.
+    pub slot_roots: FxHashMap<ControlId, [Option<ControlId>; Slot::COUNT]>,
     /// UI marshaller propagated into every nested component's
     /// [`RenderCx`] for [`RenderCx::use_async_state`].
     pub marshaller: Option<UiMarshaller>,
@@ -102,9 +103,7 @@ impl<B: Backend + 'static> Reconciler<B> {
             selection_callbacks: FxHashMap::default(),
             reorder_callbacks: FxHashMap::default(),
             unmount_callbacks: FxHashMap::default(),
-            header_elements: FxHashMap::default(),
-            pane_elements: FxHashMap::default(),
-            flyout_elements: FxHashMap::default(),
+            slot_roots: FxHashMap::default(),
             defer_templated_unmounts: false,
             deferred_unmounts: Vec::new(),
             marshaller: None,
@@ -378,25 +377,15 @@ impl<B: Backend + 'static> Reconciler<B> {
                 }
             }
 
-            // Unmount the element subtrees tracked outside children_mirror —
-            // every `Widget` slot that mounts an `Element` of its own
-            // (`header_element`, `pane_element`, `flyout_element`).
-            //
-            // `collect_subtree` only walks `children_mirror`, so a slot root is
-            // unreachable from its owner and has to be torn down by name. A rich
-            // flyout is the easiest one to miss because being parentless is its
-            // documented contract (`set_flyout_element`), not an accident — and
-            // missing it leaks the whole flyout subtree per unmount: the nodes
-            // stay in the arena, their visuals stay alive parented to that root,
-            // and `flyout_elements` keeps an entry whose owner no longer exists.
-            if let Some(hdr_id) = self.header_elements.remove(&node) {
-                self.unmount(hdr_id);
-            }
-            if let Some(pane_id) = self.pane_elements.remove(&node) {
-                self.unmount(pane_id);
-            }
-            if let Some(fly_id) = self.flyout_elements.remove(&node) {
-                self.unmount(fly_id);
+            // Every slot subtree this node mounted. `collect_subtree` walks the
+            // child mirror, and slot roots are deliberately not in it (see
+            // [`Slot`]), so they are unreachable from their owner and have to be
+            // torn down from this bookkeeping. Naming no slot is the point: a slot
+            // added later is torn down here without this line being touched.
+            if let Some(roots) = self.slot_roots.remove(&node) {
+                for root in roots.into_iter().flatten() {
+                    self.unmount(root);
+                }
             }
 
             self.selection_callbacks.remove(&node);
@@ -1007,25 +996,35 @@ mod tests {
     use super::*;
     use crate::backend::dcomp::record::{Cmd, RecordingBackend};
 
+    /// `Slot::ALL` must be ordered by `index()`, because the index is a position in
+    /// each node's slot-root array. A mismatch would silently file one slot's root
+    /// under another's — mounting a header and tearing down a flyout.
+    #[test]
+    fn slot_indices_match_their_position_in_all() {
+        for (i, slot) in Slot::ALL.into_iter().enumerate() {
+            assert_eq!(slot.index(), i, "{slot:?} is misfiled in Slot::ALL");
+        }
+        assert_eq!(Slot::ALL.len(), Slot::COUNT);
+    }
+
     /// A slot's subtree must not outlive its owner.
     ///
     /// Flyout content is the case that regressed, and it regressed for a
-    /// structural reason: `set_flyout_element`'s contract is that the subtree sits
-    /// in NO child list, so `collect_subtree` — which walks the child mirror —
-    /// cannot reach it. Teardown has to come from the slot bookkeeping instead, and
-    /// while it didn't, every unmount of a flyout-owning widget leaked the whole
-    /// flyout subtree: nodes left in the arena, visuals left alive under a
-    /// parentless root, for the life of the process.
+    /// structural reason: a slot root sits in NO child list, so `collect_subtree` —
+    /// which walks the child mirror — cannot reach it. Teardown has to come from
+    /// the slot bookkeeping instead, and while the flyout slot was missing from it,
+    /// every unmount of a flyout-owning widget leaked the whole flyout subtree:
+    /// nodes left in the arena, visuals left alive under a parentless root, for the
+    /// life of the process.
     #[test]
     fn unmounting_an_owner_destroys_its_flyout_content() {
         let mut r = Reconciler::new(RecordingBackend::new());
         let el: Element = button("open").flyout_element(body("panel")).into();
 
         let id = r.mount(&el).expect("the owner mounts");
-        let fly = *r
-            .flyout_elements
-            .get(&id)
-            .expect("mounting an owner with rich flyout content tracks that content's root");
+        let fly = r.slot_roots.get(&id).and_then(|roots| roots[Slot::Flyout.index()]).expect(
+            "mounting an owner with rich flyout content records that content's root",
+        );
 
         // Only the teardown commands are of interest.
         let _ = r.backend.take_cmds();
@@ -1037,9 +1036,38 @@ mod tests {
                 .any(|c| matches!(c, Cmd::Destroy { id } if *id == fly)),
             "the flyout content subtree was never destroyed — it leaked"
         );
+    }
+
+    /// The invariant behind the case above, stated without naming a slot: once the
+    /// owner is gone, no slot bookkeeping may survive it.
+    ///
+    /// Deliberately slot-agnostic. A per-slot test only ever covers the slots
+    /// someone remembered to write a test for, which is the same failure mode as
+    /// the per-slot teardown code this replaced; this one covers slots that do not
+    /// exist yet.
+    #[test]
+    fn no_slot_root_outlives_its_owner() {
+        let mut r = Reconciler::new(RecordingBackend::new());
+
+        // One owner per slot kind, so every slot is populated at once.
+        let el: Element = vstack((
+            Element::from(button("open").flyout_element(body("flyout body"))),
+            Element::from(split_view(body("content")).pane(body("pane body"))),
+            Element::from(Expander::new(body("expanded")).header_content(body("header body"))),
+        ))
+        .into();
+
+        let id = r.mount(&el).expect("the tree mounts");
         assert!(
-            !r.flyout_elements.contains_key(&id),
-            "the owner is gone but its slot bookkeeping still names a content root"
+            !r.slot_roots.is_empty(),
+            "no slots were populated — this test would pass vacuously"
+        );
+
+        r.unmount(id);
+        assert!(
+            r.slot_roots.is_empty(),
+            "slot roots outlived their owners: {:?}",
+            r.slot_roots
         );
     }
 }

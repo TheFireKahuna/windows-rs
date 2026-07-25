@@ -14,25 +14,15 @@ impl<B: Backend + 'static> Reconciler<B> {
         self.apply_modifiers(id, w.modifiers());
         self.apply_attached(id, w.attached());
         self.mount_widget_children(id, w.children());
-        if let Some(hdr) = w.header_element()
-            && let Some(hdr_id) = self.mount(hdr)
-        {
-            self.backend.set_header_element(id, Some(hdr_id));
-            self.header_elements.insert(id, hdr_id);
-        }
-        if let Some(pane) = w.pane_element()
-            && let Some(pane_id) = self.mount(pane)
-        {
-            self.backend.set_pane_element(id, Some(pane_id));
-            self.pane_elements.insert(id, pane_id);
-        }
-        // Mounted, never appended: a flyout's content belongs to a popup, so
-        // its subtree is a parentless root the backend lays out separately.
-        if let Some(fly) = w.flyout_element()
-            && let Some(fly_id) = self.mount(fly)
-        {
-            self.backend.set_flyout_element(id, Some(fly_id));
-            self.flyout_elements.insert(id, fly_id);
+        // Mounted, never appended: a slot's subtree is a parentless root the
+        // backend places itself (a popup, a pane region), so it takes no part in
+        // this node's layout and appears in no child list.
+        for slot in Slot::ALL {
+            if let Some(el) = w.slot_element(slot)
+                && let Some(root) = self.mount(el)
+            {
+                self.attach_slot(id, slot, Some(root));
+            }
         }
         if let Some(cb) = w.on_mounted_callback() {
             let native = self.backend.get_native_element(id);
@@ -49,9 +39,9 @@ impl<B: Backend + 'static> Reconciler<B> {
         self.diff_modifiers(id, old.modifiers(), new.modifiers());
         self.diff_attached(id, old.attached(), new.attached());
         self.update_widget_children(id, old.children(), new.children());
-        self.update_header_element(id, old.header_element(), new.header_element());
-        self.update_pane_element(id, old.pane_element(), new.pane_element());
-        self.update_flyout_element(id, old.flyout_element(), new.flyout_element());
+        for slot in Slot::ALL {
+            self.update_slot(id, slot, old.slot_element(slot), new.slot_element(slot));
+        }
         if let Some(cb) = new.on_unmounted_callback() {
             self.unmount_callbacks.insert(id, cb.clone());
         } else {
@@ -113,147 +103,103 @@ impl<B: Backend + 'static> Reconciler<B> {
         }
     }
 
-    fn update_header_element(
+    /// One slot, reconciled: mounted, updated in place, or torn down.
+    ///
+    /// In place whenever the element kind matches, so a slot that is showing while
+    /// its owner re-renders — an open flyout, most visibly — keeps its focus and
+    /// its state instead of being rebuilt underneath the user.
+    ///
+    /// Generic over [`Slot`] on purpose. This logic was previously written out once
+    /// per slot kind, and the copies drifted: the flyout one was missing from
+    /// teardown entirely, which leaked a whole subtree per unmount. One
+    /// implementation cannot drift from itself.
+    fn update_slot(
         &mut self,
         id: ControlId,
+        slot: Slot,
         old: Option<&Element>,
         new: Option<&Element>,
     ) {
         match (old, new) {
             (None, None) => {}
-            (None, Some(hdr)) => {
-                if let Some(hdr_id) = self.mount(hdr) {
-                    self.backend.set_header_element(id, Some(hdr_id));
-                    self.header_elements.insert(id, hdr_id);
+            (None, Some(el)) => {
+                if let Some(root) = self.mount(el) {
+                    self.attach_slot(id, slot, Some(root));
                 }
             }
             (Some(_), None) => {
-                if let Some(hdr_id) = self.header_elements.remove(&id) {
-                    self.backend
-                        .set_header_element(id, Option::<ControlId>::None);
-                    self.unmount(hdr_id);
+                if let Some(root) = self.slot_root(id, slot) {
+                    self.attach_slot(id, slot, None);
+                    self.unmount(root);
                 }
             }
             (Some(old_el), Some(new_el)) => {
-                // Reconcile in-place when possible to preserve focus/state.
-                if let Some(hdr_id) = self.header_elements.get(&id).copied() {
+                if let Some(root) = self.slot_root(id, slot) {
                     if old_el.kind_matches(new_el) {
-                        let new_id = self.update(old_el, new_el, hdr_id);
-                        match new_id {
-                            Some(nid) if nid != hdr_id => {
-                                self.backend.set_header_element(id, Some(nid));
-                                self.header_elements.insert(id, nid);
+                        match self.update(old_el, new_el, root) {
+                            // A replacement control: the backend must be pointed at
+                            // the new root before the old id goes stale.
+                            Some(new_root) if new_root != root => {
+                                self.attach_slot(id, slot, Some(new_root));
                             }
-                            None => {
-                                self.backend
-                                    .set_header_element(id, Option::<ControlId>::None);
-                                self.header_elements.remove(&id);
-                            }
+                            None => self.attach_slot(id, slot, None),
                             _ => {}
                         }
                         return;
                     }
-                    self.header_elements.remove(&id);
-                    self.unmount(hdr_id);
+                    // Kind changed: the control cannot be reused. Drop the
+                    // bookkeeping before unmounting so the teardown walk does not
+                    // see a root that is already being destroyed, then mount fresh.
+                    self.put_slot_root(id, slot, None);
+                    self.unmount(root);
                 }
-                if let Some(hdr_id) = self.mount(new_el) {
-                    self.backend.set_header_element(id, Some(hdr_id));
-                    self.header_elements.insert(id, hdr_id);
+                if let Some(root) = self.mount(new_el) {
+                    self.attach_slot(id, slot, Some(root));
                 }
             }
         }
     }
 
-    fn update_pane_element(&mut self, id: ControlId, old: Option<&Element>, new: Option<&Element>) {
-        match (old, new) {
-            (None, None) => {}
-            (None, Some(pane)) => {
-                if let Some(pane_id) = self.mount(pane) {
-                    self.backend.set_pane_element(id, Some(pane_id));
-                    self.pane_elements.insert(id, pane_id);
-                }
+    /// The root currently mounted in `slot`, if any.
+    fn slot_root(&self, id: ControlId, slot: Slot) -> Option<ControlId> {
+        self.slot_roots.get(&id).and_then(|roots| roots[slot.index()])
+    }
+
+    /// Record (or clear) `slot`'s root without telling the backend — the teardown
+    /// paths that destroy a root themselves want exactly this half.
+    fn put_slot_root(&mut self, id: ControlId, slot: Slot, root: Option<ControlId>) {
+        match root {
+            Some(root) => {
+                self.slot_roots.entry(id).or_default()[slot.index()] = Some(root);
             }
-            (Some(_), None) => {
-                if let Some(pane_id) = self.pane_elements.remove(&id) {
-                    self.backend.set_pane_element(id, Option::<ControlId>::None);
-                    self.unmount(pane_id);
-                }
-            }
-            (Some(old_el), Some(new_el)) => {
-                // Reconcile in-place when possible to preserve focus/state.
-                if let Some(pane_id) = self.pane_elements.get(&id).copied() {
-                    if old_el.kind_matches(new_el) {
-                        let new_id = self.update(old_el, new_el, pane_id);
-                        match new_id {
-                            Some(nid) if nid != pane_id => {
-                                self.backend.set_pane_element(id, Some(nid));
-                                self.pane_elements.insert(id, nid);
-                            }
-                            None => {
-                                self.backend.set_pane_element(id, Option::<ControlId>::None);
-                                self.pane_elements.remove(&id);
-                            }
-                            _ => {}
-                        }
-                        return;
+            None => {
+                if let Some(roots) = self.slot_roots.get_mut(&id) {
+                    roots[slot.index()] = None;
+                    // Don't keep an all-empty array alive: `slot_roots` is what
+                    // teardown iterates, and an empty entry per node that ever had
+                    // a slot is pure overhead.
+                    if roots.iter().all(Option::is_none) {
+                        self.slot_roots.remove(&id);
                     }
-                    self.pane_elements.remove(&id);
-                    self.unmount(pane_id);
-                }
-                if let Some(pane_id) = self.mount(new_el) {
-                    self.backend.set_pane_element(id, Some(pane_id));
-                    self.pane_elements.insert(id, pane_id);
                 }
             }
         }
     }
 
-    /// The flyout-content slot, reconciled exactly as the header and pane
-    /// slots are — in place when the element kind matches, so a flyout that
-    /// is open while its owner re-renders keeps its focus and its state.
-    fn update_flyout_element(&mut self, id: ControlId, old: Option<&Element>, new: Option<&Element>) {
-        match (old, new) {
-            (None, None) => {}
-            (None, Some(fly)) => {
-                if let Some(fly_id) = self.mount(fly) {
-                    self.backend.set_flyout_element(id, Some(fly_id));
-                    self.flyout_elements.insert(id, fly_id);
-                }
-            }
-            (Some(_), None) => {
-                if let Some(fly_id) = self.flyout_elements.remove(&id) {
-                    self.backend.set_flyout_element(id, Option::<ControlId>::None);
-                    self.unmount(fly_id);
-                }
-            }
-            (Some(old_el), Some(new_el)) => {
-                // Reconcile in-place when possible to preserve focus/state.
-                if let Some(fly_id) = self.flyout_elements.get(&id).copied() {
-                    if old_el.kind_matches(new_el) {
-                        let new_id = self.update(old_el, new_el, fly_id);
-                        match new_id {
-                            Some(nid) if nid != fly_id => {
-                                self.backend.set_flyout_element(id, Some(nid));
-                                self.flyout_elements.insert(id, nid);
-                            }
-                            None => {
-                                self.backend.set_flyout_element(id, Option::<ControlId>::None);
-                                self.flyout_elements.remove(&id);
-                            }
-                            _ => {}
-                        }
-                        return;
-                    }
-                    self.flyout_elements.remove(&id);
-                    self.unmount(fly_id);
-                }
-                if let Some(fly_id) = self.mount(new_el) {
-                    self.backend.set_flyout_element(id, Some(fly_id));
-                    self.flyout_elements.insert(id, fly_id);
-                }
-            }
+    /// Point the backend at `slot`'s root and record it — the two halves that must
+    /// not disagree, so they are never written apart.
+    ///
+    /// The match is the second compile-time gate on adding a [`Slot`]: a new
+    /// variant fails to compile here until it has a backend setter.
+    fn attach_slot(&mut self, id: ControlId, slot: Slot, root: Option<ControlId>) {
+        match slot {
+            Slot::Header => self.backend.set_header_element(id, root),
+            Slot::Pane => self.backend.set_pane_element(id, root),
+            Slot::Flyout => self.backend.set_flyout_element(id, root),
         }
+        self.put_slot_root(id, slot, root);
     }
+
 
     fn mount_tab_item(&mut self, parent: ControlId, tab: &TabItem) {
         let tab_id = self.acquire_control(ControlKind::TabViewItem);
