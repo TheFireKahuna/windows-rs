@@ -478,12 +478,115 @@ pub(crate) fn size_mask(
     h: f32,
     scale: f32,
 ) {
-    let phys = Vector2::new(w * scale, h * scale);
-    mask_shape.set_size(phys.x, phys.y);
-    visual_surface.set_source_size(phys);
+    size_mask_cropped(mask_shape, visual_surface, shapes, w, h, GlowCrop::full(w, h), scale);
+}
+
+/// [`size_mask`], capturing only `crop` of the mask rather than all of it.
+///
+/// The shape still spans the whole node: its geometry is in node-local
+/// coordinates, so moving that origin would move the curve. What narrows is the
+/// CAPTURE — `SourceOffset` and `SourceSize` select a sub-rect of the source
+/// visual, which is a crop and not a scale, provided the display sprite is given
+/// the same sub-rect. A caller that crops here MUST offset its display sprite by
+/// `crop`'s origin, or the layer draws in the right size at the wrong place.
+pub(crate) fn size_mask_cropped(
+    mask_shape: &ShapeVisual,
+    visual_surface: &CompositionVisualSurface,
+    shapes: &[&CompositionSpriteShape],
+    w: f32,
+    h: f32,
+    crop: GlowCrop,
+    scale: f32,
+) {
+    mask_shape.set_size(w * scale, h * scale);
+    visual_surface.set_source_offset(Vector2::new(crop.x * scale, crop.y * scale));
+    visual_surface.set_source_size(Vector2::new(crop.w * scale, crop.h * scale));
     for shape in shapes {
         shape.set_scale(Vector2::new(scale, scale));
     }
+}
+
+/// The part of a node a glow's capture actually needs, in node-local DIPs.
+///
+/// A mask layer captures its node's whole rect because the geometry inside it is
+/// node-local and the capture has to be in that same space. For a STROKE that
+/// rect is nearly all empty — a curve is a measure-zero subset of the box it is
+/// drawn in, and a node pinned to its canvas makes that box the entire plot.
+///
+/// The glow is the layer with the most to gain: it is the only one DWM runs a
+/// BLUR over, and it carries two captures rather than one.
+///
+/// How much that is worth depends entirely on the curve, and for a response
+/// curve it is not much. A 2 DIP stroke is thin, but its BOUNDING BOX is not —
+/// an EQ response sweeps most of the dB range it is plotted against, so the
+/// analyzer's hero curve measured at 84.9% of its 1974x283 node, and the band
+/// tiles at 82.1%. A rectangle cannot exploit a thin diagonal.
+///
+/// So this exists for the cases where the ink genuinely is small against its
+/// box — a flat 0 dB line in a full-height plot is the extreme — and it is NOT
+/// a lever on the analyzer's halo cost. That cost was measured at ~215 ms of a
+/// ~1950 ms draw pass and is sub-linear in area (roughly 50x a spectrum bar's
+/// cost for 143x its pixels), i.e. it is what compositing a large translucent
+/// sprite over a busy region costs, not an oversized capture.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct GlowCrop {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+}
+
+impl GlowCrop {
+    /// The whole node — what every mask layer captures, and still the right
+    /// answer wherever the ink's extent is unknown or the colour source is
+    /// mapped against the node rather than against the ink.
+    pub(crate) fn full(w: f32, h: f32) -> Self {
+        Self { x: 0.0, y: 0.0, w, h }
+    }
+}
+
+/// How far past the stroke a halo still puts ink, as a multiple of the authored
+/// blur. `DropShadow.BlurRadius` is 2σ — the CSS convention this backend passes
+/// through untouched, see [`GlowLayer::sync`] — and a Gaussian is spent by 3σ,
+/// so one and a half times the authored blur covers the whole falloff instead of
+/// clipping its tail.
+const GLOW_FALLOFF: f32 = 1.5;
+
+/// Physical-pixel granularity the capture box is rounded out to. An edit moves
+/// the ink by a pixel or two constantly, and without a quantum each of those
+/// would resize three surfaces to save a few hundred pixels of capture.
+const CROP_QUANTUM: f32 = 32.0;
+
+/// The box a glow's capture needs, derived from the points it will blur.
+///
+/// Control points of a cubic sit outside the curve they describe, so the span of
+/// the raw point list is a conservative superset of the ink. That is the safe
+/// direction to be wrong in: too large costs a margin of empty capture, too
+/// small clips the halo. Anything degenerate — no points, a non-finite
+/// coordinate, an empty box — falls back to the whole node.
+fn glow_crop(points: &[f32], thickness: f32, blur: f32, w: f32, h: f32, scale: f32) -> GlowCrop {
+    let full = GlowCrop::full(w, h);
+    let mut pts = points.chunks_exact(2);
+    let Some(first) = pts.next() else { return full };
+    let (mut l, mut t) = (first[0], first[1]);
+    let (mut r, mut b) = (first[0], first[1]);
+    for p in pts {
+        l = l.min(p[0]);
+        r = r.max(p[0]);
+        t = t.min(p[1]);
+        b = b.max(p[1]);
+    }
+    let margin = thickness * 0.5 + blur * GLOW_FALLOFF;
+    // Quantise in DIPs so the rounding still lands on whole physical pixels.
+    let q = CROP_QUANTUM / scale.max(f32::MIN_POSITIVE);
+    let l = (((l - margin) / q).floor() * q).max(0.0);
+    let t = (((t - margin) / q).floor() * q).max(0.0);
+    let r = (((r + margin) / q).ceil() * q).min(w);
+    let b = (((b + margin) / q).ceil() * q).min(h);
+    if !(l.is_finite() && t.is_finite() && r.is_finite() && b.is_finite()) || r <= l || b <= t {
+        return full;
+    }
+    GlowCrop { x: l, y: t, w: r - l, h: b - t }
 }
 
 /// What a [`PathLayer`] draws its outline from.
@@ -1172,7 +1275,7 @@ struct GlowLayer {
     stops_seen: Vec<(f64, Color)>,
     grad_axis_seen: Option<GradientAxis>,
     grad_epoch: u32,
-    size: Option<(f32, f32, f32)>,
+    size: Option<(f32, f32, GlowCrop, f32)>,
     thickness: Option<f32>,
     blur: Option<u32>,
 }
@@ -1257,26 +1360,45 @@ impl GlowLayer {
     /// DIP→px scale (they are only visual-surface sources), so — exactly as in
     /// [`PathLayer::resize`] — the scale rides the SHAPE, whose transform is
     /// content and therefore survives capture, while the extents are physical.
-    fn resize(&mut self, w: f32, h: f32, scale: f32) {
-        if self.size == Some((w, h, scale)) {
+    ///
+    /// `crop` narrows every stage to the part of the node the halo can reach.
+    /// The shape keeps the full node extent so the geometry inside it is
+    /// undisturbed; the two captures and the display sprite move and shrink
+    /// together, which is a translation of where the pixels are read from and
+    /// not a scale of what they contain.
+    fn resize(&mut self, w: f32, h: f32, crop: GlowCrop, scale: f32) {
+        if self.size == Some((w, h, crop, scale)) {
             return;
         }
-        let phys = Vector2::new(w * scale, h * scale);
-        size_mask(&self.stroke_shape, &self.stroke_surface, &[&self.shape], w, h, scale);
+        let phys = Vector2::new(crop.w * scale, crop.h * scale);
+        size_mask_cropped(
+            &self.stroke_shape,
+            &self.stroke_surface,
+            &[&self.shape],
+            w,
+            h,
+            crop,
+            scale,
+        );
         // The halo stage already works in physical pixels (it captures the
-        // stroke surface), so it takes the extent but no scale of its own.
+        // stroke surface), so it takes the extent but no scale of its own. Its
+        // own capture starts at zero: the crop was already applied upstream, and
+        // applying it twice would offset the halo from the stroke it blurs.
         self.halo_sprite.set_size(phys.x, phys.y);
         self.halo_surface.set_source_size(phys);
         // In DIPs, and explicitly sized for the same reason as
         // [`PathLayer::resize`]: it is paired with a capture that cannot be.
-        self.display.set_size(w, h);
+        // The offset is what keeps a cropped capture landing where an uncropped
+        // one did.
+        self.display.set_size(crop.w, crop.h);
+        self.display.set_offset(crop.x, crop.y, 0.0);
         // A multi-hue ramp source is a real visual tree measured against this
         // extent; a single-hue one is `MappingMode::Relative` and ignores it.
         // Either way nothing re-rasterizes here.
         if let Some(r) = self.ramp.as_ref() {
             r.resize(w, h, scale);
         }
-        self.size = Some((w, h, scale));
+        self.size = Some((w, h, crop, scale));
     }
 
     /// Sync the halo's inputs. Each is gated separately, so a drag that only
@@ -1299,9 +1421,18 @@ impl GlowLayer {
         atlas_epoch: u32,
         w: f32,
         h: f32,
+        crop: GlowCrop,
         scale: f32,
     ) {
-        self.resize(w, h, scale);
+        // A ramped glow keeps the whole node. Its colour source is mapped
+        // against the extent it is painted on — a single-hue ramp is
+        // `MappingMode::Relative` end to end and has no extent of its own — so
+        // shrinking the display sprite would slide the gradient along the curve
+        // rather than merely capture less of it. Decided from the stops rather
+        // than from `self.ramp`, which is not bound until further down on the
+        // sync that first builds it.
+        let crop = if stops.is_empty() { crop } else { GlowCrop::full(w, h) };
+        self.resize(w, h, crop, scale);
         if geometry_changed
             && let Some(p) = path
         {
@@ -1754,6 +1885,10 @@ fn sync_parts(
             parts.glow = GlowLayer::new(comp, node, p);
         }
         if let Some(g) = parts.glow.as_mut() {
+            // From the same point list the halo is tessellated from, which is
+            // already dereferenced here — an O(points) span, and the layer's own
+            // gate makes it a no-op whenever the box quantises to what it holds.
+            let crop = glow_crop(geometry.data().points(), stroke_w, blur, w, h, scale);
             g.sync(
                 comp,
                 hollow.as_ref(),
@@ -1766,6 +1901,7 @@ fn sync_parts(
                 atlas_epoch,
                 w,
                 h,
+                crop,
                 scale,
             );
         }
