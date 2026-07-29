@@ -1,36 +1,188 @@
 --out crates/libs/window/src/bindings.rs
 --flat --minimal --dead-code
 
+// `default` is the metadata bundled with windows-bindgen; the second input carries
+// the Win32 entry point that mints a dispatcher queue, which that corpus lacks. See
+// `metadata/dispatcherqueue.rdl`.
+--in default target/authored.winmd
+
 --filter
     RECT
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-    SetProcessDpiAwarenessContext
+    POINT
+    SIZE
     CreateWindowExW
+    DestroyWindow
+    DefWindowProcW
+    RegisterClassW
+    RegisterClassExW
+    UnregisterClassW
+    WNDCLASSW
+    WNDCLASSEXW
     CS_HREDRAW
     CS_VREDRAW
     CW_USEDEFAULT
-    DefWindowProcW
-    DestroyWindow
-    DispatchMessageW
-    GetClientRect
-    GetMessageW
-    GetWindowLongPtrW
-    GWLP_USERDATA
-    IDC_ARROW
+    GetModuleHandleW
     IsWindow
+    IsZoomed
+    ShowWindow
+    UpdateWindow
+    SW_SHOWNORMAL
+    SW_SHOW
+    SW_SHOWNOACTIVATE
+    WS_OVERLAPPEDWINDOW
+// A window with no redirection surface. Its content is whatever the compositor is
+// given, which is the point: nothing is drawn into a bitmap the window owns.
+    WS_EX_NOREDIRECTIONBITMAP
+    GetClientRect
+    GetWindowRect
+    ClientToScreen
+    ScreenToClient
+    SetWindowPos
+    SWP_NOSIZE
+    SWP_NOZORDER
+    SWP_NOACTIVATE
+    SWP_FRAMECHANGED
+    GetWindowLongPtrW
+    SetWindowLongPtrW
+    GWLP_USERDATA
     LoadCursorW
+    SetCursor
+    IDC_ARROW
+    BeginPaint
+    EndPaint
+    ValidateRect
+
+// ── The message pump ──────────────────────────────────────────────────────────
     MSG
+    GetMessageW
     PeekMessageW
     PM_REMOVE
-    PostQuitMessage
-    RegisterClassW
-    SetWindowLongPtrW
-    ShowWindow
-    SW_SHOWNORMAL
     TranslateMessage
+    DispatchMessageW
+    PostMessageW
+    SendMessageW
+    PostQuitMessage
     WM_DESTROY
     WM_NCDESTROY
     WM_QUIT
     WM_SIZE
-    WNDCLASSW
-    WS_OVERLAPPEDWINDOW
+    WM_WINDOWPOSCHANGED
+    WM_ERASEBKGND
+    WM_DISPLAYCHANGE
+    WM_SETTINGCHANGE
+    WM_SETCURSOR
+    WM_APP
+    SIZE_MAXIMIZED
+    SIZE_MINIMIZED
+
+// ── DPI ───────────────────────────────────────────────────────────────────────
+// Per-monitor v2, so the frame scales with the window rather than with the process,
+// and metrics are asked for at a DPI rather than read from a process-wide cache.
+    SetProcessDpiAwarenessContext
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    GetDpiForWindow
+    GetSystemMetricsForDpi
+    SM_CYFRAME
+    SM_CXPADDEDBORDER
+    WM_DPICHANGED
+
+// ── Monitors ──────────────────────────────────────────────────────────────────
+    MonitorFromWindow
+    MonitorFromPoint
+    GetMonitorInfoW
+    MONITORINFO
+    MONITORINFOEXW
+    MONITOR_DEFAULTTONEAREST
+
+// ── The custom caption ────────────────────────────────────────────────────────
+// A caption the app draws is a hit test, not a chrome: `WM_NCCALCSIZE` removes the
+// system frame, `WM_NCHITTEST` answers the eight resize zones and the caption band,
+// and `HTMAXBUTTON` is what makes Snap Layouts open. Both `WM_NCCALCSIZE` forms have
+// to be handled — creation sends the `wParam == FALSE` one, whose lParam is a bare
+// `RECT` — and the frame only takes effect after an explicit `SWP_FRAMECHANGED`.
+    WM_NCCALCSIZE
+    NCCALCSIZE_PARAMS
+    WM_NCHITTEST
+    WM_GETMINMAXINFO
+    MINMAXINFO
+    WM_SYSCOMMAND
+    WM_NCLBUTTONDOWN
+    WM_NCLBUTTONUP
+    WM_NCMOUSEMOVE
+    WM_NCMOUSELEAVE
+    HTCLIENT
+    HTCAPTION
+    HTTOP
+    HTCLOSE
+    HTMAXBUTTON
+    HTMINBUTTON
+    SC_CLOSE
+    SC_MAXIMIZE
+    SC_MINIMIZE
+    SC_RESTORE
+    GetSystemMenu
+    TrackPopupMenu
+    TPM_RETURNCMD
+    TPM_RIGHTBUTTON
+// Rounded corners and the frame colour are DWM's, not ours, even when the caption is
+// drawn by the app; `DWMWA_COLOR_NONE` is how the one-pixel border is removed rather
+// than painted over.
+    DwmSetWindowAttribute
+    DWMWINDOWATTRIBUTE
+    DWM_WINDOW_CORNER_PREFERENCE
+    DWMWA_COLOR_NONE
+
+// ── Pointer opt-ins ───────────────────────────────────────────────────────────
+// The window declares what it wants delivered; reading what arrives belongs to
+// `windows-ui`. `EnableMouseInPointer` does not suppress the legacy message stream —
+// `DefWindowProc` generates it from the pointer message — so a window that opts in
+// must handle the pointer messages and return 0.
+    EnableMouseInPointer
+    SetWindowFeedbackSetting
+    FEEDBACK_TYPE
+
+// ── Quality of service ────────────────────────────────────────────────────────
+// A window that is not visible should not keep its threads out of efficiency states,
+// and one that is presenting must not be throttled into missing vblanks.
+    SetThreadInformation
+    THREAD_POWER_THROTTLING_STATE
+    SetProcessInformation
+    PROCESS_POWER_THROTTLING_STATE
+
+// ── Display colour capability ─────────────────────────────────────────────────
+// Whether the display is SDR, wide-gamut or HDR, and at what luminance, is a property
+// of the window's monitor — so it belongs to the window rather than to the renderer.
+// A desktop app has no CoreWindow, so `DisplayInformation` is reached through its
+// interop factory; `AdvancedColorInfoChanged` is the single signal that covers an HDR
+// toggle, an SDR-white-level change and a monitor hop alike.
+    Windows.Graphics.Display.DisplayInformation
+    Windows.Graphics.Display.AdvancedColorInfo
+    Windows.Graphics.Display.AdvancedColorKind
+    IDisplayInformationStaticsInterop
+
+// ── The dispatcher queue ──────────────────────────────────────────────────────
+// A system `Compositor` cannot be created on a thread that has no dispatcher queue,
+// so the window's thread mints one before it has any composition at all.
+    CreateDispatcherQueueController
+    DispatcherQueueOptions
+    DISPATCHERQUEUE_THREAD_TYPE
+    DISPATCHERQUEUE_THREAD_APARTMENTTYPE
+    Windows.System.DispatcherQueue
+    Windows.System.DispatcherQueueController
+    Windows.System.DispatcherQueueHandler
+
+// ── User interface preferences ────────────────────────────────────────────────
+// Settings → Accessibility → Visual effects. Animations and transparency are the
+// user's choice, and a framework that ignores them is not accessible.
+    Windows.UI.ViewManagement.UISettings
+
+// ── Waitable primitives ───────────────────────────────────────────────────────
+    CreateEventW
+    SetEvent
+    CloseHandle
+    WaitForMultipleObjects
+    WAIT_OBJECT_0
+    WAIT_FAILED
+    CreateWaitableTimerExW
+    SetWaitableTimerEx
+    TIMER_ALL_ACCESS
