@@ -18,6 +18,9 @@ reactor = []
 windows-core = { workspace = true }
 windows-collections = { workspace = true }
 windows-numerics = { workspace = true }
+# An interaction tracker's inertia modifiers take `IReference<T>` values, and that
+# type is only exported under the crate's `std` feature.
+windows-reference = { workspace = true, features = ["std"] }
 windows-time = { workspace = true }
 
 [dependencies.windows-window]

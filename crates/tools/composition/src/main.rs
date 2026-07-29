@@ -6,12 +6,18 @@ const FILTER: &str = "crates/tools/composition/src/composition.txt";
 fn main() {
     let time = std::time::Instant::now();
 
+    // The Direct2D geometry bridge is not in the vendored Win32 corpus; it is compiled
+    // from `metadata/windowsgraphicsinterop.rdl` alongside the rest of the authored
+    // metadata. See `helpers::AUTHORED_METADATA`.
+    let authored = helpers::compile_authored_metadata();
+
     // System stack: Windows.UI.Composition lives in Windows.winmd; Windows.Win32.winmd
     // supplies ICompositorDesktopInterop and the HWND/BOOL types used to host a visual
     // tree in a plain window. Flat + minimal keeps the crate's own surface small and
     // namespace-free (see docs/crates/windows-composition.md).
     builder()
         .input_default()
+        .input(authored)
         .output("crates/libs/composition/src/bindings.rs")
         .minimal()
         .dead_code()

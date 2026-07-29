@@ -11,6 +11,11 @@ compile_error!(
     "the `system` and `reactor` composition stacks are mutually exclusive; enable only one"
 );
 
+// `dead_code` is expected rather than allowed, and is temporary: the filter now
+// carries the interactions, springs, clips, paths, gradients and shadows this crate's
+// wrapper has yet to grow, and `--dead-code` exists precisely to report bindings
+// nothing uses. When the wrapper consumes them, `expect` starts warning on its own —
+// which is the signal to delete this line and let the lint prune whatever is left.
 #[cfg(feature = "system")]
 #[allow(
     non_snake_case,
@@ -18,6 +23,7 @@ compile_error!(
     non_camel_case_types,
     clippy::upper_case_acronyms
 )]
+#[expect(dead_code)]
 #[path = "bindings.rs"]
 mod bindings;
 #[cfg(feature = "reactor")]
@@ -27,6 +33,7 @@ mod bindings;
     non_camel_case_types,
     clippy::upper_case_acronyms
 )]
+#[expect(dead_code)]
 #[path = "bindings_lifted.rs"]
 mod bindings;
 

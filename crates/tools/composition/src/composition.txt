@@ -45,6 +45,11 @@ Windows.Win32.DispatcherQueueOptions
 Windows.UI.Composition.Visual
 Windows.UI.Composition.IVisual::{put_Offset, get_Offset, put_Size, get_Size, put_Opacity, get_Opacity, put_IsVisible, get_IsVisible, put_AnchorPoint, put_CenterPoint, put_Scale, get_Scale, put_BorderMode, get_Parent}
 Windows.UI.Composition.IVisual2::{put_RelativeSizeAdjustment, put_RelativeOffsetAdjustment, put_ParentForTransform}
+// Round this visual's composed position to whole device pixels. It governs where the
+// visual LANDS, not what its animated Offset holds, so an animation driving that
+// Offset still produces a fresh value every frame — snapping is a placement rule, not
+// a rate limit, and pairs with rather than replaces a step-eased animation.
+Windows.UI.Composition.IVisual4::{put_IsPixelSnappingEnabled}
 Windows.UI.Composition.CompositionBorderMode
 
 Windows.UI.Composition.ContainerVisual
@@ -99,6 +104,19 @@ Windows.UI.Composition.CompositionEasingFunction
 Windows.UI.Composition.LinearEasingFunction
 Windows.UI.Composition.CubicBezierEasingFunction
 
+// A step easing HOLDS its value across a step and jumps, rather than producing a
+// fresh value every vblank. That is a rendering choice for a curve that has to land
+// on discrete positions, but it is also the only lever a key-frame animation has over
+// how OFTEN it writes: a continuously-eased animation on a visual's Offset rewrites
+// that Offset every frame, and the compositor invalidates the visual's whole bounds
+// each time — old bounds and new — however small the delta. For a large, slow-moving
+// sprite the delta can be a fraction of a pixel while the invalidation is a large
+// fraction of the window, so the cost is set by the write RATE and not by the
+// distance travelled. Stepping decouples the two: the path and its duration are
+// unchanged, only the number of distinct positions along it is chosen.
+Windows.UI.Composition.StepEasingFunction
+Windows.UI.Composition.ICompositor2::{CreateStepEasingFunctionWithStepCount}
+
 // Implicit animations: a target-name → animation map applied to a visual so
 // property changes animate automatically. The `IMap` projection it exposes is
 // referenced from windows-collections rather than re-generated here.
@@ -133,8 +151,248 @@ Windows.UI.Composition.CompositionDrawingSurface
 Windows.UI.Composition.ICompositionSurface
 Windows.Graphics.DirectX.DirectXPixelFormat
 Windows.Graphics.DirectX.DirectXAlphaMode
-Windows.Win32.ICompositorInterop::{CreateGraphicsDevice}
+// `CreateCompositionSurfaceForHandle` turns a composition surface HANDLE — the kind
+// `DCompositionCreateSurfaceHandle` mints and a presentation manager presents into —
+// into content a surface brush can paint with. It is the seam that lets
+// app-presented buffers appear in this visual tree without the compositor owning the
+// allocation.
+Windows.Win32.ICompositorInterop::{CreateGraphicsDevice, CreateCompositionSurfaceForHandle}
 Windows.Win32.ICompositionDrawingSurfaceInterop::{BeginDraw, EndDraw, Resize}
+// Integer-pixel drawing surfaces. A surface sized in DIPs cannot be made exactly N
+// pixels wide, which is what a content-addressed raster cache needs.
+Windows.UI.Composition.ICompositionGraphicsDevice2::{CreateDrawingSurface2}
+Windows.Graphics.SizeInt32
+// How a surface brush maps its surface onto the visual it paints. The default is
+// Uniform; content-addressed atlases and gradient ramps need Fill.
+Windows.UI.Composition.CompositionStretch
+Windows.UI.Composition.ICompositionSurfaceBrush::{put_Stretch}
+// Sparsely-allocated surfaces, and the brush transform that addresses one tile of
+// one. A raster cache that mints a surface per entry pays a composition object, a
+// texture allocation and the engine's per-surface bookkeeping for every glyph it has
+// ever drawn; a virtual surface holds them all in one object and materializes storage
+// only for the regions actually drawn into. Selecting a tile is a brush transform:
+// `Stretch::None` with both alignment ratios at zero anchors the surface's top-left
+// to the sprite's, and the documented order — stretch and align first, then the
+// custom transform, evaluated in the SPRITE's coordinate space — makes `Scale` the
+// pixel-to-DIP factor and `Offset` the negated tile origin.
+Windows.UI.Composition.CompositionVirtualDrawingSurface
+Windows.UI.Composition.ICompositionGraphicsDevice2::{CreateVirtualDrawingSurface}
+Windows.UI.Composition.ICompositionSurfaceBrush::{put_HorizontalAlignmentRatio, put_VerticalAlignmentRatio}
+Windows.UI.Composition.ICompositionSurfaceBrush2::{put_Offset, put_Scale}
+// No `Trim` here: `ICompositionVirtualDrawingSurfaceInterop` is absent from this
+// repo's Win32 metadata, and the allocator has no use for partial reclaim anyway — it
+// never re-lets a region a sprite may still be bound to, so the only reclaim it
+// performs is dropping a whole page, which releases its tiles with it.
+// endregion
+
+// The base every composition object derives from. StopAnimation belongs here
+// alongside StartAnimation, and the base type is what an expression animation takes
+// as a reference parameter — so a property set, a clip or an interaction tracker can
+// be referenced, not only a visual.
+Windows.UI.Composition.ICompositionObject::{StopAnimation}
+Windows.UI.Composition.ICompositionObject4::{TryGetAnimationController}
+Windows.UI.Composition.AnimationController
+
+// Property sets: the CPU-to-compositor frontier. The app writes named values when
+// they change; an expression animation referencing the set re-reads them every vblank
+// without waking the writing thread.
+Windows.UI.Composition.CompositionPropertySet
+Windows.UI.Composition.ICompositionPropertySet::{InsertScalar, InsertVector2, InsertVector3, TryGetScalar, TryGetVector2, TryGetVector3}
+Windows.UI.Composition.CompositionGetValueStatus
+Windows.UI.Composition.ICompositor::{CreatePropertySet}
+
+// Expression animations: a compositor-evaluated expression over referenced objects,
+// re-evaluated every frame. Unlike a key-frame animation, its text is validated only
+// when the animation starts.
+Windows.UI.Composition.ExpressionAnimation
+Windows.UI.Composition.IExpressionAnimation::{put_Expression}
+Windows.UI.Composition.ICompositionAnimation::{SetReferenceParameter, SetScalarParameter, SetVector2Parameter, SetVector3Parameter}
+Windows.UI.Composition.ICompositor::{CreateExpressionAnimationWithExpression}
+
+// Vector2 key frames complete the scalar/Vector2/Vector3 set, so a size or a two-axis
+// offset can be animated without decomposing it.
+Windows.UI.Composition.Vector2KeyFrameAnimation
+Windows.UI.Composition.IVector2KeyFrameAnimation::{InsertKeyFrame, InsertKeyFrameWithEasingFunction}
+Windows.UI.Composition.ICompositor::{CreateVector2KeyFrameAnimation}
+Windows.UI.Composition.IScalarKeyFrameAnimation::{InsertKeyFrame}
+
+// Natural-motion (spring) animations. A spring retargets mid-flight by having its
+// final value reassigned, which is what lets a gesture redirect without the
+// discontinuity a restarted key-frame animation would show.
+Windows.UI.Composition.NaturalMotionAnimation
+Windows.UI.Composition.ScalarNaturalMotionAnimation
+Windows.UI.Composition.Vector2NaturalMotionAnimation
+Windows.UI.Composition.Vector3NaturalMotionAnimation
+Windows.UI.Composition.SpringScalarNaturalMotionAnimation
+Windows.UI.Composition.SpringVector2NaturalMotionAnimation
+Windows.UI.Composition.SpringVector3NaturalMotionAnimation
+Windows.UI.Composition.IScalarNaturalMotionAnimation::{put_FinalValue}
+Windows.UI.Composition.IVector2NaturalMotionAnimation::{put_FinalValue}
+Windows.UI.Composition.IVector3NaturalMotionAnimation::{put_FinalValue}
+Windows.UI.Composition.ISpringScalarNaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows.UI.Composition.ISpringVector2NaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows.UI.Composition.ISpringVector3NaturalMotionAnimation::{put_DampingRatio, put_Period}
+Windows.UI.Composition.ICompositor4::{CreateSpringScalarAnimation, CreateSpringVector2Animation, CreateSpringVector3Animation}
+
+// Clips: an inset rectangle applied to a visual's subtree. Its insets are animatable,
+// so a clip is an animation target in its own right — a reveal is a clip whose inset
+// animates, not a visual whose size does.
+Windows.UI.Composition.CompositionClip
+Windows.UI.Composition.InsetClip
+Windows.UI.Composition.IInsetClip::{put_LeftInset, put_TopInset, put_RightInset, put_BottomInset}
+Windows.UI.Composition.ICompositor::{CreateInsetClip}
+Windows.UI.Composition.IVisual::{put_Clip, put_RotationAngle}
+
+// A rectangle clip is the same idea carrying per-corner radii, and it is the only way
+// to round a sprite whose one brush slot is already spent on a mask: a clip is not a
+// brush, so rounding costs no second visual and no capture. Its sides are absolute in
+// the clipped visual's own space, not insets from its edges, so a clip that must track
+// the visual's size is written on resize.
+Windows.UI.Composition.RectangleClip
+Windows.UI.Composition.IRectangleClip::{put_Left, put_Top, put_Right, put_Bottom, put_TopLeftRadius, put_TopRightRadius, put_BottomLeftRadius, put_BottomRightRadius}
+Windows.UI.Composition.ICompositor7::{CreateRectangleClip}
+
+// A geometric clip takes any composition geometry, so a path already tessellated for a
+// shape can clip a subtree instead of being rebuilt as one. `ViewBox` is left out: it
+// would pull in CompositionViewBox to express a fit the geometry can already carry.
+Windows.UI.Composition.CompositionGeometricClip
+Windows.UI.Composition.ICompositionGeometricClip::{put_Geometry}
+Windows.UI.Composition.ICompositor6::{CreateGeometricClipWithGeometry}
+
+// Paths and stroked shapes. A composition PATH is immutable, but the GEOMETRY holding
+// it is not: `put_Path` re-points an existing geometry at new vectors, so a curve that
+// reshapes keeps its object — and with it any trim animation already running on it.
+// Trimming exposes a fraction of the path, which is how an arc sweeps without
+// regenerating geometry.
+Windows.UI.Composition.CompositionPath
+Windows.UI.Composition.ICompositionPathFactory::{Create}
+Windows.UI.Composition.CompositionPathGeometry
+Windows.UI.Composition.ICompositionPathGeometry::{put_Path}
+Windows.UI.Composition.ICompositor5::{CreatePathGeometryWithPath, CreateRoundedRectangleGeometry}
+Windows.UI.Composition.CompositionRoundedRectangleGeometry
+Windows.UI.Composition.ICompositionRoundedRectangleGeometry::{put_CornerRadius, put_Offset, put_Size}
+Windows.UI.Composition.ICompositionGeometry::{put_TrimStart, put_TrimEnd}
+Windows.UI.Composition.ICompositionSpriteShape::{put_Geometry, put_StrokeBrush, put_StrokeThickness, put_StrokeStartCap, put_StrokeEndCap}
+Windows.UI.Composition.CompositionStrokeCap
+Windows.UI.Composition.ICompositionShape::{put_Scale}
+
+// A stroke's corner treatment, and the rest of its style, so a retained sprite can
+// express everything a stroke-style builder could and no shape has to keep a drawing
+// surface alive for a dash alone. The dash array is a live `IVector<f32>` hanging off
+// the shape rather than a property to assign, and its runs — like Direct2D's — are
+// multiples of the stroke thickness, not DIPs. The mitre limit is what makes
+// `MiterOrBevel` a distinct join rather than a plain mitre, and a non-scaling stroke
+// keeps its thickness when the shape is scaled, which is the only way a hairline rule
+// survives a `set_scale`.
+Windows.UI.Composition.ICompositionSpriteShape::{put_StrokeLineJoin, get_StrokeDashArray, put_StrokeDashCap, put_StrokeDashOffset, put_StrokeMiterLimit, put_IsStrokeNonScaling}
+Windows.UI.Composition.CompositionStrokeLineJoin
+Windows.UI.Composition.CompositionStrokeDashArray
+
+// Mask brushes. A visual surface captures a live subtree as a surface; masking a
+// wide-gamut source with it keeps colour in the source brush and coverage in the mask,
+// which an 8-bit colour brush could not carry.
+Windows.UI.Composition.CompositionMaskBrush
+Windows.UI.Composition.ICompositionMaskBrush::{put_Mask, put_Source}
+Windows.UI.Composition.ICompositor2::{CreateMaskBrush}
+// region: system-only
+// The visual-surface wrapper lives alongside the D2D bridge, which is system-only, so
+// the lifted stack has no consumer for these. The type itself exists on both stacks —
+// move this out of the region if a lifted caller appears.
+Windows.UI.Composition.CompositionVisualSurface
+Windows.UI.Composition.ICompositorWithVisualSurface::{CreateVisualSurface}
+Windows.UI.Composition.ICompositionVisualSurface::{put_SourceVisual, put_SourceOffset, put_SourceSize}
+// endregion
+
+// Drop shadows. A compositor-side Gaussian applied to a sprite, with an arbitrary
+// brush as its alpha mask — a shadow at zero offset IS a glow, and unlike an effect
+// graph it needs no D2D interop at all. `SourcePolicy` selects whether the shadow
+// tints with its own (8-bit) Color or derives from the visual's own content.
+Windows.UI.Composition.CompositionShadow
+Windows.UI.Composition.DropShadow
+Windows.UI.Composition.ICompositor2::{CreateDropShadow}
+Windows.UI.Composition.IDropShadow::{put_BlurRadius, put_Color, put_Mask, put_Offset, put_Opacity}
+Windows.UI.Composition.IDropShadow2::{put_SourcePolicy}
+Windows.UI.Composition.CompositionDropShadowSourcePolicy
+Windows.UI.Composition.ISpriteVisual2::{put_Shadow}
+
+Windows.UI.Composition.ICompositionNineGridBrush::{SetInsetScales}
+Windows.UI.Composition.IVisualCollection::{InsertAbove}
+
+// Linear gradient brushes. Not a colour carrier — a `Windows.UI.Color` stop is 8-bit
+// and clamps below paper white on an HDR desktop — but a legal MASK: a gradient brush
+// bound as `CompositionMaskBrush.Mask` supplies an alpha ramp the compositor evaluates
+// per pixel, with an app-allocated FP16 surface still supplying the colour.
+// `MappingMode::Relative` makes the ramp follow the sprite, so a resize costs no
+// raster at all.
+Windows.UI.Composition.CompositionGradientBrush
+Windows.UI.Composition.CompositionLinearGradientBrush
+Windows.UI.Composition.ICompositionGradientBrush::{get_ColorStops}
+Windows.UI.Composition.ICompositionGradientBrush2::{put_MappingMode}
+Windows.UI.Composition.ICompositionLinearGradientBrush::{put_StartPoint, put_EndPoint}
+Windows.UI.Composition.CompositionColorGradientStop
+Windows.UI.Composition.CompositionColorGradientStopCollection
+Windows.UI.Composition.CompositionMappingMode
+Windows.UI.Composition.ICompositor4::{CreateLinearGradientBrush, CreateColorGradientStopWithOffsetAndColor}
+
+// Scoped-batch completion: the only signal that a batch's animations have all
+// finished. Without it a visual retained for an exit transition has no defined moment
+// of release.
+Windows.UI.Composition.ICompositionScopedBatch::{add_Completed, remove_Completed}
+Windows.UI.Composition.CompositionBatchCompletedEventArgs
+
+// ── Interactions ──────────────────────────────────────────────────────────────
+// An interaction tracker is a compositor-side value driven by a manipulation and by
+// inertia. Delegating a scroll to one means the motion continues at display rate with
+// the app thread idle — and keeps running when that thread is busy, which is the
+// property a front-side stepped animation cannot have.
+//
+// The owner is not free: registering one costs the front thread roughly what stepping
+// the motion yourself would, because every `ValuesChanged` crossing is a callback.
+// `CreateWithOwner` takes it at construction and there is no per-callback
+// subscription, so a tracker that needs no callbacks should be created without one.
+Windows.UI.Composition.Interactions.InteractionTracker
+Windows.UI.Composition.Interactions.IInteractionTrackerOwner
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaModifier
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaMotion
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaNaturalMotion
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaRestingValue
+Windows.UI.Composition.Interactions.InteractionTrackerVector2InertiaNaturalMotion
+Windows.UI.Composition.Interactions.InteractionTrackerClampingOption
+Windows.UI.Composition.Interactions.InteractionTrackerPositionUpdateOption
+Windows.UI.Composition.Interactions.InteractionTrackerIdleStateEnteredArgs
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaStateEnteredArgs
+Windows.UI.Composition.Interactions.InteractionTrackerInteractingStateEnteredArgs
+Windows.UI.Composition.Interactions.InteractionTrackerCustomAnimationStateEnteredArgs
+Windows.UI.Composition.Interactions.InteractionTrackerRequestIgnoredArgs
+Windows.UI.Composition.Interactions.InteractionTrackerValuesChangedArgs
+Windows.UI.Composition.Interactions.VisualInteractionSource
+Windows.UI.Composition.Interactions.VisualInteractionSourceRedirectionMode
+Windows.UI.Composition.Interactions.InteractionSourceMode
+Windows.UI.Composition.Interactions.InteractionSourceRedirectionMode
+Windows.UI.Composition.Interactions.InteractionSourceConfiguration
+Windows.UI.Composition.Interactions.InteractionChainingMode
+Windows.UI.Composition.Interactions.InteractionBindingAxisModes
+Windows.UI.Composition.Interactions.CompositionInteractionSourceCollection
+Windows.UI.Composition.Interactions.ICompositionInteractionSource
+// In `Interactions`, not in `Windows.UI.Composition` — it is the conditional an
+// inertia modifier is expressed with, not a general composition value.
+Windows.UI.Composition.Interactions.CompositionConditionalValue
+
+// region: system-only
+// Redirecting a contact into a manipulation, and the Direct2D geometry bridge. Both
+// are Win32 interop, which the lifted stack has no metadata for.
+//
+// `TryRedirectForManipulation` rejects `PT_MOUSE` outright — touch or pen only — and
+// success is signalled by the window LOSING the pointer, not by the returned HRESULT:
+// for an injected contact it returns S_OK while UPDATE and UP keep arriving, which
+// means the contact was never handed over.
+Windows.Win32.IVisualInteractionSourceInterop::{TryRedirectForManipulation}
+// A geometry already tessellated for Direct2D becomes a CompositionPath through this
+// pair, so a curve is authored once rather than rebuilt as composition geometry.
+// `IGeometrySource2DInterop` is not in the vendored Win32 corpus; see
+// `metadata/windowsgraphicsinterop.rdl`.
+Windows.Graphics.IGeometrySource2D
+Windows.Win32.IGeometrySource2DInterop
 // endregion
 
 Windows.UI.Color
