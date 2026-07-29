@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 windows-link = { workspace = true }
+windows-rdl = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 toml = "1.0"
 

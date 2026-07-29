@@ -18,6 +18,11 @@ fn main() {
     bindgen(["--etc", "crates/tools/bindings/src/time.txt"]);
     bindgen(["--etc", "crates/tools/bindings/src/services.txt"]);
 
+    // The namespaces the vendored corpus does not carry, compiled from
+    // `metadata/*.rdl` into a throwaway winmd that the filters below name alongside
+    // `default`. See `helpers::AUTHORED_METADATA`.
+    helpers::compile_authored_metadata();
+
     bindgen(["--etc", "crates/tools/bindings/src/canvas.txt"]);
     bindgen(["--etc", "crates/tools/bindings/src/animation.txt"]);
     bindgen(["--etc", "crates/tools/bindings/src/window.txt"]);

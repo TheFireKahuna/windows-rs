@@ -1,0 +1,139 @@
+// The composition swapchain ("presentation") API — `Presentation.h` /
+// `PresentationTypes.h`, exported from `dcomp.dll`.
+//
+// Transcribed from the Windows SDK headers because the upstream Win32 metadata
+// set vendored here does not carry this namespace. The vtable ORDER below is the
+// contract: it is taken from the C-style `*Vtbl` structs in `Presentation.h`, not
+// from the documentation, which still describes a superseded
+// `AddBufferFromSharedHandle` in place of `AddBufferFromResource`.
+#[win32]
+mod Windows {
+    mod Win32 {
+        // A system-relative (interrupt) time in 100 ns units — the same clock
+        // `QueryInterruptTimePrecise` reads. Wrapped in a struct by the API, and
+        // passed BY VALUE, so it cannot be flattened to a bare `u64` here.
+        struct SystemInterruptTime {
+            value: u64,
+        }
+
+        // A 3x2 affine applied to a presentation surface's source rect.
+        struct PresentationTransform {
+            M11: f32,
+            M12: f32,
+            M21: f32,
+            M22: f32,
+            M31: f32,
+            M32: f32,
+        }
+
+        type CompositionFrameId = u64;
+
+        #[repr(i32)]
+        enum PresentStatisticsKind {
+            PresentStatisticsKind_PresentStatus = 1,
+            PresentStatisticsKind_CompositionFrame = 2,
+            PresentStatisticsKind_IndependentFlipFrame = 3,
+        }
+
+        #[repr(i32)]
+        enum PresentStatus {
+            PresentStatus_Queued = 0,
+            PresentStatus_Skipped = 1,
+            PresentStatus_Canceled = 2,
+        }
+
+        #[repr(i32)]
+        enum CompositionFrameInstanceKind {
+            CompositionFrameInstanceKind_ComposedOnScreen = 0,
+            CompositionFrameInstanceKind_ScanoutOnScreen = 1,
+            CompositionFrameInstanceKind_ComposedToIntermediate = 2,
+        }
+
+        // How one instance of a presented buffer reached one display. The field
+        // that answers "did DWM have to compose us" is `instanceKind`.
+        struct CompositionFrameDisplayInstance {
+            displayAdapterLUID: LUID,
+            displayVidPnSourceId: u32,
+            displayUniqueId: u32,
+            renderAdapterLUID: LUID,
+            instanceKind: CompositionFrameInstanceKind,
+            finalTransform: PresentationTransform,
+            requiredCrossAdapterCopy: u8,
+            colorSpace: DXGI_COLOR_SPACE_TYPE,
+        }
+
+        // Returned by `IPresentationManager::Present` once the manager is lost;
+        // every other method keeps working, so this is the only call that has to
+        // test for it.
+        const PRESENTATION_ERROR_LOST: HRESULT = 0x88810001;
+
+        #[guid(0x2e217d3a_5abb_4138_9a13_a775593c89ca)]
+        interface IPresentationBuffer: IUnknown {
+            fn GetAvailableEvent(&self, #[retval] availableEventHandle: *mut HANDLE) -> HRESULT;
+            fn IsAvailable(&self, #[retval] isAvailable: *mut u8) -> HRESULT;
+        }
+
+        #[guid(0x5668bb79_3d8e_415c_b215_f38020f2d252)]
+        interface IPresentationContent: IUnknown {
+            fn SetTag(&self, tag: usize);
+        }
+
+        #[guid(0x956710fb_ea40_4eba_a3eb_4375a0eb4edc)]
+        interface IPresentationSurface: IPresentationContent {
+            fn SetBuffer(&self, presentationBuffer: IPresentationBuffer) -> HRESULT;
+            fn SetColorSpace(&self, colorSpace: DXGI_COLOR_SPACE_TYPE) -> HRESULT;
+            fn SetAlphaMode(&self, alphaMode: DXGI_ALPHA_MODE) -> HRESULT;
+            fn SetSourceRect(&self, sourceRect: *const RECT) -> HRESULT;
+            fn SetTransform(&self, transform: *mut PresentationTransform) -> HRESULT;
+            fn RestrictToOutput(&self, output: IUnknown) -> HRESULT;
+            fn SetDisableReadback(&self, value: u8) -> HRESULT;
+            fn SetLetterboxingMargins(&self, leftLetterboxSize: f32, topLetterboxSize: f32, rightLetterboxSize: f32, bottomLetterboxSize: f32) -> HRESULT;
+        }
+
+        #[guid(0xb44b8bda_7282_495d_9dd7_ceadd8b4bb86)]
+        interface IPresentStatistics: IUnknown {
+            fn GetPresentId(&self) -> u64;
+            fn GetKind(&self) -> PresentStatisticsKind;
+        }
+
+        #[guid(0xc9ed2a41_79cb_435e_964e_c8553055420c)]
+        interface IPresentStatusPresentStatistics: IPresentStatistics {
+            fn GetCompositionFrameId(&self) -> CompositionFrameId;
+            fn GetPresentStatus(&self) -> PresentStatus;
+        }
+
+        #[guid(0xab41d127_c101_4c0a_911d_f9f2e9d08e64)]
+        interface ICompositionFramePresentStatistics: IPresentStatistics {
+            fn GetContentTag(&self) -> usize;
+            fn GetCompositionFrameId(&self) -> CompositionFrameId;
+            fn GetDisplayInstanceArray(&self, displayInstanceArrayCount: *mut u32, displayInstanceArray: *mut *const CompositionFrameDisplayInstance);
+        }
+
+        #[guid(0xfb562f82_6292_470a_88b1_843661e7f20c)]
+        interface IPresentationManager: IUnknown {
+            fn AddBufferFromResource(&self, resource: IUnknown, #[retval] presentationBuffer: *mut IPresentationBuffer) -> HRESULT;
+            fn CreatePresentationSurface(&self, compositionSurfaceHandle: HANDLE, #[retval] presentationSurface: *mut IPresentationSurface) -> HRESULT;
+            fn GetNextPresentId(&self) -> u64;
+            fn SetTargetTime(&self, targetTime: SystemInterruptTime) -> HRESULT;
+            fn SetPreferredPresentDuration(&self, preferredDuration: SystemInterruptTime, deviationTolerance: SystemInterruptTime) -> HRESULT;
+            fn ForceVSyncInterrupt(&self, forceVsyncInterrupt: u8) -> HRESULT;
+            fn Present(&self) -> HRESULT;
+            fn GetPresentRetiringFence(&self, riid: *const GUID, #[iid_is] #[retval] fence: *mut *mut void) -> HRESULT;
+            fn CancelPresentsFrom(&self, presentIdToCancelFrom: u64) -> HRESULT;
+            fn GetLostEvent(&self, #[retval] lostEventHandle: *mut HANDLE) -> HRESULT;
+            fn GetPresentStatisticsAvailableEvent(&self, #[retval] presentStatisticsAvailableEventHandle: *mut HANDLE) -> HRESULT;
+            fn EnablePresentStatisticsKind(&self, presentStatisticsKind: PresentStatisticsKind, enabled: u8) -> HRESULT;
+            fn GetNextPresentStatistics(&self, #[retval] nextPresentStatistics: *mut IPresentStatistics) -> HRESULT;
+        }
+
+        #[guid(0x8fb37b58_1d74_4f64_a49c_1f97a80a2ec0)]
+        interface IPresentationFactory: IUnknown {
+            fn IsPresentationSupported(&self) -> u8;
+            fn IsPresentationSupportedWithIndependentFlip(&self) -> u8;
+            fn CreatePresentationManager(&self, #[retval] ppPresentationManager: *mut IPresentationManager) -> HRESULT;
+        }
+
+        #[library("dcomp.dll")]
+        extern fn CreatePresentationFactory(d3dDevice: IUnknown, riid: *const GUID, #[iid_is] presentationFactory: *mut *mut void) -> HRESULT;
+    }
+}

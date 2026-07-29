@@ -1,0 +1,34 @@
+// `DispatcherQueue` creation from Win32 (`dispatcherqueue.h`, exported from
+// CoreMessaging.dll).
+//
+// Transcribed because the vendored Win32 corpus carries the WinRT
+// `Windows.System.DispatcherQueue` type but not the Win32 entry point that mints a
+// controller for an existing thread. A system `Compositor` cannot be constructed on
+// a thread that has no dispatcher queue, so a desktop app needs this call before it
+// has any composition at all.
+#[win32]
+mod Windows {
+    mod Win32 {
+        #[library("CoreMessaging.dll")]
+        extern fn CreateDispatcherQueueController(options: DispatcherQueueOptions, dispatcherQueueController: *mut super::System::IDispatcherQueueController) -> HRESULT;
+
+        #[repr(i32)]
+        enum DISPATCHERQUEUE_THREAD_APARTMENTTYPE {
+            DQTAT_COM_NONE = 0,
+            DQTAT_COM_ASTA = 1,
+            DQTAT_COM_STA = 2,
+        }
+
+        #[repr(i32)]
+        enum DISPATCHERQUEUE_THREAD_TYPE {
+            DQTYPE_THREAD_DEDICATED = 1,
+            DQTYPE_THREAD_CURRENT = 2,
+        }
+
+        struct DispatcherQueueOptions {
+            dwSize: u32,
+            threadType: DISPATCHERQUEUE_THREAD_TYPE,
+            apartmentType: DISPATCHERQUEUE_THREAD_APARTMENTTYPE,
+        }
+    }
+}

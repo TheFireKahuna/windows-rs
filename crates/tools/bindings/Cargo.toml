@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+helpers = { workspace = true }
 windows-bindgen = { workspace = true }
 
 [lints]

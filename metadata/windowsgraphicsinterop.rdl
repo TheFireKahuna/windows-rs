@@ -1,0 +1,21 @@
+// The Direct2D geometry bridge (`Windows.Graphics.Interop.h`).
+//
+// Transcribed because the vendored Win32 corpus carries the rest of the composition
+// interop surface — `ICompositorInterop`, `ICompositorDesktopInterop`,
+// `ICompositionDrawingSurfaceInterop`, `IVisualInteractionSourceInterop` — but not
+// this one. It is what lets a path already tessellated as an `ID2D1Geometry` become
+// a `CompositionPath`, so a curve is authored once and consumed by the compositor
+// rather than rebuilt as composition geometry.
+//
+// An object implementing it also implements `Windows.Graphics.IGeometrySource2D`,
+// which the compositor queries for; this interface is how it gets the geometry back.
+#[win32]
+mod Windows {
+    mod Win32 {
+        #[guid(0x0657af73_53fd_47cf_84ff_c8492d2a80a3)]
+        interface IGeometrySource2DInterop: IUnknown {
+            fn GetGeometry(&self, value: *mut ID2D1Geometry) -> HRESULT;
+            fn TryGetGeometryUsingFactory(&self, factory: ID2D1Factory, value: *mut ID2D1Geometry) -> HRESULT;
+        }
+    }
+}
