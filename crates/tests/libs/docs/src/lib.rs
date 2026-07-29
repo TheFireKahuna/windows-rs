@@ -61,6 +61,9 @@ mod windows_services {}
 #[doc = include_str!("../../../../../docs/crates/windows-strings.md")]
 mod windows_strings {}
 
+#[doc = include_str!("../../../../../docs/crates/windows-text.md")]
+mod windows_text {}
+
 #[doc = include_str!("../../../../../docs/crates/windows-threading.md")]
 mod windows_threading {}
 

@@ -92,6 +92,10 @@ jobs:
       - name: Check windows-sys
         run:  cargo check -p windows-sys --all-features
       - name: Rust version
+        run: rustup update --no-self-update 1.95 && rustup default 1.95
+      - name: Check windows-text
+        run:  cargo check -p windows-text --all-features
+      - name: Rust version
         run: rustup update --no-self-update 1.85 && rustup default 1.85
       - name: Check windows-link
         run:  cargo check -p windows-link --all-features

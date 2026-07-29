@@ -1,0 +1,89 @@
+--out crates/libs/text/src/bindings.rs
+--flat --minimal
+
+// DirectWrite: shaping, measurement, and the coverage rasterizer. No Direct2D — a
+// coverage tile is produced on the CPU by `IDWriteGlyphRunAnalysis`, and the crate
+// that draws text owns its own Direct2D surface.
+
+// The glyph-run walker implements a DirectWrite text renderer so that a shaped
+// `IDWriteTextLayout` can be replayed as individual glyph runs — the input a run
+// rasterizer needs. `IDWriteTextRenderer` derives from `IDWritePixelSnapping`, so
+// both need `_Impl` scaffolding for the callback object to be constructible. The
+// canonical Win32 metadata is a flat `Windows.Win32` namespace, so these name the
+// interface directly under it — a stale sub-namespace here silently matches nothing
+// and the scaffolding is simply not emitted.
+--implement
+    Windows.Win32.IDWriteTextRenderer
+    Windows.Win32.IDWritePixelSnapping
+
+--filter
+    DWriteCreateFactory
+    DWRITE_FACTORY_TYPE_SHARED
+    IDWriteFactory::{CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign, CreateCustomRenderingParams}
+    IDWriteFactory1
+    IDWriteFactory2::{TranslateColorGlyphRun, CreateGlyphRunAnalysis}
+    IDWriteFactory3
+    IDWriteFactory4
+    IDWriteFactory5
+    IDWriteFactory6
+    IDWriteFactory7
+
+// ── Formats and layouts ───────────────────────────────────────────────────────
+    IDWriteTextFormat::{SetTextAlignment, SetParagraphAlignment, SetWordWrapping, SetTrimming}
+    IDWriteTextFormat1
+    IDWriteTextFormat2
+    IDWriteTextFormat3::{SetFontAxisValues, SetAutomaticFontAxes}
+    IDWriteTextLayout::{SetMaxWidth, SetMaxHeight, GetMetrics, HitTestPoint, HitTestTextPosition, SetFontWeight, SetFontStyle, SetFontStretch, SetUnderline, SetStrikethrough, SetDrawingEffect, HitTestTextRange, Draw}
+    IDWriteTextLayout1::SetCharacterSpacing
+    IDWriteTextLayout2
+    IDWriteTextLayout3
+    IDWriteTextLayout4
+    IDWriteInlineObject::Draw
+    DWRITE_FONT_STRETCH_NORMAL
+    DWRITE_FONT_STYLE_NORMAL
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+    DWRITE_PARAGRAPH_ALIGNMENT_FAR
+    DWRITE_PARAGRAPH_ALIGNMENT_NEAR
+    DWRITE_TEXT_ALIGNMENT_CENTER
+    DWRITE_TEXT_ALIGNMENT_LEADING
+    DWRITE_TEXT_ALIGNMENT_TRAILING
+    DWRITE_WORD_WRAPPING_NO_WRAP
+    DWRITE_WORD_WRAPPING_WRAP
+    DWRITE_TRIMMING
+    DWRITE_TRIMMING_GRANULARITY_NONE
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER
+    DWRITE_TRIMMING_GRANULARITY_WORD
+    DWRITE_HIT_TEST_METRICS
+    DWRITE_TEXT_METRICS
+// Variable-font axes. Optical size must be set explicitly: leaving it automatic
+// makes a size change reshape rather than rescale.
+    DWRITE_FONT_AXIS_VALUE
+    DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE
+
+// ── Runs, faces, and metrics ──────────────────────────────────────────────────
+    IDWriteTextRenderer
+    IDWritePixelSnapping
+    IDWriteFontFace::{GetMetrics, GetDesignGlyphMetrics, GetGlyphIndices}
+    DWRITE_GLYPH_RUN
+    DWRITE_GLYPH_RUN_DESCRIPTION
+    DWRITE_GLYPH_OFFSET
+    DWRITE_MEASURING_MODE_NATURAL
+    DWRITE_MATRIX
+    IDWriteColorGlyphRunEnumerator::{MoveNext, GetCurrentRun}
+    DWRITE_COLOR_GLYPH_RUN
+
+// ── The coverage rasterizer ───────────────────────────────────────────────────
+// Rasterizes a glyph run to a CPU alpha texture. This is the whole static-text
+// path: one coverage tile per run, alpha only, keyed on the scale it was rasterized
+// at. It is also the only way to observe what the rasterizer actually produced — a
+// composition surface has no read path, so without this "the glyph landed where we
+// asked" is unfalsifiable.
+    IDWriteGlyphRunAnalysis::{GetAlphaTextureBounds, CreateAlphaTexture}
+    DWRITE_TEXTURE_TYPE
+    DWRITE_TEXTURE_ALIASED_1x1
+    DWRITE_TEXTURE_CLEARTYPE_3x1
+    DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC
+    DWRITE_GRID_FIT_MODE_DEFAULT
+    DWRITE_GRID_FIT_MODE_DISABLED
+    DWRITE_GRID_FIT_MODE_ENABLED
+    DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE
