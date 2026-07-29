@@ -43,6 +43,9 @@ mod windows_metadata {}
 #[doc = include_str!("../../../../../docs/crates/windows-numerics.md")]
 mod windows_numerics {}
 
+#[doc = include_str!("../../../../../docs/crates/windows-present.md")]
+mod windows_present {}
+
 #[doc = include_str!("../../../../../docs/crates/windows-reactor.md")]
 mod windows_reactor {}
 

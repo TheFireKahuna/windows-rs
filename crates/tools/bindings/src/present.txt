@@ -1,0 +1,73 @@
+--out crates/libs/present/src/bindings.rs
+--flat --minimal
+
+// `default` is the metadata bundled with windows-bindgen. The second input carries
+// the composition swapchain ("presentation") namespace, which that corpus does not
+// carry: it is compiled by `tool_bindings` from `metadata/presentation.rdl`
+// immediately before this file is read. The two are disjoint, so naming `default`
+// here keeps every other filter entry resolving exactly as it would alone.
+--in default target/authored.winmd
+
+--filter
+// ── The presentation API ──────────────────────────────────────────────────────
+// A presentation manager owns a queue of presents and the buffers they show. The
+// statistics interfaces are how a region learns whether its buffer reached a display
+// plane (independent flip) or had to be composed — the one report that cannot be
+// inferred from anything else the API returns.
+    CreatePresentationFactory
+    IPresentationFactory
+    IPresentationManager
+    IPresentationSurface
+    IPresentationContent
+    IPresentationBuffer
+    IPresentStatistics
+    IPresentStatusPresentStatistics
+    ICompositionFramePresentStatistics
+    PresentStatisticsKind
+    PresentStatus
+    CompositionFrameInstanceKind
+    CompositionFrameDisplayInstance
+    PresentationTransform
+    SystemInterruptTime
+    PRESENTATION_ERROR_LOST
+
+// ── The composition surface a manager presents into ───────────────────────────
+// `DCompositionCreateSurfaceHandle` mints the handle a presentation surface is
+// created on; the compositor turns the same handle into content a surface brush can
+// paint with, which is the seam that puts app-presented buffers in a visual tree
+// without the compositor owning the allocation.
+    DCompositionCreateSurfaceHandle
+    COMPOSITIONOBJECT_ALL_ACCESS
+
+// ── Buffers ───────────────────────────────────────────────────────────────────
+// The buffers a presentation manager presents are ordinary Direct3D 11 textures.
+// They must be SHARED + NTHANDLE, and DISPLAYABLE to be eligible for a hardware
+// overlay plane or independent flip. FP16 keeps them in linear scRGB with values
+// above paper white intact.
+    ID3D11Device::CreateTexture2D
+    ID3D11Texture2D
+    D3D11_TEXTURE2D_DESC
+    D3D11_USAGE_DEFAULT
+    D3D11_BIND_SHADER_RESOURCE
+    D3D11_BIND_RENDER_TARGET
+    D3D11_RESOURCE_MISC_SHARED
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE
+    D3D11_RESOURCE_MISC_SHARED_DISPLAYABLE
+    DXGI_FORMAT_R16G16B16A16_FLOAT
+    DXGI_ALPHA_MODE_PREMULTIPLIED
+    DXGI_ALPHA_MODE_IGNORE
+    DXGI_COLOR_SPACE_TYPE
+    DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+    RECT
+
+// ── Pacing ────────────────────────────────────────────────────────────────────
+// The present thread waits on the compositor clock rather than a timer, so it wakes
+// at the display's rate without a periodic wake of its own. Target times are read
+// from the same interrupt-time clock the presentation API takes.
+    DCompositionWaitForCompositorClock
+    QueryInterruptTimePrecise
+    WaitForMultipleObjects
+    WAIT_OBJECT_0
+    WAIT_TIMEOUT
+    WAIT_FAILED
+    CloseHandle
