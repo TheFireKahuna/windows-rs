@@ -73,6 +73,9 @@ mod windows_threading {}
 #[doc = include_str!("../../../../../docs/crates/windows-time.md")]
 mod windows_time {}
 
+#[doc = include_str!("../../../../../docs/crates/windows-ui.md")]
+mod windows_ui {}
+
 #[doc = include_str!("../../../../../docs/crates/windows-version.md")]
 mod windows_version {}
 

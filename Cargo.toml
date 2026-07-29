@@ -75,6 +75,7 @@ windows-sys = { version = "0.100.0", path = "crates/libs/sys", default-features 
 windows-text = { version = "0.100.0", path = "crates/libs/text", default-features = false }
 windows-threading = { version = "0.100.0", path = "crates/libs/threading", default-features = false }
 windows-time = { version = "0.100.0", path = "crates/libs/time", default-features = false }
+windows-ui = { version = "0.100.0", path = "crates/libs/ui", default-features = false }
 windows-version = { version = "0.100.0", path = "crates/libs/version", default-features = false }
 windows-webview = { version = "0.100.0", path = "crates/libs/webview", default-features = false }
 windows-window = { version = "0.100.0", path = "crates/libs/window", default-features = false }

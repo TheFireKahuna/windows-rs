@@ -1,0 +1,601 @@
+--out crates/libs/ui/src/bindings.rs
+--flat --minimal
+
+// The framework's own Windows surface: reading pointer input, recognising gestures,
+// the rotary controller, the touch keyboard, text services and UI Automation.
+//
+// Creating the window and opting it into pointer input belong to `windows-window`;
+// this crate reads what those opt-ins deliver. Both crates name `HWND`, which is a
+// raw-pointer alias in this style and so is one type across both.
+//
+// `default` is the metadata bundled with windows-bindgen; the second input carries
+// the UI Automation provider API and its identifiers, which that corpus lacks. See
+// `metadata/uiautomation.rdl`.
+--in default target/authored.winmd
+
+// UI Automation providers are implemented, not called: the framework hands UIA an
+// object per element. `_Impl` scaffolding is what makes those objects constructible,
+// and each interface a provider answers to needs it.
+--implement
+    Windows.Win32.IRawElementProviderSimple
+    Windows.Win32.IRawElementProviderFragment
+    Windows.Win32.IRawElementProviderFragmentRoot
+    Windows.Win32.IRawElementProviderAdviseEvents
+    Windows.Win32.IInvokeProvider
+    Windows.Win32.IToggleProvider
+    Windows.Win32.IValueProvider
+    Windows.Win32.IRangeValueProvider
+    Windows.Win32.ISelectionProvider
+    Windows.Win32.ISelectionItemProvider
+    Windows.Win32.IExpandCollapseProvider
+    Windows.Win32.IScrollProvider
+    Windows.Win32.IScrollItemProvider
+    Windows.Win32.ITextProvider
+    Windows.Win32.ITextRangeProvider
+    Windows.Win32.ITextStoreACP
+    Windows.Win32.ITfContextOwnerCompositionSink
+
+--filter
+// ── Reading pointer input ─────────────────────────────────────────────────────
+// The window opts in; what arrives is a pointer id, and the frame of history behind
+// it is fetched rather than pushed. `SkipPointerFrameMessages` is how a handler that
+// consumed a whole frame tells the system not to deliver the rest of it one message
+// at a time.
+    GetPointerInfo
+    GetPointerInfoHistory
+    GetPointerFrameInfo
+    GetPointerFrameInfoHistory
+    GetPointerTouchInfo
+    GetPointerTouchInfoHistory
+    GetPointerPenInfo
+    GetPointerPenInfoHistory
+    GetPointerInputTransform
+    SkipPointerFrameMessages
+    GetPointerType
+    POINTER_INFO
+    POINTER_TOUCH_INFO
+    POINTER_PEN_INFO
+    POINTER_INPUT_TYPE
+    POINTER_FLAGS
+    POINTER_BUTTON_CHANGE_TYPE
+    INPUT_TRANSFORM
+    PT_MOUSE
+    PT_TOUCH
+    PT_PEN
+    PT_TOUCHPAD
+    WM_POINTERDOWN
+    WM_POINTERUP
+    WM_POINTERUPDATE
+    WM_POINTERENTER
+    WM_POINTERLEAVE
+    WM_POINTERCAPTURECHANGED
+    WM_POINTERWHEEL
+    WM_POINTERHWHEEL
+
+// ── Legacy mouse, capture, and keys ───────────────────────────────────────────
+// Retained because focus, capture and the keyboard still arrive as window messages
+// even when pointer input is opted into.
+    SetCapture
+    ReleaseCapture
+    GetCapture
+    TrackMouseEvent
+    TRACKMOUSEEVENT
+    TME_LEAVE
+    TME_NONCLIENT
+    GetKeyState
+    GetAsyncKeyState
+    WHEEL_DELTA
+    WM_LBUTTONDOWN
+    WM_LBUTTONUP
+    WM_RBUTTONDOWN
+    WM_RBUTTONUP
+    WM_MOUSEMOVE
+    WM_MOUSELEAVE
+    WM_MOUSEWHEEL
+    WM_MOUSEHWHEEL
+    WM_CAPTURECHANGED
+    WM_KEYDOWN
+    WM_KEYUP
+    WM_SYSKEYDOWN
+    WM_SYSKEYUP
+    WM_CHAR
+    WM_SETFOCUS
+    WM_KILLFOCUS
+    VK_RETURN
+    VK_ESCAPE
+    VK_BACK
+    VK_DELETE
+    VK_TAB
+    VK_SPACE
+    VK_LEFT
+    VK_RIGHT
+    VK_UP
+    VK_DOWN
+    VK_HOME
+    VK_END
+    VK_PRIOR
+    VK_NEXT
+    VK_SHIFT
+    VK_CONTROL
+    VK_MENU
+
+// ── Gesture recognition ───────────────────────────────────────────────────────
+// The system recogniser, fed the same pointer points the hit test resolved, so a
+// gesture and a hit agree by construction. `PhysicalGestureRecognizer` is the
+// precision-touchpad path, which reports in physical units rather than as a
+// synthesized wheel.
+    Windows.UI.Input.GestureRecognizer
+    Windows.UI.Input.PhysicalGestureRecognizer
+    Windows.UI.Input.GestureSettings
+    Windows.UI.Input.PointerPoint
+    Windows.UI.Input.PointerPointProperties
+    Windows.UI.Input.IPointerPointStatics
+    Windows.UI.Input.TappedEventArgs
+    Windows.UI.Input.RightTappedEventArgs
+    Windows.UI.Input.HoldingEventArgs
+    Windows.UI.Input.DraggingEventArgs
+    Windows.UI.Input.CrossSlidingEventArgs
+    Windows.UI.Input.ManipulationStartedEventArgs
+    Windows.UI.Input.ManipulationUpdatedEventArgs
+    Windows.UI.Input.ManipulationInertiaStartingEventArgs
+    Windows.UI.Input.ManipulationCompletedEventArgs
+
+// ── Rotary input ──────────────────────────────────────────────────────────────
+// A desktop app has no CoreWindow, so the controller is reached through its interop
+// factory rather than its WinRT static.
+    Windows.UI.Input.RadialController
+    Windows.UI.Input.RadialControllerConfiguration
+    Windows.UI.Input.RadialControllerMenuItem
+    IRadialControllerInterop
+    IRadialControllerConfigurationInterop
+
+// ── Touch keyboard and device capability ──────────────────────────────────────
+// The soft keyboard occludes part of the window rather than resizing it, so the
+// occlusion is a layout input. `UIViewSettings` reports whether the user is in touch
+// mode, which changes hit-target sizing.
+    Windows.UI.ViewManagement.Core.CoreInputView
+    Windows.UI.ViewManagement.Core.CoreFrameworkInputView
+    Windows.UI.ViewManagement.Core.CoreInputViewKind
+    Windows.UI.ViewManagement.Core.CoreInputViewOcclusion
+    Windows.UI.ViewManagement.Core.CoreInputViewOcclusionKind
+    Windows.UI.ViewManagement.UIViewSettings
+    IUIViewSettingsInterop
+    Windows.Devices.Input.PointerDevice
+    Windows.Devices.Input.TouchCapabilities
+
+// ── Text services (TSF) ───────────────────────────────────────────────────────
+// An IME composes into the app's own text store, so the editor implements the store
+// and TSF drives it. The composition sink is what tells the editor a composition is
+// in progress, which is the difference between drawing a caret and drawing a
+// composition underline.
+    ITfThreadMgr
+    ITfThreadMgrEx
+    ITfThreadMgr2
+    ITfDocumentMgr
+    ITfContext
+    ITfSource
+    ITfKeystrokeMgr
+    ITfRangeACP
+    ITfCompositionView
+    ITfContextOwnerCompositionSink
+    ITfDisplayAttributeInfo
+    ITfDisplayAttributeMgr
+    ITfDisplayAttributeProvider
+    ITextStoreACP
+    ITextStoreACPSink
+// What KIND of text a field holds: the input scope selects the touch keyboard's
+// layout and the IME's starting conversion mode. A field advertises it by
+// implementing `ITfInputScope` rather than by setting it on an HWND, since a field
+// here is not a window. See `metadata/inputscope.rdl`.
+    ITfInputScope
+    Windows.Win32.InputScope
+    TS_STATUS
+    TS_TEXTCHANGE
+    TS_SELECTION_ACP
+    TS_RUNINFO
+
+// ── UI Automation ─────────────────────────────────────────────────────────────
+// The tree a screen reader walks. `UiaHostProviderFromHwnd` supplies the host
+// provider a fragment root defers to for window-level properties, and
+// `UiaDisconnectProvider` is what releases a provider whose element is gone —
+// without it a client keeps a dead element addressable.
+//
+// The provider interfaces and their enums are named with their namespace because
+// XAML declares its own `IInvokeProvider`, `ToggleState`, `TextUnit` and the rest
+// under `Windows.UI.Xaml.Automation`. A bare name expands to every namespace that
+// defines it, and `--flat` then emits both into one module — which fails as a
+// duplicate definition rather than as an ambiguity, so the diagnostic points at the
+// generated file rather than at this line.
+    Windows.Win32.IRawElementProviderSimple
+    IRawElementProviderFragment
+    IRawElementProviderFragmentRoot
+    IRawElementProviderAdviseEvents
+    Windows.Win32.IInvokeProvider
+    Windows.Win32.IToggleProvider
+    Windows.Win32.IValueProvider
+    Windows.Win32.IRangeValueProvider
+    Windows.Win32.ISelectionProvider
+    Windows.Win32.ISelectionItemProvider
+    Windows.Win32.IExpandCollapseProvider
+    Windows.Win32.IScrollProvider
+    Windows.Win32.IScrollItemProvider
+    Windows.Win32.ITextProvider
+    Windows.Win32.ITextRangeProvider
+    UiaReturnRawElementProvider
+    UiaHostProviderFromHwnd
+    UiaRaiseAutomationEvent
+    UiaRaiseAutomationPropertyChangedEvent
+    UiaRaiseStructureChangedEvent
+    UiaDisconnectProvider
+    UiaClientsAreListening
+    UiaRect
+    ProviderOptions
+    NavigateDirection
+    Windows.Win32.ToggleState
+    Windows.Win32.ExpandCollapseState
+    Windows.Win32.ScrollAmount
+    Windows.Win32.SupportedTextSelection
+    Windows.Win32.TextUnit
+    Windows.Win32.TextPatternRangeEndpoint
+    StructureChangeType
+    PROPERTYID
+    PATTERNID
+    EVENTID
+    CONTROLTYPEID
+    WM_GETOBJECT
+
+// The automation identifiers. Every one is named explicitly: filter matching is
+// by namespace prefix or exact type name, with no wildcard, and the alternative
+// — naming the whole flat `Windows.Win32` namespace — would pull in the entire
+// Win32 surface. Generated from `metadata/uiautomation.rdl`; regenerate both
+// together.
+    UIA_AcceleratorKeyPropertyId
+    UIA_AccessKeyPropertyId
+    UIA_ActiveTextPositionChangedEventId
+    UIA_AfterParagraphSpacingAttributeId
+    UIA_AnimationStyleAttributeId
+    UIA_AnnotationAnnotationTypeIdPropertyId
+    UIA_AnnotationAnnotationTypeNamePropertyId
+    UIA_AnnotationAuthorPropertyId
+    UIA_AnnotationDateTimePropertyId
+    UIA_AnnotationObjectsAttributeId
+    UIA_AnnotationObjectsPropertyId
+    UIA_AnnotationPatternId
+    UIA_AnnotationTargetPropertyId
+    UIA_AnnotationTypesAttributeId
+    UIA_AnnotationTypesPropertyId
+    UIA_AppBarControlTypeId
+    UIA_AriaPropertiesPropertyId
+    UIA_AriaRolePropertyId
+    UIA_AsyncContentLoadedEventId
+    UIA_AutomationFocusChangedEventId
+    UIA_AutomationIdPropertyId
+    UIA_AutomationPropertyChangedEventId
+    UIA_BackgroundColorAttributeId
+    UIA_BeforeParagraphSpacingAttributeId
+    UIA_BoundingRectanglePropertyId
+    UIA_BulletStyleAttributeId
+    UIA_ButtonControlTypeId
+    UIA_CalendarControlTypeId
+    UIA_CapStyleAttributeId
+    UIA_CaretBidiModeAttributeId
+    UIA_CaretPositionAttributeId
+    UIA_CenterPointPropertyId
+    UIA_ChangesEventId
+    UIA_CheckBoxControlTypeId
+    UIA_ClassNamePropertyId
+    UIA_ClickablePointPropertyId
+    UIA_ComboBoxControlTypeId
+    UIA_ControlTypePropertyId
+    UIA_ControllerForPropertyId
+    UIA_CultureAttributeId
+    UIA_CulturePropertyId
+    UIA_CustomControlTypeId
+    UIA_CustomLandmarkTypeId
+    UIA_CustomNavigationPatternId
+    UIA_DataGridControlTypeId
+    UIA_DataItemControlTypeId
+    UIA_DescribedByPropertyId
+    UIA_DockDockPositionPropertyId
+    UIA_DockPatternId
+    UIA_DocumentControlTypeId
+    UIA_DragDropEffectPropertyId
+    UIA_DragDropEffectsPropertyId
+    UIA_DragGrabbedItemsPropertyId
+    UIA_DragIsGrabbedPropertyId
+    UIA_DragPatternId
+    UIA_Drag_DragCancelEventId
+    UIA_Drag_DragCompleteEventId
+    UIA_Drag_DragStartEventId
+    UIA_DropTargetDropTargetEffectPropertyId
+    UIA_DropTargetDropTargetEffectsPropertyId
+    UIA_DropTargetPatternId
+    UIA_DropTarget_DragEnterEventId
+    UIA_DropTarget_DragLeaveEventId
+    UIA_DropTarget_DroppedEventId
+    UIA_E_ELEMENTNOTAVAILABLE
+    UIA_E_ELEMENTNOTENABLED
+    UIA_E_INVALIDOPERATION
+    UIA_E_NOCLICKABLEPOINT
+    UIA_E_NOTSUPPORTED
+    UIA_E_PROXYASSEMBLYNOTLOADED
+    UIA_E_TIMEOUT
+    UIA_EditControlTypeId
+    UIA_ExpandCollapseExpandCollapseStatePropertyId
+    UIA_ExpandCollapsePatternId
+    UIA_FillColorPropertyId
+    UIA_FillTypePropertyId
+    UIA_FlowsFromPropertyId
+    UIA_FlowsToPropertyId
+    UIA_FontNameAttributeId
+    UIA_FontSizeAttributeId
+    UIA_FontWeightAttributeId
+    UIA_ForegroundColorAttributeId
+    UIA_FormLandmarkTypeId
+    UIA_FrameworkIdPropertyId
+    UIA_FullDescriptionPropertyId
+    UIA_GridColumnCountPropertyId
+    UIA_GridItemColumnPropertyId
+    UIA_GridItemColumnSpanPropertyId
+    UIA_GridItemContainingGridPropertyId
+    UIA_GridItemPatternId
+    UIA_GridItemRowPropertyId
+    UIA_GridItemRowSpanPropertyId
+    UIA_GridPatternId
+    UIA_GridRowCountPropertyId
+    UIA_GroupControlTypeId
+    UIA_HasKeyboardFocusPropertyId
+    UIA_HeaderControlTypeId
+    UIA_HeaderItemControlTypeId
+    UIA_HeadingLevelPropertyId
+    UIA_HelpTextPropertyId
+    UIA_HorizontalTextAlignmentAttributeId
+    UIA_HostedFragmentRootsInvalidatedEventId
+    UIA_HyperlinkControlTypeId
+    UIA_IAFP_DEFAULT
+    UIA_IAFP_UNWRAP_BRIDGE
+    UIA_ImageControlTypeId
+    UIA_IndentationFirstLineAttributeId
+    UIA_IndentationLeadingAttributeId
+    UIA_IndentationTrailingAttributeId
+    UIA_InputDiscardedEventId
+    UIA_InputReachedOtherElementEventId
+    UIA_InputReachedTargetEventId
+    UIA_InvokePatternId
+    UIA_Invoke_InvokedEventId
+    UIA_IsActiveAttributeId
+    UIA_IsAnnotationPatternAvailablePropertyId
+    UIA_IsContentElementPropertyId
+    UIA_IsControlElementPropertyId
+    UIA_IsCustomNavigationPatternAvailablePropertyId
+    UIA_IsDataValidForFormPropertyId
+    UIA_IsDialogPropertyId
+    UIA_IsDockPatternAvailablePropertyId
+    UIA_IsDragPatternAvailablePropertyId
+    UIA_IsDropTargetPatternAvailablePropertyId
+    UIA_IsEnabledPropertyId
+    UIA_IsExpandCollapsePatternAvailablePropertyId
+    UIA_IsGridItemPatternAvailablePropertyId
+    UIA_IsGridPatternAvailablePropertyId
+    UIA_IsHiddenAttributeId
+    UIA_IsInvokePatternAvailablePropertyId
+    UIA_IsItalicAttributeId
+    UIA_IsItemContainerPatternAvailablePropertyId
+    UIA_IsKeyboardFocusablePropertyId
+    UIA_IsLegacyIAccessiblePatternAvailablePropertyId
+    UIA_IsMultipleViewPatternAvailablePropertyId
+    UIA_IsObjectModelPatternAvailablePropertyId
+    UIA_IsOffscreenPropertyId
+    UIA_IsPasswordPropertyId
+    UIA_IsPeripheralPropertyId
+    UIA_IsRangeValuePatternAvailablePropertyId
+    UIA_IsReadOnlyAttributeId
+    UIA_IsRequiredForFormPropertyId
+    UIA_IsScrollItemPatternAvailablePropertyId
+    UIA_IsScrollPatternAvailablePropertyId
+    UIA_IsSelectionItemPatternAvailablePropertyId
+    UIA_IsSelectionPattern2AvailablePropertyId
+    UIA_IsSelectionPatternAvailablePropertyId
+    UIA_IsSpreadsheetItemPatternAvailablePropertyId
+    UIA_IsSpreadsheetPatternAvailablePropertyId
+    UIA_IsStylesPatternAvailablePropertyId
+    UIA_IsSubscriptAttributeId
+    UIA_IsSuperscriptAttributeId
+    UIA_IsSynchronizedInputPatternAvailablePropertyId
+    UIA_IsTableItemPatternAvailablePropertyId
+    UIA_IsTablePatternAvailablePropertyId
+    UIA_IsTextChildPatternAvailablePropertyId
+    UIA_IsTextEditPatternAvailablePropertyId
+    UIA_IsTextPattern2AvailablePropertyId
+    UIA_IsTextPatternAvailablePropertyId
+    UIA_IsTogglePatternAvailablePropertyId
+    UIA_IsTransformPattern2AvailablePropertyId
+    UIA_IsTransformPatternAvailablePropertyId
+    UIA_IsValuePatternAvailablePropertyId
+    UIA_IsVirtualizedItemPatternAvailablePropertyId
+    UIA_IsWindowPatternAvailablePropertyId
+    UIA_ItemContainerPatternId
+    UIA_ItemStatusPropertyId
+    UIA_ItemTypePropertyId
+    UIA_LabeledByPropertyId
+    UIA_LandmarkTypePropertyId
+    UIA_LayoutInvalidatedEventId
+    UIA_LegacyIAccessibleChildIdPropertyId
+    UIA_LegacyIAccessibleDefaultActionPropertyId
+    UIA_LegacyIAccessibleDescriptionPropertyId
+    UIA_LegacyIAccessibleHelpPropertyId
+    UIA_LegacyIAccessibleKeyboardShortcutPropertyId
+    UIA_LegacyIAccessibleNamePropertyId
+    UIA_LegacyIAccessiblePatternId
+    UIA_LegacyIAccessibleRolePropertyId
+    UIA_LegacyIAccessibleSelectionPropertyId
+    UIA_LegacyIAccessibleStatePropertyId
+    UIA_LegacyIAccessibleValuePropertyId
+    UIA_LevelPropertyId
+    UIA_LineSpacingAttributeId
+    UIA_LinkAttributeId
+    UIA_ListControlTypeId
+    UIA_ListItemControlTypeId
+    UIA_LiveRegionChangedEventId
+    UIA_LiveSettingPropertyId
+    UIA_LocalizedControlTypePropertyId
+    UIA_LocalizedLandmarkTypePropertyId
+    UIA_MainLandmarkTypeId
+    UIA_MarginBottomAttributeId
+    UIA_MarginLeadingAttributeId
+    UIA_MarginTopAttributeId
+    UIA_MarginTrailingAttributeId
+    UIA_MenuBarControlTypeId
+    UIA_MenuClosedEventId
+    UIA_MenuControlTypeId
+    UIA_MenuItemControlTypeId
+    UIA_MenuModeEndEventId
+    UIA_MenuModeStartEventId
+    UIA_MenuOpenedEventId
+    UIA_MultipleViewCurrentViewPropertyId
+    UIA_MultipleViewPatternId
+    UIA_MultipleViewSupportedViewsPropertyId
+    UIA_NamePropertyId
+    UIA_NativeWindowHandlePropertyId
+    UIA_NavigationLandmarkTypeId
+    UIA_NotificationEventId
+    UIA_ObjectModelPatternId
+    UIA_OptimizeForVisualContentPropertyId
+    UIA_OrientationPropertyId
+    UIA_OutlineColorPropertyId
+    UIA_OutlineStylesAttributeId
+    UIA_OutlineThicknessPropertyId
+    UIA_OverlineColorAttributeId
+    UIA_OverlineStyleAttributeId
+    UIA_PFIA_DEFAULT
+    UIA_PFIA_UNWRAP_BRIDGE
+    UIA_PaneControlTypeId
+    UIA_PositionInSetPropertyId
+    UIA_ProcessIdPropertyId
+    UIA_ProgressBarControlTypeId
+    UIA_ProviderDescriptionPropertyId
+    UIA_RadioButtonControlTypeId
+    UIA_RangeValueIsReadOnlyPropertyId
+    UIA_RangeValueLargeChangePropertyId
+    UIA_RangeValueMaximumPropertyId
+    UIA_RangeValueMinimumPropertyId
+    UIA_RangeValuePatternId
+    UIA_RangeValueSmallChangePropertyId
+    UIA_RangeValueValuePropertyId
+    UIA_RotationPropertyId
+    UIA_RuntimeIdPropertyId
+    UIA_SayAsInterpretAsAttributeId
+    UIA_SayAsInterpretAsMetadataId
+    UIA_ScrollBarControlTypeId
+    UIA_ScrollHorizontalScrollPercentPropertyId
+    UIA_ScrollHorizontalViewSizePropertyId
+    UIA_ScrollHorizontallyScrollablePropertyId
+    UIA_ScrollItemPatternId
+    UIA_ScrollPatternId
+    UIA_ScrollVerticalScrollPercentPropertyId
+    UIA_ScrollVerticalViewSizePropertyId
+    UIA_ScrollVerticallyScrollablePropertyId
+    UIA_SearchLandmarkTypeId
+    UIA_Selection2CurrentSelectedItemPropertyId
+    UIA_Selection2FirstSelectedItemPropertyId
+    UIA_Selection2ItemCountPropertyId
+    UIA_Selection2LastSelectedItemPropertyId
+    UIA_SelectionActiveEndAttributeId
+    UIA_SelectionCanSelectMultiplePropertyId
+    UIA_SelectionIsSelectionRequiredPropertyId
+    UIA_SelectionItemIsSelectedPropertyId
+    UIA_SelectionItemPatternId
+    UIA_SelectionItemSelectionContainerPropertyId
+    UIA_SelectionItem_ElementAddedToSelectionEventId
+    UIA_SelectionItem_ElementRemovedFromSelectionEventId
+    UIA_SelectionItem_ElementSelectedEventId
+    UIA_SelectionPattern2Id
+    UIA_SelectionPatternId
+    UIA_SelectionSelectionPropertyId
+    UIA_Selection_InvalidatedEventId
+    UIA_SemanticZoomControlTypeId
+    UIA_SeparatorControlTypeId
+    UIA_SizeOfSetPropertyId
+    UIA_SizePropertyId
+    UIA_SliderControlTypeId
+    UIA_SpinnerControlTypeId
+    UIA_SplitButtonControlTypeId
+    UIA_SpreadsheetItemAnnotationObjectsPropertyId
+    UIA_SpreadsheetItemAnnotationTypesPropertyId
+    UIA_SpreadsheetItemFormulaPropertyId
+    UIA_SpreadsheetItemPatternId
+    UIA_SpreadsheetPatternId
+    UIA_StatusBarControlTypeId
+    UIA_StrikethroughColorAttributeId
+    UIA_StrikethroughStyleAttributeId
+    UIA_StructureChangedEventId
+    UIA_StyleIdAttributeId
+    UIA_StyleNameAttributeId
+    UIA_StylesExtendedPropertiesPropertyId
+    UIA_StylesFillColorPropertyId
+    UIA_StylesFillPatternColorPropertyId
+    UIA_StylesFillPatternStylePropertyId
+    UIA_StylesPatternId
+    UIA_StylesShapePropertyId
+    UIA_StylesStyleIdPropertyId
+    UIA_StylesStyleNamePropertyId
+    UIA_SummaryChangeId
+    UIA_SynchronizedInputPatternId
+    UIA_SystemAlertEventId
+    UIA_TabControlTypeId
+    UIA_TabItemControlTypeId
+    UIA_TableColumnHeadersPropertyId
+    UIA_TableControlTypeId
+    UIA_TableItemColumnHeaderItemsPropertyId
+    UIA_TableItemPatternId
+    UIA_TableItemRowHeaderItemsPropertyId
+    UIA_TablePatternId
+    UIA_TableRowHeadersPropertyId
+    UIA_TableRowOrColumnMajorPropertyId
+    UIA_TabsAttributeId
+    UIA_TextChildPatternId
+    UIA_TextControlTypeId
+    UIA_TextEditPatternId
+    UIA_TextEdit_ConversionTargetChangedEventId
+    UIA_TextEdit_TextChangedEventId
+    UIA_TextFlowDirectionsAttributeId
+    UIA_TextPattern2Id
+    UIA_TextPatternId
+    UIA_Text_TextChangedEventId
+    UIA_Text_TextSelectionChangedEventId
+    UIA_ThumbControlTypeId
+    UIA_TitleBarControlTypeId
+    UIA_TogglePatternId
+    UIA_ToggleToggleStatePropertyId
+    UIA_ToolBarControlTypeId
+    UIA_ToolTipClosedEventId
+    UIA_ToolTipControlTypeId
+    UIA_ToolTipOpenedEventId
+    UIA_Transform2CanZoomPropertyId
+    UIA_Transform2ZoomLevelPropertyId
+    UIA_Transform2ZoomMaximumPropertyId
+    UIA_Transform2ZoomMinimumPropertyId
+    UIA_TransformCanMovePropertyId
+    UIA_TransformCanResizePropertyId
+    UIA_TransformCanRotatePropertyId
+    UIA_TransformPattern2Id
+    UIA_TransformPatternId
+    UIA_TreeControlTypeId
+    UIA_TreeItemControlTypeId
+    UIA_UnderlineColorAttributeId
+    UIA_UnderlineStyleAttributeId
+    UIA_ValueIsReadOnlyPropertyId
+    UIA_ValuePatternId
+    UIA_ValueValuePropertyId
+    UIA_VirtualizedItemPatternId
+    UIA_VisualEffectsPropertyId
+    UIA_WindowCanMaximizePropertyId
+    UIA_WindowCanMinimizePropertyId
+    UIA_WindowControlTypeId
+    UIA_WindowIsModalPropertyId
+    UIA_WindowIsTopmostPropertyId
+    UIA_WindowPatternId
+    UIA_WindowWindowInteractionStatePropertyId
+    UIA_WindowWindowVisualStatePropertyId
+    UIA_Window_WindowClosedEventId
+    UIA_Window_WindowOpenedEventId

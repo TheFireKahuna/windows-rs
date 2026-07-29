@@ -1,0 +1,17 @@
+[package]
+name = "windows-ui"
+version = "0.100.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Windows UI framework: input, accessibility, and text services"
+repository = "https://github.com/microsoft/windows-rs"
+categories = ["os::windows-apis"]
+readme = "readme.md"
+
+[dependencies]
+windows-collections = { workspace = true }
+windows-core = { workspace = true }
+
+[lints]
+workspace = true
