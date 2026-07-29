@@ -1,0 +1,224 @@
+--out crates/libs/d2d/src/bindings.rs
+--flat --minimal
+
+// Direct2D, and the Direct3D 11 / DXGI surface a D2D device is built on. DirectWrite
+// appears here only where a Direct2D signature names it — a text layout to draw, a
+// glyph run to fill. The shaping and rasterizing side belongs to `windows-text`, and
+// a run crosses between them as plain data rather than as a DirectWrite struct.
+
+--filter
+    D2DERR_RECREATE_TARGET
+    E_INVALIDARG
+    E_FAIL
+    GENERIC_READ
+    D2D1CreateFactory
+    D2D1_FACTORY_TYPE_SINGLE_THREADED
+    D2D1_FACTORY_TYPE_MULTI_THREADED
+    ID2D1Factory1::{CreateDevice, CreateStrokeStyle, CreatePathGeometry}
+    ID2D1Factory2
+    ID2D1Factory3
+    ID2D1Factory4
+    ID2D1Factory5
+    ID2D1Factory6
+    ID2D1Factory7
+    ID2D1Device::CreateDeviceContext
+    ID2D1Device1
+    ID2D1Device2
+    ID2D1Device3
+    ID2D1Device4
+    ID2D1Device5
+    ID2D1Device6
+    ID2D1Multithread::{Enter, Leave}
+
+// ── Drawing session ───────────────────────────────────────────────────────────
+// `SetTarget` is what lets one open bracket render a cached layer and then go back
+// to the frame's own target, which is why a cached layer needs no context of its own.
+    ID2D1DeviceContext::{CreateBitmap, CreateBitmapFromDxgiSurface, CreateBitmapFromWicBitmap, CreateEffect, SetTarget, GetTarget, DrawBitmap, DrawImage, CreateBitmapBrush, CreateGradientStopCollection, SetPrimitiveBlend, CreateCommandList, DrawGlyphRun}
+    ID2D1DeviceContext1::{CreateFilledGeometryRealization, CreateStrokedGeometryRealization, DrawGeometryRealization}
+    ID2D1DeviceContext2
+    ID2D1DeviceContext3
+    ID2D1DeviceContext4
+    ID2D1DeviceContext5::CreateColorContextFromDxgiColorSpace
+    ID2D1DeviceContext6
+    ID2D1RenderTarget::{BeginDraw, EndDraw, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawText, DrawTextLayout, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateGradientStopCollection, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, SetTextRenderingParams, PushAxisAlignedClip, PopAxisAlignedClip, SetTextAntialiasMode, SetAntialiasMode, GetAntialiasMode}
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE
+    D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS
+    D2D1_ANTIALIAS_MODE_ALIASED
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+    D2D1_DRAW_TEXT_OPTIONS_NONE
+    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
+    D2D1_PRIMITIVE_BLEND_SOURCE_OVER
+    D2D1_PRIMITIVE_BLEND_ADD
+    ID2D1CommandList
+
+// ── Geometry, and realizations ────────────────────────────────────────────────
+// A realization tessellates once for a shape that outlives the frame that built it.
+// It is a device resource tied to the scale it was realized at, so it is keyed on
+// both — and it is never worth it for a shape Direct2D rasterizes analytically.
+    ID2D1Geometry::{GetBounds, FillContainsPoint, StrokeContainsPoint, Widen, Outline, CombineWithGeometry}
+    ID2D1PathGeometry::{Open, GetSegmentCount, GetFigureCount}
+    ID2D1SimplifiedGeometrySink::{BeginFigure, AddLines, AddBeziers, EndFigure, Close}
+    ID2D1GeometrySink::{AddLine, AddBezier}
+    ID2D1GeometryRealization
+    D2D1_BEZIER_SEGMENT
+    D2D1_FIGURE_BEGIN_FILLED
+    D2D1_FIGURE_BEGIN_HOLLOW
+    D2D1_FIGURE_END_CLOSED
+    D2D1_FIGURE_END_OPEN
+    D2D1_COMBINE_MODE_UNION
+    D2D1_COMBINE_MODE_INTERSECT
+    D2D1_COMBINE_MODE_XOR
+    D2D1_COMBINE_MODE_EXCLUDE
+    D2D1_ELLIPSE
+    D2D1_ROUNDED_RECT
+    D2D_POINT_2U
+    D2D_RECT_U
+
+// ── Strokes and brushes ───────────────────────────────────────────────────────
+// Restating a linear gradient's two endpoints is how one brush paints N spans
+// (a per-bar fade across a spectrum) without allocating a brush per span.
+    ID2D1LinearGradientBrush::{SetStartPoint, SetEndPoint}
+    ID2D1SolidColorBrush::SetColor
+    ID2D1Brush::SetOpacity
+    ID2D1BitmapBrush1
+    ID2D1GradientStopCollection1
+    D2D1_GRADIENT_STOP
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES
+    D2D1_BITMAP_BRUSH_PROPERTIES1
+    D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT
+    D2D1_EXTEND_MODE_CLAMP
+    D2D1_EXTEND_MODE_WRAP
+    D2D1_GAMMA_1_0
+    D2D1_GAMMA_2_2
+    D2D1_CAP_STYLE_FLAT
+    D2D1_CAP_STYLE_ROUND
+    D2D1_CAP_STYLE_SQUARE
+    D2D1_CAP_STYLE_TRIANGLE
+    D2D1_DASH_STYLE_CUSTOM
+    D2D1_DASH_STYLE_DASH
+    D2D1_DASH_STYLE_DASH_DOT
+    D2D1_DASH_STYLE_DOT
+    D2D1_DASH_STYLE_SOLID
+    D2D1_LINE_JOIN_BEVEL
+    D2D1_LINE_JOIN_MITER
+    D2D1_LINE_JOIN_ROUND
+
+// ── Bitmaps, layers, sprite batches ───────────────────────────────────────────
+// Blits are `DrawBitmap`; effect outputs are `DrawImage`. There is no general image
+// draw: `DrawImage` accepts any `ID2D1Image` and runs Direct2D's image command graph
+// to discover what it was handed, which for a bitmap is an order of magnitude of
+// pure overhead (2473 samples against 108, for six blits a frame).
+    ID2D1Bitmap::{GetSize, CopyFromBitmap}
+    ID2D1Bitmap1::{Map, Unmap}
+    D2D1_BITMAP_OPTIONS_NONE
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW
+    D2D1_BITMAP_OPTIONS_CPU_READ
+    D2D1_BITMAP_OPTIONS_TARGET
+    D2D1_BITMAP_PROPERTIES1
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+    D2D1_INTERPOLATION_MODE_LINEAR
+    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+    D2D1_MAPPED_RECT
+    D2D1_MAP_OPTIONS_READ
+// One `DrawSpriteBatch` draws N rectangles sampled from one bitmap, where N
+// `FillRectangle` calls are N primitives — the documented way to put "hundreds or
+// thousands of images" on screen per frame. `SetSprites` rewrites an existing batch
+// in place, so a field that changes every frame costs no allocation. Deliberately
+// NOT taking `GetSprites`: nothing here reads back.
+    ID2D1SpriteBatch::{AddSprites, SetSprites, GetSpriteCount, Clear}
+    D2D1_SPRITE_OPTIONS_NONE
+    D2D1_SPRITE_OPTIONS_CLAMP_TO_SOURCE_RECTANGLE
+
+// ── Effects ───────────────────────────────────────────────────────────────────
+    ID2D1Effect::{SetInput, GetOutput}
+    ID2D1Properties::SetValue
+    D2D1_PROPERTY_TYPE_FLOAT
+    D2D1_PROPERTY_TYPE_VECTOR4
+    D2D1_PROPERTY_TYPE_ENUM
+    CLSID_D2D1Shadow
+    D2D1_SHADOW_PROP
+    D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION
+    D2D1_SHADOW_PROP_COLOR
+    CLSID_D2D1GaussianBlur
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION
+    CLSID_D2D1ColorManagement
+    ID2D1ColorContext1
+    D2D1_COLOR_SPACE
+    D2D1_BUFFER_PRECISION
+
+// ── The device pair ───────────────────────────────────────────────────────────
+// The full descending ladder is what `D3D11CreateDevice` is meant to be given. It
+// walks the list and returns the first level the machine supports, so a single-entry
+// array is both a floor no weaker GPU can meet and a ceiling no stronger one can
+// exceed.
+    D3D11CreateDevice
+    D3D_DRIVER_TYPE_HARDWARE
+    D3D_DRIVER_TYPE_WARP
+    D3D_FEATURE_LEVEL_11_1
+    D3D_FEATURE_LEVEL_11_0
+    D3D_FEATURE_LEVEL_10_1
+    D3D_FEATURE_LEVEL_10_0
+    D3D_FEATURE_LEVEL_9_3
+    D3D_FEATURE_LEVEL_9_2
+    D3D_FEATURE_LEVEL_9_1
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT
+    D3D11_CREATE_DEVICE_SINGLETHREADED
+// Suppresses the display driver's own worker pool, which a presentation device does
+// not want and pays for per device.
+    D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
+    D3D11_SDK_VERSION
+
+// ── DXGI: formats, colour spaces, and device loss ─────────────────────────────
+    IDXGIDevice::GetAdapter
+    IDXGIObject::GetParent
+    DXGI_FORMAT_R16G16B16A16_FLOAT
+    DXGI_FORMAT_B8G8R8A8_UNORM
+    DXGI_FORMAT_UNKNOWN
+    DXGI_ALPHA_MODE_PREMULTIPLIED
+    DXGI_ALPHA_MODE_IGNORE
+    D2D1_ALPHA_MODE_PREMULTIPLIED
+    D2D1_ALPHA_MODE_IGNORE
+    DXGI_COLOR_SPACE_TYPE
+    DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+    DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    DXGI_ERROR_DEVICE_HUNG
+    DXGI_ERROR_DEVICE_REMOVED
+    DXGI_ERROR_DEVICE_RESET
+    DXGI_ERROR_DRIVER_INTERNAL_ERROR
+// Output description carries the display's colour capability, which the output
+// transform needs and which no D2D call reports.
+    IDXGIOutput1
+    IDXGIOutput2
+    IDXGIOutput3
+    IDXGIOutput4
+    IDXGIOutput5
+    IDXGIOutput6::GetDesc1
+    DXGI_OUTPUT_DESC1
+
+// ── Swap chains ───────────────────────────────────────────────────────────────
+// A secondary presentation model, retained from the previous stack pending cleanup.
+// New per-frame work belongs on a presentation region (`windows-present`).
+    IDXGIFactory2::{CreateSwapChainForComposition, CreateSwapChainForHwnd}
+    IDXGISwapChain::{Present, GetBuffer, ResizeBuffers}
+    IDXGISwapChain2::{SetMatrixTransform, GetFrameLatencyWaitableObject, SetMaximumFrameLatency}
+    IDXGISwapChain3::{SetColorSpace1, CheckColorSpaceSupport}
+    DXGI_SWAP_CHAIN_DESC1
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+    DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+    DXGI_USAGE_RENDER_TARGET_OUTPUT
+    WaitForSingleObjectEx
+
+// ── Image decoding ────────────────────────────────────────────────────────────
+    CLSID_WICImagingFactory
+    GUID_WICPixelFormat32bppPBGRA
+    IWICImagingFactory::{CreateDecoderFromFilename, CreateFormatConverter}
+    IWICBitmapDecoder::GetFrame
+    IWICFormatConverter::Initialize
+    WICBitmapDitherTypeNone
+    WICBitmapPaletteTypeMedianCut
+    WICDecodeMetadataCacheOnDemand
+    CLSCTX_INPROC_SERVER
+    CoCreateInstance

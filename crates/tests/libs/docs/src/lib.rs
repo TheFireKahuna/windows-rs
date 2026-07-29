@@ -22,6 +22,9 @@ mod windows_collections {}
 #[doc = include_str!("../../../../../docs/crates/windows-core.md")]
 mod windows_core {}
 
+#[doc = include_str!("../../../../../docs/crates/windows-d2d.md")]
+mod windows_d2d {}
+
 #[doc = include_str!("../../../../../docs/crates/windows-future.md")]
 mod windows_future {}
 
