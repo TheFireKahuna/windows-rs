@@ -11,19 +11,20 @@ compile_error!(
     "the `system` and `reactor` composition stacks are mutually exclusive; enable only one"
 );
 
-// `dead_code` is expected rather than allowed, and is temporary: the filter now
-// carries the interactions, springs, clips, paths, gradients and shadows this crate's
-// wrapper has yet to grow, and `--dead-code` exists precisely to report bindings
-// nothing uses. When the wrapper consumes them, `expect` starts warning on its own —
-// which is the signal to delete this line and let the lint prune whatever is left.
+// `dead_code` is allowed rather than expected, and only for one standing reason: an
+// interface named in the filter's `--implement` list keeps its caller-side projection too,
+// and this crate never calls the tracker owner's six callbacks — it receives them. Every
+// other unused binding is a filter entry the wrapper does not consume, which `--dead-code`
+// exists to report, so keep this at `allow` on the generated module and nowhere else.
 #[cfg(feature = "system")]
+#[allow(dead_code)]
 #[allow(
     non_snake_case,
     non_upper_case_globals,
     non_camel_case_types,
-    clippy::upper_case_acronyms
+    clippy::upper_case_acronyms,
+    clippy::missing_transmute_annotations
 )]
-#[expect(dead_code)]
 #[path = "bindings.rs"]
 mod bindings;
 #[cfg(feature = "reactor")]
@@ -33,7 +34,6 @@ mod bindings;
     non_camel_case_types,
     clippy::upper_case_acronyms
 )]
-#[expect(dead_code)]
 #[path = "bindings_lifted.rs"]
 mod bindings;
 
@@ -42,6 +42,7 @@ mod batch;
 mod brush;
 mod color;
 mod compositor;
+mod geometry;
 mod shape;
 mod visual;
 
@@ -54,16 +55,51 @@ mod surface;
 #[cfg(feature = "system")]
 mod target;
 
+// The retained-composition surface: clips, paths, masks, springs, expressions, property
+// sets, interaction trackers, and the constructions built out of them. Carried for the
+// system stack only, matching the filter's `// region: system-only` block — the types
+// mostly exist on both stacks, but the lifted stack's only consumer is reactor's
+// transition engine, which wants none of them. Each is a module of its own with its own
+// `impl Compositor`, so a new capability costs this file two lines and nothing else a
+// rebase has to reconcile.
+#[cfg(feature = "system")]
+mod animatable;
+#[cfg(feature = "system")]
+mod clip;
+#[cfg(feature = "system")]
+mod idiom;
+#[cfg(feature = "system")]
+mod interactions;
+#[cfg(feature = "system")]
+mod mask;
+#[cfg(feature = "system")]
+mod motion;
+#[cfg(feature = "system")]
+mod path;
+#[cfg(feature = "system")]
+mod property_set;
+#[cfg(feature = "system")]
+mod retained;
+#[cfg(feature = "system")]
+mod shadow;
+
 mod sealed {
     /// Prevents downstream crates from implementing this crate's marker traits
     /// ([`Brush`](crate::Brush), [`Shape`](crate::Shape),
-    /// [`Animation`](crate::Animation)).
+    /// [`Geometry`](crate::Geometry), [`Animation`](crate::Animation), and — on the system
+    /// stack — [`Clip`](crate::Clip), [`Surface`](crate::Surface) and
+    /// [`Animatable`](crate::Animatable)).
     pub trait Sealed {}
 }
 
 // Wrapper modules import these through `super::*`.
 pub(crate) use sealed::Sealed;
 pub(crate) use windows_core::Interface;
+
+// Object identity, for the `PartialEq` impls that answer "is this the same object I
+// already bound?" without an interface pointer leaving the crate.
+#[cfg(feature = "system")]
+pub(crate) use animatable::canonical;
 
 pub use animation::{
     Animation, CompositionAnimation, CompositionAnimationGroup, CompositionEasingFunction,
@@ -73,6 +109,7 @@ pub use batch::{BatchKind, CompositionScopedBatch};
 pub use brush::{Brush, CompositionBrush, CompositionColorBrush, CompositionNineGridBrush};
 pub use color::Color;
 pub use compositor::Compositor;
+pub use geometry::Geometry;
 pub use shape::{
     CompositionContainerShape, CompositionEllipseGeometry, CompositionGeometry, CompositionShape,
     CompositionShapeCollection, CompositionSpriteShape, Shape, ShapeVisual,
@@ -82,9 +119,39 @@ pub use visual::{BorderMode, ContainerVisual, SpriteVisual, Visual, VisualCollec
 #[cfg(feature = "system")]
 pub use stack::DispatcherQueueController;
 #[cfg(feature = "system")]
-pub use surface::{CompositionDrawingSurface, CompositionGraphicsDevice, CompositionSurfaceBrush};
+pub use surface::{
+    AlphaMode, CompositionDrawHandle, CompositionDrawingSurface, CompositionGraphicsDevice,
+    CompositionSurface, CompositionSurfaceBrush, CompositionVirtualDrawingSurface,
+    CompositionVisualSurface, PixelFormat, Stretch, Surface,
+};
 #[cfg(feature = "system")]
 pub use target::DesktopWindowTarget;
+
+#[cfg(feature = "system")]
+pub use animatable::{Animatable, CompositionObject};
+#[cfg(feature = "system")]
+pub use clip::{Clip, CompositionClip, CompositionGeometricClip, InsetClip, RectangleClip};
+#[cfg(feature = "system")]
+pub use interactions::{
+    BindingAxes, ChainingMode, Clamping, InertiaModifier, InteractionTracker, RedirectionMode,
+    RequestId, ScaleAnimationPolicy, SourceMode, TrackerEvent, VisualInteractionSource, WheelMode,
+};
+#[cfg(feature = "system")]
+pub use mask::{CompositionLinearGradientBrush, CompositionMaskBrush, MappingMode};
+#[cfg(feature = "system")]
+pub use motion::{
+    ExpressionAnimation, SpringScalarNaturalMotionAnimation, SpringVector2NaturalMotionAnimation,
+    SpringVector3NaturalMotionAnimation, Vector2KeyFrameAnimation,
+};
+#[cfg(feature = "system")]
+pub use path::{
+    CompositionPath, CompositionPathGeometry, CompositionRoundedRectangleGeometry, StrokeCap,
+    StrokeJoin,
+};
+#[cfg(feature = "system")]
+pub use property_set::CompositionPropertySet;
+#[cfg(feature = "system")]
+pub use shadow::{DropShadow, ShadowSource};
 
 pub use windows_core::Result;
 pub use windows_numerics::{Vector2, Vector3};

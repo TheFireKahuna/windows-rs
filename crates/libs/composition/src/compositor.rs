@@ -103,10 +103,7 @@ impl Compositor {
     }
 
     /// Creates a sprite shape that fills the given geometry with a brush.
-    pub fn create_sprite_shape(
-        &self,
-        geometry: &CompositionEllipseGeometry,
-    ) -> CompositionSpriteShape {
+    pub fn create_sprite_shape(&self, geometry: &impl Geometry) -> CompositionSpriteShape {
         let compositor: bindings::ICompositor5 = self.0.cast().unwrap();
         CompositionSpriteShape(
             compositor
@@ -177,15 +174,13 @@ impl Compositor {
         Ok(CompositionGraphicsDevice(graphics.cast()?))
     }
 
-    /// Creates a brush that paints a visual with a composition drawing surface.
+    /// Creates a brush that paints a visual with any composition [`Surface`] — drawn
+    /// pixels, a captured subtree, or a buffer the app presents itself.
     #[cfg(feature = "system")]
-    pub fn create_surface_brush(
-        &self,
-        surface: &CompositionDrawingSurface,
-    ) -> CompositionSurfaceBrush {
+    pub fn create_surface_brush(&self, surface: &impl Surface) -> CompositionSurfaceBrush {
         CompositionSurfaceBrush(
             self.0
-                .CreateSurfaceBrushWithSurface(&surface.as_surface())
+                .CreateSurfaceBrushWithSurface(&surface.as_surface().0)
                 .unwrap(),
         )
     }

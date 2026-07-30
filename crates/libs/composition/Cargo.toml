@@ -15,10 +15,15 @@ system = ["dep:windows-window"]
 reactor = []
 
 [dependencies]
-windows-core = { workspace = true }
-windows-collections = { workspace = true }
+# `proc-macros` for `#[implement]`: `IInteractionTrackerOwner` is a callback interface
+# the app side has to supply, and this crate implements it once so no generated COM
+# type crosses a crate boundary to do it.
+windows-core = { workspace = true, features = ["proc-macros"] }
+# `std` for `IIterable<T>: From<Vec<T>>`, which is how an inertia-modifier list is
+# handed to the tracker.
+windows-collections = { workspace = true, features = ["std"] }
 windows-numerics = { workspace = true }
-# An interaction tracker's inertia modifiers take `IReference<T>` values, and that
+# An interaction tracker's inertia decay rates take `IReference<T>` values, and that
 # type is only exported under the crate's `std` feature.
 windows-reference = { workspace = true, features = ["std"] }
 windows-time = { workspace = true }

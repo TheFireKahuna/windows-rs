@@ -22,10 +22,15 @@ fn build(compositor: &Compositor) -> SpriteVisual {
 }
 ```
 
-Core types include `Compositor`, the visual types, brushes, shapes, key-frame animations, and
-animation groups. For system composition, create a `DispatcherQueueController` and `Compositor`,
-then host the root visual with `Compositor::create_desktop_window_target`, which takes a
-[`windows-window`][window-guide] `Window`. See the [composition
+Core types: `Compositor`, `Visual`, `ContainerVisual`, `SpriteVisual`, `ShapeVisual`, composition
+brushes and shapes, and key-frame animations. On the system stack it also carries what a retained
+visual tree needs to change without being repainted: clips and paths, mask and gradient brushes,
+drop shadows, drawing and virtual surfaces, springs and compositor-evaluated expressions, property
+sets, and `InteractionTracker` — motion the compositor drives from a manipulation with the
+application thread idle. To show a tree, create a `DispatcherQueueController` on the thread, create
+a `Compositor`, then host the root visual in a window with
+`Compositor::create_desktop_window_target`, which takes a [`windows-window`][window-guide] `Window`.
+See the [composition
 guide](https://github.com/microsoft/windows-rs/blob/master/docs/crates/windows-composition.md) for
 the API and hosting options.
 

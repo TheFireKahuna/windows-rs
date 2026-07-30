@@ -45,11 +45,6 @@ Windows.Win32.DispatcherQueueOptions
 Windows.UI.Composition.Visual
 Windows.UI.Composition.IVisual::{put_Offset, get_Offset, put_Size, get_Size, put_Opacity, get_Opacity, put_IsVisible, get_IsVisible, put_AnchorPoint, put_CenterPoint, put_Scale, get_Scale, put_BorderMode, get_Parent}
 Windows.UI.Composition.IVisual2::{put_RelativeSizeAdjustment, put_RelativeOffsetAdjustment, put_ParentForTransform}
-// Round this visual's composed position to whole device pixels. It governs where the
-// visual LANDS, not what its animated Offset holds, so an animation driving that
-// Offset still produces a fresh value every frame — snapping is a placement rule, not
-// a rate limit, and pairs with rather than replaces a step-eased animation.
-Windows.UI.Composition.IVisual4::{put_IsPixelSnappingEnabled}
 Windows.UI.Composition.CompositionBorderMode
 
 Windows.UI.Composition.ContainerVisual
@@ -103,19 +98,6 @@ Windows.UI.Composition.AnimationIterationBehavior
 Windows.UI.Composition.CompositionEasingFunction
 Windows.UI.Composition.LinearEasingFunction
 Windows.UI.Composition.CubicBezierEasingFunction
-
-// A step easing HOLDS its value across a step and jumps, rather than producing a
-// fresh value every vblank. That is a rendering choice for a curve that has to land
-// on discrete positions, but it is also the only lever a key-frame animation has over
-// how OFTEN it writes: a continuously-eased animation on a visual's Offset rewrites
-// that Offset every frame, and the compositor invalidates the visual's whole bounds
-// each time — old bounds and new — however small the delta. For a large, slow-moving
-// sprite the delta can be a fraction of a pixel while the invalidation is a large
-// fraction of the window, so the cost is set by the write RATE and not by the
-// distance travelled. Stepping decouples the two: the path and its duration are
-// unchanged, only the number of distinct positions along it is chosen.
-Windows.UI.Composition.StepEasingFunction
-Windows.UI.Composition.ICompositor2::{CreateStepEasingFunctionWithStepCount}
 
 // Implicit animations: a target-name → animation map applied to a visual so
 // property changes animate automatically. The `IMap` projection it exposes is
@@ -185,13 +167,45 @@ Windows.UI.Composition.ICompositionSurfaceBrush2::{put_Offset, put_Scale}
 // performs is dropping a whole page, which releases its tiles with it.
 // endregion
 
+// ── The retained-composition surface ─────────────────────────────────────────────
+// region: system-only
+// Everything from here to the matching `endregion` is carried for the SYSTEM stack
+// only. Most of these types exist on the lifted stack as well, but its only consumer
+// is reactor's transition engine, which wants none of them — and an entry costs the
+// lifted output whether or not anything calls it, which is how that output once
+// tripled (2,314 lines to 6,655) with surface nothing can call it from. Move an
+// entry out of this region if a lifted caller appears; the wrapper modules that
+// consume these are `#[cfg(feature = "system")]` for the same reason.
+//
+// Round this visual's composed position to whole device pixels. It governs where the
+// visual LANDS, not what its animated Offset holds, so an animation driving that
+// Offset still produces a fresh value every frame — snapping is a placement rule, not
+// a rate limit, and pairs with rather than replaces a step-eased animation.
+Windows.UI.Composition.IVisual4::{put_IsPixelSnappingEnabled}
+
+// A step easing HOLDS its value across a step and jumps, rather than producing a
+// fresh value every vblank. That is a rendering choice for a curve that has to land
+// on discrete positions, but it is also the only lever a key-frame animation has over
+// how OFTEN it writes: a continuously-eased animation on a visual's Offset rewrites
+// that Offset every frame, and the compositor invalidates the visual's whole bounds
+// each time — old bounds and new — however small the delta. For a large, slow-moving
+// sprite the delta can be a fraction of a pixel while the invalidation is a large
+// fraction of the window, so the cost is set by the write RATE and not by the
+// distance travelled. Stepping decouples the two: the path and its duration are
+// unchanged, only the number of distinct positions along it is chosen.
+Windows.UI.Composition.StepEasingFunction
+Windows.UI.Composition.ICompositor2::{CreateStepEasingFunctionWithStepCount}
+
 // The base every composition object derives from. StopAnimation belongs here
 // alongside StartAnimation, and the base type is what an expression animation takes
 // as a reference parameter — so a property set, a clip or an interaction tracker can
 // be referenced, not only a visual.
-Windows.UI.Composition.ICompositionObject::{StopAnimation}
-Windows.UI.Composition.ICompositionObject4::{TryGetAnimationController}
-Windows.UI.Composition.AnimationController
+Windows.UI.Composition.ICompositionObject::{StopAnimation, get_Properties}
+// NOT carried: `ICompositionObject4::TryGetAnimationController` and `AnimationController`.
+// The controller is playback control for a KEY-FRAME animation, and the call returns null
+// when "the animation is not found" — a null class return that arrives as a successful call,
+// so any is-this-animating predicate built on it answers yes either way. A caller that must
+// not restart a live animation knows what it started.
 
 // Property sets: the CPU-to-compositor frontier. The app writes named values when
 // they change; an expression animation referencing the set re-reads them every vblank
@@ -229,6 +243,12 @@ Windows.UI.Composition.SpringVector3NaturalMotionAnimation
 Windows.UI.Composition.IScalarNaturalMotionAnimation::{put_FinalValue}
 Windows.UI.Composition.IVector2NaturalMotionAnimation::{put_FinalValue}
 Windows.UI.Composition.IVector3NaturalMotionAnimation::{put_FinalValue}
+Windows.UI.Composition.IScalarNaturalMotionAnimation::{put_InitialVelocity}
+Windows.UI.Composition.IVector2NaturalMotionAnimation::{put_InitialVelocity}
+Windows.UI.Composition.IVector3NaturalMotionAnimation::{put_InitialVelocity}
+// `put_InitialValue` is deliberately absent. Its documented null default is "the beginning
+// value of the property being animated", which is exactly what a spring taking over from a
+// gesture wants; setting it makes the motion start somewhere the property is not.
 Windows.UI.Composition.ISpringScalarNaturalMotionAnimation::{put_DampingRatio, put_Period}
 Windows.UI.Composition.ISpringVector2NaturalMotionAnimation::{put_DampingRatio, put_Period}
 Windows.UI.Composition.ISpringVector3NaturalMotionAnimation::{put_DampingRatio, put_Period}
@@ -294,14 +314,11 @@ Windows.UI.Composition.CompositionStrokeDashArray
 Windows.UI.Composition.CompositionMaskBrush
 Windows.UI.Composition.ICompositionMaskBrush::{put_Mask, put_Source}
 Windows.UI.Composition.ICompositor2::{CreateMaskBrush}
-// region: system-only
-// The visual-surface wrapper lives alongside the D2D bridge, which is system-only, so
-// the lifted stack has no consumer for these. The type itself exists on both stacks —
-// move this out of the region if a lifted caller appears.
+// The visual-surface wrapper lives alongside the D2D bridge, which is system-only
+// regardless; these are inside the enclosing region with everything else.
 Windows.UI.Composition.CompositionVisualSurface
 Windows.UI.Composition.ICompositorWithVisualSurface::{CreateVisualSurface}
 Windows.UI.Composition.ICompositionVisualSurface::{put_SourceVisual, put_SourceOffset, put_SourceSize}
-// endregion
 
 // Drop shadows. A compositor-side Gaussian applied to a sprite, with an arbitrary
 // brush as its alpha mask — a shadow at zero offset IS a glow, and unlike an effect
@@ -350,43 +367,119 @@ Windows.UI.Composition.CompositionBatchCompletedEventArgs
 // the motion yourself would, because every `ValuesChanged` crossing is a callback.
 // `CreateWithOwner` takes it at construction and there is no per-callback
 // subscription, so a tracker that needs no callbacks should be created without one.
+// Naming a CLASS materializes the type and nothing else — its members come from the
+// interfaces below, which is why every one of these is spelled out. A class named on
+// its own generates a shell that cannot be called.
 Windows.UI.Composition.Interactions.InteractionTracker
-Windows.UI.Composition.Interactions.IInteractionTrackerOwner
-Windows.UI.Composition.Interactions.InteractionTrackerInertiaModifier
-Windows.UI.Composition.Interactions.InteractionTrackerInertiaMotion
-Windows.UI.Composition.Interactions.InteractionTrackerInertiaNaturalMotion
-Windows.UI.Composition.Interactions.InteractionTrackerInertiaRestingValue
-Windows.UI.Composition.Interactions.InteractionTrackerVector2InertiaNaturalMotion
+Windows.UI.Composition.Interactions.IInteractionTrackerStatics::{Create, CreateWithOwner}
+// Bounds, decay and the sources collection. `put_PositionInertiaDecayRate` takes an
+// `IReference<Vector3>` — a null reference restores the system default, which is why
+// the crate depends on windows-reference.
+Windows.UI.Composition.Interactions.IInteractionTracker::{get_InteractionSources, put_MinPosition, get_MinPosition, put_MaxPosition, get_MaxPosition, put_MinScale, put_MaxScale, put_PositionInertiaDecayRate, put_ScaleInertiaDecayRate}
+// NOT carried: `get_Position` and `get_Scale`. The tracker is cross-process and
+// asynchronous, so a direct read races the value the compositor is evaluating; the
+// only trustworthy read is the one `ValuesChanged` delivers. Leaving the getters out
+// makes that a compile error rather than a convention.
+//
+// Position and scale requests. Every one returns a request id and may be dropped
+// silently depending on the tracker's state, so the wrapper surfaces the id rather
+// than discarding it.
+Windows.UI.Composition.Interactions.IInteractionTracker::{TryUpdatePositionWithAdditionalVelocity, TryUpdatePositionWithAnimation, TryUpdateScale, TryUpdateScaleWithAdditionalVelocity, ConfigurePositionXInertiaModifiers, ConfigurePositionYInertiaModifiers}
+// The clamping and position-update options are stated rather than defaulted, so the
+// option-free overloads are deliberately NOT carried: a defaulted clamping option is how a
+// correction silently lands outside the tracker's range. `IInteractionTracker5`'s overload
+// is the one that also decides whether a running custom scale animation survives.
+Windows.UI.Composition.Interactions.IInteractionTracker4::{TryUpdatePositionByWithOption, get_IsInertiaFromImpulse}
+Windows.UI.Composition.Interactions.IInteractionTracker5::{TryUpdatePositionWithOption}
 Windows.UI.Composition.Interactions.InteractionTrackerClampingOption
 Windows.UI.Composition.Interactions.InteractionTrackerPositionUpdateOption
-Windows.UI.Composition.Interactions.InteractionTrackerIdleStateEnteredArgs
-Windows.UI.Composition.Interactions.InteractionTrackerInertiaStateEnteredArgs
-Windows.UI.Composition.Interactions.InteractionTrackerInteractingStateEnteredArgs
-Windows.UI.Composition.Interactions.InteractionTrackerCustomAnimationStateEnteredArgs
-Windows.UI.Composition.Interactions.InteractionTrackerRequestIgnoredArgs
+// Two trackers bound on an axis stay locked compositor-side instead of by copying a
+// value per tick.
+Windows.UI.Composition.Interactions.IInteractionTrackerStatics2::{SetBindingMode, GetBindingMode}
+Windows.UI.Composition.Interactions.InteractionBindingAxisModes
+
+// Three interfaces here are IMPLEMENTED rather than called — the tracker's owner, and the
+// pair that presents a Direct2D geometry to the compositor — so they need `_Impl`
+// scaffolding and nothing else does. Naming them narrows that scaffolding to these three
+// instead of emitting it for every interface in the filter.
+--implement
+    Windows.UI.Composition.Interactions.IInteractionTrackerOwner
+    Windows.Graphics.IGeometrySource2D
+    Windows.Win32.IGeometrySource2DInterop
+
+--filter
+
+// The owner interface is named in `--implement` above and NOT here: naming it in the filter
+// too would emit the caller-side projection of six callbacks this crate only ever receives.
+// The args types carry the values those callbacks report; a class with no interface named
+// beside it would deliver six callbacks that can read nothing.
 Windows.UI.Composition.Interactions.InteractionTrackerValuesChangedArgs
+Windows.UI.Composition.Interactions.IInteractionTrackerValuesChangedArgs::{get_Position, get_Scale, get_RequestId}
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaStateEnteredArgs
+Windows.UI.Composition.Interactions.IInteractionTrackerInertiaStateEnteredArgs::{get_NaturalRestingPosition, get_ModifiedRestingPosition, get_NaturalRestingScale, get_ModifiedRestingScale, get_PositionVelocityInPixelsPerSecond, get_RequestId}
+Windows.UI.Composition.Interactions.IInteractionTrackerInertiaStateEnteredArgs2::{get_IsInertiaFromImpulse}
+Windows.UI.Composition.Interactions.IInteractionTrackerInertiaStateEnteredArgs3::{get_IsFromBinding}
+Windows.UI.Composition.Interactions.InteractionTrackerIdleStateEnteredArgs
+Windows.UI.Composition.Interactions.IInteractionTrackerIdleStateEnteredArgs::{get_RequestId}
+Windows.UI.Composition.Interactions.IInteractionTrackerIdleStateEnteredArgs2::{get_IsFromBinding}
+Windows.UI.Composition.Interactions.InteractionTrackerInteractingStateEnteredArgs
+Windows.UI.Composition.Interactions.IInteractionTrackerInteractingStateEnteredArgs::{get_RequestId}
+Windows.UI.Composition.Interactions.IInteractionTrackerInteractingStateEnteredArgs2::{get_IsFromBinding}
+Windows.UI.Composition.Interactions.InteractionTrackerCustomAnimationStateEnteredArgs
+Windows.UI.Composition.Interactions.IInteractionTrackerCustomAnimationStateEnteredArgs::{get_RequestId}
+Windows.UI.Composition.Interactions.IInteractionTrackerCustomAnimationStateEnteredArgs2::{get_IsFromBinding}
+Windows.UI.Composition.Interactions.InteractionTrackerRequestIgnoredArgs
+Windows.UI.Composition.Interactions.IInteractionTrackerRequestIgnoredArgs::{get_RequestId}
+
+// The source: which axes a manipulation drives, how input reaches it, and how it
+// chains to a neighbour at its bounds. `TryRedirectForManipulation` is deliberately
+// the Win32 interop overload further down and not this WinRT one, which would drag
+// `Windows.UI.Input.PointerPoint` into the crate for a call a desktop app makes with
+// a pointer id.
 Windows.UI.Composition.Interactions.VisualInteractionSource
-Windows.UI.Composition.Interactions.VisualInteractionSourceRedirectionMode
+Windows.UI.Composition.Interactions.IVisualInteractionSourceStatics::{Create}
+Windows.UI.Composition.Interactions.IVisualInteractionSource::{put_PositionXSourceMode, put_PositionYSourceMode, put_ScaleSourceMode, put_IsPositionXRailsEnabled, put_IsPositionYRailsEnabled, put_ManipulationRedirectionMode, put_PositionXChainingMode, put_PositionYChainingMode, put_ScaleChainingMode, get_Source}
+// Wheel input is configured separately from touch and pen, which is what makes
+// mouse-wheel scrolling compositor-side with no front-thread handling at all.
+Windows.UI.Composition.Interactions.IVisualInteractionSource3::{get_PointerWheelConfig}
+Windows.UI.Composition.Interactions.InteractionSourceConfiguration
+Windows.UI.Composition.Interactions.IInteractionSourceConfiguration::{put_PositionXSourceMode, put_PositionYSourceMode, put_ScaleSourceMode}
 Windows.UI.Composition.Interactions.InteractionSourceMode
 Windows.UI.Composition.Interactions.InteractionSourceRedirectionMode
-Windows.UI.Composition.Interactions.InteractionSourceConfiguration
+Windows.UI.Composition.Interactions.VisualInteractionSourceRedirectionMode
 Windows.UI.Composition.Interactions.InteractionChainingMode
-Windows.UI.Composition.Interactions.InteractionBindingAxisModes
 Windows.UI.Composition.Interactions.CompositionInteractionSourceCollection
+Windows.UI.Composition.Interactions.ICompositionInteractionSourceCollection::{Add, Remove, RemoveAll}
 Windows.UI.Composition.Interactions.ICompositionInteractionSource
-// In `Interactions`, not in `Windows.UI.Composition` — it is the conditional an
-// inertia modifier is expressed with, not a general composition value.
-Windows.UI.Composition.Interactions.CompositionConditionalValue
 
-// region: system-only
+// Inertia modifiers: a condition evaluated ONCE at inertia entry, plus either a
+// resting value (a snap point) or an explicit second-derivative motion equation. Both
+// halves are expression animations, so a snap point is authored the same way every
+// other compositor-evaluated value is. The modifier list is an `IIterable`, which
+// windows-collections builds from a `Vec`.
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaModifier
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaRestingValue
+Windows.UI.Composition.Interactions.IInteractionTrackerInertiaRestingValueStatics::{Create}
+Windows.UI.Composition.Interactions.IInteractionTrackerInertiaRestingValue::{put_Condition, put_RestingValue}
+Windows.UI.Composition.Interactions.InteractionTrackerInertiaMotion
+Windows.UI.Composition.Interactions.IInteractionTrackerInertiaMotionStatics::{Create}
+Windows.UI.Composition.Interactions.IInteractionTrackerInertiaMotion::{put_Condition, put_Motion}
+
 // Redirecting a contact into a manipulation, and the Direct2D geometry bridge. Both
-// are Win32 interop, which the lifted stack has no metadata for.
+// are Win32 interop, which the lifted stack has no metadata for — so they would be
+// system-only even without the enclosing region.
 //
 // `TryRedirectForManipulation` rejects `PT_MOUSE` outright — touch or pen only — and
 // success is signalled by the window LOSING the pointer, not by the returned HRESULT:
 // for an injected contact it returns S_OK while UPDATE and UP keep arriving, which
 // means the contact was never handed over.
 Windows.Win32.IVisualInteractionSourceInterop::{TryRedirectForManipulation}
+// The redirect takes a `POINTER_INFO`, and a caller holding a pointer id would otherwise
+// have to fill one and hand over a raw pointer — an unsafe public method for what is really
+// one lookup. Reading it here keeps the id the caller already has as the whole argument.
+// Input belongs to other crates; this is not reading input, it is the redirect's own
+// argument conversion, and no caller can do it more safely than this.
+Windows.Win32.GetPointerInfo
 // A geometry already tessellated for Direct2D becomes a CompositionPath through this
 // pair, so a curve is authored once rather than rebuilt as composition geometry.
 // `IGeometrySource2DInterop` is not in the vendored Win32 corpus; see
