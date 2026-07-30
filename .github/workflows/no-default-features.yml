@@ -84,6 +84,8 @@ jobs:
         run:  cargo check -p windows-clang --no-default-features
       - name: Check windows-collections
         run:  cargo check -p windows-collections --no-default-features
+      - name: Check windows-color
+        run:  cargo check -p windows-color --no-default-features
       - name: Check windows-composition
         run:  cargo check -p windows-composition --no-default-features --features reactor
       - name: Check windows-core

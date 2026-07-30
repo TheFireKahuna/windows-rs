@@ -1,0 +1,16 @@
+[package]
+name = "windows-color"
+version = "0.100.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Colour-space mathematics and the display output transform"
+repository = "https://github.com/microsoft/windows-rs"
+categories = ["graphics"]
+readme = "readme.md"
+
+# No dependencies. Not even windows-core: this crate is pure mathematics and must
+# stay unit-testable with no device, no window and no display.
+
+[lints]
+workspace = true
