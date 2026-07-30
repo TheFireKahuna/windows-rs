@@ -9,9 +9,25 @@ repository = "https://github.com/microsoft/windows-rs"
 categories = ["os::windows-apis"]
 readme = "readme.md"
 
+[features]
+default = []
+# Draw Direct2D content into a `windows-composition` drawing surface. Behind a feature
+# because a present thread never needs it, and because it is the only place this crate
+# knows the composition object model exists. It has to live on this side of the seam:
+# the surface's `begin_draw` is generic over the interface to return, and only this
+# crate can name a Direct2D device context.
+composition = ["dep:windows-composition", "windows-composition/system"]
+
 [dependencies]
+# Every brush and every stop takes an `Scrgb`. There is no colour type in this crate,
+# which is what makes the output transform unskippable rather than merely documented.
+windows-color = { workspace = true }
 windows-core = { workspace = true }
 windows-numerics = { workspace = true }
+
+[dependencies.windows-composition]
+workspace = true
+optional = true
 
 [lints]
 workspace = true
