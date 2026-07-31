@@ -19,7 +19,7 @@
 --filter
     DWriteCreateFactory
     DWRITE_FACTORY_TYPE_SHARED
-    IDWriteFactory::{CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign, CreateCustomRenderingParams}
+    IDWriteFactory::{GetSystemFontCollection, CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign, CreateCustomRenderingParams}
     IDWriteFactory1
     IDWriteFactory2::{TranslateColorGlyphRun, CreateGlyphRunAnalysis}
     IDWriteFactory3
@@ -60,6 +60,21 @@
     DWRITE_FONT_AXIS_VALUE
     DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE
 
+// ── Resolving a face ──────────────────────────────────────────────────────────
+// A shaped run crosses the app→front seam as plain data naming a font by an
+// interned family id, so the *front* half resolves that id to a face and caches it.
+// The system collection is the whole of the lookup: family name in, one face out at
+// the requested weight, style and stretch. There is no custom font set here — an
+// application ships its ladder as system-installed families or as a collection this
+// crate does not yet build.
+    IDWriteFontCollection::{FindFamilyName, GetFontFamily}
+    IDWriteFontFamily::GetFirstMatchingFont
+    IDWriteFont::CreateFontFace
+    IDWriteFontList
+    DWRITE_FONT_WEIGHT
+    DWRITE_FONT_STYLE
+    DWRITE_FONT_STRETCH
+
 // ── Runs, faces, and metrics ──────────────────────────────────────────────────
     IDWriteTextRenderer
     IDWritePixelSnapping
@@ -87,3 +102,6 @@
     DWRITE_GRID_FIT_MODE_DISABLED
     DWRITE_GRID_FIT_MODE_ENABLED
     DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE
+// Coverage is grayscale, so the rasterizer is told there is no subpixel structure to
+// exploit rather than being left to infer one from the user's ClearType tuning.
+    DWRITE_PIXEL_GEOMETRY_FLAT

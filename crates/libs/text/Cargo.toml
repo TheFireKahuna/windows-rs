@@ -9,9 +9,22 @@ repository = "https://github.com/microsoft/windows-rs"
 categories = ["os::windows-apis"]
 readme = "readme.md"
 
+[features]
+default = []
+# Put a shaped run's coverage on whatever `windows-d2d` is drawing into. Behind a
+# feature because measuring and shaping need no drawing stack, and because the face a
+# run names is DirectWrite's — so the crate that owns the face owns the trait, and
+# neither drawing crate grows a dependency it does not need.
+d2d = ["dep:windows-d2d"]
+
 [dependencies]
+rustc-hash = { workspace = true }
 windows-core = { workspace = true }
 windows-numerics = { workspace = true }
+
+[dependencies.windows-d2d]
+workspace = true
+optional = true
 
 [lints]
 workspace = true

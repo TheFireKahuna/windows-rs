@@ -54,10 +54,39 @@ pub struct DWRITE_FONT_METRICS {
 }
 pub type DWRITE_FONT_SIMULATIONS = u32;
 pub type DWRITE_FONT_STRETCH = i32;
+pub const DWRITE_FONT_STRETCH_CONDENSED: DWRITE_FONT_STRETCH = 3;
+pub const DWRITE_FONT_STRETCH_EXPANDED: DWRITE_FONT_STRETCH = 7;
+pub const DWRITE_FONT_STRETCH_EXTRA_CONDENSED: DWRITE_FONT_STRETCH = 2;
+pub const DWRITE_FONT_STRETCH_EXTRA_EXPANDED: DWRITE_FONT_STRETCH = 8;
+pub const DWRITE_FONT_STRETCH_MEDIUM: DWRITE_FONT_STRETCH = 5;
 pub const DWRITE_FONT_STRETCH_NORMAL: DWRITE_FONT_STRETCH = 5;
+pub const DWRITE_FONT_STRETCH_SEMI_CONDENSED: DWRITE_FONT_STRETCH = 4;
+pub const DWRITE_FONT_STRETCH_SEMI_EXPANDED: DWRITE_FONT_STRETCH = 6;
+pub const DWRITE_FONT_STRETCH_ULTRA_CONDENSED: DWRITE_FONT_STRETCH = 1;
+pub const DWRITE_FONT_STRETCH_ULTRA_EXPANDED: DWRITE_FONT_STRETCH = 9;
+pub const DWRITE_FONT_STRETCH_UNDEFINED: DWRITE_FONT_STRETCH = 0;
 pub type DWRITE_FONT_STYLE = i32;
+pub const DWRITE_FONT_STYLE_ITALIC: DWRITE_FONT_STYLE = 2;
 pub const DWRITE_FONT_STYLE_NORMAL: DWRITE_FONT_STYLE = 0;
+pub const DWRITE_FONT_STYLE_OBLIQUE: DWRITE_FONT_STYLE = 1;
 pub type DWRITE_FONT_WEIGHT = i32;
+pub const DWRITE_FONT_WEIGHT_BLACK: DWRITE_FONT_WEIGHT = 900;
+pub const DWRITE_FONT_WEIGHT_BOLD: DWRITE_FONT_WEIGHT = 700;
+pub const DWRITE_FONT_WEIGHT_DEMI_BOLD: DWRITE_FONT_WEIGHT = 600;
+pub const DWRITE_FONT_WEIGHT_EXTRA_BLACK: DWRITE_FONT_WEIGHT = 950;
+pub const DWRITE_FONT_WEIGHT_EXTRA_BOLD: DWRITE_FONT_WEIGHT = 800;
+pub const DWRITE_FONT_WEIGHT_EXTRA_LIGHT: DWRITE_FONT_WEIGHT = 200;
+pub const DWRITE_FONT_WEIGHT_HEAVY: DWRITE_FONT_WEIGHT = 900;
+pub const DWRITE_FONT_WEIGHT_LIGHT: DWRITE_FONT_WEIGHT = 300;
+pub const DWRITE_FONT_WEIGHT_MEDIUM: DWRITE_FONT_WEIGHT = 500;
+pub const DWRITE_FONT_WEIGHT_NORMAL: DWRITE_FONT_WEIGHT = 400;
+pub const DWRITE_FONT_WEIGHT_REGULAR: DWRITE_FONT_WEIGHT = 400;
+pub const DWRITE_FONT_WEIGHT_SEMI_BOLD: DWRITE_FONT_WEIGHT = 600;
+pub const DWRITE_FONT_WEIGHT_SEMI_LIGHT: DWRITE_FONT_WEIGHT = 350;
+pub const DWRITE_FONT_WEIGHT_THIN: DWRITE_FONT_WEIGHT = 100;
+pub const DWRITE_FONT_WEIGHT_ULTRA_BLACK: DWRITE_FONT_WEIGHT = 950;
+pub const DWRITE_FONT_WEIGHT_ULTRA_BOLD: DWRITE_FONT_WEIGHT = 800;
+pub const DWRITE_FONT_WEIGHT_ULTRA_LIGHT: DWRITE_FONT_WEIGHT = 200;
 pub type DWRITE_GLYPH_IMAGE_FORMATS = u32;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -169,6 +198,7 @@ pub const DWRITE_PARAGRAPH_ALIGNMENT_CENTER: DWRITE_PARAGRAPH_ALIGNMENT = 2;
 pub const DWRITE_PARAGRAPH_ALIGNMENT_FAR: DWRITE_PARAGRAPH_ALIGNMENT = 1;
 pub const DWRITE_PARAGRAPH_ALIGNMENT_NEAR: DWRITE_PARAGRAPH_ALIGNMENT = 0;
 pub type DWRITE_PIXEL_GEOMETRY = i32;
+pub const DWRITE_PIXEL_GEOMETRY_FLAT: DWRITE_PIXEL_GEOMETRY = 0;
 pub type DWRITE_READING_DIRECTION = i32;
 pub type DWRITE_RENDERING_MODE = i32;
 pub type DWRITE_RENDERING_MODE1 = i32;
@@ -329,6 +359,19 @@ windows_core::imp::define_interface!(
 );
 windows_core::imp::interface_hierarchy!(IDWriteFactory, windows_core::IUnknown);
 impl IDWriteFactory {
+    pub unsafe fn GetSystemFontCollection(
+        &self,
+        fontcollection: *mut Option<IDWriteFontCollection>,
+        checkforupdates: bool,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetSystemFontCollection)(
+                windows_core::Interface::as_raw(self),
+                core::mem::transmute(fontcollection),
+                checkforupdates.into(),
+            )
+        }
+    }
     pub unsafe fn CreateCustomRenderingParams(
         &self,
         gamma: f32,
@@ -427,7 +470,11 @@ impl IDWriteFactory {
 #[repr(C)]
 pub struct IDWriteFactory_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
-    GetSystemFontCollection: usize,
+    pub GetSystemFontCollection: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+        windows_core::BOOL,
+    ) -> windows_core::HRESULT,
     CreateCustomFontCollection: usize,
     RegisterFontCollectionLoader: usize,
     UnregisterFontCollectionLoader: usize,
@@ -1407,17 +1454,93 @@ pub struct IDWriteFactory7_Vtbl {
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
+    IDWriteFont,
+    IDWriteFont_Vtbl,
+    0xacd16696_8c14_4f5d_877e_fe3fc1d32737
+);
+windows_core::imp::interface_hierarchy!(IDWriteFont, windows_core::IUnknown);
+impl IDWriteFont {
+    pub unsafe fn CreateFontFace(&self) -> windows_core::Result<IDWriteFontFace> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateFontFace)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct IDWriteFont_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetFontFamily: usize,
+    GetWeight: usize,
+    GetStretch: usize,
+    GetStyle: usize,
+    IsSymbolFont: usize,
+    GetFaceNames: usize,
+    GetInformationalStrings: usize,
+    GetSimulations: usize,
+    GetMetrics: usize,
+    HasCharacter: usize,
+    pub CreateFontFace: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
     IDWriteFontCollection,
     IDWriteFontCollection_Vtbl,
     0xa84cee02_3eea_4eee_a827_87c1a02a0fcc
 );
 windows_core::imp::interface_hierarchy!(IDWriteFontCollection, windows_core::IUnknown);
+impl IDWriteFontCollection {
+    pub unsafe fn GetFontFamily(&self, index: u32) -> windows_core::Result<IDWriteFontFamily> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFontFamily)(
+                windows_core::Interface::as_raw(self),
+                index,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub unsafe fn FindFamilyName<P0>(
+        &self,
+        familyname: P0,
+        index: *mut u32,
+        exists: *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT
+    where
+        P0: windows_core::Param<windows_core::PCWSTR>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).FindFamilyName)(
+                windows_core::Interface::as_raw(self),
+                familyname.param().abi(),
+                index as _,
+                exists as _,
+            )
+        }
+    }
+}
 #[repr(C)]
 pub struct IDWriteFontCollection_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
     GetFontFamilyCount: usize,
-    GetFontFamily: usize,
-    FindFamilyName: usize,
+    pub GetFontFamily: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub FindFamilyName: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        windows_core::PCWSTR,
+        *mut u32,
+        *mut windows_core::BOOL,
+    ) -> windows_core::HRESULT,
     GetFontFromFontFace: usize,
 }
 windows_core::imp::define_interface!(
@@ -1643,6 +1766,51 @@ pub struct IDWriteFontFallback_Vtbl {
     MapCharacters: usize,
 }
 windows_core::imp::define_interface!(
+    IDWriteFontFamily,
+    IDWriteFontFamily_Vtbl,
+    0xda20d8ef_812a_4c43_9802_62ec4abd7add
+);
+impl core::ops::Deref for IDWriteFontFamily {
+    type Target = IDWriteFontList;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(IDWriteFontFamily, windows_core::IUnknown, IDWriteFontList);
+impl IDWriteFontFamily {
+    pub unsafe fn GetFirstMatchingFont(
+        &self,
+        weight: DWRITE_FONT_WEIGHT,
+        stretch: DWRITE_FONT_STRETCH,
+        style: DWRITE_FONT_STYLE,
+    ) -> windows_core::Result<IDWriteFont> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFirstMatchingFont)(
+                windows_core::Interface::as_raw(self),
+                weight,
+                stretch,
+                style,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct IDWriteFontFamily_Vtbl {
+    pub base__: IDWriteFontList_Vtbl,
+    GetFamilyNames: usize,
+    pub GetFirstMatchingFont: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        DWRITE_FONT_WEIGHT,
+        DWRITE_FONT_STRETCH,
+        DWRITE_FONT_STYLE,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    GetMatchingFonts: usize,
+}
+windows_core::imp::define_interface!(
     IDWriteFontFile,
     IDWriteFontFile_Vtbl,
     0x739d886a_cef5_47dc_8769_1a8b41bebbb0
@@ -1679,6 +1847,56 @@ pub struct IDWriteFontFileStream_Vtbl {
     ReleaseFileFragment: usize,
     GetFileSize: usize,
     GetLastWriteTime: usize,
+}
+windows_core::imp::define_interface!(
+    IDWriteFontList,
+    IDWriteFontList_Vtbl,
+    0x1a0d8438_1d97_4ec1_aef9_a2fb86ed6acb
+);
+windows_core::imp::interface_hierarchy!(IDWriteFontList, windows_core::IUnknown);
+impl IDWriteFontList {
+    pub unsafe fn GetFontCollection(&self) -> windows_core::Result<IDWriteFontCollection> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFontCollection)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub unsafe fn GetFontCount(&self) -> u32 {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetFontCount)(windows_core::Interface::as_raw(
+                self,
+            ))
+        }
+    }
+    pub unsafe fn GetFont(&self, index: u32) -> windows_core::Result<IDWriteFont> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetFont)(
+                windows_core::Interface::as_raw(self),
+                index,
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
+#[repr(C)]
+pub struct IDWriteFontList_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    pub GetFontCollection: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetFontCount: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+    pub GetFont: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        u32,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IDWriteFontResource,
