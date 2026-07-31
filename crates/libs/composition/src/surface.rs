@@ -461,6 +461,15 @@ impl CompositionSurfaceBrush {
         self.0.SetStretch(stretch.into()).unwrap();
     }
 
+    /// Re-points this brush at another surface.
+    ///
+    /// The brush is the sharing point: every visual painted with it follows, in place, with
+    /// no visual touched. That is what a caller re-rasterizing content several visuals paint
+    /// with wants — building a second brush would leave all of them on the old surface.
+    pub fn set_surface(&self, surface: &impl Surface) {
+        self.0.SetSurface(&surface.as_surface().0).unwrap();
+    }
+
     /// Sets where the surface sits within the painted area when it does not fill it, as a
     /// fraction of the leftover space on each axis.
     ///

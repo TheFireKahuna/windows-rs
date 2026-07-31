@@ -21,6 +21,18 @@ pub trait Animation: Sealed {
     fn as_animation(&self) -> CompositionAnimation;
 }
 
+impl Sealed for CompositionAnimation {}
+
+/// The base type is itself startable, which is what lets a caller that has erased which
+/// kind it built — a spring, a key-frame curve, an expression — still start it. Without
+/// this, a consumer holding a cache of animations keyed by shape has to keep the concrete
+/// type of every one of them.
+impl Animation for CompositionAnimation {
+    fn as_animation(&self) -> Self {
+        self.clone()
+    }
+}
+
 /// An easing function that shapes a key frame's interpolation curve.
 ///
 /// Create one with [`Compositor::create_linear_easing_function`] or
@@ -73,6 +85,23 @@ impl ScalarKeyFrameAnimation {
     pub fn set_target(&self, target: &str) {
         let animation: bindings::ICompositionAnimation2 = self.0.cast().unwrap();
         animation.SetTarget(target).unwrap();
+    }
+
+    /// Sets the animation to run for a fixed number of iterations.
+    pub fn set_iteration_count(&self, count: i32) {
+        let animation: bindings::IKeyFrameAnimation = self.0.cast().unwrap();
+        animation
+            .SetIterationBehavior(bindings::AnimationIterationBehavior::Count)
+            .unwrap();
+        animation.SetIterationCount(count).unwrap();
+    }
+
+    /// Sets the animation to repeat forever.
+    pub fn set_iterate_forever(&self) {
+        let animation: bindings::IKeyFrameAnimation = self.0.cast().unwrap();
+        animation
+            .SetIterationBehavior(bindings::AnimationIterationBehavior::Forever)
+            .unwrap();
     }
 }
 
