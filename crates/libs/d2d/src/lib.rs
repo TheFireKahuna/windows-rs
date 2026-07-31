@@ -67,7 +67,10 @@ pub use device::{Gpu, Loss, classify};
 pub use geometry::{
     Bezier, Combine, Ellipse, End, Figure, Path, Realization, Rect, RoundedRect, Shape, Sink,
 };
-pub use pass::{Additive, Aliased, Clipped, Draw, Layer, Layered, Pass, PassError, Transformed};
+pub use pass::{
+    Additive, Aliased, Clipped, Draw, GlyphRun, Layer, Layered, Pass, PassError,
+    TextParams, Transformed,
+};
 pub use target::{Opacity, Readback, Target};
 
 #[cfg(feature = "composition")]

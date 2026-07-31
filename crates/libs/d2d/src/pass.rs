@@ -309,6 +309,58 @@ impl<'p> Draw<'p> {
         }
     }
 
+    /// Draws one run of positioned glyphs, with `origin` on the baseline.
+    ///
+    /// This is `DrawGlyphRun` and there is deliberately nothing above it: a text *layout*
+    /// drawn here would put DirectWrite's shaper on whatever path issued the call, which
+    /// measured at roughly a tenth of a process for strings changing at 10 Hz. What
+    /// belongs on a live path is a run that was shaped once, somewhere else.
+    ///
+    /// **Measuring is `NATURAL`**, so glyph advances keep ideal metrics that do not depend
+    /// on the display resolution and horizontal positions are subpixel. Only the baseline
+    /// is snapped, and snapping it is the caller's: `DrawGlyphRun` takes no options
+    /// parameter, so the free baseline snapping the text APIs perform is not available
+    /// here and glyphs land wherever `origin` puts them.
+    ///
+    /// How the coverage is rasterized comes from the context, so state it with
+    /// [`text_params`](Self::text_params) rather than inheriting the system's.
+    pub fn glyphs(&self, origin: Vector2, run: &GlyphRun<'_>, brush: &impl Brush) {
+        debug_assert!(
+            run.glyphs.len() == run.advances.len() && run.glyphs.len() == run.offsets.len(),
+            "a glyph run's indices, advances and offsets are three views of one sequence"
+        );
+        let count = run.glyphs.len().min(run.advances.len()).min(run.offsets.len());
+        if count == 0 {
+            return;
+        }
+        let Ok(face) = run.face.cast::<IDWriteFontFace>() else {
+            debug_assert!(false, "a glyph run's face must be an IDWriteFontFace");
+            return;
+        };
+        // `DWRITE_GLYPH_RUN` holds a borrowed face in a `ManuallyDrop`, so the reference
+        // count is ours to keep for exactly the length of the call and to drop after it.
+        let dwrite = DWRITE_GLYPH_RUN {
+            fontFace: ManuallyDrop::new(Some(face)),
+            fontEmSize: run.em,
+            glyphCount: count as u32,
+            glyphIndices: run.glyphs.as_ptr(),
+            glyphAdvances: run.advances.as_ptr(),
+            glyphOffsets: run.offsets.as_ptr().cast::<DWRITE_GLYPH_OFFSET>(),
+            isSideways: false.into(),
+            bidiLevel: 0,
+        };
+        unsafe {
+            self.ctx.DrawGlyphRun(
+                origin,
+                &raw const dwrite,
+                None,
+                brush.brush().raw(),
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        drop(ManuallyDrop::into_inner(dwrite.fontFace));
+    }
+
     /// Draws a realization: tessellated once, rasterized per frame.
     pub fn realization(&self, r: &Realization, brush: &impl Brush) {
         debug_assert!(
@@ -385,6 +437,30 @@ impl<'p> Draw<'p> {
     pub fn additive(&self) -> Additive<'_> {
         unsafe { self.ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_ADD) };
         Additive(self)
+    }
+
+    /// States how glyph coverage is rasterized, until the guard drops.
+    ///
+    /// `params` is DirectWrite's `IDWriteRenderingParams`, built by whoever owns the font
+    /// stack; this crate names the interface only so one can be handed over. Stating it
+    /// matters more than it looks: inherited, the parameters are the *system's* — a user's
+    /// ClearType tuning, a display's gamma — and coverage that carries those comes out
+    /// systematically thin or fat and reads as a font choice rather than as a setting.
+    ///
+    /// A guard rather than a setter, for the same reason as [`aliased`](Self::aliased):
+    /// one bracket spans every target in a pass, and a mode set on the context outlives
+    /// the target it was meant for.
+    pub fn text_params(&self, params: &impl Interface) -> TextParams<'_> {
+        // A context that has never been told carries none, which the getter reports as a
+        // failed call rather than as `Ok(None)` — so "no params" and "could not ask" land
+        // in the same arm, and restoring `None` is right for both.
+        let previous = unsafe { self.ctx.GetTextRenderingParams().ok() };
+        if let Ok(params) = params.cast::<IDWriteRenderingParams>() {
+            unsafe { self.ctx.SetTextRenderingParams(&params) };
+        } else {
+            debug_assert!(false, "text params must be an IDWriteRenderingParams");
+        }
+        TextParams(self, previous)
     }
 }
 
@@ -551,6 +627,37 @@ const INFINITE: D2D_RECT_F = D2D_RECT_F {
     bottom: f32::MAX,
 };
 
+/// One run of positioned glyphs from one face, as plain data plus the face itself.
+///
+/// Shaping produces this and drawing consumes it, and the two happen on different
+/// threads: a run crosses between them as glyph indices, advances and offsets, so nothing
+/// thread-affine and no pixels travel. The face is the exception and it arrives as an
+/// `IUnknown`, because a font face is DirectWrite's type and this crate does not name
+/// DirectWrite in a public signature — it only hands the pointer back.
+pub struct GlyphRun<'a> {
+    /// The `IDWriteFontFace` every glyph index in this run is an index into.
+    pub face: &'a windows_core::IUnknown,
+    /// Em size in DIPs.
+    pub em: f32,
+    /// Glyph indices into `face`.
+    pub glyphs: &'a [u16],
+    /// Advance per glyph, in DIPs. Same length as `glyphs`.
+    pub advances: &'a [f32],
+    /// Displacement per glyph, in DIPs: `[along the baseline, up from it]`. Same length
+    /// as `glyphs`.
+    pub offsets: &'a [[f32; 2]],
+}
+
+/// A pair of `f32` per glyph *is* `DWRITE_GLYPH_OFFSET`, so a run's offsets need no
+/// conversion and no scratch buffer — and no nominal type either, which is why the seam
+/// carries an array rather than a struct one crate would have to own for the other.
+const _: () = {
+    assert!(size_of::<[f32; 2]>() == size_of::<DWRITE_GLYPH_OFFSET>());
+    assert!(align_of::<[f32; 2]>() == align_of::<DWRITE_GLYPH_OFFSET>());
+    assert!(core::mem::offset_of!(DWRITE_GLYPH_OFFSET, advanceOffset) == 0);
+    assert!(core::mem::offset_of!(DWRITE_GLYPH_OFFSET, ascenderOffset) == size_of::<f32>());
+};
+
 /// Undoes a [`Draw::clip`].
 pub struct Clipped<'d>(&'d Draw<'d>);
 
@@ -595,6 +702,18 @@ pub struct Aliased<'d>(&'d Draw<'d>, D2D1_ANTIALIAS_MODE);
 impl Drop for Aliased<'_> {
     fn drop(&mut self) {
         unsafe { self.0.ctx.SetAntialiasMode(self.1) };
+    }
+}
+
+/// Restores the rendering parameters a [`Draw::text_params`] replaced.
+///
+/// The previous value is an `Option` because a context that has never been told carries
+/// none, and restoring "none" is what puts it back rather than pinning the default.
+pub struct TextParams<'d>(&'d Draw<'d>, Option<IDWriteRenderingParams>);
+
+impl Drop for TextParams<'_> {
+    fn drop(&mut self) {
+        unsafe { self.0.ctx.SetTextRenderingParams(self.1.as_ref()) };
     }
 }
 

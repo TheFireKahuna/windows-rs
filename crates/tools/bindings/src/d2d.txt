@@ -69,7 +69,20 @@
 // `DrawText`/`DrawTextLayout` are absent on purpose: text reaches the screen as a
 // coverage tile or a cached bitmap, both rasterized through `DrawGlyphRun`, and a
 // layout-drawing call here is an invitation to put DirectWrite on the live path.
-    ID2D1RenderTarget::{BeginDraw, EndDraw, SetTags, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateLinearGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, PushAxisAlignedClip, PopAxisAlignedClip, PopLayer, SetTextAntialiasMode, SetAntialiasMode, GetAntialiasMode}
+//
+// `SetTextRenderingParams` is here for the opposite reason. `DrawGlyphRun` takes no
+// options parameter, so the *only* way to state how coverage is rasterized is on the
+// context — and left to inherit the system's parameters, a coverage tile comes out
+// systematically thin or fat and reads as a font choice rather than as a setting.
+// The params object itself is DirectWrite's and is built by `windows-text`; this
+// crate names only the interface, so that a caller can hand one over.
+    ID2D1RenderTarget::{BeginDraw, EndDraw, SetTags, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateLinearGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, PushAxisAlignedClip, PopAxisAlignedClip, PopLayer, SetTextAntialiasMode, SetTextRenderingParams, GetTextRenderingParams, SetAntialiasMode, GetAntialiasMode}
+    IDWriteRenderingParams::{}
+// Ideal glyph metrics, independent of the display resolution, positioned with
+// subpixel precision. Design metrics stay DIP-constant, so the GDI modes — which
+// round advances to whole pixels and tie layout to the display — are not an option,
+// and only the baseline is snapped.
+    DWRITE_MEASURING_MODE_NATURAL
     D2D1_RENDERING_CONTROLS
     D2D1_UNIT_MODE_DIPS
     D2D1_ANTIALIAS_MODE_ALIASED

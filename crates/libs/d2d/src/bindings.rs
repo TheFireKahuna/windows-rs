@@ -282,6 +282,7 @@ impl Default for DWRITE_GLYPH_RUN_DESCRIPTION {
     }
 }
 pub type DWRITE_MEASURING_MODE = i32;
+pub const DWRITE_MEASURING_MODE_NATURAL: DWRITE_MEASURING_MODE = 0;
 pub const DXGI_ERROR_DEVICE_HUNG: windows_core::HRESULT =
     windows_core::HRESULT(0x887A0006_u32 as _);
 pub const DXGI_ERROR_DEVICE_REMOVED: windows_core::HRESULT =
@@ -2405,6 +2406,27 @@ impl ID2D1RenderTarget {
             );
         }
     }
+    pub unsafe fn SetTextRenderingParams<P0>(&self, textrenderingparams: P0)
+    where
+        P0: windows_core::Param<IDWriteRenderingParams>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetTextRenderingParams)(
+                windows_core::Interface::as_raw(self),
+                textrenderingparams.param().abi(),
+            );
+        }
+    }
+    pub unsafe fn GetTextRenderingParams(&self) -> windows_core::Result<IDWriteRenderingParams> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetTextRenderingParams)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            );
+            windows_core::Type::from_abi(result__)
+        }
+    }
     pub unsafe fn SetTags(&self, tag1: D2D1_TAG, tag2: D2D1_TAG) {
         unsafe {
             (windows_core::Interface::vtable(self).SetTags)(
@@ -2593,8 +2615,10 @@ pub struct ID2D1RenderTarget_Vtbl {
     pub SetTextAntialiasMode:
         unsafe extern "system" fn(*mut core::ffi::c_void, D2D1_TEXT_ANTIALIAS_MODE),
     GetTextAntialiasMode: usize,
-    SetTextRenderingParams: usize,
-    GetTextRenderingParams: usize,
+    pub SetTextRenderingParams:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void),
+    pub GetTextRenderingParams:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void),
     pub SetTags: unsafe extern "system" fn(*mut core::ffi::c_void, D2D1_TAG, D2D1_TAG),
     GetTags: usize,
     PushLayer: usize,
@@ -3122,6 +3146,22 @@ pub struct IDWriteFontFace_Vtbl {
     GetGdiCompatibleGlyphMetrics: usize,
 }
 impl windows_core::RuntimeName for IDWriteFontFace {}
+windows_core::imp::define_interface!(
+    IDWriteRenderingParams,
+    IDWriteRenderingParams_Vtbl,
+    0x2f0da53a_2add_47cd_82ee_d9ec34688e75
+);
+windows_core::imp::interface_hierarchy!(IDWriteRenderingParams, windows_core::IUnknown);
+#[repr(C)]
+pub struct IDWriteRenderingParams_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    GetGamma: usize,
+    GetEnhancedContrast: usize,
+    GetClearTypeLevel: usize,
+    GetPixelGeometry: usize,
+    GetRenderingMode: usize,
+}
+impl windows_core::RuntimeName for IDWriteRenderingParams {}
 windows_core::imp::define_interface!(
     IDXGIAdapter,
     IDXGIAdapter_Vtbl,
