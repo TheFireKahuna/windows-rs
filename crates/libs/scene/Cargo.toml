@@ -1,0 +1,38 @@
+[package]
+name = "windows-scene"
+version = "0.100.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "The retained composition sink tree: sprites, layout, hit testing, and motion"
+repository = "https://github.com/microsoft/windows-rs"
+categories = ["os::windows-apis"]
+readme = "readme.md"
+
+[dependencies]
+# Layout. The dependency is confined to the crate's `Send` half, so the split in
+# `lib.rs` is also what would make hoisting it elsewhere a file move.
+taffy = { version = "0.11", default-features = false, features = [
+    "std",
+    "flexbox",
+    "grid",
+    "block_layout",
+    "calc",
+    "content_size",
+] }
+# One hash map implementation, in the two places a key is content-addressed rather
+# than minted. Every per-node table is a `Vec` indexed by a dense id.
+rustc-hash = { workspace = true }
+
+windows-color = { workspace = true }
+windows-composition = { workspace = true, features = ["system"] }
+windows-core = { workspace = true }
+windows-d2d = { workspace = true, features = ["composition"] }
+windows-numerics = { workspace = true }
+windows-text = { workspace = true, features = ["d2d"] }
+# The window this scene is hosted on, and the frame clock that paces it. Both are the
+# window's: the compositor target is created from its handle, and the pacer posts to it.
+windows-window = { workspace = true }
+
+[lints]
+workspace = true

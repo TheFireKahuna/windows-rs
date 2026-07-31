@@ -13,7 +13,9 @@
     clippy::upper_case_acronyms
 )]
 mod bindings;
+mod pace;
 mod window;
 
+pub use pace::{Pacer, PacerHealth, Tick, WM_APP_FRAME, Wake};
 pub use window::{Window, WindowBuilder, pump, quit, run, run_with};
 pub use windows_core::Result;

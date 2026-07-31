@@ -180,9 +180,18 @@
     CreateEventW
     SetEvent
     CloseHandle
+    WaitForSingleObject
     WaitForMultipleObjects
     WAIT_OBJECT_0
+    WAIT_TIMEOUT
     WAIT_FAILED
+    INFINITE
     CreateWaitableTimerExW
     SetWaitableTimerEx
     TIMER_ALL_ACCESS
+
+// ── The frame clock ───────────────────────────────────────────────────────────
+// The pacer parks on the compositor's own clock and posts a message, so a window's
+// frame work happens inside its ordinary pump and in message order with input. It is
+// the window's because the handle it posts to and the pump that receives it are.
+    DCompositionWaitForCompositorClock

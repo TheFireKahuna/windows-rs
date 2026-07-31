@@ -252,6 +252,50 @@ impl Sink {
         unsafe { self.0.EndFigure(end) };
         self
     }
+
+    /// Writes a closed box with four independent corner radii, clockwise from the top
+    /// left, as one figure.
+    ///
+    /// [`Rect::rounded`] covers the uniform case and Direct2D rasterizes *that* from a
+    /// coverage function over one quad, so prefer it whenever the four radii agree. Four
+    /// independent radii have no analytic form and need this.
+    ///
+    /// Radii are clamped so that two on the same edge cannot overlap, which is the
+    /// platform's own rule for a rounded rectangle — so "fully rounded" is a stadium and
+    /// never a football.
+    pub fn rounded_box(&mut self, rect: Rect, radius: [f32; 4]) -> &mut Self {
+        /// The Bézier control-point ratio that approximates a quarter circle, to within
+        /// about a part in ten thousand of the radius.
+        const KAPPA: f32 = 0.552_284_8;
+
+        let limit = (rect.width().min(rect.height()) * 0.5).max(0.0);
+        let [tl, tr, br, bl] = radius.map(|r| r.clamp(0.0, limit));
+        let (l, t, r, b) = (rect.left, rect.top, rect.right, rect.bottom);
+        let at = |x: f32, y: f32| Vector2 { x, y };
+        // Each corner is one cubic arc towards the corner point it rounds.
+        let arc = |from: Vector2, to: Vector2, corner: Vector2| Bezier {
+            c1: at(
+                from.x + (corner.x - from.x) * KAPPA,
+                from.y + (corner.y - from.y) * KAPPA,
+            ),
+            c2: at(
+                to.x + (corner.x - to.x) * KAPPA,
+                to.y + (corner.y - to.y) * KAPPA,
+            ),
+            to,
+        };
+
+        self.figure(at(l + tl, t), Figure::Filled);
+        self.lines(&[at(r - tr, t)]);
+        self.beziers(&[arc(at(r - tr, t), at(r, t + tr), at(r, t))]);
+        self.lines(&[at(r, b - br)]);
+        self.beziers(&[arc(at(r, b - br), at(r - br, b), at(r, b))]);
+        self.lines(&[at(l + bl, b)]);
+        self.beziers(&[arc(at(l + bl, b), at(l, b - bl), at(l, b))]);
+        self.lines(&[at(l, t + tl)]);
+        self.beziers(&[arc(at(l, t + tl), at(l + tl, t), at(l, t))]);
+        self.close(End::Closed)
+    }
 }
 
 impl Path {

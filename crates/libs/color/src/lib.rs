@@ -81,6 +81,43 @@ impl Radiance {
         let v = matrix::apply(&Gamut::REC709.matrix_from_2020(), [self.r, self.g, self.b]);
         v[0].max(v[1]).max(v[2])
     }
+
+    /// The light at `t` along a gradient's stops, mixed perceptually.
+    ///
+    /// Stops are `(position, light)` in ascending position; `t` outside their range
+    /// clamps to an end. Colour mixes through [`Ictcp`], so a ramp between two hues
+    /// takes the perceptual path rather than cutting through the desaturated middle a
+    /// linear RGB blend produces. **Alpha mixes linearly** — it is coverage, not light,
+    /// and has no hue to preserve.
+    ///
+    /// A gradient authored in this space is sampled here and rasterized somewhere else,
+    /// which is why this is a function of the stops alone and knows about no surface: a
+    /// consumer that interpolates in its own draw call has already lost the hue path.
+    #[must_use]
+    pub fn sample(stops: &[(f32, Self)], t: f32) -> Self {
+        let (Some(&(first_at, first)), Some(&(last_at, last))) = (stops.first(), stops.last())
+        else {
+            return Self::TRANSPARENT;
+        };
+        if t <= first_at {
+            return first;
+        }
+        if t >= last_at {
+            return last;
+        }
+        for pair in stops.windows(2) {
+            let ((a_at, a), (b_at, b)) = (pair[0], pair[1]);
+            if t >= a_at && t <= b_at {
+                // Coincident stops are a hard edge, not a division: the span is zero and
+                // the mix stays at the lower stop.
+                let span = b_at - a_at;
+                let local = if span > 0.0 { (t - a_at) / span } else { 0.0 };
+                return Ictcp::mix(a.to_ictcp(), b.to_ictcp(), local)
+                    .to_radiance(a.a + (b.a - a.a) * local);
+            }
+        }
+        last
+    }
 }
 
 /// Display-referred output: linear **Rec.709** primaries on the scRGB scale, which is
@@ -191,5 +228,46 @@ mod tests {
             "mid grey encoded to {}",
             out[2]
         );
+    }
+
+    #[test]
+    fn a_ramp_samples_its_ends_exactly_and_mixes_perceptually_between() {
+        let stops = [
+            (0.0, Radiance::new(10.0, 0.0, 0.0, 1.0)),
+            (1.0, Radiance::new(0.0, 10.0, 0.0, 1.0)),
+        ];
+        assert_eq!(Radiance::sample(&stops, -1.0), stops[0].1);
+        assert_eq!(Radiance::sample(&stops, 0.0), stops[0].1);
+        assert_eq!(Radiance::sample(&stops, 2.0), stops[1].1);
+        let mid = Radiance::sample(&stops, 0.5);
+        assert!(
+            mid.r > 0.0 && mid.g > 0.0,
+            "a perceptual mix passed through neither end"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_stop_list_yields_a_colour_rather_than_a_division() {
+        assert_eq!(Radiance::sample(&[], 0.5), Radiance::TRANSPARENT);
+        let one = [(0.5, Radiance::new(1.0, 1.0, 1.0, 1.0))];
+        assert_eq!(Radiance::sample(&one, 0.0), one[0].1);
+        assert_eq!(Radiance::sample(&one, 1.0), one[0].1);
+        // Coincident stops are a hard edge: zero span, no division.
+        let edge = [
+            (0.5, Radiance::new(1.0, 0.0, 0.0, 1.0)),
+            (0.5, Radiance::new(0.0, 1.0, 0.0, 1.0)),
+        ];
+        let at = Radiance::sample(&edge, 0.5);
+        assert!(at.r.is_finite() && at.g.is_finite());
+    }
+
+    #[test]
+    fn alpha_mixes_linearly_because_it_is_coverage_and_not_light() {
+        let stops = [
+            (0.0, Radiance::new(1.0, 1.0, 1.0, 0.0)),
+            (1.0, Radiance::new(1.0, 1.0, 1.0, 1.0)),
+        ];
+        let mid = Radiance::sample(&stops, 0.5);
+        assert!((mid.a - 0.5).abs() < 1.0e-3, "alpha at the midpoint was {}", mid.a);
     }
 }

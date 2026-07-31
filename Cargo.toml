@@ -70,6 +70,7 @@ windows-reactor-setup = { version = "0.100.0", path = "crates/libs/reactor-setup
 windows-reference = { version = "0.100.0", path = "crates/libs/reference", default-features = false }
 windows-registry = { version = "0.100.0", path = "crates/libs/registry", default-features = false }
 windows-result = { version = "0.100.0", path = "crates/libs/result", default-features = false }
+windows-scene = { version = "0.100.0", path = "crates/libs/scene", default-features = false }
 windows-services = { version = "0.100.0", path = "crates/libs/services", default-features = false }
 windows-strings = { version = "0.100.0", path = "crates/libs/strings", default-features = false }
 windows-sys = { version = "0.100.0", path = "crates/libs/sys", default-features = false }
