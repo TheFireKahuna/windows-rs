@@ -72,27 +72,21 @@
     WM_POINTERWHEEL
     WM_POINTERHWHEEL
 
-// ── Legacy mouse, capture, and keys ───────────────────────────────────────────
+// ── Capture and keys ──────────────────────────────────────────────────────────
 // Retained because focus, capture and the keyboard still arrive as window messages
 // even when pointer input is opted into.
+//
+// No legacy mouse message is named here, and none may be. `WM_MOUSEMOVE` and its
+// relatives, and `TrackMouseEvent` with them, are what the pointer path replaces:
+// hover is `WM_POINTERENTER`/`LEAVE`, which are real messages, so the per-move
+// tracking syscall has nothing to do. Not generating the constants makes a legacy arm
+// a compile error rather than a rule.
     SetCapture
     ReleaseCapture
     GetCapture
-    TrackMouseEvent
-    TRACKMOUSEEVENT
-    TME_LEAVE
-    TME_NONCLIENT
     GetKeyState
     GetAsyncKeyState
     WHEEL_DELTA
-    WM_LBUTTONDOWN
-    WM_LBUTTONUP
-    WM_RBUTTONDOWN
-    WM_RBUTTONUP
-    WM_MOUSEMOVE
-    WM_MOUSELEAVE
-    WM_MOUSEWHEEL
-    WM_MOUSEHWHEEL
     WM_CAPTURECHANGED
     WM_KEYDOWN
     WM_KEYUP

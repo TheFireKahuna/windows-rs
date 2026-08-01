@@ -4,12 +4,22 @@
     non_snake_case,
     non_upper_case_globals,
     non_camel_case_types,
-    clippy::upper_case_acronyms,
     clippy::too_many_arguments
 )]
 mod bindings;
 
-// The safe surface — signals, widgets, the pointer stack, overlays, UI Automation
-// and text services — replaces this blanket re-export as each module lands.
+// The signal graph, the structural combinators over it, and the role layer a widget
+// resolves its appearance through. None of the three contains `unsafe`: the graph is an
+// arena of generational indices, and the only Windows surface any of it needs is one
+// waitable event, owned by `windows-window`.
+#[deny(unsafe_code)]
+pub mod role;
+#[deny(unsafe_code)]
+pub mod signal;
+#[deny(unsafe_code)]
+pub mod structure;
+
+// The rest of the safe surface — the widget set, the pointer stack, overlays, UI
+// Automation and text services — replaces this blanket re-export as each module lands.
 pub use bindings::*;
 pub use windows_core::Result;

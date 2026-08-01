@@ -11,7 +11,22 @@ readme = "readme.md"
 
 [dependencies]
 windows-collections = { workspace = true }
+windows-color = { workspace = true }
 windows-core = { workspace = true }
+# The retained tree this framework declares into: node identity, styles, the sink
+# alphabet and the flat hit array. Widget-agnostic by design, which is what keeps the
+# alphabet closed.
+windows-scene = { workspace = true }
+# `FontSpec` — what the typography ladder resolves a role to. A font is a family id and
+# four numbers, and interning the family is the text engine's job rather than this
+# crate's.
+windows-text = { workspace = true }
+# `Event`, the waitable behind `Epoch` and the cross-thread write inbox.
+windows-window = { workspace = true }
+
+# One hash map, for the one place a structure is keyed by something the application chose
+# rather than by a dense index this crate minted.
+rustc-hash = { workspace = true }
 
 [lints]
 workspace = true

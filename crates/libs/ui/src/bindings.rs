@@ -14,7 +14,6 @@ windows_core::link!("user32.dll" "system" fn GetPointerType(pointerid : u32, poi
 windows_core::link!("user32.dll" "system" fn ReleaseCapture() -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn SetCapture(hwnd : HWND) -> HWND);
 windows_core::link!("user32.dll" "system" fn SkipPointerFrameMessages(pointerid : u32) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn TrackMouseEvent(lpeventtrack : *mut TRACKMOUSEEVENT) -> windows_core::BOOL);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaClientsAreListening() -> windows_core::BOOL);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaDisconnectProvider(pprovider : *mut core::ffi::c_void) -> windows_core::HRESULT);
 windows_core::link!("uiautomationcore.dll" "system" fn UiaHostProviderFromHwnd(hwnd : HWND, ppprovider : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
@@ -6616,18 +6615,8 @@ pub struct TF_SELECTIONSTYLE {
     pub fInterimChar: windows_core::BOOL,
 }
 pub type TF_STATUS = TS_STATUS;
-pub const TME_LEAVE: i32 = 2;
-pub const TME_NONCLIENT: i32 = 16;
 pub type TOUCH_FLAGS = u32;
 pub type TOUCH_MASK = u32;
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TRACKMOUSEEVENT {
-    pub cbSize: u32,
-    pub dwFlags: u32,
-    pub hwndTrack: HWND,
-    pub dwHoverTime: u32,
-}
 pub type TS_ATTRID = windows_core::GUID;
 #[repr(C)]
 pub struct TS_ATTRVAL {
@@ -7285,12 +7274,6 @@ pub const WM_GETOBJECT: i32 = 61;
 pub const WM_KEYDOWN: i32 = 256;
 pub const WM_KEYUP: i32 = 257;
 pub const WM_KILLFOCUS: i32 = 8;
-pub const WM_LBUTTONDOWN: i32 = 513;
-pub const WM_LBUTTONUP: i32 = 514;
-pub const WM_MOUSEHWHEEL: i32 = 526;
-pub const WM_MOUSELEAVE: i32 = 675;
-pub const WM_MOUSEMOVE: i32 = 512;
-pub const WM_MOUSEWHEEL: i32 = 522;
 pub const WM_POINTERCAPTURECHANGED: i32 = 588;
 pub const WM_POINTERDOWN: i32 = 582;
 pub const WM_POINTERENTER: i32 = 585;
@@ -7299,8 +7282,6 @@ pub const WM_POINTERLEAVE: i32 = 586;
 pub const WM_POINTERUP: i32 = 583;
 pub const WM_POINTERUPDATE: i32 = 581;
 pub const WM_POINTERWHEEL: i32 = 590;
-pub const WM_RBUTTONDOWN: i32 = 516;
-pub const WM_RBUTTONUP: i32 = 517;
 pub const WM_SETFOCUS: i32 = 7;
 pub const WM_SYSKEYDOWN: i32 = 260;
 pub const WM_SYSKEYUP: i32 = 261;
