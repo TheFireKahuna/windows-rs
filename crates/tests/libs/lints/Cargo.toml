@@ -1,0 +1,15 @@
+[package]
+name = "lints"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Source-level rules for the UI framework crates that no runtime test can catch"
+publish = false
+
+# Deliberately none. These rules read source text, so a dependency here would be a
+# dependency of the thing being audited on the thing auditing it.
+[dependencies]
+
+[lints]
+workspace = true

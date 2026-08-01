@@ -1,0 +1,469 @@
+//! The twelve source rules.
+//!
+//! Each is a rule no runtime test can catch, because each is about what the code does
+//! *not* contain. Several are vacuous today and will bite the moment the component they
+//! govern is written — which is the point of having them before it is, rather than after
+//! the thing they were supposed to gate has already been built the other way.
+
+use lints::{Source, deny, framework, generated, root};
+
+/// Collects every hit of `needle` outside `allow`, formatted for a failure message.
+fn hits(sources: &[Source], needle: &str, allow: &[&str]) -> Vec<String> {
+    sources
+        .iter()
+        .filter(|source| !source.under(allow))
+        .flat_map(|source| {
+            source
+                .find(needle)
+                .into_iter()
+                .map(move |(line, text)| format!("  {}:{line}: {text}", source.path))
+        })
+        .collect()
+}
+
+fn all(sources: &[Source], needles: &[&str], allow: &[&str]) -> Vec<String> {
+    needles
+        .iter()
+        .flat_map(|needle| hits(sources, needle, allow))
+        .collect()
+}
+
+// ── 1 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn no_timers() {
+    // Nothing in the framework ticks. Continuity comes from a compositor animation, an
+    // interaction tracker, or a presentation region — never from a timer, because a timer
+    // costs a wake whether or not anything moved, which is exactly what "zero front-thread
+    // cost at idle" forbids.
+    let sources = framework();
+    let found = all(
+        &sources,
+        &[
+            "SetTimer(",
+            "CreateTimerQueueTimer",
+            "DispatcherQueueTimer",
+            "SetWaitableTimer",
+            "thread::sleep",
+            "sleep(Duration",
+        ],
+        &[],
+    );
+    deny(
+        "no_timers",
+        "the framework has no clock of its own: a tick comes from the compositor, a \
+         tracker or a present, and a timer wakes whether or not anything moved",
+        &found,
+    );
+}
+
+// ── 2 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn no_color_brush() {
+    // An 8-bit `Windows.UI.Color` cannot express a negative component or a value above
+    // white, so every wide-gamut colour and every specular is annihilated at that API
+    // boundary. Colour reaches the compositor only as FP16 surface content; the single
+    // legitimate colour brush is the opaque white *coverage* source a mask multiplies.
+    let sources = framework();
+    let found = hits(
+        &sources,
+        "create_color_brush",
+        &[
+            // Defines it. The wrapper is 1:1 with the platform and does not get to decide
+            // policy for its callers.
+            "crates/libs/composition/src/compositor.rs",
+            // The one call: `mask_brush`'s white source, which carries no colour.
+            "crates/libs/scene/src/bind.rs",
+        ],
+    );
+    deny(
+        "no_color_brush",
+        "an 8-bit colour brush cannot carry a negative component or a value above white; \
+         colour reaches the compositor as FP16 surface content",
+        &found,
+    );
+}
+
+// ── 3 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn d2d_buffer_precision() {
+    // Direct2D splits an effect graph into sections and makes no guarantee about if or
+    // where it uses intermediate textures — and those default to limited range, which
+    // silently clamps exactly the extended-range values the pipeline exists to carry.
+    let sources = framework();
+    let found: Vec<String> = sources
+        .iter()
+        .filter(|source| {
+            !source.find("CreateEffect").is_empty() || !source.find("ID2D1Effect").is_empty()
+        })
+        .filter(|source| source.find("SetRenderingControls").is_empty())
+        .map(|source| format!("  {}: constructs a D2D effect", source.path))
+        .collect();
+    deny(
+        "d2d_buffer_precision",
+        "an effect graph without an explicit 16BPC_FLOAT buffer precision clamps its own \
+         intermediates",
+        &found,
+    );
+}
+
+// ── 4 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn no_scrgb_construction() {
+    // `OutputTransform::apply` is the only supplier of a display-referred value, which is
+    // what makes "the display transform runs exactly once" a property of the type system
+    // rather than of a convention. Hand-building one skips it.
+    //
+    // Three exemptions inside `windows-scene`, each of which is a value that has *already*
+    // been through the transform or is not a colour at all:
+    //
+    // - `quant.rs` re-materializes a transformed value from its quantized key;
+    // - `cache.rs`'s white is the mask brush's coverage source;
+    // - `backends.rs` builds that same white as a solid.
+    //
+    // Everything above the scene — where a role resolves and where the shortcut would
+    // actually be reached for — has none, and the second assertion is what keeps it that
+    // way.
+    let sources = framework();
+    let allow = [
+        "crates/libs/color/",
+        "crates/libs/scene/src/quant.rs",
+        "crates/libs/scene/src/cache.rs",
+        "crates/libs/scene/src/backends.rs",
+    ];
+    // `-> Scrgb {` opens a function that returns one; naming the type is not building one.
+    let found: Vec<String> = all(&sources, &["Scrgb {", "Scrgb::new"], &allow)
+        .into_iter()
+        .filter(|hit| !hit.contains("-> Scrgb"))
+        .collect();
+    deny(
+        "no_scrgb_construction",
+        "an Scrgb comes from OutputTransform::apply and from nowhere else, which is what \
+         makes the display transform run exactly once by construction",
+        &found,
+    );
+
+    let above: Vec<&Source> = sources
+        .iter()
+        .filter(|source| source.under(&["crates/libs/ui/"]))
+        .collect();
+    let found: Vec<String> = above
+        .iter()
+        .flat_map(|source| {
+            ["Scrgb {", "Scrgb::new", "Scrgb"]
+                .iter()
+                .flat_map(move |needle| {
+                    source
+                        .find(needle)
+                        .into_iter()
+                        .map(move |(line, text)| format!("  {}:{line}: {text}", source.path))
+                })
+        })
+        .collect();
+    deny(
+        "no_scrgb_construction",
+        "nothing above the scene may even name a display-referred colour: a role resolves \
+         to authored light",
+        &found,
+    );
+}
+
+// ── 5 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn wndproc_is_doorbell() {
+    // A pointer message's handler rings a bell and returns. It does not hit-test, does not
+    // walk a tree and does not allocate — because the cost of hover is (moves × tree size)
+    // and the frame clock is what bounds the first factor.
+    let sources = framework();
+    let found: Vec<String> = sources
+        .iter()
+        .flat_map(|source| {
+            let procs = source
+                .find("fn wndproc")
+                .into_iter()
+                .chain(source.find("fn window_proc"));
+            procs.flat_map(move |(line, _)| {
+                let body = body_after(source, line);
+                [
+                    "Vec::new",
+                    "Vec::with_capacity",
+                    "String::",
+                    "Box::new",
+                    ".hit(",
+                ]
+                .iter()
+                .filter(|needle| body.contains(**needle))
+                .map(move |needle| {
+                    format!(
+                        "  {}:{line}: the wndproc body contains {needle}",
+                        source.path
+                    )
+                })
+                .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    deny(
+        "wndproc_is_doorbell",
+        "a pointer arm rings a bell and returns; hit testing and allocation belong to the \
+         frame-clock consumer",
+        &found,
+    );
+}
+
+/// The lines of `source` from `line` to the next item at column zero. Crude, and enough:
+/// the rules that use it ask whether a token appears inside one function.
+fn body_after(source: &Source, line: usize) -> String {
+    source
+        .code
+        .lines()
+        .skip(line)
+        .take_while(|text| !text.starts_with(['}', 'p', 'f', '#']) || text.starts_with("    "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ── 6 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn patch_is_send() {
+    // The patch is the one downward channel between the app thread and the front thread,
+    // and a generated interface is `!Send` — so the assertion means exactly "no COM rode
+    // the wire". Every variable-length payload travels as a span into a typed side-buffer
+    // rather than as an owned collection inside a variant, which is also what keeps every
+    // op `Copy`.
+    let root = root();
+    let path = root.join("crates/libs/scene/src/patch.rs");
+    let raw = std::fs::read_to_string(&path).expect("windows-scene has a patch module");
+    let code = lints::strip_tests(&lints::strip_comments(&raw));
+
+    assert!(
+        code.contains("assert_send::<SinkPatch>()"),
+        "patch_is_send — patch.rs must carry the const assertion that SinkPatch is Send"
+    );
+    assert!(
+        code.contains("assert_send::<Op>()"),
+        "patch_is_send — patch.rs must carry the const assertion that Op is Send"
+    );
+
+    let ops = code
+        .split_once("pub enum Op {")
+        .expect("patch.rs declares `pub enum Op`")
+        .1;
+    let ops = &ops[..ops.find("\n}").expect("the enum closes")];
+    let found: Vec<String> = ["Vec<", "String", "Box<"]
+        .iter()
+        .filter(|owned| ops.contains(**owned))
+        .map(|owned| format!("  an Op variant names {owned}"))
+        .collect();
+    deny(
+        "patch_is_send",
+        "every op is Copy and every variable-length payload is a Span into a side-buffer",
+        &found,
+    );
+}
+
+// ── 7 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn no_widget_colors() {
+    // A widget accepts a role and a variant. There is no `.foreground(..)` to misuse, so
+    // the 259-explicit-colour-call pattern cannot come back one reasonable addition at a
+    // time.
+    let sources = framework();
+    let widgets: Vec<&Source> = sources
+        .iter()
+        .filter(|source| source.under(&["crates/libs/ui/src/widget/"]))
+        .collect();
+    let found: Vec<String> = widgets
+        .iter()
+        .flat_map(|source| {
+            source
+                .code
+                .lines()
+                .enumerate()
+                .filter(|(_, text)| text.contains("pub fn "))
+                .filter(|(_, text)| {
+                    ["Radiance", "Scrgb", "font_size", "Align", ": f32) -> Self"]
+                        .iter()
+                        .any(|banned| text.contains(banned))
+                })
+                .map(move |(i, text)| format!("  {}:{}: {}", source.path, i + 1, text.trim()))
+        })
+        .collect();
+    deny(
+        "no_widget_colors",
+        "a widget accepts a role and a variant, never a colour, a font size, a spacing or \
+         an alignment",
+        &found,
+    );
+}
+
+// ── 8 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn no_child_layout() {
+    // Alignment, gap, placement and track sizing are the container's. This also closes the
+    // footgun where a placement set on the wrong kind of node silently did nothing: the
+    // child has no such property to set.
+    let sources = framework();
+    let found = all(
+        &sources,
+        &[
+            "fn grid_row",
+            "fn grid_column",
+            "fn align_self",
+            "fn justify_self",
+            "fn horizontal_alignment",
+            "fn vertical_alignment",
+        ],
+        &["crates/libs/scene/"],
+    );
+    deny(
+        "no_child_layout",
+        "a layout property belongs to the container, never to the child",
+        &found,
+    );
+}
+
+// ── 9 ───────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn slot_roots_closed() {
+    // A parentless root is invisible to a parent-walk cleanup, which is the shape that
+    // leaked once per unmount in the stack this replaces. `orphan_group` is the only way
+    // to mint one, and the overlay layer is the only thing that may call it — so a second
+    // call site is a second minting path, and the walk stops being exhaustive.
+    let sources = framework();
+    let found: Vec<String> = sources
+        .iter()
+        .filter(|source| source.path != "crates/libs/scene/src/model.rs")
+        .flat_map(|source| {
+            source
+                .find("orphan_group(")
+                .into_iter()
+                .map(move |(line, text)| format!("  {}:{line}: {text}", source.path))
+        })
+        .collect();
+    assert!(
+        found.len() <= 1,
+        "\nslot_roots_closed — a parentless root is minted in more than one place, so the \
+         disposal walk cannot be exhaustive\n\n{}\n",
+        found.join("\n")
+    );
+}
+
+// ── 10 ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn caption_from_hit_array() {
+    // The drag strip is derived from the one hit array rather than declared as a second
+    // rect. A second rect drifts out of agreement with the controls in it, and the symptom
+    // is a title bar that drags when you press a button.
+    let sources = framework();
+    let found: Vec<String> = sources
+        .iter()
+        .flat_map(|source| {
+            source
+                .find("WM_NCHITTEST")
+                .into_iter()
+                .filter_map(|(line, _)| {
+                    let body = body_after(source, line);
+                    // Only an arm that actually answers the message is checked; a bare mention
+                    // in a match list is not one.
+                    //
+                    // The needle is a **call** and not a name. `body_after` runs to the end
+                    // of the enclosing `impl`, so a bare `hit(` is satisfied by the
+                    // definition of the accessor sitting further down the same block —
+                    // which is to say by the authority merely existing, not by this arm
+                    // consulting it. That is the exact substitution the rule exists to
+                    // catch, so it would have passed a caption arm that answered from a
+                    // literal rect.
+                    if body.contains("HTCAPTION") && !body.contains(".hit(") {
+                        Some(format!(
+                            "  {}:{line}: the caption arm does not resolve through Scene::hit",
+                            source.path
+                        ))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .collect();
+    deny(
+        "caption_from_hit_array",
+        "the caption's drag strip is the hit array's answer, not a literal rect",
+        &found,
+    );
+}
+
+// ── 11 ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn no_generated_edits() {
+    // What this rule *can* prove without running the tools is the exemption boundary: the
+    // set of files excused from every other rule is exactly what the binding filters
+    // declare they produce, and each one exists. A file cannot join that set by being
+    // called `bindings.rs`, and a filter cannot quietly stop producing one.
+    //
+    // That the committed contents still match the tools' output is proved by regenerating
+    // and diffing, which cannot run from inside a cargo test — a nested cargo invocation
+    // blocks on the same build directory. The command is:
+    //
+    //     cargo run -p tool_bindings && cargo run -p tool_composition && git diff --exit-code
+    let root = root();
+    let declared = generated();
+    let missing: Vec<String> = declared
+        .iter()
+        .filter(|rel| !root.join(rel).is_file())
+        .map(|rel| format!("  {rel}: declared by a filter but not present"))
+        .collect();
+    deny(
+        "no_generated_edits",
+        "every file the binding tools declare must exist, or the exemption covers nothing",
+        &missing,
+    );
+
+    // Nothing hand-written may sit under a declared output's name.
+    let audited = framework();
+    let smuggled: Vec<String> = audited
+        .iter()
+        .filter(|source| declared.contains(&source.path))
+        .map(|source| format!("  {}: audited and generated at once", source.path))
+        .collect();
+    deny(
+        "no_generated_edits",
+        "the exempt set and the audited set must not overlap",
+        &smuggled,
+    );
+}
+
+// ── 12 ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn no_reactor_dep() {
+    // `reactor` is upstream's WinUI-hosting reconciler. Nothing here hosts XAML, and a
+    // dependency on it would pull a second presentation model into a stack whose whole
+    // design is that there is exactly one path for every capability.
+    let root = root();
+    let found: Vec<String> = lints::FRAMEWORK
+        .iter()
+        .filter_map(|crate_dir| {
+            let manifest = root.join(crate_dir).join("Cargo.toml");
+            let text = std::fs::read_to_string(&manifest).ok()?;
+            text.lines()
+                .find(|line| line.trim_start().starts_with("windows-reactor"))
+                .map(|line| format!("  {crate_dir}/Cargo.toml: {}", line.trim()))
+        })
+        .collect();
+    deny(
+        "no_reactor_dep",
+        "nothing in this stack hosts XAML, so nothing may depend on the reconciler that \
+         does",
+        &found,
+    );
+}
