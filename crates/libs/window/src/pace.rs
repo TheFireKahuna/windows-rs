@@ -27,6 +27,7 @@
 
 use crate::bindings::*;
 use crate::Window;
+use crate::event::Event;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -345,65 +346,6 @@ fn wait_frame(s: &Inner) -> Observed {
     }
 }
 
-/// An auto-reset event, closed on drop.
-///
-/// Auto-reset is not a detail: a manual-reset event left signalled satisfies every
-/// subsequent clock wait immediately, and the pacer becomes a busy loop.
-struct Event(*mut core::ffi::c_void);
-
-// SAFETY: an event handle is a kernel object reference, and signal, wait and close are all
-// documented as safe from any thread. Nothing about it is thread-affine.
-unsafe impl Send for Event {}
-unsafe impl Sync for Event {}
-
-impl Event {
-    fn auto_reset() -> Result<Self> {
-        // SAFETY: no security attributes and no name; auto-reset, initially unsignalled.
-        let handle = unsafe {
-            CreateEventW(
-                core::ptr::null(),
-                false.into(),
-                false.into(),
-                windows_core::PCWSTR::null(),
-            )
-        };
-        if handle.is_null() {
-            // The one failure here is resource exhaustion, and there is nothing to fall
-            // back to: without an event the pacer cannot be interrupted, and an
-            // uninterruptible pacer is worse than none.
-            return Err(Error::from_thread());
-        }
-        Ok(Self(handle))
-    }
-
-    fn raw(&self) -> *mut core::ffi::c_void {
-        self.0
-    }
-
-    fn signal(&self) {
-        // SAFETY: the handle is owned by this value and is live for its whole lifetime.
-        unsafe {
-            let _ = SetEvent(self.0);
-        }
-    }
-
-    fn wait(&self, timeout_ms: u32) {
-        // SAFETY: as above.
-        unsafe {
-            WaitForSingleObject(self.0, timeout_ms);
-        }
-    }
-}
-
-impl Drop for Event {
-    fn drop(&mut self) {
-        // SAFETY: closed exactly once, from the sole owner.
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
-
 const E_FAIL: i32 = -2147467259;
 
 #[cfg(test)]
@@ -425,7 +367,7 @@ mod tests {
     /// Whether the event is signalled right now, consuming the signal if it is.
     fn signalled(shared: &Inner) -> bool {
         // SAFETY: the handle is owned by `shared` and outlives the call.
-        unsafe { WaitForSingleObject(shared.event.raw(), 0) == WAIT_OBJECT_0 as u32 }
+        shared.event.take()
     }
 
     #[test]
