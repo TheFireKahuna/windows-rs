@@ -33,7 +33,10 @@ pub use cache::{BoxKey, Cache, Cell, Gen, GenMask, SolidKey};
 pub use census::{Audit, Census};
 pub use env::Env;
 pub use hit::{ContactKind, Hit, HitTable};
-pub use hit_build::{ControlId, HitBuilder, HitDecl, HitEntry, HitFlags, NO_ENTRY};
+pub use hit_build::{
+    ControlId, HitBuilder, HitDecl, HitEntry, HitFlags, NO_ENTRY, TOUCH_TARGET_DIPS,
+    default_inflation,
+};
 pub use id::{Id, Ids};
 pub use layout::{
     LayoutKind, LayoutTree, Measure, MeasureCtx, MeasureIn, MeasureKey, Rect, Solved, snap,
