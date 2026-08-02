@@ -21,8 +21,8 @@ use crate::res::Resources;
 use crate::sink::{Cap, GeomId, Join, Mask, Paint, Prop, SpriteId, StrokeStyle};
 use windows_color::{Radiance, Scrgb};
 use windows_composition::{
-    BorderMode, Brush, Color, CompositionBrush, CompositionSurfaceBrush, StrokeCap,
-    StrokeJoin, Visual,
+    BorderMode, Brush, Color, CompositionBrush, CompositionSurfaceBrush, StrokeCap, StrokeJoin,
+    Visual,
 };
 use windows_core::Result;
 use windows_numerics::Vector2;
@@ -140,7 +140,11 @@ impl Realizer<'_> {
             Mask::Box { radius } => {
                 let key = BoxKey::new(radius, self.env.scale());
                 let inset = key.inset_px() / self.env.scale();
-                let Some(cell) = self.cells.boxes.brush(self.back, self.env, self.generation, &key)? else {
+                let Some(cell) =
+                    self.cells
+                        .boxes
+                        .brush(self.back, self.env, self.generation, &key)?
+                else {
                     return Ok((None, Route::Clip));
                 };
                 // Nine-slice, so one raster serves any width and height with pristine
@@ -229,7 +233,10 @@ impl Realizer<'_> {
         let shape = self.back.compositor.create_sprite_shape(&geometry);
         // Opaque white: the capture is a mask, so its colour comes from the paint beside it,
         // and white is the multiplicative identity that leaves that paint alone.
-        let white = self.back.compositor.create_color_brush(Color::rgb(255, 255, 255));
+        let white = self
+            .back
+            .compositor
+            .create_color_brush(Color::rgb(255, 255, 255));
         match stroke {
             None => shape.set_fill_brush(&white),
             Some(k) => {

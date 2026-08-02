@@ -27,7 +27,9 @@
 //! None of those is complete and a wrong path is a control that never moves, so the table
 //! validates itself. See `every_prop_row_animates` in this crate's device tests.
 
-use crate::node::{CLIP_CHANS, CORE_CHANS, ClipState, Node, SHADOW_CHANS, STROKE_CHANS, TRIM_CHANS};
+use crate::node::{
+    CLIP_CHANS, CORE_CHANS, ClipState, Node, SHADOW_CHANS, STROKE_CHANS, TRIM_CHANS,
+};
 use crate::sink::{Prop, Value, ValueKind};
 use windows_composition::{Animatable, CompositionAnimation, Geometry};
 use windows_numerics::{Vector2, Vector3};
@@ -72,7 +74,10 @@ pub(crate) struct PropDesc {
     /// How many channels the group covers, starting at this row's own — one for a scalar
     /// row, two for a composite. Its only reader is the proof that no row can address past
     /// its owner's shadow, which is the one thing that could make the table unsound.
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the shadow-bounds proof"))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by the shadow-bounds proof")
+    )]
     pub(crate) span: u8,
     pub(crate) kind: ValueKind,
     pub(crate) anim: Slot,
@@ -388,10 +393,7 @@ pub(crate) fn write_group(node: &Node, group: u8) {
                     Vector2 { x: c[4], y: c[5] },
                     Vector2 { x: c[6], y: c[7] },
                     Vector2 { x: c[8], y: c[9] },
-                    Vector2 {
-                        x: c[10],
-                        y: c[11],
-                    },
+                    Vector2 { x: c[10], y: c[11] },
                 ),
             }
         }
@@ -402,7 +404,10 @@ pub(crate) fn write_group(node: &Node, group: u8) {
             match group {
                 // Both ends move together on the geometry's own setter, so one write
                 // covers whichever of them changed.
-                14 | 15 => state.geometry.as_geometry().set_trim(state.trim[0], state.trim[1]),
+                14 | 15 => state
+                    .geometry
+                    .as_geometry()
+                    .set_trim(state.trim[0], state.trim[1]),
                 16 => state.shape.set_stroke_thickness(state.stroke[0]),
                 _ => state.shape.set_stroke_dash_offset(state.stroke[1]),
             }
@@ -429,12 +434,22 @@ pub(crate) fn write_group(node: &Node, group: u8) {
 pub(crate) fn animatable(node: &Node, owner: Owner) -> Option<&dyn AnimatableRef> {
     match owner {
         Owner::Visual => Some(&node.visual),
-        Owner::Clip => node.clip.as_ref().and_then(ClipState::rect).map(|c| c as &dyn AnimatableRef),
+        Owner::Clip => node
+            .clip
+            .as_ref()
+            .and_then(ClipState::rect)
+            .map(|c| c as &dyn AnimatableRef),
         // The geometry, not the shape: a trim is the geometry's property and the shape
         // rejects the name outright.
-        Owner::Trim => node.shape.as_ref().map(|s| &s.geometry as &dyn AnimatableRef),
+        Owner::Trim => node
+            .shape
+            .as_ref()
+            .map(|s| &s.geometry as &dyn AnimatableRef),
         Owner::Stroke => node.shape.as_ref().map(|s| &s.shape as &dyn AnimatableRef),
-        Owner::Shadow => node.shadow.as_ref().map(|s| &s.shadow as &dyn AnimatableRef),
+        Owner::Shadow => node
+            .shadow
+            .as_ref()
+            .map(|s| &s.shadow as &dyn AnimatableRef),
     }
 }
 
@@ -454,7 +469,6 @@ impl<T: Animatable> AnimatableRef for T {
         self.stop_animation(path);
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -166,12 +166,18 @@ mod tests {
         // The declaration goes first. Two sprites are still painting with it, so it has to
         // survive — this is the case an unconditional remove gets wrong.
         table.disclaim(id);
-        assert!(table.get(id).is_some(), "disclaiming dropped a held resource");
+        assert!(
+            table.get(id).is_some(),
+            "disclaiming dropped a held resource"
+        );
 
         table.release(id);
         assert!(table.get(id).is_some(), "one sprite still holds it");
         table.release(id);
-        assert!(table.get(id).is_none(), "the last holder left and it stayed");
+        assert!(
+            table.get(id).is_none(),
+            "the last holder left and it stayed"
+        );
     }
 
     #[test]

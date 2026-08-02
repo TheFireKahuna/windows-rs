@@ -243,7 +243,10 @@ impl ClipState {
 pub(crate) struct ShapeState {
     /// The off-tree visual the capture reads. Held because nothing else does, and a resize
     /// has to re-size it.
-    #[expect(dead_code, reason = "anchors the captured subtree; resize will read it")]
+    #[expect(
+        dead_code,
+        reason = "anchors the captured subtree; resize will read it"
+    )]
     pub(crate) host: ShapeVisual,
     pub(crate) shape: CompositionSpriteShape,
     pub(crate) geometry: CompositionPathGeometry,

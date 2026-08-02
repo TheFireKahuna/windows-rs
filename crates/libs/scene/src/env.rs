@@ -75,7 +75,10 @@ mod tests {
     use windows_color::DisplayCapability;
 
     fn env(dpi: f32) -> Env {
-        Env::new(dpi, OutputTransform::for_display(DisplayCapability::Sdr, 203.0))
+        Env::new(
+            dpi,
+            OutputTransform::for_display(DisplayCapability::Sdr, 203.0),
+        )
     }
 
     #[test]

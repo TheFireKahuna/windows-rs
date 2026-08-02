@@ -182,7 +182,10 @@ mod tests {
         backwards.reverse();
         assert_eq!(forwards, backwards, "the chain disagrees with itself");
         let ends = get(f, parent).copied().unwrap_or_default();
-        assert_eq!(forwards.first().copied().unwrap_or(NodeId::NONE), ends.first);
+        assert_eq!(
+            forwards.first().copied().unwrap_or(NodeId::NONE),
+            ends.first
+        );
         assert_eq!(forwards.last().copied().unwrap_or(NodeId::NONE), ends.last);
         forwards
     }

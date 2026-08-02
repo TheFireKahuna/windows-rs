@@ -293,8 +293,14 @@ mod tests {
             entry(1, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE),
             entry(2, (20.0, 20.0, 60.0, 60.0), HitFlags::INTERACTIVE),
         ]);
-        assert_eq!(table.hit(at(30.0, 30.0), ContactKind::Mouse).unwrap().id.0, 2);
-        assert_eq!(table.hit(at(90.0, 90.0), ContactKind::Mouse).unwrap().id.0, 1);
+        assert_eq!(
+            table.hit(at(30.0, 30.0), ContactKind::Mouse).unwrap().id.0,
+            2
+        );
+        assert_eq!(
+            table.hit(at(90.0, 90.0), ContactKind::Mouse).unwrap().id.0,
+            1
+        );
     }
 
     #[test]
@@ -305,7 +311,10 @@ mod tests {
             entry(1, (0.0, 0.0, 50.0, 50.0), HitFlags::INTERACTIVE),
             entry(2, (40.0, 40.0, 90.0, 90.0), HitFlags::INTERACTIVE),
         ]);
-        assert_eq!(table.hit(at(80.0, 80.0), ContactKind::Mouse).unwrap().id.0, 2);
+        assert_eq!(
+            table.hit(at(80.0, 80.0), ContactKind::Mouse).unwrap().id.0,
+            2
+        );
     }
 
     #[test]
@@ -314,10 +323,17 @@ mod tests {
         let mut child = entry(2, (40.0, 40.0, 200.0, 200.0), HitFlags::INTERACTIVE);
         child.clip_parent = 0;
         table.replace(&[
-            entry(1, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE | HitFlags::CLIP),
+            entry(
+                1,
+                (0.0, 0.0, 100.0, 100.0),
+                HitFlags::INTERACTIVE | HitFlags::CLIP,
+            ),
             child,
         ]);
-        assert_eq!(table.hit(at(60.0, 60.0), ContactKind::Mouse).unwrap().id.0, 2);
+        assert_eq!(
+            table.hit(at(60.0, 60.0), ContactKind::Mouse).unwrap().id.0,
+            2
+        );
         // Outside the clip: the child is gone, and so is the clip itself.
         assert!(table.hit(at(150.0, 150.0), ContactKind::Mouse).is_none());
     }
@@ -347,7 +363,9 @@ mod tests {
 
         for x in 0..=26 {
             let p = at(x as f32, 5.0);
-            let hit = table.hit(p, ContactKind::Touch).expect("inside one of them");
+            let hit = table
+                .hit(p, ContactKind::Touch)
+                .expect("inside one of them");
             // Nearest centre, and exactly one answer — the property the tie-break exists
             // for. Centres are at 5 and 21, so the boundary is 13.
             // An exact (uninflated) hit outranks any inflated one, whichever is nearer.
@@ -372,7 +390,11 @@ mod tests {
     fn a_scroll_offset_moves_the_point_and_not_the_rects() {
         let mut table = HitTable::default();
         let scroller = NodeId::raw(4, 1);
-        let mut viewport = entry(1, (0.0, 0.0, 100.0, 100.0), HitFlags::SCROLL | HitFlags::CLIP);
+        let mut viewport = entry(
+            1,
+            (0.0, 0.0, 100.0, 100.0),
+            HitFlags::SCROLL | HitFlags::CLIP,
+        );
         viewport.scroll_src = NodeId::NONE;
         let mut row = entry(2, (0.0, 200.0, 100.0, 240.0), HitFlags::INTERACTIVE);
         row.scroll_src = scroller;
@@ -380,23 +402,35 @@ mod tests {
         table.replace(&[viewport, row]);
 
         // Unscrolled, the row is far below the viewport and is clipped away.
-        assert_eq!(table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0, 1);
+        assert_eq!(
+            table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0,
+            1
+        );
         // Scrolled down by 200, the row is under the pointer — and the entry's own rect
         // never moved.
         table.set_scroll(scroller, Vector2 { x: 0.0, y: 200.0 });
-        assert_eq!(table.hit(at(50.0, 20.0), ContactKind::Mouse).unwrap().id.0, 2);
+        assert_eq!(
+            table.hit(at(50.0, 20.0), ContactKind::Mouse).unwrap().id.0,
+            2
+        );
     }
 
     #[test]
     fn the_memo_is_dropped_when_the_table_or_a_scroll_moves() {
         let mut table = HitTable::default();
         table.replace(&[entry(1, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE)]);
-        assert_eq!(table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0, 1);
+        assert_eq!(
+            table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0,
+            1
+        );
         assert!(table.memo.get().is_some());
 
         table.replace(&[entry(9, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE)]);
         assert!(table.memo.get().is_none(), "a rebuild left a stale memo");
-        assert_eq!(table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0, 9);
+        assert_eq!(
+            table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0,
+            9
+        );
 
         table.set_scroll(NodeId::raw(4, 1), Vector2 { x: 0.0, y: 10.0 });
         assert!(table.memo.get().is_none(), "a scroll left a stale memo");

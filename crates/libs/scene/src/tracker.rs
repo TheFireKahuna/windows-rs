@@ -12,7 +12,7 @@
 //! position requests **cannot** be given callbacks it does not read, because it is created
 //! as [`Passive`](crate::Passive) and `request` does not accept one.
 
-use crate::sink::{NodeId, TrackerRequest, Tracker as TrackerFamily};
+use crate::sink::{NodeId, Tracker as TrackerFamily, TrackerRequest};
 use core::cell::RefCell;
 use std::rc::Rc;
 use windows_composition::{
@@ -140,8 +140,6 @@ impl TrackerState {
         self.scale = scale;
         self.pending = [None; PENDING];
     }
-
-
 }
 
 /// Configures the source a manipulation is collected on.

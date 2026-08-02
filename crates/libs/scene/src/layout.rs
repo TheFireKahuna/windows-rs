@@ -452,9 +452,8 @@ impl LayoutTree {
                 let size = match ctx {
                     MeasureCtx::None => Vector2 { x: 0.0, y: 0.0 },
                     MeasureCtx::Fixed(size) => size,
-                    MeasureCtx::Measured(key) => measure.as_mut().map_or(
-                        Vector2 { x: 0.0, y: 0.0 },
-                        |m| {
+                    MeasureCtx::Measured(key) => {
+                        measure.as_mut().map_or(Vector2 { x: 0.0, y: 0.0 }, |m| {
                             m.measure(MeasureIn {
                                 key,
                                 class,
@@ -464,8 +463,8 @@ impl LayoutTree {
                                     available.height.into_option(),
                                 ),
                             })
-                        },
-                    ),
+                        })
+                    }
                 };
                 Size {
                     width: known.width.unwrap_or(size.x),
@@ -483,10 +482,13 @@ impl LayoutTree {
         inputs: LayoutInput,
         bounds: Bounds,
     ) -> LayoutOutput {
-        let definite = inputs.known_dimensions.width.or(match inputs.available_space.width {
-            AvailableSpace::Definite(w) => Some(w),
-            _ => None,
-        });
+        let definite = inputs
+            .known_dimensions
+            .width
+            .or(match inputs.available_space.width {
+                AvailableSpace::Definite(w) => Some(w),
+                _ => None,
+            });
         debug_assert!(
             definite.is_some() || inputs.run_mode != RunMode::PerformLayout,
             "a responsive container's inline size must be determined by its parent"
@@ -753,7 +755,8 @@ mod tests {
         let mut out = Vec::new();
         tree.solve(root, Vector2 { x: 600.0, y: 400.0 }, 1.0, &mut out);
         assert_eq!(
-            out[kids[2].index()].rect.x0, 100.0,
+            out[kids[2].index()].rect.x0,
+            100.0,
             "a re-pushed style revealed a hidden node"
         );
     }
@@ -767,9 +770,14 @@ mod tests {
         assert!(tree.set_kind(root, LayoutKind::Responsive(Bounds([600.0, 1000.0]))));
         let mut out = Vec::new();
         tree.solve(root, Vector2 { x: 600.0, y: 400.0 }, 1.0, &mut out);
-        assert_eq!(out[kids[2].index()].rect.x0, 200.0, "the children were dropped");
         assert_eq!(
-            out[root.index()].size.x, 600.0,
+            out[kids[2].index()].rect.x0,
+            200.0,
+            "the children were dropped"
+        );
+        assert_eq!(
+            out[root.index()].size.x,
+            600.0,
             "the root's own style was dropped"
         );
         // And it is idempotent, so a re-declaration is not a layout pass.
@@ -836,7 +844,15 @@ mod tests {
         });
 
         let mut out = Vec::new();
-        tree.solve(root, Vector2 { x: 1400.0, y: 400.0 }, 1.0, &mut out);
+        tree.solve(
+            root,
+            Vector2 {
+                x: 1400.0,
+                y: 400.0,
+            },
+            1.0,
+            &mut out,
+        );
         assert_eq!(out[leaf.index()].size.y, 20.0, "wide");
 
         tree.solve(root, Vector2 { x: 480.0, y: 400.0 }, 1.0, &mut out);

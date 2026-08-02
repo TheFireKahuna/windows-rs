@@ -195,8 +195,22 @@ mod tests {
         let zero = Q::new(Scrgb::TRANSPARENT).dequant();
         assert_eq!((zero.r, zero.g, zero.b, zero.a), (0.0, 0.0, 0.0, 0.0));
         for v in [0.25_f32, 1.0, 4.0, 12.0] {
-            let plus = Q::new(Scrgb { r: v, g: 0.0, b: 0.0, a: 1.0 }).dequant().r;
-            let minus = Q::new(Scrgb { r: -v, g: 0.0, b: 0.0, a: 1.0 }).dequant().r;
+            let plus = Q::new(Scrgb {
+                r: v,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            })
+            .dequant()
+            .r;
+            let minus = Q::new(Scrgb {
+                r: -v,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            })
+            .dequant()
+            .r;
             assert!((plus + minus).abs() < 1.0e-4, "{v}: {plus} vs {minus}");
         }
     }
@@ -205,22 +219,57 @@ mod tests {
     fn quantization_clips_neither_end_of_the_extended_range() {
         // Above the display's white, and outside Rec.709. Both are what the FP16
         // surfaces exist to carry, and a clamping quantizer would destroy both.
-        let wild = Scrgb { r: -0.4, g: 12.0, b: 0.5, a: 1.0 };
+        let wild = Scrgb {
+            r: -0.4,
+            g: 12.0,
+            b: 0.5,
+            a: 1.0,
+        };
         let back = Q::new(wild).dequant();
         assert!(back.r < 0.0, "a negative component survived as {}", back.r);
-        assert!(back.g > 11.9, "an above-white component survived as {}", back.g);
+        assert!(
+            back.g > 11.9,
+            "an above-white component survived as {}",
+            back.g
+        );
     }
 
     #[test]
     fn quantization_is_finer_than_sixteen_bits_at_white() {
-        let a = Q::new(Scrgb { r: 1.0, g: 1.0, b: 1.0, a: 1.0 });
-        let b = Q::new(Scrgb { r: 1.0 + 1.0 / 2048.0, g: 1.0, b: 1.0, a: 1.0 });
+        let a = Q::new(Scrgb {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        });
+        let b = Q::new(Scrgb {
+            r: 1.0 + 1.0 / 2048.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        });
         assert_ne!(a, b, "a 1/2048 step at scRGB 1.0 must be distinguishable");
     }
 
     #[test]
     fn opacity_comes_from_the_quantized_alpha_and_not_the_authored_one() {
-        assert!(Q::new(Scrgb { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }).is_opaque());
-        assert!(!Q::new(Scrgb { r: 0.0, g: 0.0, b: 0.0, a: 0.999 }).is_opaque());
+        assert!(
+            Q::new(Scrgb {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0
+            })
+            .is_opaque()
+        );
+        assert!(
+            !Q::new(Scrgb {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.999
+            })
+            .is_opaque()
+        );
     }
 }

@@ -104,7 +104,10 @@ mod tests {
             props_skipped: 40,
             ..before
         };
-        assert!(!after.changed_since(&before), "an absorbed write is not a change");
+        assert!(
+            !after.changed_since(&before),
+            "an absorbed write is not a change"
+        );
     }
 
     #[test]

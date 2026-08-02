@@ -15,14 +15,14 @@
 
 use crate::node::Node;
 use crate::sink::{Easing, Iterations, Tuning, Value};
+use core::cell::Cell as CoreCell;
 use core::time::Duration;
+use std::rc::Rc;
 use windows_composition::{
-    Animatable, Animation, BatchKind, CompositionAnimation, CompositionEasingFunction, CompositionScopedBatch,
-    Compositor, ExpressionAnimation, SpringScalarNaturalMotionAnimation,
+    Animatable, Animation, BatchKind, CompositionAnimation, CompositionEasingFunction,
+    CompositionScopedBatch, Compositor, ExpressionAnimation, SpringScalarNaturalMotionAnimation,
     SpringVector2NaturalMotionAnimation, SpringVector3NaturalMotionAnimation, Visual,
 };
-use core::cell::Cell as CoreCell;
-use std::rc::Rc;
 use windows_core::{EventRevoker, Result};
 use windows_numerics::{Vector2, Vector3};
 
@@ -201,9 +201,13 @@ impl Templates {
                 animation.insert_key_frame_with_easing(at, v, &self.easing(compositor, easing));
             }
             animation.set_duration(Duration::from_millis(u64::from(duration_ms)));
-            apply_iterations(iterations, |n| animation.set_iteration_count(n), || {
-                animation.set_iterate_forever();
-            });
+            apply_iterations(
+                iterations,
+                |n| animation.set_iteration_count(n),
+                || {
+                    animation.set_iterate_forever();
+                },
+            );
             return Some(animation.as_animation());
         }
         let animation = compositor.create_vector3_key_frame_animation();
@@ -219,9 +223,13 @@ impl Templates {
             animation.insert_key_frame_with_easing(at, v, &self.easing(compositor, easing));
         }
         animation.set_duration(Duration::from_millis(u64::from(duration_ms)));
-        apply_iterations(iterations, |n| animation.set_iteration_count(n), || {
-            animation.set_iterate_forever();
-        });
+        apply_iterations(
+            iterations,
+            |n| animation.set_iteration_count(n),
+            || {
+                animation.set_iterate_forever();
+            },
+        );
         Some(animation.as_animation())
     }
 
@@ -376,7 +384,14 @@ impl crate::Scene {
             Exit::Scale { to, ms } => {
                 let animation = back.compositor.create_vector3_key_frame_animation();
                 animation.insert_key_frame(0.0, sprite.scale());
-                animation.insert_key_frame(1.0, Vector3 { x: to, y: to, z: 1.0 });
+                animation.insert_key_frame(
+                    1.0,
+                    Vector3 {
+                        x: to,
+                        y: to,
+                        z: 1.0,
+                    },
+                );
                 animation.set_duration(Duration::from_millis(u64::from(ms)));
                 sprite.set_center_point(Vector3 {
                     x: size.x * 0.5,

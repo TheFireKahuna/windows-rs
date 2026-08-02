@@ -191,7 +191,9 @@ impl HitBuilder {
                 y0: solved.rect.y0,
                 x1: solved.rect.x1,
                 y1: solved.rect.y1,
-                touch_inflate: decl.touch_inflate.unwrap_or_else(|| default_inflation(w, h)),
+                touch_inflate: decl
+                    .touch_inflate
+                    .unwrap_or_else(|| default_inflation(w, h)),
                 clip_parent: self.clips.last().map_or(NO_ENTRY, |&(_, entry)| entry),
                 flags,
                 scroll_src: self.scrolls.last().map_or(NodeId::NONE, |&(_, node)| node),
