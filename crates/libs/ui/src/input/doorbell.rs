@@ -266,8 +266,8 @@ struct Contact {
 #[non_exhaustive]
 pub struct DoorbellHealth {
     /// Discrete transitions dropped because the ring was full. A violated invariant: any
-    /// non-zero value means [`RING_CAPACITY`] is wrong for a frame this application can
-    /// actually produce.
+    /// non-zero value means [`RING_CAPACITY`] is wrong for a frame the host can actually
+    /// produce.
     pub dropped: u32,
     /// Contacts refused because every slot was taken.
     pub unslotted: u32,

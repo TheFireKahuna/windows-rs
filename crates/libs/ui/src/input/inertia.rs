@@ -10,7 +10,7 @@
 //! Reporting matters because of what the system does *instead* when it is not told: a window
 //! whose content is in inertia and has not said so turns a touchpad tap into an ordinary
 //! click, so the user's attempt to stop a fling lands as an edit to whatever was moving under
-//! it. In this application that means an unintended change to live audio.
+//! it — a destructive answer to a gesture that meant "stop".
 //!
 //! # Two of the three cannot be written at the platform floor
 //!

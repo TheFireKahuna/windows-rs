@@ -220,10 +220,9 @@ impl Presenter {
     /// `build` runs on the present thread with that thread's `Gpu`, so the [`Frame`] it
     /// returns may hold device resources and anything else `!Send`.
     ///
-    /// Region count is data-dependent — a chain of twelve processors with four expanded
-    /// mounts four surfaces, and any of them with live metering mounts a region — so
-    /// mounting and unmounting follow structure and are ordinary operations rather than
-    /// setup.
+    /// Region count is data-dependent — a list of twelve rows with four expanded mounts
+    /// four surfaces, and any of them showing a live plot mounts a region — so mounting and
+    /// unmounting follow structure and are ordinary operations rather than setup.
     pub fn mount(
         &self,
         spec: RegionSpec,

@@ -208,9 +208,9 @@ pub enum Commit {
 
 /// A drag whose meaning depends on its direction.
 ///
-/// Reordering a processor chain and rescoping a processor to different channels are the same
-/// physical gesture on the same object, separated by axis. One policy, or every consumer
-/// invents its own and they disagree.
+/// Moving a row within its list and moving it into a different one are the same physical
+/// gesture on the same object, separated by axis. One policy, or every consumer invents its
+/// own and they disagree.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct DragDecl {
     pub axes: DragAxes,
@@ -233,7 +233,7 @@ impl Default for DragDecl {
 }
 
 impl DragDecl {
-    /// Vertical is order, horizontal is scope: the chain's own drag.
+    /// Vertical is order, horizontal is scope: a reorderable list's own drag.
     #[must_use]
     pub fn reorder() -> Self {
         Self::default()

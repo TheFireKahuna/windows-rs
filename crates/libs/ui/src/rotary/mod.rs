@@ -3,7 +3,7 @@
 //! Surface Dial and compatible wheels reach a desktop application through
 //! `IRadialControllerInterop::CreateForWindow` and
 //! `IRadialControllerConfigurationInterop::GetForWindow`: HWND-based, no `CoreWindow`, no App
-//! SDK. Unusually apt here, since this application's signature control *is* a knob.
+//! SDK.
 //!
 //! **The dial is a delta source**, so it lands on the gesture seam and drives the same value
 //! path a knob drag does — not the pointer seam. A control that declares no

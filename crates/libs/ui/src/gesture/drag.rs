@@ -1,9 +1,9 @@
 //! Drags that mean two things.
 //!
-//! Reordering the processor chain and rescoping a processor to different channels are the
-//! same physical gesture on the same object, separated by axis: vertical is order,
-//! horizontal is scope. A drag whose meaning depends on its direction needs **one** policy,
-//! or every consumer invents its own and they disagree.
+//! Moving a row within its list and moving it into a different one are the same physical
+//! gesture on the same object, separated by axis: vertical is order, horizontal is scope. A
+//! drag whose meaning depends on its direction needs **one** policy, or every consumer
+//! invents its own and they disagree.
 //!
 //! Five rules, and they hold for every two-axis drag in the application:
 //!
