@@ -1,0 +1,168 @@
+--out crates/tests/libs/injector/src/bindings.rs
+--flat --minimal --dead-code
+
+// The synthetic-input harness's own Windows surface: producing pointer streams, and
+// nothing else. This is the mirror image of `ui.txt` — that filter names what the
+// framework *reads*, this one names what a test *writes* — and the two share only the
+// structures a sample is carried in.
+//
+// No message constant is named here and none may be. What arrived is a question for the
+// window under test, and a harness that both wrote the input and owned the constants
+// naming the result would be checking itself.
+//
+// `default` is the metadata bundled with windows-bindgen; the second input carries the
+// `CreateSyntheticPointerDevice2` parameter types, which the 26100 SDK redacts and the
+// corpus that scrapes it therefore lacks. See `metadata/syntheticinput.rdl` — and note
+// that the two entry points using them are resolved by name rather than named here, for
+// the reason that file states.
+--in default target/authored.winmd
+
+--filter
+// ── Injection ─────────────────────────────────────────────────────────────────
+// `InputInjector` is the platform's injection surface: one object covering mouse, pen,
+// touch and the keyboard, with an explicit initialize/uninitialize per device class.
+// Mouse and keyboard take a *sequence* — a whole path in one call, each sample carrying
+// its own offset from the one before — which is what lets a rate be stated as data rather
+// than as a sleep between calls, and what stops anything interleaving mid-drag.
+//
+// Members are named individually because `--minimal` generates a class named alone as a
+// shell with nothing callable on it, the same trap `windows-window` hit on
+// `IDisplayInformation5`.
+    Windows.UI.Input.Preview.Injection.InputInjector
+    Windows.UI.Input.Preview.Injection.IInputInjectorStatics::{TryCreate}
+    Windows.UI.Input.Preview.Injection.IInputInjector::{InjectKeyboardInput, InjectMouseInput, InitializeTouchInjection, InjectTouchInput, UninitializeTouchInjection, InitializePenInjection, InjectPenInput, UninitializePenInjection}
+// Each sample is an activatable object with setters rather than a plain struct, so each
+// carries its own activation.
+    Windows.UI.Input.Preview.Injection.InjectedInputMouseInfo
+    Windows.UI.Input.Preview.Injection.InjectedInputMouseInfo::CreateInstance
+    Windows.UI.Input.Preview.Injection.IInjectedInputMouseInfo::{get_MouseOptions, put_DeltaX, put_DeltaY, put_MouseData, put_MouseOptions, put_TimeOffsetInMilliseconds}
+    Windows.UI.Input.Preview.Injection.InjectedInputTouchInfo
+    Windows.UI.Input.Preview.Injection.InjectedInputTouchInfo::CreateInstance
+    Windows.UI.Input.Preview.Injection.IInjectedInputTouchInfo::{put_Contact, put_Orientation, put_PointerInfo, put_Pressure, put_TouchParameters}
+    Windows.UI.Input.Preview.Injection.InjectedInputPenInfo
+    Windows.UI.Input.Preview.Injection.InjectedInputPenInfo::CreateInstance
+    Windows.UI.Input.Preview.Injection.IInjectedInputPenInfo::{put_PenButtons, put_PenParameters, put_PointerInfo, put_Pressure, put_Rotation, put_TiltX, put_TiltY}
+    Windows.UI.Input.Preview.Injection.InjectedInputKeyboardInfo
+    Windows.UI.Input.Preview.Injection.InjectedInputKeyboardInfo::CreateInstance
+    Windows.UI.Input.Preview.Injection.IInjectedInputKeyboardInfo::{put_KeyOptions, put_VirtualKey}
+// The plain values those objects are filled from.
+    Windows.UI.Input.Preview.Injection.InjectedInputPoint
+    Windows.UI.Input.Preview.Injection.InjectedInputPointerInfo
+    Windows.UI.Input.Preview.Injection.InjectedInputPointerOptions
+    Windows.UI.Input.Preview.Injection.InjectedInputRectangle
+    Windows.UI.Input.Preview.Injection.InjectedInputMouseOptions
+    Windows.UI.Input.Preview.Injection.InjectedInputKeyOptions
+    Windows.UI.Input.Preview.Injection.InjectedInputPenButtons
+    Windows.UI.Input.Preview.Injection.InjectedInputPenParameters
+    Windows.UI.Input.Preview.Injection.InjectedInputTouchParameters
+// `None`, never `Default` or `Indirect`: the system's touch circles and pen feedback are
+// pixels a visual diff would see, drawn over the thing being compared.
+    Windows.UI.Input.Preview.Injection.InjectedInputVisualizationMode
+
+// ── The mouse's absolute grid ─────────────────────────────────────────────────
+// Mouse is the one device whose samples do not carry a position: an absolute mouse
+// coordinate is normalized to a 16-bit grid over the **virtual** desktop, so a secondary
+// monitor is reachable and the primary one is not silently assumed. The metrics below are
+// what that normalization divides by, and `GetCursorPos` is read only while proving the
+// inversion — the injector places every later sample exactly, and a per-sample correction
+// is travel a drag's integral would count.
+    GetSystemMetrics
+    SM_XVIRTUALSCREEN
+    SM_YVIRTUALSCREEN
+    SM_CXVIRTUALSCREEN
+    SM_CYVIRTUALSCREEN
+    GetCursorPos
+    WHEEL_DELTA
+// The keys a focus or dismiss assertion needs, and no others: a harness carrying the whole
+// virtual-key table invites a test to drive something it is not testing.
+    VK_TAB
+    VK_ESCAPE
+    VK_RETURN
+    VK_SPACE
+    VK_LEFT
+    VK_RIGHT
+    VK_UP
+    VK_DOWN
+
+// ── Touch ─────────────────────────────────────────────────────────────────────
+// The desktop touch-injection path, and the reason it is here rather than the injection
+// object's: creating a virtual *device* is brokered, and an unpackaged process cannot do
+// it. These two are the unbrokered path that predates it, and they deliver.
+    InitializeTouchInjection
+    InjectTouchInput
+    TOUCH_FEEDBACK_NONE
+    POINTER_FLAG_INRANGE
+    POINTER_FLAG_CANCELED
+    TOUCH_MASK_CONTACTAREA
+    TOUCH_MASK_ORIENTATION
+    PT_TOUCH
+// Two injected frames closer together than a tenth of a millisecond are refused with this
+// and *not* invalidated, and the API's own documented answer is to send the same frame
+// again. It is the one retry in this crate and it repeats a call that delivered nothing.
+    ERROR_NOT_READY
+
+// ── Whether this process may create a virtual input device ────────────────────
+// `Windows.UI.Input.Preview.Injection` is documented to require the `inputInjectionBrokered`
+// restricted capability, which is declared in a package manifest — so an unpackaged process
+// has it and cannot get it. Package identity is the thing that can actually be tested for,
+// and it is what separates "the pen stream is unavailable here" from "the pen stream is
+// broken".
+    GetCurrentPackageFullName
+    APPMODEL_ERROR_NO_PACKAGE
+
+// ── Precision touchpad ────────────────────────────────────────────────────────
+// The one device class `InputInjector` does not cover. A touchpad must be created with a
+// physical size, which is why it needs `CreateSyntheticPointerDevice2` — resolved by name —
+// and why v1 cannot create one at all.
+    InjectSyntheticPointerInput
+    DestroySyntheticPointerDevice
+    HSYNTHETICPOINTERDEVICE
+    POINTER_TYPE_INFO
+    POINTER_TOUCH_INFO
+    POINTER_INFO
+    POINTER_INPUT_TYPE
+    POINTER_FLAGS
+    POINTER_FLAG_NONE
+    POINTER_FLAG_INCONTACT
+    POINTER_FLAG_DOWN
+    POINTER_FLAG_UPDATE
+    POINTER_FLAG_UP
+    POINTER_FEEDBACK_MODE
+    PT_TOUCHPAD
+    TOUCH_FLAGS
+    TOUCH_FLAG_NONE
+    TOUCH_MASK
+    TOUCH_MASK_PRESSURE
+    POINT
+    RECT
+    Windows.Win32.SYNTHETIC_DEVICE_CREATION_PARAMS
+    Windows.Win32.SYNTHETIC_DEVICE_CREATION_OPTIONS
+    Windows.Win32.TOUCHPAD_ACTION
+
+// ── The window a stream aims at ───────────────────────────────────────────────
+// Points are stated in the target window's client DIPs, because that is the space a
+// laid-out target is in and the space an assertion is written in. Converting them is two
+// facts about the window, read when a stream opens rather than held: an origin and a
+// scale.
+    ClientToScreen
+    GetDpiForWindow
+    USER_DEFAULT_SCREEN_DPI
+
+// ── Placing a sample in time ──────────────────────────────────────────────────
+// A mouse path states its own timing inside the batch, so these are for what a batch
+// cannot express: the gap between two frames of a touch gesture, and a hold. A rate faster
+// than the display needs a timer whose resolution beats the scheduler's tick, and one per
+// display frame needs the display's own clock. Neither is a fallback for the other.
+    CreateWaitableTimerExW
+    SetWaitableTimer
+    WaitForSingleObject
+    CloseHandle
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+    TIMER_ALL_ACCESS
+    INFINITE
+    WAIT_OBJECT_0
+    DCompositionWaitForCompositorClock
+
+// ── Resolving the redacted exports ────────────────────────────────────────────
+    GetModuleHandleW
+    GetProcAddress

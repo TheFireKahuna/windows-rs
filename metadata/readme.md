@@ -19,6 +19,7 @@ The `.rdl` files at this level are **transcriptions**, written and maintained by
 | `dispatcherqueue.rdl` | `dispatcherqueue.h` | the corpus carries the WinRT `DispatcherQueue` but not the Win32 call that mints a controller for a thread |
 | `inputscope.rdl` | `InputScope.h` | the corpus scrapes `msctf.h` and `textstor.h`, so TSF is present but has no way to say what kind of text a field holds |
 | `presentation.rdl` | `Presentation.h` | the composition swapchain namespace is absent entirely |
+| `syntheticinput.rdl` | `winuser.h` (Learn) | the 26100 SDK redacts the `CreateSyntheticPointerDevice2` types behind `Feature_TouchpadPublicApis3`, so the corpus that scrapes it has them nowhere to come from |
 | `uiautomation.rdl` | `UiAutomationCoreApi.h`, `UIAutomationClient.h` | the corpus has UI Automation's types but neither the provider entry points nor the identifier constants |
 | `windowsgraphicsinterop.rdl` | `Windows.Graphics.Interop.h` | the rest of the composition interop surface is scraped; this one interface is not |
 

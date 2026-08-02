@@ -1,0 +1,33 @@
+[package]
+name = "injector"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Synthetic mouse, touch, pen and precision-touchpad streams for driving the UI framework's input stack"
+publish = false
+
+[features]
+# The injection test layer. Off by default because it drives the real input stack against a
+# real foreground window, which needs an interactive session — so a headless `cargo test
+# --all` compiles the crate and runs nothing that needs a display. Run it, and lint it, with
+# `--features harness`.
+harness = []
+
+[dependencies]
+# The generated surface's own runtime: `BOOL`, `Error`, `w!`/`s!`, and `link!`. Nothing
+# else — a harness that depended on a framework crate could not be used to test it.
+windows-core = { workspace = true }
+# `IIterable`, which is how a whole mouse path or a whole touch frame is handed over in one
+# call rather than one sample at a time. `std` is what carries the `Vec` conversion — the
+# workspace default is off, and without it the only `From` in scope is the reflexive one, so
+# the failure reads as a type mismatch rather than as a missing feature.
+windows-collections = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+# A real window to aim at. The harness itself never needs one, which is why this is a
+# dev-dependency: `Space::for_window` takes a raw handle and does not care who made it.
+windows-window = { workspace = true }
+
+[lints]
+workspace = true

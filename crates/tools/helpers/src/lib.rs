@@ -167,6 +167,7 @@ pub const AUTHORED_METADATA: &[&str] = &[
     "metadata/dispatcherqueue.rdl",
     "metadata/inputscope.rdl",
     "metadata/presentation.rdl",
+    "metadata/syntheticinput.rdl",
     "metadata/uiautomation.rdl",
     "metadata/windowsgraphicsinterop.rdl",
 ];

@@ -1,0 +1,72 @@
+// The synthetic-device creation surface `winuser.h` redacts at the platform floor:
+// `CreateSyntheticPointerDevice2`'s parameter block, its options, and the touchpad
+// action enumeration.
+//
+// Transcribed from Microsoft Learn rather than from the header, because the 26100 SDK's
+// own `winuser.h` carries `// TODO(47499024): Make public when Feature_TouchpadPublicApis3
+// is enabled` exactly where these belong, and the vendored corpus is missing them for the
+// same reason. Both entry points are nevertheless real exports of `user32.dll` — verified
+// present on 26200, alongside `GetPointerTouchpadInfo` and `ReportWindowContentInertia`,
+// which the same redaction hides.
+//
+// **The two functions are deliberately absent from this file**, and their absence is the
+// point. An `extern fn` here becomes a static import, and a static import the running
+// `user32` does not export fails the *process load* — which for a harness would mean a
+// machine at the floor losing mouse and touch injection as well, because one export it
+// never needed was missing. They are resolved by name instead, in the injector's own
+// `late` module, exactly as `windows-ui` resolves the other two.
+//
+// The v1 `CreateSyntheticPointerDevice`, `InjectSyntheticPointerInput` and
+// `DestroySyntheticPointerDevice` are in the corpus already and are not repeated here;
+// so are `POINTER_INPUT_TYPE`, `POINTER_FEEDBACK_MODE`, `HMONITOR` and
+// `HSYNTHETICPOINTERDEVICE`, which the declarations below resolve against.
+#[win32]
+mod Windows {
+    mod Win32 {
+        // What a synthetic device is made of. The valid combinations are per pointer
+        // type and are enforced by the injector rather than restated here: touch takes
+        // 1–256 contacts, pen exactly 1, touchpad 1–5 with `POINTER_FEEDBACK_NONE`, a
+        // null monitor and a physical size.
+        struct SYNTHETIC_DEVICE_CREATION_PARAMS {
+            pointerType: POINTER_INPUT_TYPE,
+            maxCount: u32,
+            feedbackMode: POINTER_FEEDBACK_MODE,
+            hMonitor: HMONITOR,
+            deviceWidth: u32,
+            deviceHeight: u32,
+            options: SYNTHETIC_DEVICE_CREATION_OPTIONS,
+        }
+
+        // `SDCO_PHYSICAL_SIZE` also changes which field an injected sample is read from:
+        // `ptHimetricLocation` rather than `ptPixelLocation`. It is mandatory for a
+        // touchpad, which is why `CreateSyntheticPointerDevice` (v1, which has no options
+        // parameter) cannot create one at all.
+        #[repr(u32)]
+        #[flags]
+        enum SYNTHETIC_DEVICE_CREATION_OPTIONS {
+            SDCO_NONE = 0,
+            SDCO_PHYSICAL_SIZE = 1,
+            SDCO_TOUCHPAD_GESTURE_ONLY = 2,
+        }
+
+        // The global touchpad gestures, plus the two inertia messages. `TA_INERTIA_STOP`
+        // and `TA_INERTIA_END` are documented to produce exactly one `WM_STOPINERTIA` and
+        // one `WM_ENDINERTIA` respectively, to the window that last reported content
+        // inertia — which is the only way to observe two message numbers the SDK redacts
+        // alongside these types.
+        #[repr(i32)]
+        enum TOUCHPAD_ACTION {
+            TA_3FINGER_TAP = 0,
+            TA_3FINGER_PRESS = 1,
+            TA_3FINGER_RELEASE = 2,
+            TA_4FINGER_TAP = 3,
+            TA_4FINGER_PRESS = 4,
+            TA_4FINGER_RELEASE = 5,
+            TA_5FINGER_TAP = 6,
+            TA_5FINGER_PRESS = 7,
+            TA_5FINGER_RELEASE = 8,
+            TA_INERTIA_STOP = 9,
+            TA_INERTIA_END = 10,
+        }
+    }
+}
