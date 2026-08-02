@@ -3,7 +3,7 @@ use crate::bindings::*;
 use crate::clock::{self, Observed};
 use crate::event::{Event, wait_any};
 use crate::visibility::Watch;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::os::windows::io::AsHandle;
 use std::sync::Arc;
 use windows_core::{Error, Result};
@@ -51,6 +51,10 @@ pub(crate) struct Clock {
     stopping: AtomicBool,
     stalls: AtomicU32,
     clockless: AtomicBool,
+    /// Composition frames this pacer has posted for. Incremented **by the pacer thread**, so
+    /// it counts elapsed display frames and not window messages — a consumer that posts
+    /// [`WM_FRAME`] itself to be serviced sooner does not move it.
+    frames: AtomicU64,
 }
 
 impl Wake {
@@ -65,6 +69,18 @@ impl Wake {
     #[must_use]
     pub fn requesters(&self) -> usize {
         self.0.count.load(Ordering::Acquire)
+    }
+
+    /// How many composition frames have elapsed.
+    ///
+    /// **Diagnostic.** [`WM_FRAME`] means "service what is pending", and a consumer with
+    /// something latency-critical may post it itself rather than wait for the display — so
+    /// services outnumber frames, and the gap between this and a consumer's own service count
+    /// is the measure of how much never waited. A consumer that has to *gate* on it is
+    /// usually about to sample something it should be folding instead.
+    #[must_use]
+    pub fn frames(&self) -> u64 {
+        self.0.frames.load(Ordering::Relaxed)
     }
 }
 
@@ -173,6 +189,7 @@ impl Window {
             stopping: AtomicBool::new(false),
             stalls: AtomicU32::new(0),
             clockless: AtomicBool::new(false),
+            frames: AtomicU64::new(0),
         });
         // A second pacer would post frames the window's gate does not account for.
         if !self.claim_frame_gate(Arc::clone(&inner)) {
@@ -287,6 +304,11 @@ fn run(s: &Arc<Clock>, target: &Target) {
             Observed::Frame => s.clockless.store(false, Ordering::Relaxed),
         }
 
+        // Counted here rather than on the message, so it counts *display* frames: a
+        // consumer that posts the frame message itself to be serviced sooner must not be
+        // able to make a per-frame quantity resolve twice in one frame.
+        s.frames.fetch_add(1, Ordering::Relaxed);
+
         // One message in flight: if one is pending the pump has not reached it yet, and a
         // second would only make it do the same work twice.
         if !s.posted.swap(true, Ordering::AcqRel) {
@@ -328,6 +350,7 @@ mod tests {
             stopping: AtomicBool::new(false),
             stalls: AtomicU32::new(0),
             clockless: AtomicBool::new(false),
+            frames: AtomicU64::new(0),
         });
         (shared, visibility)
     }

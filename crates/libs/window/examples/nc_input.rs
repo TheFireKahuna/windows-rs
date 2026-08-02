@@ -40,7 +40,7 @@ enum Consume {
     Nothing,
     /// Hover only, which is the minimum a pointer-native caption needs.
     HoverOnly,
-    /// Every non-client pointer arm — the shape 05 §2.1 asks for.
+    /// Every non-client pointer arm — the fully pointer-native shape.
     AllNcPointer,
 }
 
