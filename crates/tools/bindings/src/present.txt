@@ -9,6 +9,8 @@
 --in default target/authored.winmd
 
 --filter
+    E_FAIL
+
 // ── The presentation API ──────────────────────────────────────────────────────
 // A presentation manager owns a queue of presents and the buffers they show. The
 // statistics interfaces are how a region learns whether its buffer reached a display
@@ -23,9 +25,20 @@
     IPresentStatistics
     IPresentStatusPresentStatistics
     ICompositionFramePresentStatistics
-    PresentStatisticsKind
-    PresentStatus
-    CompositionFrameInstanceKind
+// Named as individual constants and not as their enum types. Naming a *type* generates
+// every one of its members, and `rustc`'s own `dead_code` over the private generated
+// module is the signal that says the filter and the wrapper agree — so a type named for
+// three of its members reports the rest as noise in the one warning that is worth
+// reading. `PresentStatus_Queued` and `CompositionFrameInstanceKind_ComposedOnScreen`
+// are absent on purpose: each is the `else` of its comparison chain, so naming it would
+// add an entry no line consumes.
+    PresentStatisticsKind_PresentStatus
+    PresentStatisticsKind_CompositionFrame
+    PresentStatisticsKind_IndependentFlipFrame
+    PresentStatus_Skipped
+    PresentStatus_Canceled
+    CompositionFrameInstanceKind_ScanoutOnScreen
+    CompositionFrameInstanceKind_ComposedToIntermediate
     CompositionFrameDisplayInstance
     PresentationTransform
     SystemInterruptTime
@@ -56,18 +69,26 @@
     DXGI_FORMAT_R16G16B16A16_FLOAT
     DXGI_ALPHA_MODE_PREMULTIPLIED
     DXGI_ALPHA_MODE_IGNORE
-    DXGI_COLOR_SPACE_TYPE
+// The one colour space, and not the enum that carries the other twenty-eight. It is the
+// compositor's own canonical composition space, so a buffer in it blends with no
+// conversion — and the alternatives are refused rather than unused: an HDR10 surface is
+// 10-bit, alpha-hostile and a second presentation model, and a Rec.2020 one is not DWM's
+// composition space, so every present would buy a full-surface conversion in `dwm.exe`
+// and buy nothing colorimetrically, since scRGB with negatives already carries every
+// Rec.2020 colour losslessly.
     DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
     RECT
 
 // ── Pacing ────────────────────────────────────────────────────────────────────
-// The present thread waits on the compositor clock rather than a timer, so it wakes
-// at the display's rate without a periodic wake of its own. Target times are read
+// The present thread waits on the compositor clock rather than a timer, so it wakes at the
+// display's rate without a periodic wake of its own. The clock wait itself and the
+// scheduling-class lever are `windows-window`'s — both are thread properties this crate
+// consumes rather than owns, and a second copy of either is a second chance to decode the
+// clock's slot arithmetic or encode the QoS tri-state differently. Target times are read
 // from the same interrupt-time clock the presentation API takes.
-    DCompositionWaitForCompositorClock
     QueryInterruptTimePrecise
     WaitForMultipleObjects
     WAIT_OBJECT_0
-    WAIT_TIMEOUT
     WAIT_FAILED
+    INFINITE
     CloseHandle

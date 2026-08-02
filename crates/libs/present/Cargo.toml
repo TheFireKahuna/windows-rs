@@ -10,7 +10,24 @@ categories = ["os::windows-apis"]
 readme = "readme.md"
 
 [dependencies]
+# A frame's colours cross the draw choke here exactly as they do on the retained path,
+# so the transform is carried in `FrameCtx` and this crate names the type. It is the
+# dependency with no dependencies of its own.
+windows-color = { workspace = true }
 windows-core = { workspace = true }
+# The present thread's `Gpu`, the one drawing bracket, and the `Target` a buffer becomes.
+# A region allocates its own textures and hands them to `Gpu::adopt`, so no Direct2D type
+# is named on this side of the seam.
+windows-d2d = { workspace = true }
+# `Event`, which an `Epoch` signals and the clock wait parks on, and `Visibility`, the
+# window edge that leaves the parked state.
+windows-window = { workspace = true }
+
+[dev-dependencies]
+# The example binds a region's surface handle into a real visual tree, which is the one
+# thing this crate deliberately does not do itself: a composition object is front-thread
+# affine and a region is not. Keeping it a dev-dependency is what says so.
+windows-composition = { workspace = true, features = ["system"] }
 
 [lints]
 workspace = true
