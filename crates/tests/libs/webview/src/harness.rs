@@ -24,7 +24,7 @@ impl Harness {
         let window = Window::new(title).size(1024, 768).create()?;
         let environment = Environment::new()?;
         let controller = environment.create_controller(&window)?;
-        let (width, height) = window.client_size();
+        let (width, height) = window.client_size().expect("an open window");
         controller.set_bounds(0, 0, width, height)?;
         let webview = controller.webview()?;
 

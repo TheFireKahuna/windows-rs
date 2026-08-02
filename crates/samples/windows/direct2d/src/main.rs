@@ -5,7 +5,7 @@ fn main() -> windows::core::Result<()> {
     use std::cell::RefCell;
     use std::rc::Rc;
     use windows_numerics::*;
-    use windows_window::{Window, run_with};
+    use windows_window::{Window, pump};
 
     struct App {
         handle: HWND,
@@ -537,13 +537,16 @@ fn main() -> windows::core::Result<()> {
 
     app.borrow_mut().handle = HWND(window.hwnd());
 
-    run_with(move || {
-        let mut app = app.borrow_mut();
-        if app.visible {
-            app.render()?;
-            Ok(true)
+    while pump() {
+        let visible = app.borrow().visible;
+        if visible {
+            app.borrow_mut().render()?;
         } else {
-            Ok(false)
+            // Nothing to draw, so park in the kernel rather than spin. `visible` comes back
+            // on the occlusion registration's `WM_USER`, or on an un-minimizing
+            // `WM_ACTIVATE`.
+            unsafe { _ = WaitMessage() };
         }
-    })
+    }
+    Ok(())
 }

@@ -7,10 +7,13 @@ fn main() -> Result<()> {
     let window = Window::new("Canvas Standalone").size(800, 600).create()?;
 
     let device = GpuDevice::new()?;
-    let (width, height) = window.client_size();
+    // `None` once the window is gone, which nothing here can draw into.
+    let Some((width, height)) = window.client_size() else {
+        return Ok(());
+    };
     let mut chain = device.create_swap_chain_for_window(&window, width as u32, height as u32)?;
 
-    run_with(|| {
+    while pump() {
         let width = chain.width() as f32;
         let height = chain.height() as f32;
         let session = chain.begin_draw()?;
@@ -38,6 +41,6 @@ fn main() -> Result<()> {
 
         drop(session);
         chain.present()?;
-        Ok(true)
-    })
+    }
+    Ok(())
 }

@@ -10,7 +10,16 @@ categories = ["os::windows-apis"]
 readme = "readme.md"
 
 [dependencies]
+# Names the `DisplayCapability` this crate reports and the `Scrgb` its frame colour is.
+# Downward, onto a crate with no dependencies of its own.
+windows-color = { workspace = true }
 windows-core = { workspace = true }
+
+[dev-dependencies]
+# One example attaches real composition content: whether DWM's extended frame sits over or
+# under what we draw cannot be answered by a window that draws nothing.
+windows-composition = { workspace = true, features = ["system"] }
+windows-numerics = { workspace = true }
 
 [lints]
 workspace = true

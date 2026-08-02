@@ -705,8 +705,8 @@ fn main() -> windows::core::Result<()> {
 
     let handler = app.clone();
     let window = Window::new("Sample Window")
-        .style((WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX) as u32)
-        .ex_style(WS_EX_NOREDIRECTIONBITMAP as u32)
+        .resizable(false)
+        .no_redirection_bitmap()
         .on_message(move |_, message, wparam, lparam| {
             Some(
                 handler

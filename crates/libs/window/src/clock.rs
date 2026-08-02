@@ -1,0 +1,83 @@
+//! The compositor's own frame clock.
+//!
+//! One wait, decoded once. The return is neither a `WAIT_*` value nor a boolean, and the
+//! clock's own slot is the one *after* the handles passed in — three distinct ways to read it
+//! as a frame that was not one, which is why every consumer in this stack comes through here
+//! rather than calling it and deciding again.
+
+use crate::bindings::*;
+use std::os::windows::io::{BorrowedHandle, RawHandle};
+
+/// No guard: wait until the clock or one of the caller's own handles answers.
+pub const INFINITE: u32 = crate::bindings::INFINITE;
+
+/// What the call returns when the display is off. Not a `WAIT_*` value and not an error: it
+/// succeeds and returns **immediately**, so treating it as a frame is a busy loop that appears
+/// only when a monitor sleeps.
+const STATUS_GRAPHICS_PRESENT_OCCLUDED: u32 = 0xC01E_0006;
+
+/// What one wait on the compositor clock observed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Observed {
+    /// A composition frame elapsed.
+    Frame,
+    /// The caller's own handle at this index fired, and **no frame elapsed**. Doing a frame's
+    /// work here would spend one on every state change.
+    Signal(u32),
+    /// The guard expired with no frame: a stalled clock — a locked session, a sleeping
+    /// display, a mode switch. Treat it as a frame to keep motion going, but know that every
+    /// timing figure taken meanwhile is measuring the session rather than the display.
+    Stalled,
+    /// The display cannot show anything, and the call returned without blocking. Park; the
+    /// clock is the only thing that can say the display is back.
+    Occluded,
+    /// The wait failed, which is what a session with no compositor clock — headless, or
+    /// remote — answers. Nothing distinguishes that from a transient failure, so a caller
+    /// parks and probes again on its next edge rather than retrying in place, which on the
+    /// permanent case is a spin.
+    NoClock,
+}
+
+/// Blocks until a composition frame elapses, one of `handles` is signalled, or `timeout_ms`
+/// expires. Pass [`INFINITE`] for no guard.
+///
+/// Blocking is the mechanism rather than a cost: the graphics system cannot tell whether
+/// anyone is waiting on an event, so it needs a real waiter to know it must keep the
+/// vertical-blank interrupt on — and to switch it off when nobody is left.
+#[must_use]
+pub fn wait_for_frame(handles: &[BorrowedHandle<'_>], timeout_ms: u32) -> Observed {
+    // SAFETY: `BorrowedHandle` is a transparent wrapper over the raw handle, so the slice is
+    // the contiguous array the call takes, and the borrows keep every owner alive across it.
+    unsafe { wait_for_frame_raw(handles.as_ptr().cast(), handles.len() as u32, timeout_ms) }
+}
+
+/// As [`wait_for_frame`], for a caller whose handle list cannot name its owners' lifetime —
+/// one rebuilt as a field when its membership changes, rather than per wait.
+///
+/// # Safety
+///
+/// `handles` must address `count` handles, each naming a kernel object that stays live for the
+/// call.
+#[must_use]
+pub unsafe fn wait_for_frame_raw(
+    handles: *const RawHandle,
+    count: u32,
+    timeout_ms: u32,
+) -> Observed {
+    // SAFETY: the caller guarantees the list.
+    let result = unsafe { DCompositionWaitForCompositorClock(count, handles.cast(), timeout_ms) };
+    // The clock's slot is the one after the caller's handles — not zero. A
+    // proceed-on-anything-nonzero reading confuses a frame with a signal, which is precisely
+    // what this value exists to disambiguate.
+    let clock = WAIT_OBJECT_0 as u32 + count;
+    match result {
+        STATUS_GRAPHICS_PRESENT_OCCLUDED => Observed::Occluded,
+        WAIT_FAILED => Observed::NoClock,
+        r if r == clock => Observed::Frame,
+        r if r < clock => Observed::Signal(r - WAIT_OBJECT_0 as u32),
+        // The guard timeout, and an abandoned wait: neither is a frame and both mean the
+        // clock stopped answering.
+        _ => Observed::Stalled,
+    }
+}

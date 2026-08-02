@@ -55,7 +55,10 @@ fn main() -> Result<()> {
     let target = compositor.create_desktop_window_target(&window, false)?;
     target.set_root(&root);
 
-    let (width, height) = window.client_size();
+    // `None` once the window is gone, which leaves no board to size.
+    let Some((width, height)) = window.client_size() else {
+        return Ok(());
+    };
     *game.borrow_mut() = Some(Minesweeper::new(
         &root,
         &Vector2::new(width as f32, height as f32),

@@ -80,7 +80,12 @@ fn main() -> Result<()> {
     sprite.set_brush(&compositor.create_surface_brush(&surface));
     root.children().insert_at_top(&sprite);
 
-    let (width, height) = window.client_size();
+    // Publish the scene and lay it out for the current size, then let the resize
+    // handler keep it in sync as the window is resized.
+    // `None` once the window is gone, which leaves nothing to lay out.
+    let Some((width, height)) = window.client_size() else {
+        return Ok(());
+    };
     let stored = Scene {
         surface,
         sprite,

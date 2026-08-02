@@ -1,82 +1,55 @@
-//! The frame pacer: a counter with RAII guards, not a poll.
-//!
-//! One thread blocks on the compositor's own clock and posts a message, so a window's
-//! frame work happens inside its ordinary pump, in message order with input. **There is no
-//! timer.**
-//!
-//! A tick is requested by, and only by, a live [`Tick`] guard. The **0→1 transition signals
-//! the wake event**, so no window exists in which a requester exists and the pacer sleeps.
-//! A dropped guard decrements, which makes "zero wakes at idle" a property of ownership.
-//!
-//! # What the clock wait requires
-//!
-//! Five behaviours the API does not suggest, each a real failure:
-//!
-//! - **The event is auto-reset.** Left signalled, it satisfies every subsequent clock wait
-//!   instantly and the pacer becomes a busy loop posting frames as fast as a core will go.
-//! - **The return value is not a boolean.** Index `0` is our event — a state change, no
-//!   frame elapsed; `WAIT_FAILED` is a session with no compositor clock; anything else is a
-//!   frame. Posting on all of them spends a frame on every state change.
-//! - **The wait is guarded, not infinite.** A stalled clock — display off, mode switch,
-//!   locked or remote session — otherwise freezes every paced surface with nothing to
-//!   report it. A guard expiry counts as a frame, so motion degrades to a trickle.
-//! - **At most one message is in flight.** A pump slower than the display otherwise
-//!   accumulates stale frame messages and ticks for each. The gate re-opens *before* the
-//!   tick's work, so a frame completing during it is not lost.
-//! - **An occluded window parks** — the common case for a minimized app still animating.
-
-use crate::bindings::*;
 use crate::Window;
-use crate::event::Event;
-use core::marker::PhantomData;
+use crate::bindings::*;
+use crate::clock::{self, Observed};
+use crate::event::{Event, wait_any};
+use crate::visibility::Watch;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::os::windows::io::AsHandle;
 use std::sync::Arc;
 use windows_core::{Error, Result};
 
-/// The message the pacer posts. `WM_APP` is the base of the range reserved for an
-/// application's own messages, so nothing else in the window's stream can collide with it.
-pub const WM_APP_FRAME: u32 = WM_APP as u32 + 0x44;
+/// The message the pacer posts, once per composition frame, while something wants one.
+///
+/// `WM_USER` and not `WM_APP`: this crate registers the window class, and `WM_APP` upwards
+/// belongs to the application.
+pub const WM_FRAME: u32 = WM_USER as u32 + 0x44;
 
 /// How long a clock wait may block before it is treated as a frame.
 ///
-/// This only ever bounds a *stalled* clock. Wide enough that a healthy display never
-/// reaches it — six frames at 60 Hz — and short enough that a surface driving itself from
-/// the tick keeps moving, slowly, rather than appearing to hang.
+/// Only ever bounds a *stalled* clock — a locked session, a sleeping display, a mode
+/// switch. Six frames at 60 Hz: wide enough that a healthy display never reaches it, short
+/// enough that a surface driving itself from the tick keeps moving rather than hanging.
 const CLOCK_GUARD_MS: u32 = 100;
 
-/// A handle to the frame clock, handed to anything that can ask for a tick.
+/// A handle to the frame clock, for anything that can ask for a tick.
 ///
-/// `Clone + Send + Sync`, so every requester takes the same guard type: an active pointer
-/// contact, a pending realization, a queued patch on the app thread, a scene's outstanding
-/// exit animations and non-idle trackers. That is what lets a thread that is not the
-/// window's hold a request with no second mechanism.
+/// `Clone + Send + Sync`, so a pointer contact, a queued patch, a scene's outstanding exit
+/// animations and a thread that is not the window's all take the same guard type.
 #[derive(Clone)]
-pub struct Wake(Arc<Inner>);
+pub struct Wake(Arc<Clock>);
+
+const _: () = {
+    const fn assert<T: Send + Sync + Clone>() {}
+    assert::<Wake>();
+};
 
 /// One live request for the frame clock. Dropping it releases the request.
-///
-/// `Send`, and deliberately not `Copy`: the release is the drop.
-pub struct Tick(Arc<Inner>);
+pub struct Tick(Arc<Clock>);
 
-struct Inner {
-    /// Live requesters. The 0→1 and 1→0 edges are the only ones that touch the kernel.
+pub(crate) struct Clock {
+    /// Live requesters. Only the 0→1 and 1→0 edges touch the kernel.
     count: AtomicUsize,
-    /// Auto-reset, initially unsignalled: one signal, one worker wake. It rides in the
-    /// clock wait's handle list, so a state change is noticed *inside* the wait rather than
-    /// one frame later.
+    /// Rides in the clock wait's handle list, so a state change is noticed *inside* the
+    /// wait rather than one frame later.
     event: Event,
-    /// Whether a frame message is already in flight. The whole of the coalescing.
+    /// Whether a frame message is already in flight. The whole of the coalescing: a pump
+    /// slower than the display would otherwise accumulate stale frame messages.
     posted: AtomicBool,
-    /// Set while the window cannot be seen. A veto rather than a request, which is why it
-    /// is not expressible as a `Tick`.
-    occluded: AtomicBool,
+    /// The window's own half of "can anything drawn be seen". A veto rather than a request,
+    /// which is why it is not expressible as a `Tick`.
+    watch: Watch,
     stopping: AtomicBool,
-    /// Frames the clock guard produced rather than the clock. Non-zero means the compositor
-    /// clock stalled, which is a fact about the session and not about us.
     stalls: AtomicU32,
-    /// Set once if the session has no compositor clock at all. Reported rather than worked
-    /// around: a second, partially-exercised pacing path is the failure mode this design
-    /// exists to remove.
     clockless: AtomicBool,
 }
 
@@ -88,35 +61,46 @@ impl Wake {
         Tick(Arc::clone(&self.0))
     }
 
-    /// How many requesters are live. Zero means the pacer is parked and the pump is
-    /// blocked — which is what "zero wakes at idle" looks like from outside.
+    /// How many requesters are live. Zero means the pacer is parked and the pump is blocked.
     #[must_use]
     pub fn requesters(&self) -> usize {
         self.0.count.load(Ordering::Acquire)
     }
 }
 
-impl Inner {
+impl Clock {
     fn acquire(&self) {
-        // Only the 0→1 edge signals. A second requester while one is already live is one
-        // increment and no kernel call at all, which is the steady state during a drag —
-        // several guards live, none of them touching the event.
+        // Only the 0→1 edge signals, so the steady state during a drag is several live
+        // guards and no kernel call at all.
         if self.count.fetch_add(1, Ordering::AcqRel) == 0 {
             self.event.signal();
         }
     }
 
     fn release(&self) {
-        // The 1→0 edge signals too, so a pacer blocked in the clock wait parks on this
-        // frame rather than posting one more into a window that has nothing to draw.
+        // The 1→0 edge signals too, so a pacer blocked in the clock wait parks on this frame
+        // rather than posting one more into a window with nothing to draw.
         if self.count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.event.signal();
         }
     }
 
+    /// Re-opens the post gate. Called from the window procedure *before* the application
+    /// sees [`WM_FRAME`], so a frame completing during the tick's work is not swallowed.
+    pub(crate) fn begin_frame(&self) {
+        self.posted.store(false, Ordering::Release);
+    }
+
     /// Whether the pacer should be asleep: nothing wants a frame, or nothing can see one.
     fn parked(&self) -> bool {
-        self.count.load(Ordering::Acquire) == 0 || self.occluded.load(Ordering::Acquire)
+        self.count.load(Ordering::Acquire) == 0 || self.watch.is_hidden()
+    }
+
+    /// Parks until a requester appears or the window can be seen again.
+    ///
+    /// Deliberately no clock in the list: a parked pacer has nothing to do on a frame.
+    fn park(&self) {
+        wait_any(&[self.event.as_handle(), self.watch.as_handle()]);
     }
 }
 
@@ -147,67 +131,64 @@ impl core::fmt::Debug for Tick {
     }
 }
 
-/// What one blocking wait observed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Observed {
-    /// A composition frame elapsed — or the guard expired on a stalled clock, which is
-    /// treated the same so that motion degrades rather than stopping.
-    Frame,
-    /// Our own event fired: something changed, and **no frame elapsed**. Re-check and post
-    /// nothing.
-    StateChange,
-    /// The session has no compositor clock.
-    NoClock,
-}
-
-/// How the pacer reports what it could not do.
+/// What the pacer could not do.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PacerHealth {
     /// Frames produced by the stalled-clock guard rather than by the display. Steady growth
-    /// means the compositor clock is not running — a locked session, a sleeping display, a
-    /// mode switch — and every timing measurement taken during it is meaningless.
+    /// means every timing measurement taken meanwhile is measuring the session.
     pub stalls: u32,
-    /// The session has no compositor clock at all, so nothing is paced. Named rather than
-    /// worked around.
+    /// The clock wait is failing, so nothing is paced. What a session with no compositor
+    /// clock — headless, or remote — answers. Cleared by the first frame that arrives, so a
+    /// clock that comes back is reported as back.
     pub clockless: bool,
 }
 
 /// The pacer thread, tied to the window it posts to.
 ///
-/// The borrow is the safety: a pacer cannot outlive its window, so the handle it posts to
-/// cannot be destroyed and its value recycled underneath it. `Drop` joins the thread.
+/// The borrow is the safety: handle values are recycled, so a pacer that outlived its window
+/// would post into whatever now answers to that value. `Drop` joins the thread.
 pub struct Pacer<'w> {
-    inner: Arc<Inner>,
+    inner: Arc<Clock>,
     thread: Option<std::thread::JoinHandle<()>>,
-    window: PhantomData<&'w Window>,
+    window: &'w Window,
 }
 
 impl Window {
     /// Starts a frame pacer for this window.
     ///
-    /// The pacer parks until something asks for a tick, then posts [`WM_APP_FRAME`] once
-    /// per composition frame. The window's message arm calls
-    /// [`begin_tick`](Pacer::begin_tick) before doing the frame's work.
+    /// The pacer parks until something asks for a tick, then posts [`WM_FRAME`] once per
+    /// composition frame. Nothing else is required of the caller: the window procedure
+    /// re-opens the pacer's post gate itself, ahead of the application's frame work.
+    ///
+    /// # Errors
+    ///
+    /// The window is closed, or already has a pacer.
     pub fn pacer(&self) -> Result<Pacer<'_>> {
-        let inner = Arc::new(Inner {
+        let inner = Arc::new(Clock {
             count: AtomicUsize::new(0),
             event: Event::auto_reset()?,
             posted: AtomicBool::new(false),
-            occluded: AtomicBool::new(false),
+            watch: self.watch()?,
             stopping: AtomicBool::new(false),
             stalls: AtomicU32::new(0),
             clockless: AtomicBool::new(false),
         });
+        // A second pacer would post frames the window's gate does not account for.
+        if !self.claim_frame_gate(Arc::clone(&inner)) {
+            return Err(Error::new(E_HANDLE, "the window already has a pacer"));
+        }
         let worker = Arc::clone(&inner);
         let target = Target(self.hwnd());
         let thread = std::thread::Builder::new()
             .name("frame-pacer".into())
             .spawn(move || run(&worker, &target))
-            .map_err(|e| Error::new(windows_core::HRESULT(E_FAIL), e.to_string()))?;
+            .inspect_err(|_| self.release_frame_gate())
+            .map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         Ok(Pacer {
             inner,
             thread: Some(thread),
-            window: PhantomData,
+            window: self,
         })
     }
 }
@@ -219,25 +200,7 @@ impl Pacer<'_> {
         Wake(Arc::clone(&self.inner))
     }
 
-    /// Re-opens the post gate.
-    ///
-    /// Called by the window's frame-message arm **before** it does the tick's work, so a
-    /// frame that completes during that work is posted rather than swallowed.
-    pub fn begin_tick(&self) {
-        self.inner.posted.store(false, Ordering::Release);
-    }
-
-    /// Whether the window can be seen. Hiding parks the pacer even with live requesters,
-    /// because pacing a window nobody can see is pure waste.
-    pub fn set_occluded(&self, occluded: bool) {
-        if self.inner.occluded.swap(occluded, Ordering::AcqRel) != occluded {
-            // Both edges: hiding interrupts an in-flight clock wait so the park is
-            // immediate, and showing ends the park.
-            self.inner.event.signal();
-        }
-    }
-
-    /// What the pacer could not do: a stalled compositor clock, or a session without one.
+    /// A stalled compositor clock, or a session without one.
     #[must_use]
     pub fn health(&self) -> PacerHealth {
         PacerHealth {
@@ -254,125 +217,139 @@ impl Drop for Pacer<'_> {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.window.release_frame_gate();
     }
 }
 
-/// The window handle, moved into the pacer thread.
-///
-/// A raw pointer is not `Send`, and a window handle genuinely is not a pointer to anything
-/// this thread may dereference — it is an opaque token the system resolves.
+impl core::fmt::Debug for Pacer<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Pacer")
+            .field("health", &self.health())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The window handle, moved into the pacer thread. Never dereferenced here — it is an
+/// opaque token `PostMessageW` resolves itself.
 struct Target(*mut core::ffi::c_void);
 
-// SAFETY: the value is never dereferenced here; it is passed straight back to
-// `PostMessageW`, which is documented as callable from any thread and which resolves the
-// handle itself. Its lifetime is discharged by `Pacer` borrowing the window and joining
-// this thread on drop.
+// SAFETY: `PostMessageW` is callable from any thread, and the handle outlives this thread
+// because `Pacer` borrows the window and joins on drop. It can still name a *destroyed*
+// window — `WM_DESTROY` parks the pacer, but a wait that returned a frame just before it is
+// already past the check — so the post is allowed to fail and nothing is read back through it.
 unsafe impl Send for Target {}
 unsafe impl Sync for Target {}
 
-fn run(s: &Arc<Inner>, target: &Target) {
+fn run(s: &Arc<Clock>, target: &Target) {
+    // The display's half of "can anything be seen". Latched by the clock's own occluded
+    // return and cleared by one probe after an edge, because the clock is the only thing
+    // that can say the display is back.
+    let mut dark = false;
     loop {
-        // ── parked ────────────────────────────────────────────────────────────────────
-        // Zero wakes until a requester appears or the window is shown again. This is the
-        // whole of "zero cost at idle": a presentation region is *not* a requester, because
-        // it presents on its own thread and the compositor picks its buffers up without us.
-        while s.parked() {
+        // Zero wakes until a requester appears or the window is shown again.
+        while s.parked() || dark {
             if s.stopping.load(Ordering::Acquire) {
                 return;
             }
-            s.event.wait(INFINITE);
+            s.park();
+            dark = false;
         }
         if s.stopping.load(Ordering::Acquire) {
             return;
         }
 
-        // ── paced ─────────────────────────────────────────────────────────────────────
         let observed = wait_frame(s);
         if s.stopping.load(Ordering::Acquire) {
             return;
         }
         match observed {
-            // A state change is why we woke; the loop re-evaluates whether to park. No
-            // frame elapsed, so nothing is posted — posting here spends a frame on every
-            // guard that is taken or dropped.
-            Observed::StateChange => continue,
-            Observed::NoClock => {
-                // Latched and reported. There is deliberately no second pacing path: a
-                // timer here would be a partially-exercised mechanism that only ever runs
-                // where nobody is looking.
-                s.clockless.store(true, Ordering::Relaxed);
-                s.event.wait(INFINITE);
+            // No frame elapsed. Posting here would spend one on every guard taken or dropped.
+            Observed::Signal(_) => continue,
+            Observed::Occluded => {
+                dark = true;
                 continue;
             }
-            Observed::Frame => {}
+            Observed::NoClock => {
+                // Reported, and parked rather than retried in place. There is no second
+                // pacing path: a timer here would be a partially-exercised mechanism that
+                // only runs where nobody looks. Parking probes again on the next edge, so a
+                // clock that comes back is picked up without a poll.
+                s.clockless.store(true, Ordering::Relaxed);
+                s.park();
+                continue;
+            }
+            // The guard fired on a stalled clock. Counted, because a run of them invalidates
+            // every timing figure taken meanwhile, then treated as a frame so a surface
+            // driving itself from the tick degrades rather than freezes.
+            Observed::Stalled => {
+                s.stalls.fetch_add(1, Ordering::Relaxed);
+            }
+            Observed::Frame => s.clockless.store(false, Ordering::Relaxed),
         }
 
-        // One message in flight. The swap is the gate: if one is already pending the pump
-        // has not reached it yet, and a second would only make it do the same work twice.
+        // One message in flight: if one is pending the pump has not reached it yet, and a
+        // second would only make it do the same work twice.
         if !s.posted.swap(true, Ordering::AcqRel) {
-            // SAFETY: posting to a window handle is documented as callable from any thread;
-            // the handle outlives this thread because `Pacer` borrows the window.
-            let posted = unsafe { PostMessageW(target.0, WM_APP_FRAME, 0, 0) };
+            // SAFETY: see `Target`.
+            let posted = unsafe { PostMessageW(target.0, WM_FRAME, 0, 0) };
             if !posted.as_bool() {
-                // A full queue, or a window already gone. Re-open the gate and try the next
-                // frame rather than wedging the pacer shut for the rest of its life.
+                // A full queue, or a window already gone. Re-open rather than wedging the
+                // pacer shut for the rest of its life.
                 s.posted.store(false, Ordering::Release);
             }
         }
     }
 }
 
-/// One blocking wait on the compositor clock, with our event in the handle list.
-fn wait_frame(s: &Inner) -> Observed {
-    let handles = [s.event.raw()];
-    // SAFETY: the handle array outlives the call and the count matches its length.
-    let result = unsafe { DCompositionWaitForCompositorClock(1, handles.as_ptr(), CLOCK_GUARD_MS) };
-    // The wait answers with the index of what woke it: our event is the one handle we
-    // passed, and the clock is the implicit one after it.
-    const OURS: u32 = 0;
-    const CLOCK: u32 = 1;
-    match result {
-        // A requester appeared or left, or the window was hidden.
-        OURS => Observed::StateChange,
-        WAIT_FAILED => Observed::NoClock,
-        CLOCK => Observed::Frame,
-        // The guard timeout, deliberately treated as a frame so a stalled clock degrades
-        // motion rather than freezing it — but counted, because a run of them means every
-        // timing figure taken meanwhile is measuring a session rather than an application.
-        _ => {
-            s.stalls.fetch_add(1, Ordering::Relaxed);
-            Observed::Frame
-        }
-    }
+/// One blocking wait on the compositor clock, with our own wake sources in the handle list.
+///
+/// Both are in the *same* list as the clock, so a state change is noticed inside the wait
+/// rather than a frame later.
+fn wait_frame(s: &Clock) -> Observed {
+    clock::wait_for_frame(&[s.event.as_handle(), s.watch.as_handle()], CLOCK_GUARD_MS)
 }
-
-const E_FAIL: i32 = -2147467259;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::visibility::Visibility;
+    use std::os::windows::io::BorrowedHandle;
 
-    fn inner() -> Arc<Inner> {
-        Arc::new(Inner {
+    /// A clock for a window that is on screen, and the visibility it watches.
+    fn inner() -> (Arc<Clock>, Arc<Visibility>) {
+        let visibility = Arc::new(Visibility::new());
+        // A `Visibility` starts hidden, because nothing has been shown yet.
+        visibility.publish(false);
+        let shared = Arc::new(Clock {
             count: AtomicUsize::new(0),
             event: Event::auto_reset().expect("an event is available"),
             posted: AtomicBool::new(false),
-            occluded: AtomicBool::new(false),
+            watch: visibility.watch().expect("an event is available"),
             stopping: AtomicBool::new(false),
             stalls: AtomicU32::new(0),
             clockless: AtomicBool::new(false),
-        })
+        });
+        (shared, visibility)
     }
 
-    /// Whether the event is signalled right now, consuming the signal if it is.
-    fn signalled(shared: &Inner) -> bool {
-        // SAFETY: the handle is owned by `shared` and outlives the call.
-        shared.event.take()
+    /// Which of `handles` is signalled now, consuming that signal. `None` if none is. The same
+    /// wait the pacer makes, with a zero timeout so a test does not block on it.
+    fn signalled(handles: &[BorrowedHandle<'_>]) -> Option<u32> {
+        // SAFETY: the handles are borrowed from live kernel objects for the call.
+        let result = unsafe {
+            WaitForMultipleObjects(
+                handles.len() as u32,
+                handles.as_ptr().cast(),
+                false.into(),
+                0,
+            )
+        };
+        (result != WAIT_TIMEOUT as u32).then(|| result - WAIT_OBJECT_0 as u32)
     }
 
     #[test]
     fn a_dropped_guard_releases_its_request() {
-        let wake = Wake(inner());
+        let wake = Wake(inner().0);
         assert!(wake.0.parked());
         {
             let _first = wake.tick();
@@ -386,7 +363,7 @@ mod tests {
 
     #[test]
     fn a_cloned_guard_is_a_second_request_and_not_a_shared_one() {
-        let wake = Wake(inner());
+        let wake = Wake(inner().0);
         let first = wake.tick();
         let second = first.clone();
         assert_eq!(wake.requesters(), 2);
@@ -398,40 +375,70 @@ mod tests {
 
     #[test]
     fn only_the_edges_touch_the_kernel() {
-        // The steady state during a drag is several live guards and no signalling at all.
-        let shared = inner();
+        let (shared, _visibility) = inner();
         let wake = Wake(Arc::clone(&shared));
         let first = wake.tick();
-        assert!(signalled(&shared), "the 0→1 edge must wake the pacer");
+        assert!(shared.event.take(), "the 0→1 edge must wake the pacer");
 
         let second = wake.tick();
         let third = wake.tick();
-        assert!(!signalled(&shared), "an interior acquire signalled the event");
+        assert!(
+            !shared.event.take(),
+            "an interior acquire signalled the event"
+        );
         drop(third);
         drop(second);
-        assert!(!signalled(&shared), "an interior release signalled the event");
+        assert!(
+            !shared.event.take(),
+            "an interior release signalled the event"
+        );
         drop(first);
         assert!(
-            signalled(&shared),
+            shared.event.take(),
             "the 1→0 edge must interrupt the clock wait so the pacer parks at once"
         );
     }
 
     #[test]
-    fn occlusion_parks_even_with_live_requesters() {
-        let shared = inner();
+    fn a_hidden_window_parks_even_with_live_requesters() {
+        let (shared, visibility) = inner();
         let wake = Wake(Arc::clone(&shared));
         let _tick = wake.tick();
         assert!(!shared.parked());
-        shared.occluded.store(true, Ordering::Release);
-        assert!(shared.parked(), "a window nobody can see is still being paced");
+        visibility.publish(true);
+        assert!(
+            shared.parked(),
+            "a window nobody can see is still being paced"
+        );
+        visibility.publish(false);
+        assert!(
+            !shared.parked(),
+            "the window came back and the pacer did not"
+        );
+    }
+
+    #[test]
+    fn hiding_the_window_interrupts_an_in_flight_clock_wait() {
+        // The pacer's wake sources ride in the *same* handle list as the clock, so the park
+        // happens inside the wait rather than a frame later.
+        let (shared, visibility) = inner();
+        let handles = [shared.event.as_handle(), shared.watch.as_handle()];
+        visibility.publish(true);
+        assert_eq!(
+            signalled(&handles),
+            Some(1),
+            "hiding the window did not reach the pacer's own wait"
+        );
+        assert_eq!(
+            signalled(&handles),
+            None,
+            "one change woke the pacer twice, which is a parked pacer spinning"
+        );
     }
 
     #[test]
     fn a_tick_can_be_held_across_threads() {
-        // A thread that is not the window's holds one for work it has queued, which is the
-        // whole reason this is `Send` rather than a pump-thread-only handle.
-        let wake = Wake(inner());
+        let wake = Wake(inner().0);
         let tick = wake.tick();
         std::thread::spawn(move || drop(tick))
             .join()
@@ -441,13 +448,10 @@ mod tests {
 
     #[test]
     fn the_post_gate_coalesces_and_reopens() {
-        let shared = inner();
-        // The first post claims the gate; a second while one is in flight is refused.
+        let (shared, _visibility) = inner();
         assert!(!shared.posted.swap(true, Ordering::AcqRel));
         assert!(shared.posted.swap(true, Ordering::AcqRel));
-        // The tick re-opens it before doing its work, so a frame completed during that
-        // work is not lost.
-        shared.posted.store(false, Ordering::Release);
+        shared.begin_frame();
         assert!(!shared.posted.swap(true, Ordering::AcqRel));
     }
 }

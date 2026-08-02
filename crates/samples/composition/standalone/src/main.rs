@@ -16,7 +16,11 @@ fn main() -> Result<()> {
     let root = compositor.create_container_visual();
     target.set_root(&root);
 
-    let (width, height) = window.client_size();
+    // A background that fills the window.
+    // `None` once the window is gone, which leaves nothing to fill.
+    let Some((width, height)) = window.client_size() else {
+        return Ok(());
+    };
     let background = compositor.create_sprite_visual();
     background.set_size(width as f32, height as f32);
     let background_brush = compositor.create_color_brush(Color::rgb(30, 30, 46));

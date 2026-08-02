@@ -1,43 +1,38 @@
 --out crates/libs/window/src/bindings.rs
 --flat --minimal --dead-code
 
-// `default` is the metadata bundled with windows-bindgen; the second input carries
-// the Win32 entry point that mints a dispatcher queue, which that corpus lacks. See
+// `default` is the metadata bundled with windows-bindgen; the second input carries the Win32
+// entry point that mints a dispatcher queue, which that corpus lacks. See
 // `metadata/dispatcherqueue.rdl`.
 --in default target/authored.winmd
 
 --filter
     RECT
     POINT
-    SIZE
+    ATOM
     CreateWindowExW
     DestroyWindow
     DefWindowProcW
     RegisterClassW
-    RegisterClassExW
-    UnregisterClassW
     WNDCLASSW
-    WNDCLASSEXW
     CS_HREDRAW
     CS_VREDRAW
     CW_USEDEFAULT
     GetModuleHandleW
-    IsWindow
     IsZoomed
     ShowWindow
-    UpdateWindow
     SW_SHOWNORMAL
-    SW_SHOW
-    SW_SHOWNOACTIVATE
     WS_OVERLAPPEDWINDOW
-// A window with no redirection surface. Its content is whatever the compositor is
-// given, which is the point: nothing is drawn into a bitmap the window owns.
+    WS_THICKFRAME
+    WS_MAXIMIZEBOX
+// A window with no redirection surface: its content is whatever the compositor is given, and
+// nothing is drawn into a bitmap the window owns.
     WS_EX_NOREDIRECTIONBITMAP
     GetClientRect
     GetWindowRect
-    ClientToScreen
     ScreenToClient
     SetWindowPos
+    SWP_NOMOVE
     SWP_NOSIZE
     SWP_NOZORDER
     SWP_NOACTIVATE
@@ -46,11 +41,9 @@
     SetWindowLongPtrW
     GWLP_USERDATA
     LoadCursorW
-    SetCursor
     IDC_ARROW
-    BeginPaint
-    EndPaint
-    ValidateRect
+    E_FAIL
+    E_HANDLE
 
 // ── The message pump ──────────────────────────────────────────────────────────
     MSG
@@ -68,51 +61,72 @@
     WM_SIZE
     WM_WINDOWPOSCHANGED
     WM_ERASEBKGND
-    WM_DISPLAYCHANGE
-    WM_SETTINGCHANGE
-    WM_SETCURSOR
-    WM_APP
-    SIZE_MAXIMIZED
-    SIZE_MINIMIZED
+    WM_USER
+
+// ── Whether anything drawn can be seen ────────────────────────────────────────
+// Two independent questions with no single API for either half. The window's own — not shown
+// yet, minimized, or cloaked by the shell or by a virtual-desktop switch — is
+// `IsWindowVisible` plus `IsIconic` plus `DWMWA_CLOAKED`; a cloaked window is still composed
+// by DWM, so nothing else reports it. The system's is `RegisterOcclusionStatusWindow`, in its
+// message form because this thread has a pump already.
+    IsWindowVisible
+    IsIconic
+    DwmGetWindowAttribute
+    DWMWA_CLOAKED
+    CreateDXGIFactory2
+    IDXGIFactory2::RegisterOcclusionStatusWindow
+    IDXGIFactory2::UnregisterOcclusionStatus
 
 // ── DPI ───────────────────────────────────────────────────────────────────────
-// Per-monitor v2, so the frame scales with the window rather than with the process,
-// and metrics are asked for at a DPI rather than read from a process-wide cache.
+// Per-monitor v2, so the frame scales with the window rather than with the process, and every
+// metric is asked for at a DPI rather than read from a process-wide cache.
     SetProcessDpiAwarenessContext
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
     GetDpiForWindow
     GetSystemMetricsForDpi
+    SM_CXFRAME
     SM_CYFRAME
     SM_CXPADDEDBORDER
+    SM_CYCAPTION
+// The top resize band is narrower than the other three; see `Metrics::frame_top`.
+    DWMWA_VISIBLE_FRAME_BORDER_THICKNESS
     WM_DPICHANGED
 
-// ── Monitors ──────────────────────────────────────────────────────────────────
-    MonitorFromWindow
-    MonitorFromPoint
-    GetMonitorInfoW
-    MONITORINFO
-    MONITORINFOEXW
-    MONITOR_DEFAULTTONEAREST
-
 // ── The custom caption ────────────────────────────────────────────────────────
-// A caption the app draws is a hit test, not a chrome: `WM_NCCALCSIZE` removes the
-// system frame, `WM_NCHITTEST` answers the eight resize zones and the caption band,
-// and `HTMAXBUTTON` is what makes Snap Layouts open. Both `WM_NCCALCSIZE` forms have
-// to be handled — creation sends the `wParam == FALSE` one, whose lParam is a bare
-// `RECT` — and the frame only takes effect after an explicit `SWP_FRAMECHANGED`.
+// Both `WM_NCCALCSIZE` forms have to be handled — creation sends the `wParam == FALSE` one,
+// whose lParam is a bare `RECT` — and the frame only takes effect after an explicit
+// `SWP_FRAMECHANGED`.
     WM_NCCALCSIZE
     NCCALCSIZE_PARAMS
     WM_NCHITTEST
     WM_GETMINMAXINFO
     MINMAXINFO
     WM_SYSCOMMAND
-    WM_NCLBUTTONDOWN
-    WM_NCLBUTTONUP
-    WM_NCMOUSEMOVE
-    WM_NCMOUSELEAVE
+// The caption's input is pointer input; no legacy mouse message is named here, so a legacy arm
+// is unwritable. Leave is `WM_POINTERLEAVE` — scoped to the window boundary rather than the
+// client rect, and sent for mouse — so there is no `WM_NCPOINTERLEAVE`.
+    WM_NCPOINTERDOWN
+    WM_NCPOINTERUP
+    WM_NCPOINTERUPDATE
+    WM_POINTERLEAVE
+// `GET_POINTERID_WPARAM` and the `IS_POINTER_*_WPARAM` family are C macros with no metadata.
+// Which button changed comes from `POINTER_INFO::ButtonChangeType`; the wParam flags carry held
+// state rather than the transition.
+    GetPointerInfo
+    POINTER_INFO
+    POINTER_BUTTON_CHANGE_TYPE
+    WM_ACTIVATE
+    WM_THEMECHANGED
     HTCLIENT
     HTCAPTION
     HTTOP
+    HTTOPLEFT
+    HTTOPRIGHT
+    HTLEFT
+    HTRIGHT
+    HTBOTTOM
+    HTBOTTOMLEFT
+    HTBOTTOMRIGHT
     HTCLOSE
     HTMAXBUTTON
     HTMINBUTTON
@@ -120,78 +134,76 @@
     SC_MAXIMIZE
     SC_MINIMIZE
     SC_RESTORE
-    GetSystemMenu
-    TrackPopupMenu
-    TPM_RETURNCMD
-    TPM_RIGHTBUTTON
-// Rounded corners and the frame colour are DWM's, not ours, even when the caption is
-// drawn by the app; `DWMWA_COLOR_NONE` is how the one-pixel border is removed rather
-// than painted over.
+// No system-menu bindings: a secondary-button contact forwards to `DefWindowProc`, which tracks
+// the menu. `DWMWA_COLOR_NONE` is how the one-pixel border is removed rather than painted over.
     DwmSetWindowAttribute
-    DWMWINDOWATTRIBUTE
+    DWMWA_WINDOW_CORNER_PREFERENCE
+    DWMWA_BORDER_COLOR
     DWM_WINDOW_CORNER_PREFERENCE
     DWMWA_COLOR_NONE
+    DWMWA_COLOR_DEFAULT
 
 // ── Pointer opt-ins ───────────────────────────────────────────────────────────
-// The window declares what it wants delivered; reading what arrives belongs to
-// `windows-ui`. `EnableMouseInPointer` does not suppress the legacy message stream —
-// `DefWindowProc` generates it from the pointer message — so a window that opts in
-// must handle the pointer messages and return 0.
+// The window declares what it wants delivered; reading what arrives belongs to `windows-ui`.
+// `EnableMouseInPointer` does not suppress the legacy stream — `DefWindowProc` generates that
+// from the pointer message — and it is one-way and process-wide, so it is asked about before it
+// is done.
+    IsMouseInPointerEnabled
     EnableMouseInPointer
     SetWindowFeedbackSetting
     FEEDBACK_TYPE
+// `RegisterTouchpadCapableWindow` is deliberately not filtered: the vendored corpus does not
+// carry it, and a static import the running `user32` lacks fails the process load. Resolved by
+// `GetProcAddress`; see `window.rs`.
+    GetProcAddress
 
 // ── Quality of service ────────────────────────────────────────────────────────
-// A window that is not visible should not keep its threads out of efficiency states,
-// and one that is presenting must not be throttled into missing vblanks.
+// The front thread wants full speed while the app and present threads stay system-managed,
+// which the process-wide twin of this cannot express.
+    GetCurrentThread
     SetThreadInformation
+    ThreadPowerThrottling
     THREAD_POWER_THROTTLING_STATE
-    SetProcessInformation
-    PROCESS_POWER_THROTTLING_STATE
+    THREAD_POWER_THROTTLING_CURRENT_VERSION
+    THREAD_POWER_THROTTLING_EXECUTION_SPEED
 
 // ── Display colour capability ─────────────────────────────────────────────────
-// Whether the display is SDR, wide-gamut or HDR, and at what luminance, is a property
-// of the window's monitor — so it belongs to the window rather than to the renderer.
-// A desktop app has no CoreWindow, so `DisplayInformation` is reached through its
-// interop factory; `AdvancedColorInfoChanged` is the single signal that covers an HDR
-// toggle, an SDR-white-level change and a monitor hop alike.
+// A desktop app has no CoreWindow, so `DisplayInformation` is reached through its interop
+// factory, and the members live on versioned interfaces reached by cast — naming the runtime
+// classes alone yields shells with nothing callable on them.
     Windows.Graphics.Display.DisplayInformation
+    Windows.Graphics.Display.IDisplayInformation5::{GetAdvancedColorInfo, add_AdvancedColorInfoChanged, remove_AdvancedColorInfoChanged}
     Windows.Graphics.Display.AdvancedColorInfo
+// `CurrentAdvancedColorKind` is the only three-way discriminator — DXGI carries two values for
+// three modes and reads a wide-gamut panel as plain SDR.
+    Windows.Graphics.Display.IAdvancedColorInfo::{get_CurrentAdvancedColorKind, get_RedPrimary, get_GreenPrimary, get_BluePrimary, get_WhitePoint, get_SdrWhiteLevelInNits, get_MaxLuminanceInNits}
     Windows.Graphics.Display.AdvancedColorKind
     IDisplayInformationStaticsInterop
 
 // ── The dispatcher queue ──────────────────────────────────────────────────────
-// A system `Compositor` cannot be created on a thread that has no dispatcher queue,
-// so the window's thread mints one before it has any composition at all.
+// A system `Compositor` and `DisplayInformation::GetForWindow` both require one on the calling
+// thread. Minted only where the thread has none: a second controller on one thread fails.
     CreateDispatcherQueueController
     DispatcherQueueOptions
-    DISPATCHERQUEUE_THREAD_TYPE
-    DISPATCHERQUEUE_THREAD_APARTMENTTYPE
+    DQTYPE_THREAD_CURRENT
+    DQTAT_COM_NONE
     Windows.System.DispatcherQueue
+    Windows.System.IDispatcherQueueStatics::GetForCurrentThread
     Windows.System.DispatcherQueueController
-    Windows.System.DispatcherQueueHandler
-
-// ── User interface preferences ────────────────────────────────────────────────
-// Settings → Accessibility → Visual effects. Animations and transparency are the
-// user's choice, and a framework that ignores them is not accessible.
-    Windows.UI.ViewManagement.UISettings
+    Windows.System.IDispatcherQueueController::get_DispatcherQueue
 
 // ── Waitable primitives ───────────────────────────────────────────────────────
+// No timer: every state in this crate is entered and left on an event.
     CreateEventW
     SetEvent
-    CloseHandle
     WaitForSingleObject
     WaitForMultipleObjects
     WAIT_OBJECT_0
     WAIT_TIMEOUT
     WAIT_FAILED
     INFINITE
-    CreateWaitableTimerExW
-    SetWaitableTimerEx
-    TIMER_ALL_ACCESS
 
 // ── The frame clock ───────────────────────────────────────────────────────────
-// The pacer parks on the compositor's own clock and posts a message, so a window's
-// frame work happens inside its ordinary pump and in message order with input. It is
-// the window's because the handle it posts to and the pump that receives it are.
+// The pacer parks on the compositor's own clock and posts a message, so a window's frame work
+// happens inside its ordinary pump and in message order with input.
     DCompositionWaitForCompositorClock

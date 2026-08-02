@@ -51,7 +51,10 @@ where
         Err(error) if error.code().0 == E_ABORT || error.code().is_ok() => return Ok(()),
         Err(error) => return Err(error),
     };
-    let (width, height) = window.client_size();
+    // `None` once the window is gone, the same close-during-startup race `E_ABORT` covers.
+    let Some((width, height)) = window.client_size() else {
+        return Ok(());
+    };
     handle.set_bounds(0, 0, width, height)?;
 
     let webview = handle.webview()?;

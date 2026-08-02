@@ -1,23 +1,21 @@
-windows_core::link!("user32.dll" "system" fn BeginPaint(hwnd : HWND, lppaint : *mut PAINTSTRUCT) -> HDC);
-windows_core::link!("user32.dll" "system" fn ClientToScreen(hwnd : HWND, lppoint : *mut POINT) -> windows_core::BOOL);
-windows_core::link!("kernel32.dll" "system" fn CloseHandle(hobject : HANDLE) -> windows_core::BOOL);
+windows_core::link!("dxgi.dll" "system" fn CreateDXGIFactory2(flags : u32, riid : *const windows_core::GUID, ppfactory : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
 windows_core::link!("coremessaging.dll" "system" fn CreateDispatcherQueueController(options : DispatcherQueueOptions, dispatcherqueuecontroller : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
 windows_core::link!("kernel32.dll" "system" fn CreateEventW(lpeventattributes : *const SECURITY_ATTRIBUTES, bmanualreset : windows_core::BOOL, binitialstate : windows_core::BOOL, lpname : windows_core::PCWSTR) -> HANDLE);
-windows_core::link!("kernel32.dll" "system" fn CreateWaitableTimerExW(lptimerattributes : *const SECURITY_ATTRIBUTES, lptimername : windows_core::PCWSTR, dwflags : u32, dwdesiredaccess : u32) -> HANDLE);
 windows_core::link!("user32.dll" "system" fn CreateWindowExW(dwexstyle : u32, lpclassname : windows_core::PCWSTR, lpwindowname : windows_core::PCWSTR, dwstyle : u32, x : i32, y : i32, nwidth : i32, nheight : i32, hwndparent : HWND, hmenu : HMENU, hinstance : HINSTANCE, lpparam : *const core::ffi::c_void) -> HWND);
 windows_core::link!("dcomp.dll" "system" fn DCompositionWaitForCompositorClock(count : u32, handles : *const HANDLE, timeoutinms : u32) -> u32);
 windows_core::link!("user32.dll" "system" fn DefWindowProcW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
 windows_core::link!("user32.dll" "system" fn DestroyWindow(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn DispatchMessageW(lpmsg : *const MSG) -> LRESULT);
+windows_core::link!("dwmapi.dll" "system" fn DwmGetWindowAttribute(hwnd : HWND, dwattribute : u32, pvattribute : *mut core::ffi::c_void, cbattribute : u32) -> windows_core::HRESULT);
 windows_core::link!("dwmapi.dll" "system" fn DwmSetWindowAttribute(hwnd : HWND, dwattribute : u32, pvattribute : *const core::ffi::c_void, cbattribute : u32) -> windows_core::HRESULT);
 windows_core::link!("user32.dll" "system" fn EnableMouseInPointer(fenable : windows_core::BOOL) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn EndPaint(hwnd : HWND, lppaint : *const PAINTSTRUCT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn GetClientRect(hwnd : HWND, lprect : *mut RECT) -> windows_core::BOOL);
+windows_core::link!("kernel32.dll" "system" fn GetCurrentThread() -> HANDLE);
 windows_core::link!("user32.dll" "system" fn GetDpiForWindow(hwnd : HWND) -> u32);
 windows_core::link!("user32.dll" "system" fn GetMessageW(lpmsg : *mut MSG, hwnd : HWND, wmsgfiltermin : u32, wmsgfiltermax : u32) -> windows_core::BOOL);
 windows_core::link!("kernel32.dll" "system" fn GetModuleHandleW(lpmodulename : windows_core::PCWSTR) -> HMODULE);
-windows_core::link!("user32.dll" "system" fn GetMonitorInfoW(hmonitor : HMONITOR, lpmi : *mut MONITORINFO) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn GetSystemMenu(hwnd : HWND, brevert : windows_core::BOOL) -> HMENU);
+windows_core::link!("user32.dll" "system" fn GetPointerInfo(pointerid : u32, pointerinfo : *mut POINTER_INFO) -> windows_core::BOOL);
+windows_core::link!("kernel32.dll" "system" fn GetProcAddress(hmodule : HMODULE, lpprocname : windows_core::PCSTR) -> FARPROC);
 windows_core::link!("user32.dll" "system" fn GetSystemMetricsForDpi(nindex : i32, dpi : u32) -> i32);
 #[cfg(any(
     target_arch = "aarch64",
@@ -29,24 +27,20 @@ windows_core::link!("user32.dll" "system" fn GetWindowLongPtrW(hwnd : HWND, nind
 pub use GetWindowLongW as GetWindowLongPtrW;
 windows_core::link!("user32.dll" "system" fn GetWindowLongW(hwnd : HWND, nindex : i32) -> i32);
 windows_core::link!("user32.dll" "system" fn GetWindowRect(hwnd : HWND, lprect : *mut RECT) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn IsWindow(hwnd : HWND) -> windows_core::BOOL);
+windows_core::link!("user32.dll" "system" fn IsIconic(hwnd : HWND) -> windows_core::BOOL);
+windows_core::link!("user32.dll" "system" fn IsMouseInPointerEnabled() -> windows_core::BOOL);
+windows_core::link!("user32.dll" "system" fn IsWindowVisible(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn IsZoomed(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn LoadCursorW(hinstance : HINSTANCE, lpcursorname : windows_core::PCWSTR) -> HCURSOR);
-windows_core::link!("user32.dll" "system" fn MonitorFromPoint(pt : POINT, dwflags : u32) -> HMONITOR);
-windows_core::link!("user32.dll" "system" fn MonitorFromWindow(hwnd : HWND, dwflags : u32) -> HMONITOR);
 windows_core::link!("user32.dll" "system" fn PeekMessageW(lpmsg : *mut MSG, hwnd : HWND, wmsgfiltermin : u32, wmsgfiltermax : u32, wremovemsg : u32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn PostMessageW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn PostQuitMessage(nexitcode : i32));
-windows_core::link!("user32.dll" "system" fn RegisterClassExW(param0 : *const WNDCLASSEXW) -> ATOM);
 windows_core::link!("user32.dll" "system" fn RegisterClassW(lpwndclass : *const WNDCLASSW) -> ATOM);
 windows_core::link!("user32.dll" "system" fn ScreenToClient(hwnd : HWND, lppoint : *mut POINT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn SendMessageW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
-windows_core::link!("user32.dll" "system" fn SetCursor(hcursor : HCURSOR) -> HCURSOR);
 windows_core::link!("kernel32.dll" "system" fn SetEvent(hevent : HANDLE) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn SetProcessDpiAwarenessContext(value : DPI_AWARENESS_CONTEXT) -> windows_core::BOOL);
-windows_core::link!("kernel32.dll" "system" fn SetProcessInformation(hprocess : HANDLE, processinformationclass : PROCESS_INFORMATION_CLASS, processinformation : *const core::ffi::c_void, processinformationsize : u32) -> windows_core::BOOL);
 windows_core::link!("kernel32.dll" "system" fn SetThreadInformation(hthread : HANDLE, threadinformationclass : THREAD_INFORMATION_CLASS, threadinformation : *const core::ffi::c_void, threadinformationsize : u32) -> windows_core::BOOL);
-windows_core::link!("kernel32.dll" "system" fn SetWaitableTimerEx(htimer : HANDLE, lpduetime : *const i64, lperiod : i32, pfncompletionroutine : PTIMERAPCROUTINE, lpargtocompletionroutine : *const core::ffi::c_void, wakecontext : *const REASON_CONTEXT, tolerabledelay : u32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn SetWindowFeedbackSetting(hwnd : HWND, feedback : FEEDBACK_TYPE, dwflags : u32, size : u32, configuration : *const core::ffi::c_void) -> windows_core::BOOL);
 #[cfg(any(
     target_arch = "aarch64",
@@ -59,11 +53,7 @@ pub use SetWindowLongW as SetWindowLongPtrW;
 windows_core::link!("user32.dll" "system" fn SetWindowLongW(hwnd : HWND, nindex : i32, dwnewlong : i32) -> i32);
 windows_core::link!("user32.dll" "system" fn SetWindowPos(hwnd : HWND, hwndinsertafter : HWND, x : i32, y : i32, cx : i32, cy : i32, uflags : u32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn ShowWindow(hwnd : HWND, ncmdshow : i32) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn TrackPopupMenu(hmenu : HMENU, uflags : u32, x : i32, y : i32, nreserved : i32, hwnd : HWND, prcrect : *const RECT) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn TranslateMessage(lpmsg : *const MSG) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn UnregisterClassW(lpclassname : windows_core::PCWSTR, hinstance : HINSTANCE) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn UpdateWindow(hwnd : HWND) -> windows_core::BOOL);
-windows_core::link!("user32.dll" "system" fn ValidateRect(hwnd : HWND, lprect : *const RECT) -> windows_core::BOOL);
 windows_core::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u32, lphandles : *const HANDLE, bwaitall : windows_core::BOOL, dwmilliseconds : u32) -> u32);
 windows_core::link!("kernel32.dll" "system" fn WaitForSingleObject(hhandle : HANDLE, dwmilliseconds : u32) -> u32);
 pub type ATOM = u16;
@@ -117,37 +107,12 @@ pub type DISPATCHERQUEUE_THREAD_APARTMENTTYPE = i32;
 pub type DISPATCHERQUEUE_THREAD_TYPE = i32;
 pub type DPI_AWARENESS_CONTEXT = *mut core::ffi::c_void;
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT = -4 as _;
-pub const DQTAT_COM_ASTA: DISPATCHERQUEUE_THREAD_APARTMENTTYPE = 1;
 pub const DQTAT_COM_NONE: DISPATCHERQUEUE_THREAD_APARTMENTTYPE = 0;
-pub const DQTAT_COM_STA: DISPATCHERQUEUE_THREAD_APARTMENTTYPE = 2;
 pub const DQTYPE_THREAD_CURRENT: DISPATCHERQUEUE_THREAD_TYPE = 2;
-pub const DQTYPE_THREAD_DEDICATED: DISPATCHERQUEUE_THREAD_TYPE = 1;
-pub const DWMWA_ALLOW_NCPAINT: DWMWINDOWATTRIBUTE = 4;
 pub const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = 34;
-pub const DWMWA_BORDER_MARGINS: DWMWINDOWATTRIBUTE = 40;
-pub const DWMWA_CAPTION_BUTTON_BOUNDS: DWMWINDOWATTRIBUTE = 5;
-pub const DWMWA_CAPTION_COLOR: DWMWINDOWATTRIBUTE = 35;
-pub const DWMWA_CLOAK: DWMWINDOWATTRIBUTE = 13;
 pub const DWMWA_CLOAKED: DWMWINDOWATTRIBUTE = 14;
+pub const DWMWA_COLOR_DEFAULT: u32 = 4294967295;
 pub const DWMWA_COLOR_NONE: u32 = 4294967294;
-pub const DWMWA_DISALLOW_PEEK: DWMWINDOWATTRIBUTE = 11;
-pub const DWMWA_EXCLUDED_FROM_PEEK: DWMWINDOWATTRIBUTE = 12;
-pub const DWMWA_EXTENDED_FRAME_BOUNDS: DWMWINDOWATTRIBUTE = 9;
-pub const DWMWA_FLIP3D_POLICY: DWMWINDOWATTRIBUTE = 8;
-pub const DWMWA_FORCE_ICONIC_REPRESENTATION: DWMWINDOWATTRIBUTE = 7;
-pub const DWMWA_FREEZE_REPRESENTATION: DWMWINDOWATTRIBUTE = 15;
-pub const DWMWA_HAS_ICONIC_BITMAP: DWMWINDOWATTRIBUTE = 10;
-pub const DWMWA_LAST: DWMWINDOWATTRIBUTE = 41;
-pub const DWMWA_NCRENDERING_ENABLED: DWMWINDOWATTRIBUTE = 1;
-pub const DWMWA_NCRENDERING_POLICY: DWMWINDOWATTRIBUTE = 2;
-pub const DWMWA_NONCLIENT_RTL_LAYOUT: DWMWINDOWATTRIBUTE = 6;
-pub const DWMWA_PASSIVE_UPDATE_MODE: DWMWINDOWATTRIBUTE = 16;
-pub const DWMWA_REDIRECTIONBITMAP_ALPHA: DWMWINDOWATTRIBUTE = 39;
-pub const DWMWA_SYSTEMBACKDROP_TYPE: DWMWINDOWATTRIBUTE = 38;
-pub const DWMWA_TEXT_COLOR: DWMWINDOWATTRIBUTE = 36;
-pub const DWMWA_TRANSITIONS_FORCEDISABLED: DWMWINDOWATTRIBUTE = 3;
-pub const DWMWA_USE_HOSTBACKDROPBRUSH: DWMWINDOWATTRIBUTE = 17;
-pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWMWINDOWATTRIBUTE = 20;
 pub const DWMWA_VISIBLE_FRAME_BORDER_THICKNESS: DWMWINDOWATTRIBUTE = 37;
 pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWMWINDOWATTRIBUTE = 33;
 pub const DWMWCP_DEFAULT: DWM_WINDOW_CORNER_PREFERENCE = 0;
@@ -164,6 +129,28 @@ windows_core::imp::interface_hierarchy!(
     windows_core::IUnknown,
     windows_core::IInspectable
 );
+impl DispatcherQueue {
+    pub(crate) fn GetForCurrentThread() -> windows_core::Result<Self> {
+        Self::IDispatcherQueueStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).GetForCurrentThread)(
+                windows_core::Interface::as_raw(this),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    fn IDispatcherQueueStatics<
+        R,
+        F: FnOnce(&IDispatcherQueueStatics) -> windows_core::Result<R>,
+    >(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<DispatcherQueue, IDispatcherQueueStatics> =
+            windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
 impl windows_core::RuntimeType for DispatcherQueue {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_class::<Self, IDispatcherQueue>();
@@ -210,49 +197,6 @@ impl windows_core::RuntimeName for DispatcherQueueController {
 }
 unsafe impl Send for DispatcherQueueController {}
 unsafe impl Sync for DispatcherQueueController {}
-windows_core::imp::define_interface!(
-    DispatcherQueueHandler,
-    DispatcherQueueHandler_Vtbl,
-    0xdfa2dc9c_1a2d_4917_98f2_939af1d6e0c8
-);
-impl windows_core::RuntimeType for DispatcherQueueHandler {
-    const SIGNATURE: windows_core::imp::ConstBuffer =
-        windows_core::imp::ConstBuffer::for_interface::<Self>();
-}
-impl DispatcherQueueHandler {
-    pub(crate) fn new<F: Fn() + 'static>(invoke: F) -> Self {
-        let com = windows_core::imp::DelegateBox::<Self, F>::new(
-            &DispatcherQueueHandlerBox::<F>::VTABLE,
-            invoke,
-        );
-        unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
-    }
-}
-#[repr(C)]
-pub struct DispatcherQueueHandler_Vtbl {
-    base__: windows_core::IUnknown_Vtbl,
-    Invoke: unsafe extern "system" fn(this: *mut core::ffi::c_void) -> windows_core::HRESULT,
-}
-struct DispatcherQueueHandlerBox<F: Fn() + 'static>(core::marker::PhantomData<(fn() -> F,)>);
-impl<F: Fn() + 'static> DispatcherQueueHandlerBox<F> {
-    const VTABLE: DispatcherQueueHandler_Vtbl = DispatcherQueueHandler_Vtbl {
-        base__: windows_core::IUnknown_Vtbl {
-            QueryInterface:
-                windows_core::imp::DelegateBox::<DispatcherQueueHandler, F>::QueryInterface,
-            AddRef: windows_core::imp::DelegateBox::<DispatcherQueueHandler, F>::AddRef,
-            Release: windows_core::imp::DelegateBox::<DispatcherQueueHandler, F>::Release,
-        },
-        Invoke: Self::Invoke,
-    };
-    unsafe extern "system" fn Invoke(this: *mut core::ffi::c_void) -> windows_core::HRESULT {
-        unsafe {
-            let this = &mut *(this as *mut *mut core::ffi::c_void
-                as *mut windows_core::imp::DelegateBox<DispatcherQueueHandler, F>);
-            (this.invoke)();
-            windows_core::HRESULT(0)
-        }
-    }
-}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DispatcherQueueOptions {
@@ -287,6 +231,16 @@ impl windows_core::RuntimeName for DisplayInformation {
 }
 unsafe impl Send for DisplayInformation {}
 unsafe impl Sync for DisplayInformation {}
+pub const E_FAIL: windows_core::HRESULT = windows_core::HRESULT(0x80004005_u32 as _);
+pub const E_HANDLE: windows_core::HRESULT = windows_core::HRESULT(0x80070006_u32 as _);
+#[cfg(target_arch = "x86")]
+pub type FARPROC = Option<unsafe extern "system" fn() -> i32>;
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "arm64ec",
+    target_arch = "x86_64"
+))]
+pub type FARPROC = Option<unsafe extern "system" fn() -> isize>;
 pub const FEEDBACK_GESTURE_PRESSANDTAP: FEEDBACK_TYPE = 11;
 pub const FEEDBACK_MAX: FEEDBACK_TYPE = -1;
 pub const FEEDBACK_PEN_BARRELVISUALIZATION: FEEDBACK_TYPE = 2;
@@ -304,18 +258,24 @@ pub const GWLP_USERDATA: i32 = -21;
 pub type HANDLE = *mut core::ffi::c_void;
 pub type HBRUSH = *mut core::ffi::c_void;
 pub type HCURSOR = HICON;
-pub type HDC = *mut core::ffi::c_void;
 pub type HICON = *mut core::ffi::c_void;
 pub type HINSTANCE = *mut core::ffi::c_void;
 pub type HMENU = *mut core::ffi::c_void;
 pub type HMODULE = HINSTANCE;
 pub type HMONITOR = *mut core::ffi::c_void;
+pub const HTBOTTOM: i32 = 15;
+pub const HTBOTTOMLEFT: i32 = 16;
+pub const HTBOTTOMRIGHT: i32 = 17;
 pub const HTCAPTION: i32 = 2;
 pub const HTCLIENT: i32 = 1;
 pub const HTCLOSE: i32 = 20;
+pub const HTLEFT: i32 = 10;
 pub const HTMAXBUTTON: i32 = 9;
 pub const HTMINBUTTON: i32 = 8;
+pub const HTRIGHT: i32 = 11;
 pub const HTTOP: i32 = 12;
+pub const HTTOPLEFT: i32 = 13;
+pub const HTTOPRIGHT: i32 = 14;
 pub type HWND = *mut core::ffi::c_void;
 windows_core::imp::define_interface!(
     IAdvancedColorInfo,
@@ -326,11 +286,227 @@ impl windows_core::RuntimeType for IAdvancedColorInfo {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
+impl IAdvancedColorInfo {
+    pub(crate) fn CurrentAdvancedColorKind(&self) -> windows_core::Result<AdvancedColorKind> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CurrentAdvancedColorKind)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn RedPrimary(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RedPrimary)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn GreenPrimary(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GreenPrimary)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn BluePrimary(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).BluePrimary)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn WhitePoint(&self) -> windows_core::Result<Point> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).WhitePoint)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn MaxLuminanceInNits(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).MaxLuminanceInNits)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) fn SdrWhiteLevelInNits(&self) -> windows_core::Result<f32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).SdrWhiteLevelInNits)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct IAdvancedColorInfo_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
+    pub CurrentAdvancedColorKind: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut AdvancedColorKind,
+    ) -> windows_core::HRESULT,
+    pub RedPrimary:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub GreenPrimary:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub BluePrimary:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub WhitePoint:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Point) -> windows_core::HRESULT,
+    pub MaxLuminanceInNits:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
+    MinLuminanceInNits: usize,
+    MaxAverageFullFrameLuminanceInNits: usize,
+    pub SdrWhiteLevelInNits:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut f32) -> windows_core::HRESULT,
 }
 pub const IDC_ARROW: windows_core::PCWSTR = windows_core::PCWSTR(32512 as _);
+windows_core::imp::define_interface!(
+    IDXGIFactory,
+    IDXGIFactory_Vtbl,
+    0x7b7166ec_21c7_44ae_b21a_c9ae321ae369
+);
+impl core::ops::Deref for IDXGIFactory {
+    type Target = IDXGIObject;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(IDXGIFactory, windows_core::IUnknown, IDXGIObject);
+#[repr(C)]
+pub struct IDXGIFactory_Vtbl {
+    pub base__: IDXGIObject_Vtbl,
+    EnumAdapters: usize,
+    MakeWindowAssociation: usize,
+    GetWindowAssociation: usize,
+    CreateSwapChain: usize,
+    CreateSoftwareAdapter: usize,
+}
+impl windows_core::RuntimeName for IDXGIFactory {}
+windows_core::imp::define_interface!(
+    IDXGIFactory1,
+    IDXGIFactory1_Vtbl,
+    0x770aae78_f26f_4dba_a829_253c83d1b387
+);
+impl core::ops::Deref for IDXGIFactory1 {
+    type Target = IDXGIFactory;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGIFactory1,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIFactory
+);
+#[repr(C)]
+pub struct IDXGIFactory1_Vtbl {
+    pub base__: IDXGIFactory_Vtbl,
+    EnumAdapters1: usize,
+    IsCurrent: usize,
+}
+impl windows_core::RuntimeName for IDXGIFactory1 {}
+windows_core::imp::define_interface!(
+    IDXGIFactory2,
+    IDXGIFactory2_Vtbl,
+    0x50c83a1c_e072_4c48_87b0_3630fa36a6d0
+);
+impl core::ops::Deref for IDXGIFactory2 {
+    type Target = IDXGIFactory1;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    IDXGIFactory2,
+    windows_core::IUnknown,
+    IDXGIObject,
+    IDXGIFactory,
+    IDXGIFactory1
+);
+impl IDXGIFactory2 {
+    pub(crate) unsafe fn RegisterOcclusionStatusWindow(
+        &self,
+        windowhandle: HWND,
+        wmsg: u32,
+    ) -> windows_core::Result<u32> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).RegisterOcclusionStatusWindow)(
+                windows_core::Interface::as_raw(self),
+                windowhandle,
+                wmsg,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub(crate) unsafe fn UnregisterOcclusionStatus(&self, dwcookie: u32) {
+        unsafe {
+            (windows_core::Interface::vtable(self).UnregisterOcclusionStatus)(
+                windows_core::Interface::as_raw(self),
+                dwcookie,
+            );
+        }
+    }
+}
+#[repr(C)]
+pub struct IDXGIFactory2_Vtbl {
+    pub base__: IDXGIFactory1_Vtbl,
+    IsWindowedStereoEnabled: usize,
+    CreateSwapChainForHwnd: usize,
+    CreateSwapChainForCoreWindow: usize,
+    GetSharedResourceAdapterLuid: usize,
+    RegisterStereoStatusWindow: usize,
+    RegisterStereoStatusEvent: usize,
+    UnregisterStereoStatus: usize,
+    pub RegisterOcclusionStatusWindow: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        HWND,
+        u32,
+        *mut u32,
+    ) -> windows_core::HRESULT,
+    RegisterOcclusionStatusEvent: usize,
+    pub UnregisterOcclusionStatus: unsafe extern "system" fn(*mut core::ffi::c_void, u32),
+    CreateSwapChainForComposition: usize,
+}
+impl windows_core::RuntimeName for IDXGIFactory2 {}
+windows_core::imp::define_interface!(
+    IDXGIObject,
+    IDXGIObject_Vtbl,
+    0xaec22fb8_76f3_4639_9be0_28eb43a67a2e
+);
+windows_core::imp::interface_hierarchy!(IDXGIObject, windows_core::IUnknown);
+#[repr(C)]
+pub struct IDXGIObject_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    SetPrivateData: usize,
+    SetPrivateDataInterface: usize,
+    GetPrivateData: usize,
+    GetParent: usize,
+}
+impl windows_core::RuntimeName for IDXGIObject {}
 windows_core::imp::define_interface!(
     IDispatcherQueue,
     IDispatcherQueue_Vtbl,
@@ -353,9 +529,42 @@ impl windows_core::RuntimeType for IDispatcherQueueController {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
+impl IDispatcherQueueController {
+    pub(crate) fn DispatcherQueue(&self) -> windows_core::Result<DispatcherQueue> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).DispatcherQueue)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+}
 #[repr(C)]
 pub struct IDispatcherQueueController_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
+    pub DispatcherQueue: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IDispatcherQueueStatics,
+    IDispatcherQueueStatics_Vtbl,
+    0xa96d83d7_9371_4517_9245_d0824ac12c74
+);
+impl windows_core::RuntimeType for IDispatcherQueueStatics {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IDispatcherQueueStatics_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub GetForCurrentThread: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IDisplayInformation,
@@ -369,6 +578,75 @@ impl windows_core::RuntimeType for IDisplayInformation {
 #[repr(C)]
 pub struct IDisplayInformation_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    IDisplayInformation5,
+    IDisplayInformation5_Vtbl,
+    0x3a5442dc_2cde_4a8d_80d1_21dc5adcc1aa
+);
+impl windows_core::RuntimeType for IDisplayInformation5 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl IDisplayInformation5 {
+    pub(crate) fn GetAdvancedColorInfo(&self) -> windows_core::Result<AdvancedColorInfo> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetAdvancedColorInfo)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub(crate) fn AdvancedColorInfoChanged<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(windows_core::Ref<DisplayInformation>, windows_core::Ref<windows_core::IInspectable>)
+            + 'static,
+    {
+        let handler: TypedEventHandler<DisplayInformation, windows_core::IInspectable> = {
+            let com = windows_core::imp::DelegateBox::<
+                TypedEventHandler<DisplayInformation, windows_core::IInspectable>,
+                F,
+            >::new(
+                &TypedEventHandlerBox::<DisplayInformation, windows_core::IInspectable, F>::VTABLE,
+                handler,
+            );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).AdvancedColorInfoChanged)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemoveAdvancedColorInfoChanged,
+            ))
+        }
+    }
+}
+#[repr(C)]
+pub struct IDisplayInformation5_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub GetAdvancedColorInfo: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub AdvancedColorInfoChanged: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveAdvancedColorInfoChanged:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     IDisplayInformationStaticsInterop,
@@ -503,19 +781,6 @@ impl IDisplayInformationStaticsInterop_Vtbl {
 }
 impl windows_core::RuntimeName for IDisplayInformationStaticsInterop {}
 pub const INFINITE: u32 = 4294967295;
-windows_core::imp::define_interface!(
-    IUISettings,
-    IUISettings_Vtbl,
-    0x85361600_1c63_4627_bcb1_3a89e0bc9c55
-);
-impl windows_core::RuntimeType for IUISettings {
-    const SIGNATURE: windows_core::imp::ConstBuffer =
-        windows_core::imp::ConstBuffer::for_interface::<Self>();
-}
-#[repr(C)]
-pub struct IUISettings_Vtbl {
-    pub base__: windows_core::IInspectable_Vtbl,
-}
 pub type LPARAM = isize;
 pub type LRESULT = isize;
 #[repr(C)]
@@ -527,26 +792,6 @@ pub struct MINMAXINFO {
     pub ptMinTrackSize: POINT,
     pub ptMaxTrackSize: POINT,
 }
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MONITORINFO {
-    pub cbSize: u32,
-    pub rcMonitor: RECT,
-    pub rcWork: RECT,
-    pub dwFlags: u32,
-}
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MONITORINFOEXW {
-    pub Base: MONITORINFO,
-    pub szDevice: [u16; 32],
-}
-impl Default for MONITORINFOEXW {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
-}
-pub const MONITOR_DEFAULTTONEAREST: i32 = 2;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MSG {
@@ -568,21 +813,6 @@ impl Default for NCCALCSIZE_PARAMS {
         unsafe { core::mem::zeroed() }
     }
 }
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PAINTSTRUCT {
-    pub hdc: HDC,
-    pub fErase: windows_core::BOOL,
-    pub rcPaint: RECT,
-    pub fRestore: windows_core::BOOL,
-    pub fIncUpdate: windows_core::BOOL,
-    pub rgbReserved: [u8; 32],
-}
-impl Default for PAINTSTRUCT {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
-}
 pub const PM_REMOVE: i32 = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -590,57 +820,53 @@ pub struct POINT {
     pub x: i32,
     pub y: i32,
 }
-pub type PROCESS_INFORMATION_CLASS = i32;
+pub type POINTER_BUTTON_CHANGE_TYPE = i32;
+pub const POINTER_CHANGE_FIFTHBUTTON_DOWN: POINTER_BUTTON_CHANGE_TYPE = 9;
+pub const POINTER_CHANGE_FIFTHBUTTON_UP: POINTER_BUTTON_CHANGE_TYPE = 10;
+pub const POINTER_CHANGE_FIRSTBUTTON_DOWN: POINTER_BUTTON_CHANGE_TYPE = 1;
+pub const POINTER_CHANGE_FIRSTBUTTON_UP: POINTER_BUTTON_CHANGE_TYPE = 2;
+pub const POINTER_CHANGE_FOURTHBUTTON_DOWN: POINTER_BUTTON_CHANGE_TYPE = 7;
+pub const POINTER_CHANGE_FOURTHBUTTON_UP: POINTER_BUTTON_CHANGE_TYPE = 8;
+pub const POINTER_CHANGE_NONE: POINTER_BUTTON_CHANGE_TYPE = 0;
+pub const POINTER_CHANGE_SECONDBUTTON_DOWN: POINTER_BUTTON_CHANGE_TYPE = 3;
+pub const POINTER_CHANGE_SECONDBUTTON_UP: POINTER_BUTTON_CHANGE_TYPE = 4;
+pub const POINTER_CHANGE_THIRDBUTTON_DOWN: POINTER_BUTTON_CHANGE_TYPE = 5;
+pub const POINTER_CHANGE_THIRDBUTTON_UP: POINTER_BUTTON_CHANGE_TYPE = 6;
+pub type POINTER_FLAGS = u32;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PROCESS_POWER_THROTTLING_STATE {
-    pub Version: u32,
-    pub ControlMask: u32,
-    pub StateMask: u32,
+pub struct POINTER_INFO {
+    pub pointerType: POINTER_INPUT_TYPE,
+    pub pointerId: u32,
+    pub frameId: u32,
+    pub pointerFlags: POINTER_FLAGS,
+    pub sourceDevice: HANDLE,
+    pub hwndTarget: HWND,
+    pub ptPixelLocation: POINT,
+    pub ptHimetricLocation: POINT,
+    pub ptPixelLocationRaw: POINT,
+    pub ptHimetricLocationRaw: POINT,
+    pub dwTime: u32,
+    pub historyCount: u32,
+    pub InputData: i32,
+    pub dwKeyStates: u32,
+    pub PerformanceCount: u64,
+    pub ButtonChangeType: POINTER_BUTTON_CHANGE_TYPE,
 }
-pub type PTIMERAPCROUTINE = Option<
-    unsafe extern "system" fn(
-        lpargtocompletionroutine: *const core::ffi::c_void,
-        dwtimerlowvalue: u32,
-        dwtimerhighvalue: u32,
-    ),
->;
+pub type POINTER_INPUT_TYPE = u32;
 pub type PWINDOWPOS = *mut WINDOWPOS;
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct REASON_CONTEXT {
-    pub Version: u32,
-    pub Flags: u32,
-    pub Reason: REASON_CONTEXT_0,
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
 }
-impl Default for REASON_CONTEXT {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
+impl windows_core::TypeKind for Point {
+    type TypeKind = windows_core::CopyType;
 }
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub union REASON_CONTEXT_0 {
-    pub Detailed: REASON_CONTEXT_0_0,
-    pub SimpleReasonString: windows_core::PWSTR,
-}
-impl Default for REASON_CONTEXT_0 {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
-}
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct REASON_CONTEXT_0_0 {
-    pub LocalizedReasonModule: HMODULE,
-    pub LocalizedReasonId: u32,
-    pub ReasonStringCount: u32,
-    pub ReasonStrings: *mut windows_core::PWSTR,
-}
-impl Default for REASON_CONTEXT_0_0 {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
+impl windows_core::RuntimeType for Point {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.Foundation.Point;f4;f4)");
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -666,24 +892,19 @@ impl Default for SECURITY_ATTRIBUTES {
         unsafe { core::mem::zeroed() }
     }
 }
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct SIZE {
-    pub cx: i32,
-    pub cy: i32,
-}
-pub const SIZE_MAXIMIZED: i32 = 2;
-pub const SIZE_MINIMIZED: i32 = 1;
+pub const SM_CXFRAME: i32 = 32;
 pub const SM_CXPADDEDBORDER: i32 = 92;
+pub const SM_CYCAPTION: i32 = 4;
 pub const SM_CYFRAME: i32 = 33;
 pub const SWP_FRAMECHANGED: i32 = 32;
 pub const SWP_NOACTIVATE: i32 = 16;
+pub const SWP_NOMOVE: i32 = 2;
 pub const SWP_NOSIZE: i32 = 1;
 pub const SWP_NOZORDER: i32 = 4;
-pub const SW_SHOW: i32 = 5;
-pub const SW_SHOWNOACTIVATE: i32 = 4;
 pub const SW_SHOWNORMAL: i32 = 1;
 pub type THREAD_INFORMATION_CLASS = i32;
+pub const THREAD_POWER_THROTTLING_CURRENT_VERSION: i32 = 1;
+pub const THREAD_POWER_THROTTLING_EXECUTION_SPEED: i32 = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct THREAD_POWER_THROTTLING_STATE {
@@ -691,36 +912,83 @@ pub struct THREAD_POWER_THROTTLING_STATE {
     pub ControlMask: u32,
     pub StateMask: u32,
 }
-pub const TIMER_ALL_ACCESS: i32 = 2031619;
-pub const TPM_RETURNCMD: i32 = 256;
-pub const TPM_RIGHTBUTTON: i32 = 2;
+pub const ThreadPowerThrottling: THREAD_INFORMATION_CLASS = 3;
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UISettings(windows_core::IUnknown);
-windows_core::imp::interface_hierarchy!(
-    UISettings,
+pub struct TypedEventHandler<TSender, TResult>(
     windows_core::IUnknown,
-    windows_core::IInspectable
-);
-impl windows_core::RuntimeType for UISettings {
-    const SIGNATURE: windows_core::imp::ConstBuffer =
-        windows_core::imp::ConstBuffer::for_class::<Self, IUISettings>();
+    core::marker::PhantomData<TSender>,
+    core::marker::PhantomData<TResult>,
+)
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static;
+unsafe impl<
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+> windows_core::Interface for TypedEventHandler<TSender, TResult>
+{
+    type Vtable = TypedEventHandler_Vtbl<TSender, TResult>;
+    const IID: windows_core::GUID =
+        windows_core::GUID::from_signature(<Self as windows_core::RuntimeType>::SIGNATURE);
 }
-unsafe impl windows_core::Interface for UISettings {
-    type Vtable = <IUISettings as windows_core::Interface>::Vtable;
-    const IID: windows_core::GUID = <IUISettings as windows_core::Interface>::IID;
+impl<TSender: windows_core::RuntimeType + 'static, TResult: windows_core::RuntimeType + 'static>
+    windows_core::RuntimeType for TypedEventHandler<TSender, TResult>
+{
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::new()
+        .push_slice(b"pinterface({9de1c534-6ae1-11e0-84e1-18a905bcc53f}")
+        .push_slice(b";")
+        .push_other(TSender::SIGNATURE)
+        .push_slice(b";")
+        .push_other(TResult::SIGNATURE)
+        .push_slice(b")");
 }
-impl core::ops::Deref for UISettings {
-    type Target = IUISettings;
-    fn deref(&self) -> &Self::Target {
-        unsafe { core::mem::transmute(self) }
+#[repr(C)]
+pub struct TypedEventHandler_Vtbl<TSender, TResult>
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+{
+    base__: windows_core::IUnknown_Vtbl,
+    Invoke: unsafe extern "system" fn(
+        this: *mut core::ffi::c_void,
+        sender: windows_core::AbiType<TSender>,
+        args: windows_core::AbiType<TResult>,
+    ) -> windows_core::HRESULT,
+    TSender: core::marker::PhantomData<TSender>,
+    TResult: core::marker::PhantomData<TResult>,
+}
+struct TypedEventHandlerBox<
+    TSender,
+    TResult,
+    F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static,
+>(core::marker::PhantomData<(TSender, TResult, fn() -> F)>)
+where
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static;
+impl<
+    TSender: windows_core::RuntimeType + 'static,
+    TResult: windows_core::RuntimeType + 'static,
+    F: Fn(windows_core::Ref<TSender>, windows_core::Ref<TResult>) + 'static,
+> TypedEventHandlerBox<TSender, TResult, F>
+{
+    const VTABLE : TypedEventHandler_Vtbl < TSender , TResult , > = TypedEventHandler_Vtbl::< TSender , TResult , > { base__ : windows_core::IUnknown_Vtbl { QueryInterface : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::QueryInterface , AddRef : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::AddRef , Release : windows_core::imp::DelegateBox::< TypedEventHandler < TSender , TResult > , F >::Release , } , Invoke : Self::Invoke , TSender : core::marker::PhantomData::< TSender > , TResult : core::marker::PhantomData::< TResult > } ;
+    unsafe extern "system" fn Invoke(
+        this: *mut core::ffi::c_void,
+        sender: windows_core::AbiType<TSender>,
+        args: windows_core::AbiType<TResult>,
+    ) -> windows_core::HRESULT {
+        unsafe {
+            let this = &mut *(this as *mut *mut core::ffi::c_void
+                as *mut windows_core::imp::DelegateBox<TypedEventHandler<TSender, TResult>, F>);
+            (this.invoke)(
+                core::mem::transmute_copy(&sender),
+                core::mem::transmute_copy(&args),
+            );
+            windows_core::HRESULT(0)
+        }
     }
 }
-impl windows_core::RuntimeName for UISettings {
-    const NAME: &'static str = "Windows.UI.ViewManagement.UISettings";
-}
-unsafe impl Send for UISettings {}
-unsafe impl Sync for UISettings {}
 pub const WAIT_FAILED: u32 = 4294967295;
 pub const WAIT_OBJECT_0: i32 = 0;
 pub const WAIT_TIMEOUT: i32 = 258;
@@ -735,41 +1003,24 @@ pub struct WINDOWPOS {
     pub cy: i32,
     pub flags: u32,
 }
-pub const WM_APP: i32 = 32768;
+pub const WM_ACTIVATE: i32 = 6;
 pub const WM_DESTROY: i32 = 2;
-pub const WM_DISPLAYCHANGE: i32 = 126;
 pub const WM_DPICHANGED: i32 = 736;
 pub const WM_ERASEBKGND: i32 = 20;
 pub const WM_GETMINMAXINFO: i32 = 36;
 pub const WM_NCCALCSIZE: i32 = 131;
 pub const WM_NCDESTROY: i32 = 130;
 pub const WM_NCHITTEST: i32 = 132;
-pub const WM_NCLBUTTONDOWN: i32 = 161;
-pub const WM_NCLBUTTONUP: i32 = 162;
-pub const WM_NCMOUSELEAVE: i32 = 674;
-pub const WM_NCMOUSEMOVE: i32 = 160;
+pub const WM_NCPOINTERDOWN: i32 = 578;
+pub const WM_NCPOINTERUP: i32 = 579;
+pub const WM_NCPOINTERUPDATE: i32 = 577;
+pub const WM_POINTERLEAVE: i32 = 586;
 pub const WM_QUIT: i32 = 18;
-pub const WM_SETCURSOR: i32 = 32;
-pub const WM_SETTINGCHANGE: i32 = 26;
 pub const WM_SIZE: i32 = 5;
 pub const WM_SYSCOMMAND: i32 = 274;
+pub const WM_THEMECHANGED: i32 = 794;
+pub const WM_USER: i32 = 1024;
 pub const WM_WINDOWPOSCHANGED: i32 = 71;
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WNDCLASSEXW {
-    pub cbSize: u32,
-    pub style: u32,
-    pub lpfnWndProc: WNDPROC,
-    pub cbClsExtra: i32,
-    pub cbWndExtra: i32,
-    pub hInstance: HINSTANCE,
-    pub hIcon: HICON,
-    pub hCursor: HCURSOR,
-    pub hbrBackground: HBRUSH,
-    pub lpszMenuName: windows_core::PCWSTR,
-    pub lpszClassName: windows_core::PCWSTR,
-    pub hIconSm: HICON,
-}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WNDCLASSW {
@@ -789,4 +1040,6 @@ pub type WNDPROC = Option<
 >;
 pub type WPARAM = usize;
 pub const WS_EX_NOREDIRECTIONBITMAP: i32 = 2097152;
+pub const WS_MAXIMIZEBOX: i32 = 65536;
 pub const WS_OVERLAPPEDWINDOW: i32 = 13565952;
+pub const WS_THICKFRAME: i32 = 262144;
