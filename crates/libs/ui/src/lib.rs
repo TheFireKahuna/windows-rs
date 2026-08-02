@@ -19,7 +19,20 @@ pub mod signal;
 #[deny(unsafe_code)]
 pub mod structure;
 
-// The rest of the safe surface — the widget set, the pointer stack, overlays, UI
-// Automation and text services — replaces this blanket re-export as each module lands.
+// The pointer stack and what it feeds. The gesture layer and the drag policy contain no
+// `unsafe` either — the recognisers are the platform's and every call into them is a safe
+// projection — so only `input` and `rotary` reach the raw surface, and both are confined to
+// reading a pointer and creating a controller.
+#[deny(unsafe_code)]
+pub mod gesture;
+pub mod input;
+pub mod rotary;
+
+mod front;
+
+pub use front::FrontHandle;
+
+// The rest of the safe surface — the widget set, overlays, UI Automation and text services —
+// replaces this blanket re-export as each module lands.
 pub use bindings::*;
 pub use windows_core::Result;

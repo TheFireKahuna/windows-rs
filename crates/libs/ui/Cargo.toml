@@ -21,6 +21,8 @@ windows-scene = { workspace = true }
 # four numbers, and interning the family is the text engine's job rather than this
 # crate's.
 windows-text = { workspace = true }
+# `TimeSpan`, which is how the gesture recogniser states a hold delay.
+windows-time = { workspace = true }
 # `Event`, the waitable behind `Epoch` and the cross-thread write inbox.
 windows-window = { workspace = true }
 

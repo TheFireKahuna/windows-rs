@@ -34,6 +34,10 @@
     Windows.Win32.ITextRangeProvider
     Windows.Win32.ITextStoreACP
     Windows.Win32.ITfContextOwnerCompositionSink
+// The recogniser asks the application to transform its own points, which is how the
+// gesture and the hit test come to agree on a space by construction rather than by two
+// conversions that have to be kept equal.
+    Windows.UI.Input.IPointerPointTransform
 
 --filter
 // ── Reading pointer input ─────────────────────────────────────────────────────
@@ -71,6 +75,42 @@
     WM_POINTERCAPTURECHANGED
     WM_POINTERWHEEL
     WM_POINTERHWHEEL
+// The `IS_POINTER_*_WPARAM` family are C macros over the message's own flag word, so the
+// constants are named and the tests written here. Confidence is what gates palm rejection
+// and cancel is not an up, so both are load-bearing rather than informational.
+    POINTER_FLAG_NEW
+    POINTER_FLAG_INRANGE
+    POINTER_FLAG_INCONTACT
+    POINTER_FLAG_PRIMARY
+    POINTER_FLAG_CONFIDENCE
+    POINTER_FLAG_CANCELED
+    POINTER_FLAG_FIRSTBUTTON
+    POINTER_FLAG_SECONDBUTTON
+    POINTER_FLAG_THIRDBUTTON
+    POINTER_FLAG_FOURTHBUTTON
+    POINTER_FLAG_FIFTHBUTTON
+// A pen hovers, so pen users get affordances touch users do not — and the barrel button and
+// the inverted end are what a pen has instead of a second mouse button.
+    PEN_FLAG_BARREL
+    PEN_FLAG_INVERTED
+    PEN_FLAG_ERASER
+// Screen physical to client physical. The DIP divide is the window's scale, which
+// `windows-window` already resolves; what this crate must not do is invent either half.
+    ScreenToClient
+    GetClientRect
+    POINT
+    RECT
+// A discrete transition asks to be serviced on the next pump iteration rather than at the
+// next composition frame: frame-limiting a press is a frame of latency on the one number
+// users notice. The message posted is the pacer's own, so there is one consumption path.
+    PostMessageW
+// `GetPointerTouchpadInfo` and `ReportWindowContentInertia` are absent from the vendored
+// corpus *and* from the 26100 SDK — its `winuser.h` carries a redaction marker where they
+// and the two inertia messages should be. Resolved by `GetProcAddress`, exactly as
+// `windows-window` resolves `RegisterTouchpadCapableWindow`, so a machine at the floor that
+// lacks them loses the feature rather than the process load.
+    GetModuleHandleW
+    GetProcAddress
 
 // ── Capture and keys ──────────────────────────────────────────────────────────
 // Retained because focus, capture and the keyboard still arrive as window messages
@@ -118,44 +158,111 @@
 // gesture and a hit agree by construction. `PhysicalGestureRecognizer` is the
 // precision-touchpad path, which reports in physical units rather than as a
 // synthesized wheel.
+//
+// Members are named individually because `--minimal` generates a class named alone as a
+// shell with nothing callable on it — the same trap `windows-window` hit on
+// `IDisplayInformation5`. What is *not* named is as deliberate: no `CanBeDoubleTap` (the
+// recogniser answers double-tap itself through `GestureSettings::DoubleTap`), no
+// `MouseWheelParameters` (wheel over a scroll surface is the tracker's, and wheel over
+// anything else is a gesture whose step this stack states), and no cross-slide thresholds
+// (there is no cross-slide consumer yet, and a threshold set from nowhere is worse than the
+// default).
     Windows.UI.Input.GestureRecognizer
+// Standalone activation: a recogniser is minted per contact from a pool, and there is no
+// view to obtain one from.
+    Windows.UI.Input.GestureRecognizer::CreateInstance
+    Windows.UI.Input.IGestureRecognizer::{get_GestureSettings, put_GestureSettings, get_IsActive, get_IsInertial, put_ShowGestureFeedback, put_ManipulationExact, put_AutoProcessInertia, put_PivotCenter, put_PivotRadius, put_InertiaTranslationDeceleration, put_InertiaRotationDeceleration, put_InertiaExpansionDeceleration, ProcessDownEvent, ProcessMoveEvents, ProcessUpEvent, ProcessMouseWheelEvent, ProcessInertia, CompleteGesture, add_Tapped, remove_Tapped, add_RightTapped, remove_RightTapped, add_Holding, remove_Holding, add_Dragging, remove_Dragging, add_ManipulationStarted, remove_ManipulationStarted, add_ManipulationUpdated, remove_ManipulationUpdated, add_ManipulationInertiaStarting, remove_ManipulationInertiaStarting, add_ManipulationCompleted, remove_ManipulationCompleted}
+// Hold tuning and the contact-count bounds arrived in 2004, on their own interface. A
+// knob that must not be claimed by a two-finger contact needs the maxima, not just the
+// delay.
+    Windows.UI.Input.IGestureRecognizer2::{put_HoldStartDelay, put_HoldRadius, put_HoldMinContactCount, put_HoldMaxContactCount, put_TapMinContactCount, put_TapMaxContactCount, put_TranslationMinContactCount, put_TranslationMaxContactCount}
     Windows.UI.Input.PhysicalGestureRecognizer
+    Windows.UI.Input.PhysicalGestureRecognizer::CreateInstance
+    Windows.UI.Input.IPhysicalGestureRecognizer::{get_IsActive, get_GestureSettings, put_GestureSettings, put_HoldStartDelay, put_HoldRadius, put_TranslationMinContactCount, put_TranslationMaxContactCount, ProcessDownEvent, ProcessMoveEvents, ProcessUpEvent, CompleteGesture, add_ManipulationStarted, remove_ManipulationStarted, add_ManipulationUpdated, remove_ManipulationUpdated, add_ManipulationCompleted, remove_ManipulationCompleted, add_Tapped, remove_Tapped, add_Holding, remove_Holding}
     Windows.UI.Input.GestureSettings
     Windows.UI.Input.PointerPoint
+// Position is predicted and RawPosition is not, and which one a consumer wants depends on
+// whether the decision is continuous or discrete. Both are read.
+    Windows.UI.Input.IPointerPoint::{get_PointerId, get_Position, get_RawPosition, get_Timestamp, get_IsInContact, get_Properties}
     Windows.UI.Input.PointerPointProperties
+    Windows.UI.Input.IPointerPointProperties::{get_Pressure, get_XTilt, get_YTilt, get_Twist, get_Orientation, get_ContactRect, get_ContactRectRaw, get_TouchConfidence, get_IsPrimary, get_IsInRange, get_IsCanceled, get_IsBarrelButtonPressed, get_IsEraser, get_IsInverted, get_MouseWheelDelta, get_IsHorizontalMouseWheel, get_PointerUpdateKind}
     Windows.UI.Input.IPointerPointStatics
+// Implemented, not called: the recogniser asks *us* to transform, which is how it comes to
+// report in the same space the hit array is built in.
+    Windows.UI.Input.IPointerPointTransform
     Windows.UI.Input.TappedEventArgs
+    Windows.UI.Input.ITappedEventArgs::{get_Position, get_TapCount, get_PointerDeviceType}
     Windows.UI.Input.RightTappedEventArgs
+    Windows.UI.Input.IRightTappedEventArgs::{get_Position, get_PointerDeviceType}
     Windows.UI.Input.HoldingEventArgs
+    Windows.UI.Input.IHoldingEventArgs::{get_Position, get_HoldingState, get_PointerDeviceType}
     Windows.UI.Input.DraggingEventArgs
-    Windows.UI.Input.CrossSlidingEventArgs
+    Windows.UI.Input.IDraggingEventArgs::{get_Position, get_DraggingState, get_PointerDeviceType}
     Windows.UI.Input.ManipulationStartedEventArgs
+    Windows.UI.Input.IManipulationStartedEventArgs::{get_Position, get_Cumulative, get_PointerDeviceType}
     Windows.UI.Input.ManipulationUpdatedEventArgs
+    Windows.UI.Input.IManipulationUpdatedEventArgs::{get_Position, get_Delta, get_Cumulative, get_Velocities, get_PointerDeviceType}
     Windows.UI.Input.ManipulationInertiaStartingEventArgs
+    Windows.UI.Input.IManipulationInertiaStartingEventArgs::{get_Position, get_Delta, get_Cumulative, get_Velocities, get_PointerDeviceType}
     Windows.UI.Input.ManipulationCompletedEventArgs
+    Windows.UI.Input.IManipulationCompletedEventArgs::{get_Position, get_Cumulative, get_Velocities, get_PointerDeviceType}
 
 // ── Rotary input ──────────────────────────────────────────────────────────────
 // A desktop app has no CoreWindow, so the controller is reached through its interop
-// factory rather than its WinRT static.
+// factory rather than its WinRT static. The dial is a delta source: it lands on the
+// gesture seam and drives the same value path a knob drag does.
     Windows.UI.Input.RadialController
-    Windows.UI.Input.RadialControllerConfiguration
+    Windows.UI.Input.IRadialController::{get_Menu, put_RotationResolutionInDegrees, put_UseAutomaticHapticFeedback, add_RotationChanged, remove_RotationChanged, add_ButtonClicked, remove_ButtonClicked, add_ControlAcquired, remove_ControlAcquired, add_ControlLost, remove_ControlLost, add_ScreenContactStarted, remove_ScreenContactStarted, add_ScreenContactContinued, remove_ScreenContactContinued, add_ScreenContactEnded, remove_ScreenContactEnded}
+    Windows.UI.Input.IRadialController2::{add_ButtonPressed, remove_ButtonPressed, add_ButtonReleased, remove_ButtonReleased}
+    Windows.UI.Input.RadialControllerRotationChangedEventArgs
+    Windows.UI.Input.IRadialControllerRotationChangedEventArgs::{get_RotationDeltaInDegrees, get_Contact}
+    Windows.UI.Input.RadialControllerButtonClickedEventArgs
+    Windows.UI.Input.IRadialControllerButtonClickedEventArgs::{get_Contact}
+    Windows.UI.Input.RadialControllerScreenContactStartedEventArgs
+    Windows.UI.Input.IRadialControllerScreenContactStartedEventArgs::{get_Contact}
+    Windows.UI.Input.RadialControllerScreenContactContinuedEventArgs
+    Windows.UI.Input.IRadialControllerScreenContactContinuedEventArgs::{get_Contact}
+// The dial's on-screen contact carries a position, so the flat hit array picks the target
+// underneath it exactly as a finger would.
+    Windows.UI.Input.RadialControllerScreenContact
+    Windows.UI.Input.IRadialControllerScreenContact::{get_Position, get_Bounds}
+    Windows.UI.Input.RadialControllerMenu
+    Windows.UI.Input.IRadialControllerMenu::{get_Items, SelectMenuItem, TrySelectPreviouslySelectedMenuItem, GetSelectedMenuItem, put_IsEnabled}
     Windows.UI.Input.RadialControllerMenuItem
+    Windows.UI.Input.IRadialControllerMenuItem::{get_DisplayText, add_Invoked, remove_Invoked}
+// A glyph rather than a bitmap: the application's icon font is already the one thing every
+// other affordance is drawn from, and a stream-backed icon would be a second asset path.
+    Windows.UI.Input.IRadialControllerMenuItemStatics2::{CreateFromFontGlyph}
+    Windows.UI.Input.RadialControllerConfiguration
+    Windows.UI.Input.IRadialControllerConfiguration::{SetDefaultMenuItems, ResetToDefaultMenuItems, TrySelectDefaultMenuItem}
+    Windows.UI.Input.RadialControllerSystemMenuItemKind
     IRadialControllerInterop
     IRadialControllerConfigurationInterop
 
 // ── Touch keyboard and device capability ──────────────────────────────────────
 // The soft keyboard occludes part of the window rather than resizing it, so the
-// occlusion is a layout input. `UIViewSettings` reports whether the user is in touch
-// mode, which changes hit-target sizing.
+// occlusion is a layout input. Those three types belong to the text stack — the store is
+// what declares an input scope — and are named here so the crate's one Windows surface
+// stays in one file; nothing calls them until the editor exists.
     Windows.UI.ViewManagement.Core.CoreInputView
     Windows.UI.ViewManagement.Core.CoreFrameworkInputView
     Windows.UI.ViewManagement.Core.CoreInputViewKind
     Windows.UI.ViewManagement.Core.CoreInputViewOcclusion
     Windows.UI.ViewManagement.Core.CoreInputViewOcclusionKind
-    Windows.UI.ViewManagement.UIViewSettings
-    IUIViewSettingsInterop
+// Whether a digitizer exists and how many contacts it reports. A capability, never a mode:
+// affordances are decided per interaction, from the contact that arrived.
     Windows.Devices.Input.PointerDevice
+    Windows.Devices.Input.IPointerDevice::{get_PointerDeviceType, get_IsIntegrated, get_MaxContacts}
+    Windows.Devices.Input.IPointerDeviceStatics::{GetPointerDevices, GetPointerDevice}
+    Windows.Devices.Input.PointerDeviceType
     Windows.Devices.Input.TouchCapabilities
+    Windows.Devices.Input.ITouchCapabilities::{get_TouchPresent, get_Contacts}
+// `UserInteractionMode` is read once for diagnostics and is a **hint**: Windows 11 removed
+// Tablet Mode, so nothing in this design branches on it.
+    Windows.UI.ViewManagement.UIViewSettings
+    Windows.UI.ViewManagement.IUIViewSettings::{get_UserInteractionMode}
+    Windows.UI.ViewManagement.UserInteractionMode
+    IUIViewSettingsInterop
 
 // ── Text services (TSF) ───────────────────────────────────────────────────────
 // An IME composes into the app's own text store, so the editor implements the store
