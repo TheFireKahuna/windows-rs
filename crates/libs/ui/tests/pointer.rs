@@ -21,7 +21,7 @@ use std::rc::Rc;
 use windows_color::{DisplayCapability, OutputTransform};
 use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, NO_ENTRY, NodeId};
 use windows_ui::gesture::GestureDecl;
-use windows_ui::input::{Doorbell, Report, Router};
+use windows_ui::input::{Doorbell, Inertia, Late, Report, Router};
 use windows_window::Window;
 
 const WM_POINTERUPDATE: u32 = 0x0245;
@@ -328,4 +328,32 @@ fn a_capture_change_that_takes_nothing_away_is_not_a_cancel() {
         "our own release was reported as a loss"
     );
     assert_eq!(router.census().aborts, 0);
+}
+
+/// Content inertia is recorded as **told**, never as asked.
+///
+/// A hidden window is not active, so `ReportWindowContentInertia` refuses it with
+/// `E_ACCESSDENIED` — and a build without the export refuses it too. Either way nothing was
+/// told, so nothing may be recorded.
+///
+/// It regressed by writing the state before the call and discarding the answer, which also
+/// consumed the edge: the retry the next tick would have made never happened.
+#[test]
+fn a_refused_inertia_report_is_not_recorded_as_made() {
+    let window = window("inertia");
+    let inertia = Inertia::new(&window, Late::resolve());
+    assert!(!inertia.reported());
+
+    assert!(
+        !inertia.set(true),
+        "an inactive window cannot be reported for"
+    );
+    assert!(!inertia.reported(), "a refused report was recorded as made");
+    // The edge survives, so the next tick tries again rather than seeing no change.
+    assert!(!inertia.set(true));
+
+    assert!(
+        !inertia.set(false),
+        "content that is not moving is not moving"
+    );
 }

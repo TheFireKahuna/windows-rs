@@ -81,7 +81,9 @@ impl Late {
         unsafe { call(id, &mut info) }.as_bool().then_some(info)
     }
 
-    /// Tells the system whether `hwnd`'s content is in inertia. `false` if it could not.
+    /// Tells the system whether `hwnd`'s content is in inertia. `false` if it could not: the
+    /// export may be absent, and the call answers `E_ACCESSDENIED` for a window that is not
+    /// active. Both matter — see [`Inertia::set`](super::Inertia::set).
     pub(crate) fn report_inertia(&self, hwnd: HWND, started: bool) -> bool {
         let Some(call) = self.report_inertia else {
             return false;

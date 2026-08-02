@@ -1100,9 +1100,10 @@ impl Router {
         if self.bell.idle() {
             self.bell.settle();
         }
-        // Told on the edge, and told at all: a window whose content is moving and has not
-        // said so turns a touchpad tap into a click on whatever was moving under it.
-        self.inertia.set(self.pool.any_inertial());
+        // Told on the edge, and told at all: a window whose content is moving and has not said
+        // so turns a touchpad tap into a click on whatever was moving under it. A refusal is
+        // retried by the next tick, so the answer is not this function's to act on.
+        _ = self.inertia.set(self.pool.any_inertial());
     }
 }
 
