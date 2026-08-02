@@ -44,7 +44,7 @@ mod shared;
 mod tests;
 
 pub use epoch::Epoch;
-pub use graph::{SignalId, flush, live_nodes};
+pub use graph::{SignalId, flush, live_nodes, untracked};
 pub use shared::written;
 
 use core::any::Any;

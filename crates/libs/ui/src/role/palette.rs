@@ -16,6 +16,14 @@ use windows_text::FontSpec;
 /// present thread resolves data roles for a region's own drawing. Anything a palette needs
 /// to *compute* — an accent ramp, a wash — is a function over a base rather than a stored
 /// shade, so there is nothing here to synchronize.
+/// # The three colour methods may not read `scope.width`
+///
+/// Only [`metric`](Self::metric) and [`typography`](Self::typography) may. A width class
+/// is resolved inside the solve and changes whenever a window crosses a threshold, so a
+/// colour that depended on it would make a resize invalidate every rasterized cell in the
+/// subtree. [`Scope::for_paint`](super::Scope::for_paint) pins the axis on the way in, so
+/// a palette that breaks the rule cannot produce a width-dependent colour — and
+/// `colour_is_width_independent` asserts the whole `Role` × `WidthClass` product anyway.
 pub trait Palette: Send + Sync + 'static {
     fn text(&self, role: Text, scope: Scope) -> Radiance;
     fn fill(&self, role: Fill, scope: Scope) -> Radiance;

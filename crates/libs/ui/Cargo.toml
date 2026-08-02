@@ -13,6 +13,9 @@ readme = "readme.md"
 windows-collections = { workspace = true }
 windows-color = { workspace = true }
 windows-core = { workspace = true }
+# `Vector2` — the two-component value a composite channel carries. Named here rather than
+# reached through another crate's re-export, so the dependency reads as what it is.
+windows-numerics = { workspace = true }
 # The retained tree this framework declares into: node identity, styles, the sink
 # alphabet and the flat hit array. Widget-agnostic by design, which is what keeps the
 # alphabet closed.
@@ -20,7 +23,7 @@ windows-scene = { workspace = true }
 # `FontSpec` — what the typography ladder resolves a role to. A font is a family id and
 # four numbers, and interning the family is the text engine's job rather than this
 # crate's.
-windows-text = { workspace = true }
+windows-text = { workspace = true, features = ["d2d"] }
 # `TimeSpan`, which is how the gesture recogniser states a hold delay.
 windows-time = { workspace = true }
 # `Event`, the waitable behind `Epoch` and the cross-thread write inbox.

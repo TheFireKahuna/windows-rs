@@ -114,7 +114,11 @@ static REFERENCE: Reference = Reference;
 
 /// Installs once for the whole test binary. `install` is idempotent for the same palette,
 /// so every test may call it and tests may run in parallel.
-fn palette() {
+///
+/// Shared with the lowering's own tests rather than duplicated there: the palette is a
+/// process-wide `OnceLock`, so a second one would not install and the module that lost the
+/// race would silently assert against the other's answers.
+pub(crate) fn palette() {
     install(&REFERENCE);
 }
 

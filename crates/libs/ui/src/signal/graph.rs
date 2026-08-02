@@ -175,6 +175,19 @@ fn with<R>(f: impl FnOnce(&mut Graph) -> R) -> R {
     GRAPH.with(|g| f(&mut g.borrow_mut()))
 }
 
+/// The same, answering `None` where the graph is not reachable.
+///
+/// It stops being reachable in exactly one situation, and that situation is reached by
+/// ordinary code: the thread is ending, its locals are being destroyed, and the graph's own
+/// node vector is dropping. A node can hold an [`Owner`](super::Owner) — a `Branch`'s arm
+/// and a `Keyed`'s row both do — so dropping one asks the graph to dispose a scope *from
+/// inside the graph's own destructor*. Reaching a local during its destruction is an error
+/// rather than a value, and `with` answers it by panicking, inside a `Drop`, which aborts
+/// the process.
+fn try_with<R>(f: impl FnOnce(&mut Graph) -> R) -> Option<R> {
+    GRAPH.try_with(|g| f(&mut g.borrow_mut())).ok()
+}
+
 impl Graph {
     fn node(&self, id: SignalId) -> Option<&Node> {
         if id.graph != self.id {
@@ -388,6 +401,27 @@ fn resolve(id: SignalId) {
             }
         }
     }
+}
+
+/// Runs `f` with no observer installed, so what it reads subscribes nobody.
+///
+/// One caller and one shape: a read taken **while building**, inside an effect that is
+/// reconciling structure. Without this, a row's own bound value would be recorded as a
+/// dependency of the list's reconcile effect, and changing one label would rebuild the list.
+/// It is deliberately not a general escape — a value that should not track is a value that
+/// should not have been read, everywhere except at the seam where structure is built.
+pub fn untracked<R>(f: impl FnOnce() -> R) -> R {
+    // Restored by a guard and not by the line after the call: `f` is application code, and a
+    // panic that skipped the restore would leave the graph with no observer for the life of
+    // the thread — every effect created afterwards would silently subscribe to nothing.
+    struct Restore(Option<SignalId>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            try_with(|g| g.observer = self.0.take());
+        }
+    }
+    let _restore = Restore(with(|g| g.observer.take()));
+    f()
 }
 
 fn recompute(id: SignalId) {
@@ -643,7 +677,10 @@ pub(super) fn enter_scope(id: Option<OwnerId>) -> Option<OwnerId> {
 
 /// Disposes a scope and everything created under it, in reverse creation order.
 pub(super) fn dispose_scope(id: OwnerId) {
-    let Some(mut children) = with(|g| {
+    // Fallible, because this is reached from a `Drop` — see `try_with`. A graph that is
+    // already being destroyed is disposing this scope by dropping it, so there is nothing
+    // left for the walk below to do.
+    let Some(Some(mut children)) = try_with(|g| {
         let owner = g
             .owners
             .get_mut(id.index as usize)
@@ -662,7 +699,7 @@ pub(super) fn dispose_scope(id: OwnerId) {
         }
     }
 
-    with(|g| {
+    try_with(|g| {
         if let Some(owner) = g
             .owners
             .get_mut(id.index as usize)
@@ -678,7 +715,8 @@ pub(super) fn dispose_scope(id: OwnerId) {
 
 /// Disposes one node: drops its outgoing edges, releases its payload, and frees its slot.
 pub(super) fn dispose(id: SignalId) {
-    with(|g| {
+    // Fallible for the same reason `dispose_scope` is: this is reached from a `Drop`.
+    try_with(|g| {
         if g.node(id).is_none() {
             return;
         }

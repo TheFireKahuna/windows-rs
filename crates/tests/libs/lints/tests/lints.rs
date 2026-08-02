@@ -307,16 +307,21 @@ fn no_widget_colors() {
 
 #[test]
 fn no_child_layout() {
-    // Alignment, gap, placement and track sizing are the container's. This also closes the
-    // footgun where a placement set on the wrong kind of node silently did nothing: the
-    // child has no such property to set.
+    // Gap, placement and track sizing are the container's, and the failure they share is
+    // that a child setting one gets **no diagnostic**: `grid_row` on a flex child is a write
+    // that goes nowhere, which is the footgun this closes. So the container states them on
+    // the child's behalf — `at`, `span`, `rows`, `cols` — and the child has no such method.
+    //
+    // `align_self` is deliberately absent from this list and is the single per-child escape.
+    // It is the one cross-axis property every class this framework produces honours, so it
+    // cannot silently do nothing, and the rule above does not reach it. Adding a second
+    // escape is what this list exists to make someone argue for.
     let sources = framework();
     let found = all(
         &sources,
         &[
             "fn grid_row",
             "fn grid_column",
-            "fn align_self",
             "fn justify_self",
             "fn horizontal_alignment",
             "fn vertical_alignment",
@@ -325,7 +330,8 @@ fn no_child_layout() {
     );
     deny(
         "no_child_layout",
-        "a layout property belongs to the container, never to the child",
+        "a layout property a child cannot honour belongs to the container, which states it \
+         on the child's behalf",
         &found,
     );
 }

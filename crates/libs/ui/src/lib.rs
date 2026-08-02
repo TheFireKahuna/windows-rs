@@ -19,6 +19,23 @@ pub mod signal;
 #[deny(unsafe_code)]
 pub mod structure;
 
+// Measures what the modules below claim about allocation. Outside their `deny(unsafe_code)`
+// because a global allocator is `unsafe` by definition, and test-only because it exists to
+// answer one question the type system cannot.
+#[cfg(test)]
+mod counting;
+
+// The authoring surface: the build arena and the element, the length vocabulary and the
+// style presets, and the widget seeds over both. No `unsafe`, and no Windows surface at
+// all — it declares into `windows-scene` and resolves through `role`, and both of those
+// are somebody else's problem by the time a widget runs.
+#[deny(unsafe_code)]
+pub mod build;
+#[deny(unsafe_code)]
+pub mod layout;
+#[deny(unsafe_code)]
+pub mod widget;
+
 // The pointer stack and what it feeds. The gesture layer and the drag policy contain no
 // `unsafe` either — the recognisers are the platform's and every call into them is a safe
 // projection — so only `input` and `rotary` reach the raw surface, and both are confined to

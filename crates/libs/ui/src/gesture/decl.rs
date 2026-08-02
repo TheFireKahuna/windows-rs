@@ -238,6 +238,21 @@ impl DragDecl {
     pub fn reorder() -> Self {
         Self::default()
     }
+
+    /// A turned control: vertical displacement is the value, and it follows the contact.
+    ///
+    /// Vertical rather than circular, because a knob tracked around its own centre is
+    /// unaimable near the pivot and unreachable at the edges — a straight drag is what a
+    /// shipping knob actually reads. `Live`, because a knob is turned to *find* a value
+    /// rather than to state one, so what it drives has to move with it.
+    #[must_use]
+    pub fn turn() -> Self {
+        Self {
+            axes: DragAxes::Vertical,
+            commit: Commit::Live,
+            ..Self::default()
+        }
+    }
 }
 
 /// Rotary interest — what the dial does to this target.

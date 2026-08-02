@@ -33,8 +33,10 @@
 //! compositor.
 
 mod palette;
+// `pub(crate)` rather than private: the reference palette installs into a process-wide
+// `OnceLock`, so the lowering's tests must share this one rather than race a second.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use palette::{
     Palette, accent_wash, ink, install, installed, metric, resolve, typography, veil,
@@ -146,7 +148,32 @@ impl Scope {
             ..self
         }
     }
+
+    /// This scope with [`width`](Self::width) pinned to [`PAINT_WIDTH`].
+    ///
+    /// **The paint path's only entry**, and the structural half of a rule the [`Palette`]
+    /// documentation states: only `metric` and `typography` may read the width class.
+    ///
+    /// The class is not known at mount — a responsive container resolves it inside the
+    /// solve, and re-resolves it whenever a window crosses a threshold. If a colour could
+    /// depend on it, dragging a window edge would re-key every rasterized cell and
+    /// re-source every mask brush in the subtree, for a change that moved a gap. Pinning
+    /// the axis here means a palette that reads `width` in a colour method still cannot
+    /// produce a width-dependent colour, because nothing ever hands it a varying one.
+    #[must_use]
+    pub const fn for_paint(self) -> Self {
+        Self {
+            width: PAINT_WIDTH,
+            ..self
+        }
+    }
 }
+
+/// The width class every colour resolves against, whatever the container's actual extent.
+///
+/// Its value is arbitrary and load-bearing only in being *constant*. See
+/// [`Scope::for_paint`].
+pub const PAINT_WIDTH: WidthClass = WidthClass::Wide;
 
 /// Foreground roles.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
