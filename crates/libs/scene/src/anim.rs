@@ -353,9 +353,11 @@ impl crate::Scene {
             return Ok(None);
         }
 
+        // A ghost is a snapshot of something already dying, so its region never moves and
+        // the surface is not kept: the brush holds it, and nothing will ask it to resize.
         let captured = back.compositor.capture(&source, size, env.scale());
         let sprite = back.compositor.create_sprite_visual();
-        sprite.set_brush(&captured);
+        sprite.set_brush(&captured.brush);
         sprite.set_size(size.x, size.y);
         let offset = source.offset();
         sprite.set_offset(offset.x, offset.y, offset.z);

@@ -162,6 +162,14 @@ pub struct Scene {
     /// needn't** — that rule is the whole of why this is a field and they are arguments.
     pub(crate) wake: Wake,
     pub(crate) census: Census,
+    /// Channels [`retarget`](Scene::retarget) has claimed for the front thread.
+    ///
+    /// The one hazard a front-side write leaves open is *semantic*: the app writing a
+    /// channel the router is driving — a thumb offset set mid-drag. Consistency is not at
+    /// risk, because there is one shadow and one setter and both are here, so this exists
+    /// only to name the two writers at the moment they fight. Zero release cost.
+    #[cfg(debug_assertions)]
+    pub(crate) front_owned: rustc_hash::FxHashSet<(NodeId, Prop)>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -201,6 +209,8 @@ impl Scene {
             events: Rc::new(RefCell::new(Vec::new())),
             wake,
             census: Census::default(),
+            #[cfg(debug_assertions)]
+            front_owned: rustc_hash::FxHashSet::default(),
             _not_send: PhantomData,
         })
     }

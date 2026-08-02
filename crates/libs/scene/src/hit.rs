@@ -54,6 +54,12 @@ pub struct HitTable {
     /// The live offset of each scroll container, from its tracker's last reported value.
     /// A handful of scrolling surfaces, so a linear scan beats a map kept in step.
     scrolls: Vec<(NodeId, Vector2)>,
+    /// Control id to entry, sorted. A consumer holds an **id**, not a position, and a value
+    /// control asks for its own rect on every pointer move — so without this the interaction
+    /// path walks the whole screen once per sample. Sorted rather than mapped because it is
+    /// rebuilt with the array and never edited, which is exactly when a map costs more than
+    /// it saves.
+    by_id: Vec<(crate::hit_build::ControlId, u32)>,
     /// The last hit, so intra-control motion is one rectangle test. Interior mutability
     /// keeps the hover path on `&self`, which every consumer of the array shares.
     memo: core::cell::Cell<Option<Memo>>,
@@ -71,8 +77,22 @@ impl HitTable {
     pub fn replace(&mut self, entries: &[HitEntry]) {
         self.entries.clear();
         self.entries.extend_from_slice(entries);
+        self.by_id.clear();
+        self.by_id
+            .extend(entries.iter().enumerate().map(|(at, e)| (e.id, at as u32)));
+        self.by_id.sort_unstable_by_key(|&(id, _)| id);
         self.epoch = self.epoch.wrapping_add(1);
         self.memo.set(None);
+    }
+
+    /// The entry a control declared, or `None` where it has none.
+    ///
+    /// A binary search over the sorted side index: what a consumer holding an id needs when
+    /// it wants that control's own rect and not the one under a point.
+    #[must_use]
+    pub fn entry(&self, id: crate::hit_build::ControlId) -> Option<&HitEntry> {
+        let at = self.by_id.binary_search_by_key(&id, |&(key, _)| key).ok()?;
+        self.entries.get(self.by_id[at].1 as usize)
     }
 
     /// Records a scroll container's live offset.

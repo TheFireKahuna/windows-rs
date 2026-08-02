@@ -75,7 +75,10 @@ impl Scene {
                 self.declare(id, Some((mask, dashes)), None, back, env)
             }
             Op::Paint { id, paint } => self.declare(id, None, Some(paint), back, env),
-            Op::Bind { id, prop, bind } => self.bind_channel(id, prop, bind, patch, back, env),
+            Op::Bind { id, prop, bind } => {
+                self.check_not_front_owned(id, prop);
+                self.bind_channel(id, prop, bind, patch, back, env)
+            }
             Op::Res { id, op } => self.apply_res(id, op, patch, back, env),
             Op::Tracker { id, op } => {
                 self.apply_tracker(id, op);
@@ -180,6 +183,7 @@ impl Scene {
             self.motion.ghosts.push(ghost);
         }
         self.destroy_subtree(id);
+        self.release_front_claims();
         Ok(())
     }
 
@@ -407,6 +411,90 @@ impl Scene {
 
     // ── channels ──────────────────────────────────────────────────────────────────
 
+    /// Retargets a channel from the front thread, inside the tick that decided to.
+    ///
+    /// The same property table, the same shadow and the same setter [`apply`](Scene::apply)
+    /// uses — so this is not a second writer, it is the same writer reached from the other
+    /// side. Nothing about it is speculative: `Model` is the app half and `SinkPatch` is
+    /// filled there, so without this the router can resolve a hover and then has no way to
+    /// move a pixel before the app thread next runs.
+    ///
+    /// A **fourth [`Bind`] variant was considered and rejected.** The obvious hazard — a
+    /// front write desynchronising an app-side shadow — does not exist: `Model::bind` is a
+    /// passthrough and the shadow is entirely front-side, on this thread. Declaring
+    /// delegation on the wire would be state saying what the architecture already
+    /// guarantees. What is left is the app and the router writing one channel, and that is
+    /// caught by a debug-only claim rather than encoded in the alphabet.
+    ///
+    /// `env` is stated rather than held, for the reason every other entry point states it:
+    /// a channel whose owner has to be minted first rasterizes, and a scene that cached the
+    /// display could be *not told* when the window hops one.
+    ///
+    /// # Errors
+    ///
+    /// `bind` is [`Anim::Frames`]. A key-frame curve's frames live in a patch's own buffer
+    /// and the front thread has no patch, so there is nothing to read them from — refused
+    /// rather than played empty, because an animation that silently holds still is
+    /// indistinguishable from one that was never started.
+    pub fn retarget(
+        &mut self,
+        id: NodeId,
+        prop: Prop,
+        bind: Bind,
+        back: &Backends,
+        env: Env,
+    ) -> Result<()> {
+        if matches!(bind, Bind::Animate(Anim::Frames { .. })) {
+            return Err(crate::invalid_arg());
+        }
+        #[cfg(debug_assertions)]
+        self.front_owned.insert((id, prop));
+        // Empty, and not a cost: every buffer on a fresh patch is an unallocated `Vec`, and
+        // the one thing this path could read from one — a key-frame curve's frames — was
+        // refused above.
+        let patch = SinkPatch::new();
+        self.sync(back, env)?;
+        self.bind_channel(id, prop, bind, &patch, back, env)
+    }
+
+    /// Drops the claims of nodes that no longer exist.
+    ///
+    /// Called after a destroy, because a destroy cascades: the claim is keyed by node and
+    /// only the tree knows which ones went with it. Ids are generational, so a surviving
+    /// claim is never *wrong* — this keeps the set proportional to the screen rather than to
+    /// the session, which is the difference between a debug aid and a debug leak.
+    #[cfg(debug_assertions)]
+    fn release_front_claims(&mut self) {
+        let nodes = &self.nodes;
+        self.front_owned.retain(|&(id, _)| nodes.get(id).is_some());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the debug twin edits the claim set; matching signatures is the point"
+    )]
+    const fn release_front_claims(&mut self) {}
+
+    /// Fires where the app writes a channel [`retarget`](Scene::retarget) claimed, with both
+    /// writers' identities in hand. Ids are generational, so a destroyed and reminted node
+    /// does not inherit a claim.
+    #[cfg(debug_assertions)]
+    fn check_not_front_owned(&self, id: NodeId, prop: Prop) {
+        assert!(
+            !self.front_owned.contains(&(id, prop)),
+            "{prop:?} on {id:?} is driven from the front thread, and the app has just \
+             written it"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the debug twin reads the claim set; matching signatures is the point"
+    )]
+    const fn check_not_front_owned(&self, _: NodeId, _: Prop) {}
+
     fn bind_channel(
         &mut self,
         id: NodeId,
@@ -455,6 +543,9 @@ impl Scene {
                     .nodes
                     .get_mut(id)
                     .is_some_and(|node| prop::set(node, prop, value));
+                if written {
+                    self.resize_captures(id, prop, env);
+                }
                 self.census.count(written);
             }
             Bind::Animate(anim) => self.animate(id, prop, anim, patch, back),
@@ -466,6 +557,35 @@ impl Scene {
             Bind::Stop => self.stop(id, prop),
         }
         Ok(())
+    }
+
+    /// Brings a node's captures up to date with the box it now occupies.
+    ///
+    /// A capture states a region in the source's own space, so it is the one realized thing
+    /// that does not follow its sprite: a shape or a glow whose box moved keeps describing
+    /// the old one and draws at the wrong scale. Correcting it is **three property sets and
+    /// no re-tessellation** — the geometry object is untouched, no verbs cross the seam, and
+    /// the app thread is not involved. That is what makes a live window-edge drag over a
+    /// screen of paths cost what a resize should cost.
+    ///
+    /// Only a size can invalidate one, so this asks before it looks: a move, an opacity and
+    /// a rotation all land through the same setter and none of them changes the region.
+    fn resize_captures(&mut self, id: NodeId, prop: Prop, env: Env) {
+        if !matches!(prop, Prop::Size | Prop::SizeX | Prop::SizeY) {
+            return;
+        }
+        let scale = env.scale();
+        let Some(node) = self.nodes.get_mut(id) else {
+            return;
+        };
+        let size = node.size();
+        if let Some(shape) = node.shape.as_ref() {
+            shape.host.set_size(size.x, size.y);
+            shape.captured.resize(size, scale);
+        }
+        if let Some(shadow) = node.shadow.as_ref() {
+            shadow.captured.resize(size, scale);
+        }
     }
 
     fn animate(&mut self, id: NodeId, prop: Prop, anim: Anim, patch: &SinkPatch, back: &Backends) {

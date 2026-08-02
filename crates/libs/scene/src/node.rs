@@ -8,9 +8,9 @@ use crate::id::Id;
 use crate::sink::{Clip, Mask, NodeId, NodeKind, Paint};
 use crate::tree::{Forest, Links};
 use windows_composition::{
-    CompositionBrush, CompositionGeometricClip, CompositionMaskBrush, CompositionPathGeometry,
-    CompositionSpriteShape, CompositionSurfaceBrush, DropShadow, RectangleClip, ShapeVisual,
-    SpriteVisual, Visual,
+    Captured, CompositionBrush, CompositionGeometricClip, CompositionMaskBrush,
+    CompositionPathGeometry, CompositionSpriteShape, CompositionSurfaceBrush, DropShadow,
+    RectangleClip, ShapeVisual, SpriteVisual, Visual,
 };
 
 /// How many channels a node's own visual carries: offset, size and scale as pairs, plus a
@@ -241,13 +241,13 @@ impl ClipState {
 /// the wrong one is refused outright — which is what splits the shadow here rather than
 /// keeping one array over both.
 pub(crate) struct ShapeState {
-    /// The off-tree visual the capture reads. Held because nothing else does, and a resize
-    /// has to re-size it.
-    #[expect(
-        dead_code,
-        reason = "anchors the captured subtree; resize will read it"
-    )]
+    /// The off-tree visual the capture reads. Held because nothing else does, and because a
+    /// resize has to re-size it.
     pub(crate) host: ShapeVisual,
+    /// The capture, kept so a box that moves can correct it. Without this a path keeps the
+    /// extent it was built at, and every path on a resizable surface draws at the wrong
+    /// scale from the first frame the window is dragged.
+    pub(crate) captured: Captured,
     pub(crate) shape: CompositionSpriteShape,
     pub(crate) geometry: CompositionPathGeometry,
     /// Start and end of the draw-on window, on the geometry.
@@ -259,6 +259,9 @@ pub(crate) struct ShapeState {
 /// The blur a [`Paint::Captured`] glow rides on.
 pub(crate) struct ShadowState {
     pub(crate) shadow: DropShadow,
+    /// The silhouette being blurred, kept for the same reason a shape's is: the halo is a
+    /// capture of the box, and a box that moved leaves it describing the old one.
+    pub(crate) captured: Captured,
     pub(crate) chans: [f32; SHADOW_CHANS],
 }
 

@@ -132,6 +132,8 @@ pub use animatable::{Animatable, CompositionObject};
 #[cfg(feature = "system")]
 pub use clip::{Clip, CompositionClip, CompositionGeometricClip, InsetClip, RectangleClip};
 #[cfg(feature = "system")]
+pub use idiom::Captured;
+#[cfg(feature = "system")]
 pub use interactions::{
     BindingAxes, ChainingMode, Clamping, InertiaModifier, InteractionTracker, RedirectionMode,
     RequestId, ScaleAnimationPolicy, SourceMode, TrackerEvent, VisualInteractionSource, WheelMode,

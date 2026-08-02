@@ -159,13 +159,18 @@ impl Mask {
 
     /// Which invalidation generations a chain built from this mask reads.
     ///
-    /// Only the cache-backed alpha reads any: re-rasterizing a *shared* resource moves the
-    /// one brush every sprite holds, so the sprite has nothing to rebuild.
+    /// A *shared* resource reads none of them: re-rasterizing one moves the single brush
+    /// every sprite already holds, so the sprite has nothing to rebuild. A shape is the
+    /// exception, and it is not a shared resource that makes it one — the geometry is
+    /// shared, but the **capture around it is per-sprite** and states its region in
+    /// pixels, so a grid that moves leaves it describing the wrong number of them. A
+    /// resize corrects that from the size itself; a DPI change carries no size, because
+    /// the DIP rect did not move.
     #[must_use]
     pub const fn deps(self) -> GenMask {
         match self {
-            Self::Box { .. } => GenMask::GEOMETRY,
-            Self::Run(_) | Self::Shape { .. } | Self::None => GenMask::NONE,
+            Self::Box { .. } | Self::Shape { .. } => GenMask::GEOMETRY,
+            Self::Run(_) | Self::None => GenMask::NONE,
         }
     }
 }
@@ -206,12 +211,15 @@ impl Paint {
 
     /// Which invalidation generations a chain built from this paint reads.
     ///
-    /// The two carrying authored light through the output transform; the two backed by a
-    /// shared surface read nothing, for the reason [`Mask::deps`] gives.
+    /// A solid carries authored light through the output transform, so it reads the light
+    /// generation. A glow reads that *and* the grid: its tint goes through the same
+    /// transform, and it is a capture, so it states a region in pixels for the reason
+    /// [`Mask::deps`] gives. The two backed by a shared surface read neither.
     #[must_use]
     pub const fn deps(self) -> GenMask {
         match self {
-            Self::Solid(_) | Self::Captured { .. } => GenMask::LIGHT,
+            Self::Solid(_) => GenMask::LIGHT,
+            Self::Captured { .. } => GenMask::LIGHT.union(GenMask::GEOMETRY),
             Self::Ramp(_) | Self::Presented(_) => GenMask::NONE,
         }
     }
@@ -746,6 +754,30 @@ mod tests {
             let travelled = (to[0] - from[0]).abs() + (to[1] - from[1]).abs();
             assert!(travelled >= 1.0, "{axis:?} travels {travelled}");
         }
+    }
+
+    /// Everything realized through a **capture** reads the pixel grid.
+    ///
+    /// The regression this closes has no visible trigger: a capture states its region in
+    /// pixels, so a monitor DPI change leaves it describing the wrong number of them — and
+    /// it carries no size, because the DIP rect did not move. Nothing else would notice.
+    #[test]
+    fn a_capture_reads_the_pixel_grid() {
+        let shape = Mask::Shape {
+            geom: GeomId::FIRST,
+            stroke: None,
+        };
+        assert_eq!(shape.deps(), GenMask::GEOMETRY);
+        let glow = Paint::Captured {
+            group: GroupId::default(),
+            blur: 4.0,
+            tint: Radiance::new(1.0, 1.0, 1.0, 1.0),
+        };
+        assert_eq!(glow.deps(), GenMask::LIGHT.union(GenMask::GEOMETRY));
+        // And a shared resource still reads nothing: re-rasterizing one moves the brush
+        // every sprite already holds.
+        assert_eq!(Mask::Run(RunId::FIRST).deps(), GenMask::NONE);
+        assert_eq!(Paint::Ramp(RampId::FIRST).deps(), GenMask::NONE);
     }
 
     #[test]

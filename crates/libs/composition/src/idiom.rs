@@ -61,17 +61,45 @@ impl Compositor {
     /// The brush is set to stretch [`Fill`](crate::Stretch::Fill) from a `(0, 0)`
     /// alignment, because the caller has just declared the surface's size: composition's
     /// own defaults would letterbox it and centre it inside the sprite instead.
-    pub fn capture(&self, source: &Visual, size: Vector2, scale: f32) -> CompositionSurfaceBrush {
+    pub fn capture(&self, source: &Visual, size: Vector2, scale: f32) -> Captured {
         let surface = self.create_visual_surface();
         surface.set_source_visual(source);
-        surface.set_source_offset(Vector2 { x: 0.0, y: 0.0 });
-        surface.set_source_size(Vector2 {
-            x: size.x * scale,
-            y: size.y * scale,
-        });
         let brush = self.create_surface_brush(&surface);
         brush.set_stretch(Stretch::Fill);
         brush.set_alignment_ratio(0.0, 0.0);
-        brush
+        let captured = Captured { surface, brush };
+        captured.resize(size, scale);
+        captured
+    }
+}
+
+/// A captured subtree: the surface that reads it, and the brush that paints with it.
+///
+/// The two are kept together because a capture's extent has to be **restated whenever the
+/// box it stands for moves**, and only the surface can be told. A caller holding the brush
+/// alone can paint with a capture but can never correct one, which is the shape that makes
+/// a resized path draw at its old size.
+pub struct Captured {
+    pub surface: CompositionVisualSurface,
+    pub brush: CompositionSurfaceBrush,
+}
+
+impl Captured {
+    /// States the region captured, in the source's own coordinate space.
+    ///
+    /// **The one place a capture's extent is written**, called by the construction above
+    /// and by every resize. Two places would be two conventions, and the failure mode for
+    /// getting the second one wrong is silent mis-sizing rather than an error — a curve
+    /// that draws at the wrong scale, on the frame after a window edge moved.
+    ///
+    /// The scale is here and not on the source visual because a visual surface captures
+    /// *content*: scaling the source changes nothing about what lands in the surface, so
+    /// whatever geometry is inside it must be scaled by the same factor separately.
+    pub fn resize(&self, size: Vector2, scale: f32) {
+        self.surface.set_source_offset(Vector2 { x: 0.0, y: 0.0 });
+        self.surface.set_source_size(Vector2 {
+            x: size.x * scale,
+            y: size.y * scale,
+        });
     }
 }

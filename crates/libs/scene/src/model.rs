@@ -579,6 +579,27 @@ impl Model {
     /// below lands on the grid the rasters on the other side of the seam are built for,
     /// because there is one number and not two.
     pub fn flush(&mut self, patch: &mut SinkPatch, env: Env) {
+        self.solve(env);
+        // Stamped with what it was solved under, so the far side can tell geometry
+        // snapped to this pixel grid from geometry snapped to another.
+        self.pending.env = Some(env);
+        core::mem::swap(&mut self.pending, patch);
+        self.pending.clear();
+    }
+
+    /// Brings the solved layout and the hit array up to date, **without** handing the patch
+    /// over.
+    ///
+    /// Split out of [`flush`](Model::flush) for one caller and one reason: a consumer whose
+    /// declarations depend on solved geometry — shaped text, which is laid out at the width
+    /// layout gave it — would otherwise have to emit into the *next* patch and arrive a
+    /// frame after the box it was measured for. Calling this, reading [`solved`](Model::solved),
+    /// declaring, and then flushing puts both in the patch that carries the layout they
+    /// agree with.
+    ///
+    /// Idempotent: a second call with nothing changed does nothing, so `flush` needs no
+    /// flag to say whether this already ran.
+    pub fn solve(&mut self, env: Env) {
         // A pixel grid that moved re-snaps every edge in the tree, so it is a solve.
         if self.env.replace(env).is_some_and(|last| last != env) {
             self.solve_dirty = true;
@@ -598,12 +619,6 @@ impl Model {
             self.build_hits();
             self.hits_dirty = false;
         }
-
-        // Stamped with what it was solved under, so the far side can tell geometry
-        // snapped to this pixel grid from geometry snapped to another.
-        self.pending.env = Some(env);
-        core::mem::swap(&mut self.pending, patch);
-        self.pending.clear();
     }
 
     fn push_dirty_children(&mut self) {

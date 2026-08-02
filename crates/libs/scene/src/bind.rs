@@ -254,10 +254,11 @@ impl Realizer<'_> {
         shape.set_scale(Vector2 { x: scale, y: scale });
         host.shapes().append(&shape);
 
-        let brush = self
+        let captured = self
             .back
             .compositor
             .capture(&crate::base_of_shape(&host), size, scale);
+        let brush = captured.brush.clone();
 
         // A promotion keeps whatever the channels had reached, so a shape that acquires a
         // trim mid-animation does not restart from the identity. Fresh, the window is the
@@ -268,6 +269,7 @@ impl Realizer<'_> {
             .map_or(([0.0, 1.0], [1.0, 0.0]), |s| (s.trim, s.stroke));
         node.shape = Some(ShapeState {
             host,
+            captured,
             shape,
             geometry,
             trim,
@@ -297,10 +299,11 @@ impl Realizer<'_> {
             .back
             .compositor
             .capture(source, node.size(), self.env.scale());
+        let brush = captured.brush.clone();
 
         let shadow = self.back.compositor.create_drop_shadow();
         shadow.set_blur_radius(blur);
-        shadow.set_mask(&captured);
+        shadow.set_mask(&brush);
         // At zero offset a shadow *is* a glow. Its colour is eight-bit, and that is the
         // right precision for it — a shadow is darkness rather than light and never needs to
         // exceed the display's white — so the authored tint goes through the display
@@ -310,8 +313,12 @@ impl Realizer<'_> {
         node.sprite.as_ref()?.set_shadow(&shadow);
 
         let chans = node.shadow.as_ref().map_or([blur, 1.0], |s| s.chans);
-        node.shadow = Some(ShadowState { shadow, chans });
-        Some(captured)
+        node.shadow = Some(ShadowState {
+            shadow,
+            captured,
+            chans,
+        });
+        Some(brush)
     }
 }
 
