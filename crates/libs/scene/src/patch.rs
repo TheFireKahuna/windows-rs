@@ -41,25 +41,46 @@ pub enum Op {
     },
     /// Destroys a node **and its subtree**, decrementing every resource on the way down.
     /// A subtree removal is one op, and a partial destroy is not expressible.
-    Drop { id: NodeId, exit: Exit },
-    Mask { id: SpriteId, mask: Mask },
-    Paint { id: SpriteId, paint: Paint },
+    Drop {
+        id: NodeId,
+        exit: Exit,
+    },
+    Mask {
+        id: SpriteId,
+        mask: Mask,
+    },
+    Paint {
+        id: SpriteId,
+        paint: Paint,
+    },
     /// What a node's subtree may draw inside.
     ///
     /// Its own op because a clip's *kind* identifies rather than animates — a rectangle
     /// and a geometry are different objects, not different values of one — and because it
     /// is addressed to a `NodeId`: groups clip, and a group has no mask or paint to carry
     /// it on. The sides and radii are channels of whatever this mints.
-    Clip { id: NodeId, clip: Clip },
-    Bind { id: NodeId, prop: Prop, bind: Bind },
-    Res { id: ResId, op: ResOp },
+    Clip {
+        id: NodeId,
+        clip: Clip,
+    },
+    Bind {
+        id: NodeId,
+        prop: Prop,
+        bind: Bind,
+    },
+    Res {
+        id: ResId,
+        op: ResOp,
+    },
     Tracker {
         id: crate::id::Id<Tracker>,
         op: TrackerOp,
     },
     /// Replaces the whole hit table. Not a per-frame path: the array is rebuilt when
     /// layout changed and at no other time.
-    Hits { entries: Span },
+    Hits {
+        entries: Span,
+    },
 }
 
 /// A pending patch: the ops, and the buffers their payloads live in.
@@ -75,7 +96,9 @@ pub struct SinkPatch {
     pub(crate) frames: Vec<(f32, Value, Easing)>,
     pub(crate) dashes: Vec<f32>,
     pub(crate) hits: Vec<HitEntry>,
-    pub(crate) segs: Vec<GlyphSeg>,
+    /// Segments *and* the glyph data they span, in one type. They are pooled together and
+    /// cleared together because a segment addressing a buffer it did not travel with is a
+    /// span into the wrong bytes; `windows-text` appends straight into this.
     pub(crate) text: SegBuffers,
     /// The environment this patch's geometry was solved under. `None` on a patch that has
     /// not been flushed.
@@ -112,7 +135,6 @@ impl SinkPatch {
         self.frames.clear();
         self.dashes.clear();
         self.hits.clear();
-        self.segs.clear();
         self.text.clear();
     }
 
@@ -141,6 +163,9 @@ impl SinkPatch {
     }
 
     /// The glyph buffers, for a producer appending a shaped run into them.
+    ///
+    /// `ShapedRun::segments` appends here and returns the span naming what it wrote, so a
+    /// run reaches the patch without a copy in between.
     pub fn text(&mut self) -> &mut SegBuffers {
         &mut self.text
     }
@@ -171,7 +196,7 @@ impl SinkPatch {
     }
 
     pub(crate) fn push_segs(&mut self, segs: &[GlyphSeg]) -> Span {
-        Self::extend(&mut self.segs, segs)
+        Self::extend(&mut self.text.segs, segs)
     }
 
     /// The hit table's buffer, written straight into rather than through an intermediate.
@@ -216,7 +241,7 @@ impl SinkPatch {
     }
 
     pub(crate) fn segs(&self, span: Span) -> &[GlyphSeg] {
-        span.of(&self.segs)
+        span.of(&self.text.segs)
     }
 
     pub(crate) fn hits(&self, span: Span) -> &[HitEntry] {

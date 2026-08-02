@@ -137,7 +137,10 @@ impl Scene {
                 .and_then(|n| n.visual.as_container())
                 .map(|c| c.children()),
         ) else {
-            debug_assert!(false, "a node was parented under one that is no longer live");
+            debug_assert!(
+                false,
+                "a node was parented under one that is no longer live"
+            );
             return;
         };
         match after.and_then(|sibling| self.nodes.get(sibling).map(|n| n.visual.clone())) {
@@ -148,7 +151,10 @@ impl Scene {
     }
 
     fn unlink(&mut self, id: NodeId) {
-        let Some((parent, visual)) = self.nodes.get(id).map(|n| (n.links.parent, n.visual.clone()))
+        let Some((parent, visual)) = self
+            .nodes
+            .get(id)
+            .map(|n| (n.links.parent, n.visual.clone()))
         else {
             return;
         };
@@ -349,7 +355,8 @@ impl Scene {
                     (Prop::CornerBottomLeftY, radius.bl),
                 ];
                 for (prop, value) in declared {
-                    self.census.count(prop::set(node, prop, Value::Scalar(value)));
+                    self.census
+                        .count(prop::set(node, prop, Value::Scalar(value)));
                 }
                 Ok(minted)
             }
@@ -412,7 +419,11 @@ impl Scene {
         let desc = prop::desc(prop);
         // The owner may not exist yet, and what that means differs per owner — see
         // `prop::absent`.
-        if !self.nodes.get(id).is_some_and(|n| prop::has_owner(n, desc.owner)) {
+        if !self
+            .nodes
+            .get(id)
+            .is_some_and(|n| prop::has_owner(n, desc.owner))
+        {
             match prop::absent(desc.owner) {
                 Absent::MintClip => {
                     if self.mint_rect_clip(id, back) {
@@ -596,13 +607,15 @@ impl Scene {
                     });
                 }
             }
-            ResOp::Run { segs, origin, px } => {
-                let run = back.raster_run(env, patch.segs(segs), patch.glyphs(), origin, px)?;
+            ResOp::Run { segs, ink } => {
+                let run = back.raster_run(env, patch.segs(segs), patch.glyphs(), ink)?;
                 if let Some(surface) = run {
-                    // `Stretch::None`: a coverage tile is at device resolution and is
-                    // placed, not scaled. Stretching it makes text soft for no reason.
+                    // A tile's pixel extent is its `Ink` at the current scale, so a
+                    // sprite sized to that same `Ink` samples one texel per physical pixel
+                    // and nothing resamples. Fill is what makes that identity hold at every
+                    // scale; a natural-size stretch would map a texel to a DIP.
                     self.res.runs.point(id.cast::<Run>(), &surface, || {
-                        back.brush(&surface, Stretch::None)
+                        back.brush(&surface, Stretch::Fill)
                     });
                 }
             }

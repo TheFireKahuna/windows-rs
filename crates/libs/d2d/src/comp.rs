@@ -35,29 +35,53 @@ impl Gpu {
     }
 }
 
-/// Allocates the surfaces this stack's retained content is rasterized into.
+/// Allocates the surfaces retained content is rasterized into.
 ///
-/// The only allocator, which is the point: a mask cell or a colour cell that came through
-/// here cannot be 8-bit, so the compositor never gets a surface it would treat as sRGB and
-/// colour-manage on terms this pipeline does not control.
-pub trait Fp16Surface: Sealed {
-    /// A surface `px` **whole pixels** in size.
+/// The only allocator, which is the point: **no colour reaches the compositor at eight
+/// bits**, so it never gets a surface it would treat as sRGB and colour-manage on terms
+/// this pipeline does not control.
+///
+/// That rule is about colour, and a mask has none. [`mask`](Self::mask) allocates one alpha
+/// channel — an eighth of [`color`](Self::color)'s memory for the same coverage. Two
+/// methods and not one with a flag, because only one of them can fail for a reason the
+/// caller has to handle.
+pub trait SceneSurface: Sealed {
+    /// A scene-linear colour surface `px` **whole pixels** in size.
     ///
     /// Pixels and not DIPs because a cache keys its content by pixel extent, and the
     /// DIP-sized allocator converts by the current scale and rounds — so it cannot express
     /// "exactly N wide", which is what the key means.
-    fn fp16(&self, px: (i32, i32), opacity: Opacity) -> Result<CompositionDrawingSurface>;
+    fn color(&self, px: (i32, i32), opacity: Opacity) -> Result<CompositionDrawingSurface>;
+
+    /// A coverage surface `px` **whole pixels** in size: one alpha channel and no colour.
+    ///
+    /// Always premultiplied and always translucent — an opaque mask is not a mask.
+    ///
+    /// `Err` where the device has no `A8`, which is how support is discovered: the format
+    /// is not universal and there is no query for it. A caller falls back to
+    /// [`color`](Self::color), which is correct and eight times the memory, and should
+    /// remember the answer rather than ask per surface.
+    fn mask(&self, px: (i32, i32)) -> Result<CompositionDrawingSurface>;
 }
 
 impl Sealed for CompositionGraphicsDevice {}
 
-impl Fp16Surface for CompositionGraphicsDevice {
-    fn fp16(&self, px: (i32, i32), opacity: Opacity) -> Result<CompositionDrawingSurface> {
+impl SceneSurface for CompositionGraphicsDevice {
+    fn color(&self, px: (i32, i32), opacity: Opacity) -> Result<CompositionDrawingSurface> {
         let alpha = match opacity {
             Opacity::Translucent => AlphaMode::Premultiplied,
             Opacity::Opaque => AlphaMode::Ignore,
         };
         self.create_drawing_surface_with_pixel_size(px.0, px.1, PixelFormat::Rgba16Float, alpha)
+    }
+
+    fn mask(&self, px: (i32, i32)) -> Result<CompositionDrawingSurface> {
+        self.create_drawing_surface_with_pixel_size(
+            px.0,
+            px.1,
+            PixelFormat::A8UNorm,
+            AlphaMode::Premultiplied,
+        )
     }
 }
 

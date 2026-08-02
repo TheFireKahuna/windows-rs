@@ -5,6 +5,9 @@
 //! `(offset, count)`. Nothing thread-affine can enter, because there is nowhere in these
 //! types for it to go.
 
+use crate::FaceId;
+use windows_numerics::Vector2;
+
 /// A `(offset, count)` window into one of a [`SegBuffers`] buffer.
 ///
 /// Variable-length payloads travel as spans rather than as owned vectors so the thing that
@@ -54,11 +57,13 @@ impl Span {
 
 /// The typed side-buffers a shaped run's segments are appended to.
 ///
-/// Three buffers and not one: a glyph index, an advance and an offset are three different
-/// types, and packing them into a shared `f32` buffer would trade a real type for a
-/// reinterpretation at every read.
+/// Four buffers and not one: a segment, a glyph index, an advance and an offset are four
+/// different types, and packing them into a shared `f32` buffer would trade a real type
+/// for a reinterpretation at every read.
 #[derive(Debug, Default)]
 pub struct SegBuffers {
+    /// The segments themselves, addressed by the [`Span`] a line's append returned.
+    pub segs: Vec<GlyphSeg>,
     /// Glyph indices, into the face named by the segment that spans them.
     pub glyphs: Vec<u16>,
     /// Advance per glyph, in DIPs.
@@ -73,6 +78,7 @@ impl SegBuffers {
     /// This is the whole of the pooling: a consumer drains and clears, and the producer
     /// appends into capacity it already has.
     pub fn clear(&mut self) {
+        self.segs.clear();
         self.glyphs.clear();
         self.advances.clear();
         self.offsets.clear();
@@ -111,5 +117,34 @@ impl SegBuffers {
 pub struct Spans {
     pub glyphs: Span,
     pub advances: Span,
+    pub offsets: Span,
+}
+
+/// One maximal span of a shaped line drawn from a single face.
+///
+/// A line is a *list* of these and not one, because font fallback splits it: a label
+/// mixing Latin and CJK resolves to two faces, and a run that could only name one would
+/// simply fail to render the second — which is the failure mode a single-segment seam
+/// degrades into rather than an error it reports.
+///
+/// It names a [`FaceId`](crate::FaceId) and not a family, because the face fallback chose
+/// is not one the requested family names, and a glyph index is an index into a face.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct GlyphSeg {
+    /// The face every glyph index here is an index into.
+    pub face: FaceId,
+    /// Em size in DIPs, as shaped.
+    pub em: f32,
+    /// Bidi embedding level; odd means the segment advances leftward from `origin`.
+    pub bidi: u32,
+    /// Baseline origin relative to the tile's top-left, in DIPs. Carried rather than
+    /// folded from advances, so a bidi line — where visual order and advance order
+    /// disagree — needs no second rule.
+    pub origin: Vector2,
+    /// Glyph indices, in the buffers this segment was appended to.
+    pub glyphs: Span,
+    /// Advance per glyph, in DIPs.
+    pub advances: Span,
+    /// Displacement per glyph, in DIPs.
     pub offsets: Span,
 }

@@ -19,10 +19,10 @@
 use crate::quant::{Q, extent_px, snap_detail};
 use crate::sink::Corners;
 use rustc_hash::FxHashMap;
-use windows_composition::{CompositionDrawingSurface, CompositionSurfaceBrush, Stretch};
 use windows_color::Scrgb;
+use windows_composition::{CompositionDrawingSurface, CompositionSurfaceBrush, Stretch};
 use windows_core::Result;
-use windows_d2d::{Draw, Fp16Surface, Gpu, Opacity, Rect, Solid, SurfaceDraw};
+use windows_d2d::{Draw, Gpu, Opacity, Rect, SceneSurface, Solid, SurfaceDraw};
 
 /// What invalidates a rasterized cell.
 ///
@@ -102,6 +102,12 @@ impl GenMask {
 pub trait Cell: Clone + Eq + core::hash::Hash {
     /// Which invalidation generations this family reads.
     const DEPS: GenMask;
+    /// Whether this family carries coverage rather than colour.
+    ///
+    /// A coverage cell is allocated one byte a pixel, at an eighth of the memory. A colour
+    /// family declared as coverage loses its colour outright.
+    const COVERAGE: bool;
+
     /// The device resources this family draws with — **built once per device, never per
     /// cell**.
     ///
@@ -119,7 +125,8 @@ pub trait Cell: Clone + Eq + core::hash::Hash {
 
     /// Pixel extent. Already snapped — the key's constructor did it.
     fn px(&self) -> (u32, u32);
-    /// What the content does with alpha, which decides the surface's alpha mode.
+    /// What the content does with alpha, which decides the surface's alpha mode. Coverage
+    /// is always translucent: an opaque mask is not a mask.
     fn opacity(&self) -> Opacity;
     /// Paints at `(0, 0)` in DIPs.
     fn draw(&self, d: &Draw<'_>, res: &Self::Res) -> Result<()>;
@@ -226,7 +233,12 @@ impl<K: Cell> Cache<K> {
         let res = self.res.as_ref().expect("built on the line above");
         let (w, h) = key.px();
         let opacity = key.opacity();
-        let surface = back.graphics().fp16((w as i32, h as i32), opacity)?;
+        let px = (w as i32, h as i32);
+        let surface = if K::COVERAGE {
+            back.mask_surface(px)?
+        } else {
+            back.graphics().color(px, opacity)?
+        };
         // One `BeginDraw` per graphics device at a time — a concurrent second fails
         // outright. Here that is a consequence of ownership rather than a rule to keep:
         // every rasterization in this crate happens behind one `&mut Scene` on one thread,
@@ -347,11 +359,11 @@ impl BoxKey {
     fn corners(&self, scale: f32) -> [f32; 4] {
         self.radius.map(|q| q as f32 / (4.0 * scale))
     }
-
 }
 
 impl Cell for BoxKey {
     const DEPS: GenMask = GenMask::GEOMETRY;
+    const COVERAGE: bool = true;
     type Res = BoxRes;
 
     fn resources(gpu: &Gpu) -> Result<Self::Res> {
@@ -443,6 +455,9 @@ impl SolidKey {
 
 impl Cell for SolidKey {
     const DEPS: GenMask = GenMask::LIGHT;
+    /// **The draw choke.** This is the one place authored light becomes a display-referred
+    /// value, so it is the last thing in the crate that could afford to lose its colour.
+    const COVERAGE: bool = false;
     /// None at all: the whole cell is one colour, and clearing takes a colour rather than a
     /// brush. A family that needs no device resource says so in its type.
     type Res = ();
@@ -541,8 +556,16 @@ mod tests {
             a: 0.5,
         });
         let back = key.0.dequant();
-        assert!(back.r > 11.9, "an above-white channel was crushed to {}", back.r);
-        assert!(back.g < 0.0, "a wide-gamut channel was crushed to {}", back.g);
+        assert!(
+            back.r > 11.9,
+            "an above-white channel was crushed to {}",
+            back.r
+        );
+        assert!(
+            back.g < 0.0,
+            "a wide-gamut channel was crushed to {}",
+            back.g
+        );
         assert_eq!(key.opacity(), Opacity::Translucent);
     }
 }

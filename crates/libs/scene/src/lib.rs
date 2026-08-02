@@ -102,6 +102,18 @@ pub enum SceneEvent {
     GhostReleased,
     /// The device was lost and everything under it has been rebuilt.
     DeviceRebuilt,
+    /// The pixel grid moved, so the resources rasterized *at device resolution* are at the
+    /// wrong one.
+    ///
+    /// That is coverage tiles and nothing else: a gradient is a fixed strip stretched to
+    /// fill, geometry is vector, and a colour cell is four texels of one value. The
+    /// response is to re-emit every run through [`Model::set_run`](crate::Model::set_run),
+    /// which re-points the brush each sprite already holds.
+    ///
+    /// Same rule as [`DeviceRebuilt`](Self::DeviceRebuilt): **the surfaces behind shared
+    /// resources are the model's to re-emit.** Keeping a copy of every run's glyphs here to
+    /// redraw from would be a second lifetime mechanism for data the model holds.
+    ScaleChanged { scale: f32 },
 }
 
 /// The front thread's half of the scene.
@@ -122,7 +134,10 @@ pub enum SceneEvent {
 /// publish** and an idle window publishes nothing because it never ticks. Hence the rule:
 /// composition objects are touched *inside* the tick and nowhere else.
 pub struct Scene {
-    #[expect(dead_code, reason = "held to keep the visual tree attached to the window")]
+    #[expect(
+        dead_code,
+        reason = "held to keep the visual tree attached to the window"
+    )]
     target: DesktopWindowTarget,
     /// What has been invalidated since the tree was realized.
     pub(crate) generation: Gen,
@@ -158,7 +173,9 @@ impl Scene {
     /// that is where every tracker callback lands and where every publish happens. `wake`
     /// is the window's own frame clock, which exit animations hold open while they play.
     pub fn new(window: &Window, back: &Backends, wake: Wake) -> Result<Self> {
-        let target = back.compositor.create_desktop_window_target(window, false)?;
+        let target = back
+            .compositor
+            .create_desktop_window_target(window, false)?;
         let motion = Motion::new(&back.compositor);
 
         let root_visual = back.compositor.create_container_visual();
@@ -291,8 +308,19 @@ impl Scene {
         if last == env {
             return Ok(());
         }
-        self.generation.dpi = self.generation.dpi.wrapping_add(u32::from(last.geometry_moved(env)));
-        self.generation.color = self.generation.color.wrapping_add(u32::from(last.light_moved(env)));
+        let grid_moved = last.geometry_moved(env);
+        self.generation.dpi = self.generation.dpi.wrapping_add(u32::from(grid_moved));
+        self.generation.color = self
+            .generation
+            .color
+            .wrapping_add(u32::from(last.light_moved(env)));
+        // Cache-backed cells re-rasterize themselves from their keys; a coverage tile is
+        // keyed by nothing this side holds, so the model is told and re-emits it.
+        if grid_moved {
+            self.events
+                .borrow_mut()
+                .push(SceneEvent::ScaleChanged { scale: env.scale() });
+        }
         self.refresh(back, env)
     }
 

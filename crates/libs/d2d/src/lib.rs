@@ -68,13 +68,13 @@ pub use geometry::{
     Bezier, Combine, Ellipse, End, Figure, Path, Realization, Rect, RoundedRect, Shape, Sink,
 };
 pub use pass::{
-    Additive, Aliased, Clipped, Draw, GlyphRun, Layer, Layered, Pass, PassError,
-    TextParams, Transformed,
+    Additive, Aliased, Clipped, Draw, GlyphRun, Layer, Layered, Pass, PassError, TextParams,
+    Transformed,
 };
 pub use target::{Opacity, Readback, Target};
 
 #[cfg(feature = "composition")]
-pub use comp::{Fp16Surface, SurfaceDraw};
+pub use comp::{SceneSurface, SurfaceDraw};
 
 pub use windows_color::Scrgb;
 pub use windows_core::Result;

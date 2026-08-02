@@ -19,7 +19,7 @@
 --filter
     DWriteCreateFactory
     DWRITE_FACTORY_TYPE_SHARED
-    IDWriteFactory::{GetSystemFontCollection, CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign, CreateCustomRenderingParams}
+    IDWriteFactory::{GetSystemFontCollection, CreateTextFormat, CreateTextLayout, CreateEllipsisTrimmingSign, CreateCustomRenderingParams, CreateTypography}
     IDWriteFactory1
     IDWriteFactory2::{TranslateColorGlyphRun, CreateGlyphRunAnalysis}
     IDWriteFactory3
@@ -33,7 +33,7 @@
     IDWriteTextFormat1
     IDWriteTextFormat2
     IDWriteTextFormat3::{SetFontAxisValues, SetAutomaticFontAxes}
-    IDWriteTextLayout::{SetMaxWidth, SetMaxHeight, GetMetrics, HitTestPoint, HitTestTextPosition, SetFontWeight, SetFontStyle, SetFontStretch, SetUnderline, SetStrikethrough, SetDrawingEffect, HitTestTextRange, Draw}
+    IDWriteTextLayout::{SetMaxWidth, SetMaxHeight, GetMetrics, GetLineMetrics, GetOverhangMetrics, DetermineMinWidth, HitTestPoint, HitTestTextPosition, SetFontWeight, SetFontStyle, SetFontStretch, SetTypography, SetUnderline, SetStrikethrough, SetDrawingEffect, HitTestTextRange, Draw}
     IDWriteTextLayout1::SetCharacterSpacing
     IDWriteTextLayout2
     IDWriteTextLayout3
@@ -55,6 +55,13 @@
     DWRITE_TRIMMING_GRANULARITY_WORD
     DWRITE_HIT_TEST_METRICS
     DWRITE_TEXT_METRICS
+    DWRITE_LINE_METRICS
+    DWRITE_OVERHANG_METRICS
+// Typographic features. Tabular figures are the one this stack requires: a numeric
+// read-out whose digits share an advance does not jitter as the value changes.
+    IDWriteTypography::AddFontFeature
+    DWRITE_FONT_FEATURE
+    DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES
 // Variable-font axes. Optical size must be set explicitly: leaving it automatic
 // makes a size change reshape rather than rescale.
     DWRITE_FONT_AXIS_VALUE
@@ -74,6 +81,13 @@
     DWRITE_FONT_WEIGHT
     DWRITE_FONT_STYLE
     DWRITE_FONT_STRETCH
+// Fallback resolves a face the requested family does not name, and glyph indices are
+// face-specific — so a segment naming only what was *asked for* renders the fallback
+// run's ids through the wrong face. The app half therefore reads back what DirectWrite
+// actually chose and interns it; the front half resolves that description through the
+// lookup above. Nothing else here round-trips.
+    IDWriteFontFace3::{GetFamilyNames, GetWeight, GetStyle, GetStretch}
+    IDWriteLocalizedStrings::{GetStringLength, GetString}
 
 // ── Runs, faces, and metrics ──────────────────────────────────────────────────
     IDWriteTextRenderer

@@ -376,7 +376,10 @@ impl Axis {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PathVerb {
     /// Starts a figure. `filled` decides whether it contributes to the fill region.
-    Move { to: Vector2, filled: bool },
+    Move {
+        to: Vector2,
+        filled: bool,
+    },
     Line(Vector2),
     Cubic {
         c1: Vector2,
@@ -384,7 +387,9 @@ pub enum PathVerb {
         to: Vector2,
     },
     /// Ends the current figure, closing it back to the start or leaving it open.
-    End { closed: bool },
+    End {
+        closed: bool,
+    },
 }
 
 // ── binding ─────────────────────────────────────────────────────────────────────
@@ -530,7 +535,10 @@ pub enum Iterations {
 pub enum Easing {
     Linear,
     /// The CSS `cubic-bezier()` convention: two control points, each in `0..=1`.
-    Cubic { c1: Vector2, c2: Vector2 },
+    Cubic {
+        c1: Vector2,
+        c2: Vector2,
+    },
 }
 
 /// How a destroyed subtree leaves.
@@ -703,16 +711,15 @@ pub enum ResOp {
     /// cannot diverge.
     Geom { verbs: crate::Span },
     /// Gradient stops, spanning the patch's stop buffer, and the axis they run along.
-    Ramp {
-        stops: crate::Span,
-        axis: Axis,
-    },
-    /// A shaped run: fallback segments spanning the patch's segment buffer, the baseline
-    /// origin within the tile, and the tile's pixel extent.
+    Ramp { stops: crate::Span, axis: Axis },
+    /// A shaped run: fallback segments spanning the patch's segment buffer, and the tile
+    /// they occupy.
+    ///
+    /// The tile is stated in **DIPs**, like every other extent the model hands over; the
+    /// pixel grid is applied where it is rasterized, by the half that holds the scale.
     Run {
         segs: crate::Span,
-        origin: Vector2,
-        px: (u32, u32),
+        ink: windows_text::Ink,
     },
     /// Declares a region slot. The buffer itself arrives out of band, as the one kernel
     /// handle that legitimately crosses from the present thread.

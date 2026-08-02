@@ -329,7 +329,11 @@ impl<'p> Draw<'p> {
             run.glyphs.len() == run.advances.len() && run.glyphs.len() == run.offsets.len(),
             "a glyph run's indices, advances and offsets are three views of one sequence"
         );
-        let count = run.glyphs.len().min(run.advances.len()).min(run.offsets.len());
+        let count = run
+            .glyphs
+            .len()
+            .min(run.advances.len())
+            .min(run.offsets.len());
         if count == 0 {
             return;
         }
@@ -347,7 +351,7 @@ impl<'p> Draw<'p> {
             glyphAdvances: run.advances.as_ptr(),
             glyphOffsets: run.offsets.as_ptr().cast::<DWRITE_GLYPH_OFFSET>(),
             isSideways: false.into(),
-            bidiLevel: 0,
+            bidiLevel: run.bidi,
         };
         unsafe {
             self.ctx.DrawGlyphRun(
@@ -646,6 +650,10 @@ pub struct GlyphRun<'a> {
     /// Displacement per glyph, in DIPs: `[along the baseline, up from it]`. Same length
     /// as `glyphs`.
     pub offsets: &'a [[f32; 2]],
+    /// Bidi embedding level; odd means the run advances leftward from `origin`. Shaping
+    /// resolves it, and a run drawn at level 0 that was shaped at an odd one renders its
+    /// glyphs in the wrong direction rather than failing.
+    pub bidi: u32,
 }
 
 /// A pair of `f32` per glyph *is* `DWRITE_GLYPH_OFFSET`, so a run's offsets need no

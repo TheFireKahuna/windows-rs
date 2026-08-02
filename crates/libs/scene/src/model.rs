@@ -385,7 +385,11 @@ impl Model {
         self.bind(id, Prop::Offset, Bind::Set(Value::Vec2(x.offset)));
         self.bind(id, Prop::Size, Bind::Set(Value::Vec2(x.size)));
         self.bind(id, Prop::Scale, Bind::Set(Value::Vec2(x.scale)));
-        self.bind(id, Prop::RotationAngle, Bind::Set(Value::Scalar(x.rotation)));
+        self.bind(
+            id,
+            Prop::RotationAngle,
+            Bind::Set(Value::Scalar(x.rotation)),
+        );
         self.bind(id, Prop::Center, Bind::Set(Value::Vec2(x.center)));
         self.bind(id, Prop::Opacity, Bind::Set(Value::Scalar(x.opacity)));
     }
@@ -419,13 +423,18 @@ impl Model {
         }
     }
 
-    /// Records a shaped run's fallback segments and returns the span naming them. Append
-    /// the glyph data itself through [`glyphs`](Model::glyphs) first.
+    /// Copies a shaped run's fallback segments in and returns the span naming them.
+    ///
+    /// For a caller holding segments it built elsewhere. A `ShapedRun` appends straight
+    /// into [`glyphs`](Model::glyphs) and returns its own span, which is one copy fewer.
     pub fn segments(&mut self, segs: &[GlyphSeg]) -> Span {
         self.pending.push_segs(segs)
     }
 
     /// The glyph buffers a shaped run is appended into.
+    ///
+    /// `ShapedRun::segments` writes here and returns the span to hand to [`run`](Model::run),
+    /// so a run crosses without an intermediate.
     pub fn glyphs(&mut self) -> &mut windows_text::SegBuffers {
         self.pending.text()
     }
@@ -436,8 +445,10 @@ impl Model {
     pub fn geometry(&mut self, verbs: &[PathVerb]) -> GeomId {
         let id: ResId = self.res_ids.mint();
         let span = self.pending.push_verbs(verbs);
-        self.pending
-            .push_op(Op::Res { id, op: ResOp::Geom { verbs: span } });
+        self.pending.push_op(Op::Res {
+            id,
+            op: ResOp::Geom { verbs: span },
+        });
         id.cast()
     }
 
@@ -472,12 +483,12 @@ impl Model {
         });
     }
 
-    /// Mints a shaped run's coverage tile.
-    pub fn run(&mut self, segs: Span, origin: Vector2, px: (u32, u32)) -> RunId {
+    /// Mints a shaped run's coverage tile. `ink` is `ShapedRun::line_ink`, in DIPs.
+    pub fn run(&mut self, segs: Span, ink: windows_text::Ink) -> RunId {
         let id: ResId = self.res_ids.mint();
         self.pending.push_op(Op::Res {
             id,
-            op: ResOp::Run { segs, origin, px },
+            op: ResOp::Run { segs, ink },
         });
         id.cast()
     }
@@ -486,18 +497,24 @@ impl Model {
     /// re-point — and that is an event-rate operation by construction, which is what the
     /// no-live-retained-path rule requires. Text that changes at display rate belongs in a
     /// presentation region.
-    pub fn set_run(&mut self, id: RunId, segs: Span, origin: Vector2, px: (u32, u32)) {
+    ///
+    /// Also the response to [`SceneEvent::ScaleChanged`](crate::SceneEvent): a coverage
+    /// tile is the one resource rasterized at device resolution, so it is the one the model
+    /// re-emits when the grid moves.
+    pub fn set_run(&mut self, id: RunId, segs: Span, ink: windows_text::Ink) {
         self.pending.push_op(Op::Res {
             id: id.cast(),
-            op: ResOp::Run { segs, origin, px },
+            op: ResOp::Run { segs, ink },
         });
     }
 
     /// Declares a region slot. The buffer arrives out of band.
     pub fn region(&mut self) -> RegionId {
         let id: ResId = self.res_ids.mint();
-        self.pending
-            .push_op(Op::Res { id, op: ResOp::Region });
+        self.pending.push_op(Op::Res {
+            id,
+            op: ResOp::Region,
+        });
         id.cast()
     }
 
@@ -665,7 +682,10 @@ impl Model {
         }
         self.hits = builder;
 
-        let entries = Span::new(0, u32::try_from(self.pending.hits_len()).unwrap_or(u32::MAX));
+        let entries = Span::new(
+            0,
+            u32::try_from(self.pending.hits_len()).unwrap_or(u32::MAX),
+        );
         self.pending.push_op(Op::Hits { entries });
     }
 
@@ -708,7 +728,10 @@ mod tests {
     /// One display, at 96 DPI: every test here is about structure and ordering, and the
     /// environment is an input rather than a variable.
     fn env() -> Env {
-        Env::new(96.0, OutputTransform::for_display(DisplayCapability::Sdr, 203.0))
+        Env::new(
+            96.0,
+            OutputTransform::for_display(DisplayCapability::Sdr, 203.0),
+        )
     }
 
     fn root_style() -> taffy::Style {
@@ -758,7 +781,11 @@ mod tests {
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
 
         let mut patch = SinkPatch::new();
-        assert_eq!(patch.env(), None, "an unflushed patch claims no environment");
+        assert_eq!(
+            patch.env(),
+            None,
+            "an unflushed patch claims no environment"
+        );
         model.flush(&mut patch, env());
         assert_eq!(patch.env(), Some(env()));
 
@@ -783,7 +810,10 @@ mod tests {
         let mut model = Model::new(root_style());
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
 
-        let hidpi = Env::new(192.0, OutputTransform::for_display(DisplayCapability::Sdr, 203.0));
+        let hidpi = Env::new(
+            192.0,
+            OutputTransform::for_display(DisplayCapability::Sdr, 203.0),
+        );
         let mut patch = SinkPatch::new();
         model.flush(&mut patch, hidpi);
         assert_ne!(patch.env(), Some(env()));
@@ -869,10 +899,7 @@ mod tests {
         );
         model.flush(&mut patch, env());
         assert!(
-            patch
-                .ops()
-                .iter()
-                .all(|op| matches!(op, Op::Hits { .. })),
+            patch.ops().iter().all(|op| matches!(op, Op::Hits { .. })),
             "a hit declaration change emitted more than the array: {:?}",
             patch.ops()
         );
@@ -916,7 +943,11 @@ mod tests {
         model.flush(&mut patch, env());
         let entries = patch.hit_entries();
         let ids: Vec<u64> = entries.iter().map(|e| e.id.0).collect();
-        assert_eq!(ids, vec![1, 3, 2], "content, then blocker, then the overlay");
+        assert_eq!(
+            ids,
+            vec![1, 3, 2],
+            "content, then blocker, then the overlay"
+        );
         assert!(entries[1].flags.contains(HitFlags::BLOCKER));
     }
 }

@@ -19,7 +19,9 @@ d2d = ["dep:windows-d2d"]
 
 [dependencies]
 rustc-hash = { workspace = true }
-windows-core = { workspace = true }
+# `proc-macros` for `implement`: a shaped layout is walked through a DirectWrite renderer
+# callback, so the crate has to be able to be one.
+windows-core = { workspace = true, features = ["proc-macros"] }
 windows-numerics = { workspace = true }
 
 [dependencies.windows-d2d]

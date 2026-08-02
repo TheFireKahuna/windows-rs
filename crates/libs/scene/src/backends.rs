@@ -27,22 +27,30 @@
 //! what is written here is the *recipe* — what to draw, at what extent, sampled how.
 
 use crate::env::Env;
+use crate::quant::extent_px;
 use crate::sink::{Axis, PathVerb};
+use core::cell::{Cell, OnceCell};
 use windows_color::{Radiance, Scrgb};
 use windows_composition::{
     CompositionDrawingSurface, CompositionGraphicsDevice, CompositionPath, CompositionSurfaceBrush,
     Compositor, Stretch, Surface,
 };
 use windows_core::Result;
-use windows_d2d::{Extend, Fp16Surface, Gpu, Opacity, Stop, SurfaceDraw};
+use windows_d2d::{Extend, Gpu, Opacity, SceneSurface, Solid, Stop, SurfaceDraw};
 use windows_numerics::Vector2;
-use windows_text::{FontLadder, GlyphSeg, SegBuffers, TextEngine};
+use windows_text::{FontLadder, GlyphSeg, Ink, SegBuffers, TextEngine};
 
 pub struct Backends {
     pub(crate) compositor: Compositor,
     pub(crate) gpu: Gpu,
     graphics: CompositionGraphicsDevice,
     text: TextEngine,
+    /// Whether this device allocates coverage at one byte a pixel. There is no query for
+    /// it, so the failed allocation is the answer — asked once, not once per tile.
+    masks_a8: Cell<bool>,
+    /// The one opaque white brush every coverage tile draws with. White is a mask's
+    /// multiplicative identity, so it is never retinted.
+    white: OnceCell<Solid>,
 }
 
 impl Backends {
@@ -58,6 +66,8 @@ impl Backends {
             text: TextEngine::new(fonts)?,
             compositor,
             gpu: gpu.clone(),
+            masks_a8: Cell::new(true),
+            white: OnceCell::new(),
         })
     }
 
@@ -87,13 +97,51 @@ impl Backends {
     }
 
     pub(crate) fn surface(&self, px: (i32, i32)) -> Result<CompositionDrawingSurface> {
-        self.graphics.fp16(px, Opacity::Translucent)
+        self.graphics.color(px, Opacity::Translucent)
+    }
+
+    /// A coverage surface, at one byte a pixel where the device allows it.
+    ///
+    /// An FP16 mask is the same coverage, so the fallback is not a degrade: it fails over
+    /// silently, once, and every tile after takes the same route without asking.
+    pub(crate) fn mask_surface(&self, px: (i32, i32)) -> Result<CompositionDrawingSurface> {
+        if self.masks_a8.get() {
+            match self.graphics.mask(px) {
+                Ok(surface) => return Ok(surface),
+                Err(_) => self.masks_a8.set(false),
+            }
+        }
+        self.graphics.color(px, Opacity::Translucent)
+    }
+
+    /// Whether coverage is allocated at a byte a pixel on this device.
+    #[must_use]
+    pub fn masks_are_a8(&self) -> bool {
+        self.masks_a8.get()
+    }
+
+    /// The one opaque white brush every coverage tile draws with.
+    fn white(&self) -> Result<&Solid> {
+        if let Some(white) = self.white.get() {
+            return Ok(white);
+        }
+        let white = self.gpu.solid(Scrgb {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        })?;
+        Ok(self.white.get_or_init(|| white))
     }
 
     /// A brush over `surface`, anchored top-left.
     ///
     /// Composition's default is centred, which is easy to mistake for a placement bug.
-    pub(crate) fn brush(&self, surface: &impl Surface, stretch: Stretch) -> CompositionSurfaceBrush {
+    pub(crate) fn brush(
+        &self,
+        surface: &impl Surface,
+        stretch: Stretch,
+    ) -> CompositionSurfaceBrush {
         let brush = self.compositor.create_surface_brush(surface);
         brush.set_stretch(stretch);
         brush.set_alignment_ratio(0.0, 0.0);
@@ -206,49 +254,56 @@ impl Backends {
 
     /// Rasterizes one shaped run into an alpha-carrying coverage tile.
     ///
-    /// The tile is a **mask**: opaque white glyphs into premultiplied FP16, because its
-    /// colour comes from the paint beside it in the brush chain and white is the
-    /// multiplicative identity that leaves that paint alone.
+    /// The tile is a **mask**: opaque white glyphs, because its colour comes from the paint
+    /// beside it in the brush chain and white is the multiplicative identity that leaves
+    /// that paint alone.
     ///
-    /// Two things this has to get right, each a whole class of bug. Font fallback splits a
-    /// line across faces, so the segments are a list — a single-segment wire does not
-    /// degrade gracefully, it simply fails to render CJK and emoji. And the baseline is
-    /// snapped **here**: `DrawGlyphRun` takes no options parameter, so the free baseline
-    /// snapping the text-layout APIs perform is unavailable, and nothing will report a run
-    /// that landed half a pixel low. Horizontal positions stay subpixel by design —
-    /// advances carry ideal metrics that do not depend on the display resolution.
+    /// `ink` is in **DIPs**, like every other extent this crate accepts, and the pixel grid
+    /// is applied here through the same [`extent_px`] every cache key uses — one
+    /// implementation of that grid, so nothing can disagree with it at a fractional scale.
+    ///
+    /// Three things this has to get right, each a whole class of bug. Font fallback splits
+    /// a line across faces, so the segments are a list — a single-segment wire fails to
+    /// render CJK and emoji rather than degrading. Each segment carries its own origin, so
+    /// a bidi line, where visual order and advance order disagree, needs no second rule.
+    /// And the baseline is snapped **here**: `DrawGlyphRun` takes no options parameter, so
+    /// the free baseline snapping the text-layout APIs perform is unavailable and nothing
+    /// will report a run that landed half a pixel low. Horizontal positions stay subpixel
+    /// by design — advances carry ideal metrics independent of display resolution.
     pub(crate) fn raster_run(
         &self,
         env: Env,
         segs: &[GlyphSeg],
         buffers: &SegBuffers,
-        origin: Vector2,
-        px: (u32, u32),
+        ink: Ink,
     ) -> Result<Option<CompositionDrawingSurface>> {
-        let surface = self.surface((px.0 as i32, px.1 as i32))?;
+        let scale = env.scale();
+        let px = (
+            extent_px(ink.size.x, scale) as i32,
+            extent_px(ink.size.y, scale) as i32,
+        );
+        let surface = self.mask_surface(px)?;
+        let white = self.white()?;
         self.draw(&surface, env.dpi(), |d| {
             d.clear(Scrgb::TRANSPARENT);
             if segs.is_empty() {
                 return Ok(());
             }
-            let white = self.gpu.solid(Scrgb {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 1.0,
-            })?;
             // Stated rather than inherited, and as a guard so the mode cannot leak into
             // whatever the surface's context draws next. Left to inherit the system's,
             // glyphs come out systematically thin or fat and read as a font choice rather
             // than as a rasterization setting.
             let _params = d.text_params(self.text.rendering_params());
-            let baseline = Vector2 {
-                x: origin.x,
-                y: d.snap(origin.y),
+            // Every segment on a line shares one baseline, so the whole tile is nudged by
+            // what it takes to put that baseline on a physical pixel — one correction
+            // rather than a per-segment rounding that would break the shaped spacing.
+            let at = Vector2 {
+                x: 0.0,
+                y: d.snap(ink.baseline.y) - ink.baseline.y,
             };
             // Named through the trait: a `Draw` has a `line` of its own, and the two mean
             // very different things.
-            windows_text::GlyphDraw::line(d, baseline, segs, buffers, &self.text, &white);
+            windows_text::GlyphDraw::line(d, at, segs, buffers, &self.text, white);
             Ok(())
         })
     }
