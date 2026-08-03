@@ -19,7 +19,7 @@
 use std::rc::Rc;
 
 use windows_color::{DisplayCapability, OutputTransform};
-use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, NO_ENTRY, NodeId};
+use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, Ids, NO_ENTRY, NodeId};
 use windows_ui::gesture::GestureDecl;
 use windows_ui::input::{Doorbell, Inertia, Late, Report, Router};
 use windows_window::Window;
@@ -208,6 +208,15 @@ fn env() -> Env {
     )
 }
 
+/// The one control these tests route to.
+///
+/// A `ControlId` is a generational index, so it is minted rather than written: a fresh
+/// authority always hands out the same first id, which is what makes this stable across
+/// calls without any of them sharing state.
+fn target() -> ControlId {
+    Ids::<windows_scene::Control>::new().mint()
+}
+
 fn table() -> HitTable {
     let mut table = HitTable::default();
     table.replace(&[HitEntry {
@@ -219,7 +228,7 @@ fn table() -> HitTable {
         clip_parent: NO_ENTRY,
         flags: HitFlags::INTERACTIVE | HitFlags::GESTURE,
         scroll_src: NodeId::NONE,
-        id: ControlId(7),
+        id: target(),
     }]);
     table
 }
@@ -231,7 +240,7 @@ fn a_tick_with_nothing_pending_reports_nothing_and_asks_for_no_frame() {
     let pacer = window.pacer().expect("a window can be paced");
     let wake = pacer.wake();
     let mut router = Router::new(&bell, &window, wake.clone()).expect("the window is open");
-    router.declare(ControlId(7), GestureDecl::default());
+    router.declare(target(), GestureDecl::default());
 
     let hits = table();
     let mut reports = Vec::new();
@@ -259,11 +268,11 @@ fn forgetting_a_target_aborts_whatever_was_bound_to_it() {
     let window = window("windows-ui — forget");
     let pacer = window.pacer().expect("a window can be paced");
     let mut router = Router::new(&bell, &window, pacer.wake()).expect("the window is open");
-    router.declare(ControlId(7), GestureDecl::default());
+    router.declare(target(), GestureDecl::default());
 
     // Nothing is bound, so this is the no-op half — the assertion is that it stays a no-op
     // rather than counting an abort that did not happen.
-    router.forget(ControlId(7));
+    router.forget(target());
     assert_eq!(router.census().aborts, 0);
 
     let hits = table();

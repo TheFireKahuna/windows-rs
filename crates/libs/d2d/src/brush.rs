@@ -139,6 +139,20 @@ impl Brush for Ramp {
     }
 }
 
+/// A radial ramp: the same stops, run outward from a centre instead of along an axis.
+///
+/// No re-aiming twin to [`Ramp::aim`]. A radial ramp's consumer rasterizes one square
+/// profile and lets the sprite it fills stretch it into an ellipse, so the brush is
+/// built once at its own natural size and never moved.
+pub struct Radial(ID2D1RadialGradientBrush);
+
+impl Sealed for Radial {}
+impl Brush for Radial {
+    fn brush(&self) -> &BrushRef {
+        BrushRef::of(&self.0)
+    }
+}
+
 /// A target sampled as a repeating or clamped fill.
 pub struct Tile(ID2D1BitmapBrush1);
 
@@ -261,6 +275,38 @@ impl Gpu {
     /// through an sRGB-gamma stage would quantize exactly the headroom the ramp exists to
     /// carry.
     pub fn ramp(&self, stops: &[Stop], from: Vector2, to: Vector2, extend: Extend) -> Result<Ramp> {
+        let collection = self.stops(stops, extend)?;
+        let properties = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: from,
+            endPoint: to,
+        };
+        Ok(Ramp(unsafe {
+            self.ctx()
+                .CreateLinearGradientBrush(&properties, None, &collection)?
+        }))
+    }
+
+    /// A radial ramp, centred at `center` with radii `radius`.
+    ///
+    /// The same stop collection as [`ramp`](Self::ramp), interpolated in scRGB at 16 bits
+    /// of float per channel: a narrow alpha falloff quantizes to almost nothing at eight,
+    /// and a falloff is the whole content of a glow.
+    pub fn radial(&self, stops: &[Stop], center: Vector2, radius: Vector2, extend: Extend) -> Result<Radial> {
+        let collection = self.stops(stops, extend)?;
+        let properties = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+            center,
+            gradientOriginOffset: Vector2 { x: 0.0, y: 0.0 },
+            radiusX: radius.x,
+            radiusY: radius.y,
+        };
+        Ok(Radial(unsafe {
+            self.ctx()
+                .CreateRadialGradientBrush(&properties, None, &collection)?
+        }))
+    }
+
+    /// The stop collection both ramp forms are built from.
+    fn stops(&self, stops: &[Stop], extend: Extend) -> Result<ID2D1GradientStopCollection1> {
         const {
             assert!(size_of::<Stop>() == size_of::<D2D1_GRADIENT_STOP>());
             assert!(
@@ -277,23 +323,14 @@ impl Gpu {
         let stops: &[D2D1_GRADIENT_STOP] =
             unsafe { core::slice::from_raw_parts(stops.as_ptr().cast(), stops.len()) };
         unsafe {
-            let collection = self.ctx().CreateGradientStopCollection(
+            self.ctx().CreateGradientStopCollection(
                 stops,
                 D2D1_COLOR_SPACE_SCRGB,
                 D2D1_COLOR_SPACE_SCRGB,
                 D2D1_BUFFER_PRECISION_16BPC_FLOAT,
                 extend.d2d(),
                 D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT,
-            )?;
-            let properties = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                startPoint: from,
-                endPoint: to,
-            };
-            Ok(Ramp(self.ctx().CreateLinearGradientBrush(
-                &properties,
-                None,
-                &collection,
-            )?))
+            )
         }
     }
 

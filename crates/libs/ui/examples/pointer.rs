@@ -28,7 +28,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use windows_color::{DisplayCapability, OutputTransform};
-use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, NO_ENTRY, NodeId};
+use windows_scene::{ControlId, Env, HitEntry, HitFlags, HitTable, Ids, NO_ENTRY, NodeId};
 use windows_ui::Result;
 use windows_ui::gesture::{DragDecl, GestureDecl, Recognised};
 use windows_ui::input::{Doorbell, Report, Router};
@@ -94,7 +94,7 @@ fn main() -> Result<()> {
             "wheel" => GestureDecl::slider(false),
             _ => GestureDecl::default(),
         };
-        router.declare(ControlId(index as u64), decl);
+        router.declare(target_id(index), decl);
     }
 
     println!("{:#?}", router.capability());
@@ -289,14 +289,30 @@ fn targets() -> Vec<HitEntry> {
             clip_parent: NO_ENTRY,
             flags: HitFlags::INTERACTIVE | HitFlags::GESTURE,
             scroll_src: NodeId::NONE,
-            id: ControlId(index as u64),
+            id: target_id(index),
         })
         .collect()
 }
 
+/// The id the nth target is named by.
+///
+/// Minted rather than fabricated, because a `ControlId` is a generational index and there is
+/// no way to make one but to ask an authority for it. Minting densely from a fresh one means
+/// the nth is at slot n + 1, since every arena burns slot zero so that `NONE` names nothing.
+fn target_id(index: usize) -> ControlId {
+    let mut ids = Ids::<windows_scene::Control>::new();
+    let mut id = ids.mint();
+    for _ in 0..index {
+        id = ids.mint();
+    }
+    id
+}
+
 fn label(id: Option<ControlId>) -> &'static str {
     match id {
-        Some(ControlId(index)) => TARGETS.get(index as usize).map_or("?", |(name, ..)| *name),
+        Some(id) => TARGETS
+            .get(id.index().wrapping_sub(1))
+            .map_or("?", |(name, ..)| *name),
         None => "—",
     }
 }

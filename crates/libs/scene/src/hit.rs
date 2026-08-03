@@ -288,7 +288,7 @@ mod tests {
     use super::*;
     use crate::hit_build::ControlId;
 
-    fn entry(id: u64, rect: (f32, f32, f32, f32), flags: HitFlags) -> HitEntry {
+    fn entry(id: u32, rect: (f32, f32, f32, f32), flags: HitFlags) -> HitEntry {
         HitEntry {
             x0: rect.0,
             y0: rect.1,
@@ -298,7 +298,7 @@ mod tests {
             clip_parent: NO_ENTRY,
             flags,
             scroll_src: NodeId::NONE,
-            id: ControlId(id),
+            id: ControlId::raw(id, 1),
         }
     }
 
@@ -314,11 +314,19 @@ mod tests {
             entry(2, (20.0, 20.0, 60.0, 60.0), HitFlags::INTERACTIVE),
         ]);
         assert_eq!(
-            table.hit(at(30.0, 30.0), ContactKind::Mouse).unwrap().id.0,
+            table
+                .hit(at(30.0, 30.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
             2
         );
         assert_eq!(
-            table.hit(at(90.0, 90.0), ContactKind::Mouse).unwrap().id.0,
+            table
+                .hit(at(90.0, 90.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
             1
         );
     }
@@ -332,7 +340,11 @@ mod tests {
             entry(2, (40.0, 40.0, 90.0, 90.0), HitFlags::INTERACTIVE),
         ]);
         assert_eq!(
-            table.hit(at(80.0, 80.0), ContactKind::Mouse).unwrap().id.0,
+            table
+                .hit(at(80.0, 80.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
             2
         );
     }
@@ -351,7 +363,11 @@ mod tests {
             child,
         ]);
         assert_eq!(
-            table.hit(at(60.0, 60.0), ContactKind::Mouse).unwrap().id.0,
+            table
+                .hit(at(60.0, 60.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
             2
         );
         // Outside the clip: the child is gone, and so is the clip itself.
@@ -402,7 +418,7 @@ mod tests {
             } else {
                 2
             };
-            assert_eq!(hit.id.0, exact.unwrap_or(expected), "at x={x}");
+            assert_eq!(hit.id.index(), exact.unwrap_or(expected), "at x={x}");
         }
     }
 
@@ -423,14 +439,22 @@ mod tests {
 
         // Unscrolled, the row is far below the viewport and is clipped away.
         assert_eq!(
-            table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0,
+            table
+                .hit(at(50.0, 50.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
             1
         );
         // Scrolled down by 200, the row is under the pointer — and the entry's own rect
         // never moved.
         table.set_scroll(scroller, Vector2 { x: 0.0, y: 200.0 });
         assert_eq!(
-            table.hit(at(50.0, 20.0), ContactKind::Mouse).unwrap().id.0,
+            table
+                .hit(at(50.0, 20.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
             2
         );
     }
@@ -440,7 +464,11 @@ mod tests {
         let mut table = HitTable::default();
         table.replace(&[entry(1, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE)]);
         assert_eq!(
-            table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0,
+            table
+                .hit(at(50.0, 50.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
             1
         );
         assert!(table.memo.get().is_some());
@@ -448,7 +476,11 @@ mod tests {
         table.replace(&[entry(9, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE)]);
         assert!(table.memo.get().is_none(), "a rebuild left a stale memo");
         assert_eq!(
-            table.hit(at(50.0, 50.0), ContactKind::Mouse).unwrap().id.0,
+            table
+                .hit(at(50.0, 50.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
             9
         );
 

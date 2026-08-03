@@ -36,6 +36,20 @@ pub mod layout;
 #[deny(unsafe_code)]
 pub mod widget;
 
+// The window's own three commands. Two functions over the hit array and the control table
+// the layers above already own, which is why a title bar is a declaration here and not an
+// implementation in every application that draws one.
+#[deny(unsafe_code)]
+pub mod caption;
+
+// Flyouts, popups, menus and tooltips. Positioned against an anchor rather than by a
+// parent's layout, above everything, with a defined way to go away — and no `unsafe` and no
+// Windows surface, because every mechanism it needs is one the layers below already own: a
+// detached root in `windows-scene`, a blocker entry in the one hit array, a focus scope in
+// the router, and a scoped batch for a delay.
+#[deny(unsafe_code)]
+pub mod overlay;
+
 // The pointer stack and what it feeds. The gesture layer and the drag policy contain no
 // `unsafe` either — the recognisers are the platform's and every call into them is a safe
 // projection — so only `input` and `rotary` reach the raw surface, and both are confined to

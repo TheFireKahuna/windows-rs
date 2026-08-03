@@ -28,7 +28,7 @@
 
 use crate::env::Env;
 use crate::quant::extent_px;
-use crate::sink::{Axis, PathVerb};
+use crate::sink::{PathVerb, Spread};
 use core::cell::{Cell, OnceCell};
 use windows_color::{Radiance, Scrgb};
 use windows_composition::{
@@ -202,17 +202,21 @@ impl Backends {
         &self,
         env: Env,
         stops: &[(f32, Radiance)],
-        axis: Axis,
+        spread: Spread,
     ) -> Result<Option<CompositionDrawingSurface>> {
         // Along the axis for the two cardinal directions; square for a diagonal, which has
-        // no single axis to lay a strip along.
-        let px = match axis {
-            Axis::Horizontal => (256, 1),
-            Axis::Vertical => (1, 256),
-            Axis::DiagonalDown | Axis::DiagonalUp => (128, 128),
+        // no single axis to lay a strip along, and for a radial, which has none at all.
+        //
+        // 64 for the radial is not a compromise: a smootherstep falloff carries no
+        // high-frequency content, so the profile it misses at that resolution is well
+        // under a hundredth of an 8-bit level at the amplitudes a glow is authored with.
+        let px = match spread {
+            Spread::Horizontal => (256, 1),
+            Spread::Vertical => (1, 256),
+            Spread::DiagonalDown | Spread::DiagonalUp => (128, 128),
+            Spread::Radial => (64, 64),
         };
         let surface = self.surface(px)?;
-        let (from, to) = axis.ends();
 
         // Sampled, not handed over raw: the drawing stack interpolates linearly and a
         // palette authored in ICtCp means the *perceptual* mix. Enough samples that the
@@ -235,19 +239,42 @@ impl Backends {
         // the display's is: it carries no snapped dimension and is stretched to fill.
         self.draw(&surface, 96.0, |d| {
             d.clear(Scrgb::TRANSPARENT);
-            let ramp = self.gpu.ramp(
-                &sampled,
-                Vector2 {
-                    x: from[0] * w,
-                    y: from[1] * h,
-                },
-                Vector2 {
-                    x: to[0] * w,
-                    y: to[1] * h,
-                },
-                Extend::Clamp,
-            )?;
-            d.fill(windows_d2d::Rect::new(0.0, 0.0, w, h), &ramp);
+            let rect = windows_d2d::Rect::new(0.0, 0.0, w, h);
+            match spread.ends() {
+                Some((from, to)) => {
+                    let ramp = self.gpu.ramp(
+                        &sampled,
+                        Vector2 {
+                            x: from[0] * w,
+                            y: from[1] * h,
+                        },
+                        Vector2 {
+                            x: to[0] * w,
+                            y: to[1] * h,
+                        },
+                        Extend::Clamp,
+                    )?;
+                    d.fill(rect, &ramp);
+                }
+                // Centred, and its radii half the tile, so the profile's last stop lands
+                // exactly on the edge. Stretching that square into the sprite is what
+                // turns it into the ellipse the glow wants.
+                None => {
+                    let ramp = self.gpu.radial(
+                        &sampled,
+                        Vector2 {
+                            x: w / 2.0,
+                            y: h / 2.0,
+                        },
+                        Vector2 {
+                            x: w / 2.0,
+                            y: h / 2.0,
+                        },
+                        Extend::Clamp,
+                    )?;
+                    d.fill(rect, &ramp);
+                }
+            }
             Ok(())
         })
     }

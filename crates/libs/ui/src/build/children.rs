@@ -12,6 +12,10 @@ use super::El;
 
 /// Where a container's children are collected.
 ///
+/// Named for what it collects rather than for how: `Slots` is the one store this stack keeps
+/// per id family, and a second meaning of that word in the same crate is one a reader has to
+/// disambiguate by module every time they meet it.
+///
 /// Carries no buffer, and that is the point twice over. **It cannot be a borrow**, because a
 /// borrow would have to be of something, and the only correct something is the arena's own
 /// pending stack — which an implementation must be free to re-enter, since an adapter builds
@@ -22,9 +26,9 @@ use super::El;
 ///
 /// Not constructible outside this crate, so [`IntoChildren::append`] cannot be called
 /// anywhere a container is not collecting.
-pub struct Slots(());
+pub struct Children(());
 
-impl Slots {
+impl Children {
     pub(crate) const fn new() -> Self {
         Self(())
     }
@@ -48,23 +52,23 @@ impl Slots {
 /// Anything that can be a container's children: one, many, none, an array or a `Vec`.
 pub trait IntoChildren {
     /// Appends this into the container's child list, in paint order.
-    fn append(self, out: &mut Slots);
+    fn append(self, out: &mut Children);
 }
 
 impl<K> IntoChildren for El<K> {
-    fn append(self, out: &mut Slots) {
+    fn append(self, out: &mut Children) {
         out.push(self);
     }
 }
 
 /// Nothing. A container with no children is legal and says so.
 impl IntoChildren for () {
-    fn append(self, _: &mut Slots) {}
+    fn append(self, _: &mut Children) {}
 }
 
 /// Zero or one. What `.map(..)` on an optional region produces.
 impl<T: IntoChildren> IntoChildren for Option<T> {
-    fn append(self, out: &mut Slots) {
+    fn append(self, out: &mut Children) {
         if let Some(child) = self {
             child.append(out);
         }
@@ -73,7 +77,7 @@ impl<T: IntoChildren> IntoChildren for Option<T> {
 
 /// A fixed number of the same thing, at any length, with no macro behind it.
 impl<T: IntoChildren, const N: usize> IntoChildren for [T; N] {
-    fn append(self, out: &mut Slots) {
+    fn append(self, out: &mut Children) {
         for child in self {
             child.append(out);
         }
@@ -82,7 +86,7 @@ impl<T: IntoChildren, const N: usize> IntoChildren for [T; N] {
 
 /// A dynamic list — the one heap form, and it is visible at the call site.
 impl<T: IntoChildren> IntoChildren for Vec<T> {
-    fn append(self, out: &mut Slots) {
+    fn append(self, out: &mut Children) {
         for child in self {
             child.append(out);
         }
@@ -99,7 +103,7 @@ macro_rules! tuple_children {
     ($head:ident $(, $tail:ident)*) => {
         impl<$head: IntoChildren $(, $tail: IntoChildren)*> IntoChildren for ($head, $($tail,)*) {
             #[allow(non_snake_case, reason = "the type parameters name the bindings")]
-            fn append(self, out: &mut Slots) {
+            fn append(self, out: &mut Children) {
                 let ($head, $($tail,)*) = self;
                 $head.append(out);
                 $($tail.append(out);)*

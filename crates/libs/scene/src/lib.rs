@@ -17,6 +17,7 @@ mod tree;
 // ── front half · !Send · owns every composition object ──────────────────────────
 mod anim;
 mod apply;
+mod backdrop;
 mod backends;
 mod bind;
 mod cache;
@@ -28,6 +29,7 @@ mod res;
 mod tracker;
 
 pub use anim::{CHROME_DAMPING, CHROME_PERIOD, SCROLL_DAMPING, SCROLL_PERIOD};
+pub use backdrop::{BackdropSpec, Glow};
 pub use backends::Backends;
 pub use cache::{BoxKey, Cache, Cell, Gen, GenMask, SolidKey};
 pub use census::{Audit, Census};
@@ -37,12 +39,12 @@ pub use hit_build::{
     ControlId, HitBuilder, HitDecl, HitEntry, HitFlags, NO_ENTRY, TOUCH_TARGET_DIPS,
     default_inflation,
 };
-pub use id::{Id, Ids};
+pub use id::{Id, Ids, Slots};
 pub use layout::{
-    LayoutKind, LayoutTree, Measure, MeasureCtx, MeasureIn, MeasureKey, Rect, Solved, snap,
+    LayoutKind, LayoutTree, Measure, MeasureCtx, MeasureIn, MeasureKey, Rect, Restyle, Solved, snap,
 };
 pub use model::{Model, SlotRoot};
-pub use patch::{Op, PatchPool, SinkPatch, Span};
+pub use patch::{Attach, Op, PatchPool, SinkPatch, Span};
 pub use quant::{Q, quant_stop};
 pub use responsive::{Bounds, WidthClass};
 pub use sink::*;
@@ -56,13 +58,15 @@ pub use taffy;
 
 use crate::anim::Motion;
 use crate::cache::Cells;
-use crate::node::{Painted, Slots};
+use crate::node::Painted;
 use crate::res::Resources;
 use crate::tracker::{EventQueue, TrackerState};
 use core::marker::PhantomData;
 use std::cell::RefCell;
 use std::rc::Rc;
-use windows_composition::{DesktopWindowTarget, Stretch, Visual, VisualInteractionSource};
+use windows_composition::{
+    ContainerVisual, DesktopWindowTarget, Stretch, Visual, VisualInteractionSource,
+};
 use windows_numerics::{Vector2, Vector3};
 use windows_window::{Wake, Window};
 
@@ -153,14 +157,33 @@ pub struct Scene {
     /// what a move invalidated. Nothing asks this scene what the DPI is. `None` until the
     /// first operation states one.
     env: Option<Env>,
-    pub(crate) nodes: Slots<node::Node>,
-    root: NodeId,
+    pub(crate) nodes: Slots<Node, node::Node>,
+    /// The target's root, and the one visual carrying the DIP-to-pixel scale.
+    ///
+    /// Not an arena node, and neither are the three bands under it: the arena holds
+    /// what the model named, and the model names none of these.
+    window: ContainerVisual,
+    /// `Attach::Window`. Above the ground, below every overlay.
+    content: ContainerVisual,
+    /// `Attach::Detached` — slot roots — and the ghosts an exit transition leaves
+    /// behind. A band rather than an insert-at-top rule, so "an overlay is above
+    /// content" is a fact about the tree instead of an ordering every caller has to
+    /// keep.
+    overlays: ContainerVisual,
+    /// The window's ground: under every root, out of the arena, and not in the hit
+    /// array. Held because a display change re-lights it and a resize re-places it.
+    backdrop: backdrop::Backdrop,
+    /// Every node with no parent node, in attachment order.
+    ///
+    /// What [`audit`](Scene::audit) walks from. A forest and not a tree, because a
+    /// slot root is a real second root rather than a child placed oddly.
+    roots: Vec<NodeId>,
     /// Id-keyed and shared between sprites.
     pub(crate) res: Resources,
     /// Value-keyed and evicted.
     pub(crate) cells: Cells,
     pub(crate) motion: Motion,
-    pub(crate) trackers: Slots<TrackerState>,
+    pub(crate) trackers: Slots<Tracker, TrackerState>,
     pub(crate) hits: HitTable,
     events: EventQueue,
     /// Held, unlike the [`Backends`] and the [`Env`], because an exit animation's `Tick`
@@ -182,11 +205,22 @@ pub struct Scene {
 impl Scene {
     /// Builds a scene hosted on `window`, drawn with `back`.
     ///
-    /// `back` is borrowed to mint the target and the root and is **not** stored: every
-    /// later operation states it again. The calling thread must pump `window`'s messages —
-    /// that is where every tracker callback lands and where every publish happens. `wake`
-    /// is the window's own frame clock, which exit animations hold open while they play.
-    pub fn new(window: &Window, back: &Backends, wake: Wake) -> Result<Self> {
+    /// `back` is borrowed to mint the target, the root and the backdrop, and is **not**
+    /// stored: every later operation states it again. The calling thread must pump
+    /// `window`'s messages — that is where every tracker callback lands and where every
+    /// publish happens. `wake` is the window's own frame clock, which exit animations hold
+    /// open while they play.
+    ///
+    /// `env` is taken here, unlike everywhere else, for one reason: the backdrop is
+    /// painted before the window is shown and its colours are the display's. Nothing
+    /// caches it — [`resize`](Self::resize) and [`apply`](Self::apply) state it again.
+    pub fn new(
+        window: &Window,
+        back: &Backends,
+        wake: Wake,
+        env: Env,
+        backdrop: BackdropSpec,
+    ) -> Result<Self> {
         let target = back
             .compositor
             .create_desktop_window_target(window, false)?;
@@ -194,19 +228,47 @@ impl Scene {
 
         let root_visual = back.compositor.create_container_visual();
         target.set_root(&root_visual);
+        // **The one place DIPs become pixels.** Everything below this visual is authored
+        // in DIPs and snapped onto the pixel grid by `quant`; the grid it is snapped to is
+        // this scale, so the two have to be the same number or geometry lands between
+        // pixels at every scale but 100%.
+        set_dip_space(&root_visual, env);
 
-        let mut nodes = Slots::default();
-        nodes.insert(
-            NodeId::ROOT,
-            node::Node::new(base_of_group(&root_visual), None, NodeKind::Group),
-        );
+        // Three bands, bottom to top: the ground, the content, the overlays. Ordering
+        // between them is the tree's, so `after: None` can keep meaning "the bottom of
+        // *this* collection" — there is no below-the-bottom to ask for otherwise.
+        let ground = back.compositor.create_container_visual();
+        let content = back.compositor.create_container_visual();
+        let overlays = back.compositor.create_container_visual();
+        let bands = root_visual.children();
+        bands.insert_at_top(&ground);
+        bands.insert_at_top(&content);
+        bands.insert_at_top(&overlays);
+        // Each band **is** the window, stated once as a fraction of the root rather than
+        // written per resize. This is what carries the root's extent down to the layers that
+        // state themselves against it, and it is the reason [`resize`](Self::resize) is one
+        // property write for a tree of any size. A band's extent clips nothing on its own —
+        // only a `Clip` does — so giving one a size costs the content band nothing.
+        for band in [&ground, &content, &overlays] {
+            band.set_relative_size_adjustment(Vector2 { x: 1.0, y: 1.0 });
+        }
+
+        let backdrop = backdrop::Backdrop::new(backdrop, back, env)?;
+        let layers = ground.children();
+        for sprite in backdrop.sprites() {
+            layers.insert_at_top(&**sprite);
+        }
 
         Ok(Self {
+            backdrop,
+            content,
+            overlays,
             target,
             generation: Gen::default(),
             env: None,
-            nodes,
-            root: NodeId::ROOT,
+            nodes: Slots::default(),
+            window: root_visual,
+            roots: Vec::new(),
             res: Resources::default(),
             cells: Cells::default(),
             motion,
@@ -221,10 +283,18 @@ impl Scene {
         })
     }
 
-    /// The window subtree's root.
-    #[must_use]
-    pub const fn root(&self) -> GroupId {
-        GroupId(self.root)
+    /// Moves one glow's centre, as a fraction of the window.
+    ///
+    /// The index is into the [`BackdropSpec::glows`] the scene was built with. This is a
+    /// front-side write like [`retarget`](Self::retarget): the backdrop is not in the
+    /// patch, so an application driving a glow from a `Cell` calls this from its effect.
+    pub fn move_glow(&mut self, index: usize, at: Vector2) {
+        self.backdrop.move_glow(index, at);
+    }
+
+    /// The overlay band, for a ghost outliving the subtree it was captured from.
+    pub(crate) fn overlay_children(&self) -> windows_composition::VisualCollection {
+        self.overlays.children()
     }
 
     /// The hit array — the single authority every consumer resolves through.
@@ -251,14 +321,16 @@ impl Scene {
     /// frame would show that.
     #[must_use]
     pub fn audit(&self) -> Audit {
-        fn walk(nodes: &Slots<node::Node>, at: NodeId, reached: &mut u32) {
+        fn walk(nodes: &Slots<Node, node::Node>, at: NodeId, reached: &mut u32) {
             *reached += 1;
             for child in tree::children(nodes, at) {
                 walk(nodes, child, reached);
             }
         }
         let mut reached = 0;
-        walk(&self.nodes, self.root, &mut reached);
+        for root in &self.roots {
+            walk(&self.nodes, *root, &mut reached);
+        }
         Audit {
             reached,
             held: self.nodes.len() as u32,
@@ -355,9 +427,16 @@ impl Scene {
         // Cache-backed cells re-rasterize themselves from their keys; a coverage tile is
         // keyed by nothing this side holds, so the model is told and re-emits it.
         if grid_moved {
+            set_dip_space(&self.window, env);
             self.events
                 .borrow_mut()
                 .push(SceneEvent::ScaleChanged { scale: env.scale() });
+        }
+        // The backdrop is outside the cell cache, so no generation reaches it: the same
+        // authored light lands on a different display as a different value, and only a
+        // re-raster corrects that.
+        if last.light_moved(env) {
+            self.backdrop.relight(back, env)?;
         }
         self.refresh(back, env)
     }
@@ -402,7 +481,8 @@ impl Scene {
     /// over — both already rebuilding brushes.
     fn sprites_where(&self, predicate: impl Fn(&Painted) -> bool) -> Vec<NodeId> {
         self.nodes
-            .iter_ids()
+            .iter()
+            .map(|(id, _)| id)
             .filter(|id| {
                 self.nodes
                     .get(*id)
@@ -498,7 +578,7 @@ impl Scene {
         let mut state = TrackerState::new(tracker);
         state.source = Some(source);
         state.viewport = Some(viewport.node());
-        self.trackers.insert(id.raw, state);
+        self.trackers.place(id.raw, state);
         Ok(())
     }
 
@@ -525,6 +605,32 @@ pub(crate) fn base_of_sprite(sprite: &windows_composition::SpriteVisual) -> Visu
 /// The base visual of a shape host, for a capture that takes the base type.
 pub(crate) fn base_of_shape(shape: &windows_composition::ShapeVisual) -> Visual {
     (**shape).clone()
+}
+
+/// Establishes the tree's DIP space: the factor that makes every DIP below the root mean
+/// what it says, and the extent those DIPs are measured against.
+///
+/// **The extent is the window's, taken from the target rather than written by this side.**
+/// The root is the composition target's, so the compositor already knows how big it is and
+/// re-derives it as the window changes — including through a drag-resize, where the system's
+/// modal loop owns the thread and this side may not get to publish at all. Writing the extent
+/// here instead makes the whole ground lag the frame it belongs to, which is exactly what a
+/// live resize shows.
+///
+/// The reciprocal is the whole subtlety. A relative adjustment multiplies the parent's own
+/// extent, and the target's is in **physical pixels** while everything below this root is in
+/// DIPs — so the factor that converts one to the other is the reciprocal of the scale this
+/// same function just applied. Both halves therefore change on a DPI change and on nothing
+/// else, which is why they are set together and only here.
+fn set_dip_space(root: &ContainerVisual, env: Env) {
+    let scale = env.scale();
+    root.set_scale(Vector3 {
+        x: scale,
+        y: scale,
+        z: 1.0,
+    });
+    let dips = 1.0 / scale;
+    root.set_relative_size_adjustment(Vector2 { x: dips, y: dips });
 }
 
 pub(crate) fn invalid_arg() -> windows_core::Error {

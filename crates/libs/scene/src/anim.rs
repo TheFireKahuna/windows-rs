@@ -422,15 +422,11 @@ impl crate::Scene {
         sprite.set_size(size.x, size.y);
         let offset = source.offset();
         sprite.set_offset(offset.x, offset.y, offset.z);
+        // A ghost outlives the node it was captured from, so it hangs in the window's
+        // own container rather than in a subtree that is being torn down — at the top,
+        // like every other detached thing, because it plays over what replaced it.
         let visual = crate::base_of_sprite(&sprite);
-        if let Some(children) = self
-            .nodes
-            .get(self.root().node())
-            .and_then(|n| n.visual.as_container())
-            .map(|c| c.children())
-        {
-            children.insert_at_top(&visual);
-        }
+        self.overlay_children().insert_at_top(&visual);
 
         let done = Rc::new(CoreCell::new(false));
         let signal = Rc::clone(&done);

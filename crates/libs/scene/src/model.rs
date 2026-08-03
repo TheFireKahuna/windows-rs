@@ -11,8 +11,8 @@
 use crate::env::Env;
 use crate::hit_build::{HitBuilder, HitDecl};
 use crate::id::{Id, Ids};
-use crate::layout::{LayoutKind, LayoutTree, Measure, MeasureCtx, Solved};
-use crate::patch::{Op, SinkPatch, Span};
+use crate::layout::{LayoutKind, LayoutTree, Measure, MeasureCtx, Restyle, Solved};
+use crate::patch::{Attach, Op, SinkPatch, Span};
 use crate::responsive::Bounds;
 use crate::sink::*;
 use crate::tree::{self, Forest, Links};
@@ -37,10 +37,10 @@ struct ModelNode {
 /// `Send` and owns no COM, so all of it — snapping, responsive classification, hit-array
 /// construction, the virtualization window — is testable with no device and no compositor.
 pub struct Model {
-    ids: Ids,
-    res_ids: Ids,
-    tracker_ids: Ids,
-    delay_ids: Ids,
+    ids: Ids<Node>,
+    res_ids: Ids<()>,
+    tracker_ids: Ids<Tracker>,
+    delay_ids: Ids<Delay>,
     nodes: Vec<ModelNode>,
     layout: LayoutTree,
     hits: HitBuilder,
@@ -143,7 +143,7 @@ impl Model {
             solve_dirty: true,
             hits_dirty: true,
         };
-        let id = model.mint(NodeKind::Group, NodeId::NONE, None);
+        let id = model.mint(NodeKind::Group, Attach::Window, None);
         model.root = GroupId(id);
         model.layout.set_style(id, &root);
         model
@@ -159,6 +159,15 @@ impl Model {
     /// size this crate cannot know.
     pub fn on_measure(&mut self, measure: impl Measure + 'static) {
         self.layout.on_measure(measure);
+    }
+
+    /// Installs what re-lowers a style whose metrics depend on the class in scope.
+    ///
+    /// Called during the solve for the subtree of a container that just changed class, so the
+    /// styles layout runs on are the ones that class implies — and nothing above needs a
+    /// second pass to correct them.
+    pub fn on_restyle(&mut self, restyle: impl Restyle + 'static) {
+        self.layout.on_restyle(restyle);
     }
 
     /// The window's size in DIPs, as the last [`set_window`](Model::set_window) stated it.
@@ -184,12 +193,12 @@ impl Model {
 
     /// A group: it positions and clips its children and paints nothing.
     pub fn group(&mut self, parent: GroupId, after: Option<NodeId>) -> GroupId {
-        GroupId(self.mint(NodeKind::Group, parent.0, after))
+        GroupId(self.mint(NodeKind::Group, Attach::Node(parent.0), after))
     }
 
     /// A sprite: one composition sprite visual on screen.
     pub fn sprite(&mut self, parent: GroupId, after: Option<NodeId>) -> SpriteId {
-        SpriteId(self.mint(NodeKind::Sprite, parent.0, after))
+        SpriteId(self.mint(NodeKind::Sprite, Attach::Node(parent.0), after))
     }
 
     /// A group with **no parent** — a flyout, a popup, a tooltip, a ghost.
@@ -200,7 +209,7 @@ impl Model {
     /// [`open_slot`](Model::open_slot), which is what puts it in the array the walk reads.
     /// Opening it twice is inexpressible because opening consumes it.
     pub fn orphan_group(&mut self) -> SlotRoot {
-        SlotRoot(GroupId(self.mint(NodeKind::Group, NodeId::NONE, None)))
+        SlotRoot(GroupId(self.mint(NodeKind::Group, Attach::Detached, None)))
     }
 
     /// Places a slot root in the hit array, says whether a press outside it dismisses, and
@@ -282,7 +291,7 @@ impl Model {
         self.solve_dirty = true;
     }
 
-    fn mint(&mut self, kind: NodeKind, parent: NodeId, after: Option<NodeId>) -> NodeId {
+    fn mint(&mut self, kind: NodeKind, parent: Attach, after: Option<NodeId>) -> NodeId {
         let id: NodeId = self.ids.mint();
         let index = id.index();
         if index >= self.nodes.len() {
@@ -298,7 +307,9 @@ impl Model {
             self.previous[index] = Solved::default();
         }
         self.layout.create(id, LayoutKind::Container);
-        self.link(id, parent, after);
+        // The model's own forest holds only node-to-node edges; the two parentless
+        // attachments are the front half's to seat, and carry no parent here.
+        self.link(id, parent.node().unwrap_or(NodeId::NONE), after);
         self.pending.push_op(Op::New {
             id,
             kind,
@@ -501,22 +512,22 @@ impl Model {
 
     /// Mints a gradient. Stops are interpolated perceptually where they are rasterized, so
     /// what travels is the authored stops and not a sampled ramp.
-    pub fn ramp(&mut self, stops: &[(f32, Radiance)], axis: Axis) -> RampId {
+    pub fn ramp(&mut self, stops: &[(f32, Radiance)], spread: Spread) -> RampId {
         let id: ResId = self.res_ids.mint();
         let span = self.pending.push_stops(stops);
         self.pending.push_op(Op::Res {
             id,
-            op: ResOp::Ramp { stops: span, axis },
+            op: ResOp::Ramp { stops: span, spread },
         });
         id.cast()
     }
 
     /// Re-points a gradient.
-    pub fn set_ramp(&mut self, id: RampId, stops: &[(f32, Radiance)], axis: Axis) {
+    pub fn set_ramp(&mut self, id: RampId, stops: &[(f32, Radiance)], spread: Spread) {
         let span = self.pending.push_stops(stops);
         self.pending.push_op(Op::Res {
             id: id.cast(),
-            op: ResOp::Ramp { stops: span, axis },
+            op: ResOp::Ramp { stops: span, spread },
         });
     }
 
@@ -976,7 +987,7 @@ mod tests {
         let decl = |flags| {
             Some(HitDecl {
                 flags,
-                id: ControlId(1),
+                id: ControlId::raw(1, 1),
                 touch_inflate: None,
             })
         };
@@ -1014,7 +1025,7 @@ mod tests {
             under.node(),
             Some(HitDecl {
                 flags: HitFlags::INTERACTIVE,
-                id: ControlId(1),
+                id: ControlId::raw(1, 1),
                 touch_inflate: None,
             }),
         );
@@ -1022,13 +1033,13 @@ mod tests {
         // Opening is what yields the group to build into, so a parentless root cannot be
         // populated and then forgotten.
         let root = model.orphan_group();
-        let menu = model.open_slot(root, Some(ControlId(3)));
+        let menu = model.open_slot(root, Some(ControlId::raw(3, 1)));
         model.style(menu.node(), &box_style(80.0, 60.0));
         model.hit(
             menu.node(),
             Some(HitDecl {
                 flags: HitFlags::INTERACTIVE,
-                id: ControlId(2),
+                id: ControlId::raw(2, 1),
                 touch_inflate: None,
             }),
         );
@@ -1036,7 +1047,7 @@ mod tests {
         let mut patch = SinkPatch::new();
         model.flush(&mut patch, env());
         let entries = patch.hit_entries();
-        let ids: Vec<u64> = entries.iter().map(|e| e.id.0).collect();
+        let ids: Vec<usize> = entries.iter().map(|e| e.id.index()).collect();
         assert_eq!(
             ids,
             vec![1, 3, 2],
@@ -1087,7 +1098,7 @@ mod tests {
             menu.node(),
             Some(HitDecl {
                 flags: HitFlags::INTERACTIVE,
-                id: ControlId(7),
+                id: ControlId::raw(7, 1),
                 touch_inflate: None,
             }),
         );
@@ -1111,7 +1122,7 @@ mod tests {
         let entry = patch
             .hit_entries()
             .iter()
-            .find(|e| e.id == ControlId(7))
+            .find(|e| e.id == ControlId::raw(7, 1))
             .copied()
             .expect("the overlay declared a hit entry");
         assert_eq!(
@@ -1137,7 +1148,7 @@ mod tests {
         let mut model = Model::new(root_style());
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
         let root = model.orphan_group();
-        let menu = model.open_slot(root, Some(ControlId(3)));
+        let menu = model.open_slot(root, Some(ControlId::raw(3, 1)));
         model.style(menu.node(), &box_style(80.0, 60.0));
 
         let mut patch = SinkPatch::new();

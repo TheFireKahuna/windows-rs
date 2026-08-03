@@ -319,7 +319,7 @@ impl<K> El<K> {
         // Collected onto the arena's own stack, so a screen of nested containers allocates
         // once at high-water mark rather than once per container per mount.
         let mark = Build::with(|b| b.mark());
-        children.append(&mut super::Slots::new());
+        children.append(&mut super::Children::new());
         Build::with(|b| {
             b.nodes[self.at as usize].preset = preset;
             b.take_kids(self.at, mark);
@@ -524,6 +524,21 @@ impl<K> El<K> {
         self.slot_mut(|s| s.name = Some(name))
     }
 
+    /// Declares this control to be one of the window's own commands.
+    ///
+    /// It stays an ordinary control — it draws, hovers and presses like any other, and it is
+    /// in the one hit array. What this adds is identity: the caption band can then say
+    /// *which* command a point is over, so the window answers `HTMINBUTTON` / `HTMAXBUTTON` /
+    /// `HTCLOSE` there and the drag strip is whatever the bar's controls leave over.
+    ///
+    /// **No click handler goes on it.** The press is the system's from the moment the hit
+    /// test names it, and the window issues the `SC_*` itself; a handler here would be a
+    /// second close on one click. See [`caption`](crate::caption).
+    #[must_use]
+    pub fn caption(self, button: windows_window::CaptionButton) -> Self {
+        self.slot_mut(|s| s.caption = Some(button))
+    }
+
     // ── attachments ───────────────────────────────────────────────────────────────
 
     /// A hover description. One tooltip exists at a time and the overlay layer owns it; a
@@ -541,7 +556,7 @@ impl<K> El<K> {
     /// An anchored, light-dismissed surface.
     #[must_use]
     pub fn flyout(self, body: impl Fn() -> View + 'static) -> Self {
-        self.act(Act::Flyout(Box::new(body)))
+        self.act(Act::Flyout(std::rc::Rc::new(body)))
             .slot_mut(|s| add_flags(s, HitFlags::GESTURE))
     }
 

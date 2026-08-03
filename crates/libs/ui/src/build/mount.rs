@@ -14,7 +14,8 @@
 //! and every model call takes a fresh borrow.
 
 use super::arena::{Act, Build, ChanSource, MaskSeed, NIL, Part, Slot, SpriteSeed};
-use super::host::{Control, Host, MountRow, OverStore, Responsive, ValueId, ValueRow};
+use super::host::{ControlRow, Host, MountId, MountRow, ValueId, ValueRow};
+use super::style::{OverStore, Recipe};
 use super::{El, Site, View};
 use crate::layout::{Len, Over, Preset};
 use crate::role::{Metric, Role, Scope};
@@ -79,7 +80,7 @@ pub struct Mount {
     exit: Exit,
     /// The head of this subtree's chain through the mount table. A chain and not a `Vec`,
     /// so realizing a list row during a fling allocates nothing.
-    rows: u32,
+    rows: MountId,
 }
 
 impl Mount {
@@ -130,7 +131,6 @@ pub fn mount_at(el: View, parent: GroupId, after: Option<NodeId>, scope: Scope) 
     let node = walk(
         &mut build,
         Where::new(el.at, parent, after, scope),
-        None,
         &mut rows,
         &mut Claim::default(),
     );
@@ -186,26 +186,22 @@ impl Where {
 }
 
 /// The chain of mount-table rows one walk claimed, threaded as it goes.
+#[derive(Default)]
 struct Rows {
-    head: u32,
-    tail: u32,
-}
-
-impl Default for Rows {
-    fn default() -> Self {
-        Self {
-            head: NIL,
-            tail: NIL,
-        }
-    }
+    head: MountId,
+    tail: MountId,
 }
 
 impl Rows {
-    fn push(&mut self, at: u32) {
-        if self.head == NIL {
+    fn push(&mut self, at: MountId) {
+        if self.head.is_none() {
             self.head = at;
         } else {
-            Host::with(|h| h.mounts[self.tail as usize].next = at);
+            Host::with(|h| {
+                if let Some(row) = h.mounts.get_mut(self.tail) {
+                    row.next = at;
+                }
+            });
         }
         self.tail = at;
     }
@@ -213,16 +209,8 @@ impl Rows {
 
 /// Emits one slot and its subtree.
 ///
-/// `enclosing` collects every mount index below the nearest responsive container, so that
-/// container can re-lower exactly its own subtree and nothing else. `rows` collects every
-/// index the whole walk claimed, which is what the unmount releases.
-fn walk(
-    b: &mut Build,
-    at: Where,
-    enclosing: Option<&mut Vec<u32>>,
-    rows: &mut Rows,
-    claim: &mut Claim,
-) -> NodeId {
+/// `rows` collects every index the whole walk claimed, which is what the unmount releases.
+fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId {
     let slot = b.nodes[at.at as usize];
     let inner = slot.elevate.map_or(at.scope, |e| at.scope.elevate(e));
     let roles = slot.chrome.map(Chrome::roles);
@@ -266,31 +254,26 @@ fn walk(
     };
 
     // ── style, and the recipe that can re-lower it ────────────────────────────────
-    // Straight into the store the row keeps, so a recipe of four or fewer — every widget in
-    // the set — costs no allocation on the way there either.
-    let store = OverStore::collect(b.chain_over(slot.over).map(|entry| entry.over));
-    let style = crate::layout::lower(slot.preset, store.as_slice(), at.scope);
+    // The scope is stored class-free: `at.scope` carries the class in force where this node
+    // was built, and the solve supplies the current one through the restyle seam.
+    let recipe = Recipe {
+        preset: slot.preset,
+        over: OverStore::collect(b.chain_over(slot.over).map(|entry| entry.over)),
+        scope: at.scope,
+    };
+    let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), at.scope);
+    super::style::with(|table| table.place(node, recipe));
     let row = Host::with(|h| {
         h.model().style(node, &style);
         h.mint_mount(MountRow {
             node,
-            preset: slot.preset,
-            over: store,
-            scope: at.scope,
-            next: NIL,
-            generation: 0,
+            next: MountId::NONE,
             control: None,
             text: None,
-            values: NIL,
-            responsive: None,
+            values: ValueId::NONE,
             scroll: None,
-            live: true,
         })
     });
-    let mut enclosing = enclosing;
-    if let Some(collector) = enclosing.as_deref_mut() {
-        collector.push(row);
-    }
     rows.push(row);
 
     // ── the node's own sprites, where it is not one itself ────────────────────────
@@ -328,7 +311,7 @@ fn walk(
     // ── styles that follow a value ────────────────────────────────────────────────
     // Its own pass over the act chain, taking only its own variants: a spacer has a style
     // that moves and no hit entry at all, so this and the control row cannot be one pass.
-    mount_style_acts(b, &slot, node, row);
+    mount_style_acts(b, &slot, node);
 
     // ── channels: one reactive lowering ───────────────────────────────────────────
     mount_channels(b, &slot, node, row, &mut own_claim);
@@ -344,24 +327,13 @@ fn walk(
     }
 
     // ── children ──────────────────────────────────────────────────────────────────
-    // A responsive container collects its own subtree instead of contributing to its
-    // parent's, so a class change re-lowers exactly what that class governs. Above the
-    // outermost one there is no collector at all: a row nobody will re-lower is a row nobody
-    // has to remember, and that is most of a tree.
-    let mut own = Vec::new();
     if slot.kids.len > 0 {
         let group = group.expect("a node with children is a group");
         for index in 0..slot.kids.len {
             let kid = b.kids[(slot.kids.at + index) as usize];
-            let collector = if slot.responsive.is_some() {
-                Some(&mut own)
-            } else {
-                enclosing.as_deref_mut()
-            };
             previous = Some(walk(
                 b,
                 Where::new(kid, group, previous, inner),
-                collector,
                 rows,
                 &mut own_claim,
             ));
@@ -386,19 +358,7 @@ fn walk(
 
     if let Some(bounds) = slot.responsive {
         let group = group.expect("a responsive container is a group");
-        let class = inner.width;
-        Host::with(|h| {
-            h.model().responsive(group, bounds);
-            h.mint_responsive(
-                row,
-                Responsive {
-                    node: group,
-                    bounds,
-                    class,
-                    subtree: own,
-                },
-            );
-        });
+        Host::with(|h| h.model().responsive(group, bounds));
     }
 
     // Last, and outside every borrow: an adapter builds application views, so it runs where
@@ -614,12 +574,11 @@ fn mount_control(
     parts: Parts,
     claim: Claim,
     scope: Scope,
-    row: u32,
+    row: MountId,
 ) -> Option<ControlId> {
     let hit = slot.hit?;
 
-    let mut control = Control {
-        generation: 0,
+    let mut control = ControlRow {
         node,
         fill: parts.fill,
         label: parts.label,
@@ -649,7 +608,6 @@ fn mount_control(
         uia: slot.uia,
         name: slot.name,
         key: slot.key,
-        live: true,
     };
 
     let mut disabled = None;
@@ -662,7 +620,7 @@ fn mount_control(
             Some(Act::Click(f)) => control.click = Some(f),
             Some(Act::ChangeF64(f)) => control.change = Some(f),
             Some(Act::CommitF64(f)) => control.commit = Some(f),
-            Some(Act::Tip(t)) => control.tip = Some(t),
+            Some(Act::Tip(t)) => control.tip = Some(std::rc::Rc::new(t)),
             Some(Act::Flyout(f)) => control.flyout = Some(f),
             Some(Act::DisabledWhen(f)) => disabled = Some(f),
             Some(Act::SelectedWhen(f)) => selected = Some(f),
@@ -676,9 +634,12 @@ fn mount_control(
     let inflate = hit.inflate.and_then(|l| l.dips(scope));
     let gesture = b.gesture(slot.gesture);
     let value = claim.value;
+    let caption = slot.caption;
     let id = Host::with(move |h| {
         let id = h.mint_control(control);
-        h.mounts[row as usize].control = Some(id);
+        if let Some(row) = h.mounts.get_mut(row) {
+            row.control = Some(id);
+        }
         // The front thread's half, shipped as numbers and ids: its own copy stays here so a
         // solve that changed this control's room can re-send a corrected one.
         if let Some(control) = h.control_mut(id) {
@@ -703,6 +664,9 @@ fn mount_control(
         );
         if let Some(decl) = gesture {
             h.gestures.push((id, decl));
+        }
+        if let Some(button) = caption {
+            h.caption.set(button, id);
         }
         id
     });
@@ -754,7 +718,7 @@ fn mount_scroll(
     content: NodeId,
     reveal: crate::layout::Reveal,
     scope: Scope,
-    row: u32,
+    row: MountId,
 ) {
     Host::with(|h| {
         let tracker = h.model().tracker_id::<windows_scene::Observed>();
@@ -804,14 +768,9 @@ fn mount_scroll(
 /// Installs the effects behind a style that follows a value.
 ///
 /// Each re-lowers from the node's **own recipe** with one override appended, rather than
-/// from a style it has to remember: a width class that moved in between is then already in
-/// the answer, and there is no second copy of the recipe to fall out of date.
-///
-/// The scope is read from the node's mount row at effect time, and not captured. A
-/// responsive container rewrites that row's `width` axis, and a surface pushed a rung into
-/// it — so the root's scope would re-lower a card's padding at the window's class and lose
-/// the elevation, which is the same drift the recipe itself exists to prevent.
-fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: u32) {
+/// from a style it has to remember, and at the class the last solve resolved for the node
+/// rather than one captured here — so neither the recipe nor the class can fall out of date.
+fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId) {
     let mut at = slot.acts.head;
     while at != NIL {
         let entry = &mut b.acts[at as usize];
@@ -826,10 +785,6 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: u32) {
             }
         };
         at = next;
-        // The recipe is captured as the store the mount row keeps, so the effect owns four
-        // overrides inline and re-lowers without copying a `Vec` on every run.
-        let preset = slot.preset;
-        let recipe = OverStore::collect(b.chain_over(slot.over).map(|entry| entry.over));
         // Installed outside every borrow, because creating an effect runs it.
         Effect::new(move || {
             let extra = match &act {
@@ -837,10 +792,10 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: u32) {
                 Act::Restyle(over) => Some(over()),
                 _ => None,
             };
-            let Some(scope) = Host::with(|h| h.mount_scope(row)) else {
+            let class = Host::with(|h| h.model().solved(node).class);
+            let Some(style) = super::style::lower_with(node, class, extra) else {
                 return;
             };
-            let style = crate::layout::lower_with(preset, recipe.as_slice(), extra, scope);
             Host::with(|h| h.model().style(node, &style));
         });
     }
@@ -876,7 +831,7 @@ fn uia_only(flags: HitFlags) -> HitFlags {
 /// no allocation — which is the whole of "static content costs one sprite and nothing
 /// else", decided here rather than once per widget. Anything else becomes exactly one
 /// effect, and the boxed reader **moves** into it.
-fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: u32, claim: &mut Claim) {
+fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: MountId, claim: &mut Claim) {
     let mut at = slot.chans.head;
     while at != NIL {
         let entry = &mut b.chans[at as usize];
@@ -888,7 +843,6 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: u32, claim: &mu
         let value = unit.is_value().then(|| {
             let id = Host::with(|h| {
                 h.mint_value(ValueRow {
-                    generation: 0,
                     node,
                     // Its own box until the enclosing control claims it, which reads as zero
                     // room — the honest answer before layout has said anything.
@@ -902,8 +856,7 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: u32, claim: &mu
                     travel: 0.0,
                     front_driven: false,
                     row,
-                    next: NIL,
-                    live: true,
+                    next: ValueId::NONE,
                 })
             });
             claim.value = claim.value.or(Some(id));
@@ -975,7 +928,7 @@ fn mount_text(
     text: u32,
     scope: Scope,
     roles: Option<RoleSet>,
-    row: u32,
+    row: MountId,
 ) {
     let seed = &mut b.texts[text as usize];
     let (ramp, flow, source) = (seed.ramp, seed.flow, seed.source.take());
@@ -1005,7 +958,9 @@ fn mount_text(
                 group: group.filter(|_| flow == Flow::Wrap),
             })
         });
-        h.mounts[row as usize].text = Some(key);
+        if let Some(row) = h.mounts.get_mut(row) {
+            row.text = Some(key);
+        }
         h.model().measure(node, MeasureCtx::Measured(key));
         key
     });

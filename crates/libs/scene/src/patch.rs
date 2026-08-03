@@ -16,6 +16,37 @@ use windows_text::{GlyphSeg, SegBuffers};
 
 pub use windows_text::Span;
 
+/// Where a new node hangs.
+///
+/// Three cases, named. They were one `NodeId` field with `NodeId::NONE` standing in
+/// for both of the parentless ones, which meant the front half could not tell the
+/// window's own root from a flyout's — and, having no arm for either, silently
+/// parented neither.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Attach {
+    /// An ordinary child of another node.
+    Node(NodeId),
+    /// The window's own container. The founding attachment, and the front half owns
+    /// the container itself — the model names what goes in it, never it.
+    Window,
+    /// A slot root: a flyout, popup, tooltip or ghost. Placed in absolute window
+    /// DIPs by its own solve, scanned at the tail of the hit array, and above every
+    /// window-attached node in z-order.
+    Detached,
+}
+
+impl Attach {
+    /// The parent node, for the two consumers that only care about the tree: `None`
+    /// for either parentless case.
+    #[must_use]
+    pub const fn node(self) -> Option<NodeId> {
+        match self {
+            Self::Node(id) => Some(id),
+            Self::Window | Self::Detached => None,
+        }
+    }
+}
+
 /// One instruction to the front half.
 ///
 /// `Copy`, unconditionally. No `Rc`, no COM interface, no closure can enter — event
@@ -23,13 +54,13 @@ pub use windows_text::Span;
 /// thread consults without ever holding them.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Op {
-    /// Mints a node and parents it. `after` is the sibling to sit above, or `None` for the
+    /// Mints a node and attaches it. `after` is the sibling to sit above, or `None` for the
     /// bottom of the collection — the platform's own vocabulary, since a visual collection
     /// offers insert-at-bottom, insert-above and remove and no insert-at-index.
     New {
         id: NodeId,
         kind: NodeKind,
-        parent: NodeId,
+        parent: Attach,
         after: Option<NodeId>,
     },
     /// Reparents or reorders. The keyed structure diff upstream already computed the

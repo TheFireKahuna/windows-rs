@@ -76,7 +76,7 @@
 // systematically thin or fat and reads as a font choice rather than as a setting.
 // The params object itself is DirectWrite's and is built by `windows-text`; this
 // crate names only the interface, so that a caller can hand one over.
-    ID2D1RenderTarget::{BeginDraw, EndDraw, SetTags, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateLinearGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, PushAxisAlignedClip, PopAxisAlignedClip, PopLayer, SetTextAntialiasMode, SetTextRenderingParams, GetTextRenderingParams, SetAntialiasMode, GetAntialiasMode}
+    ID2D1RenderTarget::{BeginDraw, EndDraw, SetTags, Clear, DrawEllipse, FillEllipse, DrawLine, DrawRectangle, FillRectangle, DrawRoundedRectangle, FillRoundedRectangle, DrawGeometry, FillGeometry, CreateSolidColorBrush, CreateLinearGradientBrush, CreateRadialGradientBrush, GetTransform, SetTransform, SetDpi, GetDpi, GetPixelSize, PushAxisAlignedClip, PopAxisAlignedClip, PopLayer, SetTextAntialiasMode, SetTextRenderingParams, GetTextRenderingParams, SetAntialiasMode, GetAntialiasMode}
     IDWriteRenderingParams::{}
 // Ideal glyph metrics, independent of the display resolution, positioned with
 // subpixel precision. Design metrics stay DIP-constant, so the GDI modes — which
@@ -143,14 +143,16 @@
 // a gamma enum instead and cannot express scRGB at 16 bits per channel, which is why
 // neither it nor `D2D1_GAMMA` is here.
     ID2D1LinearGradientBrush::{SetStartPoint, SetEndPoint}
+    ID2D1RadialGradientBrush
     ID2D1SolidColorBrush::SetColor
     ID2D1Brush::SetOpacity
     ID2D1BitmapBrush1
     ID2D1GradientStopCollection1
     D2D1_GRADIENT_STOP
-// Linear only. Every ramp this stack authors runs along an axis, and a radial one would be
-// a second brush kind with no consumer — a filter line and fifteen more when one appears.
+// Both forms. The radial one has one consumer — the backdrop's glow blobs, whose profile is
+// a circular ramp stretched into an ellipse by the sprite it fills.
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES
     D2D1_BITMAP_BRUSH_PROPERTIES1
     D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT
     D2D1_COLOR_SPACE_SCRGB

@@ -357,3 +357,102 @@ fn an_epoch_carries_a_count_a_consumer_can_miss_and_still_detect() {
     // Already signalled, so the wait returns without parking.
     assert_eq!(epoch.wait(0), at + 5);
 }
+
+/// A host that blocks needs telling that a write happened, and telling **once**.
+///
+/// Both halves matter and they fail in opposite directions: a wake that never comes is a
+/// frozen window, and a wake per write is the spin the blocking pump exists to remove.
+#[test]
+fn a_write_asks_for_one_frame_and_a_burst_still_asks_once() {
+    let asked = Ref::new(Slot::new(0_u32));
+    let counter = Ref::clone(&asked);
+    set_waker(move || *counter.borrow_mut() += 1);
+    let asks = || *asked.borrow();
+
+    let (_owner, ()) = Owner::scope(|| {
+        let a = Cell::new(0_i32);
+        let b = Cell::new(0_i32);
+        let unread = Cell::new(0_i32);
+        let log = Ref::new(Log::default());
+        let seen = Ref::clone(&log);
+        Effect::new(move || {
+            let _ = a.get();
+            let _ = b.get();
+            seen.push("effect");
+        });
+        // The mount's own first run is the host's business, not a wake's: it flushes before
+        // it shows the window. Whatever that cost, the counting starts after it.
+        flush();
+        let mounted = asks();
+
+        a.set(1);
+        assert_eq!(
+            asks(),
+            mounted + 1,
+            "a write with a subscriber asks for a frame"
+        );
+
+        a.set(2);
+        b.set(3);
+        assert_eq!(
+            asks(),
+            mounted + 1,
+            "the queue was already dirty, so these are the same frame"
+        );
+
+        flush();
+        assert_eq!(log.count("effect"), 2, "and one frame ran the effect once");
+
+        a.set(4);
+        assert_eq!(asks(), mounted + 2, "a drained queue arms the edge again");
+
+        flush();
+        let before = asks();
+        unread.set(9);
+        assert_eq!(
+            asks(),
+            before,
+            "nothing reads it, so there is nothing to draw and nothing to ask for"
+        );
+    });
+}
+
+/// A write from inside an effect asks for nothing: the flush it is already inside picks it
+/// up on its next pass, and asking there would mean a frame after every frame.
+#[test]
+fn a_write_from_inside_a_flush_asks_for_no_further_frame() {
+    let asked = Ref::new(Slot::new(0_u32));
+    let counter = Ref::clone(&asked);
+    set_waker(move || *counter.borrow_mut() += 1);
+
+    let (_owner, ()) = Owner::scope(|| {
+        let input = Cell::new(0_i32);
+        let derived = Cell::new(0_i32);
+        let log = Ref::new(Log::default());
+        let seen = Ref::clone(&log);
+        Effect::new(move || {
+            derived.set(input.get() * 2);
+            seen.push("writer");
+        });
+        // A second effect, so the write above genuinely has a subscriber to queue.
+        let watched = Ref::new(Log::default());
+        let watcher = Ref::clone(&watched);
+        Effect::new(move || {
+            let _ = derived.get();
+            watcher.push("reader");
+        });
+        flush();
+
+        let before = *asked.borrow();
+        input.set(21);
+        assert_eq!(*asked.borrow(), before + 1, "the outside write asks once");
+        flush();
+        assert_eq!(
+            *asked.borrow(),
+            before + 1,
+            "and the effect's own write inside that flush asks for nothing"
+        );
+        assert_eq!(derived.get(), 42, "while still having happened");
+        assert_eq!(watched.count("reader"), 2, "and still having propagated");
+    });
+}

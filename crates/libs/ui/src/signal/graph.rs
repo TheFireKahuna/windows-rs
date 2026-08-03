@@ -23,8 +23,8 @@
 use super::shared;
 use core::any::Any;
 use core::cell::RefCell;
-use core::num::NonZeroU32;
 use std::rc::Rc;
+use windows_scene::{Id, Ids, Slots};
 
 /// How many times a flush may re-enter before it is treated as a cycle.
 ///
@@ -46,9 +46,16 @@ pub(super) const MAX_PASSES: u32 = 8;
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SignalId {
     pub(super) graph: u32,
-    pub(super) index: u32,
-    pub(super) generation: NonZeroU32,
+    pub(super) id: Id<Signal>,
 }
+
+/// The family a signal node belongs to.
+#[derive(Debug)]
+pub struct Signal;
+
+/// The family a disposal scope belongs to.
+#[derive(Debug)]
+pub struct Owner;
 
 /// Where a node sits between "a source it reads changed" and "it has caught up".
 ///
@@ -83,12 +90,9 @@ enum Kind {
     Source(Rc<dyn Any>),
     Memo(Rc<dyn MemoCell>),
     Effect(Rc<RefCell<dyn FnMut()>>),
-    /// A freed slot, waiting on the free list.
-    Free,
 }
 
 struct Node {
-    generation: NonZeroU32,
     state: State,
     kind: Kind,
     /// Creation order. Effects run in it, so a parent's effect lands before its child's.
@@ -106,11 +110,7 @@ struct Node {
 }
 
 /// A disposal scope's identity.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(super) struct OwnerId {
-    index: u32,
-    generation: NonZeroU32,
-}
+pub(super) type OwnerId = Id<Owner>;
 
 /// What a scope disposes, in reverse creation order.
 #[derive(Copy, Clone)]
@@ -119,8 +119,8 @@ enum Child {
     Owner(OwnerId),
 }
 
+#[derive(Default)]
 struct OwnerNode {
-    generation: NonZeroU32,
     children: Vec<Child>,
 }
 
@@ -128,10 +128,17 @@ struct OwnerNode {
 struct Graph {
     /// This graph's process-unique id, stamped into every [`SignalId`] it mints.
     id: u32,
-    nodes: Vec<Node>,
-    free: Vec<u32>,
-    owners: Vec<OwnerNode>,
-    owners_free: Vec<u32>,
+    node_ids: Ids<Signal>,
+    nodes: Slots<Signal, Node>,
+    /// Disposed nodes, kept for their edge buffers.
+    ///
+    /// Parked rather than left in a vacated slot, which is the same trick the text table
+    /// plays with a laid-out run: a recycled node keeps its `deps` and `subs` capacity, and
+    /// that is what makes the second mount of a screen allocation-free.
+    spare: Vec<Node>,
+    owner_ids: Ids<Owner>,
+    owners: Slots<Owner, OwnerNode>,
+    owner_spare: Vec<OwnerNode>,
     /// The node currently collecting dependencies, if any.
     observer: Option<SignalId>,
     /// The scope new nodes register with, if any.
@@ -155,10 +162,12 @@ static NEXT_GRAPH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 thread_local! {
     static GRAPH: RefCell<Graph> = RefCell::new(Graph {
         id: NEXT_GRAPH.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-        nodes: Vec::new(),
-        free: Vec::new(),
-        owners: Vec::new(),
-        owners_free: Vec::new(),
+        node_ids: Ids::new(),
+        nodes: Slots::new(),
+        spare: Vec::new(),
+        owner_ids: Ids::new(),
+        owners: Slots::new(),
+        owner_spare: Vec::new(),
         observer: None,
         scope: None,
         order: 0,
@@ -173,6 +182,50 @@ thread_local! {
 /// Runs `f` with the graph borrowed. See the module's one rule.
 fn with<R>(f: impl FnOnce(&mut Graph) -> R) -> R {
     GRAPH.with(|g| f(&mut g.borrow_mut()))
+}
+
+thread_local! {
+    /// What to tell when this graph acquires work. See [`set_waker`].
+    ///
+    /// Its own local rather than a field of [`Graph`], for the reason the module header
+    /// gives about application code: it is called with **no** graph borrow held, and a
+    /// waker that re-entered the graph through a field of it could not be.
+    static WAKER: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Installs what to call the moment this graph goes from having nothing to do to having
+/// something.
+///
+/// **Without one, a write schedules nothing.** `Cell::set` marks nodes and queues effects;
+/// it does not draw, and nothing downstream of it runs until somebody calls [`flush`]. A
+/// host whose loop is *blocked* — which is every host that does not spin — therefore needs
+/// telling, and this is the seam it tells through. The cross-thread half already has one in
+/// [`written`](super::written); this is the same edge for the owning thread, and the two are
+/// deliberately separate because a producer's write has a thread to wake and this one has a
+/// frame to ask for.
+///
+/// Called on the **empty → non-empty** transition of the effect queue and no other time, so
+/// a burst of writes asks once. A write made from inside a flush asks for nothing at all:
+/// the flush it is already inside picks the work up on its next pass, and asking there would
+/// request a frame after every frame — a spin with extra steps.
+pub fn set_waker(f: impl Fn() + 'static) {
+    WAKER.with(|w| *w.borrow_mut() = Some(Box::new(f)));
+}
+
+/// Calls the waker, holding no borrow of either the graph or the waker slot while it runs.
+fn wake() {
+    let waker = WAKER.with(|w| w.borrow_mut().take());
+    if let Some(waker) = waker {
+        waker();
+        WAKER.with(|w| {
+            let mut slot = w.borrow_mut();
+            // A waker that installed a new one during the call keeps it: this is putting the
+            // borrowed one back, not overwriting whatever is there now.
+            if slot.is_none() {
+                *slot = Some(waker);
+            }
+        });
+    }
 }
 
 /// The same, answering `None` where the graph is not reachable.
@@ -193,41 +246,31 @@ impl Graph {
         if id.graph != self.id {
             return None;
         }
-        self.nodes
-            .get(id.index as usize)
-            .filter(|node| node.generation == id.generation)
+        self.nodes.get(id.id)
     }
 
     fn node_mut(&mut self, id: SignalId) -> Option<&mut Node> {
         if id.graph != self.id {
             return None;
         }
-        self.nodes
-            .get_mut(id.index as usize)
-            .filter(|node| node.generation == id.generation)
+        self.nodes.get_mut(id.id)
     }
 
     fn mint(&mut self, kind: Kind) -> SignalId {
         self.order += 1;
         let order = self.order;
-        let id = if let Some(index) = self.free.pop() {
-            // The recycled node keeps its `deps` and `subs` capacity, which is what makes
-            // the second mount of a screen allocation-free.
-            let node = &mut self.nodes[index as usize];
-            node.state = State::Dirty;
-            node.kind = kind;
-            node.order = order;
-            node.queued = false;
-            node.version = 0;
-            SignalId {
-                graph: self.id,
-                index,
-                generation: node.generation,
+        // A parked node keeps its `deps` and `subs` capacity, which is what makes the second
+        // mount of a screen allocation-free.
+        let node = match self.spare.pop() {
+            Some(mut node) => {
+                node.state = State::Dirty;
+                node.kind = kind;
+                node.order = order;
+                node.queued = false;
+                node.version = 0;
+                node
             }
-        } else {
-            let index = u32::try_from(self.nodes.len()).expect("fewer than 4 billion signals");
-            self.nodes.push(Node {
-                generation: NonZeroU32::MIN,
+            None => Node {
                 state: State::Dirty,
                 kind,
                 order,
@@ -235,12 +278,11 @@ impl Graph {
                 subs: Vec::new(),
                 queued: false,
                 version: 0,
-            });
-            SignalId {
-                graph: self.id,
-                index,
-                generation: NonZeroU32::MIN,
-            }
+            },
+        };
+        let id = SignalId {
+            graph: self.id,
+            id: self.nodes.insert(&mut self.node_ids, node),
         };
         if let Some(scope) = self.scope {
             self.attach(scope, Child::Signal(id));
@@ -249,11 +291,7 @@ impl Graph {
     }
 
     fn attach(&mut self, scope: OwnerId, child: Child) {
-        if let Some(owner) = self
-            .owners
-            .get_mut(scope.index as usize)
-            .filter(|owner| owner.generation == scope.generation)
-        {
+        if let Some(owner) = self.owners.get_mut(scope) {
             owner.children.push(child);
         }
     }
@@ -292,8 +330,12 @@ impl Graph {
     fn push_subs(&mut self, id: SignalId, state: State) {
         let len = self.node(id).map_or(0, |node| node.subs.len());
         for i in 0..len {
-            // `set_state` never touches a subscriber list, so indexing is stable here.
-            let sub = self.nodes[id.index as usize].subs[i];
+            // Re-resolved each step rather than indexed: `set_state` never touches a
+            // subscriber list, so the position is stable, but reaching the row through its
+            // id is what keeps every read on the checked path.
+            let Some(sub) = self.node(id).and_then(|node| node.subs.get(i).copied()) else {
+                break;
+            };
             self.set_state(sub, state);
         }
     }
@@ -501,13 +543,20 @@ fn clear_deps(g: &mut Graph, id: SignalId) {
 /// Bumps `id`'s version and marks everything downstream of it. The push half of the
 /// scheme, and the only place a version moves.
 pub(super) fn invalidate(id: SignalId) {
-    with(|g| {
+    let acquired = with(|g| {
         if let Some(node) = g.node_mut(id) {
             node.version = node.version.wrapping_add(1);
         }
+        // Read before the marking, so what is compared afterwards is this write's own doing.
+        let idle = !g.flushing && g.queue.is_empty();
         g.invalidate(id);
         g.stack.clear();
+        idle && !g.queue.is_empty()
     });
+    // Outside the borrow: a waker is host code and may do anything, including write a signal.
+    if acquired {
+        wake();
+    }
 }
 
 /// How many times `id`'s value has moved. Zero for a node that is gone.
@@ -562,12 +611,8 @@ pub fn flush() {
             // Creation order is the contract: a parent's effect writes the container a
             // child's effect fills. Sorting in place allocates nothing.
             let nodes = &g.nodes;
-            g.running.sort_unstable_by_key(|id| {
-                nodes
-                    .get(id.index as usize)
-                    .filter(|node| node.generation == id.generation)
-                    .map_or(u64::MAX, |node| node.order)
-            });
+            g.running
+                .sort_unstable_by_key(|id| nodes.get(id.id).map_or(u64::MAX, |node| node.order));
             g.running.is_empty()
         });
         if empty {
@@ -644,23 +689,10 @@ fn apply_staged() {
 
 pub(super) fn open_scope() -> OwnerId {
     with(|g| {
-        let id = if let Some(index) = g.owners_free.pop() {
-            let owner = &mut g.owners[index as usize];
-            OwnerId {
-                index,
-                generation: owner.generation,
-            }
-        } else {
-            let index = u32::try_from(g.owners.len()).expect("fewer than 4 billion scopes");
-            g.owners.push(OwnerNode {
-                generation: NonZeroU32::MIN,
-                children: Vec::new(),
-            });
-            OwnerId {
-                index,
-                generation: NonZeroU32::MIN,
-            }
-        };
+        // A parked scope keeps its child list's capacity, which is what makes remounting a
+        // screen free.
+        let owner = g.owner_spare.pop().unwrap_or_default();
+        let id = g.owners.insert(&mut g.owner_ids, owner);
         // A scope opened inside another is disposed by it, so a subtree's scopes need no
         // separate bookkeeping and no parent walk.
         if let Some(parent) = g.scope {
@@ -681,10 +713,7 @@ pub(super) fn dispose_scope(id: OwnerId) {
     // already being destroyed is disposing this scope by dropping it, so there is nothing
     // left for the walk below to do.
     let Some(Some(mut children)) = try_with(|g| {
-        let owner = g
-            .owners
-            .get_mut(id.index as usize)
-            .filter(|owner| owner.generation == id.generation)?;
+        let owner = g.owners.get_mut(id)?;
         Some(core::mem::take(&mut owner.children))
     }) else {
         return;
@@ -700,15 +729,10 @@ pub(super) fn dispose_scope(id: OwnerId) {
     }
 
     try_with(|g| {
-        if let Some(owner) = g
-            .owners
-            .get_mut(id.index as usize)
-            .filter(|owner| owner.generation == id.generation)
-        {
+        if let Some(mut owner) = g.owners.remove(&mut g.owner_ids, id) {
             // The `Vec` goes back with its capacity, which is what makes remounting free.
             owner.children = children;
-            owner.generation = owner.generation.checked_add(1).unwrap_or(NonZeroU32::MIN);
-            g.owners_free.push(id.index);
+            g.owner_spare.push(owner);
         }
     });
 }
@@ -722,17 +746,19 @@ pub(super) fn dispose(id: SignalId) {
         }
         clear_deps(g, id);
         shared::release(id);
-        let Some(node) = g.node_mut(id) else { return };
+        let Some(mut node) = g.nodes.remove(&mut g.node_ids, id.id) else {
+            return;
+        };
         // A subscriber that outlives its source is legal — it is simply never woken again
         // — and its stale edge is pruned by the generation check the next time it is
         // walked. What must not survive is this node's entry in anyone else's list, and
         // `clear_deps` above is what removes those.
         node.subs.clear();
-        node.kind = Kind::Free;
         node.state = State::Clean;
         node.queued = false;
-        node.generation = node.generation.checked_add(1).unwrap_or(NonZeroU32::MIN);
-        g.free.push(id.index);
+        // Parked with its buffers. There is no `Free` variant to leave behind: the slot is
+        // vacant because the store says so, not because the payload has a way to say it.
+        g.spare.push(node);
     });
 }
 
@@ -742,5 +768,5 @@ pub(super) fn dispose(id: SignalId) {
 /// thousand times must return this to its baseline.
 #[must_use]
 pub fn live_nodes() -> usize {
-    with(|g| g.nodes.len() - g.free.len())
+    with(|g| g.nodes.len())
 }

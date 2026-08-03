@@ -18,11 +18,14 @@
 //! is `Send` whatever it reaches through, and a run holds a layout object that is not.
 
 use crate::role::{Scope, TypeRole};
-use crate::widget::{Flow, Run, Shaped, TextSource};
+use crate::widget::{Flow, Shaped, TextSource};
 use std::cell::RefCell;
+use windows_core::Result;
 use windows_numerics::Vector2;
-use windows_scene::{GroupId, Mask, MeasureIn, MeasureKey, Model, RunId, SpriteId, taffy};
-use windows_text::FontSpec;
+use windows_scene::{
+    GroupId, Ids, Mask, MeasureIn, MeasureKey, Measured, Model, RunId, Slots, SpriteId, taffy,
+};
+use windows_text::{FontLadder, FontSpec, SegBuffers, ShapedRun, TextEngine};
 
 /// Where one entry's lines are drawn.
 ///
@@ -96,7 +99,7 @@ impl Source {
 }
 
 pub(crate) struct Entry {
-    run: Box<dyn Run>,
+    run: ShapedRun,
     /// The current string, needed again whenever the type ramp moves.
     text: Source,
     ramp: TypeRole,
@@ -115,7 +118,6 @@ pub(crate) struct Entry {
     pinned: f32,
     /// The string or the font moved, so the run is behind its source.
     stale: bool,
-    live: bool,
 }
 
 /// What a run needs to exist.
@@ -136,12 +138,60 @@ pub(crate) struct Mint {
 
 #[derive(Default)]
 pub(crate) struct Table {
-    entries: Vec<Entry>,
-    free: Vec<u32>,
+    keys: Ids<Measured>,
+    pub(crate) entries: Slots<Measured, Entry>,
+    /// Laid-out runs whose key has been released, kept for their buffers.
+    ///
+    /// A released entry is **parked here rather than left in a vacated slot**, which is the
+    /// same trick the build arena plays with its own buffers: reshaping one costs no shaping
+    /// and no allocation, where building a fresh run costs both on the path a list row
+    /// realized during a fling takes. Keeping it in the store instead would need a second
+    /// removal verb — a slot that is vacant but still holds something — and that is the
+    /// live-flag-beside-a-generation arrangement this table just stopped having.
+    spare: Vec<Entry>,
+    /// The thread's shaping engine.
+    ///
+    /// Here rather than in [`Host`](super::Host) because the measure seam demands it:
+    /// `Model::on_measure` takes a `Send` closure that captures nothing, so the only
+    /// thing measure can reach is this table's own thread-local — and a run cannot be
+    /// reshaped without the engine that laid it out.
+    engine: Option<TextEngine>,
 }
 
 thread_local! {
     static TEXT: RefCell<Table> = RefCell::new(Table::default());
+}
+
+/// Installs this thread's shaping engine over `fonts`. Once, before anything mounts.
+///
+/// `fonts` must be the ladder the rasterizing half already holds —
+/// `Backends::ladder()`. Two ladders interning independently agree on face `0` and
+/// disagree on everything after it, and the symptom is a run drawn in the wrong face
+/// rather than an error.
+///
+/// # Errors
+///
+/// The DirectWrite factory or the font collection failing to open.
+///
+/// # Panics
+///
+/// If an engine is already installed on this thread.
+pub fn install(fonts: FontLadder) -> Result<()> {
+    let engine = TextEngine::new(fonts)?;
+    with(|table| {
+        assert!(
+            table.engine.is_none(),
+            "a text engine is already installed on this thread"
+        );
+        table.engine = Some(engine);
+    });
+    Ok(())
+}
+
+/// Whether this thread has an engine. What a diagnostic asks; nothing else needs it.
+#[must_use]
+pub fn installed() -> bool {
+    with(|table| table.engine.is_some())
 }
 
 /// Runs `f` against the thread's text table.
@@ -162,21 +212,19 @@ pub(crate) fn try_with<R>(f: impl FnOnce(&mut Table) -> R) -> Option<R> {
 /// whatever was current when the node was built.
 pub(crate) fn measure(input: MeasureIn) -> Vector2 {
     with(|table| {
-        let Some(entry) = table.entry_mut(input.key) else {
+        let Table {
+            entries, engine, ..
+        } = table;
+        let engine = engine.as_ref().expect(ENGINE);
+        let Some(entry) = entries.get_mut(input.key) else {
             return Vector2 { x: 0.0, y: 0.0 };
         };
-        entry.sync(input.class);
+        entry.sync(engine, input.class);
         entry.run.measure(input.available.0)
     })
 }
 
 impl Table {
-    fn entry_mut(&mut self, key: MeasureKey) -> Option<&mut Entry> {
-        self.entries
-            .get_mut(key.0 as usize)
-            .filter(|entry| entry.live)
-    }
-
     /// Registers a run and hands back the key layout will name it by.
     ///
     /// A released slot keeps its laid-out run, so this **reshapes** rather than building one:
@@ -202,9 +250,9 @@ impl Table {
             None => Target::Line { sprite, run: None },
         };
         let ink = ink.unwrap_or(crate::role::Text::Primary);
-        if let Some(at) = self.free.pop() {
-            let entry = &mut self.entries[at as usize];
-            entry.run.reshape(text.as_str(), font, flow);
+        let engine = self.engine.as_ref().expect(ENGINE);
+        if let Some(mut entry) = self.spare.pop() {
+            let _ = engine.reshape(&mut entry.run, text.as_str(), &font, flow);
             entry.text = text;
             entry.ramp = ramp;
             entry.flow = flow;
@@ -214,11 +262,16 @@ impl Table {
             entry.target = target;
             entry.pinned = f32::NAN;
             entry.stale = false;
-            entry.live = true;
-            return MeasureKey(u64::from(at));
+            return self.entries.insert(&mut self.keys, entry);
         }
-        self.entries.push(Entry {
-            run: crate::widget::shaper().shape(text.as_str(), font, flow),
+        let entry = Entry {
+            // Panics rather than measuring zero: a widget layer that answered a
+            // plausible size with no glyphs behind it lays the screen out around a
+            // lie, and the failure then surfaces as mysterious geometry rather than
+            // as the layout call that could not run.
+            run: engine
+                .shape(text.as_str(), &font, flow)
+                .expect("DirectWrite could not lay out a run"),
             text,
             ramp,
             flow,
@@ -232,9 +285,8 @@ impl Table {
             // at the first measure. A class that resolves a *different* font still reshapes,
             // because `sync` compares the font rather than trusting this flag.
             stale: false,
-            live: true,
-        });
-        MeasureKey((self.entries.len() - 1) as u64)
+        };
+        self.entries.insert(&mut self.keys, entry)
     }
 
     /// Re-points a run's text.
@@ -243,7 +295,7 @@ impl Table {
     /// re-rasterize, re-point — and text that changes at display rate belongs in a
     /// presentation region.
     pub(crate) fn set_text(&mut self, key: MeasureKey, text: &str) {
-        let Some(entry) = self.entry_mut(key) else {
+        let Some(entry) = self.entries.get_mut(key) else {
             return;
         };
         if entry.text.as_str() == text {
@@ -253,21 +305,13 @@ impl Table {
         entry.stale = true;
     }
 
-    /// The scope a run resolves its type ramp against, for a subtree that changed class.
-    pub(crate) fn set_scope(&mut self, key: MeasureKey, scope: Scope) {
-        if let Some(entry) = self.entry_mut(key) {
-            entry.scope = scope;
-        }
-    }
-
     /// Releases a run and the resource slots it held.
     ///
     /// The line sprites go with the subtree the destroy cascades over, so only the coverage
     /// tiles are named here — and they are refcounted on the far side, which is what makes
     /// dropping the model's claim safe while a sprite is still holding one.
     pub(crate) fn release(&mut self, key: MeasureKey, model: &mut Model) {
-        let at = key.0 as u32;
-        let Some(entry) = self.entries.get_mut(at as usize).filter(|e| e.live) else {
+        let Some(mut entry) = self.entries.remove(&mut self.keys, key) else {
             return;
         };
         match &mut entry.target {
@@ -282,17 +326,9 @@ impl Table {
                 }
             }
         }
-        // The run and its buffers stay: this slot is being recycled, not discarded, and
-        // `mint` reshapes what it finds here. Only the coverage the far side holds is
-        // named above.
-        entry.live = false;
-        self.free.push(at);
-    }
-
-    /// How many runs are live. What a leak test reads.
-    #[cfg(test)]
-    pub(crate) fn live(&self) -> usize {
-        self.entries.iter().filter(|entry| entry.live).count()
+        // The run and its buffers stay, parked for the next `mint` to reshape. Only the
+        // coverage the far side holds is named above.
+        self.spare.push(entry);
     }
 
     /// Pins every run at the width the solve gave it, and re-publishes the ones that moved.
@@ -311,11 +347,13 @@ impl Table {
     /// float compare per run, which is why the expensive halves — reshaping and re-emitting —
     /// are both behind `pin`.
     pub(crate) fn publish(&mut self, model: &mut Model) -> bool {
+        let Table {
+            entries, engine, ..
+        } = self;
+        let engine = engine.as_ref().expect(ENGINE);
         let mut emitted = false;
-        for entry in &mut self.entries {
-            if entry.live {
-                emitted |= entry.publish(model);
-            }
+        for (_, entry) in entries.iter_mut() {
+            emitted |= entry.publish(engine, model);
         }
         emitted
     }
@@ -326,7 +364,7 @@ impl Entry {
     ///
     /// `reshape` and not a fresh run: it keeps the harvest buffers and the line vector, so
     /// a label bound to a changing value allocates nothing after the first change.
-    fn sync(&mut self, class: windows_scene::WidthClass) {
+    fn sync(&mut self, engine: &TextEngine, class: windows_scene::WidthClass) {
         let font = crate::role::typography(self.ramp, self.scope.at_width(class));
         if !self.stale && font == self.font {
             return;
@@ -334,11 +372,11 @@ impl Entry {
         self.font = font;
         self.stale = false;
         self.pinned = f32::NAN;
-        self.run.reshape(self.text.as_str(), font, self.flow);
+        let _ = engine.reshape(&mut self.run, self.text.as_str(), &font, self.flow);
     }
 
     /// Fixes this run at the width it was given and re-emits what moved.
-    fn publish(&mut self, model: &mut Model) -> bool {
+    fn publish(&mut self, engine: &TextEngine, model: &mut Model) -> bool {
         // The box layout gave *this* run: the laid-out label sprite, or the column the
         // lines sit in. Both are the node whose style measured it.
         let node = match self.target {
@@ -361,18 +399,33 @@ impl Entry {
         }
         match &mut self.target {
             Target::Line { sprite, run } => {
-                let shaped = self.run.emit(0, model.glyphs());
+                let shaped = emit(engine, &mut self.run, 0, model.glyphs());
                 publish_line(model, *sprite, run, shaped);
                 true
             }
             Target::Wrapped { group, lines } => {
                 let light =
                     crate::role::resolve(crate::role::Role::Text(self.ink), self.scope.for_paint());
-                publish_lines(model, &mut *self.run, *group, lines, light)
+                publish_lines(engine, model, &mut self.run, *group, lines, light)
             }
         }
     }
 }
+
+/// One line's segments and the tile they occupy.
+///
+/// Harvest first: `pin` marks the layout stale, and reading a line before the walk
+/// would answer from the previous width.
+fn emit(engine: &TextEngine, run: &mut ShapedRun, line: usize, out: &mut SegBuffers) -> Shaped {
+    let _ = engine.harvest(run);
+    Shaped {
+        segs: run.segments(line, out),
+        ink: run.line_ink(line),
+    }
+}
+
+/// The one place a missing engine is named.
+const ENGINE: &str = "a text engine must be installed before anything mounts: call                       windows_ui::build::text::install once at start-up";
 
 /// Points one sprite at a line's coverage.
 ///
@@ -394,20 +447,24 @@ fn publish_line(model: &mut Model, sprite: SpriteId, run: &mut Option<RunId>, sh
 /// Sprites are minted and destroyed only as the line **count** changes, which for a caption
 /// is a resize crossing a break and not a keystroke.
 fn publish_lines(
+    engine: &TextEngine,
     model: &mut Model,
-    run: &mut dyn Run,
+    run: &mut ShapedRun,
     group: GroupId,
     lines: &mut Vec<Line>,
     light: windows_color::Radiance,
 ) -> bool {
-    let count = run.lines();
+    // Harvesting is what fills the line table, and pinning is what makes it stale, so
+    // the walk happens once here rather than at each reader below.
+    let _ = engine.harvest(run);
+    let count = run.lines().len();
     while lines.len() > count {
         let line = lines.pop().expect("the vector is longer than the run");
         model.destroy(line.sprite.node(), windows_scene::Exit::None);
         model.release(line.run);
     }
     for index in 0..count {
-        let shaped = run.emit(index, model.glyphs());
+        let shaped = emit(engine, run, index, model.glyphs());
         let size = shaped.ink.size;
         if let Some(line) = lines.get_mut(index) {
             model.set_run(line.run, shaped.segs, shaped.ink);

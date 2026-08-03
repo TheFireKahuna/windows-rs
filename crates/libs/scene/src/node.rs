@@ -4,7 +4,7 @@
 //! the mint branches on kind** and everything else loses a two-arm match. That one branch
 //! is also what gives `SpriteId` and `GroupId` real backing.
 
-use crate::id::Id;
+use crate::id::Slots;
 use crate::sink::{Clip, Mask, NodeId, NodeKind, Paint};
 use crate::tree::{Forest, Links};
 use windows_composition::{
@@ -30,63 +30,7 @@ pub(crate) const SHADOW_CHANS: usize = 2;
 /// The model mints and the scene stores: the free list and the generation counter live on
 /// the app side, so an id freed by a destroy can be reused by a create in the *same* patch
 /// with no round trip. This side only validates.
-#[derive(Debug)]
-pub(crate) struct Slots<T> {
-    items: Vec<Option<(u32, T)>>,
-}
-
-impl<T> Default for Slots<T> {
-    fn default() -> Self {
-        Self { items: Vec::new() }
-    }
-}
-
-impl<T> Slots<T> {
-    pub(crate) fn insert<F>(&mut self, id: Id<F>, value: T) {
-        let index = id.index();
-        if index >= self.items.len() {
-            self.items.resize_with(index + 1, || None);
-        }
-        self.items[index] = Some((id.generation(), value));
-    }
-
-    pub(crate) fn get<F>(&self, id: Id<F>) -> Option<&T> {
-        match self.items.get(id.index()) {
-            Some(Some((generation, value))) if *generation == id.generation() => Some(value),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn get_mut<F>(&mut self, id: Id<F>) -> Option<&mut T> {
-        match self.items.get_mut(id.index()) {
-            Some(Some((generation, value))) if *generation == id.generation() => Some(value),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn remove<F>(&mut self, id: Id<F>) -> Option<T> {
-        match self.items.get_mut(id.index()) {
-            Some(slot @ Some(_)) if slot.as_ref().is_some_and(|(g, _)| *g == id.generation()) => {
-                slot.take().map(|(_, value)| value)
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.items.iter().filter(|slot| slot.is_some()).count()
-    }
-
-    /// Every live id in the arena, for the walks that genuinely need all of them.
-    pub(crate) fn iter_ids<F>(&self) -> impl Iterator<Item = Id<F>> + '_ {
-        self.items.iter().enumerate().filter_map(|(index, slot)| {
-            slot.as_ref()
-                .map(|(generation, _)| Id::raw(index as u32, *generation))
-        })
-    }
-}
-
-impl Forest for Slots<Node> {
+impl Forest for Slots<crate::sink::Node, Node> {
     fn links(&self, id: NodeId) -> Option<&Links> {
         self.get(id).map(|node| &node.links)
     }

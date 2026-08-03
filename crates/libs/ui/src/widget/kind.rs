@@ -55,10 +55,16 @@ pub enum UiaRole {
     Group,
     Button,
     CheckBox,
+    /// One of a set. Reports `SelectionItem` rather than `Toggle`, which is the distinction
+    /// a screen reader announces as "3 of 5" instead of "checked".
+    RadioButton,
     Slider,
     Edit,
     ComboBox,
     List,
+    /// A menu, and the container its items are announced under. Raised as `MenuOpened` and
+    /// `MenuClosed` by the overlay layer.
+    Menu,
     ProgressBar,
     Graph,
 }

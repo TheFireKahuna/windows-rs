@@ -11,97 +11,52 @@
 //! fresh one. That is also what keeps an effect's captures to `Copy` ids, with no
 //! `Rc<RefCell<Model>>` to clone per binding.
 
-use super::arena::NIL;
 use crate::gesture::GestureDecl;
-use crate::layout::Over;
 use crate::role::{Role, Scope};
-use crate::widget::id;
 use crate::widget::{Chrome, ModelState, TextSource, UiaRole};
 use std::cell::RefCell;
+use std::rc::Rc;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Bounds, ControlId, Env, Exit, GroupId, MeasureIn, MeasureKey, Model, NodeId, Paint, Prop,
-    SinkPatch, SpriteId, WidthClass,
+    ControlId, Env, Exit, GroupId, Id, Ids, MeasureIn, MeasureKey, Model, NodeId, Paint, Prop,
+    SinkPatch, Slots, SpriteId,
 };
 
-/// One mounted node's re-lowerable recipe.
+/// The families this layer mints, and the ids that name their rows.
 ///
-/// `over` is **contiguous** here even though the arena's is a chain: mount flattens it, and
-/// at that point the whole list is known.
+/// Markers rather than the row types themselves, for the reason `windows-scene` uses them:
+/// the family is what an id belongs to, and one family can have more than one store — a
+/// control has a row here and a row on the front thread, over one set of ids.
+#[derive(Debug)]
+pub(crate) struct Mount;
+#[derive(Debug)]
+pub(crate) struct Value;
+#[derive(Debug)]
+pub(crate) struct Scroll;
+
+pub(crate) type MountId = Id<Mount>;
+pub(crate) type ValueId = Id<Value>;
+pub(crate) type ScrollId = Id<Scroll>;
+
+/// One mounted node, and everything it has to release.
 pub(crate) struct MountRow {
     pub node: NodeId,
-    pub preset: crate::layout::Preset,
-    pub over: OverStore,
-    /// The scope this node's style was lowered against. Its `width` axis is what a
-    /// responsive container rewrites.
-    pub scope: Scope,
-    /// The next row of the same mounted subtree, or [`NIL`]. A chain and not a `Vec`, so a
-    /// list row realized during a fling records its rows without allocating.
-    pub next: u32,
+    /// The next row of the same mounted subtree, or [`Id::NONE`]. A chain and not a `Vec`, so
+    /// a list row realized during a fling records its rows without allocating.
+    ///
+    /// A link is an **id** and not a bare index, which is what keeps a walk on the checked
+    /// path: an index would reach a row without asking whether it is still the row that was
+    /// linked. `Id::NONE` is the terminator, which is what it exists for.
+    pub next: MountId,
     pub control: Option<ControlId>,
     pub text: Option<MeasureKey>,
     /// Everything else this node claimed, held **here** rather than searched for.
     ///
     /// The unmount walks its own subtree's rows and releases exactly what they name. Scanning
-    /// the value, responsive and scroll tables instead made unmounting one row of a long list
-    /// cost the whole screen, which is the opposite of what a keyed list is for.
-    pub values: u32,
-    pub responsive: Option<u32>,
-    pub scroll: Option<u32>,
-    pub generation: u32,
-    pub live: bool,
-}
-
-/// Up to four overrides inline, and a boxed slice beyond.
-///
-/// Four covers every widget in the set and almost every call site, so a realized list row
-/// allocates nothing for its styles. Beyond four it is one allocation, freed with the node
-/// rather than leaked into a slab that never compacts.
-#[derive(Clone)]
-pub(crate) enum OverStore {
-    Inline { count: u8, items: [Over; 4] },
-    Spill(Box<[Over]>),
-}
-
-impl OverStore {
-    /// Taken straight off the arena's chain, and **not** through a `Vec` on the way.
-    ///
-    /// This is the store the mount was going to build anyway, so collecting into a temporary
-    /// first would be an allocation per node per mount — on the path a list row realized
-    /// during a fling takes.
-    pub(crate) fn collect(items: impl Iterator<Item = Over>) -> Self {
-        let mut inline = [Over::Grow; 4];
-        let mut count = 0usize;
-        let mut spill: Option<Vec<Over>> = None;
-        for over in items {
-            match &mut spill {
-                Some(spilled) => spilled.push(over),
-                None if count < inline.len() => {
-                    inline[count] = over;
-                    count += 1;
-                }
-                None => {
-                    let mut spilled = inline.to_vec();
-                    spilled.push(over);
-                    spill = Some(spilled);
-                }
-            }
-        }
-        match spill {
-            Some(spilled) => Self::Spill(spilled.into_boxed_slice()),
-            None => Self::Inline {
-                count: count as u8,
-                items: inline,
-            },
-        }
-    }
-
-    pub(crate) fn as_slice(&self) -> &[Over] {
-        match self {
-            Self::Inline { count, items } => &items[..*count as usize],
-            Self::Spill(items) => items,
-        }
-    }
+    /// the value and scroll tables instead made unmounting one row of a long list cost the
+    /// whole screen, which is the opposite of what a keyed list is for.
+    pub values: ValueId,
+    pub scroll: Option<ScrollId>,
 }
 
 /// One interactive node, addressed by the index inside its [`ControlId`].
@@ -113,10 +68,10 @@ impl OverStore {
 /// realizing a colour cell mid-hover would be a surface creation on the interaction path.
 #[expect(
     dead_code,
-    reason = "the overlay layer reads tip and flyout, and UI Automation reads the rest;               both are written against this row and land next"
+    reason = "UI Automation reads the name, key and role; it is written against this row \
+              and lands next"
 )]
-pub(crate) struct Control {
-    pub generation: u32,
+pub(crate) struct ControlRow {
     pub node: NodeId,
     /// The parts a model-state change re-paints. Held as ids so the swap is two ops and no
     /// search.
@@ -137,14 +92,17 @@ pub(crate) struct Control {
     pub click: Option<Box<dyn Fn()>>,
     pub change: Option<Box<dyn Fn(f64)>>,
     pub commit: Option<Box<dyn Fn(f64)>>,
-    pub tip: Option<TextSource>,
-    pub flyout: Option<Box<dyn Fn() -> super::View>>,
+    /// Both are `Rc` rather than `Box` because the overlay layer has to take them *out* of
+    /// the host's borrow before running them: building a flyout's body is application code,
+    /// and it cannot run while the host is borrowed. They stay in the row, because a
+    /// picker's flyout opens once per press and not once per lifetime.
+    pub tip: Option<Rc<TextSource>>,
+    pub flyout: Option<Rc<dyn Fn() -> super::View>>,
     pub uia: UiaRole,
     pub name: Option<&'static str>,
     /// The automation-id segment. `&'static str`, so nothing is built at mount: the path is
     /// materialized only if UI Automation asks, which is rarely and never on a hot path.
     pub key: Option<&'static str>,
-    pub live: bool,
 }
 
 /// One moving part, and the room it has.
@@ -155,7 +113,6 @@ pub(crate) struct Control {
 /// the same reason. It is also what lets the front thread move the same part from the same
 /// number without asking this thread for geometry.
 pub(crate) struct ValueRow {
-    pub generation: u32,
     /// The part that moves.
     pub node: NodeId,
     /// The box it moves in — the enclosing control, filled in when that control mounts.
@@ -178,10 +135,9 @@ pub(crate) struct ValueRow {
     /// router re-drives the part from the fraction it already holds — which is the newer of
     /// the two. Without that split, correcting a resize would fight a drag.
     pub front_driven: bool,
-    pub row: u32,
-    /// The next value row of the same mount row, or [`NIL`].
-    pub next: u32,
-    pub live: bool,
+    pub row: MountId,
+    /// The next value row of the same mount row, or [`Id::NONE`].
+    pub next: ValueId,
 }
 
 impl ValueRow {
@@ -197,24 +153,17 @@ impl ValueRow {
     }
 }
 
-/// A value row's identity.
+/// One open overlay's placement rule, and where it last landed.
 ///
-/// Generational for the reason [`ControlId`] is: an effect is disposed by the scope that owns
-/// it and a mount is released by the handle that owns it, and nothing orders those two. A
-/// write arriving after the release must find **nothing**, not whatever now occupies the
-/// slot. The packing is `id`'s, shared with a control's rather than restated.
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct ValueId(u64);
-
-/// A container that classifies its own inline size for its subtree.
-pub(crate) struct Responsive {
-    /// Held as a `GroupId` because only a group can be one, and because the model's own
-    /// signature says so — there is no way to name a group this crate did not mint.
-    pub node: GroupId,
-    pub bounds: Bounds,
-    pub class: WidthClass,
-    /// Every mount index in this container's subtree, recorded once during the walk.
-    pub subtree: Vec<u32>,
+/// Here rather than on the overlay layer's own row for the reason [`Responsive`] and
+/// [`ScrollRow`] are: resolving it needs the solve — the overlay's measured size and its
+/// anchor's rect — and this is what holds the solve. The layer above owns the overlay's
+/// *lifetime*; this owns its *geometry*, and only this writes the model.
+pub(crate) struct Placement {
+    pub root: GroupId,
+    pub anchor: crate::overlay::Anchor,
+    /// What was last published, so a pass that moved nothing emits nothing.
+    pub at: Vector2,
 }
 
 /// The app thread's half of the widget layer.
@@ -222,15 +171,16 @@ pub struct Host {
     pub(crate) model: Model,
     pub(crate) env: Env,
     pub(crate) root_scope: Scope,
-    pub(crate) mounts: Vec<MountRow>,
-    pub(crate) mount_free: Vec<u32>,
-    pub(crate) controls: Vec<Control>,
-    pub(crate) control_free: Vec<u32>,
-    /// Slotted rather than compacted, for the reason every other table here is: the mount row
-    /// holds an index, and a `retain` that shifted one would silently point it at a
-    /// neighbour.
-    pub(crate) responsives: Vec<Option<Responsive>>,
-    pub(crate) responsive_free: Vec<u32>,
+    /// The four families this thread mints, each an authority beside the store it fills.
+    ///
+    /// Held apart rather than fused into one table type, because a store keyed by ids
+    /// somebody *else* mints — the recipe table, the front thread's chrome — must have no
+    /// authority at all. Where a field of `Ids` sits beside a store, this layer owns the
+    /// counter; where it does not, it does not.
+    pub(crate) mount_ids: Ids<Mount>,
+    pub(crate) mounts: Slots<Mount, MountRow>,
+    pub(crate) control_ids: Ids<windows_scene::Control>,
+    pub(crate) controls: Slots<windows_scene::Control, ControlRow>,
     /// What each target declared about the gestures it accepts, drained by whoever owns the
     /// router. Front-resident from then on: no call is made to this thread to decide
     /// whether a gesture applies.
@@ -241,13 +191,20 @@ pub struct Host {
     /// holding a row that names a destroyed sprite.
     pub(crate) released: Vec<ControlId>,
     /// Moving parts awaiting the travel only a solve can give them.
-    pub(crate) values: Vec<ValueRow>,
-    pub(crate) value_free: Vec<u32>,
+    pub(crate) value_ids: Ids<Value>,
+    pub(crate) values: Slots<Value, ValueRow>,
     /// Trackers minted here but **created** on the front thread, because an
     /// `InteractionTracker` is a composition object and its source is a visual.
     pub(crate) trackers: Vec<TrackerSpec>,
-    pub(crate) scrolls: Vec<Option<ScrollRow>>,
-    pub(crate) scroll_free: Vec<u32>,
+    pub(crate) scroll_ids: Ids<Scroll>,
+    pub(crate) scrolls: Slots<Scroll, ScrollRow>,
+    /// Which control is which window command, for the caption band to resolve a point
+    /// through. Filled at mount by [`El::caption`](super::El::caption).
+    pub(crate) caption: crate::caption::Registry,
+    /// Open overlays, in the order they opened. **A stack, not a slotted table**: overlays
+    /// genuinely nest — a submenu is above its menu and cannot outlive it — so closing one
+    /// takes everything above it, and an index is stable for exactly as long as that holds.
+    pub(crate) overlays: Vec<Placement>,
 }
 
 /// A tracker this thread named and the other thread has to build.
@@ -301,32 +258,33 @@ impl Access {
 }
 
 impl Host {
-    /// Installs the app thread's host, and wires the measure seam into the model.
+    /// Installs the app thread's host, and wires the two solve-time seams into the model.
     ///
-    /// The measure closure captures **nothing**. It has to be `Send`, and it reaches the
-    /// text table through that table's own thread-local — which is also what lets the table
-    /// hold laid-out runs, since a run is thread-affine and an `Arc<Mutex<..>>` of one
-    /// would not compile.
+    /// Both closures capture **nothing**. They have to be `Send`, and each reaches its table
+    /// through that table's own thread-local — which is also what lets the text table hold
+    /// laid-out runs, since a run is thread-affine and an `Arc<Mutex<..>>` of one would not
+    /// compile. Reaching the *host* from either would re-enter a borrow the solve is inside.
     pub fn install(mut model: Model, env: Env, root_scope: Scope) {
         model.on_measure(|input: MeasureIn| super::text::measure(input));
+        model.on_restyle(|node, class| super::style::restyle(node, class));
         let host = Self {
             model,
             env,
             root_scope,
-            mounts: Vec::new(),
-            mount_free: Vec::new(),
-            controls: Vec::new(),
-            control_free: Vec::new(),
-            responsives: Vec::new(),
-            responsive_free: Vec::new(),
+            mount_ids: Ids::new(),
+            mounts: Slots::new(),
+            control_ids: Ids::new(),
+            controls: Slots::new(),
             gestures: Vec::new(),
             chrome: Vec::new(),
             released: Vec::new(),
-            values: Vec::new(),
-            value_free: Vec::new(),
+            value_ids: Ids::new(),
+            values: Slots::new(),
             trackers: Vec::new(),
-            scrolls: Vec::new(),
-            scroll_free: Vec::new(),
+            scroll_ids: Ids::new(),
+            scrolls: Slots::new(),
+            caption: crate::caption::Registry::default(),
+            overlays: Vec::new(),
         };
         HOST.with(|slot| *slot.borrow_mut() = Some(host));
     }
@@ -444,96 +402,42 @@ impl Host {
 
     // ── identity ──────────────────────────────────────────────────────────────────
 
-    pub(crate) fn mint_mount(&mut self, row: MountRow) -> u32 {
-        let Some(at) = self.mount_free.pop() else {
-            self.mounts.push(row);
-            return (self.mounts.len() - 1) as u32;
-        };
-        let slot = &mut self.mounts[at as usize];
-        let generation = slot.generation.wrapping_add(1);
-        *slot = MountRow { generation, ..row };
-        at
+    pub(crate) fn mint_mount(&mut self, row: MountRow) -> MountId {
+        self.mounts.insert(&mut self.mount_ids, row)
     }
 
-    /// Records a responsive container against the mount row that owns it.
-    pub(crate) fn mint_responsive(&mut self, row: u32, responsive: Responsive) {
-        let at = slot_in(&mut self.responsives, &mut self.responsive_free, responsive);
-        if let Some(row) = self.mounts.get_mut(row as usize) {
-            row.responsive = Some(at);
-        }
-    }
-
-    /// The same for a scroll container, whose tracker dies with it.
-    pub(crate) fn mint_scroll(&mut self, row: u32, scroll: ScrollRow) {
-        let at = slot_in(&mut self.scrolls, &mut self.scroll_free, scroll);
-        if let Some(row) = self.mounts.get_mut(row as usize) {
+    /// Records a scroll container against the mount row that owns it, whose tracker dies
+    /// with it.
+    pub(crate) fn mint_scroll(&mut self, row: MountId, scroll: ScrollRow) {
+        let at = self.scrolls.insert(&mut self.scroll_ids, scroll);
+        if let Some(row) = self.mounts.get_mut(row) {
             row.scroll = Some(at);
         }
-    }
-
-    /// The scope a node's style was last lowered against, or `None` where it has unmounted.
-    ///
-    /// The one reader of a live scope: a responsive container rewrites this row and a
-    /// surface pushed a rung into it, so anything re-lowering a style asks here rather than
-    /// capturing a copy that a class change will leave behind.
-    pub(crate) fn mount_scope(&self, row: u32) -> Option<Scope> {
-        self.mounts
-            .get(row as usize)
-            .filter(|row| row.live)
-            .map(|row| row.scope)
     }
 
     /// Mints a control row and its identity.
     ///
     /// The generation half is what makes a **stale intent** — one queued before an unmount
     /// — a miss rather than a call into whatever now occupies the slot.
-    pub(crate) fn mint_control(&mut self, control: Control) -> ControlId {
-        let at = if let Some(at) = self.control_free.pop() {
-            let slot = &mut self.controls[at as usize];
-            let generation = slot.generation.wrapping_add(1);
-            *slot = Control {
-                generation,
-                ..control
-            };
-            at
-        } else {
-            self.controls.push(control);
-            (self.controls.len() - 1) as u32
-        };
-        ControlId(id::pack(at, self.controls[at as usize].generation))
+    pub(crate) fn mint_control(&mut self, control: ControlRow) -> ControlId {
+        self.controls.insert(&mut self.control_ids, control)
     }
 
     /// The control a routed hit or an arriving intent names, or `None` if it is stale.
-    pub(crate) fn control(&self, id: ControlId) -> Option<&Control> {
-        let (at, generation) = (id::index(id.0), id::generation(id.0));
-        self.controls
-            .get(at as usize)
-            .filter(|c| c.live && c.generation == generation)
+    pub(crate) fn control(&self, id: ControlId) -> Option<&ControlRow> {
+        self.controls.get(id)
     }
 
-    pub(crate) fn control_mut(&mut self, id: ControlId) -> Option<&mut Control> {
-        let (at, generation) = (id::index(id.0), id::generation(id.0));
-        self.controls
-            .get_mut(at as usize)
-            .filter(|c| c.live && c.generation == generation)
+    pub(crate) fn control_mut(&mut self, id: ControlId) -> Option<&mut ControlRow> {
+        self.controls.get_mut(id)
     }
 
+    /// Releases a control, dropping the handlers it captured with it.
+    ///
+    /// The front table is told separately: the generational id already makes a stale report
+    /// a miss, so this is not what keeps that side *correct* — it is what keeps it bounded.
     fn release_control(&mut self, id: ControlId) {
-        let (at, generation) = (id::index(id.0), id::generation(id.0));
-        if let Some(slot) = self.controls.get_mut(at as usize)
-            && slot.live
-            && slot.generation == generation
-        {
-            slot.live = false;
-            // Dropped rather than left: a handler captures application state, and a table
-            // that kept them would hold a screen's worth of closures alive behind a
-            // generation nobody will ever name again.
-            slot.click = None;
-            slot.change = None;
-            slot.commit = None;
-            slot.tip = None;
-            slot.flyout = None;
-            self.control_free.push(at);
+        if self.controls.remove(&mut self.control_ids, id).is_some() {
             self.released.push(id);
         }
     }
@@ -548,32 +452,19 @@ impl Host {
         let mount = row.row;
         let head = self
             .mounts
-            .get(mount as usize)
-            .map_or(NIL, |mount| mount.values);
-        let at = if let Some(at) = self.value_free.pop() {
-            let slot = &mut self.values[at as usize];
-            let generation = slot.generation.wrapping_add(1);
-            *slot = ValueRow {
-                generation,
-                next: head,
-                ..row
-            };
-            at
-        } else {
-            self.values.push(ValueRow { next: head, ..row });
-            (self.values.len() - 1) as u32
-        };
-        if let Some(mount) = self.mounts.get_mut(mount as usize) {
-            mount.values = at;
+            .get(mount)
+            .map_or(ValueId::NONE, |mount| mount.values);
+        let id = self
+            .values
+            .insert(&mut self.value_ids, ValueRow { next: head, ..row });
+        if let Some(mount) = self.mounts.get_mut(mount) {
+            mount.values = id;
         }
-        ValueId(id::pack(at, self.values[at as usize].generation))
+        id
     }
 
     fn value_mut(&mut self, id: ValueId) -> Option<&mut ValueRow> {
-        let (at, generation) = (id::index(id.0), id::generation(id.0));
-        self.values
-            .get_mut(at as usize)
-            .filter(|v| v.live && v.generation == generation)
+        self.values.get_mut(id)
     }
 
     /// Names the control a moving part belongs to, and which thread moves it. Known only
@@ -648,11 +539,19 @@ impl Host {
     /// the newer of the two. That is what keeps one writer per channel with the app and the
     /// router both interested in the same one. A turned part has no room and appears here at
     /// all only because its sweep is constant, so it is left alone entirely.
-    fn publish_values(&mut self) -> bool {
-        let mut moved = false;
-        for index in 0..self.values.len() {
-            let value = &self.values[index];
-            if !value.live || value.unit != crate::build::arena::Unit::Travel {
+    fn publish_values(&mut self) {
+        // By position, and re-resolved through the id each step: the body reaches back into
+        // the model, which is a second field of `self`, so it cannot hold a borrow of the
+        // table across the walk. What a position yields is an **id**, so every touch of a
+        // row is still checked.
+        for at in self.values.positions() {
+            let Some(id) = self.values.id_at(at) else {
+                continue;
+            };
+            let Some(value) = self.values.get(id) else {
+                continue;
+            };
+            if value.unit != crate::build::arena::Unit::Travel {
                 continue;
             }
             let (node, track, vertical) = (value.node, value.track, value.vertical);
@@ -670,8 +569,9 @@ impl Host {
                 value.control,
                 value.front_driven,
             );
-            self.values[index].travel = travel;
-            moved = true;
+            if let Some(value) = self.values.get_mut(id) {
+                value.travel = travel;
+            }
             if !front_driven {
                 self.bind_number(
                     node,
@@ -688,7 +588,6 @@ impl Host {
                 self.chrome.push(front);
             }
         }
-        moved
     }
 
     // ── model state ───────────────────────────────────────────────────────────────
@@ -737,140 +636,219 @@ impl Host {
     /// the chain the mount threaded, and each row releases what it *names* — so this is
     /// proportional to the subtree and touches nothing else, which is what makes unmounting
     /// one row of a long list cheap.
-    pub(crate) fn unmount(&mut self, node: NodeId, exit: Exit, rows: u32) {
+    pub(crate) fn unmount(&mut self, node: NodeId, exit: Exit, rows: MountId) {
         let mut at = rows;
-        while at != NIL {
-            let Some(row) = self.mounts.get_mut(at as usize) else {
-                break;
-            };
-            let next = row.next;
-            row.live = false;
-            row.next = NIL;
-            let (control, text) = (row.control.take(), row.text.take());
-            let values = core::mem::replace(&mut row.values, NIL);
-            let (responsive, scroll) = (row.responsive.take(), row.scroll.take());
-            self.mount_free.push(at);
-            if let Some(id) = control {
+        while let Some(row) = self.mounts.remove(&mut self.mount_ids, at) {
+            // Fallibly, for the reason `try_with` gives: this can run while the thread is
+            // tearing its locals down, and the tables are going the same way anyway.
+            super::style::try_with(|table| {
+                table.take(row.node);
+            });
+            if let Some(id) = row.control {
                 self.release_control(id);
             }
-            if let Some(key) = text {
-                // Fallibly, for the reason `try_with` gives: this can run while the thread
-                // is tearing its locals down, and the runs are going the same way anyway.
+            if let Some(key) = row.text {
                 super::text::try_with(|table| table.release(key, &mut self.model));
             }
-            // A moving part: no box, no room. Released into the free list rather than
-            // removed, because an effect holds its identity and a shifted index would
-            // silently become another control's.
-            let mut value = values;
-            while let Some(row) = self.values.get_mut(value as usize) {
-                let next = core::mem::replace(&mut row.next, NIL);
-                row.live = false;
-                self.value_free.push(value);
-                value = next;
-            }
-            // A responsive container inside the subtree has nothing left to re-lower.
-            if let Some(at) = responsive {
-                self.responsives[at as usize] = None;
-                self.responsive_free.push(at);
+            let mut value = row.values;
+            while let Some(row) = self.values.remove(&mut self.value_ids, value) {
+                value = row.next;
             }
             // A tracker outliving its viewport would be a compositor object with nothing to
             // be sourced from, so it is dropped with the row that named it.
-            if let Some(at) = scroll
-                && let Some(row) = self.scrolls[at as usize].take()
+            if let Some(scroll) = row
+                .scroll
+                .and_then(|at| self.scrolls.remove(&mut self.scroll_ids, at))
             {
-                self.scroll_free.push(at);
-                self.model.drop_tracker(row.tracker);
+                self.model.drop_tracker(scroll.tracker);
             }
-            at = next;
+            at = row.next;
         }
         self.model.destroy(node, exit);
     }
 
-    // ── the width class, computed rather than reported ────────────────────────────
-
-    /// Re-classifies every responsive container against the last solve, and re-lowers the
-    /// styles of any subtree whose class moved.
-    ///
-    /// The class is resolved inside the solve and reported only to a measurement, so a
-    /// container with no measured descendant never learns it from below. It does not have
-    /// to: the solved rect is public, and classifying it here uses the same [`Bounds`] and
-    /// hysteresis. Running at the start of a flush settles one frame behind a live resize,
-    /// which is the alternative to solving the tree twice per frame.
-    pub(crate) fn reclassify(&mut self) {
-        for index in 0..self.responsives.len() {
-            let Some((node, bounds, previous)) = self.responsives[index]
-                .as_ref()
-                .map(|r| (r.node, r.bounds, r.class))
-            else {
-                continue;
-            };
-            let width = self.model.solved(node.node()).size.x;
-            if width <= 0.0 {
-                continue;
-            }
-            let class = bounds.reclassify(width, previous);
-            if class == previous {
-                continue;
-            }
-            let Some(row) = self.responsives[index].as_mut() else {
-                continue;
-            };
-            row.class = class;
-            let subtree = core::mem::take(&mut row.subtree);
-            for &at in &subtree {
-                self.relower(at, class);
-            }
-            if let Some(row) = self.responsives[index].as_mut() {
-                row.subtree = subtree;
-            }
-        }
-    }
-
-    /// Re-lowers one node's style at a new width class.
-    ///
-    /// Colour is **not** touched, and that is the point: only `metric` and `typography` may
-    /// read the width axis, so a class change re-pushes styles and re-measures text and
-    /// rebinds zero paints. `Model::style` compares before it pushes, so a class change
-    /// that moves no metric emits no op at all.
-    fn relower(&mut self, at: u32, class: WidthClass) {
-        let Some(row) = self.mounts.get_mut(at as usize) else {
-            return;
-        };
-        if !row.live {
-            return;
-        }
-        row.scope = row.scope.at_width(class);
-        let (node, preset, scope, text) = (row.node, row.preset, row.scope, row.text);
-        let style = crate::layout::lower(preset, self.mounts[at as usize].over.as_slice(), scope);
-        self.model.style(node, &style);
-        // The type ramp reads the class, so a run inside a container that reclassified is
-        // laid out under a different font — which the run finds out from here rather than
-        // from ambient state.
-        if let Some(key) = text {
-            super::text::with(|table| table.set_scope(key, scope));
-        }
-    }
-
     // ── the flush ─────────────────────────────────────────────────────────────────
 
-    /// Solves, publishes the text that solve decided the width of, and hands the patch over.
+    /// Solves, settles what only a solve can decide, and hands the patch over.
     ///
-    /// The order is the whole of it. A run laid out at the width layout chose has to reach
-    /// the *same* patch as that layout, so the solve is separated from the hand-over and the
-    /// glyphs are placed in between. Publishing can move a wrapping run's line boxes, which
-    /// is why the second solve is not redundant — and it is free when nothing moved, because
-    /// a pass that changed nothing solves nothing.
+    /// Three phases, each solving only what the one before it moved. A pass that changed
+    /// nothing solves nothing, so the second and third are free in the steady state.
+    ///
+    /// 1. **Solve.** The width class resolves *inside* this, and the styles it implies are
+    ///    re-lowered through the restyle seam before layout runs on them — so a container
+    ///    that crossed a threshold needs no correcting pass above.
+    /// 2. **Publish geometry.** Shaped runs, scroll extents and value travel are all
+    ///    functions of solved boxes, so they cannot be stated before one. Publishing can
+    ///    move a wrapping run's line boxes and a thumb's style, which is what the re-solve
+    ///    is for.
+    /// 3. **Place overlays.** After the publishes and not beside them: a menu's width is its
+    ///    labels', and the labels are placed in phase 2. This terminates rather than
+    ///    iterating, because placement moves an overlay and never resizes one — the third
+    ///    solve computes the same size the second did.
     pub fn flush(&mut self, patch: &mut SinkPatch) {
         let env = self.env;
-        self.reclassify();
         self.model.solve(env);
-        let moved = super::text::with(|table| table.publish(&mut self.model))
-            | self.publish_scrolls()
-            | self.publish_values();
-        if moved {
+        if self.publish_geometry() {
+            self.model.solve(env);
+        }
+        if self.place_overlays() {
             self.model.solve(env);
         }
         self.model.flush(patch, env);
+    }
+
+    /// Everything whose value is a function of the solve, and whether any of it moved a box.
+    fn publish_geometry(&mut self) -> bool {
+        let text = super::text::with(|table| table.publish(&mut self.model));
+        let scrolls = self.publish_scrolls();
+        // Values bind compositor properties and dirty no layout, so they are published here
+        // for ordering and contribute nothing to whether a re-solve is owed.
+        self.publish_values();
+        text | scrolls
+    }
+
+    // ── overlays ──────────────────────────────────────────────────────────────────
+
+    /// **The one call site of `Model::orphan_group` outside `windows-scene`.**
+    ///
+    /// A parentless root is invisible to a parent walk, so it has to be reachable by the
+    /// disposal walk instead — and it is reachable exactly because opening it is what puts
+    /// it in the array that walk reads. Minting and opening in one call is what keeps that
+    /// true: there is no moment at which an un-opened one exists.
+    pub(crate) fn open_overlay_slot(&mut self, blocker: Option<ControlId>) -> GroupId {
+        let root = self.model.orphan_group();
+        self.model.open_slot(root, blocker)
+    }
+
+    /// Removes a slot root from the array and releases its blocker's row. The subtree is
+    /// destroyed by the mount going out of scope, which is where its exit transition is.
+    pub(crate) fn close_overlay_slot(&mut self, root: GroupId, blocker: Option<ControlId>) {
+        self.model.close_slot(root);
+        if let Some(blocker) = blocker {
+            self.release_control(blocker);
+        }
+    }
+
+    /// Mints the control a blocker entry is named by.
+    ///
+    /// A real [`ControlId`] from the one minting authority, because the hit array, the focus
+    /// ring and automation all key on that space and a second minter would collide with it.
+    /// It carries no handlers, no chrome and no automation role: a blocker's whole behaviour
+    /// is to route a press, which the router answers from the flag alone, and it is
+    /// deliberately not a place focus can rest.
+    pub(crate) fn mint_blocker(&mut self) -> ControlId {
+        self.mint_control(ControlRow {
+            node: NodeId::NONE,
+            fill: None,
+            label: None,
+            border: None,
+            // Nothing to light and nothing to move: a blocker is a rect in the array, and
+            // the front table's hover and press paths both find nothing to do with it.
+            front: crate::widget::ChromeRow {
+                id: ControlId::default(),
+                wash: None,
+                hover: 0.0,
+                press: 0.0,
+                thumb: None,
+                travel: 0.0,
+                drive: None,
+                fraction: 0.0,
+            },
+            chrome: None,
+            scope: self.root_scope,
+            state: ModelState::Rest,
+            click: None,
+            change: None,
+            commit: None,
+            tip: None,
+            flyout: None,
+            uia: UiaRole::None,
+            name: None,
+            key: None,
+        })
+    }
+
+    /// A control's declared flyout body, shared out rather than borrowed.
+    ///
+    /// Building it is application code, so the host's borrow has to be released before it
+    /// runs — and it stays in the row, because a picker's flyout is opened once per press
+    /// and not once per lifetime.
+    pub(crate) fn flyout_of(&self, target: ControlId) -> Option<Rc<dyn Fn() -> super::View>> {
+        self.control(target).and_then(|c| c.flyout.clone())
+    }
+
+    /// A control's declared hover description, shared out for the same reason.
+    pub(crate) fn tip_of(&self, target: ControlId) -> Option<Rc<TextSource>> {
+        self.control(target).and_then(|c| c.tip.clone())
+    }
+
+    /// A control's accessible name, which is what a menu's type-ahead matches on.
+    pub(crate) fn name_of(&self, target: ControlId) -> Option<&'static str> {
+        self.control(target).and_then(|control| control.name)
+    }
+
+    /// Opens a placement row for the overlay opening at `depth`.
+    ///
+    /// Pushed rather than slotted: the stack discipline is the nesting rule, and an index is
+    /// stable exactly as long as everything above it is still open. `depth` is the caller's
+    /// own stack depth, asserted rather than returned — these are two stacks pushed and
+    /// truncated together, and the assertion is what says so instead of a stored index that
+    /// would only ever repeat what the position already knows.
+    pub(crate) fn open_overlay_placement(&mut self, depth: u32, placement: Placement) {
+        debug_assert_eq!(
+            self.overlays.len(),
+            depth as usize,
+            "placement rows drifted"
+        );
+        self.overlays.push(placement);
+    }
+
+    /// Drops every placement row from `at` upward. Closing a menu takes its submenus.
+    pub(crate) fn release_overlays_from(&mut self, at: u32) {
+        self.overlays.truncate(at as usize);
+    }
+
+    /// Resolves every open overlay's offset against the solve that just ran, and answers
+    /// whether any of them moved.
+    ///
+    /// Nothing here runs per frame: an overlay moves when it opens, when its anchor moves,
+    /// and when the window resizes under it.
+    fn place_overlays(&mut self) -> bool {
+        use crate::overlay::{AnchorTo, place};
+        let window = self.model.window();
+        let mut moved = false;
+        for index in 0..self.overlays.len() {
+            let (root, anchor, last) = {
+                let placement = &self.overlays[index];
+                (placement.root, placement.anchor, placement.at)
+            };
+            let size = self.model.solved(root.node()).size;
+            if size.x <= 0.0 || size.y <= 0.0 {
+                // Declared but not yet measured. Placing a zero box would seat it at the
+                // anchor's corner and then move it a pass later, which reads as a flash.
+                continue;
+            }
+            let against = match anchor.to {
+                AnchorTo::Control(id) => {
+                    // An anchor that has unmounted leaves the overlay exactly where it is.
+                    // Whether it should still be open is the layer above's decision, and
+                    // moving it to the origin first would answer that question wrongly.
+                    let Some(control) = self.control(id) else {
+                        continue;
+                    };
+                    self.model.solved(control.node).rect
+                }
+                AnchorTo::Point(at) => windows_scene::Rect::new(at.x, at.y, at.x, at.y),
+                AnchorTo::Window => windows_scene::Rect::new(0.0, 0.0, window.x, window.y),
+            };
+            let at = place(size, against, anchor, window);
+            if at == last {
+                continue;
+            }
+            self.overlays[index].at = at;
+            moved |= self.model.place_slot(root, at);
+        }
+        moved
     }
 
     /// Sets each scroll container's extent and thumb from the box the solve gave it.
@@ -881,8 +859,11 @@ impl Host {
     /// only speaks when the extents themselves changed.
     fn publish_scrolls(&mut self) -> bool {
         let mut moved = false;
-        for index in 0..self.scrolls.len() {
-            let Some(scroll) = self.scrolls[index].as_ref() else {
+        for at in self.scrolls.positions() {
+            let Some(id) = self.scrolls.id_at(at) else {
+                continue;
+            };
+            let Some(scroll) = self.scrolls.get(id) else {
                 continue;
             };
             let (tracker, viewport, thumb, last) =
@@ -893,7 +874,7 @@ impl Host {
             if geom == last {
                 continue;
             }
-            if let Some(scroll) = self.scrolls[index].as_mut() {
+            if let Some(scroll) = self.scrolls.get_mut(id) {
                 scroll.last = geom;
             }
             moved = true;
@@ -960,18 +941,3 @@ fn paint(model: &mut Model, id: Option<SpriteId>, role: Option<Role>, scope: Sco
         model.paint(id, Paint::Solid(crate::role::resolve(role, scope)));
     }
 }
-
-/// Puts `row` in a free slot, or on the end. Shared by the two tables whose index a mount row
-/// holds, so neither can be compacted out from under one.
-fn slot_in<T>(table: &mut Vec<Option<T>>, free: &mut Vec<u32>, row: T) -> u32 {
-    if let Some(at) = free.pop() {
-        table[at as usize] = Some(row);
-        return at;
-    }
-    table.push(Some(row));
-    (table.len() - 1) as u32
-}
-
-// The mount chain's terminator is the arena's, so a row that says "no next" and a slot that
-// says "no link" cannot drift apart.
-const _: [(); 1] = [(); (NIL == u32::MAX) as usize];

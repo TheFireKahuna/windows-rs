@@ -12,7 +12,7 @@ use crate::cache::Gen;
 use crate::env::Env;
 use crate::id::Id;
 use crate::node::{ClipState, Dashes, Node, Painted, Route};
-use crate::patch::{Op, SinkPatch};
+use crate::patch::{Attach, Op, SinkPatch};
 use crate::prop::{self, Absent, Held};
 use crate::res::Res;
 use crate::sink::*;
@@ -109,7 +109,7 @@ impl Scene {
         &mut self,
         id: NodeId,
         kind: NodeKind,
-        parent: NodeId,
+        parent: Attach,
         after: Option<NodeId>,
         back: &Backends,
     ) -> Result<()> {
@@ -123,42 +123,60 @@ impl Scene {
                 Node::new(crate::base_of_sprite(&sprite), Some(sprite), kind)
             }
         };
-        self.nodes.insert(id, node);
+        self.nodes.place(id, node);
         self.census.visuals_minted += 1;
         self.census.visuals_live += 1;
-        self.link(id, parent, after);
-        Ok(())
+        // Attached before the counters are believed: a node in the arena that is not
+        // in the visual tree is the one state that renders nothing and reports
+        // success, so the failure has to reach the caller.
+        self.link(id, parent, after)
     }
 
     fn move_node(&mut self, id: NodeId, parent: NodeId, after: Option<NodeId>) -> Result<()> {
         self.unlink(id);
-        self.link(id, parent, after);
-        Ok(())
+        self.link(id, Attach::Node(parent), after)
     }
 
     /// Parents `id` under `parent`, above `after`, in the compositor and in the arena.
     ///
     /// In that order: the chain mirrors what the compositor holds, so if the collection
     /// insert cannot happen the chain must not claim it did.
-    fn link(&mut self, id: NodeId, parent: NodeId, after: Option<NodeId>) {
-        let (Some(visual), Some(children)) = (
-            self.nodes.get(id).map(|n| n.visual.clone()),
-            self.nodes
+    fn link(&mut self, id: NodeId, parent: Attach, after: Option<NodeId>) -> Result<()> {
+        let visual = self
+            .nodes
+            .get(id)
+            .map(|n| n.visual.clone())
+            .ok_or_else(crate::invalid_arg)?;
+
+        let children = match parent {
+            Attach::Node(parent) => self
+                .nodes
                 .get(parent)
                 .and_then(|n| n.visual.as_container())
-                .map(|c| c.children()),
-        ) else {
-            debug_assert!(
-                false,
-                "a node was parented under one that is no longer live"
-            );
-            return;
+                .map(|c| c.children())
+                .ok_or_else(crate::invalid_arg)?,
+            Attach::Window => self.content.children(),
+            // Their own band, above content. Within it they stack in the order they
+            // opened, which is the order the hit array scans its tail in.
+            Attach::Detached => self.overlays.children(),
         };
-        match after.and_then(|sibling| self.nodes.get(sibling).map(|n| n.visual.clone())) {
+
+        match after.and_then(|s| self.nodes.get(s).map(|n| n.visual.clone())) {
             Some(sibling) => children.insert_above(&visual, &sibling),
+            None if matches!(parent, Attach::Detached) => children.insert_at_top(&visual),
             None => children.insert_at_bottom(&visual),
         }
-        crate::tree::link(&mut self.nodes, id, parent, after);
+
+        crate::tree::link(
+            &mut self.nodes,
+            id,
+            parent.node().unwrap_or(NodeId::NONE),
+            after,
+        );
+        if parent.node().is_none() {
+            self.roots.push(id);
+        }
+        Ok(())
     }
 
     fn unlink(&mut self, id: NodeId) {
@@ -169,12 +187,21 @@ impl Scene {
         else {
             return;
         };
-        if let Some(children) = self
-            .nodes
-            .get(parent)
-            .and_then(|n| n.visual.as_container())
-            .map(|c| c.children())
-        {
+        // A parentless node hangs in the window's own container, and the forest holds
+        // it as a root rather than as anyone's child.
+        let children = if parent.is_none() {
+            self.roots.retain(|root| *root != id);
+            // Either band; `try_remove` on the one it is not in is a no-op, and asking
+            // which would mean keeping a second record of what the tree already knows.
+            let _ = self.content.children().try_remove(&visual);
+            Some(self.overlays.children())
+        } else {
+            self.nodes
+                .get(parent)
+                .and_then(|n| n.visual.as_container())
+                .map(|c| c.children())
+        };
+        if let Some(children) = children {
             // Fallible: a caller can hold a node whose parent was torn down between two
             // operations, and "already gone" is the goal state.
             let _ = children.try_remove(&visual);
@@ -203,7 +230,7 @@ impl Scene {
             self.destroy_subtree(child);
             child = next;
         }
-        let Some(node) = self.nodes.remove(id) else {
+        let Some(node) = self.nodes.take(id) else {
             return;
         };
         self.census.visuals_live -= 1;
@@ -722,14 +749,14 @@ impl Scene {
                 let path = back.path(patch.verbs(verbs))?;
                 match self.res.geoms.get_mut(id.cast::<Geom>()) {
                     Some(res) => res.value.set_path(&path),
-                    None => self.res.geoms.insert(
+                    None => self.res.geoms.place(
                         id.cast::<Geom>(),
                         Res::new(back.compositor.create_path_geometry(&path)),
                     ),
                 }
             }
-            ResOp::Ramp { stops, axis } => {
-                if let Some(surface) = back.raster_ramp(env, patch.stops(stops), axis)? {
+            ResOp::Ramp { stops, spread } => {
+                if let Some(surface) = back.raster_ramp(env, patch.stops(stops), spread)? {
                     self.res.ramps.point(id.cast::<Ramp>(), &surface, || {
                         back.brush(&surface, Stretch::Fill)
                     });
@@ -749,7 +776,7 @@ impl Scene {
             }
             ResOp::Region => {
                 if self.res.regions.get(id.cast::<Region>()).is_none() {
-                    self.res.regions.insert(id.cast::<Region>(), Res::new(None));
+                    self.res.regions.place(id.cast::<Region>(), Res::new(None));
                 }
             }
             // Only the model's own claim — a sprite still painting with it keeps it alive
@@ -789,7 +816,7 @@ impl Scene {
                 // The viewport this tracker was scrolling, so the hit query stops resolving
                 // that node's descendants through an offset nothing updates any more.
                 let viewport = state.viewport;
-                self.trackers.remove(id);
+                self.trackers.take(id);
                 if let Some(node) = viewport {
                     self.hits.clear_scroll(node);
                 }

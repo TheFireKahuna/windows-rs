@@ -61,7 +61,8 @@ pub(crate) const FLATTEN: f32 = 0.25;
 
 pub use batch::{Interp, SpriteBatch};
 pub use brush::{
-    Brush, BrushRef, Cap, Extend, Join, Ramp, Solid, Stop, Stroke, StrokeSpec, StrokeStyle, Tile,
+    Brush, BrushRef, Cap, Extend, Join, Radial, Ramp, Solid, Stop, Stroke, StrokeSpec, StrokeStyle,
+    Tile,
 };
 pub use device::{Gpu, Loss, classify};
 pub use geometry::{

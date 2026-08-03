@@ -112,6 +112,9 @@ pub(crate) struct Slot {
     /// The automation-id segment. `&'static str`, so nothing is built at mount.
     pub key: Option<&'static str>,
     pub name: Option<&'static str>,
+    /// One of the window's own commands. Recorded at mount so the caption band can resolve a
+    /// point through the same array everything else does.
+    pub caption: Option<windows_window::CaptionButton>,
     pub uia: UiaRole,
     pub exit: Exit,
     /// A structural adapter owns this node's children instead of `kids`.
@@ -156,6 +159,7 @@ impl Default for Slot {
             scroll: None,
             key: None,
             name: None,
+            caption: None,
             uia: UiaRole::None,
             exit: Exit::None,
             adapter: None,
@@ -289,7 +293,10 @@ pub(crate) enum Act {
     ChangeF64(Box<dyn Fn(f64)>),
     CommitF64(Box<dyn Fn(f64)>),
     Tip(TextSource),
-    Flyout(Box<dyn Fn() -> super::El>),
+    /// `Rc` from the start, because the row it lands in holds one: the overlay layer has to
+    /// take the body *out* of the host's borrow before running it. Boxing here and
+    /// converting at mount would allocate twice for the same closure.
+    Flyout(std::rc::Rc<dyn Fn() -> super::El>),
     /// A width variant, so a class change is `Display::None` rather than an unmount.
     HideWhen(Box<dyn Fn() -> bool>),
     /// One override that follows a value.

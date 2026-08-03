@@ -9,13 +9,17 @@
 //! It is built here, in one linear pass over the solved layout in paint order, and queried
 //! on the other side of the seam, where live scroll offsets are.
 
+use crate::id::Id;
 use crate::layout::Solved;
-use crate::sink::{NodeId, Point};
+use crate::sink::{Control, NodeId, Point};
 
-/// A widget's identity, as the layer above mints it. This crate never interprets one — it
-/// is the join between the array and whatever table a consumer keeps beside it.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ControlId(pub u64);
+/// A widget's identity, as the layer above mints it.
+///
+/// The same generational index every other family uses, so the staleness rule is one rule:
+/// a queued intent naming a control that has since unmounted finds **nothing**, rather than
+/// whatever now occupies the slot. It was a bare `u64` and therefore forgeable, and
+/// interchangeable with any other id that happened to be one.
+pub type ControlId = Id<Control>;
 
 /// The index meaning "no entry".
 pub const NO_ENTRY: u32 = u32::MAX;

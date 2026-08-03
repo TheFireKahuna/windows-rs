@@ -40,18 +40,22 @@ pub struct Tracker;
 /// A pending timed reveal.
 #[derive(Debug)]
 pub struct Delay;
+/// An interactive node, as the layer above mints it.
+///
+/// This crate never interprets one — it is the join between the flat hit array and whatever
+/// table a consumer keeps beside it, and there are two such tables over the one family: the
+/// app thread's handlers and the front thread's chrome.
+#[derive(Debug)]
+pub struct Control;
+/// A measurement request, minted and interpreted by the layer that owns the text engine.
+///
+/// Named for the thing rather than the verb: `Measure` is the trait a layout tree is handed,
+/// and one of the two would shadow the other wherever both are in scope.
+#[derive(Debug)]
+pub struct Measured;
 
 /// Either kind of node.
 pub type NodeId = Id<Node>;
-
-impl NodeId {
-    /// The root group, named identically by both halves.
-    ///
-    /// The model creates its root before anything else and mints densely from one, so the
-    /// root *is* [`Id::FIRST`] — which is how the scene seats its own root under the same
-    /// id with no handshake between them.
-    pub const ROOT: Self = Self::FIRST;
-}
 pub type GeomId = Id<Geom>;
 pub type RampId = Id<Ramp>;
 pub type RunId = Id<Run>;
@@ -363,25 +367,37 @@ pub enum Join {
     Bevel,
 }
 
-/// The direction a [`Paint::Ramp`] runs.
+/// How a [`Paint::Ramp`]'s stops spread over the box they paint.
+///
+/// Not a direction: [`Radial`](Self::Radial) has none. Which construction realizes a
+/// spread is this crate's decision, not the author's — the four linear forms become a
+/// strip and the radial one a square tile, and every one of them is stretched to fill,
+/// so none carries the sprite's extent and a resize costs nothing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-pub enum Axis {
+pub enum Spread {
     #[default]
     Horizontal,
     Vertical,
     DiagonalDown,
     DiagonalUp,
+    /// Outward from the centre. Stretched to fill, so a square profile becomes the
+    /// ellipse of whatever box it lands in — which is what a glow is.
+    Radial,
 }
 
-impl Axis {
+impl Spread {
     /// The ramp's start and end, as fractions of the painted box.
+    ///
+    /// `None` for [`Radial`](Self::Radial), which is a centre and two radii rather than
+    /// two points, and is the one form that cannot answer.
     #[must_use]
-    pub const fn ends(self) -> ([f32; 2], [f32; 2]) {
+    pub const fn ends(self) -> Option<([f32; 2], [f32; 2])> {
         match self {
-            Self::Horizontal => ([0.0, 0.5], [1.0, 0.5]),
-            Self::Vertical => ([0.5, 0.0], [0.5, 1.0]),
-            Self::DiagonalDown => ([0.0, 0.0], [1.0, 1.0]),
-            Self::DiagonalUp => ([0.0, 1.0], [1.0, 0.0]),
+            Self::Horizontal => Some(([0.0, 0.5], [1.0, 0.5])),
+            Self::Vertical => Some(([0.5, 0.0], [0.5, 1.0])),
+            Self::DiagonalDown => Some(([0.0, 0.0], [1.0, 1.0])),
+            Self::DiagonalUp => Some(([0.0, 1.0], [1.0, 0.0])),
+            Self::Radial => None,
         }
     }
 }
@@ -729,8 +745,8 @@ pub enum ResOp {
     /// sharing the id, whichever construction each uses, so a curve's fill, stroke and glow
     /// cannot diverge.
     Geom { verbs: crate::Span },
-    /// Gradient stops, spanning the patch's stop buffer, and the axis they run along.
-    Ramp { stops: crate::Span, axis: Axis },
+    /// Gradient stops, spanning the patch's stop buffer, and how they spread over the box.
+    Ramp { stops: crate::Span, spread: Spread },
     /// A shaped run: fallback segments spanning the patch's segment buffer, and the tile
     /// they occupy.
     ///
@@ -754,17 +770,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_ramps_ends_span_the_box_on_every_axis() {
-        for axis in [
-            Axis::Horizontal,
-            Axis::Vertical,
-            Axis::DiagonalDown,
-            Axis::DiagonalUp,
+    fn a_linear_ramps_ends_span_the_box() {
+        for spread in [
+            Spread::Horizontal,
+            Spread::Vertical,
+            Spread::DiagonalDown,
+            Spread::DiagonalUp,
         ] {
-            let (from, to) = axis.ends();
+            let (from, to) = spread.ends().expect("a linear spread has ends");
             let travelled = (to[0] - from[0]).abs() + (to[1] - from[1]).abs();
-            assert!(travelled >= 1.0, "{axis:?} travels {travelled}");
+            assert!(travelled >= 1.0, "{spread:?} travels {travelled}");
         }
+    }
+
+    /// The radial form is the one that cannot answer, and saying so is what keeps a
+    /// caller from inventing two points for it.
+    #[test]
+    fn a_radial_ramp_has_no_ends() {
+        assert!(Spread::Radial.ends().is_none());
     }
 
     /// Everything realized through a **capture** reads the pixel grid.

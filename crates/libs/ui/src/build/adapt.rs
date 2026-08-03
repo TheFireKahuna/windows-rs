@@ -17,7 +17,7 @@
 //! other value in this surface does.
 
 use super::arena::{Adapter, Build, Slot};
-use super::{Any, El, IntoChildren, Mount, Site, Slots, View};
+use super::{Any, Children, El, IntoChildren, Mount, Site, View};
 use crate::layout::Preset;
 use crate::signal::{Effect, Signal};
 use crate::structure::{Branch, Keyed, Step};
@@ -63,7 +63,7 @@ where
     K: Eq + Hash + Clone + 'static,
     T: 'static,
 {
-    fn append(self, out: &mut Slots) {
+    fn append(self, out: &mut Children) {
         let Self { items, view } = self;
         out.push(El::<Any>::at_index(adapter(move |site| {
             // Detached from whatever scope is running the reconcile, for the reason the
@@ -127,7 +127,7 @@ pub fn when<M>(cond: impl Signal<bool, M> + 'static, view: impl Fn() -> View + '
 }
 
 impl IntoChildren for When {
-    fn append(self, out: &mut Slots) {
+    fn append(self, out: &mut Children) {
         let Self { cond, view } = self;
         switch_adapter(out, move || cond().then_some(true), move |_| view());
     }
@@ -155,7 +155,7 @@ pub fn switch<K: PartialEq + 'static>(
 }
 
 impl<K: PartialEq + 'static> IntoChildren for Switch<K> {
-    fn append(self, out: &mut Slots) {
+    fn append(self, out: &mut Children) {
         let Self { key, view } = self;
         switch_adapter(out, move || Some(key()), view);
     }
@@ -166,7 +166,7 @@ impl<K: PartialEq + 'static> IntoChildren for Switch<K> {
 /// `when` is `Branch<bool>` whose key is `None` when the condition is false, and `switch` is
 /// `Branch<K>` whose key always exists. One mechanism, differing in what it keys on.
 fn switch_adapter<K: PartialEq + 'static>(
-    out: &mut Slots,
+    out: &mut Children,
     key: impl Fn() -> Option<K> + 'static,
     view: impl Fn(&K) -> View + 'static,
 ) {

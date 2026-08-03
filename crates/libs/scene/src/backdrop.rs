@@ -1,0 +1,186 @@
+//! The window's own ground. **Front half.**
+//!
+//! Minted inside [`Scene::new`](crate::Scene::new), before the window is shown, and
+//! not an arena node: it is under everything the model names, it is not reachable by
+//! layout, and it is not in the hit array. An application configures it and may move
+//! its glows; it does not compose it.
+//!
+//! # Why it is not an ordinary element
+//!
+//! Timing. A surface arrives only after its size is delivered and the request is
+//! serviced on a later commit, so a backdrop authored as content cannot exist on the
+//! first composited frame — the shell lands on an unpainted window and the ground
+//! appears a couple of commits late. Minting it here puts it on frame one.
+//!
+//! It costs almost nothing to do so, and a resize costs nothing at all. Every layer is a
+//! [`Spread`] ramp — a strip or a 64×64 tile, stretched to fill — so none of them carries
+//! the window's extent and a resize re-points no surface and re-rasterizes nothing. Its
+//! *geometry* is stated the same way, as fractions of the band above it ([`place`]), so a
+//! resize does not write one property here either: the compositor re-derives every box
+//! from the one extent [`Scene::resize`](crate::Scene::resize) puts on the root.
+//!
+//! # The stack
+//!
+//! Bottom to top: the base tilt, then one blob per glow. Layers composite
+//! source-over, which is the same operation one surface performs drawing them in
+//! sequence — source-over is associative, so splitting them across sprites is not an
+//! approximation of that drawing, it is the identical composite at lower cost.
+
+use crate::backends::Backends;
+use crate::env::Env;
+use crate::sink::Spread;
+use windows_color::Radiance;
+use windows_composition::{SpriteVisual, Stretch};
+use windows_core::Result;
+use windows_numerics::{Vector2, Vector3};
+
+/// One radial layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Glow {
+    /// The profile, centre to edge. The last stop should be transparent, or the blob
+    /// ends on a visible edge where its tile does.
+    pub stops: Vec<(f32, Radiance)>,
+    /// Centre, as a fraction of the window.
+    pub at: Vector2,
+    /// Extent, as a fraction of the window. The tile is square and this is what
+    /// stretches it into an ellipse.
+    pub size: Vector2,
+}
+
+/// What an application says the window's ground looks like.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BackdropSpec {
+    /// The base tilt, top to bottom, covering the whole window. Empty for no base,
+    /// which leaves whatever is behind the window showing through.
+    pub base: Vec<(f32, Radiance)>,
+    /// The radial layers, bottom to top.
+    pub glows: Vec<Glow>,
+}
+
+/// One realized layer: its sprite, and where the spec puts it.
+struct Layer {
+    sprite: SpriteVisual,
+    /// Fractions of the window. The base is the whole of it.
+    at: Vector2,
+    size: Vector2,
+}
+
+/// The realized stack.
+pub(crate) struct Backdrop {
+    spec: BackdropSpec,
+    layers: Vec<Layer>,
+}
+
+impl Backdrop {
+    /// Rasterizes `spec` and mints one sprite per layer, bottom first.
+    ///
+    /// The caller inserts them; this builds them. `env` is needed here rather than at
+    /// the first operation because the ground has to be painted before the window is
+    /// shown, and its colours are the display's.
+    pub(crate) fn new(spec: BackdropSpec, back: &Backends, env: Env) -> Result<Self> {
+        let mut layers = Vec::with_capacity(1 + spec.glows.len());
+        if !spec.base.is_empty() {
+            layers.push(Layer {
+                sprite: Self::sprite(&spec.base, Spread::Vertical, back, env)?,
+                at: Vector2 { x: 0.5, y: 0.5 },
+                size: Vector2 { x: 1.0, y: 1.0 },
+            });
+        }
+        for glow in &spec.glows {
+            layers.push(Layer {
+                sprite: Self::sprite(&glow.stops, Spread::Radial, back, env)?,
+                at: glow.at,
+                size: glow.size,
+            });
+        }
+        for layer in &layers {
+            place(layer);
+        }
+        Ok(Self { spec, layers })
+    }
+
+    /// The sprites, bottom first, for the caller to seat.
+    pub(crate) fn sprites(&self) -> impl Iterator<Item = &SpriteVisual> {
+        self.layers.iter().map(|layer| &layer.sprite)
+    }
+
+    /// Moves one glow's centre, as a fraction of the window.
+    ///
+    /// The index is into [`BackdropSpec::glows`]; out of range is ignored, because the
+    /// caller is naming a layer of a spec it supplied and a panic here would be a crash
+    /// in the one path that must survive a display change.
+    pub(crate) fn move_glow(&mut self, index: usize, at: Vector2) {
+        let Some(glow) = self.spec.glows.get_mut(index) else {
+            return;
+        };
+        glow.at = at;
+        // The base occupies slot zero whenever there is one, so a glow's layer sits
+        // after it.
+        let offset = usize::from(!self.spec.base.is_empty());
+        let Some(layer) = self.layers.get_mut(index + offset) else {
+            return;
+        };
+        layer.at = at;
+        place(layer);
+    }
+
+    /// Re-rasterizes every layer for a display that moved.
+    ///
+    /// The geometry does not move — a ramp carries no snapped dimension — so only the
+    /// light is rebuilt, and the sprites keep their places.
+    pub(crate) fn relight(&mut self, back: &Backends, env: Env) -> Result<()> {
+        let base = usize::from(!self.spec.base.is_empty());
+        if base == 1 {
+            Self::repoint(&self.layers[0], &self.spec.base, Spread::Vertical, back, env)?;
+        }
+        for (glow, layer) in self.spec.glows.iter().zip(&self.layers[base..]) {
+            Self::repoint(layer, &glow.stops, Spread::Radial, back, env)?;
+        }
+        Ok(())
+    }
+
+    fn sprite(
+        stops: &[(f32, Radiance)],
+        spread: Spread,
+        back: &Backends,
+        env: Env,
+    ) -> Result<SpriteVisual> {
+        let sprite = back.compositor.create_sprite_visual();
+        if let Some(surface) = back.raster_ramp(env, stops, spread)? {
+            sprite.set_brush(&back.brush(&surface, Stretch::Fill));
+        }
+        Ok(sprite)
+    }
+
+    fn repoint(
+        layer: &Layer,
+        stops: &[(f32, Radiance)],
+        spread: Spread,
+        back: &Backends,
+        env: Env,
+    ) -> Result<()> {
+        if let Some(surface) = back.raster_ramp(env, stops, spread)? {
+            layer.sprite.set_brush(&back.brush(&surface, Stretch::Fill));
+        }
+        Ok(())
+    }
+}
+
+/// Centres a layer's box on its fractional position — **once**, as fractions of the band
+/// above it, rather than per resize.
+///
+/// Both halves are pure fractions, which is what makes stating them once possible at all.
+/// The extent is one by construction. The offset is one because centring `size` on `at`
+/// is `window * at - window * size / 2`, and the window cancels out of it: the layer's
+/// corner sits at `at - size/2` of the window whatever the window is.
+///
+/// So the compositor re-derives this whole box from its parent's extent, and a resize
+/// writes nothing here at all — not one property, for any number of glows.
+fn place(layer: &Layer) {
+    layer.sprite.set_relative_size_adjustment(layer.size);
+    layer.sprite.set_relative_offset_adjustment(Vector3 {
+        x: layer.at.x - layer.size.x / 2.0,
+        y: layer.at.y - layer.size.y / 2.0,
+        z: 0.0,
+    });
+}

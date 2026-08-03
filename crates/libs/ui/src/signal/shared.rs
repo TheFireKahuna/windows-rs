@@ -19,7 +19,7 @@
 //! publishes through an [`Epoch`](super::Epoch) — which carries no value — rather than
 //! through a cell.
 
-use super::graph::SignalId;
+use super::graph::{Signal, SignalId};
 use core::any::Any;
 use std::sync::{LazyLock, Mutex};
 use windows_window::Event;
@@ -37,9 +37,15 @@ struct Inbox(Vec<Pending>);
 
 #[derive(Default)]
 struct Pending {
-    slots: Vec<Option<(SignalId, Apply)>>,
+    /// Keyed by ids the app thread's graph mints, so **no authority sits beside it**: a
+    /// producer stages a write against a cell it was handed and can never invent one.
+    slots: windows_scene::Slots<Signal, Apply>,
     /// Which slots are occupied, so a drain is O(pending) rather than O(cells).
-    dirty: Vec<u32>,
+    ///
+    /// Beside the store rather than in it: this is a drain index over what is staged, not a
+    /// fact about a slot, and a store that carried one would be carrying it for every table
+    /// that has no drain.
+    dirty: Vec<SignalId>,
 }
 
 struct Shared {
@@ -68,15 +74,11 @@ pub(super) fn post(id: SignalId, apply: Apply) {
     let wake = {
         let mut inbox = lock();
         let pending = inbox.pending(id.graph);
-        let index = id.index as usize;
-        if pending.slots.len() <= index {
-            pending.slots.resize_with(index + 1, || None);
-        }
         let first = pending.dirty.is_empty();
-        if pending.slots[index].is_none() {
-            pending.dirty.push(id.index);
+        if pending.slots.get(id.id).is_none() {
+            pending.dirty.push(id);
         }
-        pending.slots[index] = Some((id, apply));
+        pending.slots.place(id.id, apply);
         first
     };
     if wake {
@@ -95,9 +97,9 @@ pub(super) fn take(graph: u32, out: &mut Vec<(SignalId, Apply)>) {
     // table again. Both it and `out` keep their capacity, so a steady producer stages and
     // the app thread drains without either of them allocating.
     let mut dirty = core::mem::take(&mut pending.dirty);
-    for index in dirty.drain(..) {
-        if let Some(entry) = pending.slots[index as usize].take() {
-            out.push(entry);
+    for id in dirty.drain(..) {
+        if let Some(apply) = pending.slots.take(id.id) {
+            out.push((id, apply));
         }
     }
     pending.dirty = dirty;
@@ -111,14 +113,10 @@ pub(super) fn take(graph: u32, out: &mut Vec<(SignalId, Apply)>) {
 pub(super) fn release(id: SignalId) {
     let mut inbox = lock();
     let pending = inbox.pending(id.graph);
-    let index = id.index as usize;
-    if let Some(slot) = pending.slots.get_mut(index)
-        && slot.as_ref().is_some_and(|(staged, _)| *staged == id)
+    if pending.slots.take(id.id).is_some()
+        && let Some(at) = pending.dirty.iter().position(|dirty| *dirty == id)
     {
-        *slot = None;
-        if let Some(at) = pending.dirty.iter().position(|dirty| *dirty == id.index) {
-            pending.dirty.swap_remove(at);
-        }
+        pending.dirty.swap_remove(at);
     }
 }
 

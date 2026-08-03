@@ -145,7 +145,51 @@ impl FocusRing {
             (Some(at), true) => at + 1,
             (Some(at), false) => at - 1,
         };
-        let id = self.scratch[next].1;
+        self.land(self.scratch[next].1)
+    }
+
+    /// Moves focus to the next control after the current one that `pick` accepts, wrapping.
+    ///
+    /// **Type-ahead, and nothing else needs it.** The candidates and their order are
+    /// [`step`](Self::step)'s own, so a menu's letter navigation cannot disagree with its
+    /// arrow navigation — which is the same rule that put focus order in the hit array in
+    /// the first place, applied one level down. Starting after the current item and wrapping
+    /// is what makes repeated presses of one letter cycle the items beginning with it.
+    pub fn step_to(&mut self, hits: &HitTable, pick: impl Fn(ControlId) -> bool) -> Move {
+        self.collect(hits);
+        let count = self.scratch.len();
+        if count == 0 {
+            return Move::Nowhere;
+        }
+        let from = self
+            .current
+            .and_then(|id| self.scratch.iter().position(|(_, entry)| *entry == id));
+        let start = from.map_or(0, |at| at + 1);
+        let found = (0..count)
+            .map(|step| (start + step) % count)
+            .find(|&at| pick(self.scratch[at].1));
+        let Some(at) = found else {
+            return Move::Nowhere;
+        };
+        self.land(self.scratch[at].1)
+    }
+
+    /// Moves focus to the first or last control of the innermost scope. `Home` and `End`.
+    pub fn step_to_end(&mut self, hits: &HitTable, last: bool) -> Move {
+        self.collect(hits);
+        let Some(&(_, id)) = (if last {
+            self.scratch.last()
+        } else {
+            self.scratch.first()
+        }) else {
+            return Move::Nowhere;
+        };
+        self.land(id)
+    }
+
+    /// Puts focus on a candidate a step chose, and says what that did. Landing where focus
+    /// already was is [`Move::Nowhere`], so no caller repaints a ring that did not move.
+    fn land(&mut self, id: ControlId) -> Move {
         match self.focus(Some(id)) {
             Some((from, _)) => Move::To { from, to: id },
             None => Move::Nowhere,
@@ -161,11 +205,17 @@ impl FocusRing {
         self.scratch.clear();
         let entries = hits.entries();
         // A scope begins at its own first entry, so everything before that is outside it.
+        //
+        // A scope whose entry is not in the array is one whose subtree is not either — it
+        // has been closed, or it has not been flushed yet. Both mean **nothing** is in
+        // scope, which is why this fails closed rather than falling back to the head of the
+        // array: that fallback silently widens a stale scope to the whole window, and a
+        // `Tab` that escapes a modal is not a failure anything else would report.
         let start = match self.scopes.last() {
-            Some((_, scope)) => entries
-                .iter()
-                .position(|entry| entry.id == scope.from)
-                .unwrap_or(0),
+            Some((_, scope)) => match entries.iter().position(|entry| entry.id == scope.from) {
+                Some(at) => at,
+                None => return,
+            },
             None => 0,
         };
         for entry in &entries[start..] {
@@ -204,9 +254,23 @@ pub enum Move {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_scene::{HitEntry, NO_ENTRY, NodeId};
+    use windows_scene::{HitEntry, Ids, NO_ENTRY, NodeId};
 
-    fn entry(id: u64, flags: HitFlags) -> HitEntry {
+    /// The `n`th id a fresh authority mints.
+    ///
+    /// A `ControlId` is a generational index with no public constructor, which is the point:
+    /// it can only come from an [`Ids`]. Minting densely from a fresh one is deterministic,
+    /// so this is stable across calls and distinct per `n` without any shared state.
+    fn cid(n: u32) -> ControlId {
+        let mut ids = Ids::<windows_scene::Control>::new();
+        let mut id = ids.mint();
+        for _ in 1..n {
+            id = ids.mint();
+        }
+        id
+    }
+
+    fn entry(id: u32, flags: HitFlags) -> HitEntry {
         HitEntry {
             x0: 0.0,
             y0: 0.0,
@@ -216,11 +280,11 @@ mod tests {
             clip_parent: NO_ENTRY,
             flags,
             scroll_src: NodeId::NONE,
-            id: ControlId(id),
+            id: cid(id),
         }
     }
 
-    fn table(ids: &[u64]) -> HitTable {
+    fn table(ids: &[u32]) -> HitTable {
         let mut table = HitTable::default();
         let entries: Vec<HitEntry> = ids
             .iter()
@@ -238,43 +302,63 @@ mod tests {
             ring.step(&hits, true),
             Move::To {
                 from: None,
-                to: ControlId(1)
+                to: cid(1)
             }
         );
         assert_eq!(
             ring.step(&hits, true),
             Move::To {
-                from: Some(ControlId(1)),
-                to: ControlId(2)
+                from: Some(cid(1)),
+                to: cid(2)
             }
         );
         assert_eq!(
             ring.step(&hits, false),
             Move::To {
-                from: Some(ControlId(2)),
-                to: ControlId(1)
+                from: Some(cid(2)),
+                to: cid(1)
             }
         );
+    }
+
+    #[test]
+    fn a_scope_whose_entry_has_gone_bounds_navigation_to_nothing() {
+        // Fail closed, and the one direction that matters. A scope is named by its own first
+        // entry; if that entry is not in the array, its subtree is not either — it closed, or
+        // it has not been flushed yet. Resolving that to the head of the array instead would
+        // silently widen a stale scope to the whole window, which is a `Tab` that walks out
+        // of a modal and nothing that would report it.
+        let hits = table(&[1, 2, 3]);
+        let mut ring = FocusRing::default();
+        ring.push_scope(FocusScope {
+            trap: true,
+            restore_to: None,
+            from: cid(99),
+        });
+        assert_eq!(ring.step(&hits, true), Move::Nowhere);
+        assert_eq!(ring.step_to_end(&hits, false), Move::Nowhere);
+        assert_eq!(ring.step_to(&hits, |_| true), Move::Nowhere);
+        assert_eq!(ring.current(), None, "and nothing was focused on the way");
     }
 
     #[test]
     fn an_explicit_index_sorts_ahead_of_everything_unstated() {
         let hits = table(&[1, 2, 3]);
         let mut ring = FocusRing::default();
-        ring.set_tab_index(ControlId(3), 1);
+        ring.set_tab_index(cid(3), 1);
         assert_eq!(
             ring.step(&hits, true),
             Move::To {
                 from: None,
-                to: ControlId(3)
+                to: cid(3)
             }
         );
         // …and the rest keep the array's own order behind it.
         assert_eq!(
             ring.step(&hits, true),
             Move::To {
-                from: Some(ControlId(3)),
-                to: ControlId(1)
+                from: Some(cid(3)),
+                to: cid(1)
             }
         );
     }
@@ -292,22 +376,22 @@ mod tests {
         let mut popup = FocusRing::default();
         popup.push_scope(FocusScope {
             trap: true,
-            restore_to: Some(ControlId(1)),
-            from: ControlId(9),
+            restore_to: Some(cid(1)),
+            from: cid(9),
         });
         // The blocker is not a focus stop, so the scope is exactly its two items.
-        assert!(matches!(popup.step(&hits, true), Move::To { to, .. } if to == ControlId(10)));
-        assert!(matches!(popup.step(&hits, true), Move::To { to, .. } if to == ControlId(11)));
+        assert!(matches!(popup.step(&hits, true), Move::To { to, .. } if to == cid(10)));
+        assert!(matches!(popup.step(&hits, true), Move::To { to, .. } if to == cid(11)));
         assert!(
-            matches!(popup.step(&hits, true), Move::To { to, .. } if to == ControlId(10)),
+            matches!(popup.step(&hits, true), Move::To { to, .. } if to == cid(10)),
             "a trapping scope let focus out"
         );
 
         let mut flyout = FocusRing::default();
         flyout.push_scope(FocusScope {
             trap: false,
-            restore_to: Some(ControlId(1)),
-            from: ControlId(9),
+            restore_to: Some(cid(1)),
+            from: cid(9),
         });
         _ = flyout.step(&hits, true);
         _ = flyout.step(&hits, true);
@@ -321,15 +405,15 @@ mod tests {
     #[test]
     fn closing_a_scope_restores_focus_to_the_invoker() {
         let mut ring = FocusRing::default();
-        _ = ring.focus(Some(ControlId(1)));
+        _ = ring.focus(Some(cid(1)));
         let scope = ring.push_scope(FocusScope {
             trap: true,
-            restore_to: Some(ControlId(1)),
-            from: ControlId(9),
+            restore_to: Some(cid(1)),
+            from: cid(9),
         });
-        _ = ring.focus(Some(ControlId(10)));
-        assert_eq!(ring.pop_scope(scope), Some(ControlId(1)));
-        assert_eq!(ring.current(), Some(ControlId(1)));
+        _ = ring.focus(Some(cid(10)));
+        assert_eq!(ring.pop_scope(scope), Some(cid(1)));
+        assert_eq!(ring.current(), Some(cid(1)));
         assert_eq!(ring.depth(), 0);
     }
 
@@ -338,16 +422,16 @@ mod tests {
         let mut ring = FocusRing::default();
         let outer = ring.push_scope(FocusScope {
             trap: false,
-            restore_to: Some(ControlId(1)),
-            from: ControlId(9),
+            restore_to: Some(cid(1)),
+            from: cid(9),
         });
         ring.push_scope(FocusScope {
             trap: false,
-            restore_to: Some(ControlId(10)),
-            from: ControlId(20),
+            restore_to: Some(cid(10)),
+            from: cid(20),
         });
         assert_eq!(ring.depth(), 2);
-        assert_eq!(ring.pop_scope(outer), Some(ControlId(1)));
+        assert_eq!(ring.pop_scope(outer), Some(cid(1)));
         assert_eq!(ring.depth(), 0, "a submenu outlived the menu that owned it");
     }
 }

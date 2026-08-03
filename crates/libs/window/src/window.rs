@@ -72,6 +72,44 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// never be handed back to a second window while a stale value still holds it.
 const GWLP_WINDOW_ID: i32 = 0;
 
+/// Which of the system's move/size operations a contact runs.
+///
+/// The eight sizing arms name the edge or corner that follows the contact, in the same
+/// lattice [`CaptionHit`] resolves and `WM_NCHITTEST` answers with; [`Self::Move`] moves the
+/// whole window instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MoveSize {
+    Left,
+    Right,
+    Top,
+    TopLeft,
+    TopRight,
+    Bottom,
+    BottomLeft,
+    BottomRight,
+    Move,
+}
+
+impl MoveSize {
+    /// The system's own `MOVESIZE_OPERATION` value.
+    ///
+    /// Written out rather than derived from the discriminant: these are an ABI's numbers, and
+    /// a reordering of the arms above is not allowed to silently become a different gesture.
+    const fn operation(self) -> i32 {
+        match self {
+            Self::Left => 1,
+            Self::Right => 2,
+            Self::Top => 3,
+            Self::TopLeft => 4,
+            Self::TopRight => 5,
+            Self::Bottom => 6,
+            Self::BottomLeft => 7,
+            Self::BottomRight => 8,
+            Self::Move => 9,
+        }
+    }
+}
+
 /// A top-level window.
 ///
 /// **A closed window leaves this value behind.** Closing destroys the `HWND` while this
@@ -269,6 +307,40 @@ impl Window {
     pub fn set_border_color(&self, color: BorderColor) -> Option<()> {
         self.caption()?.set_border(self.hwnd, color);
         Some(())
+    }
+
+    /// Hands a contact to the system's own move/size loop, and runs it here.
+    ///
+    /// **For a point the application owns.** A caption band needs none of this: it answers
+    /// `WM_NCHITTEST` with `HTCAPTION` or one of the eight resize codes and the system enters
+    /// this loop by itself, which is why [`CaptionSpec`] does not mention it. This is the
+    /// other case — a press the *client* area received, on content that has decided the
+    /// gesture moves or sizes the window rather than acting on it. There is no other way to
+    /// reach it: a hit code is the only currency `DefWindowProc` takes, and a client point
+    /// has none.
+    ///
+    /// `at` is the down event's own position in **screen** coordinates. The loop drags from
+    /// that point, so passing the pointer's current position instead of the one the contact
+    /// started at offsets the window by the difference between them.
+    ///
+    /// **This blocks until the contact is released**, pumping the drag's messages on this
+    /// thread — it *is* the sizing modal loop, entered deliberately rather than fallen into.
+    /// Everything that belongs to that loop belongs to the system here too: snapping, Aero
+    /// shake, the live frame, and the escape that cancels it. Tracking the contact and
+    /// calling `SetWindowPos` per sample reimplements all of it, badly, which is the whole
+    /// reason to prefer this.
+    ///
+    /// Keyboard move/size is **not** this API's, deliberately: `Alt`+`Space` arrives as
+    /// `WM_SYSCOMMAND` and stays `DefWindowProc`'s.
+    ///
+    /// `false` if the window is closed, or if the running build has no such export — it is a
+    /// Windows 11 addition that ships with no header and no import library at all, so it is
+    /// resolved by name for a stronger version of the reason
+    /// [`is_touchpad_capable`](Self::is_touchpad_capable)'s is: here there is nothing to link
+    /// against even where it exists.
+    #[must_use = "false means no loop ran and the window did not move"]
+    pub fn begin_move_size(&self, at: (i32, i32), operation: MoveSize) -> bool {
+        self.state().is_some() && enter_move_size_loop(self.hwnd, at, operation)
     }
 
     /// This window's caption, for one that asked for its own and is still open.
@@ -842,6 +914,47 @@ fn register_touchpad_capable(hwnd: HWND) -> bool {
     }
 }
 
+/// Runs the system's move/size loop for `hwnd`, returning when the contact lifts. `false` if
+/// the running build has no such export.
+///
+/// Resolved dynamically for [`register_touchpad_capable`]'s reason and one further one: this
+/// export has no header and no import library, so a static import is not merely a load-time
+/// hazard, it is not expressible.
+///
+/// Resolved **per call**, with no cache, because the call it guards then blocks for the whole
+/// drag — several orders of magnitude more than two handle lookups — and a cached address
+/// would be one more lifetime to keep right for a saving nothing can measure.
+fn enter_move_size_loop(hwnd: HWND, at: (i32, i32), operation: MoveSize) -> bool {
+    let Some(enter) = move_size_loop() else {
+        return false;
+    };
+    let at = POINT { x: at.0, y: at.1 };
+    // SAFETY: the address is the export's, the signature transmuted onto it is the documented
+    // one, and `hwnd` is a live top-level window of this process — which is what the API
+    // requires of it, and what `&Window` having answered `state()` establishes.
+    unsafe { enter(hwnd, at, operation.operation()).as_bool() }
+}
+
+type MoveSizeLoop = unsafe extern "system" fn(HWND, POINT, i32) -> BOOL;
+
+/// The export, on a build that has it.
+///
+/// Split from the call above so the resolution can be asserted on its own: entering the loop
+/// is not something a test can do — it does not return until a contact that no test is making
+/// is released.
+fn move_size_loop() -> Option<MoveSizeLoop> {
+    // SAFETY: `user32` is loaded — this crate registered the class and created the window
+    // through it — so the handle is live and needs no free. The transmute is of an export's
+    // address onto its documented signature.
+    unsafe {
+        let user32 = GetModuleHandleW(w!("user32.dll"));
+        if user32.is_null() {
+            return None;
+        }
+        GetProcAddress(user32, s!("EnterMoveSizeLoop")).map(|address| core::mem::transmute(address))
+    }
+}
+
 /// Resizes a freshly created window from DIPs, once its real DPI is knowable.
 fn resize_to_dips(hwnd: HWND, width: f32, height: f32) {
     let metrics = Metrics::for_window(hwnd);
@@ -1100,5 +1213,55 @@ unsafe extern "system" fn wndproc(
         }
         // SAFETY: the arguments are the ones just received.
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An ABI's numbers, asserted against the ones the API documents rather than against the
+    /// order the arms happen to be written in.
+    #[test]
+    fn move_size_operations_are_the_systems() {
+        for (operation, code) in [
+            (MoveSize::Left, 1),
+            (MoveSize::Right, 2),
+            (MoveSize::Top, 3),
+            (MoveSize::TopLeft, 4),
+            (MoveSize::TopRight, 5),
+            (MoveSize::Bottom, 6),
+            (MoveSize::BottomLeft, 7),
+            (MoveSize::BottomRight, 8),
+            (MoveSize::Move, 9),
+        ] {
+            assert_eq!(operation.operation(), code, "{operation:?}");
+        }
+    }
+
+    /// The premise the whole capability rests on. A floor that stops carrying the export is
+    /// not a build failure — `begin_move_size` answers `false` and the caller keeps working —
+    /// but it is a thing to learn from a test rather than from a window that will not drag.
+    ///
+    /// Split into its two halves because they fail for unrelated reasons and only one of them
+    /// is news: a missing module means this process never loaded `user32`, which a test
+    /// harness that has created no window genuinely might not have done, and says nothing
+    /// about the export.
+    #[test]
+    fn the_move_size_loop_resolves_on_this_floor() {
+        // Establishes what creating a window would have: nothing here has needed `user32`
+        // yet, and `GetModuleHandleW` finds a loaded module rather than loading one. The
+        // argument is deliberately not a window — the call's answer is discarded, its load is
+        // the point.
+        // SAFETY: `GetDpiForWindow` is documented against any handle and answers zero for one
+        // that is not a window.
+        _ = unsafe { GetDpiForWindow(core::ptr::null_mut()) };
+        // SAFETY: reading the handle of a module this process has loaded.
+        let user32 = unsafe { GetModuleHandleW(w!("user32.dll")) };
+        assert!(!user32.is_null(), "this process has no user32 loaded");
+        assert!(
+            move_size_loop().is_some(),
+            "user32 has no EnterMoveSizeLoop: begin_move_size is inert on this build"
+        );
     }
 }

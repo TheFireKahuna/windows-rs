@@ -18,14 +18,21 @@ mod children;
 mod el;
 mod host;
 mod mount;
+mod style;
 #[cfg(test)]
-mod tests;
-mod text;
+pub(crate) mod tests;
+/// The thread's shaping engine, and the table of laid-out runs behind every label.
+///
+/// Public for one function: [`text::install`], which the application calls at
+/// start-up with the ladder its `Backends` already holds. Everything else here is
+/// the lowering's.
+pub mod text;
 
 pub use adapt::{Each, Switch, When, each, switch, when};
-pub use children::{IntoChildren, Slots};
+pub use children::{Children, IntoChildren};
 pub use el::{Any, Button, El, Path, View};
 pub use host::Host;
+pub(crate) use host::Placement;
 pub use mount::{Mount, geometry, mount, mount_at, set_geometry};
 
 /// Where a structural adapter builds: the mounted group its rows or arms parent to, and the

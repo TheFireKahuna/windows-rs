@@ -150,6 +150,14 @@ pub const D2D1_PRIMITIVE_BLEND_ADD: D2D1_PRIMITIVE_BLEND = 3;
 pub const D2D1_PRIMITIVE_BLEND_COPY: D2D1_PRIMITIVE_BLEND = 1;
 pub const D2D1_PRIMITIVE_BLEND_SOURCE_OVER: D2D1_PRIMITIVE_BLEND = 0;
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
+    pub center: windows_numerics::Vector2,
+    pub gradientOriginOffset: windows_numerics::Vector2,
+    pub radiusX: f32,
+    pub radiusY: f32,
+}
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct D2D1_RENDERING_CONTROLS {
     pub bufferPrecision: D2D1_BUFFER_PRECISION,
@@ -2164,6 +2172,112 @@ pub struct ID2D1PathGeometry1_Vtbl {
 }
 impl windows_core::RuntimeName for ID2D1PathGeometry1 {}
 windows_core::imp::define_interface!(
+    ID2D1RadialGradientBrush,
+    ID2D1RadialGradientBrush_Vtbl,
+    0x2cd906ac_12e2_11dc_9fed_001143a055f9
+);
+impl core::ops::Deref for ID2D1RadialGradientBrush {
+    type Target = ID2D1Brush;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ID2D1RadialGradientBrush,
+    windows_core::IUnknown,
+    ID2D1Resource,
+    ID2D1Brush
+);
+impl ID2D1RadialGradientBrush {
+    pub unsafe fn SetCenter(&self, center: windows_numerics::Vector2) {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetCenter)(
+                windows_core::Interface::as_raw(self),
+                center,
+            );
+        }
+    }
+    pub unsafe fn SetGradientOriginOffset(&self, gradientoriginoffset: windows_numerics::Vector2) {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetGradientOriginOffset)(
+                windows_core::Interface::as_raw(self),
+                gradientoriginoffset,
+            );
+        }
+    }
+    pub unsafe fn SetRadiusX(&self, radiusx: f32) {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetRadiusX)(
+                windows_core::Interface::as_raw(self),
+                radiusx,
+            );
+        }
+    }
+    pub unsafe fn SetRadiusY(&self, radiusy: f32) {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetRadiusY)(
+                windows_core::Interface::as_raw(self),
+                radiusy,
+            );
+        }
+    }
+    pub unsafe fn GetCenter(&self) -> windows_numerics::Vector2 {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetCenter)(windows_core::Interface::as_raw(self))
+        }
+    }
+    pub unsafe fn GetGradientOriginOffset(&self) -> windows_numerics::Vector2 {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetGradientOriginOffset)(
+                windows_core::Interface::as_raw(self),
+            )
+        }
+    }
+    pub unsafe fn GetRadiusX(&self) -> f32 {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetRadiusX)(windows_core::Interface::as_raw(
+                self,
+            ))
+        }
+    }
+    pub unsafe fn GetRadiusY(&self) -> f32 {
+        unsafe {
+            (windows_core::Interface::vtable(self).GetRadiusY)(windows_core::Interface::as_raw(
+                self,
+            ))
+        }
+    }
+    pub unsafe fn GetGradientStopCollection(
+        &self,
+    ) -> windows_core::Result<ID2D1GradientStopCollection> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetGradientStopCollection)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            );
+            windows_core::Type::from_abi(result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct ID2D1RadialGradientBrush_Vtbl {
+    pub base__: ID2D1Brush_Vtbl,
+    pub SetCenter: unsafe extern "system" fn(*mut core::ffi::c_void, windows_numerics::Vector2),
+    pub SetGradientOriginOffset:
+        unsafe extern "system" fn(*mut core::ffi::c_void, windows_numerics::Vector2),
+    pub SetRadiusX: unsafe extern "system" fn(*mut core::ffi::c_void, f32),
+    pub SetRadiusY: unsafe extern "system" fn(*mut core::ffi::c_void, f32),
+    pub GetCenter: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_numerics::Vector2,
+    pub GetGradientOriginOffset:
+        unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_numerics::Vector2,
+    pub GetRadiusX: unsafe extern "system" fn(*mut core::ffi::c_void) -> f32,
+    pub GetRadiusY: unsafe extern "system" fn(*mut core::ffi::c_void) -> f32,
+    pub GetGradientStopCollection:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void),
+}
+impl windows_core::RuntimeName for ID2D1RadialGradientBrush {}
+windows_core::imp::define_interface!(
     ID2D1RenderTarget,
     ID2D1RenderTarget_Vtbl,
     0x2cd90694_12e2_11dc_9fed_001143a055f9
@@ -2206,6 +2320,27 @@ impl ID2D1RenderTarget {
             (windows_core::Interface::vtable(self).CreateLinearGradientBrush)(
                 windows_core::Interface::as_raw(self),
                 lineargradientbrushproperties,
+                brushproperties.unwrap_or(core::mem::zeroed()) as _,
+                gradientstopcollection.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub unsafe fn CreateRadialGradientBrush<P2>(
+        &self,
+        radialgradientbrushproperties: *const D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
+        brushproperties: Option<*const D2D1_BRUSH_PROPERTIES>,
+        gradientstopcollection: P2,
+    ) -> windows_core::Result<ID2D1RadialGradientBrush>
+    where
+        P2: windows_core::Param<ID2D1GradientStopCollection>,
+    {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).CreateRadialGradientBrush)(
+                windows_core::Interface::as_raw(self),
+                radialgradientbrushproperties,
                 brushproperties.unwrap_or(core::mem::zeroed()) as _,
                 gradientstopcollection.param().abi(),
                 &mut result__,
@@ -2539,7 +2674,13 @@ pub struct ID2D1RenderTarget_Vtbl {
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
-    CreateRadialGradientBrush: usize,
+    pub CreateRadialGradientBrush: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
+        *const D2D1_BRUSH_PROPERTIES,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
     CreateCompatibleRenderTarget: usize,
     CreateLayer: usize,
     CreateMesh: usize,

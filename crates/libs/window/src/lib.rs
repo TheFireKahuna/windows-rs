@@ -38,5 +38,5 @@ pub use event::Event;
 pub use feedback::{Feedback, FeedbackPolicy};
 pub use pace::{Pacer, PacerHealth, Tick, WM_FRAME, Wake};
 pub use visibility::{Visibility, Watch};
-pub use window::{Window, WindowBuilder, pump, quit, run};
+pub use window::{MoveSize, Window, WindowBuilder, pump, quit, run};
 pub use windows_core::Result;

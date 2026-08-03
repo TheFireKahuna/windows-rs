@@ -9,104 +9,25 @@ use crate::layout::{Len, stack};
 use crate::role::{
     AccentId, Density, Elevation, Fill, Metric, Polarity, Role, Scope, Stroke, Text, TypeRole,
 };
-use crate::widget::{Flow, Motion, Run, Shaped, Shaper, StatePolicy, Wash};
+use crate::widget::{Flow, Motion, StatePolicy, Wash};
 use windows_color::{DisplayCapability, OutputTransform, Radiance};
 use windows_numerics::Vector2;
 use windows_scene::{Env, Model, Op, Paint, SinkPatch, taffy};
-use windows_text::{FontSpec, Ink, SegBuffers};
+use windows_text::FontLadder;
 
-// ── the doubles ──────────────────────────────────────────────────────────────────
-
-/// A shaper that answers from the string's length.
+/// Installs this thread's palette, text engine and a fresh host for this test.
 ///
-/// Enough to prove that measure is wired to the right entry under the right class, and that
-/// a run is pinned at the width layout chose — which is what this layer owns. It shapes no
-/// glyphs, and says so by emitting an empty span: a double that invented segments would be
-/// asserting about the text engine rather than about the lowering.
-struct Ruler;
-
-impl Shaper for Ruler {
-    fn shape(&self, text: &str, font: FontSpec, flow: Flow) -> Box<dyn Run> {
-        Box::new(RulerRun {
-            width: text.chars().count() as f32 * font.size * 0.5,
-            height: font.size,
-            flow,
-            pinned: f32::NAN,
-        })
-    }
-}
-
-struct RulerRun {
-    /// The run's intrinsic width: what it takes on one line.
-    width: f32,
-    height: f32,
-    flow: Flow,
-    pinned: f32,
-}
-
-impl RulerRun {
-    /// How many lines it breaks into at `at`. One, unless it can wrap.
-    fn lines_at(&self, at: f32) -> usize {
-        if self.flow != Flow::Wrap || at <= 0.0 {
-            return 1;
-        }
-        (self.width / at).ceil().max(1.0) as usize
-    }
-}
-
-impl Run for RulerRun {
-    fn measure(&mut self, available: Option<f32>) -> Vector2 {
-        let at = available.unwrap_or(f32::INFINITY);
-        let lines = self.lines_at(at) as f32;
-        Vector2 {
-            x: self.width.min(at),
-            y: self.height * lines,
-        }
-    }
-
-    fn pin(&mut self, width: f32) -> bool {
-        let moved = self.pinned != width && (self.flow == Flow::Wrap || self.pinned.is_nan());
-        self.pinned = width;
-        moved
-    }
-
-    fn reshape(&mut self, text: &str, font: FontSpec, flow: Flow) {
-        self.width = text.chars().count() as f32 * font.size * 0.5;
-        self.height = font.size;
-        self.flow = flow;
-        self.pinned = f32::NAN;
-    }
-
-    fn lines(&mut self) -> usize {
-        self.lines_at(self.pinned)
-    }
-
-    fn emit(&mut self, _: usize, _: &mut SegBuffers) -> Shaped {
-        Shaped {
-            segs: windows_scene::Span::EMPTY,
-            ink: Ink {
-                size: Vector2 {
-                    x: self.width.min(self.pinned),
-                    y: self.height,
-                },
-                baseline: Vector2 {
-                    x: 0.0,
-                    y: self.height,
-                },
-            },
-        }
-    }
-}
-
-/// Installs this thread's doubles, and a fresh host for this test.
-///
-/// The palette is process-wide and installs once; the shaper and the host are per thread,
+/// The palette is process-wide and installs once; the engine and the host are per thread,
 /// and tests run on their own, so each gets a tree and an engine of its own to assert
 /// against.
-fn fixture() -> SinkPatch {
+pub(crate) fn fixture() -> SinkPatch {
     crate::role::tests::palette();
-    if !crate::widget::shaper_installed() {
-        crate::widget::install_shaper(Ruler);
+    if !super::text::installed() {
+        // The real engine, over the two inbox faces the palette names. Deliberate:
+        // a double that invented advances would let a wiring test pass while the
+        // engine it stands for measured something else entirely.
+        super::text::install(FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]))
+            .expect("DirectWrite is available on the platform floor");
     }
     let root = taffy::Style {
         size: taffy::Size {
@@ -381,32 +302,53 @@ fn a_metric_override_lowers_through_the_palette() {
     );
 }
 
-/// Text is measured under the class the **container resolved**, not the one that was
-/// current when the node was built.
+/// Text is measured under the type ramp the **palette resolved**, not under whatever
+/// was current when the node was built.
+///
+/// Asserted as a **ratio** between two rungs rather than against an absolute width. The
+/// engine is DirectWrite, so an absolute figure would pin this test to one font's
+/// advances and it would fail on a font update having caught nothing. A ratio holds
+/// whatever the face is, and it is the property the wiring actually owes: measure took
+/// the size the palette gave for the role.
 #[test]
-fn text_measures_under_the_resolved_width_class() {
-    let mut patch = fixture();
-    let label = El::<Any>::seed(crate::layout::Preset::Text).text_seed(
-        crate::widget::TextSource::Static("hello"),
-        TypeRole::Body,
-        Some(Text::Primary),
-        Flow::Line,
-    );
-    let _mount = mount(label, root());
-    flush(&mut patch);
+fn text_measures_under_the_resolved_type_ramp() {
+    fn width_of(ramp: TypeRole) -> f32 {
+        let mut patch = fixture();
+        let label = El::<Any>::seed(crate::layout::Preset::Text).text_seed(
+            crate::widget::TextSource::Static("hello"),
+            ramp,
+            Some(Text::Primary),
+            Flow::Line,
+        );
+        let _mount = mount(label, root());
+        flush(&mut patch);
+        Host::with(|h| {
+            let (_, row) = h.mounts.iter().last().expect("the label mounted");
+            let node = row.node;
+            h.model().solved(node).size.x
+        })
+    }
 
-    // Five characters at the ruler's half-em advance, at whatever body size the palette
-    // resolved for the class the container gave the measurement.
     let scope = Scope::root(AccentId(0), Density::Comfortable);
-    let expected = 5.0 * crate::role::typography(TypeRole::Body, scope).size * 0.5;
-    let solved = Host::with(|h| {
-        let node = h.mounts.last().expect("the label mounted").node;
-        h.model().solved(node)
-    });
+    let body = crate::role::typography(TypeRole::Body, scope).size;
+    let display = crate::role::typography(TypeRole::Display, scope).size;
     assert!(
-        (solved.size.x - expected).abs() < 0.5,
-        "measured {} rather than the ruler's {expected}",
-        solved.size.x
+        display > body,
+        "the ramp under test does not separate its rungs"
+    );
+
+    let (measured_body, measured_display) = (width_of(TypeRole::Body), width_of(TypeRole::Display));
+    assert!(measured_body > 0.0, "the body rung measured nothing");
+
+    // One string, one face, two sizes: advances scale with the em, so the measured
+    // widths carry the ramp's own ratio. The tolerance is hinting, which quantizes
+    // advances per size and is the only reason this is not exact.
+    let expected = display / body;
+    let actual = measured_display / measured_body;
+    assert!(
+        (actual - expected).abs() < 0.08 * expected,
+        "measured ratio {actual} against the ramp's {expected} \
+         ({measured_display} / {measured_body})"
     );
 }
 
@@ -549,7 +491,7 @@ fn a_surface_arranges_its_children_as_it_was_told() {
 
     // Mounts are pushed in walk order, so the surface is first and its two children follow.
     let (a, b) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|m| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
         (h.model().solved(nodes[1]), h.model().solved(nodes[2]))
     });
     assert!(
@@ -584,7 +526,7 @@ fn a_surface_keeps_its_chrome_whichever_class_it_takes() {
     let scope = Scope::root(AccentId(0), Density::Comfortable);
     let padding = crate::role::metric(Metric::SpaceLg, scope);
     let (surface, child) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|m| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
         (h.model().solved(nodes[0]), h.model().solved(nodes[1]))
     });
     assert!(
@@ -636,9 +578,9 @@ fn unmounting_releases_every_row_it_claimed() {
 
     let (mounts, controls, runs) = Host::with(|h| {
         (
-            h.mounts.iter().filter(|m| m.live).count(),
-            h.controls.iter().filter(|c| c.live).count(),
-            text::with(|t| t.live()),
+            h.mounts.len(),
+            h.controls.len(),
+            text::with(|t| t.entries.len()),
         )
     });
     assert!(mounts > 0 && controls == 1 && runs == 1);
@@ -647,9 +589,9 @@ fn unmounting_releases_every_row_it_claimed() {
     flush(&mut patch);
     let (mounts, controls, runs) = Host::with(|h| {
         (
-            h.mounts.iter().filter(|m| m.live).count(),
-            h.controls.iter().filter(|c| c.live).count(),
-            text::with(|t| t.live()),
+            h.mounts.len(),
+            h.controls.len(),
+            text::with(|t| t.entries.len()),
         )
     });
     assert_eq!(
@@ -661,10 +603,14 @@ fn unmounting_releases_every_row_it_claimed() {
     // rather than through a scan: a table left holding a dead node's row is what makes
     // unmounting one list row cost the whole screen.
     Host::with(|h| {
-        assert!(h.values.iter().all(|v| !v.live));
-        assert!(h.responsives.iter().all(Option::is_none));
-        assert!(h.scrolls.iter().all(Option::is_none));
+        assert_eq!(h.values.len(), 0);
+        assert_eq!(h.scrolls.len(), 0);
     });
+    assert_eq!(
+        style::with(|table| table.len()),
+        0,
+        "an unmount must release the style recipes"
+    );
 
     // One destroy op, because it cascades on the far side: a partial destroy is not
     // expressible, so a subtree cannot be half-gone.
@@ -686,10 +632,14 @@ fn released_rows_are_reused_rather_than_appended() {
         drop(mount);
         flush(&mut patch);
     }
-    let rows = Host::with(|h| (h.mounts.len(), h.controls.len()));
+    let (mounts, controls) = Host::with(|h| (h.mounts.slots(), h.controls.slots()));
     assert_eq!(
-        rows.1, 1,
+        controls, 1,
         "eight mounts of one control must occupy one control slot, not eight"
+    );
+    assert!(
+        mounts <= 2,
+        "a button is one node and its label, so eight mounts must reuse the same rows"
     );
 }
 
@@ -754,8 +704,8 @@ fn a_control_claims_the_moving_part_its_children_declared() {
     let front = Host::with(|h| {
         h.controls
             .iter()
-            .find(|c| c.live)
-            .map(|c| c.front)
+            .next()
+            .map(|(_, c)| c.front)
             .expect("the slider minted a control")
     });
     assert!(
@@ -786,8 +736,8 @@ fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
     let travel = Host::with(|h| {
         h.controls
             .iter()
-            .find(|c| c.live)
-            .map_or(0.0, |c| c.front.travel)
+            .next()
+            .map_or(0.0, |(_, c)| c.front.travel)
     });
     assert!(travel > 0.0, "a knob in a sized track has room to move");
     let offsets = offsets_bound(&patch);
@@ -816,8 +766,8 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
     let front = Host::with(|h| {
         h.controls
             .iter()
-            .find(|c| c.live)
-            .map(|c| c.front)
+            .next()
+            .map(|(_, c)| c.front)
             .expect("a slider is a control")
     });
     assert!(
@@ -901,7 +851,7 @@ fn a_meter_is_not_a_control() {
     let _meter = mount(crate::widget::meter(level), root());
     flush(&mut patch);
 
-    let controls = Host::with(|h| h.controls.iter().filter(|c| c.live).count());
+    let controls = Host::with(|h| h.controls.len());
     assert_eq!(controls, 0, "a meter must mint no control row");
     let entries = patch
         .ops()
@@ -941,7 +891,7 @@ fn a_constantly_absent_element_is_never_mounted() {
         .count();
     assert_eq!(minted, 3, "the container and the two present children");
     assert_eq!(
-        text::with(|t| t.live()),
+        text::with(|t| t.entries.len()),
         0,
         "an absent label must not shape its string"
     );
@@ -1182,7 +1132,7 @@ fn a_scroll_container_binds_its_content_and_its_thumb_to_one_tracker() {
         "both must ride the same tracker, or the thumb reports on something else"
     );
 
-    let viewport = Host::with(|h| h.mounts.iter().find(|m| m.live).map(|m| m.node));
+    let viewport = Host::with(|h| h.mounts.iter().next().map(|(_, m)| m.node));
     assert!(
         tracked.iter().all(|(id, _)| Some(*id) != viewport),
         "the viewport clips, so it must not be the thing that moves"
@@ -1262,8 +1212,8 @@ fn a_value_handler_declares_the_target_it_needs() {
     let has = Host::with(|h| {
         h.controls
             .iter()
-            .find(|c| c.live)
-            .is_some_and(|c| c.change.is_some())
+            .next()
+            .is_some_and(|(_, c)| c.change.is_some())
     });
     assert!(
         has,
@@ -1275,37 +1225,53 @@ fn a_value_handler_declares_the_target_it_needs() {
 
 /// A restyle re-lowers against the node's **own** scope, not the root's.
 ///
-/// A surface pushes a rung and a responsive container rewrites a class, and both land on the
-/// mount row. Re-lowering from the root would resolve a card's metrics at the window's class
-/// and lose the elevation — silently, because the answer is still a valid style.
+/// A surface pushes a rung, and re-lowering from the root would lose the elevation silently,
+/// because the answer is still a valid style.
 #[test]
 fn a_restyle_lowers_against_the_node_that_owns_it() {
     let mut patch = fixture();
     let shown = crate::signal::Cell::new(true);
-    // Inside a card, so the scope the row carries is not the root's.
+    // Inside a card, so the scope the recipe carries is not the root's.
     let _held = mount(
         crate::widget::card().stack(plate().padding(Metric::SpaceLg).when(shown)),
         root(),
     );
     flush(&mut patch);
 
-    let (row, elevated) = Host::with(|h| {
-        let row = h
-            .mounts
+    let root_scope = Host::with(|h| h.root_scope);
+    let elevated = style::with(|table| {
+        table
             .iter()
-            .enumerate()
-            .filter(|(_, m)| m.live)
-            .find(|(_, m)| m.scope.elevation != h.root_scope.elevation)
-            .map(|(at, _)| at as u32)
-            .expect("a card elevates the scope its children resolve against");
-        (row, h.mount_scope(row))
-    });
-    assert!(elevated.is_some(), "a live row answers with its own scope");
-    // The claim, stated as the code states it: the scope a restyle reads is this row's.
+            .find(|(_, recipe)| recipe.scope.elevation != root_scope.elevation)
+            .map(|(node, _)| node)
+    })
+    .expect("a card elevates the scope its children resolve against");
     assert_eq!(
-        elevated,
-        Host::with(|h| h.mounts[row as usize].scope).into(),
-        "a restyle must read the row rather than a copy taken at mount"
+        style::with(|table| table.get(elevated).map(|recipe| recipe.scope)).map(|s| s.elevation),
+        Some(root_scope.elevate(Elevation::Raised).elevation),
+        "a restyle must read the node's own recipe rather than the root scope"
+    );
+}
+
+/// The width class is the solve's, and is never stored in the recipe it re-lowers from.
+///
+/// The whole of the collapse: two owners of one class, one of them a frame stale, was what
+/// made a container's own re-lower disagree with the layout it was laid out under.
+#[test]
+fn a_recipe_holds_no_width_class() {
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::responsive([600.0, 1000.0], plate().padding(Metric::SpaceLg)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let root_width = Host::with(|h| h.root_scope.width);
+    assert!(
+        style::with(|table| table
+            .iter()
+            .all(|(_, recipe)| recipe.scope.width == root_width)),
+        "a recipe stored a resolved class, which is the copy that goes stale"
     );
 }
 
@@ -1336,8 +1302,8 @@ fn a_wash_is_as_round_as_the_control_it_covers() {
         let wash = Host::with(|h| {
             h.controls
                 .iter()
-                .find(|c| c.live)
-                .and_then(|c| c.front.wash)
+                .next()
+                .and_then(|(_, c)| c.front.wash)
                 .expect("an interactive control mints a wash")
         });
         let radius = patch

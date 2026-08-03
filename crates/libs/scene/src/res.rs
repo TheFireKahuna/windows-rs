@@ -11,8 +11,8 @@
 //! composition object.
 
 use crate::id::Id;
-use crate::node::Slots;
-use crate::sink::{Holding, RegionId, ResId};
+use crate::id::Slots;
+use crate::sink::{Geom, Holding, Ramp, Region, RegionId, ResId, Run};
 use windows_composition::{CompositionPathGeometry, CompositionSurfaceBrush};
 
 /// A shared resource, and the two independent claims on it.
@@ -44,22 +44,26 @@ impl<T> Res<T> {
     }
 }
 
-/// One resource family.
-pub(crate) type ResTable<T> = Slots<Res<T>>;
+/// One resource family: the ids it is keyed by, and what it holds under them.
+///
+/// The two parameters are separate because they genuinely are — the family is the model's
+/// (`Id<Geom>`), the payload is the composition object. Stating both is what stops a geom id
+/// reaching the ramp table, which a per-call family parameter allowed.
+pub(crate) type ResTable<F, T> = Slots<F, Res<T>>;
 
-impl<T> ResTable<T> {
-    pub(crate) fn value<F>(&self, id: Id<F>) -> Option<&T> {
+impl<F, T> ResTable<F, T> {
+    pub(crate) fn value(&self, id: Id<F>) -> Option<&T> {
         self.get(id).map(|res| &res.value)
     }
 
-    fn retain<F>(&mut self, id: Id<F>) {
+    fn retain(&mut self, id: Id<F>) {
         if let Some(res) = self.get_mut(id) {
             res.rc += 1;
         }
     }
 
     /// Gives up a sprite's hold, dropping the entry if that was the last claim on it.
-    fn release<F>(&mut self, id: Id<F>) {
+    fn release(&mut self, id: Id<F>) {
         if let Some(res) = self.get_mut(id) {
             res.rc = res.rc.saturating_sub(1);
         }
@@ -67,16 +71,18 @@ impl<T> ResTable<T> {
     }
 
     /// Gives up the *model's* claim. The declaration is gone; the sprites may not be.
-    fn disclaim<F>(&mut self, id: Id<F>) {
+    fn disclaim(&mut self, id: Id<F>) {
         if let Some(res) = self.get_mut(id) {
             res.claimed = false;
         }
         self.collect(id);
     }
 
-    fn collect<F>(&mut self, id: Id<F>) {
+    fn collect(&mut self, id: Id<F>) {
         if self.get(id).is_some_and(Res::unheld) {
-            self.remove(id);
+            // The authority is the model's, on the other side of the seam, so this releases
+            // the row and not the id.
+            self.take(id);
         }
     }
 }
@@ -84,12 +90,12 @@ impl<T> ResTable<T> {
 /// Every shared resource this scene holds.
 #[derive(Default)]
 pub(crate) struct Resources {
-    pub(crate) geoms: ResTable<CompositionPathGeometry>,
-    pub(crate) ramps: ResTable<CompositionSurfaceBrush>,
-    pub(crate) runs: ResTable<CompositionSurfaceBrush>,
+    pub(crate) geoms: ResTable<Geom, CompositionPathGeometry>,
+    pub(crate) ramps: ResTable<Ramp, CompositionSurfaceBrush>,
+    pub(crate) runs: ResTable<Run, CompositionSurfaceBrush>,
     /// `None` until the producer hands over its buffer, which arrives out of band as the
     /// one kernel handle that legitimately crosses from the present thread.
-    pub(crate) regions: ResTable<Option<CompositionSurfaceBrush>>,
+    pub(crate) regions: ResTable<Region, Option<CompositionSurfaceBrush>>,
 }
 
 /// Dispatches one verb to whichever table holds the family.
@@ -124,10 +130,10 @@ impl Resources {
     ///
     /// All four: a [`ResId`] names no family and exactly one table can be holding it.
     pub(crate) fn disclaim(&mut self, id: ResId) {
-        self.geoms.disclaim(id.cast::<crate::sink::Geom>());
-        self.ramps.disclaim(id.cast::<crate::sink::Ramp>());
-        self.runs.disclaim(id.cast::<crate::sink::Run>());
-        self.regions.disclaim(id.cast::<crate::sink::Region>());
+        self.geoms.disclaim(id.cast::<Geom>());
+        self.ramps.disclaim(id.cast::<Ramp>());
+        self.runs.disclaim(id.cast::<Run>());
+        self.regions.disclaim(id.cast::<Region>());
     }
 
     /// The buffer a region is currently pointed at, if the producer has handed one over.
@@ -136,17 +142,17 @@ impl Resources {
     }
 }
 
-impl ResTable<CompositionSurfaceBrush> {
+impl<F> ResTable<F, CompositionSurfaceBrush> {
     /// Re-points at a freshly drawn surface, minting the brush the first time.
     pub(crate) fn point(
         &mut self,
-        id: Id<impl Sized>,
+        id: Id<F>,
         surface: &impl windows_composition::Surface,
         fresh: impl FnOnce() -> CompositionSurfaceBrush,
     ) {
         match self.get_mut(id) {
             Some(res) => res.value.set_surface(surface),
-            None => self.insert(id, Res::new(fresh())),
+            None => self.place(id, Res::new(fresh())),
         }
     }
 }
@@ -157,9 +163,9 @@ mod tests {
 
     #[test]
     fn a_resource_outlives_the_model_but_not_its_last_sprite() {
-        let mut table: ResTable<u8> = ResTable::default();
+        let mut table: ResTable<(), u8> = ResTable::default();
         let id = Id::<()>::raw(1, 1);
-        table.insert(id, Res::new(7));
+        table.place(id, Res::new(7));
 
         table.retain(id);
         table.retain(id);
@@ -182,18 +188,18 @@ mod tests {
 
     #[test]
     fn a_resource_no_sprite_ever_took_goes_with_the_declaration() {
-        let mut table: ResTable<u8> = ResTable::default();
+        let mut table: ResTable<(), u8> = ResTable::default();
         let id = Id::<()>::raw(1, 1);
-        table.insert(id, Res::new(7));
+        table.place(id, Res::new(7));
         table.disclaim(id);
         assert!(table.get(id).is_none());
     }
 
     #[test]
     fn releasing_more_than_was_taken_cannot_drop_a_declared_resource() {
-        let mut table: ResTable<u8> = ResTable::default();
+        let mut table: ResTable<(), u8> = ResTable::default();
         let id = Id::<()>::raw(1, 1);
-        table.insert(id, Res::new(7));
+        table.place(id, Res::new(7));
         // An app-side bug must not be able to pull a resource out from under a declaration
         // that is still standing.
         table.release(id);
