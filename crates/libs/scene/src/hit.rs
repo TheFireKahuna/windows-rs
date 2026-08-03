@@ -45,6 +45,97 @@ pub struct Hit {
     pub local: Point,
 }
 
+/// The scan itself — **the** hit test, with nothing thread-affine in it.
+///
+/// Free rather than a method because it has two callers on two threads: this table's
+/// [`hit`](HitTable::hit), and automation's element-from-point, which reads a published
+/// copy of the same array from a UI Automation worker. Invariant 3 says one hit-test
+/// authority, and one function is how that is enforced rather than reviewed.
+///
+/// `floor` bounds the scan from below and does **not** short-circuit it: "still inside
+/// what it was inside" does not imply the same answer, because a control drawn *above*
+/// can have come under the point meanwhile. What it does imply is that nothing below can
+/// win, since the scan is back-to-front and takes the first hit. Callers with no memo
+/// pass 0. Returns the winning index and the point in its own space.
+pub fn scan(
+    entries: &[HitEntry],
+    offset: impl Fn(NodeId) -> Vector2,
+    floor: usize,
+    p: Point,
+    contact: ContactKind,
+) -> Option<(usize, Point)> {
+    // Layout places content **unscrolled** and the compositor applies the offset, so the
+    // query moves the *point* rather than the rects. That is the simplification: the prior
+    // shape had layout write a scroll translation and the walk carry a compensating offset
+    // in a different coordinate space.
+    let resolve = |p: Point, scroll: NodeId| {
+        if scroll.is_none() {
+            return p;
+        }
+        let o = offset(scroll);
+        Vector2 {
+            x: p.x + o.x,
+            y: p.y + o.y,
+        }
+    };
+    // Walks the clip ancestry, rejecting a point any ancestor excludes. A parent-index
+    // test and not a control-flow prune: there is no descent to prune, so overhang
+    // survives by construction and only a genuine clip removes anything.
+    let admitted = |mut parent: u32, p: Point| {
+        let mut guard = entries.len();
+        while parent != NO_ENTRY {
+            let Some(entry) = entries.get(parent as usize) else {
+                return true;
+            };
+            if !entry.contains(resolve(p, entry.scroll_src), 0.0) {
+                return false;
+            }
+            parent = entry.clip_parent;
+            // A malformed table — a cycle in the parent indices — would otherwise hang the
+            // pump. The bound is the array's own length, which no acyclic chain can exceed.
+            guard = guard.saturating_sub(1);
+            if guard == 0 {
+                debug_assert!(false, "the clip chain is cyclic");
+                return false;
+            }
+        }
+        true
+    };
+
+    let mut best: Option<(usize, f32, Point)> = None;
+    for index in (floor..entries.len()).rev() {
+        let entry = &entries[index];
+        if !entry
+            .flags
+            .intersects(HitFlags::INTERACTIVE | HitFlags::SCROLL)
+        {
+            continue;
+        }
+        let q = resolve(p, entry.scroll_src);
+        let inflate = if contact.inflates() && !entry.flags.contains(HitFlags::NO_INFLATE) {
+            entry.touch_inflate
+        } else {
+            0.0
+        };
+        if !entry.contains(q, inflate) || !admitted(entry.clip_parent, p) {
+            continue;
+        }
+        // An uninflated hit is exact and wins outright. Only inflated ones compete,
+        // nearest centre first, so two neighbours cannot both claim a point once a
+        // finger's slack is added to each. An exact tie keeps the candidate found first —
+        // the topmost — which has to be decided rather than left to scan order, or two
+        // targets equidistant from a point answer differently on different frames.
+        if entry.contains(q, 0.0) {
+            return Some((index, q));
+        }
+        let distance = entry.centre_distance_sq(q);
+        if best.is_none_or(|(_, existing, _)| distance < existing) {
+            best = Some((index, distance, q));
+        }
+    }
+    best.map(|(index, _, q)| (index, q))
+}
+
 /// The array, plus what a query needs that the array does not carry.
 #[derive(Debug, Default)]
 pub struct HitTable {
@@ -154,90 +245,15 @@ impl HitTable {
             }
             _ => 0,
         };
-
-        let mut best: Option<(usize, f32, Point)> = None;
-        for index in (floor..self.entries.len()).rev() {
-            let entry = &self.entries[index];
-            if !entry
-                .flags
-                .intersects(HitFlags::INTERACTIVE | HitFlags::SCROLL)
-            {
-                continue;
-            }
-            let q = self.resolve(p, entry.scroll_src);
-            let inflate = if contact.inflates() && !entry.flags.contains(HitFlags::NO_INFLATE) {
-                entry.touch_inflate
-            } else {
-                0.0
-            };
-            if !entry.contains(q, inflate) {
-                continue;
-            }
-            if !self.clip_chain_contains(entry.clip_parent, p) {
-                continue;
-            }
-            // An uninflated hit is exact and wins outright. Only inflated ones compete,
-            // nearest centre first, so two neighbours cannot both claim a point once a
-            // finger's slack is added to each.
-            if entry.contains(q, 0.0) {
-                return Some(self.record(index, q));
-            }
-            // Only inflated candidates compete, and the nearest centre wins. An exact tie
-            // goes to the one drawn later, which is what z-order means everywhere else
-            // here — and it has to be decided rather than left to scan order, or two
-            // targets equidistant from a point answer differently on different frames.
-            let distance = entry.centre_distance_sq(q);
-            // Strict, and the scan is back-to-front, so an exact tie keeps the candidate
-            // found first — the topmost.
-            if best.is_none_or(|(_, existing, _)| distance < existing) {
-                best = Some((index, distance, q));
-            }
-        }
-        best.map(|(index, _, q)| self.record(index, q))
+        let (index, local) = scan(&self.entries, |node| self.offset(node), floor, p, contact)?;
+        Some(self.record(index, local))
     }
 
-    /// Walks the clip ancestry, rejecting a point any ancestor excludes.
-    ///
-    /// A parent-index test and not a control-flow prune: there is no descent to prune, so
-    /// overhang survives by construction and only a genuine clip removes anything.
-    fn clip_chain_contains(&self, mut parent: u32, p: Point) -> bool {
-        let mut guard = self.entries.len();
-        while parent != NO_ENTRY {
-            let Some(entry) = self.entries.get(parent as usize) else {
-                return true;
-            };
-            let q = self.resolve(p, entry.scroll_src);
-            if !entry.contains(q, 0.0) {
-                return false;
-            }
-            parent = entry.clip_parent;
-            // A malformed table — a cycle in the parent indices — would otherwise hang the
-            // pump. The bound is the array's own length, which no acyclic chain can exceed.
-            guard = guard.saturating_sub(1);
-            if guard == 0 {
-                debug_assert!(false, "the clip chain is cyclic");
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Applies a scroll ancestry to a window-space point.
-    ///
-    /// Layout places content **unscrolled** and the compositor applies the offset, so the
-    /// query moves the *point* rather than the rects. That is the simplification: the prior
-    /// shape had layout write a scroll translation and the walk carry a compensating offset
-    /// in a different coordinate space.
-    fn resolve(&self, p: Point, scroll: NodeId) -> Point {
-        if scroll.is_none() {
-            return p;
-        }
+    /// This table's scroll offsets, as [`scan`] wants them.
+    fn offset(&self, scroll: NodeId) -> Vector2 {
         match self.scrolls.iter().find(|(id, _)| *id == scroll) {
-            Some((_, offset)) => Vector2 {
-                x: p.x + offset.x,
-                y: p.y + offset.y,
-            },
-            None => p,
+            Some(&(_, offset)) => offset,
+            None => Vector2::zero(),
         }
     }
 
@@ -296,6 +312,7 @@ mod tests {
             y1: rect.3,
             touch_inflate: 0.0,
             clip_parent: NO_ENTRY,
+            parent: NO_ENTRY,
             flags,
             scroll_src: NodeId::NONE,
             id: ControlId::raw(id, 1),

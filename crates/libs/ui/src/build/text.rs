@@ -225,6 +225,14 @@ pub(crate) fn measure(input: MeasureIn) -> Vector2 {
 }
 
 impl Table {
+    /// The string a run was laid out from.
+    ///
+    /// What automation derives an accessible name from: a widget's name is its own text
+    /// unless it was given one, and this is where its own text is.
+    pub(crate) fn str_of(&self, key: MeasureKey) -> Option<&str> {
+        self.entries.get(key).map(|entry| entry.text.as_str())
+    }
+
     /// Registers a run and hands back the key layout will name it by.
     ///
     /// A released slot keeps its laid-out run, so this **reshapes** rather than building one:
@@ -294,15 +302,17 @@ impl Table {
     /// Event rate by construction: changing a line's string is structural — reshape,
     /// re-rasterize, re-point — and text that changes at display rate belongs in a
     /// presentation region.
-    pub(crate) fn set_text(&mut self, key: MeasureKey, text: &str) {
+    /// Re-points a run's text, answering whether the string actually moved.
+    pub(crate) fn set_text(&mut self, key: MeasureKey, text: &str) -> bool {
         let Some(entry) = self.entries.get_mut(key) else {
-            return;
+            return false;
         };
         if entry.text.as_str() == text {
-            return;
+            return false;
         }
         entry.text.set(text);
         entry.stale = true;
+        true
     }
 
     /// Releases a run and the resource slots it held.

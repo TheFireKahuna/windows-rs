@@ -226,6 +226,7 @@ fn table() -> HitTable {
         y1: 80.0,
         touch_inflate: 0.0,
         clip_parent: NO_ENTRY,
+        parent: NO_ENTRY,
         flags: HitFlags::INTERACTIVE | HitFlags::GESTURE,
         scroll_src: NodeId::NONE,
         id: target(),

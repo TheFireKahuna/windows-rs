@@ -278,6 +278,7 @@ mod tests {
             y1: 10.0,
             touch_inflate: 0.0,
             clip_parent: NO_ENTRY,
+            parent: NO_ENTRY,
             flags,
             scroll_src: NodeId::NONE,
             id: cid(id),

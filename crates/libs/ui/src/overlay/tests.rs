@@ -106,9 +106,32 @@ fn an_overlay_is_placed_under_its_anchor_and_has_real_geometry() {
     flush(&mut patch);
 
     let entries = entries(&patch);
+    // Everything that is neither the blocker nor part of the **anchor's own subtree** —
+    // which is not the same as "not the anchor", because a control's label is an element
+    // of its own and sits inside it.
+    let inside_anchor = |mut at: u32| {
+        let mut guard = entries.len();
+        while at != windows_scene::NO_ENTRY && guard > 0 {
+            let Some(entry) = entries.get(at as usize) else {
+                break;
+            };
+            if entry.id == anchor {
+                return true;
+            }
+            at = entry.parent;
+            guard -= 1;
+        }
+        false
+    };
     let overlay: Vec<&HitEntry> = entries
         .iter()
-        .filter(|entry| !entry.flags.contains(HitFlags::BLOCKER) && entry.id != anchor)
+        .enumerate()
+        .filter(|(at, entry)| {
+            !entry.flags.contains(HitFlags::BLOCKER)
+                && entry.id != anchor
+                && !inside_anchor(*at as u32)
+        })
+        .map(|(_, entry)| entry)
         .collect();
     assert!(!overlay.is_empty(), "the overlay's rows are in the array");
     for entry in overlay {

@@ -66,11 +66,6 @@ pub(crate) struct MountRow {
 /// there because only that thread is in the tick that has to move a pixel. Nothing crosses
 /// that is not a number or an id — the wash opacities are resolved here, at mount, because
 /// realizing a colour cell mid-hover would be a surface creation on the interaction path.
-#[expect(
-    dead_code,
-    reason = "UI Automation reads the name, key and role; it is written against this row \
-              and lands next"
-)]
 pub(crate) struct ControlRow {
     pub node: NodeId,
     /// The parts a model-state change re-paints. Held as ids so the swap is two ops and no
@@ -100,6 +95,10 @@ pub(crate) struct ControlRow {
     pub flyout: Option<Rc<dyn Fn() -> super::View>>,
     pub uia: UiaRole,
     pub name: Option<&'static str>,
+    /// The text this control's own subtree laid out, which is what its accessible name
+    /// derives from where it was not given one. A control's label is almost never its own
+    /// sprite, so this is claimed on the way back up rather than read off its own row.
+    pub text: Option<MeasureKey>,
     /// The automation-id segment. `&'static str`, so nothing is built at mount: the path is
     /// materialized only if UI Automation asks, which is rarely and never on a hot path.
     pub key: Option<&'static str>,
@@ -187,6 +186,13 @@ pub struct Host {
     pub(crate) gestures: Vec<(ControlId, GestureDecl)>,
     /// The front-side half of each control minted — or re-measured — since the last drain.
     pub(crate) chrome: Vec<crate::widget::ChromeRow>,
+    /// Model-state changes since the last drain, for automation.
+    pub(crate) states: Vec<(ControlId, ModelState)>,
+    /// Whether the set of elements has moved since the last accessible-tree publish.
+    ///
+    /// A `Cell`, because clearing it is the front side saying "I have published" rather
+    /// than this thread mutating itself, and the two happen either side of a drain.
+    pub(crate) uia_stale: std::cell::Cell<bool>,
     /// Controls released since the last drain, so the front table forgets them rather than
     /// holding a row that names a destroyed sprite.
     pub(crate) released: Vec<ControlId>,
@@ -277,6 +283,8 @@ impl Host {
             controls: Slots::new(),
             gestures: Vec::new(),
             chrome: Vec::new(),
+            states: Vec::new(),
+            uia_stale: std::cell::Cell::new(true),
             released: Vec::new(),
             value_ids: Ids::new(),
             values: Slots::new(),
@@ -356,6 +364,114 @@ impl Host {
         core::mem::take(&mut self.chrome)
     }
 
+    /// Fills `out` with what automation needs and layout does not already carry.
+    ///
+    /// **Synthesised, never declared.** A widget names a role and the lowering derives the
+    /// rest: the name is the widget's own text unless it was given one, the value is the
+    /// channel it already binds, and the patterns follow from the role. Nineteen
+    /// hand-written declarations would be nineteen chances to disagree with a promise that
+    /// accessibility derives.
+    ///
+    /// Walks the mount rows rather than the control table, because a control's own text
+    /// and its control row are two facts about one row and this is where they meet. The
+    /// strings are resolved *here*, on the thread that owns the text table, so what
+    /// crosses to the front is plain `Send` data.
+    pub fn uia_seeds(&self, out: &mut crate::uia::Seeds) {
+        use crate::uia::{ColFlags, Seed, State, Value};
+
+        out.clear();
+        for (id, control) in self.controls.iter() {
+            if control.uia == UiaRole::None {
+                continue;
+            }
+            let name = match control.name {
+                Some(explicit) => out.intern(explicit),
+                // A `&'static str` is interned rather than borrowed because a derived name
+                // is not one, and one path for both beats two.
+                None => control
+                    .text
+                    .and_then(|key| super::text::with(|table| table.str_of(key).map(str::to_owned)))
+                    .map_or_else(Default::default, |text| out.intern(&text)),
+            };
+            // A tooltip is the element's `HelpText`, which is the same fact stated to a
+            // different sense. Read untracked: this runs inside a flush, and subscribing
+            // whatever effect is on the stack would rebuild a screen when a tip changed.
+            let help = control.tip.as_ref().map_or_else(Default::default, |tip| {
+                let text = crate::signal::untracked(|| tip.read(str::to_owned));
+                out.intern(&text)
+            });
+            let value = match (control.uia, control.front.drive) {
+                (
+                    _,
+                    Some(
+                        crate::widget::Interaction::Slide(range)
+                        | crate::widget::Interaction::Turn(range),
+                    ),
+                ) => Value::Range(range),
+                // A static run publishes its own body as a text document, which is what
+                // makes the read-only selectable surface readable at all.
+                (UiaRole::Text, _) => Value::Text,
+                _ => Value::None,
+            };
+            let mut flags = ColFlags::NONE;
+            if control.flyout.is_some() {
+                flags = flags | ColFlags::EXPANDS;
+            }
+            if control.click.is_some() || control.front.drive.is_some() {
+                flags = flags | ColFlags::FOCUSABLE;
+            }
+            let mut state = State::default();
+            if control.state != ModelState::Disabled {
+                state = state | State::ENABLED;
+            }
+            if control.state == ModelState::Selected {
+                state = state | State::SELECTED;
+            }
+            out.rows.push(Seed {
+                id,
+                role: control.uia,
+                name,
+                help,
+                key: control.key,
+                value,
+                flags,
+                state,
+            });
+        }
+        out.sort();
+    }
+
+    /// Takes the model-state changes since the last drain, for automation to announce.
+    ///
+    /// A drain rather than a republish: a toggle is not a layout change, and rebuilding the
+    /// whole tree to say one box is now checked would put an allocation on every click and
+    /// tell a client the screen's structure changed when it did not.
+    pub fn take_states(&mut self) -> Vec<(ControlId, ModelState)> {
+        core::mem::take(&mut self.states)
+    }
+
+    /// Whether the accessible tree needs rebuilding.
+    ///
+    /// Set when a control is minted or released, which is exactly when the *set* of
+    /// elements moves. Everything else a client can observe — a value, a state, focus, a
+    /// scroll offset — reaches it without one.
+    pub fn uia_stale(&self) -> bool {
+        self.uia_stale.get()
+    }
+
+    /// Clears the flag, for the caller that has just republished.
+    pub fn uia_published(&self) {
+        self.uia_stale.set(false);
+    }
+
+    /// Marks the accessible tree stale without minting anything.
+    ///
+    /// What a changed string does: a name is copied into the published blob, so a label
+    /// that re-reads leaves the tree holding the old one.
+    pub(crate) fn uia_restale(&self) {
+        self.uia_stale.set(true);
+    }
+
     /// Takes the controls released since the last drain, for the front table to forget.
     ///
     /// The generational id already makes a stale report a miss, so this is not what keeps
@@ -420,6 +536,7 @@ impl Host {
     /// The generation half is what makes a **stale intent** — one queued before an unmount
     /// — a miss rather than a call into whatever now occupies the slot.
     pub(crate) fn mint_control(&mut self, control: ControlRow) -> ControlId {
+        self.uia_stale.set(true);
         self.controls.insert(&mut self.control_ids, control)
     }
 
@@ -439,6 +556,7 @@ impl Host {
     fn release_control(&mut self, id: ControlId) {
         if self.controls.remove(&mut self.control_ids, id).is_some() {
             self.released.push(id);
+            self.uia_stale.set(true);
         }
     }
 
@@ -605,7 +723,15 @@ impl Host {
         if control.state == state {
             return;
         }
-        let Some(chrome) = control.chrome else {
+        let chrome = control.chrome;
+        // Recorded whether or not there is anything to repaint: what a state change means
+        // to a screen reader — checked, selected, unavailable — is independent of whether
+        // the control draws a difference, and a control with no chrome still has a peer.
+        self.states.push((id, state));
+        let Some(control) = self.control(id) else {
+            return;
+        };
+        let Some(chrome) = chrome else {
             // Nothing to swap: a control with no chrome row has no base paint of its own.
             if let Some(control) = self.control_mut(id) {
                 control.state = state;
@@ -764,6 +890,7 @@ impl Host {
             flyout: None,
             uia: UiaRole::None,
             name: None,
+            text: None,
             key: None,
         })
     }

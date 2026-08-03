@@ -18,10 +18,10 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 
 use windows_color::{DisplayCapability, OutputTransform, Radiance};
-use windows_composition::{Compositor, DispatcherQueueController, Stretch};
+use windows_composition::{Compositor, Stretch};
 use windows_present::{
     Bound, Draw, Epoch, Extent, Frame, FrameCtx, Gpu, Presenter, Queue, Rect, RegionInput,
     RegionKey, RegionSpec, Result, Tuning,
@@ -65,7 +65,8 @@ fn main() -> Result<()> {
             None
         })
         .create()?;
-    let _queue = DispatcherQueueController::create_on_current_thread()?;
+    // No controller is minted here: creating the window already gave this thread a
+    // dispatcher queue, and a second controller on one thread is an error.
     let compositor = Compositor::new()?;
     let target = compositor.create_desktop_window_target(&window, false)?;
     let root = compositor.create_container_visual();
@@ -143,19 +144,27 @@ fn main() -> Result<()> {
     println!("bound 3 regions; front thread parking. Close the window to stop.\n");
 
     let start = std::time::Instant::now();
+    // Dropping the sender is what ends the reporter, and a disconnect wakes it at once —
+    // so closing the window exits now rather than up to a report period later. A scope
+    // joins what it spawned, so a reporter that only ever slept would hang the process
+    // here forever with the window already gone.
+    let (stop, stopped) = channel::<()>();
     std::thread::scope(|scope| {
         // A reporter, so the numbers are readable while it runs rather than only on a
         // clean exit. It is a third thread on purpose: reporting from the front thread
         // would be the very wake this example exists to show the absence of.
-        scope.spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                report(&presenter, start.elapsed().as_secs_f64());
+        let watched = &presenter;
+        scope.spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) =
+                stopped.recv_timeout(std::time::Duration::from_secs(2))
+            {
+                report(watched, start.elapsed().as_secs_f64());
             }
         });
         // Blocks in `GetMessage`, which is the whole demonstration: a steady producer at
         // display rate posts nothing to this thread.
         windows_window::run();
+        drop(stop);
         report(&presenter, start.elapsed().as_secs_f64());
         Ok(())
     })

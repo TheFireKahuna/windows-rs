@@ -95,6 +95,13 @@ pub struct HitEntry {
     pub touch_inflate: f32,
     /// Index of the nearest clipping ancestor's entry, or [`NO_ENTRY`].
     pub clip_parent: u32,
+    /// Index of the nearest *enclosing entry*, or [`NO_ENTRY`] for a top-level one.
+    ///
+    /// Structural ancestry rather than clipping ancestry, and the two are unrelated: a
+    /// group that clips nothing is still a parent. Filled during the same walk, so the
+    /// array carries its own tree and a consumer that needs one — automation's fragment
+    /// navigation — reads it here instead of keeping a second one in step.
+    pub parent: u32,
     pub flags: HitFlags,
     /// The nearest scrolling ancestor, or [`NodeId::NONE`]. A node id and not an index,
     /// because the offset it resolves through lives on the front thread with the tracker
@@ -146,14 +153,18 @@ pub fn default_inflation(w: f32, h: f32) -> f32 {
 
 /// Builds the array from solved layout in paint order.
 ///
-/// Two small stacks carry the ancestry — clipping entries by index, scrolling nodes by id
-/// — so `clip_parent` and `scroll_src` are filled during the walk rather than by a second
-/// pass. Slot roots are appended by the caller *after* the window subtree, in the order
-/// they opened, each light-dismissing overlay preceded by its blocker: because the array
-/// is the z-order and the scan takes the first hit from the back, that places every
-/// overlay above the content it covers and gives "press outside dismisses" for free.
+/// Three small stacks carry the ancestry — every entry by index, clipping entries by
+/// index, scrolling nodes by id — so `parent`, `clip_parent` and `scroll_src` are filled
+/// during the walk rather than by a second pass. Slot roots are appended by the caller
+/// *after* the window subtree, in the order they opened, each light-dismissing overlay
+/// preceded by its blocker: because the array is the z-order and the scan takes the first
+/// hit from the back, that places every overlay above the content it covers and gives
+/// "press outside dismisses" for free.
 #[derive(Debug, Default)]
 pub struct HitBuilder {
+    /// (depth the entry was emitted at, its index). Every entry, not only the clipping
+    /// ones, because this is the array's own tree.
+    entries: Vec<(usize, u32)>,
     /// (depth the clip entered at, its entry index).
     clips: Vec<(usize, u32)>,
     /// (depth the scroll container entered at, its node).
@@ -164,6 +175,7 @@ impl HitBuilder {
     /// Starts a fresh table. The output buffer is the patch's own, so nothing intermediate
     /// is allocated.
     pub fn begin(&mut self, out: &mut Vec<HitEntry>) {
+        self.entries.clear();
         self.clips.clear();
         self.scrolls.clear();
         out.clear();
@@ -199,10 +211,12 @@ impl HitBuilder {
                     .touch_inflate
                     .unwrap_or_else(|| default_inflation(w, h)),
                 clip_parent: self.clips.last().map_or(NO_ENTRY, |&(_, entry)| entry),
+                parent: self.entries.last().map_or(NO_ENTRY, |&(_, entry)| entry),
                 flags,
                 scroll_src: self.scrolls.last().map_or(NodeId::NONE, |&(_, node)| node),
                 id: decl.id,
             });
+            self.entries.push((depth, (out.len() - 1) as u32));
             if flags.contains(HitFlags::CLIP) {
                 self.clips.push((depth, (out.len() - 1) as u32));
             }
@@ -216,8 +230,10 @@ impl HitBuilder {
     /// outside. The press is **consumed**: dismiss-and-act would make an accidental menu
     /// open cost an unintended edit.
     pub fn blocker(&mut self, out: &mut Vec<HitEntry>, id: ControlId, window: (f32, f32)) {
-        // A slot root is not inside the window subtree, so it inherits neither its clips
-        // nor its scroll offsets — and a blocker covers the window whatever is under it.
+        // A slot root is not inside the window subtree, so it inherits neither its clips,
+        // nor its scroll offsets, nor its ancestry — and a blocker covers the window
+        // whatever is under it.
+        self.entries.clear();
         self.clips.clear();
         self.scrolls.clear();
         out.push(HitEntry {
@@ -227,6 +243,7 @@ impl HitBuilder {
             y1: window.1,
             touch_inflate: 0.0,
             clip_parent: NO_ENTRY,
+            parent: NO_ENTRY,
             flags: HitFlags::INTERACTIVE | HitFlags::BLOCKER,
             scroll_src: NodeId::NONE,
             id,
@@ -236,6 +253,9 @@ impl HitBuilder {
     /// Pops whatever entered at or below `depth`: an ancestor pushed at depth `d` is live
     /// exactly while something strictly deeper is being walked.
     fn unwind(&mut self, depth: usize) {
+        while self.entries.last().is_some_and(|&(d, _)| d >= depth) {
+            self.entries.pop();
+        }
         while self.clips.last().is_some_and(|&(d, _)| d >= depth) {
             self.clips.pop();
         }
@@ -263,5 +283,37 @@ mod tests {
         assert!(f.contains(HitFlags::SCROLL));
         assert!(!f.contains(HitFlags::WHEEL));
         assert!(f.intersects(HitFlags::WHEEL | HitFlags::SCROLL));
+    }
+
+    /// The walk emits at mixed depths and skips nodes that declared nothing, so ancestry
+    /// is "the nearest *emitted* one" rather than "the one a level up".
+    #[test]
+    fn ancestry_names_the_nearest_emitted_entry_and_a_slot_root_has_none() {
+        fn at(depth: usize, decl: bool) -> (usize, Option<HitDecl>) {
+            (
+                depth,
+                decl.then_some(HitDecl {
+                    flags: HitFlags::INTERACTIVE,
+                    id: ControlId::default(),
+                    touch_inflate: Some(0.0),
+                }),
+            )
+        }
+        let mut builder = HitBuilder::default();
+        let mut out = Vec::new();
+        builder.begin(&mut out);
+        let solved = Solved::default();
+        // root · a bare wrapper that declares nothing · its child · a sibling of the root
+        for (depth, decl) in [at(0, true), at(1, false), at(2, true), at(1, true)] {
+            builder.push(&mut out, depth, NodeId::NONE, &solved, decl);
+        }
+        builder.blocker(&mut out, ControlId::default(), (100.0, 100.0));
+        builder.push(&mut out, 0, NodeId::NONE, &solved, at(0, true).1);
+
+        assert_eq!(out[0].parent, NO_ENTRY, "the first entry has no ancestor");
+        assert_eq!(out[1].parent, 0, "the wrapper is skipped, not counted");
+        assert_eq!(out[2].parent, 0, "and a sibling pops back to the root");
+        assert_eq!(out[3].parent, NO_ENTRY, "a blocker is not in any subtree");
+        assert_eq!(out[4].parent, NO_ENTRY, "nor is the slot root after it");
     }
 }

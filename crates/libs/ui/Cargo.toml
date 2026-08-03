@@ -16,6 +16,10 @@ windows-core = { workspace = true }
 # `Vector2` — the two-component value a composite channel carries. Named here rather than
 # reached through another crate's re-export, so the dependency reads as what it is.
 windows-numerics = { workspace = true }
+# `RegionParts` and `SubId`. A presentation region publishes *geometry* and this crate owns
+# what it means, which is the split that keeps `windows-present` free of any accessibility
+# type — so one of the two has to name the other, and it is this one, downward.
+windows-present = { workspace = true }
 # The retained tree this framework declares into: node identity, styles, the sink
 # alphabet and the flat hit array. Widget-agnostic by design, which is what keeps the
 # alphabet closed.

@@ -60,10 +60,18 @@ pub fn mono(s: impl Into<TextSource>) -> View {
 /// there is one, so a button's variant reaches its text without the text knowing there are
 /// variants.
 fn run(s: impl Into<TextSource>, ramp: TypeRole, ink: Text, flow: Flow) -> View {
-    El::seed(Preset::Text).text_seed(s.into(), ramp, Some(ink), flow)
+    El::seed(Preset::Text)
+        .text_seed(s.into(), ramp, Some(ink), flow)
+        // `UIA` and nothing else: a run has no gesture, takes no focus and routes no
+        // pointer, so the scan skips it on one flags test. Without an entry it has no peer
+        // at all, and a screen of labels, headings and read-outs reads as an empty window.
+        .hit(HitFlags::UIA, UiaRole::Text)
 }
 
 /// A label whose colour is the enclosing control's, not its own.
+///
+/// **No peer**, deliberately: the control it sits in derives its accessible name from this
+/// text, so publishing it again as a child would have a reader say the button's name twice.
 fn inner(s: impl Into<TextSource>, ramp: TypeRole) -> View {
     El::seed(Preset::Text).text_seed(s.into(), ramp, None, Flow::Line)
 }

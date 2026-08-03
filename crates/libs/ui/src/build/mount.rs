@@ -155,6 +155,13 @@ struct Claim {
     /// The value row a [`Unit::Travel`] channel opened, still waiting for the track it runs
     /// in — which is the enclosing control, and is not known until that control mounts.
     value: Option<ValueId>,
+    /// The first text this subtree laid out, which is what an enclosing control derives its
+    /// accessible name from.
+    ///
+    /// Collected on the way back up for the same reason the thumb is: a control's label is
+    /// almost never its own sprite — `button` is a control with a text *child* — so reading
+    /// the control's own row instead leaves every button in the stack unnamed.
+    text: Option<MeasureKey>,
 }
 
 impl Claim {
@@ -162,6 +169,7 @@ impl Claim {
     fn absorb(&mut self, inner: Self) {
         self.thumb = self.thumb.or(inner.thumb);
         self.value = self.value.or(inner.value);
+        self.text = self.text.or(inner.text);
     }
 }
 
@@ -323,7 +331,10 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         } else {
             Some(parts.label.expect("a run seed mints its own sprite"))
         };
-        mount_text(b, node, group, target, text, inner, roles, row);
+        let key = mount_text(b, node, group, target, text, inner, roles, row);
+        // This node's own text wins over anything its children offer, which is what
+        // `absorb` means one level up — and the order here is what makes it true.
+        own_claim.text.get_or_insert(key);
     }
 
     // ── children ──────────────────────────────────────────────────────────────────
@@ -607,6 +618,7 @@ fn mount_control(
         flyout: None,
         uia: slot.uia,
         name: slot.name,
+        text: claim.text,
         key: slot.key,
     };
 
@@ -929,7 +941,7 @@ fn mount_text(
     scope: Scope,
     roles: Option<RoleSet>,
     row: MountId,
-) {
+) -> MeasureKey {
     let seed = &mut b.texts[text as usize];
     let (ramp, flow, source) = (seed.ramp, seed.flow, seed.source.take());
     let ink = seed.ink.or(roles.map(|r| r.text));
@@ -969,10 +981,18 @@ fn mount_text(
     if let Some(TextSource::Dynamic(read)) = source {
         Effect::new(move || set_text(key, &read()));
     }
+    key
 }
 
 fn set_text(key: MeasureKey, text: &str) {
-    super::text::with(|table| table.set_text(key, text));
+    let moved = super::text::with(|table| table.set_text(key, text));
+    // An accessible name is a **copy**, taken into the published tree's own string blob,
+    // so a string that changes here is one the tree is now wrong about. Marking the tree
+    // stale is what republishes it — and text that changes faster than event rate does not
+    // live in the retained tree at all, so this cannot be a per-frame cost.
+    if moved {
+        Host::with(|h| h.uia_restale());
+    }
 }
 
 const _: () = {

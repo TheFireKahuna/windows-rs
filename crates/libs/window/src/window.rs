@@ -7,6 +7,7 @@ use crate::pace::Clock;
 use crate::qos::{self, Speed};
 use crate::visibility::{OcclusionStatus, Visibility, Watch};
 use core::cell::{Cell, OnceCell, RefCell};
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
@@ -853,8 +854,25 @@ thread_local! {
     /// The controller this crate minted for this thread, or `None` where the thread already
     /// had a queue. Held for the **thread's** life rather than a window's: with two windows on
     /// one thread, the first must not take the queue away from the second when it closes.
-    static QUEUE: OnceCell<Option<DispatcherQueueController>> = const { OnceCell::new() };
+    ///
+    /// The reference is deliberately never released. A thread-local's destructor runs at
+    /// process exit from inside `LdrShutdownProcess`, and CoreMessaging fail-fasts —
+    /// `0xE0464645` through `RaiseFailFastException`, so no `catch` and no exit code of ours
+    /// — on any call arriving after shutdown began. Releasing the last reference there ends
+    /// the process by crashing it. Nor would releasing it be a shutdown: the queue's is
+    /// `ShutdownQueueAsync`, which completes only while the thread keeps pumping, and a
+    /// destructor cannot pump. An application that needs the queue drained owns a controller
+    /// itself and shuts it down while its loop is still running.
+    static QUEUE: OnceCell<Option<ManuallyDrop<DispatcherQueueController>>> =
+        const { OnceCell::new() };
 }
+
+// Drop glue is what registers the destructor, so the absence of it is the invariant — and it
+// is checkable here rather than only by closing a window and reading an exit code.
+const _: () = assert!(
+    !core::mem::needs_drop::<Option<ManuallyDrop<DispatcherQueueController>>>(),
+    "a droppable QUEUE registers a thread-local destructor that fail-fasts at process exit"
+);
 
 /// Ensures the calling thread has a dispatcher queue, minting one only if it has none.
 ///
@@ -878,11 +896,11 @@ fn ensure_dispatcher_queue() -> Result<()> {
             };
             // SAFETY: the options are a stack local of the stated size and so is the
             // out-parameter; ownership of the controller transfers on success.
-            Some(unsafe {
+            Some(ManuallyDrop::new(unsafe {
                 let mut controller = core::ptr::null_mut();
                 CreateDispatcherQueueController(options, &mut controller).ok()?;
                 DispatcherQueueController::from_raw(controller)
-            })
+            }))
         };
         _ = queue.set(minted);
         Ok(())

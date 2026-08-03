@@ -1325,3 +1325,179 @@ fn a_wash_is_as_round_as_the_control_it_covers() {
         );
     }
 }
+
+// ── what automation is told ─────────────────────────────────────────────────────
+//
+// The synthesis had no tests at all, which is how every one of the defects below reached
+// a running build: each is a thing the framework half could not have caught, because the
+// framework half was verified against hand-written seeds.
+
+/// The seeds this mount produced, sorted, with their names resolved.
+fn seeds() -> Vec<(crate::widget::UiaRole, String, crate::uia::Value)> {
+    let mut out = crate::uia::Seeds::default();
+    Host::with(|h| h.uia_seeds(&mut out));
+    out.rows
+        .iter()
+        .map(|seed| {
+            let at = seed.name.at as usize;
+            let name = String::from_utf16_lossy(&out.blob[at..at + seed.name.len as usize]);
+            (seed.role, name, seed.value)
+        })
+        .collect()
+}
+
+/// The published tree this mount would produce.
+fn tree(patch: &SinkPatch) -> crate::uia::Tree {
+    let mut out = crate::uia::Seeds::default();
+    Host::with(|h| h.uia_seeds(&mut out));
+    crate::uia::Tree::build(patch.hit_entries(), &out)
+}
+
+/// A button's label is a **child element**, not text on its own node, so a name derived
+/// from the control's own row is empty for every button in the stack.
+#[test]
+fn a_control_is_named_by_the_text_its_subtree_laid_out() {
+    let mut patch = fixture();
+    let _button = mount(crate::widget::button("Mute"), root());
+    flush(&mut patch);
+
+    let named = seeds();
+    assert!(
+        named.contains(&(
+            crate::widget::UiaRole::Button,
+            "Mute".to_owned(),
+            crate::uia::Value::None
+        )),
+        "a button takes its name from its label child: {named:?}"
+    );
+}
+
+/// Static text declared no peer at all, so a screen of labels, headings and read-outs read
+/// to a client as an empty window.
+#[test]
+fn static_text_is_an_element_and_publishes_its_own_body() {
+    let mut patch = fixture();
+    let _text = mount(crate::widget::text("Output"), root());
+    flush(&mut patch);
+
+    let named = seeds();
+    assert!(
+        named.contains(&(
+            crate::widget::UiaRole::Text,
+            "Output".to_owned(),
+            crate::uia::Value::Text
+        )),
+        "a run is an element, and its body is a text document: {named:?}"
+    );
+
+    let tree = tree(&patch);
+    let at = (0..tree.len())
+        .find(|&at| {
+            tree.col(at)
+                .is_some_and(|c| c.role == crate::widget::UiaRole::Text)
+        })
+        .expect("the run is published");
+    assert!(
+        tree.patterns(at).has(crate::uia::Patterns::TEXT),
+        "and it answers the pattern its body exists for"
+    );
+}
+
+/// A slider carries no text of its own. Without this its name is empty, which is the
+/// difference between a usable screen and an unusable one.
+#[test]
+fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
+    let mut patch = fixture();
+    let value = crate::signal::Cell::new(0.5_f64);
+    let _row = mount(
+        stack((
+            crate::widget::label("Gain"),
+            crate::widget::slider(value, crate::widget::Range::UNIT).width(Metric::CardMinW),
+        )),
+        root(),
+    );
+    flush(&mut patch);
+
+    let tree = tree(&patch);
+    let slider = (0..tree.len())
+        .find(|&at| {
+            tree.col(at)
+                .is_some_and(|c| c.role == crate::widget::UiaRole::Slider)
+        })
+        .expect("the slider is published");
+    let col = tree.col(slider).expect("a column");
+    assert_eq!(
+        String::from_utf16_lossy(tree.text(col.name)),
+        "Gain",
+        "the label beside it is its name"
+    );
+    let label = tree
+        .col(col.labelled_by as usize)
+        .expect("and it says where that name came from");
+    assert_eq!(label.role, crate::widget::UiaRole::Text);
+}
+
+/// The rule is narrow on purpose: it must not reach across a row or claim a heading two
+/// controls up, because a wrong name is worse than none.
+#[test]
+fn a_control_that_has_a_name_keeps_it_and_one_with_no_run_before_it_gets_none() {
+    let mut patch = fixture();
+    let value = crate::signal::Cell::new(0.5_f64);
+    let _row = mount(
+        stack((
+            crate::widget::label("Gain"),
+            crate::widget::button("Reset"),
+            crate::widget::slider(value, crate::widget::Range::UNIT).width(Metric::CardMinW),
+        )),
+        root(),
+    );
+    flush(&mut patch);
+
+    let tree = tree(&patch);
+    let role_of = |want| {
+        (0..tree.len())
+            .find(|&at| tree.col(at).is_some_and(|c| c.role == want))
+            .and_then(|at| tree.col(at))
+            .copied()
+    };
+    let button = role_of(crate::widget::UiaRole::Button).expect("the button");
+    assert_eq!(
+        String::from_utf16_lossy(tree.text(button.name)),
+        "Reset",
+        "a control with its own text is not relabelled by its neighbour"
+    );
+    let slider = role_of(crate::widget::UiaRole::Slider).expect("the slider");
+    assert!(
+        slider.name.is_empty(),
+        "and one whose neighbour is a button, not a run, takes nothing"
+    );
+}
+
+/// A name is a **copy** in the published blob, so a label that re-reads leaves the tree
+/// holding the old string — with no event, because the name is not a live property.
+#[test]
+fn a_label_that_changes_marks_the_accessible_tree_stale() {
+    let mut patch = fixture();
+    let caption = crate::signal::Cell::new("Off".to_owned());
+    let _text = mount(
+        crate::widget::text(crate::widget::TextSource::Dynamic(Box::new(move || {
+            caption.get()
+        }))),
+        root(),
+    );
+    flush(&mut patch);
+    Host::with(|h| h.uia_published());
+    assert!(!Host::with(|h| h.uia_stale()), "nothing has moved yet");
+
+    caption.set("On".to_owned());
+    crate::signal::flush();
+    assert!(
+        Host::with(|h| h.uia_stale()),
+        "a changed string is a name the published tree is now wrong about"
+    );
+    let named = seeds();
+    assert!(
+        named.iter().any(|(_, name, _)| name == "On"),
+        "and the next publish carries the new one: {named:?}"
+    );
+}

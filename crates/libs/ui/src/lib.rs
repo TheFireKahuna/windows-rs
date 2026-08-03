@@ -59,6 +59,12 @@ pub mod gesture;
 pub mod input;
 pub mod rotary;
 
+// UI Automation. Reaches the raw surface — a provider is a COM object and a `VARIANT` is a
+// union — but nothing it touches above that boundary is: the tree it publishes is plain
+// data and every mutable field beside it is an atomic, which is what lets a client read it
+// from its own thread without the window's thread being involved at all.
+pub mod uia;
+
 mod front;
 
 pub use front::FrontHandle;

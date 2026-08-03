@@ -34,7 +34,7 @@ pub use backends::Backends;
 pub use cache::{BoxKey, Cache, Cell, Gen, GenMask, SolidKey};
 pub use census::{Audit, Census};
 pub use env::Env;
-pub use hit::{ContactKind, Hit, HitTable};
+pub use hit::{ContactKind, Hit, HitTable, scan};
 pub use hit_build::{
     ControlId, HitBuilder, HitDecl, HitEntry, HitFlags, NO_ENTRY, TOUCH_TARGET_DIPS,
     default_inflation,

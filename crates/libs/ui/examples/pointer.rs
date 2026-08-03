@@ -287,6 +287,7 @@ fn targets() -> Vec<HitEntry> {
                 0.0
             },
             clip_parent: NO_ENTRY,
+            parent: NO_ENTRY,
             flags: HitFlags::INTERACTIVE | HitFlags::GESTURE,
             scroll_src: NodeId::NONE,
             id: target_id(index),
