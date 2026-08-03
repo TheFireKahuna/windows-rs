@@ -10,9 +10,9 @@
 //! taffy type.
 
 use super::len::{Align, Len, Track};
-use crate::role::{Metric, Scope};
+use crate::role::{Metric, Scope, WidthClass};
 use windows_scene::taffy;
-use windows_scene::taffy::style_helpers::{TaffyGridLine, TaffyZero};
+use windows_scene::taffy::style_helpers::{TaffyAuto, TaffyGridLine, TaffyZero};
 
 /// Which const row a slot's style starts from.
 ///
@@ -62,6 +62,13 @@ pub enum Over {
     Gap(Len),
     /// `flex_grow: 1` — absorb the slack.
     Grow,
+    /// `flex_shrink: 0` — keep the height stated, in a box too small for it.
+    ///
+    /// What a scroll container's content is: overflow is the whole point, and a flex child
+    /// squeezed back to its parent has none. Without it a scroll surface only overflows
+    /// where every child happens to pin a minimum, which is a scrollbar that works by
+    /// accident.
+    NoShrink,
     /// A container aligning **all** of its children.
     Align(Align),
     /// Along the main axis.
@@ -75,6 +82,21 @@ pub enum Over {
     Row(Track),
     /// A track appended to the column template.
     Column(Track),
+    /// Drops the column template accumulated so far.
+    ///
+    /// What a class-gated column list opens with, so that its tracks are *the* template at
+    /// that class rather than an addition to the one stated below it. Without it,
+    /// `.cols(..).cols_when(Wide, ..)` silently concatenates and the wide arm gets five
+    /// tracks for two declarations — a write that goes somewhere nobody asked for.
+    ClearColumns,
+    /// The layout class this recipe re-bases on.
+    ///
+    /// Not applied in sequence like every other override: a preset **is** the base, so
+    /// applying one mid-list would wipe the overrides before it. [`lower_with`] resolves the
+    /// effective preset first, from the last active one of these, and then applies the rest
+    /// in order. That is what lets a width class change a flex direction without a second
+    /// storage mechanism beside the override list.
+    Class(Preset),
     /// The minimum tile width, for [`Preset::Tiles`].
     TileMin(Len),
     /// Taken out of flow, and positioned against the containing block.
@@ -84,6 +106,16 @@ pub enum Over {
     Absolute,
     /// All four insets at once.
     Inset(Len),
+    /// A uniform row, placed out of flow at a fixed offset down its container.
+    ///
+    /// Stated by the container on the child's behalf, as [`Place`](Self::Place) is. What a
+    /// virtualized list places its rows with: out of flow, the container's extent is the
+    /// whole list's rather than the realized subset's, so the scroll extent does not move
+    /// when the window does — and the realized set is free to be several disjoint runs.
+    Band {
+        at: Len,
+        height: Len,
+    },
     /// Explicit grid placement, stated by the **container** on the child's behalf.
     Place {
         row: u16,
@@ -93,6 +125,55 @@ pub enum Over {
     },
 }
 
+/// One override, and the width class it applies at.
+///
+/// A rule names a class; it does not *hold* one. The class a recipe is lowered at is the
+/// solve's and arrives in the [`Scope`], so a gated rule is a predicate over that one
+/// authority rather than a second copy of it — which is what keeps the recipe class-free
+/// while still letting a container change shape when its width class moves.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Rule {
+    /// The class this applies at, or `None` for every class.
+    pub at: Option<WidthClass>,
+    pub over: Over,
+}
+
+impl Rule {
+    /// At every width class.
+    #[must_use]
+    pub const fn always(over: Over) -> Self {
+        Self { at: None, over }
+    }
+
+    /// At `class`, and no other.
+    ///
+    /// Exact rather than a range or a set: the three call sites that exist want one class
+    /// each, and a caller who wants two states two. A set type here would be a vocabulary to
+    /// keep in step with `WidthClass` for a case nothing has yet asked for.
+    #[must_use]
+    pub const fn at(class: WidthClass, over: Over) -> Self {
+        Self {
+            at: Some(class),
+            over,
+        }
+    }
+
+    /// Whether this rule applies in `scope`.
+    #[must_use]
+    const fn applies(&self, scope: Scope) -> bool {
+        match self.at {
+            None => true,
+            Some(class) => class as u8 == scope.width as u8,
+        }
+    }
+}
+
+impl From<Over> for Rule {
+    fn from(over: Over) -> Self {
+        Self::always(over)
+    }
+}
+
 /// Lowers a recipe. The one place a `taffy::Style` is built.
 ///
 /// A flex class allocates nothing; a grid one allocates its track templates, because that is
@@ -100,8 +181,8 @@ pub enum Over {
 /// has few grids — but it is the one thing on this path that is not free, and it is taffy's
 /// to fix rather than this crate's.
 #[must_use]
-pub fn lower(preset: Preset, over: &[Over], scope: Scope) -> taffy::Style {
-    lower_with(preset, over, None, scope)
+pub fn lower(preset: Preset, rules: &[Rule], scope: Scope) -> taffy::Style {
+    lower_with(preset, rules, None, scope)
 }
 
 /// The same, with one more override on the end.
@@ -110,16 +191,29 @@ pub fn lower(preset: Preset, over: &[Over], scope: Scope) -> taffy::Style {
 /// width class that moved in between is already in the answer and there is no second copy to
 /// fall out of date. Taking the extra here rather than appending to a copy is what keeps that
 /// re-lower allocation-free.
+///
+/// The `extra` is unconditional by construction — it is this frame's value for a bound
+/// property, not a design decision that could belong to one class.
 #[must_use]
 pub fn lower_with(
     preset: Preset,
-    over: &[Over],
+    rules: &[Rule],
     extra: Option<Over>,
     scope: Scope,
 ) -> taffy::Style {
+    let active = || rules.iter().filter(|r| r.applies(scope)).map(|r| r.over);
+    // The base first, from the last class that claimed it: a preset replaces the style
+    // wholesale, so resolving it in sequence would discard every override written before it.
+    let preset = active()
+        .filter_map(|over| match over {
+            Over::Class(preset) => Some(preset),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(preset);
     let mut style = base(preset, scope);
-    for o in over.iter().copied().chain(extra) {
-        apply(&mut style, o, scope);
+    for over in active().chain(extra) {
+        apply(&mut style, over, scope);
     }
     style
 }
@@ -223,6 +317,7 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
             };
         }
         Over::Grow => style.flex_grow = 1.0,
+        Over::NoShrink => style.flex_shrink = 0.0,
         Over::Absolute => style.position = taffy::Position::Absolute,
         Over::Inset(l) => {
             let v = l.length_percentage_auto(scope);
@@ -231,6 +326,16 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
                 right: v,
                 top: v,
                 bottom: v,
+            };
+        }
+        Over::Band { at, height } => {
+            style.position = taffy::Position::Absolute;
+            style.size.height = height.dimension(scope);
+            style.inset = taffy::Rect {
+                left: taffy::LengthPercentageAuto::ZERO,
+                right: taffy::LengthPercentageAuto::ZERO,
+                top: at.length_percentage_auto(scope),
+                bottom: taffy::LengthPercentageAuto::AUTO,
             };
         }
         Over::Align(a) => style.align_items = Some(a.items()),
@@ -245,6 +350,9 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
         Over::Column(t) => style
             .grid_template_columns
             .push(taffy::GridTemplateComponent::Single(t.sizing(scope))),
+        Over::ClearColumns => style.grid_template_columns.clear(),
+        // Resolved before the base was built, and it is the base.
+        Over::Class(_) => {}
         // In place, because `Preset::Tiles` already put one track there and every caller
         // overrides it — assigning a fresh `vec!` would allocate one and drop the other on
         // every lower.

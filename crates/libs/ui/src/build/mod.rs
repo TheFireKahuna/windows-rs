@@ -28,6 +28,7 @@ pub(crate) mod tests;
 /// the lowering's.
 pub mod text;
 
+pub(crate) use adapt::each_into;
 pub use adapt::{Each, Switch, When, each, switch, when};
 pub use children::{Children, IntoChildren};
 pub use el::{Any, Button, El, Path, View};

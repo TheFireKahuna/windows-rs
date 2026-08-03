@@ -22,7 +22,7 @@
 )]
 
 use crate::gesture::GestureDecl;
-use crate::layout::{Len, Over, Preset};
+use crate::layout::{Len, Over, Preset, Rule};
 use crate::role::{Elevation, Role, Text, TypeRole};
 use crate::widget::{Chrome, Flow, Interaction, Motion, StatePolicy, TextSource, UiaRole};
 use std::cell::RefCell;
@@ -108,7 +108,7 @@ pub(crate) struct Slot {
     pub responsive: Option<Bounds>,
     /// A scroll container. The tracker is minted at mount, because only then is there a
     /// group for it to be sourced from.
-    pub scroll: Option<crate::layout::Reveal>,
+    pub scroll: Option<crate::layout::ScrollDecl>,
     /// The automation-id segment. `&'static str`, so nothing is built at mount.
     pub key: Option<&'static str>,
     pub name: Option<&'static str>,
@@ -292,12 +292,13 @@ pub(crate) enum Act {
     Click(Box<dyn Fn()>),
     ChangeF64(Box<dyn Fn(f64)>),
     CommitF64(Box<dyn Fn(f64)>),
-    Tip(TextSource),
+    Tip(TextSource, crate::overlay::Side),
     /// `Rc` from the start, because the row it lands in holds one: the overlay layer has to
     /// take the body *out* of the host's borrow before running it. Boxing here and
     /// converting at mount would allocate twice for the same closure.
     Flyout(std::rc::Rc<dyn Fn() -> super::El>),
-    /// A width variant, so a class change is `Display::None` rather than an unmount.
+    /// Presence that varies, as `Display::None` rather than as an unmount — so a subtree
+    /// whose state the user is in the middle of survives the condition flipping.
     HideWhen(Box<dyn Fn() -> bool>),
     /// One override that follows a value.
     ///
@@ -354,7 +355,7 @@ pub(crate) struct Build {
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct OverSeed {
-    pub over: Over,
+    pub rule: Rule,
     pub next: u32,
 }
 
@@ -416,9 +417,9 @@ impl Build {
         at
     }
 
-    pub(crate) fn push_over(&mut self, at: u32, over: Over) {
+    pub(crate) fn push_over(&mut self, at: u32, rule: Rule) {
         let entry = self.over.len() as u32;
-        self.over.push(OverSeed { over, next: NIL });
+        self.over.push(OverSeed { rule, next: NIL });
         let link = &mut self.nodes[at as usize].over;
         if link.is_empty() {
             *link = Link {

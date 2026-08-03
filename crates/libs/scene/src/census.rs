@@ -28,6 +28,12 @@ pub struct Census {
     /// Property writes the early return absorbed. A high ratio against `props_written` is
     /// the emitter sending a whole subtree where three nodes moved.
     pub props_skipped: u64,
+    /// Interaction trackers this scene is holding.
+    ///
+    /// A watched metric because a tracker that was never built is invisible from every other
+    /// angle: the bindings onto it apply, the ops addressed to it are dropped on a missing
+    /// row, and the surface simply never scrolls. One life event each, like the visuals.
+    pub trackers_live: u32,
     pub ops_applied: u64,
     /// Animations started, which is the event-rate cost of motion.
     pub animations: u64,

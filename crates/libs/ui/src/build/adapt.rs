@@ -31,7 +31,7 @@ use windows_scene::NodeId;
 ///
 /// Built by [`each`]; it exists to be passed to a container.
 pub struct Each<K, T> {
-    items: Box<dyn Fn() -> Vec<(K, T)>>,
+    fill: Box<dyn Fn(&mut Vec<(K, T)>)>,
     /// Erased to [`View`] here rather than carried as a kind: a list of one widget kind and
     /// a list of another are the same list, and a marker that survived to the container
     /// would make them different types for no property anyone can use.
@@ -52,8 +52,25 @@ where
     T: 'static,
     V: 'static,
 {
+    each_into(move |out| *out = items(), view)
+}
+
+/// The same, filling a buffer the adapter keeps.
+///
+/// What a list reconciling **every frame of a fling** needs: the buffer reaches its
+/// high-water mark once and the realization path allocates nothing after it. A caller who
+/// builds a fresh `Vec` per read has no reason to reach for this.
+pub(crate) fn each_into<K, T, V>(
+    fill: impl Fn(&mut Vec<(K, T)>) + 'static,
+    view: impl Fn(&T) -> El<V> + 'static,
+) -> Each<K, T>
+where
+    K: Eq + Hash + Clone + 'static,
+    T: 'static,
+    V: 'static,
+{
     Each {
-        items: Box::new(items),
+        fill: Box::new(fill),
         view: Box::new(move |item| view(item).erase()),
     }
 }
@@ -64,15 +81,18 @@ where
     T: 'static,
 {
     fn append(self, out: &mut Children) {
-        let Self { items, view } = self;
+        let Self { fill, view } = self;
         out.push(El::<Any>::at_index(adapter(move |site| {
             // Detached from whatever scope is running the reconcile, for the reason the
             // list itself is: rows belong to the list, and a list driven from an effect
             // would otherwise register every row it ever built as a child of that effect.
             let list = Rc::new(RefCell::new(Keyed::<K>::new()));
             let mounts = Rc::new(RefCell::new(FxHashMap::<K, Mount>::default()));
+            let next = Rc::new(RefCell::new(Vec::<(K, T)>::new()));
             Effect::new(move || {
-                let next = items();
+                let mut next = next.borrow_mut();
+                next.clear();
+                fill(&mut next);
                 let mut list = list.borrow_mut();
                 let mut previous: Option<NodeId> = None;
                 list.reconcile(

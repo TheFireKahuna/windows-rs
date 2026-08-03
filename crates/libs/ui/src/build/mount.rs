@@ -17,7 +17,8 @@ use super::arena::{Act, Build, ChanSource, MaskSeed, NIL, Part, Slot, SpriteSeed
 use super::host::{ControlRow, Host, MountId, MountRow, ValueId, ValueRow};
 use super::style::{OverStore, Recipe};
 use super::{El, Site, View};
-use crate::layout::{Len, Over, Preset};
+use crate::gesture::GestureDecl;
+use crate::layout::{Len, Over, Preset, Rule};
 use crate::role::{Metric, Role, Scope};
 use crate::signal::Effect;
 use crate::widget::{
@@ -266,7 +267,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // was built, and the solve supplies the current one through the restyle seam.
     let recipe = Recipe {
         preset: slot.preset,
-        over: OverStore::collect(b.chain_over(slot.over).map(|entry| entry.over)),
+        over: OverStore::collect(b.chain_over(slot.over).map(|entry| entry.rule)),
         scope: at.scope,
     };
     let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), at.scope);
@@ -361,10 +362,10 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         claim.absorb(own_claim);
     }
 
-    if let Some(reveal) = slot.scroll {
+    if let Some(decl) = slot.scroll {
         let group = group.expect("a scroll container is a group");
         let content = previous.expect("a scroll container has a content group");
-        mount_scroll(group, content, reveal, inner, row);
+        mount_scroll(group, content, decl, inner, row);
     }
 
     if let Some(bounds) = slot.responsive {
@@ -477,7 +478,14 @@ const fn chrome_inset(part: Part) -> Len {
 /// Absolute at `inset`. Because `border` is never set on any style this crate produces, the
 /// parent's padding box is its border box, so a zero inset covers the node exactly.
 fn cover(node: NodeId, scope: Scope, inset: Len) {
-    let style = crate::layout::lower(Preset::Bare, &[Over::Absolute, Over::Inset(inset)], scope);
+    let style = crate::layout::lower(
+        Preset::Bare,
+        &[
+            Rule::always(Over::Absolute),
+            Rule::always(Over::Inset(inset)),
+        ],
+        scope,
+    );
     Host::with(|h| h.model().style(node, &style));
 }
 
@@ -632,7 +640,7 @@ fn mount_control(
             Some(Act::Click(f)) => control.click = Some(f),
             Some(Act::ChangeF64(f)) => control.change = Some(f),
             Some(Act::CommitF64(f)) => control.commit = Some(f),
-            Some(Act::Tip(t)) => control.tip = Some(std::rc::Rc::new(t)),
+            Some(Act::Tip(t, side)) => control.tip = Some((std::rc::Rc::new(t), side)),
             Some(Act::Flyout(f)) => control.flyout = Some(f),
             Some(Act::DisabledWhen(f)) => disabled = Some(f),
             Some(Act::SelectedWhen(f)) => selected = Some(f),
@@ -644,7 +652,14 @@ fn mount_control(
     // still cannot conjure a target on a node that declared none.
     let flags = hit.flags | uia_flag(slot.uia) | inflate_flag(slot.no_inflate);
     let inflate = hit.inflate.and_then(|l| l.dips(scope));
-    let gesture = b.gesture(slot.gesture);
+    // A control that refined nothing still declares the default: tap, right-tap and hold,
+    // which is what gives a touch user the context menu a mouse user gets from the secondary
+    // button. Gated on the flag whose whole meaning is "has a gesture declaration", so the
+    // entry cannot claim one it does not have — and so this walk, which also runs for nodes
+    // that exist only for automation, does not put a recogniser behind a static label.
+    let gesture = b
+        .gesture(slot.gesture)
+        .or_else(|| flags.contains(HitFlags::GESTURE).then(GestureDecl::default));
     let value = claim.value;
     let caption = slot.caption;
     let id = Host::with(move |h| {
@@ -728,10 +743,11 @@ fn mount_control(
 fn mount_scroll(
     viewport: GroupId,
     content: NodeId,
-    reveal: crate::layout::Reveal,
+    decl: crate::layout::ScrollDecl,
     scope: Scope,
     row: MountId,
 ) {
+    let reveal = decl.reveal;
     Host::with(|h| {
         let tracker = h.model().tracker_id::<windows_scene::Observed>();
         h.trackers.push(super::host::TrackerSpec {
@@ -748,10 +764,20 @@ fn mount_scroll(
                 affine: windows_scene::Affine::CONTENT,
             },
         );
-        // The thumb lives in the viewport rather than in the content, because it must not
-        // scroll with what it reports on.
-        let thumb = (reveal != crate::layout::Reveal::Never).then(|| {
-            let thumb = h.model().sprite(viewport, None);
+        // The scrollbar lives in the viewport rather than in the content, because it must
+        // not scroll with what it reports on — and **above** the content, because child
+        // order is paint order and is the order the hit array is scanned in. Below it, the
+        // bar is painted under whatever the list draws and a grab resolves to the row
+        // behind it.
+        //
+        // A rail and a thumb, and the split is not decoration: the rail is static geometry
+        // and carries the target, the thumb is moved by the compositor and carries none. A
+        // hit entry on the thumb would name a rect the solve fixed and the tracker then
+        // left behind.
+        let bar = (reveal != crate::layout::Reveal::Never).then(|| {
+            let rail = h.model().group(viewport, Some(content));
+            h.model().style(rail.node(), &crate::layout::rail_style());
+            let thumb = h.model().sprite(rail, None);
             h.model().mask(
                 thumb,
                 Mask::Box {
@@ -762,19 +788,74 @@ fn mount_scroll(
                 thumb,
                 Paint::Solid(crate::role::ink(THUMB_ALPHA, scope.for_paint())),
             );
-            thumb
+            // Concealed from the mount rather than shown and faded: a surface whose content
+            // fits never overflows, and a thumb that appeared for one frame to say so is a
+            // flash on every screen that opens.
+            if reveal == crate::layout::Reveal::OnDemand {
+                h.model()
+                    .bind(thumb.node(), Prop::Opacity, Bind::Set(Value::Scalar(0.0)));
+            }
+            // The rail's control: a hit entry and a drag, and deliberately no chrome row.
+            // The thumb's opacity belongs to the reveal policy, and a control the front
+            // table adopted would give one channel two owners.
+            // The hit entry itself is `publish_scrolls`', because whether the rail is a
+            // target at all depends on whether there is anything to scroll — which is a
+            // solve output.
+            let id = h.mint_control(thumb_control(rail.node(), scope));
+            h.gestures.push((id, crate::layout::grab_decl()));
+            (rail, thumb, id)
         });
+        let control = h.mounts.get(row).and_then(|row| row.control);
         h.mint_scroll(
             row,
-            super::host::ScrollRow {
+            crate::layout::ScrollRow {
                 tracker,
                 viewport: viewport.node(),
                 content,
-                thumb,
+                thumb: bar.map(|(_, thumb, _)| thumb),
+                rail: bar.map(|(rail, ..)| rail),
+                control,
+                grab: bar.map(|(.., id)| id),
+                reveal,
+                state: decl.state,
                 last: crate::layout::ThumbGeom::default(),
+                grabbed_at: None,
+                shown: reveal == crate::layout::Reveal::Always,
             },
         );
     });
+}
+
+/// The rail's row: an identity for the hit array, and nothing that paints.
+fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
+    ControlRow {
+        node,
+        fill: None,
+        label: None,
+        border: None,
+        front: ChromeRow {
+            id: ControlId::default(),
+            wash: None,
+            hover: 0.0,
+            press: 0.0,
+            thumb: None,
+            travel: 0.0,
+            drive: None,
+            fraction: 0.0,
+        },
+        chrome: None,
+        scope,
+        state: ModelState::Rest,
+        click: None,
+        change: None,
+        commit: None,
+        tip: None,
+        flyout: None,
+        uia: UiaRole::None,
+        name: None,
+        text: None,
+        key: None,
+    }
 }
 
 /// Installs the effects behind a style that follows a value.

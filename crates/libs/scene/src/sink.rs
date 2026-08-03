@@ -649,6 +649,13 @@ impl<O> TrackerId<O> {
     pub const fn erased(self) -> TrackerId<()> {
         TrackerId::new(self.raw)
     }
+
+    /// The identity a [`SceneEvent`](crate::SceneEvent) names it by, so a consumer holding
+    /// typed ids can match a report against them.
+    #[must_use]
+    pub const fn id(self) -> Id<Tracker> {
+        self.raw
+    }
 }
 
 impl<O> Copy for TrackerId<O> {}
@@ -729,6 +736,21 @@ pub enum TrackerRequest {
 /// What a patch does to a tracker's configuration.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum TrackerOp {
+    /// Builds it, sourced from `viewport`.
+    ///
+    /// **An op rather than a call, because the order is the whole of it.** A
+    /// `VisualInteractionSource` takes its hit region from the visual's size at the moment
+    /// it is created, and a zero-size one hit-tests nothing while returning success — so
+    /// creating a tracker has to happen after the placement ops that size its viewport, and
+    /// the one thing in this system that is ordered against those is the patch.
+    Create {
+        viewport: NodeId,
+        axes: Axes,
+        /// Whether an owner is attached. Carried as data because the op stream is data; the
+        /// guarantee that a passive tracker cannot be asked to move is on
+        /// [`TrackerId`]'s parameter, where a caller meets it.
+        owned: bool,
+    },
     /// The range it rests inside. The position may travel outside during a manipulation or
     /// inertia — that overpan is the bounce, and it is wanted.
     Bounds { min: Vector2, max: Vector2 },

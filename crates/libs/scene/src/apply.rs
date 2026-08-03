@@ -80,10 +80,7 @@ impl Scene {
                 self.bind_channel(id, prop, bind, patch, back, env)
             }
             Op::Res { id, op } => self.apply_res(id, op, patch, back, env),
-            Op::Tracker { id, op } => {
-                self.apply_tracker(id, op);
-                Ok(())
-            }
+            Op::Tracker { id, op } => self.apply_tracker(id, op, back),
             Op::Hits { entries } => {
                 self.hits.replace(patch.hits(entries));
                 Ok(())
@@ -786,11 +783,21 @@ impl Scene {
         Ok(())
     }
 
-    fn apply_tracker(&mut self, id: Id<Tracker>, op: TrackerOp) {
+    fn apply_tracker(&mut self, id: Id<Tracker>, op: TrackerOp, back: &Backends) -> Result<()> {
+        if let TrackerOp::Create {
+            viewport,
+            axes,
+            owned,
+        } = op
+        {
+            return self.tracker(id, viewport, axes, owned, back);
+        }
         let Some(state) = self.trackers.get_mut(id) else {
-            return;
+            return Ok(());
         };
         match op {
+            // Handled above, before the lookup that every other arm needs.
+            TrackerOp::Create { .. } => {}
             TrackerOp::Bounds { min, max } => state.tracker.set_position_bounds(
                 Vector3 {
                     x: min.x,
@@ -816,12 +823,15 @@ impl Scene {
                 // The viewport this tracker was scrolling, so the hit query stops resolving
                 // that node's descendants through an offset nothing updates any more.
                 let viewport = state.viewport;
-                self.trackers.take(id);
+                if self.trackers.take(id).is_some() {
+                    self.census.trackers_live = self.census.trackers_live.saturating_sub(1);
+                }
                 if let Some(node) = viewport {
                     self.hits.clear_scroll(node);
                 }
             }
         }
+        Ok(())
     }
 }
 

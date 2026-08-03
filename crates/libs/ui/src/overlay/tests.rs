@@ -632,6 +632,67 @@ fn strip(patch: &mut SinkPatch, tips: [crate::widget::TextSource; 3]) -> (Mount,
 }
 
 #[test]
+fn a_description_opens_on_the_side_the_author_named() {
+    // Which side a description sits on is not a style preference. Below clears the
+    // neighbours of a toolbar button, whose siblings are left and right of it, and lands
+    // squarely on top of the next item of a vertical rail. The placer flips and clamps
+    // against the *window* and cannot decide this — it is handed one box and never sees the
+    // ones beside it — so the author states it, and the whole risk is that the statement
+    // does not survive the trip to the spec.
+    let probe = |side: Option<Side>| {
+        let mut patch = fixture();
+        let mut focus = FocusRing::default();
+        let mut overlays = Overlays::new();
+        let described = El::<Any>::seed(Preset::Bare)
+            .control()
+            .hit(HitFlags::INTERACTIVE, UiaRole::Button)
+            .width(crate::role::Metric::CardMinW)
+            .height(crate::role::Metric::RowH);
+        let mount = mount(
+            match side {
+                Some(side) => described.tip_at(side, "Mute"),
+                None => described.tip("Mute"),
+            }
+            .row(text("Mute")),
+            root(),
+        );
+        flush(&mut patch);
+        let target = entries(&patch)[0];
+
+        overlays.service(&[hover(Some(target.id))], &[], &hits(&patch), &mut focus);
+        let delay = pending_delay(&mut patch);
+        overlays.scene(&[SceneEvent::DelayElapsed { delay }], &mut focus);
+        flush(&mut patch);
+        let root = overlays
+            .open
+            .last()
+            .expect("the description did not open")
+            .root;
+        let tip = Host::with(|host| host.model().solved(root.node()).rect);
+
+        drop(mount);
+        flush(&mut patch);
+        (target, tip)
+    };
+
+    let (target, tip) = probe(None);
+    assert!(
+        tip.y0 >= target.y1,
+        "the default description is not below its control: {tip:?} against {target:?}"
+    );
+
+    let (target, tip) = probe(Some(Side::Right));
+    assert!(
+        tip.x0 >= target.x1,
+        "a description asked for the trailing side did not go there: {tip:?}"
+    );
+    assert!(
+        tip.y0 < target.y1,
+        "it went beside *and* below, so it still covers whatever follows the control"
+    );
+}
+
+#[test]
 fn one_batch_of_crossings_arms_one_delay() {
     // The pointer layer publishes every crossing in a sample batch, deliberately — a target
     // crossed and left between two samples is a real enter and a real leave, and the closing

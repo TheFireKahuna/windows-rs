@@ -175,7 +175,7 @@ impl Overlays {
             return;
         }
 
-        let Some(text) = Host::with(|host| host.tip_of(target)) else {
+        let Some((text, side)) = Host::with(|host| host.tip_of(target)) else {
             self.hide_tip(focus);
             return;
         };
@@ -184,7 +184,7 @@ impl Overlays {
             // Swap content without re-delaying: the old closes and the new opens in the same
             // tick, so the user sees the text change rather than a gap.
             self.hide_tip(focus);
-            self.show_tip(target, &text, focus);
+            self.show_tip(target, &text, side, focus);
             return;
         }
 
@@ -273,8 +273,8 @@ impl Overlays {
             Opens::Tip => {
                 // Unmounted while we waited: nothing to describe, and nothing to clean up
                 // beyond the id just released.
-                if let Some(text) = Host::with(|host| host.tip_of(target)) {
-                    self.show_tip(target, &text, focus);
+                if let Some((text, side)) = Host::with(|host| host.tip_of(target)) {
+                    self.show_tip(target, &text, side, focus);
                 }
             }
         }
@@ -307,18 +307,29 @@ impl Overlays {
         &mut self,
         target: ControlId,
         text: &crate::widget::TextSource,
+        side: super::Side,
         focus: &mut FocusRing,
     ) {
+        // On the axis the side is on, so the gap is a gap and not a slide along the control's
+        // own edge. The placer reverses it on a flip, which is what makes one number serve
+        // both directions.
+        let gap = if side.is_vertical() {
+            (0.0, TIP_GAP_DIPS)
+        } else {
+            (TIP_GAP_DIPS, 0.0)
+        };
         // The one place a tooltip spec is built, which is why `Spec` has no public
         // constructor for one: a description's lifetime is this machine's, and an overlay of
         // this kind opened from outside would have nothing left to close it.
         let spec = Spec {
             kind: Kind::Tooltip,
-            // Below the control it describes, centred on it, clear of the pointer. It flips
-            // above near the bottom edge like anything else.
+            // Centred on the control it describes and clear of the pointer, on the side the
+            // author named. It flips to the opposite one near a window edge like anything
+            // else.
             anchor: Anchor::below(target)
+                .side(side)
                 .align(super::Align::Center)
-                .gap(0.0, TIP_GAP_DIPS),
+                .gap(gap.0, gap.1),
             dismiss: Kind::Tooltip.dismiss(),
             exit: Exit::Fade { ms: TIP_EXIT_MS },
             opened: super::Opened::Dwelled,

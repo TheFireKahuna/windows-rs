@@ -131,7 +131,13 @@ impl Backdrop {
     pub(crate) fn relight(&mut self, back: &Backends, env: Env) -> Result<()> {
         let base = usize::from(!self.spec.base.is_empty());
         if base == 1 {
-            Self::repoint(&self.layers[0], &self.spec.base, Spread::Vertical, back, env)?;
+            Self::repoint(
+                &self.layers[0],
+                &self.spec.base,
+                Spread::Vertical,
+                back,
+                env,
+            )?;
         }
         for (glow, layer) in self.spec.glows.iter().zip(&self.layers[base..]) {
             Self::repoint(layer, &glow.stops, Spread::Radial, back, env)?;

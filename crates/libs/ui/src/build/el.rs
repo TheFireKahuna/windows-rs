@@ -14,8 +14,8 @@ use super::arena::{
     Act, Build, ChanSource, HitSeed, MaskSeed, Part, Slot, SpriteSeed, TextSeed, Unit,
 };
 use crate::gesture::{DragDecl, GestureDecl};
-use crate::layout::{Align, Len, Over, Preset, Track};
-use crate::role::{DataRole, Elevation, Metric, Role, Text, TypeRole};
+use crate::layout::{Align, Len, Over, Preset, Rule, Track};
+use crate::role::{DataRole, Elevation, Metric, Role, Text, TypeRole, WidthClass};
 use crate::signal::Signal;
 use crate::widget::{Chrome, Flow, Interaction, Motion, RoleSet, StatePolicy, TextSource, UiaRole};
 use core::marker::PhantomData;
@@ -108,7 +108,13 @@ impl<K> El<K> {
     }
 
     pub(crate) fn over(self, over: Over) -> Self {
-        Build::with(|b| b.push_over(self.at, over));
+        Build::with(|b| b.push_over(self.at, Rule::always(over)));
+        self
+    }
+
+    /// The same, at one width class only.
+    pub(crate) fn over_at(self, class: WidthClass, over: Over) -> Self {
+        Build::with(|b| b.push_over(self.at, Rule::at(class, over)));
         self
     }
 
@@ -252,15 +258,32 @@ impl<K> El<K> {
         })))
     }
 
+    /// Places this node as row `index` of a uniform list: out of flow, one row tall, at its
+    /// own index's offset down the container.
+    ///
+    /// Stated by the list on the row's behalf, as a grid container states a placement. The
+    /// index is fixed for the row's life — a keyed reconcile moves a row's *position in the
+    /// list*, never its key — so this is written once and re-lowered only when the metric
+    /// behind it moves, which is a density change and nothing else.
+    pub(crate) fn band_rows(self, index: f32, row: impl Fn() -> Metric + 'static) -> Self {
+        self.act(Act::Restyle(Box::new(move || {
+            let row = row();
+            Over::Band {
+                at: Len::Times(row, index),
+                height: Len::Metric(row),
+            }
+        })))
+    }
+
     /// Makes this container scroll: a tracker on its own box, and the content bound to it.
-    pub(crate) fn scrolls(self, reveal: crate::layout::Reveal) -> Self {
+    pub(crate) fn scrolls(self, decl: crate::layout::ScrollDecl) -> Self {
         Build::with(|b| {
             // Touch is handed to the tracker rather than to a recogniser, which is what
             // keeps a fling running while the front thread is busy. A knob must never have
             // this; a scroll surface must always.
             b.gesture_mut(self.at, |decl| decl.redirect = true);
             let slot = &mut b.nodes[self.at as usize];
-            slot.scroll = Some(reveal);
+            slot.scroll = Some(decl);
             add_flags(
                 slot,
                 HitFlags::SCROLL | HitFlags::INTERACTIVE | HitFlags::WHEEL,
@@ -400,12 +423,68 @@ impl<K> El<K> {
         self
     }
 
+    // ── layout: width variants ───────────────────────────────────────────────────
+    //
+    // Three methods, and the list is closed. Everything else a width class changes —
+    // padding, gap, type size, radius, control sizes — already resolves through `Scope`
+    // with nothing declared at the call site, and a fourth method here would be a
+    // breakpoint literal for something the density already answered.
+    //
+    // None of them mounts or unmounts. Crossing a threshold changes styles and never
+    // structure, which is what makes them safe to evaluate during a resize drag: no owner
+    // is dropped, no cell is disposed, and a value half-typed into a field inside the
+    // narrow arrangement survives the user wobbling across the boundary. A pane that
+    // genuinely restructures — docked column to overlay drawer — is a `switch` over the
+    // *window* size and does not belong here.
+
+    /// Lay out as a column at `class`, whatever class this container carries otherwise.
+    ///
+    /// The whole preset swaps, not just the direction: a row centres its children and gaps
+    /// them along the inline axis, and a column stretches them and gaps them along the block
+    /// axis. Flipping the direction alone leaves the other three fields describing the
+    /// arrangement it is no longer in.
+    #[must_use]
+    pub fn stack_when(self, class: WidthClass) -> Self {
+        self.over_at(class, Over::Class(Preset::Stack))
+    }
+
+    /// The column template at `class`, replacing whatever was stated for every class.
+    ///
+    /// Replacing rather than appending is the point: these tracks *are* the template at that
+    /// class. Stating one class does not oblige you to state the others — a grid with no
+    /// template auto-places into a single column, which is the narrow arrangement most of
+    /// the time and is why the two-column declaration is usually the only one written.
+    #[must_use]
+    pub fn cols_when(self, class: WidthClass, tracks: impl IntoIterator<Item = Track>) -> Self {
+        self.over_at(class, Over::ClearColumns);
+        for t in tracks {
+            self.over_at(class, Over::Column(t));
+        }
+        self
+    }
+
+    /// Not laid out and not drawn at `class`.
+    ///
+    /// `Display::None`, and deliberately not [`when`](Self::when): the subtree stays mounted,
+    /// so its state is still there on the way back. A `when` here would destroy it, and
+    /// destroy it repeatedly, mid-drag.
+    #[must_use]
+    pub fn hide_when(self, class: WidthClass) -> Self {
+        self.over_at(class, Over::Hidden)
+    }
+
     // ── layout: container properties ─────────────────────────────────────────────
 
     /// Absorb the slack.
     #[must_use]
     pub fn grow(self) -> Self {
         self.over(Over::Grow)
+    }
+
+    /// Keep the height stated, in a box too small for it.
+    #[must_use]
+    pub fn no_shrink(self) -> Self {
+        self.over(Over::NoShrink)
     }
 
     #[must_use]
@@ -489,9 +568,12 @@ impl<K> El<K> {
     /// subtree whose state the user is in the middle of — a half-typed field must survive a
     /// window edge being dragged across a breakpoint.
     ///
-    /// There is no `hide_when` twin: a closure is a [`Signal`], so `when(move || !hidden())`
-    /// is the same call and the negation reads at the call site rather than in two method
-    /// names that have to stay opposite.
+    /// There is no negated twin: a closure is a [`Signal`], so `when(move || !hidden())` is
+    /// the same call and the negation reads at the call site rather than in two method names
+    /// that have to stay opposite.
+    ///
+    /// [`hide_when`](Self::hide_when) is **not** that twin and is not reachable from here. It
+    /// takes a width class, which is resolved inside the solve and which no closure can read.
     #[must_use]
     pub fn when<M>(self, cond: impl Signal<bool, M> + 'static) -> Self {
         if cond.is_constant() {
@@ -541,15 +623,28 @@ impl<K> El<K> {
 
     // ── attachments ───────────────────────────────────────────────────────────────
 
-    /// A hover description. One tooltip exists at a time and the overlay layer owns it; a
-    /// widget only declares interest.
+    /// A hover description, below the control. One tooltip exists at a time and the overlay
+    /// layer owns it; a widget only declares interest.
     ///
     /// A tip is a hover target, so this declares one. Without that the node has no hit entry,
     /// the mount has nowhere to move the handler to, and the tip is dropped in silence — on
     /// exactly the elements that most want one, since a caption is not otherwise interactive.
     #[must_use]
     pub fn tip(self, tip: impl Into<TextSource>) -> Self {
-        self.act(Act::Tip(tip.into()))
+        self.tip_at(crate::overlay::Side::Bottom, tip)
+    }
+
+    /// The same, on a side of your choosing.
+    ///
+    /// **The axis the control's siblings run on is what decides this, and only the author
+    /// knows it.** Below is right for a toolbar, where the neighbours are left and right of
+    /// the button; it is wrong for a vertical rail, where below *is* the next item and the
+    /// description lands on top of it. The placer flips and clamps for the window's edges and
+    /// cannot help here, because it is placing against one box and knows nothing of the ones
+    /// beside it.
+    #[must_use]
+    pub fn tip_at(self, side: crate::overlay::Side, tip: impl Into<TextSource>) -> Self {
+        self.act(Act::Tip(tip.into(), side))
             .slot_mut(|s| add_flags(s, HitFlags::INTERACTIVE))
     }
 
@@ -703,9 +798,9 @@ impl El<Any> {
 
     /// The viewport of a scroll container: it clips, it does not move, and the tracker is
     /// sourced from it.
-    pub(crate) fn viewport(reveal: crate::layout::Reveal, content: Self) -> Self {
+    pub(crate) fn viewport(decl: crate::layout::ScrollDecl, content: Self) -> Self {
         Self::seed(Preset::Bare)
-            .scrolls(reveal)
+            .scrolls(decl)
             .contain(Preset::Scroll, content)
     }
 }

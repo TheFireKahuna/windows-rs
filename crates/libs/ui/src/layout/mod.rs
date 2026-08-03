@@ -10,11 +10,13 @@ mod preset;
 mod scroll;
 
 pub use len::{Align, Len, Track};
-pub use preset::{Over, Preset, lower, lower_with};
+pub use preset::{Over, Preset, Rule, lower, lower_with};
 pub use scroll::{
-    ListSpec, Reveal, ScrollState, THUMB_MARGIN, THUMB_MIN_H, THUMB_W, ThumbGeom, list, scroll,
-    scroll_with, thumb_geom, thumb_style, window,
+    ListSpec, Realized, Reveal, ScrollDecl, ScrollState, THUMB_MARGIN, THUMB_MIN_H, THUMB_W,
+    ThumbGeom, front as scroll_front, list, observe as scroll_observe, rail_style, realize, scroll,
+    scroll_for_thumb_y, scroll_with, thumb_geom, thumb_style, thumb_y_for_scroll, window,
 };
+pub(crate) use scroll::{ScrollRow, grab_decl, grab_hit};
 
 use crate::build::{El, IntoChildren, View};
 

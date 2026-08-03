@@ -37,5 +37,12 @@ windows-window = { workspace = true }
 # rather than by a dense index this crate minted.
 rustc-hash = { workspace = true }
 
+[dev-dependencies]
+# The scroll example drives a real tracker, which is a composition object on a real device.
+# Both are deliberately absent above: this crate declares into a retained tree and never
+# builds one, and keeping them dev-only is what says so.
+windows-composition = { workspace = true, features = ["system"] }
+windows-d2d = { workspace = true }
+
 [lints]
 workspace = true

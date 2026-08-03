@@ -16,7 +16,7 @@
 use crate::role::{Metric, Scope, metric};
 use windows_scene::taffy;
 use windows_scene::taffy::style_helpers::{
-    FromFr, FromLength, TaffyAuto, TaffyMaxContent, TaffyMinContent, minmax,
+    FromFr, TaffyAuto, TaffyMaxContent, TaffyMinContent, minmax,
 };
 
 /// A length in the authoring surface.
@@ -129,16 +129,25 @@ impl From<Len> for Track {
 }
 
 impl Track {
+    /// This track's sizing function.
+    ///
+    /// A track's fixed part goes through [`Len::dimension`] rather than through
+    /// [`Len::dips`]. `dips` answers `None` for the two lengths that have no intrinsic value
+    /// — a percentage is not a length until something says of what, and `Auto` is a question
+    /// — and a track built from `unwrap_or(0.0)` turns both of those into a **zero-width
+    /// column**, which lays out cleanly and reads as a design decision. `Dimension` carries
+    /// all five cases, and the grid resolves the percentage against the container the way
+    /// every other percentage in this crate is resolved.
     #[must_use]
     pub fn sizing(self, scope: Scope) -> taffy::TrackSizingFunction {
         match self {
-            Self::Fixed(l) => taffy::TrackSizingFunction::from_length(l.dips(scope).unwrap_or(0.0)),
+            Self::Fixed(l) => taffy::TrackSizingFunction::from(l.dimension(scope)),
             Self::Fr(f) => taffy::TrackSizingFunction::from_fr(f),
             Self::Auto => taffy::TrackSizingFunction::AUTO,
             Self::MinContent => taffy::TrackSizingFunction::MIN_CONTENT,
             Self::MaxContent => taffy::TrackSizingFunction::MAX_CONTENT,
             Self::MinMax(min, fr) => minmax(
-                taffy::MinTrackSizingFunction::from_length(min.dips(scope).unwrap_or(0.0)),
+                taffy::MinTrackSizingFunction::from(min.dimension(scope)),
                 taffy::MaxTrackSizingFunction::from_fr(fr),
             ),
         }

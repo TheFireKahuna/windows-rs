@@ -60,7 +60,7 @@ use crate::anim::Motion;
 use crate::cache::Cells;
 use crate::node::Painted;
 use crate::res::Resources;
-use crate::tracker::{EventQueue, TrackerState};
+use crate::tracker::{EventQueue, Events, TrackerState};
 use core::marker::PhantomData;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -102,8 +102,6 @@ pub enum SceneEvent {
     /// values change; **never re-apply it blindly**, or a user whose manipulation ends gets
     /// a double jump.
     RequestIgnored { tracker: Id<Tracker>, request: i32 },
-    /// An exit transition finished and its ghost was released.
-    GhostReleased,
     /// A timed reveal reached its deadline — a submenu's hover-open, a tooltip's show.
     ///
     /// Raised on the first frame at or past that deadline, never by a timer firing: the delay
@@ -274,7 +272,7 @@ impl Scene {
             motion,
             trackers: Slots::default(),
             hits: HitTable::default(),
-            events: Rc::new(RefCell::new(Vec::new())),
+            events: Rc::new(RefCell::new(Events::default())),
             wake,
             census: Census::default(),
             #[cfg(debug_assertions)]
@@ -365,7 +363,7 @@ impl Scene {
                 !elapsed
             });
         }
-        out.append(&mut self.events.borrow_mut());
+        self.events.borrow_mut().drain(out);
         for event in &out[appended..] {
             match *event {
                 SceneEvent::TrackerValues {
@@ -430,7 +428,7 @@ impl Scene {
             set_dip_space(&self.window, env);
             self.events
                 .borrow_mut()
-                .push(SceneEvent::ScaleChanged { scale: env.scale() });
+                .push(SceneEvent::ScaleChanged { scale: env.scale() }, &self.wake);
         }
         // The backdrop is outside the cell cache, so no generation reaches it: the same
         // authored light lands on a different display as a different value, and only a
@@ -458,7 +456,9 @@ impl Scene {
         self.cells.clear();
         self.env = Some(env);
         self.refresh(back, env)?;
-        self.events.borrow_mut().push(SceneEvent::DeviceRebuilt);
+        self.events
+            .borrow_mut()
+            .push(SceneEvent::DeviceRebuilt, &self.wake);
         Ok(())
     }
 
@@ -541,31 +541,38 @@ impl Scene {
 
     // ── trackers ──────────────────────────────────────────────────────────────────
 
-    /// Creates a tracker on `viewport`.
+    /// Creates a tracker on `viewport`, from [`TrackerOp::Create`].
     ///
-    /// The marker decides whether an owner is attached, and it is not a tuning knob: an
-    /// owner is supplied at construction with no per-callback subscription, so a tracker
-    /// needing one event pays for all six. [`request`](Self::request) will not accept a
-    /// passive id, so a surface cannot be given callbacks it does not read.
-    pub fn tracker<O: Observe>(
+    /// `owned` decides whether an owner is attached, and it is not a tuning knob: an owner
+    /// is supplied at construction with no per-callback subscription, so a tracker needing
+    /// one event pays for all six. [`request`](Self::request) will not accept a passive id,
+    /// so a surface cannot be given callbacks it does not read.
+    pub(crate) fn tracker(
         &mut self,
-        id: TrackerId<O>,
-        viewport: GroupId,
+        id: Id<Tracker>,
+        viewport: NodeId,
         axes: Axes,
+        owned: bool,
         back: &Backends,
     ) -> Result<()> {
-        let visual = self
-            .nodes
-            .get(viewport.node())
-            .map(|n| n.visual.clone())
-            .ok_or_else(invalid_arg)?;
+        let node = self.nodes.get(viewport).ok_or_else(invalid_arg)?;
+        let visual = node.visual.clone();
+        // The source takes its hit region from this size, and a zero-size one hit-tests
+        // nothing while returning success — which reads as a scroll surface that ignores
+        // every wheel notch rather than as anything failing.
+        debug_assert!(
+            node.size().x > 0.0 && node.size().y > 0.0,
+            "a tracker's viewport must be sized before its source is created"
+        );
 
-        let tracker = if O::OWNED {
+        let tracker = if owned {
             let queue = Rc::clone(&self.events);
-            let raw = id.raw;
+            let wake = self.wake.clone();
             back.compositor
                 .create_interaction_tracker_with_owner(move |event| {
-                    queue.borrow_mut().push(tracker::translate(raw, event));
+                    queue
+                        .borrow_mut()
+                        .push(tracker::translate(id, event), &wake);
                 })?
         } else {
             back.compositor.create_interaction_tracker()?
@@ -577,8 +584,9 @@ impl Scene {
 
         let mut state = TrackerState::new(tracker);
         state.source = Some(source);
-        state.viewport = Some(viewport.node());
-        self.trackers.place(id.raw, state);
+        state.viewport = Some(viewport);
+        self.trackers.place(id, state);
+        self.census.trackers_live += 1;
         Ok(())
     }
 

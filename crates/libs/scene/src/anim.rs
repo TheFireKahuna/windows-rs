@@ -378,6 +378,11 @@ pub(crate) struct Ghost {
 
 impl Ghost {
     /// Whether the compositor has reported this exit complete.
+    ///
+    /// **Nothing above the scene is told.** A ghost is unparented from the model's tree by
+    /// construction and this type is its only owner, so a release changes nothing any
+    /// consumer could act on — which is why the sweep in `apply` is the whole lifecycle and
+    /// there is no event beside it.
     pub(crate) fn finished(&self) -> bool {
         self.done.get()
     }

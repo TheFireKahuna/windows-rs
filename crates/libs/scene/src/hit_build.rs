@@ -51,6 +51,13 @@ impl HitFlags {
     /// Dismisses an overlay and consumes the press. The full-window entry an overlay
     /// contributes ahead of its own subtree.
     pub const BLOCKER: Self = Self(1 << 8);
+    /// Chrome pinned to a scroll container's viewport: its rect does **not** resolve
+    /// through that container's offset.
+    ///
+    /// A scrollbar's rail is the case, and it is not a special case — it is inside the
+    /// thing it reports on and does not move with it, so inheriting the offset would slide
+    /// the target off the surface exactly as far as the content has scrolled.
+    pub const UNSCROLLED: Self = Self(1 << 9);
 
     pub const NONE: Self = Self(0);
 
@@ -213,7 +220,11 @@ impl HitBuilder {
                 clip_parent: self.clips.last().map_or(NO_ENTRY, |&(_, entry)| entry),
                 parent: self.entries.last().map_or(NO_ENTRY, |&(_, entry)| entry),
                 flags,
-                scroll_src: self.scrolls.last().map_or(NodeId::NONE, |&(_, node)| node),
+                scroll_src: if flags.contains(HitFlags::UNSCROLLED) {
+                    NodeId::NONE
+                } else {
+                    self.scrolls.last().map_or(NodeId::NONE, |&(_, node)| node)
+                },
                 id: decl.id,
             });
             self.entries.push((depth, (out.len() - 1) as u32));

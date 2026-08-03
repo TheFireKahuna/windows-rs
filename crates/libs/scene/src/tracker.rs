@@ -187,7 +187,33 @@ pub(crate) fn configure_source(
 /// Shared rather than owned because the callback is a COM object the compositor holds, and
 /// it outlives the borrow that created it. Nothing here is `Send`: the callbacks arrive on
 /// the thread that created the compositor, which is the thread the tree lives on.
-pub(crate) type EventQueue = Rc<RefCell<Vec<crate::SceneEvent>>>;
+///
+/// **The queue holds a [`Tick`](windows_window::Tick) while anything is in it.** Inertia
+/// reports from the compositor with no input behind it, so a queue that did not ask for a
+/// frame would be read at whatever unrelated wake came next — which for a virtualized list
+/// is a fling that lands on rows nobody realized. The drain releases it, so a tracker that
+/// has stopped reporting parks the clock rather than holding it open.
+#[derive(Default)]
+pub(crate) struct Events {
+    queued: Vec<crate::SceneEvent>,
+    tick: Option<windows_window::Tick>,
+}
+
+impl Events {
+    pub(crate) fn push(&mut self, event: crate::SceneEvent, wake: &windows_window::Wake) {
+        self.queued.push(event);
+        if self.tick.is_none() {
+            self.tick = Some(wake.tick());
+        }
+    }
+
+    pub(crate) fn drain(&mut self, out: &mut Vec<crate::SceneEvent>) {
+        out.append(&mut self.queued);
+        self.tick = None;
+    }
+}
+
+pub(crate) type EventQueue = Rc<RefCell<Events>>;
 
 /// Turns a wrapper tracker event into this crate's, tagged with which tracker it came from.
 pub(crate) fn translate(

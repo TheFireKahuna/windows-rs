@@ -381,17 +381,30 @@ impl LayoutTree {
     }
 
     /// Replaces a node's children, in paint order.
+    ///
+    /// **Every child is pointed back at `node`, including when the order did not change.** A
+    /// `TaffyId` is a bare index, so an id reused at the same position leaves a list that
+    /// compares equal to one whose members are new nodes —
+    /// [`create`](Self::create) having reset each of them, parent included. Skipping the
+    /// re-link on that comparison leaves a node no walk can climb out of, and
+    /// [`mark_dirty`](Self::mark_dirty) is a walk out: the node's own cache clears and every
+    /// ancestor keeps one that predates it. The symptom is a node laid out at zero, which is
+    /// what a slot reset and never reached still holds.
     pub fn set_children(&mut self, node: NodeId, children: &[NodeId]) {
         let parent = TaffyId::from(node.index());
-        let ids: Vec<TaffyId> = children.iter().map(|c| TaffyId::from(c.index())).collect();
-        let slot = self.slot(node);
-        if slot.children == ids {
-            return;
-        }
-        slot.children = ids;
         for &child in children {
             self.slot(child).parent = Some(parent);
         }
+        let slot = self.slot(node);
+        if slot.children.len() == children.len()
+            && core::iter::zip(&slot.children, children)
+                .all(|(&a, b)| a == TaffyId::from(b.index()))
+        {
+            return;
+        }
+        slot.children.clear();
+        slot.children
+            .extend(children.iter().map(|c| TaffyId::from(c.index())));
         self.mark_dirty(parent);
     }
 
@@ -674,7 +687,16 @@ impl LayoutPartialTree for LayoutTree {
     fn compute_child_layout(&mut self, id: TaffyId, inputs: LayoutInput) -> LayoutOutput {
         compute_cached_layout(self, id, inputs, |tree, id, inputs| {
             let node = tree.node(id);
-            if node.hidden || node.style.display == Display::None {
+            // A hidden pass stays hidden the whole way down. Taffy descends into a hidden
+            // subtree with `RunMode::PerformHiddenLayout`, and in that mode a measure
+            // function may not be called at all — so a node deciding by its *own* display
+            // hands the first childless descendant of a hidden container to `measure_leaf`,
+            // which walks into taffy's `unreachable!()`. The run mode is the authority
+            // because it is the only thing that knows which pass this is.
+            if inputs.run_mode == RunMode::PerformHiddenLayout
+                || node.hidden
+                || node.style.display == Display::None
+            {
                 return compute_hidden_layout(tree, id);
             }
             if tree.child_count(id) == 0 {
@@ -963,6 +985,82 @@ mod tests {
 
         tree.solve(root, Vector2 { x: 480.0, y: 400.0 }, 1.0, &mut out);
         assert_eq!(out[leaf.index()].size.y, 60.0, "narrow, after a class flip");
+    }
+
+    #[test]
+    fn a_node_minted_after_a_solve_reaches_the_next_one() {
+        // Two passes of the flush a screen switch runs: structure and a solve, then a
+        // publish that mints — a wrapping run's line sprites — and a second solve. The
+        // publish's parent was itself rebuilt into the slot its predecessor had, so the
+        // list its own parent was handed compared equal, and only the re-link keeps that
+        // parent climbable when the mint dirties upward.
+        let mut tree = LayoutTree::new();
+        let column = Style {
+            display: Display::Flex,
+            flex_direction: taffy::FlexDirection::Column,
+            ..Style::DEFAULT
+        };
+        let root = NodeId::raw(1, 1);
+        let mid = NodeId::raw(2, 1);
+        let window = Vector2 { x: 600.0, y: 400.0 };
+        let origin = Vector2 { x: 0.0, y: 0.0 };
+        let mut out = Vec::new();
+
+        for node in [root, mid] {
+            tree.create(node, LayoutKind::Container);
+            tree.set_style(node, &column);
+        }
+        tree.set_style(
+            root,
+            &Style {
+                size: Size {
+                    width: percent(1.0_f32),
+                    height: percent(1.0_f32),
+                },
+                ..column.clone()
+            },
+        );
+        tree.set_children(root, &[mid]);
+
+        // The first screen: a group under `mid`, with one line sprite published into it.
+        let mut build =
+            |tree: &mut LayoutTree, group: NodeId, line: NodeId, out: &mut Vec<Solved>| {
+                tree.create(group, LayoutKind::Container);
+                tree.set_style(group, &column);
+                tree.set_children(mid, &[group]);
+                tree.begin(out);
+                tree.solve_root(root, window, origin, 1.0, out);
+                // Minted by the publish, which is *after* that solve and knows its box from it.
+                tree.create(line, LayoutKind::Container);
+                tree.set_style(
+                    line,
+                    &Style {
+                        size: Size {
+                            width: length(47.0_f32),
+                            height: length(16.0_f32),
+                        },
+                        ..Style::DEFAULT
+                    },
+                );
+                tree.set_children(group, &[line]);
+                tree.begin(out);
+                tree.solve_root(root, window, origin, 1.0, out);
+            };
+
+        let (group, line) = (NodeId::raw(3, 1), NodeId::raw(4, 1));
+        build(&mut tree, group, line, &mut out);
+        assert_eq!(out[line.index()].size, Vector2 { x: 47.0, y: 16.0 });
+
+        // Navigating away and back. Both slots come back at the same dense indices, so
+        // `mid`'s child list is unchanged by inspection and the group's is too.
+        tree.destroy(line);
+        tree.destroy(group);
+        build(&mut tree, NodeId::raw(3, 2), NodeId::raw(4, 2), &mut out);
+        assert_eq!(
+            out[4].size,
+            Vector2 { x: 47.0, y: 16.0 },
+            "a node minted after the solve was never reached by the next one"
+        );
     }
 
     #[test]

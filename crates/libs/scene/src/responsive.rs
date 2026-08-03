@@ -16,11 +16,19 @@
 //! narrow arrangement survives the user wobbling across the boundary.
 
 /// How wide a container found itself. Ordered, so a rule can read "at least medium".
+///
+/// **The default is the *unclassified* class, and it is `Wide`.** A node outside every
+/// responsive container has one, a node inside one has it until the first solve resolves
+/// otherwise, and a style is lowered at it before any classification exists — so it has to
+/// be the same value on both sides of the crate boundary, and the layer above states the
+/// same one at the root of its scope. Any other choice makes the first solve of a container
+/// that classifies *to* the default produce no transition, and a subtree keeps the styles
+/// its mount lowered at a class it is not in.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WidthClass {
     Narrow,
-    #[default]
     Medium,
+    #[default]
     Wide,
 }
 

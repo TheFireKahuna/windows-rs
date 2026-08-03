@@ -367,3 +367,70 @@ fn a_refused_inertia_report_is_not_recorded_as_made() {
         "content that is not moving is not moving"
     );
 }
+
+/// **A press produces a release, whatever its target declared and whatever the platform
+/// hands back for the contact.**
+///
+/// Two gates used to stand between the two halves, and a plain button failed both. A control
+/// that refined no gesture had no entry in the router's declaration table, so the down
+/// returned before binding the contact; the up then found no binding and returned before
+/// reporting. The press was published, the release never was — which latches the press wash,
+/// holds the pool slot for the life of the window, and loses the tap, because a tap is a
+/// press and a release on one control.
+///
+/// **The target here deliberately declares nothing**, and the tick is deliberately allowed to
+/// fail: a synthetic contact has no pointer behind it, so the platform cannot hand back a
+/// point for it. That is the second half of the claim — a refused sample must not be able to
+/// delete a contact's end.
+#[test]
+fn a_press_on_an_undeclared_target_still_reports_its_release() {
+    let bell = Rc::new(Doorbell::new());
+    let window = window("windows-ui — undeclared release");
+    let pacer = window.pacer().expect("a window can be paced");
+    let mut router = Router::new(&bell, &window, pacer.wake()).expect("the window is open");
+    // No `declare` at all. That is the case under test.
+
+    // Unbounded, because where a synthetic contact lands is not the claim. Nothing is behind
+    // the id for the platform to report a position from, so the down resolves to the screen
+    // origin converted into this window's client space — which is negative by wherever the
+    // window happens to have been placed.
+    let mut hits = HitTable::default();
+    hits.replace(&[HitEntry {
+        x0: -1.0e5,
+        y0: -1.0e5,
+        x1: 1.0e5,
+        y1: 1.0e5,
+        touch_inflate: 0.0,
+        clip_parent: NO_ENTRY,
+        parent: NO_ENTRY,
+        flags: HitFlags::INTERACTIVE | HitFlags::GESTURE,
+        scroll_src: NodeId::NONE,
+        id: target(),
+    }]);
+
+    let mut reports = Vec::new();
+    bell.wndproc(WM_POINTERDOWN, wparam(1, 0x2000), 0);
+    let _ = router.tick(&hits, env(), &mut reports);
+    assert!(
+        reports
+            .iter()
+            .any(|report| matches!(report, Report::Pressed { .. })),
+        "the press was not reported at all: {reports:?}"
+    );
+    assert_eq!(
+        router.census().bindings,
+        1,
+        "a target that declared no gesture was pressed and never tracked, so nothing can \
+         account for its up"
+    );
+
+    reports.clear();
+    bell.wndproc(WM_POINTERUP, wparam(1, 0), 0);
+    let _ = router.tick(&hits, env(), &mut reports);
+    assert!(
+        reports
+            .iter()
+            .any(|report| matches!(report, Report::Released { .. })),
+        "the release was lost: {reports:?}"
+    );
+}

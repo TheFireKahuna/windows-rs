@@ -23,7 +23,8 @@ use std::cell::RefCell;
 use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
-    GroupId, Ids, Mask, MeasureIn, MeasureKey, Measured, Model, RunId, Slots, SpriteId, taffy,
+    GroupId, Ids, Mask, MeasureIn, MeasureKey, Measured, Model, NodeId, RunId, Slots, SpriteId,
+    taffy,
 };
 use windows_text::{FontLadder, FontSpec, SegBuffers, ShapedRun, TextEngine};
 
@@ -116,6 +117,14 @@ pub(crate) struct Entry {
     /// The width the glyphs currently stand at. `NaN` until the first pin, so the first
     /// publish always emits.
     pinned: f32,
+    /// The inline extent of the coverage last emitted for a single line. `NaN` until there
+    /// is one.
+    ///
+    /// Held rather than read back from the run because reading a line's ink needs a harvest,
+    /// and this is compared on **every** flush — the comparison is what re-pins a box that a
+    /// class re-lower rebuilt from the recipe, which is a path with no reshape behind it and
+    /// therefore no emit to hang the correction off.
+    ink_w: f32,
     /// The string or the font moved, so the run is behind its source.
     stale: bool,
 }
@@ -288,6 +297,7 @@ impl Table {
             ink,
             target,
             pinned: f32::NAN,
+            ink_w: f32::NAN,
             // Fresh, for the same reason the recycled path above is: the run was just laid
             // out from this string under this font. Marking it stale would reshape it again
             // at the first measure. A class that resolves a *different* font still reshapes,
@@ -367,6 +377,27 @@ impl Table {
         }
         emitted
     }
+
+    /// Re-sends every run's coverage, whether or not its box moved.
+    ///
+    /// The response to a pixel grid that moved and to a device that was rebuilt, and it has
+    /// to be unconditional: a coverage tile is rasterized at **device** resolution, and
+    /// neither event changes a single DIP. [`publish`](Self::publish) is gated on the width
+    /// having moved and so answers "nothing to do" for exactly the case that needs
+    /// everything done — a display hop that leaves every glyph rasterized for the old grid.
+    ///
+    /// Shaping is not redone. It is resolution-independent, and the run is already pinned at
+    /// the width the last solve gave it; what is stale is the raster, and re-pointing each
+    /// run through `Model::set_run` is what replaces it.
+    pub(crate) fn reemit(&mut self, model: &mut Model) {
+        let Table {
+            entries, engine, ..
+        } = self;
+        let engine = engine.as_ref().expect(ENGINE);
+        for (_, entry) in entries.iter_mut() {
+            entry.emit(engine, model);
+        }
+    }
 }
 
 impl Entry {
@@ -400,16 +431,60 @@ impl Entry {
         // `pin` is the single authoritative writer of the width. Whichever probe the solve
         // happened to end on would otherwise decide where the glyphs landed.
         let moved = self.run.pin(width);
-        if !moved && self.pinned == width {
+        let mut emitted = false;
+        if moved || self.pinned != width {
+            self.pinned = width;
+            if moved {
+                emitted = self.emit(engine, model);
+            }
+        }
+        // After the emit, so the extent compared against is this pass's own.
+        emitted | self.fit_line_box(model, node)
+    }
+
+    /// Makes a single line's box exactly its coverage, and answers whether that moved a box.
+    ///
+    /// Only [`Target::Line`], because that case is the one where **the node is the sprite**:
+    /// a wrapping run owns line sprites of its own and sizes each to its own tile
+    /// ([`line_style`]), so its node is free to be whatever the container makes it.
+    ///
+    /// A single line has no such sprite to hide behind, so a container that stretches its
+    /// children stretches the tile — and the tile's brush fills, so the glyphs smear across
+    /// the whole container. A measurement leaves the cross size `auto`, which is precisely
+    /// the case stretch applies to; a definite size is what it yields to.
+    ///
+    /// **This terminates.** The width written is the ink of a run that cannot wrap, so it
+    /// does not depend on the box it is written into: the next solve hands back the width
+    /// just written, the comparison holds, and nothing is written again. That is the
+    /// argument phase 2 of [`Host::flush`](super::Host::flush) needs from every publish.
+    fn fit_line_box(&mut self, model: &mut Model, node: NodeId) -> bool {
+        let Target::Line { .. } = self.target else {
+            return false;
+        };
+        let ink = self.ink_w;
+        // Ordered so `NaN` — no coverage emitted yet — takes the same exit a zero does.
+        if !(ink > 0.0) {
             return false;
         }
-        self.pinned = width;
-        if !moved {
+        if (ink - model.solved(node).size.x).abs() < 0.01 {
             return false;
         }
+        let class = model.solved(node).class;
+        let Some(style) = super::style::pin_width(node, class, ink) else {
+            return false;
+        };
+        model.style(node, &style);
+        true
+    }
+
+    /// Sends this run's coverage, whatever the layout did. The half of
+    /// [`publish`](Self::publish) behind its gate, so a re-emit takes the same path a move
+    /// does rather than a second one to keep in step.
+    fn emit(&mut self, engine: &TextEngine, model: &mut Model) -> bool {
         match &mut self.target {
             Target::Line { sprite, run } => {
                 let shaped = emit(engine, &mut self.run, 0, model.glyphs());
+                self.ink_w = shaped.ink.size.x;
                 publish_line(model, *sprite, run, shaped);
                 true
             }

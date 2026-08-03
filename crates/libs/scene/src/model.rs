@@ -517,7 +517,10 @@ impl Model {
         let span = self.pending.push_stops(stops);
         self.pending.push_op(Op::Res {
             id,
-            op: ResOp::Ramp { stops: span, spread },
+            op: ResOp::Ramp {
+                stops: span,
+                spread,
+            },
         });
         id.cast()
     }
@@ -527,7 +530,10 @@ impl Model {
         let span = self.pending.push_stops(stops);
         self.pending.push_op(Op::Res {
             id: id.cast(),
-            op: ResOp::Ramp { stops: span, spread },
+            op: ResOp::Ramp {
+                stops: span,
+                spread,
+            },
         });
     }
 
@@ -616,6 +622,22 @@ impl Model {
     /// by.
     pub fn tracker_id<O: Observe>(&mut self) -> TrackerId<O> {
         TrackerId::new(self.tracker_ids.mint())
+    }
+
+    /// Builds the tracker `id` names, sourced from `viewport`.
+    ///
+    /// **Emit this after the solve that sizes the viewport**, never at mount: the source
+    /// takes its hit region from the visual's size at creation, and a zero-size one
+    /// hit-tests nothing while reporting success.
+    pub fn create_tracker<O: Observe>(&mut self, id: TrackerId<O>, viewport: GroupId, axes: Axes) {
+        self.pending.push_op(Op::Tracker {
+            id: id.raw,
+            op: TrackerOp::Create {
+                viewport: viewport.node(),
+                axes,
+                owned: O::OWNED,
+            },
+        });
     }
 
     /// Sets a tracker's bounds. The position may travel outside them during a manipulation

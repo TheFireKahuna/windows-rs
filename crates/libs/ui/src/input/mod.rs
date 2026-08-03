@@ -572,11 +572,16 @@ impl Router {
             self.census.rejected += 1;
         }
 
-        let Some(decl) = self.decls.get(&hit.id).copied() else {
-            return Ok(());
-        };
+        // **A contact is bound whatever its target declared.** A declaration says which
+        // gestures a press can *become*; it does not say whether the press happened. Reading
+        // it as permission to track leaves a target that declared nothing with a press and no
+        // release — which latches its wash, holds its pool slot for the life of the window,
+        // and loses the tap, because a tap is a press and a release on one control.
+        let decl = self.decls.get(&hit.id).copied().unwrap_or_default();
         // A scroll surface hands touch to its `InteractionTracker` instead, which is what
-        // keeps a fling running when the front thread is busy.
+        // keeps a fling running when the front thread is busy. The contact leaves this
+        // stack, so there is no up here to account for — `resolve_hover` reads the
+        // doorbell's own down state for exactly this case.
         if decl.redirect {
             return Ok(());
         }
@@ -631,16 +636,26 @@ impl Router {
             self.bell.release(event.id);
             return Ok(());
         };
-        let target = bound.target;
-        if !bound.rejected {
-            let point = PointerPoint::GetCurrentPointTransformed(event.id, &self.transform)?;
-            bound.recognizer().up(&point)?;
-        }
+        let (target, rejected) = (bound.target, bound.rejected);
+        // **Published before the recogniser is told, exactly as the press is.** A contact's
+        // end is a fact about the contact; a recogniser that refuses the final sample must
+        // not be able to delete it. The release is what clears the press wash, frees the
+        // binding and makes a press and a release on one control a tap — so losing it to a
+        // failed sample latches all three for the life of the window.
         out.push(Report::Released {
             target,
             contact: event.id,
             at,
         });
+        let fed = if rejected {
+            Ok(())
+        } else {
+            PointerPoint::GetCurrentPointTransformed(event.id, &self.transform).and_then(|point| {
+                self.pool
+                    .get(event.id)
+                    .map_or(Ok(()), |bound| bound.recognizer().up(&point))
+            })
+        };
         self.collect(event.id, out);
         // Inertia keeps the binding alive: the contact is gone but its motion is not, and the
         // recogniser it is running on is the one being pumped.
@@ -655,7 +670,9 @@ impl Router {
             self.pool.release(event.id, false);
         }
         self.bell.release(event.id);
-        Ok(())
+        // Reported last, so a refused sample reaches the caller **and** leaves a contact that
+        // is properly ended, rather than an error that leaves this stack still holding it.
+        fed
     }
 
     /// A canceled contact **aborts**: `CompleteGesture` and no commit.

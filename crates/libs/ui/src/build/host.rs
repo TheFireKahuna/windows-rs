@@ -19,7 +19,7 @@ use std::rc::Rc;
 use windows_numerics::Vector2;
 use windows_scene::{
     ControlId, Env, Exit, GroupId, Id, Ids, MeasureIn, MeasureKey, Model, NodeId, Paint, Prop,
-    SinkPatch, Slots, SpriteId,
+    SinkPatch, Slots, SpriteId, Tracker,
 };
 
 /// The families this layer mints, and the ids that name their rows.
@@ -91,7 +91,12 @@ pub(crate) struct ControlRow {
     /// the host's borrow before running them: building a flyout's body is application code,
     /// and it cannot run while the host is borrowed. They stay in the row, because a
     /// picker's flyout opens once per press and not once per lifetime.
-    pub tip: Option<Rc<TextSource>>,
+    ///
+    /// The side rides with the text because only an author knows which axis their controls
+    /// are stacked on, and that is the whole of what decides it: a description below a
+    /// toolbar button clears its neighbours, and the same one below a rail item lands on top
+    /// of the next.
+    pub tip: Option<(Rc<TextSource>, crate::overlay::Side)>,
     pub flyout: Option<Rc<dyn Fn() -> super::View>>,
     pub uia: UiaRole,
     pub name: Option<&'static str>,
@@ -221,15 +226,7 @@ pub struct TrackerSpec {
     pub axes: windows_scene::Axes,
 }
 
-/// One scroll container, as the post-solve step needs it.
-pub(crate) struct ScrollRow {
-    pub tracker: windows_scene::TrackerId<windows_scene::Observed>,
-    pub viewport: NodeId,
-    pub content: NodeId,
-    pub thumb: Option<SpriteId>,
-    /// What was last published, so a solve that moved nothing emits nothing.
-    pub last: crate::layout::ThumbGeom,
-}
+pub(crate) use crate::layout::ScrollRow;
 
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
@@ -396,10 +393,13 @@ impl Host {
             // A tooltip is the element's `HelpText`, which is the same fact stated to a
             // different sense. Read untracked: this runs inside a flush, and subscribing
             // whatever effect is on the stack would rebuild a screen when a tip changed.
-            let help = control.tip.as_ref().map_or_else(Default::default, |tip| {
-                let text = crate::signal::untracked(|| tip.read(str::to_owned));
-                out.intern(&text)
-            });
+            let help = control
+                .tip
+                .as_ref()
+                .map_or_else(Default::default, |(tip, _)| {
+                    let text = crate::signal::untracked(|| tip.read(str::to_owned));
+                    out.intern(&text)
+                });
             let value = match (control.uia, control.front.drive) {
                 (
                     _,
@@ -481,11 +481,6 @@ impl Host {
         core::mem::take(&mut self.released)
     }
 
-    /// Takes the trackers minted since the last drain, for the front thread to create.
-    pub fn take_trackers(&mut self) -> Vec<TrackerSpec> {
-        core::mem::take(&mut self.trackers)
-    }
-
     /// Calls what an intent asks for.
     ///
     /// A stale intent — one queued before the control unmounted — is a **miss**: the
@@ -520,6 +515,44 @@ impl Host {
 
     pub(crate) fn mint_mount(&mut self, row: MountRow) -> MountId {
         self.mounts.insert(&mut self.mount_ids, row)
+    }
+
+    /// Runs `f` against the scroll container matching `pick`.
+    ///
+    /// A scan, not a map: a screen has a handful of scroll surfaces, so four comparisons beat
+    /// a hash on the one path this is walked from — every tracker report of every fling.
+    fn scroll_where(&mut self, pick: impl Fn(&ScrollRow) -> bool, f: impl FnOnce(&mut ScrollRow)) {
+        for at in self.scrolls.positions() {
+            let Some(id) = self.scrolls.id_at(at) else {
+                continue;
+            };
+            if self.scrolls.get(id).is_some_and(&pick)
+                && let Some(row) = self.scrolls.get_mut(id)
+            {
+                f(row);
+                return;
+            }
+        }
+    }
+
+    /// The container a tracker report belongs to. Keyed by the raw id, because that is what
+    /// a [`SceneEvent`](windows_scene::SceneEvent) carries.
+    pub(crate) fn scroll_by_tracker(
+        &mut self,
+        tracker: Id<Tracker>,
+        f: impl FnOnce(&mut ScrollRow),
+    ) {
+        self.scroll_where(|row| row.tracker.id() == tracker, f);
+    }
+
+    /// The container a hover names — its viewport's own control.
+    pub(crate) fn scroll_by_control(&mut self, control: ControlId, f: impl FnOnce(&mut ScrollRow)) {
+        self.scroll_where(|row| row.control == Some(control), f);
+    }
+
+    /// The container a grabbed thumb names.
+    pub(crate) fn scroll_by_grab(&mut self, control: ControlId, f: impl FnOnce(&mut ScrollRow)) {
+        self.scroll_where(|row| row.grab == Some(control), f);
     }
 
     /// Records a scroll container against the mount row that owns it, whose tracker dies
@@ -787,6 +820,11 @@ impl Host {
                 .and_then(|at| self.scrolls.remove(&mut self.scroll_ids, at))
             {
                 self.model.drop_tracker(scroll.tracker);
+                // The thumb's control is minted beside the tracker rather than by the mount
+                // walk, so it is released here too or the id outlives the sprite it names.
+                if let Some(grab) = scroll.grab {
+                    self.release_control(grab);
+                }
             }
             at = row.next;
         }
@@ -904,8 +942,12 @@ impl Host {
         self.control(target).and_then(|c| c.flyout.clone())
     }
 
-    /// A control's declared hover description, shared out for the same reason.
-    pub(crate) fn tip_of(&self, target: ControlId) -> Option<Rc<TextSource>> {
+    /// A control's declared hover description and where it sits, shared out for the same
+    /// reason. Both in one read, because a description with no side is not placeable.
+    pub(crate) fn tip_of(
+        &self,
+        target: ControlId,
+    ) -> Option<(Rc<TextSource>, crate::overlay::Side)> {
         self.control(target).and_then(|c| c.tip.clone())
     }
 
@@ -985,6 +1027,14 @@ impl Host {
     /// runs per frame — a scroll that is *scrolling* moves entirely compositor-side, and this
     /// only speaks when the extents themselves changed.
     fn publish_scrolls(&mut self) -> bool {
+        // The trackers this mount named, built now rather than at mount: a
+        // `VisualInteractionSource` takes its hit region from the viewport's size at the
+        // moment it is created, and the solve above is what gave the viewport one. Created
+        // at mount it hit-tests nothing, reports success, and the surface silently ignores
+        // every wheel notch for the life of the window.
+        for spec in core::mem::take(&mut self.trackers) {
+            self.model.create_tracker(spec.id, spec.viewport, spec.axes);
+        }
         let mut moved = false;
         for at in self.scrolls.positions() {
             let Some(id) = self.scrolls.id_at(at) else {
@@ -995,8 +1045,12 @@ impl Host {
             };
             let (tracker, viewport, thumb, last) =
                 (scroll.tracker, scroll.viewport, scroll.thumb, scroll.last);
-            let content = scroll.content;
+            let (content, state, rail, grab) =
+                (scroll.content, scroll.state, scroll.rail, scroll.grab);
             let viewport_h = self.model.solved(viewport).size.y;
+            // The realization window is a fraction of this, so a viewport that has just been
+            // measured is the one signal a virtualized list cannot compute for itself.
+            state.resized(viewport_h);
             let geom = crate::layout::thumb_geom(viewport_h, self.model.solved(content).size.y);
             if geom == last {
                 continue;
@@ -1039,8 +1093,32 @@ impl Host {
                     },
                 );
             }
+            // The rail is a strip over the right edge of the content, so it is a target only
+            // while there is something to scroll. Left on, it takes every press on the right
+            // ten DIPs of a surface that does not scroll — which is a button at the edge of
+            // a row that cannot be clicked and nothing to say why.
+            if let (Some(rail), Some(grab)) = (rail, grab) {
+                self.model.hit(
+                    rail.node(),
+                    geom.overflow.then(|| crate::layout::grab_hit(grab)),
+                );
+            }
         }
         moved
+    }
+
+    /// Re-sends every run's coverage.
+    ///
+    /// What a [`SceneEvent::DeviceRebuilt`](windows_scene::SceneEvent::DeviceRebuilt) or a
+    /// [`ScaleChanged`](windows_scene::SceneEvent::ScaleChanged) is answered with, and it
+    /// cannot be left to the ordinary publish: neither event moves a DIP, so the width gate
+    /// that makes publishing cheap answers "nothing moved" for precisely the case where
+    /// every raster is wrong.
+    ///
+    /// Cheap to call and not cheap to call often — it re-emits every live run — so it
+    /// belongs on those two events and nowhere else.
+    pub fn reemit_text(&mut self) {
+        super::text::with(|table| table.reemit(&mut self.model));
     }
 
     /// The window's size in DIPs. Crosses upward, from the window's own resize message.
