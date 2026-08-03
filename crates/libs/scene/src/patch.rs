@@ -81,6 +81,20 @@ pub enum Op {
     Hits {
         entries: Span,
     },
+    /// Starts a timed reveal, reported back as
+    /// [`SceneEvent::DelayElapsed`](crate::SceneEvent::DelayElapsed).
+    ///
+    /// A monotonic deadline read on the frame clock, not a timer: nothing fires, and the
+    /// frame it is observed at is one the scene was servicing anyway. Re-issuing a live id
+    /// restarts it, which is what a tooltip swapping targets wants.
+    Delay {
+        id: DelayId,
+        ms: u32,
+    },
+    /// Cancels one, by dropping it. A cancelled delay never reports.
+    CancelDelay {
+        id: DelayId,
+    },
 }
 
 /// A pending patch: the ops, and the buffers their payloads live in.

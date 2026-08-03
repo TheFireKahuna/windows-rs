@@ -356,12 +356,34 @@ impl LayoutTree {
         self.mark_dirty(parent);
     }
 
-    /// Solves the tree under `root` against a window of `size` DIPs, and writes each live
-    /// node's placement into `out`, indexed by node id.
+    /// Empties the output and sizes it for the pass.
+    ///
+    /// Once per pass and not once per root: a window has one attached tree and one detached
+    /// root per open overlay, and all of them gather into the same buffer indexed by node id.
+    pub fn begin(&mut self, out: &mut Vec<Solved>) {
+        out.clear();
+        out.resize(self.nodes.len(), Solved::default());
+    }
+
+    /// Solves the tree under `root` against a window of `size` DIPs, placing it at `origin`,
+    /// and writes each live node's placement into `out`, indexed by node id.
     ///
     /// Snapping happens here, at the end, in one place — and against the *absolute* rect,
     /// because that is the space edges have to agree in.
-    pub fn solve(&mut self, root: NodeId, size: Vector2, scale: f32, out: &mut Vec<Solved>) {
+    ///
+    /// `origin` is zero for the window's own root and is the resolved placement for a
+    /// detached one. It **translates and does not constrain**: an overlay is laid out against
+    /// the window box wherever it lands, which is what keeps its size independent of its
+    /// position. Passing it here rather than adding it afterwards is what makes a detached
+    /// subtree's `rect` absolute, and the hit array reads exactly that.
+    pub fn solve_root(
+        &mut self,
+        root: NodeId,
+        size: Vector2,
+        origin: Vector2,
+        scale: f32,
+        out: &mut Vec<Solved>,
+    ) {
         self.ambient = WidthClass::default();
         let taffy_root = TaffyId::from(root.index());
         compute_root_layout(
@@ -373,9 +395,14 @@ impl LayoutTree {
             },
         );
 
-        out.clear();
-        out.resize(self.nodes.len(), Solved::default());
-        self.gather(taffy_root, 0.0, 0.0, scale, out);
+        let (ox, oy) = (snap(origin.x, scale), snap(origin.y, scale));
+        self.gather(taffy_root, ox, oy, scale, out);
+        // A root has no parent to be positioned by, so its offset within one *is* the origin
+        // it was placed at. Stated here rather than left at taffy's zero, so the placement
+        // reaches the compositor as the ordinary offset bind every other node's does.
+        if let Some(solved) = out.get_mut(root.index()) {
+            solved.local = Vector2 { x: ox, y: oy };
+        }
     }
 
     fn gather(&self, id: TaffyId, ox: f32, oy: f32, scale: f32, out: &mut Vec<Solved>) {
@@ -642,6 +669,14 @@ mod tests {
     use super::*;
     use taffy::prelude::{TaffyAuto, length, percent};
 
+    /// One attached root at the origin, which is every case below but the detached one.
+    impl LayoutTree {
+        fn solve(&mut self, root: NodeId, size: Vector2, scale: f32, out: &mut Vec<Solved>) {
+            self.begin(out);
+            self.solve_root(root, size, Vector2 { x: 0.0, y: 0.0 }, scale, out);
+        }
+    }
+
     #[test]
     fn snapping_keeps_adjacent_edges_exactly_shared() {
         for scale in [1.0_f32, 1.25, 1.5, 2.0] {
@@ -857,5 +892,57 @@ mod tests {
 
         tree.solve(root, Vector2 { x: 480.0, y: 400.0 }, 1.0, &mut out);
         assert_eq!(out[leaf.index()].size.y, 60.0, "narrow, after a class flip");
+    }
+
+    #[test]
+    fn a_detached_root_gathers_absolutely_at_its_origin() {
+        // What an overlay depends on. The window subtree and the detached one share the
+        // output buffer, so a second root must not clear the first — and the detached
+        // root's rect has to be in the same absolute space, because that is the space the
+        // one hit array is scanned in.
+        let (mut tree, root, kids) = tree_with_a_row();
+        let window = Vector2 { x: 600.0, y: 400.0 };
+
+        let overlay = NodeId::raw(5, 1);
+        let item = NodeId::raw(6, 1);
+        tree.create(overlay, LayoutKind::Container);
+        tree.create(item, LayoutKind::Container);
+        tree.set_style(
+            item,
+            &Style {
+                size: Size {
+                    width: length(120.0_f32),
+                    height: length(30.0_f32),
+                },
+                ..Style::DEFAULT
+            },
+        );
+        tree.set_children(overlay, &[item]);
+
+        let mut out = Vec::new();
+        tree.begin(&mut out);
+        tree.solve_root(root, window, Vector2 { x: 0.0, y: 0.0 }, 1.0, &mut out);
+        tree.solve_root(
+            overlay,
+            window,
+            Vector2 { x: 210.0, y: 64.0 },
+            1.0,
+            &mut out,
+        );
+
+        // The window subtree survived the second root.
+        assert_eq!(out[kids[1].index()].rect.x0, 100.0);
+        // The overlay sized itself to its content rather than to the window it was measured
+        // against, and landed where it was placed.
+        let solved = out[overlay.index()];
+        assert_eq!(solved.rect.x0, 210.0);
+        assert_eq!(solved.rect.y0, 64.0);
+        assert_eq!(solved.size, Vector2 { x: 120.0, y: 30.0 });
+        // A root's offset within its parent is the origin it was placed at, so the
+        // placement travels as the ordinary offset bind.
+        assert_eq!(solved.local, Vector2 { x: 210.0, y: 64.0 });
+        // And its children are absolute in the same space.
+        assert_eq!(out[item.index()].rect.x0, 210.0);
+        assert_eq!(out[item.index()].local, Vector2 { x: 0.0, y: 0.0 });
     }
 }

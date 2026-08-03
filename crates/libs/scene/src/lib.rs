@@ -100,6 +100,12 @@ pub enum SceneEvent {
     RequestIgnored { tracker: Id<Tracker>, request: i32 },
     /// An exit transition finished and its ghost was released.
     GhostReleased,
+    /// A timed reveal reached its deadline — a submenu's hover-open, a tooltip's show.
+    ///
+    /// Raised on the first frame at or past that deadline, never by a timer firing: the delay
+    /// is a comparison the scene makes while it is already awake. A cancelled delay never
+    /// arrives here.
+    DelayElapsed { delay: DelayId },
     /// The device was lost and everything under it has been rebuilt.
     DeviceRebuilt,
     /// The pixel grid moved, so the resources rasterized *at device resolution* are at the
@@ -265,8 +271,30 @@ impl Scene {
     /// position is the only trustworthy read of a tracker and is what the hit query resolves
     /// a scroll ancestry through, and an ignored request must be dropped, never re-applied.
     pub fn drain_events(&mut self, out: &mut Vec<SceneEvent>) {
+        // Only what this call appends is reconciled. `out` is the caller's buffer and may
+        // still hold a previous drain's events; applying a tracker position twice is not
+        // idempotent, so the range is taken rather than the vector.
+        let appended = out.len();
+        // Delays that came due. Swept here rather than in `apply`, because a delay elapsing
+        // is not a patch arriving: the tick it lands on may carry nothing at all, and this is
+        // the call whose job is to say what the scene has to report. Each one releases its
+        // own `Tick` as it goes, so the clock parks when the last expires.
+        //
+        // The clock is read once and only when something is waiting on it, so the ordinary
+        // frame — nothing pending — does not read it at all, and two delays that came due
+        // together report together rather than one frame apart.
+        if !self.motion.delays.is_empty() {
+            let now = std::time::Instant::now();
+            self.motion.delays.retain(|delay| {
+                let elapsed = delay.elapsed(now);
+                if elapsed {
+                    out.push(SceneEvent::DelayElapsed { delay: delay.id });
+                }
+                !elapsed
+            });
+        }
         out.append(&mut self.events.borrow_mut());
-        for event in out.iter() {
+        for event in &out[appended..] {
             match *event {
                 SceneEvent::TrackerValues {
                     tracker,

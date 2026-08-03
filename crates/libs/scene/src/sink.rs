@@ -37,6 +37,9 @@ pub struct Region;
 /// A compositor-side interaction tracker.
 #[derive(Debug)]
 pub struct Tracker;
+/// A pending timed reveal.
+#[derive(Debug)]
+pub struct Delay;
 
 /// Either kind of node.
 pub type NodeId = Id<Node>;
@@ -53,6 +56,14 @@ pub type GeomId = Id<Geom>;
 pub type RampId = Id<Ramp>;
 pub type RunId = Id<Run>;
 pub type RegionId = Id<Region>;
+
+/// A pending timed reveal.
+///
+/// A submenu's hover-open and a tooltip's show are the only places in the system that want
+/// "after N milliseconds", and a delay is a monotonic deadline compared on the frame the
+/// scene is already servicing. **Not a fourth clock**: nothing fires and nothing wakes, and
+/// the request that keeps the frame clock awake for its duration is the whole of its cost.
+pub type DelayId = Id<Delay>;
 
 /// A node that paints. The newtype is enforcement: a paint addressed to a group is refused
 /// at the model's own API.

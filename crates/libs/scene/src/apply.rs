@@ -88,6 +88,14 @@ impl Scene {
                 self.hits.replace(patch.hits(entries));
                 Ok(())
             }
+            Op::Delay { id, ms } => {
+                self.start_delay(id, ms);
+                Ok(())
+            }
+            Op::CancelDelay { id } => {
+                self.cancel_delay(id);
+                Ok(())
+            }
         }
     }
 

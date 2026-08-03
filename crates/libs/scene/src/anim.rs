@@ -18,6 +18,7 @@ use crate::sink::{Easing, Iterations, Tuning, Value};
 use core::cell::Cell as CoreCell;
 use core::time::Duration;
 use std::rc::Rc;
+use std::time::Instant;
 use windows_composition::{
     Animatable, Animation, BatchKind, CompositionAnimation, CompositionEasingFunction,
     CompositionScopedBatch, Compositor, ExpressionAnimation, SpringScalarNaturalMotionAnimation,
@@ -49,11 +50,15 @@ pub const CHROME_DAMPING: f32 = 0.900;
 const CHROME_REF_TRAVEL: f32 = 120.0;
 
 /// The shared animation objects, and the three expression strings.
-/// Everything in flight: the shared animation templates, and the subtrees still playing an
-/// exit after the model let go of them.
+/// Everything in flight: the shared animation templates, the subtrees still playing an exit
+/// after the model let go of them, and the timed reveals waiting to report.
 pub(crate) struct Motion {
     pub(crate) templates: Templates,
     pub(crate) ghosts: Vec<Ghost>,
+    /// Pending delays. A handful at most — one hovered submenu and one tooltip — so a
+    /// linear scan by id is the whole lookup and there is no map to keep. Empty is the
+    /// steady state, and the sweep costs nothing there.
+    pub(crate) delays: Vec<Delay>,
 }
 
 impl Motion {
@@ -61,6 +66,7 @@ impl Motion {
         Self {
             templates: Templates::new(compositor),
             ghosts: Vec::new(),
+            delays: Vec::new(),
         }
     }
 }
@@ -290,6 +296,61 @@ fn scaled_period(tuning: Tuning, travel: f32) -> Duration {
 
 fn secs(seconds: f32) -> Duration {
     Duration::from_secs_f64(f64::from(seconds.max(0.0)))
+}
+
+/// A timed reveal in flight: **a deadline, compared on the frame clock**.
+///
+/// A submenu's hover-open and a tooltip's show are the only places in the system that want
+/// "after N milliseconds", and this is the whole of what one costs — an instant and a clock
+/// request. No property set, no animation, no scoped batch, no subscription.
+///
+/// It reads like a [`Ghost`] and is not one, and the difference is what a completion signal
+/// would be *for*. A ghost's batch is load-bearing: a visual must not be destroyed until its
+/// exit has actually played, and the compositor is the only thing that knows when that is. A
+/// delay has no animation whose completion matters — only time elapsed — so a batch would
+/// report back a duration this already holds. Driving one off a scratch property cost four
+/// COM objects per reveal, at pointer-crossing rate, and opened a scoped batch each time —
+/// which captures whatever else is started on the compositor while it is open.
+///
+/// Still **not a fourth clock**, which is the constraint that mattered: nothing fires and
+/// nothing wakes. The `Tick` below is the only wake, exactly as it was, and the deadline is
+/// read on a frame the scene was already servicing — so a delay is observed at the same
+/// frame boundary a batch's completion would have been.
+pub(crate) struct Delay {
+    pub(crate) id: crate::sink::DelayId,
+    /// Monotonic, so nothing a user or a time service does to the wall clock moves it.
+    due: Instant,
+    /// Keeps the frame clock awake for the delay's own duration. Bounded, and started by a
+    /// hover the user is holding.
+    _tick: windows_window::Tick,
+}
+
+impl Delay {
+    /// Whether `now` has reached the deadline.
+    pub(crate) fn elapsed(&self, now: Instant) -> bool {
+        now >= self.due
+    }
+}
+
+impl crate::Scene {
+    /// Starts, or restarts, a timed reveal.
+    ///
+    /// Restarting drops the previous one, so a tooltip swapping between targets neither
+    /// reports the old delay nor waits a second time.
+    pub(crate) fn start_delay(&mut self, id: crate::sink::DelayId, ms: u32) {
+        self.cancel_delay(id);
+        self.motion.delays.push(Delay {
+            id,
+            due: Instant::now() + Duration::from_millis(u64::from(ms)),
+            _tick: self.wake.tick(),
+        });
+    }
+
+    /// Cancels one. It holds nothing but a deadline and a clock request, so dropping it is
+    /// the whole of the unwind and a cancelled delay never reports.
+    pub(crate) fn cancel_delay(&mut self, id: crate::sink::DelayId) {
+        self.motion.delays.retain(|delay| delay.id != id);
+    }
 }
 
 /// A dying subtree, kept alive only long enough to play its exit.

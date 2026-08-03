@@ -40,6 +40,7 @@ pub struct Model {
     ids: Ids,
     res_ids: Ids,
     tracker_ids: Ids,
+    delay_ids: Ids,
     nodes: Vec<ModelNode>,
     layout: LayoutTree,
     hits: HitBuilder,
@@ -86,6 +87,11 @@ pub struct SlotRoot(GroupId);
 struct SlotRootEntry {
     root: GroupId,
     blocker: Option<crate::hit_build::ControlId>,
+    /// Where the layer above placed it, in absolute window DIPs.
+    ///
+    /// An input to the solve rather than something applied after one: a detached subtree's
+    /// rects have to be absolute, because the hit array is one array scanned in one space.
+    offset: Vector2,
 }
 
 impl Forest for Model {
@@ -121,6 +127,7 @@ impl Model {
             ids: Ids::new(),
             res_ids: Ids::new(),
             tracker_ids: Ids::new(),
+            delay_ids: Ids::new(),
             nodes: Vec::new(),
             layout: LayoutTree::new(),
             hits: HitBuilder::default(),
@@ -152,6 +159,12 @@ impl Model {
     /// size this crate cannot know.
     pub fn on_measure(&mut self, measure: impl Measure + 'static) {
         self.layout.on_measure(measure);
+    }
+
+    /// The window's size in DIPs, as the last [`set_window`](Model::set_window) stated it.
+    #[must_use]
+    pub const fn window(&self) -> Vector2 {
+        self.window
     }
 
     /// The window's size in DIPs.
@@ -205,14 +218,38 @@ impl Model {
         self.slots.push(SlotRootEntry {
             root: root.0,
             blocker,
+            offset: Vector2 { x: 0.0, y: 0.0 },
         });
+        self.solve_dirty = true;
         self.hits_dirty = true;
         root.0
+    }
+
+    /// Places a slot root, in absolute window DIPs, and answers whether it moved.
+    ///
+    /// The placement is an **input to the next solve**, not a bind emitted beside one: the
+    /// solve gathers the detached subtree from here, so its rects are absolute and the hit
+    /// array needs nothing said twice. The root's own offset then travels as the ordinary
+    /// [`Prop::Offset`] bind every other node's placement does.
+    ///
+    /// It does not re-lay-out anything — an overlay's size never depends on where it landed,
+    /// or the two would be a cycle.
+    pub fn place_slot(&mut self, root: GroupId, offset: Vector2) -> bool {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.root == root) else {
+            return false;
+        };
+        if slot.offset == offset {
+            return false;
+        }
+        slot.offset = offset;
+        self.solve_dirty = true;
+        true
     }
 
     /// Removes a slot root from the hit array's tail. Its subtree is destroyed separately.
     pub fn close_slot(&mut self, root: GroupId) {
         self.slots.retain(|slot| slot.root != root);
+        self.solve_dirty = true;
         self.hits_dirty = true;
     }
 
@@ -530,6 +567,37 @@ impl Model {
         }
     }
 
+    // ── timed reveals ─────────────────────────────────────────────────────────────
+
+    /// Starts a delay of `ms`, reported back as
+    /// [`SceneEvent::DelayElapsed`](crate::SceneEvent::DelayElapsed).
+    ///
+    /// The only "after N milliseconds" in the system, and it is a monotonic deadline read on
+    /// the frame clock rather than a timer — there is no fourth clock. A pending delay holds
+    /// the frame clock awake for its own duration, which is bounded and user-initiated, and
+    /// that request is its whole cost.
+    ///
+    /// Re-issuing a live id restarts it, so a tooltip swapping between targets neither
+    /// leaks a delay nor re-delays.
+    pub fn delay(&mut self, ms: u32) -> DelayId {
+        let id: DelayId = self.delay_ids.mint();
+        self.pending.push_op(Op::Delay { id, ms });
+        id
+    }
+
+    /// Cancels a delay by stopping its batch. A cancelled delay never reports.
+    pub fn cancel_delay(&mut self, id: DelayId) {
+        if self.delay_ids.release(id) {
+            self.pending.push_op(Op::CancelDelay { id });
+        }
+    }
+
+    /// Releases a delay's id once it has reported, without emitting a cancel for a batch
+    /// that has already completed.
+    pub fn delay_elapsed(&mut self, id: DelayId) {
+        _ = self.delay_ids.release(id);
+    }
+
     // ── trackers ──────────────────────────────────────────────────────────────────
 
     /// Mints the id a tracker will be created under. The tracker itself is a composition
@@ -607,8 +675,19 @@ impl Model {
         self.push_dirty_children();
 
         if self.solve_dirty {
+            let (window, scale) = (self.window, env.scale());
+            self.layout.begin(&mut self.solved);
+            let origin = Vector2 { x: 0.0, y: 0.0 };
             self.layout
-                .solve(self.root.0, self.window, env.scale(), &mut self.solved);
+                .solve_root(self.root.0, window, origin, scale, &mut self.solved);
+            // Then every open overlay, each its own root, each measured against the window
+            // box and gathered at where it was placed. By index, because the slot list and
+            // the layout tree are disjoint fields of the same borrow.
+            for index in 0..self.slots.len() {
+                let slot = self.slots[index];
+                self.layout
+                    .solve_root(slot.root.0, window, slot.offset, scale, &mut self.solved);
+            }
             // A solve that moved something changes the array too; one that moved nothing
             // leaves it exactly as it was, so the rebuild follows the placements rather
             // than the pass.
@@ -964,5 +1043,115 @@ mod tests {
             "content, then blocker, then the overlay"
         );
         assert!(entries[1].flags.contains(HitFlags::BLOCKER));
+    }
+
+    #[test]
+    fn a_delay_is_started_once_and_cancelled_once() {
+        // A cancel has to be idempotent: the layer above cancels on leave, on press, on
+        // `Esc` and on focus moving, and any two of those can arrive for one hover. A
+        // second `CancelDelay` would reach the front half naming a batch already gone.
+        let mut model = Model::new(root_style());
+        let delay = model.delay(400);
+        model.cancel_delay(delay);
+        model.cancel_delay(delay);
+
+        let mut patch = SinkPatch::new();
+        model.flush(&mut patch, env());
+        let delays: Vec<Op> = patch
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::Delay { .. } | Op::CancelDelay { .. }))
+            .copied()
+            .collect();
+        assert_eq!(
+            delays.len(),
+            2,
+            "a second cancel is not a second op: {delays:?}"
+        );
+        assert!(matches!(delays[1], Op::CancelDelay { id } if id == delay));
+    }
+
+    #[test]
+    fn an_overlay_is_solved_where_it_was_placed() {
+        // The gap this closes: a slot root has no parent, so a solve that walked only the
+        // window subtree left the whole overlay at `Solved::default()` — no size, no
+        // offset op, and a hit entry at the origin with zero area. Visibly on screen and
+        // unhittable is the shape that would produce.
+        let mut model = Model::new(root_style());
+        model.set_window(Vector2 { x: 400.0, y: 300.0 });
+
+        let root = model.orphan_group();
+        let menu = model.open_slot(root, None);
+        model.style(menu.node(), &box_style(80.0, 60.0));
+        model.hit(
+            menu.node(),
+            Some(HitDecl {
+                flags: HitFlags::INTERACTIVE,
+                id: ControlId(7),
+                touch_inflate: None,
+            }),
+        );
+        let item = model.sprite(menu, None);
+        model.style(item.node(), &box_style(80.0, 20.0));
+
+        let mut patch = SinkPatch::new();
+        model.flush(&mut patch, env());
+        assert_eq!(model.solved(menu.node()).size, Vector2 { x: 80.0, y: 60.0 });
+
+        // Placed: the subtree's rects move with it, absolutely, and the array reads them.
+        assert!(model.place_slot(menu, Vector2 { x: 120.0, y: 40.0 }));
+        assert!(
+            !model.place_slot(menu, Vector2 { x: 120.0, y: 40.0 }),
+            "placing where it already is is not a solve"
+        );
+        model.flush(&mut patch, env());
+
+        assert_eq!(model.solved(menu.node()).rect.x0, 120.0);
+        assert_eq!(model.solved(item.node()).rect.y0, 40.0);
+        let entry = patch
+            .hit_entries()
+            .iter()
+            .find(|e| e.id == ControlId(7))
+            .copied()
+            .expect("the overlay declared a hit entry");
+        assert_eq!(
+            (entry.x0, entry.y0, entry.x1, entry.y1),
+            (120.0, 40.0, 200.0, 100.0)
+        );
+
+        // And the placement travelled as the ordinary offset bind, with no second mechanism.
+        assert!(patch.ops().iter().any(|op| matches!(
+            op,
+            Op::Bind {
+                id,
+                prop: Prop::Offset,
+                bind: Bind::Set(Value::Vec2(v)),
+            } if *id == menu.node() && *v == (Vector2 { x: 120.0, y: 40.0 })
+        )));
+    }
+
+    #[test]
+    fn closing_a_slot_stops_solving_it() {
+        // Nothing is retained hidden, so a closed overlay must leave no cost behind — not
+        // in the array, and not in the pass either.
+        let mut model = Model::new(root_style());
+        model.set_window(Vector2 { x: 400.0, y: 300.0 });
+        let root = model.orphan_group();
+        let menu = model.open_slot(root, Some(ControlId(3)));
+        model.style(menu.node(), &box_style(80.0, 60.0));
+
+        let mut patch = SinkPatch::new();
+        model.flush(&mut patch, env());
+        assert_eq!(patch.hit_entries().len(), 1, "the blocker");
+
+        model.close_slot(menu);
+        model.destroy(menu.node(), Exit::None);
+        model.flush(&mut patch, env());
+        assert!(patch.hit_entries().is_empty());
+
+        // And a pass after it is empty: a closed slot is not solved, so it cannot keep
+        // reporting that something moved.
+        model.flush(&mut patch, env());
+        assert!(patch.is_empty());
     }
 }
