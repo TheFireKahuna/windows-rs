@@ -1,16 +1,14 @@
 //! The front thread's half of a control: what a [`Report`] does to pixels, before anything
 //! is queued to the application.
 //!
-//! Invariant: **no intent may be the cause of a visual.** For a retained sink that means the
-//! pixels move front-side, in the tick that saw the event, and the application hears about
-//! it afterwards — so by the time an [`Intent`] exists the visual has already happened. That
-//! ordering is what makes the rule structural rather than a thing to remember.
+//! No intent causes a visual: the pixels move front-side in the tick that saw the event, and
+//! the [`Intent`] the application receives is emitted afterwards.
 //!
-//! The whole path is index arithmetic. A hover is a rect test the router already did, an
-//! array index, and one retarget: **no hash lookup, no allocation, no `resolve`, and no
-//! app-thread hop.** The wash opacities are resolved at mount, on the app thread, and shipped
-//! as numbers, because realizing a new colour cell mid-hover would be a surface creation on
-//! the interaction path.
+//! The path is index arithmetic — a rect test the router already did, an array index, and one
+//! retarget. It performs no hash lookup, no allocation, no role resolve and no hop to the app
+//! thread. Wash opacities are resolved at mount, on the app thread, and carried here as
+//! numbers, because realizing a colour cell mid-hover would create a surface on the
+//! interaction path.
 
 use super::{Interaction, Range, TURN_SPAN, angle_of, detent_delta, fraction_of, offset_of};
 use crate::input::Report;
@@ -19,12 +17,10 @@ use windows_scene::{
     Tuning, Value,
 };
 
-/// The front half's write side.
+/// The front half's write side: the scene, the backends, and the display environment.
 ///
-/// One argument because every mover needs all three and none of them means anything without
-/// the others — and because `env` is **stated rather than held**, for the reason every entry
-/// point into the scene states it: a scene that cached the display could be not told when the
-/// window hops one.
+/// `env` is passed per tick rather than cached on the [`Scene`], so a window moving to another
+/// display cannot leave a stale DPI or output transform behind.
 pub struct Front<'a> {
     pub scene: &'a mut Scene,
     pub back: &'a Backends,
@@ -39,8 +35,8 @@ impl Front<'_> {
 
 /// One control, as the front thread needs it.
 ///
-/// Everything here is a number or an id. Nothing is a role, a colour or a closure — those
-/// stay on the thread that can resolve and call them.
+/// Every field is a number or an id. Roles, colours and closures stay on the app thread,
+/// which is the side that can resolve and call them.
 #[derive(Copy, Clone, Debug)]
 pub struct ChromeRow {
     pub id: ControlId,
@@ -49,27 +45,29 @@ pub struct ChromeRow {
     /// Resolved wash opacities.
     pub hover: f32,
     pub press: f32,
-    /// The part a value moves, and the room the last solve measured for it. Both, because
-    /// moving it is one multiply and the router must never ask the app thread for geometry.
+    /// The node a value moves, and the travel the last solve measured for it. Holding both
+    /// keeps the move to one multiply and keeps the router from asking the app thread for
+    /// geometry.
     pub thumb: Option<NodeId>,
     pub travel: f32,
     /// What a pointer means here. `None` is a press and nothing else.
     pub drive: Option<Interaction>,
     /// Where this control's value stands, `0..=1`.
     ///
-    /// Seeded by the mount and advanced here, because a **turned** control has no absolute
-    /// position to read off a pointer: a drag reports displacement from its origin and a dial
-    /// reports detents, so the front thread is the only place its value can accumulate.
+    /// Seeded by the mount and advanced here. A turned control has no absolute position on
+    /// the pointer — a drag reports displacement from its origin and a dial reports detents —
+    /// so its value accumulates on the front thread.
     pub fraction: f32,
 }
 
-/// What the application is asked to do, after the pixels have already moved.
+/// What the application is asked to do, raised after the pixels have already moved.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Intent {
     pub target: ControlId,
     pub what: What,
 }
 
+/// What an [`Intent`] asks of the application.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum What {
     /// A press and a release on the same control.
@@ -83,62 +81,59 @@ pub enum What {
 /// The front thread's control table and the interaction state over it.
 ///
 /// Dense and generational: a control's index is its slot for the life of its mount, and the
-/// generation is what turns a stale report — one about a control that has since unmounted —
-/// into a miss rather than into a write to whatever now occupies the slot.
+/// generation turns a report about a control that has since unmounted into a miss rather than
+/// a write to whatever now occupies the slot.
 #[derive(Default)]
 pub struct Controls {
-    /// The front thread's store over the control family the app thread mints. **No `Ids`
-    /// beside it**, and that is the whole statement: this side owns no counter, so it can
-    /// place a row and never mint one.
+    /// The store over the control id family the app thread mints. This side holds no `Ids`
+    /// counter, so it can place a row but never mint an id.
     rows: Slots<Control, ChromeRow>,
     hovered: Option<ControlId>,
     pressed: Option<ControlId>,
-    /// The **window's** focus ring: one visual, sprung between controls. Focus is singular
-    /// by definition, so a ring per control would be eighty visuals to express one fact —
-    /// and the glide between them would be a behaviour to implement rather than a
-    /// compositor animation to start.
+    /// The window's focus ring: one visual, sprung between controls. Focus is singular, so
+    /// the ring is per window rather than per control, and moving it between two controls is
+    /// a compositor animation.
     ring: Option<NodeId>,
-    /// Whether the ring is showing. Keyboard focus shows it; a pointer interaction hides
-    /// it, which is the input-mode rule and not a widget decision.
+    /// Whether the ring is showing. Keyboard focus shows it; a pointer interaction hides it.
     ring_shown: bool,
     /// The control being turned, and the fraction it stood at when the contact landed.
     ///
-    /// A turn is a **displacement from where the contact started**, so the origin is what the
-    /// answer is relative to. Accumulating per-sample deltas instead would drift by exactly
-    /// the samples the recogniser coalesced — and it is also what lets a cancel put the value
-    /// back, which is the drag policy's rule rather than this table's.
+    /// A turn is a displacement from the contact's origin, so each drag sample is applied to
+    /// this fraction rather than accumulated onto the last one — which would drift by the
+    /// samples the recogniser coalesced. A cancel restores the same fraction.
     grabbed: Option<(ControlId, f32)>,
 }
 
 impl Controls {
+    /// Returns an empty table.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Adopts the rows a mount produced, or a solve corrected. Called with whatever the app
-    /// thread drained alongside its patch.
+    /// Adopts the rows a mount produced or a solve corrected, as drained by the app thread
+    /// alongside its patch.
     ///
-    /// A re-adopted row carries corrected **geometry**, never a corrected value: for the same
-    /// control the router's own fraction is the newer of the two, so it survives. Without
-    /// that, a window resize would snap every knob back to where the app last wrote it.
+    /// A re-adopted row carries corrected geometry, never a corrected value: where the table
+    /// already holds the control, its own fraction is kept, so a window resize does not snap
+    /// a knob back to where the application last wrote it.
     ///
-    /// And the part is re-driven **here**, because this table is the channel's only writer:
-    /// the app thread deliberately does not bind a property the router owns, so a room that
-    /// changed reaches the pixels through this multiply and no other.
+    /// A row whose travel moved is re-driven here. This table is the only writer of the
+    /// properties the router owns, so changed geometry reaches the pixels through this call
+    /// and no other.
     ///
     /// # Errors
     ///
     /// A retarget was refused by the compositor.
     pub fn adopt(&mut self, rows: &[ChromeRow], front: &mut Front<'_>) -> Result<()> {
         for &row in rows {
-            // The staleness test is the store's, so a row arriving for a control that has
-            // since been recycled into this slot is a fresh row rather than a match.
+            // `Slots` compares the generation, so a row for a control whose slot has since
+            // been recycled misses and is placed fresh.
             let held = self.rows.get(row.id).copied();
             let fraction = held.map_or(row.fraction, |old| old.fraction);
             self.rows.place(row.id, ChromeRow { fraction, ..row });
-            // Only where the room actually moved, so re-adopting an unchanged row is free
-            // and a fresh one starts wherever the mount put it.
+            // Only where travel moved: an unchanged row costs no retarget, and a fresh one
+            // keeps the position the mount gave it.
             if held.is_some_and(|old| old.travel != row.travel) {
                 self.drive(row.id, fraction, front)?;
             }
@@ -157,16 +152,16 @@ impl Controls {
         }
     }
 
-    /// The window's focus ring, minted once by whoever owns the window.
+    /// Records the window's focus ring visual, minted once by the window's owner.
     pub fn set_ring(&mut self, ring: NodeId) {
         self.ring = Some(ring);
     }
 
-    /// Consumes one tick's reports: moves what they moved, and answers what the application
-    /// is being asked to do.
+    /// Applies one tick's reports: moves the pixels they move, and appends the intents they
+    /// raise to `out`.
     ///
-    /// `out` is appended to rather than replaced, so a caller keeps one buffer for the life
-    /// of the window and this path allocates nothing.
+    /// Per-frame path: `out` is appended to rather than replaced, so a caller holding one
+    /// buffer for the life of the window allocates nothing here.
     ///
     /// # Errors
     ///
@@ -183,18 +178,16 @@ impl Controls {
         Ok(())
     }
 
-    /// Hover and press for a control the router will never see the pointer over.
+    /// Sets hover and press for a control the router never sees the pointer over.
     ///
-    /// The window's own caption buttons, and nothing else. Once `WM_NCHITTEST` names one, the
-    /// pointer over it is the system's: no [`Report`] is produced for it and no `Sample`
-    /// exists to build one from. So the two fields the reports would have set are stated
-    /// here, and the wash is derived by the same function every other control's is — a
-    /// synthesized report carrying an invented position and pointer type would be a fiction
-    /// the gesture layer could later read as fact.
+    /// The window's own caption buttons, and nothing else: once `WM_NCHITTEST` names one, the
+    /// system owns its pointer stream, so no [`Report`] and no `Sample` exist for it. The two
+    /// fields a report would have set are written here directly, and the wash is derived by
+    /// the same path every other control's is.
     ///
-    /// The pointer is one physical thing, so this and the router's own hover are never both
-    /// live. Call it only when the window says the band's state moved, not per tick, or a
-    /// stale `(None, None)` will put out a hover the router just lit.
+    /// Call this only when the window reports that the caption band's state moved, never per
+    /// tick: a stale `(None, None)` clears a hover the router has just lit. The pointer is
+    /// one physical thing, so this hover and the router's are never both live.
     ///
     /// # Errors
     ///
@@ -219,11 +212,10 @@ impl Controls {
 
     fn one(&mut self, report: &Report, front: &mut Front<'_>, out: &mut Vec<Intent>) -> Result<()> {
         match *report {
-            // More than one of these can arrive from a single service, in the order the
-            // pointer crossed them. They are all published, and what a three-millisecond
-            // traversal should light is decided here — by a retargeted spring, which
-            // swallows a sub-frame excursion at about eight percent of its ramp. That is a
-            // better filter than sampling, and it is the one that can still be wrong later.
+            // A single service can publish several of these, in the order the pointer
+            // crossed them. Each is applied; a sub-frame traversal is absorbed by the
+            // spring, which reaches about eight percent of its ramp before the next
+            // retarget replaces it.
             Report::HoverChanged { from, to, .. } => {
                 self.hovered = to;
                 if let Some(from) = from {
@@ -248,8 +240,8 @@ impl Controls {
                     return Ok(());
                 }
                 match self.rows.get(target).and_then(|row| row.drive) {
-                    // A press and a release on one control is a tap, whatever happened in
-                    // between: the drag policy has already decided that nothing did.
+                    // For a control that carries no value, a press and a release on it is a
+                    // tap whatever moved in between.
                     None | Some(Interaction::Press) => out.push(Intent {
                         target,
                         what: What::Tapped,
@@ -261,8 +253,8 @@ impl Controls {
                             what: What::Committed(value),
                         });
                     }
-                    // Where it was turned to, which is what the front table has been
-                    // accumulating — not the bottom of the range.
+                    // The fraction this table accumulated during the turn, not the bottom
+                    // of the range.
                     Some(Interaction::Turn(range)) => {
                         let fraction = self.rows.get(target).map_or(0.0, |row| row.fraction);
                         out.push(Intent {
@@ -272,9 +264,8 @@ impl Controls {
                     }
                 }
             }
-            // **Not a release.** Nothing is committed, the value goes back to what it was
-            // before the contact, and the wash goes back to whatever the pointer's current
-            // position deserves.
+            // A cancel is not a release: nothing is committed, the value returns to where it
+            // stood before the contact, and the wash is re-derived from this table's state.
             Report::Canceled { target, .. } => {
                 self.pressed = None;
                 if let Some((grabbed, fraction)) = self.grabbed.take()
@@ -295,8 +286,8 @@ impl Controls {
                     });
                 }
             }
-            // A knob is dragged rather than slid: its displacement is **from the contact's
-            // origin**, so the answer is relative to where the value stood then.
+            // A knob is dragged rather than slid: the update carries displacement from the
+            // contact's origin, so it applies to the fraction held in `grabbed`.
             Report::Dragged { target, update, .. } => {
                 if let Some(Interaction::Turn(range)) = self.rows.get(target).and_then(|r| r.drive)
                 {
@@ -313,8 +304,8 @@ impl Controls {
                 }
             }
             Report::FocusChanged { to, .. } => self.move_ring(to, front)?,
-            // A dial reports **detents**, which are a delta. Treating one as an absolute
-            // position sends a single click to an end stop.
+            // A dial reports detents, which are a delta: a step count applied as an
+            // absolute position would send one click to an end stop.
             Report::Rotary {
                 target: Some(target),
                 steps,
@@ -331,10 +322,9 @@ impl Controls {
                     });
                 }
             }
-            // Exhaustive, and deliberately so: a new `Report` variant must be a compile
-            // error here rather than an event this table quietly stops answering. Each of
-            // these is somebody else's — the overlay layer's, the text stack's, the
-            // recogniser's — and none of them moves a control's own chrome.
+            // Listed rather than matched with `_`, so a new `Report` variant fails to
+            // compile here. None of these moves a control's chrome: they belong to the
+            // overlay layer, the text stack and the recogniser.
             Report::Rotary { target: None, .. }
             | Report::RotaryButton { .. }
             | Report::CaptureLost
@@ -348,12 +338,11 @@ impl Controls {
         Ok(())
     }
 
-    /// What a control's wash should be showing right now, from the state this table holds
-    /// rather than from the event that just arrived.
+    /// Returns the wash opacity `id` should be showing, derived from the state this table
+    /// holds rather than from the event that just arrived.
     ///
-    /// Derived rather than assigned, and that is what makes hover-on-one-control-while-
-    /// another-is-pressed expressible — which happens whenever a drag passes under the
-    /// pointer, and is the case a shared window-level wash cannot represent at all.
+    /// Because it is derived per control, one control can be hovered while another is
+    /// pressed — the state a drag passing under the pointer produces.
     fn rest_alpha(&self, id: ControlId) -> f32 {
         let Some(row) = self.rows.get(id) else {
             return 0.0;
@@ -371,21 +360,19 @@ impl Controls {
         let Some(wash) = self.rows.get(id).and_then(|row| row.wash) else {
             return Ok(());
         };
-        // A spring, so it plays to completion with **zero front-thread frames** after this
-        // one, and so a retarget mid-ramp continues from where it had reached.
+        // A spring: it plays to completion with no further front-thread frames, and a
+        // retarget mid-ramp continues from where it had reached.
         front.retarget(wash.node(), Prop::Opacity, chrome(self.rest_alpha(id)))
     }
 
-    /// Moves a control's part to `fraction`, and records where it now stands.
+    /// Moves a control's part to `fraction` and records where it now stands.
     ///
-    /// **The one place a fraction becomes a property on this thread**, matching the one place
-    /// it becomes one on the other and reaching the same two functions. A slide, a knob drag
-    /// and a dial detent all land here, so none of them can disagree about which property
-    /// carries the value or which way it runs.
+    /// The one place a fraction becomes a property on this thread. A slide, a knob drag and
+    /// a dial detent all reach it, through [`offset_of`] and [`angle_of`], so none of them
+    /// can disagree about which property carries the value or which way it runs.
     ///
-    /// A control this table does not *drive* is left alone: its part follows the
-    /// application's own channel, and the app thread is the writer. Refusing here rather than
-    /// at each caller is what makes "one writer per channel" hold by construction.
+    /// A control with no thumb or no [`Interaction`] is left alone: its part follows the
+    /// application's own channel, whose writer is the app thread.
     fn drive(&mut self, id: ControlId, fraction: f32, front: &mut Front<'_>) -> Result<()> {
         let Some(row) = self.rows.get_mut(id) else {
             return Ok(());
@@ -396,11 +383,11 @@ impl Controls {
             return Ok(());
         };
         match drive {
-            // A press has no value, so nothing here moves: a toggle's knob follows the
-            // application's own channel and this table must not write it.
+            // A press carries no value: a toggle's knob follows the application's own
+            // channel, so this table does not write it.
             Interaction::Press => Ok(()),
-            // A turned part rotates through its own sweep, which is a constant; a slid one
-            // travels the room the last solve measured for it.
+            // A turned part rotates through the constant sweep; a slid one travels the
+            // extent the last solve measured for it.
             Interaction::Turn(_) => {
                 front.retarget(thumb, Prop::RotationAngle, chrome(angle_of(fraction)))
             }
@@ -416,13 +403,12 @@ impl Controls {
         }
     }
 
-    /// Reads a value off the pointer's position along the control's own rect, moves the
-    /// part, and answers the number.
+    /// Returns the value at the pointer's position along the control's own rect, having
+    /// moved the part to match.
     ///
-    /// The rect comes from the hit array, which already has it: the entry the router resolved
-    /// through *is* the control's box, so nothing here asks the app thread for geometry and
-    /// nothing measures. It is looked up by **id**, which the array indexes — a scan would put
-    /// the whole screen on the path of every pointer sample.
+    /// The rect is the hit-array entry the router already resolved through, looked up by id,
+    /// so nothing here measures or asks the app thread for geometry. Where the control has
+    /// no entry, the held fraction is returned and nothing moves.
     fn slide(
         &mut self,
         id: ControlId,
@@ -447,7 +433,8 @@ impl Controls {
         Ok(range.at(fraction))
     }
 
-    /// The same, for a control whose input is a **delta**: a knob drag or a dial detent.
+    /// Clamps `fraction`, moves the part, and returns the value, for a control whose input
+    /// is a delta: a knob drag or a dial detent.
     fn turn(
         &mut self,
         id: ControlId,
@@ -477,8 +464,8 @@ impl Controls {
             x: entry.x1 - entry.x0,
             y: entry.y1 - entry.y0,
         };
-        // Sprung on offset and size, so the glide between two controls is a compositor
-        // animation this design gets for free rather than a behaviour it implements.
+        // Sprung on offset and size, so the glide between two controls runs on the
+        // compositor and costs no further front-thread frames.
         front.retarget(ring, Prop::Offset, spring(Value::Vec2(offset)))?;
         front.retarget(ring, Prop::Size, spring(Value::Vec2(size)))?;
         if !self.ring_shown {
@@ -497,7 +484,8 @@ impl Controls {
     }
 }
 
-/// One of the shared spring templates, so starting a state transition allocates nothing.
+/// Returns the shared chrome spring bound to `to`, so starting a state transition allocates
+/// nothing.
 const fn spring(to: Value) -> Bind {
     Bind::Animate(Anim::Spring {
         to,

@@ -51,7 +51,8 @@ where
         Err(error) if error.code().0 == E_ABORT || error.code().is_ok() => return Ok(()),
         Err(error) => return Err(error),
     };
-    // `None` once the window is gone, the same close-during-startup race `E_ABORT` covers.
+    // `client_size` is `None` for a window already closed, the same close-during-startup
+    // race the `E_ABORT` arms report.
     let Some((width, height)) = window.client_size() else {
         return Ok(());
     };

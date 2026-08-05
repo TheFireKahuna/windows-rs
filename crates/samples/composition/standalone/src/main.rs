@@ -17,7 +17,7 @@ fn main() -> Result<()> {
     target.set_root(&root);
 
     // A background that fills the window.
-    // `None` once the window is gone, which leaves nothing to fill.
+    // `client_size` is `None` for a window already closed, leaving no client area to fill.
     let Some((width, height)) = window.client_size() else {
         return Ok(());
     };

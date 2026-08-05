@@ -1,18 +1,17 @@
-//! The three window commands, as declarations.
+//! Declares the three window commands — minimize, maximize and close — over the controls a
+//! title bar already mounts.
 //!
-//! `windows-window` keeps every caption *behaviour* — the drag strip, the eight resize edges,
-//! double-click maximize, the window menu, the `SC_*` a press issues — and draws nothing. The
-//! application draws the bar and the buttons in it. What joins the two halves is here, and it
-//! is two functions because the window asks exactly two questions the application cannot
-//! answer from its own state:
+//! `windows-window` owns every caption behaviour — the drag strip, the eight resize edges,
+//! double-click maximize, the window menu, the `SC_*` a press issues — and draws nothing; the
+//! application draws the bar and the buttons in it. Two functions join the halves, answering
+//! the two questions the window cannot answer from its own state:
 //!
-//! * **what is at this point**, per `WM_NCHITTEST`, and
-//! * **what is the pointer doing to a button whose input the system took**.
+//! * what is at this point, per `WM_NCHITTEST`, and
+//! * what the pointer is doing to a button whose input the system took.
 //!
-//! Neither gets a mechanism of its own. The point resolves through the one hit array, so the
-//! drag strip is whatever the bar's controls leave over and the two cannot drift apart. The
-//! pointer's answer names the same [`ControlId`]s every other control has, so a window
-//! command hovers, presses and springs down the path a button already uses.
+//! [`hit`] resolves the point through the one hit array, so the drag strip is whatever the
+//! bar's controls leave over. [`controls`] answers with the same [`ControlId`]s every other
+//! control carries, so a window command hovers and presses down the path a button uses.
 //!
 //! ```no_run
 //! # use windows_ui::{caption, widget::{button, Controls, Front}};
@@ -25,7 +24,7 @@
 //! // Answered from the array the same mount built.
 //! let _: CaptionHit = caption::hit(hits, 12.0, 8.0);
 //!
-//! // And the state the window forwards, applied where every other wash is.
+//! // And the state the window forwards, applied through the ordinary control path.
 //! let (hover, pressed) = caption::controls(state);
 //! controls.nonclient(hover, pressed, front)?;
 //! # Ok(()) }
@@ -35,7 +34,7 @@ use crate::build::Host;
 use windows_scene::{ContactKind, ControlId, HitTable, Point};
 use windows_window::{CaptionButton, CaptionHit, CaptionState};
 
-/// The three commands, in the order [`slot`] indexes them.
+/// Lists the three commands in the order [`slot`] indexes them.
 const BUTTONS: [CaptionButton; 3] = [
     CaptionButton::Minimize,
     CaptionButton::Maximize,
@@ -50,11 +49,11 @@ const fn slot(button: CaptionButton) -> usize {
     }
 }
 
-/// Which control is which window command.
+/// Maps each window command to the control that draws it.
 ///
-/// Three optional ids and nothing else — no rects, no rebuild hook, no unmount arm. A control
-/// id is generational, so an id left here by a bar that has since unmounted can never equal a
-/// live hit's, and a bar that remounts overwrites its own entry as it goes.
+/// Nothing clears an entry when a bar unmounts. A [`ControlId`] is generational, so an id left
+/// by an unmounted bar can never equal a live hit's id, and a bar that remounts overwrites its
+/// own entries as it goes.
 #[derive(Default)]
 pub(crate) struct Registry([Option<ControlId>; 3]);
 
@@ -72,29 +71,33 @@ impl Registry {
     }
 }
 
-/// What is at a point in the caption band, for [`Window::on_caption_hit`].
+/// Resolves a point in the caption band to a window command, the client area, or the drag
+/// strip.
 ///
-/// `x` and `y` are client-space DIPs, which is what the window hands over and what the layout
-/// solved in — so this costs no conversion and cannot disagree with the bar by a rounding.
+/// Answers [`Window::on_caption_hit`]. `x` and `y` are client-space DIPs, the space the window
+/// reports and the layout solves in, so this converts no coordinates.
 ///
 /// [`Window::on_caption_hit`]: windows_window::Window::on_caption_hit
 #[must_use]
 pub fn hit(hits: &HitTable, x: f32, y: f32) -> CaptionHit {
-    // Nothing interactive is the drag strip, which is the whole derivation: the strip is what
-    // the bar's own controls leave over, rather than a second rect stated beside them.
+    // A point over nothing interactive is the drag strip: the strip is whatever the bar's own
+    // controls leave over, not a second rect stated beside them.
     let Some(found) = hits.hit(Point { x, y }, ContactKind::Mouse) else {
         return CaptionHit::Drag;
     };
     match Host::try_with(|h| h.caption.button(found.id)) {
         Some(Some(button)) => CaptionHit::Button(button),
-        // An ordinary control, or a re-entrant test that could not ask. Both answer for the
-        // client: the array has already said something interactive is here, and the one thing
-        // this must not do is drag the window from on top of a control.
+        // An ordinary control, or a re-entrant call that could not borrow the host. Both
+        // answer for the client: the array has already reported something interactive here,
+        // and dragging the window from on top of a control would swallow the press.
         _ => CaptionHit::Client,
     }
 }
 
-/// The two controls a [`CaptionState`] names, for [`Controls::nonclient`].
+/// Resolves the hovered and pressed commands in `state` to the controls that draw them.
+///
+/// Feeds [`Controls::nonclient`]. Either half is `None` when `state` names no command, when no
+/// mounted bar declared that command, or when the call is re-entrant on the host.
 ///
 /// [`Controls::nonclient`]: crate::widget::Controls::nonclient
 #[must_use]
@@ -141,11 +144,11 @@ mod tests {
         }
     }
 
-    /// The three answers the window's hit test needs, all from the one array.
+    /// Resolves a command, an ordinary control and the drag strip from the one hit array.
     ///
-    /// The rects here stand in for a solve — what is under test is that a point resolves to a
-    /// *command* through the array rather than through a rect stated beside the bar, and that
-    /// bare band and ordinary control are told apart.
+    /// The rects stand in for a solve. What is under test is that a point reaches a command
+    /// through the array rather than through a rect stated beside the bar, and that bare band
+    /// and ordinary control are told apart.
     #[test]
     fn a_point_resolves_to_the_command_the_mount_declared() {
         let _patch = fixture();
@@ -183,11 +186,11 @@ mod tests {
         );
     }
 
-    /// A bar that declares no command has no command, however interactive it is.
+    /// Reports no command for a bar that declares none, however interactive its controls are.
     ///
-    /// The failure this rules out is a registry left populated by an earlier bar: a window
-    /// with an undeclared close button would answer `HTCLOSE` over an ordinary control and
-    /// hand the system a press the application never drew.
+    /// The failure this rules out is a registry left populated by an earlier bar: an
+    /// undeclared close button would answer `HTCLOSE` over an ordinary control and hand the
+    /// system a press the application never drew.
     #[test]
     fn an_undeclared_control_is_never_a_command() {
         let _patch = fixture();
@@ -206,8 +209,8 @@ mod tests {
         assert_eq!(hit(&hits, 90.0, 16.0), CaptionHit::Drag);
     }
 
-    /// The state the window forwards names controls, so it reaches the same wash every other
-    /// control's hover does rather than a second path beside it.
+    /// Maps a forwarded [`CaptionState`] onto control ids, so a command lights through the
+    /// same path an ordinary control's hover uses.
     #[test]
     fn caption_state_names_the_controls_it_lights() {
         let _patch = fixture();

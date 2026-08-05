@@ -1,30 +1,28 @@
 //! The window's own ground. **Front half.**
 //!
-//! Minted inside [`Scene::new`](crate::Scene::new), before the window is shown, and
-//! not an arena node: it is under everything the model names, it is not reachable by
-//! layout, and it is not in the hit array. An application configures it and may move
-//! its glows; it does not compose it.
+//! Minted inside [`Scene::new`](crate::Scene::new), before the window is shown, and not an
+//! arena node: it sits under everything the model names, layout cannot reach it, and it is
+//! not in the hit array. An application configures it and may move its glows; it does not
+//! compose it.
 //!
 //! # Why it is not an ordinary element
 //!
-//! Timing. A surface arrives only after its size is delivered and the request is
-//! serviced on a later commit, so a backdrop authored as content cannot exist on the
-//! first composited frame — the shell lands on an unpainted window and the ground
-//! appears a couple of commits late. Minting it here puts it on frame one.
+//! A content surface arrives only after its size is delivered and the request is serviced on
+//! a later commit, so a backdrop authored as content cannot exist on the first composited
+//! frame: the shell lands on an unpainted window and the ground appears a couple of commits
+//! later. Minting it here puts it on frame one.
 //!
-//! It costs almost nothing to do so, and a resize costs nothing at all. Every layer is a
-//! [`Spread`] ramp — a strip or a 64×64 tile, stretched to fill — so none of them carries
-//! the window's extent and a resize re-points no surface and re-rasterizes nothing. Its
-//! *geometry* is stated the same way, as fractions of the band above it ([`place`]), so a
-//! resize does not write one property here either: the compositor re-derives every box
-//! from the one extent [`Scene::resize`](crate::Scene::resize) puts on the root.
+//! A resize writes nothing here. Every layer is a [`Spread`] ramp — a strip or a 64×64 tile,
+//! stretched to fill — so no layer carries the window's extent and a resize re-points no
+//! surface and re-rasterizes nothing. Every box is stated the same way, as fractions of the
+//! band above it ([`place`]), so the compositor re-derives all of them from the one extent
+//! [`Scene::resize`](crate::Scene::resize) puts on the root.
 //!
 //! # The stack
 //!
-//! Bottom to top: the base tilt, then one blob per glow. Layers composite
-//! source-over, which is the same operation one surface performs drawing them in
-//! sequence — source-over is associative, so splitting them across sprites is not an
-//! approximation of that drawing, it is the identical composite at lower cost.
+//! Bottom to top: the base tilt, then one blob per glow. Layers composite source-over, and
+//! source-over is associative, so splitting them across sprites is the identical composite
+//! one surface drawing them in sequence performs, at lower cost.
 
 use crate::backends::Backends;
 use crate::env::Env;
@@ -74,9 +72,9 @@ pub(crate) struct Backdrop {
 impl Backdrop {
     /// Rasterizes `spec` and mints one sprite per layer, bottom first.
     ///
-    /// The caller inserts them; this builds them. `env` is needed here rather than at
-    /// the first operation because the ground has to be painted before the window is
-    /// shown, and its colours are the display's.
+    /// The caller seats the sprites. `env` is taken here rather than at the first operation
+    /// because the ground is painted before the window is shown and its colours are the
+    /// display's.
     pub(crate) fn new(spec: BackdropSpec, back: &Backends, env: Env) -> Result<Self> {
         let mut layers = Vec::with_capacity(1 + spec.glows.len());
         if !spec.base.is_empty() {
@@ -99,16 +97,15 @@ impl Backdrop {
         Ok(Self { spec, layers })
     }
 
-    /// The sprites, bottom first, for the caller to seat.
+    /// Returns the sprites, bottom first, for the caller to seat.
     pub(crate) fn sprites(&self) -> impl Iterator<Item = &SpriteVisual> {
         self.layers.iter().map(|layer| &layer.sprite)
     }
 
     /// Moves one glow's centre, as a fraction of the window.
     ///
-    /// The index is into [`BackdropSpec::glows`]; out of range is ignored, because the
-    /// caller is naming a layer of a spec it supplied and a panic here would be a crash
-    /// in the one path that must survive a display change.
+    /// `index` is into [`BackdropSpec::glows`]. An index out of range is ignored rather
+    /// than panicking.
     pub(crate) fn move_glow(&mut self, index: usize, at: Vector2) {
         let Some(glow) = self.spec.glows.get_mut(index) else {
             return;
@@ -126,8 +123,8 @@ impl Backdrop {
 
     /// Re-rasterizes every layer for a display that moved.
     ///
-    /// The geometry does not move — a ramp carries no snapped dimension — so only the
-    /// light is rebuilt, and the sprites keep their places.
+    /// A ramp carries no snapped dimension, so only the light is rebuilt and the sprites
+    /// keep their places.
     pub(crate) fn relight(&mut self, back: &Backends, env: Env) -> Result<()> {
         let base = usize::from(!self.spec.base.is_empty());
         if base == 1 {
@@ -172,16 +169,12 @@ impl Backdrop {
     }
 }
 
-/// Centres a layer's box on its fractional position — **once**, as fractions of the band
-/// above it, rather than per resize.
+/// Centres a layer's box on its fractional position, as fractions of its parent's extent.
 ///
-/// Both halves are pure fractions, which is what makes stating them once possible at all.
-/// The extent is one by construction. The offset is one because centring `size` on `at`
-/// is `window * at - window * size / 2`, and the window cancels out of it: the layer's
-/// corner sits at `at - size/2` of the window whatever the window is.
-///
-/// So the compositor re-derives this whole box from its parent's extent, and a resize
-/// writes nothing here at all — not one property, for any number of glows.
+/// Both the extent and the offset are pure fractions: centring `size` on `at` is
+/// `window * at - window * size / 2`, and the window cancels, so the layer's corner sits at
+/// `at - size/2` of the window whatever the window is. The compositor re-derives the box
+/// from its parent's extent, so a resize writes no property here, for any number of glows.
 fn place(layer: &Layer) {
     layer.sprite.set_relative_size_adjustment(layer.size);
     layer.sprite.set_relative_offset_adjustment(Vector3 {

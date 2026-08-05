@@ -1,24 +1,20 @@
-//! The menu: the one overlay with enough structure to be worth a widget.
+//! Menus: a flyout whose child is a keyboard-navigable item list.
 //!
-//! A menu is a [`Flyout`](super::Kind::Flyout) whose child is a keyboard-navigable item
-//! list. Everything else about it — anchoring, light dismiss, the focus scope, `Esc` — is
-//! the overlay layer's and is not restated here.
+//! A menu is a [`Flyout`](super::Kind::Flyout). Anchoring, light dismiss, the focus scope and
+//! `Esc` belong to the overlay layer and are not restated here.
 //!
-//! # Why the items are typed
+//! # Typed items
 //!
-//! [`MenuItem::Check`] and [`MenuItem::Radio`] exist rather than a generic label plus
-//! whatever the call site composes, because a menu that reports state — a channel scope
-//! picker, a routing preset list — then needs no per-item composition *and* reports the
-//! right automation pattern automatically. A generic item makes both the caller's problem,
-//! and the second one is the half that silently does not happen.
+//! [`MenuItem::Check`] and [`MenuItem::Radio`] are variants rather than a generic label the
+//! call site composes, so a menu that reports state needs no per-item composition and reports
+//! its automation pattern from the variant.
 //!
 //! # Keyboard
 //!
 //! `Up`/`Down` move, `Home`/`End` jump, `Right`/`Enter` open a submenu or invoke,
 //! `Left`/`Esc` close one level, and printable characters type-ahead by first letter.
-//! **Disabled items are skipped by navigation but remain in the automation tree** — a
-//! screen reader announcing "Export, dimmed" is telling the user something true, where an
-//! item that simply is not there is telling them something false.
+//! Disabled items are skipped by navigation and stay in the automation tree, so a screen
+//! reader announces "Export, dimmed" rather than omitting the item.
 //!
 //! Navigation is the focus ring's, restricted to the menu's own scope, so `Up` and `Down`
 //! are `Tab` and `Shift-Tab` under different names and there is no second order to keep in
@@ -33,16 +29,20 @@ use windows_scene::HitFlags;
 
 /// One row of a menu.
 pub enum MenuItem {
+    /// A row that invokes an action. One with `enabled` clear keeps its place in the
+    /// automation tree and declares no target.
     Command {
         label: &'static str,
         enabled: bool,
         on_invoke: Box<dyn Fn()>,
     },
+    /// A two-state row, reporting the `Toggle` pattern.
     Check {
         label: &'static str,
         checked: Box<dyn Fn() -> bool>,
         on_toggle: Box<dyn Fn()>,
     },
+    /// One of a set, reporting the `SelectionItem` pattern.
     Radio {
         label: &'static str,
         selected: Box<dyn Fn() -> bool>,
@@ -59,7 +59,7 @@ pub enum MenuItem {
 }
 
 impl MenuItem {
-    /// A plain command.
+    /// Returns an enabled command row labelled `label`.
     #[must_use]
     pub fn command(label: &'static str, on_invoke: impl Fn() + 'static) -> Self {
         Self::Command {
@@ -69,8 +69,8 @@ impl MenuItem {
         }
     }
 
-    /// A command that is present but cannot be invoked. **Present** is the point: it stays
-    /// in the automation tree and out of the focus order.
+    /// Returns this command with invocation disabled, which keeps it in the automation tree
+    /// and out of the focus order. Every other variant is returned unchanged.
     #[must_use]
     pub fn disabled(self) -> Self {
         match self {
@@ -85,7 +85,8 @@ impl MenuItem {
         }
     }
 
-    /// A two-state item, reporting `Toggle`.
+    /// Returns a two-state row labelled `label`, reporting `Toggle` and reading `checked`
+    /// for its state.
     #[must_use]
     pub fn check<M>(
         label: &'static str,
@@ -99,7 +100,8 @@ impl MenuItem {
         }
     }
 
-    /// One of a set, reporting `SelectionItem`.
+    /// Returns a row labelled `label` that is one of a set, reporting `SelectionItem` and
+    /// reading `selected` for its state.
     #[must_use]
     pub fn radio<M>(
         label: &'static str,
@@ -113,7 +115,7 @@ impl MenuItem {
         }
     }
 
-    /// A nested menu.
+    /// Returns a row labelled `label` that opens a nested menu of the items `items` builds.
     #[must_use]
     pub fn submenu(label: &'static str, items: impl Fn() -> Vec<Self> + 'static) -> Self {
         Self::Submenu {
@@ -122,8 +124,8 @@ impl MenuItem {
         }
     }
 
-    /// The automation role this variant reports. Derived rather than declared, which is the
-    /// whole reason the variants are typed.
+    /// Returns the automation role this row reports, derived from the variant rather than
+    /// declared per item.
     #[must_use]
     pub const fn role(&self) -> UiaRole {
         match self {
@@ -134,8 +136,8 @@ impl MenuItem {
         }
     }
 
-    /// Whether navigation stops here. A separator is not a stop, and neither is a disabled
-    /// command — though both remain in the tree.
+    /// Returns whether navigation stops on this row. A separator is not a stop and neither
+    /// is a disabled command, though both stay in the automation tree.
     #[must_use]
     pub const fn is_stop(&self) -> bool {
         match self {
@@ -145,7 +147,7 @@ impl MenuItem {
         }
     }
 
-    /// Its label, where it has one.
+    /// Returns the row's label, or `None` for a separator.
     #[must_use]
     pub const fn label(&self) -> Option<&'static str> {
         match self {
@@ -158,12 +160,12 @@ impl MenuItem {
     }
 }
 
-/// Whether a control's accessible name answers a type-ahead keystroke.
+/// Returns whether `name` answers a type-ahead of `key`, comparing first characters with
+/// case folded. An absent or empty name answers nothing.
 ///
-/// The **name**, and not a list of items kept beside the menu: navigation resolves through
-/// the focus ring, so type-ahead has to walk the same candidates in the same order or the
-/// two disagree the moment an item is disabled. A menu row states its label as its name for
-/// exactly this reason, and a screen reader gets it for free.
+/// Matching runs against the accessible name rather than a list of items kept beside the
+/// menu, so type-ahead walks the same candidates the focus ring does and the two cannot
+/// disagree once an item is disabled. A menu row states its label as its name.
 #[must_use]
 pub fn answers(name: Option<&str>, key: char) -> bool {
     let Some(name) = name else { return false };
@@ -176,20 +178,19 @@ pub fn answers(name: Option<&str>, key: char) -> bool {
         == Some(key)
 }
 
-/// A menu's body, for [`El::flyout`](crate::build::El::flyout) or for
+/// Returns a menu's body, for [`El::flyout`](crate::build::El::flyout) or for
 /// [`Overlays::open`](super::Overlays::open).
 ///
-/// The items come from a closure rather than a list because a menu that reports state has to
-/// read that state **when it opens**. This runs it immediately, which is the same moment:
-/// the overlay layer calls a flyout's body at open time, and an `El` is an index into an
-/// arena that the next mount clears, so there is nowhere else it could be called from. It is
-/// run once and never stored, so it is bounded by neither `'static` nor `Fn`.
+/// `items` runs immediately and is never stored, so it is bounded by neither `'static` nor
+/// `Fn`. Taking a closure rather than a list is what lets a menu that reports state read that
+/// state as it opens: the overlay layer calls a flyout's body at open time, and an `El` is an
+/// index into an arena the next mount clears.
 #[must_use]
 pub fn menu(items: impl FnOnce() -> Vec<MenuItem>) -> View {
     rows(items())
 }
 
-/// One item, lowered to the widget it is.
+/// Returns one item lowered to its widget.
 fn row(item: MenuItem) -> View {
     let Some(label) = item.label() else {
         // A rule: one hairline sprite, no hit entry, no focus stop, no automation peer.
@@ -214,14 +215,12 @@ fn row(item: MenuItem) -> View {
             crate::widget::Flow::Line,
         ));
 
-    // The label is also the accessible name, which is what type-ahead matches on: the focus
-    // ring is the one order, so a letter has to select from the same candidates the arrows
-    // walk rather than from a list kept beside them.
+    // The label is also the accessible name, which is what `answers` matches on, so
+    // type-ahead selects from the same candidates the arrow keys walk.
     let base = base.name(label);
 
-    // A disabled item keeps its row and its automation peer and loses its target, which is
-    // exactly what "skipped by navigation, present in the tree" has to mean: the focus order
-    // is the hit array filtered to `INTERACTIVE`, so dropping the flag *is* the skip.
+    // A disabled item keeps its row and its automation peer and loses its target. The focus
+    // order is the hit array filtered to `INTERACTIVE`, so dropping that flag is the skip.
     let base = if stop {
         base.hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, uia)
     } else {
@@ -244,22 +243,21 @@ fn row(item: MenuItem) -> View {
             .selected(selected)
             .interaction(Interaction::Press)
             .on_click(on_select),
-        // The nested list is the item's own flyout, so opening it is the layer's ordinary
-        // open path and a submenu is a menu anchored to a row.
+        // The nested list is the item's own flyout, so it opens through the overlay layer's
+        // ordinary path, anchored to this row.
         MenuItem::Submenu { items, .. } => base.flyout(move || rows(items())),
-        // `label()` answers `None` for a separator alone, and that arm already returned.
-        // Stated rather than folded into a catch-all, so a variant that grows a `None` label
-        // fails here instead of quietly becoming an interactive row.
+        // `Separator` is the only variant `label()` answers `None` for, and that arm
+        // returned above. Stated rather than folded into a catch-all, so a variant that
+        // grows a `None` label panics here instead of becoming an interactive row.
         MenuItem::Separator => unreachable!("a separator has no label and returned above"),
     }
 }
 
-/// The surface, shared by a menu and its submenus — a submenu **is** a menu, anchored to the
-/// row that owns it and nesting through the overlay stack like anything else, so it is the
-/// same function and not a copy of one.
+/// Returns the menu surface holding `items`, shared by a menu and its submenus: a submenu is
+/// a menu anchored to the row that owns it and nested through the overlay stack.
 ///
-/// Takes the built items rather than a closure, so a boxed one and a caller's own generic one
-/// reach the same body without a second instantiation.
+/// Takes built items rather than a closure, so a boxed closure and a caller's own generic one
+/// reach this body without a second instantiation.
 fn rows(items: Vec<MenuItem>) -> View {
     let rows: Vec<View> = items.into_iter().map(row).collect();
     crate::widget::flyout()
@@ -285,9 +283,7 @@ mod tests {
 
     #[test]
     fn every_item_that_is_not_a_stop_is_still_in_the_tree() {
-        // The distinction the whole disabled treatment rests on: unreachable by keyboard,
-        // and announced by a screen reader. An item that is simply absent tells the user
-        // something false.
+        // A disabled item is unreachable by keyboard and still announced by a screen reader.
         let items = sample();
         assert!(!items[3].is_stop(), "the dimmed item is not a focus stop");
         assert_eq!(items[3].role(), UiaRole::Button, "and it is still a button");
@@ -297,9 +293,8 @@ mod tests {
 
     #[test]
     fn type_ahead_matches_a_name_by_its_first_letter_either_case() {
-        // The order and the wrapping are `FocusRing::step_to`'s — a menu carrying its own
-        // item cursor beside that ring would be the second order the one hit array exists
-        // to prevent. What is left here is the predicate, which is all this owns.
+        // The candidate order and the wrapping belong to `FocusRing::step_to`; `answers` is
+        // only the predicate that order is filtered by.
         assert!(answers(Some("Copy"), 'c'));
         assert!(answers(Some("Copy"), 'C'), "case folds");
         assert!(!answers(Some("Copy"), 'z'));
@@ -309,8 +304,7 @@ mod tests {
 
     #[test]
     fn a_row_states_its_label_as_the_name_type_ahead_reads() {
-        // The join between the two halves. If a row ever stops naming itself, type-ahead
-        // silently matches nothing and the only symptom is a keystroke that does nothing.
+        // A row that stopped naming itself would leave type-ahead matching nothing.
         for item in sample() {
             let label = item.label();
             if let Some(label) = label {
@@ -321,8 +315,8 @@ mod tests {
 
     #[test]
     fn a_variant_reports_its_own_automation_pattern() {
-        // The reason the variants are typed rather than one labelled item: this is derived,
-        // so a menu that reports state cannot forget to say so.
+        // The role is derived from the variant, so a menu that reports state cannot omit its
+        // automation pattern.
         assert_eq!(
             MenuItem::check("Mono", || true, || {}).role(),
             UiaRole::CheckBox

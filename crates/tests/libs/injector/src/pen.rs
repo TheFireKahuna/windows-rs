@@ -1,23 +1,20 @@
 //! The pen stream.
 //!
-//! A pen is the one device here that **hovers**: it reports in range without being in
-//! contact, so pen users get the hover affordances touch users do not, and a stack that
-//! derived hover presence from contact alone would light nothing for them. That is why
-//! [`hover_to`](PenStream::hover_to) exists beside [`move_to`](PenStream::move_to) rather
-//! than being the same call with a flag.
+//! A pen is the one device here that hovers: it reports in range without being in contact, so
+//! a stack deriving hover presence from contact alone lights nothing for a pen user.
+//! [`hover_to`](PenStream::hover_to) therefore stands beside
+//! [`move_to`](PenStream::move_to) rather than being the same call with a flag.
 //!
-//! It also carries what a pen has instead of a second mouse button — pressure, tilt, the
-//! barrel button and the inverted (eraser) end — and those are state on the stream rather
-//! than arguments to every sample, because that is how they behave: a pen tilted at 20°
-//! stays tilted until it moves.
+//! Pressure, tilt, the barrel button and the inverted (eraser) end are state on the stream
+//! rather than arguments to every sample, because that is how a pen behaves: one tilted at
+//! 20° stays tilted until it moves.
 //!
-//! **A pen stream has a lifecycle, and skipping it is the failure that looks like a broken
-//! API.** `InitializePenInjection` must precede any pen sample; without it every call is
-//! accepted, returns success and delivers nothing. That is owned by
-//! [`Injection`](crate::injection::Injection) and released when the last pen stream drops.
+//! `InitializePenInjection` must precede any pen sample; without it every call is accepted,
+//! returns success and delivers nothing. [`Injection`](crate::injection::Injection) owns that
+//! initialize and releases it when the last pen stream drops.
 //!
-//! [`Phase`] enumerates the five frames an injected pointer is allowed to be, and there is
-//! no way to state a sixth — the same closed set injected touch has.
+//! [`Phase`] enumerates the five frames an injected pointer is allowed to be. The set is
+//! closed, and injected touch has the same one.
 
 use crate::bindings::*;
 use crate::space::Point;
@@ -82,7 +79,7 @@ impl<'a> PenStream<'a> {
             in_range: false,
             in_contact: false,
             at: (0, 0),
-            // Half scale, so a stream that never states a pressure still reports one a
+            // Half scale, so a stream that states no pressure still reports one a
             // pressure-sensitive control can act on.
             pressure: 0.5,
             tilt: (0, 0),
@@ -91,25 +88,25 @@ impl<'a> PenStream<'a> {
         })
     }
 
-    /// How hard the tip is pressed, from 0 to 1.
+    /// Sets how hard the tip is pressed, from 0 to 1. Values outside that range clamp.
     pub fn pressure(&mut self, pressure: f32) -> &mut Self {
         self.pressure = f64::from(pressure.clamp(0.0, 1.0));
         self
     }
 
-    /// Tilt from vertical, in degrees, on each axis. Each is −90 to 90.
+    /// Sets the tilt from vertical, in degrees, on each axis. Each clamps to −90…90.
     pub fn tilt(&mut self, x: i32, y: i32) -> &mut Self {
         self.tilt = (x.clamp(-90, 90), y.clamp(-90, 90));
         self
     }
 
-    /// Whether the barrel button is held. A pen's secondary button.
+    /// Sets whether the barrel button — a pen's secondary button — is held.
     pub fn barrel(&mut self, held: bool) -> &mut Self {
         self.barrel = held;
         self
     }
 
-    /// Whether the pen is inverted — the eraser end.
+    /// Sets whether the pen is inverted, presenting the eraser end.
     pub fn inverted(&mut self, inverted: bool) -> &mut Self {
         self.inverted = inverted;
         self
@@ -126,8 +123,8 @@ impl<'a> PenStream<'a> {
     /// Touches down at a point.
     pub fn down(&mut self, at: impl Into<Point>) -> Result<&mut Self> {
         self.at = self.injector.space.to_px(at);
-        // A pen that lands without ever having hovered still has to enter range first: the
-        // state machine has no transition from nothing to contact.
+        // The phase set has no transition from out of range to contact, so a pen that lands
+        // without having hovered enters range first.
         if !self.in_range {
             self.in_range = true;
             self.emit(Phase::Hover)?;
@@ -136,7 +133,8 @@ impl<'a> PenStream<'a> {
         self.emit(Phase::Down)
     }
 
-    /// Moves, keeping whatever contact state the pen already has.
+    /// Moves, keeping whatever contact state the pen already has. Returns
+    /// [`Error::NotDown`] if the pen is out of range.
     pub fn move_to(&mut self, at: impl Into<Point>) -> Result<&mut Self> {
         if !self.in_range {
             return Err(Error::NotDown);
@@ -149,8 +147,8 @@ impl<'a> PenStream<'a> {
         })
     }
 
-    /// Lifts the tip, staying in range — which is what a pen does, and what makes the
-    /// following samples hover rather than nothing.
+    /// Lifts the tip, staying in range, so the samples after it are hover rather than
+    /// nothing. Returns [`Error::NotDown`] if the tip is not down.
     pub fn up(&mut self) -> Result<&mut Self> {
         if !self.in_contact {
             return Err(Error::NotDown);
@@ -197,9 +195,9 @@ impl<'a> PenStream<'a> {
             buttons |= InjectedInputPenButtons::Barrel.0;
         }
         if self.inverted {
-            // Inverted is the end that is presented; eraser is what that end does. A pen
-            // turned over reports both, and a control reading only one of them either never
-            // erases or erases while hovering.
+            // Inverted is the end presented; eraser is what that end does. A pen turned over
+            // reports both, and a control reading only one of them either never erases or
+            // erases while hovering.
             buttons |= InjectedInputPenButtons::Inverted.0 | InjectedInputPenButtons::Eraser.0;
         }
 
@@ -237,7 +235,8 @@ impl<'a> PenStream<'a> {
 }
 
 impl Drop for PenStream<'_> {
-    /// Takes the pen out of range if the caller left it there, then gives the initialize back.
+    /// Takes the pen out of range if the caller left it there, then releases the pen
+    /// initialize.
     fn drop(&mut self) {
         if self.in_range {
             if self.in_contact {

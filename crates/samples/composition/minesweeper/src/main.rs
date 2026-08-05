@@ -55,7 +55,7 @@ fn main() -> Result<()> {
     let target = compositor.create_desktop_window_target(&window, false)?;
     target.set_root(&root);
 
-    // `None` once the window is gone, which leaves no board to size.
+    // `client_size` is `None` for a window already closed, leaving no size for the board.
     let Some((width, height)) = window.client_size() else {
         return Ok(());
     };

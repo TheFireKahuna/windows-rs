@@ -1,8 +1,8 @@
 //! The node arena. **Front half.**
 //!
-//! One arena holds both kinds of node: a sprite visual *is* a container visual, so **only
-//! the mint branches on kind** and everything else loses a two-arm match. That one branch
-//! is also what gives `SpriteId` and `GroupId` real backing.
+//! One arena holds both kinds of node: a sprite visual is a container visual, so only the
+//! mint branches on [`NodeKind`] and every other operation is kind-agnostic. That branch is
+//! what backs `SpriteId` and `GroupId`.
 
 use crate::id::Slots;
 use crate::sink::{Clip, Mask, NodeId, NodeKind, Paint};
@@ -25,11 +25,11 @@ pub(crate) const STROKE_CHANS: usize = 2;
 /// A glow's: the blur radius and the shadow's own opacity.
 pub(crate) const SHADOW_CHANS: usize = 2;
 
-/// A generational arena over one family.
+/// Splices the arena's nodes as a child list.
 ///
-/// The model mints and the scene stores: the free list and the generation counter live on
-/// the app side, so an id freed by a destroy can be reused by a create in the *same* patch
-/// with no round trip. This side only validates.
+/// The model mints ids and this side stores them: the free list and the generation counter
+/// live on the app side, so an id freed by a destroy can be reused by a create in the same
+/// patch with no round trip, and this side only validates.
 impl Forest for Slots<crate::sink::Node, Node> {
     fn links(&self, id: NodeId) -> Option<&Links> {
         self.get(id).map(|node| &node.links)
@@ -40,12 +40,11 @@ impl Forest for Slots<crate::sink::Node, Node> {
     }
 }
 
-/// A dash pattern, inline for the lengths a design actually uses.
+/// A dash pattern, held inline: eight runs, or four dash-and-gap pairs.
 ///
 /// Held on the node because a rebind can be provoked by something carrying no patch — a
-/// device loss, a DPI change — and a stroked shape silently losing its dashes on a monitor
-/// change is a bug nothing reports. Eight runs is four dash-and-gap pairs; longer is not
-/// expressible, because a dash array is a design token and not data.
+/// device loss, a DPI change — and the pattern has to survive that. A longer pattern is
+/// truncated.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub(crate) struct Dashes {
     runs: [f32; 8],
@@ -76,14 +75,13 @@ impl Dashes {
 
 /// The realized brush chain for a sprite, and the declaration it was built from.
 ///
-/// The chain is **flat, always**: a mask brush is never the mask or source of another — the
-/// platform documents that combination as throwing — so a gradient is one FP16 strip.
+/// The chain is always flat: a mask brush is never the mask or source of another, which the
+/// platform documents as throwing, so a gradient is one FP16 strip.
 pub(crate) struct Painted {
     /// The realized chain, held so this crate owns what the compositor paints with rather
-    /// than inferring it from what the compositor kept alive. `combined` is `None` when the
-    /// mask is [`Mask::None`] or a shape took the clip route — the paint then binds
-    /// directly, which is what a presented buffer requires, since a mask brush in the chain
-    /// disqualifies it from a display plane.
+    /// than inferring it from what the compositor kept alive. `None` when the mask is
+    /// [`Mask::None`] or a shape took the clip route, where the paint binds directly: a mask
+    /// brush in the chain disqualifies a presented buffer from a display plane.
     #[expect(dead_code, reason = "owns the chain the compositor is painting with")]
     pub(crate) combined: Option<CompositionMaskBrush>,
     /// The alpha source, as the base brush type: a coverage tile and a shape capture are
@@ -105,21 +103,22 @@ pub(crate) struct Painted {
 }
 
 impl Painted {
-    /// Whether this chain is what put a clip on the node's visual.
+    /// Returns whether this chain put the clip on the node's visual.
     ///
-    /// True for exactly one shape: a [`Mask::Shape`] on the clip route. A clip the *sink*
-    /// declared lives in [`Node::clip`] and is never this, which lets a route change tear
-    /// down its own clip without touching one it does not own.
+    /// True only for a [`Mask::Shape`] on the clip route. A clip the sink declared lives in
+    /// [`Node::clip`] instead, so a route change tears down its own clip and leaves that one
+    /// standing.
     pub(crate) fn owns_the_clip(&self) -> bool {
         self.route == Route::Clip && matches!(self.mask, Mask::Shape { .. })
     }
 
-    /// What this declaration is, for deciding whether a re-declaration changed anything.
+    /// Returns the declaration this chain was built from, for comparing against a
+    /// re-declaration.
     pub(crate) fn declaration(&self) -> (Mask, Dashes, Paint) {
         (self.mask, self.dashes, self.paint)
     }
 
-    /// Whether the realized chain still matches the generations it was built under.
+    /// Returns whether the realized chain still matches the generations it was built under.
     pub(crate) fn fresh(&self, now: crate::cache::Gen) -> bool {
         self.mask
             .deps()
@@ -130,11 +129,10 @@ impl Painted {
 
 /// Which of the two constructions realizes a [`Mask::Shape`].
 ///
-/// **The author never names one.** A stroke, a bound trim or dash phase, or an occupied
-/// clip slot each force the capture; everything else takes the clip, four composition
-/// objects and an off-tree render cheaper. A clip-route sprite acquiring any of them is
-/// *promoted* in place onto the same geometry, so correctness never depends on the author
-/// having foreseen an animation.
+/// The route is derived and never authored. A stroke, a bound trim or dash phase, or an
+/// occupied clip slot each force [`Route::Capture`]; everything else takes [`Route::Clip`],
+/// which is four composition objects and an off-tree render cheaper. A clip-route sprite
+/// that acquires any of them is promoted in place onto the same geometry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub(crate) enum Route {
     /// No mask brush at all: the paint binds directly and a geometric clip carries the
@@ -146,11 +144,10 @@ pub(crate) enum Route {
     Capture,
 }
 
-/// A node's clip, and — for the one kind that has any — the shadow of its channels.
+/// A node's clip, and the channel shadow for the kind that has one.
 ///
-/// Two kinds, because they are different objects: a rectangle clip carries four animatable
-/// sides and eight per-corner radius scalars, a geometric clip carries a shape and nothing
-/// animatable. One type would mean a channel table live for half its values.
+/// A rectangle clip carries four animatable sides and eight per-corner radius scalars; a
+/// geometric clip carries a shape and nothing animatable.
 pub(crate) enum ClipState {
     Rect {
         clip: RectangleClip,
@@ -162,7 +159,7 @@ pub(crate) enum ClipState {
 }
 
 impl ClipState {
-    /// The channel shadow, or `None` for a kind that has none.
+    /// Returns the channel shadow, or `None` for a geometric clip.
     pub(crate) fn chans_mut(&mut self) -> Option<&mut [f32; CLIP_CHANS]> {
         match self {
             Self::Rect { chans, .. } => Some(chans),
@@ -170,6 +167,7 @@ impl ClipState {
         }
     }
 
+    /// Returns the rectangle clip, or `None` for a geometric one.
     pub(crate) fn rect(&self) -> Option<&RectangleClip> {
         match self {
             Self::Rect { clip, .. } => Some(clip),
@@ -180,17 +178,15 @@ impl ClipState {
 
 /// The off-tree capture a stroked or trimmed shape mask is built from.
 ///
-/// **Two channel groups, because they are two objects.** A trim is a property of the
-/// geometry and a stroke is a property of the shape drawn from it, so an animation aimed at
-/// the wrong one is refused outright — which is what splits the shadow here rather than
-/// keeping one array over both.
+/// The channel shadow is split in two because the properties live on two objects: a trim
+/// belongs to the geometry and a stroke to the shape drawn from it, and an animation aimed
+/// at the wrong object is refused.
 pub(crate) struct ShapeState {
     /// The off-tree visual the capture reads. Held because nothing else does, and because a
     /// resize has to re-size it.
     pub(crate) host: ShapeVisual,
-    /// The capture, kept so a box that moves can correct it. Without this a path keeps the
-    /// extent it was built at, and every path on a resizable surface draws at the wrong
-    /// scale from the first frame the window is dragged.
+    /// The capture, kept so a box that moves can correct its extent. Left uncorrected, the
+    /// capture holds the extent it was built at and the path draws at the wrong scale.
     pub(crate) captured: Captured,
     pub(crate) shape: CompositionSpriteShape,
     pub(crate) geometry: CompositionPathGeometry,
@@ -203,13 +199,14 @@ pub(crate) struct ShapeState {
 /// The blur a [`Paint::Captured`] glow rides on.
 pub(crate) struct ShadowState {
     pub(crate) shadow: DropShadow,
-    /// The silhouette being blurred, kept for the same reason a shape's is: the halo is a
-    /// capture of the box, and a box that moved leaves it describing the old one.
+    /// The silhouette being blurred, kept so a box that moves can correct its extent: the
+    /// halo is a capture of the box.
     pub(crate) captured: Captured,
     pub(crate) chans: [f32; SHADOW_CHANS],
 }
 
-/// One node.
+/// One node: its visual, its place in the child list, and the shadow of everything bound
+/// onto it.
 pub(crate) struct Node {
     pub(crate) visual: Visual,
     /// The same object as the type that can be painted; `None` on a group. A base visual
@@ -230,7 +227,7 @@ pub(crate) struct Node {
     /// The last clip declared for this node.
     ///
     /// A clip is declared rather than diffed, so layout re-states it on every node it
-    /// touches. This is the shadow that makes an unchanged re-statement free, exactly as
+    /// touches; comparing against this shadow makes an unchanged re-statement free, as
     /// [`prop::set`](crate::prop::set) does for the twelve channels underneath it.
     pub(crate) declared_clip: Clip,
     pub(crate) shape: Option<ShapeState>,
@@ -256,7 +253,7 @@ impl Node {
         }
     }
 
-    /// The node's own box, in DIPs.
+    /// Returns the node's own box, in DIPs.
     pub(crate) fn size(&self) -> windows_numerics::Vector2 {
         windows_numerics::Vector2 {
             x: self.core[2],

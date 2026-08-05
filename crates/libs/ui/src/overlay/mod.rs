@@ -1,36 +1,29 @@
 //! Flyouts, popups, menus and tooltips.
 //!
-//! An overlay is content **positioned against an anchor rather than by its parent's
-//! layout**, sitting above everything, with a defined way to go away. Three kinds cover
-//! every case in an application, and they differ only in their dismiss policy and their
-//! focus behaviour — which is why [`Kind`] is an enum and not three types.
+//! An overlay is content positioned against an anchor rather than by its parent's layout,
+//! drawn above the rest of the window, with a defined way to close. The three kinds in
+//! [`Kind`] differ only in their dismiss policy and their focus behaviour.
 //!
-//! # Nothing here is a new mechanism
+//! # What an overlay is built from
 //!
-//! That is the whole design, and it is what keeps this module small. An overlay is a
-//! detached root in `windows-scene`, placed by an offset the solve gathers from. "Press
-//! outside dismisses" is a blocker entry in the *one* hit array, which the array's own
-//! back-to-front scan resolves for free — no capture, no z-index, no case in the router.
-//! `Tab` and `Esc` are the router's focus scope. A hover-open delay is a deadline read on the
-//! frame clock, because there is no fourth clock to ask. This module contributes a placement
-//! rule, a
-//! lifetime, and the state machine that decides when a tooltip is showing. It contributes no
-//! parallel path to anything.
+//! An overlay is a detached root in `windows-scene`, placed by an offset the solve reads.
+//! "Press outside dismisses" is a blocker entry in the one hit array, resolved by that
+//! array's own back-to-front scan. `Tab` and `Esc` are the router's focus scope. A hover-open
+//! delay is a deadline compared on the frame clock. This module contributes a placement rule,
+//! a lifetime, and the state machine that decides when a tooltip is showing.
 //!
 //! # Every overlay lives inside the window
 //!
 //! There is one HWND and it is composition-hosted, so an overlay is a subtree of the same
-//! visual tree and cannot extend past the client box. One that would not fit is flipped,
-//! then slid inward, then clamped ([`place`]). A second HWND would need its own compositor
-//! target, its own DPI handling and its own input plumbing, for content that is always
-//! within a few hundred DIPs of its anchor.
+//! visual tree and cannot extend past the client box. One that would not fit is flipped, then
+//! slid inward, then clamped ([`place`]).
 //!
 //! # Lifetime
 //!
 //! Opening mints a slot root and an [`Owner`]; closing drops the `Owner`, which disposes
 //! every `Cell`, `Memo` and `Effect` inside it, and drops the [`Mount`], which destroys the
-//! subtree with its exit transition. **There is no cached-and-hidden overlay**: a hidden
-//! overlay is visuals DWM still walks, and visual count is the idle frontier.
+//! subtree with its exit transition. An overlay is never cached and hidden, because a hidden
+//! overlay leaves visuals DWM still walks every frame.
 
 mod anchor;
 mod menu;
@@ -51,13 +44,11 @@ use crate::{VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, V
 use windows_numerics::Vector2;
 use windows_scene::{ControlId, Exit, GroupId, HitTable, SceneEvent};
 
-/// The character a virtual key types-ahead on, where it is one of them.
+/// Returns the character `key` types ahead on, or `None` where it is not a type-ahead key.
 ///
-/// The latin and digit keys are stated as literals because they have no metadata constants:
-/// Windows defines `VK_A`..`VK_Z` and `VK_0`..`VK_9` as the ASCII values themselves, in a
-/// header comment rather than in a macro, so there is nothing for the generator to have
-/// emitted. Recognising the key and naming its character are one decision, so they are one
-/// function and the narrowing is exact by construction.
+/// The latin and digit ranges are literals because Windows defines `VK_A`..`VK_Z` and
+/// `VK_0`..`VK_9` as the ASCII values themselves in a header comment rather than in a macro,
+/// so no generated metadata constant names them.
 const fn type_ahead(key: i32) -> Option<char> {
     match key {
         0x30..=0x39 | 0x41..=0x5A => Some(key as u8 as char),
@@ -65,7 +56,7 @@ const fn type_ahead(key: i32) -> Option<char> {
     }
 }
 
-/// Which of the three an overlay is.
+/// Selects an overlay's dismiss policy and focus behaviour.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// Anchored to a control. Light dismiss, `Esc`, focus loss; takes focus and restores it
@@ -80,7 +71,8 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The dismiss policy this kind implies. A caller may override it; most do not.
+    /// Returns the dismiss policy this kind implies, which a caller may replace with
+    /// [`Spec::dismiss()`].
     #[must_use]
     pub const fn dismiss(self) -> DismissPolicy {
         match self {
@@ -89,16 +81,16 @@ impl Kind {
                 escape: true,
                 focus_loss: true,
             },
-            // A modal a stray click could close is not a modal. It still contributes a
-            // blocker — see `takes_focus` — the blocker just does nothing.
+            // A modal is not light-dismissed. It still contributes a blocker, so a press
+            // outside it reaches nothing; that blocker's press just does nothing.
             Self::Popup => DismissPolicy {
                 light: false,
                 escape: true,
                 focus_loss: false,
             },
-            // A tooltip is dismissed by this layer's own state machine — any press, any
-            // leave, `Esc`, focus moving — and never by an entry in the array, because it
-            // has none to be dismissed through.
+            // A tooltip contributes no hit entry, so nothing in the array can dismiss it.
+            // Its exits are this module's dwell machine: any press, any leave, `Esc`, or
+            // focus moving.
             Self::Tooltip => DismissPolicy {
                 light: false,
                 escape: true,
@@ -107,13 +99,14 @@ impl Kind {
         }
     }
 
-    /// Whether it takes focus, and if so whether `Tab` may leave it.
+    /// Returns `Some(trap)` where the kind takes focus, `trap` being whether `Tab` may not
+    /// leave it, and `None` where the kind takes no focus.
     ///
-    /// This is also what decides whether it contributes a blocker, and the two are the same
-    /// question: **an overlay that takes focus must also take the pointer**, or a press
-    /// lands on content the keyboard cannot reach. A light overlay's blocker dismisses it
-    /// and a modal's does nothing, but both exist — and a scope needs a first entry to be
-    /// named by, which is exactly what a blocker is.
+    /// The same answer decides whether the kind contributes a blocker: an overlay that takes
+    /// focus also takes the pointer, so no press lands on content the keyboard cannot reach.
+    /// A light overlay's blocker dismisses it and a modal's does nothing, and both exist
+    /// because a focus scope is named by its own first entry in the hit array, which is that
+    /// blocker.
     #[must_use]
     pub const fn takes_focus(self) -> Option<bool> {
         match self {
@@ -124,51 +117,52 @@ impl Kind {
     }
 }
 
-/// What closes an overlay.
+/// Declares which events close an overlay.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DismissPolicy {
-    /// A press outside dismisses. **The press is consumed** — the router does that, from
-    /// the flag — because dismiss-and-act would make an accidental menu open cost an
-    /// unintended edit.
+    /// A press outside dismisses. The router consumes that press from this flag, so the
+    /// press that closes an overlay never also invokes what it landed on.
     pub light: bool,
+    /// `Esc` dismisses, as does `Tab` off the end of a scope that does not trap.
     pub escape: bool,
     /// Every contact being taken away dismisses: a lost capture, or the window losing
     /// focus.
     pub focus_loss: bool,
 }
 
-/// An overlay's identity: where it sits in the stack, and which occupant of that depth it is.
+/// Identifies one open overlay by its depth in the stack and the generation occupying it.
 ///
-/// Generational, so a close arriving after the overlay went — a submenu's own, queued behind
-/// the menu's — finds nothing rather than closing whatever now sits at that depth.
+/// The generation makes a stale close a miss: a close queued behind the close of the overlay
+/// above it finds a different generation and does nothing, rather than closing whatever now
+/// sits at that depth.
 ///
-/// **Not a slot id**, and it does not borrow the packing of one: overlays genuinely nest, so
-/// the stack is a `Vec` truncated from a depth and an index into it is only meaningful while
-/// everything above is still open. Naming the two halves is what says so.
+/// A depth is meaningful only while everything above it is still open, because the stack is
+/// truncated from a depth rather than having one entry removed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct OverlayId {
     depth: u32,
     generation: u32,
 }
 
-/// What opened an overlay, which is what decides whether the pointer leaving closes it.
+/// Records what opened an overlay, which decides whether the pointer leaving closes it.
 ///
-/// Not derivable from the kind: a hover-opened submenu and a clicked flyout are the same
-/// kind, opened the same way, and the right answer to "the pointer moved away" is opposite in
-/// each. Private, and set only by the dwell machine — so a caller cannot mint a hover-opened
-/// overlay by hand and get the submenu behaviour on something no hover produced.
+/// A hover-opened submenu and a clicked flyout are the same [`Kind`], so the kind cannot
+/// carry this. [`Opened::Dwelled`] is set only by the dwell machine, so no caller can claim a
+/// hover opened an overlay that no hover produced.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Opened {
+    /// A tap, a keyboard invoke, or a direct [`Overlays::open()`] call.
     Invoked,
+    /// The pointer rested on the invoker until its delay elapsed.
     Dwelled,
 }
 
-/// How an overlay is opened.
+/// Describes how an overlay opens: its kind, anchor, dismiss policy and exit transition.
 ///
-/// The fields are private and the constructors are the only doors, because two of them are
-/// not free choices: [`Kind::Tooltip`] has its lifetime owned by this module's dwell machine
-/// and would be unclosable if a caller could ask for one, and whether a hover opened it is a
-/// record of what happened rather than a setting.
+/// The fields are private and reachable only through the constructors. A [`Kind::Tooltip`]
+/// spec can be built only inside this module, because a tooltip's lifetime belongs to the
+/// dwell machine and one opened from outside would have nothing to close it; `opened` records
+/// what happened rather than being a setting.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Spec {
     kind: Kind,
@@ -180,7 +174,8 @@ pub struct Spec {
 }
 
 impl Spec {
-    /// A flyout under a control: light dismiss, `Esc`, focus restored to the invoker.
+    /// Returns a flyout anchored under `invoker`: light dismiss, `Esc`, focus restored to
+    /// `invoker` on close.
     #[must_use]
     pub const fn flyout(invoker: ControlId) -> Self {
         Self {
@@ -192,7 +187,7 @@ impl Spec {
         }
     }
 
-    /// A modal against the window, trapping focus.
+    /// Returns a modal centred in the window, trapping focus and refusing light dismiss.
     #[must_use]
     pub const fn popup() -> Self {
         Self {
@@ -204,29 +199,32 @@ impl Spec {
         }
     }
 
-    /// Which of the three it is.
+    /// Returns the kind this spec opens.
     #[must_use]
     pub const fn kind(self) -> Kind {
         self.kind
     }
 
+    /// Returns this spec placed by `anchor` instead of the kind's default placement.
     #[must_use]
     pub const fn anchor(self, anchor: Anchor) -> Self {
         Self { anchor, ..self }
     }
 
+    /// Returns this spec with `dismiss` replacing the kind's implied policy.
     #[must_use]
     pub const fn dismiss(self, dismiss: DismissPolicy) -> Self {
         Self { dismiss, ..self }
     }
 
+    /// Returns this spec with `exit` as the transition played while the subtree is destroyed.
     #[must_use]
     pub const fn exit(self, exit: Exit) -> Self {
         Self { exit, ..self }
     }
 
-    /// Records that a hover opened this rather than an invoke. Not public: the dwell machine
-    /// is the only thing that can honestly say so.
+    /// Returns this spec marked as hover-opened. Private, because the dwell machine is the
+    /// only opener that can record it.
     const fn dwelled(self) -> Self {
         Self {
             opened: Opened::Dwelled,
@@ -237,8 +235,7 @@ impl Spec {
 
 /// One open overlay.
 ///
-/// Private, and the fields with it: `tip` is a child module and sees them, and nothing else
-/// in the crate has business reading an overlay's internals.
+/// Private, along with its fields. The `tip` child module is the only other reader.
 struct Open {
     generation: u32,
     kind: Kind,
@@ -248,10 +245,10 @@ struct Open {
     /// focus scope is named by. `None` only for a tooltip.
     blocker: Option<ControlId>,
     scope: Option<ScopeId>,
-    /// The control that opened it, where one did. What a second tap on the same button
-    /// toggles against, and what a tooltip's hover is compared to.
+    /// The control that opened it, where one did. A second tap on that control closes the
+    /// overlay, and a tooltip's hover target is compared against it.
     invoker: Option<ControlId>,
-    /// What opened it. See [`Opened`] — the whole submenu-versus-flyout distinction.
+    /// What opened it; see [`Opened`].
     opened: Opened,
     /// Dropped on close, which disposes every signal the body created.
     owner: Option<Owner>,
@@ -260,12 +257,12 @@ struct Open {
 }
 
 impl Open {
-    /// Whether a hover opened it rather than an invoke.
+    /// Returns whether a hover opened it rather than an invoke.
     const fn by_dwell(&self) -> bool {
         matches!(self.opened, Opened::Dwelled)
     }
 
-    /// Whether it took focus, which is also whether it contributed a blocker.
+    /// Returns whether it took focus, which is also whether it contributed a blocker.
     const fn takes_focus(&self) -> bool {
         self.kind.takes_focus().is_some()
     }
@@ -273,11 +270,10 @@ impl Open {
 
 /// The overlay stack.
 ///
-/// **A stack and not a set**, because overlays genuinely nest: a submenu sits above its menu
-/// and cannot outlive it, and a tooltip is always topmost because any press dismisses it
-/// before anything else can open. So closing one takes everything above it, and that single
-/// rule is the whole nesting policy — for the slot roots, the focus scopes and the placement
-/// rows alike, none of which needs its own.
+/// Overlays nest: a submenu sits above its menu and cannot outlive it, and a tooltip is
+/// always topmost because any press dismisses it before anything else opens. Closing one
+/// closes everything above it, which is the whole nesting policy for the slot roots, the
+/// focus scopes and the placement rows alike.
 #[derive(Default)]
 pub struct Overlays {
     open: Vec<Open>,
@@ -286,24 +282,26 @@ pub struct Overlays {
 }
 
 impl Overlays {
+    /// Returns an empty stack.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// How many are open. Zero is the common case, and the one the idle path cares about.
+    /// Returns how many overlays are open.
     #[must_use]
     pub fn depth(&self) -> usize {
         self.open.len()
     }
 
+    /// Returns whether no overlay is open.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.open.is_empty()
     }
 
-    /// The overlay a control already has open, if any. What makes a second tap on a picker
-    /// close it rather than open a second one.
+    /// Returns the overlay `invoker` already has open, or `None`. Tooltips are skipped, so a
+    /// description showing over a control does not answer as that control's flyout.
     #[must_use]
     pub fn opened_by(&self, invoker: ControlId) -> Option<OverlayId> {
         self.open
@@ -316,18 +314,22 @@ impl Overlays {
             })
     }
 
-    /// Opens one, building `body` inside a fresh scope under a fresh detached root.
+    /// Opens an overlay, building `body` under a fresh detached root, and returns its id.
+    ///
+    /// A kind that takes focus also contributes a full-window blocker entry and pushes a
+    /// focus scope named by that blocker, recording the current focus as the scope's restore
+    /// target. `body` runs outside every host borrow, so it may build elements, read signals
+    /// and create effects that run immediately.
     pub fn open(
         &mut self,
         spec: Spec,
         focus: &mut FocusRing,
         body: impl FnOnce() -> View,
     ) -> OverlayId {
-        // The depth this one opens at, which is also its placement row's. The two stacks are
-        // pushed and truncated together, so the position is the only index either needs.
+        // The depth this one opens at, which is also its placement row. Both stacks are
+        // pushed and truncated together, so one position indexes either.
         let at = self.open.len() as u32;
-        // One borrow, not three. An overlay that takes focus must also take the pointer, so
-        // the blocker is minted here with the rest rather than beside them.
+        // The blocker, the slot root and the placement row are minted under one host borrow.
         let (blocker, root, at_scope) = Host::with(|host| {
             let blocker = spec.kind.takes_focus().map(|_| host.mint_blocker());
             let root = host.open_overlay_slot(blocker);
@@ -342,11 +344,9 @@ impl Overlays {
             (blocker, root, host.root_scope)
         });
 
-        // Over the **blocker** and not over `takes_focus` a second time: a scope is named by
-        // its own first entry in the array, and that entry *is* the blocker. Deriving it
-        // from the same value that produced the blocker is what makes the two facts one
-        // fact — asking twice would let a future kind grow a scope with nothing to name it,
-        // and the only symptom would be a `Tab` that silently walks the whole window.
+        // Mapped over the blocker rather than asking `takes_focus` again: a focus scope is
+        // named by its own first entry in the hit array, and that entry is the blocker, so
+        // deriving the scope from the blocker is what guarantees every scope has one.
         let scope = blocker.map(|from| {
             focus.push_scope(FocusScope {
                 trap: spec.kind.takes_focus() == Some(true),
@@ -376,8 +376,8 @@ impl Overlays {
             mount: None,
         });
 
-        // Outside every borrow above, and it has to be: `body` is application code — it
-        // builds elements, reads signals, and an `Effect` it creates runs immediately.
+        // Outside every host borrow above: `body` is application code that builds elements,
+        // reads signals, and runs any `Effect` it creates immediately.
         let (owner, mount) = Owner::scope(|| mount_at(body(), root, None, at_scope));
         let open = &mut self.open[at as usize];
         open.owner = Some(owner);
@@ -389,11 +389,11 @@ impl Overlays {
         }
     }
 
-    /// Closes one, and everything opened above it.
+    /// Closes `overlay` and everything opened above it.
     ///
-    /// A stale id is a **miss**: a submenu's own close, queued behind its menu's, finds a
-    /// different generation and does nothing rather than closing whatever is now at that
-    /// depth.
+    /// An id whose generation does not match the one at that depth closes nothing, so a
+    /// close queued behind the close of the overlay above it is a miss rather than closing
+    /// whatever has since taken the depth.
     pub fn close(&mut self, overlay: OverlayId, focus: &mut FocusRing) {
         if self
             .open
@@ -405,39 +405,37 @@ impl Overlays {
         self.truncate(overlay.depth as usize, focus);
     }
 
-    /// Closes the topmost, which is what `Esc` and a light-dismiss press mean.
+    /// Closes the topmost overlay, which is what `Esc` and a light-dismiss press do.
     pub fn close_top(&mut self, focus: &mut FocusRing) {
         if !self.open.is_empty() {
             self.truncate(self.open.len() - 1, focus);
         }
     }
 
-    /// Closes everything. What the window losing focus means, and what an unmounting screen
-    /// owes the disposal walk.
+    /// Closes every overlay. Called when the window loses focus, and by a screen as it
+    /// unmounts, since a drop alone cannot release the focus scopes.
     pub fn close_all(&mut self, focus: &mut FocusRing) {
         self.truncate(0, focus);
     }
 
     /// Drops every overlay at or above `at`, innermost first.
     ///
-    /// Innermost first because that is the order the focus ring and the hit array both
-    /// already assume: a submenu is gone before the menu that anchored it.
+    /// Innermost first, which is the order the focus ring and the hit array both assume: a
+    /// submenu is gone before the menu that anchored it.
     fn truncate(&mut self, at: usize, focus: &mut FocusRing) {
         if at >= self.open.len() {
             return;
         }
-        // Whatever the pointer was owed is owed by something that is closing. Cancelled
-        // here and not at each call site, because `Esc`, `Left`, a light press and the layer
-        // above's own `close` all arrive through this one function — and a delay that
-        // outlives its menu holds the frame clock awake for its whole duration and then
-        // opens a submenu against a row that has gone.
+        // Every close path arrives here, so the pending delay is cancelled once. A delay
+        // outliving its menu would hold the frame clock awake for its full duration and then
+        // open a submenu against a row that has gone.
         self.cancel_dwell();
         let mut restore = None;
         while self.open.len() > at {
             let Some(open) = self.open.pop() else { break };
             if let Some(scope) = open.scope {
-                // Answers what focus should become. The *outermost* close is the one whose
-                // answer survives, because that is the invoker the user actually came from.
+                // Overwritten as the walk goes outward, so the outermost close is the one
+                // whose restore target survives: that is the invoker focus came from.
                 restore = focus.pop_scope(scope);
             }
             // The depth just vacated, which is this overlay's own id and its placement row.
@@ -460,15 +458,12 @@ impl Overlays {
         }
     }
 
-    /// The keyboard vocabulary an open overlay owns, run **before** the front table
+    /// Applies the keyboard vocabulary an open overlay owns. Runs before the front table
     /// consumes the tick.
     ///
-    /// Before, because a keystroke that moves focus has to move the focus ring's pixels in
-    /// the same pass a pointer's would: it appends the [`Report::FocusChanged`] it made to
-    /// the same list the front table is about to read, so there is one focus-visual path
-    /// and not two. It appends an [`Intent`] for an invoke for the same reason — a menu
-    /// item pressed with `Enter` reaches the handler a click reaches, through the one
-    /// dispatch point.
+    /// Appends the [`Report::FocusChanged`] a keystroke produced to `reports`, so the focus
+    /// ring moves in the same pass a pointer's move would, and appends an [`Intent`] for an
+    /// invoke to `intents`, so `Enter` on a menu item reaches the handler a tap reaches.
     pub fn keys(
         &mut self,
         reports: &mut Vec<Report>,
@@ -479,8 +474,8 @@ impl Overlays {
         if self.open.is_empty() {
             return;
         }
-        // By index, because the loop appends to the list it is reading — and a report this
-        // call produced is not one it should then interpret.
+        // By index: the loop appends to `reports`, and a report this call produced must not
+        // then be read back as input.
         for at in 0..reports.len() {
             let Report::Key { target, event } = reports[at] else {
                 continue;
@@ -488,17 +483,14 @@ impl Overlays {
             if event.kind != KeyKind::Down {
                 continue;
             }
-            // `Esc` closing a tooltip is **this** layer's, not the router's. The router
-            // raises `Escape` only where a focus scope is open, and a tooltip deliberately
-            // pushes none — so without this arm a description could not be dismissed from
-            // the keyboard at all, and the only symptom is one that will not go away.
+            // The router raises `Report::Escape` only where a focus scope is open, and a
+            // tooltip pushes none, so a tooltip's `Esc` is read here from the raw key.
             if i32::from(event.key) == VK_ESCAPE {
                 self.hide_tip(focus);
                 continue;
             }
-            // The rest is the menu vocabulary, and it applies only while a focus-taking
-            // overlay is topmost: arrow keys inside the window's own content belong to
-            // whatever has focus there.
+            // The menu vocabulary applies only while a focus-taking overlay is topmost;
+            // otherwise arrow keys belong to whatever has focus in the window's own content.
             if self
                 .open
                 .last()
@@ -509,12 +501,9 @@ impl Overlays {
         }
     }
 
-    /// What the tick's reports and intents mean for the stack, run **after** the front
-    /// table has consumed them.
-    ///
-    /// After, because by the time an overlay opens here the press that opened it has
-    /// already lit its button. No intent may be the cause of a visual, and that ordering is
-    /// what makes it so rather than something to remember.
+    /// Applies a tick's reports and intents to the stack. Runs after the front table has
+    /// consumed them, so the press that opens an overlay here has already lit its button and
+    /// no intent is the cause of a visual.
     pub fn service(
         &mut self,
         reports: &[Report],
@@ -530,16 +519,16 @@ impl Overlays {
                 self.tapped(intent.target, focus);
             }
         }
-        // Every crossing in the batch has been seen, and every press with them. At most one
-        // of them is owed a reveal, and this is the one call that can know which.
+        // Every crossing and press in the batch has been seen, so at most one target is
+        // still owed a reveal.
         self.settle(focus);
     }
 
     fn report(&mut self, report: &Report, hits: &HitTable, focus: &mut FocusRing) {
         match *report {
-            // A press on a blocker. The array puts a blocker directly under the overlay it
-            // belongs to, so this closes that one and everything above it — and the press
-            // itself was already consumed by the router.
+            // A press on a blocker, already consumed by the router. The array puts a blocker
+            // directly under the overlay it belongs to, so this closes that overlay and
+            // everything above it.
             Report::Dismiss { blocker, .. } => {
                 self.hide_tip(focus);
                 if let Some(at) = self
@@ -551,14 +540,13 @@ impl Overlays {
                     self.truncate(at, focus);
                 }
             }
-            // `Esc`, or `Tab` off the end of a scope that does not trap. Both mean "close
-            // the innermost scope"; one that declines to escape keeps it.
+            // `Esc`, or `Tab` off the end of a scope that does not trap. Both close the
+            // innermost overlay, unless its policy declines `Esc`.
             Report::Escape { .. } => {
-                // A description is the innermost thing on screen, and dismissing it is the
-                // whole of what this keystroke means. Returning here is what stops one `Esc`
-                // taking the tooltip *and* the menu under it: the router raises `Escape`
-                // rather than a key wherever a scope is open, so both would otherwise be
-                // read from the same press. The next `Esc` reaches the menu.
+                // A description is innermost, so one `Esc` takes it alone. Returning stops
+                // the same press also closing the menu under it, because the router raises
+                // `Escape` rather than a key wherever a scope is open; the next `Esc`
+                // reaches the menu.
                 if self.dwell.showing() {
                     self.hide_tip(focus);
                     return;
@@ -578,8 +566,8 @@ impl Overlays {
             // Any press at all hides a tooltip, whether or not it was over one.
             Report::Pressed { .. } | Report::FocusChanged { .. } => self.hide_tip(focus),
             Report::HoverChanged { to, .. } => self.hovered(to, hits, focus),
-            // A right tap opens the target's flyout **at the pointer** rather than under
-            // the control, because a context menu's origin is a discrete decision.
+            // A right tap opens the target's flyout at the press point rather than under the
+            // control, so a context menu opens where the pointer was when it was pressed.
             Report::Gesture {
                 target,
                 event: Recognised::RightTapped { at },
@@ -592,15 +580,13 @@ impl Overlays {
         }
     }
 
-    /// One keystroke, while a focus-taking overlay is open.
+    /// Handles one keystroke while a focus-taking overlay is topmost.
     ///
-    /// `Tab` and `Esc` never reach here — the router takes both before any control sees
-    /// them, which is what makes an open overlay closable from the keyboard whether or not
-    /// the pointer is near it. What is left is the menu vocabulary, and every arm of it
-    /// resolves through the **focus ring**: `Down` is `Tab`, `Up` is `Shift-Tab`, and
-    /// type-ahead walks the same candidates in the same order. A menu carrying its own item
-    /// cursor beside that ring would be a second order to keep in step with the first,
-    /// which is the failure the one hit array exists to prevent.
+    /// `Tab` and `Esc` never reach here, because the router takes both before any control
+    /// sees them. What is left is the menu vocabulary, and every arm resolves through the
+    /// focus ring: `Down` is `Tab`, `Up` is `Shift-Tab`, and type-ahead walks the same
+    /// candidates in the same order, so there is no item cursor to keep in step with the
+    /// ring.
     fn key(
         &mut self,
         target: Option<ControlId>,
@@ -615,14 +601,13 @@ impl Overlays {
             VK_UP => focus.step(hits, false),
             VK_HOME => focus.step_to_end(hits, false),
             VK_END => focus.step_to_end(hits, true),
-            // One level up. `Esc` means the same thing and is already the router's.
+            // One level up, which is what `Esc` does through the router.
             VK_LEFT => {
                 self.close_top(focus);
                 return;
             }
-            // Invoke, which for a row carrying a flyout is "open the submenu" — and that is
-            // the ordinary tap path rather than a second one, so a submenu opened by
-            // keyboard and one opened by pointer are the same overlay opened the same way.
+            // Invoke through the ordinary tap path, so a row carrying a flyout opens its
+            // submenu the same way a pointer tap on that row does.
             VK_RETURN | VK_RIGHT => {
                 if let Some(target) = target {
                     intents.push(Intent {
@@ -632,10 +617,8 @@ impl Overlays {
                 }
                 return;
             }
-            // Type-ahead. Off the virtual key rather than a character message, because that
-            // is what the router delivers — so this is the unshifted latin and digit range
-            // and deliberately not a general text path. A menu whose items need one is a
-            // list, and a list has a filter field.
+            // Type-ahead off the virtual key, which is what the router delivers: the
+            // unshifted latin and digit ranges, not a general text path.
             key => {
                 let Some(letter) = type_ahead(key) else {
                     return;
@@ -646,14 +629,14 @@ impl Overlays {
             }
         };
         if let Move::To { from, to } = moved {
-            // Into the same list the front table is about to read, so the ring lands on the
-            // new item this pass — the one focus-visual path, reached the one way.
+            // Into the same list the front table is about to read, so the focus ring lands
+            // on the new item in this pass.
             reports.push(Report::FocusChanged { from, to: Some(to) });
         }
     }
 
-    /// A tap on a control that declared a flyout opens it — or closes the one it already
-    /// has, so a picker's own button is what shuts it.
+    /// Opens the flyout `target` declared, or closes the one it already has open, so a
+    /// picker's own button shuts it.
     fn tapped(&mut self, target: ControlId, focus: &mut FocusRing) {
         if let Some(overlay) = self.opened_by(target) {
             self.close(overlay, focus);
@@ -662,17 +645,17 @@ impl Overlays {
         self.open_flyout(target, Spec::flyout(target), focus);
     }
 
-    /// Opens a control's declared flyout, if it declared one. Private: `tip` is a child
-    /// module and reaches it, and nothing outside this one should.
+    /// Opens `target`'s declared flyout with `spec`, doing nothing where it declared none.
     fn open_flyout(&mut self, target: ControlId, spec: Spec, focus: &mut FocusRing) {
-        // Taken out of the borrow before it runs: building the body is application code.
+        // Taken out of the host borrow before it runs: building the body is application
+        // code.
         let Some(body) = Host::with(|host| host.flyout_of(target)) else {
             return;
         };
         _ = self.open(spec, focus, || body());
     }
 
-    /// What the scene reported. One thing reaches here: a delay that met its deadline.
+    /// Applies scene events to the stack. Only [`SceneEvent::DelayElapsed`] is acted on.
     pub fn scene(&mut self, events: &[SceneEvent], focus: &mut FocusRing) {
         for event in events {
             if let SceneEvent::DelayElapsed { delay } = *event {
@@ -683,20 +666,18 @@ impl Overlays {
 }
 
 impl Drop for Overlays {
-    /// Releases everything a stack owns **on its own**: the slot roots, the placement rows,
-    /// the subtrees and the signals under them. Non-panicking, for the reason [`Mount`]'s own
-    /// drop is: this can run while the thread is tearing its locals down, and a panic in a
-    /// drop takes the process with it.
+    /// Releases everything the stack owns by itself: the slot roots, the placement rows, the
+    /// subtrees and the signals under them. Does not panic, because this can run while the
+    /// thread is tearing its locals down, like [`Mount`]'s own drop.
     ///
-    /// A focus scope is not one of those things — it lives on the caller's [`FocusRing`], and
-    /// a destructor cannot reach one. [`close_all`](Self::close_all) is the full teardown and
-    /// is what an unmounting screen should call. What a drop leaves behind is bounded rather
-    /// than dangerous: a scope names its own first entry in the hit array, that entry has
-    /// just gone, and [`FocusRing`] resolves a scope it cannot find to nothing at all — so a
-    /// stranded scope makes `Tab` inert instead of letting it walk the whole window.
+    /// A focus scope is not released here, because it lives on the caller's [`FocusRing`]
+    /// and a destructor cannot reach one. [`close_all`](Self::close_all) is the full
+    /// teardown and is what an unmounting screen calls. A scope left behind names a hit
+    /// entry that has just gone, and [`FocusRing`] resolves a scope it cannot find to
+    /// nothing, so `Tab` goes inert rather than walking the whole window.
     fn drop(&mut self) {
-        // A pending delay outlives the stack: its id is still claimed and its `Tick` is
-        // still holding the frame clock awake. Nothing else releases either.
+        // A pending delay outlives the stack: its id stays claimed and its `Tick` holds the
+        // frame clock awake. Nothing else releases either.
         self.cancel_dwell();
         while let Some(open) = self.open.pop() {
             drop(open.mount);

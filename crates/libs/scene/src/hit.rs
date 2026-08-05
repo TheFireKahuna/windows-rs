@@ -1,21 +1,21 @@
-//! The hit query. **Front half.**
+//! Queries the flat hit array. **Front half.**
 //!
-//! The array is built on the app thread and queried here, because the query reads live
-//! scroll offsets and those live with the trackers. It is the **single authority**: pointer
-//! routing, wheel routing, gesture targeting, keyboard focus order, the window's own
-//! caption hit test and automation's element-from-point all resolve through this, and a
-//! presentation region's parts extend the array rather than forking it.
+//! The array is built on the app thread and queried here, because a query resolves through
+//! live scroll offsets and those are held by the trackers. Pointer routing, wheel routing,
+//! gesture targeting, keyboard focus order, the window's own caption hit test and
+//! automation's element-from-point all resolve through this array, and a presentation
+//! region's parts extend it rather than forking it.
 //!
-//! Back-to-front, first hit wins. Paint order *is* z-order, so that equals "the last
-//! eligible node in a depth-first walk" with no descent and no parent-miss prune to get
-//! wrong. A child extending past its parent is still hit, which is correct: a shadow, a
-//! focus ring and a popup anchor all do.
+//! The scan runs back to front and takes the first hit. Paint order is z-order, so that is
+//! the last eligible node in a depth-first walk, with no descent and no parent-miss prune.
+//! A child drawn past its parent is still hit: a shadow, a focus ring and a popup anchor
+//! all extend past theirs.
 
 use crate::hit_build::{HitEntry, HitFlags, NO_ENTRY};
 use crate::sink::{NodeId, Point};
 use windows_numerics::Vector2;
 
-/// Which device a contact came from. Only touch and pen inflate a target.
+/// Names the input device a contact came from. Only touch and pen inflate a target.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ContactKind {
     #[default]
@@ -27,36 +27,40 @@ pub enum ContactKind {
 }
 
 impl ContactKind {
-    /// Whether a target's touch inflation applies.
+    /// Returns `true` where a target's touch inflation applies to this contact.
     #[must_use]
     pub const fn inflates(self) -> bool {
         matches!(self, Self::Touch | Self::Pen)
     }
 }
 
-/// What a query resolved to.
+/// Identifies the entry a query resolved to.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Hit {
-    /// Index into the array. The join to anything a consumer keeps in parallel.
+    /// Index into the array. Joins to any table a consumer keeps in parallel.
     pub index: u32,
     pub id: crate::hit_build::ControlId,
     pub flags: HitFlags,
-    /// The point, in the target's own space — with its scroll ancestry applied.
+    /// The point in the target's own space, with its scroll ancestry applied.
     pub local: Point,
 }
 
-/// The scan itself — **the** hit test, with nothing thread-affine in it.
+/// Returns the entry under `p`, scanning back to front and taking the first hit.
 ///
-/// Free rather than a method because it has two callers on two threads: this table's
-/// [`hit`](HitTable::hit), and automation's element-from-point, which reads a published
-/// copy of the same array from a UI Automation worker. Invariant 3 says one hit-test
-/// authority, and one function is how that is enforced rather than reviewed.
+/// A free function rather than a method, because it has two callers on two threads:
+/// [`HitTable::hit`], and automation's element-from-point, which reads a published copy of
+/// the same array from a UI Automation worker. Nothing in the scan is thread-affine.
 ///
-/// `floor` bounds the scan from below and does **not** short-circuit it: "still inside
-/// what it was inside" does not imply the same answer, because a control drawn *above*
-/// can have come under the point meanwhile. What it does imply is that nothing below can
-/// win, since the scan is back-to-front and takes the first hit. Callers with no memo
-/// pass 0. Returns the winning index and the point in its own space.
+/// `offset` supplies a scroll container's live offset; `contact` decides whether touch
+/// inflation applies.
+///
+/// `floor` bounds the scan from below and does not short-circuit it. A caller may skip
+/// everything below a previous answer, because the scan is back-to-front and takes the
+/// first hit, so nothing below that index can win. It may not answer from the previous
+/// result, because a control drawn *above* can have come under the point meanwhile.
+/// Callers holding no previous answer pass 0.
+///
+/// Returns the winning index into `entries`, and `p` in that entry's own space.
 pub fn scan(
     entries: &[HitEntry],
     offset: impl Fn(NodeId) -> Vector2,
@@ -64,10 +68,8 @@ pub fn scan(
     p: Point,
     contact: ContactKind,
 ) -> Option<(usize, Point)> {
-    // Layout places content **unscrolled** and the compositor applies the offset, so the
-    // query moves the *point* rather than the rects. That is the simplification: the prior
-    // shape had layout write a scroll translation and the walk carry a compensating offset
-    // in a different coordinate space.
+    // Layout places content unscrolled and the compositor applies the offset, so a query
+    // moves the point rather than the rects.
     let resolve = |p: Point, scroll: NodeId| {
         if scroll.is_none() {
             return p;
@@ -78,9 +80,8 @@ pub fn scan(
             y: p.y + o.y,
         }
     };
-    // Walks the clip ancestry, rejecting a point any ancestor excludes. A parent-index
-    // test and not a control-flow prune: there is no descent to prune, so overhang
-    // survives by construction and only a genuine clip removes anything.
+    // Walks the clip ancestry, rejecting a point any clipping ancestor excludes. The scan
+    // has no descent to prune, so overhang survives and only a clip removes an entry.
     let admitted = |mut parent: u32, p: Point| {
         let mut guard = entries.len();
         while parent != NO_ENTRY {
@@ -91,7 +92,7 @@ pub fn scan(
                 return false;
             }
             parent = entry.clip_parent;
-            // A malformed table — a cycle in the parent indices — would otherwise hang the
+            // A cycle in the clip-parent indices would otherwise spin here and hang the
             // pump. The bound is the array's own length, which no acyclic chain can exceed.
             guard = guard.saturating_sub(1);
             if guard == 0 {
@@ -120,11 +121,10 @@ pub fn scan(
         if !entry.contains(q, inflate) || !admitted(entry.clip_parent, p) {
             continue;
         }
-        // An uninflated hit is exact and wins outright. Only inflated ones compete,
-        // nearest centre first, so two neighbours cannot both claim a point once a
-        // finger's slack is added to each. An exact tie keeps the candidate found first —
-        // the topmost — which has to be decided rather than left to scan order, or two
-        // targets equidistant from a point answer differently on different frames.
+        // An uninflated hit is exact and wins outright. Only inflated ones compete, nearest
+        // centre first, so two neighbours whose inflated boxes overlap cannot both claim a
+        // point. An exact tie keeps the candidate found first, which is the topmost, so two
+        // targets equidistant from a point resolve the same way on every frame.
         if entry.contains(q, 0.0) {
             return Some((index, q));
         }
@@ -136,23 +136,21 @@ pub fn scan(
     best.map(|(index, _, q)| (index, q))
 }
 
-/// The array, plus what a query needs that the array does not carry.
+/// Holds the hit array with the scroll offsets and memo a query resolves through.
 #[derive(Debug, Default)]
 pub struct HitTable {
     entries: Vec<HitEntry>,
-    /// Bumped on every rebuild, which is what invalidates the memo.
+    /// Bumped on every rebuild, which invalidates the memo.
     epoch: u64,
-    /// The live offset of each scroll container, from its tracker's last reported value.
-    /// A handful of scrolling surfaces, so a linear scan beats a map kept in step.
+    /// The live offset of each scroll container, as its tracker last reported it. Searched
+    /// linearly; a window holds a handful of scrolling surfaces.
     scrolls: Vec<(NodeId, Vector2)>,
-    /// Control id to entry, sorted. A consumer holds an **id**, not a position, and a value
-    /// control asks for its own rect on every pointer move — so without this the interaction
-    /// path walks the whole screen once per sample. Sorted rather than mapped because it is
-    /// rebuilt with the array and never edited, which is exactly when a map costs more than
-    /// it saves.
+    /// Control id to entry index, sorted for binary search. A consumer holds an id rather
+    /// than a position, and a value control asks for its own rect on every pointer move.
+    /// Rebuilt whole with the array and never edited in place.
     by_id: Vec<(crate::hit_build::ControlId, u32)>,
-    /// The last hit, so intra-control motion is one rectangle test. Interior mutability
-    /// keeps the hover path on `&self`, which every consumer of the array shares.
+    /// The last hit, so motion inside one control is a single rectangle test. Interior
+    /// mutability keeps the hover path on `&self`, which every consumer of the array shares.
     memo: core::cell::Cell<Option<Memo>>,
 }
 
@@ -164,7 +162,7 @@ struct Memo {
 }
 
 impl HitTable {
-    /// Replaces the whole table.
+    /// Replaces every entry, rebuilds the id index, bumps the epoch and drops the memo.
     pub fn replace(&mut self, entries: &[HitEntry]) {
         self.entries.clear();
         self.entries.extend_from_slice(entries);
@@ -176,62 +174,64 @@ impl HitTable {
         self.memo.set(None);
     }
 
-    /// The entry a control declared, or `None` where it has none.
+    /// Returns the entry `id` declared, or `None` where it declared none.
     ///
-    /// A binary search over the sorted side index: what a consumer holding an id needs when
-    /// it wants that control's own rect and not the one under a point.
+    /// Binary searches the id index. This answers with that control's own rect, not with
+    /// whatever entry lies under a point.
     #[must_use]
     pub fn entry(&self, id: crate::hit_build::ControlId) -> Option<&HitEntry> {
         let at = self.by_id.binary_search_by_key(&id, |&(key, _)| key).ok()?;
         self.entries.get(self.by_id[at].1 as usize)
     }
 
-    /// Records a scroll container's live offset.
+    /// Records a scroll container's live offset and drops the memo.
     ///
-    /// Called from the tracker's values-changed handler, the only trustworthy read of a
-    /// tracker: it runs in another process and every call and callback is asynchronous.
+    /// Called from the tracker's values-changed handler. A tracker runs in another process
+    /// and every call into it and callback out of it is asynchronous, so the value the
+    /// handler carries is the only current one.
     pub fn set_scroll(&mut self, node: NodeId, offset: Vector2) {
         match self.scrolls.iter_mut().find(|(id, _)| *id == node) {
             Some((_, existing)) => *existing = offset,
             None => self.scrolls.push((node, offset)),
         }
         // A scroll moves content under the pointer without the array changing, so the memo
-        // has to go even though the epoch does not.
+        // is dropped even though the epoch does not move.
         self.memo.set(None);
     }
 
-    /// Forgets a scroll container.
+    /// Forgets a scroll container's offset and drops the memo.
     pub fn clear_scroll(&mut self, node: NodeId) {
         self.scrolls.retain(|(id, _)| *id != node);
         self.memo.set(None);
     }
 
-    /// How many entries the table holds.
+    /// Returns how many entries the table holds.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Whether it holds none.
+    /// Returns `true` where the table holds no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// The entries, in z-order. Focus order is this, filtered to what routes input.
+    /// Returns the entries in z-order. Focus order is this sequence filtered to what routes
+    /// input.
     #[must_use]
     pub fn entries(&self) -> &[HitEntry] {
         &self.entries
     }
 
-    /// What is under `p`.
+    /// Returns what is under `p`, and records it as the next memo.
     ///
-    /// The memo **bounds the scan; it does not short-circuit it**, and that distinction is
-    /// its correctness. "Still inside what it was inside" does not imply the same answer —
-    /// a control drawn *above* can have come under the pointer meanwhile, and answering
-    /// from the memo would report the thing underneath. What it does imply is that nothing
-    /// *below* can win, since the scan is back-to-front and takes the first hit. So it is a
-    /// floor, and the skipped tail is where the entries mostly are.
+    /// The memo bounds the scan and does not short-circuit it. A pointer still inside the
+    /// rect the last answer was admitted through can have a control drawn *above* that
+    /// answer under it by now, so answering from the memo would report the entry
+    /// underneath. What the memo does establish is that nothing *below* that entry can win,
+    /// since the scan is back-to-front and takes the first hit, so it supplies a floor and
+    /// the skipped tail holds most of the entries.
     pub fn hit(&self, p: Point, contact: ContactKind) -> Option<Hit> {
         let floor = match self.memo.get() {
             Some(memo)
@@ -249,7 +249,8 @@ impl HitTable {
         Some(self.record(index, local))
     }
 
-    /// This table's scroll offsets, as [`scan`] wants them.
+    /// Returns `scroll`'s live offset in the form [`scan`] takes, or zero where none was
+    /// recorded.
     fn offset(&self, scroll: NodeId) -> Vector2 {
         match self.scrolls.iter().find(|(id, _)| *id == scroll) {
             Some(&(_, offset)) => offset,
@@ -265,9 +266,9 @@ impl HitTable {
             flags: entry.flags,
             local,
         };
-        // Intersected with the clip ancestry, so "inside the memo rect" really does mean
-        // "still admitted by every clip above it". Without that, leaving a clipped region
-        // while staying inside the entry's own box would keep answering with it.
+        // The memo rect is intersected with the clip ancestry, so a point inside it is
+        // still admitted by every clip above the entry. The entry's own box alone would
+        // keep answering after the pointer had left a clipped region.
         self.memo.set(Some(Memo {
             index: index as u32,
             epoch: self.epoch,
@@ -276,7 +277,7 @@ impl HitTable {
         hit
     }
 
-    /// An entry's box, narrowed by every clip above it.
+    /// Returns the entry's box, narrowed by every clip above it.
     fn clipped_box(&self, index: usize) -> (f32, f32, f32, f32) {
         let entry = &self.entries[index];
         let mut box_ = (entry.x0, entry.y0, entry.x1, entry.y1);
@@ -419,8 +420,8 @@ mod tests {
             let hit = table
                 .hit(p, ContactKind::Touch)
                 .expect("inside one of them");
-            // Nearest centre, and exactly one answer — the property the tie-break exists
-            // for. Centres are at 5 and 21, so the boundary is 13.
+            // Nearest centre, and exactly one answer. Centres are at 5 and 21, so the
+            // boundary is 13.
             // An exact (uninflated) hit outranks any inflated one, whichever is nearer.
             let exact = if p.x <= 10.0 {
                 Some(1)
@@ -429,7 +430,7 @@ mod tests {
             } else {
                 None
             };
-            // Equidistant goes to the one drawn later — decided, not left to scan order.
+            // Equidistant goes to the one drawn later.
             let expected = if (p.x - 5.0).abs() < (p.x - 21.0).abs() {
                 1
             } else {
@@ -513,7 +514,7 @@ mod tests {
         a.clip_parent = 1;
         b.clip_parent = 0;
         table.replace(&[a, b]);
-        // Debug builds assert; either way it returns, which is the property under test.
+        // Debug builds assert; either way the call returns rather than spinning.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             table.hit(at(50.0, 50.0), ContactKind::Mouse)
         }));

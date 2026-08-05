@@ -1,20 +1,13 @@
-//! `Cache<K: Cell>`: the second of the two storage machines. **Front half.**
+//! `Cache<K: Cell>`: rasterized cells keyed by value, evicted least-recently-used.
 //!
-//! Everything this crate rasterizes lands in one of exactly two machines, and which one is
-//! decided by a single question: **is the key an identity the model minted, or a value
-//! derived from something unbounded?**
+//! Rasterized content is stored one of two ways. Content keyed by an identity the model
+//! minted lives in [`Resources`](crate::res::Resources), refcounted by the sprites holding
+//! it and never evicted. Content keyed by a derived value — a corner profile, a colour —
+//! lives here, because a drag-resize or an animated fill can mint one key per frame; those
+//! two families are the ones quantized, so the key population stays bounded.
 //!
-//! | | keyed by | lifetime | hashing | eviction | holds |
-//! |---|---|---|---|---|---|
-//! | `Res<T>` | an id the model minted | refcount from sprites, exact | none | none | geometry · ramp strips · run tiles · region surfaces |
-//! | `Cache<K>` | a derived, unbounded value | LRU | yes | LRU | box atlas cells · solid colour cells |
-//!
-//! Only the two families here have keys a drag-resize or an animated fill could mint one
-//! surface per frame from, which is why those two are the ones quantized.
-//!
-//! What the generic saves is the **rasterize step**, not the map: eviction, generations,
-//! surface allocation, the draw bracket and the device-loss arm are written once, and each
-//! family is then its key, its extent and its draw.
+//! [`Cache`] owns eviction, generation checking, surface allocation, the draw bracket and
+//! the device-loss arm. A family supplies its key, its extent and its draw through [`Cell`].
 
 use crate::quant::{Q, extent_px, snap_detail};
 use crate::sink::Corners;
@@ -24,24 +17,23 @@ use windows_composition::{CompositionDrawingSurface, CompositionSurfaceBrush, St
 use windows_core::Result;
 use windows_d2d::{Draw, Gpu, Opacity, Rect, SceneSurface, Solid, SurfaceDraw};
 
-/// What invalidates a rasterized cell.
+/// Counts the invalidations a rasterized cell can be built against.
 ///
-/// Three counters and not one epoch, because their inputs are independent: a single epoch
-/// bumped on device loss, a DPI change, a display-capability change **or** a theme flip
-/// throws away every glyph tile in the application because the accent colour moved.
+/// Three independent counters rather than one epoch, so a cell is thrown away only by the
+/// events it depends on: a theme flip leaves every glyph tile standing.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Gen {
-    /// Device loss. Takes everything, as it must.
+    /// Device loss, which invalidates every cell.
     pub device: u32,
-    /// A DPI change: every snapped dimension is different, so geometry and text
-    /// re-rasterize and colour is untouched.
+    /// A DPI change: every snapped dimension moves, so geometry and text re-rasterize and
+    /// colour does not.
     pub dpi: u32,
-    /// A display-capability change or a theme flip: the output transform moved, so every
-    /// colour cell is wrong and no glyph tile is.
+    /// A display-capability change or a theme flip: the output transform moved, so colour
+    /// cells are stale and coverage cells are not.
     pub color: u32,
 }
 
-/// Which generations a family reads.
+/// Selects the generations a family's freshness depends on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct GenMask {
     device: bool,
@@ -56,25 +48,22 @@ impl GenMask {
         dpi: true,
         color: false,
     };
-    /// Light: cells whose whole content is a colour that has been through the output
-    /// transform.
+    /// Colour: cells whose whole content is a colour already through the output transform.
     pub const LIGHT: Self = Self {
         device: true,
         dpi: false,
         color: true,
     };
-    /// Nothing: content whose realized object survives every one of them.
-    ///
-    /// Not a degenerate case — it is what a *shared* resource reads, because re-rasterizing
-    /// one moves the brush every sprite already holds instead of asking them to rebuild.
+    /// Nothing: content whose realized object survives all three, so a sprite holding it
+    /// never rebinds. What a shared resource reads.
     pub const NONE: Self = Self {
         device: false,
         dpi: false,
         color: false,
     };
 
-    /// Everything either side reads. A sprite's chain is a mask *and* a paint, so its
-    /// freshness is theirs together.
+    /// Returns a mask reading every generation either side reads. A sprite's chain is a
+    /// mask and a paint, and is fresh only while both are.
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self {
@@ -84,7 +73,7 @@ impl GenMask {
         }
     }
 
-    /// Whether an entry built at `built` is still good under `now`.
+    /// Returns whether an entry built at `built` is still fresh under `now`.
     #[must_use]
     pub fn fresh(self, built: Gen, now: Gen) -> bool {
         (!self.device || built.device == now.device)
@@ -93,42 +82,37 @@ impl GenMask {
     }
 }
 
-/// One rasterizable family.
+/// Describes one rasterizable family: how its key sizes, and how it draws.
 ///
-/// Device loss then needs **no per-kind recovery code at all**: every brush in the system
-/// is a pure function of a key or of a resource id, so recovery is "invalidate, then rebind
-/// from the key", travelling the same path as the first bind. That property is the reason
-/// this trait exists.
+/// A cell is a pure function of its key, so recovery after device loss is to clear the cache
+/// and rebind, down the same path a first bind takes.
 pub trait Cell: Clone + Eq + core::hash::Hash {
-    /// Which invalidation generations this family reads.
+    /// Which generations this family's cells are invalidated by.
     const DEPS: GenMask;
     /// Whether this family carries coverage rather than colour.
     ///
-    /// A coverage cell is allocated one byte a pixel, at an eighth of the memory. A colour
-    /// family declared as coverage loses its colour outright.
+    /// A coverage cell is allocated one byte per pixel, an eighth of the memory. A colour
+    /// family that declares coverage loses its colour.
     const COVERAGE: bool;
 
-    /// The device resources this family draws with — **built once per device, never per
-    /// cell**.
+    /// The device resources this family draws with, built once per device rather than per
+    /// cell.
     ///
-    /// `Draw` deliberately carries no device: `Pass` holds one and `Draw` does not, and the
-    /// surface bridge hands a draw callback the target alone. That boundary is the drawing
-    /// crate's, and it says in its own words what its constructors are for — a flat-colour
-    /// brush is to be *retinted* rather than rebuilt, a stroke style is "reusable". So the
-    /// resources arrive from outside, and the only thing built inside a draw is content
-    /// genuinely particular to one key.
+    /// A [`Draw`] carries no device, so everything a draw needs beyond the target and the
+    /// key arrives through this bundle. Only content particular to one key is built inside
+    /// a draw.
     type Res;
 
-    /// Builds this family's resources. Once when the cache is first missed, and again after
-    /// device loss — which is the same path, because loss clears the cache.
+    /// Builds this family's resources. Called on the first miss, and again after device
+    /// loss, which clears the cache.
     fn resources(gpu: &Gpu) -> Result<Self::Res>;
 
-    /// Pixel extent. Already snapped — the key's constructor did it.
+    /// Returns the cell's pixel extent. Already snapped: the key's constructor snaps it.
     fn px(&self) -> (u32, u32);
-    /// What the content does with alpha, which decides the surface's alpha mode. Coverage
-    /// is always translucent: an opaque mask is not a mask.
+    /// Returns what the content does with alpha, which decides the surface's alpha mode. A
+    /// coverage family is always translucent.
     fn opacity(&self) -> Opacity;
-    /// Paints at `(0, 0)` in DIPs.
+    /// Paints the cell at `(0, 0)`, in DIPs.
     fn draw(&self, d: &Draw<'_>, res: &Self::Res) -> Result<()>;
 }
 
@@ -144,12 +128,10 @@ struct Entry {
     used: u64,
 }
 
-/// A cache of rasterized cells, evicting the least recently used.
+/// Caches the rasterized cells of one family, evicting the least recently used.
 ///
-/// **A hit is one map lookup and one store** — no list to walk, no element to shift. The
-/// a lookup happens on every bind, and a recency deque costs a linear search plus a shift
-/// each time. Eviction is a backstop against a key that turned out unbounded, not a working
-/// mechanism, so the cost belongs there.
+/// A hit is one map lookup and one store of the recency stamp. Finding the oldest entry
+/// scans the map instead, and runs only while the cache is at capacity.
 pub struct Cache<K: Cell> {
     map: FxHashMap<K, Entry>,
     res: Option<K::Res>,
@@ -162,7 +144,7 @@ pub struct Cache<K: Cell> {
     evictions: u64,
 }
 
-/// The evicting caches, together. Everything keyed by an identity the model owns lives in
+/// Holds every evicting cache. Content keyed by an identity the model owns lives in
 /// [`Resources`](crate::res::Resources) instead.
 #[derive(Default)]
 pub(crate) struct Cells {
@@ -171,16 +153,16 @@ pub(crate) struct Cells {
 }
 
 impl Cells {
-    /// Device loss takes both, which is the whole of its per-cell recovery.
+    /// Drops every cell in both caches. The whole of what device loss does here.
     pub(crate) fn clear(&mut self) {
         self.boxes.clear();
         self.solids.clear();
     }
 }
 
-/// How many cells of one family are kept. Both families are small — a handful of corner
-/// profiles and a palette's worth of colours — so the cap is a backstop against a key that
-/// turns out to be less bounded than it looked, not a working limit.
+/// How many cells one cache keeps. Both families are small — a handful of corner profiles,
+/// a palette's worth of colours — so the cap bounds a key population that turns out wider
+/// than expected rather than limiting ordinary use.
 pub const CACHE_CAP: usize = 256;
 
 impl<K: Cell> Default for Cache<K> {
@@ -190,6 +172,7 @@ impl<K: Cell> Default for Cache<K> {
 }
 
 impl<K: Cell> Cache<K> {
+    /// Creates an empty cache holding at most `cap` cells. A `cap` of zero is raised to one.
     #[must_use]
     pub fn new(cap: usize) -> Self {
         Self {
@@ -203,10 +186,16 @@ impl<K: Cell> Cache<K> {
         }
     }
 
-    /// The brush for `key`, rasterizing it if this is the first time or if it went stale.
+    /// Returns the brush for `key`, rasterizing it on a miss or when its generations went
+    /// stale.
     ///
-    /// `Ok(None)` means the device was lost while drawing: the caller drops its binding
-    /// and rebinds after recovery, which is the same path as a first bind.
+    /// `Ok(None)` reports device loss during the draw: the caller drops its binding and
+    /// rebinds after recovery, down the same path a first bind takes.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the family's resources or the cell's surface cannot be built, or if the
+    /// cell's own draw failed.
     pub(crate) fn brush(
         &mut self,
         back: &crate::backends::Backends,
@@ -239,13 +228,13 @@ impl<K: Cell> Cache<K> {
         } else {
             back.graphics().color(px, opacity)?
         };
-        // One `BeginDraw` per graphics device at a time — a concurrent second fails
-        // outright. Here that is a consequence of ownership rather than a rule to keep:
-        // every rasterization in this crate happens behind one `&mut Scene` on one thread,
-        // and a presentation region uses its own device entirely.
-        // A cell that fails to draw leaves the surface published as whatever it managed,
-        // which for a mask is a missing shape rather than a wrong one. Raising here would
-        // fail a frame over one cell; the error is carried out so the caller sees it.
+        // A graphics device admits one `BeginDraw` at a time, and a concurrent second fails
+        // outright. Every rasterization in this crate runs behind one `&mut Scene` on one
+        // thread, and a presentation region draws on its own device, so no second bracket
+        // can be open here.
+        // The draw's error is carried out of the closure rather than raised inside it: the
+        // surface publishes whatever the cell managed, and the caller still sees the
+        // failure without the frame being failed over one cell.
         let mut drawn = Ok(());
         if !surface.draw(env.dpi(), opacity, |d| drawn = key.draw(d, res))? {
             return Ok(None);
@@ -266,35 +255,34 @@ impl<K: Cell> Cache<K> {
         Ok(self.map.get(key).map(|entry| &entry.brush))
     }
 
-    /// Drops every entry. What device loss does, and what nothing else does — a stale
-    /// entry is re-rasterized in place on next use rather than swept.
+    /// Drops every entry and the family's resources. What device loss does; a merely stale
+    /// entry is re-rasterized in place on its next use rather than swept.
     pub fn clear(&mut self) {
         self.map.clear();
         self.res = None;
     }
 
-    /// Hits, misses and evictions so far.
+    /// Returns hits, misses and evictions so far, in that order.
     #[must_use]
     pub fn counts(&self) -> (u64, u64, u64) {
         (self.hits, self.misses, self.evictions)
     }
 
-    /// How many cells are live.
+    /// Returns how many cells are held.
     #[must_use]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    /// Whether it holds none.
+    /// Returns whether the cache holds no cells.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
-    /// Makes room for one entry, oldest first.
+    /// Evicts least-recently-used entries until one slot is free.
     ///
-    /// Linear, and that is the trade: it runs only when the cache is full, which for either
-    /// family here means a key turned out unbounded and something else is already wrong.
+    /// Scans the map once per eviction, and runs only while the cache is at capacity.
     fn evict_for_one(&mut self) {
         while self.map.len() >= self.cap {
             let Some(oldest) = self
@@ -311,31 +299,31 @@ impl<K: Cell> Cache<K> {
     }
 }
 
-/// A rounded-box coverage cell, consumed through a nine-grid brush.
+/// Keys a rounded-box coverage cell, consumed through a nine-grid brush.
 ///
-/// Opaque white in the requested corner profile, at exactly one atlas cell's size — the
-/// nine-grid is what makes one raster serve any width and height with pristine corners, so
-/// the key carries the *profile* and not the box.
+/// The cell is opaque white in the requested corner profile, sized to that profile alone:
+/// the nine-grid stretches one raster to any width and height with the corners intact, so
+/// the key carries the profile and not the box.
 ///
-/// The fields are private and the only constructor snaps, which is what makes "every key is
-/// snapped" unrepresentable to violate rather than a rule to lint.
+/// The fields are private and [`BoxKey::new`] is the only constructor, so every key is
+/// snapped to the physical grid.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BoxKey {
     /// Quarter-pixel radii, in the order the corners are drawn.
     radius: [i32; 4],
-    /// The cell's own pixel extent: large enough for the corner profile plus a pixel of
-    /// margin on each side, which is what the nine-grid's insets stretch from.
+    /// The cell's pixel extent: the corner profile plus a pixel of margin on each side,
+    /// which is the flat interior the nine-grid's insets stretch from.
     px: (u32, u32),
     inset: u32,
 }
 
 impl BoxKey {
-    /// The cell for a corner profile at `scale`.
+    /// Builds the key for corner profile `radius` at `scale`, snapping every dimension.
     #[must_use]
     pub fn new(radius: Corners, scale: f32) -> Self {
         let quarter = |r: f32| (snap_detail(r, scale) * scale * 4.0).round() as i32;
         // A pixel of margin past the largest radius, so the nine-grid's centre is a whole
-        // pixel of flat interior and the stretch has something to stretch.
+        // pixel of flat interior for the stretch to sample.
         let inset = extent_px(radius.max(), scale) + 1;
         let side = inset * 2 + 1;
         Self {
@@ -350,7 +338,7 @@ impl BoxKey {
         }
     }
 
-    /// The nine-grid's inset on each edge, in physical pixels.
+    /// Returns the nine-grid's inset on each edge, in physical pixels.
     #[must_use]
     pub fn inset_px(&self) -> f32 {
         self.inset as f32
@@ -390,17 +378,15 @@ impl Cell for BoxKey {
         let box_ = Rect::new(0.0, 0.0, w, h);
 
         if tl == tr && tr == br && br == bl {
-            // The analytic form, which Direct2D rasterizes by the pixels it touches rather
-            // than by tessellating a mesh — and it is the overwhelmingly common profile, so
-            // it is worth the branch. Filling rather than clipping to the shape is also one
-            // primitive and one coverage computation instead of two antialiased edges
-            // meeting at the same boundary.
+            // A uniform profile has an analytic rounded rectangle, which Direct2D
+            // rasterizes by the pixels it touches rather than by tessellating a mesh.
+            // Filling the shape is one coverage computation; clipping to it would
+            // antialias two edges meeting at the same boundary.
             d.fill(box_.rounded(tl), &res.white);
             return Ok(());
         }
-        // Four independent radii cannot be expressed analytically, so this one profile
-        // needs a path, particular to the key. The drawing crate's rule is "created once,
-        // reused every *frame*", and a cache miss is not a frame.
+        // Four independent radii have no analytic form, so this profile draws a path built
+        // for this key alone. It is built on a cache miss, not per frame.
         let path = res.gpu.path(|sink| {
             sink.rounded_box(box_, [tl, tr, br, bl]);
             Ok(())
@@ -410,21 +396,20 @@ impl Cell for BoxKey {
     }
 }
 
-/// What a box cell draws with.
+/// The resources a box cell draws with.
 ///
-/// The brush is **opaque white, built once**: a coverage cell is a mask and white is the
-/// multiplicative identity, so it is never retinted and one instance serves every box cell
-/// for the life of the device.
+/// The brush is opaque white and built once per device: a coverage cell is a mask and white
+/// is the multiplicative identity, so it is never retinted and one instance serves every box
+/// cell for the life of the device.
 ///
-/// The device is held here deliberately. A `Draw` exposes no route back to a `Gpu` — the
-/// drawing crate means resources to be built up front and passed in, and holding one in the
-/// bundle the cache owns *is* building it up front.
+/// The [`Gpu`] is held because a [`Draw`] exposes no route back to one, and a four-radius
+/// profile builds a path from the key.
 pub struct BoxRes {
     white: Solid,
     gpu: Gpu,
 }
 
-/// Opaque white. The only colour a coverage cell ever draws in.
+/// Opaque white, the only colour a coverage cell draws in.
 const WHITE: Scrgb = Scrgb {
     r: 1.0,
     g: 1.0,
@@ -432,21 +417,19 @@ const WHITE: Scrgb = Scrgb {
     a: 1.0,
 };
 
-/// A flat colour cell — **the retained path's draw choke**, and the one place in this crate
-/// a scene-referred value becomes a display-referred one.
+/// Keys a flat colour cell: one quantized, display-referred colour.
 ///
-/// Four by four rather than one by one, purely for filtering margin: a brush stretched from
-/// a single texel samples its own edge.
+/// The cell is four by four rather than one by one for filtering margin — a brush stretched
+/// from a single texel samples its own edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SolidKey(Q);
 
 impl SolidKey {
-    /// Quantizes an already-transformed colour.
+    /// Quantizes `color`, which must already have been through the output transform.
     ///
-    /// It takes an `Scrgb` and not a `Radiance` deliberately: the transform is applied by
-    /// the caller that knows the display, and quantizing the *post*-transform value is why
-    /// a display-capability change bumps the colour generation — the same authored light
-    /// produces a different cell on a different display.
+    /// The caller that knows the display applies that transform, so the key is the
+    /// post-transform value: the same authored light keys a different cell on a different
+    /// display, which is why a display-capability change bumps [`Gen::color`].
     #[must_use]
     pub fn new(color: Scrgb) -> Self {
         Self(Q::new(color))
@@ -455,11 +438,9 @@ impl SolidKey {
 
 impl Cell for SolidKey {
     const DEPS: GenMask = GenMask::LIGHT;
-    /// **The draw choke.** This is the one place authored light becomes a display-referred
-    /// value, so it is the last thing in the crate that could afford to lose its colour.
+    /// Colour, not coverage: the whole cell is the key's colour.
     const COVERAGE: bool = false;
-    /// None at all: the whole cell is one colour, and clearing takes a colour rather than a
-    /// brush. A family that needs no device resource says so in its type.
+    /// None: the cell is drawn by clearing to a colour, which needs no device resource.
     type Res = ();
 
     fn resources(_gpu: &Gpu) -> Result<Self::Res> {
@@ -479,9 +460,9 @@ impl Cell for SolidKey {
     }
 
     fn draw(&self, d: &Draw<'_>, _res: &()) -> Result<()> {
-        // The dequantized value, and there is no other in scope: the key's field is private
-        // and `Q` has no way to hand back what it was given. So "always round-trip the key
-        // before drawing" is not a rule — the un-round-tripped value does not exist here.
+        // The dequantized value is the only one in scope: the field is private and `Q`
+        // keeps no copy of what it was given, so the cell is painted in exactly the colour
+        // the key round-trips to.
         d.clear(self.0.dequant());
         Ok(())
     }
@@ -513,7 +494,7 @@ mod tests {
         // A DPI change is the other way round.
         assert!(!GenMask::GEOMETRY.fresh(built, dpi));
         assert!(GenMask::LIGHT.fresh(built, dpi));
-        // Device loss takes everything, as it must.
+        // Device loss takes everything.
         assert!(!GenMask::GEOMETRY.fresh(built, lost));
         assert!(!GenMask::LIGHT.fresh(built, lost));
     }

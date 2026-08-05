@@ -1,26 +1,25 @@
-//! Brushes, and the draw choke's lower half.
+//! Brushes and stroke styles.
 //!
-//! Every brush and every gradient stop takes a [`Scrgb`] and there is no colour type in
-//! this crate, so a scene-referred value cannot reach Direct2D without passing the output
-//! transform — and having passed it once, cannot pass it again, because nothing produces
-//! an `Scrgb` but that transform. "Exactly once" is a property of the type system here
-//! rather than of a rule someone has to remember.
+//! Every brush and every gradient stop takes a [`Scrgb`], and this crate has no colour type
+//! of its own. The output transform is the only source of an `Scrgb` and nothing converts
+//! one back, so a scene-referred value reaches Direct2D having passed that transform
+//! exactly once.
 //!
-//! Brushes belong to the device rather than to a [`Draw`], and that is load-bearing:
-//! Direct2D shares any resource created from a device context with any other context on
-//! the same device, which is what lets one cached brush serve every pass and both paths.
+//! Brushes belong to the device rather than to a [`Draw`]: Direct2D shares any resource
+//! created from a device context with every other context on the same device, so one cached
+//! brush serves every pass and both drawing paths.
 
 use super::*;
 
-/// `Scrgb` reinterpreted as Direct2D's colour struct.
+/// Reinterprets `c` as Direct2D's colour struct.
 ///
-/// Both are four `f32` in RGBA order with C layout, so this is a reinterpretation rather
-/// than a conversion. The assertions below are the proof, and they are compile-time so a
-/// change to either type breaks the build instead of the colour.
+/// Both types are four `f32` in RGBA order with C layout, so this is a reinterpretation
+/// rather than a conversion; the `const` assertions below fail the build if either layout
+/// moves. The returned pointer borrows `c` and must not outlive it.
 ///
-/// Alpha needs no handling at all: Direct2D reads a colour as **straight** alpha whatever
-/// the target's alpha mode is and premultiplies on the way in, and `Scrgb`'s alpha is
-/// documented straight. Nothing here multiplies a colour by its own alpha.
+/// Alpha needs no handling: Direct2D reads a colour as **straight** alpha whatever the
+/// target's alpha mode is and premultiplies on the way in, and `Scrgb`'s alpha is straight.
+/// Nothing here multiplies a colour by its own alpha.
 pub(crate) fn d2d_color(c: &Scrgb) -> *const D2D_COLOR_F {
     const {
         assert!(size_of::<Scrgb>() == size_of::<D2D_COLOR_F>());
@@ -33,24 +32,26 @@ pub(crate) fn d2d_color(c: &Scrgb) -> *const D2D_COLOR_F {
     (&raw const *c).cast()
 }
 
-/// A gradient stop: a position along the ramp, and the light at it.
+/// A gradient stop: a position along the ramp and the colour at it.
 ///
 /// `#[repr(C)]` and laid out identically to Direct2D's stop, so a slice of these *is* the
 /// array the API wants and a ramp costs no scratch buffer.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Stop {
+    /// Position along the ramp.
     pub at: f32,
+    /// Colour at that position.
     pub color: Scrgb,
 }
 
-/// What a brush does outside its own extent.
+/// What a brush paints outside its own extent.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Extend {
-    /// Hold the edge value.
+    /// Holds the edge value.
     #[default]
     Clamp,
-    /// Repeat.
+    /// Repeats.
     Wrap,
 }
 
@@ -63,16 +64,15 @@ impl Extend {
     }
 }
 
-/// A brush this crate can paint with. Sealed: the four kinds below are all there are, and
-/// a fifth would be a new Direct2D brush rather than a downstream type.
+/// A brush this crate can paint with. Sealed to the four kinds in this module.
 pub trait Brush: Sealed {
     #[doc(hidden)]
     fn brush(&self) -> &BrushRef;
 }
 
-/// Any brush, opaquely. Exists so [`Brush`] can hand one to a draw call without a
-/// generated type leaving the crate, and is `#[repr(transparent)]` so doing that costs no
-/// reference count — which matters on a path that draws hundreds of primitives a frame.
+/// Any brush, opaquely. [`Brush`] hands one to a draw call so that no generated type leaves
+/// the crate, and `#[repr(transparent)]` makes that a pointer cast rather than a
+/// reference-count change on a path drawing hundreds of primitives a frame.
 #[repr(transparent)]
 pub struct BrushRef(ID2D1Brush);
 
@@ -93,7 +93,8 @@ impl BrushRef {
         unsafe { core::mem::transmute(brush) }
     }
 
-    /// Scales everything this brush paints, multiplying whatever alpha it already carries.
+    /// Scales the alpha of everything this brush paints, multiplying the alpha it already
+    /// carries.
     pub fn set_alpha(&self, a: f32) {
         unsafe { self.0.SetOpacity(a) };
     }
@@ -103,7 +104,7 @@ impl BrushRef {
 pub struct Solid(ID2D1SolidColorBrush);
 
 impl Solid {
-    /// Retints in place, so a colour change costs no allocation.
+    /// Sets the colour in place, without allocating.
     pub fn set(&self, c: Scrgb) {
         unsafe { self.0.SetColor(d2d_color(&c)) };
     }
@@ -122,8 +123,8 @@ pub struct Ramp(ID2D1LinearGradientBrush);
 impl Ramp {
     /// Re-aims the ramp between two points, in the target's coordinate space.
     ///
-    /// This is how **one** brush paints N spans: a fade anchored to each bar's own top
-    /// edge is this call per bar, not a brush per bar.
+    /// One brush paints N spans by re-aiming between draws, so a fade anchored to each
+    /// span's own edge costs this call per span rather than a brush per span.
     pub fn aim(&self, from: Vector2, to: Vector2) {
         unsafe {
             self.0.SetStartPoint(from);
@@ -141,9 +142,8 @@ impl Brush for Ramp {
 
 /// A radial ramp: the same stops, run outward from a centre instead of along an axis.
 ///
-/// No re-aiming twin to [`Ramp::aim`]. A radial ramp's consumer rasterizes one square
-/// profile and lets the sprite it fills stretch it into an ellipse, so the brush is
-/// built once at its own natural size and never moved.
+/// The centre and radii are fixed at construction, and there is no counterpart to
+/// [`Ramp::aim`].
 pub struct Radial(ID2D1RadialGradientBrush);
 
 impl Sealed for Radial {}
@@ -203,11 +203,13 @@ impl Join {
     }
 }
 
-/// What a [`StrokeStyle`] is built from. Everything defaults, so a dashed hairline states
-/// only its dashes.
+/// The parameters a [`StrokeStyle`] is built from. Every field defaults, so a dashed
+/// hairline states only its dashes.
 #[derive(Clone, Debug, Default)]
 pub struct StrokeSpec<'a> {
+    /// Both ends of the stroke.
     pub cap: Cap,
+    /// Every corner of the stroke.
     pub join: Join,
     /// Beyond this multiple of the stroke width a mitre is bevelled instead.
     pub miter_limit: Option<f32>,
@@ -215,30 +217,33 @@ pub struct StrokeSpec<'a> {
     /// same array on a 1-DIP rule and a 4-DIP rule draws dashes four times as long on the
     /// second.
     pub dashes: &'a [f32],
+    /// Both ends of each dash.
     pub dash_cap: Cap,
+    /// Where in the dash pattern the stroke starts, as a multiple of the stroke width.
     pub dash_offset: f32,
 }
 
 /// A reusable stroke style: dashes, caps, joins. A device resource, so build it once.
 pub struct StrokeStyle(ID2D1StrokeStyle1);
 
-/// A stroke: a width, and optionally a style.
-///
-/// One value type instead of a `draw_*` and a `draw_*_styled` for every primitive.
+/// A stroke: a width in DIPs, and optionally a style.
 #[derive(Copy, Clone)]
 pub struct Stroke<'a> {
+    /// Stroke width in DIPs.
     pub width: f32,
+    /// Dashes, caps and joins, or the Direct2D defaults when `None`.
     pub style: Option<&'a StrokeStyle>,
 }
 
 impl Stroke<'_> {
-    /// One DIP. Direct2D rasterizes a hairline from a coverage function over one quad, so
-    /// it costs by the pixels it touches — which is why realizing one is a loss.
+    /// A one-DIP stroke with no style. Direct2D rasterizes it from a coverage function over
+    /// one quad, so it costs by the pixels it touches rather than by tessellation.
     pub const HAIRLINE: Self = Self {
         width: 1.0,
         style: None,
     };
 
+    /// Returns a stroke `width` DIPs wide, with no style.
     #[must_use]
     pub const fn width(width: f32) -> Self {
         Self { width, style: None }
@@ -246,6 +251,7 @@ impl Stroke<'_> {
 }
 
 impl<'a> Stroke<'a> {
+    /// Attaches `style` to the stroke.
     #[must_use]
     pub const fn styled(self, style: &'a StrokeStyle) -> Self {
         Self {
@@ -260,20 +266,18 @@ impl<'a> Stroke<'a> {
 }
 
 impl Gpu {
-    /// A flat-colour brush. Retint it with [`Solid::set`] rather than building another.
+    /// Creates a flat-colour brush. [`Solid::set`] retints it without building another.
     pub fn solid(&self, c: Scrgb) -> Result<Solid> {
         Ok(Solid(unsafe {
             self.ctx().CreateSolidColorBrush(d2d_color(&c), None)?
         }))
     }
 
-    /// A linear ramp. Re-aim it per span with [`Ramp::aim`].
+    /// Creates a linear ramp running from `from` to `to`, with `extend` deciding what it
+    /// paints beyond them. [`Ramp::aim`] re-aims it per span.
     ///
-    /// The stops are interpolated in scRGB at 16 bits of float per channel. The
-    /// render-target overload of this call takes a gamma enum instead and cannot say that,
-    /// which is why it is not the one used: interpolating a ramp that runs above white
-    /// through an sRGB-gamma stage would quantize exactly the headroom the ramp exists to
-    /// carry.
+    /// The stops are interpolated in scRGB at 16 bits of float per channel, which holds the
+    /// values above white that an sRGB-gamma interpolation stage would quantize away.
     pub fn ramp(&self, stops: &[Stop], from: Vector2, to: Vector2, extend: Extend) -> Result<Ramp> {
         let collection = self.stops(stops, extend)?;
         let properties = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
@@ -286,11 +290,12 @@ impl Gpu {
         }))
     }
 
-    /// A radial ramp, centred at `center` with radii `radius`.
+    /// Creates a radial ramp centred at `center` with radii `radius`, with `extend`
+    /// deciding what it paints beyond them.
     ///
     /// The same stop collection as [`ramp`](Self::ramp), interpolated in scRGB at 16 bits
-    /// of float per channel: a narrow alpha falloff quantizes to almost nothing at eight,
-    /// and a falloff is the whole content of a glow.
+    /// of float per channel, which holds a narrow alpha falloff that eight bits would
+    /// quantize to almost nothing.
     pub fn radial(&self, stops: &[Stop], center: Vector2, radius: Vector2, extend: Extend) -> Result<Radial> {
         let collection = self.stops(stops, extend)?;
         let properties = D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
@@ -305,7 +310,7 @@ impl Gpu {
         }))
     }
 
-    /// The stop collection both ramp forms are built from.
+    /// Builds the stop collection both ramp forms take.
     fn stops(&self, stops: &[Stop], extend: Extend) -> Result<ID2D1GradientStopCollection1> {
         const {
             assert!(size_of::<Stop>() == size_of::<D2D1_GRADIENT_STOP>());
@@ -318,8 +323,9 @@ impl Gpu {
                     == core::mem::offset_of!(D2D1_GRADIENT_STOP, color)
             );
         }
-        // SAFETY: the assertions above establish that the two layouts agree, so the slice
-        // is passed at its natural stride rather than copied into a scratch array.
+        // SAFETY: the `const` assertions above prove `Stop` and `D2D1_GRADIENT_STOP` have
+        // the same size and the same field offsets, so the slice is a valid array of the
+        // Direct2D type at its natural stride.
         let stops: &[D2D1_GRADIENT_STOP] =
             unsafe { core::slice::from_raw_parts(stops.as_ptr().cast(), stops.len()) };
         unsafe {
@@ -334,11 +340,10 @@ impl Gpu {
         }
     }
 
-    /// A brush that samples a target.
+    /// Creates a brush that samples `src`, with `extend` deciding what it paints outside
+    /// the source extent and `interp` how it samples when stretched.
     ///
-    /// A one-ramp target stretched into each destination rectangle by a sprite batch is
-    /// the cheap way to fade N quads from their own edges; this is for the cases a batch
-    /// cannot express, where the fill is a shape rather than a rectangle.
+    /// A sprite batch covers the rectangular case for less; this fills shapes.
     pub fn tile(&self, src: &Target, extend: Extend, interp: Interp) -> Result<Tile> {
         let properties = D2D1_BITMAP_BRUSH_PROPERTIES1 {
             extendModeX: extend.d2d(),
@@ -352,7 +357,7 @@ impl Gpu {
         Ok(Tile(brush))
     }
 
-    /// A reusable stroke style.
+    /// Creates a reusable stroke style from `spec`.
     pub fn stroke_style(&self, spec: &StrokeSpec<'_>) -> Result<StrokeStyle> {
         let properties = D2D1_STROKE_STYLE_PROPERTIES1 {
             startCap: spec.cap.d2d(),

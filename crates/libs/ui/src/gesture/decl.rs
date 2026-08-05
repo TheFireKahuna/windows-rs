@@ -31,8 +31,8 @@ pub struct GestureDecl {
 }
 
 impl Default for GestureDecl {
-    /// A plain tappable target: tap, right-tap, and hold — which is what gives touch users
-    /// the context menu mouse users get from the secondary button.
+    /// A plain tappable target: tap, right-tap, and hold, so touch reaches the context menu
+    /// the secondary button opens.
     fn default() -> Self {
         Self {
             settings: GestureSettings::Tap
@@ -50,7 +50,7 @@ impl Default for GestureDecl {
 }
 
 impl GestureDecl {
-    /// A target that only reports taps.
+    /// Returns a declaration that reports taps and nothing else.
     #[must_use]
     pub fn tap() -> Self {
         Self {
@@ -59,8 +59,8 @@ impl GestureDecl {
         }
     }
 
-    /// A one-dimensional value edit — a slider. Translation on one axis, no inertia, because
-    /// a value that keeps moving after the finger lifts is a value the user did not choose.
+    /// Returns a slider's declaration: translation on one axis, and no inertia, so the
+    /// value stops where the contact lifts.
     #[must_use]
     pub fn slider(vertical: bool) -> Self {
         Self {
@@ -74,10 +74,11 @@ impl GestureDecl {
         }
     }
 
-    /// A knob: single-pointer rotation about `center`, `radius` DIPs out.
+    /// Returns a knob's declaration: single-pointer rotation about `center`, `radius` DIPs
+    /// out.
     ///
-    /// Rotation needs `ManipulationRotate` **and** a non-zero pivot radius, and the pivot
-    /// applies only to single-pointer input. Both are the platform's rules, not ours.
+    /// The platform recognises rotation only with `ManipulationRotate` set **and** a
+    /// non-zero pivot radius, and it applies the pivot only to single-pointer input.
     #[must_use]
     pub fn knob(center: Point, radius: f32) -> Self {
         Self {
@@ -104,7 +105,7 @@ impl GestureDecl {
         self
     }
 
-    /// Whether this declaration asks for any manipulation at all, which is what decides
+    /// Returns whether this declaration asks for any manipulation, which is what decides
     /// whether a contact needs a recogniser bound to it.
     #[must_use]
     pub fn manipulates(&self) -> bool {
@@ -127,8 +128,8 @@ pub struct HoldTuning {
 }
 
 impl Default for HoldTuning {
-    /// The platform's own feel: a hold is most of a second, and a contact that wanders more
-    /// than a finger's width was a drag.
+    /// The platform's own tuning: a hold is half a second, and a contact that wanders more
+    /// than a finger's width is a drag.
     fn default() -> Self {
         Self {
             start_delay: Duration::from_millis(500),
@@ -164,7 +165,8 @@ pub enum TouchTargetDecl {
 }
 
 impl TouchTargetDecl {
-    /// What the hit array should be told, given the node's own laid-out size.
+    /// Returns the inflation for this target's hit entry, or `None` to take the platform's
+    /// own guidance.
     #[must_use]
     pub fn inflation(self) -> Option<f32> {
         match self {
@@ -187,12 +189,12 @@ pub enum DragAxes {
 /// Whether the first axis past the threshold owns the drag.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum AxisLock {
-    /// The first axis past the threshold owns the drag for its whole duration. **A drag that
-    /// changes meaning mid-flight is a drag the user cannot aim.**
+    /// The first axis past the threshold owns the drag for its whole duration. The lock is
+    /// never revisited, so a drag cannot change meaning mid-flight.
     #[default]
     FirstPast,
-    /// No lock: both axes stay live. For a free pan, never for a drag whose axis selects a
-    /// meaning.
+    /// No lock: both axes stay live. What a free pan declares; a drag whose axis selects a
+    /// meaning locks instead.
     None,
 }
 
@@ -209,8 +211,7 @@ pub enum Commit {
 /// A drag whose meaning depends on its direction.
 ///
 /// Moving a row within its list and moving it into a different one are the same physical
-/// gesture on the same object, separated by axis. One policy, or every consumer invents its
-/// own and they disagree.
+/// gesture on the same object, separated by axis. One policy covers both.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct DragDecl {
     pub axes: DragAxes,
@@ -233,18 +234,18 @@ impl Default for DragDecl {
 }
 
 impl DragDecl {
-    /// Vertical is order, horizontal is scope: a reorderable list's own drag.
+    /// Returns a reorderable list's drag: vertical is order, horizontal is scope.
     #[must_use]
     pub fn reorder() -> Self {
         Self::default()
     }
 
-    /// A turned control: vertical displacement is the value, and it follows the contact.
+    /// Returns a turned control's drag: vertical displacement is the value, and it follows
+    /// the contact.
     ///
-    /// Vertical rather than circular, because a knob tracked around its own centre is
-    /// unaimable near the pivot and unreachable at the edges — a straight drag is what a
-    /// shipping knob actually reads. `Live`, because a knob is turned to *find* a value
-    /// rather than to state one, so what it drives has to move with it.
+    /// Vertical rather than circular, so the control stays aimable near its centre and
+    /// reachable past its edges. `Live`, so what the knob drives moves with the contact
+    /// instead of landing on release.
     #[must_use]
     pub fn turn() -> Self {
         Self {
@@ -286,8 +287,8 @@ mod tests {
         let decl = GestureDecl::default();
         assert!(decl.settings.contains(GestureSettings::RightTap));
         assert!(decl.settings.contains(GestureSettings::Hold));
-        // Press-and-hold raises RightTapped, so context-menu routing gains touch support
-        // with no extra design.
+        // Press-and-hold raises RightTapped, so touch reaches the same context-menu routing
+        // the secondary button does.
         assert!(!decl.manipulates());
     }
 
@@ -327,7 +328,7 @@ mod tests {
 
     #[test]
     fn the_default_hold_is_the_platforms_own_feel() {
-        // Most of a second, and a contact that wanders more than a finger's width was a drag.
+        // Half a second, and ten DIPs of slack before a hold becomes a drag.
         let hold = HoldTuning::default();
         assert_eq!(hold.start_delay, Duration::from_millis(500));
         assert!((hold.radius - 10.0).abs() < 1e-6);

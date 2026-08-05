@@ -1,16 +1,14 @@
-//! What the custom caption answers `WM_NCHITTEST`, and where its frame is.
+//! Tests the custom caption's `WM_NCHITTEST` answers and the widths of its resize frame.
 //!
-//! `SendMessageW` from the window's own thread calls the window procedure directly, so
-//! nothing here needs a pump, injected input, the foreground or a visible window — every
-//! answer below is the production path resolved synchronously. That is the seam: the rest
-//! of the caption's contract — dragging, double-click to maximize, `Win`+arrow, the window
-//! menu, and a maximized window's frame — needs real input against a real foreground
-//! window and is driven by `examples/caption` instead.
+//! `SendMessageW` from the window's own thread calls the window procedure directly, so no
+//! test here needs a pump, injected input, the foreground or a visible window: each answer
+//! comes from the production path, resolved synchronously. Dragging, double-click to
+//! maximize, `Win`+arrow, the window menu and a maximized window's frame need real input
+//! against a foreground window, and the `caption` example drives those.
 //!
-//! Every window here asks for pointer input and is created hidden. The opt-in is
-//! process-wide, one way, and rejected once the process owns a window, so a plain window
-//! created first would make a later caption window's creation fail — which is also why
-//! creation is serialized.
+//! Every window here asks for pointer input and is created hidden. The pointer-input opt-in
+//! is process-wide, one way, and rejected once the process owns a window, so a plain window
+//! created first would fail a later caption window's creation.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -58,12 +56,14 @@ unsafe extern "system" {
     fn ClientToScreen(hwnd: *mut c_void, point: *mut Point) -> i32;
 }
 
-/// Serialized, and every window asks for pointer input: the opt-in is process-wide and is
-/// rejected once the process owns a window, so the first creation in this binary has to
-/// finish before the second starts whichever test runs first.
+/// Serializes window creation across the test binary's threads.
+///
+/// The pointer-input opt-in every window here asks for is process-wide and is rejected once
+/// the process owns a window, so one creation must finish before the next one starts,
+/// whichever test runs first.
 static CREATE: Mutex<()> = Mutex::new(());
 
-/// A hidden window, with a caption of its own or with the system's.
+/// Creates a hidden window, with a caption of its own when `caption` is `Some`.
 fn create(caption: Option<CaptionSpec>) -> Window {
     let _serial = CREATE.lock().unwrap_or_else(|poison| poison.into_inner());
     let mut builder = Window::new("windows-window — caption hit test")
@@ -76,13 +76,14 @@ fn create(caption: Option<CaptionSpec>) -> Window {
     builder.create().expect("a window can be created")
 }
 
-/// Every window here outlives the test that made it, so its metrics are always there.
+/// Returns `window`'s metrics, which every window here has because it outlives the test
+/// that made it.
 fn metrics(window: &Window) -> Metrics {
     window.metrics().expect("an open window")
 }
 
-/// The application's hit authority, scripted: what it answers, how often it was asked, and
-/// with what.
+/// A caption hit authority whose answer the test sets, recording how many times it was
+/// asked and the last client-space point it was asked about.
 #[derive(Clone)]
 struct Authority {
     answer: Rc<Cell<CaptionHit>>,
@@ -115,7 +116,9 @@ impl Authority {
 
 fn window_rect(window: &Window) -> Rect {
     let mut rect = Rect::default();
-    // SAFETY: the window is live and the destination is a stack local.
+    // SAFETY: `GetWindowRect` accepts any handle value and reports failure for one it does
+    // not recognise; it writes only through `rect`, a live stack local of the size it
+    // expects.
     assert!(
         unsafe { GetWindowRect(window.hwnd(), &mut rect) } != 0,
         "the window has a rect"
@@ -123,11 +126,11 @@ fn window_rect(window: &Window) -> Rect {
     rect
 }
 
-/// The window's client origin in screen coordinates.
+/// Returns the window's client origin in screen coordinates.
 fn client_origin(window: &Window) -> (i32, i32) {
     let mut point = Point::default();
-    // SAFETY: the window is live and the point is a stack local the call writes back
-    // through.
+    // SAFETY: `ClientToScreen` accepts any handle value and writes only through `point`, a
+    // live stack local of the size it expects.
     assert!(
         unsafe { ClientToScreen(window.hwnd(), &mut point) } != 0,
         "the window has a client origin"
@@ -135,11 +138,12 @@ fn client_origin(window: &Window) -> (i32, i32) {
     (point.x, point.y)
 }
 
-/// What the window answers for a screen point.
+/// Returns the `HT*` code the window answers for the screen point (`x`, `y`).
 fn hit(window: &Window, x: i32, y: i32) -> isize {
     let lparam = ((y as isize & 0xffff) << 16) | (x as isize & 0xffff);
-    // SAFETY: the window is live and belongs to this thread, so this calls its window
-    // procedure directly; `WM_NCHITTEST` reads only the packed point.
+    // SAFETY: `SendMessageW` accepts any handle value, and `WM_NCHITTEST` reads the point
+    // out of `lparam` rather than through a pointer. The window belongs to this thread, so
+    // the call runs its window procedure inline.
     unsafe { SendMessageW(window.hwnd(), WM_NCHITTEST, 0, lparam) }
 }
 
@@ -173,7 +177,12 @@ fn name(code: isize) -> &'static str {
     }
 }
 
-/// The caption band's height in physical pixels.
+/// Returns the caption band's height in physical pixels.
+///
+/// # Panics
+///
+/// Panics unless the band is taller than the resize frame, which every point the tests
+/// probe is chosen on the assumption of.
 fn band_px(window: &Window) -> i32 {
     let metrics = metrics(window);
     let band = metrics.px(window
@@ -188,8 +197,10 @@ fn band_px(window: &Window) -> i32 {
     band
 }
 
-/// A point inside the band and clear of the resize frame. The same place in every test, so
-/// what changes between them is the answer.
+/// Returns a screen point inside the caption band and clear of the resize frame.
+///
+/// Every test probes this same place, so the answer is the only thing that varies between
+/// them.
 fn band_point(window: &Window) -> (i32, i32) {
     let metrics = metrics(window);
     let (x, y) = client_origin(window);
@@ -207,11 +218,11 @@ struct SystemFrame {
     bottom: i32,
 }
 
-/// The system's own resize bands, read off `DefWindowProc`'s answers for an ordinary window
-/// of the same style on the same display.
+/// Returns the depth of each of the system's own resize bands, probed from
+/// `DefWindowProc`'s answers on an ordinary window of the same style and display.
 ///
-/// The oracle. A frame width this crate computed, checked against a frame width this crate
-/// computed, would agree however wrong both were.
+/// The depths come from the system rather than from this crate's metrics, so
+/// [`the_resize_frame_is_the_systems`] compares against a width it did not compute itself.
 fn system_frame() -> SystemFrame {
     let window = create(None);
     let rect = window_rect(&window);
@@ -233,13 +244,13 @@ fn system_frame() -> SystemFrame {
     }
 }
 
-/// The eight resize zones, and their boundaries where the system puts its own — on all
-/// four edges, including the narrow top one.
+/// Puts the eight resize zones and their boundaries where the system puts its own, on all
+/// four edges including the narrower top one.
 ///
-/// The top band is not the frame width: the window rect extends past the visible frame on
-/// the left, right and bottom, so a band there is mostly outside the window, while at the
-/// top it comes entirely out of the caption the application drew. The system takes the
-/// border's width back off it, and so does this ([`Metrics::frame_top`]).
+/// The top band is not the frame width. The window rect extends past the visible frame on
+/// the left, right and bottom, so a band on those edges lies mostly outside the window,
+/// while at the top it comes entirely out of the caption the application drew. The system
+/// subtracts the border's width there, and [`Metrics::frame_top`] reports the result.
 #[test]
 fn the_resize_frame_is_the_systems() {
     let system = system_frame();
@@ -298,8 +309,7 @@ fn the_resize_frame_is_the_systems() {
         "the bottom-right corner",
     );
 
-    // Where the zones end, which is what "at the DPI-correct widths" means: a zone one
-    // pixel narrower than the system's is a frame the user grabs at and misses.
+    // Where the zones end: the last pixel of a band, and the first pixel inside it.
     let inside_x = (rect.left + frame_x, mid_y);
     let last_x = (rect.left + frame_x - 1, mid_y);
     assert_hit(&window, last_x, HTLEFT, "the last column of the left edge");
@@ -315,8 +325,8 @@ fn the_resize_frame_is_the_systems() {
     );
 }
 
-/// The band's answer is the application's, whatever it is — including `HTMAXBUTTON`,
-/// without which the Snap Layouts flyout never appears.
+/// Answers the band with whatever the hit authority returns, including `HTMAXBUTTON`, which
+/// is the only code the Snap Layouts flyout opens on.
 #[test]
 fn the_band_answers_from_the_hit_authority() {
     let window = create(Some(CaptionSpec::default()));
@@ -347,8 +357,8 @@ fn the_band_answers_from_the_hit_authority() {
     }
 }
 
-/// The authority is asked in the space the layout solved in, so its answer cannot disagree
-/// with the bar it drew by a conversion.
+/// Asks the hit authority in client-space DIPs, the space the layout solves in, so no
+/// coordinate conversion sits between the bar it drew and the answer it gives.
 #[test]
 fn the_authority_is_asked_in_client_space_dips() {
     let window = create(Some(CaptionSpec::default()));
@@ -369,8 +379,8 @@ fn the_authority_is_asked_in_client_space_dips() {
     );
 }
 
-/// Below the band the client owns the point outright, and the authority is not consulted
-/// at all — so an application that answers carelessly outside its bar cannot claim one.
+/// Answers `HTCLIENT` below the band without consulting the hit authority, so an authority
+/// that returns a button for a point outside the bar cannot claim one.
 #[test]
 fn below_the_band_is_the_clients_and_the_authority_is_not_asked() {
     let window = create(Some(CaptionSpec::default()));
@@ -399,8 +409,8 @@ fn below_the_band_is_the_clients_and_the_authority_is_not_asked() {
     );
 }
 
-/// Before the surface that owns the hit array exists there is no authority, and the band
-/// drags — a window you can move being the better intermediate state.
+/// Drags from the band while no hit authority is installed, which is the window's state
+/// until the surface that owns the hit array exists.
 #[test]
 fn a_band_with_no_authority_drags() {
     let window = create(Some(CaptionSpec::default()));
@@ -413,8 +423,11 @@ fn a_band_with_no_authority_drags() {
     );
 }
 
-/// A button the window does not draw is never answered for, however the authority reports
-/// it: what the system opens on `HTMAXBUTTON` offers to maximize a window with no way back.
+/// Suppresses a button code for a button the caption spec does not declare, whatever the
+/// hit authority answers.
+///
+/// The flyout the system opens on `HTMAXBUTTON` would otherwise offer to maximize a window
+/// that draws no button to restore it.
 #[test]
 fn a_button_the_window_does_not_draw_is_never_answered_for() {
     let window = create(Some(CaptionSpec {
@@ -439,8 +452,8 @@ fn a_button_the_window_does_not_draw_is_never_answered_for() {
     assert_hit(&window, point, HTCLOSE, "a close button it does");
 }
 
-/// A stated band height moves the boundary, and `caption_height_dips` reports the same
-/// number the hit test resolves against.
+/// Moves the band boundary to a stated height, and reports that same height from
+/// [`Window::caption_height_dips`].
 #[test]
 fn a_stated_band_height_moves_the_boundary() {
     const HEIGHT: f32 = 48.0;

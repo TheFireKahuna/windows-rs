@@ -1,51 +1,45 @@
 //! The precision-touchpad stream.
 //!
-//! **Its coordinates are fractions of the pad, not window DIPs**, and that difference is
-//! the device rather than the API. A touchpad is indirect: it has no screen position, and
-//! the recogniser that reads it — `PhysicalGestureRecognizer` — reports in units relative
-//! to the device, which is exactly what makes a touchpad gesture feel right. A harness that
-//! let a caller aim a touchpad contact at a control would be inventing a mapping the system
-//! does not have.
+//! Its coordinates are fractions of the pad rather than window DIPs, which is a property of
+//! the device. A touchpad is indirect: it has no screen position, and the recogniser that
+//! reads it — `PhysicalGestureRecognizer` — reports in units relative to the device. Aiming a
+//! touchpad contact at a control would require a mapping the system does not have.
 //!
-//! Two halves, and they arrive by different routes:
+//! Two halves, arriving by different routes:
 //!
-//! * **Contacts** are injected like any other synthetic pointer, but in `ptHimetricLocation`
-//!   rather than `ptPixelLocation`, because a touchpad device must be created with a
-//!   physical size and `SDCO_PHYSICAL_SIZE` moves the sample into device space. This is why
-//!   `CreateSyntheticPointerDevice` v1 cannot create a touchpad at all — it has no options
-//!   parameter and therefore no way to state a size.
-//! * **Global gestures** — the three-, four- and five-finger taps and presses, and the two
-//!   inertia messages — are not contacts. They arrive through `InjectTouchpadAction`, and
-//!   only on a device created `SDCO_TOUCHPAD_GESTURE_ONLY`, which this stream is. On a pad
-//!   that is not gesture-only, the system produces them from physical input instead and
-//!   the injected action does nothing.
+//! * Contacts are injected like any other synthetic pointer, but in `ptHimetricLocation`
+//!   rather than `ptPixelLocation`: a touchpad device must be created with a physical size,
+//!   and `SDCO_PHYSICAL_SIZE` moves the sample into device space. `CreateSyntheticPointerDevice`
+//!   v1 cannot create a touchpad at all, because it has no options parameter to state a size
+//!   through.
+//! * Global gestures — the three-, four- and five-finger taps and presses, and the two
+//!   inertia messages — are not contacts. They arrive through `InjectTouchpadAction`, and only
+//!   on a device created `SDCO_TOUCHPAD_GESTURE_ONLY`, which this stream is. On a pad that is
+//!   not gesture-only the system produces them from physical input and the injected action
+//!   does nothing.
 //!
-//! Gesture-only also settles a second thing: injected contacts on this stream can never be
-//! recognised as mouse motion or clicks, so a run that drives the touchpad cannot silently
-//! be measuring the mouse path.
+//! Gesture-only also keeps injected contacts on this stream from being recognised as mouse
+//! motion or clicks, so a run that drives the touchpad is not measuring the mouse path.
 //!
-//! **Touchpad input is never recognised as Tap or Hold**, by the platform's design, and no
-//! amount of injection changes that. A test that asserts a tap here is asserting something
-//! the device class does not produce.
+//! The platform never recognises touchpad input as Tap or Hold, so neither gesture is
+//! reachable from this stream however it is driven.
 
 use crate::bindings::*;
 use crate::device::Device;
 use crate::{Error, Injector, Rate, Result};
 
-/// The pad this stream declares itself to be, in millimetres.
+/// The physical size this stream's pad declares, in millimetres — roughly a 13-inch laptop's.
 ///
-/// Roughly a 13-inch laptop's. It matters because the recogniser reports in units relative
-/// to the device, so the same fraction of a larger pad is a longer pan — which is the
-/// property that makes touchpad gestures scale with the hardware rather than with the
-/// screen.
+/// The recogniser reports in units relative to the device, so the same fraction of a larger
+/// pad is a longer pan: touchpad gestures scale with the pad rather than with the screen.
 pub const PAD_MM: (f32, f32) = (105.0, 65.0);
 
-/// One of the global touchpad gestures, or one of the two inertia signals.
+/// Names one of the global touchpad gestures, or one of the two inertia signals.
 ///
 /// The inertia pair is the only way to observe `WM_STOPINERTIA` and `WM_ENDINERTIA` at the
-/// platform floor: both are message *numbers*, the floor's SDK redacts them, and a number
-/// cannot be resolved by name the way an export can. Each of these produces exactly one of
-/// them, to the window that last reported content inertia.
+/// platform floor: both are message numbers, the floor's SDK redacts them, and a number
+/// cannot be resolved by name the way an export can. Each produces exactly one of them, to
+/// the window that last reported content inertia.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TouchpadAction {
     /// Three-finger tap.
@@ -66,7 +60,7 @@ pub enum TouchpadAction {
     FiveFingerPress,
     /// Five-finger button release.
     FiveFingerRelease,
-    /// Asks the tracked inertia window to stop — what a finger landing during a fling does.
+    /// Asks the tracked inertia window to stop, as a finger landing during a fling does.
     InertiaStop,
     /// Tells the tracked inertia window its inertia has ended.
     InertiaEnd,
@@ -90,8 +84,7 @@ impl TouchpadAction {
     }
 }
 
-/// How many contacts the parameter block allows a touchpad, and therefore how many this
-/// stream has.
+/// How many contacts the parameter block allows a touchpad, and how many this stream has.
 const CONTACTS: u32 = 5;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -122,7 +115,7 @@ impl<'a> TouchpadStream<'a> {
             &injector.late,
             PT_TOUCHPAD as POINTER_INPUT_TYPE,
             CONTACTS,
-            // The parameter block's own rule for a touchpad, not a preference.
+            // The parameter block accepts no other feedback mode for a touchpad.
             POINTER_FEEDBACK_NONE,
             Some(PAD_MM),
             true,
@@ -148,9 +141,9 @@ impl<'a> TouchpadStream<'a> {
     /// Puts a contact somewhere on the pad, without injecting.
     ///
     /// `at` is a fraction of the pad's surface, origin top-left, so `(0.5, 0.5)` is its
-    /// centre and `(0.0, 0.0)` its corner. Values outside 0–1 are refused rather than
-    /// clamped: a contact off the edge of the pad is a mistake in the test, not an input
-    /// the device could produce.
+    /// centre and `(0.0, 0.0)` its corner. Values outside 0–1 return [`Error::Contact`]
+    /// rather than clamping, because the pad's edge is the limit of what the device can
+    /// report.
     pub fn set(&mut self, index: u32, at: (f32, f32)) -> Result<&mut Self> {
         let (u, v) = at;
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
@@ -204,11 +197,12 @@ impl<'a> TouchpadStream<'a> {
         Ok(self)
     }
 
-    /// Pans `fingers` contacts together, from one fraction of the pad to another, at
-    /// `rate`.
+    /// Pans `fingers` contacts together, from one fraction of the pad to another, over
+    /// `steps` frames at `rate`.
     ///
-    /// Two fingers is the pan the system reads as scroll; three and four are the global
-    /// gestures, which arrive as [`action`](Self::action) rather than as contacts.
+    /// The system reads a two-finger pan as scroll. Three- and four-finger gestures are the
+    /// global ones, which arrive through [`action`](Self::action) rather than as contacts.
+    /// Returns [`Error::Contact`] if `fingers` is zero or above the stream's contact count.
     pub fn pan(
         &mut self,
         fingers: u32,
@@ -224,9 +218,8 @@ impl<'a> TouchpadStream<'a> {
             });
         }
         let steps = steps.max(1);
-        // Fingers sit side by side across the pad, a tenth of its width apart, which is
-        // about what a hand does and keeps them inside the surface for any start point the
-        // caller can state.
+        // Fingers sit side by side across the pad, a tenth of its width apart, which keeps
+        // them inside the surface for any start point the caller can state.
         let spread = 0.1;
         for step in 0..=steps {
             let t = step as f32 / steps as f32;
@@ -285,17 +278,17 @@ fn contact(id: u32, slot: &Slot) -> POINTER_TYPE_INFO {
     POINTER_TYPE_INFO {
         r#type: PT_TOUCHPAD as POINTER_INPUT_TYPE,
         Anonymous: POINTER_TYPE_INFO_0 {
-            // A touchpad contact answers in a `POINTER_TOUCH_INFO`, not a structure of its
-            // own: the extended fields are identical for touch and touchpad, which is the
-            // same reason `GetPointerTouchpadInfo` reads one.
+            // A touchpad contact travels in a `POINTER_TOUCH_INFO` rather than a structure of
+            // its own: the extended fields are identical for touch and touchpad, which is
+            // also what `GetPointerTouchpadInfo` reads.
             touchInfo: POINTER_TOUCH_INFO {
                 pointerInfo: POINTER_INFO {
                     pointerType: PT_TOUCHPAD as POINTER_INPUT_TYPE,
                     pointerId: id,
                     pointerFlags: flags as POINTER_FLAGS,
                     // Device space, because the device was created with a physical size.
-                    // `ptPixelLocation` is not read at all for such a device, and filling
-                    // it in would be stating a screen position a touchpad does not have.
+                    // `ptPixelLocation` is not read for such a device, and a touchpad has no
+                    // screen position to put there.
                     ptHimetricLocation: POINT {
                         x: slot.at.0,
                         y: slot.at.1,

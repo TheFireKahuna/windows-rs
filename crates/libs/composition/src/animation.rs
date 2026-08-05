@@ -23,10 +23,9 @@ pub trait Animation: Sealed {
 
 impl Sealed for CompositionAnimation {}
 
-/// The base type is itself startable, which is what lets a caller that has erased which
-/// kind it built — a spring, a key-frame curve, an expression — still start it. Without
-/// this, a consumer holding a cache of animations keyed by shape has to keep the concrete
-/// type of every one of them.
+/// Makes the base type startable, so a caller holding a [`CompositionAnimation`] whose
+/// concrete kind — spring, key-frame curve, expression — has been erased can still start
+/// it.
 impl Animation for CompositionAnimation {
     fn as_animation(&self) -> Self {
         self.clone()

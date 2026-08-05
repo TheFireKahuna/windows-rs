@@ -1,11 +1,13 @@
+//! The DPI-derived frame and caption metrics a window with a custom frame hit-tests against.
+
 use crate::bindings::*;
 
-/// The DPI-derived quantities a custom frame needs, in **physical pixels**.
+/// Carries the DPI-derived quantities a custom frame needs, in **physical pixels**.
 ///
-/// Nothing here is stored anywhere. A window's DPI changes on a monitor hop, on a scale change
-/// in Settings and on an undock, and the whole set — one `GetDpiForWindow`, four
+/// Nothing here is cached. A window's DPI moves on a monitor hop, on a scale change in
+/// Settings and on an undock, and the whole set — one `GetDpiForWindow`, four
 /// `GetSystemMetricsForDpi` and one `DwmGetWindowAttribute` — measures ~59 ns, which is
-/// affordable at the `WM_NCHITTEST` rate the caption asks for it. Re-measure before caching it.
+/// affordable at the `WM_NCHITTEST` rate the caption asks for it.
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct Metrics {
@@ -32,6 +34,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Measures `hwnd`'s DPI and everything the frame derives from it.
     pub(crate) fn for_window(hwnd: HWND) -> Self {
         // A window being created, or one whose monitor went away, can report zero. Unity
         // keeps every derived metric positive, which the hit test depends on.
@@ -55,21 +58,22 @@ impl Metrics {
         }
     }
 
-    /// A length in DIPs as physical pixels, rounded to the nearest — a band one pixel short
-    /// of what the renderer snapped to is visible.
+    /// Converts a length in DIPs to physical pixels, rounded to the nearest: a band one pixel
+    /// short of what the renderer snapped to is visible.
     #[must_use]
     pub fn px(self, dips: f32) -> i32 {
         (dips * self.scale).round() as i32
     }
 
-    /// A length in physical pixels as DIPs.
+    /// Converts a length in physical pixels to DIPs.
     #[must_use]
     pub fn dips(self, px: i32) -> f32 {
         px as f32 / self.scale
     }
 }
 
-/// The width of the border DWM draws around `hwnd`, or zero if it will not say.
+/// Returns the width of the border DWM draws around `hwnd`, or zero when DWM does not report
+/// one.
 fn visible_border(hwnd: HWND) -> i32 {
     let mut thickness = 0u32;
     // SAFETY: `hwnd` is live; the destination is a stack local of the stated size.

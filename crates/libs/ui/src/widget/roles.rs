@@ -1,23 +1,21 @@
-//! Every variant in the widget set, as `const` rows.
+//! Every variant in the widget set, as `const` rows of [`RoleSet`].
 //!
-//! This is the exact place a widget set grows a cross-product, so it is the place where a
-//! variant must be a **row and not a function**. Tables do not accrete behaviour: a fifth
-//! variant is visibly a fifth row, where a fifth function is a fifth body with its own
-//! conditionals, and by the time anyone counts there are sixty-six of them.
-//!
-//! Reading a row is the whole of `.accent_subtle()`.
+//! A variant is a row rather than a function, so the variants a widget has are the length of
+//! its table and a variant modifier such as `.accent_subtle()` selects an index into it.
 
 use super::RoleSet;
 use crate::role::{Fill, Stroke, Text};
 
-/// The variant a widget starts in. Named, because `[0]` at four call sites is four chances
-/// to mean a different row.
+/// The variant a widget starts in.
 pub const DEFAULT: u8 = 0;
+/// The accent-filled row of [`BUTTON`].
 pub const ACCENT: u8 = 1;
+/// The tinted row of [`BUTTON`]: an accent-subtle fill under accent text and stroke.
 pub const ACCENT_SUBTLE: u8 = 2;
+/// The unfilled row of [`BUTTON`]: no fill and no stroke.
 pub const GHOST: u8 = 3;
 
-/// `button`, `icon_button` and `select`, which is a button that opens something.
+/// The rows `button`, `icon_button` and `select` read.
 pub const BUTTON: &[RoleSet] = &[
     RoleSet {
         fill: Some(Fill::Surface),
@@ -41,8 +39,10 @@ pub const BUTTON: &[RoleSet] = &[
     },
 ];
 
-/// A card, a panel and a flyout differ in elevation and stroke, not in variant — the rung
-/// is a [`Scope`](crate::role::Scope) push and carries the fill with it.
+/// The rows `card`, `panel` and `flyout` read.
+///
+/// They differ in stroke. Their fills differ by rung of the surface ladder, which the
+/// [`Scope`](crate::role::Scope) push carries rather than the row.
 pub const SURFACE: &[RoleSet] = &[
     // A card: a hairline, so it reads as a surface rather than as a lighter patch.
     RoleSet {
@@ -50,13 +50,13 @@ pub const SURFACE: &[RoleSet] = &[
         text: Text::Primary,
         stroke: Some(Stroke::Subtle),
     },
-    // A panel: the window's own plane, so an outline would be drawing a box around nothing.
+    // A panel: the window's own plane, and no outline.
     RoleSet {
         fill: Some(Fill::Surface),
         text: Text::Primary,
         stroke: None,
     },
-    // A flyout: detached, so it states its own edge more firmly than a card does.
+    // A flyout: detached, so its edge is stated more firmly than a card's.
     RoleSet {
         fill: Some(Fill::Surface),
         text: Text::Primary,
@@ -64,14 +64,16 @@ pub const SURFACE: &[RoleSet] = &[
     },
 ];
 
+/// The card row of [`SURFACE`].
 pub const SURFACE_CARD: u8 = 0;
+/// The panel row of [`SURFACE`].
 pub const SURFACE_PANEL: u8 = 1;
+/// The flyout row of [`SURFACE`].
 pub const SURFACE_FLYOUT: u8 = 2;
 
-/// A track a value runs along: a slider's groove, a toggle's body, a meter's bed.
+/// The rows a track reads: a slider's groove, a toggle's body, a meter's bed.
 ///
-/// One row, and the second exists only because a toggle that is on is the accent itself
-/// rather than a groove with accent in it.
+/// [`TRACK_ON`] is the accent fill itself, which is what a toggle that is on is.
 pub const TRACK: &[RoleSet] = &[
     RoleSet {
         fill: Some(Fill::Surface),
@@ -85,20 +87,21 @@ pub const TRACK: &[RoleSet] = &[
     },
 ];
 
+/// The resting row of [`TRACK`]: a groove.
 pub const TRACK_OFF: u8 = 0;
+/// The filled row of [`TRACK`]: the accent itself.
 pub const TRACK_ON: u8 = 1;
 
-/// A text-editable field. Its resting state is a groove; the accent arrives with focus,
-/// which is the focus ring's business and not a variant.
+/// The single row a text-editable field reads. Focus is drawn by the focus ring rather than
+/// by a variant.
 pub const FIELD: &[RoleSet] = &[RoleSet {
     fill: Some(Fill::Surface),
     text: Text::Primary,
     stroke: Some(Stroke::Default),
 }];
 
-/// One option of a segmented picker. Selection is [`ModelState`](super::ModelState) rather
-/// than a row, because it is model state that any control can be in and not something only
-/// this one has.
+/// The single row one option of a segmented picker reads. Selection is
+/// [`ModelState`](super::ModelState) rather than a row, since any control can be selected.
 pub const OPTION: &[RoleSet] = &[RoleSet {
     fill: None,
     text: Text::Secondary,
@@ -111,9 +114,9 @@ mod tests {
 
     /// Every named index addresses a row that exists.
     ///
-    /// The failure this closes is a variant method minting an index its table is too short
-    /// for, which [`Chrome::roles`](super::super::Chrome::roles) would clamp into whichever
-    /// row happened to be last — a control that silently renders as a different variant.
+    /// An index past the end of its table is clamped by
+    /// [`Chrome::roles`](super::super::Chrome::roles) into whichever row is last, which
+    /// renders the control as some other variant.
     #[test]
     fn every_named_variant_indexes_its_own_table() {
         for at in [DEFAULT, ACCENT, ACCENT_SUBTLE, GHOST] {
@@ -127,10 +130,9 @@ mod tests {
         }
     }
 
-    /// A ghost has no fill and no stroke, so it costs the sprites it does not have.
+    /// A ghost row carries no fill and no stroke, so the mount gives it neither sprite.
     ///
-    /// This is what makes the table load-bearing rather than decorative: the row decides
-    /// the visual count, not a branch at mount.
+    /// The row decides the sprite count; there is no branch at mount that could.
     #[test]
     fn a_ghost_variant_mints_no_surface() {
         let ghost = BUTTON[GHOST as usize];

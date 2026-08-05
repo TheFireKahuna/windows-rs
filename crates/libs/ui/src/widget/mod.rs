@@ -1,8 +1,8 @@
-//! The widget set: data seeds, and the shared vocabulary they name.
+//! The widget set: the seed functions an application calls, and the vocabulary they name.
 //!
-//! A widget owns sprites, a hit entry and a role, and adding one is a framework change. A
-//! **composition** is a function returning a tree of widgets: it costs this crate nothing
-//! and needs no permission, and it belongs to the application.
+//! A widget owns sprites, a hit entry and a role, so adding one changes this crate. A
+//! composition is an application-side function returning a tree of widgets, and it adds
+//! nothing here.
 
 pub mod roles;
 
@@ -19,8 +19,7 @@ pub use seed::{
     box_, button, caption, card, field, flyout, icon_button, knob, label, meter, mono, panel, path,
     segmented, select, slider, text, title, toggle,
 };
-// `Controls` and not a second `Chrome`: one is a widget's colour table row, the other is the
-// front thread's control table, and naming both after the chrome they serve meant the crate
-// carried two types of one name and an alias to tell them apart.
+// `ChromeRow` is one row of a widget's colour table; `Controls` is the front thread's table
+// of live controls.
 pub use state::{ChromeRow, Controls, Front, Intent, What};
 pub use text::{Flow, Shaped, TextSource, Written, reactive, shown};

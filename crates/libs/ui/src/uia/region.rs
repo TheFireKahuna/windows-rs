@@ -1,23 +1,18 @@
-//! Making a presentation region's contents readable.
+//! Gives the parts of a presentation region an accessible peer.
 //!
-//! A region's pixels are a buffer, so nothing inside one can be an entry in the hit array
-//! and nothing inside one is a visual. A band handle on the analyzer therefore has no peer
-//! at all unless something makes it one — and it is the application's signature gesture.
+//! A region's contents are pixels in a buffer, so nothing inside one is an entry in the hit
+//! array or a visual of its own. A part becomes readable by joining two sources that
+//! different threads own and that move at different rates:
 //!
-//! The two halves are owned by different threads and move at different rates, which is the
-//! whole reason this module exists rather than a struct:
+//! - **geometry** is the renderer's, republished through [`RegionParts`] whenever its
+//!   mapping moves — a range change, a band added, a resize, every frame of a drag. It is
+//!   versioned, so a reader that has already seen a version does no work.
+//! - **meaning** is this side's: a part's name and role, declared once as a [`PartDecl`]
+//!   and keyed by [`SubId`]. Republishing a name with every geometry change would put an
+//!   allocation on a path with no bound.
 //!
-//! - **geometry** is the renderer's. It republishes whenever its mapping moves — a range
-//!   change, a band added, a resize, and every frame of a drag — through
-//!   [`RegionParts`], which is versioned so a reader that has seen this version does
-//!   nothing at all.
-//! - **meaning** is this side's. A part's name and role are declared once and keyed by
-//!   [`SubId`]; republishing a name with every geometry change would put an allocation on
-//!   a path that has no bound.
-//!
-//! So `windows-present` names no accessibility type and this crate names no presentation
-//! type beyond the two it joins. The join is [`Uia::sync_regions`](super::Uia::sync_regions),
-//! called from the tick: one acquire load per watched region when nothing moved.
+//! The join is [`Uia::sync_regions`](super::Uia::sync_regions), called from the tick, and
+//! costs one acquire load per watched region when nothing moved.
 
 use super::tree::Part;
 use crate::widget::UiaRole;
@@ -26,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use windows_present::{RegionParts, SubId};
 use windows_scene::ControlId;
 
-/// What one part of a region *is*. Declared once, where the region is.
+/// The name and role of one region part, declared once where the region is.
 #[derive(Copy, Clone, Debug)]
 pub struct PartDecl {
     pub sub: SubId,
@@ -35,6 +30,7 @@ pub struct PartDecl {
 }
 
 impl PartDecl {
+    /// Declares the part the renderer publishes under `sub`.
     #[must_use]
     pub const fn new(sub: u32, name: &'static str, role: UiaRole) -> Self {
         Self {
@@ -45,10 +41,10 @@ impl PartDecl {
     }
 }
 
-/// A region's accessible peer: which control it is, what its parts mean, and where the two
+/// A region's accessible peer: which control it is, what its parts mean, and where its two
 /// live sources are.
 pub struct RegionPeer {
-    /// The control the region is in the hit array — one entry, like any other.
+    /// The control the region occupies in the hit array, one entry like any other.
     pub id: ControlId,
     /// Geometry, as the renderer publishes it.
     pub geometry: Arc<RegionParts>,
@@ -57,25 +53,25 @@ pub struct RegionPeer {
     /// One slot per part, indexed by [`SubId`], written by whichever thread owns the
     /// number and read at query time.
     ///
-    /// Optional, and separate from the decls for the same reason the geometry is: a band's
-    /// gain moves while its name does not. One allocation for the region rather than an
-    /// `Arc` per part.
+    /// Optional, and separate from the decls because a band's gain moves while its name
+    /// does not. One allocation for the whole region rather than an `Arc` per part.
     pub values: Option<Arc<[AtomicU64]>>,
 }
 
-/// A watched region, plus what the join needs to not allocate.
+/// A watched region and the buffers its join reuses.
 pub(super) struct Watched {
     peer: RegionPeer,
-    /// The geometry version last joined. The whole of the hot path: a tick where the
-    /// renderer has not moved reads this and stops.
+    /// The geometry version last joined. A tick where the renderer has not moved compares
+    /// this and stops.
     seen: u64,
-    /// Both reused, so a drag joins without allocating once the buffers are at their
+    /// Both reused across joins, so a drag allocates nothing once the buffers reach their
     /// high-water mark.
     incoming: Vec<windows_present::Part>,
     joined: Vec<Part>,
 }
 
 impl Watched {
+    /// Starts watching `peer`, with nothing joined yet.
     pub(super) fn new(peer: RegionPeer) -> Self {
         Self {
             peer,
@@ -91,10 +87,10 @@ impl Watched {
         self.peer.id
     }
 
-    /// Joins geometry against meaning, if the geometry has moved.
+    /// Joins the renderer's geometry against the declared parts, if the geometry has moved.
     ///
-    /// Answers the parts to publish, or `None` when there is nothing to do — which is
-    /// every tick but the ones where the renderer's mapping actually changed.
+    /// Returns the parts to publish, or `None` where the geometry version is unchanged,
+    /// which is every tick but the ones where the renderer's mapping moved.
     pub(super) fn join(&mut self) -> Option<&[Part]> {
         let version = self.peer.geometry.version();
         if version == self.seen {
@@ -103,11 +99,10 @@ impl Watched {
         self.seen = self.peer.geometry.read_into(&mut self.incoming);
 
         self.joined.clear();
-        // Driven from the **decls**, not from the geometry: the declared order is the
-        // order a client reads the parts in, and a renderer publishing them in whatever
-        // order its own mapping produced would otherwise reorder the tree under a reader.
-        // A part with no geometry yet is simply not published, rather than published at
-        // the origin — which would render as a real element at a real place.
+        // Driven from the decls, not from the geometry: the declared order is the order a
+        // client reads the parts in, and the renderer publishes in whatever order its own
+        // mapping produced. A part the geometry does not carry is left out rather than
+        // published at the origin, where it would read as a real element at a real place.
         for decl in &self.peer.parts {
             let Some(found) = self.incoming.iter().find(|part| part.id == decl.sub) else {
                 continue;
@@ -128,7 +123,11 @@ impl Watched {
         Some(&self.joined)
     }
 
+    /// Returns the number the producer wrote for `sub`, or `None` where the peer declares
+    /// no slots, `sub` is past the end, or the slot holds no finite value.
     fn value(&self, sub: SubId) -> Option<f64> {
+        // relaxed: the slot stands alone, with no other datum ordered against it, so a
+        // reader takes whichever whole value is current.
         let value = f64::from_bits(
             self.peer
                 .values

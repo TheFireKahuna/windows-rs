@@ -11,11 +11,11 @@ compile_error!(
     "the `system` and `reactor` composition stacks are mutually exclusive; enable only one"
 );
 
-// `dead_code` is allowed rather than expected, and only for one standing reason: an
-// interface named in the filter's `--implement` list keeps its caller-side projection too,
-// and this crate never calls the tracker owner's six callbacks — it receives them. Every
-// other unused binding is a filter entry the wrapper does not consume, which `--dead-code`
-// exists to report, so keep this at `allow` on the generated module and nowhere else.
+// An interface named in the filter's `--implement` list also keeps its caller-side
+// projection, and this crate receives the tracker owner's six callbacks rather than calling
+// them, so those projections go unused. `allow` rather than `expect`, because the count of
+// unused generated items is not something this file asserts. It covers the generated module
+// alone: an unused filter entry anywhere else still reports through `--dead-code`.
 #[cfg(feature = "system")]
 #[allow(dead_code)]
 #[allow(
@@ -57,11 +57,9 @@ mod target;
 
 // The retained-composition surface: clips, paths, masks, springs, expressions, property
 // sets, interaction trackers, and the constructions built out of them. Carried for the
-// system stack only, matching the filter's `// region: system-only` block — the types
-// mostly exist on both stacks, but the lifted stack's only consumer is reactor's
-// transition engine, which wants none of them. Each is a module of its own with its own
-// `impl Compositor`, so a new capability costs this file two lines and nothing else a
-// rebase has to reconcile.
+// system stack only, matching the filter's `// region: system-only` block. Each capability
+// is a module of its own with its own `impl Compositor`, so adding one touches two lines
+// here and nothing else.
 #[cfg(feature = "system")]
 mod animatable;
 #[cfg(feature = "system")]
@@ -96,8 +94,8 @@ mod sealed {
 pub(crate) use sealed::Sealed;
 pub(crate) use windows_core::Interface;
 
-// Object identity, for the `PartialEq` impls that answer "is this the same object I
-// already bound?" without an interface pointer leaving the crate.
+// Object identity for the wrapper types' `PartialEq` impls, which compare two objects
+// without an interface pointer leaving the crate.
 #[cfg(feature = "system")]
 pub(crate) use animatable::canonical;
 

@@ -1,20 +1,20 @@
-//! The three `user32` exports this design uses that no header on the platform floor names.
+//! Resolves by name the three `user32` exports this crate uses that no header at the platform
+//! floor declares.
 //!
 //! `RegisterTouchpadCapableWindow` (which `windows-window` resolves), `GetPointerTouchpadInfo`
 //! and `ReportWindowContentInertia` are all documented on Learn against Windows 11 and all
 //! three are **absent from the 26100 SDK's own `winuser.h`**, which carries a redaction
 //! marker — `// TODO(…): Make public when Feature_TouchpadPublicApis3 is enabled` — exactly
-//! where they and the two inertia messages should be. They are absent from the vendored
-//! metadata for the same reason.
+//! where they and the two inertia messages belong. They are absent from the vendored metadata
+//! for the same reason.
 //!
-//! So they are resolved by name, once, and a machine that does not have them loses the
-//! feature rather than the process load: a static import the running `user32` does not
-//! export fails at **load**, which would mean every process linking this crate refusing to
-//! start. That is the rule for a capability that genuinely may not be present — probe by
-//! name, record the result, disable what depends on it — rather than build a second path.
+//! A static import of a symbol the running `user32` does not export fails at **load**, which
+//! would stop every process linking this crate from starting. Resolving by name costs a
+//! machine without them the feature instead: probe by name, record the result, and disable
+//! what depends on it.
 //!
-//! **What cannot be resolved this way is `WM_STOPINERTIA` and `WM_ENDINERTIA`.** A message
-//! number is not an export, so there is nothing to look up and no arm to write; see
+//! `WM_STOPINERTIA` and `WM_ENDINERTIA` cannot be resolved this way. A message number is not
+//! an export, so there is nothing to look up and no window-procedure arm to write; see
 //! [`Inertia`](super::Inertia).
 
 use crate::bindings::*;
@@ -29,7 +29,7 @@ type GetTouchpadInfo =
 /// `BOOL ReportWindowContentInertia(HWND, windows_core::BOOL)`.
 type ReportInertia = unsafe extern "system" fn(HWND, windows_core::BOOL) -> windows_core::BOOL;
 
-/// What the running `user32` turned out to have.
+/// Holds the entry points the running `user32` exports, empty where it does not.
 #[derive(Copy, Clone, Default)]
 pub struct Late {
     touchpad_info: Option<GetTouchpadInfo>,
@@ -37,11 +37,15 @@ pub struct Late {
 }
 
 impl Late {
-    /// Resolves both, once.
+    /// Resolves both entry points from the loaded `user32`.
+    ///
+    /// An export that is absent leaves its slot empty and the capability reads as
+    /// unavailable; the module failing to load does the same for both.
     #[must_use]
     pub fn resolve() -> Self {
-        // SAFETY: `user32` is loaded — this process has a window — so the handle is live and
-        // needs no free, and each signature transmuted onto an address is the documented one.
+        // SAFETY: `GetModuleHandleW` answers a borrowed handle that needs no free, and
+        // `user32` stays loaded for as long as this process has a window. Each address is
+        // transmuted to the signature the documentation gives for the name it resolved from.
         unsafe {
             let user32 = GetModuleHandleW(windows_core::w!("user32.dll"));
             if user32.is_null() {
@@ -71,24 +75,28 @@ impl Late {
         self.report_inertia.is_some()
     }
 
-    /// A touchpad contact's detail. `None` where the export is absent or the pointer is not
+    /// Returns a touchpad contact's detail. `None` where the export is absent or `id` is not
     /// a touchpad contact.
     pub(crate) fn touchpad_info(&self, id: u32) -> Option<POINTER_TOUCH_INFO> {
         let call = self.touchpad_info?;
         let mut info = POINTER_TOUCH_INFO::default();
-        // SAFETY: the address resolved from the documented name, and the destination is a
-        // stack local of the type that name writes.
+        // SAFETY: the address was resolved from the documented name and holds that name's
+        // signature, and `info` is a stack local of the type it writes.
         unsafe { call(id, &mut info) }.as_bool().then_some(info)
     }
 
-    /// Tells the system whether `hwnd`'s content is in inertia. `false` if it could not: the
-    /// export may be absent, and the call answers `E_ACCESSDENIED` for a window that is not
-    /// active. Both matter — see [`Inertia::set`](super::Inertia::set).
+    /// Tells the system whether `hwnd`'s content is in inertia, and returns whether the call
+    /// succeeded.
+    ///
+    /// `false` covers both an absent export and a refusal: the call answers `E_ACCESSDENIED`
+    /// for a window that is not active. [`Inertia::set`](super::Inertia::set) retries on
+    /// either.
     pub(crate) fn report_inertia(&self, hwnd: HWND, started: bool) -> bool {
         let Some(call) = self.report_inertia else {
             return false;
         };
-        // SAFETY: as above; `hwnd` is live for the call.
+        // SAFETY: the address was resolved from the documented name and holds that name's
+        // signature, and `hwnd` is live for the call.
         unsafe { call(hwnd, started.into()) }.as_bool()
     }
 }

@@ -1,40 +1,34 @@
-//! Drives every stream against a real window and reports what actually arrived.
+//! Drives every stream against a real window and reports what arrived.
 //!
-//! This is the instrument, and the assertions in `tests/arrives.rs` are what it settled.
-//! Four questions no document can answer:
+//! Four questions, each answered by observation:
 //!
-//! 1. **Does each stream arrive as pointer input at all, and as the right device?** The
-//!    handler reads the pointer behind every pointer message and tallies by type, so "the
-//!    pen stream produced `PT_PEN`" is observed rather than assumed. Injection fails by
-//!    succeeding — a call that returns `TRUE` and delivers nothing is the shape of every
-//!    mistake here — so a return code is not evidence and this is.
-//! 2. **Does any legacy mouse message arrive?** Every message is counted by number, so a
-//!    legacy one shows up as a raw code — which is the only way it can show up, because
-//!    this crate's binding filter generates no constant to name it with.
-//! 3. **Is the mouse placed exactly?** The run reports the calibration verdict, and a drag
-//!    of known total travel is injected so the window's own arrival positions can be
-//!    compared against it.
-//! 4. **Which of the redacted exports does this build have?** [`Capability`] says.
+//! 1. Does each stream arrive as pointer input, and as the right device? The handler reads
+//!    the pointer behind every pointer message and tallies by type, so `PT_PEN` from the pen
+//!    stream is observed rather than assumed. A call that returns `TRUE` and delivers nothing
+//!    is the shape of every mistake here, so a return code is not evidence.
+//! 2. Does any legacy mouse message arrive? Every message is counted by number, so a legacy
+//!    one shows up as a raw code — the only way it can, because this crate's binding filter
+//!    generates no constant to name it with.
+//! 3. Is the mouse placed exactly? The run reports the calibration verdict and injects a drag
+//!    of known total travel, so the window's arrival positions can be compared against it.
+//! 4. Which of the redacted exports does this build have? [`injector::Capability`] says.
 //!
 //! ```text
 //! cargo run -p injector --example streams
 //! cargo run -p injector --example streams -- --inertia
 //! ```
 //!
-//! `--inertia` runs a different question, and it is the one this program answered that
-//! nothing else could. `TA_INERTIA_STOP` and `TA_INERTIA_END` are documented to produce
-//! exactly one `WM_STOPINERTIA` and one `WM_ENDINERTIA` to the window that last reported
-//! content inertia — and those two message *numbers* are redacted from the platform floor's
-//! SDK, so unlike an export they cannot be resolved by name and a guessed constant gives a
-//! handler that either never fires or fires on something else. This arm injects each action
-//! and reports whatever unnamed message arrives.
+//! `--inertia` runs a different arm. `TA_INERTIA_STOP` and `TA_INERTIA_END` each produce one
+//! `WM_STOPINERTIA` and one `WM_ENDINERTIA`, to the window that last reported content
+//! inertia. Those two message numbers are redacted from the platform floor's SDK, and unlike
+//! an export a number cannot be resolved by name, so this arm injects each action and reports
+//! whatever unnamed message arrives.
 //!
-//! **Read off 26200: `WM_STOPINERTIA` is `0x023B`, `WM_ENDINERTIA` is `0x023C`**, one of
-//! each, immediately after its action. Two prerequisites, both of which look like the API
-//! not working until they are met: the window must be **active** — otherwise
-//! `ReportWindowContentInertia` answers `E_ACCESSDENIED`, through a `BOOL` return a caller
-//! ignoring it would never see — and the report must be **re-asserted before each action**,
-//! because the system tracks one window and the stop consumes the tracking.
+//! Read off 26200: `WM_STOPINERTIA` is `0x023B` and `WM_ENDINERTIA` is `0x023C`, one of each,
+//! immediately after its action. Two prerequisites: the window must be active, or
+//! `ReportWindowContentInertia` answers `E_ACCESSDENIED` through a `BOOL` return; and the
+//! report must be re-asserted before each action, because the system tracks one window and
+//! the stop consumes the tracking.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -49,9 +43,9 @@ struct Arrival {
     at: (i32, i32),
     /// Every sample the message carried, oldest first, in raw screen pixels.
     ///
-    /// A message can carry a *frame* of samples rather than one, so counting messages measures
-    /// the pump and reading the history measures the input — and an integral over message
-    /// positions is a lower bound rather than a path.
+    /// A message can carry a frame of samples rather than one, so counting messages measures
+    /// the pump while reading the history measures the input. An integral over message
+    /// positions is a lower bound rather than the path.
     samples: Vec<(i32, i32)>,
 }
 
@@ -85,25 +79,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     at,
                     samples,
                 });
-                // Consumed, and this is not tidiness: `DefWindowProc` is what promotes a
-                // pointer message into a legacy mouse one, so falling through here would
-                // manufacture exactly the messages question 2 is counting.
+                // Consumed: `DefWindowProc` promotes a pointer message into a legacy mouse
+                // one, so falling through here would manufacture the legacy messages this
+                // run counts.
                 Some(0)
             }
         })
         .create()
         .map_err(|error| format!("creating the window: {error}"))?;
     _ = window.show();
-    // Topmost, and this is not decoration. Injected absolute input lands on whatever window
-    // is at that screen point, which is a z-order question rather than a focus one — so a
-    // harness run from a terminal that happens to overlap the target reads zero arrivals and
-    // looks exactly like a stack that delivered nothing.
+    // Injected absolute input lands on whatever window is at that screen point, which is a
+    // z-order question rather than a focus one. Without this, a run under a terminal that
+    // overlaps the target reads zero arrivals and looks like a stack that delivered nothing.
     observe::topmost(window.hwnd());
     settle(&window, 400);
 
     let mut injector = Injector::for_window(window.hwnd())?;
-    // Read once and passed down: the window does not move during a run, and a reporter that
-    // asked the injector for it would be borrowing what a live stream already holds.
+    // Read once and passed down: the window does not move during a run, and asking the
+    // injector for it while a stream is live would borrow the injector twice.
     let space = injector.space();
     println!("{:#?}", injector.capability());
     println!("space {:?} scale {:.2}", space.origin_px(), space.scale());
@@ -121,11 +114,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     settle(&window, 200);
     arrivals.borrow_mut().clear();
 
-    // A drag of known total travel, and nothing else in the arm — the fidelity claim on its
-    // own, with nothing for the integral to pick up that the drive did not put there.
-    // A zigzag, not a line: the length of a polyline through collinear points does not change
-    // when one is removed, so a straight drive reports its full length however many samples
-    // were dropped. Every point here is a corner.
+    // A drag of known total travel and nothing else in this arm, so the integral picks up
+    // only what the drive put there. A zigzag rather than a line: the length of a polyline
+    // through collinear points does not change when one is removed, so a straight drive
+    // reports its full length however many samples were dropped. Every point here is a
+    // corner.
     let path = zigzag((100.0, 60.0), (400.0, 60.0), 40, 6.0);
     let asked = space.placed_length(&whole(Point::new(100.0, 60.0), &path));
     let mut mouse = injector.mouse()?;
@@ -176,8 +169,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report("touch gestures", &arrivals, None, space);
 
     // ── Pen ───────────────────────────────────────────────────────────────────
-    // Needs a virtual device, so it is refused in an unpackaged process rather than run:
-    // every call on that path returns success and delivers nothing.
+    // A pen needs a virtual device, so an unpackaged process is refused rather than run:
+    // every pen call there returns success and delivers nothing.
     match injector.pen() {
         Ok(mut pen) => {
             pen.pressure(0.8)
@@ -196,8 +189,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Precision touchpad ────────────────────────────────────────────────────
-    // Its contacts need a virtual device and are refused unpackaged; its *actions* do not,
-    // and `--inertia` is what drives those.
+    // Touchpad contacts need a virtual device and are refused unpackaged; its actions do
+    // not, and the `--inertia` arm drives those.
     match injector.touchpad() {
         Ok(mut pad) => {
             pad.pan(2, (0.3, 0.5), (0.7, 0.5), 24, Rate::PerFrame)?
@@ -230,16 +223,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The open-item-16 arm: read the two redacted message numbers off the system.
+/// Reads the two redacted inertia message numbers off the running system.
 fn inertia(
     window: &Window,
     injector: &mut Injector,
     counts: &Rc<RefCell<Vec<(u32, u32)>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("touchpad-capable: {}", window.is_touchpad_capable());
-    // Activate the window the way a user would before asking the system to track it: a
-    // foreground-sensitive call refused for a background window is a different finding from
-    // one refused outright.
+    // Activate the window before asking the system to track it: `ReportWindowContentInertia`
+    // refuses a background window, which is a different finding from refusing outright.
     {
         let mut mouse = injector.mouse()?;
         mouse.tap((300.0, 200.0))?;
@@ -253,9 +245,9 @@ fn inertia(
     let before: Vec<(u32, u32)> = counts.borrow().clone();
     let mut pad = injector.touchpad()?;
     for action in [TouchpadAction::InertiaStop, TouchpadAction::InertiaEnd] {
-        // Re-asserted before each: the system tracks ONE window's content inertia, and the
-        // stop is a request to end it — so a report made once and left is a report the first
-        // action consumes, and the second action then has nowhere to land.
+        // Re-asserted before each action: the system tracks one window's content inertia and
+        // the stop consumes that tracking, so a report made once leaves the second action
+        // nowhere to land.
         if let Err(why) = observe::report_inertia(window.hwnd(), true) {
             println!("re-reporting inertia refused: {why}");
             break;
@@ -302,12 +294,12 @@ fn settle(window: &Window, ms: u64) {
     }
 }
 
-/// Drains what arrived and says what it was.
+/// Drains what arrived and prints what it was.
 ///
-/// `travel` is what the drive asked for, and what it is compared against is the **path
-/// integral** over the arrivals — the sum of the segments, not the distance from the first to
-/// the last. A drag that goes out and comes back has an integral and no displacement, and the
-/// quantity a dropped sample shortens is the integral.
+/// `travel` is what the drive asked for, and it is compared against the path integral over
+/// the arrivals — the sum of the segments, not the distance from the first to the last. A
+/// drag that goes out and comes back has an integral and no displacement, and a dropped
+/// sample shortens the integral.
 fn report(what: &str, arrivals: &Rc<RefCell<Vec<Arrival>>>, travel: Option<f32>, space: Space) {
     let arrivals = arrivals.borrow_mut().drain(..).collect::<Vec<_>>();
     let mut by_type: Vec<(u32, u32)> = Vec::new();
@@ -360,11 +352,10 @@ fn report(what: &str, arrivals: &Rc<RefCell<Vec<Arrival>>>, travel: Option<f32>,
     }
 }
 
-/// The reading side, which this crate deliberately does not carry.
+/// The reading side: the message constants and pointer accessors the injector does not carry.
 ///
-/// The injector's binding filter names no message constant and no pointer accessor, because
-/// a harness that both wrote the input and owned the names for the result would be checking
-/// itself. So the observer is declared here, in the program doing the observing.
+/// The injector's binding filter names no message constant and no pointer accessor, so the
+/// program observing arrivals declares its own.
 // The names are the platform's, so they are spelled the platform's way.
 #[expect(non_snake_case)]
 mod observe {
@@ -375,7 +366,7 @@ mod observe {
     windows_core::link!("kernel32.dll" "system" fn GetModuleHandleW(name : windows_core::PCWSTR) -> *mut core::ffi::c_void);
     windows_core::link!("kernel32.dll" "system" fn GetProcAddress(module : *mut core::ffi::c_void, name : windows_core::PCSTR) -> Option<unsafe extern "system" fn() -> isize>);
 
-    /// Only the prefix this program reads; the rest of `POINTER_INFO` is padding to it.
+    /// The prefix of `POINTER_INFO` this program reads.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     pub struct POINTER_INFO {
@@ -405,11 +396,11 @@ mod observe {
         (message >= 0x0200 && message <= 0x020E) || message == 0x02A1 || message == 0x02A3
     }
 
-    /// The device and the raw position behind a pointer message.
+    /// Returns the device, the raw position and the sample history behind a pointer message.
     ///
-    /// **Raw, not predicted.** A discrete decision made from an extrapolated point is wrong
-    /// at contact start and at direction reversals, and a harness comparing what it injected
-    /// against what arrived must compare against what was actually reported.
+    /// Raw, not predicted: the predicted position is an extrapolation the system added, and
+    /// it is wrong at contact start and at direction reversals, so what was injected is
+    /// compared against what was reported.
     pub fn pointer(id: u32) -> (u32, (i32, i32), Vec<(i32, i32)>) {
         let mut info = POINTER_INFO::default();
         // SAFETY: the destination is a stack local the call writes back through.
@@ -424,13 +415,12 @@ mod observe {
             (0, (0, 0), Vec::new())
         }
     }
-    /// Every sample the message carried, oldest first, in raw screen pixels.
+    /// Returns every sample the message carried, oldest first, in raw screen pixels.
     ///
-    /// **This, not the message's own position, is what a fidelity claim integrates.** A window
-    /// that is not reading its queue receives one `WM_POINTERUPDATE` carrying a frame of
-    /// samples rather than one message per sample, so integrating message positions measures
-    /// how often the pump ran. The history is what the input actually was, and it is also what
-    /// the framework itself reads.
+    /// A fidelity claim integrates this rather than the message's own position. A window that
+    /// is not reading its queue receives one `WM_POINTERUPDATE` carrying a frame of samples
+    /// rather than one message per sample, so integrating message positions measures how
+    /// often the pump ran. The history is what the input was, and what the framework reads.
     pub fn history(id: u32) -> Vec<(i32, i32)> {
         let mut count = 0u32;
         // SAFETY: a null destination with a zero count is the documented way to ask how many
@@ -475,9 +465,9 @@ mod observe {
         }
     }
 
-    /// Tells the system this window's content is or is not in inertia, so the two inertia
-    /// actions have somewhere to be delivered. Redacted from the floor's SDK, so resolved
-    /// by name — `false` where this build does not export it.
+    /// Reports this window's content as in or out of inertia, so the two inertia actions have
+    /// a window to be delivered to. Redacted from the floor's SDK, so resolved by name, and
+    /// an error where this build does not export it.
     pub fn report_inertia(hwnd: *mut core::ffi::c_void, started: bool) -> Result<(), String> {
         type Report = unsafe extern "system" fn(*mut core::ffi::c_void, i32) -> windows_core::BOOL;
         // SAFETY: `user32` is loaded, and the signature transmuted onto the address is the
@@ -510,8 +500,8 @@ mod observe {
         }
     }
 
-    /// Names what this program expects. **Anything unnamed is the finding** — a legacy mouse
-    /// message, or one of the two inertia numbers the SDK redacts.
+    /// Returns the name this program expects for `code`, or its hexadecimal value. An
+    /// unnamed code is a legacy mouse message or one of the two redacted inertia numbers.
     pub fn name(code: u32) -> String {
         let named = [
             (0x0241, "WM_NCPOINTERUPDATE"),

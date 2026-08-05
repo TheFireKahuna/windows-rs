@@ -1,31 +1,29 @@
-//! Building the flat hit array. **App half.**
+//! Builds the flat hit array. **App half.**
 //!
-//! One contiguous, z-ordered array replaces every tree walk. It is the **single
-//! authority** for pointer routing, wheel routing, gesture targeting, keyboard focus
-//! order, the window's own caption hit test and UI Automation's element-from-point — and a
-//! presentation region's parts *extend* it rather than forking it. No parallel path may
-//! exist.
+//! One contiguous, z-ordered array stands in for every tree walk. Pointer routing, wheel
+//! routing, gesture targeting, keyboard focus order, the window's own caption hit test and
+//! UI Automation's element-from-point all resolve through it, and a presentation region's
+//! parts extend it rather than forking it.
 //!
-//! It is built here, in one linear pass over the solved layout in paint order, and queried
-//! on the other side of the seam, where live scroll offsets are.
+//! It is built here in one linear pass over the solved layout in paint order, and queried
+//! on the other side of the seam, where the live scroll offsets are.
 
 use crate::id::Id;
 use crate::layout::Solved;
 use crate::sink::{Control, NodeId, Point};
 
-/// A widget's identity, as the layer above mints it.
+/// Identifies a widget, as the layer above mints it.
 ///
-/// The same generational index every other family uses, so the staleness rule is one rule:
-/// a queued intent naming a control that has since unmounted finds **nothing**, rather than
-/// whatever now occupies the slot. It was a bare `u64` and therefore forgeable, and
-/// interchangeable with any other id that happened to be one.
+/// The same generational index every other family uses, so one staleness rule covers them
+/// all: a queued intent naming a control that has since unmounted finds nothing, rather
+/// than whatever now occupies the slot.
 pub type ControlId = Id<Control>;
 
-/// The index meaning "no entry".
+/// Marks the absence of an entry in a `clip_parent` or `parent` field.
 pub const NO_ENTRY: u32 = u32::MAX;
 
-/// What a node participates in. A bitmask rather than a set of flags on the node, because
-/// the query reads all of them in one test per entry.
+/// Records what a node participates in. One bitmask per entry, so a query tests every kind
+/// of participation with a single read.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct HitFlags(u32);
 
@@ -54,28 +52,33 @@ impl HitFlags {
     /// Chrome pinned to a scroll container's viewport: its rect does **not** resolve
     /// through that container's offset.
     ///
-    /// A scrollbar's rail is the case, and it is not a special case — it is inside the
-    /// thing it reports on and does not move with it, so inheriting the offset would slide
-    /// the target off the surface exactly as far as the content has scrolled.
+    /// A scrollbar's rail sits inside the container it reports on and does not travel with
+    /// the content, so inheriting the offset would slide its target off the rail exactly as
+    /// far as the content has scrolled.
     pub const UNSCROLLED: Self = Self(1 << 9);
 
+    /// The empty set.
     pub const NONE: Self = Self(0);
 
+    /// Returns `true` where every flag in `other` is set.
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// Returns `true` where any flag in `other` is set.
     #[must_use]
     pub const fn intersects(self, other: Self) -> bool {
         self.0 & other.0 != 0
     }
 
+    /// Returns the flags set in either.
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
+    /// Returns the raw bitmask.
     #[must_use]
     pub const fn bits(self) -> u32 {
         self.0
@@ -89,7 +92,8 @@ impl core::ops::BitOr for HitFlags {
     }
 }
 
-/// One entry. `#[repr(C)]` and `Copy`: the array is scanned linearly and rides the patch.
+/// Describes one node's participation in the hit array. `#[repr(C)]` and `Copy`: the array
+/// is scanned linearly and rides the patch.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct HitEntry {
@@ -106,8 +110,8 @@ pub struct HitEntry {
     ///
     /// Structural ancestry rather than clipping ancestry, and the two are unrelated: a
     /// group that clips nothing is still a parent. Filled during the same walk, so the
-    /// array carries its own tree and a consumer that needs one — automation's fragment
-    /// navigation — reads it here instead of keeping a second one in step.
+    /// array carries its own tree, and automation's fragment navigation reads it here
+    /// rather than keeping a second tree in step.
     pub parent: u32,
     pub flags: HitFlags,
     /// The nearest scrolling ancestor, or [`NodeId::NONE`]. A node id and not an index,
@@ -118,7 +122,7 @@ pub struct HitEntry {
 }
 
 impl HitEntry {
-    /// Whether `p` is inside, with `inflate` DIPs added on each side.
+    /// Returns `true` where `p` is inside the box, with `inflate` DIPs added on each side.
     #[must_use]
     pub fn contains(&self, p: Point, inflate: f32) -> bool {
         p.x >= self.x0 - inflate
@@ -127,8 +131,8 @@ impl HitEntry {
             && p.y <= self.y1 + inflate
     }
 
-    /// Distance from `p` to the centre, squared. The tie-break when two inflated targets
-    /// both claim a point.
+    /// Returns the squared distance from `p` to the box's centre. The tie-break when two
+    /// inflated targets both claim a point.
     #[must_use]
     pub fn centre_distance_sq(&self, p: Point) -> f32 {
         let (cx, cy) = ((self.x0 + self.x1) * 0.5, (self.y0 + self.y1) * 0.5);
@@ -136,7 +140,8 @@ impl HitEntry {
     }
 }
 
-/// What a widget declares about a node. Everything else on an entry is derived.
+/// Carries what a widget declares about a node. Every other field of an entry is derived
+/// during the build.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct HitDecl {
     pub flags: HitFlags,
@@ -148,11 +153,11 @@ pub struct HitDecl {
 /// The platform's ~9 mm touch-target guidance, in DIPs: `9 / 25.4 * 96`.
 pub const TOUCH_TARGET_DIPS: f32 = 34.015_75;
 
-/// How much to inflate a box of `w` × `h` DIPs so a finger can hit it.
+/// Returns the DIPs to add on each side of a `w` × `h` box so a finger can hit it.
 ///
-/// Zero for a target already big enough. Half the shortfall on each side, so the inflated
-/// box reaches the guidance and no further — inflating past it is what makes neighbouring
-/// targets both claim a point.
+/// Zero where the shorter side already reaches [`TOUCH_TARGET_DIPS`]. Otherwise half the
+/// shortfall on each side, so the inflated box reaches the guidance and no further; past
+/// it, neighbouring targets start claiming the same point.
 #[must_use]
 pub fn default_inflation(w: f32, h: f32) -> f32 {
     ((TOUCH_TARGET_DIPS - w.min(h)) * 0.5).max(0.0)
@@ -160,13 +165,14 @@ pub fn default_inflation(w: f32, h: f32) -> f32 {
 
 /// Builds the array from solved layout in paint order.
 ///
-/// Three small stacks carry the ancestry — every entry by index, clipping entries by
-/// index, scrolling nodes by id — so `parent`, `clip_parent` and `scroll_src` are filled
-/// during the walk rather than by a second pass. Slot roots are appended by the caller
-/// *after* the window subtree, in the order they opened, each light-dismissing overlay
-/// preceded by its blocker: because the array is the z-order and the scan takes the first
-/// hit from the back, that places every overlay above the content it covers and gives
-/// "press outside dismisses" for free.
+/// Three stacks carry the ancestry — every entry by index, clipping entries by index,
+/// scrolling nodes by id — so `parent`, `clip_parent` and `scroll_src` are filled during
+/// the walk rather than by a second pass.
+///
+/// The caller appends slot roots *after* the window subtree, in the order they opened, each
+/// light-dismissing overlay preceded by its blocker. The array is the z-order and the scan
+/// takes the first hit from the back, so that places every overlay above the content it
+/// covers and puts a press outside an overlay on that overlay's blocker.
 #[derive(Debug, Default)]
 pub struct HitBuilder {
     /// (depth the entry was emitted at, its index). Every entry, not only the clipping
@@ -179,8 +185,8 @@ pub struct HitBuilder {
 }
 
 impl HitBuilder {
-    /// Starts a fresh table. The output buffer is the patch's own, so nothing intermediate
-    /// is allocated.
+    /// Clears the ancestry stacks and `out`, starting a fresh array. `out` is the patch's
+    /// own buffer, so the build fills no intermediate one.
     pub fn begin(&mut self, out: &mut Vec<HitEntry>) {
         self.entries.clear();
         self.clips.clear();
@@ -188,10 +194,12 @@ impl HitBuilder {
         out.clear();
     }
 
-    /// Enters a node's subtree, after emitting its own entry if it declared one.
+    /// Enters a node's subtree, emitting its own entry first where `decl` is `Some`.
     ///
-    /// `depth` is the node's depth in the walk; the builder pops its stacks to match, so a
-    /// caller emits in paint order and states depth rather than pairing enter with exit.
+    /// `depth` is the node's depth in the walk, and the builder pops its stacks to match, so
+    /// a caller emits in paint order and states depth rather than pairing enter with exit.
+    /// A node that declares nothing appends no entry, and its children take the nearest
+    /// emitted ancestor as their `parent`.
     pub fn push(
         &mut self,
         out: &mut Vec<HitEntry>,
@@ -237,9 +245,9 @@ impl HitBuilder {
         }
     }
 
-    /// Appends a full-window blocker ahead of an overlay that dismisses on a press
-    /// outside. The press is **consumed**: dismiss-and-act would make an accidental menu
-    /// open cost an unintended edit.
+    /// Appends a full-window blocker ahead of an overlay that dismisses on a press outside.
+    /// The blocker consumes the press, so a dismissing press never also reaches the content
+    /// underneath.
     pub fn blocker(&mut self, out: &mut Vec<HitEntry>, id: ControlId, window: (f32, f32)) {
         // A slot root is not inside the window subtree, so it inherits neither its clips,
         // nor its scroll offsets, nor its ancestry — and a blocker covers the window

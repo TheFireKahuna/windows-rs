@@ -1,25 +1,14 @@
 //! UI Automation.
 //!
-//! # The one decision
+//! The tree is published rather than queried on demand. A client's call reads an immutable
+//! snapshot from automation's own worker thread and never enters the window's message pump,
+//! so a provider method cannot block a screen reader and a client walking the tree at idle
+//! costs no front-thread wakes.
 //!
-//! **The tree is published, not asked for.** A client's query reads an immutable snapshot
-//! from automation's own worker thread and never touches the window's. The reference this
-//! is adapted from could not do that — its tree was the `!Send` node arena — so every
-//! provider method made a blocking round trip onto the pump, and the machinery that made
-//! that affordable (a batched property snapshot, a process-global generation counter to
-//! invalidate it, a per-thread one-element cache, and a carve-out for the two properties
-//! that move without a mutation hook) is most of what this port does not contain.
-//!
-//! Two consequences beyond the size. `WM_GETOBJECT` can no longer hang a screen reader,
-//! because a query never enters the pump — not by being careful, but by construction. And
-//! a client walking the tree at idle costs zero front-thread wakes, so the window's
-//! zero-cost-at-idle property survives having a screen reader attached.
-//!
-//! Commands are the mirror image, and the platform agrees: `Invoke` "is an asynchronous
-//! call and must return immediately without blocking", as is `Toggle`, `Select` and
-//! `SetValue`. They queue and ring the front thread's existing doorbell, so an invoke runs
-//! the widget's own handler, publishes its pixels and queues its intent — exactly as a tap
-//! does, through the same code.
+//! Commands cross the other way. `Invoke`, `Toggle`, `Select` and `SetValue` must return
+//! without blocking, so each queues an [`Action`] and posts the front thread's frame
+//! message; the tick then runs the widget's own handler, publishes its pixels and queues
+//! its intent, through the same code a tap runs.
 //!
 //! # What is where
 //!
@@ -32,7 +21,7 @@
 //! | [`patterns`] | the control patterns |
 //! | [`text`] | `TextPattern` over the blob |
 //! | [`region`] | joining a presentation region's published geometry to what it means |
-//! | [`roles`] | one `const` row per role, replacing a cross-product |
+//! | [`roles`] | one `const` row per role |
 //! | [`action`] / [`events`] | the two queues that cross back |
 
 mod action;
@@ -66,29 +55,25 @@ use windows_scene::{ControlId, HitEntry, NodeId};
 
 /// The step a live region's value is quantized to before it is announced.
 ///
-/// A loudness read-out moves every frame and a client that speaks every frame is unusable,
-/// so only a change a listener could act on is worth interrupting for — the same
-/// conclusion the draw path reached about a read-out whose digits change every frame,
-/// applied to the announcement instead.
+/// A read-out can move every frame, so a value is announced only once it crosses a step.
 ///
-/// **Quantized, not rate-limited.** A value that oscillates across a step boundary still
-/// announces every tick, and this stack has no clock here to bound it with — the tick is
-/// not periodic. Bounding it properly needs a timestamp, which is a thing to add when a
-/// real producer shows the behaviour rather than a thing to guess at now.
+/// Quantization is the only bound: a value oscillating across a step boundary announces on
+/// every tick. Rate-limiting it would need a timestamp, and the tick this runs on is not
+/// periodic and carries none.
 const LIVE_QUANTUM: f64 = 0.5;
 
 /// The front thread's half of automation.
 ///
 /// Owns the publish, the event queue and the window's identity. Everything a client can
-/// reach lives behind the `Arc` and is `Send + Sync`; this is not, which is what says the
-/// publish happens on the thread that owns the tree.
+/// reach lives behind the `Arc` and is `Send + Sync`; `Uia` itself is neither, so the
+/// publish runs on the thread that owns the tree.
 pub struct Uia {
     shared: FrontHandle<Arc<Shared>>,
-    /// Held so a republish can carry the live half forward.
+    /// The published tree, held so a republish can carry the live half forward.
     current: Arc<Tree>,
     pending: Pending,
-    /// The value each live region last announced, so an announcement is a change and not a
-    /// heartbeat.
+    /// The value each live region last announced, so a value that lands on the same step
+    /// announces nothing.
     announced: Vec<(ControlId, f64)>,
     /// Presentation regions whose parts this tick may have to re-join.
     regions: Vec<region::Watched>,
@@ -101,6 +86,7 @@ impl Default for Uia {
 }
 
 impl Uia {
+    /// Creates automation state with no window attached and an empty tree.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -112,24 +98,25 @@ impl Uia {
         }
     }
 
-    /// Names the window every provider answers for.
+    /// Records the window every provider answers for.
     pub fn attach(&mut self, hwnd: HWND) {
         self.shared.attach(hwnd);
     }
 
-    /// `WM_GETOBJECT`. `None` for an object id that is somebody else's.
+    /// Answers `WM_GETOBJECT` with the fragment root, or `None` for an object id that names
+    /// something else.
     ///
-    /// The only automation call that arrives on the pump, and all it does is hand back the
-    /// fragment root.
+    /// The only automation call that arrives on the pump; everything a client asks
+    /// afterwards is answered off the front thread.
     pub fn get_object(&mut self, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         element::get_object(&self.shared, w, l)
     }
 
-    /// The window is going. **Called from `WM_DESTROY`**, while the handle is still valid.
+    /// Releases automation's cache for the window and empties the tree.
     ///
-    /// Releases automation's own cache for the window, which our references going away does
-    /// not do — and cannot be deferred to [`Drop`](Self::drop), because by then the handle
-    /// names nothing.
+    /// Must be called from `WM_DESTROY`, while the handle is still valid: the release names
+    /// the handle, so it cannot be deferred to [`Drop`](Self::drop). Dropping our own
+    /// references does not release the cache automation keeps per window.
     pub fn detach(&mut self) {
         element::disconnect(&self.shared);
         self.adopt(Arc::new(Tree::empty()));
@@ -137,28 +124,28 @@ impl Uia {
         self.regions.clear();
     }
 
-    /// Whether the tree is worth building.
+    /// Returns whether a client has asked for a provider, which is what gates building the
+    /// tree.
     ///
-    /// **The latch alone.** `UiaClientsAreListening` was the obvious gate and it is
-    /// useless: measured on a bare Windows 11 desktop with no screen reader running, it
-    /// answers `true`. Gating on it would build the tree on every machine forever, which
-    /// is the opposite of what it looks like it does. Having actually been asked for a
-    /// provider is not a hint, and it is also sufficient — `WM_GETOBJECT` is the only way
-    /// into this tree, so nothing can query before the latch is set.
+    /// The gate is the `WM_GETOBJECT` latch alone. `UiaClientsAreListening` answers `true`
+    /// on a bare Windows 11 desktop with no screen reader running, so gating the build on
+    /// it would build the tree on every machine. The latch is also sufficient:
+    /// `WM_GETOBJECT` is the only way into this tree, so nothing can query before it is
+    /// set.
     ///
-    /// The hint still gates *event raising*, where a false positive costs one call rather
-    /// than a whole tree.
+    /// Event raising gates on `UiaClientsAreListening` instead, where a false positive
+    /// costs one call rather than a whole tree.
     #[must_use]
     pub fn listening(&self) -> bool {
         self.shared.queried.load(Relaxed)
     }
 
-    /// Whether a client has appeared since the last publish and is looking at nothing.
+    /// Returns whether a client has appeared since the last publish and would walk nothing.
     ///
-    /// A window that is not laid out again will not republish on its own, so a client that
-    /// attaches to an idle window would walk an empty tree forever. The tick asks this
-    /// alongside its layout-changed check; the `WM_GETOBJECT` that set the latch has
-    /// already posted for a tick to ask in.
+    /// A window that is not laid out again does not republish on its own, so a client
+    /// attaching to an idle window would see an empty tree until something moved. The tick
+    /// asks this alongside its layout-changed check; the `WM_GETOBJECT` that set the latch
+    /// has already posted the frame message that tick runs in.
     #[must_use]
     pub fn wants_tree(&self) -> bool {
         self.listening() && self.current.is_empty()
@@ -167,12 +154,12 @@ impl Uia {
     /// Publishes a new tree, built from the adopted hit array and the seeds the
     /// application thread produced alongside it.
     ///
-    /// Called where the hit array is adopted and nowhere else, so the two are the same
-    /// data by construction rather than by an ordering rule.
+    /// Called where the hit array is adopted and nowhere else, so entries and seeds
+    /// describe the same layout by construction rather than by an ordering rule.
     pub fn publish(&mut self, entries: &[HitEntry], seeds: &Seeds) {
         if !self.listening() {
-            // Not merely a smaller tree: the string blob is never built and the columns
-            // pass never runs, so a machine with no client attached pays nothing at all.
+            // With no client latched, neither the string blob nor the columns pass is
+            // built: the tree is not merely smaller, it is not constructed at all.
             if !self.current.is_empty() {
                 self.adopt(Arc::new(Tree::empty()));
             }
@@ -184,9 +171,9 @@ impl Uia {
     }
 
     fn adopt(&mut self, tree: Arc<Tree>) {
-        // Carried before the publish, so no client can observe the new tree with the old
-        // tree's values missing. A layout change does not disable a control or move a
-        // slider, and without this a resize would report every toggle as reset.
+        // The live half carries forward before the publish, so no client can observe the
+        // new tree with the old tree's values missing. A layout change disables no control
+        // and moves no slider; without this a resize would report every toggle as reset.
         tree.live
             .carry(&self.current.live, tree.remap(&self.current));
         self.shared.evict(&tree);
@@ -194,20 +181,22 @@ impl Uia {
         self.current = tree;
     }
 
-    /// The window's client origin in physical pixels, and its DIP scale.
+    /// Publishes the window's client origin in physical pixels, and its DIP scale.
     ///
-    /// Automation speaks screen pixels. Published on every move, resize and DPI change,
-    /// because a stale origin is indistinguishable from an application placing its
-    /// controls in the wrong place.
+    /// Every bounding rectangle a provider reports is computed from these, because
+    /// automation reports screen pixels. Call on every move, resize and DPI change: a stale
+    /// origin reports every control at the wrong place.
     pub fn set_window(&mut self, origin: Vector2, scale: f32) {
         self.current.live.set_window(origin, scale);
     }
 
+    /// Publishes the offset of one scroll container, which its descendants' bounds are
+    /// resolved through. Does nothing for a node the published tree scrolls nothing by.
     pub fn set_scroll(&mut self, node: NodeId, offset: Vector2) {
         self.current.live.set_scroll(node, offset);
     }
 
-    /// Where a control's value now stands.
+    /// Records where a control's value now stands, and queues the property change.
     ///
     /// One relaxed store, which is why the router can call it per pointer sample. The
     /// event is coalesced to one per element per tick, so a drag announces once.
@@ -223,16 +212,15 @@ impl Uia {
         self.pending.push(Raise::Property {
             id,
             what: Property::Range,
-            // A first value has no predecessor, so it reports itself as having come from
-            // its own range's floor rather than from nothing — which automation would read
-            // as no change at all.
+            // A first value has no predecessor. Reporting the range's floor as where it
+            // came from keeps automation from reading the event as no change at all.
             from: Val::Number(was.unwrap_or_else(|| self.floor(at))),
             to: Val::Number(value),
         });
         self.announce(id, at, value);
     }
 
-    /// The bottom of an element's range, or zero where it names none.
+    /// Returns the bottom of the element's range, or zero where it carries none.
     fn floor(&self, at: usize) -> f64 {
         match self.current.col(at).map(|col| col.value) {
             Some(Value::Range(range)) => range.min,
@@ -240,7 +228,8 @@ impl Uia {
         }
     }
 
-    /// A model-state change: enabled, toggled, selected, expanded.
+    /// Records one state flag — enabled, toggled, selected or expanded — and queues the
+    /// matching property event for all but `ENABLED`.
     pub fn set_state(&mut self, id: ControlId, flag: State, on: bool) {
         let Some(at) = self.current.index_of(id) else {
             return;
@@ -265,7 +254,7 @@ impl Uia {
         }
     }
 
-    /// Which control has keyboard focus, if any.
+    /// Records which control holds keyboard focus, and raises a focus event when one does.
     pub fn set_focus(&mut self, id: Option<ControlId>) {
         let packed = id.map_or(u64::MAX, element::packed);
         if self.current.live.focused() == packed {
@@ -277,47 +266,45 @@ impl Uia {
         }
     }
 
-    /// Records that an overlay opened or closed.
+    /// Queues an overlay event, such as a menu or tooltip opening or closing.
     pub fn overlay(&mut self, raise: Raise) {
         self.pending.push(raise);
     }
 
-    /// Binds a producer-owned value to a control.
+    /// Binds a producer-owned value cell to a control.
     ///
     /// A presentation region's number is written by the thread that drew the pixels it
-    /// describes, so it cannot live in a snapshot the front thread replaces. This is the
-    /// whole of what makes a region readable: no visual is created and no pixel is
-    /// involved. Takes effect immediately.
+    /// describes, so it cannot live in a snapshot the front thread replaces. Creates no
+    /// visual and touches no pixels, and takes effect without a republish.
     pub fn bind_value(&mut self, id: ControlId, cell: Arc<AtomicU64>) {
         self.shared.regions.declare(id, None, Some(cell));
     }
 
     /// Declares what is nameable inside a presentation region.
     ///
-    /// Region-local rects, restated by whoever owns the region whenever its mapping moves —
-    /// a range change, a band added, a resize, or a band being dragged. That is why they do
-    /// **not** go into the tree: each of those would otherwise be a republish of every
-    /// element on the screen. What a part *means* does not move with the geometry, which is
-    /// why the name and the role travel with it rather than being looked up elsewhere.
+    /// Parts carry region-local rects and are restated by whoever owns the region whenever
+    /// its mapping moves — a range change, a band added, a resize, a band dragged. They
+    /// live beside the tree rather than in it, so none of those republishes every element
+    /// on the screen. Each part's name and role travel with it, because they do not move
+    /// when its geometry does.
     pub fn set_parts(&mut self, id: ControlId, parts: &[Part]) {
         self.shared.regions.declare(id, Some(parts), None);
     }
 
-    /// Watches a presentation region: its renderer publishes geometry, this side owns what
-    /// that geometry means, and [`sync_regions`](Self::sync_regions) joins them.
+    /// Watches a presentation region, replacing any earlier watch on the same control.
     ///
-    /// The alternative is the application forwarding parts by hand every time its renderer
-    /// moves one, which is the same join written once per region instead of once.
+    /// The region's renderer publishes the geometry, this side owns what that geometry
+    /// means, and [`sync_regions`](Self::sync_regions) joins the two.
     pub fn watch_region(&mut self, peer: RegionPeer) {
         let id = peer.id;
         self.regions.retain(|watched| watched.id() != id);
         self.regions.push(region::Watched::new(peer));
     }
 
-    /// Re-joins every watched region whose renderer has moved. **Called once per tick.**
+    /// Re-joins every watched region whose renderer has moved. Called once per tick.
     ///
-    /// One acquire load per region when nothing changed, which is the common case and the
-    /// reason this can sit on the tick unconditionally.
+    /// A region whose geometry version has not moved costs one version read and nothing
+    /// else, so this can sit on the tick unconditionally.
     pub fn sync_regions(&mut self) {
         for watched in &mut self.regions {
             let id = watched.id();
@@ -327,7 +314,8 @@ impl Uia {
         }
     }
 
-    /// Forgets everything a control declared. Called where the control table does.
+    /// Forgets everything a control declared: its parts, its bound value, its last
+    /// announcement and its region watch. Called where the control table drops the control.
     pub fn release(&mut self, id: ControlId) {
         self.shared.regions.forget(id);
         self.announced.retain(|(key, _)| *key != id);
@@ -336,12 +324,13 @@ impl Uia {
 
     // ── what the tick hands over ────────────────────────────────────────────────
 
-    /// Records the value changes an interaction produced.
+    /// Records the value changes and taps an interaction produced.
     ///
-    /// Fed the intents the front side already builds, so this is not a second observation
-    /// of the same fact: a slider that moved its own thumb queues one, and this reads the
-    /// number out of it. A committed value and a changed one say the same thing to a
-    /// client, which is why both land here and neither is announced twice.
+    /// Reads the intents the front side already builds rather than observing the
+    /// interaction a second time: a slider that moved its own thumb queues one, and this
+    /// takes the number out of it. A committed value and a changed one both report a value
+    /// change, and [`set_value`](Self::set_value) drops a value equal to the one held, so
+    /// neither is announced twice.
     pub fn observe(&mut self, intents: &[crate::widget::Intent]) {
         for intent in intents {
             match intent.what {
@@ -357,9 +346,9 @@ impl Uia {
 
     /// Records a model-state change, resolving what it means from the element's role.
     ///
-    /// A checkbox reports it as a toggle and a radio button as a selection — the same fact,
-    /// announced as "checked" or as "3 of 5". Deciding it here rather than at the call site
-    /// is what keeps the two from disagreeing.
+    /// A checkbox reports the same fact as a toggle and every other role as a selection, so
+    /// a client hears "checked" or "3 of 5". Resolving it here rather than at each call
+    /// site keeps the two from disagreeing.
     pub fn set_model(&mut self, id: ControlId, state: crate::widget::ModelState) {
         use crate::widget::ModelState;
         let Some(at) = self.current.index_of(id) else {
@@ -374,28 +363,29 @@ impl Uia {
         }
     }
 
-    /// Says an invoke has completed.
+    /// Queues an invoked event for `id`.
     ///
-    /// Raised by the application rather than by the provider, because the provider returned
-    /// before the work happened — that is the pattern's own contract. "After the control has
-    /// completed its associated action" is a fact only this side knows.
+    /// Raised by the application rather than by the provider: `Invoke` returns before the
+    /// work happens, and the event is owed after the control has completed its action,
+    /// which only this side knows.
     pub fn invoked(&mut self, id: ControlId) {
         self.pending.push(Raise::Invoked(id));
     }
 
-    /// Whether an overlay is open on `id`, which is both a state and an announcement.
+    /// Records whether an overlay is open on `id`, as both state and an expand-collapse
+    /// event.
     pub fn set_expanded(&mut self, id: ControlId, open: bool) {
         self.set_state(id, State::EXPANDED, open);
     }
 
-    /// Takes what clients have asked for since the last tick.
+    /// Moves every action clients queued since the last tick into `out`.
     pub fn drain(&mut self, out: &mut Vec<Action>) {
         self.shared.actions.drain(out);
     }
 
-    /// Raises everything pending. **The last thing a tick does**, so the tree a client
-    /// reads back is the one the event describes, and so no raise re-enters an input
-    /// handler that is still running.
+    /// Raises every pending event. Called as the last step of a tick, so the tree a client
+    /// reads back is the one the event describes and no raise re-enters an input handler
+    /// that is still running.
     pub fn flush(&mut self) {
         if self.pending.is_empty() {
             return;
@@ -404,7 +394,8 @@ impl Uia {
         self.pending.flush(|id| element::provider_for(&shared, id));
     }
 
-    /// Announces a live region, quantized and only on a change.
+    /// Queues a live-region announcement, quantized to [`LIVE_QUANTUM`] and only when the
+    /// step the value lands on differs from the one last announced.
     fn announce(&mut self, id: ControlId, at: usize, value: f64) {
         let live = self.current.col(at).is_some_and(|col| {
             col.flags.has(ColFlags::LIVE_POLITE) || col.flags.has(ColFlags::LIVE_ASSERTIVE)
@@ -424,21 +415,21 @@ impl Uia {
 
 impl Drop for Uia {
     fn drop(&mut self) {
-        // The backstop for a window that went without saying so. Providers a client still
-        // holds resolve to nothing from here on, which is what `UIA_E_ELEMENTNOTAVAILABLE`
-        // means; dropping our own references is what stops handing them out.
+        // The backstop for a window dropped without a `WM_DESTROY`. Providers a client
+        // still holds stop resolving from here on, which is what
+        // `UIA_E_ELEMENTNOTAVAILABLE` reports; dropping our references stops new ones.
         element::disconnect(&self.shared);
     }
 }
 
 #[cfg(test)]
 impl Uia {
-    /// The tree as published. Read by the tests, which is the whole query surface.
+    /// Returns the published tree.
     fn tree(&self) -> &Tree {
         &self.current
     }
 
-    /// Latches "a client asked", without one having.
+    /// Sets the client-asked latch without a `WM_GETOBJECT` having arrived.
     fn latch_for_test(&mut self) {
         self.shared.queried.store(true, Relaxed);
     }
@@ -451,20 +442,20 @@ impl Uia {
         self.pending.take(out);
     }
 
-    /// The object a client would be handed by `WM_GETOBJECT`.
-    /// The published tree by identity, so a test can say "the same tree".
+    /// Returns the published tree by identity, so a caller can compare two publishes for
+    /// sameness.
     fn tree_arc_for_test(&self) -> Arc<Tree> {
         Arc::clone(&self.current)
     }
 
-    /// How many parts `id` declared, and the second one's value.
+    /// Returns how many parts `id` declared, and the second part's value.
     fn parts_for_test(&self, id: ControlId) -> (usize, Option<f64>) {
         self.shared.regions.with_parts(id, |parts| {
             (parts.len(), parts.get(1).and_then(|p| p.value))
         })
     }
 
-    /// Which part covers a region-local point.
+    /// Returns the part covering a region-local point.
     fn part_at_for_test(&self, id: ControlId, x: f32, y: f32) -> Option<u32> {
         self.shared.regions.with_parts(id, |parts| {
             parts

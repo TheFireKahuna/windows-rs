@@ -1,24 +1,21 @@
 //! The environment a scene renders into. **Both halves.**
 //!
-//! Two facts — how many pixels a DIP is, and how authored light reaches the display — and
-//! neither is the scene's. They belong to the window and to its monitor, and they are
-//! **stated at every operation that depends on them** rather than pushed into the scene and
-//! cached there.
-//!
-//! That is the whole of why there is no `set_dpi`. A cached environment can be forgotten,
-//! and forgetting it is silent: geometry snapped to one pixel grid with rasters built for
-//! another is soft text and hairline seams, with nothing to report it. Passing it at use
-//! makes forgetting unrepresentable, and it means the two halves cannot disagree about the
-//! scale — [`Model::flush`](crate::Model::flush) and [`Scene::apply`](crate::Scene::apply)
-//! take the same value.
+//! Two facts belonging to the window and its monitor: how many pixels a DIP is, and how
+//! authored light reaches the display. Neither is stored on the scene. Both are stated at
+//! every operation that depends on them, so [`Model::flush`](crate::Model::flush) and
+//! [`Scene::apply`](crate::Scene::apply) take the same value and the two halves cannot
+//! disagree about the scale. There is no `set_dpi`: a cached environment can go stale
+//! without saying so, and geometry snapped to one pixel grid with rasters built for another
+//! is soft text and hairline seams that nothing reports.
 //!
 //! The fields are private and [`scale`](Env::scale) is the only derivation, so the DIP-to-
-//! pixel factor a layout snapped against and the one a cache keyed on are the same number
-//! by construction rather than by two call sites agreeing.
+//! pixel factor a layout snapped against and the one a cache keyed on are the same number by
+//! construction rather than by two call sites agreeing.
 
 use crate::quant::snap_scale;
 use windows_color::{OutputTransform, Radiance, Scrgb};
 
+/// The DPI and the output transform every operation on a scene is stated against.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Env {
     dpi: f32,
@@ -26,33 +23,33 @@ pub struct Env {
 }
 
 impl Env {
-    /// The environment at `dpi`, presenting through `output`.
+    /// Returns the environment at `dpi`, presenting through `output`.
     #[must_use]
     pub const fn new(dpi: f32, output: OutputTransform) -> Self {
         Self { dpi, output }
     }
 
-    /// The display's DPI, for the one consumer that needs it raw: a draw bracket, which
-    /// sets it on the device context rather than deriving a scale from it.
+    /// Returns the display's DPI, raw. A draw bracket sets it on the device context;
+    /// everything else takes [`scale`](Env::scale).
     #[must_use]
     pub const fn dpi(self) -> f32 {
         self.dpi
     }
 
-    /// The DIP-to-pixel factor, canonicalized so float noise cannot fork a cache.
+    /// Returns the DIP-to-pixel factor, canonicalized so float noise cannot fork a cache.
     #[must_use]
     pub fn scale(self) -> f32 {
         snap_scale(self.dpi / 96.0)
     }
 
-    /// Authored light to display-referred output. **The draw choke**, and the only
-    /// conversion — there is no inverse, so the transform runs exactly once per colour.
+    /// Converts authored light to display-referred output. The only such conversion, and it
+    /// has no inverse, so the transform runs exactly once per colour.
     #[must_use]
     pub fn apply(self, light: Radiance) -> Scrgb {
         self.output.apply(light)
     }
 
-    /// Whether a change from `self` to `next` invalidates rasterized geometry.
+    /// Returns whether a change from `self` to `next` invalidates rasterized geometry.
     ///
     /// Every snapped dimension is a function of the scale, so geometry and coverage
     /// re-rasterize and colour is untouched.
@@ -60,7 +57,7 @@ impl Env {
         self.scale() != next.scale()
     }
 
-    /// Whether a change from `self` to `next` invalidates rasterized colour.
+    /// Returns whether a change from `self` to `next` invalidates rasterized colour.
     ///
     /// The same authored light produces a different cell on a different display, so every
     /// colour cell is wrong and no coverage tile is.
@@ -118,9 +115,9 @@ mod tests {
 
     #[test]
     fn a_dpi_that_snaps_to_the_same_scale_invalidates_nothing() {
-        // The guard is the *snapped* scale, not the raw DPI: a hundredth of a DPI is not
-        // a different pixel grid, and re-rasterizing every cell for one would be a
-        // monitor query's rounding driving the whole cache.
+        // The guard is the snapped scale and not the raw DPI: a hundredth of a DPI is not a
+        // different pixel grid, and re-rasterizing every cell for one would put a monitor
+        // query's rounding in charge of the cache.
         let before = env(96.0);
         let after = env(96.02);
         assert!(!before.geometry_moved(after));

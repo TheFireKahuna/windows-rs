@@ -1,34 +1,34 @@
-//! A shaped run: what a string became, and everything downstream reads.
+//! Holds a shaped run: the layout a string became, and the data every reader downstream
+//! takes from it.
 //!
-//! ## It keeps its layout, and so it is not `Send`
+//! ## A run keeps its layout, so it does not cross a thread
 //!
-//! `IDWriteTextLayout` is retained because three things need it: re-flowing at a new width
+//! `IDWriteTextLayout` is retained because three readers need it: re-flowing at a new width
 //! is a property set instead of a rebuild, measuring is one call, and caret and selection
 //! geometry across bidi, combining marks and surrogate pairs is DirectWrite's arithmetic
-//! rather than ours. Nothing requires a run to cross a thread — what crosses is
-//! [`GlyphSeg`] over [`SegBuffers`], plain `Copy` data with nowhere for a face to sit.
+//! rather than ours. What crosses a thread is [`GlyphSeg`] over [`SegBuffers`], plain
+//! `Copy` data with nowhere for a face to sit.
 //!
 //! ## Measure, pin, harvest, read
 //!
-//! A layout solve probes a node several times with different constraints before deciding
-//! one, so glyph positions are not knowable until the last of those. The harvest is
-//! therefore lazy: [`measure`](ShapedRun::measure) and [`pin`](ShapedRun::pin) move the
-//! layout and mark it stale, [`TextEngine::harvest`] brings it back, and every reader after
-//! that is plain data.
+//! A layout solve probes a node several times under different constraints before deciding
+//! one, so glyph positions are not knowable until the last probe. The harvest is therefore
+//! lazy: [`measure`](ShapedRun::measure) and [`pin`](ShapedRun::pin) move the layout and
+//! mark it stale, [`TextEngine::harvest`] brings it up to date, and every reader after that
+//! reads plain data.
 //!
-//! **This type does not compare text.** Whoever owns the string owns the identity and
-//! decides when to reshape; retaining a copy to compare against would hold the one thing
-//! the layer above drops.
+//! **A run holds no copy of its text and never compares it.** Whoever owns the string owns
+//! that identity and decides when to reshape.
 
 use super::*;
 use core::cell::Cell;
 use core::ops::Range;
 
-/// The construction box a run is measured in before anything constrains it — its
-/// max-content state. Large rather than infinite: DirectWrite treats the box as a number.
+/// The layout box a run is built and measured in before anything constrains it, which
+/// gives its max-content size. Finite because DirectWrite treats the box as a number.
 const UNBOUNDED: f32 = 100_000.0;
 
-/// One laid-out line.
+/// Describes one laid-out line.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct LineMetrics {
     /// Code units on this line, trailing whitespace and newline included.
@@ -41,23 +41,28 @@ pub struct LineMetrics {
     pub baseline: f32,
 }
 
-/// The box one line's coverage occupies.
+/// Describes the box one line's coverage occupies.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Ink {
-    /// Tile extent in DIPs. Pixels belong to whoever rasterizes it, which is the half that
-    /// holds the scale and re-rasterizes when it moves.
+    /// Tile extent in DIPs. Whoever rasterizes it holds the scale and converts to pixels.
     pub size: Vector2,
     /// Baseline origin measured from the tile's top-left, in DIPs.
     pub baseline: Vector2,
 }
 
+/// Holds a laid-out string: the DirectWrite layout, the line metrics read back from it,
+/// and the glyphs the last harvest recorded.
+///
+/// [`lines`](Self::lines), [`segments`](Self::segments) and [`line_ink`](Self::line_ink)
+/// read what the last harvest recorded, so [`TextEngine::harvest`] runs after anything
+/// moves the layout box.
 pub struct ShapedRun {
     layout: IDWriteTextLayout,
     spec: FontSpec,
     flow: Flow,
     /// Code units, for the ranges DirectWrite's hit-testing speaks in.
     len: u32,
-    /// The width the layout box currently stands at.
+    /// The width the layout box stands at.
     width: f32,
     dirty: bool,
     /// How far the ink reaches past the layout box. Measured from the box's edges, so it
@@ -65,16 +70,20 @@ pub struct ShapedRun {
     pad: Cell<Option<DWRITE_OVERHANG_METRICS>>,
     pub(crate) harvest: Harvest,
     lines: Vec<LineMetrics>,
-    /// DirectWrite's own line metrics, kept only so reading them allocates once per run
-    /// rather than once per re-flow.
+    /// DirectWrite's own line metrics, kept so reading them allocates once per run rather
+    /// than once per re-flow.
     raw_lines: Vec<DWRITE_LINE_METRICS>,
 }
 
 impl TextEngine {
     /// Lays `text` out under `spec`, unconstrained.
     ///
-    /// The result is stale until harvested: it has been laid out, but the width it will be
-    /// given is not known yet.
+    /// The result is stale until harvested: it is laid out, but the width it will be given
+    /// is not known yet.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the format cannot be built or the layout cannot be created.
     pub fn shape(&self, text: &str, spec: &FontSpec, flow: Flow) -> Result<ShapedRun> {
         let (layout, len) = self.lay_out(text, spec, flow)?;
         Ok(ShapedRun {
@@ -91,7 +100,16 @@ impl TextEngine {
         })
     }
 
-    /// Re-lays `run` for new text or a new spec, keeping its buffers.
+    /// Re-lays `run` for new text or a new spec, keeping its harvest buffers and their
+    /// capacity.
+    ///
+    /// Leaves `run` stale and unconstrained; [`harvest`](Self::harvest) refills its glyph
+    /// data.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the format cannot be built or the layout cannot be created, and `run` is
+    /// then left as it was.
     pub fn reshape(
         &self,
         run: &mut ShapedRun,
@@ -118,7 +136,7 @@ impl TextEngine {
         let len = u32::try_from(scratch.len()).unwrap_or(u32::MAX);
 
         // SAFETY: the layout copies the string, so the scratch is free after the call, and
-        // the range below names code units the layout has.
+        // the range names code units the layout holds.
         unsafe {
             let layout =
                 self.factory
@@ -134,10 +152,15 @@ impl TextEngine {
         }
     }
 
-    /// Brings `run`'s glyph data up to date with the width it now stands at.
+    /// Brings `run`'s glyph data up to date with the width it stands at, and clears its
+    /// stale flag.
     ///
-    /// A no-op on a run nothing has moved, so calling it before every read is the intended
-    /// use rather than a cost to avoid.
+    /// Returns without walking the layout when `run` is not stale, so a caller may call it
+    /// before every read.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the layout's line metrics cannot be read.
     pub fn harvest(&self, run: &mut ShapedRun) -> Result<()> {
         if !run.dirty {
             return Ok(());
@@ -151,39 +174,43 @@ impl TextEngine {
 }
 
 impl ShapedRun {
-    /// What it was shaped under.
+    /// Returns the spec the run was shaped under.
     #[must_use]
     pub fn spec(&self) -> &FontSpec {
         &self.spec
     }
 
+    /// Returns the flow the run was shaped under.
     #[must_use]
     pub fn flow(&self) -> Flow {
         self.flow
     }
 
-    /// Code units in the shaped text — the unit every range here is measured in.
+    /// Returns the number of code units in the shaped text, the unit every range here is
+    /// measured in.
     #[must_use]
     pub fn len(&self) -> u32 {
         self.len
     }
 
+    /// Returns whether the shaped text has no code units.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Whether the glyph data is behind the layout.
+    /// Returns whether the glyph data is behind the layout.
     #[must_use]
     pub fn is_stale(&self) -> bool {
         self.dirty
     }
 
-    /// The size this run takes at `max_w`, or unconstrained if `None`.
+    /// Returns the size this run takes at `max_w`, or its unconstrained size for `None`.
     ///
-    /// **This does not reshape.** It is the call a layout solve makes several times per
-    /// pass with different constraints, so it is a property set and a metrics read; the
-    /// glyphs are re-placed once, later, by [`TextEngine::harvest`].
+    /// **This does not reshape.** A layout solve calls it several times per pass under
+    /// different constraints, so it sets the layout box and reads metrics; the glyphs are
+    /// re-placed once, later, by [`TextEngine::harvest`]. A failed metrics read reports a
+    /// zero size.
     pub fn measure(&mut self, max_w: Option<f32>) -> Vector2 {
         self.set_width(max_w.unwrap_or(UNBOUNDED));
         let mut m = DWRITE_TEXT_METRICS::default();
@@ -197,7 +224,7 @@ impl ShapedRun {
         }
     }
 
-    /// The narrowest width this run can occupy — its longest unbreakable span.
+    /// Returns the narrowest width this run can occupy: its longest unbreakable span.
     ///
     /// Independent of the layout box, so it neither moves the run nor stales it.
     #[must_use]
@@ -206,23 +233,28 @@ impl ShapedRun {
         unsafe { self.layout.DetermineMinWidth() }.unwrap_or_default()
     }
 
-    /// Fixes the run at the width it was actually given, and reports whether that moved
-    /// its glyphs.
+    /// Fixes the run at the width it was given, and returns whether its glyphs are now
+    /// stale.
     ///
-    /// The single authoritative writer of that width. [`measure`](Self::measure) probes
-    /// with whatever the solve is asking about, and whichever probe ran last would
-    /// otherwise decide where the glyphs land; here the answer is known.
+    /// The width a harvest places glyphs against comes from here.
+    /// [`measure`](Self::measure) sets the box to whatever a solve is probing, so without
+    /// this call the last probe would decide where the glyphs land.
     pub fn pin(&mut self, width: f32) -> bool {
         self.set_width(width);
         self.dirty
     }
 
-    /// Takes the stale flag, so an emit can ask once whether to re-publish.
+    /// Clears the stale flag and returns what it held, so an emit asks once whether to
+    /// re-publish.
+    ///
+    /// A later [`TextEngine::harvest`] then walks nothing, so call this only once the
+    /// glyph data has been read.
     pub fn take_stale(&mut self) -> bool {
         core::mem::take(&mut self.dirty)
     }
 
-    /// The laid-out lines. Harvested data — bring it up to date first.
+    /// Returns the laid-out lines. Harvested data: harvest the run first, or a debug build
+    /// asserts.
     #[must_use]
     pub fn lines(&self) -> &[LineMetrics] {
         debug_assert!(
@@ -232,7 +264,8 @@ impl ShapedRun {
         &self.lines
     }
 
-    /// Rules DirectWrite resolved that are not glyphs. Empty for almost all text.
+    /// Returns the rules DirectWrite resolved that are not glyphs, empty for almost all
+    /// text. Harvested data: harvest the run first, or a debug build asserts.
     #[must_use]
     pub fn decorations(&self) -> &[Decoration] {
         debug_assert!(
@@ -242,7 +275,10 @@ impl ShapedRun {
         &self.harvest.decorations
     }
 
-    /// The tile `line` needs, and where its baseline sits in it.
+    /// Returns the tile `line` needs, and where its baseline sits in it, or
+    /// [`Ink::default`] for a line the run does not have.
+    ///
+    /// Harvested data: harvest the run first, or a debug build asserts.
     #[must_use]
     pub fn line_ink(&self, line: usize) -> Ink {
         debug_assert!(
@@ -269,10 +305,12 @@ impl ShapedRun {
 
     /// Appends `line`'s segments to `out`, and returns the span naming them.
     ///
-    /// Origins are rebased onto the tile [`line_ink`](Self::line_ink) describes, so the
-    /// front side draws each segment at `tile_top_left + seg.origin` and never re-derives a
-    /// pen position — which is what keeps a bidi line, where visual order and advance order
-    /// disagree, from needing a second rule.
+    /// Origins are rebased onto the tile [`line_ink`](Self::line_ink) describes, so a
+    /// caller draws each segment at `tile_top_left + seg.origin` and re-derives no pen
+    /// position; a bidi line, where visual order and advance order disagree, is placed by
+    /// that same rule.
+    ///
+    /// Harvested data: harvest the run first, or a debug build asserts.
     pub fn segments(&self, line: usize, out: &mut SegBuffers) -> Span {
         debug_assert!(
             !self.dirty,
@@ -313,12 +351,11 @@ impl ShapedRun {
         &self.layout
     }
 
-    /// Sets the layout box width, reporting whether it moved.
+    /// Sets the layout box width, and returns whether the width changed.
     ///
-    /// The box always invalidates the overhang, and only sometimes the glyphs: a
-    /// non-wrapping run is laid out leading and does not break, so its box decides what
-    /// hangs outside it and nothing else. Conflating the two would re-harvest a label on
-    /// every resize of the container it sits in.
+    /// A new box always invalidates the overhang, and stales the glyphs only for a flow
+    /// that breaks: a non-wrapping run is laid out leading and does not break, so its box
+    /// decides what hangs outside it and nothing else.
     fn set_width(&mut self, width: f32) -> bool {
         if self.width == width {
             return false;
@@ -333,8 +370,8 @@ impl ShapedRun {
         true
     }
 
-    /// How far the ink reaches past the layout box, read on demand because it is a
-    /// property of the box rather than of the glyphs.
+    /// Returns how far the ink reaches past the layout box, reading it from the layout
+    /// once per box and caching it: it is a property of the box, not of the glyphs.
     fn pad(&self) -> DWRITE_OVERHANG_METRICS {
         if let Some(pad) = self.pad.get() {
             return pad;
@@ -345,14 +382,14 @@ impl ShapedRun {
         pad
     }
 
-    /// Reads back what the walk could not: line boxes, ink overhang, and which line each
-    /// segment landed on.
+    /// Reads back what the walk could not: the line boxes, and which line each segment
+    /// landed on. Clears the stale flag.
     fn after_walk(&mut self) -> Result<()> {
         self.read_lines()?;
 
         // A segment's baseline y is its line's top plus that line's baseline, and both
-        // come from the same layout — so the nearest match is an exact one, and nearest
-        // rather than equal only so a run can never end up on no line at all.
+        // come from the same layout, so the nearest match is the exact one. Nearest rather
+        // than equal so that every segment lands on some line.
         for h in &mut self.harvest.segs {
             let (mut top, mut best, mut nearest) = (0.0f32, 0u16, f32::MAX);
             for (i, line) in self.lines.iter().enumerate() {
@@ -370,19 +407,20 @@ impl ShapedRun {
 
     fn read_lines(&mut self) -> Result<()> {
         let mut count = 0u32;
-        // The first call reports the count it needs through the out-parameter and returns
-        // the expected insufficient-buffer error, so the result is deliberately dropped.
-        // SAFETY: both calls take a slice this run owns and a stack-local counter.
+        // The first call reports the count it needs through `count` and returns the
+        // expected insufficient-buffer error, so its result is dropped.
+        // SAFETY: the call takes only a stack-local counter.
         unsafe {
             let _ = self.layout.GetLineMetrics(None, &mut count);
         }
         // Reused across harvests, so a paragraph re-flowing under a resize drag allocates
-        // once and then never again.
+        // once.
         self.raw_lines.clear();
         self.raw_lines
             .resize(count as usize, DWRITE_LINE_METRICS::default());
         if count > 0 {
-            // SAFETY: as above; the slice is sized from the count the probe reported.
+            // SAFETY: the slice is sized from the count the probe reported, and the
+            // counter is a stack local outliving the call.
             unsafe {
                 self.layout
                     .GetLineMetrics(Some(&mut self.raw_lines), &mut count)
@@ -405,7 +443,7 @@ impl ShapedRun {
         Ok(())
     }
 
-    /// `line`'s top edge and metrics.
+    /// Returns `line`'s top edge and metrics, or `None` past the last line.
     fn line_at(&self, line: usize) -> Option<(f32, LineMetrics)> {
         let mut top = 0.0f32;
         for (i, m) in self.lines.iter().enumerate() {
@@ -417,11 +455,12 @@ impl ShapedRun {
         None
     }
 
-    /// `line`'s horizontal ink span, in layout space.
+    /// Returns `line`'s horizontal ink span, in layout space, or `(0.0, 0.0)` for a line
+    /// with no segments.
     ///
-    /// Taken from the segments rather than from the line's own width because a
-    /// right-to-left segment advances leftward from its origin, so its extent is not
-    /// `origin.x + width` and folding advances would place its tile past its glyphs.
+    /// Taken from the segments rather than from the line's own width: a right-to-left
+    /// segment advances leftward from its origin, so its extent is not `origin.x + width`
+    /// and folding advances would place its tile past its glyphs.
     fn line_extent(&self, line: usize) -> (f32, f32) {
         let (mut left, mut right) = (f32::MAX, f32::MIN);
         for h in self.harvest.segs.iter().filter(|h| h.line as usize == line) {
@@ -441,7 +480,7 @@ impl ShapedRun {
         }
     }
 
-    /// The code-unit range `line` covers.
+    /// Returns the code-unit range `line` covers, empty for a line the run does not have.
     #[must_use]
     pub fn line_range(&self, line: usize) -> Range<u32> {
         let start: u32 = self.lines.iter().take(line).map(|m| m.length).sum();
@@ -454,9 +493,9 @@ impl ShapedRun {
 mod tests {
     use super::*;
 
-    /// "Segoe UI" is present on every supported floor, and a ladder of one is enough to
-    /// exercise everything except fallback — which is the point of the second family
-    /// arriving without being declared.
+    /// Builds an engine over a one-family ladder. "Segoe UI" is installed on every
+    /// supported Windows version, and a fallback face reaches the tests without a second
+    /// family being declared.
     fn engine() -> (TextEngine, FontSpec) {
         let engine = TextEngine::new(FontLadder::new(["Segoe UI"])).unwrap();
         (engine, FontSpec::new(FamilyId(0), 14.0))
@@ -488,9 +527,8 @@ mod tests {
         assert!((width - run.measure(Some(400.0)).x).abs() < 0.01);
     }
 
-    /// The test the whole [`FaceId`] mechanism exists for. A segment naming only the
-    /// requested [`FontSpec`] would draw the second run's glyph ids through the first
-    /// run's face, which is not tofu — it is arbitrary glyphs at arbitrary positions.
+    /// A segment naming only the requested [`FontSpec`] would draw the CJK run's glyph ids
+    /// through the Latin face: arbitrary glyphs at arbitrary positions, not tofu.
     #[test]
     fn fallback_splits_a_line_and_every_face_it_chose_round_trips() {
         let ladder = FontLadder::new(["Segoe UI"]);
@@ -504,15 +542,15 @@ mod tests {
         faces.dedup();
         assert!(faces.len() >= 2, "and the segments must say so");
 
-        // The other half of the seam: a thread that did no shaping resolves every id the
-        // shaping thread minted, through nothing but the shared ladder.
+        // A thread that did no shaping resolves every id the shaping thread minted,
+        // through nothing but the shared ladder.
         let far_side = TextEngine::new(ladder).unwrap();
         for face in faces {
             assert!(far_side.face(face).is_ok(), "{face:?} did not round-trip");
         }
     }
 
-    /// A trimming sign is an inline object, so a walk that quietly succeeded without
+    /// A trimming sign is an inline object, so a walk that returned success without
     /// re-entering would shorten the run at the trim point and never emit the `…`.
     #[test]
     fn a_trimmed_run_yields_its_ellipsis_as_glyphs() {
@@ -553,8 +591,8 @@ mod tests {
         let text = "a paragraph with enough words in it to need more than one line";
         let mut run = engine.shape(text, &spec, Flow::Wrap).unwrap();
 
-        // What a solve does: probe max-content, probe min-content, then decide. Whichever
-        // probe ran last would otherwise be what the glyphs were placed against.
+        // A solve probes max-content, probes min-content, then decides. Without the pin
+        // below, the last probe would be what the glyphs were placed against.
         let wide = run.measure(None);
         let narrow = run.measure(Some(run.min_width()));
         assert!(wide.x > narrow.x && narrow.y > wide.y);
@@ -633,9 +671,9 @@ mod tests {
         assert!(rects.iter().all(|r| r.w > 0.0 && r.h > 0.0));
     }
 
-    /// Every extent this crate hands out is in DIPs, so a tile's size is a fact about the
-    /// text and not about the display it will land on. A scale-bearing extent would be
-    /// stale the moment the window moved to another monitor, and nothing would say so.
+    /// Every extent this crate hands out is in DIPs, so a tile's size describes the text
+    /// and not the display it lands on, and a window moving to another monitor does not
+    /// stale it.
     #[test]
     fn ink_is_scale_free() {
         let (engine, spec) = engine();
@@ -643,14 +681,14 @@ mod tests {
         let ink = run.line_ink(0);
         let (buffers, _) = segs_of(&run, 0);
         let advance: f32 = buffers.advances.iter().sum();
-        // The tile is the ink, in the same units the advances are in. Whatever pixel grid
-        // it is rasterized against is applied by whoever rasterizes it.
+        // The tile is the ink, in the same units the advances are in. The pixel grid is
+        // applied by whoever rasterizes it.
         assert!(ink.size.x >= advance && ink.size.x < advance + spec.size);
     }
 
     /// Segment origins are relative to the tile, so a caller draws at `tile + origin` and
-    /// never folds advances — which is what a bidi line, where visual order and advance
-    /// order disagree, would get wrong.
+    /// folds no advances — the step a bidi line, where visual order and advance order
+    /// disagree, would place wrongly.
     #[test]
     fn segment_origins_are_rebased_onto_their_tile() {
         let (engine, spec) = engine();
@@ -663,13 +701,13 @@ mod tests {
             assert!((seg.origin.y - ink.baseline.y).abs() < 0.01, "one baseline");
             assert!(seg.origin.x >= 0.0 && seg.origin.x <= ink.size.x);
         }
-        // The second segment starts where the first one ends, and nobody had to add it up.
+        // The second segment starts where the first one ends, without folding advances.
         let first: f32 = buffers.segs[0].advances.of(&buffers.advances).iter().sum();
         assert!((buffers.segs[1].origin.x - (buffers.segs[0].origin.x + first)).abs() < 0.5);
     }
 
-    /// A second line's segments must not carry the first line's, and each line's tile is
-    /// its own — this is what makes a wrapped paragraph N sprites rather than one.
+    /// A line's segments exclude every other line's, and each line carries its own tile,
+    /// so a wrapped paragraph rasterizes as one tile per line.
     #[test]
     fn each_line_gets_its_own_segments_and_tile() {
         let (engine, spec) = engine();
@@ -709,8 +747,8 @@ mod tests {
             .unwrap();
         assert!(run.is_stale());
         engine.harvest(&mut run).unwrap();
-        // Grown, never replaced: a reshape that swapped in a fresh `Harvest` would put an
-        // allocation on every text change.
+        // The harvest buffers grow and are never replaced, so a text change reuses their
+        // capacity.
         assert!(run.harvest.glyphs.capacity() >= capacity);
         assert_eq!(segs_of(&run, 0).0.glyphs.len(), 7);
     }

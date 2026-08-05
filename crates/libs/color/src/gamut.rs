@@ -2,35 +2,35 @@
 //!
 //! Windows does not gamut-map for an application. Auto colour management is a colour
 //! space conversion and a 1D LUT, and colours outside the display's gamut are
-//! **numerically clipped** — per channel, which drags hue with it. A saturated red
-//! that clips becomes orange. This module pre-empts that.
+//! numerically clipped per channel, which drags hue with them: a saturated red that
+//! clips reads orange. Compression here runs before that clip.
 //!
-//! Gamut is a question about *chromaticity* only. A channel above the display's
-//! ceiling is a luminance statement and belongs to the tone stage; the two are
-//! disjoint and neither can do the other's job.
+//! Containment is a question about chromaticity alone. A channel above the display's
+//! ceiling is a luminance statement, and it is spent by the tone stage in
+//! [`crate::OutputTransform`].
 
 use crate::ictcp::{self, Ictcp, M_LMS_TO_2020};
 use crate::matrix::{self, D65, Mat3, Mat3f, inv, mul, narrow, rgb_to_xyz};
 
-/// Linear Rec.2020 -> XYZ, the bridge to an arbitrary set of primaries.
+/// Linear Rec.2020 -> XYZ, the bridge from the working space to any set of primaries.
 const M_2020_TO_XYZ: Mat3 = rgb_to_xyz((0.708, 0.292), (0.170, 0.797), (0.131, 0.046), D65);
 
 /// Slack on the negative test, in cd/m². The chain runs through two matrices and a PQ
-/// round trip, so a colour exactly on a primary can land a hair below zero. Without
-/// this, in-gamut colours would be needlessly desaturated.
+/// round trip, so a colour exactly on a primary can land a hair below zero; without
+/// the slack it would be compressed as though it were out of gamut.
 const EPS: f32 = 1e-4;
 
-/// Bisection steps. The in-gamut set is a contiguous interval in the chroma scale —
-/// chroma zero is the neutral axis and is always reproducible — so plain bisection
-/// converges, and 18 steps put the bracket below `f32` chroma resolution.
+/// Bisection steps. The reproducible set is a contiguous interval in the chroma scale,
+/// because chroma zero is the neutral axis and is always reproducible, so plain
+/// bisection converges; 18 steps put the bracket below `f32` chroma resolution.
 const BISECT_STEPS: u32 = 18;
 
 /// A set of display primaries.
 ///
-/// Derived at compile time from chromaticities, so a real panel costs one
-/// construction: feed it `AdvancedColorInfo`'s red, green and blue primaries and its
-/// white point. Both matrices are precomposed, so a containment probe is one
-/// matrix apply and a PQ decode rather than a chain.
+/// Built from chromaticities, which the standard targets here do at compile time; a
+/// real panel takes one construction from `AdvancedColorInfo`'s red, green and blue
+/// primaries and its white point. Both matrices are precomposed, so a containment
+/// probe costs one matrix apply and a PQ decode.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct Gamut {
     /// LMS -> this gamut's linear RGB.
@@ -40,7 +40,7 @@ pub struct Gamut {
 }
 
 impl Gamut {
-    /// Build from primary and white chromaticities `(x, y)`.
+    /// Builds a gamut from primary and white chromaticities `(x, y)`.
     #[must_use]
     pub const fn from_primaries(
         r: (f64, f64),
@@ -56,8 +56,8 @@ impl Gamut {
         }
     }
 
-    /// BT.709 / sRGB. The container on a desktop with no Advanced Color, where
-    /// nothing colour-manages and an out-of-gamut channel simply clips.
+    /// BT.709 / sRGB. The target on a desktop with no Advanced Color, where nothing
+    /// colour-manages and an out-of-gamut channel clips.
     pub const REC709: Self =
         Self::from_primaries((0.640, 0.330), (0.300, 0.600), (0.150, 0.060), D65);
 
@@ -66,48 +66,51 @@ impl Gamut {
         Self::from_primaries((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), D65);
 
     /// BT.2020 / BT.2100, the widest standard container and this crate's working
-    /// space. Compression into it is the identity for anything a UI authors.
+    /// space. Compression into it returns any colour authored in Rec.2020 unchanged.
     pub const REC2020: Self =
         Self::from_primaries((0.708, 0.292), (0.170, 0.797), (0.131, 0.046), D65);
 
-    /// The linear Rec.2020 -> this gamut matrix.
+    /// Returns the linear Rec.2020 -> this gamut's linear RGB matrix.
     #[must_use]
     pub(crate) const fn matrix_from_2020(&self) -> Mat3f {
         self.from_2020
     }
 
-    /// This gamut's linear RGB, in cd/m², for an ICtCp coordinate. A **negative**
-    /// component means the chromaticity is outside these primaries.
+    /// Returns `c` in this gamut's linear RGB, in cd/m². A **negative** component
+    /// means the chromaticity is outside these primaries.
     #[must_use]
     pub fn rgb(&self, c: Ictcp) -> [f32; 3] {
         matrix::apply(&self.from_lms, ictcp::decode_lms(c))
     }
 
-    /// Whether these primaries can reproduce this chromaticity. Values above the
-    /// display's ceiling are *in* gamut and are left to the tone stage; this asks
-    /// only whether the hue is reachable at all.
+    /// Returns whether these primaries can reproduce `c`'s chromaticity. A luminance
+    /// above the display's ceiling is in gamut and is left to the tone stage; this
+    /// tests reachability of the chromaticity alone, to within a tolerance that
+    /// absorbs the rounding of the matrix and PQ chain.
     #[must_use]
     pub fn contains(&self, c: Ictcp) -> bool {
         self.rgb(c).iter().all(|&x| x >= -EPS)
     }
 
-    /// Compress into these primaries: hold `I` and hue **exactly**, shrink chroma
-    /// until the chromaticity is reproducible. Already-reachable colours are returned
-    /// unchanged.
+    /// Compresses `c` into these primaries: holds `I` and hue **exactly** and shrinks
+    /// chroma until the chromaticity is reproducible. A colour already inside is
+    /// returned unchanged.
     ///
     /// `Ct` and `Cp` scale by one common factor, so `atan2(Cp, Ct)` is preserved
-    /// exactly and only chroma magnitude moves. This deliberately loses to a
-    /// per-channel clip on ΔE-ITP — a clip lands on the nearest reproducible colour
-    /// by construction, so nothing can beat it on distance. Spending distance to hold
-    /// hue is the right trade for a palette: an accent with a smaller ΔE that has
-    /// rotated blue to cyan is worse than a slightly duller blue.
+    /// exactly and only chroma magnitude moves. The result sits farther from `c` in
+    /// ΔE-ITP than a per-channel clip would, since a clip lands on the nearest
+    /// reproducible colour by construction; what the clip moves instead is hue.
+    ///
+    /// A colour outside the primaries costs 18 bisection steps, each one matrix apply
+    /// and a PQ decode.
     #[must_use]
     pub fn compress(&self, c: Ictcp) -> Ictcp {
         if self.contains(c) {
             return c;
         }
-        // `lo` starts valid (the neutral axis is always reproducible) and `hi` starts
-        // invalid; bisection maintains that.
+        // `lo` is a reproducible chroma scale — zero is the neutral axis, which every
+        // set of primaries reaches — and `hi` is an unreproducible one. The loop moves
+        // whichever bound the probe belongs to, so both stay true.
         let (mut lo, mut hi) = (0.0f32, 1.0f32);
         for _ in 0..BISECT_STEPS {
             let mid = 0.5 * (lo + hi);
@@ -130,7 +133,7 @@ mod tests {
         ictcp::from_2020([0.0, 100.0, 0.0])
     }
 
-    /// The fixture must actually be out of Rec.709, or every test below is vacuous.
+    /// The shared fixture sits outside Rec.709 and inside Rec.2020.
     #[test]
     fn fixture_is_genuinely_out_of_gamut() {
         let g = wide_green();
@@ -167,7 +170,7 @@ mod tests {
         assert!(m.chroma() > 0.0, "chroma collapsed to neutral");
     }
 
-    /// The mapper reads the primaries rather than applying a fixed squeeze.
+    /// Compression reads the target's primaries rather than applying a fixed squeeze.
     #[test]
     fn wider_target_keeps_more_chroma() {
         let src = wide_green();
@@ -186,8 +189,8 @@ mod tests {
         );
     }
 
-    /// Pins the trade, so nobody later "optimises" the mapper toward ΔE and silently
-    /// reintroduces the hue rotation it exists to kill.
+    /// A per-channel clip is closer to the source in ΔE-ITP than compression is, and
+    /// moves hue by more than a degree where compression holds it.
     #[test]
     fn trades_delta_e_for_hue_fidelity() {
         let src = wide_green();
@@ -228,10 +231,8 @@ mod tests {
         );
     }
 
-    /// Gamut is chromaticity only: a colour above the anchor is in gamut and passes
-    /// through untouched, leaving the tone stage its job. Brightness and reachability
-    /// are orthogonal questions, and conflating them is the mistake this module's
-    /// separation from the tone stage exists to prevent.
+    /// Containment is chromaticity only: a colour above the reference anchor is in
+    /// gamut and passes through untouched, so the gamut stage spends no luminance.
     #[test]
     fn above_white_is_in_gamut_and_untouched() {
         let c = Ictcp::polar(380.0, 0.05, 15.0);

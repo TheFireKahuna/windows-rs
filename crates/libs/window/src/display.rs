@@ -1,10 +1,14 @@
+//! The display's colour capability for one window: read at attach, re-read on every change
+//! the system reports, and handed to the application through a scoped callback.
+
 use crate::bindings::*;
 use core::cell::{Cell, RefCell};
 use std::rc::Rc;
 use windows_color::{DisplayCapability, Gamut};
 use windows_core::{EventRevoker, Interface, Result};
 
-/// The window's `DisplayInformation`, its one handler, and the last capability read.
+/// Holds the window's `DisplayInformation`, its one change handler, and the last capability
+/// read.
 ///
 /// WinRT rather than DXGI because `CurrentAdvancedColorKind` is the only three-way
 /// discriminator: `DXGI_OUTPUT_DESC1`'s colour space carries two values for three modes, so
@@ -40,9 +44,9 @@ impl DisplayColor {
         // capability nobody has read yet; a change arriving between the two only posts a
         // message the window services with a fresh read.
         //
-        // An unrecognised kind falls back rather than failing closed as `refresh` does: there
-        // is no previous capability to keep, and SDR is the mode whose transform is a no-op,
-        // so it is the one wrong answer that cannot make a colour worse than untransformed.
+        // An unrecognised kind falls back to SDR rather than failing closed as `refresh` does:
+        // there is no previous capability to keep, and the SDR transform is a no-op, so it
+        // cannot make a colour worse than untransformed.
         let initial = capability(&info)?.unwrap_or(DisplayCapability::Sdr);
 
         // The handler does nothing but post, so the re-read, the mapping and the
@@ -60,16 +64,15 @@ impl DisplayColor {
         })
     }
 
-    /// The last capability read. No call crosses into WinRT.
+    /// Returns the last capability read. No call crosses into WinRT.
     pub(crate) fn capability(&self) -> DisplayCapability {
         self.current.get()
     }
 
-    /// Re-reads and notifies the application if it moved.
+    /// Re-reads the capability and notifies the application if it moved.
     ///
     /// Fails closed: an `AdvancedColorKind` this build does not recognise, or a read that
-    /// errors because the monitor went away mid-hop, keeps the previous capability. A wrong
-    /// guess is a screen at visibly the wrong brightness; a stale value is merely late.
+    /// errors because the monitor went away mid-hop, keeps the previous capability.
     pub(crate) fn refresh(&self) {
         let Ok(Some(next)) = capability(&self.info) else {
             return;
@@ -118,10 +121,10 @@ impl DisplayColor {
     }
 }
 
-/// A live registration for display-capability changes. Dropping it stops the callbacks.
+/// Scopes the application's display-capability callback. Dropping it stops the callbacks.
 ///
-/// It scopes the application's callback, not the system subscription — the window owns that
-/// for its whole life and revokes it on `WM_DESTROY` whether or not this still exists.
+/// It scopes that callback only, not the system subscription — the window owns that for its
+/// whole life and revokes it on `WM_DESTROY` whether or not this value still exists.
 pub struct Subscription {
     owner: Rc<DisplayColor>,
     id: u64,
@@ -141,7 +144,7 @@ impl core::fmt::Debug for Subscription {
     }
 }
 
-/// The window handle and the message, carried into the WinRT handler.
+/// Carries the window handle and the message into the WinRT change handler.
 struct Post(HWND, u32);
 
 impl Post {
@@ -192,8 +195,8 @@ fn capability(info: &IDisplayInformation5) -> Result<Option<DisplayCapability>> 
     Ok(None)
 }
 
-/// The primaries arrive as 32-bit CIE xy; the matrix inversion behind
-/// `Gamut::from_primaries` is where the precision goes.
+/// Widens a 32-bit CIE xy point to `f64`, the precision the matrix inversion behind
+/// `Gamut::from_primaries` needs.
 fn xy(p: Point) -> (f64, f64) {
     (p.x as f64, p.y as f64)
 }

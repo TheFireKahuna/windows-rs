@@ -1,17 +1,16 @@
 //! Where an overlay lands: flip, then slide, then clamp.
 //!
-//! Anchor resolution runs **after the solve**, because it needs both the anchor's rect and
-//! the overlay's own measured size. What it produces is one offset, and that offset is an
-//! input to the *next* solve rather than a transform applied over one — so a detached
-//! subtree's rects stay absolute and the one hit array needs nothing said twice.
+//! Anchor resolution runs after the solve, because it needs both the anchor's rect and the
+//! overlay's own measured size. It produces one offset, and that offset is an input to the
+//! next solve rather than a transform applied over one, so a detached subtree's rects stay
+//! absolute in window space.
 //!
-//! **Placement never changes the overlay's layout.** Flipping moves the resolved offset and
-//! nothing else; an overlay's size does not depend on where it landed, or the two would be a
-//! cycle with no fixed point. That is also what makes the placement pass terminate: the
-//! second flush computes the same offset from the same size and stops.
+//! Placement never changes the overlay's layout. Flipping moves the resolved offset and
+//! nothing else, and an overlay's size does not depend on where it landed. That is what makes
+//! the placement pass terminate: the second flush computes the same offset from the same size
+//! and stops.
 //!
-//! Everything here is pure. No model, no scene, no device — the whole file unit-tests
-//! headless, which is what a geometry rule this fiddly needs.
+//! Every function here is pure — no model, no scene, no device.
 
 use windows_numerics::Vector2;
 use windows_scene::{ControlId, Rect};
@@ -21,8 +20,8 @@ use windows_scene::{ControlId, Rect};
 pub enum AnchorTo {
     /// A control's rect, read from the one hit array. A menu under its button.
     Control(ControlId),
-    /// A raw pointer position. **A context menu's origin is a discrete decision**, so it is
-    /// the point the press was at and not wherever the pointer has since moved to.
+    /// A raw pointer position: the point a press was at, not wherever the pointer has since
+    /// moved to.
     Point(Vector2),
     /// The window itself. What a modal centres against.
     Window,
@@ -36,14 +35,13 @@ pub enum Side {
     Top,
     Left,
     Right,
-    /// No side: centred on both axes. What a modal dialog wants, and the one placement
-    /// `Side` plus [`Align`] cannot otherwise express — an alignment runs *along* a chosen
-    /// side, and a centred dialog has not chosen one.
+    /// No side: centred on both axes. [`Align`] runs along a chosen side, so centring on
+    /// both needs its own variant.
     Center,
 }
 
 impl Side {
-    /// The side to try when this one does not fit.
+    /// Returns the side to try when this one does not fit.
     #[must_use]
     pub const fn opposite(self) -> Self {
         match self {
@@ -51,14 +49,13 @@ impl Side {
             Self::Top => Self::Bottom,
             Self::Left => Self::Right,
             Self::Right => Self::Left,
-            // Nothing to flip to. A centred overlay that does not fit is clamped, which is
-            // the same answer flipping would have reached.
+            // Nothing to flip to; a centred overlay that does not fit is clamped instead.
             Self::Center => Self::Center,
         }
     }
 
-    /// Whether the overlay stacks vertically against its anchor, and therefore whether the
-    /// cross axis it slides along is x.
+    /// Returns whether the overlay stacks vertically against its anchor, so the cross axis
+    /// it slides along is x.
     #[must_use]
     pub const fn is_vertical(self) -> bool {
         matches!(self, Self::Bottom | Self::Top)
@@ -71,7 +68,9 @@ pub enum Align {
     /// Leading edges together — a menu's left edge under its button's left edge.
     #[default]
     Start,
+    /// Midpoints together.
     Center,
+    /// Trailing edges together.
     End,
 }
 
@@ -79,27 +78,31 @@ pub enum Align {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Fit {
     /// Try `side`; if it does not fit, try its opposite; then slide along the cross axis;
-    /// then clamp to the window. The default, and the order matters — sliding first would
-    /// cover the anchor a flip would have cleared.
+    /// then clamp to the window. Flipping runs before sliding, so an overlay clears its
+    /// anchor rather than sliding across it.
     #[default]
     FlipSlideClamp,
-    /// Never move. For an anchor guaranteed to have room, where a flip would be surprising.
+    /// Never move, whatever the overlay overhangs.
     Fixed,
 }
 
 /// A complete placement rule.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Anchor {
+    /// What the overlay is positioned against.
     pub to: AnchorTo,
+    /// Which side of the anchor it seats on.
     pub side: Side,
+    /// Where along that side it lines up.
     pub align: Align,
     /// DIPs, applied after side and align. The gap between a menu and its button.
     pub offset: Vector2,
+    /// How it survives not fitting.
     pub fit: Fit,
 }
 
 impl Anchor {
-    /// Under a control, leading edges aligned. What a menu, a picker and a select want.
+    /// Returns a rule seating the overlay under `to`, leading edges aligned.
     #[must_use]
     pub const fn below(to: ControlId) -> Self {
         Self {
@@ -111,7 +114,7 @@ impl Anchor {
         }
     }
 
-    /// At a point, which is what a context menu and a tooltip are placed by.
+    /// Returns a rule seating the overlay against `point`, as a context menu is placed.
     #[must_use]
     pub const fn at(point: Vector2) -> Self {
         Self {
@@ -123,7 +126,7 @@ impl Anchor {
         }
     }
 
-    /// Centred in the window. What a modal dialog wants.
+    /// Returns a rule centring the overlay in the window, with no fit adjustment.
     #[must_use]
     pub const fn centered() -> Self {
         Self {
@@ -135,7 +138,8 @@ impl Anchor {
         }
     }
 
-    /// Docked to one of the window's own edges, **inside** it. A drawer or a sheet.
+    /// Returns a rule docking the overlay inside the window against `side`, as a drawer or a
+    /// sheet is placed.
     #[must_use]
     pub const fn window(side: Side) -> Self {
         Self {
@@ -147,20 +151,22 @@ impl Anchor {
         }
     }
 
+    /// Returns this rule seating the overlay on `side` of its anchor.
     #[must_use]
     pub const fn side(self, side: Side) -> Self {
         Self { side, ..self }
     }
 
+    /// Returns this rule lining the overlay up by `align` along the chosen side.
     #[must_use]
     pub const fn align(self, align: Align) -> Self {
         Self { align, ..self }
     }
 
-    /// The gap between the overlay and its anchor, in DIPs.
+    /// Returns this rule with a gap of `x` by `y` DIPs between the overlay and its anchor.
     ///
-    /// The one raw length in this module, and it is a *position* rather than a design
-    /// metric: it is measured against the anchor's own box, which the palette does not own.
+    /// A raw length rather than a palette metric, because it is measured against the
+    /// anchor's own box. [`place`] reverses it when the overlay flips.
     #[must_use]
     pub const fn gap(self, x: f32, y: f32) -> Self {
         Self {
@@ -169,16 +175,18 @@ impl Anchor {
         }
     }
 
+    /// Returns this rule with `fit` deciding what happens when the overlay does not fit.
     #[must_use]
     pub const fn fit(self, fit: Fit) -> Self {
         Self { fit, ..self }
     }
 }
 
-/// Places `size` against the rect `against` inside `window`, in absolute window DIPs.
+/// Returns the absolute window-DIP origin for an overlay of `size` placed against the rect
+/// `against` inside a client box of `window`.
 ///
-/// A `Window` anchor is placed against the window box itself, which is what makes "centre a
-/// modal" and "dock a drawer to the right edge" the same rule rather than a special case.
+/// `against` is the anchor's own rect, which for [`AnchorTo::Window`] is the window box, so
+/// centring a modal and docking a drawer to an edge run through this one rule.
 #[must_use]
 pub fn place(size: Vector2, against: Rect, anchor: Anchor, window: Vector2) -> Vector2 {
     let how = anchor.to.seat();
@@ -190,9 +198,8 @@ pub fn place(size: Vector2, against: Rect, anchor: Anchor, window: Vector2) -> V
         return at;
     }
 
-    // 1. Flip. Only if the opposite side has room the chosen one does not — flipping into
-    //    an equally bad fit trades one overhang for another and moves the overlay for
-    //    nothing.
+    // 1. Flip, only where the opposite side has room the chosen one does not. Flipping into
+    //    an equally bad fit would move the overlay and still overhang.
     if overhangs(at, size, window, anchor.side) {
         let flipped = {
             let mut flipped = seat(size, against, anchor.side.opposite(), anchor.align, how);
@@ -207,20 +214,19 @@ pub fn place(size: Vector2, against: Rect, anchor: Anchor, window: Vector2) -> V
         }
     }
 
-    // 2. Slide along the cross axis, and 3. clamp on the main one. Both are the same
-    //    operation — pull the box back inside the window — and differ only in which axis
-    //    the flip already had its chance at.
+    // 2. Slide along the cross axis, and 3. clamp on the main one. Both pull the box back
+    //    inside the window, and differ only in which axis the flip already had a chance at.
     Vector2 {
         x: clamp_axis(at.x, size.x, window.x),
         y: clamp_axis(at.y, size.y, window.y),
     }
 }
 
-/// Which way an anchor is occupied.
+/// Whether an overlay seats outside its anchor or inside it.
 ///
-/// The distinction the [`Window`](AnchorTo::Window) case turns on, and getting it wrong puts
-/// a modal one window-height below the window: an overlay sits **beside** a control and
-/// **within** the window, and the same `Side` means opposite offsets in the two.
+/// An overlay sits beside a control and within the window, so the same [`Side`] resolves to
+/// opposite offsets in the two: seating a modal beside the window box would put it one
+/// window-height off screen.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Seat {
     /// Outside the anchor, touching the named side. A menu under its button.
@@ -230,6 +236,7 @@ enum Seat {
 }
 
 impl AnchorTo {
+    /// Returns how an overlay seats against this anchor.
     const fn seat(self) -> Seat {
         match self {
             Self::Control(_) | Self::Point(_) => Seat::Beside,
@@ -238,7 +245,7 @@ impl AnchorTo {
     }
 }
 
-/// Where the overlay sits before anything is done about fit.
+/// Returns where the overlay sits before anything is done about fit.
 fn seat(size: Vector2, anchor: Rect, side: Side, align: Align, how: Seat) -> Vector2 {
     let along = |start: f32, extent: f32, own: f32| match align {
         Align::Start => start,
@@ -267,9 +274,7 @@ fn seat(size: Vector2, anchor: Rect, side: Side, align: Align, how: Seat) -> Vec
             x: left,
             y: along(anchor.y0, anchor.height(), size.y),
         },
-        // No side at all: centred on both axes, which is the one placement a modal wants
-        // and the one `Side` plus `Align` cannot otherwise say — `Align` runs along the
-        // chosen side, and a centred dialog has not chosen one.
+        // Centred on both axes: `Align` runs along a chosen side, and this has none.
         Side::Center => Vector2 {
             x: middle(anchor.x0, anchor.width(), size.x),
             y: middle(anchor.y0, anchor.height(), size.y),
@@ -277,26 +282,25 @@ fn seat(size: Vector2, anchor: Rect, side: Side, align: Align, how: Seat) -> Vec
     }
 }
 
-/// Whether the overlay runs off the window on the side it was seated against.
+/// Returns whether the overlay runs off the window on the side it was seated against.
 ///
-/// The **main axis only**: the cross axis is what sliding fixes, and treating a cross-axis
-/// overhang as a reason to flip would send a menu above its button because it was too wide.
+/// Tests the main axis only. Sliding fixes the cross axis, so a cross-axis overhang is not a
+/// reason to flip a menu above the button it was merely too wide for.
 fn overhangs(at: Vector2, size: Vector2, window: Vector2, side: Side) -> bool {
     match side {
         Side::Bottom => at.y + size.y > window.y,
         Side::Top => at.y < 0.0,
         Side::Right => at.x + size.x > window.x,
         Side::Left => at.x < 0.0,
-        // Nothing to flip to, and nothing it could hang off that the clamp does not answer.
+        // Nothing to flip to; the clamp answers any overhang.
         Side::Center => false,
     }
 }
 
-/// Pulls one axis back inside the window.
+/// Returns `at` pulled back inside the window on one axis.
 ///
-/// Leading edge wins when the overlay is larger than the window: a menu taller than the
-/// screen shows its first items, which are the ones it was opened for. The alternative
-/// scrolls its top off and looks like a rendering fault.
+/// The leading edge wins where the overlay is larger than the window, so a menu taller than
+/// the client box keeps its first items on screen.
 fn clamp_axis(at: f32, size: f32, window: f32) -> f32 {
     at.min(window - size).max(0.0)
 }
@@ -306,11 +310,11 @@ mod tests {
     use super::*;
     use windows_scene::Ids;
 
-    /// The `n`th id a fresh authority mints.
+    /// Returns the `n`th id a fresh [`Ids`] mints.
     ///
-    /// A `ControlId` is a generational index with no public constructor, which is the point:
-    /// it can only come from an [`Ids`]. Minting densely from a fresh one is deterministic,
-    /// so this is stable across calls and distinct per `n` without any shared state.
+    /// A `ControlId` is a generational index with no public constructor, so it can only come
+    /// from an `Ids`. Minting densely from a fresh one is deterministic, so the result is
+    /// stable across calls and distinct per `n` without any shared state.
     fn cid(n: u32) -> ControlId {
         let mut ids = Ids::<windows_scene::Control>::new();
         let mut id = ids.mint();
@@ -355,8 +359,8 @@ mod tests {
 
     #[test]
     fn a_gap_reverses_with_the_side_it_is_measured_from() {
-        // Four DIPs *below* the button, and four DIPs *above* it once it flips — not four
-        // further down, which would open a gap on one side and overlap on the other.
+        // Four DIPs below the button, and four DIPs above it once it flips, rather than four
+        // further down.
         let anchor = rect(40.0, 260.0, 140.0, 284.0);
         let a = Anchor::below(cid(1)).gap(0.0, 4.0);
         let at = place(size(120.0, 80.0), anchor, a, WINDOW);
@@ -372,9 +376,8 @@ mod tests {
 
     #[test]
     fn a_flip_into_an_equally_bad_fit_does_not_happen() {
-        // Taller than the window: neither side fits, so flipping would move it for nothing
-        // and then clamp to the same place anyway. Staying put keeps the anchor's own end
-        // of the overlay where the user is looking.
+        // Taller than the window: neither side fits, so flipping would move it and clamp to
+        // the same place.
         let anchor = rect(40.0, 140.0, 140.0, 164.0);
         let at = place(size(120.0, 400.0), anchor, Anchor::below(cid(1)), WINDOW);
         assert_eq!(at.y, 0.0, "clamped, not flipped");
@@ -382,9 +385,8 @@ mod tests {
 
     #[test]
     fn a_cross_axis_overhang_slides_rather_than_flipping() {
-        // Too wide for where it was seated, but there is nothing wrong with being *below*.
-        // Flipping here would send a menu above its button because it was wide, which reads
-        // as a bug.
+        // Too wide for where it was seated, and still correctly below its anchor: a
+        // cross-axis overhang slides rather than flipping.
         let anchor = rect(340.0, 50.0, 380.0, 74.0);
         let at = place(size(120.0, 80.0), anchor, Anchor::below(cid(1)), WINDOW);
         assert_eq!(at.y, 74.0, "still below its anchor");
@@ -393,7 +395,7 @@ mod tests {
 
     #[test]
     fn nothing_ever_leaves_the_window() {
-        // Invariant 3, over every side, alignment and a deliberately awkward anchor.
+        // Every side and alignment, against an anchor straddling two window edges.
         let anchor = rect(-20.0, 290.0, 30.0, 340.0);
         for side in [Side::Bottom, Side::Top, Side::Left, Side::Right] {
             for align in [Align::Start, Align::Center, Align::End] {
@@ -418,8 +420,7 @@ mod tests {
 
     #[test]
     fn fixed_never_moves() {
-        // The whole point of the mode: an anchor guaranteed to have room, where a flip
-        // would be more surprising than an overhang.
+        // `Fit::Fixed` keeps the seated position even where the overlay overhangs.
         let anchor = rect(40.0, 260.0, 140.0, 284.0);
         let a = Anchor::below(cid(1)).fit(Fit::Fixed);
         let at = place(size(120.0, 80.0), anchor, a, WINDOW);
@@ -428,11 +429,10 @@ mod tests {
 
     #[test]
     fn a_window_anchor_seats_inside_the_window_and_not_beside_it() {
-        // The case that reads as an ordinary side and is the opposite of one. A control is
-        // something an overlay sits *next to*; the window is something it sits *in*, so the
-        // same `Side::Bottom` means "below the button" against one and "along the bottom
-        // edge" against the other. Seating a modal the first way puts it one window-height
-        // off the screen, and `Fit::Fixed` means nothing clamps it back.
+        // A control is something an overlay sits next to; the window is something it sits
+        // in, so the same `Side::Bottom` means "below the button" against one and "along the
+        // bottom edge" against the other. Seating a modal the first way puts it one
+        // window-height off screen, and `Fit::Fixed` clamps nothing back.
         let window = Rect::new(0.0, 0.0, WINDOW.x, WINDOW.y);
         let overlay = size(200.0, 100.0);
 
@@ -445,7 +445,7 @@ mod tests {
         let left = place(overlay, window, Anchor::window(Side::Left), WINDOW);
         assert_eq!(left.x, 0.0);
 
-        // And every one of them is on screen, which is the claim that actually matters.
+        // And every one of them is on screen.
         for at in [bottom, right, top, left] {
             assert!(at.x >= 0.0 && at.y >= 0.0, "{at:?}");
             assert!(
@@ -457,8 +457,7 @@ mod tests {
 
     #[test]
     fn a_modal_is_centred_on_both_axes() {
-        // What `Side` plus `Align` cannot say: an alignment runs *along* a chosen side, so
-        // "centred" needs a side that is not one.
+        // `Align` runs along a chosen side, so centring on both axes needs `Side::Center`.
         let window = Rect::new(0.0, 0.0, WINDOW.x, WINDOW.y);
         let overlay = size(200.0, 100.0);
         let at = place(overlay, window, Anchor::centered(), WINDOW);
@@ -473,9 +472,8 @@ mod tests {
 
     #[test]
     fn placing_twice_lands_in_the_same_place() {
-        // What makes the placement pass terminate: the offset is a function of the size,
-        // and the size does not depend on the offset. If this ever fails, the flush loop
-        // has become a fixed-point search rather than two passes.
+        // The placement pass terminates because the offset is a function of the size and the
+        // size does not depend on the offset.
         let anchor = rect(340.0, 250.0, 380.0, 274.0);
         let a = Anchor::below(cid(1)).gap(0.0, 4.0);
         let overlay = size(120.0, 80.0);

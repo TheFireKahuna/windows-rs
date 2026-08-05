@@ -2,20 +2,20 @@
 //!
 //! Arguments evaluate before the call consuming them, so a builder chain is constructed
 //! inner-first: children exist before the parent that has to be minted before them.
-//! Buffering that in an arena keeps [`El`](super::El) a `Copy` index and costs no
-//! allocation after warm-up, where owning children per element or boxing a mount closure
-//! costs one per node — and a realized list row is on the fling path.
+//! Buffering that here keeps [`El`](super::El) a `Copy` index and allocates nothing after
+//! warm-up, where owning children per element or boxing a mount closure costs one
+//! allocation per node — and a realized list row is on the fling path.
 //!
-//! Children are a contiguous chunk, because `.stack(c)` writes the whole list in one push.
-//! Everything a modifier appends is an intrusive chain, because modifiers can run out of
-//! order: `let a = x().grow(); let b = y().grow(); let a = a.width(..)` interleaves two
-//! slots, and a span scheme would silently give `a` one of `b`'s.
+//! Children are a contiguous chunk, since `.stack(c)` writes the whole list in one push.
+//! Everything a modifier appends is an intrusive chain, since modifiers run out of order:
+//! `let a = x().grow(); let b = y().grow(); let a = a.width(..)` interleaves two slots, and a
+//! span scheme would give `a` one of `b`'s.
 //!
-//! A `Build::with` body must not call application code. Borrows never nest naturally, since
-//! arguments finish first; a keyed list's rows and a branch's arms build at reconcile time,
-//! outside any borrow.
+//! A `Build::with` body must not call application code, because the arena is borrowed for
+//! the length of it. Borrows do not nest on their own, since arguments finish first, and a
+//! keyed list's rows and a branch's arms build at reconcile time, outside any borrow.
 
-// `expect` rather than `allow`, so the warning returns the day the last widget seed lands.
+// `expect` rather than `allow`: the lint fires again once every item here has a consumer.
 #![expect(
     dead_code,
     reason = "consumed by the widget seeds; narrow to the specific items when they land"
@@ -86,20 +86,18 @@ pub(crate) struct Slot {
     pub hit: Option<HitSeed>,
     /// The gesture declaration, in the side buffer, or [`NIL`].
     ///
-    /// Out of line because it is ninety-six bytes on a field a handful of nodes per screen
-    /// set, and the walk copies this slot once per node: inline it would be a third of the
-    /// slot spent on the rarest thing in it.
+    /// Out of line because a declaration is ninety-six bytes, a handful of nodes per screen
+    /// set one, and the walk copies this slot once per node.
     pub gesture: u32,
     pub state: StatePolicy,
     /// The widget's own surface, as a table row rather than as sprites.
     ///
-    /// Held unexpanded so a variant modifier rewrites one byte and the mount decides what
-    /// that costs — a ghost mints no fill because its row has none, not because a branch
-    /// remembered to skip one.
+    /// Held unexpanded so a variant modifier rewrites one byte and the mount decides which
+    /// sprites the row implies: a ghost mints no fill because its row has none.
     pub chrome: Option<Chrome>,
     /// What a pointer means here, front-side. `None` is every non-value control.
     pub interaction: Option<Interaction>,
-    /// Path geometry, in sprite-local DIPs. The one thing a widget names that this crate
+    /// Path geometry, in sprite-local DIPs. The one resource a widget names that this crate
     /// did not mint.
     pub geom: Option<GeomId>,
     /// A surface pushes a rung of the ladder for everything inside it.
@@ -128,20 +126,20 @@ pub(crate) struct Slot {
     pub present: bool,
     /// Whether a child was written straight into [`kids`](Self::kids) by explicit placement.
     ///
-    /// Only so `take_kids` can say what it would otherwise silently do. See there.
+    /// Read by [`Build::take_kids`], which asserts on it rather than replacing placed
+    /// children in silence.
     pub placed: bool,
     /// Declines touch inflation, whether or not a hit entry exists **yet**.
     ///
     /// Its own field and not a flag on [`hit`](Self::hit), so it does not depend on call
-    /// order: `.no_inflate().on_click(..)` and the reverse mean the same thing, which is
-    /// what every other modifier here already guarantees. It is folded in at mount, and only
-    /// where a hit entry was declared — so declining an inflation never *creates* a target.
+    /// order: `.no_inflate().on_click(..)` and the reverse are equivalent. It is folded
+    /// in at mount, and only where a hit entry was declared, so declining an inflation never
+    /// *creates* a target.
     pub no_inflate: bool,
-    /// Where the solve is to report this node's box, or `None` for the overwhelming majority
-    /// that nobody asks about.
+    /// Where the solve reports this node's box, or `None` for a node no one reads back.
     ///
-    /// A [`Cell`](crate::signal::Cell) and not a node id, because the reporting direction is
-    /// the point: the application never learns a `NodeId` and never reaches the model.
+    /// A [`Cell`](crate::signal::Cell) and not a node id, so the reporting runs one way: the
+    /// application never learns a `NodeId` and never reaches the model.
     pub probe: Option<crate::signal::Cell<crate::layout::Placed>>,
 }
 
@@ -187,9 +185,8 @@ pub(crate) struct HitSeed {
 
 /// One sprite, named by **role** and never by colour.
 ///
-/// `resolve` is called inside the mount walk, so neither `Radiance` nor `Paint` is
-/// reachable from a widget — which makes `no_widget_colors` a property of the module graph
-/// rather than of a grep.
+/// `resolve` is called inside the mount walk, so neither `Radiance` nor `Paint` is reachable
+/// from a widget.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct SpriteSeed {
     pub mask: MaskSeed,
@@ -238,15 +235,15 @@ pub(crate) enum Unit {
     /// `0..=1` of the room a moving part has along its track.
     ///
     /// A fraction cannot be lowered at mount, because the room is a **layout output**: the
-    /// track's extent less the part's own. So the mount records the fraction and the
-    /// post-solve step multiplies — which is also what lets the front thread move the same
-    /// part from the same number without asking this thread for geometry.
+    /// track's extent less the part's own. The mount records the fraction and the post-solve
+    /// step multiplies it out, which also lets the front thread move the same part from the
+    /// same number without asking this thread for geometry.
     Travel,
     /// `0..=1` of a turned part's sweep, which is a constant.
     ///
-    /// Not `Direct` even though the sweep needs nothing from layout: a turned value is a
-    /// value, so it opens the same row a slid one does and the same single arbiter decides
-    /// whether this thread or the router is the one moving it.
+    /// Not `Direct` even though the sweep needs nothing from layout: this opens the same
+    /// value row a slid part does, so one arbiter decides whether this thread or the router
+    /// moves it.
     Turn,
 }
 
@@ -272,8 +269,8 @@ pub(crate) struct ChanSeed {
 /// A channel's value, and whether reading it can ever answer differently.
 ///
 /// A constant carries its value inline and produces no graph node, no `Effect` and no
-/// allocation. That is the whole of "static content costs one sprite and nothing else",
-/// and it is decided here rather than once per widget.
+/// allocation, so static content costs its sprites and nothing else. Decided here rather
+/// than once per widget.
 pub(crate) enum ChanSource {
     Const(Value),
     Dynamic(Box<dyn Fn() -> Value>),
@@ -293,8 +290,7 @@ pub(crate) struct TextSeed {
 /// dense table.
 ///
 /// Handlers never cross the thread seam: they live in an app-thread table and reach the
-/// front thread as a presence bit in [`HitFlags`], which is what makes `SinkPatch: Send`
-/// provable rather than aspirational.
+/// front thread as a presence bit in [`HitFlags`], which is what keeps `SinkPatch: Send`.
 pub(crate) enum Act {
     Click(Box<dyn Fn()>),
     ChangeF64(Box<dyn Fn(f64)>),
@@ -309,9 +305,9 @@ pub(crate) enum Act {
     HideWhen(Box<dyn Fn() -> bool>),
     /// Overrides that follow a value, written into the lowering's buffer.
     ///
-    /// A **style** and not a channel, which is the distinction that matters: a size layout
-    /// has to see must go through the solve, where binding it would move the node and leave
-    /// everything below it where it was.
+    /// A **style** and not a channel: a size layout has to see must go through the solve,
+    /// where binding it as a channel would move the node and leave everything below it where
+    /// it was.
     ///
     /// Writing into a buffer rather than returning one override is what lets a column
     /// template be bound — `ClearColumns` and a track each — and what lets a node carry two
@@ -331,9 +327,9 @@ pub(crate) struct ActSeed {
 /// A structural adapter, which owns its node's children and produces them at reconcile
 /// time rather than at build time.
 ///
-/// Boxed once per adapter — not per row — and it is the seam where `each`, `when` and
-/// `switch` reach `Keyed` and `Branch`. The closure runs **outside** any arena borrow,
-/// which is where the module's re-entry rule is satisfied rather than violated.
+/// Boxed once per adapter and not per row. The seam where `each`, `when` and `switch` reach
+/// `Keyed` and `Branch`. The closure runs **outside** any arena borrow, so a row it builds
+/// is free to call application code.
 pub(crate) struct Adapter {
     /// `FnOnce`, because it is handed the site once and installs whatever drives it from
     /// then on. Nothing calls back into the walk.
@@ -345,14 +341,13 @@ pub(crate) struct Adapter {
 pub(crate) struct Build {
     pub nodes: Vec<Slot>,
     pub kids: Vec<u32>,
-    /// Children being collected for the containers currently under construction.
+    /// Children being collected for the containers under construction.
     ///
-    /// A **stack**, because containers nest, and the arena's own, because the alternative is
-    /// a temporary per container: `card().stack((..))` would allocate once for the card and
-    /// once for every container inside it, on every mount, which is the one thing this arena
-    /// exists to prevent. A container marks the depth on the way in and moves everything
-    /// above that mark into [`kids`](Self::kids) on the way out, so the run it records is
-    /// contiguous and the buffer keeps its capacity.
+    /// A **stack**, because containers nest, and the arena's own, because a temporary per
+    /// container would allocate once for `card().stack((..))` and once for every container
+    /// inside it, on every mount. A container marks the depth on the way in and moves
+    /// everything above that mark into [`kids`](Self::kids) on the way out, so the run it
+    /// records is contiguous and the buffer keeps its capacity.
     pub pending: Vec<u32>,
     pub over: Vec<OverSeed>,
     pub seeds: Vec<SpriteSeed>,
@@ -380,13 +375,13 @@ thread_local! {
 impl Build {
     /// Runs `f` against the thread's arena.
     ///
-    /// **`f` must not call application code.** See the module rule; `no_build_reentry`
-    /// is the lint.
+    /// **`f` must not call application code.** The arena is borrowed for the length of the
+    /// call, so anything that builds from inside `f` panics on the borrow.
     pub(crate) fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
         CURRENT.with(|b| f(&mut b.borrow_mut()))
     }
 
-    /// Empties every buffer, keeping the allocations. The whole of the pooling.
+    /// Empties every buffer, keeping the allocations.
     pub(crate) fn clear(&mut self) {
         self.nodes.clear();
         self.kids.clear();
@@ -416,8 +411,8 @@ impl Build {
         f(&mut self.gestures[entry as usize]);
     }
 
-    /// The declaration a [`Slot::gesture`] entry names. [`NIL`] answers `None`, because the
-    /// buffer is never that long.
+    /// Returns the declaration a [`Slot::gesture`] entry names. [`NIL`] answers `None`, since
+    /// the buffer is never that long.
     pub(crate) fn gesture(&self, entry: u32) -> Option<GestureDecl> {
         self.gestures.get(entry as usize).copied()
     }
@@ -517,7 +512,7 @@ impl Build {
         at
     }
 
-    /// Where the pending stack currently stands. A container takes this on the way in.
+    /// Returns where the pending stack stands. A container takes this on the way in.
     pub(crate) fn mark(&self) -> u32 {
         self.pending.len() as u32
     }
@@ -529,10 +524,10 @@ impl Build {
     /// mount rather than compacted, so an abandoned list costs high-water mark and nothing
     /// else.
     pub(crate) fn take_kids(&mut self, at: u32, mark: u32) {
-        // Placement writes straight into the child list, so a class chosen afterwards would
-        // replace it — and the only symptom is a cell that is not on screen. Replacing a
-        // previous *class*'s run is the wanted behaviour and stays silent; replacing placed
-        // children is a call-order mistake, and this is where it is visible.
+        // Placement writes straight into the child list, so a class chosen afterwards
+        // replaces it, and the only symptom is a cell that is not on screen. Replacing a
+        // previous *class*'s run is wanted and stays silent; replacing placed children is a
+        // call-order mistake.
         debug_assert!(
             !self.nodes[at as usize].placed,
             "choose this container's layout class before placing children into it"
@@ -565,9 +560,8 @@ impl Build {
         };
     }
 
-    /// How many sprites a slot declared. A count and not a collection: `walk` needs the
-    /// number before it needs the seeds, and collecting them to find out would be the
-    /// allocation the arena exists to remove.
+    /// Returns how many sprites a slot declared. A count and not a collection: `walk` needs
+    /// the number before it needs the seeds, and collecting them to find out would allocate.
     pub(crate) fn seed_count(&self, link: Link) -> usize {
         self.chain_seeds(link).count()
     }

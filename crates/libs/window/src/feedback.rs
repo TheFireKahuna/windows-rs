@@ -1,22 +1,33 @@
+//! Which touch and pen feedback visuals the system draws for a window, for an application
+//! that draws its own.
+
 use crate::bindings::*;
 use windows_core::BOOL;
 
-/// One system-drawn touch or pen feedback visual.
+/// Names one system-drawn touch or pen feedback visual.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Feedback {
     /// The contact ring drawn under a finger.
     TouchContact,
+    /// The visual drawn on a touch tap.
     TouchTap,
+    /// The visual drawn on a touch double tap.
     TouchDoubleTap,
     /// The circle that grows under a held finger, announcing a right-tap.
     TouchPressAndHold,
+    /// The visual drawn when touch resolves to a right-tap.
     TouchRightTap,
     /// The barrel-button indicator on a pen.
     PenBarrel,
+    /// The visual drawn on a pen tap.
     PenTap,
+    /// The visual drawn on a pen double tap.
     PenDoubleTap,
+    /// The visual drawn under a held pen, announcing a right-tap.
     PenPressAndHold,
+    /// The visual drawn when a pen resolves to a right-tap.
     PenRightTap,
+    /// The visual drawn for the press-and-tap gesture.
     GesturePressAndTap,
 }
 
@@ -51,26 +62,27 @@ impl Feedback {
         }
     }
 
-    /// The system numbers these from one.
+    /// Returns this kind's bit in a [`FeedbackPolicy`] mask. `FEEDBACK_TYPE` numbers the kinds
+    /// from one.
     const fn bit(self) -> u16 {
         1 << (self.kind() as u16 - 1)
     }
 }
 
-/// Which system-drawn visuals a window keeps.
+/// Selects which system-drawn visuals a window keeps.
 ///
-/// The default keeps all of them: a suppressed visual with no replacement drawn is a touch
-/// that gives no feedback at all.
+/// The default keeps all of them: a suppressed visual with nothing drawn in its place is a
+/// touch that gives no feedback at all.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FeedbackPolicy {
     suppressed: u16,
 }
 
 impl FeedbackPolicy {
-    /// Keep everything the system draws.
+    /// Keeps every visual the system draws.
     pub const SYSTEM: Self = Self { suppressed: 0 };
 
-    /// Suppress one kind, because the application draws its own.
+    /// Returns this policy with `feedback` suppressed, for an application drawing its own.
     #[must_use]
     pub const fn without(self, feedback: Feedback) -> Self {
         Self {
@@ -78,12 +90,13 @@ impl FeedbackPolicy {
         }
     }
 
-    /// Whether `feedback` is one this window suppresses.
+    /// Returns whether this policy suppresses `feedback`.
     #[must_use]
     pub const fn suppresses(self, feedback: Feedback) -> bool {
         self.suppressed & feedback.bit() != 0
     }
 
+    /// Writes the policy to `hwnd`. A policy that suppresses nothing writes nothing.
     pub(crate) fn apply(self, hwnd: HWND) {
         if self.suppressed == 0 {
             return;
@@ -93,8 +106,8 @@ impl FeedbackPolicy {
             if !self.suppresses(feedback) {
                 continue;
             }
-            // Only the suppressed kinds are written. Writing `TRUE` for the rest would pin
-            // them against a future system default.
+            // Only the suppressed kinds are written; writing `TRUE` for the rest would pin
+            // them against whatever the system default is.
             // SAFETY: `hwnd` is live; the configuration is a stack local of the stated size.
             unsafe {
                 _ = SetWindowFeedbackSetting(

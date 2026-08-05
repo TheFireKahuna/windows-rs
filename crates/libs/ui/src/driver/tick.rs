@@ -1,7 +1,7 @@
 //! One frame: everything the writes since the last one implied, and nothing else.
 //!
-//! Every ordering comment in `tick` is a defect that was found rather than a preference. Read
-//! them before moving a line.
+//! The step order in [`Frame::tick`] is a correctness rule at every seam, and each ordering
+//! comment names what breaks if the line moves.
 
 use super::env_of;
 use crate::build::Host;
@@ -20,23 +20,22 @@ use windows_window::{CaptionState, Handoff, Tick, Window};
 
 /// Everything one tick needs, in one place the window procedure can reach.
 ///
-/// A struct rather than a set of locals in [`Ui::run`](super::Ui::run) for one reason: **the
-/// tick runs inside the window procedure.** That is what makes it survive a *nested* pump —
-/// the system's own resize and move loops, the window menu, `Alt`+`Space` — each of which
-/// runs a message loop of its own inside `DefWindowProc` and does not return until the
-/// gesture ends. A tick sitting after `DispatchMessageW` in an outer loop is starved for the
-/// whole of one, which is a window whose content freezes while its frame is being dragged. A
-/// tick reached from [`WM_FRAME`](windows_window::WM_FRAME) is not.
+/// The tick runs inside the window procedure, reached from
+/// [`WM_FRAME`](windows_window::WM_FRAME), so it keeps running through a nested pump: the
+/// system's own resize and move loops, the window menu and `Alt`+`Space` each run a message
+/// loop inside `DefWindowProc` and do not return until the gesture ends. A tick placed after
+/// `DispatchMessageW` in an outer loop is starved for the whole of one, and its window's
+/// content freezes while the frame is being dragged.
 ///
-/// A message handler is `'static`, so none of this can be a local borrowed by it.
+/// A message handler is `'static`, so none of these can be a local in
+/// [`Ui::run`](super::Ui::run) borrowed by it.
 pub(super) struct Frame {
-    /// Held rather than borrowed, for the same reason: the handler outlives every stack frame
-    /// in `run`. The window's own state holds a **weak** reference back to this, so the two do
-    /// not keep each other alive.
+    /// The window, held rather than borrowed: the handler outlives every stack frame in
+    /// [`Ui::run`](super::Ui::run). The window's own state holds a weak reference back to
+    /// this frame, so the two do not keep each other alive.
     pub window: Rc<Window>,
-    /// Shared with the caption's hit authority, which answers from the window procedure and
-    /// may therefore ask while a tick is in progress. It takes the borrow fallibly for exactly
-    /// that reason.
+    /// Shared with the caption's hit handler, which answers from the window procedure and may
+    /// therefore ask while a tick is in progress. That handler takes the borrow fallibly.
     pub scene: Rc<RefCell<Scene>>,
     pub backends: Backends,
     pub router: Router,
@@ -46,8 +45,8 @@ pub(super) struct Frame {
     /// them.
     pub overlays: Overlays,
     pub patch: SinkPatch,
-    /// What the front half reported since the last tick. Held for the life of the window, like
-    /// the other three, so a fling's per-frame drain allocates nothing.
+    /// What the front half reported since the last tick. Held for the life of the window, so
+    /// a fling's per-frame drain allocates nothing.
     pub events: Vec<SceneEvent>,
     pub reports: Vec<Report>,
     pub intents: Vec<Intent>,
@@ -58,14 +57,23 @@ pub(super) struct Frame {
 }
 
 impl Frame {
-    /// One frame: everything the writes since the last one implied, and nothing else.
+    /// Runs one frame: everything the writes since the last tick implied, and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Applying the patch to the scene failed, a retarget was refused by the compositor, or
+    /// the router's own tick failed.
     pub(super) fn tick(&mut self) -> Result<()> {
-        // Released first, before any of the work. A write made *later* in this tick — an
-        // intent handler's, at the very end — then asks for the next frame instead of being
-        // folded into the request already being served and forgotten with it.
+        // Released before any of the work, so a write made later in this tick — an intent
+        // handler's, at the very end — asks for the next frame rather than folding into the
+        // request already being served and being forgotten with it.
         self.pending.take();
 
-        let env = env_of(&self.window);
+        // A closed window answers for no display, and there is nothing left to draw on one.
+        // Returning is what keeps the frame off invented DPI and colour capability.
+        let Some(env) = env_of(&self.window) else {
+            return Ok(());
+        };
         let mut scene = self.scene.borrow_mut();
 
         // Before the solve, because a solve that ran on the old extent would put the caption's
@@ -91,9 +99,9 @@ impl Frame {
         scene.drain_events(&mut self.events);
         layout::scroll_observe(&self.events);
         self.overlays.scene(&self.events, self.router.focus_mut());
-        // Neither of these moves a DIP, so the ordinary publish's width gate answers "nothing
-        // moved" for exactly the case where every coverage tile is rasterized for a grid that
-        // is gone.
+        // A scale change and a device rebuild move no DIP, so the ordinary publish's width
+        // gate reports nothing moved for exactly the case where every coverage tile is
+        // rasterized for a grid that is gone.
         if self.events.iter().any(|event| {
             matches!(
                 event,
@@ -143,11 +151,11 @@ impl Frame {
         self.router.tick(scene.hits(), env, &mut self.reports)?;
 
         // ⑥ the pixels those reports move, and only then what the application is asked to do.
-        // No intent may be the cause of a visual: by the time one exists, it has happened.
+        // No intent causes a visual: by the time one exists, the visual has happened.
         self.intents.clear();
-        // Before the front table, because this *appends* to both buffers: a menu row activated
+        // Before the front table, because this appends to both buffers: a menu row activated
         // with `Enter` reaches the handler a click reaches, through the one dispatch point
-        // rather than a keyboard-shaped second one.
+        // rather than a second, keyboard-shaped path.
         self.overlays.keys(
             &mut self.reports,
             scene.hits(),
@@ -178,8 +186,13 @@ impl Frame {
         // The scene's borrow released before the application runs. A handler is free to do
         // anything a window's thread can do, including ask the caption what is under a point —
         // which reaches this same scene. `front` holds the borrow only to its last use above.
+        let census = *scene.census();
         drop(scene);
         Host::with(|h| h.dispatch(&self.intents));
+
+        // Last, so what an observer is handed is what the whole tick settled on rather than a
+        // stage of it.
+        super::observed(&self.events, &self.reports, census);
         Ok(())
     }
 }

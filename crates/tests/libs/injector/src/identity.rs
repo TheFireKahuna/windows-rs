@@ -1,9 +1,8 @@
 //! Whether this process may create a virtual input device.
 //!
-//! `Windows.UI.Input.Preview.Injection` is documented to require the
-//! **`inputInjectionBrokered` restricted capability**, and a capability is declared in a
-//! package manifest — so an unpackaged process does not have it and cannot acquire it at
-//! run time. That one fact explains every silent failure this crate ran into:
+//! `Windows.UI.Input.Preview.Injection` requires the `inputInjectionBrokered` restricted
+//! capability, and a capability is declared in a package manifest, so an unpackaged process
+//! does not have it and cannot acquire it at run time. That decides which calls deliver:
 //!
 //! | | Needs a virtual device | Delivers unpackaged |
 //! |---|---|---|
@@ -14,16 +13,16 @@
 //! | `CreateSyntheticPointerDevice` / `…2` | yes | no |
 //! | `InjectTouchpadAction` | no — it is a message to a tracked window | **yes** |
 //!
-//! Every one of the "no" rows **returns success**. There is no error to read, which is why
-//! this is checked rather than discovered: a stream that cannot be delivered is refused
-//! with the capability's own name in it, instead of running and asserting nothing.
+//! Every one of the "no" rows returns success and delivers nothing. There is no error to
+//! read, so the check happens up front: a stream that cannot deliver is refused with the
+//! capability's name in the error rather than running and asserting nothing.
 //!
 //! Package identity is the testable proxy. Having it does not prove the capability was
-//! declared, but *not* having it proves the capability cannot have been.
+//! declared, but not having it proves the capability cannot have been.
 
 use crate::bindings::*;
 
-/// Whether this process has package identity, and therefore whether it could carry a
+/// Returns whether this process has package identity, and so whether it could carry a
 /// restricted capability at all.
 pub(crate) fn packaged() -> bool {
     let mut length = 0u32;

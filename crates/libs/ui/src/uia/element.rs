@@ -1,11 +1,9 @@
 //! The provider object, and the state every provider reads.
 //!
-//! **One object per element, carrying a weak reference and two ids.** It holds no tree
-//! pointer and caches nothing: every call reads the currently published tree, from
-//! whatever thread automation chose to call on. That is why this port is smaller than the
-//! one it replaces — with nothing cached there is nothing to invalidate, so no generation
-//! counter, no per-thread property batch, and no blocking hop onto the pump to read a
-//! field.
+//! One object per element identity, carrying a weak reference to [`Shared`] and two ids. It
+//! holds no tree pointer and caches nothing: every call reads the currently published tree,
+//! from whatever thread automation chose to call on. With nothing cached there is nothing
+//! to invalidate, and no call hops onto the window's pump to read a field.
 //!
 //! Providers built by `implement_decl!` are agile, so a client may call one from any
 //! apartment. Everything reachable from here is either immutable or an atomic.
@@ -42,18 +40,15 @@ use std::sync::{Arc, Mutex, Weak};
 use windows_core::{Error, HRESULT, IUnknown, Interface, Result, implement_decl};
 use windows_scene::{ContactKind, ControlId, NO_ENTRY, Point};
 
-/// The options this stack advertises.
+/// The provider options this stack advertises.
 ///
-/// `ServerSideProvider`, because that is what it is — the control implements its own
-/// provider. The reference advertised **`ClientSideProvider`** here, by transposing the
-/// constant against its own comment; automation broadcasts events from server-side
-/// providers and keeps client-side ones inside the client process, which is the shape of
-/// the event limitation it recorded as being outside its control.
+/// `ServerSideProvider`, because the control implements its own provider. Automation
+/// broadcasts events raised from a server-side provider and keeps a client-side one inside
+/// the client process, so claiming `ClientSideProvider` here would lose every raised event.
 ///
-/// Deliberately **not** `UseComThreading`. That option exists to spare a provider from
-/// being thread-safe, and pays for it by funnelling every query through the window's own
-/// pump — which is exactly the hazard that lets a blocking provider hang a screen reader.
-/// Nothing here needs it.
+/// `UseComThreading` is not set. It spares a provider from being thread-safe by funnelling
+/// every query through the window's own pump, which is the path along which a slow provider
+/// blocks a screen reader. Every provider here is thread-safe already.
 ///
 /// `RefuseNonClientSupport`, because the window draws its own caption and publishes those
 /// buttons as ordinary elements. Without it the system contributes a second set.
@@ -62,30 +57,30 @@ const OPTIONS: ProviderOptions =
 
 const NOT_AVAILABLE: HRESULT = HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32);
 const OUT_OF_MEMORY: HRESULT = HRESULT(0x8007_000Eu32 as i32);
-/// `UiaRootObjectId`. Any other object id in a `WM_GETOBJECT` is somebody else's.
+/// `UiaRootObjectId`. A `WM_GETOBJECT` naming any other object id is not ours to answer.
 const ROOT_OBJECT_ID: i32 = -25;
 
-/// An element that is a real entry rather than one of a region's parts.
+/// The part id of an element that is a real entry rather than one of a region's parts.
 pub const NO_PART: u32 = u32::MAX;
 
 /// Everything a provider can reach, and the only state shared across threads.
 ///
 /// Held by the front thread's [`Uia`](super::Uia) as an `Arc` and by every provider as a
 /// `Weak`, so objects a client still holds cannot keep a closed window's state alive. They
-/// stop resolving instead, which is precisely what `UIA_E_ELEMENTNOTAVAILABLE` means.
+/// stop resolving instead, which is what `UIA_E_ELEMENTNOTAVAILABLE` reports.
 #[derive(Debug, Default)]
 pub struct Shared {
     pub slot: Slot,
-    /// What presentation regions declare — parts and producer-owned values. Beside the
-    /// tree rather than in it, so a band drag republishes neither.
+    /// What presentation regions declare — parts and producer-owned values. Held beside
+    /// the tree rather than in it, so a band drag republishes no element.
     pub regions: Regions,
     pub actions: Queue,
-    /// Latched by the first `WM_GETOBJECT` and never cleared. `UiaClientsAreListening` is
-    /// a hint; having actually been asked for a provider is not.
+    /// Latched by the first `WM_GETOBJECT` and cleared only by [`disconnect`].
+    /// `UiaClientsAreListening` is a hint; having been asked for a provider is not.
     pub queried: AtomicBool,
     hwnd: AtomicIsize,
-    /// One object per element identity, so a client comparing objects — which is how the
-    /// reference found raised events are matched to listeners — always gets the same one.
+    /// One object per element identity, so an element always answers as the same object.
+    /// Automation matches a raised event to a listener by object identity.
     providers: Mutex<FxHashMap<(ControlId, u32), SendProvider>>,
 }
 
@@ -98,20 +93,22 @@ struct SendProvider(IRawElementProviderSimple);
 unsafe impl Send for SendProvider {}
 
 impl Shared {
+    /// Records the window every provider answers for.
     pub fn attach(&self, hwnd: HWND) {
         self.hwnd.store(hwnd as isize, Relaxed);
     }
 
+    /// Returns the attached window, or null before [`attach`](Self::attach) has run.
     #[must_use]
     pub fn window(&self) -> HWND {
         self.hwnd.load(Relaxed) as HWND
     }
 
-    /// Queues an action and rings the front thread's doorbell.
+    /// Queues an action and asks the front thread for a tick.
     ///
-    /// The pacer's own message, so the tick that runs it is the tick that services input —
-    /// the same code, draining in the same order, publishing the same way. Only the first
-    /// action of a batch posts, because the drain takes the whole queue.
+    /// Posts the pacer's own message, so the tick that runs the action is the tick that
+    /// services input, draining in the same order and publishing the same way. Only the
+    /// first action of a batch posts, because the drain takes the whole queue.
     pub fn act(&self, action: Action) {
         if self.actions.push(action) {
             self.wake();
@@ -124,14 +121,15 @@ impl Shared {
         if hwnd.is_null() {
             return;
         }
-        // SAFETY: posting is callable from any thread and resolves the handle itself; a
-        // window that has gone refuses the post, which is why the result is dropped.
+        // SAFETY: `PostMessageW` is callable from any thread and validates the handle
+        // itself, so a handle whose window has gone fails the call rather than faulting —
+        // which is why the result is dropped.
         unsafe {
             _ = PostMessageW(hwnd, windows_window::WM_FRAME, 0, 0);
         }
     }
 
-    /// The stable object for one element identity, minting it on first ask.
+    /// Returns the stable object for one element identity, minting it on the first ask.
     fn provider(self: &Arc<Self>, id: ControlId, part: u32) -> IRawElementProviderSimple {
         let mut providers = self.providers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(found) = providers.get(&(id, part)) {
@@ -153,9 +151,9 @@ impl Shared {
 
     /// Drops the objects for elements the new tree no longer has.
     ///
-    /// Not what keeps a stale provider *correct* — an id that no longer resolves already
-    /// answers `UIA_E_ELEMENTNOTAVAILABLE` — but what keeps the map bounded across a
-    /// session that mounts and unmounts.
+    /// A stale provider is already correct without this, because an id that no longer
+    /// resolves answers `UIA_E_ELEMENTNOTAVAILABLE`. What this bounds is the size of the
+    /// map across a session that mounts and unmounts.
     pub fn evict(&self, tree: &Tree) {
         self.providers
             .lock()
@@ -163,6 +161,7 @@ impl Shared {
             .retain(|&(id, _), _| id.is_none() || tree.index_of(id).is_some());
     }
 
+    /// Drops every provider object minted for this window.
     pub fn forget(&self) {
         self.providers
             .lock()
@@ -176,7 +175,7 @@ thread_local! {
     static SEEN: RefCell<Option<(u64, Arc<Tree>)>> = const { RefCell::new(None) };
 }
 
-/// One element. A weak reference and two ids, and nothing else.
+/// One element: a weak reference to [`Shared`], and the two ids that name it.
 pub struct Element {
     shared: Weak<Shared>,
     /// [`ControlId::NONE`] is the fragment root, which is the window and is not in the
@@ -238,8 +237,10 @@ impl Element {
         self.shared.upgrade().ok_or_else(gone)
     }
 
-    /// The window's state and the tree as it is *now*, for the root, which is not in the
-    /// array and so cannot be resolved to an index.
+    /// Returns the shared state and the tree as this thread currently sees it.
+    ///
+    /// What the root reads: it is the window, so it is not in the entry array and has no
+    /// index to resolve.
     pub fn window(&self) -> Result<(Arc<Shared>, Arc<Tree>)> {
         let shared = self.shared()?;
         let tree = SEEN.with(|seen| shared.slot.read(seen));
@@ -248,9 +249,11 @@ impl Element {
 
     /// Resolves the element against the current tree.
     ///
-    /// An element that has unmounted resolves to nothing, which is the whole of the
-    /// lifetime story: there is no cached node pointer to dangle and no registration to
-    /// forget, because the identity is an id and the id is generational.
+    /// # Errors
+    ///
+    /// `UIA_E_ELEMENTNOTAVAILABLE` once the element has unmounted or the window has gone.
+    /// The identity is a generational id rather than a cached node pointer, so an unmounted
+    /// element has nothing to dangle and no registration to forget.
     pub fn at(&self) -> Result<At> {
         let (shared, tree) = self.window()?;
         let at = tree.index_of(self.id).ok_or_else(gone)?;
@@ -266,11 +269,11 @@ impl Element {
         self.id.is_none()
     }
 
-    /// The element's own box, in screen pixels, with its scroll ancestry applied.
+    /// Returns the element's own box in screen pixels, with its scroll ancestry applied.
     ///
-    /// Automation speaks screen pixels and everything above speaks DIPs, so the window's
-    /// origin and scale are read here from the live half rather than asked for. A stale
-    /// origin reads exactly like an application placing its controls wrongly.
+    /// Automation reports screen pixels and everything above reports DIPs, so the window's
+    /// origin and scale are read from the live half here. The root has no entry of its own
+    /// and reports the extent of every published entry instead.
     fn bounds(&self) -> Result<UiaRect> {
         let (tree, rect) = if self.is_root() {
             let (_, tree) = self.window()?;
@@ -308,10 +311,10 @@ impl Element {
         })
     }
 
-    /// Whether every clipping ancestor still admits the element's own box.
+    /// Returns whether a clipping ancestor excludes the element's own box.
     ///
-    /// Scrolled out of a list is offscreen; below the fold of a window is not — which is
-    /// why this walks the clip chain rather than testing against the window.
+    /// Walks the clip chain rather than testing against the window: an element scrolled out
+    /// of a list is offscreen, and one below the fold of a window is not.
     fn offscreen(&self, tree: &Tree, at: usize) -> bool {
         let Some(entry) = tree.entry(at) else {
             return true;
@@ -337,11 +340,11 @@ impl Element {
         false
     }
 
-    /// Every property this stack answers.
+    /// Answers every property this stack publishes.
     ///
-    /// One a given element does not have is `VT_EMPTY` rather than an error: a client
-    /// walks every element asking for the same twenty properties, and failing the ones
-    /// that do not apply turns an ordinary walk into a log of failures.
+    /// A property the element does not carry answers `VT_EMPTY` rather than an error: a
+    /// client walks every element asking for the same twenty properties, and failing the
+    /// ones that do not apply turns an ordinary walk into a log of failures.
     fn property(&self, id: PROPERTYID) -> VARIANT {
         if self.is_root() {
             return match id {
@@ -365,7 +368,7 @@ impl Element {
         else {
             return variant::empty();
         };
-        // A part is pixels with a name: it reports its own role and nothing structural.
+        // A part carries a name and a role only, so it answers no structural property.
         if let Some(answer) = with_part(&shared, self.id, part, |part| {
             let row = roles::row(part.role);
             match id {
@@ -406,8 +409,8 @@ impl Element {
                 variant::wide(&wide(roles::row(col.role).localized))
             }
             _ if id == UIA_AutomationIdPropertyId => {
-                // Materialized here and nowhere else. The slot keeps a `&'static str` and
-                // this runs when a client asks, which is rarely and never on a hot path.
+                // The wide string is built here and nowhere else: the column keeps a
+                // `&'static str`, and this runs only when a client asks for the id.
                 col.key
                     .map_or_else(variant::empty, |key| variant::wide(&wide(key)))
             }
@@ -432,7 +435,7 @@ impl Element {
         }
     }
 
-    /// Which patterns this element answers.
+    /// Returns the patterns this element answers.
     fn patterns(&self) -> Patterns {
         let Ok(At {
             shared,
@@ -443,7 +446,7 @@ impl Element {
         else {
             return Patterns::NONE;
         };
-        // A part answers what its own role does, not what its region does.
+        // A part answers its own role's patterns, not its region's.
         with_part(&shared, self.id, part, |part| {
             roles::row(part.role).patterns
         })
@@ -453,16 +456,16 @@ impl Element {
     fn pattern(&self, id: PATTERNID) -> Result<IUnknown> {
         let wanted = roles::pattern_of(id);
         if wanted != Patterns::NONE && self.patterns().has(wanted) {
-            // One object implements every pattern, so the answer to "do you support this"
-            // is the element itself.
+            // One object implements every pattern, so the provider for a supported pattern
+            // is this element itself.
             return self.object()?.cast();
         }
-        // `S_OK` with a null interface is how a provider says "not this one". An error
-        // would be reported to the client as a failure rather than as an absence.
+        // `none()` marshals as `S_OK` with a null interface, which reports the pattern as
+        // absent; a real error would reach the client as a failed call.
         Err(none())
     }
 
-    /// This element's own stable object.
+    /// Returns this element's own stable provider object.
     fn object(&self) -> Result<IRawElementProviderSimple> {
         Ok(self.shared()?.provider(self.id, self.part))
     }
@@ -483,8 +486,8 @@ impl Element {
         }
         let hwnd = self.shared()?.window();
         let mut provider = core::ptr::null_mut();
-        // SAFETY: a window this process owns and an out-pointer to a local. The call
-        // transfers one reference, which `from_raw` takes ownership of.
+        // SAFETY: the handle names a window this process owns and the out-pointer is a
+        // local. The call transfers one reference, which `from_raw` takes ownership of.
         unsafe {
             UiaHostProviderFromHwnd(hwnd, &raw mut provider).ok()?;
             IRawElementProviderSimple::from_raw(provider)
@@ -505,18 +508,18 @@ impl Element {
             .or(Err(gone()))
     }
 
-    /// One step of the fragment tree.
+    /// Returns the element one step from here in the given direction.
     ///
-    /// Reads the columns the build pass filled, so every direction but one is a field
-    /// read. A region's parts extend it: they are the region's children and it is their
-    /// parent, which is what makes a band handle an element without inventing a tree.
+    /// Reads the columns the build pass filled, so every direction but `PreviousSibling` is
+    /// a field read. A region's parts extend the tree: they are the region's children and
+    /// it is their parent, so a band handle is an element without being an entry.
     fn navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
         let (shared, tree) = self.window()?;
         if self.is_root() {
             // The root's children are the elements with no ancestry of their own, which is
-            // where overlays land: a slot root is not inside the window subtree, so it
+            // where overlays land: an overlay is not inside the window's subtree, so it
             // becomes a child of the fragment root — the position it already holds in the
-            // hit array, which is what [14 §8] asks for.
+            // hit array.
             let (first, last) = tree.roots();
             let to = match direction {
                 _ if direction == NavigateDirection_FirstChild => index(first),
@@ -530,7 +533,7 @@ impl Element {
 
         if self.part != NO_PART {
             // A part's parent is its region and its siblings are the region's other parts.
-            // It has no children: it is pixels with a name.
+            // It has no children of its own.
             let step = shared.regions.with_parts(self.id, |parts| {
                 let found = parts.iter().position(|part| part.sub == self.part);
                 let sibling = |to: Option<usize>| Some(parts.get(to?)?.sub);
@@ -585,11 +588,10 @@ impl Element {
 }
 
 impl Root {
-    /// What is at a screen point.
+    /// Returns the element at a screen point.
     ///
-    /// The **same scan** the pointer resolves through, over the same entries, called from
-    /// automation's own thread. Invariant 3 asks for one hit-test authority; one function
-    /// with two callers is how that is enforced rather than reviewed.
+    /// Runs the same scan pointer routing runs, over the same entries, from automation's
+    /// own thread. Hit-testing has one implementation, so the two cannot disagree.
     fn element_at(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
         let (shared, tree) = self.window()?;
         let (origin, scale) = tree.live.window();
@@ -646,8 +648,10 @@ impl Root {
 
 const FRAMEWORK: &str = "windows-ui";
 
-/// The identity a `u64` slot holds, so focus can be one atomic and still name a
-/// generational id without reconstructing one.
+/// Packs a [`ControlId`] into one `u64`, index above generation.
+///
+/// Focus is a single atomic word and still names a generational id, so it cannot be
+/// mistaken for a reused index after a republish.
 #[must_use]
 pub fn packed(id: ControlId) -> u64 {
     (id.index() as u64) << 32 | u64::from(id.generation())
@@ -662,14 +666,13 @@ fn fragment(
     shared.provider(entry.id, NO_PART).cast().or(Err(none()))
 }
 
-/// The sibling before `at`, by walking its parent's children.
+/// Returns the sibling before `at`, by walking its parent's child list.
 ///
-/// The one direction the columns do not carry. Storing it would cost four bytes an element
-/// to save a walk over one parent's list, and a client that walks backwards is walking
-/// forwards from somewhere anyway.
+/// The one direction the columns do not carry: storing it would cost four bytes an element
+/// to save a walk over one parent's list.
 fn previous(tree: &Tree, parent: u32, at: usize) -> Option<usize> {
-    // The parentless elements are the window's children, and their list head is the tree's
-    // own — which is why this needs no second case.
+    // The parentless elements are the window's children and their list head is the tree's
+    // own, so a top-level element needs no separate case here.
     let mut next = match tree.col(parent as usize) {
         Some(col) => col.first_child,
         None => tree.roots().0,
@@ -693,11 +696,12 @@ const fn index(raw: u32) -> Option<usize> {
     }
 }
 
-/// The part `id` names, handed to `f`. `None` for an element that is not one.
+/// Calls `f` with the part `part` names under `id`, or returns `None` when `part` is
+/// [`NO_PART`] or names no declared part.
 ///
-/// A closure rather than a borrow, because the parts live behind a versioned table the
-/// reader refreshes into a thread-local — so what is handed out is a borrow of this
-/// thread's own copy and cannot outlive the call.
+/// Takes a closure rather than returning a borrow: the parts live behind a versioned table
+/// each reader refreshes into a thread-local, so what `f` receives borrows this thread's
+/// own copy and must not outlive the call.
 fn with_part<R>(
     shared: &Shared,
     id: ControlId,
@@ -712,7 +716,7 @@ fn with_part<R>(
     })
 }
 
-/// `LiveSetting`: 0 off, 1 polite, 2 assertive.
+/// Returns the `LiveSetting` value for a column's flags: 0 off, 1 polite, 2 assertive.
 const fn live_setting(flags: ColFlags) -> i32 {
     if flags.has(ColFlags::LIVE_ASSERTIVE) {
         2
@@ -727,11 +731,14 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
 }
 
+/// Returns `UIA_E_ELEMENTNOTAVAILABLE`, the answer for an element that has unmounted or a
+/// window that has gone.
 pub fn gone() -> Error {
     Error::from_hresult(NOT_AVAILABLE)
 }
 
-/// `S_OK` with nothing in it — "there is no element that way", not a failure.
+/// Returns the empty error, which marshals as `S_OK` with a null out-parameter: nothing is
+/// there, and the call did not fail.
 pub fn none() -> Error {
     Error::empty()
 }
@@ -793,12 +800,13 @@ impl crate::bindings::IRawElementProviderFragmentRoot_Impl for Root_Impl {
     }
 }
 
-/// The tree as this thread currently sees it.
+/// Returns the published tree, refreshing this thread's own reference if it has moved.
 pub fn tree_of(shared: &Arc<Shared>) -> Arc<Tree> {
     SEEN.with(|seen| shared.slot.read(seen))
 }
 
-/// The object a raised event names, or nothing if the element has gone.
+/// Returns the object a raised event names, or `None` when the element is not in the
+/// published tree.
 pub fn provider_for(shared: &Arc<Shared>, id: ControlId) -> Option<IRawElementProviderSimple> {
     if !id.is_none() {
         let tree = SEEN.with(|seen| shared.slot.read(seen));
@@ -807,18 +815,21 @@ pub fn provider_for(shared: &Arc<Shared>, id: ControlId) -> Option<IRawElementPr
     Some(shared.provider(id, NO_PART))
 }
 
-/// Tells automation the window's providers are finished with.
+/// Tells automation the window's providers are finished with, and drops every minted
+/// object.
 ///
 /// `UiaReturnRawElementProvider(hwnd, 0, 0, NULL)` is the documented way to say it, and it
-/// is not the same thing as our own references going away: automation caches per window,
-/// and without this it keeps that cache — and a client keeps a window element — for a
-/// window that no longer exists. Sent on `WM_DESTROY`, while the handle is still valid,
-/// which is why it cannot wait for `Drop`.
+/// is not the same as our own references going away: automation caches per window, so
+/// without this it keeps that cache — and a client keeps a window element — for a window
+/// that no longer exists.
+///
+/// Must be called while the window handle is still valid, which puts it on `WM_DESTROY`
+/// rather than on a drop.
 pub fn disconnect(shared: &Arc<Shared>) {
     let hwnd = shared.window();
     if !hwnd.is_null() && shared.queried.swap(false, Relaxed) {
-        // SAFETY: a window this process owns and still holds, and the documented null
-        // provider that releases automation's cache for it.
+        // SAFETY: the handle names a window this process owns and has not yet destroyed,
+        // and a null provider is the documented argument for releasing its cache.
         unsafe {
             _ = UiaReturnRawElementProvider(hwnd, 0, 0, core::ptr::null_mut());
         }
@@ -826,7 +837,7 @@ pub fn disconnect(shared: &Arc<Shared>) {
     shared.forget();
 }
 
-/// `WM_GETOBJECT`, answered with the fragment root.
+/// Answers `WM_GETOBJECT` with the fragment root, or `None` when `l` names another object.
 ///
 /// The only automation call that arrives on the pump, and it does nothing but hand back an
 /// object. Everything a client asks afterwards is answered off this thread.
@@ -834,13 +845,13 @@ pub fn get_object(shared: &Arc<Shared>, w: WPARAM, l: LPARAM) -> Option<LRESULT>
     if l as i32 != ROOT_OBJECT_ID {
         return None;
     }
-    // The transition is what asks for a tick: a window that is not laid out again would
-    // otherwise never publish, and the client that just attached would walk nothing.
+    // The latch transition is what asks for a tick: a window that is not laid out again
+    // never publishes on its own, and the client that just attached would walk nothing.
     if !shared.queried.swap(true, Relaxed) {
         shared.wake();
     }
     let object = shared.provider(ControlId::NONE, NO_PART);
-    // SAFETY: a window this process owns, and a provider it holds a reference to for the
-    // duration of the call — `UiaReturnRawElementProvider` takes its own.
+    // SAFETY: the handle names a window this process owns, and `object` holds a reference
+    // for the whole call — `UiaReturnRawElementProvider` takes its own.
     Some(unsafe { UiaReturnRawElementProvider(shared.window(), w, l, object.as_raw()) })
 }

@@ -1,13 +1,11 @@
 //! The keys a focus or dismiss assertion needs.
 //!
-//! Not a pointer stream and not shaped like one: a key has no position, no contact and no
-//! path, so there is nothing for a stream type to carry between calls. It is here because
-//! `Tab`, `Esc` and `Enter` are asserted against the same window as the pointer contracts,
-//! and because the injection object already covers the keyboard — a second harness existing
-//! only to reach it would be a second harness.
+//! A key has no position, no contact and no path, so nothing is carried between calls and
+//! there is no stream type here. `Tab`, `Esc` and `Enter` are asserted against the same
+//! window as the pointer contracts, and `InputInjector` already covers the keyboard.
 //!
-//! The set is closed on purpose. A harness carrying the whole virtual-key table invites a
-//! test to drive something it is not testing, and the binding filter names exactly these.
+//! The set is closed: the binding filter names exactly these keys, so nothing outside
+//! [`Key`] can be pressed.
 
 use windows_collections::IIterable;
 
@@ -23,9 +21,9 @@ pub enum Key {
     Escape,
     /// Invokes the focused control.
     Enter,
-    /// Invokes the focused control, and is the one a toggle answers to.
+    /// Invokes the focused control, and toggles a control that toggles.
     Space,
-    /// Arrow keys, which a composite control consumes rather than moving focus with.
+    /// An arrow key, which a composite control consumes rather than moving focus with.
     Left,
     /// See [`Key::Left`].
     Right,
@@ -50,7 +48,7 @@ impl Key {
     }
 }
 
-/// One key transition.
+/// Injects one key transition: a release when `up`, a press otherwise.
 pub(crate) fn send(injector: &InputInjector, key: Key, up: bool) -> Result<()> {
     let info = InjectedInputKeyboardInfo::new()
         .map_err(|e| Error::call("InjectedInputKeyboardInfo::new", e))?;

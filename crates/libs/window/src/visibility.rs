@@ -1,3 +1,5 @@
+//! Whether anything a window draws can be seen, and the wakes that say it changed.
+
 use crate::bindings::*;
 use crate::event::Event;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -5,55 +7,53 @@ use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use windows_core::{Interface, Result};
 
-/// Whether anything this window draws can be seen.
+/// Tracks whether the window itself is on screen, and wakes watchers when that moves.
 ///
-/// One boolean, not three. The window's own half is what the window thread can determine
-/// outright. The system's occlusion status arrives as a bare "it changed" message carrying no
-/// direction, so it only wakes; the consumer pairs that with the compositor clock's own
-/// `Occluded` return, which says whether. Between them no timer is needed.
+/// This is the half the window thread can determine outright: not shown yet, minimized, or
+/// cloaked. The system's occlusion status arrives as a bare change notification carrying no
+/// direction, so it only wakes; a consumer pairs that wake with the compositor clock's
+/// [`Occluded`](crate::clock::Observed::Occluded) return, which carries the direction. No
+/// timer is involved.
 ///
-/// A window fully covered by another window is not detected: no Windows API reports it — a
-/// flip-model chain never returns `DXGI_STATUS_OCCLUDED`, and `D3DKMTCheckOcclusion` answers
-/// "not occluded" whenever desktop composition is running.
+/// A window fully covered by another window is not detected: a flip-model chain never returns
+/// `DXGI_STATUS_OCCLUDED`, and `D3DKMTCheckOcclusion` answers "not occluded" whenever desktop
+/// composition is running.
 ///
-/// [`watch`](Self::watch) is how a thread parks on this.
+/// A thread parks on the wake returned by [`watch`](Self::watch).
 pub struct Visibility {
     hidden: AtomicBool,
-    /// One wake per watcher, rather than one shared by all of them. A wake is auto-reset —
-    /// the only correct mode, since a manual-reset event left signalled satisfies every
-    /// subsequent wait immediately and the waiter spins — and auto-reset releases *exactly
-    /// one* waiter. Two threads sharing one would mean a visibility change woke whichever
-    /// raced to it and left the other parked with no second edge coming.
+    /// One wake per watcher rather than one shared by all of them. A wake is auto-reset, so a
+    /// signal releases *exactly one* waiter: two threads sharing one would mean a visibility
+    /// change woke whichever raced to it and left the other parked, with no second edge coming.
     ///
-    /// `Weak`, so a watcher that goes away is not an entry this has to be told about.
+    /// `Weak`, so a watcher that goes away needs no deregistration.
     wakes: Mutex<Vec<Weak<Event>>>,
 }
 
 impl Visibility {
     pub(crate) fn new() -> Self {
         Self {
-            // Nothing has been shown yet. Assuming the opposite would have every consumer
-            // draw a frame before the window has been put on screen even once.
+            // Hidden until a window is evaluated: the opposite default would have every
+            // consumer draw a frame before the window has been put on screen even once.
             hidden: AtomicBool::new(true),
             wakes: Mutex::new(Vec::new()),
         }
     }
 
-    /// Whether the window itself is off screen — not shown yet, minimized, or cloaked.
+    /// Returns whether the window itself is off screen — not shown yet, minimized, or cloaked.
     ///
-    /// Not the whole question: the display may also be off, which only the compositor clock
-    /// can see.
+    /// Answers only that half. The display may also be off, which only the compositor clock
+    /// reports.
     #[must_use]
     pub fn is_hidden(&self) -> bool {
         self.hidden.load(Ordering::Acquire)
     }
 
-    /// A wake of this watcher's own, for its wait list.
+    /// Registers a watcher and returns it, carrying a wake of its own for a wait list.
     ///
     /// # Errors
     ///
-    /// Resource exhaustion. There is no degraded mode: a consumer that cannot be interrupted
-    /// would keep drawing frames nobody can see.
+    /// Fails on resource exhaustion, when the wake event cannot be created.
     pub fn watch(self: &Arc<Self>) -> Result<Watch> {
         let wake = Arc::new(Event::auto_reset()?);
         self.locked_wakes().push(Arc::downgrade(&wake));
@@ -67,20 +67,23 @@ impl Visibility {
     /// cannot be told late by an application that handles its own messages.
     pub(crate) fn evaluate(&self, hwnd: HWND) {
         // `IsWindowVisible` first: a window built hidden is neither iconic nor cloaked, so
-        // without it this crate's own build-hidden-then-show startup — the one a composition
-        // host needs, because there is nothing to draw until the first commit — would report
-        // a window that can be seen for the whole of it.
+        // without it a window created hidden and shown only after its first commit would
+        // report itself visible for the whole of that startup.
         self.publish(!is_visible(hwnd) || is_iconic(hwnd) || is_cloaked(hwnd));
     }
 
+    /// Publishes the window's own half, waking every watcher when the value moves.
     pub(crate) fn publish(&self, hidden: bool) {
+        // acq_rel: pairs with the acquire in `is_hidden`, so a watcher woken below reads the
+        // state that caused the wake rather than the one before it.
         if self.hidden.swap(hidden, Ordering::AcqRel) != hidden {
             self.wake_all();
         }
     }
 
-    /// The system's occlusion status moved. Direction unknown by construction, so this only
-    /// wakes: whoever is parked re-probes, whoever is not ignores it.
+    /// Wakes every watcher after the system's occlusion status changes. That notification
+    /// carries no direction, so this only wakes: a parked watcher re-probes, and one that is
+    /// not parked ignores it.
     pub(crate) fn poke(&self) {
         self.wake_all();
     }
@@ -98,9 +101,9 @@ impl Visibility {
         });
     }
 
-    /// The registry. Poisoning is recovered from rather than propagated: the only thing done
-    /// under this lock is signalling handles, and a poisoned lock would otherwise take the
-    /// window procedure down with it.
+    /// Locks the watcher registry. Poisoning is recovered from rather than propagated: the
+    /// only work done under this lock is signalling handles, and a poisoned lock would
+    /// otherwise take the window procedure down with it.
     fn locked_wakes(&self) -> std::sync::MutexGuard<'_, Vec<Weak<Event>>> {
         self.wakes.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -114,21 +117,21 @@ impl core::fmt::Debug for Visibility {
     }
 }
 
-/// One watcher's view of whether anything a window draws can be seen: the state, and the wake
-/// that says it moved.
+/// Carries one watcher's view of whether a window can be seen: the state, and the wake that
+/// says it moved.
 ///
-/// `Send + Sync`, so a producer on another thread parks on it directly. Every watcher holds
-/// its own wake, which is what lets a window have more than one — a frame pacer and a present
-/// thread both park on the same window, and a change has to reach both.
+/// `Send + Sync`, so a producer on another thread parks on it directly. Every watcher holds a
+/// wake of its own, which is what lets one window have several — a frame pacer and a present
+/// thread both park on the same window, and a change reaches both.
 ///
-/// [`as_handle`](AsHandle::as_handle) is the wake, for a wait list.
+/// [`as_handle`](AsHandle::as_handle) returns that wake, for a wait list.
 pub struct Watch {
     visibility: Arc<Visibility>,
     wake: Arc<Event>,
 }
 
 impl Watch {
-    /// Whether the window itself is off screen. See [`Visibility::is_hidden`].
+    /// Returns whether the window itself is off screen, as [`Visibility::is_hidden`] does.
     #[must_use]
     pub fn is_hidden(&self) -> bool {
         self.visibility.is_hidden()
@@ -159,8 +162,8 @@ fn is_iconic(hwnd: HWND) -> bool {
     unsafe { IsIconic(hwnd).as_bool() }
 }
 
-/// Whether DWM is hiding the window while still composing it — a virtual-desktop switch or a
-/// shell cloak, which nothing else reports.
+/// Returns whether DWM is hiding the window while still composing it — a virtual-desktop
+/// switch or a shell cloak, which nothing else reports.
 fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked = 0u32;
     // SAFETY: `hwnd` is live; the destination is a stack local of the stated size.
@@ -175,18 +178,20 @@ fn is_cloaked(hwnd: HWND) -> bool {
     hr.is_ok() && cloaked != 0
 }
 
-/// The system's occlusion registration, unregistered on drop.
+/// Holds the system's occlusion-status registration, unregistering it on drop.
 ///
-/// The message form rather than the event form: this thread has a pump already, where an event
-/// would need a wait slot on a thread whose whole design is that it does not wait.
+/// The message form rather than the event form: the window thread has a pump, where an event
+/// would need a wait slot on a thread that does not wait.
 pub(crate) struct OcclusionStatus {
     factory: IDXGIFactory2,
     cookie: u32,
 }
 
 impl OcclusionStatus {
-    /// `None` when the platform declines. What is lost is only the edge that says to look
-    /// again — the window's own half and the compositor clock both still answer.
+    /// Registers `hwnd` for occlusion-status changes, posting `message` to it on each.
+    ///
+    /// `None` when the platform declines. What is lost is the edge that says to look again;
+    /// the window's own state and the compositor clock both still answer.
     pub(crate) fn register(hwnd: HWND, message: u32) -> Option<Self> {
         // SAFETY: the out-parameter is a stack local; ownership transfers on success.
         let factory: IDXGIFactory2 = unsafe {
@@ -213,8 +218,8 @@ impl Drop for OcclusionStatus {
 mod tests {
     use super::*;
 
-    /// The property the whole type exists for: a pacer and a present thread park on the same
-    /// window, and one change has to reach both. A shared auto-reset wake would release one.
+    /// One change reaches every watcher: a pacer and a present thread park on the same window,
+    /// and a single shared auto-reset wake would release only one of them.
     #[test]
     fn every_watcher_sees_a_change() {
         let visibility = Arc::new(Visibility::new());

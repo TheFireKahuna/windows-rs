@@ -2,25 +2,28 @@
 //!
 //! Two of this crate's rasterized families are keyed on values the application computes
 //! rather than declares — a box cell on a laid-out size, a colour cell on whatever light a
-//! widget resolved. Left raw, a drag-resize mints one FP16 surface per frame and an
-//! animated fill mints one per step.
+//! widget resolved. Both are snapped onto the granularity the raster already has, so a
+//! drag-resize does not mint one FP16 surface per frame and an animated fill does not mint
+//! one per step.
 //!
-//! So both dimensions are snapped onto the granularity the raster already has. Every
-//! function here is pure, deterministic to the bit, non-negative where that is meaningful,
-//! and collapses a non-finite input rather than minting an entry per `NaN` payload.
+//! Every function here is pure and deterministic to the bit, is non-negative where that is
+//! meaningful, and collapses a non-finite input rather than minting an entry per `NaN`
+//! payload.
 
 /// Extents snap to whole physical pixels: a raster cannot hold a fraction of one.
 const EXTENT_STEPS_PER_PX: f32 = 1.0;
 
-/// Radii and stroke widths snap to quarter pixels. Finer than an extent because a corner
-/// profile is what the nine-grid stretches from, and a quarter-pixel change in it is
-/// visible where a quarter-pixel change in a box's width is not.
+/// Radii and stroke widths snap to quarter pixels. The nine-grid stretches from the corner
+/// profile, so a quarter-pixel change there is visible where the same change in a box's
+/// width is not.
 const DETAIL_STEPS_PER_PX: f32 = 4.0;
 
 /// Steps per unit of the signed-square-root colour encoding.
 const COLOR_STEPS: f32 = 4096.0;
 
 /// Snaps a DIP length onto the physical grid at `steps_per_px` steps per pixel.
+///
+/// Returns `0.0` for a non-finite or non-positive `dip`.
 #[must_use]
 pub fn snap_len(dip: f32, scale: f32, steps_per_px: f32) -> f32 {
     if !dip.is_finite() || dip <= 0.0 {
@@ -36,10 +39,10 @@ pub fn snap_detail(dip: f32, scale: f32) -> f32 {
     snap_len(dip, scale, DETAIL_STEPS_PER_PX)
 }
 
-/// Snaps an extent onto whole physical pixels, and never to zero.
+/// Snaps an extent onto whole physical pixels.
 ///
-/// A positive extent that rounds below one pixel still rasterizes one: a sub-pixel bar is
-/// a faint bar, and a zero-sized surface is an allocation failure.
+/// A positive extent that rounds below one pixel snaps up to one, because a zero-sized
+/// surface is an allocation failure. Returns `0.0` for a non-finite or non-positive `dip`.
 #[must_use]
 pub fn snap_extent(dip: f32, scale: f32) -> f32 {
     if !dip.is_finite() || dip <= 0.0 {
@@ -53,8 +56,9 @@ pub fn snap_extent(dip: f32, scale: f32) -> f32 {
 ///
 /// Display scales are a short list — 1.0, 1.25, 1.5, 1.75, 2.0 — and rounding to a
 /// thousandth keeps float noise in `dpi / 96.0` from forking the whole cache into two
-/// populations that differ in the last bit. Every dimension above is snapped against
-/// *this* value, so a key is self-consistent.
+/// populations that differ in the last bit. Every length is snapped against this
+/// canonicalized value, so a cache key is self-consistent. Returns `1.0` for a non-finite
+/// or non-positive `scale`.
 #[must_use]
 pub fn snap_scale(scale: f32) -> f32 {
     if !scale.is_finite() || scale <= 0.0 {
@@ -63,25 +67,25 @@ pub fn snap_scale(scale: f32) -> f32 {
     (scale * 1000.0).round() / 1000.0
 }
 
-/// The pixel extent a snapped DIP size occupies, for an allocation.
+/// Returns the pixel extent a snapped DIP size occupies, clamped to `1..=65535` so it can
+/// size an allocation.
 #[must_use]
 pub fn extent_px(dip: f32, scale: f32) -> u32 {
     let px = (snap_extent(dip, scale) * scale).round();
     px.clamp(1.0, u32::from(u16::MAX) as f32) as u32
 }
 
-/// A quantized display-referred colour: the only colour a rasterizer can reach.
+/// A quantized display-referred colour, and the colour a rasterizer draws with.
 ///
-/// The encoding is a **signed square root** before a uniform step, which is what lets it
-/// key an extended-range pipeline at all. A quantizer that clamped to `[0, 1]` would crush
-/// both of the things FP16 surfaces exist to carry: a negative component (a colour outside
-/// Rec.709 on a wide-gamut display) and a component far above one (luminance above the
-/// display's white). Sign-symmetric, exact at zero, and spending resolution where the eye
-/// is — the step in linear light is `≈ 2·√|v| / 4096`, about 1/2048 at scRGB 1.0 and
-/// quadratically finer approaching black.
+/// The encoding is a signed square root followed by a uniform step, which is what keys an
+/// extended-range pipeline: a quantizer clamped to `[0, 1]` would crush both of the values
+/// FP16 surfaces carry — a negative component, a colour outside Rec.709 on a wide-gamut
+/// display, and a component far above one, luminance above the display's white. It is
+/// sign-symmetric and exact at zero, and its step in linear light is `≈ 2·√|v| / 4096`:
+/// about 1/2048 at scRGB 1.0 and quadratically finer approaching black.
 ///
-/// Its fields are private and the only constructor quantizes, so "round-trip the key
-/// before drawing" is not a rule to keep: there is no un-round-tripped value in scope.
+/// The fields are private and the only constructor quantizes, so every value in scope has
+/// been through the encoding and [`dequant`](Q::dequant) is what it paints as.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Q([i32; 4]);
 
@@ -97,7 +101,7 @@ impl Q {
         ])
     }
 
-    /// The colour this key is actually painted in.
+    /// Returns the colour this key is painted in.
     #[must_use]
     pub fn dequant(self) -> windows_color::Scrgb {
         windows_color::Scrgb {
@@ -108,8 +112,8 @@ impl Q {
         }
     }
 
-    /// Whether the quantized alpha is fully opaque, which is what decides a cell's
-    /// alpha mode.
+    /// Returns whether the quantized alpha is fully opaque, which decides a cell's alpha
+    /// mode.
     #[must_use]
     pub fn is_opaque(self) -> bool {
         self.0[3] >= COLOR_STEPS as i32
@@ -137,8 +141,8 @@ fn dequant_channel(q: i32) -> f32 {
 
 /// Quantizes a gradient stop's position to 1/65536 of the ramp.
 ///
-/// A ramp is rasterized into 256 texels, so a stop resolved to more precision than this
-/// cannot move one and only forks the identity that holds them.
+/// A ramp is rasterized into 256 texels, so a stop resolved finer than this cannot move a
+/// texel and would only fork the identity that keys them.
 #[must_use]
 pub fn quant_stop(at: f32) -> u16 {
     if !at.is_finite() {
@@ -217,8 +221,8 @@ mod tests {
 
     #[test]
     fn quantization_clips_neither_end_of_the_extended_range() {
-        // Above the display's white, and outside Rec.709. Both are what the FP16
-        // surfaces exist to carry, and a clamping quantizer would destroy both.
+        // Above the display's white, and outside Rec.709. FP16 surfaces carry both, and a
+        // clamping quantizer would destroy both.
         let wild = Scrgb {
             r: -0.4,
             g: 12.0,

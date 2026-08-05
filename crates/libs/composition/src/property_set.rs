@@ -1,16 +1,17 @@
-//! Property sets: the CPU-to-compositor frontier (feature `system`).
+//! Property sets: named values an app writes and compositor expressions read every frame
+//! (feature `system`).
 
 use super::*;
 
 /// A named bag of animatable values owned by the compositor.
 ///
-/// This is the crate's shared-state primitive for the compositor's own thread. An
-/// [`ExpressionAnimation`] binds the set as a named reference parameter (via
+/// A property set is this crate's shared state between an app thread and the compositor.
+/// An [`ExpressionAnimation`] binds the set as a named reference parameter (via
 /// [`Animatable::as_object`]) and reads its keys — `"set.Progress"` — as part of the
 /// expression, so the compositor re-evaluates them every frame without waking the writing
-/// thread. Writing one key therefore updates every animation that references it, and
-/// reading one back never requires the writer to be running: the values live in the
-/// composition engine, not in the app.
+/// thread. Writing one key updates every animation that references it, and the values live
+/// in the composition engine, so reading one back does not require the writer to be
+/// running.
 ///
 /// Create one with [`Compositor::create_property_set`].
 #[derive(Clone)]

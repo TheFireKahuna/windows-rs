@@ -1,17 +1,13 @@
-//! Animation templates, the three expressions, scoped batches and ghosts. **Front half.**
+//! Animation templates, the tracker expressions, timed delays and exit ghosts.
 //!
-//! Two things here are shared rather than per sink, and both are the difference between an
-//! interaction path that allocates and one that does not.
+//! Springs are templates, one per (value kind × tuning) for the whole process: a
+//! natural-motion animation starts from the target property's current value and resets its
+//! velocity, whichever object drives it, so retargeting a shared instance plays the same
+//! motion as a freshly built one. Nine spring objects serve every sink.
 //!
-//! **Springs are templates, held once for the process.** Continuity across a retarget is a
-//! property of the *target* — a natural-motion animation starts from the property's current
-//! value and resets velocity to zero, whichever object drives it — so one instance per
-//! (value kind × tuning) serves every sink in the application. Nine objects, against four
-//! per sprite.
-//!
-//! **Key frames are not templates.** A key-frame animation carries its frames and there is
-//! no way to clear them, so one is minted per start and released with its scoped batch.
-//! That is event rate, not per frame.
+//! A key-frame animation carries its frames and the platform offers no way to clear them, so
+//! one is built per start and released when its scoped batch reports. That is once per
+//! event, not once per frame.
 
 use crate::node::Node;
 use crate::sink::{Easing, Iterations, Tuning, Value};
@@ -27,37 +23,35 @@ use windows_composition::{
 use windows_core::{EventRevoker, Result};
 use windows_numerics::{Vector2, Vector3};
 
-/// **Scroll carrier.** Derived from the retired CPU spring's stiffness and damping —
-/// natural period `2π/√k`, damping ratio `c/(2√k)`. Used where carrying momentum is the
-/// point.
+/// The scroll carrier's spring period, in seconds: the tuning for [`Tuning::Scroll`], which
+/// drives motion that carries momentum. Not scaled by how far the value travels.
 pub const SCROLL_PERIOD: f32 = 0.2756;
 /// The scroll carrier's damping ratio.
 pub const SCROLL_DAMPING: f32 = 0.877;
 
-/// **Control chrome.** Every indicator, ink, pill glide and trim, and nothing else.
+/// The chrome spring's period, in seconds: the tuning for [`Tuning::Chrome`], which drives
+/// every indicator, ink, pill glide and trim.
 ///
-/// **Tuned by eye, and it has to be:** the textbook settling time for a spring of this
-/// period predicts a motion several times shorter than what the compositor actually plays,
-/// so `period` here does *not* mean the undamped natural period a second-order model would
-/// assume. Do not re-derive it from the scroll carrier's stiffness and damping — that
-/// derivation is what made a selection pill travel for what read as a fifth of a second of
-/// lag. What *is* dependable is that duration scales linearly with period at fixed damping.
+/// The compositor plays a spring of this period for several times the settling time a
+/// second-order model predicts, so `period` is not that model's undamped natural period and
+/// this value cannot be computed from a stiffness and a damping ratio. It is fixed by eye.
+/// At fixed damping the motion's duration does scale linearly with the period, which is what
+/// [`scaled_period`] relies on.
 pub const CHROME_PERIOD: f32 = 0.0900;
 /// The chrome spring's damping ratio.
 pub const CHROME_DAMPING: f32 = 0.900;
 
-/// The travel a chrome spring's period is quoted against, in DIPs.
+/// The travel [`CHROME_PERIOD`] is quoted against, in DIPs. [`scaled_period`] scales the
+/// period by a travel relative to this.
 const CHROME_REF_TRAVEL: f32 = 120.0;
 
-/// The shared animation objects, and the three expression strings.
-/// Everything in flight: the shared animation templates, the subtrees still playing an exit
-/// after the model let go of them, and the timed reveals waiting to report.
+/// Holds everything in flight: the shared animation templates, the subtrees still playing an
+/// exit after the model let go of them, and the timed reveals waiting to report.
 pub(crate) struct Motion {
     pub(crate) templates: Templates,
     pub(crate) ghosts: Vec<Ghost>,
-    /// Pending delays. A handful at most — one hovered submenu and one tooltip — so a
-    /// linear scan by id is the whole lookup and there is no map to keep. Empty is the
-    /// steady state, and the sweep costs nothing there.
+    /// Pending delays, looked up by a linear scan on id. A handful at most — a hovered
+    /// submenu, a tooltip — and empty in the steady state.
     pub(crate) delays: Vec<Delay>,
 }
 
@@ -71,27 +65,28 @@ impl Motion {
     }
 }
 
+/// Holds the animation objects every sink shares: one spring per (value kind × tuning), one
+/// expression per tracker axis, and the linear easing.
 pub(crate) struct Templates {
     scalar: [SpringScalarNaturalMotionAnimation; 2],
     vec2: [SpringVector2NaturalMotionAnimation; 2],
     vec3: [SpringVector3NaturalMotionAnimation; 2],
-    /// The whole expression DSL: a tracker's X, its Y, and its scale, each mapped through
-    /// `value * m + c`. `m` and `c` are scalar parameters, so the strings themselves are
-    /// constants — which is what makes "every expression in the system is authored inside
-    /// this crate and covered by tests" a checkable claim rather than an aspiration.
+    /// One expression per tracker axis — X, Y and scale — each mapping the tracker through
+    /// `value * m + c`. `m` and `c` are scalar parameters, so the strings are constants and
+    /// one instance per axis serves every binding.
     track: [ExpressionAnimation; 3],
     linear: CompositionEasingFunction,
 }
 
-/// The three expression strings, and there are no others.
-///
-/// The negation on position is not cosmetic: a tracker's position increases for up and left
-/// motion, so content bound to it without the sign scrolls backwards.
+/// The tracker expression for the X axis. `t` is the tracker, and `m` and `c` are the
+/// affine parameters a binding supplies; the other two axes take the same shape.
 const TRACK_X: &str = "t.Position.X * m + c";
 const TRACK_Y: &str = "t.Position.Y * m + c";
 const TRACK_SCALE: &str = "t.Scale * m + c";
 
 impl Templates {
+    /// Builds one spring per (value kind × tuning), one expression per tracker axis, and
+    /// the shared linear easing.
     pub(crate) fn new(compositor: &Compositor) -> Self {
         let spring_scalar = |tuning: Tuning| {
             let spring = compositor.create_spring_scalar_animation();
@@ -127,11 +122,13 @@ impl Templates {
         }
     }
 
-    /// Retargets the scalar spring for `tuning` and returns it, ready to start.
+    /// Retargets the shared scalar spring for `tuning` to `to` and returns it, ready to
+    /// start.
     ///
-    /// `travel` scales the chrome period so a long slide is not instantaneous and a short
-    /// one is not sluggish. It is computed here, where the property's current value is
-    /// known — which is why a caller states a tuning and never a period.
+    /// `travel` is how far the value has to move, in DIPs; it scales the chrome period so a
+    /// long slide is not instantaneous and a short one is not sluggish, which is why a
+    /// caller states a tuning and never a period. The spring is shared, so its settings hold
+    /// only until the next retarget.
     pub(crate) fn spring_scalar(
         &self,
         tuning: Tuning,
@@ -144,6 +141,8 @@ impl Templates {
         spring
     }
 
+    /// Retargets the shared `Vector2` spring for `tuning` to `to` and returns it, ready to
+    /// start. `travel` scales the period as it does for [`Templates::spring_scalar`].
     pub(crate) fn spring_vec2(
         &self,
         tuning: Tuning,
@@ -156,6 +155,8 @@ impl Templates {
         spring
     }
 
+    /// Retargets the shared `Vector3` spring for `tuning` to `to` and returns it, ready to
+    /// start. `travel` scales the period as it does for [`Templates::spring_scalar`].
     pub(crate) fn spring_vec3(
         &self,
         tuning: Tuning,
@@ -168,7 +169,9 @@ impl Templates {
         spring
     }
 
-    /// The tracker expression for an axis, bound to `tracker` and mapped by `m` and `c`.
+    /// Binds the shared expression for `axis` to `tracker` as `value * m + c` and returns
+    /// it, ready to start. The expression is shared, so its parameters hold only until the
+    /// next binding on the same axis.
     pub(crate) fn track(
         &self,
         axis: crate::sink::TrackerAxis,
@@ -188,10 +191,16 @@ impl Templates {
         expression
     }
 
-    /// Builds a key-frame animation over `frames`.
+    /// Builds a key-frame animation over `frames`, each entry a progress in `0..=1`, the
+    /// value at it, and the easing into it.
     ///
-    /// Minted per start rather than cached, because a key-frame animation carries its
-    /// frames and the platform offers no way to clear them.
+    /// Frames that are all [`Value::Scalar`] build a scalar animation; any other mix builds
+    /// a `Vector3` one, splatting a scalar across all three components and giving a
+    /// [`Value::Vec2`] a zero third. `duration_ms` is the length of one run and `iterations`
+    /// how many times it runs.
+    ///
+    /// Built per call rather than shared: a key-frame animation carries its frames and the
+    /// platform offers no way to clear them.
     pub(crate) fn frames(
         &self,
         compositor: &Compositor,
@@ -239,12 +248,12 @@ impl Templates {
         Some(animation.as_animation())
     }
 
-    /// The easing object for one segment.
+    /// Returns the easing object for one key-frame segment.
     ///
-    /// Linear is one shared instance because every linear segment is the same curve; a
-    /// cubic is not, since it carries its own control points. Returned owned rather than
-    /// borrowed for that reason — the key frame it is inserted into takes its own
-    /// reference, so the one built here lives exactly as long as the call.
+    /// Linear is one shared instance, since every linear segment is the same curve; a cubic
+    /// carries its own control points and is built per call. Returned owned for that reason
+    /// — the key frame it is inserted into takes its own reference, so the one built here
+    /// lives exactly as long as the call.
     fn easing(&self, compositor: &Compositor, easing: Easing) -> CompositionEasingFunction {
         match easing {
             Easing::Linear => self.linear.clone(),
@@ -253,8 +262,8 @@ impl Templates {
     }
 }
 
-/// Applies an iteration behaviour, saturating a count that cannot be expressed rather than
-/// wrapping it into a shorter animation than asked for.
+/// Applies an iteration behaviour to an animation. A count the platform's `i32` cannot hold
+/// saturates rather than wrapping into a shorter animation than was asked for.
 fn apply_iterations(iterations: Iterations, count: impl FnOnce(i32), forever: impl FnOnce()) {
     match iterations {
         Iterations::Count(n) => count(i32::try_from(n).unwrap_or(i32::MAX)),
@@ -276,9 +285,12 @@ fn tuning_of(tuning: Tuning) -> (Duration, f32) {
     }
 }
 
-/// The chrome period scaled by how far the value has to travel, clamped so neither end is
-/// silly. The scroll carrier is not scaled: its whole job is to carry momentum, and
-/// momentum does not depend on how far the content happens to be from a bound.
+/// Returns the spring period for `tuning`.
+///
+/// The chrome period is scaled by `travel` relative to [`CHROME_REF_TRAVEL`], with the
+/// factor clamped to `0.7..=1.4`; a non-finite `travel` leaves it unscaled. The scroll
+/// carrier is not scaled at all: it carries momentum, which does not depend on how far the
+/// content is from a bound.
 fn scaled_period(tuning: Tuning, travel: f32) -> Duration {
     let (period, _) = tuning_of(tuning);
     match tuning {
@@ -298,45 +310,36 @@ fn secs(seconds: f32) -> Duration {
     Duration::from_secs_f64(f64::from(seconds.max(0.0)))
 }
 
-/// A timed reveal in flight: **a deadline, compared on the frame clock**.
+/// A timed reveal in flight: a deadline compared against the frame clock.
 ///
-/// A submenu's hover-open and a tooltip's show are the only places in the system that want
-/// "after N milliseconds", and this is the whole of what one costs — an instant and a clock
-/// request. No property set, no animation, no scoped batch, no subscription.
+/// A delay costs an instant and a clock request — no property set, no animation, no scoped
+/// batch, no subscription. Nothing fires it: the deadline is read on a frame the scene is
+/// already servicing, so a delay is observed at a frame boundary and adds no clock of its
+/// own.
 ///
-/// It reads like a [`Ghost`] and is not one, and the difference is what a completion signal
-/// would be *for*. A ghost's batch is load-bearing: a visual must not be destroyed until its
-/// exit has actually played, and the compositor is the only thing that knows when that is. A
-/// delay has no animation whose completion matters — only time elapsed — so a batch would
-/// report back a duration this already holds. Driving one off a scratch property cost four
-/// COM objects per reveal, at pointer-crossing rate, and opened a scoped batch each time —
-/// which captures whatever else is started on the compositor while it is open.
-///
-/// Still **not a fourth clock**, which is the constraint that mattered: nothing fires and
-/// nothing wakes. The `Tick` below is the only wake, exactly as it was, and the deadline is
-/// read on a frame the scene was already servicing — so a delay is observed at the same
-/// frame boundary a batch's completion would have been.
+/// Unlike a [`Ghost`], a delay has no animation whose completion matters, so it carries no
+/// scoped batch — only elapsed time decides it.
 pub(crate) struct Delay {
     pub(crate) id: crate::sink::DelayId,
     /// Monotonic, so nothing a user or a time service does to the wall clock moves it.
     due: Instant,
-    /// Keeps the frame clock awake for the delay's own duration. Bounded, and started by a
-    /// hover the user is holding.
+    /// Keeps the frame clock awake until the delay is dropped, so the deadline is reached
+    /// on a frame rather than waited for.
     _tick: windows_window::Tick,
 }
 
 impl Delay {
-    /// Whether `now` has reached the deadline.
+    /// Returns whether `now` has reached the deadline.
     pub(crate) fn elapsed(&self, now: Instant) -> bool {
         now >= self.due
     }
 }
 
 impl crate::Scene {
-    /// Starts, or restarts, a timed reveal.
+    /// Starts a timed reveal under `id`, due `ms` from now.
     ///
-    /// Restarting drops the previous one, so a tooltip swapping between targets neither
-    /// reports the old delay nor waits a second time.
+    /// Any delay already registered under `id` is dropped first, so a tooltip swapping
+    /// between targets neither reports the old deadline nor waits a second time.
     pub(crate) fn start_delay(&mut self, id: crate::sink::DelayId, ms: u32) {
         self.cancel_delay(id);
         self.motion.delays.push(Delay {
@@ -346,26 +349,25 @@ impl crate::Scene {
         });
     }
 
-    /// Cancels one. It holds nothing but a deadline and a clock request, so dropping it is
-    /// the whole of the unwind and a cancelled delay never reports.
+    /// Cancels the delay registered under `id`. It holds only a deadline and a clock
+    /// request, so dropping it is the whole unwind and a cancelled delay never reports.
     pub(crate) fn cancel_delay(&mut self, id: crate::sink::DelayId) {
         self.motion.delays.retain(|delay| delay.id != id);
     }
 }
 
-/// A dying subtree, kept alive only long enough to play its exit.
+/// A dying subtree, held on screen only long enough to play its exit.
 ///
-/// The subtree is **flattened into one capture** and that capture is mounted as a top-level
-/// sprite, so the original visuals unparent immediately and a dying panel of sixty visuals
-/// fades as one. The capture's own brush chain is what keeps the detached source alive.
+/// The subtree is flattened into one capture and that capture is mounted as a top-level
+/// sprite, so the original visuals unparent at once and a dying panel of sixty visuals fades
+/// as one. The capture's brush chain keeps the detached source alive while it plays.
 pub(crate) struct Ghost {
-    /// The flattened capture, on screen for as long as the exit plays. Held because
-    /// nothing else does: the ghost is unparented from the model's tree by construction.
+    /// The flattened capture, on screen for as long as the exit plays. Held because nothing
+    /// else does: the ghost is unparented from the model's tree by construction.
     #[expect(dead_code, reason = "the only owner of the detached capture")]
     pub(crate) visual: Visual,
-    /// Set by the batch's own completion signal — **never by a timer or an estimated
-    /// deadline**. That is the difference between a ghost released when its animation ended
-    /// and one released when we guessed it had.
+    /// Set by the scoped batch's completion signal, which is the only report that the exit
+    /// has actually played.
     done: Rc<CoreCell<bool>>,
     /// Held so the completion subscription outlives the animation. Dropping it early means
     /// the completion never arrives and the ghost leaks for the compositor's lifetime.
@@ -377,24 +379,27 @@ pub(crate) struct Ghost {
 }
 
 impl Ghost {
-    /// Whether the compositor has reported this exit complete.
+    /// Returns whether the compositor has reported this exit complete.
     ///
-    /// **Nothing above the scene is told.** A ghost is unparented from the model's tree by
-    /// construction and this type is its only owner, so a release changes nothing any
-    /// consumer could act on — which is why the sweep in `apply` is the whole lifecycle and
-    /// there is no event beside it.
+    /// Polled by the sweep that drops finished ghosts. Nothing outside the scene observes a
+    /// release: the ghost is unparented from the model's tree by construction and this type
+    /// is its only owner.
     pub(crate) fn finished(&self) -> bool {
         self.done.get()
     }
 }
 
 impl crate::Scene {
-    /// Detaches a dying subtree and keeps it on screen for the length of its exit.
+    /// Detaches the subtree at `id` and keeps it on screen for the length of `exit`.
     ///
-    /// The subtree is **flattened into one capture** and that capture is mounted as a single
-    /// top-level sprite, so the original visuals unparent immediately and a dying panel of
-    /// sixty visuals fades as one. The capture's own brush chain is what keeps the detached
-    /// source alive while it plays.
+    /// The subtree is flattened into one capture, mounted as a single top-level sprite, so
+    /// the original visuals unparent at once. Returns `Ok(None)` when `exit` is
+    /// [`Exit::None`](crate::sink::Exit::None), when `id` names no node, or when the node's
+    /// box is empty — there is then nothing to capture and nothing to fade.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the completion subscription cannot be made or the batch cannot be sealed.
     pub(crate) fn ghost(
         &mut self,
         id: crate::sink::NodeId,
@@ -414,22 +419,22 @@ impl crate::Scene {
             .get(id)
             .map_or(Vector2 { x: 0.0, y: 0.0 }, Node::size);
         if size.x <= 0.0 || size.y <= 0.0 {
-            // Nothing to capture, so nothing to fade: a zero-size ghost is a
-            // visual and a batch held open for an animation with no pixels in it.
+            // Nothing to capture, so nothing to fade: a zero-size ghost would be a visual
+            // and a batch held open for an animation with no pixels in it.
             return Ok(None);
         }
 
-        // A ghost is a snapshot of something already dying, so its region never moves and
-        // the surface is not kept: the brush holds it, and nothing will ask it to resize.
+        // A ghost is a snapshot of a subtree already being destroyed, so its region never
+        // moves: the brush holds the surface and nothing will ask it to resize.
         let captured = back.compositor.capture(&source, size, env.scale());
         let sprite = back.compositor.create_sprite_visual();
         sprite.set_brush(&captured.brush);
         sprite.set_size(size.x, size.y);
         let offset = source.offset();
         sprite.set_offset(offset.x, offset.y, offset.z);
-        // A ghost outlives the node it was captured from, so it hangs in the window's
-        // own container rather than in a subtree that is being torn down — at the top,
-        // like every other detached thing, because it plays over what replaced it.
+        // A ghost outlives the node it was captured from, so it hangs in the window's own
+        // container rather than in the subtree being torn down, and at the top because it
+        // plays over whatever replaced it.
         let visual = crate::base_of_sprite(&sprite);
         self.overlay_children().insert_at_top(&visual);
 
@@ -487,11 +492,8 @@ mod tests {
 
     #[test]
     fn the_two_tunings_are_independent_values() {
-        // Not a tautology: the failure this guards is someone deriving one from the other's
-        // stiffness and damping, which produces a chrome period several times too long.
-        // A compile-time proof, because both sides are constants: the failure it guards is
-        // someone deriving one tuning from the other, which produces a chrome period
-        // several times too long and reads as lag rather than as a wrong constant.
+        // Both sides are constants, so the ordering is proved at compile time: a chrome
+        // period derived from the scroll tuning comes out several times too long.
         const _: () = assert!(CHROME_PERIOD < SCROLL_PERIOD);
         assert_ne!(CHROME_DAMPING, SCROLL_DAMPING);
     }

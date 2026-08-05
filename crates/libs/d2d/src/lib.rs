@@ -1,19 +1,16 @@
 #![doc = include_str!("../readme.md")]
 
-// Every `unsafe` block in this crate is a call into a generated Direct2D binding, which
-// COM cannot express as safe in a signature. What discharges it is uniform enough to
-// state once instead of at eighty call sites: the interface pointer is owned by the
-// wrapper and can be neither null nor dangling, every out-parameter is a stack local
-// that outlives its call, and no Direct2D method here retains a borrow past its return.
-// The two places that genuinely ask something of the *caller* are `Gpu::adopt` and the
-// composition bridge, and both are marked and say what they need.
-// `dead_code` is `expect` and not `allow`, for one standing reason that has to stay true:
-// naming an enum *type* in the filter generates every one of its constants, and
-// `D2D1_RENDERING_CONTROLS` has a `D2D1_BUFFER_PRECISION` field, so the five precisions
-// this crate never sets come along with the one it does. Every other unused binding is a
-// filter entry the wrapper does not consume — which is exactly what this warning is for,
-// so if it ever reports something that is not a generated enum sibling, trim the filter
-// rather than widening this.
+// Every `unsafe` block in this crate calls a generated Direct2D binding, and one invariant
+// discharges all of them: the interface pointer is owned by the wrapper, so it is neither
+// null nor dangling; every out-parameter is a stack local outliving its call; and no
+// Direct2D method used here retains a borrow past its return. `Gpu::adopt` and the
+// composition bridge require something of the caller as well, and each states it.
+//
+// `dead_code` is expected because naming an enum *type* in the binding filter generates
+// every one of its constants: `D2D1_RENDERING_CONTROLS` has a `D2D1_BUFFER_PRECISION`
+// field, so the five precisions this crate never sets come along with the one it does. A
+// report for anything other than a generated enum sibling names a binding the filter lists
+// and the wrapper does not consume.
 #[expect(
     dead_code,
     non_snake_case,
@@ -41,8 +38,8 @@ mod sealed {
 
 // Re-exported crate-wide so every module can `use super::*;` rather than naming the
 // generated types it touches. None of it is public: no generated struct crosses a crate
-// boundary, and the two objects that must — the Direct2D and Direct3D devices — leave as
-// `&impl Interface` for a sibling crate to cast to its own projection.
+// boundary, and the Direct2D and Direct3D devices leave as `&impl Interface` for a sibling
+// crate to cast to its own projection.
 pub(crate) use bindings::*;
 pub(crate) use brush::d2d_color;
 pub(crate) use sealed::Sealed;
@@ -50,13 +47,14 @@ pub(crate) use sealed::Sealed;
 pub(crate) use target::check_dpi;
 pub(crate) use windows_core::Interface;
 
-/// The one pixel format. Named here and never a parameter: an 8-bit surface is treated
-/// as sRGB and colour-managed by the compositor on terms we do not control, and a UNORM
-/// one cannot hold a value above white or outside Rec.709 at all.
+/// The pixel format every render target in this crate carries.
+///
+/// Never a parameter: an 8-bit surface is treated as sRGB and colour-managed by the
+/// compositor, and a UNORM format holds no value above white or outside Rec.709.
 pub(crate) const FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
-/// Direct2D's default flattening tolerance, in *target* space — which is why a
-/// realization divides it by the scale it is built for rather than using it raw.
+/// Direct2D's default flattening tolerance, in *target* space. [`Gpu::realize`] divides it
+/// by the scale a realization is tessellated at.
 pub(crate) const FLATTEN: f32 = 0.25;
 
 pub use batch::{Interp, SpriteBatch};

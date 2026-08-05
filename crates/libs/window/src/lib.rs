@@ -1,7 +1,8 @@
 #![doc = include_str!("../readme.md")]
 
-// `dead_code` covers what arrives with a named type rather than on its own: the members of
-// an enum family, and the methods of an interface. Nothing whole is filtered unused.
+// `dead_code` covers what a generated binding brings in with a named type rather than on its
+// own: the members of an enum family, and the methods of an interface. No whole binding here
+// is unused.
 #[expect(
     non_snake_case,
     non_upper_case_globals,
@@ -20,15 +21,17 @@ mod pace;
 mod visibility;
 mod window;
 
-// The two thread-level primitives a window's lifetime implies but does not own, kept as
-// modules so their names read at the call site — `clock::wait_for_frame`, `qos::set`. Public
-// because the threads that need them are not always the window's own: a present or producer
-// thread waits on the same clock and tags its own scheduling class, and a second copy of
-// either would be a second chance to decode the clock's slots or encode the QoS tri-state
-// differently.
+// Two thread-level primitives a window's lifetime implies but does not own, kept as modules
+// so their names read at the call site: `clock::wait_for_frame`, `qos::set`. Public because
+// the threads that need them are not always the window's own — a present or producer thread
+// waits on the same clock and tags its own scheduling class — and one decoder for the clock's
+// slots and one encoder for the QoS class keep those threads agreeing with the window's.
 pub mod clock;
 pub mod qos;
 
+/// What every query on a closed window answers with, so a caller reporting the condition
+/// raises the error this crate already raises for it rather than a second one.
+pub use bindings::E_HANDLE;
 pub use caption::{
     BorderColor, CaptionButton, CaptionButtons, CaptionHit, CaptionSpec, CaptionState,
     CornerPreference,

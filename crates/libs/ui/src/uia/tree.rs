@@ -1,14 +1,11 @@
 //! The published accessibility tree, and the seeds it is built from.
 //!
-//! The tree **is the hit array**, plus four columns and a string blob. That is not a
-//! convenience: invariant 3 wants one hit-test authority, and the reference upheld it by
-//! marshalling element-from-point to the one thread that owned the array. Copying the same
-//! entries into the snapshot lets automation run the *same scan* over the *same data* from
-//! its own thread, so there is nothing to keep in step — a divergence would have to be a
-//! divergence with itself.
+//! The tree is the hit array, plus four columns and a string blob. Copying the entries into
+//! the snapshot lets automation run the same scan over the same data from its own thread,
+//! so hit-testing and element-from-point share one implementation and cannot diverge.
 //!
 //! Strings are UTF-16 because that is what automation returns. Storing them as `str` would
-//! buy a transcode on every name query and an offset table for every text range.
+//! cost a transcode on every name query and an offset table for every text range.
 
 use super::live::{Live, State};
 use super::roles::{self, Patterns};
@@ -23,6 +20,7 @@ pub struct Text {
 }
 
 impl Text {
+    /// Returns whether the span covers no units.
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.len == 0
@@ -40,7 +38,7 @@ pub enum Value {
     Text,
 }
 
-/// One element, beside its [`HitEntry`].
+/// One element's structural columns, held beside its [`HitEntry`] at the same index.
 #[derive(Copy, Clone, Debug)]
 pub struct Col {
     /// Index of the enclosing element, or [`NO_ENTRY`] for a child of the fragment root.
@@ -53,13 +51,13 @@ pub struct Col {
     /// The element this one takes its name from, or [`NO_ENTRY`].
     ///
     /// A slider, a toggle and a knob carry no text of their own, so a form row states the
-    /// name beside them rather than inside them. Both halves are published: `Name`,
-    /// because most clients read it directly, and `LabeledBy`, because that is what says
-    /// *where the name came from* — and a reader that navigates to the label should not
-    /// then announce it a second time as the control's own.
+    /// name beside them rather than inside them. Both halves are published: `Name`, which
+    /// most clients read directly, and `LabeledBy`, which says where the name came from, so
+    /// a reader that navigates to the label does not announce it a second time as the
+    /// control's own.
     pub labelled_by: u32,
-    /// The automation-id segment, materialized only if a client asks. Two `&'static str`s
-    /// and a join beat a `String` per element built at every republish.
+    /// The automation-id segment, kept as a `&'static str` and widened only when a client
+    /// asks for it.
     pub key: Option<&'static str>,
     pub role: UiaRole,
     pub value: Value,
@@ -71,17 +69,22 @@ pub struct Col {
 pub struct ColFlags(pub u16);
 
 impl ColFlags {
+    /// No flags set.
     pub const NONE: Self = Self(0);
-    /// Answers `ExpandCollapse` — it owns a flyout.
+    /// Answers `ExpandCollapse`: the element owns a flyout.
     pub const EXPANDS: Self = Self(1 << 0);
     /// Answers `SelectionItem` even though its role does not imply it.
     pub const SELECTS: Self = Self(1 << 1);
+    /// Takes keyboard focus.
     pub const FOCUSABLE: Self = Self(1 << 2);
+    /// A live region announced once the client is idle.
     pub const LIVE_POLITE: Self = Self(1 << 3);
+    /// A live region that interrupts to announce.
     pub const LIVE_ASSERTIVE: Self = Self(1 << 4);
     /// A popup, which announces itself as a dialog and is read title-first.
     pub const DIALOG: Self = Self(1 << 5);
 
+    /// Returns whether every bit set in `other` is set here.
     #[must_use]
     pub const fn has(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -95,12 +98,12 @@ impl core::ops::BitOr for ColFlags {
     }
 }
 
-/// A pickable region of a presentation region: pixels with a name.
+/// One nameable area inside a presentation region.
 ///
 /// A region's contents are a buffer, so nothing in them can be an entry in the hit array.
-/// These are how a band handle is nameable, focusable and value-reporting anyway. Their
-/// rects are region-local and move whenever the renderer's mapping does, which is why they
-/// are published separately from the tree rather than built into it.
+/// Parts are what makes a band handle nameable, focusable and value-reporting anyway. Their
+/// rects are region-local and move whenever the renderer's mapping does, so they are
+/// published separately from the tree rather than built into it.
 #[derive(Clone, Debug)]
 pub struct Part {
     pub sub: u32,
@@ -111,17 +114,18 @@ pub struct Part {
     pub value: Option<f64>,
 }
 
-/// What the application thread hands over: everything automation needs that layout does
-/// not already carry.
+/// What the application thread hands over: everything automation needs that the hit array
+/// does not already carry.
 ///
-/// `Send`, and provably so — a `&'static str` is, an id is, and the strings have already
-/// been resolved into the blob on the thread that owns the text table.
+/// `Send`, because the rows hold ids and `&'static str`s and every string has already been
+/// resolved into the blob on the thread that owns the text table.
 #[derive(Debug, Default)]
 pub struct Seeds {
     pub rows: Vec<Seed>,
     pub blob: Vec<u16>,
 }
 
+/// One element's automation facts, joined against the hit array by control id.
 #[derive(Copy, Clone, Debug)]
 pub struct Seed {
     pub id: ControlId,
@@ -148,13 +152,14 @@ impl Seeds {
         }
     }
 
+    /// Empties the rows and the blob, keeping both allocations for the next publish.
     pub fn clear(&mut self) {
         self.rows.clear();
         self.blob.clear();
     }
 
-    /// Sorted once, here, so the join against the hit array is a binary search per entry
-    /// rather than a scan.
+    /// Sorts the rows by control id, which is what makes the join in [`Tree::build`] a
+    /// binary search per entry rather than a scan.
     pub fn sort(&mut self) {
         self.rows.sort_unstable_by_key(|seed| seed.id);
     }
@@ -170,13 +175,15 @@ pub struct Tree {
     /// element that is not in the array.
     first_root: u32,
     last_root: u32,
-    /// `ControlId` to index, sorted. A client holds an id; the array is a position.
+    /// Control id to entry index, sorted for binary search. A client holds an id, and the
+    /// array is positional.
     by_id: Box<[(ControlId, u32)]>,
     pub live: Live,
 }
 
 impl Tree {
-    /// The tree a window has before anything is published, and after it stops listening.
+    /// Returns a tree with no elements: what a window holds before anything is published,
+    /// and what it publishes while no client is attached.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -192,15 +199,15 @@ impl Tree {
 
     /// Joins the adopted hit array against the seeds the application thread produced.
     ///
-    /// One pass to select and copy the entries that carry a peer, one to fill the sibling
-    /// links, and one to intern the strings. Three allocations, on a path that runs when
-    /// layout changed and never per frame.
+    /// One pass selects and copies the entries that carry a seed, one fills the sibling
+    /// links, and the string blob is cloned whole. Runs when layout changed, never per
+    /// frame.
     #[must_use]
     pub fn build(entries: &[HitEntry], seeds: &Seeds) -> Self {
         // `kept[i]` is the index an original entry landed at, or `NO_ENTRY`. Ancestry is
-        // stated in the original index space, so it has to be rewritten into this one —
-        // and an element whose parent has no peer reparents to the nearest one that does,
-        // which is what makes a decorative wrapper invisible rather than a gap.
+        // stated in the original index space and has to be rewritten into this one. An
+        // element whose parent has no seed reparents to the nearest ancestor that does,
+        // which makes a decorative wrapper invisible rather than a gap in the tree.
         let mut kept = vec![NO_ENTRY; entries.len()];
         let mut rows = Vec::new();
         let mut out = Vec::new();
@@ -244,11 +251,11 @@ impl Tree {
         adopt_labels(&mut cols);
 
         let by_id = sorted_index(&out);
-        // Keyed by the nodes descendants **resolve through**, which is not the same set as
-        // the entries that scroll: a container's own entry names its *ancestor's* offset,
-        // because the builder fills `scroll_src` before pushing the container onto its own
-        // stack. Keying on the containers would leave every lookup finding nothing, and a
-        // scan over scrolled content would silently answer as if nothing had scrolled.
+        // Keyed by the nodes descendants resolve through, which is not the same set as the
+        // entries that scroll: a container's own entry names its ancestor's offset, because
+        // the builder fills `scroll_src` before pushing the container onto its own stack.
+        // Keying on the containers would leave every lookup finding nothing, and a scan
+        // over scrolled content would answer as if nothing had scrolled.
         let mut sources: Vec<NodeId> = out
             .iter()
             .map(|entry| entry.scroll_src)
@@ -273,44 +280,50 @@ impl Tree {
         }
     }
 
+    /// Returns the number of published elements.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Returns whether the tree publishes no elements.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// The first and last elements the window itself parents.
+    /// Returns the first and last elements the window itself parents.
     #[must_use]
     pub const fn roots(&self) -> (u32, u32) {
         (self.first_root, self.last_root)
     }
 
+    /// Returns the published hit array, in the order a scan reads it.
     #[must_use]
     pub fn entries(&self) -> &[HitEntry] {
         &self.entries
     }
 
+    /// Returns the entry at `at`, or `None` past the end.
     #[must_use]
     pub fn entry(&self, at: usize) -> Option<&HitEntry> {
         self.entries.get(at)
     }
 
+    /// Returns the columns for the element at `at`, or `None` past the end.
     #[must_use]
     pub fn col(&self, at: usize) -> Option<&Col> {
         self.cols.get(at)
     }
 
+    /// Returns the entry index `id` sits at, or `None` when the tree does not hold it.
     #[must_use]
     pub fn index_of(&self, id: ControlId) -> Option<usize> {
         let at = self.by_id.binary_search_by_key(&id, |&(key, _)| key).ok()?;
         Some(self.by_id[at].1 as usize)
     }
 
-    /// The string a span names.
+    /// Returns the UTF-16 units a span names, or an empty slice for a span past the blob.
     #[must_use]
     pub fn text(&self, span: Text) -> &[u16] {
         let at = span.at as usize;
@@ -319,7 +332,8 @@ impl Tree {
             .unwrap_or_default()
     }
 
-    /// Which patterns the element at `at` answers: its role's, plus what it declared.
+    /// Returns the patterns the element at `at` answers: its role's, adjusted by the flags
+    /// it declared.
     #[must_use]
     pub fn patterns(&self, at: usize) -> Patterns {
         let Some(col) = self.cols.get(at) else {
@@ -335,7 +349,8 @@ impl Tree {
         patterns
     }
 
-    /// Pairs each surviving element with where it was in `from`, for the carry-forward.
+    /// Returns every element both trees hold, as its index in `from` paired with its index
+    /// here. This is the mapping that carries the live half forward across a republish.
     pub fn remap<'a>(&'a self, from: &'a Self) -> impl Iterator<Item = (usize, usize)> + 'a {
         self.by_id
             .iter()
@@ -343,7 +358,8 @@ impl Tree {
     }
 }
 
-/// Walks the original ancestry until it reaches an entry that survived.
+/// Returns the nearest ancestor of `parent` that survived the select pass, in the new index
+/// space, or [`NO_ENTRY`] when none did.
 fn nearest(kept: &[u32], entries: &[HitEntry], mut parent: u32) -> u32 {
     let mut guard = entries.len();
     while parent != NO_ENTRY && guard > 0 {
@@ -357,16 +373,16 @@ fn nearest(kept: &[u32], entries: &[HitEntry], mut parent: u32) -> u32 {
     NO_ENTRY
 }
 
-/// Fills the sibling and child links from the parent column, in one backward pass.
+/// Fills the sibling and child links from the parent column in one backward pass, and
+/// returns the first and last parentless element.
 ///
-/// Backward so that pushing each element to the *front* of its parent's list leaves the
-/// list in forward order. Deriving children by scanning for `parent == me` instead makes a
-/// full tree walk quadratic, which a client does on every refresh.
+/// The pass runs backward so that pushing each element to the front of its parent's list
+/// leaves the list in forward order.
 ///
-/// **The parentless ones are a list too**, and the window is its parent. Skipping them
-/// here leaves every top-level element after the first with no sibling to be reached
-/// through, so a client's walk stops at the first one — and overlays are top-level by
-/// definition, which makes every open menu but one invisible.
+/// The parentless elements are a sibling list too, whose parent is the window. Leaving them
+/// unlinked gives every top-level element after the first no sibling to be reached through,
+/// so a client's walk stops at the first one — and an overlay is top-level, which would put
+/// every open menu but one out of reach.
 fn link(cols: &mut [Col]) -> (u32, u32) {
     let (mut first_root, mut last_root) = (NO_ENTRY, NO_ENTRY);
     for at in (0..cols.len()).rev() {
@@ -389,23 +405,22 @@ fn link(cols: &mut [Col]) -> (u32, u32) {
     (first_root, last_root)
 }
 
-/// Gives a control with no text of its own the name of the run immediately before it.
+/// Gives a control with no text of its own the name of the run immediately before it, and
+/// records that run in `labelled_by`.
 ///
 /// A form row is `(label("Gain"), slider(..))`: the name is a sibling, not a child, so
-/// nothing the slider owns can derive it. This is the association a reader needs and the
-/// one an author would otherwise have to state on every control in the application.
+/// nothing the slider owns can derive it.
 ///
-/// Deliberately narrow. Only the **immediately preceding sibling**, only when it is a
-/// static run with a name, and only for a control that has none — so it cannot reach
-/// across a row, cannot claim a heading two controls up, and cannot overwrite anything an
-/// author wrote. A wider rule guesses; this one either matches the shape or does nothing.
+/// The match is narrow — only the immediately preceding sibling, only when it is a static
+/// run carrying a name, and only for a control that has none — so it cannot reach across a
+/// row, claim a heading two controls up, or overwrite a name an author wrote.
 fn adopt_labels(cols: &mut [Col]) {
     for at in 0..cols.len() {
         let col = cols[at];
         if !col.name.is_empty() || col.role == UiaRole::Text || col.role == UiaRole::Group {
             continue;
         }
-        // The sibling before it, walked from the parent's list — the columns carry the
+        // The sibling before it, walked from the parent's list: the columns carry only the
         // forward links, so this is the one direction that costs a walk.
         let mut previous = NO_ENTRY;
         let mut next = match cols.get(col.parent as usize) {
@@ -428,6 +443,7 @@ fn adopt_labels(cols: &mut [Col]) {
     }
 }
 
+/// Returns each entry's control id paired with its index, sorted by id for binary search.
 fn sorted_index(entries: &[HitEntry]) -> Box<[(ControlId, u32)]> {
     let mut index: Box<[(ControlId, u32)]> = entries
         .iter()
@@ -442,8 +458,8 @@ fn sorted_index(entries: &[HitEntry]) -> Box<[(ControlId, u32)]> {
 mod tests {
     use super::*;
 
-    /// Minted through the real authority, so the ids under test are the ids the stack
-    /// produces: dense from one, and generational.
+    /// Mints `count` ids through the authority the stack uses, so they are dense from one
+    /// and generational.
     fn ids(count: usize) -> Vec<ControlId> {
         let mut authority = windows_scene::Ids::<windows_scene::Control>::new();
         (0..count).map(|_| authority.mint()).collect()
@@ -530,10 +546,9 @@ mod tests {
         assert_eq!(tree.col(0).unwrap().last_child, 3);
     }
 
-    /// The parentless elements are the window's children, and a client reaches the second
-    /// one through the first's `next_sibling`. Leaving that link empty stops a walk at the
-    /// first top-level element — and an overlay is top-level by definition, so every open
-    /// menu but one would be invisible. Found by walking the tree from a real client.
+    /// Walks the parentless elements as one sibling list: a client reaches the second
+    /// top-level element through the first's `next_sibling`, and an unlinked list would
+    /// stop the walk at the first — putting every open overlay but one out of reach.
     #[test]
     fn the_parentless_elements_are_a_sibling_list_and_not_a_set_of_orphans() {
         let id = ids(4);

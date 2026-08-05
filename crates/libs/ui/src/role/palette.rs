@@ -1,4 +1,5 @@
-//! The total function, and the one place the application's palette is reached.
+//! The installed palette, and the total functions that resolve a role, a metric or a type
+//! rung through it.
 
 use super::{DataRole, Fill, Metric, Role, Scope, Stroke, Text, TypeRole};
 use std::sync::OnceLock;
@@ -7,53 +8,59 @@ use windows_text::FontSpec;
 
 /// What the application supplies. This crate never interprets a value it returns.
 ///
-/// Every method is **total**: it returns a value rather than an `Option`, which is what
-/// makes "missing token" unrepresentable instead of merely unlikely. A palette that has
-/// not decided what some pair means still has to answer, and answering deliberately is
-/// cheaper than a fallback chain nobody can see.
+/// Every method is total: it returns a value rather than an `Option`, so a missing token is
+/// unrepresentable. A palette that has not decided what a `(role, scope)` pair means still
+/// answers.
 ///
-/// `Send + Sync` because a palette is a lookup table over authored constants and the
-/// present thread resolves data roles for a region's own drawing. Anything a palette needs
-/// to *compute* — an accent ramp, a wash — is a function over a base rather than a stored
-/// shade, so there is nothing here to synchronize.
+/// `Send + Sync`: a palette is a lookup table over authored constants, and the present thread
+/// resolves data roles for a region's own drawing. A derived shade — an accent ramp, a wash —
+/// is a function over a base rather than stored state, so there is nothing to synchronize.
+///
 /// # The three colour methods may not read `scope.width`
 ///
 /// Only [`metric`](Self::metric) and [`typography`](Self::typography) may. A width class
 /// is resolved inside the solve and changes whenever a window crosses a threshold, so a
 /// colour that depended on it would make a resize invalidate every rasterized cell in the
-/// subtree. [`Scope::for_paint`](super::Scope::for_paint) pins the axis on the way in, so
-/// a palette that breaks the rule cannot produce a width-dependent colour — and
-/// `colour_is_width_independent` asserts the whole `Role` × `WidthClass` product anyway.
+/// subtree. [`Scope::for_paint`](super::Scope::for_paint) pins the axis on the way in, so a
+/// palette reading `scope.width` in a colour method still cannot produce a width-dependent
+/// colour.
 pub trait Palette: Send + Sync + 'static {
+    /// Returns the light a foreground role resolves to in `scope`.
     fn text(&self, role: Text, scope: Scope) -> Radiance;
+    /// Returns the light a surface role resolves to in `scope`.
     fn fill(&self, role: Fill, scope: Scope) -> Radiance;
+    /// Returns the light a line role resolves to in `scope`.
     fn stroke(&self, role: Stroke, scope: Scope) -> Radiance;
+    /// Returns the light an application-defined chromatic role resolves to.
+    ///
     /// No [`Scope`]: a data role is chromatic and shared between polarities.
     fn data(&self, role: DataRole) -> Radiance;
+    /// Returns the font a rung of the type ramp resolves to in `scope`.
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec;
+    /// Returns a scalar the palette owns, in DIPs unless the name says otherwise.
     fn metric(&self, metric: Metric, scope: Scope) -> f32;
 
-    /// The brightest channel this palette authors, in cd/m².
+    /// Returns the brightest channel this palette authors, in cd/m².
     ///
-    /// The application's **mastering statement**, and the one number the output transform
-    /// needs from the palette: it is a promise that nothing authored exceeds it, and
-    /// authoring above it clips.
+    /// The output transform's shoulder is built to reach this value, and anything authored
+    /// above it clips.
     fn content_peak_nits(&self) -> f32;
 }
 
 /// The installed palette. Written once; every resolve is one acquire load and a branch.
 static PALETTE: OnceLock<&'static dyn Palette> = OnceLock::new();
 
-/// Installs the application's palette. Once, before anything resolves.
+/// Installs the application's palette. Call it once, before any role resolves.
 ///
-/// Takes a `&'static` rather than a boxed value so that any leak is the caller's decision
-/// and visible at the call site — a palette is a table of authored constants and is
-/// expected to be a `static` or a `LazyLock`, not something built per window.
+/// Installing the same palette again succeeds and changes nothing.
+///
+/// Takes a `&'static` rather than a boxed value, so a palette is a `static` or a `LazyLock`
+/// and any leak is the caller's own decision at the call site.
 ///
 /// # Panics
 ///
-/// If a different palette is already installed. Two palettes mean two answers from a
-/// function whose whole value is being total, which is worse than either.
+/// If a different palette is already installed: two palettes would mean two answers from a
+/// resolution whose contract is to be total.
 pub fn install(palette: &'static dyn Palette) {
     if PALETTE.set(palette).is_err() {
         assert!(
@@ -66,7 +73,7 @@ pub fn install(palette: &'static dyn Palette) {
     }
 }
 
-/// Whether a palette has been installed. What a diagnostic asks; nothing else needs it.
+/// Returns whether a palette has been installed. What a diagnostic asks.
 #[must_use]
 pub fn installed() -> bool {
     PALETTE.get().is_some()
@@ -79,8 +86,14 @@ fn current() -> &'static &'static dyn Palette {
     )
 }
 
-/// The one function that turns a role into light. Total, and it returns authored light —
-/// there is no way to ask this layer for anything a display could accept.
+/// Returns the light `role` resolves to in `scope`.
+///
+/// Total: every pair has a value. The result is authored light — scene-referred, absolute
+/// cd/m² — and no display transform has run on it.
+///
+/// # Panics
+///
+/// If no palette has been installed.
 #[must_use]
 pub fn resolve(role: Role, scope: Scope) -> Radiance {
     let palette = *current();
@@ -92,26 +105,37 @@ pub fn resolve(role: Role, scope: Scope) -> Radiance {
     }
 }
 
-/// The type ramp, resolved through the same scope the colours use.
+/// Returns the font for a rung of the type ramp, resolved through the same scope the colours
+/// use.
+///
+/// # Panics
+///
+/// If no palette has been installed.
 #[must_use]
 pub fn typography(role: TypeRole, scope: Scope) -> FontSpec {
     current().typography(role, scope)
 }
 
-/// A spacing, radius, row height or border width, in DIPs.
+/// Returns a spacing, radius, row height or border width, in DIPs.
+///
+/// # Panics
+///
+/// If no palette has been installed.
 #[must_use]
 pub fn metric(metric: Metric, scope: Scope) -> f32 {
     current().metric(metric, scope)
 }
 
-/// The brightest the palette authors, in cd/m².
+/// Returns the brightest value the palette authors, in cd/m².
 ///
-/// Scope-free, because it is a property of the authored table rather than of anywhere it is
-/// used: it is what the output transform's shoulder is asked to reach, and the six speculars
-/// that go above diffuse white are the only things that depend on it.
+/// Scope-free: it is a property of the authored table rather than of any site that uses it,
+/// and it is what the output transform's shoulder is built to reach. Read from the palette
+/// rather than passed in, so the transform a window builds and the values the palette authors
+/// answer to one peak.
 ///
-/// Read from the palette rather than passed in, so the transform a window builds and the
-/// values the palette authors cannot be answering to two different peaks.
+/// # Panics
+///
+/// If no palette has been installed.
 #[must_use]
 pub fn content_peak_nits() -> f32 {
     current().content_peak_nits()
@@ -119,24 +143,23 @@ pub fn content_peak_nits() -> f32 {
 
 // ── washes: derived, never stored ───────────────────────────────────────────────
 //
-// A stroke, a scrim and a hover tint are the same colour at a fraction of opacity. Deriving
-// them from one place is what stops a palette growing a stored constant per shade — and a
-// token named after the component that wanted it is the bloat smell.
+// A hairline, a scrim and a hover tint are one resolved colour at a fraction of opacity.
+// Each is derived here, so a palette stores no per-shade constant.
 
-/// The polarity-flipping **foreground** wash: hairlines, dividers, hover tints.
+/// Returns the foreground wash: [`Text::Primary`] in `scope`, at `alpha`.
 ///
-/// The ink of the scope it is used in, at `alpha`. It flips with polarity for free, because
-/// the foreground it is derived from already did.
+/// Hairlines, dividers and hover tints. It follows polarity because the foreground it is
+/// derived from does.
 #[must_use]
 pub fn ink(alpha: f32, scope: Scope) -> Radiance {
     resolve(Role::Text(Text::Primary), scope).with_alpha(alpha)
 }
 
-/// The polarity-flipping **background** wash: scrims behind a modal, overlays over content.
+/// Returns the background wash: the window's own base surface at `alpha`.
 ///
-/// The window's own base surface at `alpha`, resolved at [`Elevation::Base`](super::Elevation::Base)
-/// rather than at the caller's rung — a scrim belongs to the window it dims, not to the
-/// card that raised it.
+/// Scrims behind a modal, and overlays over content. Resolved at
+/// [`Elevation::Base`](super::Elevation::Base) rather than at the caller's rung, because a
+/// scrim belongs to the window it dims and not to the card that raised it.
 #[must_use]
 pub fn veil(alpha: f32, scope: Scope) -> Radiance {
     resolve(
@@ -146,7 +169,8 @@ pub fn veil(alpha: f32, scope: Scope) -> Radiance {
     .with_alpha(alpha)
 }
 
-/// The accent at a fraction: a selection tint, a subtle accent fill, a focus glow.
+/// Returns the accent fill in `scope` at `alpha`: a selection tint, a subtle accent fill, a
+/// focus glow.
 #[must_use]
 pub fn accent_wash(alpha: f32, scope: Scope) -> Radiance {
     resolve(Role::Fill(Fill::Accent), scope).with_alpha(alpha)

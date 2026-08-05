@@ -16,6 +16,7 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// Builds a rectangle from its four edges.
     #[must_use]
     pub const fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
         Self {
@@ -26,16 +27,19 @@ impl Rect {
         }
     }
 
+    /// Builds a rectangle from a top-left corner and a size.
     #[must_use]
     pub const fn sized(x: f32, y: f32, w: f32, h: f32) -> Self {
         Self::new(x, y, x + w, y + h)
     }
 
+    /// Returns `right - left`.
     #[must_use]
     pub const fn width(&self) -> f32 {
         self.right - self.left
     }
 
+    /// Returns `bottom - top`.
     #[must_use]
     pub const fn height(&self) -> f32 {
         self.bottom - self.top
@@ -69,8 +73,7 @@ impl Rect {
 /// A rectangle with a corner radius per axis.
 ///
 /// Direct2D rasterizes this analytically, from a coverage function over one quad, so a
-/// border ring costs by the pixels it touches — which is why [`Gpu::realize`] does not
-/// accept one.
+/// border ring costs by the pixels it touches. [`Gpu::realize`] accepts only a [`Path`].
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct RoundedRect {
@@ -89,7 +92,8 @@ impl RoundedRect {
     }
 }
 
-/// An ellipse, by centre and radii. Analytic too, and likewise not realizable.
+/// An ellipse, by centre and radii. Rasterized analytically like [`RoundedRect`], and
+/// likewise not accepted by [`Gpu::realize`].
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Ellipse {
@@ -99,6 +103,7 @@ pub struct Ellipse {
 }
 
 impl Ellipse {
+    /// Builds an ellipse with equal radii.
     #[must_use]
     pub const fn circle(center: Vector2, radius: f32) -> Self {
         Self {
@@ -128,10 +133,7 @@ pub struct Bezier {
 
 /// What can be filled or stroked.
 ///
-/// One enum rather than a trait, so no generated type appears in a public bound, and four
-/// arms rather than a `draw_*`/`fill_*` pair per primitive. A line is not here: it cannot
-/// be filled, so it is [`Draw::line`] instead of an arm that would be meaningless in half
-/// its uses.
+/// A line is not an arm here: it cannot be filled, so it is [`Draw::line`].
 #[derive(Copy, Clone)]
 pub enum Shape<'a> {
     Rect(Rect),
@@ -200,18 +202,17 @@ impl Combine {
     }
 }
 
-/// Path geometry, authored in the coordinate space it will be drawn in.
+/// Path geometry, authored in the coordinate space it is drawn in.
 ///
-/// Not authored in a unit box and stretched: a non-uniform stretch distorts stroke width,
-/// corner radii and dash phase, so a hairline comes out one DIP on one axis and three on
-/// the other.
+/// Authored at final size rather than in a unit box and stretched: a non-uniform stretch
+/// distorts stroke width, corner radii and dash phase, so a hairline comes out one DIP on
+/// one axis and three on the other.
 pub struct Path(ID2D1PathGeometry1);
 
 /// Writes figures into a [`Path`].
 ///
-/// Only the batched calls exist. `AddLines` and `AddBeziers` are one call for N segments
-/// where the per-point forms are N calls for the same shape, and every curve here is built
-/// from a slice already.
+/// Only the batched forms exist: `AddLines` and `AddBeziers` take N segments in one call
+/// where the per-point forms take N calls for the same shape.
 pub struct Sink(ID2D1GeometrySink);
 
 impl Sink {
@@ -225,18 +226,20 @@ impl Sink {
         self
     }
 
+    /// Appends a polyline through `points`.
     pub fn lines(&mut self, points: &[Vector2]) -> &mut Self {
         unsafe { self.0.AddLines(points) };
         self
     }
 
+    /// Appends cubic segments.
     pub fn beziers(&mut self, segments: &[Bezier]) -> &mut Self {
         const {
             assert!(size_of::<Bezier>() == size_of::<D2D1_BEZIER_SEGMENT>());
             assert!(align_of::<Bezier>() == align_of::<D2D1_BEZIER_SEGMENT>());
         }
-        // SAFETY: the assertion above establishes the layouts agree; both are three
-        // consecutive `Vector2` with C layout.
+        // SAFETY: the `const` assertions above prove `Bezier` and `D2D1_BEZIER_SEGMENT` have
+        // the same size and alignment; both are three consecutive `Vector2` with C layout.
         let segments: &[D2D1_BEZIER_SEGMENT] =
             unsafe { core::slice::from_raw_parts(segments.as_ptr().cast(), segments.len()) };
         unsafe { self.0.AddBeziers(segments) };
@@ -256,13 +259,13 @@ impl Sink {
     /// Writes a closed box with four independent corner radii, clockwise from the top
     /// left, as one figure.
     ///
-    /// [`Rect::rounded`] covers the uniform case and Direct2D rasterizes *that* from a
-    /// coverage function over one quad, so prefer it whenever the four radii agree. Four
-    /// independent radii have no analytic form and need this.
+    /// [`Rect::rounded`] covers the uniform case, and Direct2D rasterizes *that* from a
+    /// coverage function over one quad, so prefer it wherever the four radii agree. Four
+    /// independent radii have no analytic form and take this.
     ///
-    /// Radii are clamped so that two on the same edge cannot overlap, which is the
-    /// platform's own rule for a rounded rectangle — so "fully rounded" is a stadium and
-    /// never a football.
+    /// Each radius is clamped to half the shorter side, the platform's own rule for a
+    /// rounded rectangle, so two radii on one edge cannot overlap and a fully rounded box
+    /// is a stadium.
     pub fn rounded_box(&mut self, rect: Rect, radius: [f32; 4]) -> &mut Self {
         /// The Bézier control-point ratio that approximates a quarter circle, to within
         /// about a part in ten thousand of the radius.
@@ -330,9 +333,8 @@ impl Path {
 
     /// Combines with another path.
     ///
-    /// Worth reaching for before a layer: a shape with a notch cut out of it is one fill of
-    /// a combined path, computed once here, where a layer with a mask is an intermediate
-    /// per frame.
+    /// A shape with a notch cut out of it is one fill of a combined path, computed once
+    /// here, where the same result through a layer mask is an intermediate per frame.
     pub fn combine(&self, gpu: &Gpu, other: &Self, mode: Combine) -> Result<Self> {
         gpu.path(|sink| unsafe {
             self.0
@@ -341,10 +343,10 @@ impl Path {
         })
     }
 
-    /// The geometry, for a compositor to wrap as a composition path.
+    /// Returns the geometry, for a compositor to wrap as a composition path.
     ///
-    /// Must be a path from the same [`Gpu`] whose Direct2D device built that compositor's
-    /// graphics device — see [`Gpu::d2d`].
+    /// The path must come from the same [`Gpu`] whose Direct2D device built that
+    /// compositor's graphics device, as [`Gpu::d2d`] states.
     pub fn geometry(&self) -> &impl Interface {
         &self.0
     }
@@ -370,17 +372,17 @@ impl Sink {
 /// not changed. A realization does it once and rasterizes per frame, drawing identical
 /// pixels because it is the same tessellator.
 ///
-/// The scale is part of it and not incidental: the triangles are fixed, so magnifying them
-/// shows the flattening as facets. Rotation and translation are free, so a scrolling plot
-/// re-realizes when its data changes and never when it scrolls.
+/// The triangles are fixed at that scale, so magnifying them shows the flattening as
+/// facets. Rotation and translation cost nothing, so a scrolling plot re-realizes when its
+/// data changes and never when it scrolls.
 pub struct Realization {
     inner: ID2D1GeometryRealization,
     scale: f32,
 }
 
 impl Realization {
-    /// The scale this was tessellated at — half of the cache key its owner needs, the
-    /// other half being the geometry.
+    /// Returns the scale this was tessellated at, which with the geometry is what an owner
+    /// keys a cache on.
     #[must_use]
     pub fn scale(&self) -> f32 {
         self.scale
@@ -392,8 +394,10 @@ impl Realization {
 }
 
 impl Gpu {
-    /// Builds a path. The sink is closed for you, and a failure inside `f` aborts the
-    /// path rather than leaving a half-built one.
+    /// Builds a path from the figures `f` writes.
+    ///
+    /// The sink is closed on the way out, and a failure inside `f` aborts the path rather
+    /// than returning a half-built one.
     pub fn path(&self, f: impl FnOnce(&mut Sink) -> Result<()>) -> Result<Path> {
         let geometry = unsafe { self.factory().CreatePathGeometry()? };
         let mut sink = Sink(unsafe { geometry.Open()? });
@@ -407,14 +411,13 @@ impl Gpu {
     ///
     /// **Only a path.** A rounded rectangle's stroke and a circle's fill are among the
     /// primitives Direct2D renders from a coverage function over one quad, so they cost by
-    /// the pixels they touch — and realizing one widens the stroke into an outline and
-    /// tessellates *that*, so a one-DIP ring becomes a mesh scaling with its perimeter.
-    /// Measured on a card's border ring and gate dot: 51 µs of the panel's ~206.
+    /// the pixels they touch, and realizing one widens the stroke into an outline and
+    /// tessellates *that*, turning a one-DIP ring into a mesh that scales with its
+    /// perimeter.
     ///
-    /// So the discriminator is not "does it survive frames" alone. It is whether the shape
-    /// has enough tessellation in it to pay for the extra draw path — a spline with a
-    /// hundred segments does; a primitive with a closed-form coverage function never does.
-    /// Accepting only a path is that rule made structural.
+    /// A realization pays where the shape carries enough tessellation to cover the extra
+    /// draw path: a spline with a hundred segments does, and a primitive with a closed-form
+    /// coverage function does not.
     pub fn realize(
         &self,
         path: &Path,

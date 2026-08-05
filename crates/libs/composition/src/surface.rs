@@ -3,19 +3,19 @@
 //! Direct2D drawing-surface interop for system composition. Lifted composition has no
 //! Direct2D-surface interop.
 //!
-//! Three kinds of content can end up on a visual through a [`CompositionSurfaceBrush`],
-//! and they differ in kind rather than in degree: a [`CompositionDrawingSurface`] holds
-//! pixels something drew, a [`CompositionVisualSurface`] holds an already-composed
-//! subtree, and a bare [`CompositionSurface`] is a buffer the app presents itself and the
-//! compositor only samples. The [`Surface`] trait is what lets one brush take any of them.
+//! Three kinds of content reach a visual through a [`CompositionSurfaceBrush`]: a
+//! [`CompositionDrawingSurface`] holds pixels something drew, a
+//! [`CompositionVisualSurface`] holds an already-composed subtree, and a bare
+//! [`CompositionSurface`] is a buffer the app presents itself and the compositor samples.
+//! The [`Surface`] trait lets one brush take any of them.
 
-// Every `unsafe` block below is a call to a Win32 interop method, which the generated
-// bindings declare `unsafe` because COM cannot express the contract in a signature. What
-// discharges it here is uniform and worth stating once instead of eight times: the interface
-// pointer is owned by the wrapper and cannot be null or dangling, the out-parameters are
-// stack locals that outlive their call, and none of these methods retains a borrow. Nothing
-// in this module asks the *caller* for an obligation except
-// [`Compositor::create_surface_for_handle`], which is `unsafe` for that reason and says so.
+// SAFETY, for every `unsafe` block below: these are Win32 interop calls the generated
+// bindings declare `unsafe` because COM cannot state the contract in a signature. One
+// invariant discharges all of them — the interface pointer is a field of the wrapper that
+// constructed it, so it is neither null nor dangling; every out-parameter is a stack local
+// that outlives its call; and none of these methods retains a borrow. Only
+// `Compositor::create_surface_for_handle` places an obligation on its caller, and it is an
+// `unsafe fn` carrying a `# Safety` section for that reason.
 
 use super::*;
 
@@ -47,10 +47,10 @@ impl CompositionGraphicsDevice {
     /// with [`AlphaMode::Ignore`] so the compositor does not blend an alpha channel the
     /// content never writes.
     ///
-    /// Not every format is supported by every device, and the error is how that is
-    /// discovered: a caller probing for [`PixelFormat::A8UNorm`] support creates a surface
-    /// and treats `Err` as "unsupported, fall back". So this returns a [`Result`] rather
-    /// than panicking the way the crate's infallible setters do.
+    /// # Errors
+    ///
+    /// Returns an error when the device does not support `format`, which is how a caller
+    /// probing for [`PixelFormat::A8UNorm`] support learns to fall back.
     pub fn create_drawing_surface_with_format(
         &self,
         width: f32,
@@ -69,10 +69,9 @@ impl CompositionGraphicsDevice {
     /// Creates a drawing surface sized in whole pixels rather than DIPs.
     ///
     /// [`create_drawing_surface_with_format`](Self::create_drawing_surface_with_format)
-    /// takes a DIP size the device converts by the current scale, so it cannot express
-    /// "exactly N pixels wide" — the conversion rounds. A cache that keys rasterized
-    /// content by its pixel extent needs the surface to match that key exactly, which is
-    /// what this allocates.
+    /// takes a DIP size the device converts by the current scale, and that conversion
+    /// rounds, so it cannot express "exactly N pixels wide". A cache keying rasterized
+    /// content by its pixel extent needs the surface to match that key exactly.
     pub fn create_drawing_surface_with_pixel_size(
         &self,
         width: i32,
@@ -97,11 +96,10 @@ impl CompositionGraphicsDevice {
     /// rather than an allocation, and a caller can declare one far larger than it expects
     /// to fill.
     ///
-    /// That is what makes a virtual surface the backing for a raster atlas. A cache minting
-    /// a surface per entry pays a composition object, a texture and the engine's
-    /// per-surface bookkeeping for every entry it has ever drawn; packing those rasters
-    /// into regions of one virtual surface costs one of each, and the memory still tracks
-    /// what was actually drawn.
+    /// This is what backs a raster atlas. A cache minting a surface per entry pays a
+    /// composition object, a texture and the engine's per-surface bookkeeping for every
+    /// entry it has drawn; packing those rasters into regions of one virtual surface pays
+    /// one of each, and the memory still tracks what was drawn.
     ///
     /// The declared size is capped at 2^24 total pixels by the platform.
     pub fn create_virtual_drawing_surface(
@@ -183,10 +181,9 @@ impl CompositionDrawingSurface {
     /// every call with [`end_draw`](Self::end_draw).
     ///
     /// **`end_draw` is the publish.** A composition drawing surface has no separate
-    /// present, so a surface must never be retargeted inside an open bracket: doing so
-    /// shows a half-drawn surface. The rule is a property of what publishes and does *not*
-    /// extend to a presentation buffer, which publishes on submit and is retargeted
-    /// mid-bracket by design.
+    /// present, so retargeting a surface inside an open bracket shows a half-drawn
+    /// surface. The rule follows from what publishes and does *not* extend to a
+    /// presentation buffer, which publishes on submit and may be retargeted mid-bracket.
     pub fn begin_draw<T: Interface>(&self) -> Result<(T, (i32, i32))> {
         let mut offset = bindings::POINT::default();
         let object = unsafe { self.interop.BeginDraw::<T>(None, &mut offset)? };
@@ -295,11 +292,11 @@ impl Surface for CompositionVirtualDrawingSurface {
 /// The drawing half of a [`CompositionDrawingSurface`], detached so it can be moved to
 /// another thread.
 ///
-/// A renderer that produces content continuously must not do that work on the thread that
-/// composites, or every raster delays a commit. The split that makes this possible is that
-/// *drawing* into a surface and *owning* it are separable: this handle carries only the
-/// former, while the surface, the brush painting with it and the visual showing it stay on
-/// the owning thread and remain that thread's to mutate.
+/// Drawing into a surface and owning it are separable: this handle carries only the
+/// drawing, while the surface, the brush painting with it and the visual showing it stay
+/// on the owning thread and remain that thread's to mutate. A renderer producing content
+/// continuously rasterizes off the compositing thread this way, where each raster would
+/// otherwise delay a commit.
 ///
 /// Drawing must still be serialized: bracket each redraw between
 /// [`begin_draw`](Self::begin_draw) and [`end_draw`](Self::end_draw), and do not let a
@@ -309,20 +306,19 @@ pub struct CompositionDrawHandle(bindings::ICompositionDrawingSurfaceInterop);
 
 // SAFETY: the interop interface is a second face on the same `CompositionDrawingSurface`
 // WinRT object, and that object is agile — it aggregates the free-threaded marshaler, which
-// is why the generated binding for the class itself is declared `Send`/`Sync`. Agility is a
-// property of the object, not of the interface: an `ICompositionDrawingSurfaceInterop`
+// is why the generated binding for the class itself is declared `Send`/`Sync`. Agility
+// belongs to the object rather than the interface, so an `ICompositionDrawingSurfaceInterop`
 // pointer obtained by `QueryInterface` on an agile object needs no marshalling and may be
-// called from any apartment. Only the interface pointer moves here; nothing thread-affine
-// does. In particular no `Compositor`, `Visual` or brush is reachable from this type — it
-// holds exactly one interface pointer and exposes no accessor back to the surface — so
-// moving it cannot smuggle the compositor's object graph off the owning thread. The Direct2D
-// interface `begin_draw` returns is a device context created for the caller, not a
+// called from any apartment. Only that pointer moves: this type holds one interface pointer,
+// exposes no accessor back to the surface, and reaches no `Compositor`, `Visual` or brush,
+// so moving it cannot carry the compositor's object graph off the owning thread. The
+// Direct2D interface `begin_draw` returns is a device context created for the caller, not a
 // composition object, so nothing escapes through the return value either.
 //
-// `Send` and deliberately not `Sync`: the underlying interface is internally synchronized
-// for lifetime purposes, but `BeginDraw`/`EndDraw` are a stateful bracket on the surface,
-// and two threads sharing one handle could interleave them. Requiring the handle to be moved
-// rather than shared keeps that bracket owned by one thread at a time.
+// `Send` and not `Sync`: the underlying interface is internally synchronized for lifetime
+// purposes, but `BeginDraw`/`EndDraw` are a stateful bracket on the surface that two threads
+// sharing one handle could interleave. Moving the handle rather than sharing it keeps that
+// bracket owned by one thread at a time.
 unsafe impl Send for CompositionDrawHandle {}
 
 impl CompositionDrawHandle {
@@ -360,10 +356,10 @@ pub struct CompositionSurface(pub(crate) bindings::ICompositionSurface);
 
 impl Sealed for CompositionSurface {}
 
-/// The base type is itself paintable, which is what lets content the compositor did not
-/// allocate — a composition swapchain adopted through
+/// Makes the base type paintable, so content the compositor did not allocate — a
+/// composition swapchain adopted through
 /// [`Compositor::create_surface_for_handle`](crate::Compositor::create_surface_for_handle)
-/// — be used exactly like a surface it did.
+/// — is painted exactly like a surface it did allocate.
 impl Surface for CompositionSurface {
     fn as_surface(&self) -> CompositionSurface {
         self.clone()
@@ -454,18 +450,18 @@ impl CompositionSurfaceBrush {
     /// Sets how the surface is fitted into the area the brush paints.
     ///
     /// The composition default is [`Stretch::Uniform`], which letterboxes the surface
-    /// whenever its aspect ratio differs from the painted area's. A caller that has already
-    /// sized the surface to the area it paints — an atlas, a glyph run, a gradient ramp —
-    /// wants [`Stretch::Fill`], so the surface maps onto the area one-to-one.
+    /// whenever its aspect ratio differs from the painted area's. [`Stretch::Fill`] maps
+    /// the surface onto the area one-to-one, which suits a caller that has already sized
+    /// it to that area — an atlas, a glyph run, a gradient ramp.
     pub fn set_stretch(&self, stretch: Stretch) {
         self.0.SetStretch(stretch.into()).unwrap();
     }
 
     /// Re-points this brush at another surface.
     ///
-    /// The brush is the sharing point: every visual painted with it follows, in place, with
-    /// no visual touched. That is what a caller re-rasterizing content several visuals paint
-    /// with wants — building a second brush would leave all of them on the old surface.
+    /// The brush is the sharing point: every visual painted with it follows, in place,
+    /// with no visual touched. A caller re-rasterizing content that several visuals paint
+    /// with re-points the brush; a second brush would leave them on the old surface.
     pub fn set_surface(&self, surface: &impl Surface) {
         self.0.SetSurface(&surface.as_surface().0).unwrap();
     }
@@ -473,9 +469,9 @@ impl CompositionSurfaceBrush {
     /// Sets where the surface sits within the painted area when it does not fill it, as a
     /// fraction of the leftover space on each axis.
     ///
-    /// Composition's default is `0.5` on both — centred — which is rarely what a caller
-    /// wants and is easy to mistake for a placement bug. Anchoring at `(0.0, 0.0)` puts the
-    /// surface's top-left on the painted area's, which is the frame
+    /// Composition's default is `0.5` on both axes, which centres the surface and reads as
+    /// a placement bug where the caller expected an anchor. Anchoring at `(0.0, 0.0)` puts
+    /// the surface's top-left on the painted area's, which is the frame
     /// [`set_source_transform`](Self::set_source_transform) measures its offsets from.
     pub fn set_alignment_ratio(&self, horizontal: f32, vertical: f32) {
         self.0.SetHorizontalAlignmentRatio(horizontal).unwrap();
@@ -521,8 +517,8 @@ impl Compositor {
         CompositionVisualSurface(compositor.CreateVisualSurface().unwrap())
     }
 
-    /// Adopts a composition surface **handle** as content this compositor can paint with —
-    /// the seam for buffers the app presents itself rather than draws into a surface the
+    /// Adopts a composition surface **handle** as content this compositor can paint with:
+    /// the seam for buffers the app presents itself rather than drawing into a surface the
     /// compositor allocated.
     ///
     /// The handle is the one `DCompositionCreateSurfaceHandle` mints and a presentation
@@ -532,14 +528,16 @@ impl Compositor {
     ///
     /// # Safety
     ///
-    /// `handle` must be a live composition surface handle. The compositor does not take
-    /// ownership — the caller keeps it valid for as long as the returned surface, or any
-    /// brush painted with it, is in the visual tree.
+    /// Behavior is undefined if any of the following conditions are violated:
     ///
-    /// The producer that minted it is normally its owner and closes it when it is dropped,
-    /// so binding one outlives nothing on its own: if the surface must survive the producer,
-    /// **duplicate the handle** and adopt the duplicate. Two owners of one handle is a
-    /// double close, which is why this takes a borrow and not a wrapper that frees.
+    /// - `handle` must be a live composition surface handle.
+    /// - `handle` must stay valid for as long as the returned surface, or any brush
+    ///   painted with it, is in the visual tree. The compositor does not take ownership.
+    ///
+    /// The producer that minted the handle usually owns it and closes it when dropped, so
+    /// adopting one extends nothing. A surface that must outlive its producer adopts a
+    /// **duplicate** of the handle. Two owners of one handle close it twice, so this takes
+    /// a raw handle rather than a wrapper that frees.
     pub unsafe fn create_surface_for_handle(
         &self,
         handle: *mut core::ffi::c_void,

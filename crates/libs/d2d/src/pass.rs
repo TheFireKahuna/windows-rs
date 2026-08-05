@@ -1,11 +1,10 @@
-//! The bracket, the target binding, and everything drawn inside one.
+//! The drawing bracket, the target binding, and everything drawn inside one.
 //!
-//! Two types carry the whole of it, and the split is the point. [`Pass`] is the
-//! `BeginDraw`/`EndDraw` bracket — exactly one per device at a time, spanning however
-//! many targets a present pass touches. [`Draw`] is *one target bound inside that
-//! bracket*, and because [`Pass::draw`] takes `&mut self` the previous binding must be
-//! dropped before the next one exists. So "one bracket per pass" and "one target bound at
-//! a time" are both properties of the borrow checker rather than of a convention.
+//! [`Pass`] is the `BeginDraw`/`EndDraw` bracket: one per device at a time, spanning
+//! however many targets a present pass touches. [`Draw`] is one target bound inside that
+//! bracket, and [`Pass::draw`] takes `&mut self`, so the previous binding drops before the
+//! next one exists. One bracket per pass and one target bound at a time are both enforced
+//! by the borrow checker.
 
 use super::*;
 use core::cell::Cell;
@@ -14,26 +13,27 @@ use core::mem::ManuallyDrop;
 /// The Direct2D drawing bracket. Opens on construction, closes on [`end`](Pass::end) or
 /// on drop.
 ///
-/// One bracket spans the whole pass because Direct2D charges a fixed cost per pair that
-/// has nothing to do with what was drawn between them — a DXGI `ReclaimResources`, an
-/// `OfferResources`, and a delayed Direct3D device-context-state swap. It scales with the
-/// number of brackets, which on a panel of regions means it scales with region count.
+/// One bracket spans the whole pass. Direct2D charges a fixed cost per pair — a DXGI
+/// `ReclaimResources`, an `OfferResources`, and a delayed Direct3D device-context-state
+/// swap — that does not depend on what was drawn between them, so the cost scales with the
+/// number of brackets.
 pub struct Pass<'g> {
     gpu: &'g Gpu,
 }
 
 /// A pass that latched an error, and the tag that names where.
 ///
-/// Direct2D defers: it records commands and does the work at `EndDraw`, and a failed call
-/// latches an error on the context that silently discards every later draw in the same
-/// bracket. Since the bracket spans every target in the pass, a draw that vanished is as
-/// likely to have been killed by an earlier one — so the tag is not a nicety, it is the
-/// only way to tell those two apart.
+/// Direct2D records commands and does the work at `EndDraw`, and a failed call latches an
+/// error on the context that discards every later draw in the same bracket. The bracket
+/// spans every target in the pass, so the tag is what separates a draw that failed from a
+/// draw killed by an earlier failure.
 #[derive(Copy, Clone, Debug)]
 pub struct PassError {
+    /// The `HRESULT` `EndDraw` reported.
     pub hr: windows_core::HRESULT,
     /// Whatever [`Pass::tag`] last set before the failing call.
     pub tag: u64,
+    /// What `hr` means for recovery.
     pub loss: Loss,
 }
 
@@ -45,9 +45,9 @@ impl<'g> Pass<'g> {
     /// Binds `target` and returns the drawing surface for it, in DIPs at the target's own
     /// DPI, with its origin at `(0, 0)`.
     ///
-    /// Retargeting inside an open bracket is what a cached intermediate costs instead of a
-    /// second context: `SetTarget` is documented as legal at any time, including while the
-    /// context is drawing.
+    /// `SetTarget` is legal at any time, including while the context is drawing, so a
+    /// cached intermediate is rendered by retargeting the open bracket rather than by a
+    /// second context.
     ///
     /// The context DPI comes from the target rather than from an argument, so the DPI the
     /// content is drawn at and the DPI the bitmap was built for cannot disagree — and it is
@@ -71,22 +71,26 @@ impl<'g> Pass<'g> {
 
     /// Labels what draws next, so a latched error names its target rather than the batch.
     ///
-    /// Meant to be called once per retarget — a tag per primitive would cost a call per
-    /// primitive to answer a question asked once per pass.
+    /// Called once per retarget: a tag per primitive costs a call per primitive to answer a
+    /// question asked once per pass.
     pub fn tag(&self, tag: u64) {
         unsafe { self.gpu.ctx().SetTags(tag, 0) };
     }
 
     /// Closes the bracket and reports what it latched.
     ///
-    /// Dropping a `Pass` closes it too, discarding the result — that path exists so a
-    /// panic cannot leave `BeginDraw` outstanding, not as a way to skip the error.
+    /// Dropping a `Pass` closes it too and discards the result, which keeps a panic from
+    /// leaving `BeginDraw` outstanding.
+    ///
+    /// # Errors
+    ///
+    /// The first failure `EndDraw` latched, with the tag active at the failing call.
     pub fn end(self) -> core::result::Result<(), PassError> {
         self.close()
     }
 
-    /// Idempotent: the device's own open flag is what makes it so, which is why there is
-    /// no second bit of state to keep in step.
+    /// Closes the bracket if it is open. Idempotent through the device's own open flag, so
+    /// there is no second bit of state to keep in step.
     fn close(&self) -> core::result::Result<(), PassError> {
         if !self.gpu.drawing().replace(false) {
             return Ok(());
@@ -113,9 +117,9 @@ impl Drop for Pass<'_> {
 
 /// One target bound inside a [`Pass`], in DIPs.
 ///
-/// Its contents are **undefined on entry**: a renderer either clears or covers its whole
-/// box. Nothing here is `Send` and nothing here is a pacer — a `Draw` draws, and the
-/// decision about when belongs to whoever opened the pass.
+/// The target's contents are **undefined on entry**: a renderer either clears or covers its
+/// whole box. A `Draw` is not `Send`, and it decides nothing about when to draw; that
+/// belongs to whoever opened the pass.
 pub struct Draw<'p> {
     ctx: &'p ID2D1DeviceContext6,
     opacity: Opacity,
@@ -138,13 +142,13 @@ impl<'p> Draw<'p> {
         }
     }
 
-    /// The DPI this target is bound at.
+    /// Returns the DPI this target is bound at.
     #[must_use]
     pub fn dpi(&self) -> f32 {
         self.dpi
     }
 
-    /// DIP-to-pixel factor.
+    /// Returns the DIP-to-pixel factor.
     #[must_use]
     pub fn scale(&self) -> f32 {
         self.dpi / 96.0
@@ -153,14 +157,12 @@ impl<'p> Draw<'p> {
     // ── pixel snapping ────────────────────────────────────────────────────────────
     //
     // Direct2D snaps nothing except text baselines, and only in the text APIs this crate
-    // does not use. For everything else the documentation is explicit that "physical device
-    // pixels might end up at fractional DIP coordinates, which is one of the reasons why
-    // Direct2D uses a floating-point coordinate space" — fractional coordinates are the
-    // expected condition, not a fault, and aligning to the grid is the caller's arithmetic.
+    // does not use. Everywhere else a physical pixel may land at a fractional DIP
+    // coordinate, which is the expected condition of a floating-point coordinate space, and
+    // aligning to the pixel grid is the caller's arithmetic. That arithmetic lives here.
     //
-    // So the arithmetic lives here, once. `D2D1_ANTIALIAS_MODE_ALIASED` is emphatically not
-    // a substitute: it makes an edge hard, not aligned, so an unsnapped aliased hairline is
-    // a crisp line in the wrong pixel.
+    // `D2D1_ANTIALIAS_MODE_ALIASED` is not a substitute: it makes an edge hard, not
+    // aligned, so an unsnapped aliased hairline is a crisp line in the wrong pixel.
 
     /// Rounds a DIP coordinate to the nearest whole physical pixel.
     #[must_use]
@@ -185,17 +187,16 @@ impl<'p> Draw<'p> {
 
     /// Positions a box so a stroke along its edges lands on whole pixels.
     ///
-    /// A stroke is centred on the path, so where its centre has to sit depends on the parity
-    /// of its physical width: an odd number of pixels covers whole pixels when centred on a
-    /// pixel *centre*, an even number when centred on a *boundary*. Getting that backwards
-    /// is what turns a one-pixel rule into two half-covered rows — the single most common
-    /// high-DPI artefact, and invisible at 96 DPI where the two happen to coincide for the
-    /// widths a design actually uses.
+    /// A stroke is centred on the path, so where its centre sits depends on the parity of
+    /// its physical width: an odd number of pixels covers whole pixels when centred on a
+    /// pixel *centre*, an even number when centred on a *boundary*. Centring an odd width on
+    /// a boundary turns a one-pixel rule into two half-covered rows; at 96 DPI the two
+    /// placements coincide for the widths a design uses, so that error is invisible there.
     ///
-    /// The **width is deliberately not snapped**. A 1-DIP rule is 1.5 physical pixels at
-    /// 1.5×, and no placement makes that crisp on both edges; rounding it to 1 or 2 would
-    /// change the design's line weight by a third, and design metrics stay DIP-constant. A
-    /// feathered 1.5-pixel rule in the right place is the correct rendering.
+    /// The **width is not snapped**. A 1-DIP rule is 1.5 physical pixels at 1.5×, and no
+    /// placement makes that crisp on both edges; rounding it to 1 or 2 changes the line
+    /// weight by a third, and design metrics stay DIP-constant. The box moves; the width
+    /// does not.
     #[must_use]
     pub fn snap_stroke(&self, r: Rect, k: Stroke<'_>) -> Rect {
         snap_stroke_to(r, k.width, self.scale())
@@ -212,6 +213,7 @@ impl<'p> Draw<'p> {
         unsafe { self.ctx.Clear(Some(d2d_color(&color))) };
     }
 
+    /// Fills `shape` with `brush`.
     pub fn fill<'s>(&self, shape: impl Into<Shape<'s>>, brush: &impl Brush) {
         let brush = brush.brush().raw();
         unsafe {
@@ -224,6 +226,7 @@ impl<'p> Draw<'p> {
         }
     }
 
+    /// Strokes the outline of `shape` with `brush`, `k` wide.
     pub fn stroke<'s>(&self, shape: impl Into<Shape<'s>>, brush: &impl Brush, k: Stroke<'_>) {
         let brush = brush.brush().raw();
         let (w, style) = k.parts();
@@ -237,8 +240,10 @@ impl<'p> Draw<'p> {
         }
     }
 
-    /// A line is stroked and never filled, so it is its own call rather than a [`Shape`]
-    /// arm that would be meaningless in [`fill`](Self::fill).
+    /// Strokes a line from `from` to `to`.
+    ///
+    /// A line cannot be filled, so it is its own call rather than a [`Shape`] arm that
+    /// would be meaningless in [`fill`](Self::fill).
     pub fn line(&self, from: Vector2, to: Vector2, brush: &impl Brush, k: Stroke<'_>) {
         let (w, style) = k.parts();
         unsafe {
@@ -249,17 +254,13 @@ impl<'p> Draw<'p> {
     /// Blits `src`. Its source rectangle is in the **source's** DIPs, which are the same
     /// DIPs as this target's because every target carries the display's DPI.
     ///
-    /// **The destination is snapped for you.** Unlike a fill or a stroke, a fractional
-    /// destination here has no legitimate use: the source was rasterized at device
-    /// resolution, so landing it off the grid resamples finished pixels and softens a cached
-    /// glyph run for nothing. The requirement has no exceptions and this method knows the
-    /// scale, so leaving it to the caller would only mean discovering later which call site
-    /// forgot.
+    /// **The destination is snapped here**, unlike a fill or a stroke: the source was
+    /// rasterized at device resolution, so landing it off the pixel grid resamples finished
+    /// pixels and softens a cached glyph run.
     ///
-    /// This is `DrawBitmap` and not `DrawImage`, and the difference is not stylistic:
-    /// `DrawImage` accepts any `ID2D1Image` and so runs Direct2D's image command graph to
-    /// discover what it was handed, measured at 2473 samples against 108 for six blits a
-    /// frame. There is no general image draw here.
+    /// This is `DrawBitmap` and not `DrawImage`. `DrawImage` accepts any `ID2D1Image` and
+    /// runs Direct2D's image command graph to discover what it was handed, at several times
+    /// the cost per call. There is no general image draw here.
     pub fn blit(&self, src: &Target, dest: Rect, src_rect: Option<Rect>, interp: Interp) {
         let dest = self.snap_rect(dest);
         unsafe {
@@ -276,21 +277,18 @@ impl<'p> Draw<'p> {
 
     /// Draws a whole sprite batch, sampling `src`.
     ///
-    /// Sets aliased mode for the duration and restores what it found. That is not a
-    /// preference: with per-primitive antialiasing on, `DrawSpriteBatch` does not draw,
-    /// and because it returns `void` the failure surfaces only as an error latched on the
-    /// context — which then discards the rest of the pass. Direct2D's reference does not
-    /// state the rule; Microsoft's own Direct2D wrapper performs exactly this swap around
-    /// every batch it submits.
+    /// Sets aliased mode for the duration and restores what it found: with per-primitive
+    /// antialiasing on, `DrawSpriteBatch` does not draw, and because it returns `void` the
+    /// failure surfaces only as an error latched on the context, which then discards the
+    /// rest of the pass.
     pub fn sprites(&self, batch: &SpriteBatch, src: &Target, interp: Interp) {
         let count = batch.len() as u32;
         if count == 0 {
             return;
         }
-        // Splitting an oversized batch would need a `Flush` between the halves, and a
-        // `Flush` with a layer outstanding puts the target into an error state. The field
-        // this stack draws is well inside the limit, so the ceiling is asserted rather
-        // than worked around.
+        // Splitting an oversized batch takes a `Flush` between the halves, and a `Flush`
+        // with a layer outstanding puts the target into an error state. Nothing splits, so
+        // the ceiling is asserted.
         debug_assert!(
             count <= SpriteBatch::CEILING || self.layers.get() == 0,
             "a batch over {} sprites needs a Flush to split, which is illegal inside a layer",
@@ -311,10 +309,9 @@ impl<'p> Draw<'p> {
 
     /// Draws one run of positioned glyphs, with `origin` on the baseline.
     ///
-    /// This is `DrawGlyphRun` and there is deliberately nothing above it: a text *layout*
-    /// drawn here would put DirectWrite's shaper on whatever path issued the call, which
-    /// measured at roughly a tenth of a process for strings changing at 10 Hz. What
-    /// belongs on a live path is a run that was shaped once, somewhere else.
+    /// This is `DrawGlyphRun` and there is nothing above it: drawing a text *layout* would
+    /// put DirectWrite's shaper on whatever path issued the call. A run reaching here was
+    /// shaped once, elsewhere.
     ///
     /// **Measuring is `NATURAL`**, so glyph advances keep ideal metrics that do not depend
     /// on the display resolution and horizontal positions are subpixel. Only the baseline
@@ -322,8 +319,8 @@ impl<'p> Draw<'p> {
     /// parameter, so the free baseline snapping the text APIs perform is not available
     /// here and glyphs land wherever `origin` puts them.
     ///
-    /// How the coverage is rasterized comes from the context, so state it with
-    /// [`text_params`](Self::text_params) rather than inheriting the system's.
+    /// How the coverage is rasterized comes from the context, which
+    /// [`text_params`](Self::text_params) states rather than inheriting the system's.
     pub fn glyphs(&self, origin: Vector2, run: &GlyphRun<'_>, brush: &impl Brush) {
         debug_assert!(
             run.glyphs.len() == run.advances.len() && run.glyphs.len() == run.offsets.len(),
@@ -341,8 +338,8 @@ impl<'p> Draw<'p> {
             debug_assert!(false, "a glyph run's face must be an IDWriteFontFace");
             return;
         };
-        // `DWRITE_GLYPH_RUN` holds a borrowed face in a `ManuallyDrop`, so the reference
-        // count is ours to keep for exactly the length of the call and to drop after it.
+        // `DWRITE_GLYPH_RUN` holds the face in a `ManuallyDrop`, so the reference the cast
+        // took is held for the length of the call and dropped after it.
         let dwrite = DWRITE_GLYPH_RUN {
             fontFace: ManuallyDrop::new(Some(face)),
             fontEmSize: run.em,
@@ -381,10 +378,9 @@ impl<'p> Draw<'p> {
 
     /// Clips to an axis-aligned rectangle until the guard drops.
     ///
-    /// This and not a layer, for a rectangle: Direct2D's debug layer emits a dedicated
-    /// performance message when a layer is pushed with a null opacity mask, 1.0 opacity
-    /// and an axis-aligned rectangular mask, because a clip achieves the same result more
-    /// cheaply.
+    /// A clip and not a layer, for a rectangle: Direct2D's debug layer emits a performance
+    /// message when a layer is pushed with a null opacity mask, 1.0 opacity and an
+    /// axis-aligned rectangular mask, because a clip reaches the same result for less.
     pub fn clip(&self, r: Rect) -> Clipped<'_> {
         unsafe {
             self.ctx
@@ -396,8 +392,7 @@ impl<'p> Draw<'p> {
     /// Applies a group operation — a geometric mask, an opacity mask, a group opacity —
     /// to everything drawn until the guard drops.
     ///
-    /// See [`Layer`] for which of the three, and for the cases where something cheaper is
-    /// both correct and better.
+    /// [`Layer`] names which of the three, and the cheaper alternatives where they apply.
     pub fn layer(&self, l: Layer<'_>) -> Layered<'_> {
         let mut params = l.params(self.opacity);
         unsafe {
@@ -405,9 +400,8 @@ impl<'p> Draw<'p> {
                 self.ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
             }
             self.ctx.PushLayer(&params, None);
-            // The parameters carry counted references the struct will not release, so the
-            // clones taken to fill them are dropped now that `PushLayer` has taken its
-            // own.
+            // The parameter struct never releases the counted references it carries, so the
+            // clones taken to fill it are dropped now that `PushLayer` holds its own.
             ManuallyDrop::drop(&mut params.geometricMask);
             ManuallyDrop::drop(&mut params.opacityBrush);
         }
@@ -445,19 +439,18 @@ impl<'p> Draw<'p> {
 
     /// States how glyph coverage is rasterized, until the guard drops.
     ///
-    /// `params` is DirectWrite's `IDWriteRenderingParams`, built by whoever owns the font
-    /// stack; this crate names the interface only so one can be handed over. Stating it
-    /// matters more than it looks: inherited, the parameters are the *system's* — a user's
-    /// ClearType tuning, a display's gamma — and coverage that carries those comes out
-    /// systematically thin or fat and reads as a font choice rather than as a setting.
+    /// `params` must be a DirectWrite `IDWriteRenderingParams`, built by whoever owns the
+    /// font stack; this crate names the interface only so one can be handed over. Inherited
+    /// parameters are the *system's* — a user's ClearType tuning, a display's gamma — and
+    /// coverage carrying those comes out systematically thin or fat.
     ///
-    /// A guard rather than a setter, for the same reason as [`aliased`](Self::aliased):
-    /// one bracket spans every target in a pass, and a mode set on the context outlives
-    /// the target it was meant for.
+    /// A guard rather than a setter, for the same reason as [`aliased`](Self::aliased): one
+    /// bracket spans every target in a pass, and a mode set on the context outlives the
+    /// target it was meant for.
     pub fn text_params(&self, params: &impl Interface) -> TextParams<'_> {
-        // A context that has never been told carries none, which the getter reports as a
-        // failed call rather than as `Ok(None)` — so "no params" and "could not ask" land
-        // in the same arm, and restoring `None` is right for both.
+        // A context that was never given parameters carries none, and the getter reports
+        // that as a failed call rather than as `Ok(None)`. Restoring `None` is correct both
+        // when there were none and when the getter could not answer.
         let previous = unsafe { self.ctx.GetTextRenderingParams().ok() };
         if let Ok(params) = params.cast::<IDWriteRenderingParams>() {
             unsafe { self.ctx.SetTextRenderingParams(&params) };
@@ -486,8 +479,7 @@ impl Drop for Draw<'_> {
 /// A group operation over everything drawn while it is pushed: Direct2D's only such
 /// operator, where everything else it offers is per-primitive.
 ///
-/// It is the right answer for a narrower set of cases than it looks, because the
-/// alternatives are cheaper wherever they apply:
+/// The alternatives below are cheaper wherever they apply:
 ///
 /// | Want | Use |
 /// |---|---|
@@ -498,11 +490,10 @@ impl Drop for Draw<'_> {
 /// | a rounded-rect clip inside an *opaque* target | overdraw the four corners in the surface colour |
 /// | an intermediate that outlives the frame | [`Gpu::offscreen`] |
 ///
-/// What is left, and what this is for: a fade over **live** content whose members
-/// **overlap**, an **arbitrary** geometric mask, and an opacity mask over a **group**. The
-/// mask cases are also where it wins on quality rather than just generality — content
-/// keeps its per-primitive antialiasing and the mask edge is antialiased separately, where
-/// masking through `FillOpacityMask` requires aliased mode for everything under it.
+/// A layer covers what is left: a fade over **live** content whose members **overlap**, an
+/// **arbitrary** geometric mask, and an opacity mask over a **group**. In the mask cases the
+/// content keeps its per-primitive antialiasing and the mask edge is antialiased separately,
+/// where masking through `FillOpacityMask` requires aliased mode for everything under it.
 #[derive(Copy, Clone)]
 pub struct Layer<'a> {
     mask: Option<&'a Path>,
@@ -523,8 +514,8 @@ impl<'a> Layer<'a> {
         replacing: false,
     };
 
-    /// Group opacity: the case per-primitive alpha gets wrong, because members that
-    /// overlap each other show through one another as the group fades.
+    /// Group opacity. Per-primitive alpha differs here: members that overlap each other
+    /// show through one another as the group fades.
     #[must_use]
     pub const fn opacity(a: f32) -> Self {
         Self {
@@ -552,14 +543,15 @@ impl<'a> Layer<'a> {
         }
     }
 
+    /// Sets the group opacity.
     #[must_use]
     pub const fn with_opacity(self, a: f32) -> Self {
         Self { opacity: a, ..self }
     }
 
-    /// Antialias the mask edge to whole pixels. Worth it where the content's own edges
-    /// meet the mask edge: two antialiased edges at one boundary multiply their coverage
-    /// and leave a faint seam.
+    /// Aligns the mask edge to whole pixels instead of antialiasing it. Worth it where the
+    /// content's own edges meet the mask edge: two antialiased edges at one boundary
+    /// multiply their coverage and leave a faint seam.
     #[must_use]
     pub const fn aliased_mask(self) -> Self {
         Self {
@@ -584,7 +576,7 @@ impl<'a> Layer<'a> {
     ///
     /// Required when masking content that itself carries transparency into a
     /// [`Translucent`](Opacity::Translucent) target, and wrong when the layer is meant to
-    /// composite over existing pixels — which is why it is stated rather than inferred.
+    /// composite over existing pixels, so the caller states it.
     #[must_use]
     pub const fn replacing(self) -> Self {
         Self {
@@ -594,10 +586,9 @@ impl<'a> Layer<'a> {
     }
 
     fn params(&self, target: Opacity) -> D2D1_LAYER_PARAMETERS1 {
-        // Skipping the clear to transparent black is documented as usually faster, and is
-        // not the default. Avoiding a write to the alpha channel is legal only when the
-        // target surface ignores alpha in the first place — so it is read off the target
-        // rather than offered as a choice.
+        // Skipping the clear to transparent black is usually faster and is not the default.
+        // Leaving the alpha channel unwritten is legal only where the target surface ignores
+        // alpha, so the flag is read off the target rather than offered as a choice.
         let mut options = D2D1_LAYER_OPTIONS1_INITIALIZE_FROM_BACKGROUND;
         if target == Opacity::Opaque {
             options |= D2D1_LAYER_OPTIONS1_IGNORE_ALPHA;
@@ -633,11 +624,10 @@ const INFINITE: D2D_RECT_F = D2D_RECT_F {
 
 /// One run of positioned glyphs from one face, as plain data plus the face itself.
 ///
-/// Shaping produces this and drawing consumes it, and the two happen on different
-/// threads: a run crosses between them as glyph indices, advances and offsets, so nothing
-/// thread-affine and no pixels travel. The face is the exception and it arrives as an
-/// `IUnknown`, because a font face is DirectWrite's type and this crate does not name
-/// DirectWrite in a public signature — it only hands the pointer back.
+/// Shaping produces this and drawing consumes it. Everything but the face is plain data —
+/// glyph indices, advances and offsets — so a run crosses between the two carrying nothing
+/// thread-affine and no pixels. The face arrives as an `IUnknown` because this crate names
+/// DirectWrite in no public signature and only hands the pointer back.
 pub struct GlyphRun<'a> {
     /// The `IDWriteFontFace` every glyph index in this run is an index into.
     pub face: &'a windows_core::IUnknown,
@@ -656,9 +646,9 @@ pub struct GlyphRun<'a> {
     pub bidi: u32,
 }
 
-/// A pair of `f32` per glyph *is* `DWRITE_GLYPH_OFFSET`, so a run's offsets need no
-/// conversion and no scratch buffer — and no nominal type either, which is why the seam
-/// carries an array rather than a struct one crate would have to own for the other.
+/// A pair of `f32` per glyph *is* `DWRITE_GLYPH_OFFSET`, so [`GlyphRun::offsets`] is passed
+/// straight through: no conversion, no scratch buffer, and no named type either crate would
+/// have to own for the other.
 const _: () = {
     assert!(size_of::<[f32; 2]>() == size_of::<DWRITE_GLYPH_OFFSET>());
     assert!(align_of::<[f32; 2]>() == align_of::<DWRITE_GLYPH_OFFSET>());
@@ -740,17 +730,16 @@ impl Drop for Additive<'_> {
 
 /// Rounds a DIP coordinate to the nearest whole physical pixel.
 ///
-/// Free-standing so the arithmetic is testable without a device — see the tests below.
+/// Free-standing so the arithmetic is testable without a device.
 fn snap_to(dip: f32, scale: f32) -> f32 {
     (dip * scale).round() / scale
 }
 
 /// Positions a box so a stroke of `width` DIPs along its edges covers whole pixels.
 ///
-/// The parity is the whole content of this function, and it is the part that is easy to
-/// invert: a stroke is centred on the path, so an **odd** number of physical pixels covers
-/// whole pixels only when its centre sits on a pixel *centre*, and an **even** number only
-/// when its centre sits on a *boundary*.
+/// The parity decides the placement: a stroke is centred on the path, so an **odd** number
+/// of physical pixels covers whole pixels only when its centre sits on a pixel *centre*, and
+/// an **even** number only when its centre sits on a *boundary*.
 fn snap_stroke_to(r: Rect, width: f32, scale: f32) -> Rect {
     let width_px = (width * scale).round().max(1.0);
     let bias = if (width_px as i32) % 2 == 1 { 0.5 } else { 0.0 };

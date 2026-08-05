@@ -1,14 +1,12 @@
 //! Shared resources: the four id-keyed tables. **Front half.**
 //!
-//! The first of the two storage machines. Which one a thing lands in is one question:
-//! **is the key an identity the model minted, or a value derived from something
-//! unbounded?** These are the identities, so they need no hash, no quantization and no
-//! eviction. See [`Cache`](crate::Cache) for the other.
+//! A resource is keyed by an identity the model minted, so these tables need no hash, no
+//! quantization and no eviction. A value derived from something unbounded is keyed in
+//! [`Cache`](crate::Cache) instead.
 //!
-//! **Re-rasterizing re-points the object every sprite holds; it never replaces it.** A
-//! geometry is re-pathed, a brush is re-surfaced. That makes "one resource, many sprites,
-//! all moving together" a property of the object, and it is why an entry here is a bare
-//! composition object.
+//! Re-rasterizing re-points the object every sprite holds and never replaces it: a geometry
+//! is re-pathed, a brush is re-surfaced. Every sprite painting with one resource therefore
+//! moves together, and an entry here is a bare composition object.
 
 use crate::id::Id;
 use crate::id::Slots;
@@ -17,14 +15,13 @@ use windows_composition::{CompositionPathGeometry, CompositionSurfaceBrush};
 
 /// A shared resource, and the two independent claims on it.
 ///
-/// **Two claims and not one**: the model disclaims when its declaration goes away, a sprite
-/// releases when it is destroyed or re-declared, and neither happens first. The entry lives
-/// until both are gone, so a resource can neither outlive its last holder nor be pulled out
-/// from under one.
+/// The model disclaims when its declaration goes away and a sprite releases when it is
+/// destroyed or re-declared, in either order. The entry lives until both claims are gone, so
+/// a resource neither outlives its last holder nor is pulled out from under one.
 #[derive(Debug)]
 pub(crate) struct Res<T> {
     pub(crate) value: T,
-    /// Sprites currently painting with it.
+    /// Sprites painting with it.
     rc: u32,
     /// Whether the model still declares it.
     claimed: bool,
@@ -46,16 +43,17 @@ impl<T> Res<T> {
 
 /// One resource family: the ids it is keyed by, and what it holds under them.
 ///
-/// The two parameters are separate because they genuinely are — the family is the model's
-/// (`Id<Geom>`), the payload is the composition object. Stating both is what stops a geom id
-/// reaching the ramp table, which a per-call family parameter allowed.
+/// `F` is the model's family marker, as in `Id<Geom>`, and `T` is the composition object.
+/// Naming the family in the type is what stops a geom id reaching the ramp table.
 pub(crate) type ResTable<F, T> = Slots<F, Res<T>>;
 
 impl<F, T> ResTable<F, T> {
+    /// Returns the resource under `id`, or `None` if no entry is live.
     pub(crate) fn value(&self, id: Id<F>) -> Option<&T> {
         self.get(id).map(|res| &res.value)
     }
 
+    /// Takes a sprite's hold on `id`.
     fn retain(&mut self, id: Id<F>) {
         if let Some(res) = self.get_mut(id) {
             res.rc += 1;
@@ -70,7 +68,8 @@ impl<F, T> ResTable<F, T> {
         self.collect(id);
     }
 
-    /// Gives up the *model's* claim. The declaration is gone; the sprites may not be.
+    /// Gives up the model's claim. The declaration is gone; the sprites holding it may not
+    /// be.
     fn disclaim(&mut self, id: Id<F>) {
         if let Some(res) = self.get_mut(id) {
             res.claimed = false;
@@ -80,8 +79,8 @@ impl<F, T> ResTable<F, T> {
 
     fn collect(&mut self, id: Id<F>) {
         if self.get(id).is_some_and(Res::unheld) {
-            // The authority is the model's, on the other side of the seam, so this releases
-            // the row and not the id.
+            // The model owns the id space on the other side of the seam, so this frees the
+            // row and not the id.
             self.take(id);
         }
     }
@@ -98,10 +97,9 @@ pub(crate) struct Resources {
     pub(crate) regions: ResTable<Region, Option<CompositionSurfaceBrush>>,
 }
 
-/// Dispatches one verb to whichever table holds the family.
+/// Dispatches one verb to the table that holds the family a [`Holding`] names.
 ///
-/// The **one** place a family maps to a table, which is what makes a resource's lifetime
-/// independent of the declaration that produced it.
+/// The single place a family maps to a table.
 macro_rules! dispatch {
     ($self:ident, $verb:ident, $holding:expr) => {
         match $holding {
@@ -126,9 +124,9 @@ impl Resources {
         }
     }
 
-    /// Drops the model's claim on `id`, whichever family it turns out to name.
+    /// Drops the model's claim on `id`, whichever family it names.
     ///
-    /// All four: a [`ResId`] names no family and exactly one table can be holding it.
+    /// A [`ResId`] carries no family, so all four tables are asked; at most one holds it.
     pub(crate) fn disclaim(&mut self, id: ResId) {
         self.geoms.disclaim(id.cast::<Geom>());
         self.ramps.disclaim(id.cast::<Ramp>());
@@ -136,7 +134,7 @@ impl Resources {
         self.regions.disclaim(id.cast::<Region>());
     }
 
-    /// The buffer a region is currently pointed at, if the producer has handed one over.
+    /// Returns the buffer a region points at, or `None` before the producer hands one over.
     pub(crate) fn region(&self, id: RegionId) -> Option<&CompositionSurfaceBrush> {
         self.regions.value(id).and_then(Option::as_ref)
     }
@@ -169,8 +167,7 @@ mod tests {
 
         table.retain(id);
         table.retain(id);
-        // The declaration goes first. Two sprites are still painting with it, so it has to
-        // survive — this is the case an unconditional remove gets wrong.
+        // The declaration goes first, while two sprites are still painting with it.
         table.disclaim(id);
         assert!(
             table.get(id).is_some(),

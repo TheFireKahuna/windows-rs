@@ -1,16 +1,14 @@
 //! The one place a render target is minted.
 //!
-//! No signature in this module names a pixel format or an alpha mode. Both are decided
-//! here, from the content's own [`Opacity`], which is why a surface allocation cannot be
-//! the thing that loses a colour: an 8-bit target, an `IGNORE` alpha mode under
-//! translucent content, or a `PREMULTIPLIED` one under content claiming to be opaque are
-//! each unreachable through this API rather than merely discouraged.
+//! No signature in this module names a pixel format or an alpha mode. Both follow from the
+//! content's own [`Opacity`], so an 8-bit target, an `IGNORE` alpha mode under translucent
+//! content, and a `PREMULTIPLIED` one under content claiming to be opaque are each
+//! unreachable through this API.
 //!
-//! A target is **allocated in pixels and drawn in DIPs**, and it carries the DPI that
-//! relates the two. That is the whole of this crate's DPI story: the extent is a pixel
-//! count because a cache keyed in DIPs would collide two different rasters at 1.5×, and
-//! every coordinate is a DIP because that is what layout solves in, what DirectWrite
-//! measures in, and what Direct2D scales by default.
+//! A target is **allocated in pixels and drawn in DIPs**, and it carries the DPI relating
+//! the two. The extent is a pixel count because a cache keyed in DIPs collides two
+//! different rasters at 1.5×, and every coordinate is a DIP because that is what layout
+//! solves in, what DirectWrite measures in, and what Direct2D scales by default.
 
 use super::*;
 use core::mem::ManuallyDrop;
@@ -23,10 +21,12 @@ pub struct Target {
     pub(crate) opacity: Opacity,
 }
 
-/// The range Direct2D's pipeline is documented to be designed for. A value outside it is
-/// almost always a scale factor passed where a DPI was wanted, or a zero from an
-/// uninitialized field — both of which produce content at the wrong size rather than an
-/// error, so they are worth catching at the boundary.
+/// Asserts, in debug builds, that `dpi` is inside the range Direct2D's pipeline is designed
+/// for.
+///
+/// A value outside it is a scale factor passed where a DPI was wanted, or a zero from an
+/// uninitialized field. Both produce content at the wrong size rather than an error, which
+/// is why they are caught at the boundary.
 pub(crate) fn check_dpi(dpi: f32) {
     debug_assert!(
         (96.0..=1200.0).contains(&dpi),
@@ -34,12 +34,11 @@ pub(crate) fn check_dpi(dpi: f32) {
     );
 }
 
-/// What the content does with alpha — named after the content rather than after the API,
-/// so the honest answer is also the easy one.
+/// What the content does with alpha, named after the content rather than after the API.
 ///
-/// This is the same question a presented region answers about itself, and the two move
-/// together: a region that leaves any pixel uncovered is `Translucent` here *and* must
-/// not ask for displayable buffers, because it will be composed either way.
+/// A presented region answers the same question about itself, and the two answers move
+/// together: a region that leaves any pixel uncovered is `Translucent` here *and* must not
+/// ask for displayable buffers, because it is composed either way.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Opacity {
     /// Some pixel of the box is not fully covered.
@@ -59,21 +58,21 @@ impl Opacity {
 }
 
 impl Target {
-    /// The target's size in whole pixels — its allocation, and half of a cache key.
+    /// Returns the size in whole pixels: the allocation, and half of a cache key.
     #[must_use]
     pub fn size_px(&self) -> (u32, u32) {
         self.px
     }
 
-    /// The target's size in DIPs: what a renderer draws inside.
+    /// Returns the size in DIPs, the box a renderer draws inside.
     #[must_use]
     pub fn size(&self) -> (f32, f32) {
         let scale = self.dpi / 96.0;
         (self.px.0 as f32 / scale, self.px.1 as f32 / scale)
     }
 
-    /// The DPI this target was built for, which is also the DPI its content is drawn at —
-    /// the two cannot disagree, because binding it sets the context from this value.
+    /// Returns the DPI this target was built for, which is also the DPI its content is
+    /// drawn at: binding the target sets the context from this value.
     #[must_use]
     pub fn dpi(&self) -> f32 {
         self.dpi
@@ -81,14 +80,13 @@ impl Target {
 }
 
 impl Gpu {
-    /// An offscreen target at an **exact pixel size**: the cached-chrome intermediate,
-    /// rendered by retargeting the caller's own open bracket.
+    /// Allocates an offscreen target at an **exact pixel size**, rendered by retargeting the
+    /// caller's own open bracket.
     ///
-    /// Deliberately not called `layer`. A [`Layer`] is a Direct2D layer — transient, torn
-    /// down when it pops, and re-derived every frame it is in flight. This is the
-    /// opposite: an intermediate keyed on whatever invalidates it, which survives until
-    /// that happens. Confusing the two is how a per-frame cost gets reintroduced after
-    /// the work of removing it.
+    /// Not a [`Layer`]. A layer is transient: it is torn down when it pops and re-derived
+    /// every frame it is in flight. This target holds its contents until whatever
+    /// invalidates them does.
+    ///
     /// The pixel extent is the allocation and the cache key; `dpi` is what its contents are
     /// drawn at, so a cell built for one display is not silently reused on another.
     pub fn offscreen(&self, px: (u32, u32), dpi: f32, opacity: Opacity) -> Result<Target> {
@@ -110,10 +108,14 @@ impl Gpu {
     /// Adopts a buffer another crate allocated — a presentation region's own texture —
     /// as a target.
     ///
-    /// `surface` must be a DXGI surface created on **this** device, in [`FORMAT`], whose
-    /// alpha mode matches `opacity`. Direct2D reports a mismatched alpha mode, but a
-    /// surface from another device is diagnosed only by the drawing quietly failing, so
-    /// the requirement is the caller's to hold.
+    /// `surface` must be a DXGI surface created on **this** device, in
+    /// `DXGI_FORMAT_R16G16B16A16_FLOAT`, whose alpha mode matches `opacity`. Direct2D
+    /// reports a mismatched alpha mode, but a surface from another device shows up only as
+    /// drawing that quietly fails, so that condition is the caller's to hold.
+    ///
+    /// # Errors
+    ///
+    /// When `surface` is not a DXGI surface, or Direct2D rejects it as a bitmap source.
     pub fn adopt(&self, surface: &impl Interface, dpi: f32, opacity: Opacity) -> Result<Target> {
         check_dpi(dpi);
         let surface: IDXGISurface = surface.cast()?;
@@ -134,14 +136,9 @@ impl Gpu {
 
 /// A target's pixels, copied back to the CPU.
 ///
-/// The oracle for everything above: a parity rig comparing a rendered frame against an
-/// approved reference, and the proof that an FP16 target really does carry a component
-/// above white and one below zero rather than quietly clamping them.
-///
-/// Deliberately yields **numbers and not colour**. An `Scrgb` comes from the output
-/// transform and from nowhere else, and a readback that minted one would be a second
-/// source — so this returns raw channel values and the caller compares them to the ones it
-/// wrote.
+/// Yields **numbers and not colour**. The output transform is the only source of an
+/// `Scrgb`, so a readback reports raw channel values and the caller compares them against
+/// the ones it wrote.
 pub struct Readback {
     staging: ID2D1Bitmap1,
     px: (u32, u32),
@@ -150,6 +147,7 @@ pub struct Readback {
 }
 
 impl Readback {
+    /// Returns the size in whole pixels.
     #[must_use]
     pub fn size_px(&self) -> (u32, u32) {
         self.px
@@ -168,8 +166,9 @@ impl Readback {
         assert!(x < self.px.0 && y < self.px.1, "pixel out of range");
         let mut out = [0.0; 4];
         for (channel, slot) in out.iter_mut().enumerate() {
-            // SAFETY: the row stride is the pitch the mapping reported and the mapping
-            // outlives this borrow, so every offset below is inside the mapped region.
+            // SAFETY: the assertion above puts `x` and `y` inside the mapped extent, the
+            // row stride is the pitch the mapping reported, and the mapping is released
+            // only when `self` drops — so the offset is inside the mapped region.
             let half = unsafe {
                 let offset =
                     y as usize * self.pitch as usize + x as usize * 8 + channel * size_of::<u16>();
@@ -225,9 +224,9 @@ impl Gpu {
 
 /// Decodes an IEEE binary16.
 ///
-/// Written out rather than reached for, because `f16` is not stable on this floor. The
-/// subnormal case is exact arithmetic rather than a shift loop: a subnormal half is
-/// `mantissa × 2⁻²⁴`, and both factors are exactly representable in `f32`.
+/// Written out rather than using `f16`, which stable Rust does not provide. The subnormal
+/// case is exact arithmetic rather than a shift loop: a subnormal half is `mantissa × 2⁻²⁴`,
+/// and both factors are exactly representable in `f32`.
 fn half_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exponent = u32::from((bits >> 10) & 0x1f);
@@ -253,7 +252,7 @@ mod tests {
         assert_eq!(half_to_f32(0x8000), -0.0);
         assert_eq!(half_to_f32(0x3c00), 1.0);
         assert_eq!(half_to_f32(0xbc00), -1.0);
-        // Above white, and outside Rec.709 — the two the pipeline exists to carry.
+        // Above white, and below zero: the two extremes an FP16 target carries.
         assert_eq!(half_to_f32(0x4200), 3.0);
         assert_eq!(half_to_f32(0xb266), -0.199_951_171_875);
         // The smallest subnormal, and the largest.
@@ -264,13 +263,14 @@ mod tests {
     }
 }
 
-/// The whole of this crate's format policy, in one value.
+/// Builds the properties every target in this crate is created with: [`FORMAT`], the alpha
+/// mode `opacity` implies, and `dpi`.
 ///
-/// The bitmap carries the **display's** DPI and not 96, which is what makes one coordinate
-/// space hold everywhere. A bitmap's DPI decides its DIP extent, and `DrawBitmap`'s source
-/// rectangle is in the *source bitmap's* DIPs — so a 96-DPI source under a display-DPI
-/// destination would make one call take a DIP destination and a pixel source. At the
-/// display's DPI both are DIPs and there is no second space to get wrong.
+/// The bitmap carries the **display's** DPI and not 96, which is what holds one coordinate
+/// space everywhere. A bitmap's DPI decides its DIP extent, and `DrawBitmap`'s source
+/// rectangle is in the *source bitmap's* DIPs, so a 96-DPI source under a display-DPI
+/// destination gives one call a DIP destination and a pixel source. At the display's DPI
+/// both are DIPs.
 fn properties(dpi: f32, opacity: Opacity) -> D2D1_BITMAP_PROPERTIES1 {
     D2D1_BITMAP_PROPERTIES1 {
         pixelFormat: D2D1_PIXEL_FORMAT {

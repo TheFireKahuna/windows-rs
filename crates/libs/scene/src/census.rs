@@ -1,26 +1,24 @@
-//! Counting our own writes, at the site that issues them. **Front half.**
+//! Counting this crate's own writes, at the site that issues them. **Front half.**
 //!
-//! Visual count is the compositor's frontier at idle — the tree *walk*, not the drawing —
-//! so how many visuals exist and how often a property is written are first-class costs
-//! rather than diagnostics.
+//! At idle the compositor's cost is the tree walk rather than the drawing, so the number of
+//! visuals alive and the number of property writes issued are first-class costs rather than
+//! diagnostics.
 //!
-//! They are counted **here** and not in the composition wrapper. A counter welded into
-//! every setter of an object model is a consumer's measurement need edited into an upstream
-//! method body, which is the worst possible rebase surface. The patch applier sees the
-//! identical events and is ours.
+//! Counting happens in the patch applier, which sees every mint, destroy and property write,
+//! and not in the composition wrapper's setters.
 
-/// What this crate did, since it started.
+/// Running tallies of what the scene has done since it was created.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Census {
     /// Visuals this scene is holding, ghosts included.
     ///
     /// One life event each: a mint raises it and a destroy lowers it. Re-parenting is
-    /// neither, which is why an unsigned count is sound — a move that both unlinks and
-    /// links must net to nothing rather than to a number that can go below zero.
+    /// neither, so a move that both unlinks and links nets to nothing and the count never
+    /// goes below zero.
     pub visuals_live: u32,
-    /// Visuals ever minted. The difference from `visuals_live` is what was destroyed, and
-    /// a mint rate that climbs while the live count is flat is recycling that is not
-    /// recycling.
+    /// Visuals ever minted. The difference from `visuals_live` is what was destroyed, and a
+    /// mint rate that climbs while the live count is flat is nodes being rebuilt instead of
+    /// reused.
     pub visuals_minted: u64,
     /// Property groups actually pushed to a composition object — the writes that survived
     /// the idempotent early return, and therefore the ones that cost something.
@@ -30,32 +28,31 @@ pub struct Census {
     pub props_skipped: u64,
     /// Interaction trackers this scene is holding.
     ///
-    /// A watched metric because a tracker that was never built is invisible from every other
-    /// angle: the bindings onto it apply, the ops addressed to it are dropped on a missing
-    /// row, and the surface simply never scrolls. One life event each, like the visuals.
+    /// Watched because a tracker that was never built is invisible from every other angle:
+    /// the bindings onto it apply, the ops addressed to it are dropped on a missing row, and
+    /// the surface never scrolls. One life event each, like the visuals.
     pub trackers_live: u32,
+    /// Ops applied, across every patch.
     pub ops_applied: u64,
     /// Animations started, which is the event-rate cost of motion.
     pub animations: u64,
     /// Patches applied under a different environment than they were solved under.
     ///
-    /// **Counted rather than refused, because a mismatch is not necessarily wrong.** A
-    /// display change that lands between a flush and its apply leaves the patch's geometry
-    /// snapped to the previous pixel grid, and the right response is to apply it and let
-    /// the next solve correct it — the scene syncs to the environment it was *given*, so
-    /// the rasters are right and only one frame of placement is stale.
+    /// A mismatch is counted and not refused. A display change landing between a flush and
+    /// its apply leaves that patch's geometry snapped to the previous pixel grid; the scene
+    /// applies it under the environment it was given, so the rasters are right and one frame
+    /// of placement is stale until the next solve.
     ///
-    /// What that makes this is a discriminator. An occasional bump is that race. A count
-    /// that keeps pace with the patch count is the failure the [`Env`](crate::Env) seam
-    /// exists to prevent, surviving one level up: two derivations of one fact, on two
-    /// threads, silently disagreeing. Neither is visible in any single call.
+    /// An occasional bump is that race. A count that keeps pace with the patch count is the
+    /// two halves deriving the [`Env`](crate::Env) independently and disagreeing, which no
+    /// single call shows.
     pub env_mismatches: u64,
 }
 
-/// A walk's ground truth against the running tallies.
+/// What a walk of the tree found, against what the arena holds.
 ///
-/// A running count drifts; only a walk knows. The two disagreeing is a link or a life event
-/// being wrong, and neither shows up any other way — a leaked node still renders.
+/// The two disagreeing means a link or a life event is wrong, which nothing else reports: an
+/// orphaned node still renders.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Audit {
     /// Nodes the walk reached from the root.
@@ -66,7 +63,7 @@ pub struct Audit {
 }
 
 impl Audit {
-    /// Whether the tree the walk found is the tree the arena holds.
+    /// Returns whether the tree the walk found is the tree the arena holds.
     #[must_use]
     pub const fn agrees(&self) -> bool {
         self.reached == self.held
@@ -74,10 +71,8 @@ impl Audit {
 }
 
 impl Census {
-    /// Records one attempted property write.
-    ///
-    /// A skip is not a non-event: the ratio against `props_written` is what says whether
-    /// the emitter is sending a subtree where three nodes moved.
+    /// Records one attempted property write, as written or as absorbed by the idempotent
+    /// early return.
     pub(crate) fn count(&mut self, written: bool) {
         if written {
             self.props_written += 1;
@@ -86,10 +81,10 @@ impl Census {
         }
     }
 
-    /// Whether the tick did anything: something was applied, or an animation started.
+    /// Returns whether the tick did anything: an op applied, a property written, an
+    /// animation started, or a visual minted.
     ///
-    /// A woken tick that answers `false` is something having asked for a frame it did not
-    /// need, which is the one shape of idle waste this crate cannot see from the inside.
+    /// A woken tick that answers `false` is a frame something asked for and did not need.
     #[must_use]
     pub fn changed_since(&self, previous: &Self) -> bool {
         self.ops_applied != previous.ops_applied

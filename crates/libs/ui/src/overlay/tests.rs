@@ -1,9 +1,9 @@
-//! What the overlay layer claims, checked by driving it headless.
+//! Drives the overlay layer headless.
 //!
 //! `Model` owns no COM, so a whole open-and-dismiss runs with no window, no device and no
 //! compositor: the slot roots, the blocker entry, the focus scope and the placement all read
-//! back off the patch. What needs no input is asserted here; what needs a real press against
-//! a real window is a harness a person runs.
+//! back off the patch. Reports and intents are built here rather than delivered by the
+//! router, so nothing in this file needs a real press against a real window.
 
 use super::*;
 use crate::build::{Any, El, mount};
@@ -13,7 +13,8 @@ use crate::signal::live_nodes;
 use crate::widget::{UiaRole, button, flyout, text};
 use windows_scene::{HitEntry, HitFlags, HitTable, SinkPatch};
 
-/// The build module's own fixture: the palette, a shaper, a fresh host, first flush drained.
+/// Returns the build module's fixture: the palette, a shaper, a fresh host, first flush
+/// drained.
 fn fixture() -> SinkPatch {
     crate::build::tests::fixture()
 }
@@ -26,7 +27,7 @@ fn root() -> GroupId {
     Host::with(|host| host.model().root())
 }
 
-/// The hit table as the front thread would hold it, rebuilt from the patch.
+/// Returns the hit table as the front thread would hold it, rebuilt from `patch`.
 fn hits(patch: &SinkPatch) -> HitTable {
     let mut table = HitTable::default();
     table.replace(patch.hit_entries());
@@ -37,12 +38,12 @@ fn entries(patch: &SinkPatch) -> Vec<HitEntry> {
     patch.hit_entries().to_vec()
 }
 
-/// A menu-ish body: a flyout surface with two focusable rows.
+/// Returns a flyout surface with two focusable rows.
 fn body() -> View {
     flyout().stack((button("Alpha"), button("Beta")))
 }
 
-/// A control to anchor against, and the id it minted.
+/// Mounts a control to anchor against and returns its mount with the id it minted.
 fn invoker(patch: &mut SinkPatch) -> (Mount, ControlId) {
     let mount = mount(
         El::<Any>::seed(Preset::Bare)
@@ -64,9 +65,8 @@ fn invoker(patch: &mut SinkPatch) -> (Mount, ControlId) {
 
 #[test]
 fn an_overlay_contributes_a_blocker_then_itself_at_the_end_of_the_array() {
-    // The whole of "press outside dismisses", and it is not a mechanism: the array is the
-    // z-order, the scan takes the first hit from the back, so a press inside resolves to
-    // the overlay and a press anywhere else resolves to the blocker.
+    // The array is the z-order and the scan takes the first hit from the back, so a press
+    // inside resolves to the overlay and a press anywhere else to the blocker.
     let mut patch = fixture();
     let (_invoker, anchor) = invoker(&mut patch);
     let mut focus = FocusRing::default();
@@ -95,8 +95,8 @@ fn an_overlay_contributes_a_blocker_then_itself_at_the_end_of_the_array() {
 
 #[test]
 fn an_overlay_is_placed_under_its_anchor_and_has_real_geometry() {
-    // The gap the detached solve closed. Before it, an overlay was laid out nowhere: no
-    // size, no offset, and a hit entry with zero area — visibly on screen and unhittable.
+    // A detached root is solved with a size and an offset, so its rows carry real area in
+    // the hit array rather than a zero-area entry that is visible and unhittable.
     let mut patch = fixture();
     let (_invoker, anchor) = invoker(&mut patch);
     let mut focus = FocusRing::default();
@@ -106,9 +106,8 @@ fn an_overlay_is_placed_under_its_anchor_and_has_real_geometry() {
     flush(&mut patch);
 
     let entries = entries(&patch);
-    // Everything that is neither the blocker nor part of the **anchor's own subtree** —
-    // which is not the same as "not the anchor", because a control's label is an element
-    // of its own and sits inside it.
+    // Everything that is neither the blocker nor inside the anchor's own subtree, which is
+    // not the same as "not the anchor": a control's label is an element of its own.
     let inside_anchor = |mut at: u32| {
         let mut guard = entries.len();
         while at != windows_scene::NO_ENTRY && guard > 0 {
@@ -143,10 +142,8 @@ fn an_overlay_is_placed_under_its_anchor_and_has_real_geometry() {
 
 #[test]
 fn a_light_dismiss_press_closes_it_and_restores_focus_to_the_invoker() {
-    // The press is consumed by the router before this layer sees it, so what is asserted
-    // here is that it closes the right overlay and puts focus back where the user came
-    // from — an overlay that dismissed without restoring would leave the next keystroke
-    // going to the window.
+    // The router consumes the press before this layer sees it, so what is asserted is that
+    // the right overlay closes and focus returns to the invoker rather than to the window.
     let mut patch = fixture();
     let (_invoker, anchor) = invoker(&mut patch);
     let mut focus = FocusRing::default();
@@ -212,8 +209,8 @@ fn escape_closes_a_flyout_and_a_popup_alike() {
 
 #[test]
 fn a_modal_is_not_light_dismissed_but_still_blocks() {
-    // The two halves of the same decision. A press outside a modal must not reach what it
-    // covers *and* must not close it, which is exactly a blocker whose press does nothing.
+    // A press outside a modal must neither reach what the modal covers nor close it, which
+    // is a blocker whose press does nothing.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -242,8 +239,8 @@ fn a_modal_is_not_light_dismissed_but_still_blocks() {
 
 #[test]
 fn a_popup_traps_tab_and_a_flyout_lets_go() {
-    // Against the ring the overlay actually pushed, rather than a hand-built one: the point
-    // is that opening declares the right scope, not that a scope behaves once declared.
+    // Against the ring the overlay pushed rather than a hand-built one, so what is checked
+    // is that opening declares the right scope.
     let mut patch = fixture();
     let (_invoker, anchor) = invoker(&mut patch);
 
@@ -278,8 +275,8 @@ fn a_popup_traps_tab_and_a_flyout_lets_go() {
 
 #[test]
 fn closing_an_overlay_takes_everything_opened_above_it() {
-    // The nesting rule, and the whole of it: a submenu cannot outlive the menu that
-    // anchored it, so the stack truncates rather than removing one entry.
+    // A submenu cannot outlive the menu that anchored it, so the stack truncates rather
+    // than removing one entry.
     let mut patch = fixture();
     let (_invoker, anchor) = invoker(&mut patch);
     let mut focus = FocusRing::default();
@@ -325,9 +322,8 @@ fn a_stale_close_is_a_miss() {
 
 #[test]
 fn a_thousand_opens_leak_no_slot_root_and_no_signal() {
-    // A parentless root is invisible to a parent walk, which is the shape that leaks once
-    // per unmount — so the claim is not "it usually gets cleaned up", it is that the counts
-    // return to exactly where they started.
+    // A slot root is parentless and so invisible to a parent walk: the live-node and
+    // hit-entry counts must return to exactly where they started.
     let mut patch = fixture();
     let (_invoker, anchor) = invoker(&mut patch);
     let mut focus = FocusRing::default();
@@ -367,8 +363,7 @@ fn a_thousand_opens_leak_no_slot_root_and_no_signal() {
 
 #[test]
 fn a_second_tap_on_the_invoker_closes_what_it_opened() {
-    // What makes a picker's own button shut it, rather than opening a second one behind
-    // the first.
+    // A picker's own button shuts it rather than opening a second overlay behind the first.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -402,14 +397,13 @@ fn a_second_tap_on_the_invoker_closes_what_it_opened() {
 
 #[test]
 fn a_kind_that_takes_focus_takes_the_pointer_with_it() {
-    // The rule the blocker's existence rests on. A modal that let a press through would
-    // let the user edit content the keyboard cannot reach, and a focus scope with no
-    // blocker has no first entry to be named by — so both follow from one answer.
+    // A modal that let a press through would let content the keyboard cannot reach be
+    // edited, and a focus scope with no blocker has no first entry to be named by.
     assert!(Kind::Flyout.takes_focus().is_some());
     assert!(Kind::Popup.takes_focus().is_some());
     assert!(Kind::Tooltip.takes_focus().is_none());
 
-    // And what the blocker's press *does* is the separate question.
+    // What the blocker's press does is a separate question.
     assert!(Kind::Flyout.dismiss().light);
     assert!(
         !Kind::Popup.dismiss().light,
@@ -420,11 +414,10 @@ fn a_kind_that_takes_focus_takes_the_pointer_with_it() {
 
 #[test]
 fn every_overlay_that_pushes_a_scope_has_a_blocker_to_name_it_by() {
-    // The join the two facts rest on. A `FocusScope` is named by its own first entry in the
-    // array, `FocusRing::collect` falls back to index 0 when it cannot find that entry, and
-    // index 0 is the top of the window's own content — so a scope with nothing to name it
-    // does not fail, it silently lets `Tab` walk the whole window. Nothing else would say
-    // so, which is why this is asserted rather than left to the comment.
+    // A `FocusScope` is named by its own first entry in the array, and `FocusRing::collect`
+    // falls back to index 0 when it cannot find that entry. Index 0 is the top of the
+    // window's own content, so a scope with nothing to name it lets `Tab` walk the whole
+    // window instead of failing.
     let mut patch = fixture();
     let (_invoker, anchor) = invoker(&mut patch);
 
@@ -453,10 +446,9 @@ fn every_overlay_that_pushes_a_scope_has_a_blocker_to_name_it_by() {
 
 #[test]
 fn escape_closes_a_tooltip_even_though_it_pushes_no_scope() {
-    // The dismiss route that is nobody else's. The router raises `Report::Escape` only
-    // while a focus scope is open, and a tooltip deliberately pushes none — so if this
-    // layer does not read the keystroke itself, a description cannot be dismissed from the
-    // keyboard at all and the only symptom is one that will not go away.
+    // The router raises `Report::Escape` only while a focus scope is open, and a tooltip
+    // pushes none, so this layer reads the raw keystroke itself. Without that arm a
+    // description cannot be dismissed from the keyboard at all.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -506,9 +498,8 @@ fn escape_closes_a_tooltip_even_though_it_pushes_no_scope() {
 
 #[test]
 fn a_hover_starts_one_delay_and_leaving_cancels_it() {
-    // The delay is a deadline on the frame clock and not a timer, so the only thing here is
-    // that exactly one is opened per dwell and that it is cancelled rather than left to
-    // fire against a target the pointer has left.
+    // The delay is a deadline on the frame clock rather than a timer, so what is checked is
+    // that exactly one opens per dwell and that leaving cancels it.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -542,7 +533,7 @@ fn a_hover_starts_one_delay_and_leaving_cancels_it() {
     flush(&mut patch);
 }
 
-/// `Esc`, as the router delivers it.
+/// Returns an `Esc` key-down event as the router delivers it.
 fn escape() -> KeyEvent {
     KeyEvent {
         kind: KeyKind::Down,
@@ -552,7 +543,7 @@ fn escape() -> KeyEvent {
     }
 }
 
-/// Flushes, and answers how many delays were started and cancelled in that patch.
+/// Flushes and returns how many delays that patch started and how many it cancelled.
 fn delay_ops(patch: &mut SinkPatch) -> (usize, usize) {
     flush(patch);
     let started = patch
@@ -568,7 +559,7 @@ fn delay_ops(patch: &mut SinkPatch) -> (usize, usize) {
     (started, cancelled)
 }
 
-/// The delay the last flush opened.
+/// Flushes and returns the delay id that patch opened. Panics where none was opened.
 fn pending_delay(patch: &mut SinkPatch) -> windows_scene::DelayId {
     flush(patch);
     patch
@@ -581,8 +572,8 @@ fn pending_delay(patch: &mut SinkPatch) -> windows_scene::DelayId {
         .expect("a hover over a described control opens one")
 }
 
-/// A hover crossing, as the router publishes them — several per service when the pointer
-/// batch crossed several targets.
+/// Returns a hover crossing as the router publishes them. Several reach one service call
+/// when the pointer batch crossed several targets.
 fn hover(to: Option<ControlId>) -> Report {
     Report::HoverChanged {
         from: None,
@@ -592,8 +583,8 @@ fn hover(to: Option<ControlId>) -> Report {
     }
 }
 
-/// A press, as the router delivers it. Nothing in the sample is read by this layer — the
-/// target and the fact of the press are the whole of what it uses.
+/// Returns a press as the router delivers it. This layer reads only the target and the fact
+/// of the press, so the sample's contents do not matter.
 fn press(target: ControlId) -> Report {
     let at = windows_scene::Point { x: 10.0, y: 10.0 };
     Report::Pressed {
@@ -614,7 +605,7 @@ fn press(target: ControlId) -> Report {
     }
 }
 
-/// A strip of described controls, and the ids they minted in array order.
+/// Mounts three described controls and returns the mount with their ids in array order.
 fn strip(patch: &mut SinkPatch, tips: [crate::widget::TextSource; 3]) -> (Mount, Vec<ControlId>) {
     let [a, b, c] = tips;
     let mount = mount(
@@ -633,12 +624,10 @@ fn strip(patch: &mut SinkPatch, tips: [crate::widget::TextSource; 3]) -> (Mount,
 
 #[test]
 fn a_description_opens_on_the_side_the_author_named() {
-    // Which side a description sits on is not a style preference. Below clears the
-    // neighbours of a toolbar button, whose siblings are left and right of it, and lands
-    // squarely on top of the next item of a vertical rail. The placer flips and clamps
-    // against the *window* and cannot decide this — it is handed one box and never sees the
-    // ones beside it — so the author states it, and the whole risk is that the statement
-    // does not survive the trip to the spec.
+    // `place` flips and clamps against the window and is handed one box, so it never sees
+    // the controls beside the anchor and cannot pick the side: below clears the neighbours
+    // of a toolbar button and covers the next item of a vertical rail. The author states
+    // the side, and this checks the statement reaches the spec the overlay opens with.
     let probe = |side: Option<Side>| {
         let mut patch = fixture();
         let mut focus = FocusRing::default();
@@ -694,11 +683,10 @@ fn a_description_opens_on_the_side_the_author_named() {
 
 #[test]
 fn one_batch_of_crossings_arms_one_delay() {
-    // The pointer layer publishes every crossing in a sample batch, deliberately — a target
-    // crossed and left between two samples is a real enter and a real leave, and the closing
-    // half needs both. Revealing does not: a sweep across a strip answers per crossing would
-    // arm and tear down a delay for each control passed through, at pointer sample rate
-    // rather than at hover rate. Only where the pointer came to rest is owed one.
+    // The pointer layer publishes every crossing in a sample batch, and the closing half
+    // needs all of them: a target crossed and left between two samples is a real enter and a
+    // real leave. Revealing needs only the last, because answering per crossing would arm
+    // and tear down a delay for every control the sweep passed through.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -726,9 +714,8 @@ fn one_batch_of_crossings_arms_one_delay() {
 
 #[test]
 fn a_dwell_survives_leaving_and_returning_within_one_batch() {
-    // The other half of answering the batch's end rather than each crossing: a sub-tick
-    // excursion off a control and back is not a reason to start the wait again. It is the
-    // same judgement the pointer layer makes when it declines to sample.
+    // The dwell is answered at the batch's end rather than at each crossing, so an excursion
+    // off a control and back inside one tick does not restart the wait.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -755,9 +742,9 @@ fn a_dwell_survives_leaving_and_returning_within_one_batch() {
 
 #[test]
 fn a_press_in_the_same_batch_as_the_hover_reveals_nothing() {
-    // Reaching a button and pressing it inside one tick is one gesture, and a description is
-    // owed to a pointer at rest. Any press is the single exit, and that has to include a
-    // reveal this tick's crossings had not performed yet.
+    // A description is owed to a pointer at rest, and reaching a button and pressing it
+    // inside one tick is one gesture. Any press is the single exit, including for a reveal
+    // this tick's crossings had not performed yet.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -777,12 +764,10 @@ fn a_press_in_the_same_batch_as_the_hover_reveals_nothing() {
 
 #[test]
 fn passing_through_a_described_control_never_reads_its_text() {
-    // The expensive half, and the one that runs *application* code. A description's text is
-    // read once as it opens, so answering a sweep per crossing mounts a tooltip and destroys
-    // it again for every control passed through — each intermediate one leaving a ghost that
-    // holds the frame clock for its exit, for content that was never on screen for a frame.
-    //
-    // Counting reads is what makes that visible: it is one per description actually shown.
+    // A description's text is read once as it opens, and that read runs application code.
+    // Answering a sweep per crossing would mount and destroy a tooltip for every control
+    // passed through, each holding the frame clock for its exit, for content never on screen
+    // for a frame. The read count is one per description actually shown.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -819,7 +804,7 @@ fn passing_through_a_described_control_never_reads_its_text() {
         "the control the pointer merely passed through had its text read"
     );
     assert_eq!(overlays.depth(), 1, "and exactly one description is up");
-    // Swapped rather than re-delayed, which is what makes scanning a strip tolerable.
+    // Swapped rather than re-delayed, so no new wait is started.
     assert_eq!(delay_ops(&mut patch), (0, 0), "the swap started a new wait");
 
     overlays.close_all(&mut focus);
@@ -829,10 +814,9 @@ fn passing_through_a_described_control_never_reads_its_text() {
 
 #[test]
 fn hovering_a_row_that_expands_opens_it_and_leaving_for_a_sibling_closes_it() {
-    // The delay's second consumer, and the pair of behaviours that look contradictory until
-    // you see what separates them: a hover-opened submenu closes when the pointer reaches a
-    // sibling row, and a clicked flyout does not close when the pointer goes anywhere. Only
-    // `by_dwell` tells them apart.
+    // The delay's second consumer. A hover-opened submenu closes when the pointer reaches a
+    // sibling row, and a clicked flyout does not close when the pointer goes anywhere; only
+    // `by_dwell` separates the two.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -862,8 +846,8 @@ fn hovering_a_row_that_expands_opens_it_and_leaving_for_a_sibling_closes_it() {
     assert_eq!(overlays.depth(), 2, "the submenu did not open");
     flush(&mut patch);
 
-    // Moving to a sibling row of the parent closes it. The sibling is in the parent menu,
-    // which is what makes it a leave rather than a move *into* the submenu.
+    // Moving to a sibling row of the parent closes the submenu. The sibling sits in the
+    // parent menu, which makes the crossing a leave rather than a move into the submenu.
     overlays.service(&[hover(Some(beta))], &[], &hits(&patch), &mut focus);
     assert_eq!(
         overlays.depth(),
@@ -878,11 +862,10 @@ fn hovering_a_row_that_expands_opens_it_and_leaving_for_a_sibling_closes_it() {
 
 #[test]
 fn a_hover_open_closes_what_the_pointer_left_and_keeps_what_it_returned_to() {
-    // Three levels, which is where "close the hover-opened ones" stops being the same
-    // question as "close the first hover-opened one". Returning from a sub-submenu to a row
-    // of the submenu must take the sub-submenu and leave the submenu: a rule stated against
-    // the bottom of the stack finds the submenu, decides it is not above the pointer, and
-    // closes nothing at all.
+    // Three levels, where closing every hover-opened overlay differs from closing the first
+    // one. Returning from a sub-submenu to a row of the submenu takes the sub-submenu and
+    // leaves the submenu; a search from the bottom of the stack finds the submenu, decides
+    // it is not above the pointer, and closes nothing.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -939,8 +922,8 @@ fn a_hover_open_closes_what_the_pointer_left_and_keeps_what_it_returned_to() {
 
 #[test]
 fn escape_takes_the_description_before_the_menu_under_it() {
-    // One keystroke closes one thing. The router raises `Escape` rather than a key wherever
-    // a focus scope is open, so a menu with a description showing over it would otherwise
+    // One keystroke closes one overlay. The router raises `Escape` rather than a key
+    // wherever a focus scope is open, so a menu with a description over it would otherwise
     // read the same press twice and lose both.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
@@ -989,9 +972,9 @@ fn escape_takes_the_description_before_the_menu_under_it() {
 
 #[test]
 fn closing_a_menu_cancels_the_dwell_it_started() {
-    // A delay outliving its menu is not idle: it holds a frame-clock `Tick` for its whole
-    // duration and then opens a submenu against a row that has gone. Every close path
-    // reaches `truncate`, which is why this is asserted there rather than at each of them.
+    // A delay outliving its menu holds a frame-clock `Tick` for its full duration and then
+    // opens a submenu against a row that has gone. Every close path reaches `truncate`,
+    // which is where it is cancelled.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
     let mut overlays = Overlays::new();
@@ -1042,9 +1025,9 @@ fn closing_a_menu_cancels_the_dwell_it_started() {
 
 #[test]
 fn a_clicked_flyout_does_not_close_because_the_pointer_moved() {
-    // The other half of the same rule, and the reason `by_dwell` is recorded rather than
-    // inferred: these two overlays are the same kind, opened the same way, differing only in
-    // what opened them — and the right behaviour is opposite in each.
+    // `by_dwell` is recorded rather than inferred because these two overlays are the same
+    // kind, opened the same way, differing only in what opened them, and the right response
+    // to the pointer leaving is opposite in each.
     let mut patch = fixture();
     let (_invoker, anchor) = invoker(&mut patch);
     let mut focus = FocusRing::default();
@@ -1075,9 +1058,8 @@ fn a_clicked_flyout_does_not_close_because_the_pointer_moved() {
 
 #[test]
 fn dropping_the_stack_releases_a_pending_delay() {
-    // A pending delay outlives the stack in two ways that both matter: its id stays claimed
-    // in the model, and its batch keeps the frame clock awake. Neither is released by the
-    // overlays going away unless the drop says so.
+    // A pending delay outlives the stack twice over: its id stays claimed in the model, and
+    // its batch keeps the frame clock awake. The drop releases both.
     let mut patch = fixture();
     let mut focus = FocusRing::default();
 

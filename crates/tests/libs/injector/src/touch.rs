@@ -1,34 +1,30 @@
-//! The touch stream, and the instrument the fidelity contracts are asserted on.
+//! The touch stream, which the fidelity contracts are asserted on.
 //!
-//! Touch is the best device here to test with, for reasons that are properties of the device
-//! rather than preferences: a contact **carries its own screen position**, so it is exact by
-//! construction with no normalization to invert, and it arrives on a device of its own, so
-//! **nothing a person does at the machine can interfere with it**. Where a claim can be made
-//! on touch it is made on touch; mouse is for the things only a mouse produces.
+//! A touch contact carries its own screen position, so it is exact by construction with no
+//! normalization to invert, and it arrives on a device of its own, so no physical device at
+//! the machine interferes with it. Every claim that can be made on touch is made on touch;
+//! mouse covers what only a mouse produces.
 //!
-//! **This is the one stream that does not go through `InputInjector`**, and the reason is
-//! the boundary the whole crate is organised around ([`identity`](crate::identity)): the
-//! injection object's touch is a *virtual device*, which is brokered, and an unpackaged
-//! process cannot create one — the calls succeed and deliver nothing. `InitializeTouchInjection`
-//! and `InjectTouchInput` are the older desktop path, need no device, and deliver.
+//! This is the one stream that does not go through `InputInjector`. That object's touch is a
+//! virtual device, which is brokered, and an unpackaged process cannot create one: the calls
+//! succeed and deliver nothing ([`identity`](crate::identity)). `InitializeTouchInjection`
+//! and `InjectTouchInput` need no device and deliver unpackaged.
 //!
-//! **Every injected call carries the whole live contact set.** That is the platform's rule
-//! and not a convenience: a frame that omits a contact still down ends that contact, so a
-//! two-finger gesture written as two independent one-finger streams is a gesture that cancels
-//! itself on the second call. The stream owns the contact table and assembles the frame,
-//! which is why moving one contact holds the others where they are.
+//! Every injected call carries the whole live contact set. A frame that omits a contact still
+//! down ends that contact, so a two-finger gesture written as two independent one-finger
+//! streams cancels itself on the second call. The stream owns the contact table and assembles
+//! the frame, so moving one contact holds the others where they are.
 //!
 //! The API is two levels for that reason. [`set`](TouchStream::set), [`lift`] and [`abort`]
-//! *stage* a contact, [`frame`] delivers one frame carrying all of them, and the
-//! single-contact methods are that pair spelled once. A pinch cannot be written any other way
-//! — both fingers have to move in the same frame or the gesture is two drags.
+//! stage a contact, [`frame`] delivers one frame carrying all of them, and the single-contact
+//! methods pair the two. A pinch has to be written with the staged level, because both
+//! fingers move in one frame or the gesture is two drags.
 //!
-//! Two rules the platform's own contract decides here, both found by it refusing. Injected
-//! touch has exactly six legal flag combinations, so a contact cannot be given
-//! `POINTER_FLAG_CONFIDENCE` at all — **palm rejection is not reachable from an injected
-//! stream**, and a test for it needs a real digitizer. And an `UP` frame must repeat the
-//! position of the frame before it, or the injection fails and every live contact is
-//! cancelled, which is why [`lift`] takes no point.
+//! Two limits come from the platform's own contract. Injected touch has exactly six legal
+//! flag combinations, and none of them admits `POINTER_FLAG_CONFIDENCE`, so palm rejection is
+//! not reachable from an injected stream and a test for it needs a real digitizer. And an
+//! `UP` frame must repeat the position of the frame before it, or the injection fails and
+//! every live contact is cancelled, which is why [`lift`] takes no point.
 //!
 //! [`lift`]: TouchStream::lift
 //! [`abort`]: TouchStream::abort
@@ -40,13 +36,14 @@ use crate::bindings::*;
 use crate::space::Point;
 use crate::{Error, Injector, Rate, Result};
 
-/// The refusal [`inject`] is allowed to retry, and the only one.
+/// The one refusal [`inject`] retries.
 const NOT_READY: WIN32_ERROR = WIN32_ERROR(ERROR_NOT_READY as u32);
 
-/// The contact box a finger is given, in DIPs, unless the caller says otherwise.
+/// The default width of a contact box, in DIPs.
 ///
-/// Touch-target sizing reads the contact rectangle, so a harness that injected a 2-pixel dot
-/// would be testing the inflation rule against a contact no finger makes.
+/// Touch-target sizing reads the contact rectangle, so this is the width of a finger rather
+/// than of a point: a 2-pixel dot would exercise the inflation rule against a contact no
+/// finger makes.
 const CONTACT_DIPS: f32 = 8.0;
 
 /// Where one contact is in the frame about to be injected.
@@ -92,10 +89,11 @@ pub struct TouchStream<'a> {
 
 impl<'a> TouchStream<'a> {
     pub(crate) fn open(injector: &'a mut Injector, contacts: u32) -> Result<Self> {
-        // Process-wide, and raised rather than reset: a narrower stream opened later must not
-        // take contacts away from what the process already declared it can inject.
+        // The contact count is process-wide, so it is raised and never lowered: a narrower
+        // stream opened later must not take contacts away from what the process declared.
         if contacts > injector.touch_max {
-            // SAFETY: a count and a mode, both by value.
+            // SAFETY: a count and a mode, both passed by value; no pointer crosses the
+            // boundary.
             unsafe { InitializeTouchInjection(contacts, TOUCH_FEEDBACK_NONE as u32) }
                 .ok()
                 .map_err(|e| Error::call("InitializeTouchInjection", e))?;
@@ -115,13 +113,13 @@ impl<'a> TouchStream<'a> {
         })
     }
 
-    /// How wide a contact reports itself, in DIPs.
+    /// Sets how wide a contact reports itself, in DIPs.
     pub fn contact_dips(&mut self, dips: f32) -> &mut Self {
         self.contact_dips = dips;
         self
     }
 
-    /// How hard a contact reports itself, from 0 to 1.
+    /// Sets how hard a contact reports itself, from 0 to 1. Values outside that range clamp.
     pub fn pressure(&mut self, pressure: f32) -> &mut Self {
         self.pressure = (pressure.clamp(0.0, 1.0) * 1024.0).round() as u32;
         self
@@ -151,9 +149,9 @@ impl<'a> TouchStream<'a> {
 
     /// Withdraws a contact, without injecting.
     ///
-    /// **A cancel is not an up.** It aborts the gesture rather than completing it, and no
-    /// value is committed — the distinction legacy mouse had no way to express, and the one
-    /// thing an injected contact can demonstrate that an injected mouse cannot.
+    /// A cancel is not an up: it aborts the gesture rather than completing it, so no value is
+    /// committed. Legacy mouse messages cannot express the distinction, and an injected mouse
+    /// stream cannot produce it.
     pub fn abort(&mut self, index: u32) -> Result<&mut Self> {
         self.ending(index, Phase::Cancel)
     }
@@ -210,8 +208,8 @@ impl<'a> TouchStream<'a> {
 
     /// Walks contact 0 along a path, one frame per point, at `rate`.
     ///
-    /// One call per sample, unlike a mouse path: a touch frame is a set of *contacts* rather
-    /// than a series in time, so there is nowhere in it to say when the next frame lands.
+    /// One frame per point: a touch frame is a set of contacts rather than a series in time,
+    /// so it carries no field stating when the next frame lands.
     pub fn polyline(&mut self, points: &[Point], rate: Rate) -> Result<&mut Self> {
         for point in points {
             self.set(0, *point)?.frame()?;
@@ -228,13 +226,13 @@ impl<'a> TouchStream<'a> {
 
     // ── Two contacts ──────────────────────────────────────────────────────────
 
-    /// Two contacts either side of `centre`, moving from a separation of `from` DIPs to `to`
+    /// Moves two contacts either side of `centre` from a separation of `from` DIPs to `to`
     /// DIPs, one frame per step.
     ///
-    /// The step count is not a constant: it is chosen so that **no contact moves more than one
-    /// DIP between frames**, which keeps the path continuous at the resolution the recogniser
-    /// measures in. A pinch expressed in a fixed number of steps is a pinch whose fidelity
-    /// depends on how far it happened to travel.
+    /// The step count is derived from the distance so that no contact moves more than one DIP
+    /// between frames, which keeps the path continuous at the resolution the recogniser
+    /// measures in. Returns [`Error::Contact`] if the stream was opened with fewer than two
+    /// contacts.
     pub fn pinch(
         &mut self,
         centre: impl Into<Point>,
@@ -282,8 +280,8 @@ impl<'a> TouchStream<'a> {
 impl Drop for TouchStream<'_> {
     /// Lifts anything the caller left down.
     ///
-    /// A digitizer the system believes still has three fingers on it is a digitizer every
-    /// later test in the process inherits.
+    /// Without this the system believes those contacts are still on the digitizer, and every
+    /// later test in the process inherits them.
     fn drop(&mut self) {
         let live: Vec<u32> = self
             .slots
@@ -302,17 +300,17 @@ impl Drop for TouchStream<'_> {
     }
 }
 
-/// Delivers one frame, retrying the documented refusal and nothing else.
+/// Delivers one frame, retrying `ERROR_NOT_READY` and no other failure.
 ///
 /// Two frames landing inside the same tenth of a millisecond are refused with
-/// `ERROR_NOT_READY`, and the API's own instruction is to send the same frame again — the
-/// injection is not invalidated, it simply has not happened yet. This is the one retry in the
-/// crate, and it repeats a call that delivered nothing rather than adding a sample. Every
-/// other failure is returned.
+/// `ERROR_NOT_READY`, and the documented response is to send the same frame again: the
+/// injection has not happened, so the retry repeats a call that delivered nothing rather than
+/// adding a sample. Every other failure is returned.
 fn inject(frame: &[POINTER_TOUCH_INFO]) -> Result<()> {
     const ATTEMPTS: u32 = 8;
     for attempt in 1..=ATTEMPTS {
-        // SAFETY: a contiguous run of fully initialized records of the declared length.
+        // SAFETY: `frame` is a slice, so it is a contiguous run of initialized records, and
+        // the count passed is its own length.
         if unsafe { InjectTouchInput(frame.len() as u32, frame.as_ptr()) }.as_bool() {
             return Ok(());
         }

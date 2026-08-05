@@ -1,10 +1,9 @@
-//! A synthetic pointer device, and the one thing that must happen when a stream ends.
+//! An owned synthetic pointer device, destroyed when its stream ends.
 //!
-//! A device that outlives its stream is not merely untidy. A live synthetic device is a
-//! device the system believes is attached, and the v1 one was observed emitting a
+//! A live synthetic device is one the system believes is attached: a v1 device emits a
 //! continuous no-op legacy mouse move at the resting cursor position for as long as it
-//! existed — which lands in the count of the very thing a legacy-message test asserts.
-//! So the handle is owned, and `Drop` is what destroys it.
+//! exists, which lands in the count a legacy-message test asserts on. `Drop` destroys the
+//! handle, so no device outlives the stream that created it.
 
 use crate::bindings::*;
 use crate::late::Late;
@@ -16,13 +15,13 @@ pub(crate) struct Device {
 }
 
 impl Device {
-    /// Creates a device of `kind` with `max` contacts, sized `width_mm` × `height_mm`.
+    /// Creates a device of `kind` with `max` contacts, `size_mm` millimetres across when a
+    /// size is given, in `feedback` mode, gesture-only when `gesture_only` is set.
     ///
-    /// The physical size is not optional for a touchpad and is what v1 could not express,
-    /// which is the whole reason this crate resolves v2 by hand. It is stated in himetric
-    /// — hundredths of a millimetre — because that is the unit the parameter block and the
-    /// injected sample's `ptHimetricLocation` both use, so a size and a position stated in
-    /// the same unit cannot disagree.
+    /// A touchpad must state a physical size, which `CreateSyntheticPointerDevice` v1 has no
+    /// parameter for. The size is converted to himetric — hundredths of a millimetre — which
+    /// is the unit the parameter block and the injected sample's `ptHimetricLocation` share,
+    /// so a size and a position cannot be stated in different units.
     pub(crate) fn new(
         late: &Late,
         kind: POINTER_INPUT_TYPE,
@@ -45,9 +44,8 @@ impl Device {
             pointerType: kind,
             maxCount: max,
             feedbackMode: feedback,
-            // Null maps the device to the virtual desktop, which is mandatory for a
-            // touchpad and is what a harness that must reach a window on any display wants
-            // for the other two.
+            // Null maps the device to the whole virtual desktop: mandatory for a touchpad,
+            // and what lets the other device kinds reach a window on any display.
             hMonitor: core::ptr::null_mut(),
             deviceWidth: width,
             deviceHeight: height,
@@ -62,8 +60,9 @@ impl Device {
 
     /// Injects one frame: every contact the device currently has, in order.
     pub(crate) fn inject(&self, frame: &[POINTER_TYPE_INFO]) -> Result<()> {
-        // SAFETY: `handle` is live for the life of this value, and the slice is a
-        // contiguous run of fully initialized records of the declared length.
+        // SAFETY: `handle` is destroyed only in `Drop`, so it is live for the life of this
+        // value; `frame` is a slice, so it is a contiguous run of initialized records and
+        // the count passed is its own length.
         unsafe { InjectSyntheticPointerInput(self.handle, frame.as_ptr(), frame.len() as u32) }
             .ok()
             .map_err(|e| Error::call("InjectSyntheticPointerInput", e))
@@ -72,7 +71,8 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // SAFETY: created by this type, destroyed exactly once.
+        // SAFETY: `Device::new` is the only producer of this handle and the value is not
+        // `Copy`, so this is the one destroy for it.
         unsafe { DestroySyntheticPointerDevice(self.handle) }
     }
 }

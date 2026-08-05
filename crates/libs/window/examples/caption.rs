@@ -1,14 +1,15 @@
-//! A composition-hosted window with a caption of its own, driven and reported on.
+//! Drives a composition-hosted window that draws a caption of its own, and reports what
+//! each probe answered.
 //!
 //! Removing the system caption removes none of its behaviour: with no title bar, no
 //! redirection surface and no content, the window still answers the eight resize zones at
 //! its monitor's own frame widths, opens the window menu, drags from the bar, and keeps its
 //! client area inside the work area when maximized.
 //!
-//! Every answer is the window's own, asked with `WM_NCHITTEST` as the system asks it, and
-//! every button is driven with real injected input — the caption reads `WM_NCPOINTER*` and
-//! asks which button changed, so a synthesized message has nothing behind it to answer
-//! with. Snap Layouts is measured by `examples/nc_input` instead.
+//! Each hit answer is the window's own, asked with `WM_NCHITTEST` as the system asks it,
+//! and each button is driven with injected input: the caption reads `WM_NCPOINTER*` and
+//! asks `GetPointerInfo` which button changed, so a synthesized message carries no pointer
+//! to answer about. The `nc_input` example measures Snap Layouts.
 //!
 //! The bar's contents stand in for the hit array a real application owns: one rectangle at
 //! the left is a control, the three at the right are the window commands, everything else
@@ -33,10 +34,11 @@ const BAR_H: f32 = 32.0;
 const CONTROL_W: f32 = 120.0;
 const BUTTON_W: f32 = 46.0;
 
-/// Pumps for `ms`, so injected input is delivered before the next question is asked.
+/// Pumps for `ms` milliseconds, so injected input reaches the window before the next probe
+/// asks about it.
 ///
-/// `SendInput` returns once the event is queued, not once the window has seen it. Pumping
-/// rather than sleeping: the messages have to be dispatched for anything to change.
+/// `SendInput` returns once the event is queued, not once the window has seen it, and a
+/// queued message changes nothing until it is dispatched.
 fn settle(ms: u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     while std::time::Instant::now() < deadline {
@@ -49,9 +51,9 @@ fn main() -> Result<()> {
     let hold = std::env::args().any(|a| a == "--hold");
 
     let state_changes = Rc::new(Cell::new(0u32));
-    // What the system actually delivers while the pointer sits on a caption button. Only a
-    // tally, and only so that a hover that does not arrive can be told apart from one that
-    // arrives by a route this crate is not reading.
+    // Counts what the system delivers while the pointer sits on a caption button, so a
+    // hover that never arrives can be told apart from one arriving by a route this crate
+    // does not read.
     let tally = Rc::new(Cell::new([0u32; 6]));
     let window = Window::new("windows-window — a caption of its own")
         .size_dips(900.0, 600.0)
@@ -78,8 +80,8 @@ fn main() -> Result<()> {
         .no_redirection_bitmap()
         .pointer_input()
         .touchpad_capable()
-        // The one decision this example makes about system-drawn feedback, so that the
-        // call is exercised rather than merely compiled.
+        // Suppresses the system's touch-contact visual; every other feedback stays as the
+        // system draws it.
         .feedback(FeedbackPolicy::SYSTEM.without(Feedback::TouchContact))
         .custom_caption(CaptionSpec {
             height: Some(BAR_H),
@@ -88,8 +90,8 @@ fn main() -> Result<()> {
         })
         .create()?;
 
-    // The stand-in hit array. A real one is the layout's flat array; the shape of the
-    // answer is the same either way.
+    // The stand-in hit array. A real application answers from its layout's flat array; the
+    // answer has the same shape either way.
     let width_dips = Cell::new(0.0f32);
     window
         .on_caption_hit(move |x, y| {
@@ -112,12 +114,11 @@ fn main() -> Result<()> {
         })
         .expect("a window with a caption of its own");
 
-    // The last state the window published, which is what the assertions below read.
+    // The last caption state the window published, which the findings read.
     let last_state = Rc::new(Cell::new(CaptionState::default()));
-    // Whether a hover was ever reported. Sticky, and reset before the arm that reads it:
-    // moving the pointer to the next probe point publishes a leave behind the finding, so
-    // reading the *latest* state after the fact would read that leave rather than the hover
-    // it is asking about.
+    // Whether a hover was ever reported. Sticky, and cleared before the arm that reads it:
+    // moving the pointer to the next probe point publishes a leave, so the latest state
+    // read after the fact carries that leave rather than the hover being asked about.
     let hover_seen = Rc::new(Cell::new(false));
     {
         let state_changes = Rc::clone(&state_changes);
@@ -135,14 +136,14 @@ fn main() -> Result<()> {
             .expect("a window with a caption of its own");
     }
 
-    // The bar's own width, which the closure above needs and which is only known once the
-    // window has a size. Re-read on every probe rather than cached, because a DPI change
-    // moves it.
+    // The bar's own width in DIPs, which the hit closure needs and which is only known once
+    // the window has a size. The closure captures it, so a resize moves the bar's real
+    // width away from it.
     let metrics = window.metrics().expect("an open window");
     let (client_w, client_h) = window.client_size().expect("an open window");
     let dips_w = metrics.dips(client_w);
-    // Re-install now that the width is known. Installing twice is the documented
-    // behaviour: the second replaces the first.
+    // Re-installs the hit closure now that the width is known; the second installation
+    // replaces the first.
     window
         .on_caption_hit(move |x, y| {
             if y >= BAR_H || x < CONTROL_W {
@@ -256,11 +257,11 @@ fn main() -> Result<()> {
         "frame widths from GetSystemMetricsForDpi; the bar from the hit authority".into(),
     ));
 
-    // ── what a REAL hover delivers on a window that asked for pointer input ──────────
+    // ── what a real hover delivers on a window that asked for pointer input ──────────
     //
-    // The arms above were driven with sent messages, which proves the caption's handling
-    // and proves nothing about what Windows sends. This moves the actual pointer, and
-    // counts what arrives. It is the question of whether any legacy mouse path is left.
+    // The probes so far were sent messages, which exercise the caption's handling and not
+    // what Windows itself sends. This arm moves the pointer with injected input and counts
+    // what arrives, which is what shows whether a legacy mouse path is left.
     let restore = probe::cursor_position();
     probe::place_on_top(&window, 200, 200, client_w, client_h);
     for _ in 0..10 {
@@ -295,8 +296,8 @@ fn main() -> Result<()> {
     ] {
         println!("    {name:<22} {count}");
     }
-    // And the same question for the client area, which is the half `EnableMouseInPointer`
-    // is actually about.
+    // The same counts over the client area, which is the half `EnableMouseInPointer`
+    // governs.
     let (client_x, client_y) = (
         origin_now.0 + client_w / 2,
         origin_now.1 + metrics.px(BAR_H) + 100,
@@ -321,17 +322,13 @@ fn main() -> Result<()> {
         println!("    {name:<22} {count}");
     }
 
-    // The caption's input arrives as pointer input. That is the assertion.
-    //
-    // It is deliberately **not** "and no legacy message arrives", because they do and
-    // always will: the system re-posts `WM_NCMOUSEMOVE` at a fixed coordinate for as long
-    // as the cursor rests in the non-client area, with no new pointer input behind it.
-    // That hover-tracking loop is a separate generator from `DefWindowProc`'s
-    // pointer-to-mouse promotion, and consuming the pointer message stops the second
-    // without touching the first. Asserting zero here passes only by hovering for less
-    // time than the repeat interval, which is a measurement of the probe.
-    //
-    // The count is reported so the number is visible, and so a change in it is noticed.
+    // The finding is that the caption's input arrives as pointer input, not that no legacy
+    // message arrives. The system re-posts `WM_NCMOUSEMOVE` at a fixed coordinate for as
+    // long as the cursor rests in the non-client area, with no new pointer input behind
+    // it. That hover-tracking loop is a separate generator from `DefWindowProc`'s
+    // pointer-to-mouse promotion, and consuming the pointer message stops the promotion
+    // without touching the tracking, so a zero legacy count would only mean the hover was
+    // shorter than the repeat interval. Both counts are reported instead.
     findings.push((
         "the caption's own input is pointer input",
         on_top && counts[3] > 0,
@@ -343,8 +340,8 @@ fn main() -> Result<()> {
 
     // ── the caption buttons: hover, press, and what a release commits ────────────────
     //
-    // Driven with real input over the real button rects. On top first, or the findings
-    // describe the terminal that launched this.
+    // Driven with injected input over the button rects. The window goes on top first, or
+    // the findings describe the terminal that launched this.
     probe::place_on_top(&window, 200, 200, client_w, client_h);
     settle(150);
     let origin_now = probe::client_origin(&window);
@@ -396,9 +393,9 @@ fn main() -> Result<()> {
 
     // ── what the hit test costs, since it runs per pointer move ──────────────────────
     //
-    // `WM_NCHITTEST` is not on the frame clock — the system wants a synchronous answer
-    // every time the pointer moves — so the metrics query behind it is measured rather
-    // than asserted to be cheap.
+    // The system wants a synchronous answer to `WM_NCHITTEST` on every pointer move, off
+    // the frame clock, so the metrics query behind it is measured here rather than assumed
+    // cheap.
     let start = std::time::Instant::now();
     let mut sink = 0i32;
     for _ in 0..100_000 {
@@ -408,7 +405,7 @@ fn main() -> Result<()> {
     println!("\n  Metrics::for_window: {per_query:.0} ns per query (sink {sink})");
 
     // ── maximized: no resize edges, and the client stays on the work area ────────────
-    // Already maximized, by the button above.
+    // The window is already maximized: its own maximize button committed the press.
     windows_window::pump();
     std::thread::sleep(std::time::Duration::from_millis(200));
     windows_window::pump();
@@ -430,9 +427,9 @@ fn main() -> Result<()> {
         format!("overhang l/t/r/b {overhang:?}"),
     ));
 
-    // The bar is drawn at the client's top edge, so a maximized client that starts below
-    // the work area's top edge leaves a band of nothing above it — the classic defect of a
-    // custom caption that keeps `DefWindowProc`'s whole maximized inset.
+    // The bar is drawn at the client's top edge, so a maximized client starting below the
+    // work area's top edge leaves an empty band above it. That is what keeping
+    // `DefWindowProc`'s whole maximized inset produces.
     let maximized_gap = probe::client_origin(&window).1 - probe::work_area(&window).1;
     findings.push((
         "a maximized window's bar starts at the top of the work area",
@@ -484,8 +481,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Everything this example needs to *ask* the window questions, and nothing it needs to
-/// answer them. Kept apart so the body above reads as the experiment it is.
+/// The raw Win32 this example questions the window with: window and client rects, hit
+/// tests, injected input, and monitor geometry.
 mod probe {
     use windows_window::Window;
 
@@ -518,8 +515,8 @@ mod probe {
 
     type Hwnd = *mut core::ffi::c_void;
 
-    // Declared here rather than reached through the crate: an example is allowed the
-    // literal rects and raw queries that the framework's own source is linted against.
+    // Declared here rather than taken from the crate: the crate's own source is linted
+    // against literal rects and raw queries, and an example is not.
     #[link(name = "user32", kind = "raw-dylib")]
     unsafe extern "system" {
         fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
@@ -558,30 +555,39 @@ mod probe {
     const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
     const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
+    /// Returns the window's outer rectangle in screen coordinates.
     pub fn window_rect(window: &Window) -> (i32, i32, i32, i32) {
         let mut rect = Rect::default();
+        // SAFETY: `GetWindowRect` accepts any handle value and writes only through `rect`,
+        // a live stack local of the size it expects.
         unsafe { GetWindowRect(window.hwnd(), &mut rect) };
         (rect.left, rect.top, rect.right, rect.bottom)
     }
 
+    /// Returns the window's client origin in screen coordinates.
     pub fn client_origin(window: &Window) -> (i32, i32) {
         let mut point = Point::default();
+        // SAFETY: `ClientToScreen` accepts any handle value and writes only through
+        // `point`, a live stack local of the size it expects.
         unsafe { ClientToScreen(window.hwnd(), &mut point) };
         (point.x, point.y)
     }
 
-    /// Asks the window the same question the system asks, at a screen point.
+    /// Returns the name of the `HT*` code the window answers for a screen point, asked as
+    /// the system asks it.
     pub fn hit_test(window: &Window, x: i32, y: i32) -> &'static str {
         let lparam = ((y as u32 as isize) << 16) | (x as u32 as isize & 0xffff);
+        // SAFETY: `SendMessageW` accepts any handle value, and `WM_NCHITTEST` reads the
+        // point out of `lparam` rather than through a pointer.
         let code = unsafe { SendMessageW(window.hwnd(), WM_NCHITTEST, 0, lparam) } as i32;
         name(code)
     }
 
-    /// Sends a non-client mouse message carrying a hit-test code, as the system does.
-    /// Presses or releases the primary button, as a real input event.
+    /// Presses or releases the primary button as an injected input event.
     ///
-    /// A synthesized `WM_NCLBUTTONDOWN` cannot drive the caption: it asks `GetPointerInfo`
-    /// which button changed, and a hand-built message carries no pointer to answer about.
+    /// A synthesized `WM_NCLBUTTONDOWN` cannot drive the caption: the caption asks
+    /// `GetPointerInfo` which button changed, and a hand-built message carries no pointer
+    /// to answer about.
     pub fn mouse_button(down: bool) {
         const INPUT_MOUSE: u32 = 0;
         const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;
@@ -598,6 +604,8 @@ mod probe {
                 ..Default::default()
             },
         };
+        // SAFETY: `SendInput` reads `size_of::<Input>()` bytes from `input`, a live local
+        // whose `#[repr(C)]` layout is the `INPUT` it expects, and the size passed says so.
         unsafe { SendInput(1, &input, size_of::<Input>() as i32) };
     }
 
@@ -608,12 +616,17 @@ mod probe {
     pub fn place_on_top(window: &Window, x: i32, y: i32, w: i32, h: i32) {
         const HWND_TOPMOST: isize = -1;
         const SWP_NOACTIVATE: u32 = 0x0010;
+        // SAFETY: `SetWindowPos` accepts any handle value and takes only integers besides
+        // it.
         unsafe { SetWindowPos(window.hwnd(), HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE) };
     }
 
+    /// Leaves the always-on-top band, keeping the window's position and size.
     pub fn drop_topmost(window: &Window) {
         const HWND_NOTOPMOST: isize = -2;
         const SWP_NOMOVE_NOSIZE_NOACTIVATE: u32 = 0x0002 | 0x0001 | 0x0010;
+        // SAFETY: `SetWindowPos` accepts any handle value and takes only integers besides
+        // it.
         unsafe {
             SetWindowPos(
                 window.hwnd(),
@@ -627,8 +640,11 @@ mod probe {
         };
     }
 
+    /// Returns the pointer's current screen position.
     pub fn cursor_position() -> (i32, i32) {
         let mut point = Point::default();
+        // SAFETY: `GetCursorPos` writes only through `point`, a live stack local of the
+        // size it expects.
         unsafe { GetCursorPos(&mut point) };
         (point.x, point.y)
     }
@@ -652,13 +668,11 @@ mod probe {
         mi: MouseInput,
     }
 
-    /// Moves the pointer with a real input event. It is the user's, so every caller puts
-    /// it back.
+    /// Moves the pointer to a screen point with an injected input event.
     ///
-    /// `SendInput` and not `SetCursorPos`: the two are not the same instrument. A cursor
-    /// warp moves the pointer and lets the window manager notice, where this injects an
-    /// event into the input stack — which is the only one of the two that can answer what
-    /// the input stack does with it.
+    /// The pointer is the user's, so every caller restores its position. `SetCursorPos`
+    /// warps the cursor and lets the window manager notice, where `SendInput` puts an event
+    /// through the input stack, which is what these probes measure.
     pub fn move_cursor(x: i32, y: i32) {
         const INPUT_MOUSE: u32 = 0;
         const MOUSEEVENTF_MOVE: u32 = 0x0001;
@@ -668,6 +682,9 @@ mod probe {
         const SM_YVIRTUALSCREEN: i32 = 77;
         const SM_CXVIRTUALSCREEN: i32 = 78;
         const SM_CYVIRTUALSCREEN: i32 = 79;
+        // SAFETY: `GetSystemMetrics` takes an index and returns an integer. `SendInput`
+        // reads `size_of::<Input>()` bytes from `input`, a live local whose `#[repr(C)]`
+        // layout is the `INPUT` it expects, and the size passed says so.
         unsafe {
             let (vx, vy) = (
                 GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -691,26 +708,35 @@ mod probe {
         }
     }
 
-    /// Which window is on top at a screen point — the check that says whether a hover
-    /// probe measured the window or measured whatever was covering it.
+    /// Returns whether `window` is the topmost one at a screen point, which is what
+    /// separates a hover probe of the window from one of whatever covers it.
     pub fn is_on_top(window: &Window, x: i32, y: i32) -> bool {
+        // SAFETY: `WindowFromPoint` takes its point by value, and the handle it returns is
+        // compared rather than dereferenced.
         unsafe { WindowFromPoint(Point { x, y }) == window.hwnd() }
     }
 
+    /// Returns whether the window is maximized.
     pub fn is_maximized(window: &Window) -> bool {
+        // SAFETY: `IsZoomed` accepts any handle value and reads no memory through it.
         unsafe { IsZoomed(window.hwnd()) != 0 }
     }
 
+    /// Sends the window a `WM_SYSCOMMAND`.
     pub fn system_command(window: &Window, command: usize) {
+        // SAFETY: `SendMessageW` accepts any handle value, and `WM_SYSCOMMAND` carries the
+        // command in `wparam` rather than a pointer.
         unsafe { SendMessageW(window.hwnd(), WM_SYSCOMMAND, command, 0) };
     }
 
-    /// The monitor's work area, in screen coordinates.
+    /// Returns the monitor's work area, in screen coordinates.
     pub fn work_area(window: &Window) -> (i32, i32, i32, i32) {
         let mut info = MonitorInfo {
             size: size_of::<MonitorInfo>() as u32,
             ..Default::default()
         };
+        // SAFETY: `MonitorFromWindow` accepts any handle value, and `info.size` is set to
+        // the struct's own size, which is what bounds `GetMonitorInfoW`'s write into it.
         unsafe {
             let monitor = MonitorFromWindow(window.hwnd(), MONITOR_DEFAULTTONEAREST);
             GetMonitorInfoW(monitor, &mut info);
@@ -723,17 +749,22 @@ mod probe {
         )
     }
 
-    /// How far the client area sticks out past the monitor's work area, if at all.
+    /// Returns how far the client area extends past the monitor's work area on each edge,
+    /// or zero for an edge inside it.
     pub fn work_area_overhang(window: &Window) -> (i32, i32, i32, i32) {
         let mut info = MonitorInfo {
             size: size_of::<MonitorInfo>() as u32,
             ..Default::default()
         };
+        // SAFETY: `MonitorFromWindow` accepts any handle value, and `info.size` is set to
+        // the struct's own size, which is what bounds `GetMonitorInfoW`'s write into it.
         unsafe {
             let monitor = MonitorFromWindow(window.hwnd(), MONITOR_DEFAULTTONEAREST);
             GetMonitorInfoW(monitor, &mut info);
         }
         let mut client = Rect::default();
+        // SAFETY: `GetClientRect` accepts any handle value and writes only through
+        // `client`, a live stack local of the size it expects.
         unsafe { GetClientRect(window.hwnd(), &mut client) };
         let (ox, oy) = client_origin(window);
         let work = info.work;
@@ -745,8 +776,11 @@ mod probe {
         )
     }
 
+    /// Returns DWM's extended frame bounds for the window, and whether DWM reported them.
     pub fn extended_frame(window: &Window) -> ((i32, i32, i32, i32), bool) {
         let mut rect = Rect::default();
+        // SAFETY: `DWMWA_EXTENDED_FRAME_BOUNDS` reports a `RECT`, and the size passed is
+        // `size_of::<Rect>()`, which is what bounds the write into `rect`.
         let hr = unsafe {
             DwmGetWindowAttribute(
                 window.hwnd(),

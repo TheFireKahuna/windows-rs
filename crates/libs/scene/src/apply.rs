@@ -1,10 +1,11 @@
-//! Patch application. **Front half.**
+//! Applies a [`SinkPatch`] to the front half's retained tree.
 //!
-//! Strictly in order, which is what the seam rests on: one emitter upstream is one
-//! ordering authority, so a slot freed by a destroy can be reused by a create *in the same
-//! patch*, and a resource re-pointed mid-patch is seen by every sprite that binds it after.
+//! Ops are applied strictly in order, so a slot freed by a destroy can be reused by a create
+//! *in the same patch*, and a resource re-pointed mid-patch is seen by every sprite that binds
+//! it afterwards.
 //!
-//! Every span is read through the patch's own bounds check, once, here — not at each use.
+//! Every span is read through the patch's own bounds check, once, here rather than at each
+//! use.
 
 use crate::Scene;
 use crate::backends::Backends;
@@ -22,20 +23,22 @@ use windows_core::Result;
 use windows_numerics::Vector3;
 
 impl Scene {
-    /// Applies a patch under `env`, and reports whether the tick changed anything.
+    /// Applies a patch under `env` and reports whether anything changed.
     ///
-    /// `&mut` on the patch is the pooling: the caller gets its allocations back.
+    /// On success the patch is cleared and keeps its buffers, so the caller reuses the
+    /// allocations. [`sync`](Scene::sync) runs first and rebinds whatever a display move
+    /// invalidated, so no op is applied against a raster built for another display. `false`
+    /// means the tick wrote nothing, so something requested a frame it did not need.
     ///
-    /// The environment is stated here rather than pushed in advance, so a display that
-    /// moved cannot be applied against stale rasters — [`sync`](Scene::sync) runs first and
-    /// rebinds whatever the move invalidated. Answering `false` on a woken tick means
-    /// something requested a frame it did not need, which is the one shape of idle waste
-    /// this crate cannot see from the inside.
+    /// # Errors
+    ///
+    /// Propagates the compositor's failure from any op in the patch. The ops before the
+    /// failing one have been applied, and the patch is left unchanged.
     pub fn apply(&mut self, patch: &mut SinkPatch, back: &Backends, env: Env) -> Result<bool> {
         let before = self.census;
-        // Geometry solved under a different display than the one being applied to. The
-        // scene still syncs to `env` — the rasters must match the display that is actually
-        // there — so this is recorded, not refused. See `Census::env_mismatches`.
+        // Geometry solved under a different display than the one being applied to. The scene
+        // still syncs to `env`, because the rasters must match the display that is there, so
+        // the divergence is counted in `Census::env_mismatches` rather than refused.
         if patch.env().is_some_and(|solved| solved != env) {
             self.census.env_mismatches += 1;
         }
@@ -98,10 +101,11 @@ impl Scene {
 
     // ── structure ─────────────────────────────────────────────────────────────────
 
-    /// The **one** place in the crate that branches on node kind.
+    /// Mints the composition object `kind` names and links it under `parent`.
     ///
-    /// A sprite visual *is* a container visual, so everything below treats them alike: the
-    /// destroy, the reorder, the bind and the device-loss rebind lose a two-arm match.
+    /// The one place in the crate that branches on node kind: a sprite visual *is* a
+    /// container visual, so the destroy, the reorder, the bind and the device-loss rebind all
+    /// treat the two alike.
     fn new_node(
         &mut self,
         id: NodeId,
@@ -123,9 +127,8 @@ impl Scene {
         self.nodes.place(id, node);
         self.census.visuals_minted += 1;
         self.census.visuals_live += 1;
-        // Attached before the counters are believed: a node in the arena that is not
-        // in the visual tree is the one state that renders nothing and reports
-        // success, so the failure has to reach the caller.
+        // A node in the arena but not in the visual tree renders nothing and reports success,
+        // so a failed link is returned rather than swallowed.
         self.link(id, parent, after)
     }
 
@@ -134,10 +137,10 @@ impl Scene {
         self.link(id, Attach::Node(parent), after)
     }
 
-    /// Parents `id` under `parent`, above `after`, in the compositor and in the arena.
+    /// Parents `id` under `parent`, above `after`, in the compositor and then in the arena.
     ///
-    /// In that order: the chain mirrors what the compositor holds, so if the collection
-    /// insert cannot happen the chain must not claim it did.
+    /// In that order, because the arena chain mirrors what the compositor holds: a collection
+    /// insert that cannot happen must not leave the chain claiming it did.
     fn link(&mut self, id: NodeId, parent: Attach, after: Option<NodeId>) -> Result<()> {
         let visual = self
             .nodes
@@ -188,8 +191,8 @@ impl Scene {
         // it as a root rather than as anyone's child.
         let children = if parent.is_none() {
             self.roots.retain(|root| *root != id);
-            // Either band; `try_remove` on the one it is not in is a no-op, and asking
-            // which would mean keeping a second record of what the tree already knows.
+            // The node is in one band or the other; `try_remove` on the band it is not in is
+            // a no-op, so neither band's membership is recorded a second time.
             let _ = self.content.children().try_remove(&visual);
             Some(self.overlays.children())
         } else {
@@ -200,13 +203,13 @@ impl Scene {
         };
         if let Some(children) = children {
             // Fallible: a caller can hold a node whose parent was torn down between two
-            // operations, and "already gone" is the goal state.
+            // operations, and already-removed is the wanted state.
             let _ = children.try_remove(&visual);
         }
         crate::tree::unlink(&mut self.nodes, id);
     }
 
-    /// Destroys a node **and its subtree**, releasing every resource on the way down.
+    /// Destroys a node *and its subtree*, releasing every resource on the way down.
     fn drop_node(&mut self, id: NodeId, exit: Exit, back: &Backends, env: Env) -> Result<()> {
         self.unlink(id);
         if exit != Exit::None
@@ -219,7 +222,9 @@ impl Scene {
         Ok(())
     }
 
-    /// Depth is layout nesting, so this recurses on the chain rather than carrying a stack.
+    /// Destroys every node below `id`, then `id` itself.
+    ///
+    /// Recurses over the child chain; the depth it reaches is layout nesting.
     fn destroy_subtree(&mut self, id: NodeId) {
         let mut child = self.nodes.get(id).map_or(NodeId::NONE, |n| n.links.first);
         while let Some(node) = self.nodes.get(child) {
@@ -239,16 +244,16 @@ impl Scene {
 
     // ── values ────────────────────────────────────────────────────────────────────
 
-    /// Records half of a sprite's declaration and realizes the chain if it moved.
+    /// Records half of a sprite's declaration and realizes the chain if it changed.
     ///
     /// A mask and a paint arrive as separate ops in either order, so this records one and
-    /// rebuilds from *both*; a half-declared sprite waits.
+    /// rebuilds from *both*. A sprite with only one half recorded holds the default for the
+    /// other: no mask, and a transparent fill.
     ///
-    /// **A declaration that changed nothing rebuilds nothing.** The emitter states a
+    /// A declaration equal to the one already held rebuilds nothing. The emitter states a
     /// sprite's appearance without diffing it, so an unmoved control re-declares on every
-    /// flush that touches it — which without this costs a mask brush, two cache lookups and
-    /// a `set_brush` per sprite per frame at rest. The property shadow's idempotence, for
-    /// the half of a sprite that is not a channel.
+    /// flush that touches it, and the comparison here is what keeps that from costing a mask
+    /// brush, two cache lookups and a `set_brush` per sprite per frame at rest.
     fn declare(
         &mut self,
         id: SpriteId,
@@ -317,9 +322,8 @@ impl Scene {
     /// A clip is *declared*, so layout re-states it on every node it touches and most
     /// re-statements change nothing. Two shadows keep that free: the declaration itself,
     /// compared here, and the twelve channels, compared in [`prop::set`]. Only a change in
-    /// which *object* occupies the slot can move a shape mask between its two
-    /// constructions, so only that re-routes — a resize writes four sides and rebuilds
-    /// nothing.
+    /// which *object* occupies the slot can move a shape mask between its two constructions,
+    /// so only that re-routes — a resize writes four sides and rebuilds nothing.
     fn set_clip(&mut self, id: NodeId, clip: Clip, back: &Backends, env: Env) -> Result<()> {
         let Some(node) = self.nodes.get_mut(id) else {
             return Ok(());
@@ -349,16 +353,16 @@ impl Scene {
         Ok(())
     }
 
-    /// Writes the clip, and answers whether a different kind of object now occupies the
-    /// slot — which is the only thing a shape mask's route depends on.
+    /// Writes the clip and returns whether a different kind of object now occupies the slot,
+    /// which is what a shape mask's route depends on.
     fn write_clip(&mut self, id: NodeId, clip: Clip, back: &Backends) -> Result<bool> {
         match clip {
             Clip::None => {
                 let Some(node) = self.nodes.get_mut(id) else {
                     return Ok(false);
                 };
-                // Only what the *sink* established. A clip-route shape mask puts its
-                // geometric clip straight on the visual without claiming this slot, and
+                // Clears only what the *sink* established. A clip-route shape mask writes its
+                // geometric clip straight onto the visual without claiming this slot, and
                 // clearing that here would tear the mask down and rebuild it every pass.
                 if node.clip.is_none() {
                     return Ok(false);
@@ -367,10 +371,9 @@ impl Scene {
                 node.clip = None;
                 Ok(true)
             }
-            // The twelve values go through the one setter, one channel each. `set` already
-            // refuses a channel a tracker holds, skips one the shadow says is unchanged,
-            // and stops an animation before overwriting it. Re-stating those rules here is
-            // how the two drift apart.
+            // The twelve values go through the one setter, one channel each: `prop::set`
+            // refuses a channel a tracker holds, skips one the shadow says is unchanged, and
+            // stops an animation before overwriting it.
             Clip::Rect { l, t, r, b, radius } => {
                 let minted = self.mint_rect_clip(id, back);
                 let Some(node) = self.nodes.get_mut(id) else {
@@ -405,8 +408,8 @@ impl Scene {
                     return Ok(false);
                 };
                 node.visual.set_clip(Some(&clip));
-                // Soft, for an antialiased edge — the whole reason a geometric clip is
-                // usable as a shape at all.
+                // Soft border mode antialiases the clip edge, which is what makes a geometric
+                // clip usable as a shape.
                 node.visual.set_border_mode(BorderMode::Soft);
                 let replaced = node.clip.is_none();
                 node.clip = Some(ClipState::Geom(clip));
@@ -415,7 +418,8 @@ impl Scene {
         }
     }
 
-    /// Mints a rectangle clip if the node has none, leaving an existing one alone.
+    /// Mints a rectangle clip if the node has none, leaving an existing one alone, and
+    /// returns whether one was minted.
     fn mint_rect_clip(&mut self, id: NodeId, back: &Backends) -> bool {
         if self
             .nodes
@@ -428,9 +432,9 @@ impl Scene {
         let clip = back.compositor.create_rectangle_clip();
         if let Some(node) = self.nodes.get_mut(id) {
             node.visual.set_clip(Some(&clip));
-            // A fresh rectangle clip has every side at zero, which clips *everything* —
-            // unlike an inset clip's harmless default. So it is seeded to the node's own
-            // box, which is the identity a caller means by "a clip".
+            // A fresh rectangle clip has every side at zero, which clips *everything*, so it
+            // is seeded to the node's own box — the identity a caller means by an unclipped
+            // node.
             let (w, h) = (node.core[2], node.core[3]);
             node.clip = Some(ClipState::Rect {
                 clip,
@@ -445,29 +449,22 @@ impl Scene {
 
     /// Retargets a channel from the front thread, inside the tick that decided to.
     ///
-    /// The same property table, the same shadow and the same setter [`apply`](Scene::apply)
-    /// uses — so this is not a second writer, it is the same writer reached from the other
-    /// side. Nothing about it is speculative: `Model` is the app half and `SinkPatch` is
-    /// filled there, so without this the router can resolve a hover and then has no way to
-    /// move a pixel before the app thread next runs.
+    /// Writes through the same property table, shadow and setter as [`apply`](Scene::apply),
+    /// so the front thread is that same writer reached from the other side rather than a
+    /// second one. The app half fills a [`SinkPatch`] on its own thread, so without this path
+    /// the router resolves a hover and cannot move a pixel until the app thread next runs.
+    /// The app writing a channel claimed here is caught by a debug-only assertion.
     ///
-    /// A **fourth [`Bind`] variant was considered and rejected.** The obvious hazard — a
-    /// front write desynchronising an app-side shadow — does not exist: `Model::bind` is a
-    /// passthrough and the shadow is entirely front-side, on this thread. Declaring
-    /// delegation on the wire would be state saying what the architecture already
-    /// guarantees. What is left is the app and the router writing one channel, and that is
-    /// caught by a debug-only claim rather than encoded in the alphabet.
-    ///
-    /// `env` is stated rather than held, for the reason every other entry point states it:
-    /// a channel whose owner has to be minted first rasterizes, and a scene that cached the
-    /// display could be *not told* when the window hops one.
+    /// `env` is stated rather than held, for the reason every other entry point states it: a
+    /// channel whose owner has to be minted first rasterizes, and a scene that cached the
+    /// display could go untold when the window hops one.
     ///
     /// # Errors
     ///
-    /// `bind` is [`Anim::Frames`]. A key-frame curve's frames live in a patch's own buffer
-    /// and the front thread has no patch, so there is nothing to read them from — refused
-    /// rather than played empty, because an animation that silently holds still is
-    /// indistinguishable from one that was never started.
+    /// Refuses `bind` when it is [`Anim::Frames`]: a key-frame curve's frames live in a
+    /// patch's own buffer, and the front thread has no patch to read them from. Otherwise
+    /// propagates the compositor's failure from minting the channel's owner or rebinding the
+    /// sprite.
     pub fn retarget(
         &mut self,
         id: NodeId,
@@ -481,9 +478,9 @@ impl Scene {
         }
         #[cfg(debug_assertions)]
         self.front_owned.insert((id, prop));
-        // Empty, and not a cost: every buffer on a fresh patch is an unallocated `Vec`, and
-        // the one thing this path could read from one — a key-frame curve's frames — was
-        // refused above.
+        // A fresh patch allocates nothing: every one of its buffers is an empty `Vec`, and
+        // the one buffer this path could read from — a key-frame curve's frames — was refused
+        // above.
         let patch = SinkPatch::new();
         self.sync(back, env)?;
         self.bind_channel(id, prop, bind, &patch, back, env)
@@ -491,10 +488,10 @@ impl Scene {
 
     /// Drops the claims of nodes that no longer exist.
     ///
-    /// Called after a destroy, because a destroy cascades: the claim is keyed by node and
-    /// only the tree knows which ones went with it. Ids are generational, so a surviving
-    /// claim is never *wrong* — this keeps the set proportional to the screen rather than to
-    /// the session, which is the difference between a debug aid and a debug leak.
+    /// Called after a destroy, which cascades: a claim is keyed by node, and only the tree
+    /// knows which nodes went with it. Ids are generational, so a surviving claim is never
+    /// applied to a different node; sweeping keeps the set proportional to the live tree
+    /// rather than to the session.
     #[cfg(debug_assertions)]
     fn release_front_claims(&mut self) {
         let nodes = &self.nodes;
@@ -508,9 +505,10 @@ impl Scene {
     )]
     const fn release_front_claims(&mut self) {}
 
-    /// Fires where the app writes a channel [`retarget`](Scene::retarget) claimed, with both
-    /// writers' identities in hand. Ids are generational, so a destroyed and reminted node
-    /// does not inherit a claim.
+    /// Panics where the app writes a channel [`retarget`](Scene::retarget) has claimed,
+    /// naming both the node and the property.
+    ///
+    /// Ids are generational, so a destroyed and reminted node does not inherit a claim.
     #[cfg(debug_assertions)]
     fn check_not_front_owned(&self, id: NodeId, prop: Prop) {
         assert!(
@@ -593,15 +591,14 @@ impl Scene {
 
     /// Brings a node's captures up to date with the box it now occupies.
     ///
-    /// A capture states a region in the source's own space, so it is the one realized thing
-    /// that does not follow its sprite: a shape or a glow whose box moved keeps describing
-    /// the old one and draws at the wrong scale. Correcting it is **three property sets and
-    /// no re-tessellation** — the geometry object is untouched, no verbs cross the seam, and
-    /// the app thread is not involved. That is what makes a live window-edge drag over a
-    /// screen of paths cost what a resize should cost.
+    /// A capture states its region in the source's own space, so it does not follow its
+    /// sprite: a shape or a glow whose box moved keeps describing the old one and draws at
+    /// the wrong scale. Correcting it is three property sets and no re-tessellation — the
+    /// geometry object is untouched, no verbs cross the seam, and the app thread is not
+    /// involved.
     ///
-    /// Only a size can invalidate one, so this asks before it looks: a move, an opacity and
-    /// a rotation all land through the same setter and none of them changes the region.
+    /// Only a size change can invalidate a capture, so `prop` is tested first: a move, an
+    /// opacity and a rotation land through the same setter and none of them moves the region.
     fn resize_captures(&mut self, id: NodeId, prop: Prop, env: Env) {
         if !matches!(prop, Prop::Size | Prop::SizeX | Prop::SizeY) {
             return;
@@ -632,6 +629,9 @@ impl Scene {
     }
 
     /// Builds the animation an [`Anim`] describes, against the shared templates.
+    ///
+    /// `None` when the value `anim` carries does not match the channel's slot, or when the
+    /// key frames it names build no animation.
     fn animation(
         &self,
         id: NodeId,
@@ -643,7 +643,7 @@ impl Scene {
         let templates = &self.motion.templates;
         match anim {
             Anim::Spring { to, tuning, .. } => {
-                // The travel is measured from the shadow, which is why a caller states a
+                // Travel is measured from the shadow's current value, so a caller states a
                 // tuning and never a period.
                 let travel = self.nodes.get(id).map_or(0.0, |n| travel_of(n, desc, to));
                 Some(match desc.anim {
@@ -708,7 +708,7 @@ impl Scene {
 
     /// Rebuilds a clip-route shape onto the capture, keeping the same geometry.
     ///
-    /// Returns whether there was a shape mask to promote at all.
+    /// Returns whether there was a shape mask to promote.
     fn promote(&mut self, id: NodeId, back: &Backends, env: Env) -> Result<bool> {
         let has_shape = self
             .nodes
@@ -719,8 +719,8 @@ impl Scene {
             return Ok(false);
         }
         // The shape state does not exist yet, so `draws_on` cannot see the channel about to
-        // be bound. Seeding it makes the route function total: the rebind then observes live
-        // channels and takes the capture.
+        // be bound. Marking the group stale is what makes the rebind below observe a live
+        // channel and take the capture.
         if let Some(node) = self.nodes.get_mut(id) {
             prop::set_held(node, prop::desc(Prop::TrimEnd).group, Held::Stale);
         }
@@ -776,8 +776,8 @@ impl Scene {
                     self.res.regions.place(id.cast::<Region>(), Res::new(None));
                 }
             }
-            // Only the model's own claim — a sprite still painting with it keeps it alive
-            // until its own destroy or re-declare, which is the whole point of counting.
+            // Drops only the model's own claim: a sprite still painting with the resource
+            // keeps it alive until that sprite is destroyed or re-declares.
             ResOp::Drop => self.res.disclaim(id),
         }
         Ok(())
@@ -835,7 +835,7 @@ impl Scene {
     }
 }
 
-/// How far a spring has to travel, from the shadow's current value to its target.
+/// Returns how far a spring travels, from the shadow's current value to `to`.
 fn travel_of(node: &Node, desc: &prop::PropDesc, to: Value) -> f32 {
     let at = desc.chan as usize;
     let current = |slot: usize| node.core.get(slot).copied().unwrap_or(0.0);

@@ -1,9 +1,8 @@
-//! Clips: what a visual's subtree is allowed to draw inside (feature `system`).
+//! Clips, which bound the region a visual's subtree draws inside (feature `system`).
 //!
-//! A clip is not a brush, so it costs no brush slot, no second visual and no capture —
-//! which is what makes it the only way to round the corners of a sprite whose one brush
-//! is already spent on a mask. Its values are animatable, so a reveal is a clip whose
-//! inset animates rather than a visual whose size does.
+//! A clip is not a brush: it takes no brush slot, no second visual and no capture, so a
+//! sprite whose one brush is already a mask can still have rounded corners. A clip's
+//! values are animatable, so a reveal animates an inset rather than the visual's size.
 
 use super::*;
 
@@ -40,10 +39,9 @@ impl Visual {
 
 /// A clip that insets each edge of the visual's own box.
 ///
-/// Insets are measured inward from the visual's edges, so a clip written once keeps
-/// following the visual as it resizes — the opposite of [`RectangleClip`], whose sides
-/// are absolute. Every inset is animatable, and animating one is how a subtree is
-/// revealed or hidden without touching its layout.
+/// Insets are measured inward from the visual's edges, so one clip keeps following the
+/// visual as it resizes; [`RectangleClip`] takes absolute sides instead. Every inset is
+/// animatable, so animating one reveals or hides a subtree without changing its layout.
 #[derive(Clone)]
 pub struct InsetClip(pub(crate) bindings::InsetClip);
 
@@ -68,13 +66,12 @@ impl Clip for InsetClip {
 /// A clip with absolute sides and per-corner radii — the rounding primitive.
 ///
 /// Its sides are coordinates in the clipped visual's own space, **not** insets from its
-/// edges, so a clip that must track the visual's size is rewritten on resize. In
-/// exchange it carries corner radii, and rounding a sprite this way costs no brush slot.
+/// edges, so a clip that must track the visual's size is rewritten on resize. It carries
+/// corner radii, and rounding a sprite this way takes no brush slot.
 ///
 /// **Corner radii animate only as scalars**, named `"TopLeftRadiusX"`,
 /// `"TopLeftRadiusY"`, `"TopRightRadiusX"`, and so on. Animating a `Vector2` radius
-/// property silently does nothing — it does not fail, it does not warn, the corner
-/// simply never moves.
+/// property has no effect and reports no error.
 #[derive(Clone)]
 pub struct RectangleClip(pub(crate) bindings::RectangleClip);
 
@@ -89,9 +86,8 @@ impl RectangleClip {
 
     /// Sets every corner to the same radius.
     ///
-    /// A radius is capped at half the box on each axis, so "fully rounded" is a
-    /// stadium and never a circle-ended football: passing a large number gives a pill,
-    /// not an ellipse.
+    /// A radius is capped at half the box on each axis, so a large value gives a
+    /// stadium-shaped pill rather than an ellipse.
     pub fn set_corner_radius(&self, radius: Vector2) {
         self.0.SetTopLeftRadius(radius).unwrap();
         self.0.SetTopRightRadius(radius).unwrap();
@@ -124,8 +120,8 @@ impl Clip for RectangleClip {
 
 /// A clip whose shape is any composition [`Geometry`].
 ///
-/// This is what lets a path already tessellated for a shape clip a subtree instead of
-/// being rebuilt as one, and it is the only clip that is not a rectangle.
+/// It is the only clip that is not a rectangle, and it takes a geometry already built for
+/// a shape rather than needing that path rebuilt.
 #[derive(Clone)]
 pub struct CompositionGeometricClip(pub(crate) bindings::CompositionGeometricClip);
 
@@ -150,8 +146,8 @@ impl Compositor {
         InsetClip(self.0.CreateInsetClip().unwrap())
     }
 
-    /// Creates a rectangle clip, with every side at zero — which clips *everything*
-    /// until the sides are set, unlike an inset clip's harmless default.
+    /// Creates a rectangle clip with every side at zero, which clips the subtree away
+    /// entirely until the sides are set.
     pub fn create_rectangle_clip(&self) -> RectangleClip {
         let compositor: bindings::ICompositor7 = self.0.cast().unwrap();
         RectangleClip(compositor.CreateRectangleClip().unwrap())

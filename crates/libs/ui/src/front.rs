@@ -1,21 +1,19 @@
-//! The front thread's ownership marker.
+//! Marks a value as owned by the front thread, which is the window's own thread.
 //!
-//! Every compositor object, gesture recogniser, interaction tracker, text-services object
-//! and automation provider in this stack lives on the window's own thread. Some of them are
-//! agile and some are not — `GestureRecognizer` declares `MarshalingBehavior(None)` — but
-//! the rule is the same for all of them, because the tree they drive lives there.
+//! Every compositor object, gesture recogniser, interaction tracker, text-services object and
+//! automation provider in this stack lives on that thread, agile or not — `GestureRecognizer`
+//! declares `MarshalingBehavior(None)` — because the tree they all drive lives there.
 //!
-//! Stating it as a type is what turns "do not touch this from the app thread" from a
-//! convention into a compile error: an app-thread closure that captures a [`FrontHandle`]
-//! does not compile, so the entire class of "a thread-local was silently empty on the wrong
-//! thread" bug cannot be written.
+//! [`FrontHandle`] carries the rule in the type system: a closure that runs on the app thread
+//! and captures one does not compile, so a front-thread object cannot be reached from a thread
+//! whose locals for it are empty.
 
 use core::marker::PhantomData;
 
-/// A handle to something that lives on the front thread. Neither `Send` nor `Sync`.
+/// Holds a value that lives on the front thread. Neither `Send` nor `Sync`.
 ///
-/// The wrapped value is reachable by [`Deref`](core::ops::Deref), so this costs nothing at a
-/// call site and everything at a thread boundary.
+/// The value is reachable through [`Deref`](core::ops::Deref) and
+/// [`DerefMut`](core::ops::DerefMut), and the wrapper is the same size as `T`.
 pub struct FrontHandle<T> {
     inner: T,
     /// A raw pointer is neither `Send` nor `Sync`, and `PhantomData` of one carries that
@@ -32,7 +30,8 @@ impl<T> FrontHandle<T> {
         }
     }
 
-    /// Releases the claim, on the thread that made it.
+    /// Returns the wrapped value, releasing the claim. The handle is not `Send`, so this runs
+    /// on the thread that made the claim.
     pub fn into_inner(self) -> T {
         self.inner
     }
@@ -61,15 +60,17 @@ impl<T: core::fmt::Debug> core::fmt::Debug for FrontHandle<T> {
 mod tests {
     use super::*;
 
-    /// The whole point of the type, asserted the only way a negative trait bound can be:
-    /// by checking that the positive one does not hold for it while it does for its payload.
+    /// Checks that a [`FrontHandle`] adds no size to a payload that is itself `Send`.
+    ///
+    /// A negative bound has no runtime assertion. Substituting `is_send::<FrontHandle<u32>>()`
+    /// for the call below must fail to compile; if it ever compiles, the marker has stopped
+    /// working.
     #[test]
     fn a_front_handle_is_neither_send_nor_sync() {
         fn is_send<T: Send>() -> bool {
             true
         }
-        // `u32` is `Send`; wrapping it takes that away. If this ever compiles with
-        // `is_send::<FrontHandle<u32>>()` the marker has stopped working.
+        // `u32` is `Send`; wrapping it takes that away.
         assert!(is_send::<u32>());
         assert_eq!(size_of::<FrontHandle<u32>>(), size_of::<u32>());
     }

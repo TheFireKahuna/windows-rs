@@ -1,8 +1,8 @@
-//! A title bar the application draws that still behaves like the system's: drag,
-//! double-click maximize, Aero shake, `Win`+arrow, the eight resize edges, the window menu,
-//! rounded corners and the frame colour.
+//! Implements a title bar the application draws that keeps the system's caption behaviours:
+//! drag, double-click maximize, Aero shake, `Win`+arrow, the eight resize edges, the window
+//! menu, rounded corners and the frame colour.
 //!
-//! Contacts over the three button regions are consumed, on a primary press only. Every
+//! Contacts over the three button regions are consumed, and only on a primary press. Every
 //! other non-client contact forwards to `DefWindowProc`, which is what keeps those
 //! behaviours the system's.
 
@@ -11,17 +11,19 @@ use crate::dpi::Metrics;
 use core::cell::{Cell, RefCell};
 use windows_color::Scrgb;
 
-/// How the application wants its own title bar framed.
+/// Describes the title bar the application draws for itself.
 #[derive(Copy, Clone, Debug)]
 pub struct CaptionSpec {
     /// Bar height in DIPs, or `None` for the system's own at the window's DPI.
     pub height: Option<f32>,
+    /// What DWM rounds the window's corners to.
     pub corners: CornerPreference,
     /// Which of the three window commands this application draws.
     pub buttons: CaptionButtons,
 }
 
 impl Default for CaptionSpec {
+    /// The system's bar height at the window's DPI, rounded corners, all three commands.
     fn default() -> Self {
         Self {
             height: None,
@@ -31,11 +33,38 @@ impl Default for CaptionSpec {
     }
 }
 
-/// What DWM rounds the window's corners to.
+impl CaptionSpec {
+    /// Returns a spec whose bar is `dips` tall.
+    ///
+    /// The band and the bar the application draws must read one number, so this takes the
+    /// height the caller already resolved rather than a policy for computing it.
+    #[must_use]
+    pub fn band(dips: f32) -> Self {
+        Self {
+            height: Some(dips),
+            ..Self::default()
+        }
+    }
+
+    /// Returns the same spec at `corners`.
+    #[must_use]
+    pub const fn corners(mut self, corners: CornerPreference) -> Self {
+        self.corners = corners;
+        self
+    }
+
+    /// Returns the same spec drawing only `buttons`.
+    #[must_use]
+    pub const fn buttons(mut self, buttons: CaptionButtons) -> Self {
+        self.buttons = buttons;
+        self
+    }
+}
+
+/// Selects what DWM rounds the window's corners to.
 ///
-/// The attribute rounds the **frame**, not composited content, so a matching rounded clip on
-/// the root visual is the application's half — without it a square backdrop paints into the
-/// corners of a round window.
+/// The attribute rounds the **frame**, not composited content. Without a matching rounded
+/// clip on the root visual, a square backdrop paints into the corners of a round window.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CornerPreference {
     /// The system's full radius — what an ordinary Windows 11 window has.
@@ -47,9 +76,10 @@ pub enum CornerPreference {
 }
 
 impl CornerPreference {
-    /// The radius DWM actually draws, in DIPs, and what the root visual's clip is built from.
+    /// Returns the radius DWM draws, in DIPs, which is what the root visual's clip is built
+    /// from.
     ///
-    /// Observed: the attribute takes a preference, not a length.
+    /// The radii are stated here because the attribute takes a preference, not a length.
     #[must_use]
     pub const fn radius_dips(self) -> f32 {
         match self {
@@ -68,10 +98,10 @@ impl CornerPreference {
     }
 }
 
-/// Which window commands the application draws in its bar.
+/// Names which window commands the application draws in its bar.
 ///
-/// A veto, enforced at the hit test *and* at every non-client pointer arm. A window that
-/// draws no maximize button must not answer `HTMAXBUTTON`: what the system opens on that
+/// Enforced at the hit test *and* at every non-client pointer arm: a window that draws no
+/// maximize button must not answer `HTMAXBUTTON`, because the flyout the system opens on that
 /// answer offers to maximize a window with no way back.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CaptionButtons {
@@ -126,10 +156,10 @@ impl CaptionButton {
     }
 }
 
-/// What the application's hit authority found at a point in the caption band.
+/// Reports what the application's hit authority found at a point in the caption band.
 ///
-/// The argument is a **client-space point in DIPs** — the space the layout solved in, so the
-/// answer costs no conversion and cannot disagree with the bar by a rounding.
+/// The authority is called with a **client-space point in DIPs**, the space the layout solved
+/// in, so the answer costs no conversion and cannot disagree with the bar by a rounding.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CaptionHit {
     /// Nothing interactive. The band drags the window, and the system provides double-click
@@ -137,15 +167,15 @@ pub enum CaptionHit {
     Drag,
     /// An ordinary control. Input belongs to the client area.
     Client,
-    /// One of the window commands the application draws. This is what raises the Snap
-    /// Layouts flyout.
+    /// One of the window commands the application draws. Answering `Maximize` raises the
+    /// Snap Layouts flyout.
     Button(CaptionButton),
 }
 
-/// The one-pixel frame DWM draws around the window.
+/// Selects the one-pixel frame DWM draws around the window.
 ///
-/// Takes an [`Scrgb`] because a border is display-referred output, and the only supplier of
-/// one is `OutputTransform::apply`.
+/// [`Solid`](Self::Solid) takes an [`Scrgb`] because a border is display-referred output,
+/// which `OutputTransform::apply` produces.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum BorderColor {
     /// The system's, which follows the user's accent and light/dark choice.
@@ -172,10 +202,10 @@ impl BorderColor {
     }
 }
 
-/// Which caption button the pointer is over, and which it is pressing.
+/// Reports which caption button the pointer is over, and which it is pressing.
 ///
-/// Both arrive as non-client messages the application never sees: once `WM_NCHITTEST`
-/// answers `HTMAXBUTTON` the pointer stream for that button is the system's. So the window
+/// Both arrive as non-client messages the application never sees: once `WM_NCHITTEST` answers
+/// a button's code, the pointer stream for that button is the system's, so the window
 /// forwards the state and the application draws from it.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptionState {
@@ -186,6 +216,7 @@ pub struct CaptionState {
 type HitAuthority = Box<dyn FnMut(f32, f32) -> CaptionHit>;
 type StateSink = Box<dyn FnMut(CaptionState)>;
 
+/// Holds a custom caption's spec, its hit authority, and the button state it publishes.
 pub(crate) struct Caption {
     spec: CaptionSpec,
     /// Absent until the surface that owns the hit array exists, which is necessarily after
@@ -233,8 +264,8 @@ impl Caption {
             );
         }
         self.apply_border(hwnd);
-        // Nothing recalculates the frame on its own: creation's `WM_NCCALCSIZE` is answered
-        // before the state is installed, and `ShowWindow` sends none. Without this the
+        // Nothing else recalculates the frame: creation's `WM_NCCALCSIZE` is answered before
+        // the state is installed, and `ShowWindow` sends none. Without the recalculation the
         // window keeps its system caption however `WM_NCCALCSIZE` is answered.
         // SAFETY: `hwnd` is live; every position and size argument is ignored under the
         // `NOMOVE`/`NOSIZE` flags.
@@ -269,7 +300,7 @@ impl Caption {
         }
     }
 
-    /// Handles the caption's messages. `None` means this is not one of them.
+    /// Handles the caption's own messages. `None` where the message is not one of them.
     pub(crate) fn message(
         &self,
         hwnd: HWND,
@@ -296,8 +327,8 @@ impl Caption {
                 }
                 // SAFETY: a writable rect of the form selected above.
                 let requested = unsafe { *target };
-                // Rewrites the rect in place, which is what makes the two reads a before and
-                // an after rather than two views of one value.
+                // `DefWindowProc` rewrites the rect in place, which is what makes the two
+                // reads a before and an after rather than two views of one value.
                 // SAFETY: `hwnd` is live and the arguments are the ones just received.
                 let default = unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
                 // SAFETY: the rect is still the system's and still writable.
@@ -305,10 +336,10 @@ impl Caption {
                     (*target).top = if is_zoomed(hwnd) {
                         // A maximized window's frame hangs off the work area by the border on
                         // every edge, so the default inset has to be kept or the client runs
-                        // over the taskbar. But it also reserves a caption band this window
-                        // does not have. Keep the border and drop the band, taking the border
-                        // from what `DefWindowProc` just did to the bottom edge so no
-                        // assumption about caption height is made anywhere.
+                        // over the taskbar. That inset also reserves a caption band this
+                        // window does not have. Keep the border and drop the band, taking the
+                        // border from what `DefWindowProc` just did to the bottom edge, so no
+                        // caption height is assumed here.
                         requested.top + (requested.bottom - (*target).bottom)
                     } else {
                         requested.top
@@ -346,7 +377,7 @@ impl Caption {
             }
 
             // Handled rather than deferred: `DefWindowProc`'s own non-client button handling
-            // draws the system's chrome into a frame this window no longer has. A secondary
+            // draws the system's chrome into a frame this window does not have. A secondary
             // press over a button opens the window menu, so it forwards in both halves.
             WM_NCPOINTERDOWN => match self.contact_button(hwnd, lparam) {
                 Some(button) if button_change(wparam) == POINTER_CHANGE_FIRSTBUTTON_DOWN => {
@@ -414,14 +445,14 @@ impl Caption {
         answer
     }
 
-    /// What is at a screen point: one of the eight resize zones, a caption button, the drag
-    /// strip, or the client area.
+    /// Returns what is at a screen point: one of the eight resize zones, a caption button,
+    /// the drag strip, or the client area.
     ///
-    /// Also what the non-client pointer arms resolve through, because those messages do not
-    /// carry the hit code — `HIWORD(wParam)` is documented as the hit-test value and
-    /// observably is not, it is the same `POINTER_FLAG_*` word the client messages carry.
-    /// Both callers resolving the same point through the same authority is the property that
-    /// matters; a cached last answer would be a second source of truth.
+    /// The non-client pointer arms resolve through here too, because those messages do not
+    /// carry the hit code: `HIWORD(wParam)` is documented as the hit-test value and carries
+    /// the same `POINTER_FLAG_*` word the client messages do. Resolving every point through
+    /// the one authority is what keeps the arms and the hit test agreeing; a cached last
+    /// answer would be a second source of truth.
     fn hit_code(&self, hwnd: HWND, x: i32, y: i32) -> i32 {
         let metrics = Metrics::for_window(hwnd);
         let mut window = RECT::default();
@@ -489,8 +520,8 @@ fn is_zoomed(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd) }.as_bool()
 }
 
-/// Which system command a press on `button` issues. Only maximize depends on state, and on
-/// the window's rather than on anything the application tracks.
+/// Returns which system command a press on `button` issues. Only maximize depends on state,
+/// and on the window's own rather than on anything the application tracks.
 fn command(hwnd: HWND, button: CaptionButton) -> usize {
     let command = match button {
         CaptionButton::Minimize => SC_MINIMIZE,
@@ -501,11 +532,12 @@ fn command(hwnd: HWND, button: CaptionButton) -> usize {
     command as usize
 }
 
-/// The eight resize edges, or `None` for anywhere inside them.
+/// Returns the resize edge or corner a screen point falls in, or `None` for anywhere inside
+/// them.
 fn resize_zone(window: &RECT, metrics: Metrics, x: i32, y: i32) -> Option<i32> {
     let left = x < window.left + metrics.frame_x;
     let right = x >= window.right - metrics.frame_x;
-    // The top band is the narrow one — see `Metrics::frame_top`.
+    // The top band is the narrow one, which `Metrics::frame_top` carries.
     let top = y < window.top + metrics.frame_top;
     let bottom = y >= window.bottom - metrics.frame_y;
     match (top, bottom, left, right) {
@@ -521,7 +553,7 @@ fn resize_zone(window: &RECT, metrics: Metrics, x: i32, y: i32) -> Option<i32> {
     }
 }
 
-/// Which button transition produced this pointer message.
+/// Returns which button transition produced this pointer message.
 ///
 /// `ButtonChangeType` rather than the `wParam` flags: the flags carry which buttons are
 /// *held*, which cannot tell a primary press from a secondary press made while the primary
@@ -539,7 +571,7 @@ fn button_change(wparam: WPARAM) -> POINTER_BUTTON_CHANGE_TYPE {
     }
 }
 
-/// The screen point a non-client message carries, sign-extended.
+/// Returns the screen point a non-client message carries, sign-extended.
 ///
 /// The halves are signed: a window left of or above the primary monitor has negative screen
 /// coordinates, and reading them unsigned puts every point 65,000 pixels from where it is.
@@ -550,7 +582,7 @@ fn screen_point(lparam: LPARAM) -> (i32, i32) {
     )
 }
 
-/// A screen point in the window's client space, in physical pixels.
+/// Converts a screen point to the window's client space, in physical pixels.
 fn client_point(hwnd: HWND, x: i32, y: i32) -> Option<(i32, i32)> {
     let mut point = POINT { x, y };
     // SAFETY: `hwnd` is live and the point is a stack local the call writes back through.

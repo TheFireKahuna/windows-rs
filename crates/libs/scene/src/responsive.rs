@@ -1,29 +1,26 @@
 //! The classifying container. **App half.**
 //!
-//! A card arranges its parts differently at 520, 700 and 900 DIPs of *its own* width, and
-//! the same card appears in a full-width row, a narrow column and a detail pane at once. A
-//! window-level breakpoint cannot answer that, and threading a width down from every call
-//! site is the ceremony an authoring layer exists to delete.
+//! A container classifies its own inline width into a [`WidthClass`], so one card can be
+//! arranged differently at 520, 700 and 900 DIPs, and can appear in a full-width row, a
+//! narrow column and a detail pane at the same time. A window-level breakpoint cannot
+//! express that.
 //!
-//! What such a card actually needs is a **classification, not a measurement**: padding,
-//! gap, type size, radius and control sizes resolve from a density; a flex direction, a
-//! grid track list and a hidden part are style variants. Every one of them is a threshold
-//! selecting a discrete variant, so the primitive is a class.
+//! The output is a classification and not a measurement: padding, gap, type size, radius and
+//! control sizes resolve from a density, and a flex direction, a grid track list or a hidden
+//! part are style variants. Each is a threshold selecting a discrete variant.
 //!
-//! **Nothing here mounts or unmounts.** Crossing a threshold changes styles and never
-//! structure, which is what makes the mechanism safe to evaluate during a resize drag: no
-//! owner is dropped, no state is disposed, and a value half-typed into a field inside the
-//! narrow arrangement survives the user wobbling across the boundary.
+//! Crossing a threshold changes styles and never structure. Nothing here mounts or unmounts,
+//! so a resize drag drops no owner, disposes no state, and leaves a value half-typed into a
+//! field standing while the width wobbles across a boundary.
 
-/// How wide a container found itself. Ordered, so a rule can read "at least medium".
+/// How wide a container classified itself. Ordered, so a rule can read "at least medium".
 ///
-/// **The default is the *unclassified* class, and it is `Wide`.** A node outside every
-/// responsive container has one, a node inside one has it until the first solve resolves
-/// otherwise, and a style is lowered at it before any classification exists — so it has to
-/// be the same value on both sides of the crate boundary, and the layer above states the
-/// same one at the root of its scope. Any other choice makes the first solve of a container
-/// that classifies *to* the default produce no transition, and a subtree keeps the styles
-/// its mount lowered at a class it is not in.
+/// [`WidthClass::Wide`] is the unclassified class: a node outside every responsive container
+/// carries it, a node inside one carries it until the first solve resolves otherwise, and a
+/// style lowered before any classification exists is lowered at it. The layer above must
+/// state the same class at the root of its scope, because a subtree that mounts at one
+/// default and solves to another produces no transition and keeps the styles its mount
+/// lowered.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WidthClass {
     Narrow,
@@ -36,15 +33,16 @@ pub enum WidthClass {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Bounds(pub [f32; 2]);
 
-/// How far past a threshold the width must travel before the class follows it back.
+/// How far past a threshold the width must travel before the class follows it.
 ///
-/// Not for correctness — the classification cannot oscillate, because a container's inline
-/// size is an input its parent hands down and nothing inside it can change. It is so a
-/// card's density does not strobe while someone drags a window edge across a threshold.
+/// The band keeps a card's density from strobing while a window edge is dragged across a
+/// threshold. The classification cannot oscillate on its own: a container's inline size is
+/// an input its parent hands down, and nothing inside the container changes it.
 pub const HYSTERESIS_DIPS: f32 = 20.0;
 
 impl Bounds {
-    /// The class `width` falls in, with no history to hold it.
+    /// Returns the class `width` falls in, with no previous class to hold it. A non-finite
+    /// `width` classifies as [`WidthClass::Narrow`].
     #[must_use]
     pub fn classify(self, width: f32) -> WidthClass {
         let [narrow, medium] = self.0;
@@ -57,7 +55,7 @@ impl Bounds {
         }
     }
 
-    /// The class `width` falls in, given the class it was last in.
+    /// Returns the class `width` falls in, given the class it was last in.
     ///
     /// The band is applied in the direction of travel: widening has to clear the threshold
     /// by the band before the class rises, and narrowing has to fall below it by the band
@@ -136,8 +134,8 @@ mod tests {
     fn a_width_parked_on_a_threshold_does_not_strobe() {
         let mut class = WidthClass::Narrow;
         for step in 0..64 {
-            // A one-DIP wobble either side of the boundary, which is what a drag on a
-            // window edge actually delivers.
+            // A one-DIP wobble either side of the boundary, as a drag on a window edge
+            // delivers it.
             let width = 600.0 + if step % 2 == 0 { 1.0 } else { -1.0 };
             let next = BOUNDS.reclassify(width, class);
             assert_eq!(next, class, "wobbling at the boundary changed the class");

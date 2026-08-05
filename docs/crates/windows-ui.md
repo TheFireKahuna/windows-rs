@@ -15,7 +15,7 @@ path that can disagree with it.
 
 Compositor objects, recognisers, trackers, text stores and automation providers are reached only
 through a front-thread handle that is neither `Send` nor `Sync`, so an app-thread closure that
-captures one fails to compile rather than failing at runtime on the wrong thread.
+captures one does not compile.
 
 Creating the window and opting it into pointer input belong to [`windows-window`](windows-window.md);
 this crate reads what those opt-ins deliver.

@@ -1,30 +1,25 @@
-//! The four handles a scene makes things with. **Front half.**
+//! The four handles a scene mints and rasterizes with. **Front half.**
 //!
-//! A factory bundle and nothing else: everything needed to *mint* a composition object or
-//! rasterize a surface, and no fact about the display it will appear on. Those arrive as an
+//! [`Backends`] carries everything needed to mint a composition object or rasterize a
+//! surface, and no fact about the display it will appear on. Those arrive as an
 //! [`Env`](crate::Env) at every operation that depends on them.
 //!
 //! # Built and owned by the application, not by the scene
 //!
-//! Every one of these is the *application's*, and a scene is one consumer of them. Holding
-//! them here would misplace three things at once, each of which is a real defect and not a
-//! matter of taste:
+//! The application constructs these handles and passes them to the calls that need them; a
+//! scene stores none of them. Three constraints hold that shape:
 //!
-//! - **The font ladder has to be shared.** `windows-text` is explicit that two
-//!   [`TextEngine`]s interning names independently "*would agree on `0` and disagree on
-//!   everything after it*", and that the symptom is a run drawn in the wrong face rather
-//!   than an error. The thread that shapes holds one engine and the thread that rasterizes
-//!   holds another, so a scene that *consumed* the ladder would take one input to that
-//!   invariant out of reach of the half that needs it.
+//! - **The font ladder is shared.** Two [`TextEngine`]s interning names independently agree
+//!   on index `0` and disagree on everything after it, and the symptom is a run drawn in the
+//!   wrong face rather than an error. The thread that shapes and the thread that rasterizes
+//!   each hold an engine, so both must be built over one ladder the application owns.
 //! - **A compositor proves its own precondition.** One cannot exist on a thread with no
-//!   dispatcher queue. Taking it as an argument means having one *is* the proof the queue
-//!   was created; minting it inside would leave that as a comment and a runtime failure.
-//! - **Device loss is the owner's to repair.** [`adopt`](Backends::adopt) belongs to
-//!   whoever owns the GPU's lifetime, and that is not the tree drawn with it.
+//!   dispatcher queue, so taking it as an argument makes holding it the proof that the queue
+//!   was created.
+//! - **Device loss is repaired by the GPU's owner**, through [`adopt`](Backends::adopt).
 //!
-//! So this type is passed to the calls that need it and stored by none of them. Every
-//! mechanism below it belongs to `windows-composition`, `windows-d2d` or `windows-text`;
-//! what is written here is the *recipe* — what to draw, at what extent, sampled how.
+//! Every mechanism below belongs to `windows-composition`, `windows-d2d` or `windows-text`;
+//! what is written here is what to draw, at what extent, sampled how.
 
 use crate::env::Env;
 use crate::quant::extent_px;
@@ -40,13 +35,14 @@ use windows_d2d::{Extend, Gpu, Opacity, SceneSurface, Solid, Stop, SurfaceDraw};
 use windows_numerics::Vector2;
 use windows_text::{FontLadder, GlyphSeg, Ink, SegBuffers, TextEngine};
 
+/// The compositor, GPU, graphics device and text engine a scene mints objects with.
 pub struct Backends {
     pub(crate) compositor: Compositor,
     pub(crate) gpu: Gpu,
     graphics: CompositionGraphicsDevice,
     text: TextEngine,
-    /// Whether this device allocates coverage at one byte a pixel. There is no query for
-    /// it, so the failed allocation is the answer — asked once, not once per tile.
+    /// Whether this device allocates coverage at one byte a pixel. No query reports it, so
+    /// the first failed allocation answers it and every tile after takes the same route.
     masks_a8: Cell<bool>,
     /// The one opaque white brush every coverage tile draws with. White is a mask's
     /// multiplicative identity, so it is never retinted.
@@ -56,10 +52,14 @@ pub struct Backends {
 impl Backends {
     /// Binds a compositor, a GPU and a font ladder together.
     ///
-    /// One GPU per compositor: when the compositor realizes a composition path it asks the
-    /// geometry source for geometry belonging to a factory of its own choosing, and neither
-    /// side of that callback can check the match — so a path built on a second GPU is
-    /// content that never appears rather than an error.
+    /// `gpu` must be the only GPU used with `compositor`. When the compositor realizes a
+    /// composition path it asks the geometry source for geometry belonging to a factory of
+    /// its own choosing, and neither side of that callback checks the match, so a path built
+    /// on a second GPU is content that never appears rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the graphics device or the text engine cannot be created.
     pub fn new(compositor: Compositor, gpu: &Gpu, fonts: FontLadder) -> Result<Self> {
         Ok(Self {
             graphics: gpu.graphics_device(&compositor)?,
@@ -73,20 +73,24 @@ impl Backends {
 
     /// Adopts a replacement GPU after device loss.
     ///
-    /// The compositor and the text engine survive — only the Direct2D device and everything
-    /// drawn with it died — so the graphics device is what is rebuilt, and the engine keeps
-    /// its resolved faces. Call this, then
-    /// [`Scene::device_lost`](crate::Scene::device_lost) to re-realize what was drawn.
+    /// Device loss takes the Direct2D device and everything drawn with it; the compositor
+    /// and the text engine survive, so only the graphics device is rebuilt and the engine
+    /// keeps its resolved faces. Call [`Scene::device_lost`](crate::Scene::device_lost)
+    /// afterwards to re-realize what was drawn.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the replacement graphics device cannot be created.
     pub fn adopt(&mut self, gpu: &Gpu) -> Result<()> {
         self.gpu = gpu.clone();
         self.graphics = gpu.graphics_device(&self.compositor)?;
         Ok(())
     }
 
-    /// The ladder every run's family index resolves against.
+    /// Returns the ladder every run's family index resolves against.
     ///
-    /// The shaping thread's own [`TextEngine`] must be built over **this** ladder: the
-    /// indices in a run are only meaningful against the one that interned them.
+    /// The shaping thread's own [`TextEngine`] must be built over this ladder: a run's
+    /// family indices are meaningful only against the ladder that interned them.
     #[must_use]
     pub fn ladder(&self) -> &FontLadder {
         self.text.ladder()
@@ -100,10 +104,11 @@ impl Backends {
         self.graphics.color(px, Opacity::Translucent)
     }
 
-    /// A coverage surface, at one byte a pixel where the device allows it.
+    /// Returns a coverage surface, at one byte a pixel where the device allows it.
     ///
-    /// An FP16 mask is the same coverage, so the fallback is not a degrade: it fails over
-    /// silently, once, and every tile after takes the same route without asking.
+    /// An FP16 colour surface carries the same coverage, so the fallback changes the
+    /// allocation and nothing else. It is taken once and every tile after it goes straight
+    /// there.
     pub(crate) fn mask_surface(&self, px: (i32, i32)) -> Result<CompositionDrawingSurface> {
         if self.masks_a8.get() {
             match self.graphics.mask(px) {
@@ -114,13 +119,14 @@ impl Backends {
         self.graphics.color(px, Opacity::Translucent)
     }
 
-    /// Whether coverage is allocated at a byte a pixel on this device.
+    /// Returns whether coverage is allocated at a byte a pixel on this device.
     #[must_use]
     pub fn masks_are_a8(&self) -> bool {
         self.masks_a8.get()
     }
 
-    /// The one opaque white brush every coverage tile draws with.
+    /// Returns the opaque white brush every coverage tile draws with, minting it on first
+    /// use.
     fn white(&self) -> Result<&Solid> {
         if let Some(white) = self.white.get() {
             return Ok(white);
@@ -134,9 +140,8 @@ impl Backends {
         Ok(self.white.get_or_init(|| white))
     }
 
-    /// A brush over `surface`, anchored top-left.
-    ///
-    /// Composition's default is centred, which is easy to mistake for a placement bug.
+    /// Returns a brush over `surface`, anchored top-left rather than at composition's
+    /// centred default.
     pub(crate) fn brush(
         &self,
         surface: &impl Surface,
@@ -148,6 +153,7 @@ impl Backends {
         brush
     }
 
+    /// Builds a composition path from `verbs`, closing any figure the verbs leave open.
     pub(crate) fn path(&self, verbs: &[PathVerb]) -> Result<CompositionPath> {
         let path = self.gpu.path(|sink| {
             let mut open = false;
@@ -194,10 +200,10 @@ impl Backends {
 
     /// Rasterizes a gradient into one premultiplied FP16 strip.
     ///
-    /// **Colour and alpha in the same texels.** A composition gradient brush carries
-    /// eight-bit stops, so a narrow alpha ramp quantizes to almost nothing; FP16 has no such
-    /// floor. A fixed strip stretched to fill *is* a linear gradient, so the resource does
-    /// not carry the sprite's extent and a resize costs nothing.
+    /// A composition gradient brush carries eight-bit stops, which quantizes a narrow alpha
+    /// ramp to almost nothing; the FP16 strip carries colour and alpha in the same texels
+    /// with no such floor. The strip is stretched to fill, so it carries none of the
+    /// sprite's extent and a resize re-rasterizes nothing.
     pub(crate) fn raster_ramp(
         &self,
         env: Env,
@@ -207,9 +213,9 @@ impl Backends {
         // Along the axis for the two cardinal directions; square for a diagonal, which has
         // no single axis to lay a strip along, and for a radial, which has none at all.
         //
-        // 64 for the radial is not a compromise: a smootherstep falloff carries no
-        // high-frequency content, so the profile it misses at that resolution is well
-        // under a hundredth of an 8-bit level at the amplitudes a glow is authored with.
+        // 64 px for the radial: a smootherstep falloff carries no high-frequency content,
+        // and what that resolution misses stays under a hundredth of an 8-bit level at the
+        // amplitudes a glow is authored with.
         let px = match spread {
             Spread::Horizontal => (256, 1),
             Spread::Vertical => (1, 256),
@@ -218,9 +224,10 @@ impl Backends {
         };
         let surface = self.surface(px)?;
 
-        // Sampled, not handed over raw: the drawing stack interpolates linearly and a
-        // palette authored in ICtCp means the *perceptual* mix. Enough samples that the
-        // linear steps between them sit below a just-noticeable difference.
+        // The stops are resampled rather than passed through: the drawing stack interpolates
+        // linearly and the palette is authored in ICtCp, so the mix has to be taken
+        // perceptually. 64 samples put the linear steps between them below a
+        // just-noticeable difference.
         const SAMPLES: usize = 64;
         let mut sampled = [Stop {
             at: 0.0,
@@ -256,9 +263,9 @@ impl Backends {
                     )?;
                     d.fill(rect, &ramp);
                 }
-                // Centred, and its radii half the tile, so the profile's last stop lands
-                // exactly on the edge. Stretching that square into the sprite is what
-                // turns it into the ellipse the glow wants.
+                // Centred with radii half the tile, so the profile's last stop lands exactly
+                // on the edge. Stretching the square tile into the sprite is what makes the
+                // ellipse.
                 None => {
                     let ramp = self.gpu.radial(
                         &sampled,
@@ -281,22 +288,18 @@ impl Backends {
 
     /// Rasterizes one shaped run into an alpha-carrying coverage tile.
     ///
-    /// The tile is a **mask**: opaque white glyphs, because its colour comes from the paint
-    /// beside it in the brush chain and white is the multiplicative identity that leaves
-    /// that paint alone.
+    /// The tile is a mask: the glyphs are drawn opaque white, the multiplicative identity,
+    /// so the paint beside it in the brush chain supplies the colour unchanged.
     ///
-    /// `ink` is in **DIPs**, like every other extent this crate accepts, and the pixel grid
-    /// is applied here through the same [`extent_px`] every cache key uses — one
-    /// implementation of that grid, so nothing can disagree with it at a fractional scale.
+    /// `ink` is in DIPs, like every other extent this crate accepts, and the pixel grid is
+    /// applied through [`extent_px`], the same function every cache key uses.
     ///
-    /// Three things this has to get right, each a whole class of bug. Font fallback splits
-    /// a line across faces, so the segments are a list — a single-segment wire fails to
-    /// render CJK and emoji rather than degrading. Each segment carries its own origin, so
-    /// a bidi line, where visual order and advance order disagree, needs no second rule.
-    /// And the baseline is snapped **here**: `DrawGlyphRun` takes no options parameter, so
-    /// the free baseline snapping the text-layout APIs perform is unavailable and nothing
-    /// will report a run that landed half a pixel low. Horizontal positions stay subpixel
-    /// by design — advances carry ideal metrics independent of display resolution.
+    /// `segs` is a list because font fallback splits one line across faces, and each segment
+    /// carries its own origin, so a bidi line — where visual order and advance order
+    /// disagree — needs no second rule. The baseline is snapped here: `DrawGlyphRun` takes
+    /// no options parameter, so it performs none of the baseline snapping the text-layout
+    /// APIs do. Horizontal positions stay subpixel, because advances carry ideal metrics
+    /// independent of display resolution.
     pub(crate) fn raster_run(
         &self,
         env: Env,
@@ -316,29 +319,28 @@ impl Backends {
             if segs.is_empty() {
                 return Ok(());
             }
-            // Stated rather than inherited, and as a guard so the mode cannot leak into
-            // whatever the surface's context draws next. Left to inherit the system's,
-            // glyphs come out systematically thin or fat and read as a font choice rather
-            // than as a rasterization setting.
+            // The rendering mode is stated here and scoped by the guard, so it cannot leak
+            // into whatever the surface's context draws next. Inheriting the system's makes
+            // glyphs systematically thin or fat.
             let _params = d.text_params(self.text.rendering_params());
-            // Every segment on a line shares one baseline, so the whole tile is nudged by
-            // what it takes to put that baseline on a physical pixel — one correction
-            // rather than a per-segment rounding that would break the shaped spacing.
+            // Every segment on a line shares one baseline, so the whole tile is nudged onto
+            // a physical pixel once; per-segment rounding would break the shaped spacing.
             let at = Vector2 {
                 x: 0.0,
                 y: d.snap(ink.baseline.y) - ink.baseline.y,
             };
-            // Named through the trait: a `Draw` has a `line` of its own, and the two mean
-            // very different things.
+            // Called through the trait: `Draw` has an inherent `line` that draws something
+            // else entirely.
             windows_text::GlyphDraw::line(d, at, segs, buffers, &self.text, white);
             Ok(())
         })
     }
 
-    /// Runs one draw bracket, surfacing the callback's error and not the bridge's.
+    /// Runs one draw bracket, surfacing the callback's error alongside the bridge's.
     ///
-    /// The bridge hands the callback a target and no way to fail, so the result travels out
-    /// in a slot — the one place this crate writes that pattern.
+    /// The bridge's callback cannot fail, so the callback's result travels out in a slot and
+    /// is raised once the bracket has closed. Returns `None` when the bracket produced no
+    /// content.
     fn draw(
         &self,
         surface: &CompositionDrawingSurface,

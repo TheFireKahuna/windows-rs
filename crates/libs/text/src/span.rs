@@ -1,17 +1,16 @@
-//! The buffers a shaped run crosses a thread boundary in.
+//! Carries a shaped run across a thread boundary as plain data.
 //!
-//! Shaping and rasterizing happen on different threads, so what travels between them is a
-//! run in plain data: glyph indices, advances and offsets, in typed buffers, addressed by
-//! `(offset, count)`. Nothing thread-affine can enter, because there is nowhere in these
-//! types for it to go.
+//! Shaping and rasterizing happen on different threads, so what travels between them is
+//! glyph indices, advances and offsets in typed buffers, addressed by `(offset, count)`.
+//! Nothing thread-affine can enter, because these types have nowhere to put it.
 
 use crate::FaceId;
 use windows_numerics::Vector2;
 
-/// A `(offset, count)` window into one of a [`SegBuffers`] buffer.
+/// Addresses an `(offset, count)` window into one of a [`SegBuffers`]'s buffers.
 ///
-/// Variable-length payloads travel as spans rather than as owned vectors so the thing that
-/// carries them stays `Copy` and the buffers stay poolable — one allocation per payload
+/// Variable-length payloads travel as spans rather than as owned vectors, so the segment
+/// carrying them stays `Copy` and the buffers stay poolable: one allocation per payload
 /// *kind* for the life of the process, rather than one per item.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Span {
@@ -20,34 +19,33 @@ pub struct Span {
 }
 
 impl Span {
-    /// An empty span. Distinct from a span at offset zero of length zero only in that
-    /// nothing has to have been appended for it to be valid.
+    /// Covers no items, at offset zero. [`of`](Self::of) yields `&[]` for it against any
+    /// buffer, including one nothing has been appended to.
     pub const EMPTY: Self = Self { off: 0, len: 0 };
 
-    /// The span covering `len` items appended at `off`.
+    /// Returns the span covering `len` items appended at `off`.
     #[must_use]
     pub const fn new(off: u32, len: u32) -> Self {
         Self { off, len }
     }
 
-    /// How many items it covers.
+    /// Returns the number of items it covers.
     #[must_use]
     pub const fn len(self) -> usize {
         self.len as usize
     }
 
-    /// Whether it covers nothing.
+    /// Returns whether it covers no items.
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.len == 0
     }
 
-    /// The items of `buffer` this span covers, or `&[]` if it runs past the end.
+    /// Returns the items of `buffer` this span covers, or `&[]` if it runs past the end.
     ///
-    /// One bounds check, at the seam, once — rather than an unchecked index per read or a
-    /// `Result` at every call site. A span that does not fit its buffer is a bug in
-    /// whoever built the pair, and reading nothing is how it presents: a missing run, not
-    /// a panic in a draw call.
+    /// One bounds check per read, at the seam. A span read against a buffer it does not
+    /// fit yields nothing, so a mismatched pair presents as a missing run rather than a
+    /// panic in a draw call.
     #[must_use]
     pub fn of<T>(self, buffer: &[T]) -> &[T] {
         let (off, len) = (self.off as usize, self.len as usize);
@@ -55,11 +53,10 @@ impl Span {
     }
 }
 
-/// The typed side-buffers a shaped run's segments are appended to.
+/// Holds the typed side-buffers a shaped run's segments are appended to.
 ///
-/// Four buffers and not one: a segment, a glyph index, an advance and an offset are four
-/// different types, and packing them into a shared `f32` buffer would trade a real type
-/// for a reinterpretation at every read.
+/// One buffer per element type: a segment, a glyph index, an advance and an offset are
+/// four different types, so nothing here is read through a reinterpretation.
 #[derive(Debug, Default)]
 pub struct SegBuffers {
     /// The segments themselves, addressed by the [`Span`] a line's append returned.
@@ -75,8 +72,8 @@ pub struct SegBuffers {
 impl SegBuffers {
     /// Empties every buffer, keeping the allocations.
     ///
-    /// This is the whole of the pooling: a consumer drains and clears, and the producer
-    /// appends into capacity it already has.
+    /// A consumer drains and clears; the producer then appends into capacity that already
+    /// exists.
     pub fn clear(&mut self) {
         self.segs.clear();
         self.glyphs.clear();
@@ -86,9 +83,9 @@ impl SegBuffers {
 
     /// Appends one segment's glyph data and returns the three spans naming it.
     ///
-    /// The three slices must be the same length — they are three views of one sequence —
-    /// and the shortest wins if they are not, so a mismatch loses a trailing glyph rather
-    /// than reading past a buffer.
+    /// `glyphs`, `advances` and `offsets` must be the same length: they are three views of
+    /// one sequence. A mismatch appends the shortest of the three, losing a trailing glyph
+    /// rather than reading past a buffer, and asserts in a debug build.
     pub fn push(&mut self, glyphs: &[u16], advances: &[f32], offsets: &[[f32; 2]]) -> Spans {
         debug_assert!(
             glyphs.len() == advances.len() && glyphs.len() == offsets.len(),
@@ -112,7 +109,7 @@ impl SegBuffers {
     }
 }
 
-/// The three spans one appended segment occupies.
+/// Names the three spans one appended segment occupies.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Spans {
     pub glyphs: Span,
@@ -120,12 +117,11 @@ pub struct Spans {
     pub offsets: Span,
 }
 
-/// One maximal span of a shaped line drawn from a single face.
+/// Covers one maximal span of a shaped line drawn from a single face.
 ///
-/// A line is a *list* of these and not one, because font fallback splits it: a label
-/// mixing Latin and CJK resolves to two faces, and a run that could only name one would
-/// simply fail to render the second — which is the failure mode a single-segment seam
-/// degrades into rather than an error it reports.
+/// A line is a *list* of these, because font fallback splits it: a label mixing Latin and
+/// CJK resolves to two faces, and a segment that could name only one would leave the
+/// second unrendered rather than report an error.
 ///
 /// It names a [`FaceId`](crate::FaceId) and not a family, because the face fallback chose
 /// is not one the requested family names, and a glyph index is an index into a face.
@@ -138,8 +134,8 @@ pub struct GlyphSeg {
     /// Bidi embedding level; odd means the segment advances leftward from `origin`.
     pub bidi: u32,
     /// Baseline origin relative to the tile's top-left, in DIPs. Carried rather than
-    /// folded from advances, so a bidi line — where visual order and advance order
-    /// disagree — needs no second rule.
+    /// folded from advances, so a bidi line, where visual order and advance order
+    /// disagree, is placed by the same rule as any other.
     pub origin: Vector2,
     /// Glyph indices, in the buffers this segment was appended to.
     pub glyphs: Span,

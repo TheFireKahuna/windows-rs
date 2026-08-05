@@ -1,30 +1,28 @@
 //! The presentation manager, and what one present costs.
 //!
-//! Presents are queued **per manager**, so a group is the unit of "one present shows
-//! everything that moved, and the regions that did not move cost nothing". Regions own
-//! their buffers, because a buffer is allocated at one size; the manager is what they
-//! share, and where the saving is.
+//! Presents are queued per manager, so a group is the unit of "one present shows everything
+//! that moved, and the regions that did not move cost nothing". Regions own their buffers,
+//! because a buffer is allocated at one size; the manager is what they share.
 //!
-//! That saving is real and it is usually not worth taking. A present that rebinds more
-//! than one surface **cannot be an independent flip** — a property of the queue, not of
-//! the surfaces. Measured with both regions opaque and each independently reaching
-//! independent flip: folding them onto one queue saves this process **1.8% of a core**
-//! and costs `dwm.exe` **ten**, because sharing trades independent flip for *overlay
-//! scanout*, where DWM runs a composition frame for every one of our presents to program
-//! the plane. Statistics still read `composed 0` throughout, so `composed 0` is not
-//! evidence of a flip; the tell is DWM's frame *rate*.
+//! A present that rebinds more than one surface cannot be an independent flip, and that is a
+//! property of the queue rather than of the surfaces. Measured with two opaque regions each
+//! reaching independent flip on a queue of its own, folding them onto one queue saves this
+//! process 1.8% of a core and costs `dwm.exe` ten, because sharing trades independent flip
+//! for overlay scanout and DWM then runs a composition frame per present to program the
+//! plane. Statistics read `composed 0` in both cases, so `composed 0` does not report a
+//! flip; the tell is DWM's frame rate.
 //!
-//! So: share a queue for regions that are composed anyway, never to save presents, and
-//! **merge regions that share a clock into one region with parts** rather than onto one
-//! queue — a merged region keeps its plane and a shared queue does not.
+//! A queue is therefore shared only for regions that are composed anyway. Regions that share
+//! a clock merge into one region with parts, which keeps the plane, rather than onto one
+//! queue, which does not.
 
 use super::*;
 use core::cell::Cell;
 
-/// Which present queue a region asks for.
+/// Names the present queue a region asks for.
 ///
-/// A region names the queue rather than the group object, so the group set is this
-/// crate's business and a consumer states only its timing requirement.
+/// A region names a queue rather than a group object, so the present thread owns the group
+/// set and a consumer states only its timing requirement.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Queue {
     /// A queue of this region's own, guaranteed. For the region whose plane the layout
@@ -32,31 +30,28 @@ pub enum Queue {
     Solo,
     /// The named queue, shared with every region that asks for it.
     ///
-    /// One present shows every region that drew and the ones that did not cost nothing —
-    /// at the price of the plane, for every region in the queue, **whenever it has more
-    /// than one member**. With a single member it is `Solo` in all but name, which is how
-    /// a per-frame card gets a plane in the common case and degrades predictably when a
-    /// second one mounts.
+    /// One present shows every region that drew and the ones that did not cost nothing — at
+    /// the price of the plane, for every region in the queue, whenever it has more than one
+    /// member. With a single member it is [`Solo`](Self::Solo) in all but name.
     ///
-    /// The reason a shared card queue exists at all rather than a queue per card is the
-    /// asymmetry in how the two shapes fail: an extra `Solo` queue that does not get a
-    /// plane costs one present, ~100 µs, linear and ours — while an extra member on a
-    /// `Shared` queue costs that queue's plane outright. We do not choose which surfaces
-    /// get planes, so a third `Solo` candidate competes against the hero and can cost
-    /// *it* the plane. One shared queue firewalls the degradation to the cards.
+    /// An extra member on a shared queue costs that queue's plane outright, while an extra
+    /// `Solo` queue that gets no plane costs one present, about 100 µs. The system chooses
+    /// which surfaces get planes, so a further `Solo` candidate competes with the region
+    /// whose plane the layout protects; one shared queue confines the loss to its own
+    /// members.
     Shared(&'static str),
 }
 
-/// Whether a present wakes the CPU when the display shows it.
+/// Selects whether a present wakes the CPU when the display shows it.
 ///
-/// The interrupt is how the CPU learns a present was shown: it runs kernel code that
-/// updates the buffer-available events, the retiring fence and the statistics queue.
-/// Nothing reads any of that for the earlier frames of a batch before the next wake, so
-/// they can be reported lazily — **~26 µs of our own CPU per interrupt, about 14% of a
-/// present**, and it is what lets the GPU run the flip queue with the CPU out of it.
+/// The interrupt is how the CPU learns a present was shown: it runs kernel code that updates
+/// the buffer-available events, the retiring fence and the statistics queue. Nothing reads
+/// any of that for the earlier frames of a batch before the next wake, so they can be
+/// reported lazily — about 26 µs of CPU per interrupt, some 14% of a present — which lets
+/// the GPU run the flip queue with the CPU out of it.
 ///
-/// Correctness never depends on this. Deferred feedback makes a wait take longer, not
-/// return the wrong answer.
+/// Correctness does not depend on this. Deferred feedback makes a wait take longer rather
+/// than return the wrong answer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Interrupt {
     /// Wake the CPU. For the one present of a batch that the next pass waits behind.
@@ -65,7 +60,7 @@ pub enum Interrupt {
     Defer,
 }
 
-/// How one present reached one display.
+/// Reports how one present reached one display.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Instance {
     /// DWM composed the buffer into its back buffer. The expensive case, and the only
@@ -79,7 +74,7 @@ pub enum Instance {
     Intermediate,
 }
 
-/// What happened to one issued present.
+/// Reports what happened to one issued present.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Queued for display.
@@ -91,14 +86,16 @@ pub enum Outcome {
     Canceled,
 }
 
-/// One record dequeued from the manager's statistics queue.
+/// Carries one record dequeued from the manager's statistics queue.
 #[derive(Copy, Clone, Debug)]
 pub enum PresentStatistic {
-    /// Whether this producer is being skipped.
+    /// Whether this producer is being skipped, for the present `present_id`.
     Status { present_id: u64, outcome: Outcome },
     /// Whether DWM composed the buffer or the display scanned it out.
     Frame {
+        /// The present this record describes.
         present_id: u64,
+        /// How the buffer reached the display.
         instance: Instance,
         /// Whether the buffer had to be copied to another adapter to be displayed — a
         /// reason to reallocate on the display's adapter.
@@ -106,29 +103,34 @@ pub enum PresentStatistic {
     },
     /// The present reached a display plane, bypassing the compositor.
     ///
-    /// The **only** report such a present makes at all: composition frames are not issued
-    /// for flipped presents, so a caller reading only those sees silence and cannot tell
-    /// success from a surface displaying nothing.
+    /// The only report such a present makes: composition frames are not issued for flipped
+    /// presents, so a caller reading only those sees silence and cannot tell success from a
+    /// surface displaying nothing.
     Flip { present_id: u64 },
 }
 
-/// A running count of what a group's presents did, drained from the statistics queue.
+/// Counts what a group's presents did, folded from the records the statistics queue yields.
 ///
-/// Lives here rather than in a consumer because every consumer wants the same five
-/// numbers and the decode is not obvious — in particular that `flipped` and `composed`
-/// come from two different record kinds and never both describe one present.
+/// `flipped` and `composed` come from two different record kinds and never both describe one
+/// present.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct PresentTally {
+    /// Presents the queue accepted for display.
     pub queued: u32,
+    /// Presents superseded by a later one before they could be shown.
     pub skipped: u32,
+    /// Presents cancelled.
     pub canceled: u32,
+    /// Presents that reached a display plane, from independent-flip records.
     pub flipped: u32,
+    /// Presents DWM composed, into its back buffer or into an intermediate.
     pub composed: u32,
+    /// Presents the display controller scanned out, from composition-frame records.
     pub scanout: u32,
 }
 
 impl PresentTally {
-    /// Folds one record in.
+    /// Folds one record into the running counts.
     pub fn record(&mut self, stat: PresentStatistic) {
         match stat {
             PresentStatistic::Status { outcome, .. } => match outcome {
@@ -147,10 +149,9 @@ impl PresentTally {
 
 struct Inner {
     manager: IPresentationManager,
-    /// Signalled when the manager has failed unrecoverably. **Peeked** before each
-    /// present rather than waited on, because the manager can be lost without our having
-    /// presented at all — so a caller waiting for `Present` to report it can wait
-    /// forever.
+    /// Signalled when the manager has failed unrecoverably. Peeked before each present
+    /// rather than waited on: the manager can be lost with no present outstanding, so a
+    /// caller waiting for `Present` to report the loss can wait forever.
     lost_event: HANDLE,
     statistics_event: HANDLE,
     statistics: bool,
@@ -162,10 +163,10 @@ struct Inner {
     pending: Cell<u32>,
 }
 
-/// A presentation manager and the regions presenting through it.
+/// Owns a presentation manager and issues the presents for the regions on it.
 ///
-/// Thread-affine like the device inside it. [`Clone`] shares the manager — a region holds
-/// its group, and cloning is how it does that.
+/// Thread-affine, like the device it was created from. [`Clone`] shares the manager: a
+/// region holds a clone of its group.
 #[derive(Clone)]
 pub struct PresentationGroup(Rc<Inner>);
 
@@ -179,8 +180,9 @@ impl PresentationGroup {
             (manager, lost, stats)
         };
         if statistics {
-            // All three kinds, or none. They answer different halves of one question and
-            // the gap between them is a trap — see `PresentStatistic::Flip`.
+            // All three kinds, or none: a flipped present issues no composition frame and a
+            // composed one issues no flip record, so a subset cannot separate a present
+            // that reached a plane from one that displayed nothing.
             for kind in [
                 PresentStatisticsKind_PresentStatus,
                 PresentStatisticsKind_CompositionFrame,
@@ -200,7 +202,8 @@ impl PresentationGroup {
         })))
     }
 
-    /// Whether the group has failed and must be rebuilt, along with every region in it.
+    /// Reports whether the group has failed and must be rebuilt, along with every region in
+    /// it.
     #[must_use]
     pub fn is_lost(&self) -> bool {
         if self.0.lost.get() {
@@ -217,13 +220,18 @@ impl PresentationGroup {
     /// `at` — a system-interrupt time from [`interrupt_time_now`], or `0` for as early as
     /// the system can.
     ///
-    /// A run of presents at increasing times is a *queue*: each occupies its own refresh
-    /// and the GPU works through them with the CPU out of it. **A run at `0` is not**,
-    /// because `0` supersedes anything still queued and the system does work to resolve
-    /// that — about 10% of a present. So a batch always states its slots, and `0` is for
-    /// the one-off case where there is nothing queued to supersede.
+    /// A run of presents at increasing times forms a queue: each occupies its own refresh
+    /// and the GPU works through them with the CPU out of it. A run at `0` does not, because
+    /// `0` supersedes anything still queued and the system does about 10% of a present's
+    /// work to resolve that. A batch therefore states its slots, and `0` is for the one-off
+    /// case with nothing queued to supersede.
     ///
-    /// `Ok(false)` when nothing was bound or the group is lost.
+    /// Returns `Ok(false)` when nothing was bound or the group is lost.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the manager rejects the target time or the present itself. A manager that
+    /// reports loss here is latched instead and returns `Ok(false)`.
     pub fn present_at(&self, at: u64, interrupt: Interrupt) -> Result<bool> {
         let inner = &*self.0;
         if inner.pending.replace(0) == 0 {
@@ -232,16 +240,16 @@ impl PresentationGroup {
         if self.is_lost() {
             return Ok(false);
         }
-        // A statistic describes a present the CPU was woken for, so a group reporting
-        // them forces the interrupt on rather than letting a caller defer the feedback it
-        // is about to read. Folded in here, and not a setter, because a mode set before
-        // one present and read by the next is exactly the state a caller forgets.
+        // A statistic describes a present the CPU was woken for, so a group that reports
+        // them forces the interrupt on rather than letting a caller defer the feedback it is
+        // about to read. Decided per present rather than through a setter, so the mode
+        // cannot be left set from an earlier one.
         let raise = inner.statistics || interrupt == Interrupt::Raise;
         // SAFETY: `manager` is live and owned by this group; none of these retains a
         // borrow past its return.
         unsafe {
-            // No error path worth surfacing: it cannot fail in a way that changes what
-            // the caller does, and a manager that has gone is caught by the present below.
+            // Discarded: no failure here changes what the caller does, and a manager that
+            // has gone is caught by the present below.
             _ = inner.manager.ForceVSyncInterrupt(u8::from(raise));
             inner
                 .manager
@@ -257,19 +265,19 @@ impl PresentationGroup {
         Ok(true)
     }
 
-    /// Whether this group was built to report statistics.
+    /// Reports whether this group was built to report statistics.
     #[must_use]
     pub fn reports_statistics(&self) -> bool {
         self.0.statistics
     }
 
-    /// Folds every pending record into `tally`, and answers how many it read.
+    /// Folds every pending record into `tally` and returns how many it read.
     ///
-    /// Call it **ahead of issuing this pass's presents**, as the API's own guidance asks:
-    /// the queue holds a few seconds and retires its oldest entries when it fills, so a
-    /// producer that presents first and reads later reads a queue that has already
-    /// dropped the answer. A group that enables statistics and never drains is making the
-    /// compositor generate work for a queue that only ever overflows.
+    /// Call this ahead of issuing the pass's presents, as the API's guidance asks: the queue
+    /// holds a few seconds and retires its oldest entries when it fills, so a producer that
+    /// presents first and reads later reads a queue that has already dropped the answer. A
+    /// group that enables statistics and never drains makes the compositor fill a queue that
+    /// only overflows.
     pub fn drain_statistics(&self, tally: &mut PresentTally) -> u32 {
         if !self.0.statistics {
             return 0;
@@ -281,10 +289,9 @@ impl PresentationGroup {
                 break;
             };
             read += 1;
-            // A record this build does not understand is still a record that was read.
-            // Folding "decoded to nothing" back into "the queue is empty" would end the
-            // drain at the first one and leave every record behind it unread — which is
-            // how a run reports a healthy present count and no composition frames at all.
+            // A record this crate does not decode still counts as read. Treating it as an
+            // empty queue would end the drain at the first one and leave every record behind
+            // it unread, which reports a healthy present count and no composition frames.
             if let Some(stat) = decode(&item) {
                 tally.record(stat);
             }
@@ -305,13 +312,12 @@ impl PresentationGroup {
     }
 }
 
-/// One statistics record, or `None` when it is a kind this build does not read.
+/// Decodes one statistics record, or returns `None` for a kind this crate does not read.
 fn decode(item: &IPresentStatistics) -> Option<PresentStatistic> {
     // SAFETY: `item` is live for the rest of this function.
     let (present_id, kind) = unsafe { (item.GetPresentId(), item.GetKind()) };
-    // The generated kinds are bare `i32` constants, so these are comparisons rather
-    // than match arms — an arm naming one would bind a fresh variable and match
-    // everything, which is a bug that compiles and reads correctly.
+    // The generated kinds are bare `i32` constants, so these are comparisons rather than
+    // match arms: an arm naming one would bind a fresh variable and match everything.
     if kind == PresentStatisticsKind_PresentStatus {
         let status = item.cast::<IPresentStatusPresentStatistics>().ok()?;
         // SAFETY: `status` is a live interface pointer.
@@ -349,8 +355,8 @@ fn decode(item: &IPresentStatistics) -> Option<PresentStatistic> {
         if count == 0 || instances.is_null() {
             return None;
         }
-        // One display is the question worth answering: the first instance is the one
-        // whose plane the layout is protecting.
+        // Only the first instance is decoded: it is the display whose plane the layout is
+        // protecting.
         // SAFETY: `count` is non-zero, so element 0 is inside the array.
         let first = unsafe { *instances };
         let instance = if first.instanceKind == CompositionFrameInstanceKind_ScanoutOnScreen {
@@ -369,10 +375,10 @@ fn decode(item: &IPresentStatistics) -> Option<PresentStatistic> {
     None
 }
 
-/// Whether `handle` is signalled right now, without blocking.
+/// Reports whether `handle` is signalled right now, without blocking.
 ///
-/// A zero timeout polls. Used for the two manager events, both of which are the manager's
-/// to reset, so this never consumes a signal another reader needed.
+/// A zero timeout polls. Called only for the two manager events, both of which the manager
+/// resets, so this never consumes a signal another reader needed.
 fn peek(handle: HANDLE) -> bool {
     // SAFETY: `handle` is owned by the manager and outlives this call; the list is a
     // stack local of the stated length.

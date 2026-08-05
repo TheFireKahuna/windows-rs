@@ -1,9 +1,7 @@
-//! `IntoChildren` — and why there is no `Child` type.
+//! `IntoChildren`: the one child parameter every container takes.
 //!
-//! One trait covers one child, many, none, an array and a `Vec`, so every container takes
-//! the same parameter and there is **no single-child position to get wrong**. That is
-//! strictly stronger than distinguishing a `Child` type from a `Children` type: the position
-//! that could be given the wrong one does not exist.
+//! One trait covers one child, many, none, an array and a `Vec`, so a container has a single
+//! child parameter and there is **no separate single-child position**.
 //!
 //! `Vec` is the only heap form, and it is the caller's own: static structure goes through
 //! tuples and arrays and never touches it.
@@ -12,17 +10,11 @@ use super::El;
 
 /// Where a container's children are collected.
 ///
-/// Named for what it collects rather than for how: `Slots` is the one store this stack keeps
-/// per id family, and a second meaning of that word in the same crate is one a reader has to
-/// disambiguate by module every time they meet it.
-///
-/// Carries no buffer, and that is the point twice over. **It cannot be a borrow**, because a
-/// borrow would have to be of something, and the only correct something is the arena's own
-/// pending stack — which an implementation must be free to re-enter, since an adapter builds
-/// its own slot while it appends. And it hands nothing out: the indices underneath are the
-/// arena's, and a trait that exposed them would let an implementation name a node it did not
-/// build. Appending an element is the only thing one can do, and the only thing one has ever
-/// needed to do.
+/// **Carries no buffer.** A borrow of the arena's pending stack would hold that borrow across
+/// an [`IntoChildren::append`] call, and an adapter builds its own slot while it appends. It
+/// also hands nothing out: the indices underneath are the arena's, and exposing them would
+/// let an implementation name a node it did not build. Appending an element is the only
+/// operation.
 ///
 /// Not constructible outside this crate, so [`IntoChildren::append`] cannot be called
 /// anywhere a container is not collecting.
@@ -35,11 +27,11 @@ impl Children {
 
     /// Appends one element, in paint order.
     ///
-    /// Straight onto the arena's pending stack. One borrow per child, released before the
-    /// next — which is what lets an adapter push its own slot from inside an append.
+    /// Straight onto the arena's pending stack, one borrow per child released before the
+    /// next, so an adapter can push its own slot from inside an append.
     ///
-    /// An element a constant `.when(false)` marked absent is **not appended**, which is what
-    /// makes it cost no node rather than a hidden one.
+    /// An element a constant `.when(false)` marked absent is **not appended**, so it costs no
+    /// node rather than a hidden one.
     pub fn push<K>(&mut self, el: El<K>) {
         super::arena::Build::with(|b| {
             if b.nodes[el.at as usize].present {
@@ -61,7 +53,7 @@ impl<K> IntoChildren for El<K> {
     }
 }
 
-/// Nothing. A container with no children is legal and says so.
+/// Nothing: a container with no children.
 impl IntoChildren for () {
     fn append(self, _: &mut Children) {}
 }
@@ -75,7 +67,7 @@ impl<T: IntoChildren> IntoChildren for Option<T> {
     }
 }
 
-/// A fixed number of the same thing, at any length, with no macro behind it.
+/// A fixed number of children of one type, at any length, with no macro behind it.
 impl<T: IntoChildren, const N: usize> IntoChildren for [T; N] {
     fn append(self, out: &mut Children) {
         for child in self {
@@ -93,11 +85,12 @@ impl<T: IntoChildren> IntoChildren for Vec<T> {
     }
 }
 
-/// Tuples of mixed kinds, which is what a hand-written screen is made of.
+/// Implements the trait for tuples of mixed kinds, which is what a hand-written screen is
+/// made of.
 ///
-/// One invocation. Each expansion emits its own arity and then recurses on its tail, so the
-/// arities are a consequence of the list rather than twelve lines that have to agree with
-/// it — and raising the ceiling is one identifier.
+/// One invocation: each expansion emits its own arity and then recurses on its tail, so the
+/// set of arities follows from the identifier list and raising the ceiling is one more
+/// identifier.
 macro_rules! tuple_children {
     () => {};
     ($head:ident $(, $tail:ident)*) => {

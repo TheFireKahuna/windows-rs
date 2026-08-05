@@ -1,8 +1,7 @@
-//! What the scheme claims, asserted as **evaluation counts** rather than as values.
+//! Tests for the signal graph, asserting evaluation counts rather than values.
 //!
-//! Every failure this module exists to catch — a glitch, a lost cutoff, a leaked
-//! subscription, a wasted recompute — produces the right answer at the wrong cost or on
-//! the wrong pass. Asserting on the value would miss all four.
+//! A glitch, a lost cutoff, a leaked subscription and a wasted recompute all produce the
+//! right value at the wrong cost or on the wrong pass, so each test counts what ran.
 
 use super::*;
 use std::cell::RefCell as Slot;
@@ -54,8 +53,8 @@ fn a_write_that_changes_nothing_propagates_nothing() {
 
 #[test]
 fn a_diamond_evaluates_its_shared_node_once() {
-    // a → b, a → c, (b, c) → d. A naive depth-first push evaluates `d` twice and shows it
-    // one old input in between, which is the glitch two-level marking exists to prevent.
+    // a → b, a → c, (b, c) → d. A depth-first push without two-level marking evaluates `d`
+    // twice and shows it one old input in between, which is the glitch.
     let (_owner, ()) = Owner::scope(|| {
         let a = Cell::new(1_i32);
         let log = Ref::new(Log::default());
@@ -94,7 +93,7 @@ fn a_diamond_evaluates_its_shared_node_once() {
 #[test]
 fn a_diamond_whose_branches_disagree_does_not_answer_from_a_stale_cache() {
     // The shape that makes marking a settled derivation's subscribers `Clean` unsound: one
-    // branch moves and the other does not, and whichever resolves second must not undo the
+    // branch moves and the other does not, and whichever resolves second must not clear the
     // first's mark.
     let (_owner, ()) = Owner::scope(|| {
         let a = Cell::new(1_i32);
@@ -117,9 +116,8 @@ fn a_diamond_whose_branches_disagree_does_not_answer_from_a_stale_cache() {
 
 #[test]
 fn a_derivation_that_settles_stops_the_propagation() {
-    // The cutoff. Without it, every write to `raw` wakes the effect even where the clamp
-    // already held — the difference between an interaction costing one comparison and one
-    // costing a subtree.
+    // The cutoff: without it, every write to `raw` wakes the effect even where the clamp
+    // already held.
     let (_owner, ()) = Owner::scope(|| {
         let raw = Cell::new(5.0_f64);
         let clamped = Memo::new(move || raw.get().clamp(0.0, 1.0));
@@ -194,8 +192,8 @@ fn effects_run_in_creation_order_after_every_memo() {
 
 #[test]
 fn a_branch_no_longer_read_stops_costing() {
-    // The dependency set is rebuilt per run, so a hidden arm's inputs stop waking it.
-    // Without that, a subtree behind a `false` keeps the cost it had when it was visible.
+    // The dependency set is rebuilt per run, so a hidden arm's inputs stop waking the
+    // effect and a subtree behind a `false` costs nothing.
     let (_owner, ()) = Owner::scope(|| {
         let show = Cell::new(true);
         let hidden = Cell::new(0_i32);
@@ -233,8 +231,8 @@ fn a_thousand_mounts_leak_no_node() {
             Effect::new(move || {
                 let _ = b.get();
             });
-            // A scope opened inside another is disposed by it, with no walk of its own —
-            // which is the shape that leaked once per unmount in the stack this replaces.
+            // A scope opened inside another is disposed by it: the inner handle is
+            // forgotten below, so only the outer scope's drop can free these nodes.
             let (inner, ()) = Owner::scope(|| {
                 let c = Cell::new(2_i32);
                 Effect::new(move || {
@@ -256,8 +254,8 @@ fn a_disposed_cell_answers_that_it_is_gone_rather_than_reading_a_stranger() {
         cell
     };
     assert!(!stale.alive());
-    // The slot is recycled here, so the generation check is the only thing between the
-    // stale handle and its new occupant.
+    // The slot is recycled here, so the generation check is all that separates the stale
+    // handle from its new occupant.
     let (_owner, fresh) = Owner::scope(|| Cell::new(9_i32));
     assert_eq!(fresh.get(), 9);
     assert!(!stale.alive());
@@ -302,7 +300,7 @@ fn a_producer_thread_stages_a_write_and_the_flush_applies_it() {
         log.take();
 
         std::thread::spawn(move || {
-            // A burst. The last value is what lands, and one wake is what is signalled.
+            // A burst: the last value lands, and the event is signalled once.
             for value in 1..=100 {
                 level.post(value);
             }
@@ -333,8 +331,8 @@ fn a_staged_write_against_a_disposed_cell_is_dropped() {
 
 #[test]
 fn a_constant_is_distinguishable_from_a_signal_without_reading_it() {
-    // What lets a static label cost one sprite and no graph node. Most of a screen is
-    // static, so this is not a micro-optimization.
+    // A constant is told apart from a signal without reading it, so binding one creates no
+    // graph node.
     fn constant<M>(value: impl Signal<f32, M>) -> bool {
         value.is_constant()
     }
@@ -358,10 +356,8 @@ fn an_epoch_carries_a_count_a_consumer_can_miss_and_still_detect() {
     assert_eq!(epoch.wait(0), at + 5);
 }
 
-/// A host that blocks needs telling that a write happened, and telling **once**.
-///
-/// Both halves matter and they fail in opposite directions: a wake that never comes is a
-/// frozen window, and a wake per write is the spin the blocking pump exists to remove.
+/// Covers both halves of the waker edge: a write asks a blocked host for a frame, and a
+/// burst of writes asks only once.
 #[test]
 fn a_write_asks_for_one_frame_and_a_burst_still_asks_once() {
     let asked = Ref::new(Slot::new(0_u32));
@@ -380,8 +376,8 @@ fn a_write_asks_for_one_frame_and_a_burst_still_asks_once() {
             let _ = b.get();
             seen.push("effect");
         });
-        // The mount's own first run is the host's business, not a wake's: it flushes before
-        // it shows the window. Whatever that cost, the counting starts after it.
+        // A host flushes the mount before it shows the window, so the counting below starts
+        // after that first flush rather than including it.
         flush();
         let mounted = asks();
 
@@ -417,8 +413,8 @@ fn a_write_asks_for_one_frame_and_a_burst_still_asks_once() {
     });
 }
 
-/// A write from inside an effect asks for nothing: the flush it is already inside picks it
-/// up on its next pass, and asking there would mean a frame after every frame.
+/// A write from inside an effect asks for no frame: the flush it is already inside picks it
+/// up on its next pass.
 #[test]
 fn a_write_from_inside_a_flush_asks_for_no_further_frame() {
     let asked = Ref::new(Slot::new(0_u32));
@@ -434,7 +430,7 @@ fn a_write_from_inside_a_flush_asks_for_no_further_frame() {
             derived.set(input.get() * 2);
             seen.push("writer");
         });
-        // A second effect, so the write above genuinely has a subscriber to queue.
+        // A second effect, so the write above has a subscriber to queue.
         let watched = Ref::new(Log::default());
         let watcher = Ref::clone(&watched);
         Effect::new(move || {

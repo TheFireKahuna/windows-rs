@@ -1,24 +1,20 @@
-//! Drives UI Automation against a real window, so a real client can walk it.
+//! Drives UI Automation against a real window, so an automation client can walk the tree.
 //!
-//! The unit tests answer whether the tree is right and whether a provider answers off the
-//! publishing thread. They cannot answer the one thing only a client can: whether
-//! **Windows** accepts this as a provider — that `WM_GETOBJECT` hands back something
-//! `UiaReturnRawElementProvider` is happy with, that the fragment root is reachable, that
-//! the control types read as intended, and whether a raised event reaches a listener.
+//! An attached client exercises what no unit test reaches: that `WM_GETOBJECT` returns a
+//! provider `UiaReturnRawElementProvider` accepts, that the fragment root is reachable, that
+//! the control types read as intended, and that a raised event reaches a listener.
 //!
 //! ```text
 //! cargo run -p windows-ui --example uia
 //! ```
 //!
-//! Then attach **Accessibility Insights** or **Inspect** and walk the tree. Press `T` to
-//! toggle the check box, `←`/`→` to move the slider, `Tab` to move focus, and `Q` to
-//! finish. Everything a client does — invoking the button, setting the slider's value,
-//! toggling the box — arrives as an [`Action`] and is applied by the same tick, so driving
-//! it from the app and driving it from a screen reader are the same code path.
+//! Attach Accessibility Insights or Inspect and walk the tree. Press `T` to toggle the check
+//! box, `←`/`→` to move the slider, `Tab` to move focus, and `Q` to finish. Invoking the
+//! button, setting the slider's value and toggling the box each arrive as an [`Action`] and
+//! are applied in the same tick, so a keystroke here and a screen reader take one code path.
 //!
-//! The one thing this deliberately does **not** build is a scene: the array and the seeds
-//! are written by hand, which is the point — automation resolves through the same flat hit
-//! array whatever produced it.
+//! No scene is built: the hit array and the seeds are written out by hand, because
+//! automation resolves through the same flat hit array whatever produced it.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,13 +30,14 @@ use windows_ui::uia::{
 use windows_ui::widget::{ModelState, Range, UiaRole};
 use windows_window::Window;
 
-/// The screen, in DIPs: a group with three controls, and a graph with two bands in it.
+/// The screen, in DIPs: a group holding a button, a check box, a label and a slider, and a
+/// graph beside it.
 const LAYOUT: [(&str, UiaRole, f32, f32, f32, f32); 6] = [
     ("Output", UiaRole::Group, 16.0, 16.0, 464.0, 132.0),
     ("Mute", UiaRole::Button, 32.0, 40.0, 152.0, 76.0),
     ("Bypass", UiaRole::CheckBox, 168.0, 40.0, 288.0, 76.0),
-    // A run, and then a control with no text of its own: the slider takes its name from
-    // the label beside it and says so through `LabeledBy`, which is what a form row is.
+    // A text run, then a control with no text of its own: the slider takes its name from the
+    // label beside it and reports the relation through `LabeledBy`.
     ("Gain", UiaRole::Text, 32.0, 92.0, 96.0, 112.0),
     ("", UiaRole::Slider, 104.0, 92.0, 464.0, 124.0),
     ("Spectrum", UiaRole::Graph, 16.0, 164.0, 464.0, 324.0),
@@ -49,7 +46,7 @@ const LAYOUT: [(&str, UiaRole, f32, f32, f32, f32); 6] = [
 const GROUP: usize = 0;
 const MUTE: usize = 1;
 const BYPASS: usize = 2;
-/// Named for the row it reads as; the slider beside it is what takes the name.
+/// Indexes the text run whose name the slider beside it adopts.
 #[expect(dead_code, reason = "names the layout row rather than indexing it")]
 const LABEL: usize = 3;
 const GAIN: usize = 4;
@@ -57,13 +54,13 @@ const SPECTRUM: usize = 5;
 
 const GAIN_RANGE: Range = Range::new(-60.0, 12.0);
 
-/// What a client can do to the screen, and what the screen currently is.
+/// Holds the screen's state and everything a client can change through automation.
 struct Model {
     ids: Vec<ControlId>,
     gain: f64,
     bypassed: bool,
     muted: bool,
-    /// How far the renderer has moved its bands, standing in for a mapping change.
+    /// Distance the renderer has moved its bands, standing in for a mapping change.
     spread: f32,
 }
 
@@ -86,14 +83,13 @@ fn main() -> Result<()> {
             let uia = Rc::clone(&uia);
             let quit = Rc::clone(&quit);
             move |_, message, wparam, lparam| {
-                // The one automation call that arrives on the pump. Answered here and
-                // nowhere else; everything a client asks afterwards is served off this
-                // thread entirely.
+                // The only automation call that arrives on the pump. Everything a client asks
+                // after this is served off this thread.
                 if message == WM_GETOBJECT {
                     return uia.borrow_mut().get_object(wparam, lparam);
                 }
-                // While the handle is still valid: automation caches per window, and
-                // `Drop` is too late to tell it which one.
+                // Detached while the handle is still valid: automation caches per window, and
+                // by `Drop` the handle names no window to clear.
                 if message == WM_DESTROY {
                     uia.borrow_mut().detach();
                 }
@@ -111,12 +107,12 @@ fn main() -> Result<()> {
     let mut hits = HitTable::default();
     hits.replace(&entries(&model.ids));
 
-    // A band handle exists only as pixels inside the graph, so it is a *part*: nameable,
-    // value-reporting, and reachable by element-from-point, with no visual behind it.
+    // A band handle exists only as pixels inside the graph, so it is a part: nameable,
+    // value-reporting and reachable by element-from-point, with no visual behind it.
     //
-    // The two halves come from where they really do. `RegionParts` is what a renderer
-    // publishes — geometry, versioned — and stands in here for the present thread; the
-    // names and roles are declared once on this side. `sync_regions` joins them each tick.
+    // The two halves arrive from different places. `RegionParts` carries the versioned
+    // geometry a renderer publishes, standing in here for the present thread; the names and
+    // roles are declared once on this side. `sync_regions` joins them each tick.
     let geometry = Arc::new(RegionParts::new());
     let levels: Arc<[AtomicU64]> = Arc::from([
         AtomicU64::new((-3.0f64).to_bits()),
@@ -144,25 +140,28 @@ fn main() -> Result<()> {
     let mut actions = Vec::new();
     let mut message = MSG::default();
     loop {
-        // SAFETY: no window filter, and the destination is a stack local.
+        // SAFETY: `message` is a stack local valid for writes for the whole call, and a null
+        // window handle is the documented request for every message on this thread.
         let more = unsafe { GetMessageW(&mut message, core::ptr::null_mut(), 0, 0) };
         if more.0 <= 0 || quit.get() {
             break;
         }
-        // SAFETY: `message` was just filled in by the call above.
+        // SAFETY: `GetMessageW` returned a positive result above, so `message` is fully
+        // initialized, and both calls take it by shared reference.
         unsafe {
             _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
 
-        // A keystroke stands in for the widget layer this example does not have: it changes
-        // the model exactly as an application would, and automation learns about it through
-        // the same calls a real front thread makes.
+        // A keystroke stands in for the widget layer this example does not build: it changes
+        // the model as an application would, and automation learns about the change through
+        // the same calls a front thread makes.
         if message.message == WM_KEYDOWN {
-            // A key stands in for the front thread's own sources, so it has to ask for the
-            // tick they would. A presenting region's epoch drives the frame clock
-            // continuously, which is why nothing in the real arrangement does this.
-            // SAFETY: a window this process owns, and the pacer's own message.
+            // The keystroke asks for the tick a front thread's own sources would have asked
+            // for. A presenting region's epoch drives the frame clock continuously, so a
+            // window with one never posts this itself.
+            // SAFETY: `hwnd` names a window this process owns, and `WM_FRAME` carries no
+            // pointer in either parameter.
             unsafe {
                 _ = PostMessageW(window.hwnd(), windows_window::WM_FRAME, 0, 0);
             }
@@ -170,8 +169,8 @@ fn main() -> Result<()> {
             match message.wParam as u16 {
                 // A republish, so a client that is already attached can observe one.
                 0x52 => publish(&uia, &hits, &mut seeds, &model, &window), // R
-                // The renderer's mapping moves — which is what a band drag looks like from
-                // here — and the join carries it without republishing the tree.
+                // Moves the renderer's mapping, which is what a band drag looks like from
+                // here; the join carries it without republishing the tree.
                 0x42 => {
                     model.spread += 24.0;
                     levels[0].store((-3.0 - f64::from(model.spread) * 0.1).to_bits(), Relaxed);
@@ -206,8 +205,8 @@ fn main() -> Result<()> {
                 Action::Invoke(id) if id == model.ids[MUTE] => {
                     model.muted = !model.muted;
                     println!("invoked Mute → {}", model.muted);
-                    // Said here and not by the provider: the provider returned before this
-                    // ran, which is what the pattern's contract requires of it.
+                    // Raised here rather than by the provider: the provider returned before
+                    // this ran, as the Invoke pattern requires of it.
                     uia.borrow_mut().invoked(id);
                     uia.borrow_mut().set_model(
                         id,
@@ -233,8 +232,8 @@ fn main() -> Result<()> {
             }
         }
 
-        // 3. Any watched region whose renderer has moved is re-joined. One acquire load
-        //    per region when nothing did, which is why this sits here unconditionally.
+        // 3. Re-joins any watched region whose renderer has moved. A region that did not move
+        //    costs one acquire load, so this runs unconditionally.
         uia.borrow_mut().sync_regions();
 
         // 4. The window may have moved, and automation speaks screen pixels.
@@ -253,9 +252,9 @@ fn main() -> Result<()> {
 
 /// Rebuilds the accessible tree from the hit array and the model.
 ///
-/// In a real front thread this runs where the patch is applied, against
-/// `Host::uia_seeds` — the seeds are synthesised from what each widget already declared.
-/// Here they are written out, which is the same data by hand.
+/// A front thread runs this where the patch is applied, taking seeds from `Host::uia_seeds`,
+/// which synthesises them from what each widget declared. The seeds built here are the same
+/// data written out by hand.
 fn publish(
     uia: &Rc<RefCell<Uia>>,
     hits: &HitTable,
@@ -316,7 +315,7 @@ fn label(model: &Model, id: ControlId) -> &'static str {
         .map_or("?", |at| LAYOUT[at].0)
 }
 
-/// What a renderer publishes: where each band sits, in **region-local** DIPs.
+/// Publishes where each band sits, in region-local DIPs, as a renderer would.
 fn publish_bands(geometry: &RegionParts, spread: f32) {
     let at = |sub: u32, x: f32| windows_present::Part {
         id: SubId(sub),
@@ -325,8 +324,10 @@ fn publish_bands(geometry: &RegionParts, spread: f32) {
     geometry.publish(&[at(0, 24.0), at(1, 200.0), at(2, 376.0)]);
 }
 
-/// The hit array, by hand. Ancestry is what automation's fragment navigation reads, so the
-/// three controls name the group and the group names nothing.
+/// Builds the hit array by hand.
+///
+/// Automation's fragment navigation reads the `parent` column, so the group's four children
+/// name the group, and the group and the graph name no parent.
 fn entries(ids: &[ControlId]) -> Vec<HitEntry> {
     LAYOUT
         .iter()
@@ -354,10 +355,11 @@ fn entries(ids: &[ControlId]) -> Vec<HitEntry> {
         .collect()
 }
 
-/// Where the client area's top-left sits, in physical pixels.
+/// Returns the client area's top-left corner, in physical pixels.
 fn client_origin(hwnd: *mut core::ffi::c_void) -> windows_numerics::Vector2 {
     let mut point = [0i32; 2];
-    // SAFETY: a window this process owns and an out-pointer to a stack local.
+    // SAFETY: `hwnd` names a window this process owns, and `point` is a stack local valid for
+    // writes for the whole call.
     unsafe {
         _ = ClientToScreen(hwnd, &raw mut point);
     }
@@ -371,7 +373,7 @@ const WM_GETOBJECT: u32 = 0x003D;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_DESTROY: u32 = 0x0002;
 
-/// The platform's shape. Most fields go unread here; they are declared because the layout
+/// Mirrors the platform's message record. The unread fields are declared because the layout
 /// is the ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

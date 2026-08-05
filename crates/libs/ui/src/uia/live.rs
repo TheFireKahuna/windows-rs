@@ -1,14 +1,12 @@
-//! What cannot be in an immutable snapshot.
+//! Holds the mutable state that sits beside an immutable published tree.
 //!
-//! A published tree is replaced when *structure* changes. A value moves per pointer
+//! A published tree is replaced only when structure changes. A value moves per pointer
 //! sample, a toggle flips per click, a scroll offset arrives from a tracker and the window
-//! moves whenever the user drags it — republishing for any of those would put an
-//! allocation on an interaction path and a rebuild on the frame clock.
+//! moves as the user drags it, so those live here instead: allocated with the tree and
+//! indexed by the same entry index, which keeps an interaction off the republish path.
 //!
-//! So the tree is immutable and these sit beside it, allocated with it and indexed by the
-//! same entry index. Atomics rather than cells, because the writer is the front thread and
-//! the readers are automation's own workers: a `Cell` here is not merely wrong, it does
-//! not compile as `Sync`.
+//! Every slot is an atomic, because the front thread writes while automation's own worker
+//! threads read.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use windows_numerics::Vector2;
@@ -24,11 +22,13 @@ impl State {
     pub const SELECTED: Self = Self(1 << 2);
     pub const EXPANDED: Self = Self(1 << 3);
 
+    /// Returns whether every flag in `other` is set.
     #[must_use]
     pub const fn has(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// Returns this state with the flags in `other` set or cleared according to `on`.
     #[must_use]
     pub const fn with(self, other: Self, on: bool) -> Self {
         Self(if on {
@@ -49,35 +49,42 @@ impl core::ops::BitOr for State {
 /// The mutable half of a published tree.
 ///
 /// Every field is written by the front thread and read from anywhere. Nothing here
-/// allocates after construction, so a drag writes one relaxed store per sample and a tree
-/// walk reads without taking a lock.
+/// allocates after construction, so a drag writes one store per sample and a tree walk
+/// reads without taking a lock.
+///
+/// Every load and store here is relaxed: each slot stands alone, with no other datum
+/// ordered against it, so a reader takes whichever whole value is current. The tree these
+/// slots index into is published under its own release-acquire pair.
 #[derive(Debug)]
 pub struct Live {
     /// `f64` bits per entry, `NaN` where the entry carries no value.
     values: Box<[AtomicU64]>,
     state: Box<[AtomicU32]>,
-    /// One slot per scroll container, keyed by node. A handful per screen, so a linear
-    /// scan beats a map that would have to be kept in step with the tree.
+    /// One slot per scroll container, keyed by node. A handful per screen, so lookup is a
+    /// linear scan.
     scrolls: Box<[(NodeId, AtomicU64)]>,
-    /// The focused control, as a packed generational id. Focus is singular, so it is one
-    /// word — and packed rather than an index, because an index is only meaningful until
-    /// the next republish.
+    /// The focused control as a packed generational id. Focus is singular, so it is one
+    /// word, and an id rather than an index because an index is only meaningful until the
+    /// next republish.
     focused: AtomicU64,
     /// The window's top-left in physical pixels, packed as two `f32`s.
     ///
-    /// Automation speaks screen pixels and everything above speaks DIPs, so this and
-    /// [`scale`](Self::scale) are what the boundary is crossed with. A stale origin reads
-    /// exactly like an application placing its controls wrongly, which is why it is
-    /// published rather than asked for.
+    /// Automation speaks screen pixels and everything above speaks DIPs; this and
+    /// [`scale`](Self::scale) convert between them. Both are written on every window move,
+    /// because a stale origin reports every control at the wrong place.
     origin: AtomicU64,
     /// `dpi / 96`, as `f32` bits.
     scale: AtomicU32,
 }
 
-/// `f64::NAN` bits — the absence of a value, and not a value that could be written.
+/// The `f64::NAN` bit pattern, standing for no value. A written value reads back only when
+/// it is finite, so this cannot collide with one.
 const NO_VALUE: u64 = 0x7ff8_0000_0000_0000;
 
 impl Live {
+    /// Allocates state for `len` entries and one scroll slot per node in `scrolls`.
+    ///
+    /// Every entry starts enabled and carrying no value.
     pub fn new(len: usize, scrolls: impl Iterator<Item = NodeId>) -> Self {
         Self {
             values: (0..len).map(|_| AtomicU64::new(NO_VALUE)).collect(),
@@ -89,6 +96,8 @@ impl Live {
         }
     }
 
+    /// Returns the value at entry `at`, or `None` where none was written, the value is not
+    /// finite, or the index is past the end.
     #[must_use]
     pub fn value(&self, at: usize) -> Option<f64> {
         let bits = self.values.get(at)?.load(Relaxed);
@@ -96,23 +105,28 @@ impl Live {
         value.is_finite().then_some(value)
     }
 
+    /// Stores `value` at entry `at`. An index past the end is ignored.
     pub fn set_value(&self, at: usize, value: f64) {
         if let Some(slot) = self.values.get(at) {
             slot.store(value.to_bits(), Relaxed);
         }
     }
 
+    /// Returns the flags set at entry `at`, or none where the index is past the end.
     #[must_use]
     pub fn state(&self, at: usize) -> State {
         State(self.state.get(at).map_or(0, |s| s.load(Relaxed)))
     }
 
+    /// Sets or clears `flag` at entry `at` according to `on`, leaving the other flags as
+    /// they are. An index past the end is ignored.
     pub fn set_state(&self, at: usize, flag: State, on: bool) {
         if let Some(slot) = self.state.get(at) {
             let _ = slot.fetch_update(Relaxed, Relaxed, |bits| Some(State(bits).with(flag, on).0));
         }
     }
 
+    /// Returns the scroll offset of `node`, or zero where it has no slot.
     #[must_use]
     pub fn scroll(&self, node: NodeId) -> Vector2 {
         match self.scrolls.iter().find(|(id, _)| *id == node) {
@@ -121,22 +135,25 @@ impl Live {
         }
     }
 
+    /// Stores the scroll offset of `node`. A node with no slot is ignored.
     pub fn set_scroll(&self, node: NodeId, offset: Vector2) {
         if let Some((_, packed)) = self.scrolls.iter().find(|(id, _)| *id == node) {
             packed.store(pack(offset), Relaxed);
         }
     }
 
+    /// Returns the focused control as a packed generational id.
     #[must_use]
     pub fn focused(&self) -> u64 {
         self.focused.load(Relaxed)
     }
 
+    /// Stores the focused control's packed generational id.
     pub fn set_focused(&self, id: u64) {
         self.focused.store(id, Relaxed);
     }
 
-    /// Where the window's client area sits, and what one DIP is worth there.
+    /// Returns the window's client origin in physical pixels and the DIP scale there.
     #[must_use]
     pub fn window(&self) -> (Vector2, f32) {
         (
@@ -145,15 +162,18 @@ impl Live {
         )
     }
 
+    /// Stores the window's client origin in physical pixels and the DIP scale there.
     pub fn set_window(&self, origin: Vector2, scale: f32) {
         self.origin.store(pack(origin), Relaxed);
         self.scale.store(scale.to_bits(), Relaxed);
     }
 
-    /// Carries the mutable half of the outgoing tree into the incoming one.
+    /// Copies the outgoing tree's live state into this one.
     ///
-    /// A republish is a layout change, and a layout change does not disable a control or
-    /// move a slider. Without this a resize would announce every toggle as reset.
+    /// `mapping` yields `(old, new)` entry-index pairs; an entry with no pair keeps the
+    /// state it was constructed with. Scroll offsets, focus and the window are carried
+    /// whole. A republish is a layout change, which disables no control and moves no
+    /// slider, so without this a resize would announce every toggle as reset.
     pub fn carry(&self, from: &Self, mapping: impl Iterator<Item = (usize, usize)>) {
         for (old, new) in mapping {
             if let (Some(src), Some(dst)) = (from.values.get(old), self.values.get(new)) {

@@ -1,20 +1,17 @@
-//! `each`, `when` and `switch`: the two structure mechanisms bound to a view type.
+//! `each`, `when` and `switch`: the two structure mechanisms of [`Keyed`] and [`Branch`],
+//! bound to this crate's view type.
 //!
-//! `windows-scene`'s neighbours supply [`Keyed`] and [`Branch`] and deliberately stop there,
-//! because binding them needs a view type and the view type is this crate's. What is added
-//! here is that binding and nothing else — no third mechanism, and no container special
-//! case: all three are [`IntoChildren`](super::IntoChildren) implementations, so a list is
-//! passed exactly where a tuple would be.
+//! Binding is the whole of what this module adds. There is no third mechanism and no
+//! container special case: all three types are [`IntoChildren`](super::IntoChildren)
+//! implementations, so a list is passed exactly where a tuple would be.
 //!
-//! Rows and arms build at **reconcile** time, inside a detached scope. That is where the
-//! arena's re-entry rule is satisfied rather than violated: reconcile runs from an effect,
-//! outside any `Build::with` borrow, so a row is free to call application code.
+//! Rows and arms build at **reconcile** time, inside a detached scope. Reconcile runs from an
+//! effect, outside any `Build::with` borrow, so a row is free to call application code.
 //!
-//! Nothing here pushes data into a surviving row. A survivor is a move and a value change,
-//! and the value change arrives through the ordinary channel on sinks the row already has —
-//! which is what makes a filter keystroke that keeps a card reorder it rather than rebuild
-//! it. A row whose contents must follow its item therefore closes over a signal, as every
-//! other value in this surface does.
+//! Nothing here pushes data into a surviving row. A survivor gets a move and, through the
+//! ordinary channels on the sinks it already has, a value change — so a filter keystroke that
+//! keeps a card reorders it rather than rebuilding it. A row whose contents follow its item
+//! closes over a signal, as every other value in this surface does.
 
 use super::arena::{Adapter, Build, Slot};
 use super::{Any, Children, El, IntoChildren, Mount, Site, View};
@@ -33,21 +30,19 @@ use windows_scene::NodeId;
 pub struct Each<K, T> {
     fill: Box<dyn Fn(&mut Vec<T>)>,
     key: Box<dyn Fn(&T) -> &K>,
-    /// Erased to [`View`] here rather than carried as a kind: a list of one widget kind and
-    /// a list of another are the same list, and a marker that survived to the container
-    /// would make them different types for no property anyone can use.
+    /// Erased to [`View`] here rather than carried as a kind, so a list of one widget kind
+    /// and a list of another are the same type at the container.
     view: Box<dyn Fn(&T) -> View>,
 }
 
-/// A list whose rows are recycled by key.
+/// Builds a list whose rows are recycled by key.
 ///
 /// `items` is read inside an effect, so it tracks whatever it reads and the list reconciles
-/// when that moves. The `Vec` it returns is the one heap allocation on the path, and it is
-/// visible here rather than hidden per row — [`each_into`] is the form without it.
+/// when that moves. The `Vec` it returns is the one heap allocation on the path;
+/// [`each_into`] is the form without it.
 ///
-/// `key` **projects** the identity out of the item rather than being carried beside it. A
-/// list whose items are their own keys writes `|item| item` and stores each one once; the
-/// pair form this replaced stored every key twice, at both of its call sites.
+/// `key` **projects** the identity out of the item rather than being carried beside it, so a
+/// list whose items are their own keys writes `|item| item` and stores each one once.
 pub fn each<K, T, V>(
     items: impl Fn() -> Vec<T> + 'static,
     key: impl Fn(&T) -> &K + 'static,
@@ -61,13 +56,12 @@ where
     each_into(move |out| *out = items(), key, view)
 }
 
-/// The same, filling a buffer the adapter keeps.
+/// Builds a keyed list that fills a buffer the adapter keeps.
 ///
-/// What a list reconciling **every frame of a fling** needs, and what any list on a path
-/// that must not allocate needs: the buffer reaches its high-water mark once and nothing
-/// after it allocates. A caller who is building a fresh `Vec` per read anyway has no reason
-/// to reach for this — but a caller who is copying one out of state it already holds does,
-/// and that is most of them.
+/// The buffer reaches its high-water mark once and nothing after that allocates, which is
+/// what a list reconciling **every frame of a fling** needs, and what any list on a path that
+/// must not allocate needs. A caller copying items out of state it already holds wants this
+/// form; a caller building a fresh `Vec` per read gains nothing over [`each`].
 pub fn each_into<K, T, V>(
     fill: impl Fn(&mut Vec<T>) + 'static,
     key: impl Fn(&T) -> &K + 'static,
@@ -93,9 +87,9 @@ where
     fn append(self, out: &mut Children) {
         let Self { fill, key, view } = self;
         out.push(El::<Any>::at_index(adapter(move |site| {
-            // Detached from whatever scope is running the reconcile, for the reason the
-            // list itself is: rows belong to the list, and a list driven from an effect
-            // would otherwise register every row it ever built as a child of that effect.
+            // Detached from whatever scope runs the reconcile: rows belong to the list, and
+            // a list driven from an effect would otherwise register every row it ever built
+            // as a child of that effect.
             let list = Rc::new(RefCell::new(Keyed::<K>::new()));
             let mounts = Rc::new(RefCell::new(FxHashMap::<K, Mount>::default()));
             let next = Rc::new(RefCell::new(Vec::<T>::new()));
@@ -105,8 +99,8 @@ where
                 fill(&mut next);
                 let mut list = list.borrow_mut();
                 // The anchor, not the head of the container: rows share their parent with
-                // the container's static children now, so starting from `None` would put
-                // the first row above everything written before the list.
+                // the container's static children, so starting from `None` would put the
+                // first row above everything written before the list.
                 let mut previous: Option<NodeId> = site.after;
                 list.reconcile(
                     &next,
@@ -115,10 +109,9 @@ where
                         mounts.borrow_mut().remove(key);
                     },
                     |key, item| {
-                        // Born at the anchor rather than at the head. The pass below places
-                        // every insert anyway, so this is only about where a new row exists
-                        // in between — and "somewhere inside this list" is the answer that
-                        // cannot be briefly wrong.
+                        // Born at the anchor rather than at the head, so a new row exists
+                        // inside this list from the moment it is mounted. The pass below
+                        // places every insert afterwards.
                         let mount =
                             super::mount_at(view(item), site.parent, site.after, site.scope);
                         mounts.borrow_mut().insert(key.clone(), mount);
@@ -145,19 +138,18 @@ where
 
 /// A subtree that is present or absent.
 ///
-/// Not generic over the signal's marker: the condition is boxed on the way in, so carrying
-/// the marker out would make two lists of the same shape two types for no property anyone
-/// can use.
+/// Not generic over the signal's marker: the condition is boxed on the way in, so two
+/// conditionals of the same shape are one type.
 pub struct When {
     cond: Box<dyn Fn() -> bool>,
     view: Box<dyn Fn() -> View>,
 }
 
-/// Present when `cond`, absent otherwise.
+/// Builds a subtree that is present while `cond` holds and absent otherwise.
 ///
-/// **Absence contributes nothing** — no node, no layout participation, no hidden
-/// placeholder. A constant condition is resolved here and never reaches the graph, which is
-/// what makes the common case free.
+/// **Absence contributes nothing**: no node, no layout participation, no hidden placeholder.
+/// A constant condition tracks nothing, so the effect driving it runs once and the subtree is
+/// decided once.
 pub fn when<M>(cond: impl Signal<bool, M> + 'static, view: impl Fn() -> View + 'static) -> When {
     When {
         cond: Box::new(move || cond.read()),
@@ -178,11 +170,10 @@ pub struct Switch<K> {
     view: Box<dyn Fn(&K) -> View>,
 }
 
-/// One arm of several, rebuilt when the key changes.
+/// Builds one arm of several, rebuilt when `key` changes.
 ///
-/// The arm's scope is dropped and rebuilt on a change, so a screen's state is genuinely
-/// gone when you navigate away. Where that is *not* wanted, the state lives in a cell owned
-/// above the switch — a decision the call site makes by where it puts the cell.
+/// The outgoing arm's scope is dropped, so state owned inside it is gone. State that has to
+/// outlive the arm lives in a cell owned above the switch.
 pub fn switch<K: PartialEq + 'static>(
     key: impl Fn() -> K + 'static,
     view: impl Fn(&K) -> View + 'static,
@@ -200,10 +191,10 @@ impl<K: PartialEq + 'static> IntoChildren for Switch<K> {
     }
 }
 
-/// The shape both conditional forms share: one [`Branch`], driven by one effect.
+/// Appends the adapter both conditional forms share: one [`Branch`], driven by one effect.
 ///
-/// `when` is `Branch<bool>` whose key is `None` when the condition is false, and `switch` is
-/// `Branch<K>` whose key always exists. One mechanism, differing in what it keys on.
+/// `when` passes a key that is `None` while its condition is false; `switch` passes a key
+/// that always exists.
 fn switch_adapter<K: PartialEq + 'static>(
     out: &mut Children,
     key: impl Fn() -> Option<K> + 'static,
@@ -223,8 +214,8 @@ fn switch_adapter<K: PartialEq + 'static>(
                     mount.borrow_mut().take();
                 },
                 |key| {
-                    // The anchor is the whole of this arm's position — a branch has one
-                    // arm and therefore no reorder pass to correct it afterwards.
+                    // The anchor is the whole of this arm's position: a branch has one arm
+                    // and no reorder pass to correct it afterwards.
                     *mount.borrow_mut() = Some(super::mount_at(
                         view(key),
                         site.parent,
@@ -237,12 +228,12 @@ fn switch_adapter<K: PartialEq + 'static>(
     })));
 }
 
-/// Appends the arena slot an adapter owns: its **anchor**, and nothing else.
+/// Appends the arena slot an adapter owns — its **anchor** — and returns its index.
 ///
 /// The node this becomes is hidden at mount and never holds a child. What it holds is a
-/// position — see [`Site`] — so that rows and arms are laid out by the container the list was
-/// passed to rather than by a box the author never wrote, and so that two adjacent lists keep
-/// their order across being empty.
+/// position, as [`Site`] describes: rows and arms are laid out by the container the list was
+/// passed to rather than by a box the author never wrote, and two adjacent lists keep their
+/// order across being empty.
 fn adapter(install: impl FnOnce(Site) + 'static) -> u32 {
     Build::with(|b| {
         let at = b.push_slot(Slot {

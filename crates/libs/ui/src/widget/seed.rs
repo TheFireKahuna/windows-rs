@@ -1,13 +1,10 @@
-//! The widget set: nineteen functions, each a seed with no body.
+//! The widget seeds: each writes a slot and returns an element.
 //!
-//! A widget writes a slot and returns an element. It does not call `Model`, resolve a
-//! colour or build a style — the lowering does all three — which is what makes nineteen
-//! widgets nineteen short functions rather than nineteen implementations, and what makes
-//! the twentieth cost the same as the first.
+//! A seed does not call `Model`, resolve a colour or build a style. The lowering does all
+//! three, which is what keeps a widget to one short function.
 //!
-//! A **composition** is a function returning a tree of these. It costs this crate nothing
-//! and needs no permission, and it is where `badge`, `nav`, `tabs` and every screen an
-//! application assembles for itself live.
+//! A composition is a function returning a tree of these. It is where `badge`, `nav`, `tabs`
+//! and every screen an application assembles for itself live, and it adds nothing here.
 
 use crate::build::{Button, El, Path, View};
 use crate::gesture::{DragDecl, GestureDecl};
@@ -19,8 +16,8 @@ use windows_scene::{GeomId, HitFlags};
 
 // ── text ─────────────────────────────────────────────────────────────────────────
 //
-// Five rungs of one ladder. Each carries its own role and type ramp and **none accepts a
-// colour or a size**, which is the whole of why a call site never restates the theme's job.
+// Five rungs of one ladder. Each carries its own role and type ramp, and none takes a colour
+// or a size.
 
 /// Body copy.
 #[must_use]
@@ -34,15 +31,14 @@ pub fn title(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Title, Text::Primary, Flow::Line)
 }
 
-/// A field's or a group's name. Secondary, because a label is not the thing it labels.
+/// A field's or a group's name, set secondary to the thing it labels.
 #[must_use]
 pub fn label(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Label, Text::Secondary, Flow::Line)
 }
 
-/// Supporting prose. **Wraps by definition**, which is why it is the one text widget that
-/// is a group: a coverage tile is one line's, so a run that can break needs a sprite per
-/// line and everything else stays a single visual.
+/// Supporting prose. It wraps, so it is the one text widget that mounts as a group: a
+/// coverage tile covers one line, and a run that can break needs a sprite per line.
 #[must_use]
 pub fn caption(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Caption, Text::Tertiary, Flow::Wrap)
@@ -54,34 +50,34 @@ pub fn mono(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Mono, Text::Primary, Flow::Line)
 }
 
-/// The shared body of all five, and of every label inside a control.
+/// Builds a text run: the shared body of the five text widgets and of every label inside a
+/// control.
 ///
 /// `ink` is stated here and overridden at mount by the enclosing widget's chrome row where
-/// there is one, so a button's variant reaches its text without the text knowing there are
-/// variants.
+/// there is one, so a button's variant reaches its text without the text naming a variant.
 fn run(s: impl Into<TextSource>, ramp: TypeRole, ink: Text, flow: Flow) -> View {
     El::seed(Preset::Text)
         .text_seed(s.into(), ramp, Some(ink), flow)
         // `UIA` and nothing else: a run has no gesture, takes no focus and routes no
-        // pointer, so the scan skips it on one flags test. Without an entry it has no peer
-        // at all, and a screen of labels, headings and read-outs reads as an empty window.
+        // pointer, so the hit scan skips it on one flags test. With no entry at all it
+        // would have no automation peer, and a screen of text would read as empty.
         .hit(HitFlags::UIA, UiaRole::Text)
 }
 
-/// A label whose colour is the enclosing control's, not its own.
+/// A label whose colour is the enclosing control's rather than its own.
 ///
-/// **No peer**, deliberately: the control it sits in derives its accessible name from this
-/// text, so publishing it again as a child would have a reader say the button's name twice.
+/// It mints no automation peer: the control it sits in derives its accessible name from this
+/// text, so a peer would have a reader announce the control's name twice.
 fn inner(s: impl Into<TextSource>, ramp: TypeRole) -> View {
     El::seed(Preset::Text).text_seed(s.into(), ramp, None, Flow::Line)
 }
 
 // ── surfaces ─────────────────────────────────────────────────────────────────────
 //
-// **A surface takes an optional key, never children.** Children arrive through a layout
-// modifier — `card().stack((..))`, `panel("effects").row((..))` — because every layout
-// class exists as both a free function and a method over one table. That is what keeps four
-// surfaces by seven classes from being twenty-eight signatures.
+// A surface takes an optional key and never children. Children arrive through a layout
+// modifier — `card().stack((..))`, `panel("effects").row((..))` — since every layout class
+// exists as both a free function and a method over one table, so four surfaces and seven
+// classes are not twenty-eight signatures.
 
 /// A bare filled rectangle. No scope push, so nothing inside it resolves differently.
 #[must_use]
@@ -89,7 +85,7 @@ pub fn box_() -> View {
     El::seed(Preset::Bare).chrome(roles::SURFACE, roles::SURFACE_PANEL, Metric::Radius)
 }
 
-/// The workhorse. A scope push to `Raised`, its own padding, radius and hairline, and
+/// A raised surface: a scope push to `Raised`, its own padding, radius and hairline, and
 /// minimum metrics from the palette.
 #[must_use]
 pub fn card() -> View {
@@ -103,8 +99,7 @@ pub fn card() -> View {
         .min_height(Metric::CardMinH)
 }
 
-/// A region of the window's own plane. No hairline — an outline here would be a box drawn
-/// around nothing.
+/// A region of the window's own plane, with no hairline.
 #[must_use]
 pub fn panel(key: &'static str) -> View {
     El::seed(Preset::Bare)
@@ -157,7 +152,7 @@ pub fn toggle<M>(on: impl Signal<bool, M> + Copy + 'static) -> View {
         .row(knob_sprite().along(false, move || f32::from(u8::from(on.read()))))
 }
 
-/// A value along a track. The thumb moves **front-side** in the tick that saw the contact,
+/// A value along a track. The thumb moves front-side in the tick that saw the contact,
 /// and the number reaches the application afterwards.
 #[must_use]
 pub fn slider<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> View {
@@ -169,14 +164,13 @@ pub fn slider<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> V
         .row(knob_sprite().along(range.vertical, move || range.fraction(value.read())))
 }
 
-/// A value turned rather than dragged.
+/// A value turned rather than slid.
 ///
-/// The moving part is a **child**, not the control itself: "the part a value moves" is one
-/// concept whether it slides or turns, and the router retargets that part. A knob whose
-/// rotation sat on its own node would be the one control the front thread could not move.
+/// The moving part is a child node rather than the control itself, so the router retargets
+/// the same kind of part it retargets for a slider.
 ///
-/// Its bed is a chrome row like every other control's, which is also what gives its
-/// interaction wash a radius — a wash resolves the surface it covers, and a control with no
+/// Its bed is a chrome row like every other control's, which is what gives the interaction
+/// wash its radius: a wash takes the shape of the surface it covers, and a control with no
 /// row would be washed as a square.
 #[must_use]
 pub fn knob<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> View {
@@ -188,9 +182,9 @@ pub fn knob<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> Vie
         .stack(
             El::<crate::build::Any>::seed(Preset::Bare)
                 .thumb(Metric::RadiusPill, Role::Fill(Fill::Accent))
-                // A fraction and not an angle: the sweep is applied by whichever side is
-                // moving the part, from one function, so a committed value and a live drag
-                // cannot land the knob in two different places.
+                // A fraction and not an angle: whichever side is moving the part applies
+                // the sweep, through `angle_of`, so a committed value and a live drag land
+                // the knob in the same place.
                 .turns(move || range.fraction(value.read())),
         )
 }
@@ -205,8 +199,8 @@ pub fn segmented<T>(value: Cell<T>, options: &'static [(&'static str, T)]) -> Vi
 where
     T: Copy + PartialEq + 'static,
 {
-    // The one heap form, and it is visible here: a widget whose child count comes from a
-    // slice cannot be a tuple. Static structure elsewhere never touches it.
+    // The one allocation in the widget set: a child count that comes from a slice cannot be
+    // a tuple, which is what static structure elsewhere uses.
     let kids: Vec<View> = options
         .iter()
         .map(|&(name, option)| {
@@ -239,8 +233,8 @@ pub fn field(value: impl Into<TextSource>) -> View {
 
 /// A button that opens a list of options.
 ///
-/// A widget rather than a composition for one reason: its automation pattern is `ComboBox`,
-/// and that has to be declared somewhere.
+/// A widget rather than a composition, because its automation pattern is `ComboBox` and only
+/// a widget declares one.
 #[must_use]
 pub fn select(text: impl Into<TextSource>, body: impl Fn() -> View + 'static) -> El<Button> {
     control(UiaRole::ComboBox)
@@ -251,11 +245,9 @@ pub fn select(text: impl Into<TextSource>, body: impl Fn() -> View + 'static) ->
 
 /// A read-only level.
 ///
-/// **No hit entry at all**, which is what "not interactive" has to mean here: it is the hit
-/// entry that mints a control row, a front-side row and a slot in the array every pointer
-/// sample is resolved against — and a column of meters is exactly where that adds up. Its
-/// level springs, because a meter carries momentum where a value the application wrote must
-/// be where it was put.
+/// It mints no hit entry, so it costs no control row, no front-side row and no slot in the
+/// array every pointer sample is resolved against — which is what a column of meters would
+/// otherwise add up to. Its level springs, because a meter carries momentum.
 #[must_use]
 pub fn meter<M>(level: impl Signal<f32, M> + 'static) -> View {
     El::seed(Preset::Bare)
@@ -296,8 +288,8 @@ const fn ink_wash() -> StatePolicy {
     }
 }
 
-/// What a control whose whole purpose is a value washes with. The accent is already the
-/// colour it moves in, so hovering it in ink would be a second hue for one gesture.
+/// The wash for a control whose moving part is drawn in the accent, so hover and press stay
+/// in the one hue.
 const fn accent_wash() -> StatePolicy {
     StatePolicy::Wash {
         hover: Wash::Accent,
@@ -306,9 +298,9 @@ const fn accent_wash() -> StatePolicy {
 }
 
 const _: () = {
-    // Every widget above names a table this crate owns, and a variant method addresses a
-    // row of one. An empty table would resolve every label through the fallback ink, which
-    // is a different colour from the one the variant chose and nothing would say so.
+    // Every widget above names one of these tables, and a variant method addresses a row of
+    // it. `Chrome::roles` clamps to the last row, so an empty table would index out of
+    // bounds.
     assert!(!roles::BUTTON.is_empty());
     assert!(!roles::SURFACE.is_empty());
     assert!(!roles::TRACK.is_empty());

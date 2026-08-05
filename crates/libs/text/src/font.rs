@@ -1,45 +1,46 @@
-//! Naming a font, and resolving that name to a face.
+//! Names a font, and resolves that name to a face.
 //!
-//! A shaped run crosses a thread boundary as plain `Copy` data, so it cannot carry a family
+//! A shaped run crosses a thread boundary as plain `Copy` data, so it carries no family
 //! *name*. It names a font by an index into an application-wide [`FontLadder`], and the
-//! thread that rasterizes resolves that index against the same ladder. Two [`TextEngine`]s
-//! interning independently would agree on `0` and disagree on everything after it, and the
-//! symptom is a run drawn in the wrong face rather than an error.
+//! thread that rasterizes resolves that index against the same ladder. Every thread must
+//! share one ladder: two [`TextEngine`]s interning independently agree on `0` and disagree
+//! on everything after it, and the symptom is a run drawn in the wrong face rather than an
+//! error.
 //!
-//! ## Two tables, because a run names what it *got*
+//! ## Two id spaces
 //!
-//! Fallback resolves a face the requested family does not name, and a glyph index is an
-//! index into a face — so a segment carrying only the requested [`FontSpec`] draws the
-//! fallback run's ids through the primary family. Not tofu: arbitrary glyphs at arbitrary
-//! positions. [`FamilyId`] is what an application declares, [`FaceId`] is what shaping
-//! resolved, and only the second travels.
+//! [`FamilyId`] names what an application declared; [`FaceId`] names the face shaping
+//! resolved, fallback included, and only [`FaceId`] travels. Fallback resolves a face the
+//! requested family does not name, and a glyph index is an index into a face, so a segment
+//! carrying only the requested [`FontSpec`] draws the fallback run's ids through the
+//! primary family — arbitrary glyphs at arbitrary positions, not tofu.
 //!
-//! The face table is append-only, which keeps what matters: an id is never reassigned, and
-//! a reader only ever asks for one the writer already minted.
+//! The face table is append-only: an id is never reassigned, and a reader only ever asks
+//! for one the writer already minted.
 
 use super::*;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, RwLock};
 use windows_core::ComObject;
 
-/// A family's position in the application's [`FontLadder`].
+/// Names a family by its position in the application's [`FontLadder`].
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FamilyId(pub u16);
 
-/// A resolved face's position in the application's [`FontLadder`].
+/// Names a resolved face by its position in the application's [`FontLadder`].
 ///
-/// Minted by shaping, consumed by rasterization. Unlike [`FamilyId`] it is not something an
-/// application declares — it names the face DirectWrite chose, fallback included.
+/// Minted by shaping, consumed by rasterization. Unlike [`FamilyId`], an application never
+/// declares one: it names the face DirectWrite chose, fallback included.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FaceId(pub u16);
 
 impl FaceId {
-    /// Names no face, and never will: [`FontLadder::intern`] refuses to grow into this
-    /// index and returns it on overflow, so the failure is a run that does not draw.
+    /// Names no face. [`FontLadder::intern`] never assigns this index and returns it on
+    /// overflow, so an overflowed intern yields a run that does not draw.
     pub const NONE: Self = Self(u16::MAX);
 }
 
-/// Everything that selects one face. Size is absent: one face serves every size.
+/// Selects one face. Size is absent: one face serves every size.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FaceKey {
     pub family: Box<str>,
@@ -54,12 +55,12 @@ struct Ladder {
     faces: RwLock<Vec<FaceKey>>,
 }
 
-/// The families an application uses, in a fixed order, plus the faces shaping has
-/// resolved, shared by every thread.
+/// Holds the families an application uses, in a fixed order, plus the faces shaping has
+/// resolved.
 ///
-/// Built once and cloned — the family half is immutable and the face half is append-only,
-/// so both halves of a shaping/rasterizing split resolve the same id to the same font by
-/// construction rather than by staying in step.
+/// Built once and cloned, so every clone shares one table. The family half is immutable
+/// and the face half is append-only, so an id resolves to the same font on the shaping
+/// side and on the rasterizing side.
 #[derive(Clone, Debug, Default)]
 pub struct FontLadder(Arc<Ladder>);
 
@@ -72,52 +73,49 @@ impl FontLadder {
         }))
     }
 
-    /// The id of `family`, if the ladder carries it.
+    /// Returns the id of `family`, or `None` if the ladder does not carry it.
     ///
-    /// Linear, and deliberately: a ladder is a handful of families, this is called when a
-    /// view is built rather than per glyph, and a map here would cost more to keep than
-    /// the scan costs to run.
+    /// Scans the ladder's families linearly. Called when a view is built, not per glyph.
     #[must_use]
     pub fn id(&self, family: &str) -> Option<FamilyId> {
         let index = self.0.families.iter().position(|name| &**name == family)?;
         u16::try_from(index).ok().map(FamilyId)
     }
 
-    /// The family `id` names, or `""` if it names nothing in this ladder.
+    /// Returns the family name `id` selects, or `""` if it names nothing in this ladder.
     #[must_use]
     pub fn name(&self, id: FamilyId) -> &str {
         self.0.families.get(id.0 as usize).map_or("", |name| name)
     }
 
-    /// How many families it carries.
+    /// Returns the number of families.
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.families.len()
     }
 
-    /// Whether it carries none.
+    /// Returns whether the ladder carries no families.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.families.is_empty()
     }
 
-    /// The id of `key`, appending it if this is the first time shaping produced it.
+    /// Returns the id of `key`, appending it to the face table on first sight.
     ///
-    /// Written by the shaping thread only, and rarely — a screen's worth of text resolves
-    /// a handful of faces and then never appends again.
+    /// Returns [`FaceId::NONE`] when the table has no index left to assign. Only shaping
+    /// appends: a screen's worth of text resolves a handful of faces and then reads.
     pub fn intern(&self, key: &FaceKey) -> FaceId {
         if let Some(id) = self.face_id(key) {
             return id;
         }
         let mut faces = self.0.faces.write().unwrap_or_else(|e| e.into_inner());
-        // Re-checked under the write lock: two threads may have raced the read above, and
-        // a duplicated entry is a face rasterized twice rather than an error.
+        // Re-checked under the write lock: two threads can race the read that precedes it,
+        // and a duplicated entry rasterizes one face twice rather than failing.
         if let Some(id) = index_of(&faces, key) {
             return id;
         }
-        // A ladder holds a handful of faces, so this is a backstop and not a limit. It
-        // fails closed because the alternative — wrapping — would silently alias one face
-        // onto another's index, which renders as the wrong font and reports nothing.
+        // Fails closed on overflow: an index that wrapped would alias one face onto
+        // another's, which renders as the wrong font and reports nothing.
         let Ok(index) = u16::try_from(faces.len()) else {
             debug_assert!(false, "a font ladder overflowed {} faces", u16::MAX);
             return FaceId::NONE;
@@ -130,7 +128,7 @@ impl FontLadder {
         FaceId(index)
     }
 
-    /// The face `id` names, or `None` if it names nothing in this ladder.
+    /// Returns the [`FaceKey`] `id` names, or `None` if it names nothing in this ladder.
     #[must_use]
     pub fn face_key(&self, id: FaceId) -> Option<FaceKey> {
         let faces = self.0.faces.read().unwrap_or_else(|e| e.into_inner());
@@ -148,14 +146,14 @@ fn index_of(faces: &[FaceKey], key: &FaceKey) -> Option<FaceId> {
     u16::try_from(index).ok().map(FaceId)
 }
 
-/// Upright, or one of the two slanted forms.
+/// Selects upright letterforms, or one of the two slanted forms.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FontStyle {
     #[default]
     Normal,
-    /// Slanted, using the family's designed italic — a different set of letterforms.
+    /// Slants using the family's designed italic, a different set of letterforms.
     Italic,
-    /// Slanted by shearing the upright, for a family with no designed italic.
+    /// Slants by shearing the upright, for a family with no designed italic.
     Oblique,
 }
 
@@ -177,7 +175,7 @@ impl FontStyle {
     }
 }
 
-/// How wide the letterforms are, as the nine standard steps.
+/// Selects the width of the letterforms, as the nine standard steps.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FontStretch {
     UltraCondensed,
@@ -222,7 +220,7 @@ impl FontStretch {
     }
 }
 
-/// Typographic features applied over a whole run.
+/// Carries the typographic features applied over a whole run.
 ///
 /// A bitfield rather than a list, so [`FontSpec`] stays `Copy` and small enough to key a
 /// cache on.
@@ -230,32 +228,35 @@ impl FontStretch {
 pub struct FontFeatures(u8);
 
 impl FontFeatures {
-    /// The family's own defaults.
+    /// Applies the family's own defaults.
     pub const NONE: Self = Self(0);
-    /// Digits share one advance, so a numeric read-out does not shift as its value
-    /// changes. Required of every `mono` rung.
+    /// Gives every digit one advance, so a numeric read-out does not shift as its value
+    /// changes.
     pub const TABULAR: Self = Self(1 << 0);
 
+    /// Returns the features of `self` together with those of `other`.
     #[must_use]
     pub const fn with(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
+    /// Returns whether every feature in `other` is set.
     #[must_use]
     pub const fn has(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// Returns whether no feature is set.
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 }
 
-/// Everything that picks a face, plus the size to draw it at.
+/// Picks a face, and carries the size to draw it at.
 ///
-/// What a caller *asks for*. What shaping resolved is a [`FaceId`], and only that travels:
-/// see the module documentation.
+/// Names what a caller asks for. What shaping resolved is a [`FaceId`], and only the
+/// [`FaceId`] crosses a thread boundary.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct FontSpec {
     pub family: FamilyId,
@@ -269,7 +270,7 @@ pub struct FontSpec {
 }
 
 impl FontSpec {
-    /// A regular upright face of `family` at `size` DIPs.
+    /// Returns a spec for a regular upright face of `family` at `size` DIPs.
     #[must_use]
     pub const fn new(family: FamilyId, size: f32) -> Self {
         Self {
@@ -282,46 +283,50 @@ impl FontSpec {
         }
     }
 
+    /// Returns the same spec at `weight` on the 100–950 axis.
     #[must_use]
     pub const fn weight(self, weight: u16) -> Self {
         Self { weight, ..self }
     }
 
+    /// Returns the same spec in `style`.
     #[must_use]
     pub const fn style(self, style: FontStyle) -> Self {
         Self { style, ..self }
     }
 
+    /// Returns the same spec at `stretch`.
     #[must_use]
     pub const fn stretch(self, stretch: FontStretch) -> Self {
         Self { stretch, ..self }
     }
 
+    /// Returns the same spec with `features`, replacing whatever it carried.
     #[must_use]
     pub const fn features(self, features: FontFeatures) -> Self {
         Self { features, ..self }
     }
 }
 
-/// A resolved font face.
+/// Holds a resolved font face.
 ///
-/// It leaves this crate as `&impl Interface` and never as the DirectWrite type, so a
-/// consumer can hand it to a drawing call without naming DirectWrite itself.
+/// Leaves this crate as `&impl Interface` and never as the DirectWrite type, so a consumer
+/// hands it to a drawing call without naming DirectWrite itself.
 #[derive(Clone)]
 pub struct FontFace(pub(crate) IDWriteFontFace);
 
 impl FontFace {
-    /// The face as the interface a drawing call takes.
+    /// Returns the face as the interface a drawing call takes.
     pub fn as_interface(&self) -> &impl Interface {
         &self.0
     }
 }
 
-/// DirectWrite's factory, the system font collection, and the caches over both.
+/// Holds DirectWrite's factory, the system font collection, and the caches over both.
 ///
-/// One per thread. DirectWrite is agile and a shared factory is cheap to create, so a
-/// thread that shapes and a thread that rasterizes each hold their own rather than sharing
-/// one behind a lock — and the caches inside are then uncontended.
+/// One per thread: the caches are `RefCell`s, so an engine is neither `Send` nor `Sync`,
+/// and a thread that shapes and a thread that rasterizes each create their own over the
+/// same [`FontLadder`].
 pub struct TextEngine {
     pub(crate) factory: IDWriteFactory3,
     pub(crate) collection: IDWriteFontCollection,
@@ -330,8 +335,8 @@ pub struct TextEngine {
     faces: RefCell<FxHashMap<FaceId, FontFace>>,
     pub(crate) formats: RefCell<FxHashMap<FormatKey, IDWriteTextFormat>>,
     pub(crate) typography: RefCell<FxHashMap<FontFeatures, Option<IDWriteTypography>>>,
-    /// One walker for the whole engine. Minting one per walk, with a fresh vector per run
-    /// inside it, is three allocations per run per reshape.
+    /// One walker for the whole engine, so a walk reuses it and the buffers inside it
+    /// rather than allocating per run.
     pub(crate) collector: RefCell<Option<ComObject<Collector>>>,
     /// UTF-16 staging for `CreateTextLayout`, which copies what it is handed.
     pub(crate) scratch: RefCell<Vec<u16>>,
@@ -339,6 +344,11 @@ pub struct TextEngine {
 
 impl TextEngine {
     /// Creates an engine over `ladder`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the DirectWrite factory, the system font collection, or the rendering
+    /// parameters cannot be created.
     pub fn new(ladder: FontLadder) -> Result<Self> {
         // SAFETY: the out-parameter is a stack local that outlives the call, and the IID
         // is the one for the interface the pointer is then adopted as.
@@ -353,9 +363,10 @@ impl TextEngine {
             IDWriteFactory3::from_raw(factory)
         };
 
-        // SAFETY: as above. Both flags are declined: downloadable fonts would make a
-        // lookup fallible on the network, and the update check is a per-call enumeration
-        // for a set this crate resolves once per face and then caches.
+        // Both flags are false: downloadable fonts would make a lookup depend on the
+        // network, and the update check enumerates the collection on every call.
+        // SAFETY: the out-parameter is a stack local that outlives the call, and the
+        // interface it receives is checked for absence before it is cast.
         let collection: IDWriteFontCollection = unsafe {
             let mut collection = None;
             factory
@@ -377,16 +388,21 @@ impl TextEngine {
         })
     }
 
-    /// The ladder this engine resolves ids against.
+    /// Returns the ladder this engine resolves ids against.
     #[must_use]
     pub fn ladder(&self) -> &FontLadder {
         &self.ladder
     }
 
-    /// The face `id` names, from the cache or freshly resolved.
+    /// Returns the face `id` names, from this engine's cache or freshly resolved.
     ///
-    /// The lookup — family name to index to family to font to face — is four cross-process
-    /// calls for a value that never changes, so it happens once per id per thread.
+    /// Resolving walks family name to index to family to font to face, so the result is
+    /// cached and the walk runs once per id per engine.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `id` names nothing in the ladder, and when the family it names is not
+    /// installed.
     pub fn face(&self, id: FaceId) -> Result<FontFace> {
         if let Some(face) = self.faces.borrow().get(&id) {
             return Ok(face.clone());
@@ -397,14 +413,14 @@ impl TextEngine {
         Ok(face)
     }
 
-    /// How glyph coverage is rasterized, to be stated on whatever draws it.
+    /// Returns the parameters glyph coverage is rasterized under, to be stated on whatever
+    /// draws it.
     ///
-    /// Explicitly constructed rather than inherited, and that is the whole point of it
-    /// existing: the system's parameters carry a user's ClearType tuning and a display's
-    /// gamma, and coverage rasterized under those comes out systematically thin or fat.
-    /// The values pin it — ClearType level zero because coverage is grayscale, enhanced
-    /// contrast zero because contrast belongs to the palette, gamma at 1.0 because the
-    /// surface this lands on is already linear.
+    /// Constructed here rather than inherited from the system, whose parameters carry a
+    /// user's ClearType tuning and a display's gamma and rasterize coverage systematically
+    /// thin or fat. ClearType level is zero because coverage is grayscale, enhanced
+    /// contrast is zero because contrast belongs to the palette, and gamma is 1.0 because
+    /// the surface this lands on is linear.
     pub fn rendering_params(&self) -> &impl Interface {
         &self.params
     }
@@ -434,11 +450,9 @@ impl TextEngine {
             self.collection
                 .FindFamilyName(windows_core::PCWSTR(name.as_ptr()), &mut index, &mut exists)
                 .ok()?;
-            // A family the system does not have is not an error to raise here — falling
-            // back is the caller's policy and it has the ladder to do it with — but it is
-            // also not something to paper over with family zero, which would render every
-            // missing font as whatever happened to be first. So it fails, and the caller
-            // decides.
+            // A missing family fails rather than resolving to family zero, which would
+            // render every missing font as whatever the collection lists first. Falling
+            // back to another family is the caller's policy, and it holds the ladder.
             if !exists.as_bool() {
                 return Err(no_font());
             }
@@ -453,13 +467,13 @@ impl TextEngine {
     }
 }
 
-/// A NUL-terminated UTF-16 copy of `s`, for the APIs that take a `PCWSTR`.
+/// Returns a NUL-terminated UTF-16 copy of `s`, for the APIs that take a `PCWSTR`.
 pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(core::iter::once(0)).collect()
 }
 
-/// `DWRITE_E_NOFONT` — the family is not installed, so nothing can be drawn in it. Not in
-/// the metadata as a constant, and it is the one `HRESULT` this crate has to name.
+/// Returns `DWRITE_E_NOFONT`: the family is not installed, so nothing can be drawn in it.
+/// The metadata carries no constant for it, so the value is spelled out here.
 pub(crate) fn no_font() -> windows_core::Error {
     windows_core::Error::from(windows_core::HRESULT(-2003283965))
 }
@@ -485,8 +499,8 @@ mod tests {
         assert_ne!(first, ladder.intern(&key("Segoe UI")));
     }
 
-    /// The property the whole seam rests on: an id minted on one side names the same font
-    /// on the other, and appending never disturbs one already handed out.
+    /// An id minted through one clone names the same font through another, and appending
+    /// leaves an id already handed out where it was.
     #[test]
     fn a_clone_sees_what_the_other_side_interned() {
         let ladder = FontLadder::new(["Segoe UI"]);
@@ -510,8 +524,8 @@ mod tests {
         assert_ne!(regular, bold);
     }
 
-    /// The sentinel exists so an overflowed intern cannot alias one face onto another's
-    /// index — the failure that renders as the wrong font and reports nothing.
+    /// [`FaceId::NONE`] resolves to no face, so an overflowed intern cannot alias one face
+    /// onto another's index.
     #[test]
     fn the_none_face_resolves_to_nothing() {
         let ladder = FontLadder::new(["Segoe UI"]);

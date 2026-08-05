@@ -1,3 +1,9 @@
+//! A top-level window, its window procedure, and the process-wide message loop.
+//!
+//! The procedure answers what belongs to a window's lifetime — visibility, DPI, the minimum
+//! track size, the frame gate and the thread's scheduling class — around the application's
+//! own message handler.
+
 use crate::bindings::*;
 use crate::caption::{BorderColor, Caption, CaptionHit, CaptionSpec, CaptionState};
 use crate::display::{DisplayColor, Subscription};
@@ -24,60 +30,59 @@ type ResizeHandler = Box<dyn FnMut(i32, i32)>;
 /// Receives the window's metrics after its DPI changed.
 type ScaleHandler = Box<dyn FnMut(Metrics)>;
 
-/// Everything the window procedure owns. Every field it mutates is behind interior
+/// Holds everything the window procedure owns. Every field it mutates is behind interior
 /// mutability, so a shared reference to this never aliases a `&mut`.
 struct State {
     message: RefCell<Option<MessageHandler>>,
     resize: RefCell<Option<ResizeHandler>>,
     scale: RefCell<Option<ScaleHandler>>,
-    /// Shared with whoever draws for this window, on whatever thread. Updated by the window
-    /// procedure itself, so a consumer cannot be told late by an application that forgot to
-    /// forward a message.
+    /// Shared with the threads that draw for this window. The window procedure updates it
+    /// directly, so delivery does not depend on the application forwarding a message.
     visibility: Arc<Visibility>,
-    /// Held for its `Drop`, which unregisters. `None` when the platform declined.
+    /// Held for its `Drop`, which unregisters. `None` when the registration failed.
     _occlusion: Option<OcclusionStatus>,
     /// Cleared on `WM_DESTROY`, while the handle is still valid.
     display: RefCell<Option<Rc<DisplayColor>>>,
-    /// `Rc` because a hit authority can destroy the window from inside a hit test, and the
-    /// caption is mid-call when it does.
+    /// `Rc` so the caption outlives a hit test whose authority destroys the window while the
+    /// caption is mid-call.
     caption: Option<Rc<Caption>>,
-    /// Whether the precision-touchpad registration took: the export is absent on some builds
-    /// of the floor.
+    /// Whether the precision-touchpad registration succeeded. `false` where `user32` has no
+    /// `RegisterTouchpadCapableWindow`.
     touchpad: bool,
     /// The last scheduling class asked for, so a drag does not re-tag the thread on every
     /// `WM_WINDOWPOSCHANGED`.
     speed: Cell<Speed>,
-    /// Resolved against the window's current DPI on every ask rather than stored in pixels,
-    /// so it survives a monitor hop.
+    /// Resolved against the window's current DPI on each query rather than stored in pixels,
+    /// so the floor is the same apparent size on every monitor.
     min_size_dips: Option<(f32, f32)>,
     quit_on_close: bool,
     /// The live pacer's clock, if there is one.
     frame_gate: RefCell<Option<Arc<Clock>>>,
 }
 
-/// The system's occlusion-status registration posts this. `WM_USER`, not `WM_APP`: this
-/// crate registers the window class, and `WM_APP` upwards is the application's to number.
+/// Carries the system's occlusion-status notification. Numbered in the `WM_USER` range
+/// because this crate registers the window class; `WM_APP` and above are the application's to
+/// number.
 const WM_USER_OCCLUSION: u32 = WM_USER as u32 + 0x45;
 
-/// The display-capability handler posts this. A message rather than work done in the WinRT
-/// callback, so the application's callback runs from the ordinary pump, in message order, on
-/// a stack this crate owns rather than inside a projection frame it may not re-enter.
+/// Carries a display-capability change out of its WinRT handler. Posting rather than calling
+/// out from the handler runs the application's callback from the ordinary pump, in message
+/// order, and not inside a projection frame it may not re-enter.
 const WM_USER_COLOR: u32 = WM_USER as u32 + 0x46;
 
-/// The identity stamped into a window's own extra bytes at creation, and what the next one
-/// will be. Monotonic for the process, so no value is ever issued twice.
+/// Supplies the identity stamped into a window's own extra bytes at creation. Monotonic for
+/// the process, so no value is issued twice.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The offset of that identity within the class's extra window bytes. Kernel-side per-window
-/// storage: it is zeroed for a new window and freed with it, so unlike a heap address it can
-/// never be handed back to a second window while a stale value still holds it.
+/// Locates that identity within the class's extra window bytes. The storage is kernel-side
+/// and per-window: zeroed for a new window and freed with it, so no second window is handed
+/// the same slot while a stale [`Window`] still holds its value.
 const GWLP_WINDOW_ID: i32 = 0;
 
-/// Which of the system's move/size operations a contact runs.
+/// Names the system move/size operation a contact runs.
 ///
-/// The eight sizing arms name the edge or corner that follows the contact, in the same
-/// lattice [`CaptionHit`] resolves and `WM_NCHITTEST` answers with; [`Self::Move`] moves the
-/// whole window instead.
+/// The eight sizing arms name the edge or corner that follows the contact, matching the codes
+/// `WM_NCHITTEST` answers with; [`Self::Move`] moves the whole window instead.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MoveSize {
     Left,
@@ -92,10 +97,10 @@ pub enum MoveSize {
 }
 
 impl MoveSize {
-    /// The system's own `MOVESIZE_OPERATION` value.
+    /// Returns the system's `MOVESIZE_OPERATION` value for this operation.
     ///
-    /// Written out rather than derived from the discriminant: these are an ABI's numbers, and
-    /// a reordering of the arms above is not allowed to silently become a different gesture.
+    /// The values are written out rather than derived from the discriminant: they belong to
+    /// an ABI, so reordering the variants must not change them.
     const fn operation(self) -> i32 {
         match self {
             Self::Left => 1,
@@ -113,14 +118,14 @@ impl MoveSize {
 
 /// A top-level window.
 ///
-/// **A closed window leaves this value behind.** Closing destroys the `HWND` while this
-/// still holds its numeric value, and handle values are recycled — so every accessor checks
-/// that the handle still carries *this* window's identity and answers `None` when it does not.
+/// Closing destroys the `HWND` while this value still holds its number, and handle values
+/// are recycled, so every accessor checks that the handle still carries this window's
+/// identity and answers `None` when it does not.
 pub struct Window {
     hwnd: HWND,
-    /// Never reissued, so a window that answers to it is this one. `IsWindow` cannot tell that
-    /// apart, and neither can the address of the state box: a box freed by one window's
-    /// destruction is exactly the block the allocator hands the next one.
+    /// Never reissued, so a window carrying this value is this window. `IsWindow` answers for
+    /// whatever now owns a recycled handle, and the state box's address is no better: the
+    /// allocator hands a freed box to the next window.
     id: u64,
 }
 
@@ -146,16 +151,16 @@ impl Window {
         }
     }
 
-    /// The raw window handle, for interop with other Windows APIs.
+    /// Returns the raw window handle, for interop with other Windows APIs.
     ///
-    /// Stale once the window is closed, like every handle value.
-    /// [`is_open`](Self::is_open) is the question to ask first.
+    /// The value is stale once the window is closed, as every handle value is. Ask
+    /// [`is_open`](Self::is_open) first.
     #[must_use]
     pub fn hwnd(&self) -> *mut core::ffi::c_void {
         self.hwnd
     }
 
-    /// Whether this handle still names this window, rather than nothing or something else.
+    /// Returns whether this handle still names this window rather than a recycled one.
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.state().is_some()
@@ -173,11 +178,11 @@ impl Window {
         Some(())
     }
 
-    /// Whether anything this window draws can be seen.
+    /// Returns whether anything this window draws can be seen.
     ///
-    /// `Send + Sync`, so a producer on another thread reads it directly. Maintained by the
-    /// window procedure itself, so an application that handles its own messages cannot starve
-    /// it. [`watch`](Self::watch) is what a thread that wants to *park* on it takes.
+    /// The value is `Send + Sync`, so a producer on another thread reads it directly. The
+    /// window procedure maintains it, so an application that handles its own messages cannot
+    /// starve it. Take [`watch`](Self::watch) to park on a change instead of reading.
     ///
     /// `None` once the window is closed.
     #[must_use]
@@ -185,14 +190,14 @@ impl Window {
         Some(self.state()?.visibility.clone())
     }
 
-    /// A wake of the caller's own for [`visibility`](Self::visibility), for its wait list.
+    /// Returns a wake of the caller's own, added to [`visibility`](Self::visibility)'s list.
     ///
-    /// One per consumer, so a window can have as many as it needs — a frame pacer and a
-    /// present thread both park on the same window, and a change has to reach both.
+    /// One per consumer: a wake releases exactly one waiter, so a frame pacer and a present
+    /// thread parked on the same window each take their own and a change reaches both.
     ///
     /// # Errors
     ///
-    /// The window is closed, or an event could not be created.
+    /// The window is closed, or the event could not be created.
     pub fn watch(&self) -> Result<Watch> {
         let Some(state) = self.state() else {
             return Err(Error::new(E_HANDLE, "the window is closed"));
@@ -200,7 +205,8 @@ impl Window {
         state.visibility.watch()
     }
 
-    /// The client-area size in pixels as `(width, height)`. `None` once the window is closed.
+    /// Returns the client-area size in pixels as `(width, height)`. `None` once the window is
+    /// closed.
     #[must_use]
     pub fn client_size(&self) -> Option<(i32, i32)> {
         self.state()?;
@@ -211,41 +217,41 @@ impl Window {
             .then(|| (rect.right - rect.left, rect.bottom - rect.top))
     }
 
-    /// The window's DPI and everything the frame derives from it. `None` once the window is
-    /// closed.
+    /// Returns the window's DPI and the frame metrics derived from it. `None` once the window
+    /// is closed.
     #[must_use]
     pub fn metrics(&self) -> Option<Metrics> {
         self.state()?;
         Some(Metrics::for_window(self.hwnd))
     }
 
-    /// `dpi / 96`, the DIP-to-physical-pixel factor. `None` once the window is closed.
+    /// Returns `dpi / 96`, the DIP-to-physical-pixel factor. `None` once the window is closed.
     #[must_use]
     pub fn scale(&self) -> Option<f32> {
         Some(self.metrics()?.scale)
     }
 
-    /// What this window's current display can present.
+    /// Returns what this window's current display can present.
     ///
-    /// Cheap: the answer is cached and re-read only when the system says it moved. One signal
-    /// covers an HDR toggle, an SDR-white-level change and a monitor hop alike.
+    /// The answer is cached and re-read only when the system reports the display changed; one
+    /// notification covers an HDR toggle, an SDR-white-level change and a monitor hop alike.
     ///
-    /// `None` once the window is closed. Not `Sdr`: a closed window has no display, and an
-    /// SDR answer is one a caller would act on.
+    /// `None` once the window is closed, rather than `Sdr`, which a caller would act on.
     #[must_use]
     pub fn color_capability(&self) -> Option<DisplayCapability> {
         Some(self.state()?.display.borrow().as_ref()?.capability())
     }
 
-    /// Called on this window's own thread whenever the display colour capability changes.
+    /// Installs a callback run on this window's own thread whenever the display colour
+    /// capability changes.
     ///
-    /// There is one callback, and installing a second replaces the first — the system
-    /// registration behind it permits exactly one handler, so single ownership is structural.
-    /// Dropping the returned [`Subscription`] clears the callback; the registration itself
-    /// lives until the window is destroyed.
+    /// There is one callback, and installing a second replaces the first: the system
+    /// registration behind it permits exactly one handler. Dropping the returned
+    /// [`Subscription`] clears the callback; the registration lives until the window is
+    /// destroyed.
     ///
-    /// `None` once the window is closed. It cannot otherwise fail: a window whose display
-    /// cannot be interrogated does not get created at all.
+    /// `None` once the window is closed. There is no other failure: a window whose display
+    /// cannot be interrogated is never created.
     #[must_use = "dropping the Subscription clears the callback again"]
     pub fn on_color_capability_changed(
         &self,
@@ -257,24 +263,22 @@ impl Window {
 
     /// Installs the caption's hit authority.
     ///
-    /// Called with a **client-space point in DIPs** whenever the system asks what is under
-    /// the pointer in the caption band, and answered from the application's one hit structure
-    /// — the same one the pointer, the wheel, focus order and accessibility resolve through.
-    /// Until it is installed the band drags the window.
+    /// The authority is called with a client-space point in DIPs whenever the system asks
+    /// what is under the pointer in the caption band. Until one is installed the band drags
+    /// the window.
     ///
-    /// `None` once the window is closed, and on one that did not ask for a caption of its own
-    /// — where installing an authority is a mistake rather than a no-op, since nothing will
-    /// ever consult it.
+    /// `None` once the window is closed, and on a window that did not ask for a caption of
+    /// its own, where nothing would ever consult the authority.
     #[must_use = "None means the authority was not installed and the band will only drag"]
     pub fn on_caption_hit(&self, f: impl FnMut(f32, f32) -> CaptionHit + 'static) -> Option<()> {
         self.caption()?.set_hit_authority(Box::new(f));
         Some(())
     }
 
-    /// Called when the hover or pressed state of a caption button changes.
+    /// Installs the sink called when the hover or pressed state of a caption button changes.
     ///
-    /// Those arrive as non-client pointer messages the application never sees: the moment the
-    /// hit test claims a button, that contact is answered here.
+    /// Those changes arrive as non-client pointer messages the application never sees: once
+    /// the hit test claims a button, the system routes that contact to the frame.
     ///
     /// `None` as for [`on_caption_hit`](Self::on_caption_hit).
     #[must_use = "None means the sink was not installed and no button state will arrive"]
@@ -283,10 +287,10 @@ impl Window {
         Some(())
     }
 
-    /// The resolved caption band height in DIPs, for a window that has one.
+    /// Returns the caption band height in DIPs, for a window that has one.
     ///
-    /// Resolved, because a `CaptionSpec` that named no height means the system's own at
-    /// this window's current DPI.
+    /// A [`CaptionSpec`] that named no height resolves to the system's caption height at this
+    /// window's current DPI.
     #[must_use]
     pub fn caption_height_dips(&self) -> Option<f32> {
         let caption = self.caption()?;
@@ -301,65 +305,57 @@ impl Window {
 
     /// Sets the one-pixel frame colour DWM draws around the window.
     ///
-    /// Re-applied on activation and on a theme change, because neither preserves it — which is
-    /// why it belongs to a window that draws its own caption and answers `None` on one that
-    /// does not.
+    /// The colour is re-applied on activation and on a theme change, neither of which
+    /// preserves it. `None` on a window that does not draw its own caption.
     #[must_use = "None means the colour was not applied and the frame keeps the system's"]
     pub fn set_border_color(&self, color: BorderColor) -> Option<()> {
         self.caption()?.set_border(self.hwnd, color);
         Some(())
     }
 
-    /// Hands a contact to the system's own move/size loop, and runs it here.
+    /// Enters the system's move/size loop for a press the client area received.
     ///
-    /// **For a point the application owns.** A caption band needs none of this: it answers
-    /// `WM_NCHITTEST` with `HTCAPTION` or one of the eight resize codes and the system enters
-    /// this loop by itself, which is why [`CaptionSpec`] does not mention it. This is the
-    /// other case — a press the *client* area received, on content that has decided the
-    /// gesture moves or sizes the window rather than acting on it. There is no other way to
-    /// reach it: a hit code is the only currency `DefWindowProc` takes, and a client point
-    /// has none.
+    /// A caption band needs none of this: it answers `WM_NCHITTEST` with `HTCAPTION` or one
+    /// of the eight resize codes and the system enters the loop itself. A client-area press
+    /// carries no hit code, which is the only argument `DefWindowProc` takes, so this is the
+    /// only route to the loop for content that has decided the gesture moves or sizes the
+    /// window rather than acting on it.
     ///
     /// `at` is the down event's own position in **screen** coordinates. The loop drags from
     /// that point, so passing the pointer's current position instead of the one the contact
     /// started at offsets the window by the difference between them.
     ///
-    /// **This blocks until the contact is released**, pumping the drag's messages on this
-    /// thread — it *is* the sizing modal loop, entered deliberately rather than fallen into.
-    /// Everything that belongs to that loop belongs to the system here too: snapping, Aero
-    /// shake, the live frame, and the escape that cancels it. Tracking the contact and
-    /// calling `SetWindowPos` per sample reimplements all of it, badly, which is the whole
-    /// reason to prefer this.
+    /// **Blocks until the contact is released**, pumping the drag's messages on this thread:
+    /// this call is the sizing modal loop. The system owns everything inside it — snapping,
+    /// Aero shake, the live frame, and the escape that cancels the drag.
     ///
-    /// Keyboard move/size is **not** this API's, deliberately: `Alt`+`Space` arrives as
-    /// `WM_SYSCOMMAND` and stays `DefWindowProc`'s.
+    /// Keyboard move/size is not reachable here: `Alt`+`Space` arrives as `WM_SYSCOMMAND` and
+    /// is `DefWindowProc`'s.
     ///
-    /// `false` if the window is closed, or if the running build has no such export — it is a
-    /// Windows 11 addition that ships with no header and no import library at all, so it is
-    /// resolved by name for a stronger version of the reason
-    /// [`is_touchpad_capable`](Self::is_touchpad_capable)'s is: here there is nothing to link
-    /// against even where it exists.
+    /// `false` if the window is closed, or if `user32` has no `EnterMoveSizeLoop` — a Windows
+    /// 11 addition that ships with no header and no import library, so it is resolved by name
+    /// and there is nothing to link against even where it exists.
     #[must_use = "false means no loop ran and the window did not move"]
     pub fn begin_move_size(&self, at: (i32, i32), operation: MoveSize) -> bool {
         self.state().is_some() && enter_move_size_loop(self.hwnd, at, operation)
     }
 
-    /// This window's caption, for one that asked for its own and is still open.
+    /// Returns this window's caption, for an open window that asked for one.
     fn caption(&self) -> Option<&Caption> {
         self.state()?.caption.as_deref()
     }
 
-    /// Whether this window is registered for real precision-touchpad contacts.
+    /// Returns whether this window is registered for real precision-touchpad contacts.
     ///
-    /// `false` when it was not asked for, and also when the running build has no such export.
-    /// The difference is visible: an unregistered window gets synthesized wheel messages
-    /// where a registered one gets two-finger pointer contacts.
+    /// `false` when it was not asked for, and when `user32` has no
+    /// `RegisterTouchpadCapableWindow`. An unregistered window receives synthesized wheel
+    /// messages where a registered one receives two-finger pointer contacts.
     #[must_use]
     pub fn is_touchpad_capable(&self) -> bool {
         self.state().is_some_and(|state| state.touchpad)
     }
 
-    /// Installs the pacer's clock, or `false` if the window is closed or already has one.
+    /// Installs the pacer's clock. `false` if the window is closed or already has one.
     pub(crate) fn claim_frame_gate(&self, gate: Arc<Clock>) -> bool {
         let Some(state) = self.state() else {
             return false;
@@ -372,17 +368,18 @@ impl Window {
         true
     }
 
+    /// Clears the pacer's clock, leaving the slot free for another pacer.
     pub(crate) fn release_frame_gate(&self) {
         if let Some(state) = self.state() {
             *state.frame_gate.borrow_mut() = None;
         }
     }
 
-    /// This window's state, or `None` once the window has been closed.
+    /// Returns this window's state, or `None` once the window has been closed.
     ///
     /// The check is identity, not liveness: `IsWindow` on a recycled handle value answers for
     /// whatever now owns it. The identity is read before the state box is touched, so a stale
-    /// value never dereferences a pointer it has no claim to.
+    /// [`Window`] never dereferences a box it has no claim to.
     fn state(&self) -> Option<&State> {
         // SAFETY: reading a window word of a window that is gone, or of one belonging to a
         // class with no extra bytes, answers zero — and no identity is ever zero. A match
@@ -421,8 +418,8 @@ impl core::fmt::Debug for Window {
     }
 }
 
-/// The initial size, in whichever space the caller stated it. One value rather than a pair of
-/// numbers and a flag saying how to read them, so the two spaces cannot be mixed.
+/// Names the initial size in the space the caller stated it in. One value rather than a pair
+/// of numbers and a flag saying how to read them, so the two spaces cannot be mixed.
 #[derive(Copy, Clone, Debug)]
 enum Size {
     /// Whatever the system picks.
@@ -460,8 +457,8 @@ impl WindowBuilder {
     /// Sets the initial window size in DIPs, resolved against the DPI the window lands on.
     ///
     /// `CreateWindowExW` takes physical pixels, and a per-monitor-v2-aware process does not
-    /// know its window's DPI until the window exists — so the size is applied after creation
-    /// and before the window is shown, which is invisible and correct on every monitor.
+    /// know its window's DPI until the window exists, so the size is applied after creation
+    /// and before the window is shown.
     #[must_use]
     pub fn size_dips(mut self, width: f32, height: f32) -> Self {
         self.size = Size::Dips(width, height);
@@ -478,8 +475,8 @@ impl WindowBuilder {
     /// Creates the window with no redirection surface.
     ///
     /// Required for a composition-hosted window: its content is whatever the compositor is
-    /// given, and nothing is drawn into a bitmap the window owns. Such a window still gets
-    /// DWM's frame, shadow and rounded corners.
+    /// given, and nothing is drawn into a bitmap the window owns. The window keeps DWM's
+    /// frame, shadow and rounded corners.
     #[must_use]
     pub fn no_redirection_bitmap(mut self) -> Self {
         self.ex_style |= WS_EX_NOREDIRECTIONBITMAP as u32;
@@ -488,8 +485,8 @@ impl WindowBuilder {
 
     /// Delivers mouse input as `WM_POINTER*` rather than as legacy mouse messages.
     ///
-    /// **Process-wide and one-way**, and it must happen before the process has any window —
-    /// which is why it is a property of the first window's creation rather than a free
+    /// The opt-in is **process-wide and one-way**, and the system rejects it once the process
+    /// owns a window, so it is made as part of creating the first one rather than by a free
     /// function anyone can call late.
     ///
     /// It does not suppress the legacy stream: `DefWindowProc` synthesizes that from whatever
@@ -502,8 +499,8 @@ impl WindowBuilder {
     }
 
     /// Registers for real precision-touchpad contacts instead of synthesized wheel input, so
-    /// two-finger pans and zooms arrive as `PT_TOUCHPAD` pointer input. See
-    /// [`Window::is_touchpad_capable`] for whether the running build could.
+    /// two-finger pans and zooms arrive as `PT_TOUCHPAD` pointer input.
+    /// [`Window::is_touchpad_capable`] reports whether the registration took.
     #[must_use]
     pub fn touchpad_capable(mut self) -> Self {
         self.touchpad = true;
@@ -519,7 +516,7 @@ impl WindowBuilder {
 
     /// Removes the system caption and lets the application draw the title bar.
     ///
-    /// The client area then covers the whole window, and every caption *behaviour* is kept,
+    /// The client area then covers the whole window, and the caption behaviours are kept,
     /// because the contacts that drive them are forwarded rather than consumed. Install
     /// [`Window::on_caption_hit`] once the application's hit structure exists.
     ///
@@ -531,11 +528,11 @@ impl WindowBuilder {
         self
     }
 
-    /// The smallest size the user may drag the window to, in DIPs.
+    /// Sets the smallest size the user may drag the window to, in DIPs.
     ///
     /// Answered from `WM_GETMINMAXINFO` at the window's current DPI, so the constraint is the
-    /// same apparent size on every monitor. Without one the system's floor applies, which is
-    /// a caption's width and nothing more.
+    /// same apparent size on every monitor. Without one the system's own minimum applies,
+    /// which is a caption's width and nothing more.
     #[must_use]
     pub fn min_size_dips(mut self, width: f32, height: f32) -> Self {
         self.min_size_dips = Some((width, height));
@@ -544,17 +541,16 @@ impl WindowBuilder {
 
     /// Creates the window without showing it. [`Window::show`] puts it on screen.
     ///
-    /// For a composition-hosted window this is the difference between the user seeing an
-    /// empty frame and seeing the first committed content: with no redirection surface there
-    /// is nothing to draw until the compositor's first commit.
+    /// A composition-hosted window has no redirection surface and so nothing to draw until
+    /// the compositor's first commit; showing it before then shows an empty frame.
     #[must_use]
     pub fn hidden(mut self) -> Self {
         self.hidden = true;
         self
     }
 
-    /// Whether destroying this window posts a quit message, ending [`run`]. On by default,
-    /// which is what a single-window application wants.
+    /// Sets whether destroying this window posts a quit message, ending [`run`]. On by
+    /// default, which is what a single-window application wants.
     #[must_use]
     pub fn quit_on_close(mut self, quit: bool) -> Self {
         self.quit_on_close = quit;
@@ -564,28 +560,49 @@ impl WindowBuilder {
     /// Sets a handler called for every window message. Return `Some(result)` to handle the
     /// message, or `None` to fall through to default processing.
     ///
-    /// The handler sits in the middle of three tiers, and which side of it a message is
-    /// answered on is the difference between a policy and a fact:
+    /// The window procedure runs three tiers in order:
     ///
-    /// * **Before it, and unsuppressable** — whether anything drawn can be seen, the thread's
-    ///   scheduling class, the minimum track size and the frame gate. A handler returning
-    ///   `Some` must not be able to stop a producer on another thread being told the window
-    ///   went away.
+    /// * **Before the handler, and not suppressable** — whether anything drawn can be seen,
+    ///   the thread's scheduling class, the minimum track size and the frame gate. A handler
+    ///   returning `Some` cannot stop a producer on another thread being told the window went
+    ///   away.
     /// * **The handler.**
-    /// * **After it** — resize, DPI change, and the custom caption, each only if the handler
-    ///   passed. Answering `WM_NCCALCSIZE` or `WM_NCHITTEST` here therefore replaces the
-    ///   caption rather than adding to it, which is what an application deliberately taking
-    ///   the frame over wants and is a footgun for one that is not.
+    /// * **After the handler, and only where it returned `None`** — resize, DPI change, and
+    ///   the custom caption. Answering `WM_NCCALCSIZE` or `WM_NCHITTEST` here replaces the
+    ///   caption rather than adding to it.
     ///
     /// This crate registers the window class, so `WM_USER..WM_APP` is its range to number and
-    /// three of them are in use ([`WM_FRAME`](crate::WM_FRAME) among them). An application
-    /// numbering messages of its own starts at `WM_APP` (`0x8000`).
+    /// three of those values are in use, [`WM_FRAME`](crate::WM_FRAME) among them. An
+    /// application numbering messages of its own starts at `WM_APP` (`0x8000`).
     #[must_use]
     pub fn on_message<F>(mut self, handler: F) -> Self
     where
         F: FnMut(*mut core::ffi::c_void, u32, usize, isize) -> Option<isize> + 'static,
     {
         self.message = Some(Box::new(handler));
+        self
+    }
+
+    /// Adds `handler` behind whatever [`on_message`](Self::on_message) already installed,
+    /// rather than in place of it.
+    ///
+    /// The installed handler answers first and `handler` runs only where it returned `None`,
+    /// which is the layering `on_message` already documents between itself and this crate's
+    /// own processing. What it is for is a layer that must see every message — a frame tick,
+    /// a doorbell — attaching to a builder it did not configure, without discarding the
+    /// caller's handler and without the caller knowing to check.
+    #[must_use]
+    pub fn chain_message<F>(mut self, mut handler: F) -> Self
+    where
+        F: FnMut(*mut core::ffi::c_void, u32, usize, isize) -> Option<isize> + 'static,
+    {
+        let Some(mut installed) = self.message.take() else {
+            return self.on_message(handler);
+        };
+        self.message = Some(Box::new(move |hwnd, message, wparam, lparam| {
+            installed(hwnd, message, wparam, lparam)
+                .or_else(|| handler(hwnd, message, wparam, lparam))
+        }));
         self
     }
 
@@ -603,7 +620,7 @@ impl WindowBuilder {
     /// Sets a handler called after the window's DPI changed, with its new metrics.
     ///
     /// The window has already been moved and resized to the rect the system suggested, so the
-    /// handler's job is the content's scale and nothing else.
+    /// handler is responsible for the content's scale and nothing else.
     #[must_use]
     pub fn on_scale_changed<F>(mut self, handler: F) -> Self
     where
@@ -615,9 +632,8 @@ impl WindowBuilder {
 
     /// Creates the window.
     ///
-    /// The first window in the process makes it per-monitor-DPI-aware, which is process-wide
-    /// and one-way. It has to happen before any window exists, so this is the last point at
-    /// which it can be done at all.
+    /// Creating the first window in the process makes it per-monitor-DPI-aware, which is
+    /// process-wide, one-way, and possible only before any window exists.
     ///
     /// # Errors
     ///
@@ -643,8 +659,8 @@ impl WindowBuilder {
         let mut title: Vec<u16> = self.title.encode_utf16().collect();
         title.push(0);
 
-        // A DIP size is not knowable yet — this process is per-monitor-v2-aware, so its
-        // window's DPI is whatever monitor the window lands on — and is applied below.
+        // A DIP size cannot be resolved yet: this process is per-monitor-v2-aware, so the
+        // window's DPI is whichever monitor it lands on. Applied after creation.
         let (width, height) = match self.size {
             Size::Pixels(width, height) => (width, height),
             Size::System | Size::Dips(..) => (CW_USEDEFAULT, CW_USEDEFAULT),
@@ -672,12 +688,11 @@ impl WindowBuilder {
             return Err(Error::from_thread());
         }
 
-        // Everything fallible, before anything is installed. A failure past this point would
-        // leave a live window nothing owns and nothing destroys — the `Window` that would
-        // have is what is not being returned.
+        // Every fallible step runs before anything is installed: a failure past this point
+        // would leave a live window that no `Window` owns and nothing destroys.
         //
-        // Fails creation rather than degrading. There is one colour path, and a window that
-        // cannot say what its display is would render every colour for the wrong one, silently.
+        // A display that cannot be interrogated fails creation rather than degrading, because
+        // a window that cannot name its display renders every colour for the wrong one.
         let display = match DisplayColor::new(hwnd, WM_USER_COLOR) {
             Ok(display) => Rc::new(display),
             Err(error) => {
@@ -694,8 +709,8 @@ impl WindowBuilder {
             resize: RefCell::new(self.resize),
             scale: RefCell::new(self.scale),
             visibility: Arc::new(Visibility::new()),
-            // Registered before the window is shown, so the first status change after it
-            // appears is not the one that is missed.
+            // Registered before the window is shown, so no status change after it appears is
+            // missed.
             _occlusion: OcclusionStatus::register(hwnd, WM_USER_OCCLUSION),
             display: RefCell::new(Some(display)),
             caption: self.caption.map(|spec| Rc::new(Caption::new(spec))),
@@ -707,6 +722,8 @@ impl WindowBuilder {
         });
         let (caption, visibility) = (state.caption.clone(), Arc::clone(&state.visibility));
         let installed = Box::into_raw(state);
+        // relaxed: the counter synchronises nothing, and uniqueness across threads is the
+        // whole requirement, which the read-modify-write itself carries.
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `hwnd` is live, its class reserves the identity word, and the window
         // procedure takes ownership of the box from here until it frees it on `WM_NCDESTROY`.
@@ -733,8 +750,8 @@ impl WindowBuilder {
                 _ = ShowWindow(hwnd, SW_SHOWNORMAL);
             }
         }
-        // Measured rather than assumed, so a window handed straight to a producer carries a
-        // real answer instead of waiting for the first message that happens to arrive.
+        // Evaluated here so a window handed straight to a producer carries a real answer
+        // rather than waiting for the first message to arrive.
         visibility.evaluate(hwnd);
         Ok(Window { hwnd, id })
     }
@@ -746,7 +763,7 @@ pub fn run() {
     loop {
         // SAFETY: no window filter, and the destination is a stack local.
         let more = unsafe { GetMessageW(&mut message, core::ptr::null_mut(), 0, 0) };
-        // Zero is `WM_QUIT`; `-1` is a failed call, whose `message` is not a message at all.
+        // Zero is `WM_QUIT`; `-1` is a failed call, which leaves `message` unfilled.
         if more.0 <= 0 {
             return;
         }
@@ -778,8 +795,8 @@ pub fn pump() -> bool {
             return true;
         }
         if message.message == WM_QUIT as u32 {
-            // Put it back. Peeking removed it, and a caller pumping in a loop that checks the
-            // answer on only some iterations would otherwise lose the quit for good.
+            // Reposts the quit that peeking removed, so a caller that checks the answer on
+            // only some iterations does not lose it.
             // SAFETY: takes no handle and writes through no pointer.
             unsafe { PostQuitMessage(message.wParam as i32) };
             return false;
@@ -800,16 +817,19 @@ fn class_name() -> PCWSTR {
 
 /// Registers the window class once per process.
 ///
-/// The outcome is cached either way. A failure is almost always the name being taken by
-/// something whose window procedure is not this one — which would read this crate's state box
-/// through another crate's layout — and a name this process could not take is not one a later
-/// window will get, so retrying would only re-report it against a stale thread error.
+/// The outcome is cached, success or failure alike: a class name this process could not take
+/// stays taken, so a retry would only re-report the failure against a stale thread error.
+///
+/// # Errors
+///
+/// The class name is already registered to a window procedure that is not this one, which
+/// would read this crate's state box through another crate's layout.
 fn register_class() -> Result<()> {
     static ATOM: OnceLock<core::result::Result<ATOM, HRESULT>> = OnceLock::new();
     ATOM.get_or_init(|| {
-        // The class must not paint: whatever it painted would be a frame of the wrong colour
-        // between the window appearing and the compositor's first commit. `WM_ERASEBKGND` is
-        // answered rather than deferred for the same reason.
+        // The class carries no background brush: anything it painted would be a frame of the
+        // wrong colour between the window appearing and the compositor's first commit.
+        // `WM_ERASEBKGND` is answered rather than deferred for the same reason.
         // SAFETY: the descriptor is a stack local, and its class name outlives the process.
         let atom = unsafe {
             _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -818,10 +838,9 @@ fn register_class() -> Result<()> {
                 lpfnWndProc: Some(wndproc),
                 hCursor: LoadCursorW(core::ptr::null_mut(), IDC_ARROW),
                 lpszClassName: class_name(),
-                // Kernel-side storage for each window's identity. Unlike the state box's
-                // address it is freed with the window rather than back to an allocator, so no
-                // second window can ever be handed the same value while a stale `Window`
-                // still holds it.
+                // Kernel-side storage for each window's identity. It is freed with the window
+                // rather than back to an allocator, so no second window is handed the same
+                // slot while a stale `Window` still holds its value.
                 cbWndExtra: size_of::<u64>() as i32,
                 ..Default::default()
             };
@@ -838,8 +857,8 @@ fn register_class() -> Result<()> {
 
 /// Turns mouse input into pointer input for the whole process.
 ///
-/// Asked about before it is done: the call is rejected once the process owns a window, and a
-/// rejection there is indistinguishable from a real failure.
+/// The state is queried first: the call is rejected once the process owns a window, and that
+/// rejection is indistinguishable from a real failure.
 fn enable_pointer_input() -> Result<()> {
     // SAFETY: neither call takes a handle or writes through a pointer.
     unsafe {
@@ -851,15 +870,16 @@ fn enable_pointer_input() -> Result<()> {
 }
 
 thread_local! {
-    /// The controller this crate minted for this thread, or `None` where the thread already
-    /// had a queue. Held for the **thread's** life rather than a window's: with two windows on
-    /// one thread, the first must not take the queue away from the second when it closes.
+    /// Holds the controller this crate minted for this thread, or `None` where the thread
+    /// already had a queue. Kept for the **thread's** life rather than a window's: with two
+    /// windows on one thread, the first must not take the queue from the second when it
+    /// closes.
     ///
-    /// The reference is deliberately never released. A thread-local's destructor runs at
-    /// process exit from inside `LdrShutdownProcess`, and CoreMessaging fail-fasts —
-    /// `0xE0464645` through `RaiseFailFastException`, so no `catch` and no exit code of ours
-    /// — on any call arriving after shutdown began. Releasing the last reference there ends
-    /// the process by crashing it. Nor would releasing it be a shutdown: the queue's is
+    /// The reference is never released. A thread-local's destructor runs at process exit from
+    /// inside `LdrShutdownProcess`, and CoreMessaging fail-fasts on any call arriving after
+    /// shutdown began, raising `0xE0464645` through `RaiseFailFastException` past any `catch`
+    /// and past this process's own exit code, so releasing the last reference there ends the
+    /// process by crashing it. Releasing it would not be a shutdown either: the queue's is
     /// `ShutdownQueueAsync`, which completes only while the thread keeps pumping, and a
     /// destructor cannot pump. An application that needs the queue drained owns a controller
     /// itself and shuts it down while its loop is still running.
@@ -867,8 +887,7 @@ thread_local! {
         const { OnceCell::new() };
 }
 
-// Drop glue is what registers the destructor, so the absence of it is the invariant — and it
-// is checkable here rather than only by closing a window and reading an exit code.
+// Drop glue is what registers the thread-local destructor, so the type must have none.
 const _: () = assert!(
     !core::mem::needs_drop::<Option<ManuallyDrop<DispatcherQueueController>>>(),
     "a droppable QUEUE registers a thread-local destructor that fail-fasts at process exit"
@@ -889,9 +908,8 @@ fn ensure_dispatcher_queue() -> Result<()> {
             let options = DispatcherQueueOptions {
                 dwSize: size_of::<DispatcherQueueOptions>() as u32,
                 threadType: DQTYPE_THREAD_CURRENT,
-                // The queue rides this thread's existing apartment: a window thread's
-                // apartment is the application's choice, already made by the time it has a
-                // window to create.
+                // The queue joins this thread's existing apartment, which the application has
+                // already chosen by the time it has a window to create.
                 apartmentType: DQTAT_COM_NONE,
             };
             // SAFETY: the options are a stack local of the stated size and so is the
@@ -909,10 +927,10 @@ fn ensure_dispatcher_queue() -> Result<()> {
 
 /// Registers `hwnd` for real precision-touchpad contacts. `false` if it could not.
 ///
-/// Resolved dynamically rather than imported: the export is documented against a pre-release
-/// SDK, and a static import the running `user32` does not have fails the **process load** —
-/// so every process linking this crate would refuse to start on a machine at the platform
-/// floor that has not taken the servicing update.
+/// The export is resolved by name rather than imported: it is documented against a
+/// pre-release SDK, and a static import the running `user32` does not carry fails the
+/// **process load**, so every process linking this crate would refuse to start on a machine
+/// that has not taken the servicing update.
 fn register_touchpad_capable(hwnd: HWND) -> bool {
     type Register = unsafe extern "system" fn(HWND, BOOL) -> BOOL;
     // SAFETY: `user32` is loaded — this crate has already registered the class and created
@@ -933,15 +951,13 @@ fn register_touchpad_capable(hwnd: HWND) -> bool {
 }
 
 /// Runs the system's move/size loop for `hwnd`, returning when the contact lifts. `false` if
-/// the running build has no such export.
+/// `user32` does not export it.
 ///
-/// Resolved dynamically for [`register_touchpad_capable`]'s reason and one further one: this
-/// export has no header and no import library, so a static import is not merely a load-time
-/// hazard, it is not expressible.
+/// Resolved by name for [`register_touchpad_capable`]'s reason and one further one: this
+/// export has no header and no import library, so a static import is not expressible at all.
 ///
-/// Resolved **per call**, with no cache, because the call it guards then blocks for the whole
-/// drag — several orders of magnitude more than two handle lookups — and a cached address
-/// would be one more lifetime to keep right for a saving nothing can measure.
+/// Resolved **per call**, with no cache: the call it guards then blocks for the whole drag,
+/// which is several orders of magnitude longer than two handle lookups.
 fn enter_move_size_loop(hwnd: HWND, at: (i32, i32), operation: MoveSize) -> bool {
     let Some(enter) = move_size_loop() else {
         return false;
@@ -955,11 +971,10 @@ fn enter_move_size_loop(hwnd: HWND, at: (i32, i32), operation: MoveSize) -> bool
 
 type MoveSizeLoop = unsafe extern "system" fn(HWND, POINT, i32) -> BOOL;
 
-/// The export, on a build that has it.
+/// Resolves the export, or `None` on a build that does not carry it.
 ///
-/// Split from the call above so the resolution can be asserted on its own: entering the loop
-/// is not something a test can do — it does not return until a contact that no test is making
-/// is released.
+/// Split from [`enter_move_size_loop`] so the resolution can be asserted on its own: the loop
+/// does not return until a contact is released, so no test can enter it.
 fn move_size_loop() -> Option<MoveSizeLoop> {
     // SAFETY: `user32` is loaded — this crate registered the class and created the window
     // through it — so the handle is live and needs no free. The transmute is of an export's
@@ -992,9 +1007,9 @@ fn resize_to_dips(hwnd: HWND, width: f32, height: f32) {
 
 /// Moves and resizes the window to the rect the system suggested for its new DPI.
 ///
-/// The suggestion is not advice: it is the rect that keeps the window the same apparent size
-/// and place across the scale change, and computing a different one is how a window walks
-/// across the screen every time it crosses a monitor boundary.
+/// The suggested rect keeps the window at the same apparent size and place across the scale
+/// change; a rect computed here instead walks the window across the screen at every monitor
+/// boundary.
 ///
 /// # Safety
 ///
@@ -1049,7 +1064,7 @@ unsafe fn with_state<R>(hwnd: HWND, f: impl FnOnce(&State) -> R) -> Option<R> {
 ///
 /// # Safety
 ///
-/// As [`with_state`].
+/// `hwnd` must be a window of this crate's class, as for [`with_state`].
 unsafe fn detached<H, R>(
     hwnd: HWND,
     slot: impl Fn(&State) -> &RefCell<Option<H>>,
@@ -1070,22 +1085,28 @@ unsafe fn detached<H, R>(
     Some(result)
 }
 
+/// Answers every message delivered to a window of this crate's class.
+///
+/// # Safety
+///
+/// The caller must be the system's message dispatch: `hwnd` must be a window of this crate's
+/// class, and `wparam` and `lparam` must be the values delivered with `message`.
 unsafe extern "system" fn wndproc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // Handled from here rather than from a handler, so a handler that returns `Some` cannot
-    // swallow any of them, and answered before the application's handler runs.
+    // These arms run before the application's handler and are not suppressable: a handler
+    // returning `Some` cannot swallow any of them.
     let edges = |state: &State| {
         match message {
             m if m == WM_SIZE as u32 || m == WM_WINDOWPOSCHANGED as u32 => {
                 state.visibility.evaluate(hwnd);
                 // The window's thread carries the pump, the input and the retained tree, so
-                // it wants full speed while any of that is observable. Gated on the class
-                // changing and **not** on visibility changing: a window created visible and
-                // never hidden never sees a visibility edge.
+                // it runs at full speed while any of that is observable. The re-tag is gated
+                // on the scheduling class changing, not on a visibility edge: a window
+                // created visible and never hidden sees no such edge.
                 let speed = if state.visibility.is_hidden() {
                     Speed::Managed
                 } else {
@@ -1095,8 +1116,8 @@ unsafe extern "system" fn wndproc(
                     qos::set(speed);
                 }
             }
-            // A window the user can drag smaller than its layout can solve is not a
-            // preference, so this runs ahead of the application's handler.
+            // The minimum track size runs ahead of the application's handler, so no handler
+            // can drop it and leave the window draggable below what its layout can solve.
             m if m == WM_GETMINMAXINFO as u32 => {
                 let info = lparam as *mut MINMAXINFO;
                 if let Some((width, height)) = state.min_size_dips
@@ -1128,9 +1149,9 @@ unsafe extern "system" fn wndproc(
     // SAFETY: this is the procedure of this crate's own class.
     let caption = unsafe { with_state(hwnd, edges) }.flatten();
 
-    // One signal covers an HDR toggle, an SDR-white-level change and a monitor hop alike,
-    // which is why there is no display-change plumbing anywhere. Cloned out first: the
-    // application's callback runs from here and may destroy the window.
+    // One notification covers an HDR toggle, an SDR-white-level change and a monitor hop
+    // alike. The display is cloned out first: the application's callback runs from here and
+    // may destroy the window.
     if message == WM_USER_COLOR {
         // SAFETY: as above.
         let display = unsafe { with_state(hwnd, |state| state.display.borrow().clone()) }.flatten();
@@ -1160,7 +1181,8 @@ unsafe extern "system" fn wndproc(
     }
 
     if handled.is_none() && message == WM_DPICHANGED as u32 {
-        // Before the scale handler, whose job is then the content's scale and nothing else.
+        // Applied before the scale handler, which is then responsible for the content's
+        // scale and nothing else.
         // SAFETY: this is the message's own `lparam`.
         unsafe { apply_dpi_change(hwnd, lparam) };
         // SAFETY: as above.
@@ -1179,11 +1201,12 @@ unsafe extern "system" fn wndproc(
         // SAFETY: as above.
         let teardown = unsafe {
             with_state(hwnd, |state| {
-                // Nothing this window draws can be seen again, so every producer parked on it
-                // parks now — a pacer outliving a closed window would otherwise keep waiting
-                // on the compositor clock and posting into a handle that is no longer ours.
+                // Nothing this window draws can be seen again, so the hidden state is
+                // published and every thread parked on it wakes: a pacer outliving a closed
+                // window would otherwise keep waiting on the compositor clock and posting
+                // into a handle this crate no longer owns.
                 state.visibility.publish(true);
-                // The request would otherwise outlive its reason for the rest of the thread's
+                // A full-speed request would otherwise stay on the thread for the rest of its
                 // life.
                 if state.speed.replace(Speed::Managed) != Speed::Managed {
                     qos::set(Speed::Managed);
@@ -1193,9 +1216,9 @@ unsafe extern "system" fn wndproc(
         };
         if let Some((display, quit)) = teardown {
             quit_on_close = quit;
-            // While the handle is still valid: `GetForWindow` hooks the window's message
-            // loop, so a subscription revoked after the window is gone is revoked against a
-            // hook that no longer has one.
+            // Closed while the handle is still valid: `GetForWindow` hooks the window's
+            // message loop, and a subscription revoked after the window is gone is revoked
+            // against a hook that no longer has one.
             if let Some(display) = display {
                 display.close();
             }
@@ -1238,8 +1261,8 @@ unsafe extern "system" fn wndproc(
 mod tests {
     use super::*;
 
-    /// An ABI's numbers, asserted against the ones the API documents rather than against the
-    /// order the arms happen to be written in.
+    /// Asserts each operation against the value the API documents, not against the order the
+    /// variants are written in.
     #[test]
     fn move_size_operations_are_the_systems() {
         for (operation, code) in [
@@ -1257,20 +1280,17 @@ mod tests {
         }
     }
 
-    /// The premise the whole capability rests on. A floor that stops carrying the export is
-    /// not a build failure — `begin_move_size` answers `false` and the caller keeps working —
-    /// but it is a thing to learn from a test rather than from a window that will not drag.
+    /// Asserts that this platform's `user32` exports `EnterMoveSizeLoop`. Without it
+    /// `begin_move_size` answers `false` and the window does not drag.
     ///
-    /// Split into its two halves because they fail for unrelated reasons and only one of them
-    /// is news: a missing module means this process never loaded `user32`, which a test
-    /// harness that has created no window genuinely might not have done, and says nothing
-    /// about the export.
+    /// The two assertions are separate because they fail for unrelated reasons: a missing
+    /// module means this process never loaded `user32`, which a test harness that has created
+    /// no window may not have done, and says nothing about the export.
     #[test]
     fn the_move_size_loop_resolves_on_this_floor() {
-        // Establishes what creating a window would have: nothing here has needed `user32`
-        // yet, and `GetModuleHandleW` finds a loaded module rather than loading one. The
-        // argument is deliberately not a window — the call's answer is discarded, its load is
-        // the point.
+        // Loads `user32`, which nothing in this test has needed yet and which
+        // `GetModuleHandleW` finds rather than loads. The argument is not a window and the
+        // answer is discarded; the load is what this call is for.
         // SAFETY: `GetDpiForWindow` is documented against any handle and answers zero for one
         // that is not a window.
         _ = unsafe { GetDpiForWindow(core::ptr::null_mut()) };

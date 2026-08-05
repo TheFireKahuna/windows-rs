@@ -1,20 +1,20 @@
-//! Text: where a naive authoring layer allocates, and how this one does not.
+//! Text sources: what a text-taking widget accepts, and how a changing string reaches the
+//! shaper without allocating.
 //!
-//! Most strings on a screen are chrome and are `&'static str`, so they must cost nothing.
-//! The rest are the application's own data, which it has already paid for.
+//! Chrome strings are `&'static str` and cost nothing. The rest are the application's own
+//! data, which it has already allocated.
 //!
 //! # A changing string is written, never returned
 //!
-//! [`Table::set_text`](crate::build::text) already compares before it reshapes, because the
-//! case that matters is **a value moving at display rate whose text does not**: a gain
-//! readout dragged from `-6.031` to `-6.028` formats to `-6.0 dB` both times. A source that
-//! answered with a `String` defeated half of what that comparison bought — the frame still
-//! allocated, formatted, copied and freed to discover nothing had changed.
+//! [`Table::set_text`](crate::build::text) compares before it reshapes, and the case it
+//! exists for is a value moving at display rate whose text does not: a gain readout dragged
+//! from `-6.031` to `-6.028` formats to `-6.0 dB` both times. A source answering with a
+//! `String` would allocate, format, copy and free on every one of those frames to discover
+//! nothing had changed.
 //!
-//! So a dynamic source **writes into a buffer the caller owns**. One scratch buffer per
-//! reactive run reaches its high-water mark once and allocates nothing afterwards, and the
-//! call site's `push_str` reaches it directly rather than through a `String` built to be
-//! thrown away.
+//! So a dynamic source writes into a buffer the caller owns. One scratch buffer per reactive
+//! run reaches its high-water mark once and allocates nothing afterwards, and the call site's
+//! `push_str` reaches it directly.
 
 use core::fmt::{Display, Write};
 use windows_scene::Span;
@@ -25,11 +25,13 @@ pub use windows_text::Flow;
 
 /// What a text-taking method accepts.
 ///
-/// `&'static str` — the common case — costs **no allocation, ever**. An owned string costs
-/// the application's own clone and no copy of ours: the shaped result goes into the patch's
-/// glyph buffers and the source is dropped.
+/// `&'static str` allocates nothing. An owned string costs the application's own allocation
+/// and no copy here: the shaped result goes into the patch's glyph buffers and the source is
+/// dropped.
 pub enum TextSource {
+    /// A string with the program's lifetime.
     Static(&'static str),
+    /// A string this source owns.
     Owned(String),
     /// Appends the current text to the buffer it is given. The buffer is the caller's and is
     /// cleared before each read, so nothing here allocates once it has grown.
@@ -37,20 +39,20 @@ pub enum TextSource {
 }
 
 impl TextSource {
-    /// Whether reading can ever answer differently — the same gate every other value goes
-    /// through, so a static label produces no `Effect`.
+    /// Returns whether reading this source can ever answer differently. A constant source
+    /// raises no effect, so a static label registers no dependency.
     #[must_use]
     pub fn is_constant(&self) -> bool {
         !matches!(self, Self::Dynamic(_))
     }
 
-    /// Appends the current text to `out`, registering a dependency where there is one.
+    /// Appends the current text to `out`, registering a signal dependency where the source
+    /// has one.
     ///
-    /// The **only** reader, so the three cases are answered in one place and a caller that
-    /// wants an owned snapshot writes into a `String` of its own rather than being handed one
-    /// this crate built. That is what keeps the eager callers — a tooltip resolved when it
-    /// opens, an accessible name interned into the published blob — from being a second path
-    /// with its own allocation policy.
+    /// The only reader of a [`TextSource`]. A caller wanting an owned snapshot appends into a
+    /// `String` of its own, so the eager callers — a tooltip resolved when it opens, an
+    /// accessible name interned into the published blob — share this path and its allocation
+    /// policy.
     pub fn append(&self, out: &mut String) {
         match self {
             Self::Static(s) => out.push_str(s),
@@ -82,76 +84,62 @@ impl From<String> for TextSource {
     }
 }
 
-impl From<&String> for TextSource {
-    fn from(s: &String) -> Self {
-        Self::Owned(s.clone())
-    }
-}
-
 /// What a text-writing closure may answer.
 ///
-/// Nothing, which is what a `push_str` body ends in; or the [`core::fmt::Result`] a `write!`
-/// produces, which is discarded — a `String` does not fail to grow, it aborts, so there is
-/// never anything to propagate. Accepting both is what removes the `let _ =` that otherwise
-/// stands in front of every formatted binding in an application.
+/// `()`, which a `push_str` body ends in, or the [`core::fmt::Result`] a `write!` produces.
+/// The result is discarded: a `String` aborts rather than failing to grow, so there is
+/// nothing to propagate and no `let _ =` in front of a formatted binding.
 pub trait Written {}
 impl Written for () {}
 impl Written for core::fmt::Result {}
 
-/// Text a closure writes.
+/// Returns a source whose text `f` writes.
 ///
-/// The workhorse, and the one that costs nothing: `push_str` and `write!` reach the run's
-/// own buffer, so a binding that follows a value allocates only while that buffer grows.
+/// `push_str` and `write!` inside `f` reach the run's own buffer, so a binding that follows a
+/// value allocates only while that buffer grows.
 ///
-/// Writing **nothing** is how a binding says there is no text — an absent subject, a figure
-/// the engine has not answered — and it is both cheaper and more direct than returning an
-/// empty `String`.
+/// Writing nothing is how a binding says there is no text: an absent subject, or a figure the
+/// engine has not answered.
 pub fn reactive<R: Written>(f: impl Fn(&mut String) -> R + 'static) -> TextSource {
     TextSource::Dynamic(Box::new(move |out| {
         f(out);
     }))
 }
 
-/// A readout: a value that can show itself.
+/// Returns a source that shows what `f` answers, through [`Display`].
 ///
-/// The [`Display`] impl writes straight into the run's buffer, so a scalar following a meter
-/// costs a format and no allocation at all.
+/// The [`Display`] impl writes straight into the run's buffer, so a readout following a meter
+/// costs a format and no allocation.
 ///
-/// A closure and **not** an `impl Signal`, which is the one place that trick does not reach.
-/// [`Signal`]'s marker disambiguates a closure from a value only when the method fixes the
-/// value type — `opacity` knows it wants an `f32`. Here the whole point is that the type is
-/// the caller's, so `Signal<T, IsFn>` and `Signal<Self, IsValue>` both apply and nothing
-/// pins `T`. A cell reads as `shown(move || cell.get())`, which is what every other binding
-/// in an application already looks like.
+/// Takes a closure rather than an `impl Signal`: [`Signal`](crate::signal::Signal)'s marker
+/// separates a closure from a value only where the method fixes the value type, and here the
+/// value type is the caller's, so `Signal<T, IsFn>` and `Signal<Self, IsValue>` both apply
+/// and nothing pins `T`. A cell reads as `shown(move || cell.get())`.
 pub fn shown<T: Display>(f: impl Fn() -> T + 'static) -> TextSource {
     TextSource::Dynamic(Box::new(move |out| {
-        // Infallible: the only error `write!` can answer with here is a `String`'s, and a
-        // `String` does not fail to grow — it aborts. There is nothing to propagate.
+        // The only error `write!` can answer with here is a `String`'s, and a `String`
+        // aborts rather than failing to grow.
         let _ = write!(out, "{}", f());
     }))
 }
 
 // ── text about a subject that may not be there ───────────────────────────────────
 //
-// A surface bound to a selection asks the same question at every one of its bindings: is
-// there a subject, is it the kind I describe, and if so write this about it. Written out, it
-// is a `with`, an `as_ref`, an `and_then` and an `if let` per binding — four lines of
-// scaffolding around one `push_str`, repeated once per field of the panel.
+// A surface bound to a selection asks the same question at every binding: is there a subject,
+// is it the kind this binding describes, and if so write about it. Written out, that is a
+// `with`, an `as_ref`, an `and_then` and an `if let` per binding, around one `push_str`.
 //
-// It is worth a combinator rather than a per-application helper for one reason: the answer to
-// "there is nothing here" is **write nothing**, and that is a rule of this text layer rather
-// than a convention an application is free to get wrong. A binding that returns an empty
-// string instead is still a run, and a run still occupies a line.
+// `about` answers all three in one place, and its answer to "there is nothing here" is to
+// write nothing: an empty string is still a run, and a run still occupies a line.
 
 /// Text about a subject that may not be there.
 ///
-/// `project` reaches from whatever the signal holds to the thing this binding describes, and
-/// may answer `None` a second time — a row that is not a processor, a processor with no
-/// figure of this kind. Where the signal's value is already the subject, it is `|it|
+/// `project` reaches from whatever the signal holds to the subject this binding describes,
+/// and may answer `None` a second time — a row that is not a processor, or a processor with
+/// no figure of this kind. Where the signal's value is already the subject, it is `|it|
 /// Some(it)`.
 ///
-/// Either absence writes **nothing at all**: no run, no line, and no empty string standing in
-/// for one.
+/// Either absence writes nothing: no run, no line, and no empty string standing in for one.
 ///
 /// ```no_run
 /// # use windows_ui::signal::Memo;
@@ -166,9 +154,9 @@ pub fn shown<T: Display>(f: impl Fn() -> T + 'static) -> TextSource {
 macro_rules! about {
     ($holder:ident $(, $bound:path)*) => {
         impl<T: 'static $(+ $bound)*> crate::signal::$holder<Option<T>> {
-            #[doc = "Text about this subject, or nothing at all when there is none."]
+            #[doc = "Returns a source describing this subject, or nothing where there is none."]
             #[doc = ""]
-            #[doc = "See [the module's note](self) on why absence writes nothing."]
+            #[doc = "Where the held value or `project` answers `None`, this writes nothing: no run, and no empty string standing in for one."]
             #[must_use]
             pub fn about<U, R: Written>(
                 self,
@@ -176,10 +164,9 @@ macro_rules! about {
                 write: impl Fn(&mut String, &U) -> R + 'static,
             ) -> TextSource {
                 TextSource::Dynamic(Box::new(move |out| {
-                    // The borrow is held across the write, which is the whole reason this is
-                    // a combinator and not a projection an application could write with
-                    // `get`: taking the subject out would clone it, once per binding, once
-                    // per read.
+                    // The borrow is held across the write, so the subject is never taken out
+                    // of the holder: a `get` would clone it once per binding, once per
+                    // read.
                     self.with(|held| {
                         if let Some(subject) = held.as_ref().and_then(&project) {
                             write(out, subject);
@@ -192,8 +179,8 @@ macro_rules! about {
 }
 
 about!(Cell);
-// A memo's read is gated on its own cutoff, which is where the extra bound comes from — it
-// is the same `PartialEq` that stops a write propagating past a derivation it did not change.
+// A memo's read is gated on its own cutoff, which is where the extra bound comes from: the
+// same `PartialEq` that stops a write propagating past a derivation it did not change.
 about!(Memo, PartialEq);
 
 // ── the shaping seam ─────────────────────────────────────────────────────────────
@@ -201,9 +188,10 @@ about!(Memo, PartialEq);
 /// What one line left in the buffers it was appended to.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Shaped {
-    /// The segments, spanning the buffer that was passed in. A **list**, because font
-    /// fallback splits a line: a label mixing scripts resolves to two faces, and a segment
-    /// that could only name one would draw the second face's glyph ids through the first.
+    /// The segments this line left, spanning the buffer that was passed in. Font fallback
+    /// splits a line, so a label mixing scripts resolves to more than one face and more than
+    /// one segment; a single segment would draw the second face's glyph ids through the
+    /// first.
     pub segs: Span,
     /// The tile the line occupies, and where its baseline sits in it.
     pub ink: Ink,

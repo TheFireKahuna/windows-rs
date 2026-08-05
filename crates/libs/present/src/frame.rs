@@ -1,34 +1,34 @@
-//! The framework's entire knowledge of a consumer, and the two plain-data objects that
-//! sit between the front thread and one.
+//! The [`Frame`] trait a consumer implements, and the plain-data objects the front thread
+//! and the present thread share: a change counter, the pickable parts a region publishes,
+//! and the pointer state the front thread decides.
 
 use super::*;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::Mutex;
 
-/// A payload-free "something changed": a version and a wake.
+/// Signals that something changed, carrying a monotonic version and a wake.
 ///
-/// **There is no data parameter anywhere in this crate.** No `src: &dyn AnySource`, no
-/// facet traits, no union of what consumers read — a renderer closes over its own reader
-/// and data arrival is a wake source it registers. The prior stack's god-trait
-/// (`VizSource: OverlaySource + MeterSource + DynamicsSource + CurveSource`) meant that
-/// adding a consumer with a new data need required editing the framework, and it was
-/// already leaking: two sibling facet traits existed outside the union. Adding a consumer
-/// here is zero framework edits.
+/// No API in this crate takes a data parameter: there is no source trait and no union of
+/// what consumers read. A renderer closes over its own reader and registers an `Epoch` as
+/// the wake source for it, so a consumer with a new data need adds nothing to this crate.
 ///
-/// The event is a wake and **never the truth**. It is auto-reset, so a signal is consumed
-/// by whichever wait happens to observe it — including a wait the present loop entered
-/// for the compositor clock — while `seq` is monotonic and is what a
-/// [`Frame::should_draw`] compares against. A manual-reset event would satisfy every
-/// subsequent wait immediately and turn the present thread into a busy loop, which is the
-/// difference between parking at idle and spending a core reporting that nothing
-/// happened.
+/// The event is a wake and never the truth. It is auto-reset, so a signal is consumed by
+/// whichever wait observes it — including a wait the present loop entered for the compositor
+/// clock — while [`seq`](Self::seq) is monotonic and is what a [`Frame::should_draw`]
+/// compares against. A manual-reset event would satisfy every subsequent wait immediately
+/// and turn the present thread into a busy loop.
 pub struct Epoch {
     seq: AtomicU64,
     event: Event,
 }
 
 impl Epoch {
+    /// Creates an epoch at version 0, behind an auto-reset event.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the event cannot be created.
     pub fn new() -> Result<Self> {
         Ok(Self {
             seq: AtomicU64::new(0),
@@ -38,13 +38,17 @@ impl Epoch {
 
     /// Records a change and wakes whoever is parked on it. Callable from any thread.
     pub fn bump(&self) {
+        // release: pairs with the acquire in `seq`, so a reader that observes the new
+        // version also observes whatever the caller wrote before bumping.
         self.seq.fetch_add(1, Ordering::Release);
         self.event.signal();
     }
 
-    /// The current version — a cheap gate, with no kernel call in it.
+    /// Returns the current version. No kernel call, so this is the gate a renderer compares
+    /// against every tick.
     #[must_use]
     pub fn seq(&self) -> u64 {
+        // acquire: pairs with the release in `bump`.
         self.seq.load(Ordering::Acquire)
     }
 }
@@ -55,43 +59,38 @@ impl AsHandle for Epoch {
     }
 }
 
-/// A pickable part inside a region, identified by the renderer that drew it.
+/// Identifies a pickable part inside a region, minted by the renderer that drew it.
 ///
-/// `u32::MAX` is reserved as the niche for "no part", so an `Option<SubId>` fits an
-/// `AtomicU32` and the front thread can publish hover with one store.
+/// `u32::MAX` is reserved as the sentinel for "no part", so an `Option<SubId>` fits an
+/// `AtomicU32` and the front thread publishes hover with one store.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubId(pub u32);
 
 const NO_SUB: u32 = u32::MAX;
 
-/// One pickable region of a region's pixels, in **region-local DIPs**.
+/// Bounds one pickable piece of a region's pixels, in region-local DIPs.
 ///
-/// Geometry only. What a part *means* to a screen reader is declared once where the
-/// region is declared, and is keyed by [`SubId`] there — it is not republished with the
-/// geometry, because the geometry moves whenever the renderer's mapping does and an
-/// accessible name does not. That also keeps this crate free of any accessibility type,
-/// which lives a layer up.
+/// Geometry only. A part's accessible name is declared where the region is declared and
+/// keyed by [`SubId`] there, so it is not republished when the renderer's mapping moves and
+/// no accessibility type appears in this crate.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Part {
+    /// The renderer's identity for this piece.
     pub id: SubId,
+    /// The piece's box, in region-local DIPs.
     pub rect: Rect,
 }
 
-/// What is pickable inside a region: published by the renderer whenever its **mapping**
+/// Holds what is pickable inside a region: published by the renderer whenever its mapping
 /// changes — a range change, a band added, a resize — and read by the front thread's hit
-/// test after the region's own entry wins.
+/// test once the region's own hit entry wins.
 ///
-/// The region is one hit entry and declares its gestures like any control, so the
-/// recogniser pool, capture, cancel and inertia are unchanged; what is new is only *which
-/// part* the contact landed on.
+/// The region is a single hit entry and declares its gestures like any other control, so a
+/// part names only which piece of it a contact landed on.
 ///
-/// **The reader owns the second buffer, which is why it never blocks.** A publish is rare
-/// and a hover read is frequent, so the version is the only thing on the hot path: a
-/// front thread that has already seen this version does nothing at all — one acquire load
-/// — and takes the lock solely to refresh its own copy on the rare pass where the mapping
-/// actually moved. Double-buffering it the other way round, with the reader copying out
-/// of a slot the writer is cycling, buys the same thing and costs a cutover protocol to
-/// get wrong.
+/// The reader keeps its own copy, so the hot path is the version alone: a front thread that
+/// has already seen this version does one acquire load and nothing else, and takes the lock
+/// only on the rare pass where the mapping moved.
 #[derive(Default)]
 pub struct RegionParts {
     version: AtomicU64,
@@ -99,28 +98,33 @@ pub struct RegionParts {
 }
 
 impl RegionParts {
+    /// Creates an empty set at version 0.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replaces the published set. Present thread; rare.
+    /// Replaces the published set. Called on the present thread, when the renderer's
+    /// mapping moves.
     pub fn publish(&self, parts: &[Part]) {
         if let Ok(mut held) = self.parts.lock() {
             held.clear();
             held.extend_from_slice(parts);
         }
+        // release: pairs with the acquire in `version`, so the new set is in place before
+        // the version that advertises it becomes visible.
         self.version.fetch_add(1, Ordering::Release);
     }
 
-    /// The published version. Front thread, per hover — compare it against the one whose
-    /// copy you hold, and read nothing further when it has not moved.
+    /// Returns the published version. Compare it against the version your copy holds, and
+    /// read nothing further when it has not moved.
     #[must_use]
     pub fn version(&self) -> u64 {
+        // acquire: pairs with the release in `publish`.
         self.version.load(Ordering::Acquire)
     }
 
-    /// Refreshes `out` from the published set, answering the version it now holds.
+    /// Refreshes `out` from the published set and returns the version it now holds.
     ///
     /// Reuses `out`'s allocation, so a front thread that keeps its copy allocates only
     /// when the part count grows.
@@ -138,16 +142,19 @@ impl RegionParts {
     }
 }
 
-/// What the front thread has decided about a region, read by [`Frame::should_draw`].
+/// Carries what the front thread has decided about a region, read by
+/// [`Frame::should_draw`].
 ///
-/// The front thread writes here and bumps the region's [`Epoch`] **directly** — it does
-/// not go through the app thread. The next present carries the new pixels: one display
-/// frame, the same latency the retained path has, and a busy app thread can never stall a
-/// gesture. The app is told *afterwards*, once the pixels are committed to.
+/// The front thread writes here and bumps the region's [`Epoch`] directly, without going
+/// through the app thread, so the next present carries the new pixels one display frame
+/// later and a busy app thread cannot stall a gesture. The app is told afterwards.
 ///
-/// No input is routed to the present thread and no [`Frame`] method is callable from
-/// another one. The renderer publishes geometry and consumes state; it is never asked a
-/// question synchronously.
+/// No input is routed to the present thread and no [`Frame`] method is callable from another
+/// thread: the renderer publishes geometry and reads state, and is never asked a question
+/// synchronously.
+///
+/// Each field is stored with `Release` and loaded with `Acquire`, pairing the front thread's
+/// write with the present thread's next read of it.
 #[derive(Debug)]
 pub struct RegionInput {
     hover: AtomicU32,
@@ -170,24 +177,26 @@ impl Default for RegionInput {
 }
 
 impl RegionInput {
+    /// Creates an input with no hover, no active part and no cursor.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The part under the pointer.
+    /// Returns the part under the pointer, or `None` when the pointer is over none of them.
     #[must_use]
     pub fn hover(&self) -> Option<SubId> {
         sub(self.hover.load(Ordering::Acquire))
     }
 
-    /// The part under an in-flight gesture.
+    /// Returns the part under an in-flight gesture, or `None` when no gesture is running.
     #[must_use]
     pub fn active(&self) -> Option<SubId> {
         sub(self.active.load(Ordering::Acquire))
     }
 
-    /// The pointer, in region-local DIPs.
+    /// Returns the pointer position in region-local DIPs, or `None` when the pointer is
+    /// outside the region.
     #[must_use]
     pub fn cursor(&self) -> Option<(f32, f32)> {
         let packed = self.cursor.load(Ordering::Acquire);
@@ -198,14 +207,18 @@ impl RegionInput {
         (!x.is_nan() && !y.is_nan()).then_some((x, y))
     }
 
+    /// Publishes the part under the pointer.
     pub fn set_hover(&self, id: Option<SubId>) {
         self.hover.store(raw_sub(id), Ordering::Release);
     }
 
+    /// Publishes the part under an in-flight gesture.
     pub fn set_active(&self, id: Option<SubId>) {
         self.active.store(raw_sub(id), Ordering::Release);
     }
 
+    /// Publishes the pointer position, in region-local DIPs. A NaN coordinate publishes as
+    /// absence, which is the same value `None` publishes.
     pub fn set_cursor(&self, at: Option<(f32, f32)>) {
         let packed = match at {
             Some((x, y)) if !x.is_nan() && !y.is_nan() => {
@@ -228,7 +241,7 @@ fn raw_sub(id: Option<SubId>) -> u32 {
     }
 }
 
-/// Everything a renderer is handed for one frame.
+/// Carries everything a renderer is handed for one frame.
 #[derive(Copy, Clone)]
 pub struct FrameCtx<'a> {
     /// The region's DIP box, and the display it is solved for. Every number a renderer
@@ -241,93 +254,98 @@ pub struct FrameCtx<'a> {
     /// The region's own device. Build every brush, geometry and text layout from it;
     /// resources from another `Gpu` do not bind here.
     pub device: &'a Gpu,
-    /// The draw choke, the same value the retained path uses.
+    /// The transform every colour drawn this frame passes through, the same value the
+    /// retained path uses.
     ///
     /// A `Frame` holds `Radiance`, `windows-d2d` accepts only `Scrgb`, and
-    /// `OutputTransform::apply` is the only bridge — so a colour that skips the transform
-    /// does not compile and one that takes it twice is unrepresentable. "Exactly once"
-    /// needs no discipline here.
+    /// `OutputTransform::apply` is the only conversion between them, so a colour reaches the
+    /// target through the transform exactly once.
     pub out: OutputTransform,
     /// What the front thread has decided about this region since the last frame.
     pub input: &'a RegionInput,
 }
 
 impl FrameCtx<'_> {
-    /// The region's DIP width.
+    /// Returns the region's width in DIPs.
     #[must_use]
     pub fn w(&self) -> f32 {
         self.extent.w
     }
 
-    /// The region's DIP height.
+    /// Returns the region's height in DIPs.
     #[must_use]
     pub fn h(&self) -> f32 {
         self.extent.h
     }
 
-    /// DIP-to-pixel factor — the scale a realization or a cached raster is keyed on.
+    /// Returns the DIP-to-pixel factor, the scale a realization or a cached raster is keyed
+    /// on.
     #[must_use]
     pub fn scale(&self) -> f32 {
         self.extent.scale()
     }
 }
 
-/// One consumer of the per-frame path.
+/// Draws one region's content, once per frame.
 ///
-/// Built **on the present thread** by a factory, so it may hold `!Send` state — which it
-/// must, because everything it draws with belongs to the region's own device.
+/// Built on the present thread by the factory passed to
+/// [`Presenter::mount`](crate::Presenter::mount), so an implementation may hold `!Send`
+/// state — which it must, because every device resource it draws with belongs to that
+/// thread.
 pub trait Frame {
-    /// Advances live state and reports whether this frame would **differ** from the one
-    /// already on screen. `false` skips the tick entirely: no draw, and — more to the
-    /// point — no present, so the compositor is not woken.
+    /// Advances live state and reports whether this frame would differ from the one already
+    /// on screen. `false` skips the tick entirely: no draw and no present, so the compositor
+    /// is not woken.
     ///
-    /// Allocation-free, and called every tick whether or not `draw` follows. It is asked
-    /// **once per pass and not once per slot**: it both tests and *commits* its version
-    /// stamp, so asking it per slot would consume the change on a batch's first frame and
-    /// report "nothing moved" for the rest of it.
+    /// Called once per pass whether or not [`draw`](Self::draw) follows, and not once per
+    /// slot of a batch: an implementation both tests and commits its version stamp, so a
+    /// per-slot call would consume the change on the batch's first frame and report "nothing
+    /// moved" for the rest of it.
+    ///
+    /// Real-time: runs on the present thread's per-frame path and must not allocate.
     fn should_draw(&mut self, ctx: FrameCtx<'_>) -> bool;
 
     /// Draws one frame.
     ///
     /// The target is bound in DIPs with the region's origin at `(0, 0)`, and its contents
-    /// are **undefined** on entry — so this must clear or cover the whole box.
+    /// are undefined on entry, so an implementation must clear or cover the whole box.
     ///
-    /// Called `depth` times per pass, once per frame the batch will show, in the order
-    /// they will be shown. An ease stepped inside it cannot tell that the calls arrived
-    /// together: a batch draws exactly the frames that will appear, so the motion is
-    /// identical to a pass per refresh.
+    /// Called `depth` times per pass, once per frame the batch will show, in the order they
+    /// will be shown. A batch draws exactly the frames that will appear, so an ease stepped
+    /// once per call produces the same motion as a pass per refresh.
     ///
-    /// It must never do anything that can wait. A later region's buffer acquisition can
-    /// block with this pass's bracket already open, which is correct and deliberate — the
-    /// alternative is a bracket per region — but it is why blocking here compounds.
+    /// Must not block. A later region's buffer acquisition can block with this pass's
+    /// bracket already open, so time spent waiting here delays every region in the pass.
     fn draw(&mut self, ctx: FrameCtx<'_>, draw: &Draw<'_>);
 
-    /// True when **every pixel** of the box is covered opaquely.
+    /// Returns `true` when every pixel of the region's box is covered opaquely.
     ///
-    /// This is the difference between DWM drawing the region and the display controller
-    /// scanning it out, and it decides the alpha mode and the displayable allocation
-    /// together. A renderer whose first act is not a full-cover clear or fill must answer
-    /// `false`: claiming opacity while leaving pixels through shows whatever the buffer
-    /// happened to hold, and the region is composed anyway.
+    /// This decides the surface's alpha mode, the Direct2D target's alpha mode and whether
+    /// the buffers are requested displayable — together, the difference between DWM drawing
+    /// the region and the display controller scanning it out. An implementation whose first
+    /// act is not a full-cover clear or fill must answer `false`: claiming opacity while
+    /// leaving pixels through shows whatever the buffer happened to hold, and the region is
+    /// composed anyway.
     ///
-    /// **Opacity is work, not a flag.** A region earns it by drawing the chrome inside its
-    /// own box rather than leaving gaps for what sits underneath — which is what took the
-    /// one region DWM still composed to independent flip.
+    /// A region reaches opacity by drawing the chrome inside its own box rather than leaving
+    /// gaps for what sits underneath it.
     ///
-    /// Read **once**, when the region is allocated, because it decides the allocation.
-    /// Debug builds check it has not changed since.
+    /// Read once, when the region is allocated, because it decides the allocation. Debug
+    /// builds assert it has not changed since.
     fn opaque(&self) -> bool {
         false
     }
 
-    /// True while something this renderer draws is still moving, so the present thread
-    /// keeps display-clock pacing alive rather than parking.
+    /// Returns `true` while something this renderer draws is still moving, which keeps the
+    /// present thread paced off the display clock rather than parked.
     fn animating(&self) -> bool {
         false
     }
 
-    /// Drop every cached device resource: the region was rebuilt and the device those
-    /// resources came from is gone. Called before the next [`draw`](Self::draw).
+    /// Drops every cached device resource.
+    ///
+    /// Called after the region is rebuilt on a new device and before the next
+    /// [`draw`](Self::draw); a resource built on the previous device does not bind.
     fn device_reset(&mut self) {}
 }
 
@@ -348,7 +366,8 @@ mod tests {
         assert_eq!(input.active(), Some(SubId(0)));
         assert_eq!(input.cursor(), Some((12.5, -3.25)));
 
-        // The niche and the sentinel are not values a caller can smuggle a `Some` through.
+        // `u32::MAX` and a NaN coordinate are the absence sentinels, so neither round-trips
+        // as `Some`.
         input.set_hover(Some(SubId(u32::MAX)));
         assert_eq!(input.hover(), None);
         input.set_cursor(Some((f32::NAN, 0.0)));

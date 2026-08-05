@@ -1,9 +1,8 @@
-//! Layout: the length vocabulary, the style presets, and the classes over them.
+//! Layout: the length vocabulary, the style presets, and the layout classes over them.
 //!
-//! Taffy implements all of this, so these are presets over one `Style` and they are cheap
-//! *because* the engine does the work. Every class exists in two forms over one const table:
-//! a free function here, and an `El` method. `stack(c)` is `El::seed(Bare).stack(c)`, which
-//! is what keeps surfaces × classes from being a grid of signatures.
+//! Taffy runs the solve; a layout class here is one row of a const preset table lowered to
+//! a `taffy::Style`. Every class exists in two forms over that one table: a free function
+//! in this module, and an [`El`] method. `stack(c)` is `El::seed(Preset::Bare).stack(c)`.
 
 mod len;
 mod preset;
@@ -11,9 +10,9 @@ mod probe;
 mod scroll;
 
 pub use len::{Align, Len, Track};
-pub use probe::{Placed, Probe, probe};
-pub(crate) use probe::ProbeRow;
 pub use preset::{Over, Preset, Rule, lower, lower_with, root};
+pub(crate) use probe::ProbeRow;
+pub use probe::{Placed, Probe, probe};
 pub use scroll::{
     ListSpec, Realized, Reveal, ScrollDecl, ScrollState, THUMB_MARGIN, THUMB_MIN_H, THUMB_W,
     ThumbGeom, front as scroll_front, list, observe as scroll_observe, rail_style, realize, scroll,
@@ -23,51 +22,50 @@ pub(crate) use scroll::{ScrollRow, grab_decl, grab_hit};
 
 use crate::build::{El, IntoChildren, View};
 
-/// A column. Children stretch; the gap comes from the scope.
+/// Returns a column of `children`. Children stretch, and the gap comes from the scope.
 #[must_use]
 pub fn stack(children: impl IntoChildren) -> View {
     El::seed(Preset::Bare).stack(children)
 }
 
-/// A row. Children centre; the gap comes from the scope.
+/// Returns a row of `children`. Children centre, and the gap comes from the scope.
 #[must_use]
 pub fn row(children: impl IntoChildren) -> View {
     El::seed(Preset::Bare).row(children)
 }
 
-/// A row that wraps.
+/// Returns a row of `children` that wraps onto further lines.
 #[must_use]
 pub fn wrap(children: impl IntoChildren) -> View {
     El::seed(Preset::Bare).wrap(children)
 }
 
-/// An explicit grid. Children are auto-placed unless the container places them.
+/// Returns an explicit grid. Children are auto-placed unless the container places them.
 #[must_use]
 pub fn grid(children: impl IntoChildren) -> View {
     El::seed(Preset::Bare).grid(children)
 }
 
-/// Responsive tiles: `repeat(auto-fill, minmax(min, 1fr))`.
+/// Returns a tile grid whose single track is `repeat(auto-fill, minmax(min, 1fr))`.
 ///
-/// No column count is computed anywhere; the track expression is the whole of it.
+/// The track expression decides how many columns fit; no column count is computed here.
 #[must_use]
 pub fn tiles(min: impl Into<Len>, children: impl IntoChildren) -> View {
     El::seed(Preset::Bare).tiles(min, children)
 }
 
-/// Absorbs the slack.
-///
-/// This replaces the prior pattern for bottom-aligning a card's call to action: a
-/// three-track grid, two placement calls, an explicit track list and a row spacing.
+/// Returns an empty node with `flex_grow: 1`, absorbing its container's slack.
 #[must_use]
 pub fn spacer() -> View {
     El::seed(Preset::Bare).grow()
 }
 
-/// A container that classifies its own inline size for its subtree.
+/// Returns a column that classifies its own inline size for its subtree.
 ///
-/// A caller never passes a width down, so a body is correct in a full-width row, a narrow
-/// column and a detail pane at once. A width variant changes **styles, never structure**.
+/// `bounds` is `[narrow_max, medium_max]` in DIPs: the two widths that separate the three
+/// width classes. Descendants resolve their metrics against the class this container
+/// publishes, so no caller passes a width down. A width class changes styles, never
+/// structure — nothing unmounts while a window edge is dragged across a bound.
 #[must_use]
 pub fn responsive(bounds: [f32; 2], children: impl IntoChildren) -> View {
     El::seed(Preset::Bare)

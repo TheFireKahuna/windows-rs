@@ -1,6 +1,7 @@
 # Metadata
 
-Two kinds of file live here, and the difference matters before you edit either.
+Two kinds of file live here: generated snapshots, which are rewritten by a tool, and hand-authored
+transcriptions, which are edited directly.
 
 ## Generated snapshots
 
@@ -24,15 +25,15 @@ The `.rdl` files at this level are **transcriptions**, written and maintained by
 | `windowsgraphicsinterop.rdl` | `Windows.Graphics.Interop.h` | the rest of the composition interop surface is scraped; this one interface is not |
 
 **Why transcribe rather than extend the scrape.** Adding a header to `tool_win32`'s manifest is the
-right mechanism when the surface belongs in the corpus, but re-running the scrape rewrites every
-partition against whatever SDK and libclang are installed — tens of thousands of lines of churn,
-across files nobody asked to change, to acquire a handful of symbols. A transcription keeps the
-blast radius to exactly the symbols it names, and its diff is reviewable.
+right mechanism when the surface belongs in the corpus. Re-running the scrape, though, rewrites
+every partition against whatever SDK and libclang are installed, so acquiring a handful of symbols
+costs tens of thousands of changed lines across unrelated files. A transcription changes only the
+symbols it names.
 
-The trade is that a transcription can drift from the header it was taken from, and nothing detects
-that. So each file states which header it transcribes and what it deliberately omits, and anything
-it omits must resolve from the corpus rather than being redefined here — a duplicate definition is
-what a filter naming it will hit, in the generated file rather than at the filter line.
+A transcription can drift from the header it was taken from, and nothing detects that. Each file
+therefore names the header it transcribes and what it omits. What it omits must resolve from the
+corpus rather than being redefined here: a filter naming both winmds hits a duplicate definition,
+and the error surfaces in the generated file rather than at the filter line.
 
-`helpers::compile_authored_metadata` compiles these into one throwaway winmd under `target/`, which
-the generators name alongside `default`. It is never committed: the `.rdl` is the source.
+`helpers::compile_authored_metadata` compiles these into one winmd under `target/`, which the
+generators name alongside `default`. That winmd is never committed; the `.rdl` files are the source.

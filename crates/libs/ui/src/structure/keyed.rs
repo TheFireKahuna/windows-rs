@@ -4,15 +4,16 @@ use crate::signal::Owner;
 use core::hash::Hash;
 use rustc_hash::FxHashMap;
 
-/// The indices of a longest increasing subsequence of `seq`.
+/// Returns the indices of a longest increasing subsequence of `seq`.
 ///
-/// Everything **not** in the result needs one move; everything in it is already in relative
-/// order and must not be touched. `O(n log n)`, by patience sorting with a predecessor
-/// chain.
+/// Everything not in the result needs one move; everything in it is already in relative
+/// order and is left alone. `O(n log n)`, by patience sorting with a predecessor chain.
 ///
-/// This is the whole of "minimal moves", and it is why it is worth having: a reconciler
-/// without it moves every element after the first change, so a list that gained one row at
-/// the top moves every row.
+/// This is what makes the move set minimal: a reconciler without it moves every element
+/// after the first change, so a list that gained one row at the top moves every row.
+///
+/// Allocates the returned `Vec`. [`Keyed::reconcile`] runs the same computation over pooled
+/// scratch instead.
 #[must_use]
 pub fn compute_lis(seq: &[usize]) -> Vec<usize> {
     let mut out = Vec::new();
@@ -45,7 +46,7 @@ impl Lis {
 
         for (i, &value) in seq.iter().enumerate() {
             // The first tail not less than `value`. Strictly increasing, so a tie extends
-            // nothing — which is what keeps equal old-positions from being called stable.
+            // nothing and two equal old positions are never both counted as stable.
             let at = self.tails.partition_point(|&t| seq[t] < value);
             if at > 0 {
                 self.prev[i] = self.tails[at - 1];
@@ -84,7 +85,7 @@ pub enum Step {
 
 /// A keyed list, and the [`Owner`] behind each of its rows.
 ///
-/// Reconciling to a new item set does four things, in this order:
+/// Reconciling to a new item set proceeds in four steps, in this order:
 ///
 /// 1. **destroys** removed keys, dropping their scopes;
 /// 2. **creates** added keys, each in a fresh scope;
@@ -92,25 +93,26 @@ pub enum Step {
 /// 4. **rebinds** every key's data — a survivor's view is not rebuilt.
 ///
 /// Step 4 is what makes recycling free: a row scrolling out and another scrolling in is a
-/// move plus a value change, not a destroy plus a create. It is also why a filter keystroke
-/// that keeps a card reorders it rather than rebuilding it.
+/// move plus a value change, not a destroy plus a create, and a filter keystroke that keeps
+/// a card reorders it rather than rebuilding it.
 ///
-/// A row's scope is **detached** from whatever scope is current when `reconcile` runs. It
-/// has to be: reconciling from inside an effect would otherwise register every row it ever
-/// created as a child of the effect's own scope, and that list would grow for the life of
-/// the screen. The rows are this list's, and the list is its parent's.
+/// A row's scope is detached from whatever scope is current when
+/// [`reconcile`](Self::reconcile) runs: reconciling from inside an effect would otherwise
+/// register every row it ever created as a child of the effect's own scope, and that list
+/// would grow for the life of the screen. A row belongs to this list, and this list to its
+/// parent scope.
 pub struct Keyed<K: Eq + Hash + Clone> {
     /// The current order.
     keys: Vec<K>,
     rows: FxHashMap<K, Row>,
-    /// Bumped per reconcile, and stamped on every key present in the new set. What
-    /// separates a survivor from a departure in one pass per side, with no set to build.
+    /// Bumped per reconcile and stamped on every key present in the new set, so a survivor
+    /// is told from a departure in one pass per side with no set to allocate.
     epoch: u32,
     scratch: Scratch,
 }
 
 struct Row {
-    /// Disposes everything this row's view created. Dropping the row is the unmount.
+    /// Disposes everything this row's view created; dropping the row is the unmount.
     _owner: Owner,
     /// This row's index in `keys`.
     at: usize,
@@ -135,7 +137,7 @@ impl<K: Eq + Hash + Clone> Default for Keyed<K> {
 }
 
 impl<K: Eq + Hash + Clone> Keyed<K> {
-    /// An empty list.
+    /// Creates an empty list.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -146,25 +148,26 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
         }
     }
 
-    /// The current order.
+    /// Returns the keys in their current order.
     #[must_use]
     pub fn keys(&self) -> &[K] {
         &self.keys
     }
 
-    /// How many rows are live.
+    /// Returns how many rows are live.
     #[must_use]
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
-    /// Whether the list is empty.
+    /// Returns whether the list holds no rows.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
 
-    /// Drops every row's scope, last first. What unmounting a list does.
+    /// Drops every row's scope, last first, calling `remove` with each key before that
+    /// row's scope goes. Unmounting a list is this call.
     pub fn clear(&mut self, mut remove: impl FnMut(&K)) {
         while let Some(key) = self.keys.pop() {
             remove(&key);
@@ -174,16 +177,19 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
 
     /// Reconciles to `next`.
     ///
-    /// - `key` projects an item to its identity. A **borrow** and not a value, so a key that
-    ///   is not `Copy` costs nothing to read four times, and so the identity may live inside
-    ///   the item rather than beside it. Where the item *is* its own key, this is `|item|
-    ///   item`.
+    /// - `key` projects an item to its identity. It returns a borrow rather than a value, so
+    ///   a key that is not `Copy` costs nothing to read four times and the identity may live
+    ///   inside the item rather than beside it. Where the item is its own key, this is
+    ///   `|item| item`.
     /// - `remove` is called for every departing key, before anything is built.
     /// - `build` is called for every arriving key, **inside that key's own scope**, so
     ///   everything it creates is disposed when the key later leaves.
     /// - `place` is called once per key in `next`, front to back, with that key's [`Step`]
     ///   and the index in `next` of the key it follows — `None` at the head. Front to back
     ///   is what makes the predecessor already correct when a step is applied.
+    ///
+    /// The keys of `next` must be unique; a repeat collapses two rows into one, and a debug
+    /// build asserts it.
     ///
     /// Allocates nothing once the scratch has grown, so a list reconciling per keystroke
     /// costs the callbacks and the hash lookups and nothing else.
@@ -231,7 +237,7 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
                 scratch.positions.push(position);
             } else {
                 // Detached: this row belongs to the list, not to whatever scope is running
-                // the reconcile. See the type's own note.
+                // the reconcile.
                 let (owner, ()) = Owner::detached(|| Owner::scope(|| build(key, item)));
                 rows.insert(
                     key.clone(),

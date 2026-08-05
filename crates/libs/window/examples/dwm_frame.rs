@@ -1,11 +1,11 @@
-//! Does `DwmDefWindowProc` still draw and hit-test the caption buttons on a window with
-//! **no redirection surface**?
+//! Measures whether `DwmDefWindowProc` draws and hit-tests the caption buttons on a window
+//! with **no redirection surface**.
 //!
 //! The documented recipe — extend the frame into the client area, remove the standard frame
 //! in `WM_NCCALCSIZE`, pass the non-client messages to `DwmDefWindowProc` first — is
-//! written for a window that has a redirection bitmap for DWM to draw into. This one does
-//! not. If it holds anyway, the caption keeps its drag strip, DWM takes the three window
-//! commands, and no legacy mouse message is read at all.
+//! written for a window that has a redirection bitmap for DWM to draw into, and this window
+//! has none. Where the recipe holds anyway, the caption keeps its drag strip, DWM takes the
+//! three window commands, and no legacy mouse message is read.
 //!
 //! The DWM entry points are declared here and routed from this example's own message
 //! handler, which runs ahead of the caption's.
@@ -38,8 +38,8 @@ fn main() -> Result<()> {
     let hold = std::env::args().any(|a| a == "--hold");
     let tally = Rc::new(Cell::new(Tally::default()));
     let extended = Rc::new(Cell::new(false));
-    // Re-applied on every activation, so an arm switches by setting this and poking the
-    // window rather than by rebuilding it.
+    // Re-applied on every activation, so an arm switches margins by setting this and poking
+    // the window rather than by rebuilding it.
     let margins = Rc::new(Cell::new((-1, -1, -1, -1)));
 
     let window = Window::new("windows-window — DWM custom frame")
@@ -56,8 +56,8 @@ fn main() -> Result<()> {
                     dwm::WM_NCMOUSEMOVE => counts.nc_mouse_move += 1,
                     dwm::WM_NCLBUTTONDOWN => counts.nc_lbutton_down += 1,
                     dwm::WM_NCMOUSELEAVE => counts.nc_mouse_leave += 1,
-                    // The documented place to extend the frame: not `WM_CREATE`, so that a
-                    // window opening maximized is handled by the same code path.
+                    // `WM_ACTIVATE` rather than `WM_CREATE`, so a window that opens
+                    // maximized extends its frame through the same path.
                     dwm::WM_ACTIVATE => {
                         let hr = dwm::extend_frame(hwnd, margins.get());
                         extended.set(hr >= 0);
@@ -65,9 +65,9 @@ fn main() -> Result<()> {
                     _ => {}
                 }
 
-                // DWM first, for every non-client message. It answers only where it owns
-                // something — over its caption buttons — and declines everywhere else,
-                // which is what leaves the drag strip and the resize edges to the caption.
+                // DWM sees every non-client message first. It answers only over its own
+                // caption buttons and declines elsewhere, which leaves the drag strip and
+                // the resize edges to the caption.
                 if matches!(
                     message,
                     dwm::WM_NCHITTEST
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
         .custom_caption(CaptionSpec {
             height: Some(BAR_H),
             corners: CornerPreference::Round,
-            // We declare none of our own: the whole question is whether DWM supplies them.
+            // The caption declares no buttons of its own; DWM supplies them or nothing does.
             buttons: CaptionButtons {
                 minimize: false,
                 maximize: false,
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
         })
         .create()?;
 
-    // Only ever "drag or client" — every window command is DWM's in this design.
+    // Drag or client only: every window command belongs to DWM here.
     window
         .on_caption_hit(|_, y| {
             if y < BAR_H {
@@ -108,11 +108,11 @@ fn main() -> Result<()> {
         })
         .expect("a window with a caption of its own");
 
-    // Real content, opaque and covering the whole window. Without it the capture shows
-    // DWM's frame against nothing and cannot say whether the buttons are drawn *over* what
-    // the application composes — which is the only arrangement that is any use.
+    // Opaque content covering the whole window, so a capture shows whether DWM's buttons
+    // are drawn over what the application composes.
     let compositor = Compositor::new()?;
-    // SAFETY: the window is live and owned by this thread.
+    // SAFETY: `window` owns the handle and destroys it only on drop, so the target is bound
+    // to a live window, on the thread that created it.
     let target = unsafe { compositor.create_desktop_window_target_for_hwnd(window.hwnd(), false)? };
     let root = compositor.create_container_visual();
     root.set_relative_size_adjustment(Vector2 { x: 1.0, y: 1.0 });
@@ -179,8 +179,8 @@ fn main() -> Result<()> {
     if let Some((bl, bt, br, bb)) = bounds {
         // The bounds are relative to the window's top-left.
         let centre = (rect.0 + (bl + br) / 2, rect.1 + (bt + bb) / 2);
-        // The maximize button is the middle of the three, so aim a button-width left of
-        // the close button rather than at the centre of the whole cluster.
+        // The bounds cover all three buttons, which run minimize, maximize, close from the
+        // left, so the probe aims into the right half of the cluster.
         let button_w = (br - bl) / 3;
         let maximize = (centre.0 + button_w / 2, centre.1);
         println!("\n  hovering DWM's maximize button at {maximize:?}");
@@ -248,11 +248,12 @@ fn answer(claim: &str, held: bool, note: String) {
     );
 }
 
-/// The caption band height in physical pixels, for the stand-in strip.
+/// Returns the caption band's height in physical pixels, for the stand-in strip.
 fn band_px(window: &Window) -> f32 {
     window.metrics().expect("an open window").px(BAR_H) as f32
 }
 
+/// Pumps for `ms` milliseconds, so the window services the input just injected.
 fn settle(ms: u64) {
     for _ in 0..(ms / 10).max(1) {
         windows_window::pump();
@@ -272,8 +273,8 @@ fn ht_name(code: isize) -> String {
     }
 }
 
-/// The DWM entry points this experiment needs, declared here so that measuring it commits
-/// nothing: none of them is in the crate's binding filter.
+/// The DWM and user32 entry points this example calls, declared here because none of them
+/// is in the crate's binding filter.
 mod dwm {
     use windows_window::Window;
 
@@ -360,18 +361,21 @@ mod dwm {
         fn IsWindowVisible(hwnd: Hwnd) -> i32;
     }
 
-    /// `Some(result)` when DWM handled the message itself.
+    /// Returns `Some(result)` when DWM handled the message itself, and `None` when it
+    /// declined and the caller still owns the message.
     pub fn def_window_proc(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
         let mut result = 0isize;
+        // SAFETY: `DwmDefWindowProc` accepts any handle value, forwards `wparam` and
+        // `lparam` to the window procedure it stands in for, and writes only through
+        // `result`, a live stack local.
         let handled = unsafe { DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut result) };
         (handled != 0).then_some(result)
     }
 
-    /// Extends the frame into the client area.
+    /// Extends the frame into the client area by `margins`, given as left, right, top,
+    /// bottom.
     ///
-    /// **All four fields at `-1` is the sheet-of-glass form**, and all four at `0` extends
-    /// nothing at all — which is not a subtle distinction, it is the difference between
-    /// running the experiment and not running it.
+    /// All four fields at `-1` is the sheet-of-glass form; all four at `0` extends nothing.
     pub fn extend_frame(hwnd: Hwnd, margins: (i32, i32, i32, i32)) -> i32 {
         let margins = Margins {
             left: margins.0,
@@ -379,12 +383,17 @@ mod dwm {
             top: margins.2,
             bottom: margins.3,
         };
+        // SAFETY: `DwmExtendFrameIntoClientArea` accepts any handle value and reads
+        // `margins`, a live local with the `MARGINS` layout, for the duration of the call.
         unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) }
     }
 
-    /// Where DWM says its own caption buttons are, relative to the window's top-left.
+    /// Returns where DWM says its own caption buttons are, relative to the window's
+    /// top-left, or `None` where it reports nothing.
     pub fn caption_button_bounds(window: &Window) -> Option<(i32, i32, i32, i32)> {
         let mut rect = Rect::default();
+        // SAFETY: `DWMWA_CAPTION_BUTTON_BOUNDS` reports a `RECT`, and the size passed is
+        // `size_of::<Rect>()`, which is what bounds the write into `rect`.
         let hr = unsafe {
             DwmGetWindowAttribute(
                 window.hwnd(),
@@ -396,31 +405,45 @@ mod dwm {
         (hr >= 0).then_some((rect.left, rect.top, rect.right, rect.bottom))
     }
 
-    /// Asks DWM directly whether it owns a screen point.
+    /// Returns DWM's own hit-test answer for a screen point, or `None` where it declines
+    /// the point.
     pub fn hit_test(window: &Window, x: i32, y: i32) -> Option<isize> {
         let lparam = ((y as u32 as isize) << 16) | (x as u32 as isize & 0xffff);
         def_window_proc(window.hwnd(), WM_NCHITTEST, 0, lparam)
     }
 
+    /// Returns the window's outer rectangle in screen coordinates.
     pub fn window_rect(window: &Window) -> (i32, i32, i32, i32) {
         let mut rect = Rect::default();
+        // SAFETY: `GetWindowRect` accepts any handle value and writes only through `rect`,
+        // a live stack local of the size it expects.
         unsafe { GetWindowRect(window.hwnd(), &mut rect) };
         (rect.left, rect.top, rect.right, rect.bottom)
     }
 
+    /// Places the window at a screen position in the topmost band, without activating it.
     pub fn place(window: &Window, x: i32, y: i32, w: i32, h: i32) {
+        // SAFETY: `SetWindowPos` accepts any handle value and takes only integers besides
+        // it.
         unsafe { SetWindowPos(window.hwnd(), -1, x, y, w, h, 0x0010) };
     }
 
+    /// Leaves the topmost band, keeping the window's position and size.
     pub fn drop_topmost(window: &Window) {
+        // SAFETY: `SetWindowPos` accepts any handle value and takes only integers besides
+        // it.
         unsafe { SetWindowPos(window.hwnd(), -2, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010) };
     }
 
     fn send(input: Input) {
+        // SAFETY: `SendInput` reads `size_of::<Input>()` bytes from `input`, a live local
+        // whose `#[repr(C)]` layout is the `INPUT` it expects, and the size passed says so.
         unsafe { SendInput(1, &input, size_of::<Input>() as i32) };
     }
 
+    /// Moves the pointer to a screen point with an injected input event.
     pub fn move_cursor(x: i32, y: i32) {
+        // SAFETY: `GetSystemMetrics` takes an index and returns an integer.
         let (vx, vy, vw, vh) = unsafe {
             (
                 GetSystemMetrics(76),
@@ -441,8 +464,10 @@ mod dwm {
         });
     }
 
-    /// Clicks a client point, which is how a background process legitimately becomes
-    /// foreground — `SetForegroundWindow` is refused to one that owns no recent input.
+    /// Clicks a point given relative to the window's top-left.
+    ///
+    /// `SetForegroundWindow` is refused to a process that owns no recent input, so a click
+    /// is how this one becomes foreground.
     pub fn click(window: &Window, x: i32, y: i32) {
         let rect = window_rect(window);
         move_cursor(rect.0 + x, rect.1 + y);
@@ -461,8 +486,16 @@ mod dwm {
     use std::sync::Mutex;
     static FOUND: Mutex<Option<String>> = Mutex::new(None);
 
+    /// Returns the class name of the Snap Layouts flyout while it is open, matching the two
+    /// names the shell gives that separate window.
     pub fn snap_flyout() -> Option<String> {
+        /// # Safety
+        ///
+        /// `hwnd` must be a window handle `EnumWindows` supplied for the enumeration in
+        /// progress.
         unsafe extern "system" fn visit(hwnd: Hwnd, _: isize) -> i32 {
+            // SAFETY: `hwnd` names a live window for the duration of the callback, and
+            // `GetClassNameW` writes at most `buffer.len()` code units into `buffer`.
             unsafe {
                 if IsWindowVisible(hwnd) == 0 {
                     return 1;
@@ -483,6 +516,8 @@ mod dwm {
             1
         }
         *FOUND.lock().expect("no panic holds this lock") = None;
+        // SAFETY: `visit` has the signature `EnumWindows` calls, and every handle it passes
+        // is one this enumeration produced.
         unsafe { EnumWindows(visit, 0) };
         FOUND.lock().expect("no panic holds this lock").clone()
     }

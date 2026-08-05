@@ -1,16 +1,14 @@
 //! Interaction trackers, and scroll. **Front half.**
 //!
 //! A tracker is a value the composition engine drives from a manipulation and from inertia,
-//! **in another process**. Every call into it and every callback out of it is asynchronous,
-//! and that single fact shapes everything here: the position is read only from a
-//! values-changed callback, and a request may be dropped silently by design.
+//! in another process. Every call into it and every callback out of it is asynchronous: the
+//! position is read only from a values-changed callback, and a request may be dropped.
 //!
-//! **An owner is not free and it is all-or-nothing.** It is supplied at construction and
-//! there is no per-callback subscription, so a tracker that needs one event pays for all
-//! six — measured at ~19× against an ownerless one over the same fling. So the type answers
-//! "which surfaces qualify": a surface that is neither virtualized nor driven by explicit
-//! position requests **cannot** be given callbacks it does not read, because it is created
-//! as [`Passive`](crate::Passive) and `request` does not accept one.
+//! An owner is supplied at construction and there is no per-callback subscription, so a
+//! tracker that needs one event pays for all six — measured at ~19× the callback cost of an
+//! ownerless tracker over the same fling. A surface that is neither virtualized nor driven
+//! by explicit position requests is created as [`Passive`](crate::Passive), which `request`
+//! does not accept, so it cannot be given callbacks it does not read.
 
 use crate::sink::{NodeId, Tracker as TrackerFamily, TrackerRequest};
 use core::cell::RefCell;
@@ -22,7 +20,7 @@ use windows_composition::{
 use windows_core::Result;
 use windows_numerics::{Vector2, Vector3};
 
-/// What phase a tracker is in, as its last reported transition said.
+/// The phase a tracker's last reported transition put it in.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
     #[default]
@@ -34,10 +32,9 @@ pub enum Phase {
 
 /// How many requests can be outstanding before the oldest is forgotten.
 ///
-/// A bounded array and not a map: a mouse drag issues one request per frame and every
-/// values-changed clears the set, so it never holds more than a frame or two of latency —
-/// and a map there would allocate on the drag path for a collection that never grows. A
-/// linear scan over eight entries is both faster and inside the zero-allocation rule.
+/// The pending set is a fixed array because the drag path allocates nothing: a mouse drag
+/// issues one request per frame and every values-changed callback clears the set, so it
+/// holds a frame or two of latency and a linear scan over eight entries resolves a reply.
 const PENDING: usize = 8;
 
 /// One tracker and everything known about it on this side.
@@ -47,8 +44,9 @@ pub(crate) struct TrackerState {
     /// The group this tracker scrolls. The hit array resolves a scroll ancestry through it,
     /// so a reported position has somewhere to land.
     pub(crate) viewport: Option<NodeId>,
-    /// The last values reported. **The only trustworthy read**: the tracker runs in another
-    /// process and its own getter would answer with whatever was last *set*.
+    /// The last values reported by a values-changed callback, and the only sound read: the
+    /// tracker runs in another process and its own getter answers with whatever was last
+    /// set.
     pub(crate) position: Vector3,
     pub(crate) scale: f32,
     pub(crate) phase: Phase,
@@ -74,8 +72,9 @@ impl TrackerState {
 
     /// Issues a request and holds it against its id.
     ///
-    /// **Never assume one applied.** A position update arriving while the user is actively
-    /// manipulating is documented to be dropped, and the drop is silent.
+    /// A request is not an assignment: a position update arriving while the user is
+    /// manipulating is documented as dropped, and the tracker reports the drop only as an
+    /// ignored request.
     pub(crate) fn request(&mut self, request: TrackerRequest) -> Result<RequestId> {
         let id = match request {
             TrackerRequest::To(p) => self.tracker.try_update_position(
@@ -115,17 +114,16 @@ impl TrackerState {
             *slot = Some((id, request));
             return;
         }
-        // Full means the tracker has not reported in several frames, which is itself the
-        // signal: the oldest entry matters least, and dropping it is
-        // better than growing a buffer on the drag path.
+        // A full set means the tracker has not reported in several frames. The oldest entry
+        // is the least useful one to keep, and the drag path allocates nothing.
         self.pending.rotate_left(1);
         self.pending[PENDING - 1] = Some((id, request));
     }
 
     /// Drops a request the system reported as ignored.
     ///
-    /// It is **not** re-applied. Re-applying blindly gives a user whose manipulation ends a
-    /// double jump, which is the failure this reconciliation exists to prevent.
+    /// The request is not re-applied: re-applying it would jump a second time once the
+    /// user's manipulation ends.
     pub(crate) fn ignored(&mut self, id: i32) {
         for slot in &mut self.pending {
             if slot.is_some_and(|(pending, _)| pending == id) {
@@ -134,7 +132,7 @@ impl TrackerState {
         }
     }
 
-    /// Records the one trustworthy read, and clears the pending set.
+    /// Records the reported values and clears the pending set.
     pub(crate) fn values_changed(&mut self, position: Vector3, scale: f32) {
         self.position = position;
         self.scale = scale;
@@ -145,9 +143,8 @@ impl TrackerState {
 /// Configures the source a manipulation is collected on.
 ///
 /// The source visual is both the hit-test target and the gesture's coordinate space, so it
-/// **must not move during the manipulation** — which is why it is the scroll container's
-/// viewport and never the content that scrolls inside it. No visual exists purely for
-/// input.
+/// must not move during the manipulation: it is the scroll container's viewport and never
+/// the content scrolling inside it.
 pub(crate) fn configure_source(
     source: &VisualInteractionSource,
     axes: crate::sink::Axes,
@@ -160,17 +157,17 @@ pub(crate) fn configure_source(
         }
     };
     source.set_axis_modes(mode(axes.x), mode(axes.y), mode(axes.scale));
-    // Rails: a pan started primarily on one axis locks to it. Wanted whenever both are
-    // live — a vertical list should not drift sideways — and meaningless when only one is.
+    // Rails lock a pan to the axis it started on, so a vertical list does not drift
+    // sideways. Meaningful only while both axes are live.
     source.set_rails(axes.x && axes.y, axes.x && axes.y);
-    // Precision touchpad and wheel arrive without the window's help. Touch and pen must be
-    // redirected explicitly, and mouse cannot be redirected at all — which is why a mouse
-    // drag is driven by explicit position requests instead.
+    // Precision touchpad and wheel arrive without the window's help. Touch and pen need
+    // explicit redirection, and mouse cannot be redirected at all, so a mouse drag is driven
+    // by explicit position requests.
     source.set_redirection_mode(RedirectionMode::TouchpadAndWheel);
-    // Nested scrollers hand off at their bounds with no hand-written plumbing.
+    // Nested scrollers hand off at their bounds.
     source.set_chaining(ChainingMode::Auto, ChainingMode::Auto, ChainingMode::Auto);
-    // Wheel drives Y only; X and scale are left to touch and the touchpad. With this set, a
-    // wheel message over a scroll container needs **no front-thread handling whatsoever**.
+    // Wheel drives Y only; X and scale are left to touch and the touchpad. A wheel message
+    // over a scroll container then needs no front-thread handling.
     source.set_wheel_modes(
         WheelMode::Disabled,
         if axes.y {
@@ -184,15 +181,15 @@ pub(crate) fn configure_source(
 
 /// The queue a tracker's owner callbacks push into, drained on the front thread's tick.
 ///
-/// Shared rather than owned because the callback is a COM object the compositor holds, and
-/// it outlives the borrow that created it. Nothing here is `Send`: the callbacks arrive on
-/// the thread that created the compositor, which is the thread the tree lives on.
+/// Shared rather than owned because the callback is a COM object the compositor holds past
+/// the borrow that created it. Nothing here is `Send`: the callbacks arrive on the thread
+/// that created the compositor, which is the thread the tree lives on.
 ///
-/// **The queue holds a [`Tick`](windows_window::Tick) while anything is in it.** Inertia
-/// reports from the compositor with no input behind it, so a queue that did not ask for a
-/// frame would be read at whatever unrelated wake came next — which for a virtualized list
-/// is a fling that lands on rows nobody realized. The drain releases it, so a tracker that
-/// has stopped reporting parks the clock rather than holding it open.
+/// The queue holds a [`Tick`](windows_window::Tick) while anything is in it. Inertia reports
+/// from the compositor with no input behind it, so without the tick the queue would be read
+/// at whatever unrelated wake came next — for a virtualized list, a fling landing on rows the
+/// list never realized. [`drain`](Events::drain) releases the tick, so a tracker that has
+/// stopped reporting parks the clock.
 #[derive(Default)]
 pub(crate) struct Events {
     queued: Vec<crate::SceneEvent>,
@@ -200,6 +197,7 @@ pub(crate) struct Events {
 }
 
 impl Events {
+    /// Queues an event, taking a tick if the queue was empty.
     pub(crate) fn push(&mut self, event: crate::SceneEvent, wake: &windows_window::Wake) {
         self.queued.push(event);
         if self.tick.is_none() {
@@ -207,6 +205,7 @@ impl Events {
         }
     }
 
+    /// Moves the queued events onto `out` and releases the tick.
     pub(crate) fn drain(&mut self, out: &mut Vec<crate::SceneEvent>) {
         out.append(&mut self.queued);
         self.tick = None;
@@ -215,7 +214,8 @@ impl Events {
 
 pub(crate) type EventQueue = Rc<RefCell<Events>>;
 
-/// Turns a wrapper tracker event into this crate's, tagged with which tracker it came from.
+/// Translates a wrapper tracker event into this crate's, tagged with the tracker it came
+/// from.
 pub(crate) fn translate(
     id: crate::id::Id<TrackerFamily>,
     event: TrackerEvent,

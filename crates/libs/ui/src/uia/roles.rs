@@ -1,9 +1,8 @@
-//! What a role means to automation: one `const` row each.
+//! Maps a [`UiaRole`] to what automation is told about it: one row per role.
 //!
-//! The reference spent seven functions and a `ControlKind` cross-product on this — control
-//! type, localized type, presentational-or-not, value-is-a-string, item type, is-a-
-//! container, pattern-supported — each a match that had to be extended in step with the
-//! others. A row cannot fall out of step with itself, and a new role is visibly a new row.
+//! A row carries the control type, the spoken type name, the patterns the role answers to,
+//! and whether the element appears in the content view. The table is indexed by the enum
+//! through [`index`], so each role has exactly one row.
 
 use crate::bindings::{
     UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
@@ -17,7 +16,7 @@ use crate::bindings::{
 };
 use crate::widget::UiaRole;
 
-/// Which patterns a role answers to. A mask rather than a list, so support is one test.
+/// The set of patterns a role answers to, as a bit mask, so a support check is one test.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Patterns(u16);
 
@@ -33,17 +32,19 @@ impl Patterns {
     pub const SCROLL_ITEM: Self = Self(1 << 8);
     pub const TEXT: Self = Self(1 << 9);
 
+    /// Returns whether every pattern in `other` is in this set.
     #[must_use]
     pub const fn has(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    /// Returns the union of the two sets.
     #[must_use]
     pub const fn or(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
-    /// The same set without `other`.
+    /// Returns this set with the patterns in `other` cleared.
     #[must_use]
     pub const fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
@@ -53,8 +54,8 @@ impl Patterns {
 /// One role, as automation sees it.
 pub struct Row {
     pub control_type: i32,
-    /// The spoken name of the type. Automation has a default per control type, but a
-    /// custom type has none at all and reads as silence.
+    /// The spoken name of the control type. A custom control type has no platform default
+    /// name, so without this it reads as silence.
     pub localized: &'static str,
     pub patterns: Patterns,
     /// Whether the element is in the **content** view as well as the control view. A
@@ -77,9 +78,8 @@ static ROWS: [Row; 13] = [
         control_type: UIA_TextControlTypeId,
         localized: "text",
         // A static run publishes its body as a text document, so it can be read, selected
-        // and navigated. This is the surface `TextPattern` exists for here — an editable
-        // one belongs to text services, and advertising it before that lands would be a
-        // pattern that answers every call by refusing.
+        // and navigated. An editable document belongs to text services and is not this
+        // pattern.
         patterns: P.or(Patterns::TEXT),
         content: true,
     },
@@ -92,8 +92,8 @@ static ROWS: [Row; 13] = [
     Row {
         control_type: UIA_ButtonControlTypeId,
         localized: "button",
-        // Expand-collapse rides along because a button that opens a flyout is still a
-        // button; whether it *answers* is the entry's own flag, not the role's.
+        // A button that opens a flyout is still a button, so the role carries
+        // expand-collapse; whether an element answers it is the entry's `EXPANDS` flag.
         patterns: P.or(Patterns::INVOKE).or(Patterns::EXPAND),
         content: true,
     },
@@ -104,7 +104,7 @@ static ROWS: [Row; 13] = [
         content: true,
     },
     // A radio button reports `SelectionItem`, which a screen reader announces as "3 of 5"
-    // rather than as "checked". That distinction is the whole reason the role exists.
+    // rather than as "checked".
     Row {
         control_type: UIA_RadioButtonControlTypeId,
         localized: "radio button",
@@ -120,9 +120,8 @@ static ROWS: [Row; 13] = [
     Row {
         control_type: UIA_EditControlTypeId,
         localized: "edit",
-        // No `TEXT`: an editable document is text services' and is not written yet. A role
-        // that advertised the pattern and then refused every call would be worse than one
-        // that does not claim it.
+        // No `TEXT`: an editable document belongs to text services, and a pattern is
+        // advertised only where every call it takes is answered.
         patterns: P.or(Patterns::VALUE),
         content: true,
     },
@@ -150,8 +149,8 @@ static ROWS: [Row; 13] = [
         patterns: P.or(Patterns::RANGE).or(Patterns::VALUE),
         content: true,
     },
-    // A graph has no control type of its own. It is a custom control that reports a value,
-    // which is what makes a presented analyzer readable at all.
+    // Automation has no graph control type, so a graph is a custom control that reports a
+    // value, which is what makes a presented analyzer readable.
     Row {
         control_type: UIA_CustomControlTypeId,
         localized: "graph",
@@ -160,14 +159,17 @@ static ROWS: [Row; 13] = [
     },
 ];
 
-/// The row for `role`.
+/// Returns the row for `role`.
 #[must_use]
 pub fn row(role: UiaRole) -> &'static Row {
     &ROWS[index(role)]
 }
 
-/// A menu's rows are menu items, not buttons, and a list's are list items — the container
-/// decides, because the same widget is authored either way.
+/// Returns the control type `role` reports inside `parent`.
+///
+/// A button is a menu item inside a menu and a list item inside a list, because the same
+/// widget is authored for either container. Every other pairing reports the role's own
+/// control type.
 #[must_use]
 pub fn control_type_in(role: UiaRole, parent: UiaRole) -> i32 {
     match (parent, role) {
@@ -177,10 +179,12 @@ pub fn control_type_in(role: UiaRole, parent: UiaRole) -> i32 {
     }
 }
 
-/// A popup announces itself as a dialog, so a reader reads its title before its content.
+/// The control type a popup reports, which makes a reader announce its title before its
+/// content.
 pub const DIALOG_CONTROL_TYPE: i32 = UIA_WindowControlTypeId;
 
-/// The pattern id a mask bit stands for, for `GetPatternProvider`.
+/// Returns the mask bit standing for automation's pattern `id`, as `GetPatternProvider`
+/// needs it, or [`Patterns::NONE`] for a pattern this stack does not answer.
 #[must_use]
 pub fn pattern_of(id: i32) -> Patterns {
     match id {
@@ -219,8 +223,8 @@ const fn index(role: UiaRole) -> usize {
 mod tests {
     use super::*;
 
-    /// The table is indexed by the enum, so a role added without a row would read whatever
-    /// sits at that position. This is the assertion that says so.
+    /// The table is indexed by the enum, so a role added without a row would read
+    /// whichever row sits at its position.
     #[test]
     fn every_role_has_its_own_row() {
         let all = [
@@ -242,8 +246,8 @@ mod tests {
         for (at, role) in all.into_iter().enumerate() {
             assert_eq!(index(role), at, "{role:?} indexes the wrong row");
         }
-        // Every published role names its type out loud. Only `None`, which is never
-        // published, is allowed to be silent.
+        // Every published role names its type; only `None`, which is never published, may
+        // be silent.
         for role in all.into_iter().skip(1) {
             assert!(!row(role).localized.is_empty(), "{role:?} is unnamed");
         }

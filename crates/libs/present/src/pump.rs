@@ -1,46 +1,43 @@
 //! The present thread: one wake source, one reader, one core touched.
 //!
-//! A thread per surface wakes N threads and opens N readers per publish — N times the
-//! wake-to-context-switch churn and N cores pulled out of deep idle, which is exactly the
-//! platform-idle cost that dominates laptop power. The draw work itself is under 0.2 ms
-//! per publish, so one thread is amply sufficient.
+//! Every region draws on this one thread. The draw work is under 0.2 ms per publish, while a
+//! thread per surface would wake N threads and open N readers per publish, pulling N cores
+//! out of deep idle.
 //!
-//! **A steady producer at display rate posts nothing to the front thread.** It presents,
-//! and the compositor picks up the new buffer on its own; after the one call that binds
-//! the surface handle the front thread is out of the loop entirely. That is why an idle
-//! window costs zero front-thread wakes and zero publishes while three regions run at
-//! display rate.
+//! A steady producer at display rate posts nothing to the front thread: it presents, and the
+//! compositor picks up the new buffer on its own. After the one call that binds the surface
+//! handle the front thread is out of the loop, so an idle window costs zero front-thread
+//! wakes while its regions run at display rate.
 
 use super::*;
 use std::os::windows::io::{AsHandle, AsRawHandle};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-/// Frames drawn, and buffers held, per region.
+/// Sets frames drawn, and buffers held, per region.
 ///
-/// Both numbers are knees on measured curves and both curves are hardware-shaped, so both
-/// stay tunable rather than becoming constants.
+/// Both numbers are knees on hardware-shaped curves, so both stay tunable rather than
+/// becoming constants.
 #[derive(Copy, Clone, Debug)]
 pub struct Tuning {
     /// Frames drawn per wake, each presented into its own scheduled slot.
     ///
-    /// At one frame per wake, present and the Direct2D bracket were **87% of a 494 µs
-    /// compositor frame before anything was drawn**, and nearly all of that is fixed per
-    /// pass rather than per frame — so it divides. **Three is the knee**: 7.12% of a core
-    /// at 1, 6.55% at 2, **5.00% at 3**, 4.76% at 4, 4.69% at 5.
+    /// At one frame per wake, present and the Direct2D bracket were 87% of a 494 µs
+    /// compositor frame before anything was drawn, and nearly all of that is fixed per pass
+    /// rather than per frame, so it divides: 7.12% of a core at 1, 6.55% at 2, 5.00% at 3,
+    /// 4.76% at 4, 4.69% at 5.
     ///
-    /// What it costs is freshness. Inside a batch the first frame is as current as a
-    /// per-refresh pass and the last is `depth - 1` refreshes stale — 13.9 ms at 144 Hz
-    /// for three, half that on average. That is what rules out 4 and 5, not their CPU.
+    /// The cost is freshness. Inside a batch the first frame is as current as a per-refresh
+    /// pass and the last is `depth - 1` refreshes stale — 13.9 ms at 144 Hz for three, half
+    /// that on average — which is what bounds the value rather than the CPU curve.
     pub depth: u32,
     /// Buffers beyond `depth`: one for what the display is showing, one of slack so the
     /// rotation never catches its own tail on a frame the queue was late to retire.
     ///
-    /// **Two, and not more.** Widening it is monotonically *worse* — 5.00% of a core at
-    /// `+2`, 5.94% at `+4`, 6.13% at `+5` — which rules out buffer starvation as the cause
-    /// of a stall under batching and says the cost runs the other way: a wider rotation
-    /// cycles more cold memory per burst. Memory is not the constraint either way; 3
-    /// buffers to 5 moved the process working set by 0.1 MB.
+    /// Widening it is monotonically worse — 5.00% of a core at `+2`, 5.94% at `+4`, 6.13% at
+    /// `+5` — so a stall under batching is not buffer starvation; a wider rotation cycles
+    /// more cold memory per burst. Memory is not the constraint either way: 3 buffers to 5
+    /// moved the process working set by 0.1 MB.
     pub slack: u32,
     /// Consecutive ticks with nothing to draw before the loop drops back to the zero-cost
     /// event park.
@@ -53,10 +50,10 @@ pub struct Tuning {
     pub quiet_ticks: u32,
     /// Whether the groups report per-present statistics.
     ///
-    /// Off unless a question is being asked. The system produces a record per present per
-    /// enabled kind, and enabling them additionally **forces the VSync interrupt on for
-    /// every present** — about 26 µs of CPU each — because a statistic describes a present
-    /// the CPU was woken for. So a diagnostic run does not measure the shipping cadence.
+    /// The system produces a record per present per enabled kind, and enabling them also
+    /// forces the VSync interrupt on for every present — about 26 µs of CPU each — because a
+    /// statistic describes a present the CPU was woken for. A run with this on therefore
+    /// does not measure the cadence a run with it off has.
     pub statistics: bool,
 }
 
@@ -72,7 +69,7 @@ impl Default for Tuning {
 }
 
 impl Tuning {
-    /// Buffers per region. Derived, so `depth + 2` cannot drift apart from `depth`.
+    /// Returns the buffer count a region allocates: `depth` plus `slack`.
     #[must_use]
     pub fn pool(&self) -> u32 {
         self.depth + self.slack
@@ -81,50 +78,46 @@ impl Tuning {
 
 /// Refresh interval assumed until the clock has been measured, in 100 ns units — 60 Hz.
 ///
-/// The safe guess in both directions: too long a tick spaces a batch's slots wider than
-/// the display and shows each frame twice, which is visible; too short bunches them and
-/// the extras are skipped, which is waste. It converges within a handful of wakes either
-/// way.
+/// Too long a tick spaces a batch's slots wider than the display and shows each frame twice;
+/// too short bunches them and the extras are skipped. The measured average converges within
+/// a handful of wakes from either side.
 const DEFAULT_TICK: u64 = 166_667;
-/// Bounds a measured wake interval must fall inside to be believed: 1000 Hz down to
-/// 24 Hz. Outside it is a stall or a preemption rather than the display's cadence, and
-/// folding one into the average misplaces a batch's slots for several passes after.
+/// Bounds a measured wake interval must fall inside to be believed: 1000 Hz down to 24 Hz.
+/// Outside them the interval is a stall or a preemption rather than the display's cadence,
+/// and folding one into the average misplaces a batch's slots for several passes after.
 const MIN_TICK: u64 = 10_000;
 const MAX_TICK: u64 = 416_667;
 
-/// Every wait in this loop is `INFINITE`, and that is the design rather than an oversight.
+/// Every wait in this loop is `INFINITE`, with no guard timeout, retry interval or backoff.
 ///
-/// There is no guard timeout, no retry interval and no backoff, because each of the four
-/// reasons the compositor clock can stop has an **edge** behind it: every monitor off, the
-/// session disconnected, another app owning the screen, or the active desktop not being
-/// ours are the four conditions `windows-window` registers for, and a minimized or cloaked
-/// window is the other half of the same signal. A lost manager and a removed device raise
-/// events of their own. A timeout would only ever ask a question one of those already
-/// answers — which is the definition of a poll, however long the interval.
+/// Each reason the compositor clock can stop raises an edge this thread already waits on:
+/// every monitor off, the session disconnected, another app owning the screen, and the
+/// active desktop not being ours are the four conditions `windows-window` registers for, and
+/// a minimized or cloaked window is the other half of that signal. A lost manager and a
+/// removed device raise events of their own.
 ///
-/// What that costs is a hang if some *fifth* cause exists and produces no edge. The
-/// command handle is in every wait array, so the thread stays interruptible and shutdown,
-/// mounting and resizing always work; the failure mode is frames that stop, not a wedge.
+/// A cause that raised no edge would stop frames rather than wedge the thread: the command
+/// handle is in every wait array, so shutdown, mounting and resizing interrupt any wait.
 const _: () = ();
 
-/// What the front thread is told about a region's buffer.
+/// Tells the front thread what to do with a region's buffer.
 #[derive(Copy, Clone, Debug)]
 pub enum Bound {
     /// Bind this composition surface handle as the sink's brush, sampled 1:1 at `px`.
     ///
-    /// `isize` rather than a pointer so the message is `Send`; cast it back at the
-    /// binding. The region owns the handle and closes it, so a binding must be released
-    /// before the region is — which is what [`Released`](Self::Released) is for.
+    /// `isize` rather than a pointer so the message is `Send`; cast it back at the binding.
+    /// The region owns the handle and closes it, so a binding must be released before the
+    /// region is, which [`Released`](Self::Released) asks for.
     Surface { handle: isize, px: (u32, u32) },
     /// Release the binding. The handle behind it is about to close.
     Released,
-    /// Release the binding, and know that the region is gone because its renderer
-    /// **panicked** rather than because anything asked it to.
+    /// Release the binding: the region is gone because its renderer panicked rather than
+    /// because anything asked it to.
     ///
     /// Distinct from [`Released`](Self::Released) because a region that stops presenting
-    /// looks exactly like one whose data stopped arriving, and the two want opposite
-    /// responses. The region is unmounted either way: a panicking renderer costs its own
-    /// region and never the whole per-frame path.
+    /// looks exactly like one whose data stopped arriving, and the two call for opposite
+    /// responses. The region is unmounted either way, so a panicking renderer costs its own
+    /// region and not the per-frame path.
     Failed,
 }
 
@@ -144,17 +137,16 @@ enum Cmd {
     Quit,
 }
 
-/// A running present thread.
+/// Drives a running present thread.
 ///
-/// Every method is a message: the thread owns the device, the groups, the regions and
+/// Every method sends a message: the thread owns the device, the groups, the regions and
 /// every [`Frame`], because all of them are thread-affine and none of them is `Send`. A
-/// `Frame` is *built* on the present thread by a factory this hands over, which is what
-/// lets it hold `!Send` state.
+/// `Frame` is built on the present thread by a factory this hands over, which is what lets
+/// it hold `!Send` state.
 pub struct Presenter {
-    /// Behind a lock so the handle is `Sync`, and not because sending contends. Mounting,
-    /// unmounting and resizing all happen on structural events, and both the app thread
-    /// and the front thread legitimately raise them — a handle only one of them could hold
-    /// would push the other through a channel of its own.
+    /// Behind a lock so the handle is `Sync`, not because sending contends. Mounting,
+    /// unmounting and resizing happen on structural events that both the app thread and the
+    /// front thread raise, so both must be able to hold this handle.
     tx: Mutex<Sender<Cmd>>,
     wake: Arc<Event>,
     tally: Arc<Mutex<PresentTally>>,
@@ -162,16 +154,20 @@ pub struct Presenter {
 }
 
 impl Presenter {
-    /// Starts the thread.
+    /// Starts the present thread and returns the handle that drives it.
     ///
-    /// `on_bind` runs **on the present thread** and is how a surface handle reaches the
-    /// front thread — post it; do not touch the scene from inside it.
-    /// Starts the thread.
+    /// `on_bind` runs on the present thread and is how a surface handle reaches the front
+    /// thread. Post from it rather than touching the scene: a composition object may only be
+    /// used on the thread that owns the compositor.
     ///
-    /// `visibility` is the window's, from [`Window::visibility`](windows_window::Window).
-    /// Pass it: without it the loop cannot know that the window went off screen, and will
-    /// keep drawing and presenting frames nobody can see. `None` is for a headless
-    /// producer, which by definition has no window to be hidden.
+    /// `visibility` is the window's watch, from [`Window::watch`](windows_window::Window).
+    /// Without it the loop cannot learn that the window went off screen and keeps drawing
+    /// and presenting frames nobody can see. `None` is for a headless producer, which has no
+    /// window to be hidden.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the wake event or the thread itself cannot be created.
     pub fn spawn(
         tuning: Tuning,
         out: OutputTransform,
@@ -204,25 +200,25 @@ impl Presenter {
         })
     }
 
-    /// What this thread's presents have done, as of the last pass.
+    /// Returns what this thread's presents have done, as of the last pass.
     ///
     /// Zero unless [`Tuning::statistics`] is on, because nothing is reported otherwise.
-    /// Republished once per pass and not once per present, so reading it costs an
+    /// Republished once per pass rather than once per present, so reading it costs an
     /// uncontended lock on a path that runs at wake rate.
     #[must_use]
     pub fn tally(&self) -> PresentTally {
         self.tally.lock().map(|t| *t).unwrap_or_default()
     }
 
-    /// Mounts a region, at its solved box, and hands its surface handle to the binder
-    /// once it exists.
+    /// Mounts a region at its solved box, and hands its surface handle to the binder once it
+    /// exists.
     ///
     /// `build` runs on the present thread with that thread's `Gpu`, so the [`Frame`] it
     /// returns may hold device resources and anything else `!Send`.
     ///
-    /// Region count is data-dependent — a list of twelve rows with four expanded mounts
-    /// four surfaces, and any of them showing a live plot mounts a region — so mounting and
-    /// unmounting follow structure and are ordinary operations rather than setup.
+    /// Region count is data-dependent — a list of twelve rows with four expanded mounts four
+    /// surfaces — so mounting and unmounting follow the structure on screen and are ordinary
+    /// operations rather than start-up.
     pub fn mount(
         &self,
         spec: RegionSpec,
@@ -243,14 +239,15 @@ impl Presenter {
         self.send(Cmd::Unmount(key));
     }
 
-    /// Resizes **in place**. Never unmount and remount to change a box: that drops
-    /// frames, reallocates buffers and re-issues a handle the front thread has already
-    /// bound.
+    /// Resizes a region in place. The surface handle survives, so the front thread's binding
+    /// is untouched; unmounting and remounting instead would drop frames, reallocate buffers
+    /// and re-issue a handle that is already bound.
     pub fn resize(&self, key: RegionKey, extent: Extent) {
         self.send(Cmd::Resize(key, extent));
     }
 
-    /// Restates the draw choke after a display-capability change.
+    /// Replaces the output transform every region draws through, after a display-capability
+    /// change.
     pub fn set_output_transform(&self, out: OutputTransform) {
         self.send(Cmd::Display(out));
     }
@@ -273,8 +270,8 @@ impl Drop for Presenter {
 
 // ── the thread ──────────────────────────────────────────────────────────────────────
 
-/// Which queue a group serves. `Solo` is keyed by the region so that asking for one
-/// always yields a group of one, which is the whole of what `Solo` promises.
+/// Identifies the queue a group serves. `Solo` is keyed by the region, so asking for one
+/// always yields a group of one.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum GroupKey {
     Solo(RegionKey),
@@ -301,15 +298,12 @@ struct Mounted {
     opaque: bool,
 }
 
-/// This thread deliberately does **not** initialize a COM apartment.
+/// Runs the present thread until a [`Cmd::Quit`] arrives.
 ///
-/// Everything it builds is reached through a plain export — `D3D11CreateDevice`,
-/// `D2D1CreateFactory`, `CreatePresentationFactory`, `DCompositionCreateSurfaceHandle` —
-/// and none of them is activated. The prior stack's render thread did need an MTA, but
-/// for a reason that is gone: it created WinRT `CompositionDrawingSurface` objects
-/// off-thread, and **nothing on the presented path draws onto a composition drawing
-/// surface** any more. Initializing one anyway would be four filter entries and an
-/// apartment this thread has no business declaring.
+/// Initializes no COM apartment. Everything this thread builds is reached through a plain
+/// export — `D3D11CreateDevice`, `D2D1CreateFactory`, `CreatePresentationFactory`,
+/// `DCompositionCreateSurfaceHandle` — and none of them is activated, so nothing on the
+/// presented path needs one.
 fn run(
     tuning: Tuning,
     out: OutputTransform,
@@ -321,13 +315,14 @@ fn run(
 ) {
     match Pump::new(tuning, out, on_bind, tally.clone(), visibility) {
         Ok(mut pump) => pump.drive(wake, rx),
-        // Nothing to fall back to and nobody to tell: the caller asked for a present
-        // thread on a floor where presentation is unconditional, so a failure here is a
-        // machine with no graphics stack. Every mounted region simply never binds.
+        // Presentation support is unconditional on this stack's floor, so a failure here is
+        // a machine with no graphics stack and there is no fallback to take. Every mounted
+        // region never binds.
         Err(_) => drain_until_quit(rx, wake),
     }
 }
 
+/// Accepts and discards commands until [`Cmd::Quit`], so a caller's `Drop` still joins.
 fn drain_until_quit(rx: &Receiver<Cmd>, wake: &Event) {
     loop {
         while let Ok(cmd) = rx.try_recv() {
@@ -349,9 +344,8 @@ struct Pump {
     tally: PresentTally,
     /// The same numbers, republished once per pass for whoever holds the [`Presenter`].
     published: Arc<Mutex<PresentTally>>,
-    /// Whether anything drawn can be seen. `None` when the caller attached no window,
-    /// which is the headless case: the loop then has no way to know it is invisible and
-    /// correctly assumes it is not.
+    /// Whether anything drawn can be seen. `None` when the caller attached no window: the
+    /// loop then has no way to learn it is invisible and treats itself as visible.
     visibility: Option<Watch>,
     speed: Speed,
     /// Increments once per pass — it identifies the wake, which is what a version gate
@@ -364,17 +358,15 @@ struct Pump {
     poisoned: Vec<RegionKey>,
 }
 
-/// Runs one call into a renderer, and answers `None` if it panicked.
+/// Runs one call into a renderer, and returns `None` if it panicked.
 ///
-/// A [`Frame`] is application code on the thread that owns **every** region's clock, so an
-/// unwind out of one would take the whole per-frame path down and freeze every other
-/// region with nothing to say why. That is the same failure the two device-loss domains
-/// are separated to prevent, and it deserves the same answer: a panicking renderer costs
-/// its own region and nothing else.
+/// A [`Frame`] is application code on the thread that owns every region's clock, so an
+/// unwind out of one would stop the whole per-frame path and freeze every other region.
+/// Catching it costs the panicking renderer its own region and nothing else.
 ///
-/// Asserting unwind safety is honest here rather than a shrug — the frame is destroyed
-/// immediately afterwards, its region with it, so no broken invariant outlives the panic.
-/// The pass's bracket closes on its own `Drop`, which is what that `Drop` is for.
+/// Unwind safety is asserted: the frame is destroyed immediately afterwards and its region
+/// with it, so nothing the panic left half-updated is read again, and the pass's bracket
+/// closes on its own `Drop`.
 fn guarded<T>(f: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
 }
@@ -411,9 +403,9 @@ impl Pump {
         // clock, one wake per display refresh. Otherwise it parks on the events alone and
         // an idle producer costs zero wakes.
         let (mut paced, mut quiet) = (false, 0u32);
-        // Latched false only by `WAIT_FAILED` — this session has no compositor clock at
-        // all (headless, or remote). A display that is merely *off* is transient and is
-        // handled without latching.
+        // Latched false only by `WAIT_FAILED`: this session has no compositor clock at all
+        // (headless, or remote). A display that is merely off is transient and is handled
+        // without latching.
         let mut clock_ok = true;
         // Latched by the clock's occluded return, cleared by one probe after an edge.
         let mut dark = false;
@@ -433,9 +425,9 @@ impl Pump {
                 if self.commands(rx, wake) {
                     return;
                 }
-                // The clock is the only thing that can say whether the display is back,
-                // so leaving is a single probe on the next iteration rather than a state
-                // this thread could get wrong.
+                // Only the clock reports whether the display is back, so leaving the parked
+                // state is a single probe on the next iteration rather than state this
+                // thread tracks itself.
                 dark = false;
                 continue;
             }
@@ -496,14 +488,14 @@ impl Pump {
         }
     }
 
-    /// One pass: gate, draw the whole batch inside one bracket, then bind and show.
-    /// `true` when anything was drawn.
+    /// Runs one pass: gate every region, draw the whole batch inside one bracket, then bind
+    /// and show. Returns `true` when anything was drawn.
     fn pass(&mut self, now: u64, tick: u64) -> bool {
         self.tick_count += 1;
 
-        // Ahead of issuing this pass's presents, as the API's guidance asks: the queue is
-        // finite and retires its oldest entries, so a producer that presents first and
-        // reads later reads a queue that has already dropped the answer.
+        // Ahead of issuing this pass's presents: the queue is finite and retires its oldest
+        // entries, so a producer that presents first and reads later reads a queue that has
+        // already dropped the answer.
         let mut read = 0;
         for (_, group) in &self.groups {
             read += group.drain_statistics(&mut self.tally);
@@ -514,9 +506,9 @@ impl Pump {
             *published = self.tally;
         }
 
-        // Which regions this pass is for, decided ONCE. `should_draw` both tests and
-        // commits its version stamp, so asking it per slot would consume the change on the
-        // batch's first frame and report "nothing moved" for the rest.
+        // Which regions this pass is for, decided once. `should_draw` both tests and commits
+        // its version stamp, so asking it per slot would consume the change on the batch's
+        // first frame and report "nothing moved" for the rest.
         let Self {
             device,
             mounted,
@@ -580,8 +572,8 @@ impl Pump {
                     out: *out,
                     input: &m.input,
                 };
-                // Once per retarget, not once per call: a latched error takes out the rest
-                // of the batch, so what the tag has to answer is *which region* killed it.
+                // Once per retarget rather than once per call: a latched error discards the
+                // rest of the batch, and the tag names the region that latched it.
                 pass.tag(m.spec.key.0);
                 let draw = pass.draw(target);
                 if guarded(|| m.frame.draw(ctx, &draw)).is_none() {
@@ -635,17 +627,17 @@ impl Pump {
 
     /// Takes every renderer that panicked this pass out of service.
     ///
-    /// Reported as [`Bound::Failed`] rather than as an ordinary release, because silence
-    /// is the worse failure here: a region that simply stops presenting looks exactly like
-    /// one whose data stopped arriving, and the two want opposite responses.
+    /// Reported as [`Bound::Failed`] rather than as an ordinary release: a region that stops
+    /// presenting looks exactly like one whose data stopped arriving, and the two call for
+    /// opposite responses.
     fn retire_poisoned(&mut self) {
         while let Some(key) = self.poisoned.pop() {
             self.unmount_as(key, Bound::Failed);
         }
     }
 
-    /// The pass latched an error. A device that is gone is rebuilt whole; anything else
-    /// was one region's bad draw and the next pass is a fresh bracket.
+    /// Handles an error latched by the pass. A device that is gone is rebuilt whole;
+    /// anything else was one region's bad draw, and the next pass opens a fresh bracket.
     fn failed(&mut self, error: PassError) {
         if error.loss == Loss::DeviceRemoved {
             self.rebuild_device();
@@ -654,7 +646,7 @@ impl Pump {
 
     // ── commands ────────────────────────────────────────────────────────────────────
 
-    /// Drains the queue. `true` means quit.
+    /// Drains the command queue. Returns `true` when the thread must quit.
     fn commands(&mut self, rx: &Receiver<Cmd>, wake: &Event) -> bool {
         let mut moved = false;
         while let Ok(cmd) = rx.try_recv() {
@@ -707,8 +699,8 @@ impl Pump {
         build: Build,
     ) -> Result<()> {
         let frame = build(self.device.gpu())?;
-        // Read once, here, because it is what decides the alpha mode, the Direct2D
-        // target's alpha mode and the displayable allocation — all three together.
+        // Read once, here: it decides the surface's alpha mode, the Direct2D target's alpha
+        // mode and the displayable allocation, all three together.
         let opaque = frame.opaque();
         let group = GroupKey::of(spec.queue, spec.key);
         let handle = self.group(group)?;
@@ -777,9 +769,10 @@ impl Pump {
 
     // ── device loss ─────────────────────────────────────────────────────────────────
 
-    /// Two independent recovery domains. A lost *manager* costs its group and the regions
-    /// in it; a lost *device* costs everything. Neither costs the retained scene, which is
-    /// why an analyzer glitch cannot take the window down.
+    /// Rebuilds every region whose group has lost its manager.
+    ///
+    /// A lost manager costs its group and the regions in it; a lost device costs every
+    /// region. Neither costs the retained visual tree.
     fn recover(&mut self) {
         let lost: Vec<GroupKey> = self
             .groups
@@ -802,8 +795,8 @@ impl Pump {
         self.remake(|_| true);
     }
 
-    /// Rebuilds every region matching `which`, on a group that no longer exists, and tells
-    /// each frame to drop the device resources it cached.
+    /// Rebuilds every region matching `which` onto a freshly created group, and tells each
+    /// frame to drop the device resources it cached.
     fn remake(&mut self, which: impl Fn(&Mounted) -> bool) {
         for i in 0..self.mounted.len() {
             if !which(&self.mounted[i]) {
@@ -840,8 +833,9 @@ impl Pump {
 
     // ── waiting ─────────────────────────────────────────────────────────────────────
 
-    /// Handle 0 is the command event; the rest are the distinct epochs. Rebuilt when the
-    /// mounted set changes, never per pass.
+    /// Rebuilds the wait array: handle 0 is the command event, then the visibility watch
+    /// when a window is attached, then each distinct epoch. Called when the mounted set
+    /// changes, never per pass.
     fn rebuild_handles(&mut self, wake: &Event) {
         // Raw, because a `BorrowedHandle`'s lifetime cannot be named in the field's type.
         // The owners outlive every entry: `wake` is the `Arc` held for this thread, and the
@@ -849,9 +843,8 @@ impl Pump {
         self.handles.clear();
         self.handles.push(wake.as_handle().as_raw_handle());
         // Slot 1 when a window is attached: the edge that says the window came back on
-        // screen, or that the system's occlusion status moved. It is in **both** wait
-        // arrays deliberately — it is what leaves the parked state, and there is nothing
-        // else that can.
+        // screen, or that the system's occlusion status moved. It is in both the paced wait
+        // and the park, because it is the only handle that can leave the parked state.
         if let Some(visibility) = &self.visibility {
             self.handles.push(visibility.as_handle().as_raw_handle());
         }
@@ -863,12 +856,12 @@ impl Pump {
         }
     }
 
-    /// One wait, either paced off the compositor clock or on this thread's own edges alone.
+    /// Waits once, either paced off the compositor clock or on this thread's own edges
+    /// alone.
     ///
-    /// `INFINITE` in both arms, which is the design rather than an oversight. There is no
-    /// guard timeout here as there is in a window's pacer: nothing downstream of this thread
-    /// is driving itself from the tick, so a stalled clock has nothing to degrade and every
-    /// reason the loop should move again is already an edge in the list.
+    /// `INFINITE` in both arms, with no guard timeout: nothing downstream of this thread
+    /// drives itself from the tick, so a stalled clock has nothing to degrade, and every
+    /// reason the loop should move again is already an edge in the wait array.
     fn wait(&self, paced: bool, clock_ok: bool) -> Waken {
         let count = self.handles.len() as u32;
         let ptr = self.handles.as_ptr();
@@ -880,8 +873,8 @@ impl Pump {
                 Observed::Occluded => Waken::Occluded,
                 Observed::NoClock => Waken::Failed,
                 // A frame, one of this thread's own edges, or a stalled clock: all three mean
-                // look at the mounted set, and what to draw is decided from epoch stamps
-                // rather than from which handle woke this.
+                // look at the mounted set, and what to draw comes from epoch stamps rather
+                // than from which handle woke this.
                 _ => Waken::Ready,
             };
         }
@@ -894,11 +887,10 @@ impl Pump {
 
     /// Parks until something can be seen again.
     ///
-    /// The command handle and the visibility wake, and nothing else — **not** the data
-    /// epochs. Data arriving while nothing is displayed is not a reason to wake a core,
-    /// and no state is lost by ignoring it: `should_draw` compares against a stored stamp,
-    /// so ten thousand accumulated changes still produce exactly one redraw on the way
-    /// back.
+    /// Waits on the command handle and the visibility watch, and not on the data epochs.
+    /// Ignoring data that arrives while nothing is displayed loses no state:
+    /// [`Frame::should_draw`] compares against a stored stamp, so any number of accumulated
+    /// changes produce exactly one redraw on the way back.
     fn park(&self) {
         let count = if self.visibility.is_some() { 2 } else { 1 };
         // SAFETY: both handles are live kernel objects owned by this pump and by the
@@ -908,13 +900,12 @@ impl Pump {
         }
     }
 
-    /// Tags this thread's scheduling class, on a change and only on one.
+    /// Sets this thread's scheduling class, and only when it changes.
     ///
-    /// [`Speed::Eco`] rather than [`Speed::Managed`], which is what a *window* thread asks
-    /// for when it goes quiet: Windows already demotes a fully-occluded window-owning process
-    /// on its own, so a window thread can leave the decision to it. This thread's reason for
-    /// stopping — a display that is off, or a producer with nothing to publish — shows up in
-    /// no window state, so nothing will infer it and it is said outright.
+    /// [`Speed::Eco`] rather than [`Speed::Managed`], which is what a window thread asks for
+    /// when it goes quiet: Windows demotes a fully-occluded window-owning process on its
+    /// own. This thread's reason for stopping — a display that is off, or a producer with
+    /// nothing to publish — appears in no window state, so nothing infers it.
     fn qos(&mut self, speed: Speed) {
         if self.speed == speed {
             return;
@@ -924,13 +915,15 @@ impl Pump {
     }
 }
 
+/// Reports why the loop woke.
 enum Waken {
-    /// Run the pass. A clock tick, a data epoch, a command, or a guard expiry — the loop
-    /// gates on `should_draw` either way, so it does not need them told apart.
+    /// Run the pass. A clock tick, a data epoch, a command, or a stalled clock — the loop
+    /// gates on [`Frame::should_draw`] either way and does not need them told apart.
     Ready,
     /// The display is off, and the call returned immediately.
     Occluded,
-    /// This session has no compositor clock. Permanent; fall back to timeout pacing.
+    /// This session has no compositor clock. Latched: the loop then waits on its own edges
+    /// alone.
     Failed,
 }
 

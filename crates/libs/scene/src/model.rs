@@ -1,12 +1,11 @@
-//! The app-side tree, and the one emitter. **App half.**
+//! The app-side tree and the one patch emitter. **App half.**
 //!
-//! Every app-side act — structure, style, paint, bind, resource — is recorded into the
-//! pending patch here, and [`flush`](Model::flush) appends the layout-derived ops and hands
-//! the buffer over. One emitter is one ordering authority, which lets the front half apply
-//! ops strictly in order and reuse a slot freed earlier in the same patch.
+//! [`Model`] records every app-side act — structure, style, paint, bind, resource — into the
+//! pending patch, and [`flush`](Model::flush) appends the layout-derived ops and hands the
+//! buffer over. One emitter gives one op order, so the front half applies ops strictly in
+//! order and can reuse a slot freed earlier in the same patch.
 //!
-//! Nothing here touches a composition object, and nothing can: the types are ids, plain
-//! values and spans.
+//! Nothing here holds a composition object: the types are ids, plain values and spans.
 
 use crate::env::Env;
 use crate::hit_build::{HitBuilder, HitDecl};
@@ -34,8 +33,8 @@ struct ModelNode {
 
 /// The app thread's half of the scene: structure, layout, and the patch.
 ///
-/// `Send` and owns no COM, so all of it — snapping, responsive classification, hit-array
-/// construction, the virtualization window — is testable with no device and no compositor.
+/// Holds no COM object, so snapping, responsive classification and hit-array construction
+/// all run with no device and no compositor.
 pub struct Model {
     ids: Ids<Node>,
     res_ids: Ids<()>,
@@ -59,26 +58,25 @@ pub struct Model {
     window: Vector2,
     /// The environment the last solve ran under.
     ///
-    /// A **watermark**, not an authority: its only reader is the comparison that decides
-    /// whether the pixel grid moved. `None` until the first flush states one.
+    /// Read only by the comparison in [`solve`](Model::solve) that decides whether the pixel
+    /// grid moved. `None` until the first solve states one.
     env: Option<Env>,
     /// Set by anything that can move a rect. A pass that changed nothing solves nothing.
     solve_dirty: bool,
     /// Set by anything that changes what the hit array *says* without moving a rect — a
     /// widget becoming interactive on hover, an overlay opening.
     ///
-    /// Separate from the solve, which is the point: hover flips a flag on one entry, and
-    /// one flag would put a full taffy pass behind every pointer move over a control.
+    /// Separate from the solve flag: a hover flips one entry's flags, and sharing a flag
+    /// would put a full taffy pass behind every pointer move over a control.
     hits_dirty: bool,
 }
 
 /// A parentless root that has been minted but not yet placed in the hit array.
 ///
-/// Not `Copy` and not constructible outside this crate: the only source is
-/// [`Model::orphan_group`] and the only sink is [`Model::open_slot`], which consumes it.
-/// A root that is never opened is unreachable by the disposal walk and leaks its subtree
-/// on every unmount, so that mistake is a `must_use` warning at the call site rather than
-/// a rule someone else's crate has to lint for.
+/// Not `Copy` and not constructible outside this crate: [`Model::orphan_group`] is the only
+/// source and [`Model::open_slot`] the only sink, and opening consumes it. A root that is
+/// never opened is unreachable by the disposal walk and leaks its subtree on every unmount,
+/// which the `must_use` reports at the call site.
 #[must_use = "a parentless root that is never opened leaks its subtree"]
 #[derive(Debug)]
 pub struct SlotRoot(GroupId);
@@ -89,8 +87,8 @@ struct SlotRootEntry {
     blocker: Option<crate::hit_build::ControlId>,
     /// Where the layer above placed it, in absolute window DIPs.
     ///
-    /// An input to the solve rather than something applied after one: a detached subtree's
-    /// rects have to be absolute, because the hit array is one array scanned in one space.
+    /// An input to the solve rather than a translation applied after one, so the detached
+    /// subtree's rects are absolute in the one space the hit array is scanned in.
     offset: Vector2,
 }
 
@@ -121,7 +119,7 @@ impl core::fmt::Debug for Model {
 }
 
 impl Model {
-    /// A model with one root group, styled by `root`.
+    /// Creates a model with one root group, styled by `root`.
     pub fn new(root: taffy::Style) -> Self {
         let mut model = Self {
             ids: Ids::new(),
@@ -149,39 +147,39 @@ impl Model {
         model
     }
 
-    /// The window subtree's root.
+    /// Returns the window subtree's root group.
     #[must_use]
     pub const fn root(&self) -> GroupId {
         self.root
     }
 
-    /// Installs what measures content-sized nodes — shaped text, and anything else whose
-    /// size this crate cannot know.
+    /// Installs the callback that measures content-sized nodes — shaped text, and anything
+    /// else whose size this crate cannot know.
     pub fn on_measure(&mut self, measure: impl Measure + 'static) {
         self.layout.on_measure(measure);
     }
 
-    /// Installs what re-lowers a style whose metrics depend on the class in scope.
+    /// Installs the callback that re-lowers a style whose metrics depend on the class in
+    /// scope.
     ///
-    /// Called during the solve for the subtree of a container that just changed class, so the
-    /// styles layout runs on are the ones that class implies — and nothing above needs a
-    /// second pass to correct them.
+    /// Called during the solve for the subtree of a container that just changed class, so
+    /// layout runs on the styles that class implies and no second pass corrects them.
     pub fn on_restyle(&mut self, restyle: impl Restyle + 'static) {
         self.layout.on_restyle(restyle);
     }
 
-    /// The window's size in DIPs, as the last [`set_window`](Model::set_window) stated it.
+    /// Returns the window's size in DIPs, as the last
+    /// [`set_window`](Model::set_window) stated it.
     #[must_use]
     pub const fn window(&self) -> Vector2 {
         self.window
     }
 
-    /// The window's size in DIPs.
+    /// States the window's size in DIPs, from the window's own resize message.
     ///
-    /// Window size crosses *upward*, written from the window's own resize message. The one
-    /// thing that travels against the patch, and a value rather than a channel. The scale
-    /// it is solved against is not here — that arrives with [`flush`](Model::flush), so the
-    /// grid layout snaps to and the grid the front half rasterizes for cannot disagree.
+    /// The scale that size is solved against arrives with [`flush`](Model::flush) instead,
+    /// so the grid layout snaps to and the grid the front half rasterizes for are one value
+    /// and cannot disagree.
     pub fn set_window(&mut self, size: Vector2) {
         if self.window != size {
             self.window = size;
@@ -191,34 +189,36 @@ impl Model {
 
     // ── structure ─────────────────────────────────────────────────────────────────
 
-    /// A group: it positions and clips its children and paints nothing.
+    /// Mints a group under `parent`, above `after`. A group positions and clips its children
+    /// and paints nothing.
     pub fn group(&mut self, parent: GroupId, after: Option<NodeId>) -> GroupId {
         GroupId(self.mint(NodeKind::Group, Attach::Node(parent.0), after))
     }
 
-    /// A sprite: one composition sprite visual on screen.
+    /// Mints a sprite under `parent`, above `after`: one composition sprite visual on screen.
     pub fn sprite(&mut self, parent: GroupId, after: Option<NodeId>) -> SpriteId {
         SpriteId(self.mint(NodeKind::Sprite, Attach::Node(parent.0), after))
     }
 
-    /// A group with **no parent** — a flyout, a popup, a tooltip, a ghost.
+    /// Mints a group with **no parent** — a flyout, a popup, a tooltip, a ghost.
     ///
     /// Every parentless root must be reachable by the disposal walk, or it leaks a subtree
-    /// per unmount with nothing to notice. The returned [`SlotRoot`] is what enforces that:
-    /// it is `#[must_use]`, and the only thing that accepts one is
-    /// [`open_slot`](Model::open_slot), which is what puts it in the array the walk reads.
-    /// Opening it twice is inexpressible because opening consumes it.
+    /// per unmount. The returned [`SlotRoot`] is `#[must_use]`, and the only function that
+    /// accepts one is [`open_slot`](Model::open_slot), which puts it in the array the walk
+    /// reads and consumes it, so it cannot be opened twice.
     pub fn orphan_group(&mut self) -> SlotRoot {
         SlotRoot(GroupId(self.mint(NodeKind::Group, Attach::Detached, None)))
     }
 
-    /// Places a slot root in the hit array, says whether a press outside it dismisses, and
-    /// hands back the group to build into.
+    /// Places a slot root in the hit array and returns the group to build into.
+    ///
+    /// `blocker` names the control a full-window entry ahead of the root is attributed to.
+    /// Supplying one is what makes a press outside the root dismiss it; `None` leaves
+    /// presses outside to whatever they land on.
     ///
     /// Slot roots occupy the **end** of the array, in the order they opened. The array is
-    /// the z-order and the scan takes the first hit from the back, so that places every
-    /// overlay above what it covers, nests a submenu over its menu, and gives "press
-    /// outside dismisses" for free — no capture, no z-index, no case in the router.
+    /// the z-order and the scan takes the first hit from the back, so every overlay sits
+    /// above what it covers and a submenu above its menu, with no capture and no z-index.
     pub fn open_slot(
         &mut self,
         root: SlotRoot,
@@ -234,15 +234,15 @@ impl Model {
         root.0
     }
 
-    /// Places a slot root, in absolute window DIPs, and answers whether it moved.
+    /// Places a slot root, in absolute window DIPs, and returns whether it moved.
     ///
     /// The placement is an **input to the next solve**, not a bind emitted beside one: the
-    /// solve gathers the detached subtree from here, so its rects are absolute and the hit
-    /// array needs nothing said twice. The root's own offset then travels as the ordinary
-    /// [`Prop::Offset`] bind every other node's placement does.
+    /// solve gathers the detached subtree from this offset, so its rects are absolute and
+    /// the hit array reads them as they are. The root's own offset then travels as the
+    /// ordinary [`Prop::Offset`] bind every other node's placement does.
     ///
-    /// It does not re-lay-out anything — an overlay's size never depends on where it landed,
-    /// or the two would be a cycle.
+    /// The offset translates and does not constrain, so an overlay's size does not depend on
+    /// where it landed. A `root` that is not an open slot returns `false`.
     pub fn place_slot(&mut self, root: GroupId, offset: Vector2) -> bool {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.root == root) else {
             return false;
@@ -262,7 +262,7 @@ impl Model {
         self.hits_dirty = true;
     }
 
-    /// Reparents or reorders a node.
+    /// Reparents or reorders a node, placing it above `after`. A dead `id` is ignored.
     pub fn place(&mut self, id: NodeId, parent: GroupId, after: Option<NodeId>) {
         if !self.ids.is_live(id) {
             return;
@@ -277,10 +277,10 @@ impl Model {
         self.solve_dirty = true;
     }
 
-    /// Destroys a node **and its subtree**.
+    /// Destroys a node **and its subtree**, with `exit` naming how it leaves the screen.
     ///
-    /// One op: the destroy cascades on the far side, which is fewer ops and the only
-    /// encoding under which a partial destroy is inexpressible.
+    /// One op: the destroy cascades on the far side, so a partial destroy is inexpressible.
+    /// A dead `id` is ignored.
     pub fn destroy(&mut self, id: NodeId, exit: Exit) {
         if !self.ids.is_live(id) {
             return;
@@ -367,69 +367,69 @@ impl Model {
         }
     }
 
-    /// Makes a container classify its own inline size for its subtree.
+    /// Makes a container classify its own inline size for its subtree, against `bounds`.
     ///
     /// Declares how the node lays out and nothing else, so it composes in any order with
-    /// the style and the children — a node does not lose either by becoming responsive.
+    /// pushing a style and setting children: a node loses neither by becoming responsive.
     pub fn responsive(&mut self, id: GroupId, bounds: Bounds) {
         if self.layout.set_kind(id.0, LayoutKind::Responsive(bounds)) {
             self.solve_dirty = true;
         }
     }
 
-    /// Hides a node without unmounting it: `Display::None`, so its subtree, its state and
-    /// anything half-typed into it survive.
+    /// Hides a node without unmounting it: it takes no space and paints nothing, while its
+    /// subtree, its state and anything half-typed into it survive.
     pub fn hide(&mut self, id: NodeId, hidden: bool) {
         if self.layout.set_hidden(id, hidden) {
             self.solve_dirty = true;
         }
     }
 
-    /// Where a node's intrinsic size comes from.
+    /// Declares where a node's intrinsic size comes from.
     pub fn measure(&mut self, id: NodeId, ctx: MeasureCtx) {
         self.layout.set_measure(id, ctx);
         self.solve_dirty = true;
     }
 
-    /// Says that a measured node's **input** moved, though its context did not.
+    /// Marks a measured node's **input** as moved, though its measure context did not
+    /// change.
     ///
-    /// The one invalidation this type cannot notice for itself. Every other input to a
-    /// layout is a field it holds and compares; a measure's input belongs to whoever
-    /// produces it — a text run's string — and [`measure`](Self::measure) is handed a key
-    /// that is stable for the run's whole life, so pushing it again correctly reports that
-    /// nothing changed.
+    /// Every other input to a layout is a field this type holds and compares. A
+    /// measurement's input belongs to whoever produces it — a text run's string — and the
+    /// key handed to [`measure`](Self::measure) is stable for the run's whole life, so
+    /// pushing it again correctly reports that nothing changed.
     pub fn remeasure(&mut self, id: NodeId) {
         self.layout.remeasure(id);
         self.solve_dirty = true;
     }
 
-    /// What a node participates in, for the hit array. `None` removes it from routing
-    /// entirely.
+    /// Declares what a node participates in, for the hit array. `None` removes it from
+    /// routing entirely.
     pub fn hit(&mut self, id: NodeId, decl: Option<HitDecl>) {
         if let Some(node) = self.nodes.get_mut(id.index())
             && node.hit != decl
         {
             node.hit = decl;
-            // A declaration change moves nothing, so this rebuilds the array and does not
-            // touch layout — which is the whole cost of a hover flipping `INTERACTIVE`.
+            // A declaration change moves nothing, so the array is rebuilt and layout is left
+            // alone: that is the whole cost of a hover flipping a hit flag.
             self.hits_dirty = true;
         }
     }
 
-    /// What a node's subtree may draw inside.
+    /// Declares what a node's subtree may draw inside.
     ///
-    /// A clip costs no brush slot and no second visual, which is what makes it the only way
-    /// to round the corners of a sprite whose one brush is already spent on a mask.
+    /// A clip costs no brush slot and no second visual, so a sprite whose one brush is
+    /// already spent on a mask can still have rounded corners.
     pub fn clip(&mut self, id: NodeId, clip: Clip) {
         self.pending.push_op(Op::Clip { id, clip });
     }
 
-    /// A sprite's alpha.
+    /// Sets a sprite's alpha.
     pub fn mask(&mut self, id: SpriteId, mask: Mask) {
         self.pending.push_op(Op::Mask { id, mask });
     }
 
-    /// A sprite's colour, in authored scene light.
+    /// Sets a sprite's colour, in authored scene light.
     pub fn paint(&mut self, id: SpriteId, paint: Paint) {
         self.pending.push_op(Op::Paint { id, paint });
     }
@@ -439,7 +439,7 @@ impl Model {
         self.pending.push_op(Op::Bind { id, prop, bind });
     }
 
-    /// Sets a whole transform at once: six binds and, if it has one, a clip.
+    /// Sets a whole transform at once: the clip, then six property binds.
     pub fn xform(&mut self, id: NodeId, x: &Xform) {
         self.clip(id, x.clip);
         self.bind(id, Prop::Offset, Bind::Set(Value::Vec2(x.offset)));
@@ -458,8 +458,8 @@ impl Model {
 
     /// Records a dash pattern and returns the stroke naming it.
     ///
-    /// Runs are multiples of the stroke width, as the platform's are — so the same array on
-    /// a 1-DIP rule and a 4-DIP rule draws dashes four times as long on the second.
+    /// Dash runs are multiples of the stroke width, as the platform's are, so the same array
+    /// draws dashes four times as long on a 4-DIP rule as on a 1-DIP one.
     pub fn stroke(&mut self, width: f32, cap: Cap, join: Join, dashes: &[f32]) -> StrokeStyle {
         StrokeStyle {
             width,
@@ -485,8 +485,8 @@ impl Model {
 
     /// Copies a shaped run's fallback segments in and returns the span naming them.
     ///
-    /// For a caller holding segments it built elsewhere. A `ShapedRun` appends straight
-    /// into [`glyphs`](Model::glyphs) and returns its own span, which is one copy fewer.
+    /// For a caller holding segments it built elsewhere. A `ShapedRun` appends straight into
+    /// [`glyphs`](Model::glyphs) and returns its own span, avoiding this copy.
     pub fn segments(&mut self, segs: &[GlyphSeg]) -> Span {
         self.pending.push_segs(segs)
     }
@@ -512,8 +512,8 @@ impl Model {
         id.cast()
     }
 
-    /// Re-points geometry. **Every** sprite sharing the id moves together, whichever
-    /// construction each one uses, so a curve's fill, stroke and glow cannot diverge.
+    /// Re-points geometry. **Every** sprite sharing the id moves together, whatever each one
+    /// draws with it, so a curve's fill, stroke and glow cannot diverge.
     pub fn set_geometry(&mut self, id: GeomId, verbs: &[PathVerb]) {
         let span = self.pending.push_verbs(verbs);
         self.pending.push_op(Op::Res {
@@ -559,14 +559,13 @@ impl Model {
         id.cast()
     }
 
-    /// Re-shapes a run. Changing a line's *text* is structural — reshape, re-rasterize,
-    /// re-point — and that is an event-rate operation by construction, which is what the
-    /// no-live-retained-path rule requires. Text that changes at display rate belongs in a
-    /// presentation region.
+    /// Re-shapes a run: reshape, re-rasterize, re-point. Changing a line's *text* is
+    /// structural and runs at event rate; text that changes at display rate belongs in a
+    /// presentation region instead.
     ///
     /// Also the response to [`SceneEvent::ScaleChanged`](crate::SceneEvent): a coverage
     /// tile is the one resource rasterized at device resolution, so it is the one the model
-    /// re-emits when the grid moves.
+    /// re-emits when the pixel grid moves.
     pub fn set_run(&mut self, id: RunId, segs: Span, ink: windows_text::Ink) {
         self.pending.push_op(Op::Res {
             id: id.cast(),
@@ -601,10 +600,9 @@ impl Model {
     /// Starts a delay of `ms`, reported back as
     /// [`SceneEvent::DelayElapsed`](crate::SceneEvent::DelayElapsed).
     ///
-    /// The only "after N milliseconds" in the system, and it is a monotonic deadline read on
-    /// the frame clock rather than a timer — there is no fourth clock. A pending delay holds
-    /// the frame clock awake for its own duration, which is bounded and user-initiated, and
-    /// that request is its whole cost.
+    /// A delay is a monotonic deadline compared on the frame clock, not a timer, so it adds
+    /// no clock of its own. A pending delay holds the frame clock awake for its duration,
+    /// and that request is its whole cost.
     ///
     /// Re-issuing a live id restarts it, so a tooltip swapping between targets neither
     /// leaks a delay nor re-delays.
@@ -629,18 +627,17 @@ impl Model {
 
     // ── trackers ──────────────────────────────────────────────────────────────────
 
-    /// Mints the id a tracker will be created under. The tracker itself is a composition
-    /// object and is built on the front thread; this reserves the slot both sides name it
-    /// by.
+    /// Mints the id a tracker is created under. The tracker itself is a composition object
+    /// built on the front thread; this reserves the slot both sides name it by.
     pub fn tracker_id<O: Observe>(&mut self) -> TrackerId<O> {
         TrackerId::new(self.tracker_ids.mint())
     }
 
-    /// Builds the tracker `id` names, sourced from `viewport`.
+    /// Builds the tracker `id` names, sourced from `viewport` and following `axes`.
     ///
-    /// **Emit this after the solve that sizes the viewport**, never at mount: the source
-    /// takes its hit region from the visual's size at creation, and a zero-size one
-    /// hit-tests nothing while reporting success.
+    /// **The caller must emit this after the solve that sizes `viewport`**, not at mount:
+    /// the source takes its hit region from the visual's size at creation, and a zero-size
+    /// one hit-tests nothing while reporting success.
     pub fn create_tracker<O: Observe>(&mut self, id: TrackerId<O>, viewport: GroupId, axes: Axes) {
         self.pending.push_op(Op::Tracker {
             id: id.raw,
@@ -653,7 +650,7 @@ impl Model {
     }
 
     /// Sets a tracker's bounds. The position may travel outside them during a manipulation
-    /// or inertia — that overpan is the bounce, and it is wanted.
+    /// or inertia; that overpan is the bounce.
     pub fn tracker_bounds<O>(&mut self, id: TrackerId<O>, min: Vector2, max: Vector2) {
         self.pending.push_op(Op::Tracker {
             id: id.raw,
@@ -684,13 +681,12 @@ impl Model {
     /// Solves, snaps, rebuilds the hit array, appends the layout-derived ops, and hands the
     /// buffer over.
     ///
-    /// `patch` is expected drained and comes back full; the model keeps the one it was
-    /// given, which is the whole of the pooling.
+    /// `patch` must be drained and comes back full; the model keeps the buffer it was
+    /// handed, which is the whole of the pooling.
     ///
-    /// `env` is stated here rather than pushed in advance, and is the same value
-    /// [`Scene::apply`](crate::Scene::apply) is given: every snapped edge in the solve
-    /// below lands on the grid the rasters on the other side of the seam are built for,
-    /// because there is one number and not two.
+    /// `env` is the same value [`Scene::apply`](crate::Scene::apply) is given, so every edge
+    /// this solve snaps lands on the grid the rasters on the far side of the seam are built
+    /// for.
     pub fn flush(&mut self, patch: &mut SinkPatch, env: Env) {
         self.solve(env);
         // Stamped with what it was solved under, so the far side can tell geometry
@@ -703,15 +699,14 @@ impl Model {
     /// Brings the solved layout and the hit array up to date, **without** handing the patch
     /// over.
     ///
-    /// Split out of [`flush`](Model::flush) for one caller and one reason: a consumer whose
-    /// declarations depend on solved geometry — shaped text, which is laid out at the width
-    /// layout gave it — would otherwise have to emit into the *next* patch and arrive a
-    /// frame after the box it was measured for. Calling this, reading [`solved`](Model::solved),
-    /// declaring, and then flushing puts both in the patch that carries the layout they
-    /// agree with.
+    /// For a caller whose declarations depend on solved geometry, such as text laid out at
+    /// the width layout gave it. Calling this, reading [`solved`](Model::solved), declaring,
+    /// and then calling [`flush`](Model::flush) puts the declarations and the layout they
+    /// agree with in one patch; declaring after a flush would put them a frame behind the
+    /// box they were measured for.
     ///
-    /// Idempotent: a second call with nothing changed does nothing, so `flush` needs no
-    /// flag to say whether this already ran.
+    /// Idempotent: a second call with nothing changed does nothing, and
+    /// [`flush`](Model::flush) calls it unconditionally.
     pub fn solve(&mut self, env: Env) {
         // A pixel grid that moved re-snaps every edge in the tree, so it is a solve.
         if self.env.replace(env).is_some_and(|last| last != env) {
@@ -733,9 +728,8 @@ impl Model {
                 self.layout
                     .solve_root(slot.root.0, window, slot.offset, scale, &mut self.solved);
             }
-            // A solve that moved something changes the array too; one that moved nothing
-            // leaves it exactly as it was, so the rebuild follows the placements rather
-            // than the pass.
+            // A solve that moved something changes the array too, so the rebuild follows the
+            // placements rather than the pass.
             self.hits_dirty |= self.emit_placements();
             self.solve_dirty = false;
         }
@@ -765,11 +759,11 @@ impl Model {
         self.scratch = scratch;
     }
 
-    /// Emits an offset and a size for the nodes that moved, and for no others.
+    /// Emits an offset and a size for the nodes that moved, and returns whether any did.
     ///
-    /// The front half's idempotent early return is the safety net for this, not the
-    /// strategy: leaning on it would put six ops per node per pass on the wire for a pass
-    /// in which three nodes moved.
+    /// The diff against the previous solve is what bounds the op count. The front half's
+    /// idempotent early return would accept the ops either way, but every live node would
+    /// put two on the wire every pass.
     fn emit_placements(&mut self) -> bool {
         let mut moved = false;
         self.previous.resize(self.solved.len(), Solved::default());
@@ -849,8 +843,10 @@ impl Model {
         }
     }
 
-    /// The last solved placement of a node, for a caller that needs geometry it just
-    /// declared — a tracker's bounds, a thumb's travel.
+    /// Returns `id`'s placement from the last solve, for a caller that needs geometry it
+    /// just declared — a tracker's bounds, a thumb's travel.
+    ///
+    /// A node the last solve did not reach reads as `Solved::default()`.
     #[must_use]
     pub fn solved(&self, id: NodeId) -> Solved {
         self.solved.get(id.index()).copied().unwrap_or_default()
@@ -864,8 +860,8 @@ mod tests {
     use taffy::prelude::{length, percent};
     use windows_color::{DisplayCapability, OutputTransform};
 
-    /// One display, at 96 DPI: every test here is about structure and ordering, and the
-    /// environment is an input rather than a variable.
+    /// One display at 96 DPI. The tests here cover structure and ordering, so the
+    /// environment is fixed.
     fn env() -> Env {
         Env::new(
             96.0,
@@ -913,9 +909,8 @@ mod tests {
 
     #[test]
     fn a_flush_stamps_the_patch_with_what_it_solved_under() {
-        // The stamp is what lets the far side tell geometry snapped to this pixel grid
-        // from geometry snapped to another — the `Env` seam's own failure, surviving one
-        // level up where the two halves meet.
+        // The stamp is what lets the far side tell geometry snapped to this pixel grid from
+        // geometry snapped to another.
         let mut model = Model::new(root_style());
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
 
@@ -928,9 +923,9 @@ mod tests {
         model.flush(&mut patch, env());
         assert_eq!(patch.env(), Some(env()));
 
-        // Even a pass that emitted nothing carries it: an output transform that moved
-        // without moving a rect still has to reach the front half, and the stamp is how
-        // an empty patch says which display it is empty *for*.
+        // Even a pass that emitted nothing carries it: an output transform can move without
+        // moving a rect and still has to reach the front half, and the stamp is how an empty
+        // patch names the display it is empty *for*.
         let mut second = SinkPatch::new();
         model.flush(&mut second, env());
         assert!(second.is_empty());
@@ -943,9 +938,8 @@ mod tests {
 
     #[test]
     fn a_patch_solved_under_a_different_environment_is_distinguishable() {
-        // What the far side compares against. Two derivations of one fact disagree here
-        // and nowhere else — there is no other signal that layout snapped to one grid
-        // while the rasters were built for another.
+        // What the far side compares against: the stamp is the only signal that layout
+        // snapped to one grid while the rasters were built for another.
         let mut model = Model::new(root_style());
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
 
@@ -1011,9 +1005,8 @@ mod tests {
 
     #[test]
     fn a_hover_flag_rebuilds_the_array_and_solves_nothing() {
-        // The waste this guards: a pointer moving over a control flips `INTERACTIVE`, and
-        // folding that into the solve flag would put a full taffy pass and a full placement
-        // diff behind every hover.
+        // A pointer moving over a control flips a hit flag, and folding that into the solve
+        // flag would put a full taffy pass and a full placement diff behind every hover.
         let mut model = Model::new(root_style());
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
         let button = model.sprite(model.root(), None);
@@ -1118,10 +1111,9 @@ mod tests {
 
     #[test]
     fn an_overlay_is_solved_where_it_was_placed() {
-        // The gap this closes: a slot root has no parent, so a solve that walked only the
-        // window subtree left the whole overlay at `Solved::default()` — no size, no
-        // offset op, and a hit entry at the origin with zero area. Visibly on screen and
-        // unhittable is the shape that would produce.
+        // A slot root has no parent, so a solve that walked only the window subtree would
+        // leave the whole overlay at `Solved::default()`: no size, no offset op, and a hit
+        // entry at the origin with zero area.
         let mut model = Model::new(root_style());
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
 
@@ -1177,8 +1169,8 @@ mod tests {
 
     #[test]
     fn closing_a_slot_stops_solving_it() {
-        // Nothing is retained hidden, so a closed overlay must leave no cost behind — not
-        // in the array, and not in the pass either.
+        // A closed overlay leaves no cost behind: nothing in the array, and nothing in the
+        // pass either.
         let mut model = Model::new(root_style());
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
         let root = model.orphan_group();

@@ -1,26 +1,18 @@
-//! Constructions rather than factories (feature `system`).
+//! Multi-object constructions a retained tree repeats: a masked sprite, a clipped group,
+//! and a captured subtree (feature `system`).
 //!
-//! A wrapper that is 1:1 with WinRT classes makes every call site spell out the same
-//! sequence — create, set eight properties, parent, clip. The three constructions here
-//! are the ones a retained tree repeats until they are worth naming, and naming them is
-//! what stops a subtle one (a masked sprite, a capture) from being written five slightly
-//! different ways.
-//!
-//! The raw factories stay available; nothing that has one of these to reach for should be
-//! using them.
+//! Each creates several composition objects and wires their properties together, so a call
+//! site names the construction instead of respelling the sequence. The individual factories
+//! stay available for anything these three do not cover.
 
 use super::*;
 
 impl Compositor {
-    /// A sprite that paints `paint`'s colour through `mask`'s alpha — the universal
-    /// retained construction, as **one** visual.
+    /// Creates a single sprite visual that paints `paint`'s colour through `mask`'s alpha.
     ///
-    /// Coverage and colour are separate brushes because they have to be: coverage comes
-    /// from an 8-bit alpha source, and colour comes from whatever can carry the value,
-    /// which for wide-gamut or above-paper-white content is a float surface no colour
-    /// brush could express. Stacking source-over is associative, so a sprite tree built
-    /// this way is exactly equivalent to one surface drawing the same layers in
-    /// sequence — at lower cost, and with no effect graph anywhere.
+    /// Coverage and colour stay separate brushes: `mask` supplies 8-bit coverage, and
+    /// `paint` supplies the colour, which for wide-gamut or above-paper-white content is a
+    /// float surface a colour brush cannot express.
     ///
     /// The sprite is returned unsized: a `SpriteVisual` paints its own bounds, so it draws
     /// nothing until [`set_size`](Visual::set_size) or
@@ -34,29 +26,26 @@ impl Compositor {
         sprite
     }
 
-    /// A container visual whose subtree is clipped.
+    /// Creates a container visual whose subtree is clipped by `clip`.
     ///
-    /// The clip is a property of the group and costs no extra visual, which is why
-    /// clipping is not something a caller composes out of nested sprites.
+    /// The clip is a property of the group, so clipping adds no visual to the tree.
     pub fn clipped_group(&self, clip: &impl Clip) -> ContainerVisual {
         let group = self.create_container_visual();
         group.set_clip(Some(clip));
         group
     }
 
-    /// A brush that paints with an already-composed subtree, rather than with pixels
-    /// something drew.
+    /// Creates a brush that paints with `source`'s already-composed subtree rather than
+    /// with pixels something drew.
     ///
-    /// This is how a subtree becomes reusable content — a mask, a ghost held alive for an
-    /// exit transition, a cached layer — without being rasterized again by the app.
+    /// A subtree captured this way becomes reusable content — a mask, a layer held alive
+    /// for an exit transition, a cached layer — without the app rasterizing it again.
     ///
     /// `size` is the DIP box to capture and `scale` the DIP→pixel factor it is rasterized
     /// at, so the captured region is `size * scale` in the source's own coordinate space.
-    /// That factor is not a display property this crate can infer, and the reason is worth
-    /// stating: **a visual surface captures content, not the source visual's own
-    /// transform.** Scaling the source visual therefore does not scale what lands in the
-    /// surface; the scale has to live on the geometry inside it — on the shape — which is
-    /// what `scale` here has to agree with.
+    /// **A visual surface captures content, not the source visual's own transform.**
+    /// Scaling the source visual does not scale what lands in the surface, so the scale
+    /// lives on the geometry inside it — on the shape — and `scale` must match that.
     ///
     /// The brush is set to stretch [`Fill`](crate::Stretch::Fill) from a `(0, 0)`
     /// alignment, because the caller has just declared the surface's size: composition's
@@ -75,26 +64,26 @@ impl Compositor {
 
 /// A captured subtree: the surface that reads it, and the brush that paints with it.
 ///
-/// The two are kept together because a capture's extent has to be **restated whenever the
-/// box it stands for moves**, and only the surface can be told. A caller holding the brush
-/// alone can paint with a capture but can never correct one, which is the shape that makes
-/// a resized path draw at its old size.
+/// A capture's extent must be restated whenever the box it stands for moves, and only the
+/// surface accepts that. The two travel together so a holder can both paint with the
+/// capture and [`resize`](Self::resize) it; a brush on its own can only paint.
 pub struct Captured {
+    /// The surface reading the source subtree, and the only place its extent is set.
     pub surface: CompositionVisualSurface,
+    /// The brush painting a visual with the captured content.
     pub brush: CompositionSurfaceBrush,
 }
 
 impl Captured {
-    /// States the region captured, in the source's own coordinate space.
+    /// Sets the captured region to `size * scale`, in the source's own coordinate space.
     ///
-    /// **The one place a capture's extent is written**, called by the construction above
-    /// and by every resize. Two places would be two conventions, and the failure mode for
-    /// getting the second one wrong is silent mis-sizing rather than an error — a curve
-    /// that draws at the wrong scale, on the frame after a window edge moved.
+    /// A capture's extent is written only here, by [`Compositor::capture`] and by every
+    /// resize, so the origin and the `size * scale` convention have one definition. A stale
+    /// extent mis-sizes the captured content without reporting an error.
     ///
-    /// The scale is here and not on the source visual because a visual surface captures
-    /// *content*: scaling the source changes nothing about what lands in the surface, so
-    /// whatever geometry is inside it must be scaled by the same factor separately.
+    /// The scale belongs here and not on the source visual because a visual surface
+    /// captures *content*: scaling the source changes nothing about what lands in the
+    /// surface, so geometry inside it is scaled by the same factor separately.
     pub fn resize(&self, size: Vector2, scale: f32) {
         self.surface.set_source_offset(Vector2 { x: 0.0, y: 0.0 });
         self.surface.set_source_size(Vector2 {

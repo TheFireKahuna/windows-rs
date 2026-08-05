@@ -1,9 +1,9 @@
-//! 3x3 linear algebra, derived at compile time in `f64` and stored as `f32`.
+//! 3x3 linear algebra for colour matrices, derived at compile time in `f64` and
+//! stored as `f32`.
 //!
-//! Every matrix this crate uses is const-derived from primary chromaticities or from
-//! a standard's exact rational constants — nothing is a hand-copied decimal that
-//! can silently drift. The derivation runs in `f64`, where exactness is free; the
-//! runtime form is `f32`, where speed is not.
+//! Every matrix in this crate is const-derived from primary chromaticities or from a
+//! standard's exact rational constants, never written as a decimal literal. The
+//! derivation runs in `f64`; the runtime form is `f32`.
 
 pub(crate) type Mat3 = [[f64; 3]; 3];
 pub(crate) type Mat3f = [[f32; 3]; 3];
@@ -11,7 +11,7 @@ pub(crate) type Mat3f = [[f32; 3]; 3];
 /// D65 white chromaticity. sRGB, BT.709 and BT.2020 share it.
 pub(crate) const D65: (f64, f64) = (0.3127, 0.3290);
 
-/// `a * b`.
+/// Returns the matrix product `a * b`.
 pub(crate) const fn mul(a: Mat3, b: Mat3) -> Mat3 {
     let mut out = [[0.0; 3]; 3];
     let mut r = 0;
@@ -26,8 +26,8 @@ pub(crate) const fn mul(a: Mat3, b: Mat3) -> Mat3 {
     out
 }
 
-/// Inverse via the adjugate. No pivoting, which is fine for the well-conditioned
-/// colorimetric matrices this crate derives, and which keeps it `const`.
+/// Returns the inverse of `m`, computed from the adjugate. No pivoting, which keeps
+/// the function `const`; a singular `m` divides by a zero determinant.
 pub(crate) const fn inv(m: Mat3) -> Mat3 {
     let c00 = m[1][1] * m[2][2] - m[1][2] * m[2][1];
     let c01 = m[1][2] * m[2][0] - m[1][0] * m[2][2];
@@ -52,9 +52,9 @@ pub(crate) const fn inv(m: Mat3) -> Mat3 {
     ]
 }
 
-/// Linear RGB -> XYZ from primary and white chromaticities `(x, y)`. The columns are
-/// the primaries' XYZ, scaled so that RGB `(1, 1, 1)` lands exactly on the white
-/// point.
+/// Builds the linear RGB -> XYZ matrix from primary and white chromaticities `(x, y)`.
+/// The columns are the primaries' XYZ, scaled so that RGB `(1, 1, 1)` lands exactly on
+/// the white point.
 pub(crate) const fn rgb_to_xyz(r: (f64, f64), g: (f64, f64), b: (f64, f64), w: (f64, f64)) -> Mat3 {
     // xyY (Y = 1) -> XYZ for each primary.
     let p = [
@@ -81,7 +81,7 @@ pub(crate) const fn rgb_to_xyz(r: (f64, f64), g: (f64, f64), b: (f64, f64), w: (
     ]
 }
 
-/// Narrow a derived matrix to its runtime form.
+/// Narrows a derived `f64` matrix to the `f32` runtime form.
 pub(crate) const fn narrow(m: Mat3) -> Mat3f {
     [
         [m[0][0] as f32, m[0][1] as f32, m[0][2] as f32],
@@ -90,7 +90,7 @@ pub(crate) const fn narrow(m: Mat3) -> Mat3f {
     ]
 }
 
-/// Matrix-vector product.
+/// Returns the matrix-vector product `m * v`.
 #[inline]
 pub(crate) fn apply(m: &Mat3f, v: [f32; 3]) -> [f32; 3] {
     [
@@ -133,8 +133,8 @@ mod tests {
         }
     }
 
-    /// BT.2087 publishes the BT.709 -> BT.2020 conversion to four decimals. If the
-    /// derivation drifts, this is where it shows.
+    /// Checks the derived BT.709 -> BT.2020 conversion against the four-decimal
+    /// matrix published in BT.2087.
     #[test]
     fn derived_709_to_2020_matches_bt2087() {
         let m = mul(inv(REC2020), REC709);

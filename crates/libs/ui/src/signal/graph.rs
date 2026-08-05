@@ -1,24 +1,23 @@
-//! The graph: one arena, two-level marking, and a flush that allocates nothing.
+//! The signal graph: one arena of nodes, two-level marking, and a flush that allocates
+//! nothing.
 //!
-//! Everything here is the app thread's. A node holds its dependency and subscriber lists
-//! as `Vec`s that are **cleared, never dropped** — and a disposed node returns to a free
-//! list with that capacity intact, so mounting and unmounting a screen repeatedly
-//! allocates on the first cycle and never again.
+//! Every node belongs to the app thread. A node holds its dependency and subscriber lists
+//! as `Vec`s that are cleared, never dropped, and a disposed node returns to a free list
+//! with that capacity intact, so mounting and unmounting a screen repeatedly allocates on
+//! the first cycle only.
 //!
-//! # Why an arena, and not `Rc<RefCell<Node>>`
+//! # Edges are generational indices
 //!
-//! Edges are generational indices. A node whose target was disposed is detected by a
-//! generation mismatch and pruned on the next traversal, so there is **no `Rc` cycle to
-//! leak** — the usual failure of a signal library in a language without a garbage
-//! collector.
+//! An edge names a slot and the generation that minted the node in it, so no node holds an
+//! `Rc` to another node and no cycle of nodes can leak. An edge whose target was disposed
+//! fails the generation check and is pruned on the next traversal.
 //!
-//! # The one rule every function here obeys
+//! # The graph is never borrowed across application code
 //!
-//! **The graph is never borrowed across application code.** Every path that must run a
-//! closure — recomputing a memo, running an effect, reading a cell through `with` — clones
-//! an `Rc` out and drops the borrow first. That is why a memo's cell and an effect's
-//! closure are `Rc` rather than `Box`, and it is what lets a closure read and even write
-//! other signals.
+//! Every path that runs a closure — recomputing a memo, running an effect, reading a cell
+//! through `with` — clones an `Rc` out and drops the borrow first. A memo's cell and an
+//! effect's closure are `Rc` rather than `Box` for that reason, and it is what lets such a
+//! closure read and even write other signals.
 
 use super::shared;
 use core::any::Any;
@@ -26,23 +25,22 @@ use core::cell::RefCell;
 use std::rc::Rc;
 use windows_scene::{Id, Ids, Slots};
 
-/// How many times a flush may re-enter before it is treated as a cycle.
+/// How many passes a flush may take before it stops.
 ///
-/// An `Effect` that writes a `Cell` legitimately re-enters; one that writes a `Cell` it
-/// also reads does not terminate. Eight passes is far above any real fixpoint and far
-/// below a hang.
+/// An [`Effect`](super::Effect) that writes a [`Cell`](super::Cell) adds a pass; one that
+/// writes a cell it also reads never settles. A flush that has not settled after this many
+/// passes trips a debug assertion and returns.
 pub(super) const MAX_PASSES: u32 = 8;
 
 /// A node's identity: which graph, a dense index into it, and the generation that minted
 /// the node in that slot.
 ///
-/// `Copy` and twelve bytes, which is what makes `move ||` captures free — there is no `Rc`
-/// to clone at a binding site.
+/// `Copy`, with no reference count, so a `move ||` closure captures one at no cost.
 ///
 /// The graph is part of the identity rather than implied by the thread, because a
-/// producer's staged write is looked up by id on a thread that is not the one that minted
-/// it. Without it, an index is unique only *within* a graph, and two graphs would alias
-/// each other's staged writes — reading as a write that silently vanished.
+/// producer's staged write is looked up by id from a thread other than the one that minted
+/// it, and an index is unique only within the graph that minted it. Without the graph
+/// field, two graphs would alias each other's staged writes.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct SignalId {
     pub(super) graph: u32,
@@ -57,11 +55,11 @@ pub struct Signal;
 #[derive(Debug)]
 pub struct Owner;
 
-/// Where a node sits between "a source it reads changed" and "it has caught up".
+/// How far a node is from being up to date.
 ///
-/// Two levels rather than one is what makes a diamond evaluate its shared node **once**:
-/// `Check` says only *a transitive dependency may have changed*, and resolving it walks
-/// the dependencies rather than recomputing.
+/// Two levels rather than one make a diamond evaluate its shared node once: `Check` says
+/// only that a transitive dependency may have changed, and resolving it walks the
+/// dependencies rather than recomputing.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum State {
     Clean,
@@ -69,17 +67,16 @@ enum State {
     Dirty,
 }
 
-/// What a memo owns: its closure, its cached value, and the comparison that stops
-/// propagation.
+/// A memo's closure, cached value and equality comparison, behind a type the graph can
+/// name.
 ///
-/// The trait exists so the graph can recompute a memo without naming its closure type and
-/// a reader can reach the cache without naming it either. Recomputing writes **into** the
-/// existing cache rather than producing a new box, so a memo that recomputes on every
-/// flush still allocates nothing.
+/// The graph recomputes a memo, and a reader reaches its cache, without naming the closure
+/// type. An implementation must write into the existing cache rather than allocating a new
+/// one, so that a memo recomputing on every flush allocates nothing.
 pub(super) trait MemoCell {
-    /// Recomputes, and answers whether the value changed.
+    /// Recomputes the value and returns whether it changed.
     fn recompute(&self) -> bool;
-    /// The cache, as `RefCell<Option<T>>`.
+    /// Returns the cache, a `RefCell<Option<T>>` erased to `dyn Any`.
     fn value(&self) -> &dyn Any;
 }
 
@@ -101,8 +98,8 @@ struct Node {
     deps: Vec<SignalId>,
     /// What read this node.
     subs: Vec<SignalId>,
-    /// Already in the effect queue. Cheaper than scanning it, and it is what makes a burst
-    /// of writes to one cell enqueue its effects once.
+    /// Already in the effect queue, so a burst of writes to one cell enqueues its effects
+    /// once and no scan of the queue is needed.
     queued: bool,
     /// How many times this node's value has moved. Read by a consumer that wants change
     /// detection without the value.
@@ -124,17 +121,16 @@ struct OwnerNode {
     children: Vec<Child>,
 }
 
-/// The runtime. One per thread that builds signals, and in practice one per process.
+/// The signal runtime. One per thread that builds signals.
 struct Graph {
     /// This graph's process-unique id, stamped into every [`SignalId`] it mints.
     id: u32,
     node_ids: Ids<Signal>,
     nodes: Slots<Signal, Node>,
-    /// Disposed nodes, kept for their edge buffers.
+    /// Disposed nodes, parked for their edge buffers.
     ///
-    /// Parked rather than left in a vacated slot, which is the same trick the text table
-    /// plays with a laid-out run: a recycled node keeps its `deps` and `subs` capacity, and
-    /// that is what makes the second mount of a screen allocation-free.
+    /// A recycled node keeps its `deps` and `subs` capacity, so the second mount of a
+    /// screen allocates no edge storage.
     spare: Vec<Node>,
     owner_ids: Ids<Owner>,
     owners: Slots<Owner, OwnerNode>,
@@ -156,11 +152,13 @@ struct Graph {
     flushing: bool,
 }
 
-/// Hands each graph its id. Production allocates exactly one.
+/// Hands each graph the process-unique id it stamps into every [`SignalId`].
 static NEXT_GRAPH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 thread_local! {
     static GRAPH: RefCell<Graph> = RefCell::new(Graph {
+        // Relaxed: nothing is published through this counter, and the atomic
+        // read-modify-write alone is what makes every returned id distinct.
         id: NEXT_GRAPH.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         node_ids: Ids::new(),
         nodes: Slots::new(),
@@ -179,35 +177,33 @@ thread_local! {
     });
 }
 
-/// Runs `f` with the graph borrowed. See the module's one rule.
+/// Runs `f` with the graph borrowed. `f` must not call application code, which may re-enter
+/// and borrow the graph again.
 fn with<R>(f: impl FnOnce(&mut Graph) -> R) -> R {
     GRAPH.with(|g| f(&mut g.borrow_mut()))
 }
 
 thread_local! {
-    /// What to tell when this graph acquires work. See [`set_waker`].
+    /// What to call when this graph acquires work; installed by [`set_waker`].
     ///
-    /// Its own local rather than a field of [`Graph`], for the reason the module header
-    /// gives about application code: it is called with **no** graph borrow held, and a
-    /// waker that re-entered the graph through a field of it could not be.
+    /// Held outside [`Graph`] so it can be called with no graph borrow held: a waker is
+    /// host code and may re-enter the graph.
     static WAKER: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
 }
 
-/// Installs what to call the moment this graph goes from having nothing to do to having
-/// something.
+/// Installs the callback this graph invokes when its effect queue goes from empty to
+/// non-empty.
 ///
-/// **Without one, a write schedules nothing.** `Cell::set` marks nodes and queues effects;
-/// it does not draw, and nothing downstream of it runs until somebody calls [`flush`]. A
-/// host whose loop is *blocked* — which is every host that does not spin — therefore needs
-/// telling, and this is the seam it tells through. The cross-thread half already has one in
-/// [`written`](super::written); this is the same edge for the owning thread, and the two are
-/// deliberately separate because a producer's write has a thread to wake and this one has a
-/// frame to ask for.
+/// Without a waker a write schedules nothing: [`Cell::set`](super::Cell::set) marks nodes
+/// and queues effects, and nothing downstream runs until a caller invokes [`flush`]. A host
+/// that blocks its loop between frames learns through this callback that a frame is owed.
+/// [`written`](super::written) is the matching signal for a producer thread's write, and
+/// the two are separate because that one wakes a thread and this one asks for a frame.
 ///
-/// Called on the **empty → non-empty** transition of the effect queue and no other time, so
-/// a burst of writes asks once. A write made from inside a flush asks for nothing at all:
-/// the flush it is already inside picks the work up on its next pass, and asking there would
-/// request a frame after every frame — a spin with extra steps.
+/// The callback runs on the empty-to-non-empty transition and at no other time, so a burst
+/// of writes asks once. A write made from inside a flush does not call it: that flush picks
+/// the work up on its next pass. It runs with no borrow of the graph held, so it may write
+/// signals.
 pub fn set_waker(f: impl Fn() + 'static) {
     WAKER.with(|w| *w.borrow_mut() = Some(Box::new(f)));
 }
@@ -228,15 +224,13 @@ fn wake() {
     }
 }
 
-/// The same, answering `None` where the graph is not reachable.
+/// Runs `f` with the graph borrowed, answering `None` where the graph is not reachable.
 ///
-/// It stops being reachable in exactly one situation, and that situation is reached by
-/// ordinary code: the thread is ending, its locals are being destroyed, and the graph's own
-/// node vector is dropping. A node can hold an [`Owner`](super::Owner) — a `Branch`'s arm
-/// and a `Keyed`'s row both do — so dropping one asks the graph to dispose a scope *from
-/// inside the graph's own destructor*. Reaching a local during its destruction is an error
-/// rather than a value, and `with` answers it by panicking, inside a `Drop`, which aborts
-/// the process.
+/// The graph is unreachable while the thread's locals are being destroyed and its own node
+/// storage is dropping. A node can hold an [`Owner`](super::Owner) — a `Branch`'s arm and a
+/// `Keyed`'s row both do — so dropping one asks the graph to dispose a scope from inside
+/// the graph's own destructor. `with` panics there, inside a `Drop`, which aborts the
+/// process; every path reached from a `Drop` uses this instead.
 fn try_with<R>(f: impl FnOnce(&mut Graph) -> R) -> Option<R> {
     GRAPH.try_with(|g| f(&mut g.borrow_mut())).ok()
 }
@@ -330,9 +324,9 @@ impl Graph {
     fn push_subs(&mut self, id: SignalId, state: State) {
         let len = self.node(id).map_or(0, |node| node.subs.len());
         for i in 0..len {
-            // Re-resolved each step rather than indexed: `set_state` never touches a
-            // subscriber list, so the position is stable, but reaching the row through its
-            // id is what keeps every read on the checked path.
+            // Re-resolved each step rather than indexed once: `set_state` never touches a
+            // subscriber list, so the position stays valid, and reaching the node through
+            // its id keeps every read on the generation-checked path.
             let Some(sub) = self.node(id).and_then(|node| node.subs.get(i).copied()) else {
                 break;
             };
@@ -385,10 +379,10 @@ pub(super) fn effect(f: Rc<RefCell<dyn FnMut()>>) -> SignalId {
 
 // ── reading ─────────────────────────────────────────────────────────────────────
 
-/// A cell's payload, with the read recorded against the current observer.
+/// Returns a cell's payload, recording the read against the current observer.
 ///
-/// Returns `None` if the cell was disposed, which is the generation check doing its work:
-/// a stale `Cell` handle reads nothing rather than reading whatever now occupies its slot.
+/// `None` where the cell was disposed: the generation check makes a stale handle read
+/// nothing rather than whatever now occupies its slot.
 pub(super) fn read_source(id: SignalId) -> Option<Rc<dyn Any>> {
     with(|g| {
         g.track(id);
@@ -399,7 +393,7 @@ pub(super) fn read_source(id: SignalId) -> Option<Rc<dyn Any>> {
     })
 }
 
-/// A cell's payload, **without** recording a dependency.
+/// Returns a cell's payload without recording a dependency.
 pub(super) fn peek_source(id: SignalId) -> Option<Rc<dyn Any>> {
     with(|g| match g.node(id).map(|node| &node.kind) {
         Some(Kind::Source(value)) => Some(Rc::clone(value)),
@@ -407,7 +401,7 @@ pub(super) fn peek_source(id: SignalId) -> Option<Rc<dyn Any>> {
     })
 }
 
-/// A memo's cache, resolved first, with the read recorded.
+/// Returns a memo's cache, resolving the memo first and recording the read.
 pub(super) fn read_memo(id: SignalId) -> Option<Rc<dyn MemoCell>> {
     let cell = with(|g| {
         g.track(id);
@@ -420,7 +414,7 @@ pub(super) fn read_memo(id: SignalId) -> Option<Rc<dyn MemoCell>> {
     Some(cell)
 }
 
-/// Brings `id` up to date if anything it reads changed. The pull half of the scheme.
+/// Brings `id` up to date if anything it reads changed. The pull half of propagation.
 fn resolve(id: SignalId) {
     match state_of(id) {
         None | Some(State::Clean) => {}
@@ -445,17 +439,17 @@ fn resolve(id: SignalId) {
     }
 }
 
-/// Runs `f` with no observer installed, so what it reads subscribes nobody.
+/// Runs `f` with no observer installed, so nothing `f` reads is subscribed to.
 ///
-/// One caller and one shape: a read taken **while building**, inside an effect that is
-/// reconciling structure. Without this, a row's own bound value would be recorded as a
-/// dependency of the list's reconcile effect, and changing one label would rebuild the list.
-/// It is deliberately not a general escape — a value that should not track is a value that
-/// should not have been read, everywhere except at the seam where structure is built.
+/// The read this exists for is one taken while building, inside an effect that reconciles
+/// structure: without it a row's own bound value is recorded as a dependency of the list's
+/// reconcile effect, and changing one label rebuilds the list.
+///
+/// The previous observer is restored even if `f` panics.
 pub fn untracked<R>(f: impl FnOnce() -> R) -> R {
-    // Restored by a guard and not by the line after the call: `f` is application code, and a
-    // panic that skipped the restore would leave the graph with no observer for the life of
-    // the thread — every effect created afterwards would silently subscribe to nothing.
+    // A guard rather than a line after the call: `f` is application code, and a panic that
+    // skipped the restore would leave the graph with no observer for the life of the
+    // thread, so every effect created afterwards would subscribe to nothing.
     struct Restore(Option<SignalId>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -490,13 +484,13 @@ fn recompute(id: SignalId) {
         if changed {
             // Only the direct subscribers are promoted. Everything below them is already
             // `Check` from the write that started this, and each promotes its own
-            // subscribers if its value actually moves.
+            // subscribers if its value moves.
             //
-            // The no-change arm leaves subscribers **`Check`** rather than marking them
-            // **`Clean`**. Clearing them is unsound in exactly the shape two-level marking
-            // exists for: where a diamond's two branches resolve in sequence, the second
-            // clears the first's `Dirty` and the shared node answers from a stale cache. A
-            // `Check` node re-asks its dependencies before believing its cache.
+            // Where the value did not change, subscribers stay `Check` and are not marked
+            // `Clean`. Clearing them is unsound in the shape two-level marking exists for:
+            // in a diamond whose two branches resolve in sequence, clearing drops the first
+            // branch's `Dirty` and the shared node answers from a stale cache. A `Check`
+            // node re-asks its dependencies before believing its cache.
             g.push_subs(id, State::Dirty);
             g.stack.clear();
         }
@@ -515,10 +509,10 @@ fn mark_clean(id: SignalId) {
     });
 }
 
-/// Drops every edge into `id`'s dependencies, so a recompute can collect a fresh set.
+/// Drops every edge between `id` and its dependencies, so a recompute collects a fresh set.
 ///
-/// A node that stops reading a source must stop being woken by it, or a `when(false)`
-/// branch keeps costing what it did when it was true.
+/// A node that stops reading a source stops being woken by it, so a hidden branch costs
+/// nothing once its arm has stopped reading.
 fn clear_deps(g: &mut Graph, id: SignalId) {
     let Some(node) = g.node_mut(id) else {
         return;
@@ -540,14 +534,14 @@ fn clear_deps(g: &mut Graph, id: SignalId) {
 
 // ── writing ─────────────────────────────────────────────────────────────────────
 
-/// Bumps `id`'s version and marks everything downstream of it. The push half of the
-/// scheme, and the only place a version moves.
+/// Bumps `id`'s version and marks everything downstream of it. The push half of
+/// propagation, and the only place a version moves.
 pub(super) fn invalidate(id: SignalId) {
     let acquired = with(|g| {
         if let Some(node) = g.node_mut(id) {
             node.version = node.version.wrapping_add(1);
         }
-        // Read before the marking, so what is compared afterwards is this write's own doing.
+        // Read before the marking, so the comparison afterwards reflects this write alone.
         let idle = !g.flushing && g.queue.is_empty();
         g.invalidate(id);
         g.stack.clear();
@@ -559,12 +553,12 @@ pub(super) fn invalidate(id: SignalId) {
     }
 }
 
-/// How many times `id`'s value has moved. Zero for a node that is gone.
+/// Returns how many times `id`'s value has moved. Zero for a node that is gone.
 pub(super) fn version(id: SignalId) -> u64 {
     with(|g| g.node(id).map_or(0, |node| node.version))
 }
 
-/// Whether this thread's graph holds `id` — the test that separates the owning thread's
+/// Returns whether this thread's graph holds `id`, which separates the owning thread's
 /// direct write from a producer's staged one.
 pub(super) fn owns(id: SignalId) -> bool {
     GRAPH.with(|g| g.try_borrow().is_ok_and(|g| g.node(id).is_some()))
@@ -594,6 +588,9 @@ fn run_effect(id: SignalId, f: &Rc<RefCell<dyn FnMut()>>) {
 /// Effects run after memos, so no effect observes a half-updated graph. A pass allocates
 /// nothing: both queues are drained rather than dropped, the staging buffer is swapped
 /// back, and the sort is in place.
+///
+/// A call made while a flush is running returns immediately, leaving the work to the
+/// running flush.
 pub fn flush() {
     if with(|g| core::mem::replace(&mut g.flushing, true)) {
         // A write from inside an effect appends to the queue the running flush picks up on
@@ -631,9 +628,8 @@ pub fn flush() {
                 continue;
             };
 
-            // An effect marked only `Check` re-asks its dependencies, and if none of them
-            // actually moved it does not run. That is the value-equality cutoff doing its
-            // work one level below a memo.
+            // An effect marked only `Check` re-asks its dependencies, and does not run if
+            // none of them moved. The value-equality cutoff, one level below a memo.
             if state_of(id) == Some(State::Check) {
                 let mut d = 0;
                 while let Some(dep) = with(|g| g.node(id).and_then(|n| n.deps.get(d).copied())) {
@@ -709,9 +705,9 @@ pub(super) fn enter_scope(id: Option<OwnerId>) -> Option<OwnerId> {
 
 /// Disposes a scope and everything created under it, in reverse creation order.
 pub(super) fn dispose_scope(id: OwnerId) {
-    // Fallible, because this is reached from a `Drop` — see `try_with`. A graph that is
-    // already being destroyed is disposing this scope by dropping it, so there is nothing
-    // left for the walk below to do.
+    // Fallible because this runs from a `Drop`, as `try_with` describes. A graph already
+    // being destroyed disposes this scope by dropping it, so the walk below has nothing
+    // left to do.
     let Some(Some(mut children)) = try_with(|g| {
         let owner = g.owners.get_mut(id)?;
         Some(core::mem::take(&mut owner.children))
@@ -749,23 +745,23 @@ pub(super) fn dispose(id: SignalId) {
         let Some(mut node) = g.nodes.remove(&mut g.node_ids, id.id) else {
             return;
         };
-        // A subscriber that outlives its source is legal — it is simply never woken again
-        // — and its stale edge is pruned by the generation check the next time it is
-        // walked. What must not survive is this node's entry in anyone else's list, and
-        // `clear_deps` above is what removes those.
+        // A subscriber that outlives its source is legal: it is never woken again, and its
+        // stale edge is pruned by the generation check the next time it is walked. What
+        // must not survive is this node's entry in anyone else's subscriber list, which
+        // `clear_deps` above removes.
         node.subs.clear();
         node.state = State::Clean;
         node.queued = false;
-        // Parked with its buffers. There is no `Free` variant to leave behind: the slot is
-        // vacant because the store says so, not because the payload has a way to say it.
+        // Parked with its buffers. Vacancy is the store's fact, so a node needs no `Free`
+        // variant of its own.
         g.spare.push(node);
     });
 }
 
-/// How many signal nodes are live on this thread.
+/// Returns how many signal nodes are live on this thread.
 ///
-/// The leak assertion's instrument and nothing else: a screen mounted and unmounted a
-/// thousand times must return this to its baseline.
+/// The instrument leak assertions read: mounting and unmounting a screen returns this count
+/// to its baseline.
 #[must_use]
 pub fn live_nodes() -> usize {
     with(|g| g.nodes.len())

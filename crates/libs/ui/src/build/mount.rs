@@ -1,10 +1,10 @@
-//! The mount walk: the one place this crate touches `Model`.
+//! Walks a built element into the model. The only module in this crate that names `Model`.
 //!
 //! The arena is post-order — a child finishes before the call consuming it — and the model
 //! needs pre-order, so this walks down from the root and emits as it goes. `after` is the
 //! previous sibling, which is what makes child order paint order.
 //!
-//! A slot with exactly one sprite and no children *is* that sprite. Anything richer mints a
+//! A slot with exactly one sprite and no children is that sprite. Anything richer mints a
 //! group whose chrome is absolute at inset zero, ahead of the laid-out children: chrome
 //! paints under content, and since `border` is never set, inset zero covers the node rather
 //! than the space inside a border.
@@ -31,23 +31,18 @@ use windows_scene::{
     MeasureCtx, MeasureKey, NodeId, Paint, PathVerb, Prop, SpriteId, Tuning, Value,
 };
 
-/// Mints path geometry, in sprite-local DIPs.
+/// Mints path geometry from `verbs`, in sprite-local DIPs.
 ///
-/// Lives here rather than beside the builder because this module is the only one that names
-/// `Model`, and a second caller is how that rule stops being true.
-///
-/// **Whoever authors the verbs re-points them when the box changes**, through
-/// [`set_geometry`]. This layer cannot do it for them: the verbs are in the sprite's own
-/// space, so at a new size they are different verbs and only their author knows which. That
-/// is not a gap in practice — a response curve, a knob arc and a routing wire all have a
-/// shape that depends on the width, so the code that recomputes them is the code that
-/// already knows the width moved.
+/// The author of the verbs re-points them through [`set_geometry`] when the box changes.
+/// This layer cannot do it for them: the verbs are in the sprite's own space, so at a new
+/// size they are different verbs and only their author knows which — a response curve, a
+/// knob arc and a routing wire each have a shape that depends on the width.
 #[must_use]
 pub fn geometry(verbs: &[PathVerb]) -> GeomId {
     Host::with(|h| h.model().geometry(verbs))
 }
 
-/// Re-points geometry. **Every** sprite sharing the id moves together, whichever
+/// Re-points the geometry `id` names. Every sprite sharing the id moves together, whichever
 /// construction each one uses, so a curve's fill, stroke and glow cannot diverge.
 pub fn set_geometry(id: GeomId, verbs: &[PathVerb]) {
     Host::with(|h| h.model().set_geometry(id, verbs));
@@ -55,26 +50,24 @@ pub fn set_geometry(id: GeomId, verbs: &[PathVerb]) {
 
 /// A hover wash's opacity, and a press's.
 ///
-/// Two numbers, and they live here rather than in the palette because they are the
-/// **opacity of a derived wash**, not a colour. A token named after the component that
-/// wanted it is the bloat smell; a token that is not a colour at all is worse.
+/// Opacities of a derived wash rather than colours, so they are held here and not in the
+/// palette.
 const HOVER_ALPHA: f32 = 0.06;
 const PRESS_ALPHA: f32 = 0.12;
 
-/// A thumb's resting opacity. Ink at a fraction, for the reason the washes are: it is an
-/// opacity over whatever it sits on rather than a colour of its own.
+/// A thumb's resting opacity: ink at a fraction, an opacity over whatever it sits on rather
+/// than a colour of its own.
 const THUMB_ALPHA: f32 = 0.30;
 
-/// A mounted subtree, and the only thing that unmounts it.
+/// Owns a mounted subtree and unmounts it on drop.
 ///
-/// Dropping it destroys the node and releases every table row the walk claimed — the style
-/// recipes, the control rows, the measured runs. Holding one *is* "this is on screen", and
-/// forgetting to release is not expressible.
+/// Dropping destroys the node and releases every table row the walk claimed: the style
+/// recipes, the control rows, the measured runs. A live handle is what keeps the subtree on
+/// screen, so a subtree cannot be left mounted with nothing holding it.
 ///
-/// It does **not** own the effects the mount installed. Those belong to whatever
-/// [`Owner`](crate::signal::Owner) was current, which is the right place: an application
-/// scope, a keyed row's, a branch arm's — all three already dispose in the same breath as
-/// they drop this.
+/// It does not own the effects the mount installed. Those belong to whatever
+/// [`Owner`](crate::signal::Owner) was current — an application scope, a keyed row's, a
+/// branch arm's — each of which disposes them as it drops this handle.
 #[must_use = "dropping a mount unmounts its subtree immediately"]
 #[derive(Debug)]
 pub struct Mount {
@@ -86,7 +79,7 @@ pub struct Mount {
 }
 
 impl Mount {
-    /// The node this subtree is rooted at.
+    /// Returns the node this subtree is rooted at.
     #[must_use]
     pub const fn node(&self) -> NodeId {
         self.node
@@ -94,8 +87,7 @@ impl Mount {
 
     /// Gives up the right to unmount, for a root that lives as long as the process.
     ///
-    /// The rows stay claimed, which is the honest outcome: a deliberate leak of a bounded
-    /// amount, rather than a release.
+    /// The subtree's table rows stay claimed for the life of the thread.
     pub fn leak(self) -> NodeId {
         let node = self.node;
         core::mem::forget(self);
@@ -117,13 +109,17 @@ pub fn mount<K>(el: El<K>, parent: GroupId) -> Mount {
     mount_at(el.erase(), parent, None, scope)
 }
 
-/// Mounts under `parent` at an explicit sibling position and scope. What a structural
+/// Mounts `el` under `parent`, after the sibling `after`, at `scope`. What a structural
 /// adapter calls for each row or arm it realizes.
+///
+/// # Panics
+///
+/// Panics if `el` was built before an earlier mount: the arena is cleared after each mount,
+/// so the slot the element indexes is gone.
 pub fn mount_at(el: View, parent: GroupId, after: Option<NodeId>, scope: Scope) -> Mount {
     let mut build = Build::take();
-    // The one place a stale element can be named. The arena is cleared after each mount, so
-    // an `El` held across one indexes a slot that is no longer there — and a raw bounds
-    // panic here would point at the arena rather than at the call site that kept it.
+    // The one place a stale element can be named, so the message names the call site that
+    // held the `El` across a mount rather than leaving a raw bounds panic in the arena.
     let exit = build
         .nodes
         .get(el.at as usize)
@@ -144,25 +140,25 @@ pub fn mount_at(el: View, parent: GroupId, after: Option<NodeId>, scope: Scope) 
     }
 }
 
-/// What a subtree hands up to the control enclosing it.
+/// Carries what a subtree hands up to the control enclosing it.
 ///
-/// A control's moving part is almost never its own sprite — a slider's knob, a toggle's knob
-/// and a meter's level are all children of the thing they belong to — so the parts a control
-/// needs are collected on the way back up rather than read off its own seed list. Reading
-/// them off the seed list is how a `ChromeRow` ends up with `thumb: None` for every control
-/// that has one, and how the front thread ends up computing a value it cannot show.
+/// A control's moving part is rarely its own sprite — a slider's knob, a toggle's knob and a
+/// meter's level are all children of the control they belong to — so the parts a control
+/// needs are collected on the way back up rather than read off its own seed list. Read off
+/// the seed list instead, a `ChromeRow` carries `thumb: None` for every control that has one
+/// and the front thread computes a value it cannot show.
 #[derive(Default)]
 struct Claim {
     thumb: Option<SpriteId>,
-    /// The value row a [`Unit::Travel`] channel opened, still waiting for the track it runs
-    /// in — which is the enclosing control, and is not known until that control mounts.
+    /// The value row a [`Travel`](super::arena::Unit::Travel) channel opened, waiting for the
+    /// track it runs in: the enclosing control, which is not known until that control mounts.
     value: Option<ValueId>,
-    /// The first text this subtree laid out, which is what an enclosing control derives its
+    /// The first text this subtree laid out, which an enclosing control derives its
     /// accessible name from.
     ///
     /// Collected on the way back up for the same reason the thumb is: a control's label is
-    /// almost never its own sprite — `button` is a control with a text *child* — so reading
-    /// the control's own row instead leaves every button in the stack unnamed.
+    /// rarely its own sprite — `button` is a control with a text child — so reading the
+    /// control's own row instead leaves every button in the stack unnamed.
     text: Option<MeasureKey>,
 }
 
@@ -175,7 +171,8 @@ impl Claim {
     }
 }
 
-/// Where one node in the walk goes: which slot, under what, after what, at which scope.
+/// Names where one node in the walk goes: which slot, under which parent, after which
+/// sibling, at which scope.
 #[derive(Copy, Clone)]
 struct Where {
     at: u32,
@@ -217,17 +214,18 @@ impl Rows {
     }
 }
 
-/// Emits one slot and its subtree.
+/// Emits one slot and its subtree, and returns the node it minted.
 ///
-/// `rows` collects every index the whole walk claimed, which is what the unmount releases.
+/// `rows` collects every mount row the whole walk claimed, which is what the unmount
+/// releases. `claim` receives the parts this subtree did not consume itself.
 fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId {
     let slot = b.nodes[at.at as usize];
     let inner = slot.elevate.map_or(at.scope, |e| at.scope.elevate(e));
     let roles = slot.chrome.map(Chrome::roles);
 
-    // Walked, never collected. A `Vec` of seeds here is one allocation per node per mount,
-    // on the path a list row realized during a fling takes — and the seeds are `Copy`, so
-    // the chain answers every question the collection would have.
+    // Counted through the chain rather than collected: a `Vec` of seeds here is one
+    // allocation per node per mount, on the path a list row realized during a fling takes.
+    // The seeds are `Copy`, so the chain answers every question a collection would have.
     let seed_count = b.seed_count(slot.seeds);
     // Chrome is a table row and not sprites yet, so a variant with no fill costs one visual
     // fewer rather than one invisible one.
@@ -267,18 +265,15 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // The scope is stored class-free: `at.scope` carries the class in force where this node
     // was built, and the solve supplies the current one through the restyle seam.
     //
-    // **An adapter's node is an anchor, never a box.** Its rows are the enclosing
-    // container's children, and this node exists only so the position they insert at has an
-    // identity — so it takes one const style and carries no recipe. `restyle` answering
-    // `None` leaves such a node alone, which is exactly right for one with no style to
-    // re-lower: the saving is a `lower()` and a table entry per list.
+    // An adapter's node is an anchor rather than a box. Its rows are the enclosing
+    // container's children, and this node exists only to give the position they insert at an
+    // identity, so it takes one const style and carries no recipe; `restyle` answers `None`
+    // for it and leaves it alone, saving a `lower()` and a table entry per list.
     //
-    // `Display::None` written into the style, and **not** `Model::hide`. The flag exists so
-    // that hiding is reversible without knowing what a node's display was; an anchor is
-    // never revealed and has no other display. What matters here is the difference in what
-    // the *parent* does: a hidden node is still one of its flex items, so a column gaps
-    // around it and the list sits one gap short of its box. `Display::None` takes it out of
-    // the item list altogether.
+    // `Display::None` in the style rather than `Model::hide`, which is reversible without
+    // knowing a node's display and keeps a hidden node as one of its parent's flex items —
+    // a column would gap around the anchor and sit one gap short of its box. `Display::None`
+    // takes it out of the item list, and an anchor is never revealed.
     let style = if slot.adapter.is_some() {
         Some(taffy::Style {
             display: taffy::Display::None,
@@ -308,10 +303,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             probe: None,
         });
         if let Some(cell) = slot.probe {
-            h.mint_probe(
-                row,
-                crate::layout::ProbeRow { node, cell },
-            );
+            h.mint_probe(row, crate::layout::ProbeRow { node, cell });
         }
         row
     });
@@ -351,7 +343,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
 
     // ── styles that follow a value ────────────────────────────────────────────────
     // Its own pass over the act chain, taking only its own variants: a spacer has a style
-    // that moves and no hit entry at all, so this and the control row cannot be one pass.
+    // that moves and no hit entry at all, so this cannot be folded into the control pass.
     mount_style_acts(b, &slot, node);
 
     // ── channels: one reactive lowering ───────────────────────────────────────────
@@ -365,8 +357,8 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             Some(parts.label.expect("a run seed mints its own sprite"))
         };
         let key = mount_text(b, node, group, target, text, inner, roles, row);
-        // This node's own text wins over anything its children offer, which is what
-        // `absorb` means one level up — and the order here is what makes it true.
+        // Set before the children walk, so this node's own text wins over anything they
+        // offer: `absorb` keeps the value already present.
         own_claim.text.get_or_insert(key);
     }
 
@@ -390,7 +382,8 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     if slot.hit.is_some() {
         mount_control(b, &slot, node, parts, own_claim, inner, row);
     } else {
-        // Not a control, so whatever the subtree offered belongs to whoever encloses this.
+        // Not a control, so what the subtree offered belongs to whichever control encloses
+        // this node.
         claim.absorb(own_claim);
     }
 
@@ -410,11 +403,11 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     if let Some(adapter) = slot.adapter
         && let Some(install) = b.adapters[adapter as usize].install.take()
     {
-        // The **enclosing** container and this node's own position in it, not the group
-        // minted above: rows and arms are laid out by the container the list was passed to,
-        // and this node is only the anchor they insert after. `at.scope` rather than
-        // `inner` for the same reason — an adapter pushes no scope, and the two are equal
-        // in every case an adapter can be in.
+        // The enclosing container and this node's own position in it, not the group minted
+        // for this slot: rows and arms are laid out by the container the list was passed to,
+        // and this node is only the anchor they insert after. `at.scope` rather than `inner`
+        // for the same reason — an adapter pushes no scope, so the two are equal in every
+        // case an adapter can be in.
         install(Site {
             parent: at.parent,
             after: Some(node),
@@ -425,7 +418,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     node
 }
 
-/// The text seed a slot carries, and how it flows.
+/// Returns the slot's text seed and how it flows, or `None` where it carries no run.
 fn run_seed(b: &Build, slot: &Slot) -> Option<(u32, Flow)> {
     b.chain_seeds(slot.seeds).find_map(|s| match s.mask {
         MaskSeed::Run { text } => Some((text, b.texts[text as usize].flow)),
@@ -443,8 +436,10 @@ struct Parts {
 }
 
 impl Parts {
-    /// The moving part goes to the claim rather than here, because it is the one part a
-    /// control usually does not own: it belongs to whichever control encloses it.
+    /// Records which sprite plays `part`.
+    ///
+    /// A thumb goes to `claim` rather than into [`Parts`]: the control that owns a moving
+    /// part is the one enclosing the sprite, not the node that minted it.
     fn set(&mut self, part: Part, id: SpriteId, claim: &mut Claim) {
         match part {
             Part::Fill => self.fill = Some(id),
@@ -457,13 +452,13 @@ impl Parts {
     }
 }
 
-/// The sprites a chrome row expands to, bottom first.
+/// Returns the sprites a chrome row expands to, bottom first.
 ///
-/// A stroked surface is **two boxes and not one outlined box**: the alphabet has no
-/// outlined rectangle, only outlined geometry, and geometry is authored in sprite-local
-/// DIPs and must be re-emitted whenever the box moves. An outer box in the stroke colour
-/// with the fill inset by a hairline over it draws the same ring, keeps the nine-grid's
-/// exact corners, is shared through the same raster cache, and costs nothing on a resize.
+/// A stroked surface is two boxes rather than one outlined box: the mask alphabet has no
+/// outlined rectangle, only outlined geometry, and geometry is authored in sprite-local DIPs
+/// and must be re-emitted whenever the box moves. An outer box in the stroke colour with the
+/// fill inset by a hairline over it draws the same ring, keeps the nine-grid's exact corners,
+/// is shared through the same raster cache, and costs nothing on a resize.
 fn chrome_seeds(
     roles: Option<RoleSet>,
     chrome: Option<Chrome>,
@@ -501,7 +496,7 @@ fn chrome_seeds(
     stroke.into_iter().chain(fill)
 }
 
-/// How far a chrome sprite is inset from the node it covers.
+/// Returns how far a chrome sprite is inset from the node it covers.
 const fn chrome_inset(part: Part) -> Len {
     match part {
         // The fill sits inside the ring the border draws.
@@ -526,12 +521,11 @@ fn cover(node: NodeId, scope: Scope, inset: Len) {
     Host::with(|h| h.model().style(node, &style));
 }
 
-/// Resolves one sprite's mask and paint.
+/// Resolves one sprite's mask and paint and writes both to the model.
 ///
-/// **`resolve` is called here and nowhere above it.** Neither `Radiance` nor `Paint` is
-/// reachable from a widget, which makes "a widget may not accept a colour" a property of
-/// the module graph rather than of a lint. The scope's width axis is pinned on the way in,
-/// so a resize cannot re-key a single cell.
+/// The only caller of [`role::resolve`](crate::role::resolve) in this layer: neither
+/// `Radiance` nor [`Paint`] is reachable from a widget, so a widget cannot accept a colour.
+/// `for_paint` pins the scope's width axis, so a resize cannot re-key a single cell.
 fn emit_sprite(
     id: SpriteId,
     seed: &SpriteSeed,
@@ -565,9 +559,9 @@ fn emit_sprite(
     });
 }
 
-/// A sprite's role: its own, unless it is the label of a widget whose chrome row owns the
-/// text colour. That is what lets `.accent()` reach the text without the text seed knowing
-/// there are variants.
+/// Returns a sprite's role: its own, unless it is the label of a widget whose chrome row
+/// owns the text colour. A chrome variant therefore reaches the text without the text seed
+/// naming one.
 fn role_of(seed: &SpriteSeed, roles: Option<RoleSet>) -> Role {
     match (seed.part, roles) {
         (Part::Label, Some(roles)) => Role::Text(roles.text),
@@ -575,12 +569,12 @@ fn role_of(seed: &SpriteSeed, roles: Option<RoleSet>) -> Role {
     }
 }
 
-/// The wash a hover or a press fades in.
+/// Emits the wash sprite a hover or a press fades in.
 ///
-/// Its paint is the wash at **full** strength and its opacity carries the alpha, so hover
-/// and press are one channel and one spring rather than two colours. A colour animation is
-/// not available here at all: a sprite's colour is an FP16 cell, a composition colour brush
-/// is 8-bit, and no brush interpolates between two FP16 sources.
+/// The paint is the wash at full strength and the opacity carries the alpha, so hover and
+/// press share one channel and one spring rather than two colours. A colour animation is not
+/// available: a sprite's colour is an FP16 cell, a composition colour brush is 8-bit, and no
+/// brush interpolates between two FP16 sources.
 fn emit_wash(id: SpriteId, wash: Wash, scope: Scope, radius: f32) {
     let light = match wash {
         Wash::Ink => crate::role::ink(1.0, scope),
@@ -601,8 +595,8 @@ fn emit_wash(id: SpriteId, wash: Wash, scope: Scope, radius: f32) {
     });
 }
 
-/// The radius the wash should match, so a pill's wash is a pill and a card's is a card with
-/// nothing declared twice.
+/// Returns the radius a wash matches, taken from the chrome row or from the fill seed, so a
+/// pill's wash is a pill and a card's is a card with nothing declared twice.
 fn radius_of(b: &Build, slot: &Slot, scope: Scope) -> f32 {
     if let Some(chrome) = slot.chrome {
         return crate::role::metric(chrome.radius, scope);
@@ -617,12 +611,12 @@ fn radius_of(b: &Build, slot: &Slot, scope: Scope) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// Moves the slot's actions into the host's dense table and declares the node to the one
-/// hit array.
+/// Moves the slot's actions into the host's control table and declares the node to the hit
+/// array.
 ///
-/// The handlers **move**; they are not cloned and not referenced. They live on this thread
-/// for the node's lifetime and reach the front thread only as a presence bit in
-/// [`HitFlags`], which is what keeps `SinkPatch: Send` provable rather than aspirational.
+/// The handlers move rather than being cloned or borrowed. They live on this thread for the
+/// node's lifetime and reach the front thread only as a presence bit in [`HitFlags`], which
+/// is what keeps `SinkPatch: Send`.
 fn mount_control(
     b: &mut Build,
     slot: &Slot,
@@ -640,8 +634,8 @@ fn mount_control(
         label: parts.label,
         border: parts.border,
         front: ChromeRow {
-            // Overwritten below, once the id exists. The row and its identity are minted in
-            // the same breath so the two halves cannot disagree about what a control is.
+            // Filled in once the id exists. The row and its identity are minted in one
+            // borrow, so the two halves cannot disagree about what a control is.
             id: ControlId::default(),
             wash: parts.wash,
             hover: HOVER_ALPHA,
@@ -686,14 +680,13 @@ fn mount_control(
     }
 
     // Folded in here, so declining an inflation is order-independent at the call site and
-    // still cannot conjure a target on a node that declared none.
+    // cannot make a target of a node that declared none.
     let flags = hit.flags | uia_flag(slot.uia) | inflate_flag(slot.no_inflate);
     let inflate = hit.inflate.and_then(|l| l.dips(scope));
-    // A control that refined nothing still declares the default: tap, right-tap and hold,
-    // which is what gives a touch user the context menu a mouse user gets from the secondary
-    // button. Gated on the flag whose whole meaning is "has a gesture declaration", so the
-    // entry cannot claim one it does not have — and so this walk, which also runs for nodes
-    // that exist only for automation, does not put a recogniser behind a static label.
+    // A control that refined nothing still declares the default set — tap, right-tap and
+    // hold — which is what gives a touch user the context menu a mouse user reaches with the
+    // secondary button. Gated on `HitFlags::GESTURE`, so a node that declared no gesture gets
+    // no recogniser; this walk also runs for nodes that exist only for automation.
     let gesture = b
         .gesture(slot.gesture)
         .or_else(|| flags.contains(HitFlags::GESTURE).then(GestureDecl::default));
@@ -712,9 +705,9 @@ fn mount_control(
             h.chrome.push(front);
         }
         // The moving part's track is this control's own box, and this is the first moment
-        // both are known — as is **who moves it**: a control the router drives owns the
-        // channel outright from here, so this thread corrects its geometry by re-sending the
-        // room rather than by writing the property behind the router's back.
+        // both are known, along with which thread moves it. A control the router drives owns
+        // the channel from here, so this thread corrects its geometry by re-sending the room
+        // rather than by writing the property.
         if let Some(value) = value {
             h.own_value(value, id, node, front_driven(slot.interaction));
         }
@@ -735,9 +728,9 @@ fn mount_control(
         id
     });
 
-    // Model state, and therefore a discrete paint swap at event rate — not a wash. Both
-    // arms answer one question through one setter, so the last writer of a frame wins in
-    // the order the effects were created and there is no pair of them to disagree.
+    // Model state, so a discrete paint swap at event rate rather than a wash. Both arms go
+    // through one setter, so the last of them to run in a frame wins, in the order the
+    // effects were created.
     if let Some(disabled) = disabled {
         Effect::new(move || {
             let off = disabled();
@@ -772,11 +765,10 @@ fn mount_control(
 
 /// Delegates a container's scrolling to a tracker, and gives it a thumb.
 ///
-/// **Two bindings and one tracker.** The content rides it negated, because a tracker's
-/// position increases for up and left; the thumb rides the same one at the ratio of the two
-/// extents, which is what makes the thumb follow the content with no front-thread work at
-/// all. The tracker itself is a composition object, so it is named here and created on the
-/// other side.
+/// Two bindings on one tracker: the content rides it negated, since a tracker's position
+/// increases for up and left, and the thumb rides the same tracker at the ratio of the two
+/// extents, so it follows the content with no front-thread work at all. The tracker is a
+/// composition object, so it is named here and created on the front thread.
 fn mount_scroll(
     viewport: GroupId,
     content: NodeId,
@@ -801,16 +793,14 @@ fn mount_scroll(
                 affine: windows_scene::Affine::CONTENT,
             },
         );
-        // The scrollbar lives in the viewport rather than in the content, because it must
-        // not scroll with what it reports on — and **above** the content, because child
-        // order is paint order and is the order the hit array is scanned in. Below it, the
-        // bar is painted under whatever the list draws and a grab resolves to the row
-        // behind it.
+        // The scrollbar lives in the viewport rather than in the content, so it does not
+        // scroll with what it reports on, and above the content, because child order is paint
+        // order and the order the hit array is scanned in. Below it, the bar paints under
+        // whatever the list draws and a grab resolves to the row behind it.
         //
-        // A rail and a thumb, and the split is not decoration: the rail is static geometry
-        // and carries the target, the thumb is moved by the compositor and carries none. A
-        // hit entry on the thumb would name a rect the solve fixed and the tracker then
-        // left behind.
+        // The rail is static geometry and carries the hit target; the thumb is moved by the
+        // compositor and carries none. A hit entry on the thumb would name a rect the solve
+        // fixed and the tracker then moved away from.
         let bar = (reveal != crate::layout::Reveal::Never).then(|| {
             let rail = h.model().group(viewport, Some(content));
             h.model().style(rail.node(), &crate::layout::rail_style());
@@ -825,19 +815,18 @@ fn mount_scroll(
                 thumb,
                 Paint::Solid(crate::role::ink(THUMB_ALPHA, scope.for_paint())),
             );
-            // Concealed from the mount rather than shown and faded: a surface whose content
-            // fits never overflows, and a thumb that appeared for one frame to say so is a
-            // flash on every screen that opens.
+            // Hidden from the mount rather than shown and faded out: a surface whose content
+            // fits never overflows, and a thumb visible for one frame to say so is a flash on
+            // every screen that opens.
             if reveal == crate::layout::Reveal::OnDemand {
                 h.model()
                     .bind(thumb.node(), Prop::Opacity, Bind::Set(Value::Scalar(0.0)));
             }
-            // The rail's control: a hit entry and a drag, and deliberately no chrome row.
-            // The thumb's opacity belongs to the reveal policy, and a control the front
-            // table adopted would give one channel two owners.
-            // The hit entry itself is `publish_scrolls`', because whether the rail is a
-            // target at all depends on whether there is anything to scroll — which is a
-            // solve output.
+            // The rail's control carries a hit entry and a drag and no chrome row: the
+            // thumb's opacity belongs to the reveal policy, and a row the front table adopted
+            // would give that channel two owners. The hit entry itself is written by
+            // `publish_scrolls`, because whether the rail is a target at all depends on
+            // whether there is anything to scroll, which is a solve output.
             let id = h.mint_control(thumb_control(rail.node(), scope));
             h.gestures.push((id, crate::layout::grab_decl()));
             (rail, thumb, id)
@@ -863,7 +852,7 @@ fn mount_scroll(
     });
 }
 
-/// The rail's row: an identity for the hit array, and nothing that paints.
+/// Builds the rail's control row: an identity for the hit array, and nothing that paints.
 fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
     ControlRow {
         node,
@@ -897,16 +886,16 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
 
 /// Installs the effect behind a style that follows a value.
 ///
-/// It re-lowers from the node's **own recipe** with the bound overrides appended, rather
+/// The effect re-lowers from the node's own recipe with the bound overrides appended, rather
 /// than from a style it has to remember, and at the class the last solve resolved for the
-/// node rather than one captured here — so neither the recipe nor the class can fall out of
+/// node rather than one captured here, so neither the recipe nor the class can fall out of
 /// date.
 ///
-/// **One effect per node, not one per act.** Lowering starts from the recipe every time, so
-/// an effect that appended only its own override published a style with every *other* bound
-/// override missing, and two of them on one node took turns. Collecting them means a node's
-/// style is written once per change and is always the whole of it. The buffer is held by the
-/// effect and reaches its high-water mark once.
+/// One effect per node rather than one per act: lowering starts from the recipe every time,
+/// so an effect appending only its own override would publish a style with every other bound
+/// override missing, and two of them on one node would take turns. Collected, a node's style
+/// is written once per change and is always the whole of it. The scratch buffer belongs to
+/// the effect and reaches its high-water mark once.
 fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId) {
     let mut acts = Vec::new();
     let mut at = slot.acts.head;
@@ -961,7 +950,8 @@ const fn inflate_flag(declined: bool) -> HitFlags {
     }
 }
 
-/// Everything routing, removed; the automation peer, kept.
+/// Returns `flags` with everything that routes a pointer removed and the automation peer
+/// kept.
 fn uia_only(flags: HitFlags) -> HitFlags {
     if flags.contains(HitFlags::UIA) {
         HitFlags::UIA
@@ -970,12 +960,11 @@ fn uia_only(flags: HitFlags) -> HitFlags {
     }
 }
 
-/// The one reactive lowering.
+/// Lowers a slot's channels into bindings. The one reactive lowering in this crate.
 ///
-/// A **constant** is one `Bind::Set` at mount and produces no graph node, no `Effect` and
-/// no allocation — which is the whole of "static content costs one sprite and nothing
-/// else", decided here rather than once per widget. Anything else becomes exactly one
-/// effect, and the boxed reader **moves** into it.
+/// A constant becomes one `Bind::Set` at mount and produces no graph node, no `Effect` and
+/// no allocation, so static content costs one sprite and nothing else. Anything else becomes
+/// exactly one effect, and the boxed reader moves into it.
 fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: MountId, claim: &mut Claim) {
     let mut at = slot.chans.head;
     while at != NIL {
@@ -983,14 +972,14 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: MountId, claim:
         let (prop, motion, unit) = (entry.prop, entry.motion, entry.unit);
         let source = entry.source.take();
         at = entry.next;
-        // A value is finished by whoever is moving the part — this thread, or the router.
-        // A slid one also waits on the room it is a fraction *of*, which is a solve output.
+        // A value is finished by whichever thread moves the part, this one or the router's.
+        // A slid one also waits on the room it is a fraction of, which is a solve output.
         let value = unit.is_value().then(|| {
             let id = Host::with(|h| {
                 h.mint_value(ValueRow {
                     node,
-                    // Its own box until the enclosing control claims it, which reads as zero
-                    // room — the honest answer before layout has said anything.
+                    // Its own box until the enclosing control claims it, which gives zero
+                    // room until layout has said anything.
                     track: node,
                     control: None,
                     unit,
@@ -1035,7 +1024,7 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: MountId, claim:
     }
 }
 
-/// Whether the router moves this control's part, rather than the application.
+/// Returns whether the router moves this control's part rather than the application.
 ///
 /// A press has no value to move, so its part follows the app's own channel; a slide and a
 /// turn are read off the pointer, and from the first contact the router is the only writer.
@@ -1046,8 +1035,9 @@ const fn front_driven(interaction: Option<Interaction>) -> bool {
     )
 }
 
-/// A fraction's number. A value channel is scalar by construction — there is no
-/// two-component fraction — so anything else is a widget seeding the wrong channel.
+/// Returns a fraction's number. A value channel is scalar by construction — there is no
+/// two-component fraction — so any other variant is a widget seeding the wrong channel, and
+/// debug builds assert.
 fn scalar(value: Value) -> f32 {
     if let Value::Scalar(v) = value {
         return v;
@@ -1058,9 +1048,9 @@ fn scalar(value: Value) -> f32 {
 
 /// Registers a measured run and points layout at it.
 ///
-/// The measure path cannot read a signal — it runs inside the solve, and `Measure` is
-/// `Send` — so a dynamic string is snapshotted here and re-snapshotted by its own effect.
-/// The glyphs are placed later, once, at the width layout chose.
+/// The measure path cannot read a signal: it runs inside the solve, and `Measure` is `Send`.
+/// A dynamic string is therefore snapshotted here and re-snapshotted by its own effect. The
+/// glyphs are placed later, once, at the width layout chose.
 #[expect(
     clippy::too_many_arguments,
     reason = "one call site, and every argument is a distinct fact the entry records"
@@ -1078,14 +1068,13 @@ fn mount_text(
     let seed = &mut b.texts[text as usize];
     let (ramp, flow, source) = (seed.ramp, seed.flow, seed.source.take());
     let ink = seed.ink.or(roles.map(|r| r.text));
-    // Snapshotted once, here. A `&'static str` crosses as a borrow rather than as a copy,
-    // which is what keeps a screen of chrome labels free.
+    // Snapshotted once, here. A `&'static str` crosses as a borrow rather than as a copy, so
+    // a screen of chrome labels allocates nothing.
     //
-    // **Untracked**, and that is not an optimisation. A mount can run from inside an
-    // effect — a keyed list reconciling — and a read taken here would subscribe *that*
-    // effect. A row with a bound label would then rebuild the whole list every time its own
-    // label changed. The dependency belongs to the effect installed below, which is the one
-    // that can act on it.
+    // Untracked: a mount can run from inside an effect — a keyed list reconciling — and a
+    // read taken here would subscribe that effect, so a row with a bound label would rebuild
+    // the whole list every time its own label changed. The dependency belongs to the effect
+    // this function installs for a dynamic source, which is the one that can act on it.
     let initial = crate::signal::untracked(|| {
         source
             .as_ref()
@@ -1113,9 +1102,8 @@ fn mount_text(
     // the same gate every other value goes through, in the same place.
     //
     // The scratch buffer is the effect's own and outlives every run of it, so it reaches its
-    // high-water mark once. That is what makes an unchanged readout cost a format and a
-    // compare: `set_text` already declines to reshape a string that did not move, and a
-    // buffer allocated afresh each time would have paid a malloc to learn the same thing.
+    // high-water mark once and an unchanged readout costs a format and a compare: `set_text`
+    // declines to reshape a string that did not move.
     if let Some(TextSource::Dynamic(read)) = source {
         let mut scratch = String::new();
         Effect::new(move || {
@@ -1127,22 +1115,22 @@ fn mount_text(
     key
 }
 
+/// Replaces a run's text, re-measuring its node and marking the accessible tree stale.
 fn set_text(key: MeasureKey, text: &str) {
     let Some(node) = super::text::with(|table| table.set_text(key, text)) else {
         return;
     };
     Host::with(|h| {
-        // The measure's **input** moved and its context did not, which is the one
-        // invalidation the model holds no copy of and therefore cannot notice. Without this
-        // the run stays stale forever: `sync` reshapes from the measure function, and the
-        // measure function runs for a dirty node. A row in a list or an arm of a branch is
-        // dirtied by being built, which is why those looked right — and a caption that
-        // outlives its own value never was.
+        // The measure's input moved and its context did not, which the model holds no copy
+        // of and therefore cannot notice. Without this the run stays stale: reshaping runs
+        // from the measure function, and the measure function runs for a dirty node. A row in
+        // a list or an arm of a branch is dirtied by being built; a caption that outlives its
+        // own value is not.
         h.model().remeasure(node);
-        // An accessible name is a **copy**, taken into the published tree's own string blob,
-        // so a string that changes here is one the tree is now wrong about. Marking the tree
-        // stale is what republishes it — and text that changes faster than event rate does
-        // not live in the retained tree at all, so this cannot be a per-frame cost.
+        // An accessible name is copied into the published tree's own string blob, so a
+        // string that changes here leaves the tree wrong until it is republished. Text that
+        // changes faster than event rate does not live in the retained tree at all, so this
+        // is not a per-frame cost.
         h.uia_restale();
     });
 }

@@ -1,13 +1,11 @@
-//! The control patterns.
+//! Implements the control patterns on the provider object.
 //!
-//! Every **query** reads the published tree and its live half; every **command** queues an
-//! action and returns. That split is the platform's own — `Invoke` "is an asynchronous
-//! call and must return immediately without blocking", and the same is written of `Toggle`,
-//! `Select` and both `SetValue`s — so returning before the work happens is the contract,
-//! and it is also what keeps a client off the critical path of a busy front thread.
+//! A query reads the published tree and its live half. A command queues an [`Action`] and
+//! returns without blocking, which is what the platform requires of `Invoke`, `Toggle`,
+//! `Select` and both `SetValue`s.
 //!
-//! One object answers all of them; which ones it *admits* to is the role table's business,
-//! decided in `GetPatternProvider` before anything here is reached.
+//! One object implements every pattern. Which ones an element advertises is decided by the
+//! role table in `GetPatternProvider`, before any method here is reached.
 
 use super::action::Action;
 use super::element::{At, Element_Impl, NO_PART, gone, none};
@@ -22,14 +20,16 @@ use crate::widget::Range;
 use windows_core::{BOOL, BSTR, PCWSTR, Result};
 use windows_scene::NO_ENTRY;
 
-/// A large step is a page; a small one is the range's own step, or a hundredth of it where
-/// the range is continuous. Both are what a client offers as keyboard equivalents, so they
-/// have to be the increments the control itself moves in.
+/// Fraction of a range's span reported as `LargeChange`, one page of movement.
+/// [`SMALL_FRACTION`] is what `SmallChange` reports where the range declares no step of its
+/// own. A client offers both as keyboard increments, so they are the steps the control
+/// itself moves in.
 const LARGE_FRACTION: f64 = 0.1;
 const SMALL_FRACTION: f64 = 0.01;
 
 impl Element_Impl {
-    /// The element's own range, or `None` where it carries no number.
+    /// Resolves the element and returns its numeric range, or `None` where it carries no
+    /// number.
     fn range(&self) -> Option<(At, Range)> {
         let at = self.at().ok()?;
         match at.tree.col(at.at)?.value {
@@ -38,10 +38,16 @@ impl Element_Impl {
         }
     }
 
-    /// The live number, whether written by the front thread or by a region's producer.
+    /// Returns the live number for this element, or for the region part it addresses.
     ///
-    /// A producer's cell wins where there is one: it is the newer of the two by
-    /// construction, written from the thread that drew the pixels the number describes.
+    /// An element addressing a part reads that part's slot. Otherwise a region's producer
+    /// cell is preferred over the tree's live cell, because it is written by the thread
+    /// that drew the pixels the number describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the empty error, which reports "no value here" rather than a failure, where
+    /// no cell holds a finite number.
     fn number(&self) -> Result<f64> {
         let At {
             shared,
@@ -101,18 +107,16 @@ impl crate::bindings::IToggleProvider_Impl for Element_Impl {
 
 impl crate::bindings::IValueProvider_Impl for Element_Impl {
     fn SetValue(&self, value: &PCWSTR) -> Result<()> {
-        // Refused where `IsReadOnly` says so, rather than accepted and dropped: a provider
-        // that answers `S_OK` to a write it will not perform tells a client the value
-        // changed, and the client then reads the old one back and reports a stuck control.
-        //
-        // A string-valued surface is always read-only here — the editable one is text
-        // services', and it publishes `TextPattern` rather than taking dictated strings
-        // through this seam. A number parses, because a client offers "type a value".
+        // Only a numeric element takes a write, which is what `IsReadOnly` reports. The
+        // write is refused rather than accepted and dropped, so a client cannot read the
+        // old value back after an `S_OK`. A text-valued element is read-only through this
+        // pattern and publishes `TextPattern` instead.
         let range = self.range().ok_or_else(readonly)?.1;
         if !self.enabled() {
             return Err(disabled());
         }
-        // SAFETY: automation passes a null-terminated wide string it owns for the call.
+        // SAFETY: the `IValueProvider::SetValue` ABI passes a null-terminated wide string
+        // owned by automation and valid for the duration of the call.
         let text = unsafe { value.to_string() }.map_err(|_| invalid())?;
         let parsed: f64 = text.trim().parse().map_err(|_| invalid())?;
         if !parsed.is_finite() || parsed < range.min || parsed > range.max {
@@ -125,8 +129,8 @@ impl crate::bindings::IValueProvider_Impl for Element_Impl {
     fn Value(&self) -> Result<BSTR> {
         let At { tree, at, .. } = self.at()?;
         let col = tree.col(at).ok_or_else(gone)?;
-        // A read-only surface reports its own body; a numeric one formats its number to
-        // the precision its step implies, so a reader does not speak a slider's float noise.
+        // A text element answers with its own body. A numeric one formats to the precision
+        // its step implies, so the announced value carries no float noise.
         if col.value == Value::Text {
             return Ok(super::variant::bstr(tree.text(col.name)));
         }
@@ -188,8 +192,7 @@ impl crate::bindings::IRangeValueProvider_Impl for Element_Impl {
 
 impl crate::bindings::ISelectionProvider_Impl for Element_Impl {
     fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
-        // A container reports which of its children is selected. Built from the live half,
-        // so a selection change does not republish the tree.
+        // Read from the live half, so a selection change needs no republish.
         let At {
             shared, tree, at, ..
         } = self.at()?;
@@ -219,14 +222,13 @@ impl crate::bindings::ISelectionItemProvider_Impl for Element_Impl {
     }
 
     fn AddToSelection(&self) -> Result<()> {
-        // Single-selection, so adding to the selection *is* selecting. Failing instead
-        // would make a client believe the control cannot be operated at all.
+        // Selection here is single, so adding to it is selecting.
         crate::bindings::ISelectionItemProvider_Impl::Select(self)
     }
 
     fn RemoveFromSelection(&self) -> Result<()> {
-        // Single-selection: there is no state in which nothing is selected, so clearing
-        // one is not a thing the control can be asked to do.
+        // Selection here is single: no state has nothing selected, so there is no
+        // selection to clear.
         Err(invalid())
     }
 
@@ -269,15 +271,12 @@ impl crate::bindings::IExpandCollapseProvider_Impl for Element_Impl {
     }
 }
 
-/// `ScrollPattern` is deliberately **not** implemented.
+/// `ScrollItem` is the only scrolling pattern implemented.
 ///
-/// It reports where a container stands as a percentage of its *content*, and how much of
-/// that content is visible — and this tree publishes neither. The scroll extent lives with
-/// the interaction tracker and never reaches the hit array, so every number the pattern
-/// asks for would be a plausible fabrication of the viewport's own size. `ScrollItem` is
-/// what a reader actually needs, it is a command rather than a measurement, and it is
-/// correct. Publishing the extent alongside the offset is what would bring the other one
-/// back.
+/// `ScrollPattern` reports a container's position as a percentage of its content and how
+/// much of that content is visible. The scroll extent lives with the interaction tracker
+/// and never reaches the hit array, so neither number is available here. `ScrollItem` is a
+/// command rather than a measurement and needs neither.
 impl crate::bindings::IScrollItemProvider_Impl for Element_Impl {
     fn ScrollIntoView(&self) -> Result<()> {
         self.shared()?.act(Action::Reveal(self.id()));
@@ -285,7 +284,7 @@ impl crate::bindings::IScrollItemProvider_Impl for Element_Impl {
     }
 }
 
-/// Every child of `at`, through the links the build pass filled.
+/// Returns each child index of the entry at `at`, in sibling order.
 fn children(tree: &Tree, at: usize) -> impl Iterator<Item = usize> + '_ {
     let mut next = tree.col(at).map_or(NO_ENTRY, |col| col.first_child);
     core::iter::from_fn(move || {
@@ -298,36 +297,38 @@ fn children(tree: &Tree, at: usize) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
-/// The three failures automation distinguishes, named once rather than spelled at each
-/// call site.
+/// Returns `UIA_E_ELEMENTNOTENABLED`, the answer to a command on a disabled element.
 fn disabled() -> windows_core::Error {
     windows_core::Error::from_hresult(windows_core::HRESULT(
         crate::bindings::UIA_E_ELEMENTNOTENABLED as i32,
     ))
 }
 
+/// Returns `UIA_E_INVALIDOPERATION`, the answer to a value or operation the control cannot
+/// hold.
 fn invalid() -> windows_core::Error {
     windows_core::Error::from_hresult(windows_core::HRESULT(
         crate::bindings::UIA_E_INVALIDOPERATION as i32,
     ))
 }
 
-/// A write to something that does not take one. Distinct from `invalid`, which is a value
-/// the control could not have held.
+/// Returns the answer to a write on an element that accepts none. Named apart from
+/// [`invalid`], which reports a value outside what the control can hold.
 fn readonly() -> windows_core::Error {
     invalid()
 }
 
-/// A number at the precision its own step implies.
+/// Formats `value` at the number of decimal places `step` implies.
 ///
-/// A slider reading "-14.500000001 decibels" is a defect a screen reader cannot work
-/// around, and rounding at the draw is not rounding at the announcement.
+/// A `step` of zero or less marks a continuous range and formats to two places. The
+/// rounding a control applies when drawing does not reach the announced string, so it is
+/// applied here.
 fn format(value: f64, step: f64) -> String {
     let places: usize = if step <= 0.0 {
         2
     } else {
-        // The first decimal place the step is not a multiple of, capped where an f64 stops
-        // being able to tell.
+        // The fewest decimal places that express `step` exactly, capped at six where the
+        // comparison stops discriminating in an f64.
         (0..=6)
             .find(|places| {
                 let scale = 10f64.powi(i32::try_from(*places).unwrap_or(6));

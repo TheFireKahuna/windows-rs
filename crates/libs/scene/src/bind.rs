@@ -1,16 +1,15 @@
-//! The universal construction: alpha × light → one sprite visual. **Front half.**
+//! Realizes a sprite's brush chain: alpha × light onto one sprite visual. **Front half.**
 //!
 //! ```text
 //! Sprite.Brush = MaskBrush { Mask = <box | run | shape alpha>, Source = <paint brush> }
 //! ```
 //!
-//! **The chain is flat, always.** A mask brush is never the mask or the source of another —
-//! the platform's brush-combination table lists that under "using an unsupported
-//! combination will throw an exception" — so a gradient is one premultiplied FP16 strip.
+//! The chain is flat. A mask brush is never the mask or the source of another, because the
+//! platform throws on that brush combination, so a gradient is one premultiplied FP16 strip.
 //!
-//! **Every paint is a surface brush.** The four variants differ only in where the surface
-//! comes from, so there is one binding type and one device-loss rebind, and the enum picks
-//! a constructor, not a shape.
+//! Every paint is a surface brush. The four variants differ only in where the surface comes
+//! from, so there is one binding type and one device-loss rebind, and the paint enum picks
+//! a constructor rather than a shape.
 
 use crate::backends::Backends;
 use crate::cache::{BoxKey, Cells, Gen, SolidKey};
@@ -27,12 +26,12 @@ use windows_composition::{
 use windows_core::Result;
 use windows_numerics::Vector2;
 
-/// Which construction realizes a shape mask.
+/// Returns the construction that realizes a shape mask.
 ///
-/// **The author never names a route.** A total function of the mask's value and the
-/// sprite's bound channels; a clip-route sprite that later receives a trim, a dash phase or
-/// its own clip is *promoted* onto the capture, keeping the same geometry. So the conflict
-/// between a shape's clip and the sink's own costs a promotion, never a wrong render.
+/// A total function of the mask's value and the sprite's bound channels, so an author never
+/// names a route. A clip-route sprite that later receives a trim, a dash phase or its own
+/// clip is promoted onto the capture with the same geometry, so a shape's clip colliding
+/// with the sink's own costs a promotion rather than a wrong render.
 pub(crate) fn route(stroke: Option<StrokeStyle>, draws_on: bool, clip_taken: bool) -> Route {
     if stroke.is_some() || draws_on || clip_taken {
         Route::Capture
@@ -41,13 +40,15 @@ pub(crate) fn route(stroke: Option<StrokeStyle>, draws_on: bool, clip_taken: boo
     }
 }
 
-/// Everything realizing a sprite reaches for, and nothing else.
+/// Borrows everything realizing a sprite reaches for, and nothing else.
 ///
 /// Named once so the functions below thread one borrow set, and so what they touch is a
-/// fact the compiler checks. The node arrives separately and mutably: a realize writes one.
+/// fact the compiler checks. The node arrives separately and mutably, because a realize
+/// writes one.
 ///
-/// Five fields, each one fact: what to make things with, what display they are for, what
-/// has been invalidated since, and the two stores a chain is assembled from.
+/// The fields are the backends brushes are created from, the display environment they are
+/// built for, the generation saying what has been invalidated since, and the two stores a
+/// chain is assembled out of.
 pub(crate) struct Realizer<'a> {
     pub(crate) back: &'a Backends,
     pub(crate) env: Env,
@@ -57,15 +58,15 @@ pub(crate) struct Realizer<'a> {
 }
 
 impl Realizer<'_> {
-    /// Builds or rebuilds a sprite's brush chain from its declaration.
+    /// Builds or rebuilds a sprite's brush chain from the declaration held on its node.
     ///
-    /// **Everything needed is on the node already**, which makes device-loss recovery, a
-    /// DPI change and a first bind the same call: every brush is a pure function of a cache
-    /// key or a resource id, and the stroke pattern is held, not re-read from a patch that
-    /// may not exist.
+    /// Everything needed is on the node already, so device-loss recovery, a DPI change and
+    /// a first bind are the same call: every brush is a pure function of a cache key or a
+    /// resource id, and the stroke pattern is held rather than re-read from a patch that may
+    /// no longer exist.
     ///
-    /// `glow` is the captured group's visual, resolved by the caller because it belongs to
-    /// a *different* node.
+    /// `glow` is the captured group's visual. The caller resolves it, because it belongs to
+    /// a different node.
     pub(crate) fn sprite(&mut self, node: &mut Node, glow: Option<&Visual>) -> Result<()> {
         let Some((mask, paint, dashes, owned_clip)) = node
             .painted
@@ -78,7 +79,7 @@ impl Realizer<'_> {
         let paint_brush = self.paint(node, &paint, glow)?;
         let (mask_brush, route) = self.mask(node, &mask, dashes.as_slice())?;
 
-        // A shape leaving the clip route takes its clip with it, or it is masked *twice* by
+        // A shape leaving the clip route takes its clip with it, or it is masked twice by
         // itself and an outward stroke is cut in half along the fill's own outline.
         //
         // `clip.is_none()` is the whole condition, not a guard: the other way onto the
@@ -94,9 +95,9 @@ impl Realizer<'_> {
         }
 
         let combined = match (&node.sprite, &mask_brush, &paint_brush) {
-            // No mask brush at all: the paint binds directly. Required for a presented
-            // buffer, since a mask brush in the chain disqualifies it from a display plane —
-            // and it is also what the clip route is.
+            // No mask brush: the paint binds directly. A presented buffer requires this,
+            // since a mask brush in the chain disqualifies it from a display plane, and it
+            // is also what the clip route amounts to.
             (Some(sprite), None, Some(paint)) => {
                 sprite.set_brush(paint);
                 None
@@ -126,7 +127,7 @@ impl Realizer<'_> {
         Ok(())
     }
 
-    /// The alpha half.
+    /// Builds the alpha half of the chain, and reports the route it took.
     fn mask(
         &mut self,
         node: &mut Node,
@@ -147,9 +148,9 @@ impl Realizer<'_> {
                 else {
                     return Ok((None, Route::Clip));
                 };
-                // Nine-slice, so one raster serves any width and height with pristine
-                // corners. It reaches the mask slot as the base brush type, which is what
-                // that slot actually accepts.
+                // Nine-slice, so one raster serves any width and height with exact corners.
+                // It reaches the mask slot as the base brush type, which is what that slot
+                // accepts.
                 let nine = self.back.compositor.create_nine_grid_brush();
                 nine.set_source(cell);
                 nine.set_insets(inset, inset, inset, inset);
@@ -175,7 +176,7 @@ impl Realizer<'_> {
         }
     }
 
-    /// The colour half. Always a surface brush.
+    /// Builds the colour half of the chain, which is always a surface brush.
     fn paint(
         &mut self,
         node: &mut Node,
@@ -184,7 +185,7 @@ impl Realizer<'_> {
     ) -> Result<Option<CompositionSurfaceBrush>> {
         match *paint {
             Paint::Solid(light) => {
-                // **The retained path's draw choke**, and the only place in this crate a
+                // The retained path's draw choke: the one place in this crate a
                 // scene-referred value becomes a display-referred one.
                 let key = SolidKey::new(self.env.apply(light));
                 Ok(self
@@ -201,7 +202,7 @@ impl Realizer<'_> {
         }
     }
 
-    /// The cheap route: no mask brush, the paint bound directly, and a geometric clip
+    /// Takes the clip route: no mask brush, the paint bound directly, and a geometric clip
     /// carrying the shape with a soft border for an antialiased edge.
     fn geometric_clip(&mut self, node: &mut Node, geom: GeomId) {
         let Some(geometry) = self.res.geoms.value(geom) else {
@@ -212,11 +213,11 @@ impl Realizer<'_> {
         node.visual.set_border_mode(BorderMode::Soft);
     }
 
-    /// The general route: an off-tree shape visual captured through a visual surface.
+    /// Takes the capture route: an off-tree shape visual captured through a visual surface.
     ///
-    /// It exists because a sprite shape's fill and stroke brushes do not accept a surface
-    /// brush, so an FP16 colour cannot reach a shape directly — which is the whole reason
-    /// the expensive route is the general one, and why a shape carries only alpha.
+    /// A sprite shape's fill and stroke brushes do not accept a surface brush, so an FP16
+    /// colour cannot reach a shape directly. The captured shape therefore carries alpha
+    /// only, and its colour comes from the paint beside it.
     fn shape_capture(
         &mut self,
         node: &mut Node,
@@ -248,9 +249,9 @@ impl Realizer<'_> {
                 shape.set_stroke_dashes(dashes);
             }
         }
-        // **The scale goes on the shape, not on the visual.** A visual surface captures
-        // *content* and ignores the source visual's own transform, so scaling the host would
-        // change nothing about what lands in the surface.
+        // The scale goes on the shape, not on the visual. A visual surface captures content
+        // and ignores the source visual's own transform, so scaling the host would change
+        // nothing about what lands in the surface.
         shape.set_scale(Vector2 { x: scale, y: scale });
         host.shapes().append(&shape);
 
@@ -261,8 +262,8 @@ impl Realizer<'_> {
         let brush = captured.brush.clone();
 
         // A promotion keeps whatever the channels had reached, so a shape that acquires a
-        // trim mid-animation does not restart from the identity. Fresh, the window is the
-        // whole path and the stroke is one DIP with no dash phase.
+        // trim mid-animation does not restart from the identity. Fresh, the trim window is
+        // the whole path and the stroke is one DIP with no dash phase.
         let (trim, stroke) = node
             .shape
             .as_ref()
@@ -278,16 +279,15 @@ impl Realizer<'_> {
         Some(brush)
     }
 
-    /// The glow: capture a subtree, blur it, tint it, and cast it behind the sprite.
+    /// Captures a subtree, blurs it, tints it, and casts it behind the sprite.
     ///
-    /// The halo under a curve stroke *is* a capture of that stroke, which is why the blur
-    /// and tint live on the paint variant — without them the construction has nowhere to
-    /// state its parameters.
+    /// The halo under a curve stroke is a capture of that stroke, so the blur radius and the
+    /// tint are carried by the paint variant.
     ///
-    /// The shadow is cast by **the sprite this paint belongs to**, not the subtree it
-    /// captures: that puts the blurred silhouette under the real stroke, and it is why the
-    /// state lands on `node`. The glow's channels are addressed to the sprite, so a shadow
-    /// parked anywhere else could never take a write.
+    /// The shadow is cast by the sprite this paint belongs to and not by the subtree it
+    /// captures, which puts the blurred silhouette under the real stroke. The state
+    /// therefore lands on `node`: the glow's channels are addressed to the sprite, and a
+    /// shadow parked on any other node could never take a write.
     fn glow(
         &mut self,
         node: &mut Node,
@@ -304,10 +304,9 @@ impl Realizer<'_> {
         let shadow = self.back.compositor.create_drop_shadow();
         shadow.set_blur_radius(blur);
         shadow.set_mask(&brush);
-        // At zero offset a shadow *is* a glow. Its colour is eight-bit, and that is the
-        // right precision for it — a shadow is darkness rather than light and never needs to
-        // exceed the display's white — so the authored tint goes through the display
-        // transform first and agrees with everything beside it.
+        // At zero offset a shadow is a glow. Its colour is eight-bit and never exceeds the
+        // display's white, so the authored tint goes through the display transform first
+        // and agrees with everything beside it.
         shadow.set_offset(0.0, 0.0, 0.0);
         shadow.set_color(color_of(self.env.apply(tint)));
         node.sprite.as_ref()?.set_shadow(&shadow);
@@ -322,11 +321,11 @@ impl Realizer<'_> {
     }
 }
 
-/// Whether anything is driving a channel only the capture route can carry.
+/// Returns `true` where a channel only the capture route can carry is held.
 ///
-/// Trim and the dash phase live on a sprite shape, so a clip cannot express them. A channel
-/// driven once will be driven again, so a stopped animation counts as much as a running
-/// one — otherwise a control demotes to the clip route between two hovers.
+/// Trim and the dash phase live on a sprite shape, so a clip cannot express them. A held
+/// channel counts whether or not its animation is running, so a control does not demote to
+/// the clip route between two hovers.
 fn draws_on(node: &Node) -> bool {
     [Prop::TrimStart, Prop::TrimEnd, Prop::DashOffset]
         .iter()
@@ -351,14 +350,16 @@ fn join_of(join: Join) -> StrokeJoin {
     }
 }
 
-/// Eight-bit, for the one place the platform offers nothing better.
+/// Narrows a display-referred colour to the compositor's eight-bit `Color`, for the shadow
+/// slot, which accepts nothing wider.
 fn color_of(c: Scrgb) -> Color {
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     Color::rgba(byte(c.r), byte(c.g), byte(c.b), byte(c.a))
 }
 
 impl crate::Scene {
-    /// Realizes a sprite, resolving the one thing that lives on another node first.
+    /// Realizes a sprite, first resolving the captured group's visual, which lives on
+    /// another node.
     pub(crate) fn rebind(&mut self, id: SpriteId, back: &Backends, env: Env) -> Result<()> {
         let glow = match self.nodes.get(id.node()).and_then(|n| n.painted.as_ref()) {
             Some(p) => match p.paint {

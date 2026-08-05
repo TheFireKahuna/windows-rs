@@ -1,8 +1,8 @@
-//! Drop shadows: a compositor-side Gaussian (feature `system`).
+//! Drop shadows: a Gaussian blur the compositor evaluates (feature `system`).
 //!
-//! The blur happens in the compositor process from an alpha mask, so a shadow costs the
-//! app no rasterization and no drawing surface. At zero offset it is a glow, and unlike
-//! an effect graph it needs no Direct2D interop at all.
+//! The blur runs in the compositor process from an alpha mask, so a shadow costs the app
+//! no rasterization, no drawing surface and no Direct2D interop. At zero offset it is a
+//! glow.
 
 use super::*;
 
@@ -10,9 +10,8 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShadowSource {
     /// The [mask](DropShadow::set_mask) if one is assigned, and **a rectangle the size of
-    /// the visual if none is**. This is the platform default, and the "or a rectangle" half
-    /// is the part that surprises: a shadow configured this way with no mask is a box
-    /// shadow, not a missing one.
+    /// the visual if none is**. The platform default: with no mask assigned the shadow is
+    /// a box the size of the visual, not an absent one.
     MaskOrRectangle,
     /// A mask derived from the alpha of the visual's own brush, so the shadow matches
     /// whatever the visual actually paints.
@@ -30,14 +29,13 @@ impl From<ShadowSource> for bindings::CompositionDropShadowSourcePolicy {
 
 /// A blurred silhouette cast behind a [`SpriteVisual`].
 ///
-/// Its colour is a `Windows.UI.Color` and therefore 8-bit — which is the right precision
-/// for a shadow, since a shadow is darkness rather than light and never needs to exceed
-/// paper white.
+/// Its colour is a `Windows.UI.Color` and therefore 8-bit, which a shadow stays inside: it
+/// darkens and never needs values above paper white.
 ///
-/// Every property here is animatable through [`Animatable`], and the shape of the shadow is
-/// what it costs: a rectangular one is cheap, an assigned mask or
-/// [`ShadowSource::VisualAlpha`] is expensive, and **animating the blur radius is
-/// expensive** — a static blur is not.
+/// Every property here is animatable through [`Animatable`]. Cost follows the silhouette:
+/// a rectangular shadow is cheap, an assigned mask or [`ShadowSource::VisualAlpha`] is
+/// not, and **animating the blur radius re-blurs every frame** where a static blur does
+/// not.
 ///
 /// A shadow is not clipped by the implicit clip a visual's size implies, but it *is* clipped
 /// by an explicit [clip](Visual::set_clip) — so a shadow inside a clipped group is cut off

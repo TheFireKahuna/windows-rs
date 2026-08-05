@@ -1,16 +1,15 @@
-//! BT.2100 ICtCp and BT.2124 ΔE-ITP — the authoring space.
+//! BT.2100 ICtCp and BT.2124 ΔE-ITP, the space colours are authored in.
 //!
-//! BT.2100 defines its LMS matrix *from* Rec.2020, so with [`Radiance`] in Rec.2020
-//! the conversion is the Recommendation's chain verbatim: one published `/4096`
-//! matrix, PQ, one published `/4096` matrix, and two const inverses. Rec.709 does not
-//! appear here at all.
+//! BT.2100 defines its LMS matrix from Rec.2020 and [`Radiance`] is in Rec.2020, so
+//! the conversion is the Recommendation's own chain: one published `/4096` matrix, PQ,
+//! a second `/4096` matrix, and two const inverses. Rec.709 does not appear here.
 
 use crate::matrix::{Mat3, Mat3f, inv, narrow};
 use crate::{Radiance, pq};
 
-/// BT.2100 linear Rec.2020 -> LMS. The Recommendation's exact `/4096` integers, with
-/// crosstalk already folded in; the rows sum to exactly 1, so a neutral maps to
-/// `L = M = S` and therefore to zero chroma.
+/// BT.2100 linear Rec.2020 -> LMS, the Recommendation's exact `/4096` integers with
+/// crosstalk folded in. The rows sum to exactly 1, so a neutral maps to `L = M = S`
+/// and therefore to zero chroma.
 pub(crate) const M_2020_TO_LMS: Mat3 = [
     [1688.0 / 4096.0, 2146.0 / 4096.0, 262.0 / 4096.0],
     [683.0 / 4096.0, 2951.0 / 4096.0, 462.0 / 4096.0],
@@ -38,8 +37,9 @@ pub(crate) const F_ICTCP_TO_LMS: Mat3f = narrow(M_ICTCP_TO_LMS);
 /// and protan (red-green) chroma axes. The space is hue-linear, which is what lets
 /// gamut compression hold hue exactly while it moves chroma.
 ///
-/// Never interpolate linear light here, and never interpolate this in linear light.
-/// [`Ictcp::mix`] is the one interpolation primitive.
+/// [`Ictcp::mix`] is the interpolation primitive for this space. A blend of the same
+/// two endpoints taken in linear light passes through the desaturated middle instead
+/// of the perceptual path.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct Ictcp {
     /// Intensity: PQ-encoded achromatic axis.
@@ -51,46 +51,47 @@ pub struct Ictcp {
 }
 
 impl Ictcp {
-    /// Construct from raw axes. Prefer [`Ictcp::polar`] for authoring.
+    /// Constructs a coordinate from raw axes. [`Ictcp::polar`] takes luminance, chroma
+    /// and hue instead.
     #[must_use]
     pub const fn new(i: f32, ct: f32, cp: f32) -> Self {
         Self { i, ct, cp }
     }
 
-    /// Author a colour: absolute luminance in cd/m², chroma magnitude, hue in
-    /// degrees. The only constructor a palette needs.
+    /// Constructs a coordinate from absolute luminance in cd/m², chroma magnitude, and
+    /// hue in degrees.
     ///
-    /// Luminance is absolute because the pipeline is scene-referred throughout. A
-    /// ratio to some reference white is a display-referred habit in absolute
-    /// clothing, and it would be a second luminance encoding to keep in step.
+    /// Luminance is absolute rather than a ratio to a reference white, because the
+    /// pipeline is scene-referred from authoring up to the display transform.
     #[must_use]
     pub fn polar(nits: f32, chroma: f32, hue_deg: f32) -> Self {
         let (sin, cos) = hue_deg.to_radians().sin_cos();
         Self::new(pq::encode(nits), chroma * cos, chroma * sin)
     }
 
-    /// Chroma magnitude, `sqrt(Ct² + Cp²)`.
+    /// Returns the chroma magnitude, `sqrt(Ct² + Cp²)`.
     #[must_use]
     pub fn chroma(self) -> f32 {
         self.ct.hypot(self.cp)
     }
 
-    /// Hue angle in degrees, `atan2(Cp, Ct)`, normalised to `[0, 360)` so that it
-    /// reads back what [`Ictcp::polar`] was given.
+    /// Returns the hue angle in degrees, `atan2(Cp, Ct)`, normalised to `[0, 360)` so
+    /// that it reads back the angle given to [`Ictcp::polar`].
     #[must_use]
     pub fn hue(self) -> f32 {
         let h = self.cp.atan2(self.ct).to_degrees();
         if h < 0.0 { h + 360.0 } else { h }
     }
 
-    /// The achromatic luminance this intensity encodes, in cd/m².
+    /// Returns the achromatic luminance the intensity axis encodes, in cd/m².
     #[must_use]
     pub fn nits(self) -> f32 {
         pq::decode(self.i)
     }
 
-    /// The same hue and intensity at a different chroma. Scaling both axes by one
-    /// factor preserves `atan2(Cp, Ct)` exactly, not approximately.
+    /// Returns this coordinate at a different chroma magnitude, holding hue and
+    /// intensity. Both axes scale by one factor, so `atan2(Cp, Ct)` is preserved
+    /// exactly. A neutral has no hue to hold and is returned unchanged.
     #[must_use]
     pub fn with_chroma(self, chroma: f32) -> Self {
         let c = self.chroma();
@@ -101,23 +102,25 @@ impl Ictcp {
         Self::new(self.i, self.ct * s, self.cp * s)
     }
 
-    /// The same chromaticity at a different luminance.
+    /// Returns this coordinate at a different luminance, holding both chroma axes.
     #[must_use]
     pub fn with_nits(self, nits: f32) -> Self {
         Self::new(pq::encode(nits), self.ct, self.cp)
     }
 
-    /// Scale chroma by a factor, holding hue and intensity. The gamut stage's step.
+    /// Scales both chroma axes by `s`, holding hue and intensity. The gamut stage's
+    /// bisection step.
     #[must_use]
     pub(crate) fn scale_chroma(self, s: f32) -> Self {
         Self::new(self.i, self.ct * s, self.cp * s)
     }
 
-    /// BT.2124 ΔE-ITP: perceptual difference, scaled so `1.0` is about one JND. ITP
-    /// rescales the chroma axes (`T = 0.5 * Ct`) before the Euclidean distance.
+    /// Returns the BT.2124 ΔE-ITP difference between two coordinates, scaled so that
+    /// `1.0` is about one JND. ITP rescales the chroma axes (`T = 0.5 * Ct`) before
+    /// taking the Euclidean distance.
     ///
-    /// This is the legibility metric, and it is evaluated on authored values — never
-    /// on post-transform panel values, which vary by display.
+    /// Meaningful on authored coordinates. Post-transform values differ from panel to
+    /// panel, so a difference measured there is not a property of the palette.
     #[must_use]
     pub fn delta_itp(self, other: Self) -> f32 {
         let di = self.i - other.i;
@@ -126,19 +129,19 @@ impl Ictcp {
         720.0 * (di * di + dt * dt + dp * dp).sqrt()
     }
 
-    /// Perceptually even interpolation, componentwise in ICtCp.
+    /// Interpolates componentwise between `a` and `b` at `t`, which is perceptually
+    /// even in this space.
     ///
     /// Endpoints of different hue interpolate through the achromatic axis, which is
-    /// what "linear in an opponent space" means and is usually what a UI ramp wants.
-    /// A ramp that should travel *around* the hue circle is expressed as extra stops,
-    /// which is what this primitive is for.
+    /// what interpolating linearly in an opponent space does. A ramp that must travel
+    /// around the hue circle takes intermediate stops.
     #[must_use]
     pub fn mix(a: Self, b: Self, t: f32) -> Self {
         let l = |x: f32, y: f32| x + (y - x) * t;
         Self::new(l(a.i, b.i), l(a.ct, b.ct), l(a.cp, b.cp))
     }
 
-    /// Resolve to scene light at the given alpha.
+    /// Converts to scene light, carrying `alpha` through as straight alpha.
     #[must_use]
     pub fn to_radiance(self, alpha: f32) -> Radiance {
         let [r, g, b] = to_2020(self);
@@ -147,15 +150,15 @@ impl Ictcp {
 }
 
 impl Radiance {
-    /// The authoring coordinate for this light. Alpha is dropped — ICtCp is a colour
-    /// coordinate, not a composite.
+    /// Returns the ICtCp coordinate for this light. Alpha is dropped; ICtCp carries
+    /// colour, not coverage.
     #[must_use]
     pub fn to_ictcp(self) -> Ictcp {
         from_2020([self.r, self.g, self.b])
     }
 }
 
-/// Linear Rec.2020 in cd/m² -> ICtCp.
+/// Converts linear Rec.2020 in cd/m² to ICtCp.
 pub(crate) fn from_2020(rgb: [f32; 3]) -> Ictcp {
     let lms = crate::matrix::apply(&F_2020_TO_LMS, rgb);
     let lms_p = [pq::encode(lms[0]), pq::encode(lms[1]), pq::encode(lms[2])];
@@ -163,14 +166,14 @@ pub(crate) fn from_2020(rgb: [f32; 3]) -> Ictcp {
     Ictcp::new(i, ct, cp)
 }
 
-/// ICtCp -> linear Rec.2020 in cd/m².
+/// Converts ICtCp to linear Rec.2020 in cd/m².
 pub(crate) fn to_2020(c: Ictcp) -> [f32; 3] {
     let lms = decode_lms(c);
     crate::matrix::apply(&F_LMS_TO_2020, lms)
 }
 
-/// ICtCp -> LMS in cd/m². Shared with the gamut stage, which needs LMS so it can go
-/// straight to an arbitrary target's primaries without a Rec.2020 detour.
+/// Decodes ICtCp to LMS in cd/m². The gamut stage converts from LMS straight into a
+/// target's primaries, with no Rec.2020 intermediate.
 #[inline]
 pub(crate) fn decode_lms(c: Ictcp) -> [f32; 3] {
     let lms_p = crate::matrix::apply(&F_ICTCP_TO_LMS, [c.i, c.ct, c.cp]);
@@ -189,8 +192,8 @@ mod tests {
         (a - b).abs() <= tol
     }
 
-    /// The `/4096` rows sum to exactly 1, so a neutral must land on `L = M = S` and
-    /// therefore on zero chroma. If a matrix entry is mistyped, this fails first.
+    /// The `/4096` rows sum to exactly 1, so a neutral lands on `L = M = S` and
+    /// therefore on zero chroma.
     #[test]
     fn neutrals_have_zero_chroma() {
         for nits in [0.5f32, 2.0, 61.0, 203.0, 438.0, 1000.0] {
@@ -211,10 +214,9 @@ mod tests {
         ];
         for s in samples {
             let rt = to_2020(from_2020(s));
-            // Tolerance against the vector's own magnitude, not per channel: the chain
-            // is a matrix pair around a PQ round trip, so a small channel beside a
-            // large one carries the large one's absolute error, and judging it against
-            // its own value would be measuring the wrong thing.
+            // Tolerance against the vector's magnitude, not per channel: the chain is a
+            // matrix pair around a PQ round trip, so a small channel carries the
+            // absolute error of the large one beside it.
             let mag = s[0].abs().max(s[1].abs()).max(s[2].abs());
             for k in 0..3 {
                 assert!(
@@ -265,15 +267,14 @@ mod tests {
         // An achromatic pair's distance is exactly 720 * dI.
         let want = 720.0 * (pq::encode(203.0) - pq::encode(61.0));
         assert!(close(a.delta_itp(b), want, 1e-2));
-        // A few nits around 200 is a few JND: sane magnitude, not 0.001 and not 10^4.
+        // A few nits around 200 is a few JND.
         let d = w(203.0).delta_itp(w(200.0));
         assert!(d > 0.3 && d < 10.0, "JND scale off: {d}");
     }
 
-    /// The point of mixing in ICtCp: equal steps in `t` are equal steps to the eye,
-    /// so the perceptual midpoint of black -> white sits far below the linear-light
-    /// midpoint. If this ever reads as a linear lerp, the ramp primitive has been
-    /// quietly rewired.
+    /// Equal steps in `t` are equal perceptual steps, so the midpoint of a dark-to-
+    /// white ramp sits far below the linear-light midpoint and is roughly equidistant
+    /// from both ends in ΔE-ITP.
     #[test]
     fn mix_is_perceptual_not_linear() {
         let a = from_2020([2.0, 2.0, 2.0]);

@@ -1,8 +1,8 @@
-//! What the module claims, asserted without a window.
+//! Headless tests for the automation tree: what a publish builds, what a query resolves,
+//! and what each path allocates.
 //!
-//! Everything here runs headless, which is itself the point: a query resolves against a
-//! published snapshot and reaches no compositor, no pump and no COM apartment, so the
-//! whole query surface is testable as data.
+//! A query resolves against a published snapshot, so nothing here needs a compositor, a
+//! message pump or a COM apartment.
 
 use super::*;
 use crate::widget::{Range, UiaRole};
@@ -25,16 +25,19 @@ fn entry(id: ControlId, parent: u32, rect: (f32, f32, f32, f32)) -> HitEntry {
     }
 }
 
+/// A screen under construction: its hit entries, its seeds, and the authority that minted
+/// their control ids.
 pub(super) struct Screen {
     entries: Vec<HitEntry>,
     seeds: Seeds,
-    /// The real authority, so the ids under test are the ids the stack produces —
-    /// dense from one and generational, never the fragment root.
+    /// The authority the stack itself uses, so an id under test is dense from one and
+    /// generational, and never collides with the root's `ControlId::NONE`.
     authority: windows_scene::Ids<windows_scene::Control>,
     minted: Vec<ControlId>,
 }
 
 impl Screen {
+    /// Returns an empty screen whose id authority has minted nothing.
     pub(super) fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -44,12 +47,12 @@ impl Screen {
         }
     }
 
-    /// A fresh screen continuing this one's id authority, with everything this one minted
-    /// **released**.
+    /// Returns an empty screen that continues this one's id authority, releasing every id
+    /// this one minted.
     ///
-    /// Which is what an unmount does, and the only thing that makes a stale id stale: ids
-    /// are dense, so a second authority would hand the replacement screen the very ids the
-    /// first one used and nothing would be stale at all.
+    /// The release is what makes those ids stale. Ids are dense, so a second authority
+    /// would hand the replacement screen the same ids the first one used and nothing would
+    /// go stale at all.
     pub(super) fn successor(mut self) -> Self {
         for id in self.minted.drain(..) {
             self.authority.release(id);
@@ -62,11 +65,16 @@ impl Screen {
         }
     }
 
-    /// The id of the `index`th element this screen added.
+    /// Returns the control id of the `index`th element added to this screen.
     fn control(&self, index: u32) -> ControlId {
         self.minted[index as usize]
     }
 
+    /// Adds an interactive element under `parent` and returns its entry index.
+    ///
+    /// `parent` is an entry index, or `NO_ENTRY` for a root-level element. The element is
+    /// focusable and enabled, carries no value, and takes its id from this screen's
+    /// authority.
     pub(super) fn add(
         &mut self,
         parent: u32,
@@ -92,19 +100,26 @@ impl Screen {
         index
     }
 
+    /// Adds a slider named `gain` under `parent`, bounded by `range`, and returns its entry
+    /// index.
     pub(super) fn slider(&mut self, parent: u32, rect: (f32, f32, f32, f32), range: Range) -> u32 {
         let index = self.add(parent, rect, UiaRole::Slider, "gain");
         self.seeds.rows.last_mut().expect("just pushed").value = Value::Range(range);
         index
     }
 
+    /// Sorts the seeds by id, which the join against the hit array requires, and publishes
+    /// them to `uia` with this screen's entries.
     pub(super) fn publish(&mut self, uia: &mut Uia) {
         self.seeds.sort();
         uia.publish(&self.entries, &self.seeds);
     }
 }
 
-/// A `Uia` that believes a client is attached, without one being.
+/// Returns a [`Uia`] latched as though a client had attached, so a publish builds a tree.
+///
+/// The window origin is at zero and its scale is 1, which keeps a control's bounds equal to
+/// the rect it was laid out with.
 pub(super) fn listening() -> Uia {
     let mut uia = Uia::new();
     uia.latch_for_test();
@@ -149,8 +164,8 @@ fn a_published_tree_carries_its_names_and_its_shape() {
     assert_eq!(tree.col(1).unwrap().next_sibling, 2);
 }
 
-/// Invariant 3: automation's element-from-point and the pointer's hit test are the same
-/// scan over the same array. Not a similar one.
+/// Element-from-point and the pointer's hit test run the same scan over the same hit array,
+/// so the two answer identically at every point.
 #[test]
 fn element_from_point_agrees_with_the_pointer_over_ten_thousand_points() {
     let mut uia = listening();
@@ -165,8 +180,8 @@ fn element_from_point_agrees_with_the_pointer_over_ten_thousand_points() {
     table.replace(&screen.entries);
 
     let tree = uia.tree();
-    // A deterministic sweep rather than a generator: the point of the check is coverage of
-    // the array, not randomness.
+    // A fixed xorshift seed, so the sweep covers the same points on every run. The range
+    // overhangs the card on all four sides, so misses are covered too.
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     for _ in 0..10_000 {
         state ^= state << 13;
@@ -191,10 +206,10 @@ fn element_from_point_agrees_with_the_pointer_over_ten_thousand_points() {
 }
 
 /// A scroll container's own entry names its **ancestor's** offset, because the builder
-/// fills `scroll_src` before pushing the container onto its own stack. Keying the live
-/// table on the containers therefore finds nothing, and the failure is silent: every
-/// lookup answers zero and a scan over scrolled content reports the row that *was* under
-/// the point before the user scrolled.
+/// fills `scroll_src` before pushing the container onto its own stack. The live scroll
+/// table is keyed on the node each entry's `scroll_src` names for that reason. Keyed on the
+/// containers instead, every lookup answers zero and a scan over scrolled content reports
+/// the row that was under the point before the scroll.
 #[test]
 fn a_scrolled_row_is_found_where_it_is_drawn_and_not_where_it_was_laid_out() {
     let mut uia = listening();
@@ -252,7 +267,7 @@ fn a_republish_carries_state_forward_rather_than_resetting_it() {
     uia.set_value(screen.control(slider), -6.0);
 
     // A resize: the same controls in different boxes, with one new element ahead of them
-    // so the indices genuinely move.
+    // so their indices move.
     let mut resized = Screen::new();
     resized.add(NO_ENTRY, (0.0, 0.0, 200.0, 24.0), UiaRole::Text, "output");
     resized.entries.push(entry(
@@ -378,7 +393,7 @@ fn a_live_region_announces_a_change_and_not_a_heartbeat() {
     uia.take_pending_for_test(&mut raised);
     raised.clear();
 
-    // A producer at display rate, drifting by less than the quantum.
+    // A producer at display rate, drifting by less than one announcement quantum in total.
     for step in 0..64 {
         uia.set_value(screen.control(meter), -14.0 + f64::from(step) * 0.001);
     }
@@ -485,10 +500,10 @@ fn releasing_a_control_forgets_what_it_declared() {
     );
 }
 
-// ── what these paths cost ───────────────────────────────────────────────────────
+// ── allocation cost ─────────────────────────────────────────────────────────────
 //
-// The claims worth measuring rather than arguing. A temporary is invisible to a capacity
-// check — it is allocated and freed inside the call — so only a count sees it.
+// These count allocations rather than checking capacity: a temporary allocated and freed
+// inside a call leaves every capacity where it was, so only a count sees it.
 
 use super::element::provider_for;
 use crate::counting::allocations;
@@ -505,8 +520,8 @@ fn the_interaction_path_allocates_nothing() {
         "bypass",
     );
     screen.publish(&mut uia);
-    // Warmed, so the pending set is at its high-water mark: the claim is about a steady
-    // drag, not about the first event of one.
+    // Warm-up, so the pending set reaches its high-water mark before the count starts and
+    // the loop below measures a steady drag rather than the first event of one.
     let mut raised = Vec::new();
     uia.set_value(screen.control(slider), -1.0);
     uia.set_state(screen.control(toggle), State::TOGGLED, true);
@@ -537,11 +552,9 @@ fn a_query_allocates_only_what_com_demands() {
     screen.add(group, (8.0, 8.0, 80.0, 32.0), UiaRole::Button, "mute");
     screen.publish(&mut uia);
     let root = uia.root_for_test();
-    // Warmed: the first ask mints the provider objects and this thread's reference to the
-    // tree. What is being measured is a client walking, not a client attaching.
-    // Minting an element's object costs one map entry — one per element a client has
-    // actually visited, and zero for a session nothing ever queried. What is measured is
-    // the walk after that, which is the path a client repeats.
+    // The first ask mints the provider object and this thread's reference to the tree.
+    // Minting costs one map entry per element a client visits, and nothing for a session
+    // that queried none; the loop below measures the walk a client then repeats.
     let mint = allocations();
     let first = provider_for(&uia.shared, screen.control(1));
     let mint = allocations() - mint;
@@ -563,9 +576,8 @@ fn a_query_allocates_only_what_com_demands() {
     drop(root);
 }
 
-/// The reason parts are not in the tree: a renderer moving its mapping — which is what a
-/// band drag is — must not republish every element on the screen, and must not tell a
-/// client the window's structure changed when it did not.
+/// Region parts live beside the published tree, not in it, so a renderer moving its part
+/// geometry republishes no element and raises no structure-changed event.
 #[test]
 fn a_moving_region_changes_its_parts_and_not_the_tree() {
     use std::sync::Arc;
@@ -621,8 +633,8 @@ fn a_moving_region_changes_its_parts_and_not_the_tree() {
     );
 }
 
-/// A band being dragged republishes its geometry every frame. The join is therefore the
-/// one path here that is not rare, and it has to cost what a hover costs.
+/// A dragged band republishes its part geometry every frame, so the join that picks it up
+/// runs per frame and allocates on neither side of the hand-off.
 #[test]
 fn re_joining_a_moving_region_allocates_nothing() {
     use std::sync::Arc;
@@ -662,7 +674,8 @@ fn re_joining_a_moving_region_allocates_nothing() {
             },
         ]);
     };
-    // Warmed: every buffer on both sides of the hand-off reaches its high-water mark.
+    // Warm-up, so every buffer on both sides of the hand-off reaches its high-water mark
+    // before the count starts.
     for step in 0..4 {
         publish_at(step as f32);
         uia.sync_regions();
@@ -681,7 +694,8 @@ fn re_joining_a_moving_region_allocates_nothing() {
         "a drag joins into buffers it already has, on both sides of the publish"
     );
 
-    // And a tick where the renderer has not moved is one acquire load per region.
+    // A tick where the renderer has published nothing new is one version load per watched
+    // region, and copies no parts.
     let before = allocations();
     for _ in 0..256 {
         uia.sync_regions();
@@ -710,7 +724,7 @@ fn a_publish_allocates_a_bounded_amount_and_an_idle_window_allocates_none() {
          element; it cost {cost}"
     );
 
-    // And a window that is not laid out again publishes nothing at all.
+    // A window that is not laid out again publishes nothing at all.
     let before = allocations();
     for _ in 0..64 {
         uia.set_window(Vector2 { x: 1.0, y: 2.0 }, 1.0);

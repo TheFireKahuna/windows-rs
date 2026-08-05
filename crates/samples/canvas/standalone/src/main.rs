@@ -7,7 +7,8 @@ fn main() -> Result<()> {
     let window = Window::new("Canvas Standalone").size(800, 600).create()?;
 
     let device = GpuDevice::new()?;
-    // `None` once the window is gone, which nothing here can draw into.
+    // `client_size` is `None` for a window already closed, leaving no client area to
+    // size the swap chain to.
     let Some((width, height)) = window.client_size() else {
         return Ok(());
     };

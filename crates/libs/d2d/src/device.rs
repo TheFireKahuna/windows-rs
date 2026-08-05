@@ -1,11 +1,11 @@
-//! The device, which *is* the context.
+//! The device and the one device context that belongs to it.
 //!
-//! Direct2D charges a fixed cost per `BeginDraw`/`EndDraw` pair and a delayed Direct3D
-//! device-context-state swap whenever a second context on the same device starts
-//! drawing. Both are avoided the same way: there is one context per device, it is
-//! created here, and no method hands one out or makes another. A cached intermediate is
-//! rendered by retargeting the open bracket ([`Pass::draw`](crate::Pass::draw)), which
-//! `SetTarget` permits at any time, including while the context is drawing.
+//! Direct2D charges a fixed cost per `BeginDraw`/`EndDraw` pair, and a delayed Direct3D
+//! device-context-state swap whenever a second context on the same device starts drawing.
+//! There is one context per device, it is created here, and no method hands it out or makes
+//! another. A cached intermediate is rendered by retargeting the open bracket
+//! ([`Pass::draw`](crate::Pass::draw)), which `SetTarget` permits at any time, including
+//! while the context is drawing.
 
 use super::*;
 use core::cell::Cell;
@@ -13,10 +13,8 @@ use std::rc::Rc;
 
 /// A Direct2D device and its one device context, plus the Direct3D 11 device underneath.
 ///
-/// Thread-affine for its whole life. [`Clone`] shares the same underlying objects — a
-/// presentation group holds the device its regions draw through, and cloning is how it
-/// does that without a second device — so a clone is emphatically not a second device
-/// and stays on the thread that built the first.
+/// Thread-affine for its whole life. [`Clone`] shares the same underlying objects rather
+/// than building a second device, so a clone stays on the thread that built the first.
 #[derive(Clone)]
 pub struct Gpu(Rc<Inner>);
 
@@ -36,10 +34,9 @@ struct Inner {
     drawing: Cell<bool>,
 }
 
-/// The descending feature-level ladder, which is what `D3D11CreateDevice` is meant to be
-/// given: it walks the list and returns the first level the machine supports. A
-/// single-entry array would be simultaneously a floor no weaker GPU could meet and a
-/// ceiling no stronger one could exceed.
+/// The descending feature-level ladder `D3D11CreateDevice` walks, returning the first level
+/// the machine supports. A single-entry array would be both a floor a weaker GPU could not
+/// meet and a ceiling a stronger one could not exceed.
 const LEVELS: [D3D_FEATURE_LEVEL; 7] = [
     D3D_FEATURE_LEVEL_11_1,
     D3D_FEATURE_LEVEL_11_0,
@@ -51,13 +48,13 @@ const LEVELS: [D3D_FEATURE_LEVEL; 7] = [
 ];
 
 impl Gpu {
-    /// The window thread's device.
+    /// Creates the window thread's device.
     pub fn for_window() -> Result<Self> {
         Self::new(0)
     }
 
-    /// A present thread's device. Additionally suppresses the display driver's own
-    /// worker pool, which a presentation device does not want and pays for per device.
+    /// Creates a present thread's device, suppressing the display driver's own worker pool,
+    /// which the driver otherwise creates per device.
     pub fn for_presentation() -> Result<Self> {
         Self::new(D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS)
     }
@@ -65,9 +62,9 @@ impl Gpu {
     fn new(extra: D3D11_CREATE_DEVICE_FLAG) -> Result<Self> {
         let flags =
             (D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED | extra) as u32;
-        // One fallback, for the whole device, and then a hard error. A machine with no
-        // hardware Direct3D at all still renders through WARP; a machine where WARP also
-        // fails has no graphics stack to host a window on.
+        // One fallback and then a hard error: a machine with no hardware Direct3D still
+        // renders through WARP, and a machine where WARP also fails has no graphics stack to
+        // host a window on.
         let d3d = d3d11(D3D_DRIVER_TYPE_HARDWARE, flags)
             .or_else(|_| d3d11(D3D_DRIVER_TYPE_WARP, flags))?;
         let dxgi: IDXGIDevice = d3d.cast()?;
@@ -84,26 +81,29 @@ impl Gpu {
         })))
     }
 
-    /// The Direct2D device, for a compositor's graphics-device interop.
+    /// Returns the Direct2D device, for a compositor's graphics-device interop.
     ///
-    /// One `Gpu` per compositor, and only this one: when the compositor realizes a
-    /// [`CompositionPath`] it asks the geometry source for geometry belonging to a
-    /// factory of its own choosing, and nothing on either side of that callback can
-    /// verify the match. A geometry from a different `Gpu` surfaces as content that
-    /// never appears, not as an error.
+    /// One `Gpu` per compositor. When the compositor realizes a [`CompositionPath`] it asks
+    /// the geometry source for geometry belonging to a factory of its own choosing, and
+    /// nothing on either side of that callback verifies the match, so a geometry from a
+    /// different `Gpu` renders as content that never appears rather than as an error.
     ///
     /// [`CompositionPath`]: https://learn.microsoft.com/uwp/api/windows.ui.composition.compositionpath
     pub fn d2d(&self) -> &impl Interface {
         &self.0.device
     }
 
-    /// The Direct3D 11 device, for a presentation region's own buffer allocation. Cast
-    /// it to the caller's `ID3D11Device` projection; it is the same object.
+    /// Returns the Direct3D 11 device, for a presentation region's own buffer allocation.
+    /// Cast it to the caller's `ID3D11Device` projection; it is the same object.
     pub fn d3d(&self) -> &impl Interface {
         &self.0.dxgi
     }
 
-    /// Opens the drawing bracket. `Err` if one is already open on this device.
+    /// Opens the drawing bracket.
+    ///
+    /// # Errors
+    ///
+    /// `E_INVALIDARG` when a bracket is already open on this device.
     pub fn pass(&self) -> Result<Pass<'_>> {
         if self.0.drawing.replace(true) {
             return Err(windows_core::Error::from_hresult(E_INVALIDARG));
@@ -159,19 +159,21 @@ fn d3d11(kind: D3D_DRIVER_TYPE, flags: u32) -> Result<windows_core::IUnknown> {
     }
 }
 
-/// Probes the two capabilities this stack has no fallback for, then sets the context
-/// state that is a property of the pipeline rather than of a frame.
+/// Probes the two capabilities this crate has no fallback for, then sets the context state
+/// that belongs to the pipeline rather than to a frame.
 ///
-/// Shared with the composition bridge, because a composition drawing surface hands back
-/// a context created for that call rather than this one — so the same settings have to be
-/// restated there, and restating them from one function is how they cannot drift.
+/// Shared with the composition bridge, whose surfaces hand back a context created for that
+/// call: restating the settings from one function keeps the two contexts in step.
+///
+/// # Errors
+///
+/// `E_FAIL` where the device lacks FP16 render targets or 16-bit float buffer precision.
 pub(crate) fn configure(ctx: &ID2D1DeviceContext6) -> Result<()> {
     unsafe {
-        // Feature-level 9 hardware may support neither, and quietly falling back to 8
-        // bits per channel is the exact failure the FP16 pipeline exists to prevent: the
-        // surface becomes a colour-managed island whose transform we do not control.
-        // There is no fallback path in this stack, so the honest report is a hard error
-        // at construction rather than washed-out colour at run time.
+        // Feature-level 9 hardware may support neither. Falling back to 8 bits per channel
+        // would make the surface a colour-managed island whose transform this crate does
+        // not control, and there is no such fallback path, so an unsupported device fails
+        // at construction.
         if !ctx.IsDxgiFormatSupported(FORMAT).as_bool()
             || !ctx
                 .IsBufferPrecisionSupported(D2D1_BUFFER_PRECISION_16BPC_FLOAT)
@@ -182,33 +184,26 @@ pub(crate) fn configure(ctx: &ID2D1DeviceContext6) -> Result<()> {
 
         ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
 
-        // DIPs, everywhere, for the whole life of the device — the one coordinate space this
-        // crate has. Direct2D applies the DPI scale by default in this mode, which is what
-        // stops every call site from having to discover and apply the scalar itself; the
-        // documentation names that as one of the simplest reasons applications get high-DPI
-        // wrong. It is also the space DirectWrite measures in, so a glyph run needs no
-        // hand-scaled em size, and the space layout solves in.
-        //
-        // Pixels are available and are *not* used. They would suit a cache cell, whose
-        // identity is a pixel extent — but the cell's radius and its glyph sizes are
-        // authored in DIPs, so pixel space would convert them down only for Direct2D to
-        // scale them back up. Allocation is in pixels; coordinates never are.
+        // DIPs for the whole life of the device: the one coordinate space this crate has.
+        // Direct2D applies the DPI scale in this mode, so no call site discovers and applies
+        // the scalar itself. It is also the space DirectWrite measures in, so a glyph run
+        // needs no hand-scaled em size, and the space layout solves in. Allocation is in
+        // pixels; coordinates never are.
         ctx.SetUnitMode(D2D1_UNIT_MODE_DIPS);
 
-        // ClearType on a surface with an alpha channel produces unpredictable results,
-        // and Direct2D switches away from it on its own for any alpha mode but IGNORE.
-        // Stating it means a target that *does* ignore alpha gets the same glyphs.
+        // ClearType on a surface with an alpha channel produces unpredictable results, and
+        // Direct2D switches away from it for any alpha mode but IGNORE. Stating grayscale
+        // gives a target that ignores alpha the same glyphs as one that does not.
         ctx.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
-        // Direct2D "makes no guarantees about if or where" it materializes an effect
-        // graph's intermediates, and their default precision is limited-range — which
-        // would silently clamp every extended-range value passing through one. Setting
-        // it here, before any caller sees the context, means a graph built later inherits
-        // the right precision by default and cannot be built without it.
+        // Direct2D gives no guarantee about if or where it materializes an effect graph's
+        // intermediates, and their default precision is limited-range, which clamps every
+        // extended-range value passing through one. Set before any caller sees the context,
+        // so a graph built later inherits this precision.
         //
-        // Read-modify-write rather than construct: the struct also carries a tile
-        // allocation size, and zero is rejected outright, so the only way to change
-        // precision without inventing a tile size is to put back the one Direct2D chose.
+        // Read-modify-write rather than construct: the struct also carries a tile allocation
+        // size and zero is rejected, so changing precision without inventing a tile size
+        // means putting back the one Direct2D chose.
         let mut controls = ctx.GetRenderingControls();
         controls.bufferPrecision = D2D1_BUFFER_PRECISION_16BPC_FLOAT;
         ctx.SetRenderingControls(&controls);
@@ -216,9 +211,9 @@ pub(crate) fn configure(ctx: &ID2D1DeviceContext6) -> Result<()> {
     Ok(())
 }
 
-/// What a failing `HRESULT` means for recovery. Two outcomes and not a boolean, because
-/// the two have independent scopes: a lost target does not cost the device, and a lost
-/// device costs every target, brush, path and realization built from it.
+/// What a failing `HRESULT` means for recovery. The two losses have independent scopes: a
+/// lost target does not cost the device, and a lost device costs every target, brush, path
+/// and realization built from it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Loss {
     /// Not a loss.

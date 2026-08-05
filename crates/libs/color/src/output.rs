@@ -1,25 +1,24 @@
-//! The display output transform — the last stage before the compositor.
+//! The display output transform, the last stage before the compositor.
 //!
-//! Three facts about the platform decide everything here.
+//! The platform constrains this module in four ways.
 //!
-//! **DWM's canonical composition colour space is scRGB FP16** — BT.709 primaries,
-//! linear gamma, half precision. It converts every application into that space before
-//! blending, so that is what an application hands it.
+//! DWM's canonical composition colour space is scRGB FP16: BT.709 primaries, linear
+//! gamma, half precision. It converts every application into that space before
+//! blending, so that is the space an application hands it.
 //!
-//! **scRGB's extended range is the wide-gamut mechanism, not a side effect.** Values
-//! outside `[0, 1]` represent colours outside sRGB and luminance above 80 nits, and
-//! there is no enforced clamp. Encoding in Rec.709 primaries therefore loses no
-//! gamut: a 3x3 on floats is an exact change of basis.
+//! scRGB's extended range carries the wide gamut. Values outside `[0, 1]` represent
+//! colours outside sRGB and luminance above 80 nits, and nothing clamps them, so
+//! encoding in Rec.709 primaries loses no gamut — a 3x3 on floats is an exact change
+//! of basis.
 //!
-//! **Windows does not gamut-map or tonemap for an application.** Colours beyond the
+//! Windows does not gamut-map or tonemap for an application. Colours beyond the
 //! display's gamut are numerically clipped, per channel, which rotates hue.
 //!
-//! And one distinction that is easy to get wrong, because "Advanced Color is on" does
-//! **not** imply headroom: composition is scene-referred only on an HDR display. On a
-//! wide-gamut SDR display it is display-referred — `1.0` is the panel's white and
-//! there is nothing above it — so a WCG desktop needs the tone stage exactly as much
-//! as a plain SDR one. It differs from plain SDR in the gamut it can reach, and in
-//! nothing else.
+//! Advanced Color being on does not imply headroom. Composition is scene-referred only
+//! on an HDR display; on a wide-gamut SDR display it is display-referred, where `1.0`
+//! is the panel's white and there is nothing above it. A wide-gamut desktop therefore
+//! needs the tone stage exactly as much as a plain SDR one, and differs from it only
+//! in the gamut it can reach.
 
 use crate::matrix::{self, Mat3f};
 use crate::{Gamut, Ictcp, REFERENCE_WHITE_NITS, Radiance, SCRGB_UNITY_NITS, Scrgb, ictcp};
@@ -30,16 +29,15 @@ const INTENSITY_STEPS: u32 = 18;
 
 /// What the window's current display can present.
 ///
-/// The arms carry different data because they *are* different: a white level is
-/// meaningful only where composition is scene-referred, and panel primaries are
-/// reachable only where Windows colour-manages. Reading a white level on a
-/// wide-gamut display is a compile error rather than a brightness bug.
+/// Each arm carries only the data its desktop defines: a white level is meaningful
+/// only where composition is scene-referred, and panel primaries only where Windows
+/// colour-manages. Reading a white level off a wide-gamut display is a compile error.
 ///
 /// Populated from `Windows.Graphics.Display.AdvancedColorInfo`'s
-/// `CurrentAdvancedColorKind`, primaries and luminances. Not from DXGI:
-/// `IDXGIOutput6` cannot distinguish a wide-gamut display from a plain SDR one, so a
-/// DXGI-sourced capability would select Rec.709 and discard the whole wide gamut on
-/// exactly the class of display auto colour management exists to serve.
+/// `CurrentAdvancedColorKind`, primaries and luminances. `IDXGIOutput6` cannot
+/// distinguish a wide-gamut display from a plain SDR one, so a DXGI-sourced capability
+/// selects Rec.709 and discards the wide gamut on exactly the displays auto colour
+/// management serves.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum DisplayCapability {
     /// `StandardDynamicRange`. Not colour-managed: scRGB is interpreted as sRGB and
@@ -64,11 +62,11 @@ pub enum DisplayCapability {
     },
 }
 
-/// Everything the current display implies, folded into one cheap function.
+/// The exposure, tone, gamut and encode stages resolved for one display capability.
 ///
-/// A plain value: construct one per display-capability change and hand it to whoever
-/// draws. There is no global state, so it is testable with no device and two
-/// capabilities can be compared side by side in one process.
+/// A plain value with no global state: construct one per display-capability change and
+/// hand it to whatever draws. Neither construction nor [`OutputTransform::apply`]
+/// touches a device, so two capabilities can be resolved side by side in one process.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct OutputTransform {
     /// Authored nits -> presented nits.
@@ -84,23 +82,23 @@ pub struct OutputTransform {
     /// Presented headroom above diffuse white, in nits. Zero on a display-referred
     /// desktop, which degenerates the shoulder to a hue-preserving clamp.
     head: f32,
-    /// Presented nits above which the shoulder engages. Infinite when the content
-    /// already fits the display, which is how "no tonemap" stops being a mode.
+    /// Presented nits above which the shoulder engages, or infinity when the content
+    /// already fits the display.
     knee: f32,
-    /// The exposed content peak, for the debug assertion in [`OutputTransform::apply`].
+    /// The declared content peak after exposure, in presented nits. Bounds the debug
+    /// assertion in [`OutputTransform::apply`].
     peak_limit: f32,
 }
 
 impl OutputTransform {
-    /// Resolve a capability into a transform.
+    /// Resolves a display capability into a transform.
     ///
-    /// `content_peak_nits` is the application's **mastering statement**: the brightest
-    /// *channel* its palette authors, which for a saturated colour is well above that
-    /// colour's ICtCp intensity — [`Radiance::peak_nits`] over the resolved palette is
-    /// the way to compute it. It decides whether the shoulder engages at all, so
-    /// under-declaring it means content above the display's ceiling reaches the
-    /// compositor and is clipped per channel. The debug assertion in
-    /// [`OutputTransform::apply`] reports that.
+    /// `content_peak_nits` must be the brightest *channel* the application's palette
+    /// authors — [`Radiance::peak_nits`] maximised over the resolved palette — which
+    /// for a saturated colour is well above that colour's ICtCp intensity. It decides
+    /// whether the shoulder engages, so a value below the true peak lets content above
+    /// the display's ceiling reach the compositor and be clipped per channel. The debug
+    /// assertion in [`OutputTransform::apply`] reports that case.
     #[must_use]
     pub fn for_display(cap: DisplayCapability, content_peak_nits: f32) -> Self {
         let (exposure, encode, gamut, ceiling) = match cap {
@@ -139,10 +137,8 @@ impl OutputTransform {
             to_709: Gamut::REC709.matrix_from_2020(),
             white,
             head: (ceiling - white).max(0.0),
-            // Engage only when the content actually overflows the display. When it
-            // fits — an HDR panel with real headroom — every colour passes at its
-            // authored luminance and the speculars punch, instead of being
-            // compressed for no reason.
+            // The shoulder engages only when the content overflows the display. Where
+            // it fits, every colour passes at its authored luminance.
             knee: if peak_limit > ceiling {
                 white
             } else {
@@ -152,32 +148,39 @@ impl OutputTransform {
         }
     }
 
-    /// What to hold before the first capability arrives: the `Sdr` arm.
+    /// Returns the transform to hold before the display's capability is known: the
+    /// `Sdr` arm.
     ///
-    /// Deliberately **not** an identity. An identity map presents diffuse white at
-    /// scRGB 2.5375, and on a display-referred desktop the whole upper palette clips
-    /// per channel and rotates hue. The `Sdr` arm clips nothing on any of the three
-    /// desktops, and on an HDR panel merely renders at reference white until the real
-    /// capability arrives one event later.
+    /// The `Sdr` arm clips on none of the three desktops, and on an HDR panel presents
+    /// at reference white until the real capability resolves. An identity map would
+    /// present diffuse white at scRGB 2.5375, which a display-referred desktop clips
+    /// per channel, rotating hue across the upper palette.
     ///
-    /// There is no `Default` impl, because a safe transform cannot be built without
-    /// knowing the content peak.
+    /// There is no `Default` impl: a transform cannot be resolved without the content
+    /// peak.
     #[must_use]
     pub fn pre_fit(content_peak_nits: f32) -> Self {
         Self::for_display(DisplayCapability::Sdr, content_peak_nits)
     }
 
-    /// Authored scene light -> the value handed to the compositor.
+    /// Converts authored scene light into the value handed to the compositor.
     ///
-    /// This is the **only** function producing an [`Scrgb`], and nothing converts one
-    /// back, so the display transform runs exactly once per colour by construction
-    /// rather than by discipline.
+    /// The only function producing an [`Scrgb`], and nothing converts one back, so the
+    /// display transform runs exactly once per colour.
     ///
-    /// Each stage spends only the resource that ran out. Luminance ran out — the
-    /// display cannot go brighter — so the tone stage spends luminance and holds hue
-    /// and chroma exactly. Chroma runs out only when the panel's primaries cannot make
-    /// a chromaticity, and only then does the gamut stage spend chroma, holding hue
-    /// and intensity.
+    /// Each stage spends only the resource the display ran out of. The tone stage
+    /// spends luminance and holds hue and chroma exactly. The gamut stage runs only
+    /// where the panel's primaries cannot make the chromaticity, and it spends chroma
+    /// while holding hue and intensity.
+    ///
+    /// Allocates nothing and takes no lock. A colour above the knee costs 18 bisection
+    /// steps, and one outside the panel's primaries another 18.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds assert that the presented peak channel is within the content peak
+    /// declared to [`OutputTransform::for_display`]. Release builds do not check it,
+    /// and an over-peak colour reaches the compositor's per-channel clip.
     #[must_use]
     pub fn apply(&self, c: Radiance) -> Scrgb {
         // 1. Exposure: authored nits -> presented nits. A pure scale of the triple, so
@@ -191,17 +194,16 @@ impl OutputTransform {
         // 2. Tone: lower `I` until the peak channel reaches the ceiling, holding `Ct`
         //    and `Cp`. Hue and chroma survive exactly; only luminance is spent.
         //
-        //    The peak is taken in the DISPLAY's primaries, not in the working space.
-        //    The two differ, and not by a little: the Rec.2020 -> display matrix has
-        //    negative off-diagonal terms, so a saturated colour's display-space channel
-        //    runs above its working-space one. Bounding the working peak leaves the
-        //    panel to clip exactly what this stage exists to protect.
+        //    The peak is taken in the display's primaries, not in the working space.
+        //    The Rec.2020 -> display matrix has negative off-diagonal terms, so a
+        //    saturated colour's display-space channel runs above its working-space one,
+        //    and a bound on the working peak leaves the panel to clip what this stage
+        //    exists to prevent.
         //
-        //    And on the peak channel rather than on `I` directly, because `I` is
-        //    achromatic and bounding it bounds nothing the container cares about: a
-        //    saturated blue sits comfortably under an `I` knee while its blue channel
-        //    is far over the ceiling and clips to cyan. The container bounds channels,
-        //    so the channels decide how much to spend — and `I` is what pays.
+        //    The bound is on the peak channel rather than on `I`, because `I` is
+        //    achromatic and the display's container bounds channels: a saturated blue
+        //    sits under an `I` knee while its blue channel is far over the ceiling and
+        //    clips to cyan.
         let peak = self.display_peak(v);
         debug_assert!(
             peak <= self.peak_limit * 1.001 + 1e-3,
@@ -213,15 +215,14 @@ impl OutputTransform {
             v = ictcp::to_2020(self.spend_intensity(ictcp::from_2020(v), self.shoulder(peak)));
         }
 
-        // 3. Gamut: only when the display's primaries cannot make this chromaticity.
-        //    Gated on one matrix apply and three sign tests, because the compression
-        //    itself costs a PQ round trip.
+        // 3. Gamut: runs only where the display's primaries cannot make this
+        //    chromaticity. Gated on one matrix apply and three sign tests, because the
+        //    compression itself costs a PQ round trip.
         //
-        //    This order is forced, and it is closed. Stage 2 raises chroma relative to
-        //    intensity, so it can push a colour out of gamut — hence gamut second.
+        //    The stage order is forced and closed. Stage 2 raises chroma relative to
+        //    intensity and so can push a colour out of gamut, which puts gamut second.
         //    Compression moves toward the achromatic axis, which lowers the peak
-        //    channel, so it can never push back over the ceiling. Neither stage can
-        //    undo the other's guarantee.
+        //    channel, so it can never push back over the ceiling.
         let t = matrix::apply(&self.gamut.matrix_from_2020(), v);
         if t[0] < 0.0 || t[1] < 0.0 || t[2] < 0.0 {
             v = ictcp::to_2020(self.gamut.compress(ictcp::from_2020(v)));
@@ -240,27 +241,24 @@ impl OutputTransform {
         }
     }
 
-    /// The brightest channel this colour asks the display for, in presented nits.
+    /// Returns the brightest of `v`'s channels in the display's primaries, in
+    /// presented nits.
     #[inline]
     fn display_peak(&self, v: [f32; 3]) -> f32 {
         let t = matrix::apply(&self.gamut.matrix_from_2020(), v);
         t[0].max(t[1]).max(t[2])
     }
 
-    /// Lower `I` until the display-space peak channel lands on `target`, holding `Ct`
-    /// and `Cp` — so the colour arrives with the hue **and the chroma** it was authored
-    /// with, at whatever luminance the display could give it.
+    /// Lowers `I` until the display-space peak channel lands on `target`, holding `Ct`
+    /// and `Cp`, so the colour arrives with the hue **and the chroma** it was authored
+    /// with at whatever luminance the display can give it.
     ///
-    /// Scaling the linear triple instead would hold chromaticity, which sounds
-    /// equivalent and is not: PQ is compressive, so a uniform scale in linear light
-    /// shrinks the colour's ICtCp chroma. A specular rolled from 380 to 203 nits comes
-    /// out roughly a tenth less colourful — a few JND under ΔE-ITP, and in the wrong
-    /// direction. It reads washed out rather than merely dimmer, and it delivers a
-    /// different colour than the palette authored, differently on every panel.
+    /// Scaling the linear triple instead holds chromaticity but not ICtCp chroma: PQ
+    /// is compressive, so a uniform scale in linear light shrinks chroma, and a
+    /// specular taken from 380 to 203 nits comes out roughly a tenth less colourful.
     ///
-    /// Bisection, because the map from `I` to the peak channel runs through PQ and has
-    /// no closed-form inverse. It is monotone — `I` is the intensity axis — which is
-    /// asserted over a hue and chroma sweep rather than assumed.
+    /// Bisects because the map from `I` to the peak channel runs through PQ and has no
+    /// closed-form inverse. It rests on that map being monotone in `I`.
     fn spend_intensity(&self, c: Ictcp, target: f32) -> Ictcp {
         let (mut lo, mut hi) = (0.0f32, c.i);
         for _ in 0..INTENSITY_STEPS {
@@ -274,31 +272,29 @@ impl OutputTransform {
         Ictcp::new(lo, c.ct, c.cp)
     }
 
-    /// The display-space peak channel of an ICtCp coordinate, in nits.
+    /// Returns the display-space peak channel of an ICtCp coordinate, in nits.
     #[inline]
     fn peak_at(&self, c: Ictcp) -> f32 {
         let v = self.gamut.rgb(c);
         v[0].max(v[1]).max(v[2])
     }
 
-    /// The shoulder, in presented nits. Three properties, and they are the contract:
+    /// Maps a presented peak of `m` nits onto the display's range, in presented nits.
+    /// The curve holds three properties:
     ///
-    /// 1. **Identity at and below diffuse white.** A user interface's diffuse white is
-    ///    a hard anchor — it has to match every other window on the desktop — and the
-    ///    ladder beneath it is the design. Only content *above* white is negotiable.
+    /// 1. **Identity at and below diffuse white.** A user interface's diffuse white
+    ///    matches every other window on the desktop, and the ladder beneath it is the
+    ///    design, so only content above white is negotiable.
     /// 2. **Slope 1 and continuous at white**, so there is no visible break where the
     ///    shoulder starts.
-    /// 3. **Asymptotic to the display's ceiling**, so nothing can exceed it however
-    ///    bright it was authored, and with no headroom it degenerates to a clamp at
-    ///    white. That clamp is spent out of `I` alone, so a red specular arrives as the
-    ///    most colourful red the display can hold — where the compositor's per-channel
-    ///    clip would have rotated it toward orange.
+    /// 3. **Asymptotic to the display's ceiling**, so nothing exceeds it however bright
+    ///    it was authored. With no headroom it degenerates to a clamp at white, spent
+    ///    out of `I` alone, so a red specular arrives as the most colourful red the
+    ///    display holds rather than rotated toward orange by a per-channel clip.
     ///
-    /// This is deliberately *not* BT.2390's EETF. That curve maps a mastered source
-    /// range onto a display range and compresses everything in between, which is right
-    /// for HDR video — where no particular luminance is privileged — and wrong here:
-    /// it would roll diffuse white itself down to about 0.89 of the display's white,
-    /// leaving the interface visibly dimmer than every window beside it.
+    /// Not BT.2390's EETF, which maps a mastered source range onto the display range
+    /// and compresses everything between: it would roll diffuse white itself down to
+    /// about 0.89 of the display's white.
     fn shoulder(&self, m: f32) -> f32 {
         if self.head <= 0.0 {
             return self.white;
@@ -315,9 +311,9 @@ mod tests {
     use super::*;
     use crate::matrix::{D65, inv, mul, narrow, rgb_to_xyz};
 
-    /// Rec.709 -> Rec.2020, so a result can be read back as an [`Ictcp`]. The contract
-    /// this module has to meet is stated in hue and chroma, so the assertions are made
-    /// there rather than on encoded channels.
+    /// Rec.709 -> Rec.2020, so a result can be read back as an [`Ictcp`]. This module's
+    /// contract is stated in hue and chroma, so the assertions are made there rather
+    /// than on encoded channels.
     const M_709_TO_2020: Mat3f = narrow(mul(
         inv(rgb_to_xyz(
             (0.708, 0.292),
@@ -338,9 +334,9 @@ mod tests {
     }
 
     /// A palette's worth of authored light: a card surface, disabled and primary text,
-    /// the accent, and a specular above white. Chroma values are modest, as real
-    /// interface tokens are — a colour's ICtCp intensity is not its peak channel, and
-    /// a heavily saturated one carries a channel far above its intensity.
+    /// the accent, and a specular above white. Chroma values are modest, as interface
+    /// tokens are; a heavily saturated colour carries a channel far above its ICtCp
+    /// intensity.
     fn samples() -> Vec<Radiance> {
         vec![
             Ictcp::polar(3.7, 0.004, 250.0).to_radiance(1.0),
@@ -351,8 +347,8 @@ mod tests {
         ]
     }
 
-    /// The brightest channel any sample authors — what an application computes over
-    /// its own resolved palette to declare its content peak.
+    /// The brightest channel any sample authors, computed the way an application
+    /// computes it over its own resolved palette.
     fn content_peak() -> f32 {
         samples()
             .into_iter()
@@ -381,11 +377,11 @@ mod tests {
         )
     }
 
-    /// The transform's linear regime: what `apply` would produce if the shoulder never
+    /// The transform's linear regime: what `apply` produces with the shoulder never
     /// engaged, obtained by evaluating far below the knee and scaling back up. Uses
-    /// only the public API, and is basis-independent -- which matters, because the
-    /// output is in Rec.709 and the input is in Rec.2020, so comparing channel `r` to
-    /// channel `r` across that boundary compares two different things.
+    /// only the public API, and stays in the output's own basis — the input is in
+    /// Rec.2020 and the output in Rec.709, so channel `r` on one side and channel `r`
+    /// on the other are different quantities.
     fn untoned(out: &OutputTransform, c: Radiance) -> [f32; 3] {
         const T: f32 = 1e-3;
         let o = out.apply(Radiance::new(c.r * T, c.g * T, c.b * T, c.a));
@@ -401,12 +397,12 @@ mod tests {
         )
     }
 
-    /// Diffuse white lands exactly where each desktop defines white. This is the whole
-    /// luminance model in three assertions, and the one an interface cannot get wrong:
-    /// a white that is not white reads as a dim application next to every other window.
+    /// Diffuse white lands exactly where each desktop defines white: at scRGB `1.0`
+    /// where composition is display-referred, and at the OS SDR white level where it
+    /// is scene-referred.
     #[test]
     fn diffuse_white_lands_on_the_display_white() {
-        // Display-referred: 1.0 IS the display's white.
+        // Display-referred: 1.0 is the display's white.
         for out in [sdr(), wcg()] {
             let w = out.apply(white());
             assert!((w.r - 1.0).abs() < 1e-3, "display-referred white = {}", w.r);
@@ -417,8 +413,8 @@ mod tests {
         assert!((w.r - 3.0).abs() < 3e-3, "scene-referred white = {}", w.r);
     }
 
-    /// Everything at or below diffuse white passes through untouched, on every
-    /// desktop. The shoulder spends the above-white range and nothing else.
+    /// Everything at or below diffuse white passes through untouched on every desktop.
+    /// The shoulder spends the above-white range and nothing else.
     #[test]
     fn the_diffuse_ladder_is_exact() {
         for out in [sdr(), wcg()] {
@@ -434,15 +430,14 @@ mod tests {
         }
     }
 
-    /// The headline claim: SDR is a tonemap, not a mode. An HDR capability whose white
-    /// and peak are both the reference must present the same **luminance** as the SDR
-    /// arm, colour for colour -- the exposure, gamut and tone stages are identical and
-    /// only the encode differs.
+    /// SDR is a tonemap rather than a mode: an HDR capability whose white and peak are
+    /// both the reference presents the same **luminance** as the SDR arm, colour for
+    /// colour, because the exposure, gamut and tone stages are identical and only the
+    /// encode differs.
     ///
-    /// The encoded numbers are deliberately *not* equal, and that is not a caveat: the
-    /// two desktops define scRGB `1.0` differently, so identical light is identical
-    /// only after each is read back through its own encode. Asserting numeric equality
-    /// here would be asserting that one of the two desktops is wrong about its units.
+    /// The encoded numbers are not equal. The two desktops define scRGB `1.0`
+    /// differently, so identical light compares equal only after each side is read back
+    /// through its own encode.
     #[test]
     fn sdr_is_not_a_mode() {
         let a = sdr();
@@ -468,16 +463,15 @@ mod tests {
         }
     }
 
-    /// Nothing may reach the compositor above the display's ceiling on a
-    /// display-referred desktop, because there is nothing above white to reach.
+    /// Nothing reaches the compositor above the display's ceiling on a display-referred
+    /// desktop, where there is nothing above white to reach.
     ///
-    /// The bound is asserted twice, in two different bases, because the transform
-    /// bounds the peak in the *panel's* primaries and Rec.709 is only the wire
-    /// encoding. On the plain SDR arm those coincide, so the channel bound is exact.
-    /// On a wide-gamut panel they do not: a colour the panel reaches comfortably can
-    /// read above 1.0 in Rec.709, because reaching the same chromaticity from
-    /// narrower primaries takes more signal — and that value is correct, not an
-    /// overflow. What must hold on both is luminance, which is basis-independent.
+    /// The bound is checked in two bases, because the transform bounds the peak in the
+    /// panel's primaries and Rec.709 is only the wire encoding. On the plain SDR arm
+    /// the two coincide, so the channel bound is exact. On a wide-gamut panel they do
+    /// not: a colour the panel reaches can read above 1.0 in Rec.709, since reaching
+    /// the same chromaticity from narrower primaries takes more signal. Luminance is
+    /// basis-independent and holds on both.
     #[test]
     fn nothing_exceeds_the_ceiling_when_display_referred() {
         // Rec.709 luminance weights; Y is a physical quantity and does not care which
@@ -505,8 +499,8 @@ mod tests {
         }
     }
 
-    /// And nothing may go negative when the target is Rec.709, for the same reason in
-    /// the other direction.
+    /// Nothing goes negative when the target is Rec.709: a negative component would
+    /// carry a chromaticity the gamut stage was supposed to have compressed away.
     #[test]
     fn nothing_goes_negative_when_the_target_is_rec709() {
         let out = sdr();
@@ -519,10 +513,9 @@ mod tests {
         }
     }
 
-    /// The test the whole Rec.2020-working-space argument exists for: a colour inside
-    /// the panel's gamut but outside Rec.709 must survive to the compositor as a
-    /// **negative** scRGB component. If this ever passes trivially, the pipeline has
-    /// quietly become Rec.709-limited and the wide gamut is gone.
+    /// A colour inside the panel's gamut but outside Rec.709 survives to the
+    /// compositor as a **negative** scRGB component, which is how scRGB carries a
+    /// gamut wider than its own primaries.
     #[test]
     fn wide_gamut_survives_as_a_negative_component() {
         let c = Ictcp::polar(100.0, 0.25, 150.0).to_radiance(1.0);
@@ -548,9 +541,8 @@ mod tests {
         );
     }
 
-    /// The contract, and the reason this module exists: compression spends the
-    /// resource that ran out. Luminance ran out; hue and chroma did not, so they
-    /// arrive intact.
+    /// The tone stage spends the resource that ran out: luminance drops, and hue and
+    /// chroma arrive intact.
     #[test]
     fn tone_spends_intensity_and_holds_hue_and_chroma() {
         let authored = Ictcp::polar(380.0, 0.04, 15.0);
@@ -581,11 +573,10 @@ mod tests {
         );
     }
 
-    /// The same claim, measured against the design this replaces. A uniform scale of
-    /// the linear triple holds chromaticity, which sounds equivalent and is not: PQ is
-    /// compressive, so it sheds ICtCp chroma and the colour arrives washed out rather
-    /// than merely dimmer. This records how much, so a later reader tempted back to the
-    /// obvious implementation sees the number instead of re-deriving the argument.
+    /// The same claim measured against a uniform scale of the linear triple, which
+    /// holds chromaticity but not ICtCp chroma: PQ is compressive, so the scale sheds
+    /// chroma and the colour arrives washed out rather than dimmer. This records how
+    /// much it sheds.
     #[test]
     fn a_uniform_scale_would_have_shed_chroma() {
         let authored = Ictcp::polar(380.0, 0.04, 15.0);
@@ -618,14 +609,11 @@ mod tests {
             "the delivered colour should be more colourful than the uniform scale's"
         );
 
-        // And the trade, pinned so that nobody later "optimises" toward it. Holding
-        // chroma costs MORE intensity to reach the same peak channel, and ΔE-ITP is
-        // dominated by intensity, so the uniform scale is the ΔE-closer of the two by
-        // construction — exactly as a per-channel clip beats hue-preserving gamut
-        // compression on the same metric. Distance is not the objective. The objective
-        // is that a token arrives with the hue and chroma it was authored with, so that
-        // it is the same token on every panel; luminance is the only parameter the
-        // display actually took away.
+        // Holding chroma costs more intensity to reach the same peak channel, and
+        // ΔE-ITP is dominated by intensity, so the uniform scale is the ΔE-closer of
+        // the two by construction — as a per-channel clip is against hue-preserving
+        // gamut compression on the same metric. What the tone stage holds instead is
+        // the authored hue and chroma, so a token is the same colour on every panel.
         assert!(
             authored.delta_itp(uniform) < authored.delta_itp(got),
             "expected the uniform scale to win on ΔE; got {} vs {}",
@@ -634,10 +622,9 @@ mod tests {
         );
     }
 
-    /// The premise the tone stage's bisection rests on. `I` is the intensity axis, so
-    /// the display-space peak should rise with it — but the LMS-to-display matrix has
-    /// negative terms, so this is asserted over a hue and chroma sweep rather than
-    /// assumed. Chroma is swept well past anything a palette authors.
+    /// The premise the tone stage's bisection rests on: the display-space peak channel
+    /// rises with `I`. The LMS-to-display matrix has negative terms, so the sweep
+    /// covers hue and chroma as well, out past anything a palette authors.
     #[test]
     fn the_display_peak_is_monotonic_in_intensity() {
         for gamut in [Gamut::REC709, Gamut::DISPLAY_P3, Gamut::REC2020] {
@@ -662,8 +649,8 @@ mod tests {
         }
     }
 
-    /// The payoff over the per-channel clip it replaces: the roll holds the channel
-    /// ratios that carry hue, and the clip crushes them.
+    /// The roll holds the channel ratios that carry hue; the compositor's per-channel
+    /// clip crushes them.
     #[test]
     fn beats_the_clip_on_hue() {
         let c = Ictcp::polar(300.0, 0.03, 250.0).to_radiance(1.0);
@@ -705,8 +692,8 @@ mod tests {
         );
     }
 
-    /// Brighter content stays brighter. A curve that inverts a pair would scramble the
-    /// palette's luminance hierarchy, which is the one thing a designer relies on.
+    /// Brighter content stays brighter, so the palette's luminance hierarchy survives
+    /// the transform.
     #[test]
     fn the_curve_is_monotonic() {
         let out = OutputTransform::for_display(DisplayCapability::Sdr, 700.0);
@@ -723,17 +710,16 @@ mod tests {
         }
     }
 
-    /// Content that already fits its display is not touched at all: the knee is
-    /// infinite and the transform is a pure scale. This is "no tonemap" without an
-    /// enum arm to select it, and it is what lets speculars punch on a real HDR panel.
+    /// Content that already fits its display is untouched: the knee is infinite and
+    /// the transform is a pure scale, with no capability arm selecting that behaviour.
     #[test]
     fn content_that_fits_is_a_pure_scale() {
         let out = hdr(240.0, 1000.0);
         for c in samples() {
             assert!(Gamut::DISPLAY_P3.contains(c.to_ictcp()), "fixture left P3");
             let o = out.apply(c);
-            // "Pure scale" is a statement about the map, not about any one channel:
-            // halving the input halves the output exactly.
+            // A pure scale is a property of the map, not of any one channel: halving
+            // the input halves the output exactly.
             let half = out.apply(Radiance::new(c.r * 0.5, c.g * 0.5, c.b * 0.5, c.a));
             for (full, h) in [(o.r, half.r), (o.g, half.g), (o.b, half.b)] {
                 assert!(
@@ -744,8 +730,8 @@ mod tests {
         }
     }
 
-    /// A dimmer panel rolls harder. The map reads the peak, so "works on any display"
-    /// is a queried parameter rather than an assumption.
+    /// A dimmer panel rolls harder: the shoulder reads the panel's peak luminance
+    /// rather than assuming one.
     #[test]
     fn a_lower_panel_peak_rolls_more() {
         let c = Ictcp::polar(380.0, 0.05, 15.0).to_radiance(1.0);
@@ -757,9 +743,9 @@ mod tests {
         );
     }
 
-    /// The property that licenses compositing *after* the transform: DWM forms only
+    /// The property that licenses compositing after the transform: DWM forms only
     /// convex combinations, and a convex combination of two in-range values is in
-    /// range. Post-transform blending can therefore introduce neither a clip nor an
+    /// range, so post-transform blending introduces neither a clip nor an
     /// out-of-gamut value.
     #[test]
     fn convex_blends_stay_in_range() {
@@ -781,9 +767,9 @@ mod tests {
         }
     }
 
-    /// With no headroom the shoulder degenerates to a clamp at white — and the clamp
-    /// is a uniform scale of the triple, so a red specular stays red and only its
-    /// brightness caps. That is the whole difference from the compositor's clip.
+    /// With no headroom the shoulder degenerates to a clamp at white, spent out of `I`
+    /// alone, so a red specular stays red and only its brightness caps — where the
+    /// compositor's per-channel clip would move its hue.
     #[test]
     fn no_headroom_clamps_at_white_without_moving_hue() {
         let c = Ictcp::polar(380.0, 0.05, 15.0).to_radiance(1.0);
@@ -807,8 +793,8 @@ mod tests {
     }
 
     /// Debug-only: the assertion it exercises is compiled out of a release build,
-    /// where an under-declared peak degrades to the compositor's clip rather than to a
-    /// panic. Reporting it is a development affordance, not a runtime guarantee.
+    /// where a peak declared below the content's degrades to the compositor's
+    /// per-channel clip rather than to a panic.
     #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "exceeds the declared content peak")]

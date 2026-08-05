@@ -1,9 +1,8 @@
-//! The COM surface, driven.
+//! Tests that drive the provider through its COM vtables from a thread that never
+//! published, with the publishing thread parked in a join.
 //!
-//! [`tests`](super::tests) exercises the data. This exercises what the design actually
-//! claims: that a provider answers correctly **from another thread**, with the publishing
-//! thread not involved and not even running. A data model that is right and a vtable that
-//! deadlocks would pass every test over there.
+//! [`tests`](super::tests) covers the data model. These calls go through the generated
+//! implement-side vtables, which is the surface automation itself calls.
 
 use super::tests::{Screen, listening};
 use crate::bindings::{
@@ -16,12 +15,13 @@ use crate::widget::{Range, UiaRole};
 use windows_core::Interface;
 use windows_scene::NO_ENTRY;
 
-/// A provider addressed the way automation addresses one: a bare pointer any apartment may
-/// call. Sending it is the test.
+/// A raw provider pointer, moved to another thread and called from there the way automation
+/// calls one: from any apartment, without marshalling.
 struct Agile(*mut core::ffi::c_void);
 
-// SAFETY: this is the claim under test, and it is the platform's own contract for an agile
-// object. The referent outlives the thread because the `Uia` that owns it does.
+// SAFETY: the referent is a provider with no apartment affinity — every method reads an
+// immutable published snapshot — and the `Uia` that owns it stays alive until the thread
+// the pointer was moved to has been joined.
 unsafe impl Send for Agile {}
 
 impl Agile {
@@ -29,7 +29,12 @@ impl Agile {
         Self(provider.as_raw())
     }
 
-    /// SAFETY: the caller keeps the owning `Uia` alive across the borrow.
+    /// Takes a counted reference to the provider the pointer names.
+    ///
+    /// # Safety
+    ///
+    /// The `Uia` that owns the provider must outlive both this call and the returned
+    /// interface.
     unsafe fn simple(&self) -> IRawElementProviderSimple {
         unsafe { IRawElementProviderSimple::from_raw_borrowed(&self.0) }
             .expect("a live provider")
@@ -37,17 +42,17 @@ impl Agile {
     }
 }
 
-// The generated bindings are implement-side, so there are no client wrappers to call. That
-// is not a gap here: calling straight through the vtable is exactly what automation does,
-// and it is the surface actually under test.
+// The generated bindings are implement-side and carry no client wrappers, so the helpers
+// below call through the vtable directly, which is the path automation takes.
 
 fn navigate(
     element: &IRawElementProviderFragment,
     direction: crate::bindings::NavigateDirection,
 ) -> Option<IRawElementProviderFragment> {
     let mut out = core::ptr::null_mut();
-    // SAFETY: a live provider, the direction it declares, and an out-pointer to a local.
-    // A `S_OK` with null is "nothing that way", which is why the pointer is checked.
+    // SAFETY: `element` holds a counted reference for the whole call, and `out` points at a
+    // local that outlives it. `Navigate` returns `S_OK` with a null out-pointer where there
+    // is no element in that direction, so the pointer is checked before it is cloned.
     unsafe {
         (element.vtable().Navigate)(element.as_raw(), direction, &raw mut out)
             .ok()
@@ -58,8 +63,9 @@ fn navigate(
 
 fn property(element: &IRawElementProviderSimple, id: i32) -> VARIANT {
     let mut out = VARIANT::default();
-    // SAFETY: a live provider and an out-pointer to a zeroed variant, which the callee
-    // fills and this thread owns from here.
+    // SAFETY: `element` holds a counted reference for the whole call, and `out` points at a
+    // local `VARIANT` that outlives it. The callee initialises the variant, and whatever it
+    // stores there is owned by this thread from the return onward.
     unsafe {
         _ = (element.vtable().GetPropertyValue)(element.as_raw(), id, &raw mut out);
     }
@@ -68,7 +74,9 @@ fn property(element: &IRawElementProviderSimple, id: i32) -> VARIANT {
 
 fn supports(element: &IRawElementProviderSimple, pattern: i32) -> bool {
     let mut out = core::ptr::null_mut();
-    // SAFETY: as above. A null out with `S_OK` is the documented "not supported".
+    // SAFETY: `element` holds a counted reference for the whole call, and `out` points at a
+    // local that outlives it. `GetPatternProvider` stores null for a pattern the element
+    // does not support, so a non-null pointer is an owned reference, released here.
     unsafe {
         _ = (element.vtable().GetPatternProvider)(element.as_raw(), pattern, &raw mut out);
         if out.is_null() {
@@ -85,7 +93,8 @@ fn from_point(
     y: f64,
 ) -> Option<IRawElementProviderFragment> {
     let mut out = core::ptr::null_mut();
-    // SAFETY: a live provider and an out-pointer to a local.
+    // SAFETY: `root` holds a counted reference for the whole call, and `out` points at a
+    // local that outlives it.
     unsafe {
         (root.vtable().ElementProviderFromPoint)(root.as_raw(), x, y, &raw mut out)
             .ok()
@@ -96,7 +105,8 @@ fn from_point(
 
 fn bounds(element: &IRawElementProviderFragment) -> Option<crate::bindings::UiaRect> {
     let mut out = crate::bindings::UiaRect::default();
-    // SAFETY: a live provider and an out-pointer to a local.
+    // SAFETY: `element` holds a counted reference for the whole call, and `out` points at a
+    // local that outlives it.
     unsafe {
         (element.vtable().get_BoundingRectangle)(element.as_raw(), &raw mut out)
             .ok()
@@ -105,21 +115,23 @@ fn bounds(element: &IRawElementProviderFragment) -> Option<crate::bindings::UiaR
     Some(out)
 }
 
-/// The tag every variant carries, which is the whole of what "nothing here" is.
+/// Returns a variant's type tag, which is `VT_EMPTY` where the provider answered nothing.
 fn tag(value: &VARIANT) -> u16 {
-    // SAFETY: the tag is present in every arm of the union.
+    // SAFETY: `vt` sits at the same offset in every arm of the union, so it is initialised
+    // whichever arm the callee filled.
     unsafe { value.Anonymous.Anonymous.vt }
 }
 
 fn text(value: &VARIANT) -> String {
     assert_eq!(tag(value), 8, "expected a BSTR");
-    // SAFETY: read only after asserting the tag, and `bstrVal` is the arm it names.
+    // SAFETY: the tag asserted above is `VT_BSTR`, so `bstrVal` is the arm the callee
+    // filled and it names a live string.
     unsafe { String::try_from(&*value.Anonymous.Anonymous.Anonymous.bstrVal).unwrap_or_default() }
 }
 
 fn number(value: &VARIANT) -> i32 {
     assert_eq!(tag(value), 3, "expected an I4");
-    // SAFETY: as above, for the `VT_I4` arm.
+    // SAFETY: the tag asserted above is `VT_I4`, so `lVal` is the arm the callee filled.
     unsafe { value.Anonymous.Anonymous.Anonymous.lVal }
 }
 
@@ -134,7 +146,7 @@ fn a_provider_answers_from_a_thread_that_never_published() {
 
     let root = Agile::of(&uia.root_for_test());
     let walked = std::thread::spawn(move || {
-        // SAFETY: `uia` is alive on the parent thread, which joins below.
+        // SAFETY: the parent thread owns `uia` and joins this one before dropping it.
         let root = unsafe { root.simple() };
         let root_of_fragments: IRawElementProviderFragmentRoot =
             root.cast().expect("the root is a fragment root");
@@ -152,7 +164,8 @@ fn a_provider_answers_from_a_thread_that_never_published() {
             child = navigate(&element, NavigateDirection_NextSibling);
         }
 
-        // Element-from-point, from here, over the same array the pointer scans.
+        // Element-from-point, resolved from this thread over the same array the pointer
+        // scans.
         let at: IRawElementProviderSimple = from_point(&root_of_fragments, 20.0, 20.0)
             .expect("something is under the point")
             .cast()

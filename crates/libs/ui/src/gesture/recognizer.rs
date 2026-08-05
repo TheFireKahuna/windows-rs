@@ -7,10 +7,9 @@
 //!
 //! Both emit the **same** `Windows.UI.Input` event argument types, so the sink downstream is
 //! one code path regardless of device. They differ in the coordinate space of their output —
-//! the physical one reports relative to the device rather than in display-independent pixels,
-//! which is what makes touchpad gestures feel right — and in what they will recognise at all:
-//! **touchpad input is never recognised as Tap or Hold**, by design, because touchpad input
-//! only arrives in scenarios where those are no longer possible.
+//! the physical one reports relative to the device rather than in display-independent pixels
+//! — and in what they recognise at all: the platform never recognises touchpad input as Tap
+//! or Hold.
 //!
 //! Both are **non-agile** (`MarshalingBehavior(None)`), so both are created and used only on
 //! the front thread — the same constraint the compositor and text services already impose,
@@ -30,8 +29,8 @@ use windows_scene::Point;
 pub struct Manip {
     pub translation: Point,
     pub scale: f32,
-    /// Degrees, positive clockwise — the platform's convention, kept rather than converted
-    /// so a value that came from the system reads the same in a debugger as in its docs.
+    /// Degrees, positive clockwise: the platform's convention, carried unconverted so a
+    /// value from the system reads the same here as in its own documentation.
     pub rotation: f32,
     pub expansion: f32,
 }
@@ -119,31 +118,31 @@ pub enum Recognised {
 pub struct Events(Rc<RefCell<Vec<Recognised>>>);
 
 impl Events {
-    /// A fresh queue.
+    /// Returns an empty queue.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Appends one event.
+    /// Appends one event, dropping it if the queue is already borrowed.
     ///
-    /// A re-entrant raise would otherwise unwind across the COM boundary; dropping the event
-    /// is the conservative answer and loses a gesture rather than the process.
+    /// A re-entrant raise would otherwise panic and unwind across the COM boundary, so the
+    /// drop loses a gesture rather than the process.
     fn push(&self, event: Recognised) {
         if let Ok(mut queue) = self.0.try_borrow_mut() {
             queue.push(event);
         }
     }
 
-    /// Takes everything raised since the last drain, into a buffer the caller owns.
+    /// Appends everything raised since the last drain to `out`.
     pub fn drain(&self, out: &mut Vec<Recognised>) {
         if let Ok(mut queue) = self.0.try_borrow_mut() {
             out.append(&mut queue);
         }
     }
 
-    /// Discards whatever is queued. What a canceled contact does, so an abort cannot deliver
-    /// the gesture it aborted.
+    /// Discards whatever is queued. What a canceled contact does, so an abort delivers no
+    /// part of the gesture it aborted.
     pub fn clear(&self) {
         if let Ok(mut queue) = self.0.try_borrow_mut() {
             queue.clear();
@@ -171,7 +170,12 @@ pub struct Recognizer {
 }
 
 impl Recognizer {
-    /// A recogniser for touch, pen and mouse, wired to `events`.
+    /// Returns a recogniser for touch, pen and mouse, wired to `events`.
+    ///
+    /// # Errors
+    ///
+    /// The recogniser could not be constructed, or one of its handlers could not be
+    /// registered.
     pub fn gesture(events: &Events) -> Result<Self> {
         let inner = GestureRecognizer::new()?;
         let mut revokers = Vec::with_capacity(8);
@@ -267,11 +271,16 @@ impl Recognizer {
         })
     }
 
-    /// A recogniser for precision-touchpad contacts, wired to `events`.
+    /// Returns a recogniser for precision-touchpad contacts, wired to `events`.
     ///
-    /// It carries no inertia of its own — there is no `ProcessInertia` on it — because a
-    /// touchpad manipulation's continuation is the system's business, reported through the
-    /// inertia messages rather than pumped by us.
+    /// It carries no inertia of its own — there is no `ProcessInertia` on it — because the
+    /// system continues a touchpad manipulation itself and reports it through the inertia
+    /// messages.
+    ///
+    /// # Errors
+    ///
+    /// The recogniser could not be constructed, or one of its handlers could not be
+    /// registered.
     pub fn physical(events: &Events) -> Result<Self> {
         let inner = PhysicalGestureRecognizer::new()?;
         let mut revokers = Vec::with_capacity(5);
@@ -340,7 +349,7 @@ impl Recognizer {
         })
     }
 
-    /// Whether this is the precision-touchpad recogniser.
+    /// Returns whether this is the precision-touchpad recogniser.
     #[must_use]
     pub const fn is_physical(&self) -> bool {
         matches!(self.kind, Kind::Physical(_))
@@ -349,22 +358,27 @@ impl Recognizer {
     /// Configures the recogniser from a target's declaration.
     ///
     /// The physical recogniser supports a subset of `GestureSettings` — `Tap`, `Hold`, the
-    /// translate/rails flags, `ManipulationRotate`, `ManipulationScale` and additionally
+    /// translate and rails flags, `ManipulationRotate`, `ManipulationScale` and
     /// `ManipulationMultipleFingerPanning` — so anything else is masked off rather than
     /// offered and rejected.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused one of the settings, or the second tuning interface was not
+    /// available on this recogniser.
     pub fn configure(&self, decl: &GestureDecl) -> Result<()> {
         match &self.kind {
             Kind::Gesture(inner) => {
                 inner.SetGestureSettings(decl.settings)?;
-                // We draw our own feedback, everywhere. The system's would be a second
-                // affordance for the same contact.
+                // This stack draws its own feedback everywhere; the system's would be a
+                // second affordance for the same contact.
                 inner.SetShowGestureFeedback(false)?;
                 // Inertia is advanced by the frame tick rather than by a clock of the
                 // recogniser's own — there is no fourth clock.
                 inner.SetAutoProcessInertia(false)?;
-                // Hold tuning and the contact-count bounds arrived in 2004 and live on the
-                // class's *second* interface, reached by cast. A knob that must not be
-                // claimed by a two-finger contact needs the maxima, not just the delay.
+                // Hold tuning and the contact-count bounds live on the class's second
+                // interface, reached by cast. A knob that must not be claimed by a
+                // two-finger contact needs the maxima, not just the delay.
                 let tuning: IGestureRecognizer2 = inner.cast()?;
                 tuning.SetHoldStartDelay(timespan(decl.hold.start_delay))?;
                 tuning.SetHoldRadius(decl.hold.radius)?;
@@ -386,11 +400,16 @@ impl Recognizer {
         }
     }
 
-    /// Restates the pivot.
+    /// Restates the pivot centre and radius.
     ///
-    /// Called on **every** `ManipulationUpdated` and not once at down: the platform
-    /// documents both values as ones to update regularly during the interaction, and a stale
-    /// centre makes a knob drift under a finger that has not moved.
+    /// Must be called on **every** `ManipulationUpdated` rather than once at down: the
+    /// platform documents both values as ones to update regularly during the interaction,
+    /// and a stale centre makes a knob drift under a finger that has not moved. Does nothing
+    /// on the physical recogniser, which has no pivot.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused the centre or the radius.
     pub fn pivot(&self, pivot: PivotDecl) -> Result<()> {
         let Kind::Gesture(inner) = &self.kind else {
             return Ok(());
@@ -402,8 +421,15 @@ impl Recognizer {
         inner.SetPivotRadius(pivot.radius)
     }
 
-    /// Tunes inertia. **Only legal inside `InertiaStarting`** — the platform states these
-    /// cannot be changed after the event.
+    /// Sets the translation, rotation and expansion decelerations inertia runs down at.
+    ///
+    /// Must be called from inside the `InertiaStarting` handler: the platform rejects a
+    /// change to these after that event. Does nothing on the physical recogniser, which runs
+    /// no inertia of its own.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused one of the decelerations.
     pub fn decelerate(&self, translation: f32, rotation: f32, expansion: f32) -> Result<()> {
         let Kind::Gesture(inner) = &self.kind else {
             return Ok(());
@@ -413,6 +439,11 @@ impl Recognizer {
         inner.SetInertiaExpansionDeceleration(expansion)
     }
 
+    /// Feeds the contact's down sample.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused the sample.
     pub fn down(&self, p: &PointerPoint) -> Result<()> {
         match &self.kind {
             Kind::Gesture(inner) => inner.ProcessDownEvent(p),
@@ -420,9 +451,15 @@ impl Recognizer {
         }
     }
 
-    /// Feeds the frame's batch. **Exactly the shape `ProcessMoveEvents` wants** — the
-    /// platform's own sample feeds it `GetIntermediatePoints`, and the frame-clock batch
-    /// *is* that.
+    /// Feeds the frame's batch of move samples, oldest first.
+    ///
+    /// `ProcessMoveEvents` takes the intermediate points for a frame, which is what the
+    /// frame-clock batch holds, so the recogniser sees the whole path rather than its
+    /// newest point.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused the batch.
     pub fn moves(&self, batch: &IVector<PointerPoint>) -> Result<()> {
         match &self.kind {
             Kind::Gesture(inner) => inner.ProcessMoveEvents(batch),
@@ -430,6 +467,11 @@ impl Recognizer {
         }
     }
 
+    /// Feeds the contact's up sample.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused the sample.
     pub fn up(&self, p: &PointerPoint) -> Result<()> {
         match &self.kind {
             Kind::Gesture(inner) => inner.ProcessUpEvent(p),
@@ -437,8 +479,14 @@ impl Recognizer {
         }
     }
 
-    /// A wheel notch over a target that declared gesture interest. Scroll surfaces never
-    /// reach here: their wheel is the tracker's, compositor-side, with no front-thread work.
+    /// Feeds a wheel notch over a target that declared gesture interest.
+    ///
+    /// A scroll surface never reaches here: its wheel drives the tracker compositor-side,
+    /// with no front-thread work. Does nothing on the physical recogniser.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused the notch.
     pub fn wheel(&self, p: &PointerPoint, shift: bool, ctrl: bool) -> Result<()> {
         let Kind::Gesture(inner) = &self.kind else {
             return Ok(());
@@ -446,8 +494,14 @@ impl Recognizer {
         inner.ProcessMouseWheelEvent(p, shift, ctrl)
     }
 
-    /// Advances inertia by one frame. Pumped from the pacer tick, so inertia, springs and a
-    /// system stop request all resolve on one clock.
+    /// Advances inertia by one frame.
+    ///
+    /// Pumped from the pacer tick, so inertia, springs and a system stop request all resolve
+    /// on one clock. Does nothing on the physical recogniser, which the system pumps itself.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused to advance inertia.
     pub fn inertia(&self) -> Result<()> {
         let Kind::Gesture(inner) = &self.kind else {
             return Ok(());
@@ -455,7 +509,7 @@ impl Recognizer {
         inner.ProcessInertia()
     }
 
-    /// Whether inertia is still running, which is what keeps a tick requested.
+    /// Returns whether inertia is still running, which is what keeps a tick requested.
     #[must_use]
     pub fn is_inertial(&self) -> bool {
         match &self.kind {
@@ -464,7 +518,7 @@ impl Recognizer {
         }
     }
 
-    /// Whether a gesture is in progress at all.
+    /// Returns whether a gesture is in progress at all.
     #[must_use]
     pub fn is_active(&self) -> bool {
         match &self.kind {
@@ -475,7 +529,11 @@ impl Recognizer {
 
     /// Ends whatever is in progress, discarding it.
     ///
-    /// **This is what a cancel does**, and it is not an up: no value is committed.
+    /// **What a cancel does**, and not an up: no value is committed.
+    ///
+    /// # Errors
+    ///
+    /// The platform refused to complete the gesture.
     pub fn complete(&self) -> Result<()> {
         match &self.kind {
             Kind::Gesture(inner) => inner.CompleteGesture(),

@@ -1,50 +1,45 @@
-//! The one thing about a signal that is not the app thread's: a write from a producer.
+//! Cross-thread writes: how a producer thread stages a write that the app thread applies.
 //!
-//! A producer thread cannot touch the graph, so it stages the *write* rather than
-//! performing it — a boxed closure that knows how to put its value into the cell's payload
-//! and answers whether the value actually moved. The app thread applies whatever is staged
-//! at the top of its next flush.
+//! A producer thread cannot touch the graph, so it stages the write rather than performing
+//! it — a boxed closure that puts its value into the cell's payload and answers whether the
+//! value moved. The app thread applies whatever is staged at the top of its next flush.
 //!
-//! Two properties fall out of the shape and both are contractual:
+//! Two properties hold by construction and both are contractual:
 //!
-//! - **Writes coalesce by construction.** The staging table is indexed by node, so a
-//!   producer that outruns the app thread overwrites its own pending write. Memory is
-//!   bounded by the number of live cells, not by the write rate.
-//! - **At most one wake is in flight.** The event is signalled on the empty→pending
+//! - **Writes coalesce.** The staging table is indexed by node, so a producer that outruns
+//!   the app thread overwrites its own pending write. Memory is bounded by the number of
+//!   live cells, not by the write rate.
+//! - **At most one wake is in flight.** The event is signalled on the empty-to-pending
 //!   transition only, so a producer writing at any rate wakes the app thread once per
 //!   flush.
 //!
-//! What is *not* free here is one box per cross-thread write. That is the honest cost of
-//! type-erasing a write the receiver cannot name, and it is why a display-rate producer
-//! publishes through an [`Epoch`](super::Epoch) — which carries no value — rather than
-//! through a cell.
+//! Each cross-thread write costs one box, because the receiving side cannot name the
+//! value's type. A display-rate producer publishes through an [`Epoch`](super::Epoch),
+//! which carries no value and allocates nothing.
 
 use super::graph::{Signal, SignalId};
 use core::any::Any;
 use std::sync::{LazyLock, Mutex};
 use windows_window::Event;
 
-/// A staged write: puts its value into the cell's payload, and answers whether that
-/// changed anything.
+/// A staged write: puts its value into the cell's payload and returns whether the value
+/// moved.
 pub(super) type Apply = Box<dyn FnOnce(&dyn Any) -> bool + Send>;
 
-/// Indexed by graph, then by node index, so replacing a pending write is O(1) with no hash
-/// and no scan — and so two graphs cannot alias each other's staged writes. Production
-/// allocates exactly one graph; the nesting exists because a node index is unique only
-/// within the graph that minted it.
+/// Every graph's staged writes, indexed by graph id.
+///
+/// Indexing by graph and then by node index makes replacing a pending write O(1) with no
+/// hash and no scan, and keeps two graphs from aliasing each other's staged writes: a node
+/// index is unique only within the graph that minted it.
 #[derive(Default)]
 struct Inbox(Vec<Pending>);
 
 #[derive(Default)]
 struct Pending {
-    /// Keyed by ids the app thread's graph mints, so **no authority sits beside it**: a
-    /// producer stages a write against a cell it was handed and can never invent one.
+    /// Keyed by ids the app thread's graph minted, so a producer can only stage a write
+    /// against a cell it was handed.
     slots: windows_scene::Slots<Signal, Apply>,
-    /// Which slots are occupied, so a drain is O(pending) rather than O(cells).
-    ///
-    /// Beside the store rather than in it: this is a drain index over what is staged, not a
-    /// fact about a slot, and a store that carried one would be carrying it for every table
-    /// that has no drain.
+    /// Which slots are occupied, so a drain costs O(pending) rather than O(cells).
     dirty: Vec<SignalId>,
 }
 
@@ -55,21 +50,23 @@ struct Shared {
 
 static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     inbox: Mutex::new(Inbox::default()),
-    // A wake source with no event cannot be waited on, and an app thread that cannot be
-    // woken by a producer is a polling loop. There is nothing to fall back to.
+    // The app thread waits on this event; without it, a producer's write could be observed
+    // only by polling, so there is no degraded mode to fall back to.
     event: Event::auto_reset().expect("an event is available"),
 });
 
-/// Signalled when a producer's write lands, so the app thread's wait has something to
-/// name alongside its other wake sources.
+/// Returns the event signalled when a producer's write lands, for the app thread to name
+/// alongside its other wake sources.
 ///
-/// Auto-reset, and signalled only on the empty→pending transition.
+/// Auto-reset, and signalled only on the empty-to-pending transition, so a burst of writes
+/// releases the waiter once.
 #[must_use]
 pub fn written() -> &'static Event {
     &SHARED.event
 }
 
-/// Stages a write against `id`, replacing any write already pending for it.
+/// Stages a write against `id`, replacing any write already pending for it, and signals
+/// [`written`] where nothing was pending for `id`'s graph.
 pub(super) fn post(id: SignalId, apply: Apply) {
     let wake = {
         let mut inbox = lock();
@@ -105,11 +102,10 @@ pub(super) fn take(graph: u32, out: &mut Vec<(SignalId, Apply)>) {
     pending.dirty = dirty;
 }
 
-/// Discards anything staged against a node that has been disposed.
+/// Discards anything staged against `id`, which has been disposed.
 ///
-/// Without this a write in flight when a screen unmounts would be kept alive for a flush
-/// and then applied to whatever now occupies the slot — which the generation check catches,
-/// but only after the fact.
+/// A write in flight when a screen unmounts is dropped here rather than held until the next
+/// flush, where the generation check would reject it.
 pub(super) fn release(id: SignalId) {
     let mut inbox = lock();
     let pending = inbox.pending(id.graph);
@@ -130,11 +126,10 @@ impl Inbox {
     }
 }
 
-/// The inbox, recovering from a poisoned lock.
+/// Locks the inbox, recovering from poisoning.
 ///
-/// A producer panicking mid-`post` leaves the table structurally sound — the slot it was
-/// writing is either replaced or not — and refusing every subsequent write because one
-/// thread died is a worse failure than continuing.
+/// A producer panicking mid-`post` leaves the table structurally sound: the slot it was
+/// writing is either replaced or not, so a poisoned lock is taken rather than propagated.
 fn lock() -> std::sync::MutexGuard<'static, Inbox> {
     SHARED.inbox.lock().unwrap_or_else(|e| e.into_inner())
 }

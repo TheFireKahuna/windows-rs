@@ -1,21 +1,20 @@
-//! Drives the pointer stack against a real window and reports what a run actually did.
+//! Drives the pointer stack against a real window and prints a census of the run.
 //!
-//! Four questions this answers that no document can:
+//! The run measures four properties of the stack:
 //!
-//! 1. **Which unit do the WinRT pointer statics answer in?** `PointerPoint.Position` is
-//!    documented as "*client coordinates, in device-independent pixel*" and the statics
-//!    "*always use the app context*" — but that is UWP's account of itself, and this is a
-//!    per-monitor-v2 desktop window with no view and no rasterization scale. If the statics
-//!    answer in client *pixels*, every gesture threshold is wrong by the display scale.
-//!    [`Router::measured_unit`] reports what the first contact measured.
-//! 2. **Is hover really frame-bounded?** The census separates hover hit tests from discrete
-//!    ones. Sweep the pointer and watch `hover_hits` rise no faster than `ticks`.
-//! 3. **Does a legacy mouse message ever arrive?** This handler counts every message it sees
-//!    by number, so a legacy one shows up as a raw code with no name — which is the only way
-//!    it *can* show up, since neither binding filter generates a constant to match on.
-//! 4. **Which of the redacted exports does this build have?** `GetPointerTouchpadInfo` and
-//!    `ReportWindowContentInertia` are resolved by name; the capability report says whether
-//!    they resolved.
+//! 1. The unit the WinRT pointer statics answer in. `PointerPoint.Position` is documented as
+//!    client coordinates in device-independent pixels, for a UWP view; this is a
+//!    per-monitor-v2 desktop window with no view and no rasterization scale, so the unit is
+//!    measured from the first contact and reported by [`Router::measured_unit`]. If the
+//!    statics answer in client pixels, every gesture threshold is off by the display scale.
+//! 2. Whether hover is frame-bounded. The census counts hover hit tests separately from
+//!    discrete ones, so a sweep raises `hover_hits` no faster than `ticks`.
+//! 3. Whether a legacy mouse message arrives. The handler counts every message by number,
+//!    and a legacy one prints as a bare code because neither binding filter generates a
+//!    constant to match on.
+//! 4. Which of the redacted exports this build resolved. `GetPointerTouchpadInfo` and
+//!    `ReportWindowContentInertia` are resolved by name, and [`Router::capability`] reports
+//!    which of them bound.
 //!
 //! ```text
 //! cargo run -p windows-ui --example pointer
@@ -34,7 +33,7 @@ use windows_ui::gesture::{DragDecl, GestureDecl, Recognised};
 use windows_ui::input::{Doorbell, Report, Router};
 use windows_window::Window;
 
-/// How much of the message stream is kept in order.
+/// Bounds the number of messages kept in the ordered trace.
 const TRACE_MAX: usize = 4000;
 
 /// Four targets across the top of the window, in DIPs.
@@ -48,9 +47,9 @@ const TARGETS: [(&str, f32, f32, f32, f32); 4] = [
 fn main() -> Result<()> {
     let bell = Rc::new(Doorbell::new());
     let seen: Rc<RefCell<Vec<(u32, u32)>>> = Rc::new(RefCell::new(Vec::new()));
-    // The first messages in the order they arrived. A tally says *whether* a legacy message
-    // came; only an ordered trace says **when**, which is the difference between "the
-    // pointer arms leak" and "the window was still being created".
+    // The first messages in arrival order. The tally in `seen` says whether a legacy message
+    // arrived; its index in this trace says when, which separates a leaking pointer arm from
+    // a message that arrived while the window was still being created.
     let trace: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
 
     let window = Window::new("windows-ui — pointer stack")
@@ -63,8 +62,8 @@ fn main() -> Result<()> {
             let trace = Rc::clone(&trace);
             move |_, message, wparam, lparam| {
                 // Counted before the doorbell, so a message the doorbell consumes is still
-                // visible here. This is how a legacy arrival would be caught: it has no name
-                // in this crate, so it prints as a bare number.
+                // visible here. A legacy mouse message has no constant in this crate and so
+                // prints as a bare number.
                 {
                     let mut seen = seen.borrow_mut();
                     match seen.iter_mut().find(|(code, _)| *code == message) {
@@ -83,8 +82,8 @@ fn main() -> Result<()> {
     let pacer = window.pacer()?;
     let mut router = Router::new(&bell, &window, pacer.wake())?;
 
-    // The one authority, built by hand: this example has no scene, and the point is that the
-    // router does not care where the array came from.
+    // The hit array, built by hand: this example has no scene, and the router reads the array
+    // whatever produced it.
     let mut hits = HitTable::default();
     hits.replace(&targets());
 
@@ -123,8 +122,7 @@ fn main() -> Result<()> {
     let mut reports = Vec::new();
     let quit = Rc::new(std::cell::Cell::new(false));
 
-    // The frame clock is the only clock: everything below happens on `WM_FRAME` and nothing
-    // else drives it.
+    // The tick below runs on `WM_FRAME`; nothing else drives it.
     let tick = {
         let quit = Rc::clone(&quit);
         let mut last: Option<(&'static str, windows_scene::Point)> = None;
@@ -149,16 +147,16 @@ fn main() -> Result<()> {
                                 }
                             );
                         }
-                        // One per moved contact per frame; the pen detail rides here.
+                        // One per moved contact per frame; carries the pen detail.
                         Report::Moved { .. } => {}
                         Report::Dragged { update, .. } => {
                             if update.decided {
                                 println!("drag locked to {:?}", update.phase);
                             }
                         }
-                        // Summarised rather than printed: a manipulation raises one of these per
-                        // sample, and sixty lines of identical deltas hide the four events that
-                        // matter.
+                        // Summarised rather than printed: a manipulation raises one report per
+                        // sample, so only the last cumulative translation is kept and printed
+                        // when the manipulation completes.
                         Report::Gesture { target, event, .. } => match event {
                             Recognised::ManipulationUpdated { cumulative, .. } => {
                                 last = Some((label(Some(*target)), cumulative.translation));
@@ -193,24 +191,25 @@ fn main() -> Result<()> {
         )
     };
 
-    // The window's handler already forwards to the doorbell; this second one services the
-    // frame message. Installed by re-entering the pump rather than by a second handler,
-    // because `on_message` holds exactly one.
+    // The window's handler forwards to the doorbell. The frame message is serviced by this
+    // pump rather than by a second handler, because `on_message` holds exactly one.
     let mut message = MSG::default();
     loop {
-        // SAFETY: no window filter, and the destination is a stack local.
+        // SAFETY: `message` is a stack local valid for writes for the whole call, and a null
+        // window handle is the documented request for every message on this thread.
         let more = unsafe { GetMessageW(&mut message, core::ptr::null_mut(), 0, 0) };
         if more.0 <= 0 || quit.get() {
             break;
         }
-        // SAFETY: `message` was just filled in by the call above.
+        // SAFETY: `GetMessageW` returned a positive result above, so `message` is fully
+        // initialized, and both calls take it by shared reference.
         unsafe {
             _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
         if message.message == windows_window::WM_FRAME {
-            // Stated at every tick and never held: the window and its monitor own both
-            // facts, and a router that cached them could be left holding a stale one.
+            // Rebuilt each tick: DPI and colour capability belong to the monitor the window
+            // is on, and a copy held across a monitor change would be stale.
             let env = Env::new(
                 window.metrics().map_or(96.0, |m| m.dpi as f32),
                 OutputTransform::for_display(
@@ -227,14 +226,12 @@ fn main() -> Result<()> {
     println!("measured unit: {:?}", router.measured_unit());
     println!("doorbell: {:?}", bell.health());
     println!("pacer: {:?}", pacer.health());
-    // The claim this separation exists for: ticks may exceed display frames — a press asks
-    // to be serviced at once — but hover must not resolve more than once per frame.
-    // Two counts, because they answer different questions. `hover_hits` is samples
-    // *examined* — bounded by the pointer's own report rate, and deliberately not by the
-    // frame clock, because a crossing between two samples is an event that sampling would
-    // erase. `hover_changes` is crossings *published*, which is the one bounded by what a
-    // user can see. A run where the first is not comfortably larger than the second is a run
-    // where the platform coalesced above us and the batch carried one entry.
+    // Ticks may exceed display frames, because a press asks to be serviced at once; hover
+    // resolves at most once per frame. `hover_hits` counts samples examined, bounded by the
+    // pointer's own report rate rather than by the frame clock, so a crossing that falls
+    // between two samples is not erased. `hover_changes` counts crossings published, which is
+    // the count bounded by the frame clock. `hover_hits` no larger than `hover_changes` means
+    // the platform coalesced above this stack and each batch carried one entry.
     println!(
         "display frames {}   ticks {}   samples examined {}   crossings {}   deepest batch {}",
         pacer.wake().frames(),
@@ -243,8 +240,9 @@ fn main() -> Result<()> {
         router.census().hover_changes,
         router.census().deepest_batch
     );
-    // Where each legacy arrival sits in the stream, and what the first pointer message's
-    // index was. A count says whether; a position says *when*, which is the whole finding.
+    // The index of each legacy arrival in the stream, and of the first pointer message. An
+    // index separates a leaking arm from a message that arrived before the pointer path was
+    // in place.
     let trace = trace.borrow();
     let first_pointer = trace.iter().position(|code| *code == 0x0245);
     let legacy: Vec<usize> = trace
@@ -279,8 +277,8 @@ fn targets() -> Vec<HitEntry> {
             y0: *y0,
             x1: *x1,
             y1: *y1,
-            // The smallest target declares none, so the platform's ~9 mm guidance applies to
-            // it and to nothing else here.
+            // Only the smallest target takes the platform's default touch inflation; the
+            // other three are hit at their declared bounds.
             touch_inflate: if index == 3 {
                 windows_scene::default_inflation(x1 - x0, y1 - y0)
             } else {
@@ -295,11 +293,11 @@ fn targets() -> Vec<HitEntry> {
         .collect()
 }
 
-/// The id the nth target is named by.
+/// Returns the [`ControlId`] naming the target at `index`.
 ///
-/// Minted rather than fabricated, because a `ControlId` is a generational index and there is
-/// no way to make one but to ask an authority for it. Minting densely from a fresh one means
-/// the nth is at slot n + 1, since every arena burns slot zero so that `NONE` names nothing.
+/// A `ControlId` is a generational index, so it is minted from an [`Ids`] authority rather
+/// than written out. Minting densely from a fresh authority puts the nth target at slot
+/// n + 1, because slot zero is reserved so that `NONE` names no control.
 fn target_id(index: usize) -> ControlId {
     let mut ids = Ids::<windows_scene::Control>::new();
     let mut id = ids.mint();
@@ -318,8 +316,10 @@ fn label(id: Option<ControlId>) -> &'static str {
     }
 }
 
-/// Names the messages this stack expects. **Anything unnamed is the finding**: a legacy
-/// mouse message has no constant in either binding filter, so it can only appear as a number.
+/// Returns a name for `code`, or its hexadecimal value when the message is not in the table.
+///
+/// The two legacy mouse messages are named out here because neither binding filter generates
+/// a constant for them, so nothing else in the run would identify them.
 fn name_of(code: u32) -> String {
     let named = [
         (0x0245, "WM_POINTERUPDATE"),
@@ -350,28 +350,27 @@ fn name_of(code: u32) -> String {
     }
 }
 
-/// Injects a hover sweep, a click and a drag, so the run answers its own questions with no
-/// hand on the mouse.
+/// Injects a hover sweep, a tap, a drag, a manipulation, a wheel notch and `Q`, so the run
+/// completes with no hand on the mouse.
 ///
-/// **`SendInput`, never `SetCursorPos`.** A cursor warp moves the pointer and lets the window
-/// manager notice; only the injected event goes through the input stack, and the same probe
-/// reads "zero pointer messages, legacy only" under a warp — the right conclusion's exact
-/// opposite, from an instrument that was never measuring the stack.
+/// Every motion goes through `SendInput`. `SetCursorPos` warps the cursor and leaves the
+/// window manager to notice, which yields legacy mouse messages and no pointer messages, so
+/// it measures nothing about the stack under test.
 fn drive(origin: (i32, i32), scale: f32) {
     let px = |x: f32, y: f32| (origin.0 + (x * scale) as i32, origin.1 + (y * scale) as i32);
     let rest = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
     rest(600);
 
-    // A sweep across all four targets, far faster than the frame rate. Hover must resolve
-    // once per frame regardless of how many of these arrive.
+    // A sweep across all four targets, far faster than the frame rate. Hover resolves at most
+    // once per frame however many of these arrive.
     for step in 0..=60 {
         let (x, y) = px(20.0 + step as f32 * 7.5, 50.0);
         pump::move_to(x, y);
         rest(4);
     }
 
-    // A tap that does not move: the recogniser's own `Tapped`, which is what a control
-    // without a manipulation is waiting for.
+    // A tap with no motion, which the recogniser reports as `Tapped` — the report a control
+    // that declares no manipulation acts on.
     let (x, y) = px(80.0, 50.0);
     pump::move_to(x, y);
     rest(80);
@@ -381,7 +380,7 @@ fn drive(origin: (i32, i32), scale: f32) {
     rest(200);
 
     // A two-axis drag on a target that declares one. It crosses the threshold horizontally
-    // first and then travels further vertically — the lock must stay where it landed.
+    // and then travels further vertically; the axis lock stays where the crossing put it.
     let (x, y) = px(200.0, 50.0);
     pump::move_to(x, y);
     rest(80);
@@ -393,8 +392,8 @@ fn drive(origin: (i32, i32), scale: f32) {
         rest(8);
     }
     // Out of the window entirely and back. A contact routes to its down-window for its whole
-    // life, so the drag must survive leaving — no cancel, no lost capture, and a release that
-    // still names the target it began on.
+    // life, so leaving cancels nothing, loses no capture, and the release still names the
+    // target the drag began on.
     let (x, y) = px(-400.0, -300.0);
     pump::move_to(x, y);
     rest(60);
@@ -424,11 +423,12 @@ fn drive(origin: (i32, i32), scale: f32) {
     pump::key(b'Q' as u16);
 }
 
-/// The pump's own surface, plus the injector this example drives itself with.
+/// Declares the message-pump entry points and the input injector this example drives itself
+/// with.
 ///
-/// Declared here rather than filtered into the crate: driving input is a harness concern, and
-/// `windows-ui`'s generated surface is what the framework *reads*.
-// The names are the platform's, so they are spelled the platform's way.
+/// These live here rather than in the crate's generated bindings, which cover the input the
+/// framework reads rather than the input a harness writes.
+// The names, field names and layouts are the platform's.
 #[expect(non_snake_case, clippy::upper_case_acronyms)]
 mod pump {
     windows_core::link!("user32.dll" "system" fn GetMessageW(lpmsg: *mut MSG, hwnd: *mut core::ffi::c_void, wmsgfiltermin: u32, wmsgfiltermax: u32) -> windows_core::BOOL);
@@ -500,10 +500,11 @@ mod pump {
     const SM_CXVIRTUALSCREEN: i32 = 78;
     const SM_CYVIRTUALSCREEN: i32 = 79;
 
-    /// A client point in screen pixels.
+    /// Returns the client area's top-left corner, in screen pixels.
     pub fn client_origin(hwnd: *mut core::ffi::c_void) -> (i32, i32) {
         let mut point = [0, 0];
-        // SAFETY: `hwnd` is live and the point is a stack local the call writes back through.
+        // SAFETY: `hwnd` names a window this process owns and has not destroyed, and `point`
+        // is a stack local valid for writes for the whole call.
         unsafe {
             _ = ClientToScreen(hwnd, &mut point);
         }
@@ -511,7 +512,8 @@ mod pump {
     }
 
     fn send(input: INPUT) {
-        // SAFETY: one fully initialized record of exactly the size declared.
+        // SAFETY: `input` is one fully initialized record, and `cbsize` is its exact size, so
+        // the count and stride the call reads with match the allocation.
         unsafe {
             SendInput(1, &input, size_of::<INPUT>() as i32);
         }
@@ -532,28 +534,27 @@ mod pump {
         });
     }
 
-    /// Where the cursor actually is.
+    /// Returns the cursor position, in screen pixels.
     pub fn cursor() -> (i32, i32) {
         let mut point = [0, 0];
-        // SAFETY: the destination is a stack local the call writes back through.
+        // SAFETY: `point` is a stack local valid for writes for the whole call.
         unsafe {
             _ = GetCursorPos(&mut point);
         }
         (point[0], point[1])
     }
 
-    /// Absolute motion, corrected against where the cursor actually landed.
+    /// Moves the cursor to `(x, y)` in screen pixels, correcting against where it landed.
     ///
-    /// The correction is not defensive padding: `SendInput`'s absolute coordinates are
-    /// normalized over the virtual desktop and rounded to a 16-bit grid, which on a
-    /// 7680-pixel-wide desktop quantizes to whole pixels only by luck — and a harness that
-    /// aims at a 120-DIP target and lands two pixels outside it reports a stack bug that is
-    /// its own. One feedback step removes the whole class.
+    /// `SendInput`'s absolute coordinates are normalized over the virtual desktop onto a
+    /// 16-bit grid, so a requested pixel is reachable in one step only when the desktop's
+    /// width divides that grid evenly. Up to two feedback steps land the cursor on the
+    /// requested pixel, which keeps a miss of a few pixels from reading as a hit-test fault.
     pub fn move_to(x: i32, y: i32) {
         absolute(x, y);
-        // Corrected from where it landed, never from where it started: an aim taken from a
-        // cursor that is still on the other monitor overshoots by the whole desktop, and the
-        // path there crosses out of the window and back.
+        // The correction is measured from where the cursor landed, not from where it started:
+        // an offset taken against a cursor still on another monitor overshoots by the width
+        // of the desktop.
         for _ in 0..2 {
             let (ax, ay) = cursor();
             if (ax, ay) == (x, y) {
@@ -563,10 +564,11 @@ mod pump {
         }
     }
 
-    /// Absolute motion, normalized over the **virtual** desktop so a secondary monitor is
-    /// reachable and the primary one is not silently assumed.
+    /// Injects absolute motion to `(x, y)` in screen pixels, normalized over the virtual
+    /// desktop so that points on a secondary monitor are reachable.
     fn absolute(x: i32, y: i32) {
-        // SAFETY: each takes an index and returns a metric.
+        // SAFETY: `GetSystemMetrics` takes an index by value and returns a metric; no pointer
+        // crosses the boundary.
         let (left, top, width, height) = unsafe {
             (
                 GetSystemMetrics(SM_XVIRTUALSCREEN),

@@ -1,19 +1,18 @@
-//! Placing a sample in time.
+//! Placing a sample in time: the two rates a multi-sample drive is paced at, and the clocks
+//! they wait on.
 //!
-//! Two rates, and neither is a fallback for the other — they answer different questions:
+//! Neither rate substitutes for the other:
 //!
-//! * **[`Rate::PerMs`]** puts samples *faster than the display*, which is the whole point
-//!   of a drag-fidelity test: a stack that consumes the newest sample instead of the batch
-//!   is indistinguishable from a correct one until the input outruns the frame clock.
-//! * **[`Rate::PerFrame`]** puts one sample per composition frame, waited on the
-//!   compositor's own clock rather than on a duration derived from a refresh rate we asked
-//!   for separately. There is no arithmetic to be wrong.
+//! * [`Rate::PerMs`] places samples faster than the display refreshes, which is what
+//!   separates a stack that consumes the whole batch from one that consumes only the newest
+//!   sample.
+//! * [`Rate::PerFrame`] places one sample per composition frame, waited on the compositor's
+//!   own clock rather than on a duration derived from a separately queried refresh rate.
 //!
-//! **`thread::sleep` appears nowhere here.** Its resolution is the scheduler's tick — on a
-//! default system, 15.6 ms — so a harness built on it cannot express a 1 ms rate at all,
-//! and a "900 ms hold" would be 900 ms plus a coin flip. The high-resolution waitable
-//! timer expresses both without `timeBeginPeriod`, which is a system-wide power cost this
-//! process has no claim to.
+//! Every wait here uses a high-resolution waitable timer or the compositor clock.
+//! `thread::sleep` resolves to the scheduler's tick — 15.6 ms on a default system — which
+//! cannot express a 1 ms rate and turns a 900 ms hold into 900 ms plus one tick. The timer
+//! needs no `timeBeginPeriod`, which would change the tick system-wide.
 
 use crate::bindings::*;
 use crate::{Error, Result};
@@ -21,18 +20,17 @@ use crate::{Error, Result};
 /// How fast a multi-sample operation places its samples.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Rate {
-    /// One sample every `n` milliseconds. `PerMs(0)` waits not at all, which is as fast as
-    /// the injection call returns and faster than any device reports.
+    /// One sample every `n` milliseconds. `PerMs(0)` does not wait, so samples are placed as
+    /// fast as the injection call returns, which is faster than any physical device reports.
     PerMs(u32),
     /// One sample per composition frame, waited on `DCompositionWaitForCompositorClock`.
     PerFrame,
 }
 
-/// The clocks a stream waits on, owned once for the injector's life.
+/// Holds the clocks a stream waits on, for the injector's life.
 ///
-/// The timer is created on first use rather than at construction: a run that only ever
-/// asks for [`Rate::PerFrame`] never needs one, and a kernel object nothing waits on is a
-/// handle leaked in every such run.
+/// The timer is created on first use: a run that only ever asks for [`Rate::PerFrame`] never
+/// creates a kernel object it does not wait on.
 #[derive(Default)]
 pub(crate) struct Pace {
     timer: Option<HANDLE>,
@@ -54,11 +52,12 @@ impl Pace {
             return Ok(());
         }
         let timer = self.timer()?;
-        // A negative due time is relative, in 100 ns units — the only form that does not
-        // depend on the system clock, which a harness must not be perturbed by.
+        // A negative due time is relative, in 100 ns units. An absolute due time would follow
+        // the system clock, which can be stepped underneath a running drive.
         let due = -(i64::try_from(duration.as_nanos() / 100).unwrap_or(i64::MAX));
-        // SAFETY: `timer` is a live waitable timer this type owns; the due time is a stack
-        // local; no completion routine and no resume are wanted.
+        // SAFETY: `timer` comes from `Self::timer`, the only producer of this handle, and it
+        // stays live until `Drop`; `due` is a stack local the call reads. No completion
+        // routine and no resume are asked for.
         unsafe {
             SetWaitableTimer(
                 timer,
@@ -71,7 +70,8 @@ impl Pace {
         }
         .ok()
         .map_err(|e| Error::call("SetWaitableTimer", e))?;
-        // SAFETY: as above. `INFINITE` is correct because the timer is what ends the wait.
+        // SAFETY: `timer` is the same live handle; `INFINITE` is bounded because that timer
+        // is armed and signals the wait.
         let waited = unsafe { WaitForSingleObject(timer, INFINITE) };
         if waited != WAIT_OBJECT_0 as u32 {
             return Err(Error::call(
@@ -84,8 +84,8 @@ impl Pace {
 
     /// Waits for the next composition frame.
     ///
-    /// Callable from any thread and needing no compositor of its own, which is what makes
-    /// it usable from the injecting thread while the window under test pumps on another.
+    /// Callable from any thread and needing no compositor of its own, so the injecting thread
+    /// waits on it while the window under test pumps on another.
     fn frame() -> Result<()> {
         // SAFETY: no handles are passed, so the count is zero and the pointer is null by
         // the call's own contract.
@@ -103,8 +103,10 @@ impl Pace {
         if let Some(timer) = self.timer {
             return Ok(timer);
         }
-        // SAFETY: no security attributes and no name; the flag asks for the ~0.5 ms timer
-        // rather than the ~15.6 ms one, and is available at the platform floor.
+        // The high-resolution flag asks for the ~0.5 ms timer rather than the ~15.6 ms one,
+        // and is available at the platform floor.
+        // SAFETY: a null security descriptor and a null name are the documented defaults;
+        // the call reads its arguments and returns a handle this type owns.
         let timer = unsafe {
             CreateWaitableTimerExW(
                 core::ptr::null(),
@@ -127,7 +129,8 @@ impl Pace {
 impl Drop for Pace {
     fn drop(&mut self) {
         if let Some(timer) = self.timer.take() {
-            // SAFETY: the handle was created by this type and is closed exactly once.
+            // SAFETY: `Self::timer` is the only producer of this handle, and `take` leaves
+            // nothing behind for a second close.
             unsafe {
                 _ = CloseHandle(timer);
             }

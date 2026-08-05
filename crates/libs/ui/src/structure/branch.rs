@@ -4,24 +4,23 @@ use crate::signal::Owner;
 
 /// A subtree keyed by which arm is showing.
 ///
-/// This is the mechanism behind both conditional forms, and they differ only in what they
-/// key on:
+/// Both conditional forms are this one mechanism, differing only in what they key on:
 ///
-/// - a condition is `Branch<bool>` — `set(Some(true), ..)` builds, `set(None, ..)` tears
-///   down. **Absence contributes nothing**: no node, no layout participation, no hidden
-///   placeholder. That is what replaces an empty-element ternary at every call site.
-/// - navigation is `Branch<Route>` — the scope is dropped and rebuilt on a key change, so
-///   a screen's state is genuinely gone when you navigate away. When that is *not* wanted,
-///   the state lives in a cell owned by a scope above the branch, which is a decision the
-///   call site makes by where it puts the cell rather than by a flag here.
+/// - a condition is `Branch<bool>`: [`set`](Self::set) with `Some(true)` builds, with
+///   `None` tears down. Absence contributes nothing — no node, no layout participation, no
+///   placeholder.
+/// - navigation is `Branch<Route>`: the scope is dropped and rebuilt on a key change, so a
+///   screen's state is gone once its arm is torn down. State that must outlive the arm
+///   lives in a cell owned by a scope above the branch, which the call site decides by
+///   where it creates the cell.
 ///
-/// The arm's scope is **detached** from whatever scope is running the update, for the same
-/// reason a keyed list's rows are: a branch driven from an effect would otherwise register
-/// every arm it ever built as a child of that effect's scope, and that list would grow for
-/// the life of the screen.
+/// The arm's scope is detached from whatever scope is running the update, as a keyed list's
+/// rows are: a branch driven from an effect would otherwise register every arm it ever
+/// built as a child of that effect's scope, and that list would grow for the life of the
+/// screen.
 pub struct Branch<K: PartialEq> {
     key: Option<K>,
-    /// Dropping this disposes the arm. The whole teardown story.
+    /// Dropping this scope disposes everything the showing arm created.
     arm: Option<Owner>,
 }
 
@@ -32,7 +31,7 @@ impl<K: PartialEq> Default for Branch<K> {
 }
 
 impl<K: PartialEq> Branch<K> {
-    /// A branch showing nothing.
+    /// Creates a branch showing nothing.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -41,13 +40,13 @@ impl<K: PartialEq> Branch<K> {
         }
     }
 
-    /// Which arm is showing.
+    /// Returns the key of the arm showing, or `None` where nothing is.
     #[must_use]
     pub fn key(&self) -> Option<&K> {
         self.key.as_ref()
     }
 
-    /// Whether anything is showing.
+    /// Returns whether an arm is showing.
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.arm.is_some()
@@ -55,10 +54,10 @@ impl<K: PartialEq> Branch<K> {
 
     /// Shows `key`'s arm, tearing down whatever was showing.
     ///
-    /// Nothing happens if `key` is already the one showing — which is what makes this
-    /// callable from an effect on every flush rather than only on a change. `teardown` is
-    /// called with the outgoing key while its nodes still exist; `build` is called inside
-    /// the new arm's own scope.
+    /// Nothing happens where `key` is already the one showing, so this may be called from
+    /// an effect on every flush rather than only on a change. `teardown` is called with the
+    /// outgoing key while its nodes still exist; `build` is called inside the new arm's own
+    /// scope.
     pub fn set(&mut self, key: Option<K>, teardown: impl FnOnce(&K), build: impl FnOnce(&K)) {
         if self.key == key {
             return;

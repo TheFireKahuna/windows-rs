@@ -6,9 +6,9 @@ const FILTER: &str = "crates/tools/composition/src/composition.txt";
 fn main() {
     let time = std::time::Instant::now();
 
-    // The Direct2D geometry bridge is not in the vendored Win32 corpus; it is compiled
-    // from `metadata/windowsgraphicsinterop.rdl` alongside the rest of the authored
-    // metadata. See `helpers::AUTHORED_METADATA`.
+    // The Direct2D geometry bridge is absent from the scraped Win32 corpus and comes from
+    // `metadata/windowsgraphicsinterop.rdl`, compiled with the rest of the authored
+    // metadata into one winmd named beside the two below.
     let authored = helpers::compile_authored_metadata();
 
     // System stack: Windows.UI.Composition lives in Windows.winmd; Windows.Win32.winmd

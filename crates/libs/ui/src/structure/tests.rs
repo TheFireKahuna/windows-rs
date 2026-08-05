@@ -1,9 +1,8 @@
-//! What reconciliation claims, asserted as the **steps it emitted** rather than as the
-//! order it ended up in.
+//! Tests for reconciliation, asserting the steps emitted rather than the final order.
 //!
-//! Any correct reconciler ends up in the right order. The whole value of this one is that
-//! it gets there with the minimum number of moves and without rebuilding a survivor, and
-//! only the step list shows that.
+//! Any correct reconciler ends in the right order; these tests check that this one reaches
+//! it with the minimum number of moves and without rebuilding a survivor, which only the
+//! step list shows.
 
 use super::*;
 use crate::signal::{Cell, Owner, live_nodes};
@@ -20,8 +19,8 @@ struct Recorder {
 
 impl Recorder {
     fn run(list: &mut Keyed<char>, next: &str) -> Self {
-        // The item **is** the key here, which is the case the projection exists for: no
-        // pair to build, and nothing stored twice.
+        // The item is its own key here, so the projection is the identity: no pair to
+        // build, and nothing stored twice.
         let items: Vec<char> = next.chars().collect();
         let out = Rc::new(RefCell::new(Self::default()));
         let (removed, built, placed) = (Rc::clone(&out), Rc::clone(&out), Rc::clone(&out));
@@ -95,8 +94,8 @@ fn an_unchanged_list_moves_nothing_and_rebuilds_nothing() {
 
 #[test]
 fn a_row_added_at_the_head_moves_no_survivor() {
-    // The case a reconciler without a subsequence gets wrong: it moves every row after the
-    // insertion, which for a list that gained one row at the top is the whole list.
+    // A reconciler without a subsequence moves every row after the insertion, which for a
+    // list that gained one row at the top is the whole list.
     let mut list = Keyed::new();
     Recorder::run(&mut list, "abc");
     let out = Recorder::run(&mut list, "zabc");
@@ -127,8 +126,8 @@ fn a_reversal_moves_all_but_one() {
 
 #[test]
 fn a_survivor_is_placed_after_the_key_already_in_front_of_it() {
-    // Front to back, so the predecessor is already correct when a step is applied — which
-    // is what lets the caller use "insert after this one" and nothing else.
+    // Front to back, so the predecessor is already correct when a step is applied and the
+    // caller needs no operation other than "insert after this one".
     let mut list = Keyed::new();
     let out = Recorder::run(&mut list, "abc");
     let afters: Vec<Option<usize>> = out.steps.iter().map(|(_, _, after)| *after).collect();
@@ -186,8 +185,8 @@ fn a_departing_row_disposes_its_scope_and_a_surviving_one_does_not() {
 #[test]
 fn a_list_reconciled_from_inside_an_effect_does_not_grow_its_scope() {
     // A row's scope is detached, so reconciling from an effect does not register every row
-    // it ever built as a child of the effect's own scope — which would grow for the life of
-    // the screen and is invisible until a profile shows the arena climbing.
+    // it ever built as a child of the effect's own scope, which would grow for the life of
+    // the screen.
     let baseline = live_nodes();
     let (owner, ()) = Owner::scope(|| {
         let mut list: Keyed<u32> = Keyed::new();

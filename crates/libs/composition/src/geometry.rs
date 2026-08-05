@@ -1,3 +1,6 @@
+//! The [`Geometry`] trait, which lets a sprite shape or a geometric clip take any
+//! composition geometry.
+
 use super::*;
 
 /// A geometry that can be filled or stroked by a
@@ -14,8 +17,8 @@ impl Sealed for CompositionEllipseGeometry {}
 
 impl Geometry for CompositionEllipseGeometry {
     fn as_geometry(&self) -> CompositionGeometry {
-        // The inherent method of the same name, which predates this trait and is what
-        // `shape.rs` reaches for internally.
+        // `Self::` selects the inherent method of the same name, the one `shape.rs` calls
+        // internally, rather than recursing into this trait method.
         Self::as_geometry(self)
     }
 }

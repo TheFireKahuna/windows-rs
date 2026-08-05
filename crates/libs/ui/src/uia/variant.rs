@@ -1,8 +1,8 @@
-//! The COM value types automation speaks in.
+//! Constructs the COM value types automation speaks in: `VARIANT`s, `BSTR`s and
+//! `SAFEARRAY`s.
 //!
-//! Every one of these is a constructor and nothing else. They are here so that the
-//! provider reads as the answers it gives rather than as union field writes, and so the
-//! one `unsafe` block per shape is written once.
+//! Every item here is a constructor, so each union write and each `SAFEARRAY` fill is
+//! written once rather than at every provider method that answers with one.
 
 use crate::bindings::{SAFEARRAY, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VARTYPE};
 use windows_core::BSTR;
@@ -36,25 +36,29 @@ fn variant(vt: VARTYPE, value: VARIANT_0_0_0) -> VARIANT {
     }
 }
 
-/// The answer to a property this element does not have.
+/// Returns the `VT_EMPTY` variant, which is how a provider answers a property the element
+/// does not have.
 ///
-/// **Not an error.** A provider that fails an unsupported property makes a client log
-/// noise for every element it walks; `VT_EMPTY` is how the contract says "nothing here".
+/// An unsupported property is answered rather than failed, so a client walking every
+/// element logs nothing.
 #[must_use]
 pub fn empty() -> VARIANT {
     variant(VT_EMPTY, VARIANT_0_0_0 { llVal: 0 })
 }
 
+/// Returns `value` as a `VT_I4` variant.
 #[must_use]
 pub fn i4(value: i32) -> VARIANT {
     variant(VT_I4, VARIANT_0_0_0 { lVal: value })
 }
 
+/// Returns `value` as a `VT_R8` variant.
 #[must_use]
 pub fn r8(value: f64) -> VARIANT {
     variant(VT_R8, VARIANT_0_0_0 { dblVal: value })
 }
 
+/// Returns `value` as a `VT_BOOL` variant.
 #[must_use]
 pub fn bool(value: bool) -> VARIANT {
     variant(
@@ -66,10 +70,10 @@ pub fn bool(value: bool) -> VARIANT {
     )
 }
 
-/// A UTF-16 slice as a `BSTR`, which is the only string automation accepts.
+/// Returns `value` as a `VT_BSTR` variant, or [`empty`] where the slice is empty.
 ///
-/// The tree stores its strings as UTF-16 for exactly this: the conversion is a length
-/// prefix and a memcpy, with no transcode on a path a client walks element by element.
+/// The tree stores its strings as UTF-16, which is what automation accepts, so the
+/// conversion is a length prefix and a memcpy with no transcode.
 #[must_use]
 pub fn wide(value: &[u16]) -> VARIANT {
     if value.is_empty() {
@@ -83,15 +87,21 @@ pub fn wide(value: &[u16]) -> VARIANT {
     )
 }
 
-/// The same, kept as a `BSTR` for the methods that return one directly.
+/// Returns `value` as a `BSTR`, for the methods that return one directly rather than
+/// inside a variant.
 #[must_use]
 pub fn bstr(value: &[u16]) -> BSTR {
     BSTR::from_wide(value)
 }
 
-/// An element, as automation returns one inside a property.
+/// Returns `value` as a `VT_UNKNOWN` variant, which is how automation carries an element
+/// inside a property.
 ///
-/// The variant takes a reference of its own, which the caller's is independent of.
+/// The variant holds a reference of its own, so the caller keeps its own.
+///
+/// # Panics
+///
+/// Panics if `value` does not answer `IUnknown`, which every COM object does.
 #[must_use]
 pub fn provider(value: &crate::bindings::IRawElementProviderSimple) -> VARIANT {
     variant(
@@ -105,18 +115,21 @@ pub fn provider(value: &crate::bindings::IRawElementProviderSimple) -> VARIANT {
     )
 }
 
-/// A `SAFEARRAY` of `count` elements of `vt`, each written by `fill`.
+/// Returns a `SAFEARRAY` of `vt` holding one element per entry of `values`, each written
+/// through `fill`.
 ///
-/// One helper for the three array shapes automation asks for, because the difference
-/// between them is a variant type and a stride, and three copies of this loop is three
-/// places to get the index arithmetic wrong.
+/// `fill` yields a pointer to the bytes `SafeArrayPutElement` copies for that element, so
+/// it must point at a value of `vt`. Returns null where the allocation fails, which the
+/// caller reports as a failed call.
 fn array<T>(
     vt: VARTYPE,
     values: &[T],
     fill: impl Fn(&T) -> *const core::ffi::c_void,
 ) -> *mut SAFEARRAY {
-    // SAFETY: a vector of the requested length, each index written once and in range. A
-    // null return is an allocation failure, which the caller reports as a failed call.
+    // SAFETY: `SafeArrayCreateVector` returns either null, which is checked, or an array
+    // of `values.len()` elements of `vt`. Every index written comes from enumerating
+    // `values`, so it is below that length, and each pointer `fill` yields addresses a
+    // value that outlives the call.
     unsafe {
         let out = SafeArrayCreateVector(vt, 0, values.len() as u32);
         if out.is_null() {
@@ -130,14 +143,15 @@ fn array<T>(
     }
 }
 
-/// Rectangles, as automation wants them: one flat array of `left, top, width, height`.
+/// Returns `values` as a `SAFEARRAY` of doubles, the flat `left, top, width, height` runs
+/// automation expects for rectangles.
 #[must_use]
 pub fn rect_array(values: &[f64]) -> *mut SAFEARRAY {
     array(VT_R8, values, |value| (&raw const *value).cast())
 }
 
-/// Providers. `SafeArrayPutElement` takes its own reference to each, so the caller's
-/// references are still the caller's.
+/// Returns `values` as a `SAFEARRAY` of providers. `SafeArrayPutElement` takes its own
+/// reference to each, so the caller keeps its own.
 #[must_use]
 pub fn provider_array(values: &[crate::bindings::IRawElementProviderSimple]) -> *mut SAFEARRAY {
     array(VT_UNKNOWN, values, |value| {
@@ -145,7 +159,8 @@ pub fn provider_array(values: &[crate::bindings::IRawElementProviderSimple]) -> 
     })
 }
 
-/// Text ranges, the same way.
+/// Returns `values` as a `SAFEARRAY` of text ranges, on the same terms as
+/// [`provider_array`].
 #[must_use]
 pub fn range_array(values: &[crate::bindings::ITextRangeProvider]) -> *mut SAFEARRAY {
     array(VT_UNKNOWN, values, |value| {
@@ -153,15 +168,19 @@ pub fn range_array(values: &[crate::bindings::ITextRangeProvider]) -> *mut SAFEA
     })
 }
 
-/// A runtime id: the append marker, then the two numbers that identify the element.
+/// Returns a runtime id: [`APPEND_RUNTIME_ID`], then the control id and part that identify
+/// the element.
 ///
-/// Stable across a republish, because a [`ControlId`](windows_scene::ControlId) is
-/// generational and lives as long as its mount. That is what lets a client correlate the
-/// element it is reading with the one an event named.
+/// The id is stable across a republish, because a
+/// [`ControlId`](windows_scene::ControlId) is generational and lives as long as its mount,
+/// which is what lets a client match the element it is reading against the one an event
+/// named. Returns null where the allocation fails, which the caller reports as a failed
+/// property.
 #[must_use]
 pub fn runtime_id(id: u32, part: u32) -> *mut SAFEARRAY {
-    // SAFETY: a vector of three `i32`s, each written once at a valid index. A null return
-    // is an allocation failure, which the caller reports as a failed property.
+    // SAFETY: `SafeArrayCreateVector` returns either null, which is checked, or an array
+    // of three `i32`s. Each of the three indices is written once and is below that length,
+    // and each source value is an `i32` alive for the duration of the call.
     unsafe {
         let array = SafeArrayCreateVector(VT_I4, 0, 3);
         if array.is_null() {

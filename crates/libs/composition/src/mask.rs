@@ -1,18 +1,16 @@
-//! Masking, and the gradient that is a mask rather than a colour (feature `system`).
+//! Mask brushes, and the linear gradient that supplies a mask's alpha (feature `system`).
 //!
 //! A mask brush multiplies one brush's alpha by another brush's colour, as a single
-//! sprite. That separation is the whole reason the retained tree can carry wide-gamut
-//! colour: coverage comes from an 8-bit alpha source, colour comes from a surface the
-//! app allocated in a float format, and neither constrains the other.
+//! sprite. Coverage comes from an 8-bit alpha source and colour from a surface the app
+//! allocated, so a float-format surface can carry wide-gamut colour behind an 8-bit mask.
 
 use super::*;
 
 /// A brush that paints `source`'s colour through `mask`'s alpha.
 ///
-/// The universal retained construction. The mask supplies coverage — a rasterized
-/// coverage surface, a gradient ramp, a captured subtree — and the source supplies
-/// colour, which may be an FP16 surface holding values above paper white that no
-/// `CompositionColorBrush` could express.
+/// The mask supplies coverage — a rasterized coverage surface, a gradient ramp, a
+/// captured subtree — and the source supplies colour, which may be an FP16 surface
+/// holding values above paper white that no `CompositionColorBrush` could express.
 ///
 /// **Nesting is legal exactly two levels deep**: a mask brush whose *source* is itself
 /// a mask brush works, and is how a gradient ramp stays unrasterized. Three levels
@@ -64,10 +62,10 @@ impl From<MappingMode> for bindings::CompositionMappingMode {
 /// A linear gradient, used here as an **alpha ramp** rather than as a colour source.
 ///
 /// Its stops are `Windows.UI.Color`, which is 8-bit and clamps below paper white on an
-/// HDR desktop — so a gradient is the wrong way to carry colour in this stack. Bound as
-/// a [`CompositionMaskBrush`]'s mask it is exactly right: the compositor evaluates the
-/// ramp per pixel, an app-allocated float surface still supplies the colour, and a
-/// resize under [`MappingMode::Relative`] costs nothing.
+/// HDR desktop, so a gradient cannot carry colour in this stack. Bound as a
+/// [`CompositionMaskBrush`]'s mask it supplies coverage instead: the compositor evaluates
+/// the ramp per pixel, an app-allocated float surface supplies the colour, and a resize
+/// under [`MappingMode::Relative`] needs no property write.
 #[derive(Clone)]
 pub struct CompositionLinearGradientBrush(pub(crate) bindings::CompositionLinearGradientBrush);
 
@@ -87,11 +85,11 @@ impl CompositionLinearGradientBrush {
 
     /// Replaces the ramp with `stops` of `(offset, alpha)`, each in `0.0..=1.0`.
     ///
-    /// Every stop is white at the given alpha, because this brush exists to supply
-    /// coverage: the colour is the other half of the mask brush. Alpha is quantized to
-    /// 8 bits by the composition `Color` ABI, so a narrow ramp — a fade from `0.10` to
-    /// `0.14`, say — resolves to a handful of distinct steps and bands. Normalize such a
-    /// ramp to full range and scale the *source* brush instead.
+    /// Every stop is white at the given alpha; the colour comes from the mask brush's
+    /// other half. Alpha is quantized to 8 bits by the composition `Color` ABI, so a
+    /// narrow ramp — a fade from `0.10` to `0.14`, say — resolves to a handful of distinct
+    /// steps and bands. Normalize such a ramp to full range and scale the *source* brush
+    /// instead.
     pub fn set_alpha_stops(&self, stops: &[(f32, f32)]) {
         let compositor = self.compositor();
         let brush: bindings::ICompositionGradientBrush = self.0.cast().unwrap();
@@ -108,8 +106,8 @@ impl CompositionLinearGradientBrush {
         }
     }
 
-    /// The compositor that created this brush, reached through the object base rather
-    /// than passed in by the caller.
+    /// Returns the compositor that created this brush, reached through the composition
+    /// object base rather than passed in by the caller.
     fn compositor(&self) -> bindings::ICompositor4 {
         let object: bindings::ICompositionObject = self.0.cast().unwrap();
         object.Compositor().unwrap().cast().unwrap()
@@ -126,9 +124,9 @@ impl Brush for CompositionLinearGradientBrush {
 
 impl Sealed for CompositionBrush {}
 
-/// The base type is itself a brush, so a caller that has erased which kind it built — a
-/// solid source, a mask, a gradient, a surface — can still bind it into either half of a
-/// mask brush.
+/// Makes the base type usable as a brush, so a [`CompositionBrush`] whose concrete kind —
+/// colour, mask, gradient, surface — has been erased can still be bound into either half
+/// of a mask brush.
 impl Brush for CompositionBrush {
     fn as_brush(&self) -> CompositionBrush {
         self.clone()

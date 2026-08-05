@@ -1,18 +1,19 @@
-//! Can a custom caption be driven entirely from pointer input, with no legacy mouse?
+//! Measures whether a custom caption can be driven entirely from pointer input, with no
+//! legacy mouse.
 //!
-//! Three things have to be true, and none of them is answerable from documentation:
+//! Three conditions have to hold:
 //!
-//! 1. **Consuming the non-client pointer messages suppresses the legacy stream.** If it
-//!    does not, there is nothing to discuss — the legacy messages arrive regardless.
-//! 2. **The Snap Layouts flyout survives it.** `HTMAXBUTTON` is the only trigger there is,
-//!    and the flyout may hook the hit-test answer alone or may need the system's own
-//!    non-client hover tracking. If it needs the tracking, that one button's hover is
+//! 1. **Consuming the non-client pointer messages suppresses the legacy stream.** Where it
+//!    does not, the legacy messages arrive whatever the caption does with the pointer ones.
+//! 2. **The Snap Layouts flyout survives that consumption.** `HTMAXBUTTON` is its only
+//!    trigger, and the flyout may hook the hit-test answer alone or may need the system's
+//!    own non-client hover tracking. If it needs the tracking, that one button's hover is
 //!    legacy by force.
-//! 3. **The drag still works.** Microsoft states that selectively consuming some pointer
-//!    input and passing the rest to `DefWindowProc` is *undefined* — so a caption that
-//!    eats hover and forwards presses may or may not still drag. And if it does not, the
-//!    replacement is `WM_SYSCOMMAND`/`SC_MOVE`, which is only equivalent if it enters the
-//!    same modal loop — the loop Aero shake runs on.
+//! 3. **The system's own drag still runs.** Microsoft documents selectively consuming some
+//!    pointer input and passing the rest to `DefWindowProc` as *undefined*, so a caption
+//!    that eats hover and forwards presses may or may not still drag. The replacement is
+//!    `WM_SYSCOMMAND`/`SC_MOVE`, which is equivalent only if it enters the same modal loop
+//!    — the loop Aero shake runs on.
 //!
 //! The consumption strategies are applied from this example's own message handler, which
 //! runs ahead of the caption's.
@@ -32,15 +33,16 @@ use windows_window::{
 const BAR_H: f32 = 32.0;
 const BUTTON_W: f32 = 46.0;
 
-/// What this window's handler swallows before the caption sees it.
+/// Selects which non-client pointer messages this window's handler swallows before the
+/// caption sees them.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Consume {
-    /// This example swallows nothing, so the caption's own partition runs: consumed over
-    /// the three button regions, forwarded elsewhere.
+    /// Swallows nothing, leaving the caption's own partition: consumed over its button
+    /// regions, forwarded elsewhere.
     Nothing,
-    /// Hover only, which is the minimum a pointer-native caption needs.
+    /// Swallows `WM_NCPOINTERUPDATE` only, the minimum a pointer-native caption needs.
     HoverOnly,
-    /// Every non-client pointer arm — the fully pointer-native shape.
+    /// Swallows update, down and up: the fully pointer-native shape.
     AllNcPointer,
 }
 
@@ -80,8 +82,8 @@ fn main() -> Result<()> {
                 }
                 tally.set(counts);
 
-                // Consumption is "handle it and return 0", which is exactly what stops
-                // `DefWindowProc` synthesizing the legacy message behind it.
+                // Consuming is returning 0 rather than passing the message on, which is
+                // what stops `DefWindowProc` synthesizing the legacy message behind it.
                 let swallow = match mode.get() {
                     Consume::Nothing => false,
                     Consume::HoverOnly => message == msg::NC_POINTER_UPDATE,
@@ -96,8 +98,8 @@ fn main() -> Result<()> {
         .custom_caption(CaptionSpec {
             height: Some(BAR_H),
             corners: CornerPreference::Round,
-            // Only the maximize button, which is the one that must answer a non-client hit
-            // code. Close and minimize belong on the client path and are not modelled here.
+            // Only the maximize button, which is the one that has to answer a non-client
+            // hit code. Close and minimize belong on the client path and are left out.
             buttons: CaptionButtons {
                 minimize: false,
                 maximize: true,
@@ -125,9 +127,8 @@ fn main() -> Result<()> {
     // terminal, and every finding then describes the harness.
     sys::place_on_top(&window, 100, 100, 900, 600);
     settle(&window, 200);
-    // Click the client area to activate, then ask. A window that is not foreground is not
-    // offered Snap Layouts at all, so this is a precondition of the experiment and not a
-    // step of it.
+    // Clicks the client area to activate. Snap Layouts is not offered to a window that is
+    // not foreground, so every arm depends on this having worked.
     sys::move_cursor(400, 500);
     settle(&window, 120);
     sys::mouse_button(true);
@@ -139,9 +140,8 @@ fn main() -> Result<()> {
         foreground = sys::activate(&window);
         settle(&window, 250);
     }
-    // Raised and active by the click; now leave the topmost band, because a topmost window
-    // is the prime suspect for the flyout's absence and the click has already bought the
-    // z-order this needs.
+    // Leaves the topmost band now that the click has raised and activated the window: a
+    // topmost window is not offered Snap Layouts.
     sys::drop_topmost(&window);
     settle(&window, 250);
     println!("  foreground: {foreground}");
@@ -162,8 +162,8 @@ fn main() -> Result<()> {
         "  window at {origin:?}, maximize button at {maximize:?}, dpi {}",
         metrics.dpi
     );
-    // The precondition of the whole flyout arm: the window must actually answer
-    // HTMAXBUTTON there. 9 is HTMAXBUTTON.
+    // The flyout arm depends on the window answering HTMAXBUTTON, which is 9, at this
+    // point.
     let answer_at_button = sys::hit_test(&window, maximize.0, maximize.1);
     println!(
         "  hit test at the maximize button: {answer_at_button} ({})",
@@ -192,13 +192,13 @@ fn main() -> Result<()> {
         mode.set(strategy);
         tally.set(Tally::default());
 
-        // Several small moves inside the button, so "one pointer message per legacy
-        // message" is a ratio rather than a single sample.
+        // Several small moves inside the button, so the pointer and legacy counts are a
+        // ratio rather than a single sample.
         for step in 0..6 {
             sys::move_cursor(maximize.0 - step, maximize.1);
             settle(&window, 60);
         }
-        // The flyout is a hover-intent gesture; probe 0.3 needed ~1.6 s for it to appear.
+        // The flyout is a hover-intent gesture and takes upwards of 1.6 s to appear.
         settle(&window, 1800);
         let flyout = sys::snap_flyout();
         if strategy == Consume::Nothing {
@@ -229,7 +229,7 @@ fn main() -> Result<()> {
     // ── 3. does the system's own drag survive selective consumption? ─────────────────
     //
     // A press on `HTCAPTION` puts `DefWindowProc` into its modal move loop, which pumps
-    // for itself — so the release has to come from another thread or this never returns.
+    // for itself, so the release has to come from another thread or this one never returns.
     println!("\n  pressing the drag strip, per consumption strategy");
     println!(
         "    {:<16} {:>12} {:>14} {:>16}",
@@ -244,8 +244,9 @@ fn main() -> Result<()> {
 
         let from = strip;
         let releaser = std::thread::spawn(move || {
-            // Move past the drag threshold, then release. From another thread because the
-            // modal move loop pumps for itself and this one never returns until it ends.
+            // Moves past the drag threshold, then releases. From another thread because the
+            // modal move loop pumps for itself and the main thread stays in it until the
+            // release.
             std::thread::sleep(Duration::from_millis(250));
             for step in 1..=6 {
                 sys::move_cursor(from.0 + step * 4, from.1);
@@ -276,9 +277,8 @@ fn main() -> Result<()> {
 
     // ── 4. is SC_MOVE the same modal loop? ───────────────────────────────────────────
     //
-    // The replacement for a system drag, if the system's own is lost. It is only
-    // equivalent if it enters the loop Aero shake runs on, and `WM_ENTERSIZEMOVE` is that
-    // loop announcing itself.
+    // `SC_MOVE` replaces a system drag only if it enters the loop Aero shake runs on, and
+    // `WM_ENTERSIZEMOVE` is that loop announcing itself.
     mode.set(Consume::Nothing);
     tally.set(Tally::default());
     let escaper = std::thread::spawn(|| {
@@ -344,7 +344,7 @@ fn answer(claim: &str, held: bool, note: String) {
     );
 }
 
-/// Pumps for `ms`, so the window services what was just injected.
+/// Pumps for `ms` milliseconds, so the window services the input just injected.
 fn settle(_window: &Window, ms: u64) {
     let step = 10;
     for _ in 0..(ms / step).max(1) {
@@ -353,6 +353,7 @@ fn settle(_window: &Window, ms: u64) {
     }
 }
 
+/// The non-client and modal-loop message identifiers this example counts.
 mod msg {
     pub const NC_MOUSE_MOVE: u32 = 0x00A0;
     pub const NC_LBUTTON_DOWN: u32 = 0x00A1;
@@ -363,8 +364,8 @@ mod msg {
     pub const EXIT_SIZE_MOVE: u32 = 0x0232;
 }
 
-/// Raw Win32 the example needs to *drive* the window. An example is allowed what the
-/// framework's own source is linted against.
+/// The raw Win32 this example drives the window with: injected input, z-order, activation
+/// and window enumeration.
 mod sys {
     use windows_window::Window;
 
@@ -441,14 +442,16 @@ mod sys {
         fn GetForegroundWindow() -> Hwnd;
     }
 
-    /// Places and raises the window, **without** making it topmost.
+    /// Places the window at a screen position and raises it into the topmost band, without
+    /// activating it.
     ///
-    /// `HWND_TOPMOST` was the first thing tried and it is not innocent: a topmost window is
-    /// not offered Snap Layouts, so it turns the flyout arm's control into a false negative.
-    /// Ordinary z-order plus the activating click is enough to get above the terminal.
+    /// A topmost window is not offered Snap Layouts, so the flyout arm calls
+    /// [`drop_topmost`] before it measures.
     pub fn place_on_top(window: &Window, x: i32, y: i32, w: i32, h: i32) {
         const HWND_TOPMOST: isize = -1;
         const SWP_NOACTIVATE: u32 = 0x0010;
+        // SAFETY: `SetWindowPos` accepts any handle value and takes only integers besides
+        // it.
         unsafe { SetWindowPos(window.hwnd(), HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE) };
     }
 
@@ -456,6 +459,8 @@ mod sys {
     pub fn drop_topmost(window: &Window) {
         const HWND_NOTOPMOST: isize = -2;
         const NOMOVE_NOSIZE_NOACTIVATE: u32 = 0x0002 | 0x0001 | 0x0010;
+        // SAFETY: `SetWindowPos` accepts any handle value and takes only integers besides
+        // it.
         unsafe {
             SetWindowPos(
                 window.hwnd(),
@@ -469,56 +474,79 @@ mod sys {
         };
     }
 
-    /// Whether our window is the one under a screen point.
+    /// Returns whether `window` is the one under a screen point.
     pub fn covers(window: &Window, x: i32, y: i32) -> bool {
+        // SAFETY: `WindowFromPoint` takes its point by value, and the handle it returns is
+        // compared rather than dereferenced.
         unsafe { WindowFromPoint(Point { x, y }) == window.hwnd() }
     }
 
-    /// Activates the window. Without this the control arm measures nothing: Snap Layouts
-    /// does not offer to arrange a window that is not the foreground one, and a press on an
-    /// inactive window's caption activates it rather than beginning a drag.
+    /// Activates the window, returning whether it became the foreground one.
     ///
-    /// `SetForegroundWindow` alone is refused for a process that did not receive the last
-    /// input event — which a console child launched by a build tool has not. So the window
-    /// is activated the way a user would: by clicking it.
+    /// Snap Layouts does not offer to arrange a window that is not foreground, and a press
+    /// on an inactive window's caption activates it rather than beginning a drag, so every
+    /// arm depends on the window being foreground.
+    ///
+    /// `SetForegroundWindow` is refused to a process that did not receive the last input
+    /// event, which a console child launched by a build tool has not, so the caller clicks
+    /// the window the way a user would and calls this only as a fallback.
     pub fn activate(window: &Window) -> bool {
+        // SAFETY: both calls accept any handle value, and the handle returned is compared
+        // rather than dereferenced.
         unsafe {
             SetForegroundWindow(window.hwnd());
             GetForegroundWindow() == window.hwnd()
         }
     }
 
+    /// Returns whether the window is the foreground one.
     pub fn is_foreground(window: &Window) -> bool {
+        // SAFETY: `GetForegroundWindow` takes no argument, and the handle it returns is
+        // compared rather than dereferenced.
         unsafe { GetForegroundWindow() == window.hwnd() }
     }
 
+    /// Returns the window's client origin in screen coordinates.
     pub fn client_origin(window: &Window) -> (i32, i32) {
         let mut point = Point::default();
+        // SAFETY: `ClientToScreen` accepts any handle value and writes only through
+        // `point`, a live stack local of the size it expects.
         unsafe { ClientToScreen(window.hwnd(), &mut point) };
         (point.x, point.y)
     }
 
+    /// Returns the pointer's current screen position.
     pub fn cursor_position() -> (i32, i32) {
         let mut point = Point::default();
+        // SAFETY: `GetCursorPos` writes only through `point`, a live stack local of the
+        // size it expects.
         unsafe { GetCursorPos(&mut point) };
         (point.x, point.y)
     }
 
+    /// Posts a `WM_SYSCOMMAND` to the window, returning before it runs.
     pub fn post_syscommand(window: &Window, command: usize) {
         const WM_SYSCOMMAND: u32 = 0x0112;
+        // SAFETY: `PostMessageW` accepts any handle value, and `WM_SYSCOMMAND` carries the
+        // command in `wparam` rather than a pointer, so nothing has to outlive the post.
         unsafe { PostMessageW(window.hwnd(), WM_SYSCOMMAND, command, 0) };
     }
 
     fn send(input: Input) {
+        // SAFETY: `SendInput` reads `size_of::<Input>()` bytes from `input`, a live local
+        // whose `#[repr(C)]` layout is the `INPUT` it expects, and the size passed says so.
         unsafe { SendInput(1, &input, size_of::<Input>() as i32) };
     }
 
-    /// A real injected move. `SetCursorPos` warps the cursor and lets the window manager
-    /// notice; only this goes through the input stack, which is the thing being measured.
+    /// Moves the pointer to a screen point with an injected input event.
+    ///
+    /// `SetCursorPos` warps the cursor and lets the window manager notice, where this puts
+    /// an event through the input stack, which is what this example counts.
     pub fn move_cursor(x: i32, y: i32) {
         const MOUSEEVENTF_MOVE: u32 = 0x0001;
         const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
         const MOUSEEVENTF_VIRTUALDESK: u32 = 0x4000;
+        // SAFETY: `GetSystemMetrics` takes an index and returns an integer.
         let (vx, vy, vw, vh) = unsafe {
             (
                 GetSystemMetrics(76),
@@ -541,6 +569,7 @@ mod sys {
         });
     }
 
+    /// Presses or releases the primary button as an injected input event.
     pub fn mouse_button(down: bool) {
         const LEFTDOWN: u32 = 0x0002;
         const LEFTUP: u32 = 0x0004;
@@ -556,7 +585,8 @@ mod sys {
         });
     }
 
-    /// Escapes a modal move loop, which otherwise runs until the user ends it.
+    /// Presses and releases Escape, ending a modal move loop that would otherwise run until
+    /// the user ends it.
     pub fn press_escape() {
         const VK_ESCAPE: u16 = 0x1B;
         const KEYEVENTF_KEYUP: u32 = 0x0002;
@@ -578,11 +608,18 @@ mod sys {
     use std::sync::Mutex;
     static CLASSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    /// Every visible top-level window class right now. Used as a before/after difference so
-    /// that "the flyout did not appear" can be told apart from "it appeared under a name
-    /// this probe does not recognise".
+    /// Returns the class name of every visible top-level window.
+    ///
+    /// Differencing the list across a hover separates a flyout that did not appear from one
+    /// that appeared under a class name [`snap_flyout`] does not recognise.
     pub fn visible_classes() -> Vec<String> {
+        /// # Safety
+        ///
+        /// `hwnd` must be a window handle `EnumWindows` supplied for the enumeration in
+        /// progress.
         unsafe extern "system" fn collect(hwnd: Hwnd, _: isize) -> i32 {
+            // SAFETY: `hwnd` names a live window for the duration of the callback, and
+            // `GetClassNameW` writes at most `buffer.len()` code units into `buffer`.
             unsafe {
                 if IsWindowVisible(hwnd) == 0 {
                     return 1;
@@ -599,22 +636,37 @@ mod sys {
             1
         }
         CLASSES.lock().expect("no panic holds this lock").clear();
+        // SAFETY: `collect` has the signature `EnumWindows` calls, and every handle it
+        // passes is one this enumeration produced.
         unsafe { EnumWindows(collect, 0) };
         CLASSES.lock().expect("no panic holds this lock").clone()
     }
 
+    /// Returns the `HT*` code the window answers for a screen point.
     pub fn hit_test(window: &Window, x: i32, y: i32) -> i32 {
         const WM_NCHITTEST: u32 = 0x0084;
         let lparam = ((y as u32 as isize) << 16) | (x as u32 as isize & 0xffff);
+        // SAFETY: `SendMessageW` accepts any handle value, and `WM_NCHITTEST` reads the
+        // point out of `lparam` rather than through a pointer.
         unsafe { SendMessageW(window.hwnd(), WM_NCHITTEST, 0, lparam) as i32 }
     }
 
     static mut FOUND: Option<String> = None;
 
-    /// The Snap Layouts flyout is a separate shell window. Its class has been stable across
-    /// 22H2–24H2; anything else plausible is reported so a rename does not read as absence.
+    /// Returns the class name of the Snap Layouts flyout while it is open, matching the two
+    /// names the shell gives that separate window.
+    ///
+    /// A flyout under any other class name reads as absence here, which is what
+    /// [`visible_classes`] distinguishes.
     pub fn snap_flyout() -> Option<String> {
+        /// # Safety
+        ///
+        /// `hwnd` must be a window handle `EnumWindows` supplied for the enumeration in
+        /// progress, and the calling thread must be the one that owns `FOUND`.
         unsafe extern "system" fn visit(hwnd: Hwnd, _: isize) -> i32 {
+            // SAFETY: `hwnd` names a live window for the duration of the callback,
+            // `GetClassNameW` writes at most `buffer.len()` code units into `buffer`, and
+            // the enumeration this callback runs under is the only writer of `FOUND`.
             unsafe {
                 if IsWindowVisible(hwnd) == 0 {
                     return 1;
@@ -634,6 +686,8 @@ mod sys {
             }
             1
         }
+        // SAFETY: `EnumWindows` runs `visit` synchronously on this thread, and no other
+        // thread in this example touches `FOUND`, so the two accesses cannot overlap.
         unsafe {
             FOUND = None;
             EnumWindows(visit, 0);

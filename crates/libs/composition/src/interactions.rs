@@ -1,20 +1,18 @@
-//! Interaction trackers: motion the compositor owns (feature `system`).
+//! Interaction trackers: values the composition engine drives from a manipulation and from
+//! inertia (feature `system`).
 //!
-//! A tracker is a value the composition engine drives from a manipulation and from
-//! inertia, in **another process**. Every call into it and every callback out of it is
-//! asynchronous, and that single fact shapes this whole module:
+//! The engine runs in another process, so every call into a tracker and every callback out
+//! of it is asynchronous. Three consequences run through this module:
 //!
-//! - A request may be **dropped**, silently and by design, depending on the state the
-//!   tracker is in when it arrives. So every `try_update_*` returns the
-//!   [`RequestId`] the tracker assigned, and a caller that cares reconciles it against
-//!   [`TrackerEvent::RequestIgnored`].
-//! - The tracker's position **cannot be read directly** — this crate deliberately does
-//!   not carry that getter. The value delivered by [`TrackerEvent::ValuesChanged`] is
-//!   the only trustworthy one.
-//! - An **owner is not free**: it is supplied at construction, there is no per-callback
-//!   subscription, and the crossing itself dominates its cost. A tracker whose motion
-//!   nothing needs to observe should be created with
-//!   [`Compositor::create_interaction_tracker`] and no owner at all.
+//! - A request that arrives in a state the tracker will not accept it in is dropped rather
+//!   than failed. Every `try_update_*` returns the [`RequestId`] the tracker assigned, and
+//!   a caller that cares reconciles it against [`TrackerEvent::RequestIgnored`].
+//! - The tracker's position cannot be read directly, and this crate carries no such
+//!   getter. The value delivered by [`TrackerEvent::ValuesChanged`] is the only
+//!   trustworthy one.
+//! - An owner is supplied at construction, there is no per-callback subscription, and the
+//!   process crossing dominates its cost. A tracker whose motion nothing observes is
+//!   created with [`Compositor::create_interaction_tracker`] and no owner.
 
 use super::*;
 
@@ -94,8 +92,8 @@ impl From<RedirectionMode> for bindings::VisualInteractionSourceRedirectionMode 
 /// What happens when a manipulation reaches this tracker's bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChainingMode {
-    /// Hand off to an enclosing tracker if there is one. Nested scrollers then behave
-    /// correctly with no hand-written plumbing.
+    /// Hand off to an enclosing tracker if there is one, so nested scrollers chain
+    /// without app-side plumbing.
     Auto,
     /// Always hand off, even with nothing to hand off to.
     Always,
@@ -183,7 +181,7 @@ impl From<BindingAxes> for bindings::InteractionBindingAxisModes {
 /// the user rather than a request.
 #[derive(Clone, Copy, Debug)]
 pub enum TrackerEvent {
-    /// The tracker's value moved. **This is the only trustworthy read of it.**
+    /// The tracker's value moved. **These fields are the only trustworthy read of it.**
     ValuesChanged {
         /// The tracker's position. Increases for up/left motion, so the canonical
         /// content binding is its negation.
@@ -204,9 +202,8 @@ pub enum TrackerEvent {
     },
     /// The contact was released and the compositor is now animating the fling.
     ///
-    /// This arrives at the *instant* inertia begins, when where the motion will land is
-    /// already known — which is what makes destination prefetch possible while DWM
-    /// animates.
+    /// Arrives the instant inertia begins, when the resting position is already known, so
+    /// a consumer can prefetch the destination while the compositor animates.
     InertiaStateEntered {
         /// Where the motion would rest with no modifiers applied.
         natural_resting_position: Vector3,
@@ -219,7 +216,7 @@ pub enum TrackerEvent {
         /// The velocity inertia started with, in pixels per second.
         position_velocity: Vector3,
         /// Whether the motion came from an impulse (a wheel notch) rather than a fling,
-        /// which is worth a shorter decay.
+        /// which usually takes a shorter decay rate.
         from_impulse: bool,
         /// Whether this transition came from a tracker bound to this one rather than from
         /// this tracker's own input.
@@ -245,11 +242,11 @@ pub enum TrackerEvent {
         /// [`InteractionTracker::bind`] was used.
         from_binding: bool,
     },
-    /// A request was **dropped**. Not an error: a position update arriving while the
-    /// user is actively manipulating is documented to be ignored.
+    /// A request was dropped. Not an error: a position update that arrives while the user
+    /// is manipulating the tracker is ignored.
     ///
-    /// Drop the pending request and reconcile against the next `ValuesChanged`. Never
-    /// re-apply it blindly, or a user whose manipulation ends gets a double jump.
+    /// Discard the pending request and reconcile against the next `ValuesChanged`.
+    /// Re-applying it blindly double-jumps the position once the manipulation ends.
     RequestIgnored {
         /// The request that did not take.
         request: RequestId,
@@ -268,8 +265,8 @@ struct Owner(core::cell::RefCell<Box<dyn FnMut(TrackerEvent)>>);
 
 impl Owner {
     fn deliver(&self, event: TrackerEvent) {
-        // A re-entrant raise would otherwise unwind across the COM boundary; yielding is
-        // the conservative answer and drops an event rather than the process.
+        // A re-entrant raise would panic on the double borrow and unwind across the COM
+        // boundary; failing the borrow drops the event instead.
         if let Ok(mut handler) = self.0.try_borrow_mut() {
             handler(event);
         }
@@ -278,10 +275,10 @@ impl Owner {
 
 /// Reads `IsFromBinding` off whichever revision of an args type carries it.
 ///
-/// Each args type grew the flag in its **own** later interface, so the interface has to be
-/// named per call site — a single shared cast would answer only for the one type it named
-/// and silently report `false` for the other three. Absence reads as "not from a binding",
-/// which is right: a system that cannot report it is a system on which nothing was bound.
+/// Each args type carries the flag on its own later interface, so the interface is named
+/// per call site; one shared cast would report `false` for every args type but the one it
+/// named. A missing interface reads as `false`, which is correct — a system that does not
+/// carry the flag is one on which nothing can be bound.
 macro_rules! from_binding {
     ($args:expr, $iface:ident) => {
         $args
@@ -391,10 +388,9 @@ impl bindings::IInteractionTrackerOwner_Impl for Owner_Impl {
 
 /// A compositor-side value driven by a manipulation and by inertia.
 ///
-/// Bind a sink to it with an [`ExpressionAnimation`] referencing it as an
-/// [`Animatable`], and the compositor evaluates that binding every vblank with the app
-/// thread asleep — and keeps evaluating it when the app thread is busy, which is the
-/// property a front-side stepped animation cannot have.
+/// Bind a sink to it with an [`ExpressionAnimation`] referencing it as an [`Animatable`].
+/// The compositor evaluates that binding every vblank whether the app thread is asleep or
+/// busy.
 #[derive(Clone)]
 pub struct InteractionTracker(pub(crate) bindings::InteractionTracker);
 
@@ -428,9 +424,8 @@ impl InteractionTracker {
 
     /// Sets the range the tracker rests inside.
     ///
-    /// The position may travel *outside* it while interacting or in inertia — that
-    /// overpan is the bounce, and it is wanted, so a consumer must not clamp its own
-    /// reads.
+    /// The position may travel outside the range while interacting or in inertia; that
+    /// overpan is the bounce, so a consumer does not clamp its own reads.
     pub fn set_position_bounds(&self, min: Vector3, max: Vector3) {
         let tracker: bindings::IInteractionTracker = self.0.cast().unwrap();
         tracker.SetMinPosition(min).unwrap();
@@ -462,8 +457,8 @@ impl InteractionTracker {
     /// Sets how fast inertia decays per axis, in `0.0..=1.0`, or restores the system
     /// default with `None`.
     ///
-    /// A wheel notch deserves a shorter tail than a fling, which is what
-    /// [`TrackerEvent::InertiaStateEntered`]'s `from_impulse` distinguishes.
+    /// [`TrackerEvent::InertiaStateEntered`]'s `from_impulse` distinguishes a wheel notch
+    /// from a fling, which usually take different rates.
     pub fn set_position_inertia_decay_rate(&self, rate: Option<Vector3>) {
         let tracker: bindings::IInteractionTracker = self.0.cast().unwrap();
         tracker.SetPositionInertiaDecayRate(rate).unwrap();
@@ -477,9 +472,9 @@ impl InteractionTracker {
 
     /// Moves the tracker to `position`.
     ///
-    /// Ignored outright while the user is interacting. `scale_animation` says whether a
-    /// running custom scale animation survives — stated rather than defaulted, because
-    /// the default silently stops it.
+    /// The request is ignored while the user is interacting. `scale_animation` states
+    /// whether a running custom scale animation survives; the platform's own default
+    /// stops it.
     pub fn try_update_position(
         &self,
         position: Vector3,
@@ -496,10 +491,9 @@ impl InteractionTracker {
 
     /// Moves the tracker by `delta`. Ignored while the user is interacting.
     ///
-    /// This is the mouse-drag path: mouse contacts cannot be redirected into a
-    /// manipulation at all, so the front thread writes a request per consumed sample
-    /// while the button is down — and does nothing after release, which is where most of
-    /// a fling's frames are.
+    /// The mouse-drag path: a mouse contact cannot be redirected into a manipulation, so
+    /// the app writes one request per consumed sample while the button is down, and
+    /// nothing after release.
     pub fn try_update_position_by(&self, delta: Vector3, clamping: Clamping) -> Result<RequestId> {
         let tracker: bindings::IInteractionTracker4 = self.0.cast()?;
         Ok(RequestId(
@@ -524,10 +518,9 @@ impl InteractionTracker {
     /// Hands the tracker's position to an animation of the app's own, entering the
     /// custom-animation state until it finishes.
     ///
-    /// This is how a position is *moved* rather than jumped: scrolling a focused row into
-    /// view, returning to the top, settling on a chosen tab. Without it a programmatic
-    /// scroll is a discontinuity, and [`TrackerEvent::CustomAnimationStateEntered`] is a
-    /// state the owner reports that nothing can reach.
+    /// Moves the position rather than jumping it: scrolling a focused row into view,
+    /// returning to the top, settling on a chosen tab. It is the only way to enter the
+    /// state [`TrackerEvent::CustomAnimationStateEntered`] reports.
     ///
     /// The animation runs on the compositor like any other, so the front thread does
     /// nothing while it plays.
@@ -615,18 +608,17 @@ impl InteractionTracker {
 /// The visual a manipulation is collected on: both the hit-test target and the gesture's
 /// coordinate space.
 ///
-/// **It must not move during the manipulation**, which is why it is the scroll
-/// container's viewport and never the content that scrolls inside it. No visual needs to
-/// exist purely for input.
+/// The source visual must not move during the manipulation, so it is the scroll
+/// container's viewport rather than the content scrolling inside it. Any visual already in
+/// the tree can serve; none has to exist for input alone.
 #[derive(Clone)]
 pub struct VisualInteractionSource(pub(crate) bindings::VisualInteractionSource);
 
 impl VisualInteractionSource {
     /// Creates a source on `visual`.
     ///
-    /// `visual` must have a non-zero size or it will not hit-test correctly — a
-    /// zero-size viewport is a bug rather than a surface that merely never responds, so
-    /// it is asserted in debug builds.
+    /// `visual` must have a non-zero size, or the source never hit-tests. Debug builds
+    /// assert it.
     pub fn for_visual(visual: &Visual) -> Result<Self> {
         let size = visual.size();
         debug_assert!(
@@ -646,8 +638,8 @@ impl VisualInteractionSource {
 
     /// Enables rails, so a pan started primarily on one axis locks to it.
     ///
-    /// Wanted whenever both axes are live — a vertical list should not drift sideways —
-    /// and meaningless when only one is.
+    /// Rails matter only where both axes are live, keeping a vertical list from drifting
+    /// sideways; with one axis enabled they do nothing.
     pub fn set_rails(&self, x: bool, y: bool) {
         let source: bindings::IVisualInteractionSource = self.0.cast().unwrap();
         source.SetIsPositionXRailsEnabled(x).unwrap();
@@ -682,7 +674,7 @@ impl VisualInteractionSource {
         Ok(())
     }
 
-    /// The visual this source collects manipulations on.
+    /// Returns the visual this source collects manipulations on.
     pub fn source_visual(&self) -> Result<Visual> {
         let source: bindings::IVisualInteractionSource = self.0.cast()?;
         Ok(Visual(source.Source()?))
@@ -691,22 +683,22 @@ impl VisualInteractionSource {
     /// Hands an in-flight contact over to this source, so the compositor drives the
     /// manipulation from here on.
     ///
-    /// **Touch and pen only** — a mouse contact is rejected outright, which is why mouse
-    /// drags are driven by
-    /// [`try_update_position_by`](InteractionTracker::try_update_position_by) instead. And
-    /// **success is signalled by the window losing the pointer**, not by the returned
-    /// `Ok`: an injected contact returns success while its updates keep arriving at the
-    /// window, which means the contact was never handed over. Treat the pointer as
-    /// redirected only once the window stops being told about it.
+    /// **Touch and pen only**: a mouse contact is rejected, so mouse drags go through
+    /// [`try_update_position_by`](InteractionTracker::try_update_position_by) instead.
     ///
-    /// Takes the pointer id a `WM_POINTER*` message carries, and reads the contact's state
+    /// **The window losing the pointer signals success, not the returned `Ok`.** An
+    /// injected contact returns success while its updates keep arriving at the window,
+    /// meaning the contact was never handed over. Treat the pointer as redirected only
+    /// once the window stops being told about it.
+    ///
+    /// `pointer_id` is the id a `WM_POINTER*` message carries; the contact's state is read
     /// here. An `Err` is a pointer id the system no longer knows — the ordinary race
     /// between a message being handled and the contact ending, not a failure to redirect.
     pub fn try_redirect_for_manipulation(&self, pointer_id: u32) -> Result<()> {
         let mut info = bindings::POINTER_INFO::default();
-        // SAFETY: `info` is a live, correctly-sized out-parameter for the duration of the
-        // call, and `pointer_id` is validated by the system rather than by us — an id that
-        // is stale or was never real fails the call instead of reading anything.
+        // SAFETY: `info` is a stack local of the layout the system writes, live for the
+        // whole call. `pointer_id` is validated by the system, so a stale or invented id
+        // fails the call rather than reading anything.
         unsafe { bindings::GetPointerInfo(pointer_id, &mut info).ok()? };
 
         let interop: bindings::IVisualInteractionSourceInterop = self.0.cast()?;
@@ -719,19 +711,18 @@ impl VisualInteractionSource {
 /// A rule applied to a tracker's inertia: a condition, plus either a resting value or an
 /// explicit motion equation.
 ///
-/// Built complete — there is no way to have one with a condition and no value — because a
-/// half-configured modifier is applied silently rather than rejected.
+/// Every constructor sets both halves, since a modifier missing one is applied silently
+/// rather than rejected.
 #[derive(Clone)]
 pub struct InertiaModifier(pub(crate) bindings::InteractionTrackerInertiaModifier);
 
 impl Compositor {
     /// Creates a tracker with **no owner**, and therefore no callbacks.
     ///
-    /// This is the cheap form and the default: the owner is what costs, and it costs
-    /// whether or not the callbacks are read. Use it for any surface that is neither
-    /// virtualized nor driven by
-    /// [`try_update_position_by`](InteractionTracker::try_update_position_by) — nothing
-    /// needs to observe motion the compositor is already carrying.
+    /// An owner costs a cross-process callback per event whether or not the events are
+    /// read, so a surface that is neither virtualized nor driven by
+    /// [`try_update_position_by`](InteractionTracker::try_update_position_by) takes this
+    /// form: nothing has to observe motion the compositor already carries.
     pub fn create_interaction_tracker(&self) -> Result<InteractionTracker> {
         Ok(InteractionTracker(bindings::InteractionTracker::Create(
             &self.0,
@@ -740,11 +731,11 @@ impl Compositor {
 
     /// Creates a tracker that reports to `handler`.
     ///
-    /// The owner is supplied here because the API takes it at construction and there is
-    /// **no per-callback subscription**: a tracker that needs `RequestIgnored` or
-    /// `InertiaStateEntered` pays for `ValuesChanged` too. Prefer
-    /// [`create_interaction_tracker`](Self::create_interaction_tracker) unless something
-    /// genuinely reconciles against the events.
+    /// The owner is taken at construction and there is no per-callback subscription, so a
+    /// tracker that needs `RequestIgnored` or `InertiaStateEntered` receives
+    /// `ValuesChanged` as well. Use
+    /// [`create_interaction_tracker`](Self::create_interaction_tracker) where nothing
+    /// reconciles against the events.
     pub fn create_interaction_tracker_with_owner(
         &self,
         handler: impl FnMut(TrackerEvent) + 'static,
@@ -759,9 +750,8 @@ impl Compositor {
 
     /// Creates a snap point: where inertia rests when `condition` holds at inertia entry.
     ///
-    /// Both halves are expressions, so a snap point is authored the way every other
-    /// compositor-evaluated value is. The condition is evaluated **once**, when inertia
-    /// begins.
+    /// Both halves are expressions the compositor evaluates. The condition is evaluated
+    /// **once**, when inertia begins.
     pub fn create_inertia_resting_value(
         &self,
         condition: &ExpressionAnimation,
@@ -775,9 +765,6 @@ impl Compositor {
 
     /// Creates an explicit inertia motion: a second-derivative equation the compositor
     /// evaluates **every frame** while `condition` held at inertia entry.
-    ///
-    /// This is the escape hatch when natural motion settles wrong — the same curve, stated
-    /// rather than tuned.
     pub fn create_inertia_motion(
         &self,
         condition: &ExpressionAnimation,

@@ -1,22 +1,25 @@
+//! The wake source the window's threads park on: a Windows auto-reset event, and the
+//! multi-handle wait that takes several of them.
+
 use crate::bindings::*;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use windows_core::{Error, Result};
 
-/// An auto-reset event: one signal releases exactly one waiter.
+/// Releases exactly one waiter per signal: a Windows auto-reset event.
 ///
-/// Auto-reset is the only correct mode for a wake source. A manual-reset event left
-/// signalled satisfies every subsequent wait immediately, so the waiter spins.
+/// A manual-reset event left signalled satisfies every subsequent wait immediately, so a
+/// waiter on one spins; a wake source is auto-reset for that reason.
 pub struct Event(OwnedHandle);
 
 impl Event {
-    /// A new, unsignalled event.
+    /// Creates an unsignalled event.
     ///
     /// # Errors
     ///
-    /// Resource exhaustion. There is no degraded mode: a waiter that cannot be interrupted
-    /// is worse than no waiter.
+    /// Fails on resource exhaustion, when the kernel object cannot be created.
     pub fn auto_reset() -> Result<Self> {
-        // SAFETY: no security attributes and no name; auto-reset, initially unsignalled.
+        // SAFETY: the call takes flags by value and two null pointers — no security
+        // attributes and no name — so nothing has to stay live across it.
         let handle = unsafe {
             CreateEventW(
                 core::ptr::null(),
@@ -28,7 +31,8 @@ impl Event {
         if handle.is_null() {
             return Err(Error::from_thread());
         }
-        // SAFETY: a fresh non-null handle, owned here and closed by `OwnedHandle`.
+        // SAFETY: `handle` is non-null by the check above and was created by this call, so
+        // no other owner exists and `OwnedHandle` is its sole closer.
         Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle) }))
     }
 
@@ -40,8 +44,10 @@ impl Event {
         }
     }
 
-    /// Waits up to `timeout_ms`, or [`INFINITE`]. A signal and an expiry are
-    /// indistinguishable; a caller that must tell them apart carries its own state.
+    /// Blocks until the event is signalled or `timeout_ms` elapses; pass
+    /// [`INFINITE`](crate::clock::INFINITE) for no expiry. A signal and an expiry are
+    /// indistinguishable on return, so a caller that must tell them apart carries its own
+    /// state.
     pub fn wait(&self, timeout_ms: u32) {
         // SAFETY: as above.
         unsafe {
@@ -49,7 +55,7 @@ impl Event {
         }
     }
 
-    /// Whether the event is signalled now, consuming the signal if it is.
+    /// Returns whether the event is signalled now, consuming the signal if it is.
     #[must_use]
     pub fn take(&self) -> bool {
         // SAFETY: as above. A zero timeout polls.
@@ -75,9 +81,8 @@ impl core::fmt::Debug for Event {
 
 /// Blocks until one of `handles` is signalled.
 ///
-/// The count comes off the slice rather than from the caller, so the two cannot disagree —
-/// which is the one way to get `WaitForMultipleObjects` wrong that the compiler will not
-/// catch.
+/// The count comes off the slice rather than from the caller, so the pointer and the length
+/// passed to `WaitForMultipleObjects` cannot disagree.
 pub(crate) fn wait_any(handles: &[BorrowedHandle<'_>]) {
     // SAFETY: `BorrowedHandle` is a transparent wrapper over the raw handle, so the slice is
     // the contiguous array the call takes, and the borrows keep every owner alive across it.

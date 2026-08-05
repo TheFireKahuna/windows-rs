@@ -1,29 +1,28 @@
-//! Turning a [`FontSpec`] into the DirectWrite format a layout is built from.
+//! Turns a [`FontSpec`] into the DirectWrite format a layout is built from.
 //!
-//! Formats are cached because a screen resolves a handful of type rungs and then asks for
-//! them once per label, and building one is a family lookup plus three property sets.
+//! Formats are cached per [`FormatKey`]: a screen resolves a handful of type rungs and then
+//! asks for one per label, and building one costs a family lookup plus three property sets.
 //!
-//! **A format carries no alignment.** A layout property belongs to the container, so text
-//! is always laid out leading and near, and where it sits inside its box is decided by
-//! whoever placed the box.
+//! **A format carries no alignment.** Text is laid out leading and near, and where it sits
+//! inside its box is decided by whoever placed the box.
 
 use super::*;
 
-/// The locale a format is built for, as the reference has it. It drives number
-/// substitution and the Han unification fallback picks with it, so it is a stated choice
-/// rather than a default to inherit.
+/// The locale every format is built for. It drives number substitution and the Han
+/// unification fallback selects with, so it is stated here rather than inherited from the
+/// system.
 const LOCALE: &str = "en-us";
 
-/// How a run occupies the width it is given.
+/// Selects how a run occupies the width it is given.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Flow {
-    /// One line, whatever the width. Its intrinsic width *is* its measurement, which is
-    /// what a pill or a label sizes to.
+    /// Lays out one line, whatever the width. Its intrinsic width is its measurement,
+    /// which is what a pill or a label sizes to.
     #[default]
     Line,
-    /// One line, trimmed at the width with an ellipsis.
+    /// Lays out one line, trimmed at the width with an ellipsis.
     Ellipsis,
-    /// Wrapped into as many lines as the width needs.
+    /// Wraps into as many lines as the width needs.
     Wrap,
 }
 
@@ -36,8 +35,8 @@ impl Flow {
     }
 }
 
-/// What selects a cached format. `size` is carried as bits so the key can be hashed —
-/// two sizes that compare equal as `f32` produce the same format either way.
+/// Selects a cached format. `size` is carried as bits so the key can be hashed; two sizes
+/// that compare equal as `f32` select the same format either way.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct FormatKey {
     family: FamilyId,
@@ -62,10 +61,10 @@ impl FormatKey {
 }
 
 impl TextEngine {
-    /// The format `spec` and `flow` select, from the cache or freshly built.
+    /// Returns the format `spec` and `flow` select, from the cache or freshly built.
     ///
-    /// Features are absent from the key: they are applied to the *layout* as a typography
-    /// range, because that is the only place DirectWrite accepts them.
+    /// Features are absent from the key: DirectWrite accepts them only on a layout, as a
+    /// typography range.
     pub(crate) fn format(&self, spec: &FontSpec, flow: Flow) -> Result<IDWriteTextFormat> {
         let key = FormatKey::new(spec, flow);
         if let Some(format) = self.formats.borrow().get(&key) {
@@ -93,16 +92,16 @@ impl TextEngine {
                 windows_core::PCWSTR(locale.as_ptr()),
             )?;
 
-            // Drive the optical-size axis from the em size on a variable font, so a size
+            // Drives the optical-size axis from the em size on a variable font, so a size
             // change selects the letterforms designed for it instead of scaling one set.
-            // A no-op on a static face. An application wanting this asks its ladder for a
-            // variable family by name; substituting one here would be a policy the crate
-            // has no standing to have.
+            // A no-op on a static face: no family is substituted here, and an application
+            // that wants a variable family names one in its ladder.
             if let Ok(format3) = format.cast::<IDWriteTextFormat3>() {
                 let _ = format3.SetAutomaticFontAxes(DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE);
             }
 
-            // Stated rather than inherited: a layout property belongs to the container.
+            // Alignment is stated on every format: where the text sits inside its box is
+            // decided by whoever placed the box.
             format
                 .SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)
                 .ok()?;
@@ -125,8 +124,9 @@ impl TextEngine {
         }
     }
 
-    /// The typography object for `features`, or `None` where the family's own defaults are
-    /// wanted. Cached: there are as many of these as there are feature sets, which is two.
+    /// Returns the typography object for `features`, or `None` for
+    /// [`FontFeatures::NONE`] and for a set the factory refuses to build, both of which
+    /// leave the family's own defaults in place. Cached per feature set.
     pub(crate) fn typography(&self, features: FontFeatures) -> Option<IDWriteTypography> {
         if features.is_empty() {
             return None;

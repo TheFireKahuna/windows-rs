@@ -1,42 +1,43 @@
-//! Reading the framework's own source, so a rule no runtime test can catch has somewhere
-//! to live.
+//! Collects the framework crates' hand-written Rust source and matches source rules
+//! against it.
 //!
-//! Three decisions shape everything here, and each of them is a class of false positive
-//! that would otherwise make these rules unusable:
+//! Three exclusions bound what a rule sees, so it fires only on production code:
 //!
-//! - **Generated files are not audited.** The exempt set is not a filename heuristic; it
-//!   is read from the binding tools' own `--out` declarations, so nothing can be smuggled
-//!   into it by being called `bindings.rs`.
-//! - **Comments are stripped before matching.** A rule that fires on the sentence
-//!   explaining the rule is worse than no rule.
-//! - **Test modules are stripped before matching.** A test may legitimately construct what
-//!   production must not — quantization is tested by handing it out-of-range values, and
-//!   forbidding that would be forbidding the test.
+//! - Generated files are excluded. The exempt set is read from the binding tools' own
+//!   `--out` declarations, so a hand-written file cannot join it by being called
+//!   `bindings.rs`.
+//! - Comments are blanked before matching, so a rule does not fire on the prose that
+//!   describes it.
+//! - `#[cfg(test)]` modules are blanked before matching, because a test constructs the
+//!   values production is forbidden to construct — quantization is tested by handing it
+//!   out-of-range inputs.
 
 use std::path::{Path, PathBuf};
 
-/// One hand-written source file, ready to match against.
+/// A hand-written source file, stripped and ready to match against.
 pub struct Source {
-    /// Path relative to the workspace root, with forward slashes. What a failure prints,
-    /// and what an allowlist names.
+    /// Path relative to the workspace root, with forward slashes. Failure messages print
+    /// this path and allowlists name it.
     pub path: String,
-    /// The file with comments and test modules removed.
+    /// The file with comments and `#[cfg(test)]` modules blanked out.
     pub code: String,
-    /// The file as written. What a line number is resolved against.
+    /// The file as written. Line numbers resolve against this text.
     pub raw: String,
 }
 
 impl Source {
-    /// The one-based line `at` falls on, in the original file.
+    /// Returns the one-based line that byte offset `at` falls on.
     ///
-    /// The stripped text keeps every newline, so an offset into it is an offset into the
-    /// original — which is what lets a failure name a line a reader can open.
+    /// [`Source::code`] blanks comments and test modules in place rather than removing
+    /// them, so it keeps every newline of [`Source::raw`] and a line number found in one
+    /// names the same line in the other.
     #[must_use]
     pub fn line(&self, at: usize) -> usize {
         self.code[..at].matches('\n').count() + 1
     }
 
-    /// Every occurrence of `needle` in the stripped text, as `(line, the line's text)`.
+    /// Returns every occurrence of `needle` in [`Source::code`] as `(line, text)`, where
+    /// `text` is that line of [`Source::raw`], trimmed.
     #[must_use]
     pub fn find(&self, needle: &str) -> Vec<(usize, String)> {
         let mut out = Vec::new();
@@ -58,14 +59,18 @@ impl Source {
         out
     }
 
-    /// Whether the file's path starts with any of `prefixes`.
+    /// Returns `true` when [`Source::path`] starts with any of `prefixes`.
     #[must_use]
     pub fn under(&self, prefixes: &[&str]) -> bool {
         prefixes.iter().any(|prefix| self.path.starts_with(prefix))
     }
 }
 
-/// The workspace root, derived from this crate's own location.
+/// Returns the workspace root, derived from this crate's manifest directory.
+///
+/// # Panics
+///
+/// Panics if this crate does not sit four directories below the workspace root.
 #[must_use]
 pub fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -75,10 +80,10 @@ pub fn root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The crates these rules govern: the UI framework, and nothing upstream of it.
+/// The crate directories these rules govern, relative to the workspace root.
 ///
-/// Upstream's own crates are not ours to constrain, and a rule that fired on them would be
-/// a rule nobody could act on.
+/// The set covers the UI framework crates only. Crates outside it are out of scope for
+/// every rule.
 pub const FRAMEWORK: [&str; 8] = [
     "crates/libs/color",
     "crates/libs/composition",
@@ -90,7 +95,12 @@ pub const FRAMEWORK: [&str; 8] = [
     "crates/libs/window",
 ];
 
-/// Every hand-written `.rs` file in the framework crates.
+/// Returns every hand-written `.rs` file under [`FRAMEWORK`], with the files listed by
+/// [`generated`] excluded.
+///
+/// # Panics
+///
+/// Panics if no source file is found, which means the crate directories were not located.
 #[must_use]
 pub fn framework() -> Vec<Source> {
     let root = root();
@@ -112,10 +122,16 @@ pub fn framework() -> Vec<Source> {
     out
 }
 
-/// The files the binding tools declare they produce, relative to the workspace root.
+/// Returns the output paths the binding tools declare, relative to the workspace root.
 ///
-/// Read from the filters rather than guessed, so the exemption is exactly what the tools
-/// claim and a hand-written file cannot join it by being named `bindings.rs`.
+/// The paths come from the `--out` lines of the tools' filter files and from the string
+/// literals in `tool_composition`'s own source, so the exempt set is exactly what the
+/// tools declare rather than a filename pattern.
+///
+/// # Panics
+///
+/// Panics if fewer than eleven outputs are declared, which means the filter files were not
+/// found.
 #[must_use]
 pub fn generated() -> Vec<String> {
     let root = root();
@@ -140,9 +156,8 @@ pub fn generated() -> Vec<String> {
             }
         }
     }
-    // `tool_composition` writes two files from one filter and names them in its own
-    // source rather than on an `--out` line. Read them from there for the same reason the
-    // rest are read from the filters: the tool is the declaration.
+    // `tool_composition` writes two files from one filter and names them in its own source
+    // rather than on an `--out` line, so read those paths from its string literals.
     let dir = root.join("crates/tools/composition/src");
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -200,10 +215,12 @@ fn collect(root: &Path, dir: &Path, generated: &[String], out: &mut Vec<Source>)
     }
 }
 
-/// Blanks out comments, preserving every byte position and every newline.
+/// Replaces every comment with spaces, keeping each newline in place.
 ///
-/// Position-preserving rather than removing, so a match offset still resolves to the line
-/// it was written on.
+/// String, character and raw-string literals are copied through, so a `//` inside a
+/// literal is not treated as a comment. Blanking rather than removing is what preserves
+/// the line count ahead of any offset, so a match in the result names the line it was
+/// written on.
 #[must_use]
 pub fn strip_comments(text: &str) -> String {
     #[derive(Clone, Copy, PartialEq)]
@@ -225,8 +242,8 @@ pub fn strip_comments(text: &str) -> String {
         let next = bytes.get(i + 1).copied().unwrap_or(0);
         match state {
             In::Code => {
-                // A raw string's hashes have to be counted, or its closing quote is missed
-                // and everything after it reads as a string.
+                // Count a raw string's hashes: without the count its closing quote is
+                // missed and the rest of the file reads as one string.
                 if b == b'r' && (next == b'"' || next == b'#') {
                     let mut hashes = 0;
                     while bytes.get(i + 1 + hashes) == Some(&b'#') {
@@ -311,10 +328,10 @@ pub fn strip_comments(text: &str) -> String {
     out
 }
 
-/// Blanks out `#[cfg(test)]` modules, preserving newlines.
+/// Replaces each `#[cfg(test)]` module with spaces, keeping newlines.
 ///
-/// A test may construct what production must not: quantization is tested by handing it
-/// out-of-range values, and a rule that forbade that would be forbidding the test.
+/// Rules match production code only: a test may construct the values a rule forbids, as
+/// quantization is tested by handing it out-of-range inputs.
 #[must_use]
 pub fn strip_tests(code: &str) -> String {
     let mut out = code.to_owned();
@@ -347,10 +364,14 @@ pub fn strip_tests(code: &str) -> String {
     out
 }
 
-/// Fails with every hit listed, or passes silently.
+/// Asserts that `hits` is empty, naming `rule` and `why` in the failure.
 ///
-/// One assertion per rule with the full list, rather than one per hit: a rule that stops at
-/// the first violation is a rule you fix one recompile at a time.
+/// One assertion carries the whole list, so a run reports every violation of the rule
+/// rather than stopping at the first.
+///
+/// # Panics
+///
+/// Panics when `hits` is not empty.
 pub fn deny(rule: &str, why: &str, hits: &[String]) {
     assert!(
         hits.is_empty(),

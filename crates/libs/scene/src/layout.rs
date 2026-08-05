@@ -1,15 +1,12 @@
 //! The taffy tree, the measure seam, and pixel snapping. **App half.**
 //!
-//! Taffy already implements flexbox, CSS grid with auto-placement, block layout,
-//! min/max/aspect-ratio, absolute positioning, gap and overflow with gutter reservation,
-//! and this crate uses [`taffy::Style`] directly rather than redeclaring thirty fields and
-//! a conversion between them. The one thing taffy does not have is a container that
-//! classifies its own width for its subtree, and that is the whole of what is added here.
+//! [`LayoutTree`] implements taffy's low-level tree traits, so flexbox, CSS grid, block
+//! layout and the classifying container are all arms of one `compute_child_layout`. Styles
+//! are [`taffy::Style`] with no conversion layer, and every per-node table is a `Vec`
+//! indexed by the node's own dense id, so no node path hashes.
 //!
-//! The tree is the low-level one and not [`taffy::TaffyTree`], because the classifying
-//! container *is* a `compute_child_layout` arm — and a custom tree also makes every
-//! per-node table a `Vec` indexed by the node's own dense id, so no hash map appears on any
-//! node path.
+//! The one layout mode this crate adds is [`LayoutKind::Responsive`]: a container that
+//! classifies its own inline size into a [`WidthClass`] for its subtree.
 
 use crate::id::Id;
 use crate::responsive::{Bounds, WidthClass};
@@ -26,29 +23,36 @@ use windows_numerics::Vector2;
 /// An axis-aligned box in absolute layout DIPs.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Rect {
+    /// Left edge.
     pub x0: f32,
+    /// Top edge.
     pub y0: f32,
+    /// Right edge.
     pub x1: f32,
+    /// Bottom edge.
     pub y1: f32,
 }
 
 impl Rect {
+    /// Returns the box with those four edges.
     #[must_use]
     pub const fn new(x0: f32, y0: f32, x1: f32, y1: f32) -> Self {
         Self { x0, y0, x1, y1 }
     }
 
+    /// Returns the distance between the left and right edges.
     #[must_use]
     pub fn width(self) -> f32 {
         self.x1 - self.x0
     }
 
+    /// Returns the distance between the top and bottom edges.
     #[must_use]
     pub fn height(self) -> f32 {
         self.y1 - self.y0
     }
 
-    /// The smallest box containing both.
+    /// Returns the smallest box containing both.
     #[must_use]
     pub fn union(self, other: Self) -> Self {
         Self {
@@ -60,36 +64,38 @@ impl Rect {
     }
 }
 
-/// One node's placement, as plain data.
+/// One node's solved placement.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Solved {
-    /// Absolute, window-relative, pixel-snapped, and **unscrolled** — the position layout
-    /// placed the node at, before any tracker offset.
+    /// Absolute, window-relative, pixel-snapped and **unscrolled**: where layout placed the
+    /// node, before any tracker offset.
     pub rect: Rect,
-    /// Offset relative to the parent group, which is what a visual's own offset is.
+    /// Offset relative to the parent group, which is the value a visual's offset takes.
     pub local: Vector2,
+    /// Size in DIPs, measured between the snapped edges of `rect`.
     pub size: Vector2,
-    /// Content size — the scroll extent's source.
+    /// Content size in DIPs, which a scroll extent is derived from.
     pub content: Vector2,
-    /// Whether it clips or scrolls, and therefore confines its children.
+    /// Whether the node clips or scrolls, and so confines its children.
     pub bounded: bool,
     /// The class the enclosing responsive container resolved for this node.
     ///
     /// Written for every node by the gather walk, so a re-lower running *outside* the solve
-    /// reads the class from the one authority instead of keeping a copy that a flip leaves
-    /// behind.
+    /// reads the class from here rather than from a copy a class flip leaves behind.
     pub class: WidthClass,
 }
 
-/// Snaps a DIP coordinate onto the physical pixel grid.
+/// Snaps a DIP coordinate onto the physical pixel grid at `scale`.
 ///
-/// In DIP space against the physical grid, and not at the end: the root visual carries the
-/// display scale, so a fractional DIP offset lands *between* physical pixels and the
-/// compositor bilinear-resamples the whole surface — text and hairlines blur.
+/// The root visual carries the display scale, so a coordinate that falls between physical
+/// pixels makes the compositor bilinear-resample the whole surface and blurs text and
+/// hairlines.
 ///
-/// **Edges are snapped, never extents.** Snapping `x` and `x + w` keeps adjacent nodes
+/// **Callers snap edges, never extents.** Snapping `x` and `x + w` keeps adjacent nodes
 /// sharing an edge exactly; snapping `x` and `w` independently opens a hairline gap
 /// between them at some scales and overlaps them at others.
+///
+/// A non-finite `v` returns `0.0`.
 #[must_use]
 pub fn snap(v: f32, scale: f32) -> f32 {
     if !v.is_finite() {
@@ -101,7 +107,7 @@ pub fn snap(v: f32, scale: f32) -> f32 {
 /// What a node's intrinsic size comes from.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum MeasureCtx {
-    /// Nothing to measure: the style is the whole answer.
+    /// Nothing to measure: the style determines the size.
     #[default]
     None,
     /// A fixed intrinsic size, in DIPs.
@@ -112,36 +118,33 @@ pub enum MeasureCtx {
 
 /// A measurement request's identity, minted and interpreted by the layer above.
 ///
-/// This crate holds no text engine and no font ladder, so it cannot measure a string. What
-/// it can do is make sure the measurement happens at the right moment and under the right
-/// width class, which is the part that is easy to get wrong.
+/// This crate holds no text engine and no font ladder, so it never interprets a key. What it
+/// decides is when the measurement runs and which [`WidthClass`] it runs under.
 ///
-/// Generational like every other id, which is what makes a key held past the release of the
-/// run it named a miss rather than a read of that slot's next occupant.
+/// Generational like every other id, so a key held past the release of the run it named
+/// misses rather than reading that slot's next occupant.
 pub type MeasureKey = Id<crate::sink::Measured>;
 
 /// How much room an axis has, in taffy's own three states.
 ///
-/// **Three and not two.** Flattening the two intrinsic probes into "indefinite" is what makes
-/// a wrapping run report its one-line width to a min-content question — and flex then shrinks
-/// it below its own longest word, which reads as a break in the middle of a word. The two
-/// probes are asking opposite questions and a measurement that cannot tell them apart can
-/// only answer one of them right.
+/// The two intrinsic probes ask opposite questions, so a measurement answers each one
+/// separately. Answering `MinContent` with the width a wrapping run occupies on one line
+/// lets flex shrink the run below its own longest word, which breaks a word mid-way.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Avail {
     /// This much room, in DIPs.
     Definite(f32),
-    /// *How narrow can you be?* — the largest indivisible piece of the content.
+    /// The narrowest the content can be: the largest indivisible piece of it.
     MinContent,
-    /// *How wide would you like to be?* — the content with nothing forced to break.
+    /// The width the content takes with nothing forced to break.
     MaxContent,
 }
 
 impl Avail {
-    /// The room in DIPs, or `None` for either intrinsic probe.
+    /// Returns the room in DIPs, or `None` for either intrinsic probe.
     ///
-    /// For a measurement whose answer genuinely does not depend on which probe it is — a
-    /// fixed-size leaf, a single-line run that never breaks. Anything that *can* break must
+    /// For a measurement whose answer does not depend on which probe it is: a fixed-size
+    /// leaf, or a single-line run that never breaks. A measurement that *can* break must
     /// match on the variant instead.
     #[must_use]
     pub const fn definite(self) -> Option<f32> {
@@ -162,22 +165,24 @@ impl From<AvailableSpace> for Avail {
     }
 }
 
-/// What a measurement is given.
+/// The inputs to one measurement.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct MeasureIn {
+    /// The request being answered, as the layer above minted it.
     pub key: MeasureKey,
     /// The class the enclosing responsive container resolved. Every metric a measurement
-    /// depends on — type size, padding, tracking — resolves against this, which is why it
-    /// is an input and not something read from ambient state.
+    /// depends on — type size, padding, tracking — resolves against this, so it is passed in
+    /// rather than read from ambient state.
     pub class: WidthClass,
     /// Whichever dimensions layout has already fixed.
     pub known: (Option<f32>, Option<f32>),
-    /// The room on each axis, and **which question is being asked** where there is no number.
+    /// The room on each axis, and **which probe is being asked** where there is no number.
     pub available: (Avail, Avail),
 }
 
 /// Measures what this crate cannot: shaped text, and anything else whose size is content.
 pub trait Measure: Send {
+    /// Returns the size in DIPs of the content `input` names.
     fn measure(&mut self, input: MeasureIn) -> Vector2;
 }
 
@@ -187,15 +192,16 @@ impl<F: FnMut(MeasureIn) -> Vector2 + Send> Measure for F {
     }
 }
 
-/// Re-lowers what this crate cannot: a style whose metrics depend on the class in scope.
+/// Re-lowers a style whose metrics depend on the class in scope.
 ///
-/// The twin of [`Measure`], and for the same reason — this crate owns the class and the layer
-/// above owns what a class *means*. Called during the solve, for the subtree of a container
-/// that just changed class, so the styles layout runs on are the ones that class implies.
-/// Answering `None` leaves the node's style alone.
+/// The twin of [`Measure`]: this crate resolves the class, and the layer above resolves what
+/// a class *means*. Called during the solve, for the subtree of a container that just
+/// changed class, so layout runs on the styles that class implies.
 ///
-/// **Runs inside the solve**, so an implementation must not re-enter the model or allocate.
+/// **Runs inside the solve**, so an implementation must not re-enter the model and must not
+/// allocate.
 pub trait Restyle: Send {
+    /// Returns the style `node` takes at `class`, or `None` to leave its style alone.
     fn restyle(&mut self, node: NodeId, class: WidthClass) -> Option<Style>;
 }
 
@@ -208,41 +214,39 @@ impl<F: FnMut(NodeId, WidthClass) -> Option<Style> + Send> Restyle for F {
 /// How a node lays its children out.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum LayoutKind {
-    /// Whatever `style.display` says.
+    /// Lays children out by `style.display`.
     #[default]
     Container,
     /// Classifies its own inline size for its subtree, then delegates.
     ///
-    /// **Its inline size must be determined by its parent.** A content-sized one has
-    /// nothing to classify, and that is a bug that announces itself: on the final layout
-    /// call a parent-determined container arrives with a known inline size and a
-    /// content-sized one does not, so the assertion fires at exactly the moment the
-    /// problem exists.
+    /// **Its inline size must be determined by its parent.** A content-sized container has
+    /// nothing to classify: it arrives at the `PerformLayout` pass with no known inline
+    /// size, where a debug assertion fires.
     Responsive(Bounds),
 }
 
 #[derive(Debug)]
 struct LayoutNode {
-    /// This slot's own id. Held because a `TaffyId` is a bare index and carries no
-    /// generation, so it cannot name a node back to the layer above.
+    /// This slot's own id. A `TaffyId` is a bare index and carries no generation, so it
+    /// cannot name a node back to the layer above.
     id: NodeId,
     style: Style,
     kind: LayoutKind,
     measure: MeasureCtx,
     children: Vec<TaffyId>,
-    /// Who to walk up to when this node is dirtied. Taffy caches a node's output keyed on
-    /// its *input*, so a change here that does not change a parent's input — hiding a
+    /// The node to walk up to when this one is dirtied. Taffy caches a node's output keyed
+    /// on its *input*, so a change here that leaves a parent's input alone — hiding a
     /// child, re-measuring a leaf — leaves the parent's cached answer standing.
     parent: Option<TaffyId>,
     cache: Cache,
-    /// The class this node last resolved, for the hysteresis band. Meaningless on anything
-    /// but a responsive node.
+    /// The class this node last resolved, for the hysteresis band. Unused on anything but a
+    /// responsive node.
     class: WidthClass,
     /// Hidden independently of `style.display`.
     ///
-    /// Its own flag and not a written-in `Display::None`, because hiding must be
-    /// reversible without knowing what the node's display *was*: a grid that is hidden and
-    /// shown again is a grid, and a style re-pushed while hidden must not reveal it.
+    /// A flag of its own rather than a `Display::None` written into the style keeps hiding
+    /// reversible without recording what the display *was*: a hidden grid comes back a
+    /// grid, and a style re-pushed while hidden does not reveal the node.
     hidden: bool,
     unrounded: Layout,
     solved: Layout,
@@ -268,11 +272,11 @@ impl Default for LayoutNode {
     }
 }
 
-/// The persistent layout tree.
+/// The layout tree, persistent across passes.
 ///
-/// Persistent, and that is not an optimization detail: rebuilding it per pass allocates a
-/// node and a cloned style per node per frame, and throws away the cache that makes an
-/// unchanged subtree cost nothing.
+/// A node and its style live from [`create`](Self::create) to [`destroy`](Self::destroy), so
+/// a pass neither rebuilds them nor discards the taffy cache that makes an unchanged subtree
+/// cost nothing.
 pub struct LayoutTree {
     nodes: Vec<LayoutNode>,
     /// The class in scope while a subtree is being laid out. Written by a responsive node
@@ -298,6 +302,7 @@ impl Default for LayoutTree {
 }
 
 impl LayoutTree {
+    /// Returns an empty tree, with no measure and no restyle callback installed.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -308,22 +313,22 @@ impl LayoutTree {
         }
     }
 
-    /// Installs what measures content-sized nodes.
+    /// Installs the callback that measures content-sized nodes, replacing any previous one.
     pub fn on_measure(&mut self, measure: impl Measure + 'static) {
         self.measure = Some(Box::new(measure));
     }
 
-    /// Installs what re-lowers a class-dependent style.
+    /// Installs the callback that re-lowers a class-dependent style, replacing any previous
+    /// one.
     pub fn on_restyle(&mut self, restyle: impl Restyle + 'static) {
         self.restyle = Some(Box::new(restyle));
     }
 
     /// Clears `id`'s cache and every cache above it.
     ///
-    /// The walk up is the whole of it, and it is not optional: taffy keys a cached layout
-    /// on the input it was given, so a subtree change that leaves a parent's input alone —
-    /// hiding a child, re-measuring a leaf, reordering siblings — would otherwise be
-    /// answered from the parent's cache and never reach the screen.
+    /// Taffy keys a cached layout on the input it was given, so a subtree change that leaves
+    /// a parent's input alone — hiding a child, re-measuring a leaf, reordering siblings —
+    /// is answered from the parent's cache unless the walk up clears it.
     fn mark_dirty(&mut self, id: TaffyId) {
         let mut next = Some(id);
         while let Some(current) = next {
@@ -350,8 +355,8 @@ impl LayoutTree {
             id: node,
             kind,
             live: true,
-            // The `Vec` keeps its allocation: ids are dense and reused, so this slot will
-            // be filled again by whatever is minted into it next.
+            // The `Vec` keeps its allocation: ids are dense and reused, so the next mint
+            // into this slot fills it again.
             children: core::mem::take(&mut slot.children),
             ..LayoutNode::default()
         };
@@ -359,11 +364,11 @@ impl LayoutTree {
         self.mark_dirty(TaffyId::from(node.index()));
     }
 
-    /// Declares how a node lays its children out, leaving everything else about it alone.
+    /// Declares how a node lays its children out, leaving the rest of the slot alone, and
+    /// returns whether the kind differed.
     ///
-    /// Separate from [`create`](Self::create) so that becoming responsive composes in any
-    /// order with styling and parenting: re-creating the slot would silently drop both.
-    /// Answers whether the kind actually differed.
+    /// Separate from [`create`](Self::create), which resets the slot: setting the kind
+    /// composes in any order with pushing a style and setting children.
     pub fn set_kind(&mut self, node: NodeId, kind: LayoutKind) -> bool {
         let slot = self.slot(node);
         if slot.kind == kind {
@@ -386,8 +391,9 @@ impl LayoutTree {
         }
     }
 
-    /// Pushes a style. Returns whether it actually differed — the caller leaves taffy's own
-    /// dirty propagation to decide what to recompute, and pushing an equal style would
+    /// Pushes a style, and returns whether it differed from the one in place.
+    ///
+    /// An equal style is dropped rather than pushed, so re-stating a style does not
     /// invalidate a subtree that did not change.
     pub fn set_style(&mut self, node: NodeId, style: &Style) -> bool {
         let slot = self.slot(node);
@@ -399,11 +405,12 @@ impl LayoutTree {
         true
     }
 
-    /// Hides a node without removing it, so its state and its subtree survive.
+    /// Hides a node without removing it, so its state and its subtree survive, and returns
+    /// whether the flag changed.
     ///
-    /// The flag is the node's own, never a `Display::None` written into its style: a style
-    /// carries what the node *is*, and overwriting it means a hidden grid comes back as a
-    /// flexbox and a style re-pushed while hidden reveals it.
+    /// The flag is the node's own, never a `Display::None` written into its style: the style
+    /// carries what the node *is*, so a hidden grid comes back a grid and a style re-pushed
+    /// while hidden does not reveal the node.
     pub fn set_hidden(&mut self, node: NodeId, hidden: bool) -> bool {
         let slot = self.slot(node);
         if slot.hidden == hidden {
@@ -414,6 +421,7 @@ impl LayoutTree {
         true
     }
 
+    /// Declares where a node's intrinsic size comes from.
     pub fn set_measure(&mut self, node: NodeId, ctx: MeasureCtx) {
         let slot = self.slot(node);
         if slot.measure != ctx {
@@ -422,32 +430,26 @@ impl LayoutTree {
         }
     }
 
-    /// Says that a measured node's **input** moved, though its context did not.
+    /// Marks a measured node's **input** as moved, though its measure context did not
+    /// change.
     ///
-    /// [`set_measure`](Self::set_measure) cannot express this and must not try: a run's
-    /// context is a key that is stable for its whole life, so a label whose string changed
-    /// pushes an identical context and is told nothing happened. Everything else that
-    /// invalidates a layout is a field this type owns and compares — a style, a hidden flag,
-    /// a child list. A measure's input is the one thing it holds no copy of, so the owner of
-    /// that input is the only one who can say it moved.
-    ///
-    /// Without it, a text run bound to a signal reshapes only when something *else* dirties
-    /// its node — which is why a list row or a rebuilt branch looked correct and a long-lived
-    /// caption bound to the same signal never changed at all.
+    /// A run's [`MeasureKey`] is stable for the run's whole life, so a label whose string
+    /// changed pushes an identical [`MeasureCtx`] and
+    /// [`set_measure`](Self::set_measure) reports no change. Every other input to a layout
+    /// is a field this type holds and compares — a style, a hidden flag, a child list — and
+    /// a measurement's input is not, so its owner is the only one that can invalidate it.
     pub fn remeasure(&mut self, node: NodeId) {
         self.mark_dirty(TaffyId::from(node.index()));
     }
 
     /// Replaces a node's children, in paint order.
     ///
-    /// **Every child is pointed back at `node`, including when the order did not change.** A
-    /// `TaffyId` is a bare index, so an id reused at the same position leaves a list that
-    /// compares equal to one whose members are new nodes —
-    /// [`create`](Self::create) having reset each of them, parent included. Skipping the
-    /// re-link on that comparison leaves a node no walk can climb out of, and
-    /// [`mark_dirty`](Self::mark_dirty) is a walk out: the node's own cache clears and every
-    /// ancestor keeps one that predates it. The symptom is a node laid out at zero, which is
-    /// what a slot reset and never reached still holds.
+    /// **Every child is pointed back at `node`, including when the list compares equal.** A
+    /// `TaffyId` is a bare index, so a list of ids reused at the same positions compares
+    /// equal to one whose members are fresh nodes that [`create`](Self::create) reset,
+    /// parent included. A child left with no parent stops
+    /// [`mark_dirty`](Self::mark_dirty) at itself, and every ancestor keeps a cache that
+    /// predates the change.
     pub fn set_children(&mut self, node: NodeId, children: &[NodeId]) {
         let parent = TaffyId::from(node.index());
         for &child in children {
@@ -466,26 +468,29 @@ impl LayoutTree {
         self.mark_dirty(parent);
     }
 
-    /// Empties the output and sizes it for the pass.
+    /// Empties `out` and sizes it to one entry per node.
     ///
-    /// Once per pass and not once per root: a window has one attached tree and one detached
-    /// root per open overlay, and all of them gather into the same buffer indexed by node id.
+    /// Called once per pass, not once per root: the attached tree and every detached root
+    /// gather into the same buffer, indexed by node id.
     pub fn begin(&mut self, out: &mut Vec<Solved>) {
         out.clear();
         out.resize(self.nodes.len(), Solved::default());
     }
 
     /// Solves the tree under `root` against a window of `size` DIPs, placing it at `origin`,
-    /// and writes each live node's placement into `out`, indexed by node id.
+    /// and writes each node's placement into `out`, indexed by node id.
+    ///
+    /// [`begin`](Self::begin) must have sized `out` for this pass; the gather indexes it
+    /// directly.
     ///
     /// Snapping happens here, at the end, in one place — and against the *absolute* rect,
-    /// because that is the space edges have to agree in.
+    /// which is the space adjacent edges have to agree in.
     ///
     /// `origin` is zero for the window's own root and is the resolved placement for a
-    /// detached one. It **translates and does not constrain**: an overlay is laid out against
-    /// the window box wherever it lands, which is what keeps its size independent of its
-    /// position. Passing it here rather than adding it afterwards is what makes a detached
-    /// subtree's `rect` absolute, and the hit array reads exactly that.
+    /// detached one. It **translates and does not constrain**: the subtree is laid out
+    /// against `size` wherever it lands, so an overlay's size does not depend on its
+    /// position. Because the origin is an input to the gather, a detached subtree's
+    /// [`Solved::rect`] is absolute, which is the space the hit array is scanned in.
     pub fn solve_root(
         &mut self,
         root: NodeId,
@@ -507,9 +512,9 @@ impl LayoutTree {
 
         let (ox, oy) = (snap(origin.x, scale), snap(origin.y, scale));
         self.gather(taffy_root, ox, oy, scale, WidthClass::default(), out);
-        // A root has no parent to be positioned by, so its offset within one *is* the origin
-        // it was placed at. Stated here rather than left at taffy's zero, so the placement
-        // reaches the compositor as the ordinary offset bind every other node's does.
+        // A root has no parent to position it, so its offset within one is the origin it was
+        // placed at. Taffy leaves that at zero; writing it here makes the placement reach the
+        // compositor as the same offset bind every other node's does.
         if let Some(solved) = out.get_mut(root.index()) {
             solved.local = Vector2 { x: ox, y: oy };
         }
@@ -554,8 +559,9 @@ impl LayoutTree {
                 || overflow.y != taffy::Overflow::Visible,
             class,
         };
-        // A container classifies its size *for its subtree*: its own style was lowered at the
-        // enclosing class, so the replacement happens on the way down and not for this node.
+        // A responsive container classifies its size *for its subtree*: its own style was
+        // lowered at the enclosing class, so the class changes on the way down to the
+        // children and not for this node.
         let inner = match node.kind {
             LayoutKind::Responsive(_) => node.class,
             LayoutKind::Container => class,
@@ -575,18 +581,17 @@ impl LayoutTree {
 
     /// Re-lowers `id` at `class` and clears its cache, then descends.
     ///
-    /// The cache clear is not optional: taffy keys a cached layout on its *input*, and the
-    /// ambient class is not in that key — so a descendant whose own inputs did not change
-    /// would keep the measurement it took under the previous class. The symptom is stale
-    /// geometry only on the frame a threshold is crossed.
+    /// Taffy keys a cached layout on its *input* and the ambient class is not in that key,
+    /// so a descendant whose own inputs did not change keeps the measurement it took under
+    /// the previous class unless its cache is cleared.
     ///
-    /// The descent **stops at a nested container**: that node's own style resolves at the
-    /// class enclosing it, which is this one, but its subtree resolves at its own — which it
-    /// re-resolves for itself when this cleared cache makes it lay out again.
+    /// The descent **stops at a nested responsive container**: that node's own style
+    /// resolves at the class enclosing it, which is `class`, while its subtree resolves at
+    /// the class it classifies for itself once the cleared cache makes it lay out again.
     fn reclass(&mut self, id: TaffyId, class: WidthClass) {
         self.node_mut(id).cache.clear();
-        // Taken out for the call and put back: the callback cannot borrow the tree, and
-        // `measure_leaf` splits the same borrow the same way.
+        // Taken out for the call and put back, so the callback does not borrow the tree the
+        // node lookups around it borrow.
         if let Some(mut restyle) = self.restyle.take() {
             let node = self.node(id).id;
             if let Some(style) = restyle.restyle(node, class) {
@@ -608,9 +613,8 @@ impl LayoutTree {
             let node = self.node(id);
             (node.style.clone(), node.measure, self.ambient)
         };
-        // The measurement closure lives in this tree, and `compute_leaf_layout` borrows
-        // the tree's style at the same time — so it is taken out for the call and put
-        // back, rather than the whole tree being borrowed twice.
+        // Taken out for the call and put back, so the closure handed to
+        // `compute_leaf_layout` holds the callback directly and borrows no part of the tree.
         let mut measure = self.measure.take();
         let output = compute_leaf_layout(
             inputs,
@@ -661,9 +665,9 @@ impl LayoutTree {
 
         let previous = self.node(id).class;
         let class = definite.map_or(previous, |w| bounds.reclassify(w, previous));
-        // Committed on the authoritative pass only. Taffy probes a subtree at widths it may
+        // Committed on the `PerformLayout` pass only. Taffy probes a subtree at widths it may
         // not lay it out at, and a flip consumed by a probe would leave `PerformLayout` with
-        // no transition to re-lower against — stale metrics on exactly the frame that crossed.
+        // no transition to re-lower against.
         if inputs.run_mode == RunMode::PerformLayout && class != previous {
             self.node_mut(id).class = class;
             for index in 0..self.node(id).children.len() {
@@ -672,9 +676,8 @@ impl LayoutTree {
             }
         }
 
-        // Scoped to the subtree: a sibling laid out afterwards sees whatever *its* own
-        // enclosing container resolved, not this one's. Saving and restoring is what makes
-        // that true without threading the class through every call.
+        // Scoped to the subtree: saving and restoring `ambient` leaves a sibling laid out
+        // afterwards reading the class *its* own enclosing container resolved.
         let enclosing = core::mem::replace(&mut self.ambient, class);
         let output = self.delegate(id, inputs);
         self.ambient = enclosing;
@@ -734,8 +737,9 @@ impl LayoutPartialTree for LayoutTree {
     fn set_unrounded_layout(&mut self, id: TaffyId, layout: &Layout) {
         let node = self.node_mut(id);
         node.unrounded = *layout;
-        // Rounding is this crate's own — taffy's rounds to whole *DIPs*, where snapping has
-        // to land on whole physical pixels, which at 1.5× is a third of a DIP.
+        // Rounding is this crate's own: taffy rounds to whole *DIPs*, and a snapped edge has
+        // to land on a whole physical pixel, which at a fractional scale is not a DIP
+        // boundary.
         node.solved = *layout;
     }
 
@@ -743,11 +747,11 @@ impl LayoutPartialTree for LayoutTree {
         compute_cached_layout(self, id, inputs, |tree, id, inputs| {
             let node = tree.node(id);
             // A hidden pass stays hidden the whole way down. Taffy descends into a hidden
-            // subtree with `RunMode::PerformHiddenLayout`, and in that mode a measure
-            // function may not be called at all — so a node deciding by its *own* display
-            // hands the first childless descendant of a hidden container to `measure_leaf`,
-            // which walks into taffy's `unreachable!()`. The run mode is the authority
-            // because it is the only thing that knows which pass this is.
+            // subtree with `RunMode::PerformHiddenLayout` and does not call a measure
+            // function in that mode, so a node deciding by its *own* display alone would
+            // hand the first childless descendant of a hidden container to `measure_leaf`
+            // and reach taffy's `unreachable!()`. The run mode is the only input that names
+            // which pass this is.
             if inputs.run_mode == RunMode::PerformHiddenLayout
                 || node.hidden
                 || node.style.display == Display::None
@@ -819,7 +823,7 @@ mod tests {
     use super::*;
     use taffy::prelude::{TaffyAuto, length, percent};
 
-    /// One attached root at the origin, which is every case below but the detached one.
+    /// Solves one attached root at the origin, which is every case here but the detached one.
     impl LayoutTree {
         fn solve(&mut self, root: NodeId, size: Vector2, scale: f32, out: &mut Vec<Solved>) {
             self.begin(out);
@@ -830,8 +834,8 @@ mod tests {
     #[test]
     fn snapping_keeps_adjacent_edges_exactly_shared() {
         for scale in [1.0_f32, 1.25, 1.5, 2.0] {
-            // Two boxes meeting at a fractional edge. Snapping the shared coordinate — not
-            // each box's extent — is what keeps them meeting.
+            // Two boxes meeting at a fractional edge: snapping the shared coordinate, not
+            // each box's extent, keeps them meeting.
             let edge = snap(37.3, scale);
             assert_eq!(snap(37.3, scale), edge);
             let px = edge * scale;
@@ -898,8 +902,8 @@ mod tests {
 
     #[test]
     fn hiding_a_node_does_not_rewrite_what_it_is() {
-        // A style says what a node *is*; hiding says whether it is shown. Folding the
-        // second into the first means a grid comes back from a hide as a flexbox.
+        // The style carries the node's display and the hidden flag is separate. Folding the
+        // two together brings a hidden grid back as a flexbox.
         let (mut tree, _, kids) = tree_with_a_row();
         let grid = kids[0];
         tree.set_style(
@@ -920,8 +924,8 @@ mod tests {
 
     #[test]
     fn a_style_re_pushed_while_hidden_does_not_reveal_the_node() {
-        // A widget layer re-states a node's style on every rebuild. If hidden-ness lives
-        // in the style, one of those re-statements silently shows the node.
+        // The widget layer re-states a node's style on every rebuild, so a style push must
+        // not clear the hidden flag.
         let (mut tree, root, kids) = tree_with_a_row();
         let hidden = kids[1];
         assert!(tree.set_hidden(hidden, true));
@@ -946,9 +950,8 @@ mod tests {
 
     #[test]
     fn becoming_responsive_keeps_the_style_and_the_children() {
-        // The kind is a declaration about how a node lays out, so it has to compose in any
-        // order with the other two. Re-creating the slot to set it drops both, and the
-        // symptom is a subtree that silently stops being laid out at all.
+        // Setting the kind composes in any order with pushing a style and setting children.
+        // Re-creating the slot to set it drops both, leaving a subtree that is not laid out.
         let (mut tree, root, kids) = tree_with_a_row();
         assert!(tree.set_kind(root, LayoutKind::Responsive(Bounds([600.0, 1000.0]))));
         let mut out = Vec::new();
@@ -963,7 +966,7 @@ mod tests {
             600.0,
             "the root's own style was dropped"
         );
-        // And it is idempotent, so a re-declaration is not a layout pass.
+        // Idempotent, so re-declaring the kind does not dirty the tree.
         assert!(!tree.set_kind(root, LayoutKind::Responsive(Bounds([600.0, 1000.0]))));
     }
 
@@ -978,9 +981,8 @@ mod tests {
         tree.create(root, LayoutKind::Container);
         tree.create(card, LayoutKind::Responsive(Bounds([600.0, 1000.0])));
         tree.create(leaf, LayoutKind::Container);
-        // Cross-axis stretch is flexbox's default, and it would make every height the
-        // container's — so the measured height, which is what this test is about, would
-        // never be visible.
+        // Cross-axis stretch is flexbox's default and would give every child the
+        // container's height, hiding the measured height this test reads.
         let top_aligned = Some(taffy::AlignItems::FLEX_START);
         tree.set_style(
             root,
@@ -1044,11 +1046,11 @@ mod tests {
 
     #[test]
     fn a_node_minted_after_a_solve_reaches_the_next_one() {
-        // Two passes of the flush a screen switch runs: structure and a solve, then a
-        // publish that mints — a wrapping run's line sprites — and a second solve. The
-        // publish's parent was itself rebuilt into the slot its predecessor had, so the
-        // list its own parent was handed compared equal, and only the re-link keeps that
-        // parent climbable when the mint dirties upward.
+        // The two solves a screen switch runs: structure and a solve, then a publish that
+        // mints a wrapping run's line sprites, and a second solve. The publish's parent was
+        // rebuilt into the slot its predecessor held, so its own parent's child list
+        // compares equal, and only the re-link keeps that parent climbable when the mint
+        // dirties upward.
         let mut tree = LayoutTree::new();
         let column = Style {
             display: Display::Flex,
@@ -1085,7 +1087,7 @@ mod tests {
                 tree.set_children(mid, &[group]);
                 tree.begin(out);
                 tree.solve_root(root, window, origin, 1.0, out);
-                // Minted by the publish, which is *after* that solve and knows its box from it.
+                // Minted by the publish, which runs after that solve and takes its box from it.
                 tree.create(line, LayoutKind::Container);
                 tree.set_style(
                     line,
@@ -1120,10 +1122,9 @@ mod tests {
 
     #[test]
     fn a_detached_root_gathers_absolutely_at_its_origin() {
-        // What an overlay depends on. The window subtree and the detached one share the
-        // output buffer, so a second root must not clear the first — and the detached
-        // root's rect has to be in the same absolute space, because that is the space the
-        // one hit array is scanned in.
+        // The window subtree and the detached one share the output buffer, so a second root
+        // must not clear the first, and the detached root's rect has to be in the same
+        // absolute space the one hit array is scanned in.
         let (mut tree, root, kids) = tree_with_a_row();
         let window = Vector2 { x: 600.0, y: 400.0 };
 
@@ -1184,7 +1185,8 @@ mod tests {
         tree.create(inner, LayoutKind::Responsive(Bounds([200.0, 400.0])));
         tree.create(grandchild, LayoutKind::Container);
         // Column, so each child gets the container's full inline size. In a row they would
-        // share it, and the nested container would flip on its own for the wrong reason.
+        // share it, and the nested container would classify against a width this test did
+        // not set.
         let stack = Style {
             display: Display::Flex,
             flex_direction: taffy::FlexDirection::Column,
@@ -1218,8 +1220,8 @@ mod tests {
     #[test]
     fn a_nodes_solved_class_is_the_one_its_own_style_was_lowered_at() {
         // A container classifies its size *for its subtree*. Its own style resolved at the
-        // class enclosing it, so reporting its own back would re-lower its padding at the
-        // class it hands down — which is the drift the report exists to prevent.
+        // class enclosing it, so reporting its own class back would re-lower its padding at
+        // the class it hands down.
         let (mut tree, root, [outer, child, inner, grandchild]) = nested_containers();
         let mut out = Vec::new();
         tree.solve(root, Vector2 { x: 300.0, y: 400.0 }, 1.0, &mut out);

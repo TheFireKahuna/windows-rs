@@ -1,16 +1,15 @@
-//! Cluster geometry: point to position, position to caret, range to rectangles.
+//! Resolves cluster geometry: point to position, position to caret, range to rectangles.
 //!
-//! All three are `IDWriteTextLayout`'s, and none of them is re-derived from the harvested
+//! All three come from `IDWriteTextLayout` and none is re-derived from the harvested
 //! glyphs. A cluster is not a code unit — a surrogate pair, a combining sequence and a
 //! ligature are each one indivisible caret stop spanning several — and across a direction
 //! boundary the two edges of a position are different points on opposite sides of a word.
-//! Arithmetic over advances gets both wrong in ways that only reproduce in the text that
-//! has them.
+//! Arithmetic over advances answers neither.
 
 use super::*;
 use core::ops::Range;
 
-/// Where a point landed.
+/// Describes the cluster a point or a text position landed in.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct TextHit {
     /// Code-unit index of the cluster under the point.
@@ -23,18 +22,19 @@ pub struct TextHit {
     pub inside: bool,
     /// The cluster's box, in layout space.
     pub rect: Rect,
-    /// Bidi embedding level; **odd means right-to-left**, and is what says whether the
-    /// caret's affinity is observable here at all.
+    /// Bidi embedding level; **odd means right-to-left**, which is where the two edges of
+    /// a position are two different points.
     pub bidi: u32,
 }
 
 impl TextHit {
+    /// Returns whether the cluster runs right to left.
     #[must_use]
     pub const fn is_rtl(&self) -> bool {
         self.bidi % 2 == 1
     }
 
-    /// The position the caret goes to, which is past the cluster on a trailing hit.
+    /// Returns the position the caret goes to: past the cluster on a trailing hit.
     #[must_use]
     pub const fn caret(&self) -> u32 {
         if self.trailing {
@@ -45,7 +45,7 @@ impl TextHit {
     }
 }
 
-/// An axis-aligned box in layout space, DIPs.
+/// Holds an axis-aligned box in layout space, in DIPs.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -66,7 +66,10 @@ impl From<DWRITE_HIT_TEST_METRICS> for Rect {
 }
 
 impl ShapedRun {
-    /// The cluster at `p`, in layout space.
+    /// Returns the cluster at `p`, with `p` in layout space.
+    ///
+    /// A hit-test the layout refuses returns [`TextHit::default`], which reads as a hit on
+    /// position zero that was not inside the text.
     #[must_use]
     pub fn hit_test(&self, p: Vector2) -> TextHit {
         let mut trailing = windows_core::BOOL(0);
@@ -91,13 +94,13 @@ impl ShapedRun {
         }
     }
 
-    /// Where the caret sits at `position`.
+    /// Returns where the caret sits at `position`, and the cluster that position falls in.
     ///
     /// `after` selects which **edge of the character at `position`** is wanted: `false` its
     /// leading edge, `true` its trailing. In left-to-right text `caret(i, false)` and
-    /// `caret(i - 1, true)` name the same point, which is why a caret can get away with
-    /// only ever asking for the first. Across a direction boundary they are two points on
-    /// opposite sides of a word, and choosing between them is the caret's affinity.
+    /// `caret(i - 1, true)` name the same point, so a caret can ask only for the leading
+    /// edge. Across a direction boundary they are two points on opposite sides of a word,
+    /// and choosing between them is the caret's affinity.
     #[must_use]
     pub fn caret(&self, position: u32, after: bool) -> (Vector2, TextHit) {
         let (mut x, mut y) = (0.0f32, 0.0f32);
@@ -117,8 +120,8 @@ impl ShapedRun {
                 position: m.textPosition,
                 length: m.length,
                 trailing: after,
-                // Both are answers to *point* hit-testing, and a text position is by
-                // construction a position in the text.
+                // `inside` distinguishes a point outside the text, and a text position is
+                // by construction a position in the text.
                 inside: true,
                 rect: m.into(),
                 bidi: m.bidiLevel,
@@ -126,14 +129,14 @@ impl ShapedRun {
         )
     }
 
-    /// Appends the boxes covering the code-unit `range`, one per line it spans and one per
-    /// direction run within a line.
+    /// Appends the boxes covering the code-unit `range` to `out`, one per line it spans and
+    /// one per direction run within a line.
     ///
-    /// Caller-pooled, and the staging buffer is on the stack for anything a person can
-    /// select by dragging: this runs on every pointer move of a selection gesture, and a
-    /// heap allocation per move is the whole of its cost.
+    /// Runs on every pointer move of a selection gesture. `out` is the caller's to pool,
+    /// and the staging buffer is on the stack for the box counts a drag selection
+    /// produces, so such a call allocates nothing.
     pub fn cluster_rects(&self, range: Range<u32>, out: &mut Vec<Rect>) {
-        /// Lines a drag-selection covers before this spills to the heap.
+        /// Boxes staged on the stack before the read spills to the heap.
         const INLINE: usize = 16;
 
         let length = range.end.saturating_sub(range.start);
@@ -141,9 +144,9 @@ impl ShapedRun {
             return;
         }
         let mut count = 0u32;
-        // The first call reports the count it needs and returns the expected
-        // insufficient-buffer error, so the result is deliberately dropped.
-        // SAFETY: both calls take a slice this frame owns and a stack-local counter.
+        // The first call reports the count it needs through `count` and returns the
+        // expected insufficient-buffer error, so its result is dropped.
+        // SAFETY: the call takes only a stack-local counter.
         unsafe {
             let _ = self
                 .layout()
@@ -162,7 +165,8 @@ impl ShapedRun {
             &mut heap
         };
 
-        // SAFETY: as above; the slice is sized from the count the probe reported.
+        // SAFETY: the slice is sized from the count the probe reported, and the counter is
+        // a stack local outliving the call.
         if unsafe {
             self.layout()
                 .HitTestTextRange(range.start, length, 0.0, 0.0, Some(raw), &mut count)

@@ -1,16 +1,16 @@
 //! The style recipe: what a node's style can be lowered from again, and nothing more.
 //!
 //! A style is a function of a preset, a rule list and a [`Scope`]. The width axis reaches it
-//! two ways and no third: through `metric` and `typography`, which is how a class re-spaces a
-//! subtree it has no declaration in; and through a rule that names a class, which is how a
-//! container states the handful of arrangements that are genuinely a layout decision. Both
-//! read the same axis of the same scope, so a container that changes class changes the styles
-//! of its subtree and nothing else about them — no structure, and no colour.
+//! two ways: through `metric` and `typography`, which is how a class re-spaces a subtree that
+//! has no declaration in it, and through a rule naming a class, which is how a container
+//! states an arrangement. Both read the same axis of the same scope, so a container that
+//! changes class changes the styles of its subtree and nothing else — no structure, and no
+//! colour.
 //!
 //! **The scope kept here is class-free.** The width axis is a layout *output* and
-//! `windows-scene` is its one authority — it resolves the class inside the solve and hands it
-//! back through [`Restyle`](windows_scene::Restyle). Storing a class-resolved scope is what
-//! made the class two facts on two sides of the crate boundary, one of them a frame stale.
+//! `windows-scene` is its one authority: it resolves the class inside the solve and hands it
+//! back through [`Restyle`](windows_scene::Restyle). A class-resolved scope stored here would
+//! be a second copy of that fact, on the other side of the crate boundary and a frame stale.
 //!
 //! A thread-local rather than a field of the host, for the reason the text table is one:
 //! re-lowering runs *inside* the solve, where the host is already borrowed.
@@ -31,7 +31,8 @@ pub(crate) enum OverStore {
 }
 
 impl OverStore {
-    /// Taken straight off the arena's chain, and not through a `Vec` on the way.
+    /// Collects `items` into a store, taking them straight off the arena's chain rather than
+    /// through a `Vec` on the way.
     pub(crate) fn collect(items: impl Iterator<Item = Rule>) -> Self {
         let mut inline = [Rule::always(Over::Grow); 4];
         let mut count = 0usize;
@@ -67,7 +68,7 @@ impl OverStore {
     }
 }
 
-/// One node's style, as the thing it can be lowered from again.
+/// Everything one node's style is lowered from, kept so it can be lowered again.
 #[derive(Clone)]
 pub(crate) struct Recipe {
     pub preset: Preset,
@@ -79,13 +80,12 @@ pub(crate) struct Recipe {
 thread_local! {
     /// A recipe per node, keyed by ids the **model** mints.
     ///
-    /// The store itself, with nothing wrapped around it: a type whose every method forwarded
-    /// one of `place`, `take`, `get` and `len` under a second name would be four chances for
-    /// this table to mean something different from the others, for no behaviour of its own.
+    /// The store itself, with no wrapper around it, so `place`, `take`, `get` and `len` mean
+    /// here what they mean in every other table over [`Slots`].
     ///
-    /// **No authority beside it**, and that is the statement: this layer owns no node counter,
-    /// so it can place a recipe against a node and never invent one. The staleness rule stays
-    /// the model's — a node index is dense and reused, and the stored id catches the reuse.
+    /// This layer owns no node counter, so it can place a recipe against a node and never
+    /// invent one. Staleness stays the model's rule: a node index is dense and reused, and
+    /// the stored id catches the reuse.
     static STYLES: RefCell<Slots<Node, Recipe>> = RefCell::new(Slots::new());
 }
 
@@ -94,15 +94,16 @@ pub(crate) fn with<R>(f: impl FnOnce(&mut Slots<Node, Recipe>) -> R) -> R {
     STYLES.with(|table| f(&mut table.borrow_mut()))
 }
 
-/// The same, for a caller that may be running while the thread's locals are being destroyed.
+/// Runs `f` against the thread's recipe table, answering `None` where the thread's locals are
+/// being destroyed and the table cannot be reached.
 pub(crate) fn try_with<R>(f: impl FnOnce(&mut Slots<Node, Recipe>) -> R) -> Option<R> {
     STYLES.try_with(|table| f(&mut table.borrow_mut())).ok()
 }
 
-/// What the solve asks when a container's class moved: this node's style at that class.
+/// Lowers this node's style at `class`. What the solve asks when a container's class moved.
 ///
 /// `None` where the node has no recipe — a sprite the widget layer minted for chrome rather
-/// than from a slot — which leaves its style alone, since nothing about it reads the class.
+/// than from a slot — which leaves its style alone, since nothing in it reads the class.
 pub(crate) fn restyle(node: NodeId, class: WidthClass) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get(node)?;
@@ -114,19 +115,19 @@ pub(crate) fn restyle(node: NodeId, class: WidthClass) -> Option<taffy::Style> {
     })
 }
 
-/// This node's style with a definite inline size written over it, at the class the last solve
-/// resolved.
+/// Lowers this node's style with a definite inline size written over it, at the class the
+/// last solve resolved. `None` where the node has no recipe.
 ///
-/// What a single-line run's own node needs, and it does not go through the [`Over`] vocabulary
+/// What a single-line run's own node needs. It does not go through the [`Over`] vocabulary,
 /// for the reason a wrapped line's box does not either: the number is the **text engine's**
-/// rather than an author's, so this is the lowering resolving a measurement and `Len`
-/// deliberately cannot say it.
+/// rather than an author's, so this is the lowering resolving a measurement and `Len` cannot
+/// say it.
 ///
-/// The reason it has to be said at all is that a measured cross size does not survive a
-/// container that stretches its children — CSS stretch applies wherever the cross size is
-/// `auto`, and a measurement leaves it `auto`. A run stretched that way keeps drawing the same
-/// coverage tile into a box several times its width, and the tile's brush fills, so the glyphs
-/// come out smeared across the container. A definite size is the only thing stretch yields to.
+/// A measured cross size does not survive a container that stretches its children: CSS
+/// stretch applies wherever the cross size is `auto`, and a measurement leaves it `auto`. A
+/// run stretched that way draws the same coverage tile into a box several times its width,
+/// and the tile's brush fills, so the glyphs smear across the container. A definite size is
+/// what stretch yields to.
 pub(crate) fn pin_width(node: NodeId, class: WidthClass, width: f32) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get(node)?;
@@ -140,15 +141,16 @@ pub(crate) fn pin_width(node: NodeId, class: WidthClass, width: f32) -> Option<t
     })
 }
 
-/// This node's style with the bound overrides appended, at the class the last solve resolved.
+/// Lowers this node's style with `extra` appended, at the class the last solve resolved.
+/// `None` where the node has no recipe.
 ///
-/// What a style that follows a value re-lowers through: taking the class from the solve
+/// What a style that follows a value re-lowers through. Taking the class from the solve
 /// rather than from a captured scope is what keeps a bound style and a classified container
 /// from disagreeing.
 ///
-/// **Every** bound override for the node at once, which is why the node has one effect
-/// rather than one per act: lowering from the recipe plus a single override discards the
-/// others, so two bound styles on one node used to take turns winning.
+/// `extra` must carry **every** bound override for the node, which is why the node has one
+/// effect rather than one per act: lowering from the recipe plus a single override discards
+/// the others, and two bound styles on one node would take turns winning.
 pub(crate) fn lower_with(node: NodeId, class: WidthClass, extra: &[Over]) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get(node)?;

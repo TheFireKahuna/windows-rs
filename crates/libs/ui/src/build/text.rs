@@ -1,21 +1,20 @@
 //! Measured text: the table the solve reads, and the step that turns it into coverage.
 //!
-//! Three properties of the text engine decide the shape of everything here, and each is a
-//! cost this module would otherwise pay per frame:
+//! Three properties of the text engine shape everything here:
 //!
 //! * **A run is kept, not rebuilt.** Re-flowing at a new width is a property set on the
 //!   layout it already holds, so a resize costs no shaping. A changed string reshapes *in
 //!   place*, keeping the harvest buffers and the line vector.
 //! * **Measuring never moves a glyph.** A solve probes one node several times per pass with
 //!   different constraints, so measure is a metrics read and the glyphs are placed once,
-//!   afterwards, at the width layout actually chose.
+//!   afterwards, at the width layout chose.
 //! * **`pin` says whether they moved.** A non-wrapping run laid out leading does not break,
 //!   so a window resize re-pins every label and re-rasterizes none of them.
 //!
 //! The table is a thread-local rather than a field of the host, because measure runs
-//! *inside* `Model::flush`'s own solve — where the host is already borrowed. It is also why
-//! it is not an `Arc<Mutex<..>>`: `Measure` is `Send`, but a closure that captures nothing
-//! is `Send` whatever it reaches through, and a run holds a layout object that is not.
+//! *inside* `Model::flush`'s own solve, where the host is already borrowed. An
+//! `Arc<Mutex<..>>` would not do either: a closure that captures nothing is `Send` whatever
+//! it reaches through, and a run holds a layout object that is not.
 
 use crate::role::{Scope, TypeRole};
 use crate::widget::{Flow, Shaped, TextSource};
@@ -24,17 +23,15 @@ use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
     Avail, GroupId, Ids, Mask, MeasureIn, MeasureKey, Measured, Model, NodeId, RunId, Slots,
-    SpriteId,
-    taffy,
+    SpriteId, taffy,
 };
 use windows_text::{FontLadder, FontSpec, SegBuffers, ShapedRun, TextEngine};
 
 /// Where one entry's lines are drawn.
 ///
-/// A coverage tile is **one line's**, so a run that can break needs one sprite per line.
-/// Keeping the two cases apart is what preserves "a static label costs one visual": the
-/// wrapping case is the only one that pays for a group and a vector, and whether a widget
-/// can wrap is decided by its seed rather than by its content.
+/// A coverage tile covers **one line**, so a run that can break needs one sprite per line.
+/// Only the wrapping case pays for a group and a vector, so a static label costs one visual.
+/// Which case an entry takes is decided by the widget's seed rather than by its content.
 enum Target {
     /// One line, always: the node is the sprite.
     Line {
@@ -54,8 +51,8 @@ struct Line {
 /// The string a run is laid out from.
 ///
 /// Most of a screen's text is chrome and is `&'static str`, so it is **kept as a borrow**.
-/// Copying it into a `String` would be one allocation per label per mount — on the path a list
-/// row realized during a fling takes, and for a string that already exists in the binary.
+/// Copying it into a `String` would be one allocation per label per mount, on the path a list
+/// row realized during a fling takes.
 ///
 /// A bound value's string is owned, because it is a closure's result and is kept nowhere else.
 /// That one is written **in place**, so a label following a changing number allocates once.
@@ -67,14 +64,14 @@ pub(crate) enum Source {
 impl From<&TextSource> for Source {
     /// Snapshots a text source for the table.
     ///
-    /// A static string crosses as a **borrow**; the other two hand over a string that is
-    /// already the caller's own, so nothing here copies anything twice.
+    /// A static string crosses as a **borrow**; the other two hand over a string of their
+    /// own, so nothing is copied twice.
     fn from(source: &TextSource) -> Self {
         match source {
             TextSource::Static(s) => Self::Static(s),
             TextSource::Owned(s) => Self::Owned(s.clone()),
             // The one allocation a reactive run makes at mount, and it is a buffer it keeps:
-            // every change after this is written into it in place.
+            // every later change is written into it in place.
             TextSource::Dynamic(_) => {
                 let mut owned = String::new();
                 source.append(&mut owned);
@@ -99,13 +96,14 @@ impl Source {
                 owned.clear();
                 owned.push_str(text);
             }
-            // A static run that acquired a dynamic string: the first change is where it
-            // becomes owned, and every one after that reuses this buffer.
+            // A static run given a dynamic string: the first change is where it becomes
+            // owned, and every one after that reuses this buffer.
             Self::Static(_) => *self = Self::Owned(text.to_owned()),
         }
     }
 }
 
+/// One laid-out run, and everything needed to lay it out again.
 pub(crate) struct Entry {
     run: ShapedRun,
     /// The current string, needed again whenever the type ramp moves.
@@ -121,16 +119,16 @@ pub(crate) struct Entry {
     /// what colour its widget resolved.
     ink: crate::role::Text,
     target: Target,
-    /// The width the glyphs currently stand at. `NaN` until the first pin, so the first
+    /// The width the glyphs stand at. `NaN` until the first pin, so the first
     /// publish always emits.
     pinned: f32,
     /// The inline extent of the coverage last emitted for a single line. `NaN` until there
     /// is one.
     ///
-    /// Held rather than read back from the run because reading a line's ink needs a harvest,
-    /// and this is compared on **every** flush — the comparison is what re-pins a box that a
-    /// class re-lower rebuilt from the recipe, which is a path with no reshape behind it and
-    /// therefore no emit to hang the correction off.
+    /// Held rather than read back from the run, because reading a line's ink needs a harvest
+    /// and this is compared on **every** flush. The comparison is what re-pins a box that a
+    /// class re-lower rebuilt from the recipe: that path reshapes nothing, so it emits
+    /// nothing to hang the correction off.
     ink_w: f32,
     /// The string or the font moved, so the run is behind its source.
     stale: bool,
@@ -138,8 +136,7 @@ pub(crate) struct Entry {
 
 /// What a run needs to exist.
 ///
-/// One argument rather than seven, because every one of them is decided at the same call site
-/// and a positional list of that length is a place to transpose two.
+/// One argument rather than seven positional ones, all decided at the same call site.
 pub(crate) struct Mint {
     pub text: Source,
     pub ramp: TypeRole,
@@ -158,19 +155,18 @@ pub(crate) struct Table {
     pub(crate) entries: Slots<Measured, Entry>,
     /// Laid-out runs whose key has been released, kept for their buffers.
     ///
-    /// A released entry is **parked here rather than left in a vacated slot**, which is the
-    /// same trick the build arena plays with its own buffers: reshaping one costs no shaping
-    /// and no allocation, where building a fresh run costs both on the path a list row
-    /// realized during a fling takes. Keeping it in the store instead would need a second
-    /// removal verb — a slot that is vacant but still holds something — and that is the
-    /// live-flag-beside-a-generation arrangement this table just stopped having.
+    /// A released entry is **parked here rather than left in a vacated slot**. Reshaping a
+    /// parked run allocates nothing, where building a fresh one shapes and allocates on the
+    /// path a list row realized during a fling takes. Leaving it in the store would need a
+    /// second removal verb for a slot that is vacant and still holds something, which is a
+    /// live flag beside a generation.
     spare: Vec<Entry>,
     /// The thread's shaping engine.
     ///
-    /// Here rather than in [`Host`](super::Host) because the measure seam demands it:
-    /// `Model::on_measure` takes a `Send` closure that captures nothing, so the only
-    /// thing measure can reach is this table's own thread-local — and a run cannot be
-    /// reshaped without the engine that laid it out.
+    /// Here rather than in [`Host`](super::Host) because of the measure seam:
+    /// `Model::on_measure` takes a `Send` closure that captures nothing, so measure can reach
+    /// only this table's own thread-local, and a run cannot be reshaped without the engine
+    /// that laid it out.
     engine: Option<TextEngine>,
 }
 
@@ -178,12 +174,11 @@ thread_local! {
     static TEXT: RefCell<Table> = RefCell::new(Table::default());
 }
 
-/// Installs this thread's shaping engine over `fonts`. Once, before anything mounts.
+/// Installs this thread's shaping engine over `fonts`, once, before anything mounts.
 ///
-/// `fonts` must be the ladder the rasterizing half already holds —
-/// `Backends::ladder()`. Two ladders interning independently agree on face `0` and
-/// disagree on everything after it, and the symptom is a run drawn in the wrong face
-/// rather than an error.
+/// `fonts` must be the ladder the rasterizing half already holds — `Backends::ladder()`. Two
+/// ladders interning independently agree on face `0` and disagree on everything after it,
+/// which draws a run in the wrong face rather than reporting an error.
 ///
 /// # Errors
 ///
@@ -204,7 +199,7 @@ pub fn install(fonts: FontLadder) -> Result<()> {
     Ok(())
 }
 
-/// Whether this thread has an engine. What a diagnostic asks; nothing else needs it.
+/// Returns whether this thread has a shaping engine installed.
 #[must_use]
 pub fn installed() -> bool {
     with(|table| table.engine.is_some())
@@ -215,24 +210,27 @@ pub(crate) fn with<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     TEXT.with(|table| f(&mut table.borrow_mut()))
 }
 
-/// The same, for a caller that may be running while the thread's locals are being
-/// destroyed — where reaching one is an error and [`with`] would answer by panicking.
+/// Runs `f` against the thread's text table, answering `None` where the thread's locals are
+/// being destroyed and the table cannot be reached. [`with`] panics there instead.
 pub(crate) fn try_with<R>(f: impl FnOnce(&mut Table) -> R) -> Option<R> {
     TEXT.try_with(|table| f(&mut table.borrow_mut())).ok()
 }
 
-/// What the solve asks of the layer that owns the text engine.
+/// Measures the run `input` names, under the availability and width class the solve is
+/// probing with. What the solve asks of the layer that owns the text engine.
 ///
-/// The class is an **input** rather than something read from ambient state, so a
-/// measurement is taken under the width the container actually resolved and not under
-/// whatever was current when the node was built.
+/// The class is an **input** rather than ambient state, so the measurement is taken under the
+/// width the container resolved rather than the one current when the node was built.
 ///
 /// **The three availability states are answered separately**, and for a run that can break
 /// they are three different numbers. A min-content probe asks how narrow the run can be,
-/// which is its longest unbreakable span; a max-content probe asks how wide it would like
-/// to be, which is its one-line width. Answering the one-line width to both is what lets
-/// flex shrink a paragraph below its own longest word, and the symptom is a break in the
-/// middle of a word.
+/// which is its longest unbreakable span; a max-content probe asks its one-line width.
+/// Answering the one-line width to both lets flex shrink a paragraph below its own longest
+/// word, which breaks a word in the middle.
+///
+/// # Panics
+///
+/// If no shaping engine is installed on this thread.
 pub(crate) fn measure(input: MeasureIn) -> Vector2 {
     with(|table| {
         let Table {
@@ -244,9 +242,9 @@ pub(crate) fn measure(input: MeasureIn) -> Vector2 {
         };
         entry.sync(engine, input.class);
         match input.available.0 {
-            // Unbounded, which is what a run laid out at its natural width is. A
-            // single-line run answers this to every probe, and correctly: it has no break
-            // opportunity, so its narrowest width *is* its widest.
+            // Unbounded: the run at its natural width. A single-line run answers this to
+            // every probe, since it has no break opportunity and its narrowest width is its
+            // widest.
             Avail::MaxContent => entry.run.measure(None),
             Avail::Definite(w) => entry.run.measure(Some(w)),
             // Measured at the longest unbreakable span, so the height is the one that span
@@ -259,17 +257,7 @@ pub(crate) fn measure(input: MeasureIn) -> Vector2 {
 }
 
 impl Table {
-    /// A run's longest unbreakable span, in DIPs.
-    ///
-    /// The number behind [`Avail::MinContent`], read back so a test can assert the floor
-    /// rather than write down a width that moves with the type ramp.
-    pub(crate) fn min_width_of(&self, key: MeasureKey) -> f32 {
-        self.entries
-            .get(key)
-            .map_or(0.0, |entry| entry.run.min_width())
-    }
-
-    /// The string a run was laid out from.
+    /// Returns the string a run was laid out from.
     ///
     /// What automation derives an accessible name from: a widget's name is its own text
     /// unless it was given one, and this is where its own text is.
@@ -279,10 +267,14 @@ impl Table {
 
     /// Registers a run and hands back the key layout will name it by.
     ///
-    /// A released slot keeps its laid-out run, so this **reshapes** rather than building one:
-    /// the same reason a changed string reshapes in place, extended across the unmount that
-    /// recycled the slot. That is what makes a list row realized during a fling cost the walk
-    /// and nothing else.
+    /// A released slot keeps its laid-out run, so this **reshapes** a parked entry rather
+    /// than building one — the same reuse a changed string gets, extended across the unmount
+    /// that recycled the slot.
+    ///
+    /// # Panics
+    ///
+    /// If no shaping engine is installed on this thread, or if DirectWrite cannot lay out the
+    /// run.
     pub(crate) fn mint(&mut self, mint: Mint) -> MeasureKey {
         let Mint {
             text,
@@ -317,10 +309,9 @@ impl Table {
             return self.entries.insert(&mut self.keys, entry);
         }
         let entry = Entry {
-            // Panics rather than measuring zero: a widget layer that answered a
-            // plausible size with no glyphs behind it lays the screen out around a
-            // lie, and the failure then surfaces as mysterious geometry rather than
-            // as the layout call that could not run.
+            // Panics rather than measuring zero: a plausible size with no glyphs behind it
+            // lays the screen out around a number nothing produced, and the failure then
+            // surfaces as geometry rather than as the layout call that could not run.
             run: engine
                 .shape(text.as_str(), &font, flow)
                 .expect("DirectWrite could not lay out a run"),
@@ -333,28 +324,27 @@ impl Table {
             target,
             pinned: f32::NAN,
             ink_w: f32::NAN,
-            // Fresh, for the same reason the recycled path above is: the run was just laid
-            // out from this string under this font. Marking it stale would reshape it again
-            // at the first measure. A class that resolves a *different* font still reshapes,
-            // because `sync` compares the font rather than trusting this flag.
+            // Fresh, as on the recycled path above: the run is laid out from this string
+            // under this font, and marking it stale would reshape it again at the first
+            // measure. A class resolving a *different* font still reshapes, because `sync`
+            // compares the font rather than trusting this flag.
             stale: false,
         };
         self.entries.insert(&mut self.keys, entry)
     }
 
-    /// Re-points a run's text.
+    /// Re-points a run's text, answering the node whose measure has to be re-asked, or `None`
+    /// where the string did not move.
     ///
-    /// Event rate by construction: changing a line's string is structural — reshape,
-    /// re-rasterize, re-point — and text that changes at display rate belongs in a
-    /// presentation region.
-    /// Re-points a run's text, answering the node whose measure has to be re-asked — or
-    /// `None` where the string did not move.
+    /// Changing a line's string is structural — reshape, re-rasterize, re-point — so this is
+    /// an event-rate call; text that changes at display rate belongs in a presentation
+    /// region.
     ///
     /// The node and not a `bool`, because marking the entry stale is only half of it.
     /// `stale` is read by [`Entry::sync`], `sync` runs from the measure function, and the
-    /// measure function runs only for a node taffy considers dirty. Nothing about re-pointing
-    /// a string makes it dirty — the measure *context* is a key that never changes — so the
-    /// caller has to say so, and this is what it needs to say it about.
+    /// measure function runs only for a node taffy considers dirty. Re-pointing a string does
+    /// not make it dirty, since the measure context is a key that never changes, so the
+    /// caller has to mark it — and this is the node to mark.
     pub(crate) fn set_text(&mut self, key: MeasureKey, text: &str) -> Option<NodeId> {
         let entry = self.entries.get_mut(key)?;
         if entry.text.as_str() == text {
@@ -391,21 +381,21 @@ impl Table {
         self.spare.push(entry);
     }
 
-    /// Pins every run at the width the solve gave it, and re-publishes the ones that moved.
+    /// Pins every run at the width the solve gave it, re-publishes the ones that moved, and
+    /// answers whether anything was emitted so a caller can skip the re-solve.
     ///
-    /// Runs between the solve and the hand-over, which is the whole reason
-    /// [`Model::solve`] is separable: a run laid out at the width layout chose has to reach
-    /// the *same* patch as that layout, or it arrives a frame after the box it was measured
-    /// for.
-    ///
-    /// Answers whether anything was emitted, so a caller can skip the re-solve when nothing
-    /// did.
+    /// Runs between the solve and the hand-over, which is what [`Model::solve`] being
+    /// separable buys: a run laid out at the width layout chose reaches the *same* patch as
+    /// that layout rather than arriving a frame after the box it was measured for.
     ///
     /// Every live run, and **not** a dirty list: a resize moves every label's box without
-    /// touching a single string, so the thing that decides whether a run moved is the solved
-    /// width and nothing above knows it. What the walk costs is one solved-rect read and a
-    /// float compare per run, which is why the expensive halves — reshaping and re-emitting —
-    /// are both behind `pin`.
+    /// touching a string, and the solved width is what decides whether a run moved. The walk
+    /// costs one solved-rect read and a float compare per run; reshaping and re-emitting are
+    /// both behind `pin`.
+    ///
+    /// # Panics
+    ///
+    /// If no shaping engine is installed on this thread.
     pub(crate) fn publish(&mut self, model: &mut Model) -> bool {
         let Table {
             entries, engine, ..
@@ -420,15 +410,18 @@ impl Table {
 
     /// Re-sends every run's coverage, whether or not its box moved.
     ///
-    /// The response to a pixel grid that moved and to a device that was rebuilt, and it has
-    /// to be unconditional: a coverage tile is rasterized at **device** resolution, and
-    /// neither event changes a single DIP. [`publish`](Self::publish) is gated on the width
-    /// having moved and so answers "nothing to do" for exactly the case that needs
-    /// everything done — a display hop that leaves every glyph rasterized for the old grid.
+    /// The response to a pixel grid that moved and to a device that was rebuilt. A coverage
+    /// tile is rasterized at **device** resolution and neither event changes a DIP, so
+    /// [`publish`](Self::publish), which is gated on the width having moved, answers "nothing
+    /// to do" for a display hop that leaves every glyph rasterized for the old grid.
     ///
-    /// Shaping is not redone. It is resolution-independent, and the run is already pinned at
-    /// the width the last solve gave it; what is stale is the raster, and re-pointing each
-    /// run through `Model::set_run` is what replaces it.
+    /// Shaping is not redone: it is resolution-independent, and the run is already pinned at
+    /// the width the last solve gave it. What is stale is the raster, and re-pointing each
+    /// run through `Model::set_run` replaces it.
+    ///
+    /// # Panics
+    ///
+    /// If no shaping engine is installed on this thread.
     pub(crate) fn reemit(&mut self, model: &mut Model) {
         let Table {
             entries, engine, ..
@@ -456,8 +449,8 @@ impl Entry {
         let _ = engine.reshape(&mut self.run, self.text.as_str(), &font, self.flow);
     }
 
-    /// The node whose style measured this run: the laid-out label sprite, or the column the
-    /// lines sit in.
+    /// Returns the node whose style measured this run: the laid-out label sprite, or the
+    /// column the lines sit in.
     fn node(&self) -> NodeId {
         match self.target {
             Target::Line { sprite, .. } => sprite.node(),
@@ -488,19 +481,20 @@ impl Entry {
 
     /// Makes a single line's box exactly its coverage, and answers whether that moved a box.
     ///
-    /// Only [`Target::Line`], because that case is the one where **the node is the sprite**:
-    /// a wrapping run owns line sprites of its own and sizes each to its own tile
+    /// Only [`Target::Line`], because that is the case where **the node is the sprite**: a
+    /// wrapping run owns line sprites of its own and sizes each to its own tile
     /// ([`line_style`]), so its node is free to be whatever the container makes it.
     ///
-    /// A single line has no such sprite to hide behind, so a container that stretches its
-    /// children stretches the tile — and the tile's brush fills, so the glyphs smear across
-    /// the whole container. A measurement leaves the cross size `auto`, which is precisely
-    /// the case stretch applies to; a definite size is what it yields to.
+    /// A single line has no such sprite behind it, so a container that stretches its children
+    /// stretches the tile, and the tile's brush fills — the glyphs smear across the whole
+    /// container. A measurement leaves the cross size `auto`, which is the case stretch
+    /// applies to; a definite size is what it yields to.
     ///
     /// **This terminates.** The width written is the ink of a run that cannot wrap, so it
     /// does not depend on the box it is written into: the next solve hands back the width
-    /// just written, the comparison holds, and nothing is written again. That is the
-    /// argument phase 2 of [`Host::flush`](super::Host::flush) needs from every publish.
+    /// just written, the comparison holds, and nothing is written again.
+    /// [`Host::flush`](super::Host::flush) re-solves once after a publish and needs that of
+    /// every publish.
     fn fit_line_box(&mut self, model: &mut Model, node: NodeId) -> bool {
         let Target::Line { .. } = self.target else {
             return false;
@@ -523,7 +517,7 @@ impl Entry {
 
     /// Sends this run's coverage, whatever the layout did. The half of
     /// [`publish`](Self::publish) behind its gate, so a re-emit takes the same path a move
-    /// does rather than a second one to keep in step.
+    /// does rather than a second one that has to be kept in step with it.
     fn emit(&mut self, engine: &TextEngine, model: &mut Model) -> bool {
         match &mut self.target {
             Target::Line { sprite, run } => {
@@ -541,10 +535,10 @@ impl Entry {
     }
 }
 
-/// One line's segments and the tile they occupy.
+/// Returns one line's segments and the tile they occupy.
 ///
-/// Harvest first: `pin` marks the layout stale, and reading a line before the walk
-/// would answer from the previous width.
+/// Harvests first: `pin` marks the layout stale, and reading a line before the walk would
+/// answer from the previous width.
 fn emit(engine: &TextEngine, run: &mut ShapedRun, line: usize, out: &mut SegBuffers) -> Shaped {
     let _ = engine.harvest(run);
     Shaped {
@@ -553,7 +547,7 @@ fn emit(engine: &TextEngine, run: &mut ShapedRun, line: usize, out: &mut SegBuff
     }
 }
 
-/// The one place a missing engine is named.
+/// The message every missing-engine panic carries.
 const ENGINE: &str = "a text engine must be installed before anything mounts: call                       windows_ui::build::text::install once at start-up";
 
 /// Points one sprite at a line's coverage.
@@ -583,8 +577,8 @@ fn publish_lines(
     lines: &mut Vec<Line>,
     light: windows_color::Radiance,
 ) -> bool {
-    // Harvesting is what fills the line table, and pinning is what makes it stale, so
-    // the walk happens once here rather than at each reader below.
+    // Harvesting fills the line table and pinning makes it stale, so the walk happens once
+    // here rather than at each reader below.
     let _ = engine.harvest(run);
     let count = run.lines().len();
     while lines.len() > count {
@@ -618,11 +612,11 @@ fn publish_lines(
     true
 }
 
-/// One line's box: exactly its coverage tile.
+/// Returns one line's box: exactly its coverage tile.
 ///
 /// Built here rather than through the [`Over`](crate::layout::Over) vocabulary because the
-/// number is the text engine's rather than an author's — this is the lowering resolving a
-/// measurement, not a widget expressing a size, and `Len` deliberately cannot say it.
+/// number is the text engine's rather than an author's. This is the lowering resolving a
+/// measurement rather than a widget expressing a size, and `Len` cannot say it.
 fn line_style(size: Vector2) -> taffy::Style {
     taffy::Style {
         size: taffy::Size {

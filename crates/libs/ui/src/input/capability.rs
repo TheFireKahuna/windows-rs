@@ -1,24 +1,25 @@
-//! What the machine can do, and what it is being used as.
+//! Reports what pointer devices the machine has and how the user is holding it.
 //!
 //! **Affordances are per-interaction, not per-device-mode.** A touch contact gets touch
 //! treatment; a mouse move gets mouse treatment; both may occur seconds apart on one machine.
-//! **Nothing in this design branches on a global "touch mode"** — which is why everything
-//! here is diagnostic, and why the one thing that looks like a mode switch is documented as a
-//! hint.
+//! Nothing here decides anything: [`Devices`] is diagnostic and [`Interaction`] is a hint.
 //!
-//! The honest per-interaction signal is the contact itself: `rcContactRaw` at gesture time
-//! ([`Sample::contact`](super::Sample)) says how big the thing touching the screen actually
-//! was, which no global flag can.
+//! The per-interaction signal is the contact itself: `rcContactRaw` at gesture time
+//! ([`Sample::contact`](super::Sample)) states how large the contact was, which no global
+//! flag can.
 
 use crate::bindings::*;
 use windows_core::Result;
 
-/// What the attached digitizers report.
+/// Holds what the attached digitizers report.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Devices {
+    /// A touch digitizer is attached.
     pub touch: bool,
+    /// A pen digitizer is attached.
     pub pen: bool,
+    /// A precision touchpad is attached.
     pub touchpad: bool,
     /// The largest simultaneous contact count any attached digitizer reports. Zero where
     /// there is no digitizer at all.
@@ -26,9 +27,14 @@ pub struct Devices {
 }
 
 impl Devices {
-    /// Enumerates the pointer devices. Called once at startup and on nothing else: this is a
-    /// capability, and a capability that changes is a device arriving, which changes nothing
-    /// about how a contact that has already arrived is treated.
+    /// Enumerates the attached pointer devices.
+    ///
+    /// Read once at startup. A later change means a device arrived, which alters nothing
+    /// about how a contact already in flight is treated.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `GetPointerDevices` or a device property read does.
     pub fn enumerate() -> Result<Self> {
         let mut devices = Self::default();
         for device in PointerDevice::GetPointerDevices()? {
@@ -42,26 +48,34 @@ impl Devices {
     }
 }
 
-/// How the user is currently holding the machine, **as a hint only**.
+/// States how the user is holding the machine, **as a hint only**.
 ///
 /// Windows 11 removed Tablet Mode and points at Convertible Slate Mode for keyboard
-/// attach/detach, so this is weak on the platform floor by the platform's own account. It is
-/// read for diagnostics — a report that says "touch mode, and yet no touch contact has ever
-/// arrived" is worth having — and it decides nothing.
+/// attach/detach, so the signal is weak at the platform floor by the platform's own account.
+/// It is read for diagnostics — a report saying "touch mode, and yet no touch contact has
+/// ever arrived" is worth having — and it decides nothing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Interaction {
+    /// The machine reports a mode driven by an indirect pointer.
     Mouse,
+    /// The machine reports a mode driven by direct touch.
     Touch,
 }
 
 impl Interaction {
-    /// The mode the window is in. A desktop app has no `CoreWindow`, so this goes through the
-    /// interop factory rather than `GetForCurrentView`.
+    /// Returns the interaction mode `window` is in.
+    ///
+    /// A desktop app has no `CoreWindow`, so the settings come from the interop factory
+    /// rather than from `GetForCurrentView`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the interop factory, `GetForWindow`, or the mode read does.
     pub fn for_window(window: &windows_window::Window) -> Result<Self> {
         let hwnd = window.hwnd();
         let interop = windows_core::factory::<UIViewSettings, IUIViewSettingsInterop>()?;
-        // SAFETY: `hwnd` is live for the call, and the interface it is asked for is the one
-        // the returned object implements.
+        // SAFETY: `hwnd` is live for the call, and `UIViewSettings` is the class the interop
+        // factory returns for a window, so the interface asked for is one it implements.
         let settings: UIViewSettings = unsafe { interop.GetForWindow(hwnd)? };
         Ok(match settings.UserInteractionMode()? {
             UserInteractionMode::Touch => Self::Touch,
@@ -70,10 +84,11 @@ impl Interaction {
     }
 }
 
-/// Everything the machine reports about itself, read once.
+/// Holds what the machine reports about its pointer input, read once.
 #[derive(Copy, Clone, Debug)]
 #[non_exhaustive]
 pub struct Capability {
+    /// The digitizers attached at the time of the read.
     pub devices: Devices,
     /// `None` where the mode could not be read, which is not an error: it decides nothing.
     pub interaction: Option<Interaction>,
@@ -84,8 +99,8 @@ pub struct Capability {
 }
 
 impl Capability {
-    /// Reads what this machine reports. Never fails: an unreadable capability is one this
-    /// design does not branch on.
+    /// Reads every capability for `window`. Never fails: a capability that cannot be read is
+    /// reported absent, and nothing branches on one.
     #[must_use]
     pub fn read(window: &windows_window::Window, late: &super::dynamic::Late) -> Self {
         Self {

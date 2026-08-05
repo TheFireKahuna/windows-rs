@@ -1,13 +1,12 @@
 //! Recogniser lifetime: a pool.
 //!
-//! The platform's own guidance rejects both "one per element forever" — which does not scale
-//! past a few dozen targets — and per-gesture construction, which churns; pooling is the
-//! third option it names. So a recogniser is **bound to a `(contact, target)` pair on down**,
-//! configured from that target's declaration, and returned on up, cancel or inertia end.
+//! A recogniser is **bound to a `(contact, target)` pair on down**, configured from that
+//! target's declaration, and returned to the pool on up, cancel or inertia end. Neither a
+//! recogniser per element nor one constructed per gesture is used: the first does not scale
+//! past a few dozen targets, and the second churns.
 //!
-//! Two pools, not one: a precision-touchpad contact needs the physical recogniser and the
-//! two are different types, so a free list that mixed them would hand out the wrong one at
-//! whatever rate the user alternated devices.
+//! Two free lists, not one: a precision-touchpad contact needs the physical recogniser and
+//! the two are different types, so one mixed list would hand out the wrong kind.
 
 use super::decl::GestureDecl;
 use super::drag::Drag;
@@ -32,14 +31,15 @@ pub struct Bound {
     pub manipulating: bool,
     /// Whether the contact has lifted and its motion is still being pumped.
     pub inertial: bool,
-    /// Whether the contact was low-confidence at down. Such a contact **never starts a
-    /// gesture**: it is a palm, and this is the whole of palm rejection on this stack.
+    /// Whether the contact arrived without the digitizer's confidence. Such a contact
+    /// **never starts a gesture** — nothing is fed to its recogniser — and that is the whole
+    /// of palm rejection on this stack.
     pub rejected: bool,
     recognizer: FrontHandle<Recognizer>,
 }
 
 impl Bound {
-    /// The recogniser this contact is bound to.
+    /// Returns the recogniser this contact is bound to.
     #[must_use]
     pub fn recognizer(&self) -> &Recognizer {
         &self.recognizer
@@ -50,8 +50,8 @@ impl Bound {
 pub struct RecognizerPool {
     free: Vec<FrontHandle<Recognizer>>,
     ptp_free: Vec<FrontHandle<Recognizer>>,
-    /// The one place in this crate a structure is keyed by something the system chose rather
-    /// than by a dense index this crate minted.
+    /// Keyed by the system's pointer id — the one structure in this crate not keyed by a
+    /// dense index this crate minted.
     bound: FxHashMap<u32, Bound>,
     events: Events,
     minted: u32,
@@ -64,7 +64,7 @@ impl Default for RecognizerPool {
 }
 
 impl RecognizerPool {
-    /// An empty pool. Nothing is minted until a contact needs one.
+    /// Returns an empty pool. Nothing is minted until a contact needs a recogniser.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -76,20 +76,21 @@ impl RecognizerPool {
         }
     }
 
-    /// Where every bound recogniser raises. Drained by the router after each feed.
+    /// Returns the queue every bound recogniser raises into, drained by the router after
+    /// each feed.
     #[must_use]
     pub fn events(&self) -> &Events {
         &self.events
     }
 
-    /// How many recognisers have ever been constructed. A pool that keeps minting is a pool
-    /// whose contacts are not being released.
+    /// Returns how many recognisers have been constructed. A count that keeps rising means
+    /// contacts are not being released.
     #[must_use]
     pub const fn minted(&self) -> u32 {
         self.minted
     }
 
-    /// How many contacts are bound right now.
+    /// Returns how many contacts are bound.
     #[must_use]
     pub fn live(&self) -> usize {
         self.bound.len()
@@ -100,6 +101,11 @@ impl RecognizerPool {
     /// `rejected` says the contact arrived without the digitizer's confidence. It is still
     /// bound — so that its up and its cancel are accounted for — but nothing is fed to the
     /// recogniser, so it can never start a gesture.
+    ///
+    /// # Errors
+    ///
+    /// A recogniser could not be constructed, or the platform refused the configuration
+    /// `decl` asks for.
     pub fn bind(
         &mut self,
         id: u32,
@@ -124,29 +130,29 @@ impl RecognizerPool {
         }))
     }
 
-    /// What a contact is bound to.
+    /// Returns what a contact is bound to, or `None` if it is not bound.
     #[must_use]
     pub fn get(&self, id: u32) -> Option<&Bound> {
         self.bound.get(&id)
     }
 
-    /// What a contact is bound to, mutably.
+    /// Returns what a contact is bound to, mutably, or `None` if it is not bound.
     pub fn get_mut(&mut self, id: u32) -> Option<&mut Bound> {
         self.bound.get_mut(&id)
     }
 
-    /// Whether any contact is bound to `target`.
+    /// Returns whether any contact is bound to `target`.
     #[must_use]
     pub fn holds(&self, target: ControlId) -> bool {
         self.bound.values().any(|bound| bound.target == target)
     }
 
-    /// Every bound contact, for the tick that pumps inertia.
+    /// Returns every bound contact, for the tick that pumps inertia.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut Bound)> {
         self.bound.iter_mut().map(|(id, bound)| (*id, bound))
     }
 
-    /// Whether anything is still in inertia, which is what keeps a frame requested.
+    /// Returns whether anything is still in inertia, which is what keeps a frame requested.
     #[must_use]
     pub fn any_inertial(&self) -> bool {
         self.bound.values().any(|bound| bound.inertial)
@@ -183,7 +189,8 @@ impl RecognizerPool {
         }
     }
 
-    /// A free recogniser of the kind this device needs, minting one if the list is empty.
+    /// Returns a free recogniser of the kind `ptype` needs, minting one if the list is
+    /// empty.
     fn take(&mut self, ptype: PointerType) -> Result<FrontHandle<Recognizer>> {
         let physical = ptype.is_touchpad();
         let free = if physical {

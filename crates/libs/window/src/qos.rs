@@ -1,18 +1,17 @@
-//! What a thread asks the scheduler for.
+//! What a thread asks the scheduler for: an execution-speed request on the calling thread.
 //!
-//! The thread lever rather than the process-wide twin: one process legitimately runs a front
-//! thread at full speed while its present thread is parked, which the process-wide form cannot
-//! express.
+//! The per-thread lever rather than the process-wide one, which cannot express a process
+//! running its front thread at full speed while its present thread is parked.
 
 use crate::bindings::*;
 
-/// How the calling thread asks to be scheduled.
+/// Selects how the calling thread asks to be scheduled.
 ///
-/// All three states the system distinguishes, because the right one depends on whether the
-/// *reason* a thread went idle is visible from outside it. A window thread's is: Windows
-/// already demotes a minimized or fully-occluded window's process on its own, so [`Managed`]
-/// says nothing and lets it. A present thread's is not — a display that is off, or a producer
-/// with nothing to publish, shows up in no window state — so it says [`Eco`] outright.
+/// All three states the system distinguishes. Which one fits depends on whether the reason a
+/// thread went idle is visible from outside it: Windows demotes a minimized or fully-occluded
+/// window's process on its own, so a window thread takes [`Managed`] and leaves it to the
+/// system, while a present thread's idleness — a display that is off, or a producer with
+/// nothing to publish — appears in no window state, so that thread asks for [`Eco`] outright.
 ///
 /// [`Managed`]: Self::Managed
 /// [`Eco`]: Self::Eco
@@ -27,13 +26,12 @@ pub enum Speed {
     Managed,
 }
 
-/// Tags the **calling** thread.
+/// Tags the **calling** thread with `speed`.
 pub fn set(speed: Speed) {
-    // Three encodings, and the third is not "neither": control set with state clear asks for
-    // full speed, control set with state set is an explicit EcoQoS request, and control clear
-    // hands the decision back. An explicit request outlives its reason — nothing re-raises one
-    // that was never made — so a caller that cannot say when to withdraw it wants `Managed`
-    // rather than a request it will not take back.
+    // Three encodings: control set with state clear asks for full speed, control set with
+    // state set is an explicit EcoQoS request, and control clear hands the decision back to
+    // the system. An explicit request stands until it is withdrawn, so a caller that cannot
+    // say when to withdraw one asks for `Speed::Managed`.
     let mut state = THREAD_POWER_THROTTLING_STATE {
         Version: THREAD_POWER_THROTTLING_CURRENT_VERSION as u32,
         ControlMask: match speed {

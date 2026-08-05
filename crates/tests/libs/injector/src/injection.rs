@@ -1,31 +1,28 @@
 //! The one injection object, and the lifecycle each device class has on it.
 //!
-//! `InputInjector` covers mouse, pen, touch and the keyboard. Touch and pen additionally
-//! have an **initialize/uninitialize pair**, and that pair is not ceremony: a pen sample
-//! injected without `InitializePenInjection` is accepted and goes nowhere, which is the
-//! failure mode a return code cannot show and the one that costs an afternoon. So the
-//! initialize is owned here, refcounted per class, and released when the last stream of
-//! that class drops — never per stream, because uninitializing under a live stream would
-//! silently stop delivering.
+//! `InputInjector` covers mouse, pen, touch and the keyboard. Touch and pen additionally have
+//! an initialize/uninitialize pair: a pen sample injected without `InitializePenInjection` is
+//! accepted, returns success and delivers nothing. The initialize is owned here and
+//! refcounted per class, so it is released when the last stream of that class drops rather
+//! than per stream — uninitializing under a live stream stops delivery without an error.
 //!
-//! **Visualization is `None`.** The system's touch circles and pen feedback are pixels a
-//! visual diff would see, drawn over the thing being compared.
+//! Visualization is `None`. The system's touch circles and pen feedback are pixels drawn over
+//! the window a visual comparison is made against.
 
 use crate::bindings::*;
 use crate::{Error, Result};
 
-/// The injector's handle on the platform, and what has been initialized on it.
+/// Holds the injection object and the per-class initializes taken out on it.
 pub(crate) struct Injection {
     injector: InputInjector,
     pen: u32,
 }
 
 impl Injection {
-    /// Obtains the injection object, or says why the session would not give one.
+    /// Obtains the injection object, or reports why the session refused one.
     pub(crate) fn open() -> Result<Self> {
-        // Activation initializes this thread's apartment on its own if nothing has —
-        // `FactoryCache` falls back to `CoIncrementMTAUsage` — so a harness has no apartment
-        // discipline to get wrong.
+        // Activation initializes this thread's apartment if nothing has: `FactoryCache` falls
+        // back to `CoIncrementMTAUsage`, so a caller needs no apartment of its own.
         let injector =
             InputInjector::TryCreate().map_err(|e| Error::call("InputInjector::TryCreate", e))?;
         Ok(Self { injector, pen: 0 })
@@ -47,6 +44,7 @@ impl Injection {
         Ok(())
     }
 
+    /// Drops one pen stream's claim, uninitializing pen injection when the last one goes.
     pub(crate) fn release_pen(&mut self) {
         self.pen = self.pen.saturating_sub(1);
         if self.pen == 0 {
@@ -56,7 +54,7 @@ impl Injection {
 }
 
 impl Drop for Injection {
-    /// Releases whatever a panicking test left initialized.
+    /// Releases any initialize still outstanding, including one a panicking drive left.
     fn drop(&mut self) {
         if self.pen > 0 {
             _ = self.injector.UninitializePenInjection();

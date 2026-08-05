@@ -1,14 +1,12 @@
 //! Scroll and virtualization: the two policies that sit over the tracker.
 //!
-//! **Scroll is tracker-delegated, always. There is no CPU-sprung scroll.** The viewport does
-//! not move and clips; the content's offset and the thumb's offset are both bound to the one
-//! tracker, so the thumb follows the content with **no front-thread work at all** — no
-//! per-frame thumb positioning, which was a measured cost before.
+//! **Scroll is tracker-delegated, always.** The viewport does not move; it clips. The
+//! content's offset and the thumb's offset are both bound to the one tracker, so the thumb
+//! follows the content with no per-frame front-thread work.
 //!
-//! Two things live here rather than one layer down, and for the same reason: how wide a
-//! thumb is and which rows are worth existing are decisions shaped by the widget that
-//! consumes them, and neither is widget-agnostic. `windows-scene` supplies the tracker and
-//! the binding and stops there.
+//! Thumb geometry and the realization window live here rather than in `windows-scene`
+//! because both are shaped by the widget that consumes them. `windows-scene` supplies the
+//! tracker and the binding.
 
 use crate::bindings::GestureSettings;
 use crate::build::{Any, El, Host, IntoChildren, View};
@@ -44,18 +42,18 @@ pub enum Reveal {
 
 // ── thumb geometry ───────────────────────────────────────────────────────────────
 //
-// Raw DIPs, and deliberately so: these are the scrollbar's own dimensions rather than the
-// palette's spacing scale, and a `Metric` for them would put a component's private geometry
-// in the theme — which is the token-bloat smell the role layer exists to avoid.
+// Raw DIPs: these are the scrollbar's own dimensions rather than the palette's spacing
+// scale, so they carry no `Metric` and do not move with density.
 
 /// How wide the thumb is.
 pub const THUMB_W: f32 = 6.0;
 /// How far it is inset from the right edge, and from each end of its travel.
 pub const THUMB_MARGIN: f32 = 2.0;
-/// Its floor, however long the content: a thumb that shrinks to nothing cannot be grabbed.
+/// The thumb's minimum height, however long the content: a thumb that shrinks to nothing
+/// cannot be grabbed.
 pub const THUMB_MIN_H: f32 = 24.0;
-/// How far past the thumb a pointer still counts as over it. The drawn bar is 6 DIP and the
-/// system's minimum target is not; inflating the entry is cheaper than drawing a wider one.
+/// How far past the thumb a pointer still counts as over it. The drawn bar is 6 DIP, under
+/// the system's minimum target, so the hit entry is inflated rather than the bar widened.
 const THUMB_GRAB: f32 = 8.0;
 
 /// How long a concealed thumb waits before fading, once the reason to show it ends.
@@ -72,12 +70,14 @@ pub struct ThumbGeom {
     pub overflow: bool,
     /// How far the content can move.
     pub max_scroll: f32,
+    /// How tall the thumb is.
     pub thumb_h: f32,
     /// How far the thumb itself travels, which is not how far the content does.
     pub travel: f32,
 }
 
-/// The scrollbar for a viewport of `viewport_h` showing `content_h` of content.
+/// Returns the scrollbar geometry for a viewport of `viewport_h` showing `content_h` of
+/// content.
 #[must_use]
 pub fn thumb_geom(viewport_h: f32, content_h: f32) -> ThumbGeom {
     let max_scroll = (content_h - viewport_h).max(0.0);
@@ -90,8 +90,9 @@ pub fn thumb_geom(viewport_h: f32, content_h: f32) -> ThumbGeom {
             travel: 0.0,
         };
     }
-    // Proportional, then floored — and floored *after*, so a very long document still gets
-    // a grabbable thumb and the travel below is corrected for it rather than overflowing.
+    // Proportional, then floored at THUMB_MIN_H and capped at the track: a very long
+    // document keeps a grabbable thumb, and the travel below subtracts the floored height
+    // rather than the proportional one.
     let ratio = (viewport_h / content_h).clamp(0.0, 1.0);
     let thumb_h = (track_h * ratio).max(THUMB_MIN_H).min(track_h);
     ThumbGeom {
@@ -102,10 +103,10 @@ pub fn thumb_geom(viewport_h: f32, content_h: f32) -> ThumbGeom {
     }
 }
 
-/// Where the thumb sits when the content is at `scroll`.
+/// Returns where the thumb sits when the content is at `scroll`.
 ///
-/// The same affine the compositor evaluates from the tracker, stated once so the value a
-/// grab starts from and the value the binding renders cannot disagree.
+/// The same affine map the compositor evaluates from the tracker, so a grab starts from the
+/// value the binding is rendering.
 #[must_use]
 pub fn thumb_y_for_scroll(scroll: f32, geom: ThumbGeom) -> f32 {
     if geom.max_scroll <= 0.0 {
@@ -114,7 +115,8 @@ pub fn thumb_y_for_scroll(scroll: f32, geom: ThumbGeom) -> f32 {
     THUMB_MARGIN + (scroll / geom.max_scroll).clamp(0.0, 1.0) * geom.travel
 }
 
-/// Its inverse — what a thumb dragged to `thumb_y` means for the content.
+/// Returns the content offset a thumb dragged to `thumb_y` means, inverting
+/// [`thumb_y_for_scroll`].
 #[must_use]
 pub fn scroll_for_thumb_y(thumb_y: f32, geom: ThumbGeom) -> f32 {
     if geom.travel <= 0.0 {
@@ -123,16 +125,15 @@ pub fn scroll_for_thumb_y(thumb_y: f32, geom: ThumbGeom) -> f32 {
     ((thumb_y - THUMB_MARGIN) / geom.travel).clamp(0.0, 1.0) * geom.max_scroll
 }
 
-/// The scrollbar's rail: a strip down the right edge of the viewport, full height.
+/// Returns the rail's style: a strip down the right edge of the viewport, full height.
 ///
-/// **This is the grab target, and the thumb is not.** A thumb is moved by the compositor, so
-/// its layout rect stays where the solve put it however far the content has travelled — a
-/// hit entry on it would be a target that stops being under the bar the moment either
-/// moves. The rail is static geometry, which is the only kind layout can describe, and where
-/// inside it a press landed is answered from the reported position instead.
+/// **The rail is the grab target, and the thumb is not.** The compositor moves the thumb, so
+/// its layout rect stays where the solve put it however far the content has travelled, and a
+/// hit entry on it would stop being under the drawn bar. The rail is static geometry, and
+/// where inside it a press landed is answered from the reported position.
 ///
-/// It is pinned rather than scrolled: it lives inside the container it reports on and does
-/// not move with it.
+/// Pinned rather than scrolled: it lives inside the container it reports on and does not
+/// move with it.
 #[must_use]
 pub fn rail_style() -> windows_scene::taffy::Style {
     use windows_scene::taffy;
@@ -153,13 +154,13 @@ pub fn rail_style() -> windows_scene::taffy::Style {
     }
 }
 
-/// The thumb's own box, inside the rail: as tall as the scrollbar says, at the top of its
+/// Returns the thumb's own box inside the rail: as tall as `geom` says, at the top of its
 /// travel.
 ///
-/// Built here rather than through the [`Over`](super::Over) vocabulary for the same reason a
-/// shaped line's box is: the numbers are this component's own geometry, resolved from
-/// extents the solve produced, and `Len` deliberately cannot say them. Its offset is the
-/// tracker's alone — a laid-out thumb would have layout and the tracker writing one channel.
+/// Built as a style rather than through the [`Over`](super::Over) vocabulary because the
+/// numbers are this component's own geometry, resolved from extents the solve produced, and
+/// [`Len`](super::Len) states no raw DIP. The thumb's offset is the tracker's alone: laying
+/// it out would leave layout and the tracker writing one channel between them.
 #[must_use]
 pub fn thumb_style(geom: ThumbGeom) -> windows_scene::taffy::Style {
     use windows_scene::taffy;
@@ -180,25 +181,27 @@ pub fn thumb_style(geom: ThumbGeom) -> windows_scene::taffy::Style {
     }
 }
 
-/// What a scroll container is declared with. The state travels with the reveal because a
-/// list needs the same one the mount reports into, and a second handle would be a second
-/// answer to where the content has got to.
+/// What a scroll container is declared with.
+///
+/// The state travels with the reveal policy so that a list and the mount reporting into it
+/// share one [`ScrollState`]; a second handle would be a second answer to where the content
+/// is.
 #[derive(Copy, Clone, Debug)]
 pub struct ScrollDecl {
     pub reveal: Reveal,
     pub state: ScrollState,
 }
 
-/// A scrolling container.
+/// Returns a scrolling container over `children`, with the default reveal policy.
 ///
 /// The children go into a content group of their own, because the viewport must not move:
-/// it is the thing that clips, and an offset on it would take the clip with it.
+/// it is what clips, and an offset on it would take the clip with it.
 #[must_use]
 pub fn scroll(children: impl IntoChildren) -> View {
     scroll_with(Reveal::default(), children)
 }
 
-/// The same, with an explicit reveal policy.
+/// Returns a scrolling container with an explicit thumb reveal policy.
 #[must_use]
 pub fn scroll_with(reveal: Reveal, children: impl IntoChildren) -> View {
     scroll_state(
@@ -210,30 +213,31 @@ pub fn scroll_with(reveal: Reveal, children: impl IntoChildren) -> View {
     )
 }
 
-/// The content never shrinks to its viewport. Overflow is the whole point of the container,
-/// and a flex child squeezed back to its parent has none.
+/// Wraps `content` in a viewport declared by `decl`.
+///
+/// The content never shrinks to its viewport: a flex child squeezed back to its parent never
+/// overflows, and a container with no overflow has no travel and no thumb.
 fn scroll_state(decl: ScrollDecl, content: El<Any>) -> View {
     El::<Any>::viewport(decl, content.no_shrink())
 }
 
-// ── where the content has got to ─────────────────────────────────────────────────
+// ── where the content is ─────────────────────────────────────────────────────────
 
-/// Where a scroll container has got to, as values rather than as events.
+/// Where a scroll container's content is, as values rather than as events.
 ///
-/// The tracker reports through [`SceneEvent`], and a reported position is **the only
-/// trustworthy read of one** — its getter answers with what was last set, not with what the
-/// compositor is evaluating. So [`observe`] writes what it was told into here, and everything
-/// above reads it as an ordinary signal: the realization window is then a [`Memo`], and no
-/// part of this needs a mechanism of its own.
+/// A tracker's own getter answers with what was last set rather than with what the
+/// compositor is evaluating, so the position reported in a [`SceneEvent`] is **the only
+/// trustworthy read of one**. [`observe`] writes what it was told into here, and everything
+/// above reads it as an ordinary signal — the realization window is a [`Memo`] over it.
 #[derive(Copy, Clone, Debug)]
 pub struct ScrollState {
     offset: Cell<f32>,
     /// Where inertia will rest, for as long as it is running.
     ///
-    /// Held **beside** the offset and never in place of it: a fling's destination is worth
-    /// realizing the moment it is known, but a window that jumped there would drop the rows
-    /// the user is still looking at — which is the blank this exists to prevent.
+    /// Held **beside** the offset and never in place of it: the destination is realized as
+    /// soon as it is known, while the rows the offset still names stay realized too.
     target: Cell<Option<f32>>,
+    /// The viewport's solved height.
     viewport: Cell<f32>,
 }
 
@@ -244,6 +248,7 @@ impl Default for ScrollState {
 }
 
 impl ScrollState {
+    /// Returns a state at the origin, with no viewport height and nothing in flight.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -253,37 +258,42 @@ impl ScrollState {
         }
     }
 
-    /// Where the content is, as the tracker last reported it.
+    /// Records the content offset the tracker reported.
     pub fn moved(self, y: f32) {
         self.offset.set(y);
     }
 
-    /// Where inertia will rest. Pass the *modified* destination — snap points are applied to
-    /// it and not to the natural one.
+    /// Records where inertia will rest.
+    ///
+    /// `y` must be the **modified** destination: snap points are applied to that one and not
+    /// to the natural one.
     pub fn flinging_to(self, y: f32) {
         self.target.set(Some(y));
     }
 
-    /// Inertia ended, so there is nothing ahead left to realize.
+    /// Clears the destination once inertia ends, leaving nothing ahead to realize.
     pub fn settled(self) {
         self.target.set(None);
     }
 
-    /// The viewport's own height, from the solved layout.
+    /// Records the viewport's own height, from the solved layout.
     pub fn resized(self, height: f32) {
         self.viewport.set(height);
     }
 
+    /// Returns the content offset the tracker last reported.
     #[must_use]
     pub fn offset(self) -> f32 {
         self.offset.get()
     }
 
+    /// Returns where inertia will rest, or `None` when nothing is in flight.
     #[must_use]
     pub fn target(self) -> Option<f32> {
         self.target.get()
     }
 
+    /// Returns the viewport's height.
     #[must_use]
     pub fn viewport(self) -> f32 {
         self.viewport.get()
@@ -294,12 +304,12 @@ impl ScrollState {
 
 /// What a list needs to decide which rows exist.
 ///
-/// **Uniform extents.** With a fixed row height an offset is affine in its index and the
-/// maximum position is a constant, so neither of the hard problems with variable extents
-/// arises: there is no progressively corrected estimate, and therefore no maximum shifting
-/// mid-fling and moving content under the user's finger.
+/// **Uniform extents.** With a fixed row height a row's offset is affine in its index and
+/// the maximum scroll position is a constant, so no estimate is corrected as rows realize
+/// and the maximum never shifts mid-fling.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ListSpec {
+    /// How many rows the list has.
     pub count: usize,
     /// The row height, as the palette's — so a list is as dense as the user asked for.
     pub row_h: Metric,
@@ -309,21 +319,46 @@ pub struct ListSpec {
     pub overscan: usize,
 }
 
-/// Points sampled between where a fling started and where it lands.
+/// Rows realized beyond the viewport on each side unless a list states otherwise.
+const OVERSCAN: usize = 3;
+
+impl ListSpec {
+    /// Returns a list of `count` rows, each one [`Metric::RowH`](crate::role::Metric) tall.
+    ///
+    /// The height is a metric rather than a length, so the list is as dense as the user
+    /// asked for and re-lowers with the type ramp.
+    #[must_use]
+    pub const fn uniform(count: usize, row_h: Metric) -> Self {
+        Self {
+            count,
+            row_h,
+            overscan: OVERSCAN,
+        }
+    }
+
+    /// Returns the same list realizing `overscan` rows past each edge of the viewport.
+    #[must_use]
+    pub const fn overscan(mut self, overscan: usize) -> Self {
+        self.overscan = overscan;
+        self
+    }
+}
+
+/// How many points are sampled between where a fling started and where it lands.
 ///
-/// Two, because the corridor answers a glance and not a read: a long fling crosses thousands
-/// of rows and realizing the path would cost more than the destination it exists to protect.
+/// The corridor covers a glance mid-flight rather than a read, so the path is sampled and
+/// the rows realized for it do not scale with the distance flung.
 const CORRIDOR: usize = 2;
 
-/// The live window, the destination, and the corridor between them.
+/// How many runs a realized set holds: the live window, the destination, and the corridor
+/// between them.
 const MAX_RUNS: usize = 2 + CORRIDOR;
 
 /// Which rows are worth existing, as a bounded set of runs.
 ///
-/// A set rather than one range, because destination prefetch is the whole point: at the
-/// instant inertia begins the resting position is already known, so the rows a fling lands
-/// on can exist before it arrives — and those are nowhere near the ones on screen. Bounded
-/// and `Copy`, so the realization path allocates nothing.
+/// Several runs rather than one range: the resting position is known the instant inertia
+/// begins, so the rows a fling lands on are realized before it arrives, and those are
+/// nowhere near the ones on screen. Bounded and `Copy`, so realization allocates nothing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Realized {
     runs: [(usize, usize); MAX_RUNS],
@@ -336,12 +371,12 @@ impl Realized {
         len: 0,
     };
 
-    /// The runs, ascending and disjoint.
+    /// Returns the runs, ascending and disjoint.
     pub fn runs(&self) -> impl Iterator<Item = Range<usize>> + '_ {
         self.runs[..self.len].iter().map(|&(start, end)| start..end)
     }
 
-    /// How many rows the set realizes.
+    /// Returns how many rows the set realizes.
     #[must_use]
     pub fn rows(&self) -> usize {
         self.runs[..self.len]
@@ -350,6 +385,7 @@ impl Realized {
             .sum()
     }
 
+    /// Returns whether `index` falls in one of the runs.
     #[must_use]
     pub fn contains(&self, index: usize) -> bool {
         self.runs[..self.len]
@@ -357,6 +393,7 @@ impl Realized {
             .any(|&(start, end)| index >= start && index < end)
     }
 
+    /// Appends a run, dropping an empty one and anything past `MAX_RUNS`.
     fn push(&mut self, run: Range<usize>) {
         if run.is_empty() || self.len == MAX_RUNS {
             return;
@@ -365,7 +402,8 @@ impl Realized {
         self.len += 1;
     }
 
-    /// Sorts and coalesces. Insertion sort over at most four entries, in place.
+    /// Sorts the runs by start and coalesces the overlaps. Insertion sort over at most
+    /// `MAX_RUNS` entries, in place.
     fn merge(&mut self) {
         for i in 1..self.len {
             let mut j = i;
@@ -387,11 +425,12 @@ impl Realized {
     }
 }
 
-/// Which rows are worth existing at `scroll_y`.
+/// Returns the rows worth realizing at `scroll_y`, plus `spec.overscan` on each side.
 ///
-/// **Always inside `0..count`, at any `scroll_y`.** A tracker's position travels outside its
-/// bounds during a manipulation — the overpan is the bounce, and it is wanted — so this is
-/// asked about positions past the end of the content.
+/// **The range is inside `0..spec.count` at any `scroll_y`.** A tracker's position travels
+/// outside its bounds during a manipulation — the overpan is the bounce — so this is asked
+/// about positions past the end of the content. A non-positive `row_h` or an empty list
+/// answers `0..0`.
 #[must_use]
 pub fn window(scroll_y: f32, viewport_h: f32, row_h: f32, spec: &ListSpec) -> Range<usize> {
     if row_h <= 0.0 || spec.count == 0 {
@@ -403,12 +442,11 @@ pub fn window(scroll_y: f32, viewport_h: f32, row_h: f32, spec: &ListSpec) -> Ra
     first..last.max(first)
 }
 
-/// The whole realized set: where the content is, where a fling is taking it, and enough of
-/// the path between that a glance mid-flight is not blank.
+/// Returns the whole realized set: where the content is, where a fling is taking it, and a
+/// fixed number of samples of the path between.
 ///
-/// The corridor is sampled rather than swept. A fling crossing three thousand rows realizes
-/// the two windows that will actually be read plus two bands nobody dwells on, which is a
-/// bounded cost against an unbounded one.
+/// The corridor is sampled rather than swept, so a fling crossing three thousand rows
+/// realizes two windows and two overscan bands however far it travels. Allocates nothing.
 #[must_use]
 pub fn realize(
     offset: f32,
@@ -432,17 +470,17 @@ pub fn realize(
     out
 }
 
-/// A virtualized list: a scroll container whose rows exist only near the viewport.
+/// Returns a virtualized list: a scroll container whose rows exist only near the viewport.
 ///
 /// Rows are **placed rather than laid out** — each is absolute at its own index's offset, and
-/// the content group's height is the whole list's. So the scroll extent never moves when the
-/// window does, the maximum position is the constant [`ListSpec`] promises, and the realized
-/// set is free to be several disjoint runs rather than one contiguous span.
+/// the content group's height is the whole list's. So the scroll extent does not move when
+/// the realized window does, the maximum position stays the constant a uniform row height
+/// gives, and the realized set can be several disjoint runs rather than one contiguous span.
 ///
 /// Rows are keyed by index and reconciled by the same keyed `each` as any other list, so a
-/// row's index is fixed for its life and its placement is written once. `items` fills what it
-/// has for the runs it is handed, **in ascending index order**; a realized index it does not
-/// supply gets a placeholder of the right height rather than a gap.
+/// row's index is fixed for its life and its placement is written once. `items` must push
+/// the items it has for the runs it is handed **in ascending index order**; a realized index
+/// it does not supply gets a placeholder of the right height rather than a gap.
 #[must_use]
 pub fn list<T, V>(
     spec: impl Fn() -> ListSpec + 'static,
@@ -460,8 +498,8 @@ where
     let row_metric = Memo::new(move || spec.get().row_h);
     let realized = Memo::new(move || {
         let spec = spec.get();
-        // The root scope, and correctly so: a row height varies with **density**, which is a
-        // root axis, and not with elevation or width — which are the axes a surface pushes.
+        // The root scope: a row height varies with density, a root axis, and not with the
+        // elevation or width a surface pushes.
         let row_h = crate::role::metric(spec.row_h, Host::with(|h| h.root_scope));
         realize(
             state.offset(),
@@ -496,12 +534,11 @@ where
                 }
             }
         },
-        // The index **is** the key, and it is also what places the row — which is why the
-        // pair form stored it twice here. One field, projected.
+        // The index is the key and also what places the row: one field, projected.
         |(index, _): &(usize, Option<T>)| index,
-        // A realized index the caller did not supply gets its space and nothing in it. That
-        // is the honest placeholder: the row is where it will be when the data arrives, and
-        // no invented content claims to be the data.
+        // A realized index the caller did not supply gets its space and nothing in it: the
+        // row is where it will be when the data arrives, and nothing invented stands in for
+        // the data.
         move |(index, item): &(usize, Option<T>)| {
             let at = *index as f32;
             match item {
@@ -547,11 +584,10 @@ pub(crate) struct ScrollRow {
     pub shown: bool,
 }
 
-/// Records what the trackers reported.
+/// Records what the trackers reported into each container's [`ScrollState`].
 ///
-/// **App-side and signals only.** It runs before the flush, so the realization window a
-/// reported position implies is resolved in the same tick the position arrived in rather
-/// than one frame later.
+/// **Writes signals only**, and runs before the flush, so the realization window a reported
+/// position implies is resolved in the tick that position arrived in.
 pub fn observe(events: &[SceneEvent]) {
     if events.is_empty() {
         return;
@@ -575,15 +611,17 @@ pub fn observe(events: &[SceneEvent]) {
     });
 }
 
-/// Moves what a tick's events and reports moved: the thumb's reveal, and a thumb being
-/// dragged.
+/// Applies a tick's events and reports to the compositor: a thumb's reveal, and a thumb
+/// being dragged.
 ///
-/// **After the apply**, so a retarget never names a node the patch was about to rebuild, and
-/// after the router's tick, so a grab resolves against the array this frame published.
+/// Must run **after the apply**, so a retarget never names a node the patch was about to
+/// rebuild, and after the router's tick, so a grab resolves against the hit array this frame
+/// published.
 ///
 /// # Errors
 ///
-/// A retarget or a tracker request was refused by the compositor.
+/// The compositor refused a retarget or a tracker request. The first failure is returned;
+/// the rest of the tick still runs.
 pub fn front(events: &[SceneEvent], reports: &[Report], front: &mut Front<'_>) -> Result<()> {
     if events.is_empty() && reports.is_empty() {
         return Ok(());
@@ -636,8 +674,8 @@ pub fn front(events: &[SceneEvent], reports: &[Report], front: &mut Front<'_>) -
 
 /// Shows or conceals a thumb.
 ///
-/// `Always` and `Never` never reach the compositor at all: one is opaque from the mount and
-/// the other has no thumb. Only `OnDemand` retargets, and only on an edge.
+/// Only [`Reveal::OnDemand`] retargets, and only on an edge: `Always` is opaque from the
+/// mount and `Never` has no thumb, so neither reaches the compositor here.
 fn reveal(row: &mut ScrollRow, show: bool, front: &mut Front<'_>) -> Result<()> {
     let Some(thumb) = row.thumb else {
         return Ok(());
@@ -681,11 +719,10 @@ fn drag(row: &mut ScrollRow, phase: DragPhase, dy: f32, front: &mut Front<'_>) -
         .map(|_| ())
 }
 
-/// What the rail declares, so a pointer can grab the bar in it.
+/// Returns the rail's gesture declaration, so a pointer can grab the bar in it.
 ///
-/// No wash and no chrome row: the thumb's opacity is this layer's, and a control the front
-/// table adopted would have two owners for one channel. It is a hit entry, a drag, and
-/// nothing else.
+/// A hit entry and a drag, with no wash and no chrome row: the thumb's opacity is retargeted
+/// here, and a control the front table adopted would give that channel two owners.
 pub(crate) fn grab_decl() -> GestureDecl {
     GestureDecl {
         settings: GestureSettings::None,
@@ -701,6 +738,7 @@ pub(crate) fn grab_decl() -> GestureDecl {
     }
 }
 
+/// Returns the rail's hit entry: interactive, unscrolled, and inflated for touch.
 pub(crate) fn grab_hit(id: ControlId) -> HitDecl {
     HitDecl {
         // Pinned: the rail lives inside the container it reports on and does not move with
@@ -779,9 +817,9 @@ mod tests {
 
     /// A tracker overpans past the end of the content, and the window stays inside the list.
     ///
-    /// The bounce is wanted, so this position is reachable by ordinary use; a window running
-    /// past the last row makes a row count negative, which is a debug panic and, in release,
-    /// a placement some eighteen quintillion rows down.
+    /// The overpan is the bounce, so this position is reached by ordinary use. A window
+    /// running past the last row underflows a row count: a debug panic, and in release a
+    /// placement far past the end of the list.
     #[test]
     fn an_overpanned_window_stays_inside_the_list() {
         let bounced = window(2100.0, 100.0, 20.0, &SPEC);
@@ -810,8 +848,8 @@ mod tests {
         assert_eq!(at_rest.runs().next().unwrap(), 18..27);
     }
 
-    /// A fling realizes where it lands as well as where it is, and the two are disjoint —
-    /// which is the whole reason the set is not one range.
+    /// A fling realizes where it lands as well as where it is, and the two are disjoint,
+    /// which is why the set is not one range.
     #[test]
     fn a_long_fling_realizes_its_destination_and_a_bounded_corridor() {
         let flung = realize(0.0, Some(1900.0), 100.0, 20.0, &SPEC);

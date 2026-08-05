@@ -542,9 +542,12 @@ fn main() -> windows::core::Result<()> {
         if visible {
             app.borrow_mut().render()?;
         } else {
-            // Nothing to draw, so park in the kernel rather than spin. `visible` comes back
-            // on the occlusion registration's `WM_USER`, or on an un-minimizing
-            // `WM_ACTIVATE`.
+            // Nothing to draw: block until the next message rather than spinning.
+            // `visible` is set again by the occlusion registration's `WM_USER` or by an
+            // un-minimizing `WM_ACTIVATE`.
+            //
+            // SAFETY: `WaitMessage` takes no arguments and only parks this thread until a
+            // message reaches its queue.
             unsafe { _ = WaitMessage() };
         }
     }

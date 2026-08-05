@@ -1,28 +1,22 @@
-//! Drags that mean two things.
+//! Drags whose meaning depends on their direction.
 //!
 //! Moving a row within its list and moving it into a different one are the same physical
-//! gesture on the same object, separated by axis: vertical is order, horizontal is scope. A
-//! drag whose meaning depends on its direction needs **one** policy, or every consumer
-//! invents its own and they disagree.
-//!
-//! Five rules, and they hold for every two-axis drag in the application:
+//! gesture on the same object, separated by axis: vertical is order, horizontal is scope.
+//! One policy holds for every two-axis drag in the application:
 //!
 //! 1. **Nothing is decided before the threshold.** Below it the gesture has no axis and no
 //!    meaning, so a nudge while clicking is a click.
 //! 2. **The first axis past the threshold owns the drag for its whole duration.** The lock
-//!    never revisits itself, because a drag that changes meaning mid-flight is a drag the
-//!    user cannot aim.
+//!    is never revisited, so a drag cannot change meaning mid-flight.
 //! 3. **The locked axis is named on screen**, beside the pointer, for as long as the lock
-//!    holds — which is what makes the axis decision legible instead of something the user
-//!    infers from the result. This module reports the axis; the overlay layer anchors the
-//!    label.
+//!    holds. This module reports the axis; the overlay layer anchors the label.
 //! 4. **Commit on release is the default, and cancel aborts.** A canceled contact restores
 //!    the pre-drag value — for a reorder that means the row returns to its original index,
 //!    not to wherever it was hovering.
 //! 5. **Displacement is a compositor animation, not a per-frame write.** The dragged row
-//!    follows the contact — one control, on the frame clock — and the rows it displaces move
-//!    by a retargeted chrome spring started when the insertion index changes. That belongs
-//!    to the widget; what belongs here is knowing *when* the index changed.
+//!    follows the contact on the frame clock, and the rows it displaces move by a retargeted
+//!    chrome spring started when the insertion index changes. The widget owns that; this
+//!    module reports *when* the index changed.
 
 use super::decl::{AxisLock, Commit, DragAxes, DragDecl};
 use windows_scene::Point;
@@ -34,7 +28,7 @@ pub enum Axis {
     Horizontal,
 }
 
-/// Where a drag has got to.
+/// How far a drag has been decided.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DragPhase {
     /// Below the threshold. No axis, no meaning — and still a click if it ends here.
@@ -53,7 +47,8 @@ pub struct DragUpdate {
     /// A locked drag reports zero on the axis it does not own, so a consumer cannot
     /// accidentally act on the other one.
     pub delta: Point,
-    /// Whether this sample is the one that decided the axis. The moment the label appears.
+    /// Whether this sample is the one that decided the axis, which is when the label
+    /// appears.
     pub decided: bool,
 }
 
@@ -66,7 +61,7 @@ pub struct Drag {
 }
 
 impl Drag {
-    /// A drag beginning at `origin`, in client DIPs.
+    /// Returns a drag beginning at `origin`, in client DIPs.
     #[must_use]
     pub const fn new(decl: DragDecl, origin: Point) -> Self {
         Self {
@@ -76,13 +71,13 @@ impl Drag {
         }
     }
 
-    /// Where the drag has got to.
+    /// Returns how far the drag has been decided.
     #[must_use]
     pub const fn phase(&self) -> DragPhase {
         self.phase
     }
 
-    /// The axis the drag locked to, if it has locked.
+    /// Returns the axis the drag locked to, or `None` if it has not locked.
     #[must_use]
     pub const fn axis(&self) -> Option<Axis> {
         match self.phase {
@@ -91,19 +86,24 @@ impl Drag {
         }
     }
 
-    /// When the value takes effect.
+    /// Returns when the drag's value takes effect.
     #[must_use]
     pub const fn commit(&self) -> Commit {
         self.decl.commit
     }
 
-    /// Whether the contact never passed the threshold, and is therefore still a click.
+    /// Returns whether the contact never passed the threshold, and is therefore still a
+    /// click.
     #[must_use]
     pub const fn is_click(&self) -> bool {
         matches!(self.phase, DragPhase::Undecided)
     }
 
-    /// Advances the drag with one sample, in client DIPs.
+    /// Advances the drag with one sample at `at`, in client DIPs.
+    ///
+    /// Every sample of the contact's path must be fed, in order: the axis is decided by a
+    /// threshold crossing on the path, so a caller that skips to the newest sample of a
+    /// batch can lock an axis the contact has already left.
     pub fn update(&mut self, at: Point) -> DragUpdate {
         let raw = Point {
             x: at.x - self.origin.x,
@@ -122,7 +122,7 @@ impl Drag {
                 self.phase = match self.decl.lock {
                     AxisLock::None => DragPhase::Free,
                     // The larger displacement wins where one sample crosses on both axes at
-                    // once — which is what "first past" means when the frame clock delivered
+                    // once, which is what "first past" means when the frame clock delivers
                     // the crossing as a single batch rather than as two samples.
                     AxisLock::FirstPast if past_x && past_y => {
                         DragPhase::Locked(if raw.x.abs() >= raw.y.abs() {
@@ -238,14 +238,11 @@ mod tests {
 
     #[test]
     fn folding_the_batch_locks_to_the_axis_that_actually_crossed_first() {
-        // The property the batch exists for. This path goes out horizontally and comes back
-        // while descending, so the *newest* sample is level and below the origin — a drag
-        // decided from it alone locks vertical. The crossing happened on the way out and it
-        // was horizontal, and only walking every sample can see that.
-        //
-        // Which axis a drag owns is a **threshold crossing**: an event on the path, not a
-        // state at an instant. Point-sampling an event aliases it, and here the aliasing
-        // does not merely lose the gesture — it reports the opposite one.
+        // This path goes out horizontally and comes back while descending, so the newest
+        // sample alone is level and below the origin and locks vertical. The crossing
+        // happened on the way out and was horizontal, and only walking every sample sees
+        // it: which axis a drag owns is a threshold crossing on the path, not a state at an
+        // instant.
         let path = [at(112.0, 102.0), at(108.0, 104.0), at(100.0, 112.0)];
 
         let mut folded = drag();

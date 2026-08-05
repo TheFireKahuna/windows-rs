@@ -1,13 +1,13 @@
 //! The child list. **Both halves.**
 //!
 //! Each half keeps its own tree — the app's carries hit declarations and layout ids, the
-//! front's carries composition visuals — and they mirror each other. The *mechanics* of
-//! that are one thing, so the splice lives here and both halves call it.
+//! front's carries composition visuals — and they mirror each other. The splice is the same
+//! in both, so it lives here and both halves call it.
 //!
-//! Children are an intrusive chain and not a `Vec`: five ids give O(1) link and unlink with
-//! no allocation, against twenty-four bytes and a heap allocation per branch node. They
-//! mirror `VisualCollection`'s vocabulary — insert-at-bottom, insert-above and remove, and
-//! no insert-at-index, so neither has this.
+//! Children are an intrusive chain: five ids give O(1) link and unlink with no allocation,
+//! against twenty-four bytes and a heap allocation per branch node for a `Vec`. The
+//! operations mirror `VisualCollection`'s — insert-at-bottom, insert-above and remove, and
+//! no insert-at-index.
 
 use crate::sink::NodeId;
 
@@ -23,12 +23,12 @@ pub(crate) struct Links {
 
 /// A store of nodes that can be spliced.
 ///
-/// The whole of what the splice needs, which is why it is two methods: a generational
-/// arena and a dense vector are both this.
+/// The splice needs only these two methods, so a generational arena and a dense vector both
+/// qualify.
 ///
-/// Implementors answer for live ids only. [`NodeId::NONE`] is handled *here*: the splice
-/// reads "no neighbour" off a `None`, and a dense vector answers for index zero quite
-/// happily — so an implementor that forgot would corrupt the chain silently.
+/// An implementor answers for live ids only, and need not special-case [`NodeId::NONE`]:
+/// the splice tests for it before every lookup and reads "no neighbour" off the resulting
+/// `None`.
 pub(crate) trait Forest {
     fn links(&self, id: NodeId) -> Option<&Links>;
     fn links_mut(&mut self, id: NodeId) -> Option<&mut Links>;
@@ -68,11 +68,9 @@ fn backward(f: &mut impl Forest, parent: NodeId, next: NodeId, to: NodeId) {
 
 /// Splices `id` into `parent`'s children, directly above `after`.
 ///
-/// `after` names the sibling below; `None` is the bottom of the stack.
-///
-/// Both directions have the same shape — point the neighbour's edge, or the parent's end
-/// pointer where there is no neighbour — and that shape *is* the invariant. Writing it once
-/// makes this and [`unlink`] exact mirrors.
+/// `after` names the sibling below; `None` is the bottom of the stack. Both directions take
+/// the same step — point the neighbour's edge, or the parent's end pointer where there is no
+/// neighbour — which is what makes this and [`unlink`] mirrors.
 pub(crate) fn link(f: &mut impl Forest, id: NodeId, parent: NodeId, after: Option<NodeId>) {
     debug_assert!(
         after.is_none_or(|s| get(f, s).is_some_and(|s| s.parent == parent)),
@@ -131,8 +129,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Neither half's storage, so the splice is tested against the trait rather than
-    /// against whichever store happened to be convenient.
+    /// A [`Forest`] belonging to neither half, so the splice is exercised through the
+    /// trait rather than through one half's storage.
     #[derive(Default)]
     struct Bare(HashMap<usize, Links>);
 
@@ -168,9 +166,8 @@ mod tests {
         (f, parent, ids)
     }
 
-    /// Walks forwards and backwards; both must agree, and both must agree with the parent's
-    /// end pointers. A splice that corrupts one direction only is invisible to any walk
-    /// that goes one way, and that is the failure this catches.
+    /// Returns the children in order, asserting that the forward and backward walks agree
+    /// with each other and with the parent's end pointers.
     fn order(f: &Bare, parent: NodeId) -> Vec<NodeId> {
         let forwards: Vec<_> = children(f, parent).collect();
         let mut backwards = Vec::new();
@@ -206,8 +203,7 @@ mod tests {
 
     #[test]
     fn unlinking_holds_the_chain_together_wherever_it_is_cut() {
-        // Every position: head, tail and middle take different arms, and the single-child
-        // case is the one where both end pointers move at once.
+        // Head, tail and middle take different arms of the splice.
         for cut in 0..4 {
             let (mut f, parent, ids) = stack(4);
             unlink(&mut f, ids[cut]);

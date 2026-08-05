@@ -82,7 +82,7 @@ fn main() -> Result<()> {
 
     // Publish the scene and lay it out for the current size, then let the resize
     // handler keep it in sync as the window is resized.
-    // `None` once the window is gone, which leaves nothing to lay out.
+    // `client_size` is `None` for a window already closed, leaving nothing to lay out.
     let Some((width, height)) = window.client_size() else {
         return Ok(());
     };

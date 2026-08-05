@@ -1,19 +1,16 @@
 //! Compositor-evaluated motion: springs and expressions (feature `system`).
 //!
-//! A key-frame animation plays a curve the app authored. The two forms here are
-//! different in kind: a **spring** is retargeted mid-flight by reassigning its final
-//! value, which is what lets a gesture redirect without the discontinuity a restarted
-//! key-frame animation shows; and an **expression** is re-evaluated every vblank against
-//! objects it references, so the value it produces is not a curve at all but a function
-//! of live state the app is not awake to compute.
+//! A key-frame animation plays a curve the app authored; the two forms here do not. A
+//! **spring** is retargeted mid-flight by reassigning its final value, so a gesture
+//! redirects without the discontinuity a restarted key-frame animation shows. An
+//! **expression** is re-evaluated every vblank against the objects it references, so its
+//! value is a function of live state that the app thread never computes.
 
 use super::*;
 use std::time::Duration;
 use windows_time::TimeSpan;
 
-// Durations too large for a WinRT `TimeSpan` saturate rather than wrap. Kept local
-// rather than shared with `animation.rs`, which owns the same conversion for key frames:
-// four lines twice is a smaller cost than widening that module's surface.
+// Durations too large for a WinRT `TimeSpan` saturate rather than wrap.
 fn to_time_span(duration: Duration) -> TimeSpan {
     TimeSpan::try_from(duration).unwrap_or(TimeSpan::MAX)
 }
@@ -83,9 +80,8 @@ impl Animation for ExpressionAnimation {
     }
 }
 
-/// A key-frame animation over a [`Vector2`] property, completing the
-/// scalar/`Vector2`/`Vector3` set so a size or a two-axis offset animates without being
-/// decomposed into two animations that can drift apart.
+/// A key-frame animation over a [`Vector2`] property, so a size or a two-axis offset
+/// animates as one value rather than as two scalar animations that can drift apart.
 #[derive(Clone)]
 pub struct Vector2KeyFrameAnimation(pub(crate) bindings::Vector2KeyFrameAnimation);
 
@@ -146,12 +142,11 @@ macro_rules! spring {
     ($name:ident, $binding:ident, $value:ty, $final_value:ident, $spring:ident, $doc:literal) => {
         #[doc = $doc]
         ///
-        /// Retargeting is the whole point: a state change is
-        /// `set_final_value(v)` followed by `start_animation(prop, anim)` on the **same
-        /// cached object**, which costs no allocation on the interaction path and carries
-        /// whatever velocity the property already had. A value that must land immediately
-        /// with no motion is `stop_animation` plus a plain property set — never a
-        /// zero-duration spring.
+        /// Retarget a running spring with `set_final_value(v)` followed by
+        /// `start_animation(prop, anim)` on the **same cached object**: that allocates
+        /// nothing on the interaction path and carries whatever velocity the property
+        /// already had. A value that must land immediately, with no motion, takes
+        /// `stop_animation` plus a plain property set.
         ///
         /// As an implicit animation a spring is **not** handed the target value
         /// automatically: set the final value explicitly at start, or it animates toward
@@ -169,11 +164,11 @@ macro_rules! spring {
 
             /// Sets the spring's period.
             ///
-            /// This does **not** behave as the undamped natural period of a second-order
-            /// model: the motion the compositor plays for a given period is several times
-            /// longer than that model predicts. What is dependable is that duration
-            /// scales linearly with period at fixed damping — so tune one value by eye and
-            /// scale it, rather than deriving a period from a stiffness constant.
+            /// The period is **not** the undamped natural period of a second-order model:
+            /// the motion the compositor plays for a given period runs several times
+            /// longer than that model predicts. Duration does scale linearly with period
+            /// at fixed damping, so a period measured by eye scales while one derived from
+            /// a stiffness constant does not hold.
             pub fn set_period(&self, period: Duration) {
                 let spring: bindings::$spring = self.0.cast().unwrap();
                 spring.SetPeriod(to_time_span(period)).unwrap();
@@ -183,23 +178,19 @@ macro_rules! spring {
             /// running is what retargets it.
             pub fn set_final_value(&self, value: $value) {
                 // The property is an `IReference<T>` whose documented default is null,
-                // meaning "use the ending value of the property being animated". This crate
-                // does not surface that state, and the reason is a measured disagreement
-                // with the documentation: as an implicit animation on this stack, a spring
-                // left with a null final value animated toward zero rather than toward the
-                // value being assigned. Requiring the target makes that unreachable.
+                // meaning "use the ending value of the property being animated". A spring
+                // left null as an implicit animation on this stack animates toward zero
+                // instead, so the target is always supplied and the null state unreachable.
                 let motion: bindings::$final_value = self.0.cast().unwrap();
                 motion.SetFinalValue(Some(value)).unwrap();
             }
 
             /// Sets the velocity the spring starts with, per second.
             ///
-            /// This is what makes a released gesture continue at the speed the user was
-            /// moving instead of restarting from rest: measure the velocity at release and
-            /// hand it over. Retargeting a spring that is already running needs none of
-            /// this — it keeps whatever velocity the property already had — so this is for
-            /// the handoff, where the motion so far was the app's and the rest is the
-            /// compositor's.
+            /// A released gesture continues at the speed the user was moving when its
+            /// velocity measured at release is handed over here. A spring already running
+            /// keeps the property's current velocity when it is retargeted, so this
+            /// applies to the handoff from app-driven motion to the compositor's.
             pub fn set_initial_velocity(&self, velocity: $value) {
                 let motion: bindings::$final_value = self.0.cast().unwrap();
                 motion.SetInitialVelocity(velocity).unwrap();
@@ -253,13 +244,12 @@ spring!(
 impl CompositionScopedBatch {
     /// Seals the batch, reporting failure instead of panicking.
     ///
-    /// A caller that arms a batch does two fallible things — subscribes with
-    /// [`on_completed`](Self::on_completed) and seals — and is only correct if both
+    /// Arming a batch takes two fallible steps — subscribing with
+    /// [`on_completed`](Self::on_completed) and sealing — and is correct only if both
     /// succeed: a batch subscribed to but never sealed keeps swallowing later animations,
-    /// and one sealed with no subscriber never reports completion. This lets that pair be
-    /// written as one `?`-chain with one fallback path. Prefer
-    /// [`end`](CompositionScopedBatch::end) where there is no subscriber and so nothing to
-    /// unwind.
+    /// and one sealed with no subscriber never reports completion. This form lets both be
+    /// written in one `?`-chain. [`end`](CompositionScopedBatch::end) covers the case with
+    /// no subscriber and so nothing to unwind.
     pub fn try_end(&self) -> Result<()> {
         self.0.End()
     }
@@ -268,8 +258,8 @@ impl CompositionScopedBatch {
     /// work this batch tracks has finished.
     ///
     /// This is the **only** signal that a batch's animations are done. Anything held alive
-    /// for their duration — a visual retained purely so an exit transition can play out —
-    /// is released from here, and never from a timer.
+    /// for their duration — a visual retained so an exit transition can play out — is
+    /// released from here.
     ///
     /// The returned [`EventRevoker`](windows_core::EventRevoker) unsubscribes when it is
     /// dropped, so it must be kept alive until the handler has run: dropping it early means
@@ -332,14 +322,13 @@ impl Compositor {
     /// interpolating continuously.
     ///
     /// Applied per key-frame segment, so an animation with `k` segments visits
-    /// `k * steps` distinct values. That makes it the only lever a key-frame animation
-    /// has over how *often* it writes: a property whose write invalidates something
-    /// expensive — a visual's whole bounds, old and new — is charged per write and not
-    /// per unit of motion.
+    /// `k * steps` distinct values. It is the only control a key-frame animation has over
+    /// how *often* it writes, which matters where each write invalidates something
+    /// expensive — a visual's whole bounds, old and new.
     ///
     /// **It takes the segment's END value immediately.** A key-frame pair intended to
-    /// hold a value and then jump instead jumps at the start. Never use step easing to
-    /// hold a level; insert an explicit key frame at the held value with linear easing.
+    /// hold a value and then jump instead jumps at the start. To hold a level, insert an
+    /// explicit key frame at that value with linear easing.
     ///
     /// `steps` must be positive.
     pub fn create_step_easing_function(&self, steps: i32) -> CompositionEasingFunction {

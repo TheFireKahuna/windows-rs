@@ -1,11 +1,9 @@
-//! Signals: the handles, and the scheduler behind them.
+//! Reactive signals: the value handles, and the flush that propagates writes through them.
 //!
-//! A signal is a **stable, named, addressable handle meaning "the current value of X"**.
-//! That is the whole reason this is not a virtual DOM: binding a value to a compositor
-//! property — a tracker expression, a retargetable spring, a coalesced cross-thread write
-//! — needs such a handle, and a value that exists only transiently inside a `render()`
-//! call is not one. With signals, a producer-written level, a hover state, a
-//! tracker-driven offset and an automation-visible number are all the same thing.
+//! A signal is a stable, `Copy` handle naming "the current value of X". A sink binds to the
+//! handle rather than to a value produced inside one call, so a producer-written level, a
+//! hover state, a tracker-driven offset and an automation-visible number are read the same
+//! way and outlive the code that created them.
 //!
 //! # The three primitives
 //!
@@ -15,27 +13,27 @@
 //! | [`Memo`] | a pure derivation | lazily, when read and a dependency moved |
 //! | [`Effect`] | a leaf that touches the world | at the end of a flush, in creation order |
 //!
-//! [`Owner`] is the disposal scope that owns all three, and [`Epoch`] is the payload-free
-//! twin of a `Cell` for a consumer that wants a wake rather than a value.
+//! [`Owner`] is the disposal scope that owns all three. [`Epoch`] is the payload-free
+//! counterpart of a `Cell`, for a consumer that wants a wake rather than a value.
 //!
 //! # Propagation is glitch-free
 //!
 //! A *glitch* is an observer seeing a derived value computed from a mix of old and new
-//! inputs. Two properties prevent it: **two-level marking**, so a diamond's shared node is
-//! evaluated once, and a **value-equality cutoff**, so a derivation whose result did not
-//! change stops the propagation at itself. Both live in `graph`.
+//! inputs. Two properties prevent it: two-level marking, so a diamond's shared node is
+//! evaluated once, and a value-equality cutoff, so a derivation whose result did not change
+//! stops the propagation at itself. Both are implemented in the `graph` module.
 //!
 //! # There is no timer
 //!
-//! Nothing here ticks. [`flush`] is called by whoever woke — a write, a published config,
-//! a theme flip, a resize — and does exactly the work those writes implied.
+//! Nothing here ticks. [`flush`] runs when a caller invokes it — after a write, a published
+//! config, a theme flip, a resize — and performs exactly the work those writes marked.
 //!
 //! # Threads
 //!
-//! The graph is the app thread's. [`Cell`] is `Send` when its value is, so a producer may
-//! hold one and call [`Cell::post`]; it is deliberately **not** `Sync`, and [`Memo`] and
-//! [`Effect`] are neither, so a handle whose graph lives elsewhere cannot reach that graph
-//! by being shared into a closure.
+//! The graph belongs to the app thread. [`Cell`] is `Send` when its value is, so a producer
+//! may hold one and call [`Cell::post`]. `Cell` is not `Sync`, and [`Memo`] and [`Effect`]
+//! are neither, so a handle cannot reach a graph on another thread by being shared into a
+//! closure.
 
 mod epoch;
 mod graph;
@@ -54,16 +52,15 @@ use std::rc::Rc;
 
 /// A source cell. Reads track; writes invalidate subscribers.
 ///
-/// `Copy`, eight bytes, and no reference count: a cell may be captured by any number of
-/// closures with no bookkeeping, which is what keeps `move ||` at a binding site free.
+/// `Copy` and reference-count free, so any number of closures may capture a cell with no
+/// bookkeeping at the binding site.
 ///
-/// `Send` when `T` is — a producer thread holds a copy and calls [`post`](Self::post).
-/// Never `Sync`: every other method reads or writes the app thread's graph, and sharing a
-/// reference across threads is the one way to reach them from the wrong one.
+/// `Send` when `T` is, so a producer thread may hold a copy and call [`post`](Self::post).
+/// Not `Sync`: every other method reads or writes the app thread's graph, and only a shared
+/// reference could reach that graph from another thread.
 pub struct Cell<T: 'static> {
     id: SignalId,
-    /// Exactly the auto-trait behaviour wanted: `Copy` whatever `T` is, `Send` when `T`
-    /// is, and never `Sync`.
+    /// Carries the auto traits: `Copy` for any `T`, `Send` when `T` is, never `Sync`.
     marker: PhantomData<core::cell::Cell<T>>,
 }
 
@@ -81,7 +78,7 @@ impl<T: 'static> core::fmt::Debug for Cell<T> {
 }
 
 impl<T: 'static> Cell<T> {
-    /// A new cell holding `v`, registered with the enclosing [`Owner`].
+    /// Creates a cell holding `v`, registered with the enclosing [`Owner`].
     #[must_use]
     pub fn new(v: T) -> Self {
         Self {
@@ -90,7 +87,8 @@ impl<T: 'static> Cell<T> {
         }
     }
 
-    /// This cell's identity. What a sink binds to, and what a diagnostic names.
+    /// Returns this cell's identity, which is what a sink binds to and what a diagnostic
+    /// names.
     #[must_use]
     pub fn id(self) -> SignalId {
         self.id
@@ -101,37 +99,42 @@ impl<T: 'static> Cell<T> {
     ///
     /// # Panics
     ///
-    /// If `f` reads or writes *this* cell. Nested access to a **different** cell is fine;
-    /// re-entering the same one is a value defined in terms of itself.
+    /// Panics if the cell has been disposed, or if `f` writes this same cell: the read
+    /// borrow taken here is still held for the duration of `f`. Reading any cell from
+    /// inside `f`, including this one, is allowed.
     pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
         let value = graph::read_source(self.id).expect("the cell is live");
         let slot = downcast::<T>(&*value).borrow();
         f(&slot)
     }
 
-    /// Replaces the value through `f` and propagates unconditionally.
+    /// Mutates the value through `f` and propagates unconditionally.
     ///
-    /// The equality gate cannot apply here — the mutation is opaque — so an `update` that
-    /// changes nothing still wakes every subscriber. Prefer [`set`](Self::set) wherever
-    /// the value can be compared.
+    /// Subscribers wake even where `f` changed nothing, because the mutation is opaque and
+    /// cannot be compared. [`set`](Self::set) gates on equality where `T: PartialEq`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cell has been disposed, or if `f` reads or writes this same cell: the
+    /// write borrow taken here is held for the duration of `f`.
     pub fn update(self, f: impl FnOnce(&mut T)) {
         let value = graph::peek_source(self.id).expect("the cell is live");
         f(&mut downcast::<T>(&*value).borrow_mut());
         graph::invalidate(self.id);
     }
 
-    /// How many times this cell's value has moved.
+    /// Returns how many times this cell's value has changed.
     ///
-    /// Cheap change detection for a consumer that does not want the value — and the reason
-    /// it is a counter rather than a flag is that a consumer may miss any number of writes
-    /// and still needs to know that it did.
+    /// Change detection for a consumer that does not want the value: a counter rather than
+    /// a flag, so a consumer that misses any number of writes still sees that it missed
+    /// them. A disposed cell reports zero.
     #[must_use]
     pub fn version(self) -> u64 {
         graph::version(self.id)
     }
 
-    /// Whether this cell is still live. A disposed handle answers `false` rather than
-    /// reading whatever now occupies its slot.
+    /// Returns `true` while this cell is live. A disposed handle answers `false` rather
+    /// than reading whatever now occupies its slot.
     #[must_use]
     pub fn alive(self) -> bool {
         graph::peek_source(self.id).is_some()
@@ -139,16 +142,16 @@ impl<T: 'static> Cell<T> {
 }
 
 impl<T: Clone + 'static> Cell<T> {
-    /// The current value, registering a dependency.
+    /// Returns a clone of the current value, registering a dependency.
     #[must_use]
     pub fn get(self) -> T {
         self.with(Clone::clone)
     }
 
-    /// The current value **without** registering a dependency.
+    /// Returns a clone of the current value without registering a dependency.
     ///
-    /// Deliberate, not a shortcut: it is how a write avoids depending on what it writes,
-    /// and how a diagnostic reads state it must not subscribe to.
+    /// The read a write takes of its own target, and the read a diagnostic takes of state
+    /// it must not subscribe to.
     #[must_use]
     pub fn peek(self) -> T {
         let value = graph::peek_source(self.id).expect("the cell is live");
@@ -158,10 +161,10 @@ impl<T: Clone + 'static> Cell<T> {
 }
 
 impl<T: PartialEq + 'static> Cell<T> {
-    /// Writes, and propagates **only if the value moved**.
+    /// Writes `v`, and propagates only where it differs from the current value.
     ///
-    /// Value equality gates everything downstream: without it, a derivation over a clamped
-    /// input would wake on every write to that input even where the clamp already held.
+    /// The comparison gates everything downstream, so a derivation over a clamped input is
+    /// not woken by a write the clamp absorbs.
     pub fn set(self, v: T) {
         let value = graph::peek_source(self.id).expect("the cell is live");
         if write_slot(downcast::<T>(&*value), v) {
@@ -171,15 +174,15 @@ impl<T: PartialEq + 'static> Cell<T> {
 }
 
 impl<T: PartialEq + Send + 'static> Cell<T> {
-    /// Writes from **any** thread.
+    /// Writes `v` from any thread.
     ///
-    /// On the thread that owns the graph this is exactly [`set`](Self::set). Anywhere else
-    /// the write is staged and applied at the app thread's next [`flush`], coalesced so
-    /// that a producer outrunning the app thread overwrites its own pending value and
-    /// wakes it once. [`written`] is the event to wait on.
+    /// On the thread that owns the graph this is [`set`](Self::set). Anywhere else the
+    /// write is staged and applied at the app thread's next [`flush`], coalesced so that a
+    /// producer outrunning the app thread overwrites its own pending value and wakes that
+    /// thread once. [`written`] is the event the app thread waits on.
     ///
-    /// A staged write costs one allocation, which is why a display-rate producer publishes
-    /// through an [`Epoch`] — which carries no value — instead.
+    /// A staged write allocates one box. A display-rate producer publishes through an
+    /// [`Epoch`], which carries no value and allocates nothing.
     pub fn post(self, v: T) {
         if graph::owns(self.id) {
             self.set(v);
@@ -197,13 +200,13 @@ impl<T: PartialEq + Send + 'static> Cell<T> {
 
 /// A memoized pure derivation.
 ///
-/// It tracks its own reads, so there is no dependency list to state and none to get wrong.
-/// It recomputes lazily — a memo nothing reads never runs — and its result is compared
-/// with the previous one, so a derivation that settles stops the propagation at itself.
+/// Tracks its own reads, so its dependency set is collected rather than declared. It
+/// recomputes lazily — a memo nothing reads never runs — and its result is compared with
+/// the previous one, so a derivation whose value settles stops the propagation at itself.
 pub struct Memo<T: 'static> {
     id: SignalId,
-    /// Neither `Send` nor `Sync`: the closure lives in the app thread's graph, so a handle
-    /// on another thread could only fail.
+    /// Neither `Send` nor `Sync`: the closure lives in the app thread's graph, and every
+    /// method on the handle reaches that graph.
     marker: PhantomData<*const T>,
 }
 
@@ -244,10 +247,11 @@ impl<T: PartialEq + 'static, F: Fn() -> T + 'static> graph::MemoCell for Derivat
 }
 
 impl<T: PartialEq + 'static> Memo<T> {
-    /// A derivation over whatever `f` reads.
+    /// Creates a derivation over whatever `f` reads.
     ///
-    /// `T: PartialEq` is the cutoff's requirement rather than a convenience: comparing the
-    /// result is what stops a write propagating past a derivation it did not change.
+    /// `f` does not run here; the first read runs it. `T: PartialEq` is what the cutoff
+    /// needs: comparing the result stops a write propagating past a derivation it did not
+    /// change.
     #[must_use]
     pub fn new(f: impl Fn() -> T + 'static) -> Self {
         Self {
@@ -259,13 +263,17 @@ impl<T: PartialEq + 'static> Memo<T> {
         }
     }
 
-    /// This memo's identity.
+    /// Returns this memo's identity.
     #[must_use]
     pub fn id(self) -> SignalId {
         self.id
     }
 
-    /// Reads through `f`, resolving first and registering a dependency.
+    /// Reads through `f`, resolving the memo first and registering a dependency.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the memo has been disposed.
     pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
         let cell = graph::read_memo(self.id).expect("the memo is live");
         let cache = downcast::<Option<T>>(cell.value()).borrow();
@@ -274,19 +282,20 @@ impl<T: PartialEq + 'static> Memo<T> {
 }
 
 impl<T: PartialEq + Clone + 'static> Memo<T> {
-    /// The current value, resolving first and registering a dependency.
+    /// Returns a clone of the current value, resolving the memo first and registering a
+    /// dependency.
     #[must_use]
     pub fn get(self) -> T {
         self.with(Clone::clone)
     }
 }
 
-/// A leaf that performs a side effect when its dependencies change. Where a value reaches
-/// a sink.
+/// A leaf that performs a side effect when what it read changes. The point at which a
+/// value reaches a sink.
 ///
-/// It runs once when created — which is what collects its dependency set — and thereafter
-/// at the end of any flush in which something it read moved. Effects run **after** every
-/// memo has resolved, so one never observes a half-updated graph.
+/// Runs once when created, which collects its dependency set, and thereafter at the end of
+/// any flush in which something it read moved. Effects run after every memo has resolved,
+/// so none observes a half-updated graph.
 #[derive(Copy, Clone, Debug)]
 pub struct Effect {
     id: SignalId,
@@ -302,7 +311,7 @@ impl Effect {
         }
     }
 
-    /// This effect's identity.
+    /// Returns this effect's identity.
     #[must_use]
     pub fn id(self) -> SignalId {
         self.id
@@ -313,13 +322,12 @@ impl Effect {
 /// under it, and disposes them in reverse creation order when dropped.
 ///
 /// Every structural node — a mounted widget, a realized list row, an open flyout — owns
-/// one. Unmounting drops it. That is the whole disposal story, and it is why there is no
-/// `unsubscribe` anywhere in this module.
+/// one, and unmounting drops it. Disposal is by scope alone; no signal carries an
+/// unsubscribe.
 pub struct Owner(graph::OwnerId);
 
 impl Owner {
-    /// Runs `f` with a fresh scope installed, and hands back the scope alongside its
-    /// result.
+    /// Runs `f` with a fresh scope installed, and returns the scope alongside `f`'s result.
     ///
     /// Dropping the returned `Owner` disposes everything `f` created.
     #[must_use = "dropping the scope immediately disposes everything it just created"]
@@ -331,8 +339,8 @@ impl Owner {
         (Self(id), out)
     }
 
-    /// Runs `f` inside this scope, so what it creates is owned here rather than wherever
-    /// the caller happens to be. How a list row rebinds without leaking into its parent.
+    /// Runs `f` inside this scope, so what `f` creates is owned here rather than by the
+    /// scope current at the call site.
     pub fn run<R>(&self, f: impl FnOnce() -> R) -> R {
         let outer = graph::enter_scope(Some(self.0));
         let out = f();
@@ -340,8 +348,9 @@ impl Owner {
         out
     }
 
-    /// Runs `f` with **no** scope installed, so what it creates outlives every enclosing
-    /// one. For state that must survive the structure reading it.
+    /// Runs `f` with no scope installed, so what `f` creates belongs to no enclosing scope
+    /// and outlives every one of them. The caller takes responsibility for disposing it,
+    /// which is what a scope `f` itself opens and returns is for.
     pub fn detached<R>(f: impl FnOnce() -> R) -> R {
         let outer = graph::enter_scope(None);
         let out = f();
@@ -364,36 +373,33 @@ impl core::fmt::Debug for Owner {
 
 // ── the reactive overload ───────────────────────────────────────────────────────
 
-/// A constant.
+/// [`Signal`] marker: the source is a constant.
 #[derive(Copy, Clone, Debug)]
 pub struct IsValue;
-/// A [`Cell`].
+/// [`Signal`] marker: the source is a [`Cell`].
 #[derive(Copy, Clone, Debug)]
 pub struct IsCell;
-/// A [`Memo`].
+/// [`Signal`] marker: the source is a [`Memo`].
 #[derive(Copy, Clone, Debug)]
 pub struct IsMemo;
-/// A closure.
+/// [`Signal`] marker: the source is a closure.
 #[derive(Copy, Clone, Debug)]
 pub struct IsFn;
 
-/// The four readable things, unified, so a builder need not care which it was handed.
+/// Anything readable as a `T`: a constant, a [`Cell`], a [`Memo`], or a closure.
 ///
-/// This is what lets every value-taking method have a reactive overload at no call-site
-/// cost: `opacity(0.6)` and `opacity(move || hover.get())` are the same method,
-/// `fn opacity<M>(self, v: impl Signal<f32, M>)`.
+/// One method accepts all four, so `opacity(0.6)` and `opacity(move || hover.get())` reach
+/// the same `fn opacity<M>(self, v: impl Signal<f32, M>)`.
 ///
-/// `Marker` exists because the four impls would otherwise overlap — a closure is a value
-/// and a `Cell` is a value — and Rust resolves an overlap by refusing to compile it. It is
-/// inferred at every call site and never written.
+/// `Marker` separates the four impls, which would otherwise overlap: a closure is a value
+/// and so is a `Cell`. It is inferred at every call site and never written.
 pub trait Signal<T, Marker = IsValue> {
-    /// The current value, registering a dependency where there is one to register.
+    /// Returns the current value, registering a dependency where the source has one.
     fn read(&self) -> T;
 
-    /// Whether reading can ever produce a different answer.
+    /// Returns whether reading can ever produce a different answer.
     ///
-    /// A constant needs no [`Effect`], and that is the difference between a static label
-    /// costing one sprite and costing a graph node. Most of a screen is static.
+    /// A caller binding a constant creates no [`Effect`] and no graph node for it.
     fn is_constant(&self) -> bool;
 }
 

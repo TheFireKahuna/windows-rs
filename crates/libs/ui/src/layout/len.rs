@@ -1,17 +1,12 @@
-//! Lengths and tracks — and the reason a widget cannot express a spacing.
+//! Lengths and grid tracks, in the units the authoring surface admits.
 //!
-//! A call site writing `.font_size(14.0)` or `.spacing(8.0)` is doing the theme's job. A
-//! lint catches that after it is written; a type stops it being written:
+//! [`Len`] has no raw-DIP constructor. Every length-taking method takes `impl Into<Len>`,
+//! and the only conversions into it are from a [`Metric`] — which the palette owns and
+//! resolves against the enclosing [`Scope`] — and from the variants declared here. So
+//! `.padding(12.0)` does not compile and a spacing is always the theme's.
 //!
-//! > **[`Len`] has no raw-DIP constructor.**
-//!
-//! Every length-taking method takes `impl Into<Len>`, and the only things that convert are a
-//! [`Metric`] — which the palette owns and resolves against the enclosing scope — and the
-//! shapes below, which carry no design decision. `.padding(12.0)` does not compile.
-//!
-//! [`Len::Zero`] is the one honest constant: a floor of exactly zero is a layout instruction
-//! rather than a spacing, and it is what lets a child shrink below its content instead of
-//! inflating its container.
+//! [`Len::Zero`] is the one raw constant: a floor of exactly zero is a layout instruction
+//! rather than a spacing, and it is what lets a child shrink below its content size.
 
 use crate::role::{Metric, Scope, metric};
 use windows_scene::taffy;
@@ -20,9 +15,6 @@ use windows_scene::taffy::style_helpers::{
 };
 
 /// A length in the authoring surface.
-///
-/// Adding a variant here, or a variant to [`Metric`], is a lower-crate API addition and
-/// therefore an escalation rather than a merge.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Len {
     /// The palette's, resolved against the enclosing [`Scope`].
@@ -31,13 +23,11 @@ pub enum Len {
     Zero,
     /// A fraction of the containing block, `0.0..=1.0`.
     Pct(f32),
-    /// A **multiple** of a metric: `n` of them, end to end.
+    /// A multiple of a metric: `n` of them, end to end.
     ///
-    /// The one thing virtualization cannot do without — the space forty unrealized rows
-    /// occupy is forty row heights — and it does not reopen the door this type exists to
-    /// close. It can say "forty rows"; it cannot say "twelve DIPs", because the metric is
-    /// still the palette's and the number is a **count**, not a length. A caller wanting an
-    /// arbitrary size still has nothing to write.
+    /// What a virtualized list states its extent in — forty unrealized rows occupy forty
+    /// row heights. The metric is still the palette's and `n` is a count, so this states no
+    /// arbitrary DIP length.
     Times(Metric, f32),
     /// Sized by content.
     Auto,
@@ -50,10 +40,10 @@ impl From<Metric> for Len {
 }
 
 impl Len {
-    /// This length in DIPs, or `None` where it has no intrinsic value.
+    /// Returns this length in DIPs, or `None` where it has no intrinsic value.
     ///
-    /// `Pct` answers `None` because a fraction is not a length until something says of
-    /// what, and `Auto` because it is a question rather than an answer.
+    /// `Pct` and `Auto` both answer `None`: a fraction resolves only against a containing
+    /// block, and `Auto` only against content.
     #[must_use]
     pub fn dips(self, scope: Scope) -> Option<f32> {
         match self {
@@ -64,6 +54,10 @@ impl Len {
         }
     }
 
+    /// Returns this length as a size, resolving any metric against `scope`.
+    ///
+    /// Carries all five cases, so a percentage stays a percentage for the solve to resolve
+    /// and `Auto` stays content-sized.
     #[must_use]
     pub fn dimension(self, scope: Scope) -> taffy::Dimension {
         match self {
@@ -75,7 +69,7 @@ impl Len {
         }
     }
 
-    /// As a padding, border or gap, where `Auto` has no meaning and reads as zero.
+    /// Returns this length as a padding, border or gap, where `Auto` resolves to zero.
     #[must_use]
     pub fn length_percentage(self, scope: Scope) -> taffy::LengthPercentage {
         match self {
@@ -86,7 +80,7 @@ impl Len {
         }
     }
 
-    /// As a margin or an inset, where `Auto` centres.
+    /// Returns this length as a margin or an inset, where `Auto` centres.
     #[must_use]
     pub fn length_percentage_auto(self, scope: Scope) -> taffy::LengthPercentageAuto {
         match self {
@@ -101,9 +95,8 @@ impl Len {
 
 /// One grid track.
 ///
-/// Separate from [`Len`] because `fr` is only a length inside a track, and a type that
-/// carried it everywhere would have to answer what `width: 1fr` means on a flex child —
-/// which is a question with two plausible answers and therefore a footgun.
+/// Separate from [`Len`] because `fr` is a length only inside a track: it has no meaning
+/// as the width of a flex child.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Track {
     Fixed(Len),
@@ -129,15 +122,12 @@ impl From<Len> for Track {
 }
 
 impl Track {
-    /// This track's sizing function.
+    /// Returns this track's sizing function, resolving any metric against `scope`.
     ///
-    /// A track's fixed part goes through [`Len::dimension`] rather than through
-    /// [`Len::dips`]. `dips` answers `None` for the two lengths that have no intrinsic value
-    /// — a percentage is not a length until something says of what, and `Auto` is a question
-    /// — and a track built from `unwrap_or(0.0)` turns both of those into a **zero-width
-    /// column**, which lays out cleanly and reads as a design decision. `Dimension` carries
-    /// all five cases, and the grid resolves the percentage against the container the way
-    /// every other percentage in this crate is resolved.
+    /// The fixed part goes through [`Len::dimension`], which carries all five length cases,
+    /// so a percentage track is resolved by the grid against its container and an `Auto`
+    /// track is sized by content. [`Len::dips`] answers `None` for both of those, and a
+    /// track built from it would be a zero-width column.
     #[must_use]
     pub fn sizing(self, scope: Scope) -> taffy::TrackSizingFunction {
         match self {
@@ -154,10 +144,10 @@ impl Track {
     }
 }
 
-/// How a container aligns **all** of its children.
+/// How a container aligns all of its children.
 ///
-/// Alignment is a container property. The per-child escape is `align_self`, and it should
-/// be rare: stating it once per container is what stops every child restating it.
+/// Alignment is a container property; the per-child escape is
+/// [`El::align_self`](crate::build::El::align_self).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Align {
     Start,
@@ -170,6 +160,9 @@ pub enum Align {
 }
 
 impl Align {
+    /// Returns the cross-axis alignment for the container's children.
+    ///
+    /// `SpaceBetween` has no cross-axis meaning and lowers to `STRETCH`.
     #[must_use]
     pub const fn items(self) -> taffy::AlignItems {
         match self {
@@ -180,6 +173,7 @@ impl Align {
         }
     }
 
+    /// Returns the main-axis distribution for the container's content.
     #[must_use]
     pub const fn content(self) -> taffy::AlignContent {
         match self {

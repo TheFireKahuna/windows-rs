@@ -1,9 +1,8 @@
-//! What the role layer claims, checked against a palette that answers by construction
-//! rather than from a table.
+//! Tests for the role layer, against a reference palette that computes every answer from the
+//! role and the scope.
 //!
-//! The point of this palette is that it cannot have a hole: every method computes from the
-//! role and the scope, so a failure here is the *mechanism* — a scope that did not reach a
-//! resolve, a wash that read the wrong rung — rather than a token someone forgot.
+//! The palette holds no table and so has no missing entry: a failure here is in the
+//! resolution — a scope that did not reach a resolve, a wash that read the wrong rung.
 
 use super::*;
 use windows_color::{Ictcp, Radiance};
@@ -23,7 +22,7 @@ fn light(nits: f32, chroma: f32, hue: f32) -> Radiance {
 
 impl Palette for Reference {
     fn text(&self, role: Text, scope: Scope) -> Radiance {
-        // Polarity inverts the ladder; that is the whole of what polarity means here.
+        // Polarity inverts the ladder.
         let rung = |i: usize| match scope.polarity {
             Polarity::Dark => TEXT_NITS[i],
             Polarity::Light => TEXT_NITS[TEXT_NITS.len() - 1 - i],
@@ -61,7 +60,7 @@ impl Palette for Reference {
     }
 
     fn data(&self, role: DataRole) -> Radiance {
-        // Chromatic and shared: the hue is the role, and nothing about it reads a scope.
+        // The hue is the role; nothing here reads a scope.
         light(84.0, 0.12, f32::from(role.0) * 31.0 % 360.0)
     }
 
@@ -112,18 +111,18 @@ impl Palette for Reference {
 
 static REFERENCE: Reference = Reference;
 
-/// Installs once for the whole test binary. `install` is idempotent for the same palette,
-/// so every test may call it and tests may run in parallel.
+/// Installs the reference palette for the whole test binary. `install` is idempotent for the
+/// same palette, so every test may call it and tests may run in parallel.
 ///
 /// Shared with the lowering's own tests rather than duplicated there: the palette is a
 /// process-wide `OnceLock`, so a second one would not install and the module that lost the
-/// race would silently assert against the other's answers.
+/// race would assert against the other's answers.
 pub(crate) fn palette() {
     install(&REFERENCE);
 }
 
-/// Every scope the axes can produce. Five axes, and the product is what "total" is a claim
-/// about.
+/// Returns every scope the four varying axes produce, with the accent fixed. Totality is a
+/// claim about this product.
 fn every_scope() -> impl Iterator<Item = Scope> {
     const ELEVATIONS: [Elevation; 4] = [
         Elevation::Base,
@@ -339,8 +338,8 @@ fn the_type_ramp_resolves_through_the_same_scope_the_colours_use() {
 
 #[test]
 fn a_polarity_flip_is_reported_only_when_it_moved() {
-    // Step one of four. The caller has to do the other three, and the return value is what
-    // tells it whether it needs to.
+    // Step one of four; the return value tells the caller whether the other three are
+    // needed.
     let start = polarity();
     assert!(
         !set_polarity(start),

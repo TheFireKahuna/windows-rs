@@ -1,60 +1,61 @@
-//! Keyboard focus, and the scopes it nests in.
+//! Keyboard focus and the scopes that bound it.
 //!
-//! **Focus order is the hit array's order**, filtered to `INTERACTIVE`, with an explicit
-//! `tab_index` escape. That is not a convenience: the pointer, the wheel, keyboard focus
-//! order, the window's own caption hit test and automation's element-from-point all resolve
-//! through the *same* z-ordered flat array, and a second ordering maintained beside it is
-//! exactly the failure that arrangement exists to prevent.
+//! Focus order is the hit array's order, filtered to `INTERACTIVE`, with `tab_index` as an
+//! explicit override. The pointer, the wheel, keyboard focus order, the window's caption hit
+//! test and automation's element-from-point all resolve through that one z-ordered flat
+//! array, so no second ordering is maintained beside it.
 //!
 //! Scopes nest. An open overlay pushes one, so `Tab` cycles within it and closing it restores
 //! focus to whatever invoked it; `Esc` is delivered to the innermost scope before any control
-//! sees it. A scope is named by the entry its subtree begins after, rather than by an index
-//! range, so that it survives the array being rebuilt underneath it.
+//! sees it. A scope is named by the entry its subtree begins at rather than by an index range,
+//! so it survives the array being rebuilt underneath it.
 
 use rustc_hash::FxHashMap;
 use windows_scene::{ControlId, HitFlags, HitTable};
 
-/// A live focus scope.
+/// Identifies one open focus scope.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScopeId(pub u32);
 
-/// What an overlay declares when it opens.
+/// Describes a focus scope at the moment an overlay opens it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FocusScope {
-    /// `Tab` wraps at the ends rather than leaving. What a modal popup wants; a flyout wants
-    /// the opposite, because tabbing past a picker's last item should dismiss it and move on.
+    /// Wraps `Tab` at the ends of the scope instead of letting it leave. A modal popup sets
+    /// this; a flyout leaves it clear, so tabbing past its last item dismisses it.
     pub trap: bool,
-    /// Captured at open and focused at close, unless the control is gone. Without it,
-    /// dismissing a menu leaves focus nowhere and the next keystroke goes to the window.
+    /// The control focus returns to when the scope closes. `None` leaves focus cleared, so
+    /// the next keystroke reaches the window rather than a control.
     pub restore_to: Option<ControlId>,
-    /// The scope's own first entry in the hit array — its blocker for a light-dismissing
-    /// overlay, or its root otherwise. Everything at or after it in the array is inside.
+    /// The scope's first entry in the hit array: its blocker for a light-dismissing overlay,
+    /// or its root otherwise. Everything at or after it in the array is inside the scope.
     pub from: ControlId,
 }
 
-/// Where focus is, and what bounds it.
+/// Holds the focused control and the stack of scopes that bound navigation.
 #[derive(Debug, Default)]
 pub struct FocusRing {
     current: Option<ControlId>,
     scopes: Vec<(ScopeId, FocusScope)>,
     next: u32,
-    /// The explicit escape. Empty for every screen that does not need it, which is most.
+    /// Explicit tab positions, keyed by control. Empty for every screen that does not
+    /// override the hit array's order.
     order: FxHashMap<ControlId, i32>,
-    /// Reused across navigations, so moving focus allocates nothing after the first move.
+    /// Candidate buffer reused across navigations, so moving focus allocates nothing after
+    /// the first move.
     scratch: Vec<(i32, ControlId)>,
 }
 
 impl FocusRing {
-    /// What has focus.
+    /// Returns the focused control, or `None` when nothing has focus.
     #[must_use]
     pub const fn current(&self) -> Option<ControlId> {
         self.current
     }
 
-    /// Focuses a control directly — what a press does.
+    /// Focuses `next` directly, as a press does.
     ///
-    /// Answers the control that lost focus, so a caller can move both sets of pixels in one
-    /// pass. `None` back means nothing changed.
+    /// Returns the control that lost focus alongside the one that took it, so a caller
+    /// repaints both in one pass. `None` means `next` already had focus and nothing changed.
     pub fn focus(
         &mut self,
         next: Option<ControlId>,
@@ -67,20 +68,22 @@ impl FocusRing {
         Some((previous, next))
     }
 
-    /// Gives a control an explicit position in the order.
+    /// Gives `id` an explicit position in the focus order.
     ///
-    /// The escape, not the mechanism: a screen that needs one for every control has a layout
-    /// whose reading order is wrong.
+    /// A position above zero sorts ahead of every control without one; the rest keep the hit
+    /// array's order.
     pub fn set_tab_index(&mut self, id: ControlId, index: i32) {
         self.order.insert(id, index);
     }
 
-    /// Forgets a control's explicit position, on unmount.
+    /// Drops `id`'s explicit position, returning it to the hit array's order. Called on
+    /// unmount.
     pub fn clear_tab_index(&mut self, id: ControlId) {
         self.order.remove(&id);
     }
 
-    /// Opens a scope. Everything at or after `from` in the hit array is inside it.
+    /// Opens a scope and returns its id. Everything at or after `scope.from` in the hit array
+    /// is inside it.
     pub fn push_scope(&mut self, scope: FocusScope) -> ScopeId {
         self.next += 1;
         let id = ScopeId(self.next);
@@ -88,35 +91,36 @@ impl FocusRing {
         id
     }
 
-    /// Closes a scope and restores focus to whatever invoked it.
+    /// Closes the scope `id` and moves focus to its `restore_to`.
     ///
-    /// Answers what focus should become, which the caller applies — so the pixels move on the
-    /// front thread in the same pass that closed the overlay.
+    /// Returns the control focus was moved to, which the caller repaints in the same pass
+    /// that closed the overlay. `None` when `id` names no open scope.
     pub fn pop_scope(&mut self, id: ScopeId) -> Option<ControlId> {
         let at = self.scopes.iter().position(|(scope, _)| *scope == id)?;
-        // Everything nested inside it goes too: an overlay that closes takes its submenus.
+        // Truncating takes the nested scopes with it: closing an overlay closes its submenus.
         let restore = self.scopes[at].1.restore_to;
         self.scopes.truncate(at);
         self.current = restore;
         restore
     }
 
-    /// The innermost scope, which is what `Esc` is delivered to first.
+    /// Returns the innermost open scope, which `Esc` is delivered to before any control.
     #[must_use]
     pub fn innermost(&self) -> Option<(ScopeId, FocusScope)> {
         self.scopes.last().copied()
     }
 
-    /// How many scopes are open.
+    /// Returns the number of open scopes.
     #[must_use]
     pub fn depth(&self) -> usize {
         self.scopes.len()
     }
 
-    /// Moves focus one step through the order.
+    /// Moves focus one step through the order, forwards when `forward` is set.
     ///
-    /// [`Move::Left`] means the step ran off the end of a non-trapping scope, which is what
-    /// dismisses a flyout and moves on rather than wrapping inside it.
+    /// With nothing focused, the step enters the scope at whichever end it came from.
+    /// [`Move::Left`] means the step ran off the end of a scope that does not trap, which the
+    /// caller answers by dismissing that scope and stepping again outside it.
     pub fn step(&mut self, hits: &HitTable, forward: bool) -> Move {
         self.collect(hits);
         if self.scratch.is_empty() {
@@ -148,13 +152,12 @@ impl FocusRing {
         self.land(self.scratch[next].1)
     }
 
-    /// Moves focus to the next control after the current one that `pick` accepts, wrapping.
+    /// Moves focus to the next control after the focused one that `pick` accepts, wrapping.
     ///
-    /// **Type-ahead, and nothing else needs it.** The candidates and their order are
-    /// [`step`](Self::step)'s own, so a menu's letter navigation cannot disagree with its
-    /// arrow navigation — which is the same rule that put focus order in the hit array in
-    /// the first place, applied one level down. Starting after the current item and wrapping
-    /// is what makes repeated presses of one letter cycle the items beginning with it.
+    /// Drives type-ahead. The candidates and their order are [`step`](Self::step)'s own, so a
+    /// menu's letter navigation cannot disagree with its arrow navigation. The search starts
+    /// after the focused control and wraps, so repeated presses of one letter cycle the
+    /// controls beginning with it. [`Move::Nowhere`] means `pick` accepted none of them.
     pub fn step_to(&mut self, hits: &HitTable, pick: impl Fn(ControlId) -> bool) -> Move {
         self.collect(hits);
         let count = self.scratch.len();
@@ -174,7 +177,8 @@ impl FocusRing {
         self.land(self.scratch[at].1)
     }
 
-    /// Moves focus to the first or last control of the innermost scope. `Home` and `End`.
+    /// Moves focus to the last control of the innermost scope when `last` is set, and to the
+    /// first otherwise. Drives `Home` and `End`.
     pub fn step_to_end(&mut self, hits: &HitTable, last: bool) -> Move {
         self.collect(hits);
         let Some(&(_, id)) = (if last {
@@ -187,7 +191,7 @@ impl FocusRing {
         self.land(id)
     }
 
-    /// Puts focus on a candidate a step chose, and says what that did. Landing where focus
+    /// Focuses the candidate a step chose and reports what that did. Landing where focus
     /// already was is [`Move::Nowhere`], so no caller repaints a ring that did not move.
     fn land(&mut self, id: ControlId) -> Move {
         match self.focus(Some(id)) {
@@ -196,21 +200,21 @@ impl FocusRing {
         }
     }
 
-    /// The focusable controls, in order, restricted to the innermost scope.
+    /// Fills `scratch` with the innermost scope's focusable controls, in focus order.
     ///
-    /// Explicit indices sort first and among themselves; everything else keeps the array's
-    /// own order, which is the reading order layout produced. A stable sort is what makes
-    /// the second half true.
+    /// Explicit indices sort first and among themselves; everything else keeps the hit
+    /// array's own order, which is the reading order layout produced. The sort is stable,
+    /// which is what preserves that order.
     fn collect(&mut self, hits: &HitTable) {
         self.scratch.clear();
         let entries = hits.entries();
         // A scope begins at its own first entry, so everything before that is outside it.
         //
-        // A scope whose entry is not in the array is one whose subtree is not either — it
-        // has been closed, or it has not been flushed yet. Both mean **nothing** is in
-        // scope, which is why this fails closed rather than falling back to the head of the
-        // array: that fallback silently widens a stale scope to the whole window, and a
-        // `Tab` that escapes a modal is not a failure anything else would report.
+        // A scope whose entry is absent from the array has no subtree in it either: it has
+        // closed, or it has not been flushed yet. Both mean nothing is in scope, so this
+        // leaves the candidates empty rather than falling back to the head of the array —
+        // that fallback widens a stale scope to the whole window and lets `Tab` walk out of
+        // a modal, which nothing downstream would report.
         let start = match self.scopes.last() {
             Some((_, scope)) => match entries.iter().position(|entry| entry.id == scope.from) {
                 Some(at) => at,
@@ -219,8 +223,9 @@ impl FocusRing {
             None => 0,
         };
         for entry in &entries[start..] {
-            // A blocker routes a press and is not a place focus can rest, and neither is a
-            // scroll viewport that carries no control of its own.
+            // A blocker routes a press rather than holding focus, and an entry that is not
+            // interactive — a scroll viewport carrying no control of its own — is not a
+            // focus stop either.
             if !entry.flags.contains(HitFlags::INTERACTIVE)
                 || entry.flags.contains(HitFlags::BLOCKER)
             {
@@ -229,17 +234,17 @@ impl FocusRing {
             let index = self.order.get(&entry.id).copied().unwrap_or(0);
             self.scratch.push((index, entry.id));
         }
-        // Positive indices first, in their own order; zero — everything unstated — after, in
-        // the array's.
+        // Positive indices first, in their own order; everything unstated after, in the hit
+        // array's.
         self.scratch
             .sort_by_key(|(index, _)| if *index > 0 { (0, *index) } else { (1, 0) });
     }
 }
 
-/// What a focus step did.
+/// Reports what a focus step did.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Move {
-    /// Focus moved.
+    /// Focus moved from `from` to `to`.
     To {
         from: Option<ControlId>,
         to: ControlId,
@@ -256,11 +261,11 @@ mod tests {
     use super::*;
     use windows_scene::{HitEntry, Ids, NO_ENTRY, NodeId};
 
-    /// The `n`th id a fresh authority mints.
+    /// Returns the `n`th id a fresh [`Ids`] mints.
     ///
-    /// A `ControlId` is a generational index with no public constructor, which is the point:
-    /// it can only come from an [`Ids`]. Minting densely from a fresh one is deterministic,
-    /// so this is stable across calls and distinct per `n` without any shared state.
+    /// A `ControlId` is a generational index with no public constructor, so it can only come
+    /// from an [`Ids`]. Minting densely from a fresh one is deterministic, which makes this
+    /// stable across calls and distinct per `n` without any shared state.
     fn cid(n: u32) -> ControlId {
         let mut ids = Ids::<windows_scene::Control>::new();
         let mut id = ids.mint();
@@ -324,11 +329,10 @@ mod tests {
 
     #[test]
     fn a_scope_whose_entry_has_gone_bounds_navigation_to_nothing() {
-        // Fail closed, and the one direction that matters. A scope is named by its own first
-        // entry; if that entry is not in the array, its subtree is not either — it closed, or
-        // it has not been flushed yet. Resolving that to the head of the array instead would
-        // silently widen a stale scope to the whole window, which is a `Tab` that walks out
-        // of a modal and nothing that would report it.
+        // A scope is named by its own first entry. If that entry is absent from the array,
+        // its subtree is absent too — the scope closed, or it has not been flushed yet — so
+        // navigation is bounded to nothing. Resolving to the head of the array instead would
+        // widen a stale scope to the whole window and let `Tab` walk out of a modal.
         let hits = table(&[1, 2, 3]);
         let mut ring = FocusRing::default();
         ring.push_scope(FocusScope {

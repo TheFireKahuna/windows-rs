@@ -1,24 +1,25 @@
-//! The small shared vocabulary the arena and the widgets both name.
+//! The vocabulary the arena and the widgets both name: motion, state policy, colour rows,
+//! automation roles, value ranges, and the arithmetic that places a moving part.
 
 use crate::role::{Fill, Metric, Stroke, Text};
 
 /// How a channel moves when its value changes.
 ///
-/// Per channel and declared by the seed, so two call sites cannot disagree about the same
-/// control: a meter level carries momentum and springs, a slider thumb the application
-/// writes must be where it was put.
+/// Declared per channel by the seed, so two call sites cannot disagree about one control: a
+/// meter level springs, and a slider thumb the application writes lands where it was put.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Motion {
+    /// The channel lands on the new value with no animation.
     #[default]
     Snap,
+    /// The channel springs to the new value.
     Chrome,
 }
 
 /// Whether a node has interaction chrome, and which wash it fades in.
 ///
-/// **Not automatic.** Text, captions, meters, paths and info rows are `None`, which is most
-/// of a screen, and they pay nothing. Only a control that can be hovered mints the extra
-/// sprite.
+/// Only a control that can be hovered mints the extra sprite. Text, captions, meters, paths
+/// and info rows are `None` and mint none.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum StatePolicy {
     #[default]
@@ -31,22 +32,23 @@ pub enum StatePolicy {
 
 /// Which derived wash a state fades in.
 ///
-/// A wash, not a different base colour — which is both what the palette already derives
-/// (`ink` / `accent_wash`) and the only colour transition this architecture can express: a
-/// sprite's colour is an FP16 surface cell, a composition colour brush is 8-bit, and there
-/// is no brush the compositor interpolates between two FP16 sources. So a state change is a
-/// crossfade, and the thing being faded is a wash.
+/// A state change is a crossfade of a wash over the base colour rather than an interpolation
+/// towards a second base colour: a sprite's colour is an FP16 surface cell, a composition
+/// colour brush is 8-bit, and no brush interpolates between two FP16 sources. The palette
+/// derives both washes, through [`ink`](crate::role::ink) and
+/// [`accent_wash`](crate::role::accent_wash).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Wash {
+    /// The scope's foreground, at the state's opacity.
     Ink,
+    /// The scope's accent fill, at the state's opacity.
     Accent,
 }
 
 /// What a widget names instead of writing a `UiaDecl`.
 ///
-/// Synthesised into one by the lowering, from this plus the slot's own text and the channel
-/// bound to it. A hand-written declaration per widget is a chance per widget to disagree
-/// with a promise that accessibility derives.
+/// The lowering synthesises the declaration from this, the slot's own text, and the channel
+/// bound to it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum UiaRole {
     #[default]
@@ -69,10 +71,10 @@ pub enum UiaRole {
     Graph,
 }
 
-/// A widget's colour triple, as one row of a const table.
+/// A widget's colour triple: one row of a `const` table.
 ///
-/// A variant is a row and never a function. A table does not accrete behaviour: a fifth
-/// variant is visibly a fifth row, where a fifth function is not.
+/// A variant is a row rather than a function, so the variants a widget has are the length of
+/// its table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RoleSet {
     pub fill: Option<Fill>,
@@ -80,10 +82,10 @@ pub struct RoleSet {
     pub stroke: Option<Stroke>,
 }
 
-/// Which interaction state a control's roles are resolved in.
+/// Which model state a control's roles are resolved in.
 ///
-/// Hover and press are **not** here as colours. They are the wash's opacity. What is here
-/// is the model state that swaps a base role: a selected row and a disabled control.
+/// Hover and press are not here: they are the wash's opacity. This is the state that swaps a
+/// base role — a selected row, a disabled control.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ModelState {
     #[default]
@@ -93,7 +95,7 @@ pub enum ModelState {
 }
 
 impl RoleSet {
-    /// The same roles, resolved in `state`. One function, not one per widget.
+    /// Returns these roles resolved in `state`.
     #[must_use]
     pub const fn in_state(self, state: ModelState) -> Self {
         match state {
@@ -111,12 +113,11 @@ impl RoleSet {
     }
 }
 
-/// A widget's own surface: which const table it reads, which row of it, and how round it is.
+/// A widget's own surface: which `const` table it reads, which row of it, and how round it is.
 ///
-/// The slot carries the **index**, not the sprites, so `.accent()` rewrites one byte and the
-/// mount decides what that costs. A variant that drops the stroke therefore mints one sprite
-/// fewer rather than minting an invisible one, and the number of visuals on a screen follows
-/// from the table instead of from the order the modifiers ran in.
+/// The slot carries the row index rather than the sprites, so a variant modifier rewrites one
+/// byte and the mount reads the sprite count off the row. A row with no stroke mints one
+/// sprite fewer rather than an invisible one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Chrome {
     pub roles: &'static [RoleSet],
@@ -125,11 +126,15 @@ pub struct Chrome {
 }
 
 impl Chrome {
-    /// The row this chrome selects.
+    /// Returns the row this chrome selects.
     ///
     /// A variant index is minted by a method on the widget that owns the table, so an
-    /// out-of-range one is a defect rather than a case: it is asserted where it can be seen
-    /// and clamped in release, because rendering as the last variant beats not rendering.
+    /// out-of-range index is a defect rather than a case. It clamps to the last row in
+    /// release, which renders the control as some other variant.
+    ///
+    /// # Panics
+    ///
+    /// In a debug build, if `variant` is past the end of `roles`.
     #[must_use]
     pub fn roles(self) -> RoleSet {
         debug_assert!(
@@ -144,52 +149,49 @@ impl Chrome {
 
 // ── where a moving part sits ─────────────────────────────────────────────────────
 //
-// The mount binds these and the router retargets them, so they live in one place. Two copies
-// of this arithmetic would drift the first time a vertical control was added, and the symptom
-// would be a thumb that runs the wrong way rather than a compile error.
+// The mount binds these properties and the router retargets them, so both sides reach the
+// same arithmetic from here.
 
 /// How far a turned control rotates end to end, in radians.
 pub const TURN_SWEEP: f32 = core::f32::consts::TAU * 0.75;
 
-/// DIPs of vertical drag for a full sweep. The knob's own sensitivity, so it is a number
-/// here rather than a [`Metric`] in the theme — see the scrollbar's dimensions for the same
-/// call.
+/// DIPs of vertical drag for a full sweep. A knob's sensitivity is an interaction constant
+/// rather than a themed [`Metric`].
 pub const TURN_SPAN: f32 = 200.0;
 
 /// A dial's full sweep, in detents, where the range does not name its own step.
 const TURN_DETENTS: f64 = 64.0;
 
-/// Where a part sitting at `fraction` of its travel goes, in the property's own unit.
+/// Returns the offset of a part sitting at `fraction` of `travel`, in DIPs.
 ///
-/// Downward is increasing and a value grows upward, so a vertical control at its maximum
-/// sits at the **top** of its travel.
+/// The coordinate grows downward and a value grows upward, so a vertical control at its
+/// maximum sits at the top of its travel.
 #[must_use]
 pub fn offset_of(fraction: f32, travel: f32, vertical: bool) -> f32 {
     fraction_of(fraction, vertical) * travel
 }
 
-/// The same for a turned part: where `fraction` of a value sits on its sweep, in radians.
+/// Returns the angle a turned part sitting at `fraction` of [`TURN_SWEEP`] takes, in radians.
 ///
-/// Beside `offset_of` and not beside the knob, because the mount writes this angle and the
-/// router retargets it. A second copy would drift, and the symptom would be a knob that
-/// jumps the moment it is let go rather than a compile error.
+/// The mount writes this angle and the router retargets it, so both reach the same function
+/// and a committed value cannot land the part where a live drag did not.
 #[must_use]
 pub fn angle_of(fraction: f32) -> f32 {
     fraction.clamp(0.0, 1.0) * TURN_SWEEP
 }
 
-/// The same mapping, read the other way: where a pointer at `along` of a control's own
-/// extent puts its value. Its own inverse, which is why one function serves both.
+/// Returns the value fraction for a pointer at `along` of a control's own extent, clamped to
+/// `0..=1`. The mapping is its own inverse, so [`offset_of`] shares it.
 #[must_use]
 pub fn fraction_of(along: f32, vertical: bool) -> f32 {
     let along = along.clamp(0.0, 1.0);
     if vertical { 1.0 - along } else { along }
 }
 
-/// What a dial detent moves a value by, as a fraction of its range.
+/// Returns what `steps` detents move a value by, as a fraction of `range`.
 ///
-/// A **delta**, which is the whole of what a dial reports: treating a detent count as an
-/// absolute position sends one click to an end stop.
+/// The result is a delta to add to the fraction a control already stands at. Where `range`
+/// names no step, a full sweep is 64 detents.
 #[must_use]
 pub fn detent_delta(range: Range, steps: f64) -> f32 {
     let span = range.max - range.min;
@@ -206,9 +208,8 @@ pub fn detent_delta(range: Range, steps: f64) -> f32 {
 
 /// What a pointer means to a control, front-side.
 ///
-/// The router owns the pixels of an interaction, so it needs to know what kind of thing it
-/// is moving without asking the application. Four cases, and the fourth is the one that
-/// carries a number.
+/// The front thread moves the pixels of an interaction, so the kind is named here rather than
+/// asked of the application. Two of the three carry the range the value runs over.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Interaction {
     /// A press and a release, and nothing in between.

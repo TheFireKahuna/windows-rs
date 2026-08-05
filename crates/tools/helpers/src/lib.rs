@@ -154,15 +154,12 @@ pub fn set_thread_ui_language() {
     }
 }
 
-/// The hand-authored metadata under `metadata/*.rdl`, and where it is compiled to.
+/// The hand-authored metadata compiled by [`compile_authored_metadata`].
 ///
-/// These are the namespaces the vendored Win32 corpus does not carry. They are
-/// authored rather than scraped because the corpus under `metadata/win32` is emitted
-/// by `tool_win32` from a fixed header list, and re-running that scrape to pick up a
-/// handful of symbols rewrites every partition and the merged winmd along with them —
-/// tens of thousands of lines of churn for a few types. Compiling a few hand-written
-/// `.rdl` files instead keeps the blast radius to the symbols actually named. Each
-/// file states which header it transcribes and why the corpus lacks it.
+/// Each file transcribes one header whose types the scraped Win32 corpus under
+/// `metadata/win32` does not carry, and names that header in its own banner. A type the
+/// corpus already defines resolves from there rather than being repeated here, because a
+/// filter naming both winmds would then see a duplicate definition.
 pub const AUTHORED_METADATA: &[&str] = &[
     "metadata/dispatcherqueue.rdl",
     "metadata/inputscope.rdl",
@@ -172,18 +169,22 @@ pub const AUTHORED_METADATA: &[&str] = &[
     "metadata/windowsgraphicsinterop.rdl",
 ];
 
-/// Where [`compile_authored_metadata`] writes its winmd. Never committed.
+/// The output path of [`compile_authored_metadata`], under `target/` and never committed.
 pub const AUTHORED_WINMD: &str = "target/authored.winmd";
 
-/// Compiles [`AUTHORED_METADATA`] to [`AUTHORED_WINMD`], returning that path.
+/// Compiles [`AUTHORED_METADATA`] to [`AUTHORED_WINMD`] and returns that path.
 ///
-/// The bundled winmds are supplied only to RESOLVE the types the RDL references
-/// (`HRESULT`, `HANDLE`, `ID2D1Geometry`, `IDispatcherQueueController`, …); the
-/// emitted winmd carries the authored namespaces alone, which is what makes it safe
-/// for a filter to name beside `default` without duplicate definitions.
+/// The bundled winmds are inputs only so that the references in the RDL resolve
+/// (`HRESULT`, `HANDLE`, `ID2D1Geometry`, `IDispatcherQueueController`, …). The emitted
+/// winmd carries the authored namespaces alone, so a filter can name it beside `default`
+/// without defining a type twice.
 ///
-/// Both `tool_bindings` and `tool_composition` call this, so whichever runs first
-/// produces the same bytes for the other.
+/// The output depends only on these inputs, so `tool_bindings` and `tool_composition`
+/// write the same bytes whichever runs first.
+///
+/// # Panics
+///
+/// Panics if the output directory cannot be created or the metadata does not compile.
 pub fn compile_authored_metadata() -> &'static str {
     const RESOLVE: &[&str] = &[
         "crates/libs/bindgen/default/Windows.Win32.winmd",

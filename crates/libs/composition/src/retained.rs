@@ -1,29 +1,26 @@
 //! The rest of the retained visual tree (feature `system`).
 //!
-//! What a tree needs to be *driven* rather than merely built: the placement and
-//! rotation properties an animation targets, the collection operations a reconciler
-//! performs, and the one part of composition state that can be read back exactly.
+//! The placement and rotation properties an animation targets, the collection operations
+//! a reconciler performs, and the enumeration of a visual's children.
 
 use super::*;
 
 impl Visual {
     /// Sets the visual's rotation about its
     /// [center point](Visual::set_center_point), in **radians** — the unit of the
-    /// `RotationAngle` property that animations and expressions drive. (Composition
-    /// also exposes the same rotation in degrees as a separate property, which this
-    /// crate does not surface: two names for one value invites animating the one
-    /// nothing is bound to.)
+    /// `RotationAngle` property that animations and expressions drive. Composition also
+    /// exposes the same rotation in degrees under a second property name; this crate
+    /// surfaces only the radian one, so an animation and a setter always agree.
     pub fn set_rotation_angle(&self, radians: f32) {
         self.0.SetRotationAngle(radians).unwrap();
     }
 
     /// Rounds this visual's composed position to whole device pixels.
     ///
-    /// This governs where the visual is placed, not what its `Offset` holds: an
+    /// This governs where the visual is composed, not what its `Offset` holds: an
     /// animation driving that offset still evaluates and writes every frame, and
-    /// anything charged per write is charged just the same. Snapping is for crispness
-    /// — content that would otherwise be resampled across a pixel boundary — and
-    /// pairs with a step-eased animation rather than substituting for one.
+    /// anything charged per write is charged just the same. Snapping keeps content crisp
+    /// that would otherwise be resampled across a pixel boundary.
     pub fn set_pixel_snapping(&self, enabled: bool) {
         let visual: bindings::IVisual4 = self.0.cast().unwrap();
         visual.SetIsPixelSnappingEnabled(enabled).unwrap();
@@ -34,23 +31,21 @@ impl Visual {
     /// The common case of
     /// [`set_relative_size_adjustment`](Visual::set_relative_size_adjustment), which
     /// is *additive* — `size + parent.size * adjustment` — so this pairs a `(1, 1)`
-    /// adjustment with whatever `set_size` already holds. **The parent must carry a
-    /// real size.** For a `SpriteVisual` that is automatic, since size IS its painted
-    /// area, but a bare `ContainerVisual` left at its `(0, 0)` default silently
-    /// resolves every child's adjustment to nothing: nothing throws, nothing logs, and
-    /// the subtree simply does not draw. A container children measure against is a
-    /// size anchor and has to be sized deliberately.
+    /// adjustment with whatever `set_size` already holds. **The parent must carry a real
+    /// size.** A `SpriteVisual` does so already, its size being its painted area, but a
+    /// bare `ContainerVisual` left at its `(0, 0)` default resolves every child's
+    /// adjustment to zero, with no error raised, and the subtree does not draw. A
+    /// container that children size against is given a size explicitly.
     pub fn fill_parent(&self) {
         self.set_relative_size_adjustment(Vector2 { x: 1.0, y: 1.0 });
     }
 
-    /// Views this visual as a container, if it is one.
+    /// Returns this visual as a [`ContainerVisual`], or `None` if it is not one.
     ///
     /// [`VisualCollection::iter`] hands back the base [`Visual`] type, which has no
-    /// children of its own, so without this a tree walk could only ever see one level.
-    /// Every visual this crate mints except a bare `Visual` is a container underneath
-    /// — sprites and shape visuals both derive from `ContainerVisual` — so the cast
-    /// usually succeeds.
+    /// children of its own, so a tree walk descends a level through this. Every visual
+    /// this crate mints except a bare `Visual` is a container underneath — sprites and
+    /// shape visuals both derive from `ContainerVisual` — so the cast usually succeeds.
     pub fn as_container(&self) -> Option<ContainerVisual> {
         self.0.cast().ok().map(ContainerVisual::new)
     }
@@ -74,21 +69,20 @@ impl SpriteVisual {
 }
 
 impl VisualCollection {
-    /// Every child, in z-order (bottom first).
+    /// Returns every child, in z-order (bottom first).
     ///
-    /// The child collection is enumerable, which makes the visual tree the one part of
-    /// composition state an app can read back exactly rather than infer. That is what
-    /// an authoritative visual census needs: a running insert/remove tally can drift,
-    /// a walk cannot.
+    /// The child collection is enumerable, so a walk reads what the tree actually holds
+    /// rather than a tally the app maintains alongside it.
     ///
-    /// Fallible because the enumeration is a `QueryInterface` away — a collection that
-    /// does not answer to `IIterable` cannot be walked, and inventing an empty iterator
-    /// for that case would report a populated subtree as childless.
+    /// The returned iterator holds its own reference to the collection's WinRT iterator
+    /// and borrows nothing; the `use<>` bound keeps edition 2024 from capturing `&self`,
+    /// so a walk can enumerate a collection obtained from a temporary — which every
+    /// nested level of a tree walk is.
     ///
-    /// The `use<>` bound is load-bearing: the iterator holds its own reference to the
-    /// collection's WinRT iterator and borrows nothing, so without it edition 2024
-    /// would capture `&self` and a walk could not enumerate a collection obtained from
-    /// a temporary — which is every nested level of a tree walk.
+    /// # Errors
+    ///
+    /// Returns an error when the collection does not answer to `IIterable` and so cannot
+    /// be walked. An empty iterator there would report a populated subtree as childless.
     pub fn iter(&self) -> Result<impl Iterator<Item = Visual> + use<>> {
         let iterable: windows_collections::IIterable<bindings::Visual> = self.0.cast()?;
         Ok(iterable.into_iter().map(Visual))
@@ -104,10 +98,10 @@ impl VisualCollection {
     /// is not there.
     ///
     /// A caller that tracks children of its own can hold a visual that has since been
-    /// detached — a parent torn down between the two operations, say. For that caller
-    /// "already gone" is the goal state rather than an error, so the removal is
-    /// fallible instead of a panic. Prefer [`remove`](VisualCollection::remove) when
-    /// the visual's membership is known.
+    /// detached — a parent torn down between the two operations, say. For that caller an
+    /// already-detached visual is the goal state rather than an error, so the removal
+    /// reports instead of panicking. [`remove`](VisualCollection::remove) suits a visual
+    /// whose membership is known.
     pub fn try_remove(&self, visual: &Visual) -> Result<()> {
         self.0.Remove(&visual.0)
     }

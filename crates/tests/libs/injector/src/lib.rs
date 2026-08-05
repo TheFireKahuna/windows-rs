@@ -1,76 +1,64 @@
 //! Synthetic mouse, touch, pen and precision-touchpad streams, for driving the real input
 //! stack against a real window.
 //!
-//! **Real device streams, not a fake pointer layer.** A fake would test the fake. Every
-//! stream here goes through the system's own input path and arrives at the window under test
-//! as `WM_POINTER*`, which is what makes an assertion about the pointer stack an assertion
-//! about the thing that ships.
+//! Every stream goes through the system's own input path and arrives at the target window as
+//! `WM_POINTER*`. Nothing here fabricates a pointer message directly.
 //!
 //! # One injection object
 //!
-//! `Windows.UI.Input.Preview.Injection.InputInjector` is the platform's injection surface
-//! and covers mouse, pen, touch and the keyboard. The precision touchpad is the one device
-//! class it does not reach, and that one alone falls back to `CreateSyntheticPointerDevice2`
-//! — a touchpad must be created with a physical size, which is also why the v1 entry point
-//! cannot create one at all.
+//! `Windows.UI.Input.Preview.Injection.InputInjector` covers mouse, pen, touch and the
+//! keyboard. The precision touchpad is the one device class it does not reach, and that one
+//! alone falls back to `CreateSyntheticPointerDevice2`: a touchpad must be created with a
+//! physical size, and the v1 entry point has no parameter to state one.
 //!
-//! Two things about that object are worth knowing before writing against it, because each
-//! fails by succeeding:
+//! Two properties of that object fail by succeeding:
 //!
-//! * **Touch and pen have an initialize/uninitialize pair, and it is not ceremony.** A pen
-//!   sample injected without `InitializePenInjection` is accepted, returns success and goes
-//!   nowhere. The pair is owned by the injector and refcounted per device class, so it
-//!   cannot be skipped and cannot be released under a live stream.
-//! * **`SetCursorPos` is not injection.** A cursor warp moves the pointer and lets the
-//!   window manager notice; only an injected event goes through the input stack. The same
-//!   probe reads "zero pointer messages, legacy only" under a warp — the right conclusion's
-//!   exact opposite, from an instrument that was never measuring the stack.
+//! * Touch and pen have an initialize/uninitialize pair. A pen sample injected without
+//!   `InitializePenInjection` is accepted, returns success and delivers nothing. The injector
+//!   owns the pair and refcounts it per device class, so it cannot be skipped and cannot be
+//!   released under a live stream.
+//! * `SetCursorPos` is not injection. A cursor warp moves the pointer without producing
+//!   input, so a run driven by warps reports zero pointer messages and legacy messages only.
 //!
 //! # Which device to assert on
 //!
-//! **Touch.** A touch contact carries its own screen position, so it is exact by
-//! construction, and it arrives on a device of its own, so nothing a person does at the
-//! machine can interfere with it. Mouse is the opposite on both counts — no injection API
-//! gives `PT_MOUSE` a device of its own, so it shares the one system cursor, and its
-//! absolute coordinate is a 16-bit normalization rather than a pixel. Mouse is here for
-//! `PT_MOUSE` coverage; where a claim can be made on touch it is made on touch.
+//! A touch contact carries its own screen position, so it is exact by construction, and it
+//! arrives on a device of its own, so no physical device at the machine interferes with it.
+//! Mouse differs on both counts: no injection API gives `PT_MOUSE` a device of its own, so it
+//! shares the one system cursor, and its absolute coordinate is a 16-bit normalization rather
+//! than a pixel. Mouse covers `PT_MOUSE`; every claim that can be made on touch is made on
+//! touch.
 //!
 //! # Exactness
 //!
-//! A drag-fidelity assertion is on the **integral** — a drive of known total travel must
-//! produce a cumulative translation equal to it — because a dropped sample shows up as a
-//! short total and as nothing else. That only works if the harness places its samples where
-//! it said it would:
+//! A drag-fidelity assertion compares path integrals: a drive of known total travel must
+//! produce a cumulative translation equal to it, because a dropped sample shows up as a short
+//! total and as nothing else. That holds only if the harness places its samples where it
+//! stated:
 //!
 //! * touch, pen and touchpad carry a location in the sample, so they are exact by
 //!   construction;
-//! * mouse's normalization is **inverted in closed form and then verified once**
-//!   ([`Injector::mouse`]). A harness that instead corrects its aim against `GetCursorPos`
-//!   adds travel of its own — up to three injected moves per logical one — and a drag's
-//!   integral counts every one of them.
-//!
-//! A mouse path is additionally handed over as **one call carrying its own timing**, so
-//! nothing can interleave in the middle of a drag.
+//! * mouse's normalization is inverted in closed form and verified once
+//!   ([`Injector::mouse`]). Correcting aim against `GetCursorPos` instead would add travel of
+//!   its own — up to three injected moves per logical one — and a drag's integral counts
+//!   every one of them.
 //!
 //! # Concurrency
 //!
 //! There is one input stack per session, so there is one stream at a time: every constructor
 //! takes `&mut self` and a stream borrows the injector for as long as it lives. Injection
-//! tests do not run concurrently, for the same reason.
+//! tests do not run concurrently.
 //!
-//! # What this crate deliberately does not do
+//! # What this crate does not do
 //!
 //! It never calls `EnableMouseInPointer`. That opt-in is process-wide, one-way, and must
-//! happen before the first window — so it belongs to the application under test, and a
-//! harness that made it would be deciding for the window whether the thing being tested is
-//! switched on at all.
+//! happen before the first window, so it belongs to the application under test.
 //!
-//! It also names no message constant. What arrived is a question for the window, and a
-//! harness that both wrote the input and owned the constants naming the result would be
-//! checking itself.
+//! It names no message constant. The binding filter generates none, and the program reading
+//! what arrived declares its own.
 
-// `dead_code` covers what arrives with a named type rather than on its own — the members of
-// an enum family. Nothing whole is filtered unused.
+// `dead_code` covers enum members generated alongside the types this crate does use. No
+// whole binding is unused.
 #[expect(
     non_snake_case,
     non_upper_case_globals,
@@ -101,37 +89,37 @@ pub use space::{Point, Space, line, zigzag};
 pub use touch::TouchStream;
 pub use touchpad::{PAD_MM, TouchpadAction, TouchpadStream};
 
-/// What went wrong, in terms a failing test can act on.
+/// Reports why an injector operation failed.
 #[derive(Debug)]
 pub enum Error {
-    /// Something a stream needs is absent from this process or this build of `user32`.
+    /// Names an export or capability this process or this build of `user32` does not have.
     ///
-    /// Not a fallback point: the stream is unavailable and says which thing is missing. See
-    /// [`Capability`].
+    /// The stream is refused rather than degraded. [`Capability`] reports the same facts
+    /// before a stream is opened.
     Unavailable {
-        /// What did not resolve — an export, or a capability.
+        /// The export or capability that did not resolve.
         export: &'static str,
     },
     /// A platform call failed.
     Call {
         /// The function that failed.
         what: &'static str,
-        /// What the platform said about it.
+        /// The platform's error for that call.
         source: windows_core::Error,
     },
     /// A mouse sample did not land where it was aimed.
     ///
-    /// Injection is exact or it is not used: a harness that misses by a pixel reports a bug
-    /// in the stack under test that is its own. See [`Injector::mouse`].
+    /// Opening a mouse stream verifies the absolute-coordinate mapping and returns this
+    /// instead of placing samples approximately. See [`Injector::mouse`].
     Calibration {
         /// The screen pixel the injector asked for.
         asked: (i32, i32),
         /// Where the cursor actually landed.
         landed: (i32, i32),
         /// The virtual desktop the normalization divided by, as `(left, top, width, height)`.
-        /// Carried because the two ways this fails look identical without it: a rounding rule
-        /// that is not the one assumed, and a process reading metrics that were virtualised
-        /// because its thread is not DPI-aware.
+        /// It separates the two causes, which look identical without it: a rounding rule
+        /// other than the one assumed, and a thread that is not DPI-aware reading metrics
+        /// the system virtualised.
         desktop: (i32, i32, i32, i32),
     },
     /// A contact index outside the stream's declared maximum.
@@ -175,27 +163,24 @@ impl core::fmt::Display for Error {
     }
 }
 
-// No `source`: `windows_core::Error` is not a `core::error::Error`, and the platform's
-// account of the failure is already in this one's `Display` — which is where a failing test
-// reads it.
+// No `source`: `windows_core::Error` does not implement `core::error::Error`, and its own
+// message is already carried by this type's `Display`.
 impl core::error::Error for Error {}
 
-/// What every fallible operation in this crate answers with.
+/// The result of every fallible operation in this crate, carrying [`Error`].
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// Runs a drive on a thread of its own, so the caller can pump the window while it happens.
+/// Runs `drive` on a thread of its own, so the caller can pump the window while injection
+/// happens.
 ///
-/// **This is not a convenience, and skipping it costs fidelity.** A harness that injects on
-/// the same thread its window pumps on delivers the whole drive into a queue nobody is
-/// reading, and the platform coalesces what it finds there. Touch survives that — a coalesced
-/// frame keeps its samples in the pointer's history — but **mouse does not**: a coalesced
-/// mouse update reports `historyCount` of 1 and the samples between are simply gone. Measured
-/// on 26200: a 40-sample zigzag injected without a running pump arrives as 5 messages
-/// carrying 300 DIPs of a 557-DIP path, which reads exactly like a stack that dropped them.
+/// Injecting on the thread that pumps the window delivers the whole drive into a queue that
+/// is not being read, and the platform coalesces what it finds there. Touch survives — a
+/// coalesced frame keeps its samples in the pointer's history — but a coalesced mouse update
+/// reports `historyCount` of 1 and the samples between are gone. Measured on 26200: a
+/// 40-sample zigzag injected without a running pump arrives as 5 messages carrying 300 DIPs
+/// of a 557-DIP path.
 ///
-/// So the drive gets a thread and the window keeps pumping, which is also what a real
-/// application does. The returned handle carries the drive's own result; join it, and pump
-/// until it is done.
+/// The returned handle carries the drive's own result. Pump until it finishes, then join it.
 ///
 /// ```no_run
 /// # use injector::{Injector, Space, drive};
@@ -220,17 +205,18 @@ where
     })
 }
 
-/// The one input stack, and the space its streams aim at.
+/// Holds the session's one input stack and the space its streams aim at.
 ///
-/// Open one stream at a time; the borrow is what says so.
+/// One stream is open at a time: every constructor borrows the injector mutably for as long
+/// as the stream lives.
 pub struct Injector {
     space: Space,
     injection: injection::Injection,
     late: late::Late,
     pace: pace::Pace,
-    /// The virtual-desktop mapping the mouse normalizes against, once it has been proven.
-    /// `None` until the first [`mouse`](Injector::mouse) call, because proving it moves the
-    /// cursor and a run that injects no mouse should not pay for that.
+    /// The virtual-desktop mapping the mouse normalizes against, once verified. `None` until
+    /// the first [`mouse`](Injector::mouse) call: verifying it moves the cursor, so a run
+    /// that injects no mouse never does it.
     desktop: Option<mouse::Desktop>,
     /// The contact count `InitializeTouchInjection` was last given. It is process-wide, so it
     /// is raised when a wider stream asks and never lowered.
@@ -240,10 +226,9 @@ pub struct Injector {
 impl Injector {
     /// Aims every stream at `hwnd`'s client area, in DIPs.
     ///
-    /// The window's origin and scale are read **here**, not held from somewhere earlier: a
-    /// stream that cached a scale across a display hop would place every contact on the wrong
-    /// pixel grid, silently, for the rest of the run. [`retarget`](Self::retarget) is how a
-    /// moved or rescaled window is restated.
+    /// Reads the window's origin and scale now and holds them for the injector's life. Until
+    /// [`retarget`](Self::retarget) restates them, every sample is placed on the pixel grid
+    /// read here, so a window that moved or changed DPI places its contacts on the old one.
     pub fn for_window(hwnd: *mut core::ffi::c_void) -> Result<Self> {
         Self::new(Space::for_window(hwnd)?)
     }
@@ -260,7 +245,7 @@ impl Injector {
         })
     }
 
-    /// Where a point stated in DIPs lands.
+    /// Returns the space a point stated in DIPs is placed in.
     #[must_use]
     pub const fn space(&self) -> Space {
         self.space
@@ -268,26 +253,25 @@ impl Injector {
 
     /// Re-reads the target window's origin and scale.
     ///
-    /// Wanted after a move or a DPI change, and after nothing else — a window that has not
-    /// moved does not need it, and doing it per sample would be two syscalls per sample.
+    /// Call after the window moves or changes DPI. Each call costs two syscalls, which is why
+    /// the space is not re-read per sample.
     pub fn retarget(&mut self, hwnd: *mut core::ffi::c_void) -> Result<()> {
         self.space = Space::for_window(hwnd)?;
         Ok(())
     }
 
-    /// What this process and this build can actually inject.
+    /// Returns what this process and this build of `user32` can inject.
     #[must_use]
     pub fn capability(&self) -> Capability {
         self.late.capability()
     }
 
-    /// A mouse stream.
+    /// Opens a mouse stream.
     ///
-    /// The first call **verifies the desktop's absolute-coordinate mapping** by placing three
-    /// probes and reading back where they landed, and fails with [`Error::Calibration`]
-    /// rather than proceeding approximately. That costs three injected moves and restores the
-    /// cursor afterwards, so open this stream before the window under test starts counting
-    /// anything.
+    /// The first call verifies the desktop's absolute-coordinate mapping by placing three
+    /// probes and reading back where they landed, and returns [`Error::Calibration`] if one
+    /// misses rather than proceeding approximately. It injects three moves and restores the
+    /// cursor, so open this stream before the window under test starts counting messages.
     pub fn mouse(&mut self) -> Result<MouseStream<'_>> {
         if self.desktop.is_none() {
             self.desktop = Some(mouse::Desktop::verified(self.injection.injector())?);
@@ -295,44 +279,42 @@ impl Injector {
         Ok(MouseStream::new(self))
     }
 
-    /// A touch stream carrying up to `contacts` simultaneous contacts.
+    /// Opens a touch stream carrying up to `contacts` simultaneous contacts.
     ///
-    /// Every injected frame carries the whole live contact set, which is the platform's rule
-    /// rather than a convenience: a frame that omits a contact still down ends it. The stream
-    /// assembles that frame, so moving one contact holds the others where they are instead of
-    /// dropping them.
+    /// Every injected frame carries the whole live contact set: a frame that omits a contact
+    /// still down ends that contact. The stream assembles the frame, so moving one contact
+    /// holds the others where they are.
     pub fn touch(&mut self, contacts: u32) -> Result<TouchStream<'_>> {
         TouchStream::open(self, contacts)
     }
 
-    /// A pen stream. One contact, with pressure, tilt, the barrel button and the inverted end
-    /// — and a hover, which is the thing a pen has that touch does not.
+    /// Opens a pen stream: one contact with pressure, tilt, the barrel button, the inverted
+    /// end, and hover, which no other device here reports.
     ///
-    /// **Refused in an unpackaged process**, because a pen is a virtual device and creating
-    /// one needs the `inputInjectionBrokered` capability ([`Capability`]). Refusing is the
-    /// point: every call on that path returns success and delivers nothing, so a stream that
-    /// ran would let a test pass on no input at all.
+    /// Refused in an unpackaged process. A pen is a virtual device, and creating one needs
+    /// the `inputInjectionBrokered` capability ([`Capability`]); without it every pen call
+    /// returns success and delivers nothing.
     pub fn pen(&mut self) -> Result<PenStream<'_>> {
         self.require_brokered()?;
         PenStream::open(self)
     }
 
-    /// A precision-touchpad stream.
+    /// Opens a precision-touchpad stream.
     ///
-    /// Its coordinates are **fractions of the pad**, not window DIPs, because a touchpad is
-    /// an indirect device: it has no screen position, and the recogniser that reads it
-    /// reports in units relative to the device. See [`TouchpadStream`].
+    /// Its coordinates are fractions of the pad rather than window DIPs: a touchpad is
+    /// indirect, has no screen position, and the recogniser reading it reports in units
+    /// relative to the device. See [`TouchpadStream`].
     ///
-    /// **Refused in an unpackaged process**, for the same reason as [`pen`](Self::pen): its
-    /// contacts come from a virtual device. [`TouchpadStream::action`] does *not* — a global
-    /// gesture is a message to a tracked window rather than a device sample — which is why the
-    /// two inertia signals are reachable where touchpad contacts are not.
+    /// Refused in an unpackaged process, because its contacts come from a virtual device, as
+    /// [`pen`](Self::pen)'s do. [`TouchpadStream::action`] needs no such device — a global
+    /// gesture is a message to a tracked window rather than a device sample — so the two
+    /// inertia signals stay reachable where touchpad contacts are not.
     pub fn touchpad(&mut self) -> Result<TouchpadStream<'_>> {
         self.require_brokered()?;
         TouchpadStream::open(self)
     }
 
-    /// Whether this process could create a virtual input device at all.
+    /// Succeeds when this process has the package identity a virtual input device needs.
     fn require_brokered(&self) -> Result<()> {
         if identity::packaged() {
             Ok(())
@@ -343,7 +325,7 @@ impl Injector {
         }
     }
 
-    /// A key press and release.
+    /// Presses a key and releases it.
     pub fn key(&mut self, key: Key) -> Result<&mut Self> {
         self.key_down(key)?.key_up(key)
     }
@@ -360,12 +342,12 @@ impl Injector {
         Ok(self)
     }
 
-    /// Waits, precisely, without injecting anything.
+    /// Waits `duration` without injecting anything.
     ///
-    /// A hold is a gap in a stream rather than an absence of one: a press held for 900 ms is
-    /// what raises `Holding`, and the recogniser measures that against a clock this harness
-    /// has to be honest with. `thread::sleep` is not — its resolution is the scheduler's
-    /// tick, an order of magnitude coarser than the thresholds under test.
+    /// A held press is a gap in the stream — 900 ms of it is what raises `Holding` — and the
+    /// recogniser measures that gap against its own clock, so the wait runs on a
+    /// high-resolution timer. `thread::sleep` resolves to the scheduler's tick, an order of
+    /// magnitude coarser than the thresholds under test.
     pub fn wait(&mut self, duration: core::time::Duration) -> Result<&mut Self> {
         self.pace.sleep(duration)?;
         Ok(self)

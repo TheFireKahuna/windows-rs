@@ -1,12 +1,12 @@
-//! Handing a tree across threads without either side waiting on the other.
+//! Publishes the accessibility tree and the region declarations across threads.
 //!
-//! The same shape a presentation region publishes its parts with: a version anybody can
-//! read, and the value behind a lock only the publisher and a stale reader ever take. A
-//! client walking the tree does one acquire load per query and touches no lock at all;
-//! the front thread takes the lock once per republish, which is once per layout change.
+//! Each holds a version any thread can read and a value behind a lock. A reader compares
+//! the version against the copy it already holds and takes the lock only when the version
+//! moved, so a query against an unchanged tree is one acquire load. The front thread takes
+//! the lock once per publish, which is once per layout change.
 //!
-//! The reader keeps its own reference rather than copying out of a slot the writer cycles.
-//! That buys the same freedom from blocking and costs no cutover protocol to get wrong.
+//! A reader keeps its own `Arc` rather than copying out of a slot the writer cycles, so
+//! there is no cutover window for a reader to land in.
 
 use super::tree::{Part, Tree};
 use std::cell::RefCell;
@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use windows_scene::ControlId;
 
+/// The published tree, with the version a reader checks before taking the lock.
 #[derive(Debug)]
 pub struct Slot {
     version: AtomicU64,
@@ -30,25 +31,28 @@ impl Default for Slot {
 }
 
 impl Slot {
-    /// Replaces the tree, and hands back what it replaced so the caller can carry the live
-    /// half forward.
+    /// Replaces the published tree and returns the one it replaced, so the caller can carry
+    /// its live half forward.
     pub fn publish(&self, tree: Arc<Tree>) -> Arc<Tree> {
         let previous = {
             let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
             core::mem::replace(&mut *current, tree)
         };
-        // Released *after* the value, so a reader that sees the new version cannot then
-        // read the old tree.
+        // release: pairs with the acquire in `read`. Bumped after the value is installed,
+        // so a reader that sees this version finds the new tree under the lock.
         self.version.fetch_add(1, Ordering::Release);
         previous
     }
 
-    /// The current tree, refreshing this thread's own reference only if it has moved.
+    /// Returns the current tree, refreshing `cached` only when the version has moved.
     ///
-    /// A poisoned lock is stepped over rather than propagated: the tree is plain data with
-    /// no invariant a panicking publisher could have broken halfway, and an accessibility
-    /// client should not inherit a panic from the thread it is reading.
+    /// `cached` is this thread's own reference and the version it was taken at. A poisoned
+    /// lock is stepped over rather than propagated: the tree is plain data, and a publisher
+    /// that panicked left either the outgoing `Arc` or the incoming one, never a half-built
+    /// tree.
     pub fn read(&self, cached: &RefCell<Option<(u64, Arc<Tree>)>>) -> Arc<Tree> {
+        // acquire: pairs with the release in `publish`, so a version this observes as new
+        // means the tree behind the lock is the one it names.
         let version = self.version.load(Ordering::Acquire);
         if let Some((seen, tree)) = cached.borrow().as_ref()
             && *seen == version
@@ -61,14 +65,12 @@ impl Slot {
     }
 }
 
-/// What a presentation region declares about itself, beside the tree rather than in it.
+/// What each presentation region declares about itself, held beside the tree.
 ///
-/// **Not in the tree, and that is the whole point.** A region's parts move whenever its
-/// renderer's mapping does — a range change, a band added, a resize — and a band being
-/// dragged moves them per frame. Baking them into the snapshot would make each of those a
-/// republish of every element on the screen. They are also the one thing a *producer*
-/// owns: the cell a region's value is read from is written by the thread that drew the
-/// pixels it describes, so it outlives any one tree by construction.
+/// A region's parts move whenever its renderer's mapping does — a range change, a band
+/// added, a resize, every frame of a drag — so they are versioned separately here and a
+/// change to them republishes no tree. The value cell is the producer's: it is written by
+/// the thread that drew the pixels it describes and outlives any one tree.
 #[derive(Debug, Default)]
 pub struct Regions {
     version: AtomicU64,
@@ -83,12 +85,12 @@ struct Row {
 }
 
 impl Regions {
-    /// Replaces what `id` declares. `None` leaves that half alone.
+    /// Replaces what `id` declares, adding the row on first use.
     ///
-    /// The parts are **copied into the row's own buffer** rather than handed over behind a
-    /// pointer. A band being dragged republishes its geometry every frame, so this is the
-    /// one write here that is not rare — and a row at its high-water mark makes it a
-    /// memcpy under a lock nobody contends, rather than an allocation per frame.
+    /// A `None` argument leaves that half of the declaration as it was. The parts are
+    /// copied into the row's own buffer rather than handed over behind a pointer, so a row
+    /// at its high-water mark takes a memcpy under an uncontended lock rather than an
+    /// allocation per frame of a drag.
     pub fn declare(&self, id: ControlId, parts: Option<&[Part]>, value: Option<Arc<AtomicU64>>) {
         let mut rows = self.rows.lock().unwrap_or_else(|e| e.into_inner());
         if !rows.iter().any(|row| row.id == id) {
@@ -108,22 +110,29 @@ impl Regions {
         if value.is_some() {
             row.value = value;
         }
+        // release: pairs with the acquire in `refresh`, so a reader that sees this version
+        // finds the declaration it names under the lock.
         self.version.fetch_add(1, Ordering::Release);
     }
 
+    /// Drops what `id` declares, so nothing is published for it.
     pub fn forget(&self, id: ControlId) {
         self.rows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|row| row.id != id);
+        // release: pairs with the acquire in `refresh`, so a reader that sees this version
+        // finds the row gone.
         self.version.fetch_add(1, Ordering::Release);
     }
 
-    /// This thread's own copy, refreshed only when a declaration moved.
+    /// Refreshes this thread's copy of the declarations, and only when the version moved.
     ///
-    /// The same bargain the tree's slot makes: a hover reads one atomic and takes no lock,
-    /// and only the rare pass where the mapping actually changed pays for a refresh.
+    /// A pass with nothing declared since the last one reads one atomic and takes no lock.
+    /// A refresh reuses each row's buffers rather than reallocating them.
     fn refresh(&self, cached: &RefCell<(u64, Vec<Row>)>) {
+        // acquire: pairs with the release in `declare` and `forget`, so a version this
+        // observes as new means the rows behind the lock are the ones it names.
         let version = self.version.load(Ordering::Acquire);
         if cached.borrow().0 == version {
             return;
@@ -140,8 +149,8 @@ impl Regions {
         cached.0 = version;
     }
 
-    /// The parts `id` declared, handed to `f`. Borrowed rather than cloned, because the
-    /// caller scans them and drops them.
+    /// Calls `f` with the parts `id` declared, or with an empty slice where it declared
+    /// none. The parts are borrowed from this thread's copy rather than cloned.
     pub fn with_parts<R>(&self, id: ControlId, f: impl FnOnce(&[Part]) -> R) -> R {
         SEEN_REGIONS.with(|cached| {
             self.refresh(cached);
@@ -155,7 +164,8 @@ impl Regions {
         })
     }
 
-    /// The value a producer writes for `id`, if it declared one.
+    /// Returns the value a producer wrote for `id`, or `None` where it declared no cell or
+    /// the cell holds no finite number.
     pub fn value(&self, id: ControlId) -> Option<f64> {
         SEEN_REGIONS.with(|cached| {
             self.refresh(cached);
@@ -166,6 +176,8 @@ impl Regions {
                 .find(|row| row.id == id)?
                 .value
                 .as_ref()?
+                // relaxed: the cell stands alone, with no other datum ordered against it,
+                // so a reader takes whichever whole value is current.
                 .load(Ordering::Relaxed);
             let value = f64::from_bits(bits);
             value.is_finite().then_some(value)
@@ -174,6 +186,7 @@ impl Regions {
 }
 
 thread_local! {
+    /// This thread's copy of the declarations, with the version it was taken at.
     static SEEN_REGIONS: RefCell<(u64, Vec<Row>)> = const { RefCell::new((0, Vec::new())) };
 }
 

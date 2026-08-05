@@ -1,40 +1,34 @@
-//! The mouse stream, and the one device here that shares something with the user.
+//! The mouse stream, and the only device here that shares its state with the user.
 //!
-//! Two properties follow from the platform and neither is a choice this crate made:
+//! Two properties come from the platform:
 //!
-//! * **A mouse sample carries no position.** `InjectedInputMouseInfo` states an absolute
-//!   coordinate normalized to a 16-bit grid over the virtual desktop, so on a wide desktop
-//!   a whole pixel is a fraction of one normalized step and the mapping back is not the
-//!   identity. [`Desktop::normalize`] inverts it in closed form — aiming at the *centre* of
-//!   the interval that lands on the wanted pixel — and [`Desktop::verified`] proves that, at
-//!   three points across the desktop, before a single test sample is placed. A miss is
-//!   [`Error::Calibration`]: a failure, not a correction. A harness that instead corrects
-//!   its aim against `GetCursorPos` injects up to three moves per logical one, and a drag's
-//!   integral counts every one of them.
-//! * **There is one system cursor and this is not its only source.** No injection API
+//! * A mouse sample carries no pixel position. `InjectedInputMouseInfo` states an absolute
+//!   coordinate normalized to a 16-bit grid over the virtual desktop, so on a wide desktop a
+//!   whole pixel spans a fraction of one normalized step and the mapping back is not the
+//!   identity. [`Desktop::normalize`] inverts it in closed form, aiming at the centre of the
+//!   interval that lands on the wanted pixel, and [`Desktop::verified`] checks that at three
+//!   points across the desktop before any test sample is placed. A miss is
+//!   [`Error::Calibration`] rather than a correction: correcting aim against `GetCursorPos`
+//!   injects up to three moves per logical one, and a drag's integral counts every one.
+//! * There is one system cursor, and this crate is not its only source. No injection API
 //!   produces a `PT_MOUSE` stream on a device of its own — pen, touch and touchpad each get
-//!   one, mouse does not — so a hand resting on a real mouse adds travel to a drag whose
-//!   total is the thing under test. That is a property of the device class rather than of
-//!   this harness, and the answer is that **the exactness contract is asserted on touch**,
-//!   which has its own device and cannot be interfered with. Mouse is here for `PT_MOUSE`
-//!   coverage, and its own integral is a diagnostic.
+//!   one — so a hand on a real mouse adds travel to a drag whose total is under test. The
+//!   exactness contract is therefore asserted on touch, which has its own device. Mouse
+//!   covers `PT_MOUSE`, and its own integral is a diagnostic.
 //!
-//! **A path is one sample per call, paced.** `InjectMouseInput` takes a sequence and each
-//! sample can carry its own offset in milliseconds, which reads like the right way to state a
-//! rate — and it is not. Measured on 26200 against a pumping window: a 40-sample zigzag handed
-//! over as three batched calls arrives as 16 messages carrying 353 DIPs of a 557-DIP path,
-//! while the same path injected one sample per call, spaced by a high-resolution timer,
-//! arrives whole. The batch is a convenience for throughput, not a fidelity mechanism, and
-//! this stream wants fidelity.
+//! A path is one sample per call, paced by a high-resolution timer. `InjectMouseInput` takes
+//! a sequence whose samples each carry an offset in milliseconds, and that sequence is
+//! coalesced. Measured on 26200 against a pumping window: a 40-sample zigzag handed over as
+//! three batched calls arrives as 16 messages carrying 353 DIPs of a 557-DIP path, while the
+//! same path injected one sample per call arrives whole.
 //!
-//! Two things about that sequence are worth recording even though nothing here uses it now,
-//! because the next person to reach for it will meet both: **it caps at sixteen samples per
-//! call** — seventeen is `E_INVALIDARG`, undocumented, and the message names neither the
-//! parameter nor the limit — and the samples it does accept are coalesced as above.
+//! Two further limits on that sequence: it caps at sixteen samples per call — seventeen is
+//! `E_INVALIDARG`, and the message names neither the parameter nor the limit — and the samples
+//! it accepts are coalesced as above.
 //!
-//! One consequence worth knowing before it confuses a run: **an absolute move to the pixel the
-//! cursor is already on produces no input at all.** A path with a repeated point is a path one
-//! sample short, and the harness cannot tell that apart from a stack that dropped it.
+//! An absolute move to the pixel the cursor is already on produces no input at all. A path
+//! with a repeated point therefore arrives one sample short, which reads the same as a stack
+//! that dropped one.
 
 use windows_collections::IIterable;
 
@@ -42,8 +36,8 @@ use crate::bindings::*;
 use crate::space::Point;
 use crate::{Error, Injector, Rate, Result};
 
-/// The virtual desktop an absolute mouse coordinate is normalized against, once the
-/// normalization has been proven to place a sample exactly.
+/// Holds the virtual-desktop extent an absolute mouse coordinate is normalized against,
+/// verified to place a sample on the exact pixel asked for.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Desktop {
     left: i32,
@@ -54,7 +48,8 @@ pub(crate) struct Desktop {
 
 impl Desktop {
     fn read() -> Self {
-        // SAFETY: each takes an index and returns a metric.
+        // SAFETY: each call takes a metric index by value and returns a number; no pointer
+        // crosses the boundary.
         unsafe {
             Self {
                 left: GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -65,13 +60,13 @@ impl Desktop {
         }
     }
 
-    /// The normalized coordinate that lands on exactly this screen pixel.
+    /// Returns the normalized coordinate that lands on exactly the screen pixel `(x, y)`.
     ///
     /// The system maps a normalized value back by scaling it into the desktop's extent and
-    /// truncating, so a *range* of normalized values lands on each pixel. Aiming at the
-    /// centre of that range — `(p + ½) · 65536 / extent` — leaves the whole half-interval as
-    /// margin, which on a 7680-pixel desktop is about four normalized steps either way. That
-    /// is what makes one verification enough rather than one per pixel.
+    /// truncating, so a range of normalized values lands on each pixel. Aiming at the centre
+    /// of that range — `(p + ½) · 65536 / extent` — leaves the whole half-interval as margin,
+    /// which on a 7680-pixel desktop is about four normalized steps either way. That margin
+    /// is why one verification covers the desktop rather than one per pixel.
     const fn normalize(&self, x: i32, y: i32) -> (i32, i32) {
         (
             normalize_axis(x, self.left, self.width),
@@ -79,19 +74,16 @@ impl Desktop {
         )
     }
 
-    /// Reads the desktop and proves its mapping, or refuses to place a sample.
+    /// Reads the desktop and verifies its mapping, or returns [`Error::Calibration`].
     ///
-    /// Three probes: near the origin, at the centre, and near the far corner — the places a
-    /// rounding rule that is off by a step or by a scale would show. The cursor is restored
-    /// afterwards, and all of it happens before the caller's first stream, so a window that
-    /// has started counting has not seen any of it.
+    /// Places three probes — near the origin, at the centre, and near the far corner — where
+    /// a rounding rule off by a step or by a scale shows. The cursor is restored afterwards,
+    /// and the whole sequence runs before the caller's first stream.
     ///
-    /// **Each probe is attempted more than once, and that is not a correction.** The cursor
-    /// is shared: a hand on a real mouse moves it between the injection and the read, and the
-    /// miss that produces is indistinguishable from a mapping that is wrong. A retry
-    /// separates them — a wrong mapping misses every time, a competing device does not — and
-    /// it costs nothing a measurement could see, because calibration happens before the first
-    /// measured sample.
+    /// Each probe is retried rather than corrected. The cursor is shared, so a competing
+    /// device moving it between the injection and the read produces a miss indistinguishable
+    /// from a wrong mapping; a wrong mapping misses on every attempt and a competing device
+    /// does not.
     pub(crate) fn verified(injector: &InputInjector) -> Result<Self> {
         const ATTEMPTS: u32 = 4;
         let desktop = Self::read();
@@ -119,8 +111,8 @@ impl Desktop {
                 }
             }
             if !held {
-                // Put the cursor back before reporting, so a failing run does not also leave
-                // the pointer in a corner.
+                // Put the cursor back before reporting, so a failing run does not leave the
+                // pointer in a corner.
                 _ = desktop.place(injector, restore.0, restore.1);
                 return Err(Error::Calibration {
                     asked,
@@ -133,20 +125,19 @@ impl Desktop {
         Ok(desktop)
     }
 
-    /// One absolute move, to an exact screen pixel.
+    /// Injects one absolute move, landing on the screen pixel `(x, y)`.
     fn place(&self, injector: &InputInjector, x: i32, y: i32) -> Result<()> {
         let (nx, ny) = self.normalize(x, y);
         inject(injector, vec![sample(MOVE, nx, ny, 0)?])
     }
 }
 
-/// Every absolute move carries these four.
+/// The four options every absolute move carries.
 ///
-/// `MoveNoCoalesce` is not optional: the system coalesces injected moves by default, which
-/// shortens the integral a drag-fidelity assertion is written on — so a stack that dropped
-/// nothing would fail against a harness that dropped for it. A real high-rate mouse produces
-/// distinct events; so does this. `VirtualDesk` is what makes a secondary monitor reachable
-/// rather than silently assuming the primary.
+/// `MoveNoCoalesce` keeps each injected move a distinct event, as a high-rate physical mouse
+/// produces; without it the system coalesces them and shortens the integral a drag-fidelity
+/// assertion is written on. `VirtualDesk` makes the coordinate span the whole virtual
+/// desktop, so a secondary monitor is reachable.
 const MOVE: InjectedInputMouseOptions = InjectedInputMouseOptions(
     InjectedInputMouseOptions::Move.0
         | InjectedInputMouseOptions::MoveNoCoalesce.0
@@ -154,11 +145,11 @@ const MOVE: InjectedInputMouseOptions = InjectedInputMouseOptions(
         | InjectedInputMouseOptions::VirtualDesk.0,
 );
 
-/// Which button, for the buttons that are not the contact itself.
+/// Names a mouse button other than the one that starts and ends the contact.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Button {
-    /// The one a context menu answers to. A press of this while nothing is down is what
-    /// raises `RightTapped` on a mouse.
+    /// The button a context menu answers to. Pressed while nothing is down, it raises
+    /// `RightTapped`.
     Secondary,
     /// The wheel button.
     Middle,
@@ -166,11 +157,11 @@ pub enum Button {
 
 /// A mouse, aimed at the injector's space.
 ///
-/// The primary button is not on [`Button`] and that is the platform's model rather than an
-/// omission: a `WM_POINTERDOWN` is *a contact starting*, and a second button pressed while
-/// the first is held arrives as an update carrying a changed button set — never as a second
-/// down. So [`down`](Self::down) and [`up`](Self::up) start and end the contact, and
-/// [`press`](Self::press) / [`release`](Self::release) change the buttons within one.
+/// The primary button is absent from [`Button`] because it is the contact: a `WM_POINTERDOWN`
+/// is a contact starting, and a second button pressed while the first is held arrives as an
+/// update carrying a changed button set rather than as a second down. So [`down`](Self::down)
+/// and [`up`](Self::up) start and end the contact, and [`press`](Self::press) /
+/// [`release`](Self::release) change the buttons within one.
 pub struct MouseStream<'a> {
     injector: &'a mut Injector,
     down: bool,
@@ -187,13 +178,13 @@ impl<'a> MouseStream<'a> {
     }
 
     fn desktop(&self) -> Desktop {
-        // Set by `Injector::mouse` before this type is constructed, and never cleared.
+        // `Injector::mouse` sets this before constructing the stream, and nothing clears it.
         self.injector
             .desktop
             .expect("a mouse stream exists only after its desktop mapping was verified")
     }
 
-    /// Moves to a point, exactly.
+    /// Moves to a point, landing on the exact pixel it maps to.
     pub fn move_to(&mut self, to: impl Into<Point>) -> Result<&mut Self> {
         let to = to.into();
         let (x, y) = self.injector.space.to_px(to);
@@ -205,9 +196,8 @@ impl<'a> MouseStream<'a> {
 
     /// Moves to a point and starts a contact there.
     ///
-    /// The move is separate from the press on purpose: a press at a position the pointer has
-    /// not been to is a press whose target the stack resolves from a sample it never saw
-    /// arrive, which is not what a user does.
+    /// The move is injected before the press, so the stack resolves the press against a
+    /// position it has already seen the pointer reach.
     pub fn down(&mut self, at: impl Into<Point>) -> Result<&mut Self> {
         self.move_to(at)?;
         self.button(InjectedInputMouseOptions::LeftDown)?;
@@ -240,17 +230,16 @@ impl<'a> MouseStream<'a> {
         Ok(self)
     }
 
-    /// A press and a release, without moving between them. What a `Tapped` is made of.
+    /// Presses and releases without moving between them, which is what raises `Tapped`.
     pub fn tap(&mut self, at: impl Into<Point>) -> Result<&mut Self> {
         self.down(at)?.up()
     }
 
-    /// Walks a path, one sample per call, waiting `rate` between them.
+    /// Walks a path, injecting one sample per call and waiting `rate` between them.
     ///
-    /// One call per sample rather than one call per path, and that is measured rather than
-    /// stylistic — see this module's documentation. The wait is a high-resolution timer or
-    /// the compositor clock, never `thread::sleep`, whose resolution is coarser than the
-    /// rates under test.
+    /// One call per sample rather than one call per path, because `InjectMouseInput`
+    /// coalesces a batched sequence. The wait is a high-resolution timer or the compositor
+    /// clock, never `thread::sleep`, whose resolution is coarser than the rates under test.
     pub fn polyline(&mut self, points: &[Point], rate: Rate) -> Result<&mut Self> {
         if points.is_empty() {
             return Ok(self);
@@ -304,9 +293,8 @@ impl<'a> MouseStream<'a> {
 impl Drop for MouseStream<'_> {
     /// Ends a contact the caller left down.
     ///
-    /// A test that fails mid-drag would otherwise leave the button held for the rest of the
-    /// session, and every later test in the same process would run against a machine with the
-    /// mouse pressed.
+    /// Without this, a drive that fails mid-drag leaves the button held for the rest of the
+    /// session and every later test in the process runs with the mouse pressed.
     fn drop(&mut self) {
         if self.down
             && let Ok(one) = sample(InjectedInputMouseOptions::LeftUp, 0, 0, 0)
@@ -316,12 +304,12 @@ impl Drop for MouseStream<'_> {
     }
 }
 
-/// One axis of [`Desktop::normalize`].
+/// Normalizes one axis for [`Desktop::normalize`].
 const fn normalize_axis(value: i32, origin: i32, extent: i32) -> i32 {
     (((value - origin) as i64 * 2 + 1) * 32768 / extent as i64) as i32
 }
 
-/// One mouse sample.
+/// Builds one mouse sample.
 fn sample(
     options: InjectedInputMouseOptions,
     dx: i32,
@@ -335,8 +323,8 @@ fn sample(
         info.SetDeltaX(dx)?;
         info.SetDeltaY(dy)?;
         info.SetMouseData(data)?;
-        // Zero, so the platform stamps the sample as it takes it. The offset only means
-        // something inside a batch, and a batch is not what this stream sends.
+        // Zero, so the platform stamps the sample as it takes it. The offset is meaningful
+        // only within a batched sequence, which this stream does not send.
         info.SetTimeOffsetInMilliseconds(0)
     };
     fill().map_err(|e| Error::call("InjectedInputMouseInfo", e))?;
@@ -362,7 +350,7 @@ fn inject(injector: &InputInjector, batch: Vec<Option<InjectedInputMouseInfo>>) 
         .map_err(|e| Error::call("InjectMouseInput", e))
 }
 
-/// Where the cursor actually is.
+/// Returns the cursor's current screen position.
 fn cursor() -> Result<(i32, i32)> {
     let mut point = POINT::default();
     // SAFETY: the destination is a stack local the call writes back through.
@@ -372,12 +360,11 @@ fn cursor() -> Result<(i32, i32)> {
     Ok((point.x, point.y))
 }
 
-/// Reads the cursor until it reaches `target` or a deadline passes, and answers with where it
-/// actually got to.
+/// Returns the position the cursor reached, polling until it matches `target` or 250 ms pass.
 ///
 /// Injection is asynchronous — the sample crosses the raw input thread — so reading the cursor
-/// in the same breath as injecting reads the position from before the move. This is a read
-/// loop and not a wait: it adds no input, and it is used only while proving the mapping.
+/// immediately after injecting reads the position from before the move. This loop injects
+/// nothing, and runs only while verifying the mapping.
 fn settle(target: (i32, i32)) -> Result<(i32, i32)> {
     let deadline = std::time::Instant::now() + core::time::Duration::from_millis(250);
     loop {

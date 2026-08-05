@@ -1,14 +1,12 @@
-//! Telling a client what changed.
+//! Queues and raises the automation events for what a tick changed.
 //!
-//! Raised from the front thread at the end of the tick, after the publish. Both halves of
-//! that matter: an event is only correct if the tree is consistent at the instant of the
-//! call, and raising from inside an input handler re-enters a client's callback in the
-//! middle of a gesture. Draining at one point gets both without either being remembered.
+//! A flush runs on the front thread at the end of the tick, after the publish, so the tree
+//! is consistent when a client reads it back and no raise re-enters a client's callback in
+//! the middle of an input handler.
 //!
-//! A raise is coalesced to one per element per property per tick — a drag would otherwise
-//! raise a property change per pointer sample — and a coalesced one keeps the **oldest**
-//! previous value and the **newest** current one, which is what the whole burst amounted
-//! to.
+//! A property raise is folded to one per element per property per tick, keeping the oldest
+//! previous value and the newest current one, so a drag reports one change spanning the
+//! whole burst rather than one per pointer sample.
 
 use crate::bindings::{
     IRawElementProviderSimple, StructureChangeType_ChildrenBulkAdded,
@@ -22,17 +20,17 @@ use crate::bindings::{
 use windows_core::Interface;
 use windows_scene::ControlId;
 
-/// What a tick has to tell a client about.
+/// One event a tick has to raise.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Raise {
     /// The tree was replaced. One event for the whole change, not one per element.
     Structure,
     Focus(ControlId),
     Invoked(ControlId),
-    /// A property, **with what it was and what it is**.
+    /// A property change, carrying both the previous and the current value.
     ///
-    /// Both, because automation compares them: a change reported as empty-to-empty is a
-    /// change from nothing to nothing, and never reaches a listener.
+    /// Automation compares the two: a raise whose values are both empty describes a
+    /// change from nothing to nothing and reaches no listener.
     Property {
         id: ControlId,
         what: Property,
@@ -45,7 +43,7 @@ pub enum Raise {
     TooltipOpened(ControlId),
 }
 
-/// The properties this stack announces a change to, and the type each carries.
+/// A property this stack raises changes for, and the type it is reported as.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Property {
     /// `RangeValue.Value`, as a double.
@@ -59,6 +57,7 @@ pub enum Property {
 }
 
 impl Property {
+    /// Returns the automation property id this property is raised under.
     #[must_use]
     pub const fn id(self) -> i32 {
         match self {
@@ -69,7 +68,7 @@ impl Property {
         }
     }
 
-    /// A boolean state, in whichever type this property is reported as.
+    /// Returns `on` in the variant type this property is reported as.
     #[must_use]
     pub const fn of(self, on: bool) -> Val {
         match self {
@@ -98,14 +97,19 @@ impl Val {
     }
 }
 
-/// The pending set. Bounded by the number of elements that changed in one tick, and its
-/// allocation is kept across ticks, so a steady drag allocates nothing.
+/// The events queued for the current tick.
+///
+/// Bounded by the number of elements that changed in that tick. The allocation is kept
+/// across ticks, so a steady drag allocates nothing.
 #[derive(Debug, Default)]
 pub struct Pending(Vec<Raise>);
 
 impl Pending {
-    /// Records an event, folding it into one that says the same thing about the same
-    /// element.
+    /// Records `raise`, folding it into a queued event that names the same element.
+    ///
+    /// A property change merges into the queued change for that element and property,
+    /// keeping the queued previous value and taking the new current one. Any other event
+    /// is recorded once and a duplicate is dropped.
     pub fn push(&mut self, raise: Raise) {
         if let Raise::Property { id, what, to, .. } = raise {
             // The burst becomes one change: from where it started to where it ended.
@@ -121,26 +125,26 @@ impl Pending {
         self.0.push(raise);
     }
 
+    /// Returns whether nothing is queued.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    /// Moves what is pending into `out` without raising it. The tests' whole view of this
-    /// module.
+    /// Moves everything queued into `out` without raising it.
     ///
-    /// Appends rather than hands the buffer over, for the same reason [`flush`](Self::flush)
-    /// drains: the set keeps its allocation across ticks, and a helper that took it would
-    /// make the next event allocate and the measurement blame the code for the helper.
+    /// Appends rather than handing the buffer over, as [`flush`](Self::flush) drains
+    /// rather than replacing it, so the set keeps its allocation across ticks.
     #[cfg(test)]
     pub fn take(&mut self, out: &mut Vec<Raise>) {
         out.append(&mut self.0);
     }
 
-    /// Raises everything pending, then empties the set.
+    /// Raises every queued event, then empties the set.
     ///
-    /// `provider` resolves an element to the object a client holds; an element that has
-    /// gone since the event was recorded resolves to nothing and is skipped, which is the
-    /// correct outcome rather than a failure.
+    /// `provider` resolves an element to the object a client holds. An element that has
+    /// unmounted since the event was recorded resolves to `None` and is skipped rather
+    /// than failing the flush. Nothing is raised when no client is [`listening`], and the
+    /// set is emptied either way.
     pub fn flush(&mut self, provider: impl Fn(ControlId) -> Option<IRawElementProviderSimple>) {
         if self.0.is_empty() {
             return;
@@ -152,14 +156,14 @@ impl Pending {
         for raise in self.0.drain(..) {
             let (id, event) = match raise {
                 Raise::Structure => {
-                    // Named on the fragment root — a bulk change over the whole window,
-                    // because the array is replaced wholesale and there is no diff to
-                    // describe.
+                    // Raised on the fragment root as a bulk change: the array is replaced
+                    // wholesale, so there is no per-element diff to describe.
                     let Some(root) = provider(ControlId::NONE) else {
                         continue;
                     };
-                    // SAFETY: a live provider, and a runtime id of zero length, which is
-                    // what "the root itself" means for a bulk change.
+                    // SAFETY: `root` is a provider object alive for the call, and a null
+                    // runtime id of length zero names the root itself, which is the form a
+                    // bulk change takes.
                     unsafe {
                         _ = UiaRaiseStructureChangedEvent(
                             root.as_raw(),
@@ -174,9 +178,9 @@ impl Pending {
                     let Some(element) = provider(id) else {
                         continue;
                     };
-                    // SAFETY: a live provider, and two variants of the type this property
-                    // is reported as. Both are plain scalars, so neither owns an allocation
-                    // the callee would have to release.
+                    // SAFETY: `element` is a provider object alive for the call, and both
+                    // variants carry the type this property is reported as. Each holds a
+                    // scalar, so neither owns an allocation the callee would release.
                     unsafe {
                         _ = UiaRaiseAutomationPropertyChangedEvent(
                             element.as_raw(),
@@ -197,7 +201,8 @@ impl Pending {
             let Some(element) = provider(id) else {
                 continue;
             };
-            // SAFETY: a live provider and a constant event id.
+            // SAFETY: `element` is a provider object alive for the call, and `event` is one
+            // of the event id constants above.
             unsafe {
                 _ = UiaRaiseAutomationEvent(element.as_raw(), event);
             }
@@ -205,13 +210,14 @@ impl Pending {
     }
 }
 
-/// Whether raising an event could reach anybody.
+/// Returns whether a raised event could reach a client.
 ///
-/// A hint rather than a guarantee — measured `true` on a bare desktop with nothing
-/// attached — which is why it gates only the cost of a raise and nothing structural.
+/// A hint rather than a guarantee: it answers `true` on a desktop with no client attached,
+/// so it gates only the cost of raising and nothing structural.
 #[must_use]
 pub fn listening() -> bool {
-    // SAFETY: no arguments, no state, callable from any thread.
+    // SAFETY: the call takes no arguments, reads no caller state, and is callable from any
+    // thread.
     unsafe { UiaClientsAreListening().as_bool() }
 }
 
@@ -219,8 +225,8 @@ pub fn listening() -> bool {
 mod tests {
     use super::*;
 
-    /// Minted through the real authority: an id is generational, and forging one would
-    /// test a shape the rest of the stack cannot produce.
+    /// Mints `count` ids through the id authority. An id is generational, so a value not
+    /// minted here is not one the stack can produce.
     fn ids(count: usize) -> Vec<ControlId> {
         let mut authority = windows_scene::Ids::<windows_scene::Control>::new();
         (0..count).map(|_| authority.mint()).collect()

@@ -1,22 +1,21 @@
-//! The two `user32` exports this harness uses that no header on the platform floor names.
+//! The two `user32` exports this harness resolves by name, because no header on the platform
+//! floor declares them.
 //!
-//! `CreateSyntheticPointerDevice2` and `InjectTouchpadAction` are documented on Learn
-//! against Windows 11 and both are **absent from the 26100 SDK's own `winuser.h`**, which
-//! carries `// TODO(47499024): Make public when Feature_TouchpadPublicApis3 is enabled`
-//! exactly where they and their types belong. The types are transcribed into
-//! `metadata/syntheticinput.rdl` and generated; the functions are resolved here, by name.
+//! `CreateSyntheticPointerDevice2` and `InjectTouchpadAction` are documented against Windows
+//! 11 and absent from the 26100 SDK's own `winuser.h`, which carries
+//! `// TODO(47499024): Make public when Feature_TouchpadPublicApis3 is enabled` exactly where
+//! they and their types belong. The types are transcribed into `metadata/syntheticinput.rdl`
+//! and generated; the functions are resolved here, by name.
 //!
-//! The reason they are not `link!`ed alongside everything else is the same one
-//! `windows-ui` gives for `GetPointerTouchpadInfo`: a static import the running `user32`
-//! does not export fails the **process load**, so a machine at the floor without them
-//! would lose mouse and touch injection too — streams that never needed either function.
-//! Probe by name, record the result, refuse the streams that depend on it.
+//! A static import of an export the running `user32` does not have fails the process load, so
+//! `link!`ing these would cost mouse and touch injection on a machine at the floor — streams
+//! that need neither function. They are probed by name instead, the result is reported by
+//! [`Capability`], and the streams that depend on them are refused.
 //!
-//! What cannot be resolved this way is `WM_STOPINERTIA` and `WM_ENDINERTIA`, which the same
-//! redaction hides. A message number is not an export. `InjectTouchpadAction` is how they
-//! are read instead: `TA_INERTIA_STOP` and `TA_INERTIA_END` are documented to produce
-//! exactly one of each, to the window that last reported content inertia — see
-//! `examples/inertia_numbers`.
+//! `WM_STOPINERTIA` and `WM_ENDINERTIA` are hidden by the same redaction and cannot be
+//! resolved this way, because a message number is not an export. `InjectTouchpadAction`
+//! reaches them instead: `TA_INERTIA_STOP` and `TA_INERTIA_END` each produce exactly one of
+//! them, to the window that last reported content inertia.
 
 use crate::bindings::*;
 use crate::{Error, Result};
@@ -29,10 +28,10 @@ type CreateDevice2 =
 type InjectAction =
     unsafe extern "system" fn(HSYNTHETICPOINTERDEVICE, TOUCHPAD_ACTION) -> windows_core::BOOL;
 
-/// What the running `user32` turned out to have.
+/// Reports what this process and the running `user32` can inject.
 ///
-/// A capability, never a mode: a stream is refused with the export's own name in the
-/// error, rather than quietly becoming a different stream.
+/// A stream that depends on a missing entry is refused with that entry's name in the error,
+/// rather than becoming a different stream.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Capability {
     /// Whether this process could create a virtual input device at all.
@@ -44,11 +43,11 @@ pub struct Capability {
     /// was declared, but not having it proves the capability cannot have been.
     pub packaged: bool,
     /// Whether `CreateSyntheticPointerDevice2` resolved. Necessary for a touchpad stream, and
-    /// not sufficient — see `packaged`.
+    /// not sufficient: [`Capability::packaged`] is the other half.
     pub synthetic_devices: bool,
     /// Whether the global touchpad gestures and the two inertia messages can be injected.
-    /// Unlike a contact, an action is a message to a tracked window rather than a device
-    /// sample, so this one works unpackaged.
+    /// An action is a message to a tracked window rather than a device sample, so it needs no
+    /// package identity.
     pub touchpad_actions: bool,
 }
 
@@ -59,11 +58,11 @@ pub(crate) struct Late {
 }
 
 impl Late {
-    /// Resolves both, once.
+    /// Resolves both exports, once.
     pub(crate) fn resolve() -> Self {
-        // SAFETY: `user32` is loaded into every process that has reached this code, so the
-        // handle is live and needs no free, and each signature transmuted onto an address
-        // is the documented one.
+        // SAFETY: `user32` is loaded into every process that reaches this code, so
+        // `GetModuleHandleW` returns a live borrowed handle that needs no free, and each
+        // transmuted signature is the documented one for the name it resolved from.
         unsafe {
             let user32 = GetModuleHandleW(windows_core::w!("user32.dll"));
             if user32.is_null() {
@@ -86,7 +85,7 @@ impl Late {
         }
     }
 
-    /// Creates a synthetic device, or says which export was missing.
+    /// Creates a synthetic device, or reports which export is missing.
     pub(crate) fn create_device(
         &self,
         params: &SYNTHETIC_DEVICE_CREATION_PARAMS,
@@ -115,7 +114,8 @@ impl Late {
         let call = self.action.ok_or(Error::Unavailable {
             export: "InjectTouchpadAction",
         })?;
-        // SAFETY: as above; `device` is a live device this crate created.
+        // SAFETY: the address resolved from the documented name, and `device` is a handle
+        // owned by a live `Device`, which destroys it only on drop.
         unsafe { call(device, action) }
             .ok()
             .map_err(|e| Error::call("InjectTouchpadAction", e))

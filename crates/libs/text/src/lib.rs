@@ -1,10 +1,8 @@
 #![doc = include_str!("../readme.md")]
 
-// `dead_code` is `allow` and not `expect` for one standing reason: the filter carries
-// entries with no consumer in this crate — the colour-glyph enumerator, which needs a
-// sprite of its own before it can mean anything, and the glyph-run analyser, which exists
-// so a test can read back what the rasterizer produced. Narrow this the moment either
-// grows one.
+// The bindings filter carries interfaces no module here calls — the colour-glyph
+// enumerator and the glyph-run analyser — so the whole generated module allows
+// `dead_code`.
 #[allow(dead_code)]
 #[allow(
     non_snake_case,
@@ -22,14 +20,13 @@ mod hit;
 mod shape;
 mod span;
 
-// Drawing a run needs a target to draw into, which is the one thing this crate cannot
-// supply for itself. Everything above it — naming a font, shaping, measuring, carrying a
-// run as plain data — is independent of any drawing stack and is not gated.
+// Drawing a run needs a target, which comes from `windows-d2d`. Naming a font, shaping,
+// measuring and carrying a run as plain data need no drawing stack and stay ungated.
 #[cfg(feature = "d2d")]
 mod glyph;
 
-// Re-exported crate-wide so every module can `use super::*;` rather than naming the
-// generated types it touches. None of it is public: a font face leaves this crate as
+// Re-exported crate-wide so each module reaches the generated types through
+// `use super::*;`. None of it is public: a font face leaves this crate as
 // `&impl Interface`, and a run leaves it as glyph indices, advances and offsets.
 pub(crate) use bindings::*;
 pub(crate) use core::cell::RefCell;

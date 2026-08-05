@@ -1,7 +1,7 @@
-//! What the lowering claims, checked by driving it headless.
+//! Tests for the build lowering, driven headless.
 //!
 //! `Model` owns no COM, so a whole mount runs with no window, no device and no compositor,
-//! and the ops it emitted read back off the patch.
+//! and the ops it emits are read back off the patch.
 
 use super::arena::{Build, MaskSeed, Part};
 use super::*;
@@ -15,24 +15,21 @@ use windows_numerics::Vector2;
 use windows_scene::{Env, Model, Op, Paint, SinkPatch, taffy};
 use windows_text::FontLadder;
 
-/// Installs this thread's palette, text engine and a fresh host for this test.
+/// Installs this thread's palette, text engine and a fresh host, and returns a drained patch.
 ///
-/// The palette is process-wide and installs once; the engine and the host are per thread,
-/// and tests run on their own, so each gets a tree and an engine of its own to assert
-/// against.
+/// The palette is process-wide and installs once; the engine and the host are per thread, and
+/// tests run on their own, so each gets a tree and an engine of its own to assert against.
 pub(crate) fn fixture() -> SinkPatch {
     crate::role::tests::palette();
     if !super::text::installed() {
-        // The real engine, over the two inbox faces the palette names. Deliberate:
-        // a double that invented advances would let a wiring test pass while the
-        // engine it stands for measured something else entirely.
+        // The real engine, over the two inbox faces the palette names, so every width
+        // asserted below is DirectWrite's own advance rather than an invented one.
         super::text::install(FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]))
             .expect("DirectWrite is available on the platform floor");
     }
-    // The **driver's** root, not one written here: a fixture that roots differently tests an
-    // arrangement no window ever has. This one was a flex row, so a mounted child took its
-    // content width — which is how six scroll tests came to assert about a viewport zero DIPs
-    // wide, whose interaction source hit-tests nothing.
+    // The driver's own root, so a mount here is arranged exactly as a window arranges it. A
+    // root written here instead can differ — a flex row gives a mounted child its content
+    // width, which leaves a scroll viewport zero DIPs wide and hit-testing nothing.
     let mut model = Model::new(crate::layout::root());
     model.set_window(Vector2 { x: 800.0, y: 600.0 });
     Host::install(
@@ -43,8 +40,8 @@ pub(crate) fn fixture() -> SinkPatch {
         ),
         Scope::root(AccentId(0), Density::Comfortable),
     );
-    // The model minted its own root before this test existed, and that op rides the first
-    // flush. Draining it here is what makes every assertion below about *this* mount.
+    // The root's own `New` op rides the first flush. Draining it leaves the patch carrying
+    // only what the test itself mounts.
     let mut patch = SinkPatch::new();
     Host::with(|h| h.flush(&mut patch));
     patch.clear();
@@ -59,7 +56,7 @@ fn root() -> windows_scene::GroupId {
     Host::with(|h| h.model().root())
 }
 
-/// A bare rounded box, which is the smallest thing that mints a sprite.
+/// Returns a bare rounded box, the smallest view that mints a sprite.
 fn plate() -> View {
     El::<Any>::seed(crate::layout::Preset::Bare).sprite(
         MaskSeed::Box {
@@ -70,12 +67,9 @@ fn plate() -> View {
     )
 }
 
-// ── the claims ───────────────────────────────────────────────────────────────────
+// ── lowering ─────────────────────────────────────────────────────────────────────
 
-/// A slot with one sprite and no children **is** that sprite: one visual, no group.
-///
-/// This is the case that decides a screen's visual count, because most of a screen is
-/// exactly this shape.
+/// A slot with one sprite and no children lowers to that sprite: one visual, no group.
 #[test]
 fn a_single_sprite_slot_costs_one_visual() {
     let mut patch = fixture();
@@ -93,10 +87,9 @@ fn a_single_sprite_slot_costs_one_visual() {
     assert_eq!(minted, vec![windows_scene::NodeKind::Sprite]);
 }
 
-/// A container mints a group, and its children land in **paint order**.
+/// A container mints a group, and its children land in paint order.
 ///
-/// Order is the whole of z-order in this system, so it is asserted as an order and not as
-/// a set.
+/// Child order is z-order, so the ops are asserted as a sequence rather than as a set.
 #[test]
 fn children_mount_in_paint_order() {
     let mut patch = fixture();
@@ -128,19 +121,17 @@ fn children_mount_in_paint_order() {
     assert_eq!(minted[3].1, Some(minted[2].0), "the third above the second");
 }
 
-/// A **constant** channel is one `Set` at mount: no graph node, no effect.
+/// A constant channel lowers to one `Set` at mount: no graph node, no effect.
 ///
-/// This is the invariant that makes a static screen cost sprites and nothing else, and it
-/// is enforced in one place for the whole widget set.
+/// A static screen therefore costs sprites and nothing else.
 #[test]
 fn a_constant_channel_produces_no_effect() {
     let mut patch = fixture();
     let _mount = mount(plate().opacity(0.5), root());
     flush(&mut patch);
 
-    // `.opacity` declares `Motion::Chrome`, so anything that went through an effect would
-    // arrive as a spring. A plain `Set` is the proof that the constant path was taken and
-    // no effect was created.
+    // `.opacity` declares `Motion::Chrome`, so a value routed through an effect arrives as a
+    // spring. A plain `Set` means the constant path was taken and no effect was created.
     assert!(
         !patch.ops().iter().any(|op| matches!(
             op,
@@ -168,7 +159,7 @@ fn a_constant_channel_produces_no_effect() {
     assert_eq!(sets, 1);
 }
 
-/// A **reactive** channel is one effect, and writing its cell re-binds the property.
+/// A reactive channel lowers to one effect, and writing its cell re-binds the property.
 #[test]
 fn a_reactive_channel_tracks_its_cell() {
     let mut patch = fixture();
@@ -196,10 +187,9 @@ fn a_reactive_channel_tracks_its_cell() {
     assert!(bound, "a cell write must reach the sink it was bound to");
 }
 
-/// An interactive control mints exactly **one** extra visual, and parks it invisible.
+/// An interactive control mints exactly one extra visual, and parks it at zero opacity.
 ///
-/// One visual per interactive control is the cost this design accepted for a hover that
-/// costs the app thread nothing. If it ever becomes two, that trade has silently changed.
+/// The wash crossfades compositor-side, so hover costs one visual and no app-thread work.
 #[test]
 fn a_wash_is_one_extra_visual_parked_at_zero() {
     let mut patch = fixture();
@@ -243,8 +233,7 @@ fn a_wash_is_one_extra_visual_parked_at_zero() {
     );
 }
 
-/// A sprite's colour is resolved through the palette, at the **elevated** scope its
-/// surface pushed — and with the width axis pinned.
+/// A sprite's colour resolves through the palette at the scope its surface pushed.
 #[test]
 fn a_surface_elevates_the_scope_its_children_resolve_against() {
     let mut patch = fixture();
@@ -265,8 +254,8 @@ fn a_surface_elevates_the_scope_its_children_resolve_against() {
             _ => None,
         })
         .collect();
-    // A surface resolves its own chrome at the rung it pushed — a card *is* the raised
-    // thing — so what a push means is that the same sprite differs inside it and outside.
+    // A surface resolves its own chrome at the rung it pushed, so the same role paints one
+    // colour inside the push and another outside it.
     assert_eq!(
         painted.len(),
         3,
@@ -282,8 +271,7 @@ fn a_surface_elevates_the_scope_its_children_resolve_against() {
     );
 }
 
-/// A `Metric` reaches the style through the palette, so a spacing is never a number a
-/// widget wrote.
+/// A `Metric` resolves through the palette on its way into the lowered style.
 #[test]
 fn a_metric_override_lowers_through_the_palette() {
     let scope = Scope::root(AccentId(0), Density::Comfortable);
@@ -301,14 +289,10 @@ fn a_metric_override_lowers_through_the_palette() {
     );
 }
 
-/// Text is measured under the type ramp the **palette resolved**, not under whatever
-/// was current when the node was built.
+/// Text is measured under the type ramp the palette resolved for its role.
 ///
-/// Asserted as a **ratio** between two rungs rather than against an absolute width. The
-/// engine is DirectWrite, so an absolute figure would pin this test to one font's
-/// advances and it would fail on a font update having caught nothing. A ratio holds
-/// whatever the face is, and it is the property the wiring actually owes: measure took
-/// the size the palette gave for the role.
+/// The claim is the ratio between two rungs rather than an absolute width: the engine is
+/// DirectWrite, so a figure written down here would pin the test to one font's advances.
 #[test]
 fn text_measures_under_the_resolved_type_ramp() {
     fn width_of(ramp: TypeRole) -> f32 {
@@ -339,9 +323,9 @@ fn text_measures_under_the_resolved_type_ramp() {
     let (measured_body, measured_display) = (width_of(TypeRole::Body), width_of(TypeRole::Display));
     assert!(measured_body > 0.0, "the body rung measured nothing");
 
-    // One string, one face, two sizes: advances scale with the em, so the measured
-    // widths carry the ramp's own ratio. The tolerance is hinting, which quantizes
-    // advances per size and is the only reason this is not exact.
+    // One string, one face, two sizes: advances scale with the em, so the measured widths
+    // carry the ramp's own ratio. The tolerance covers hinting, which quantizes advances
+    // per size.
     let expected = display / body;
     let actual = measured_display / measured_body;
     assert!(
@@ -370,10 +354,10 @@ fn the_arena_is_pooled_across_mounts() {
     );
 }
 
-/// A widget cannot express a length that is not the palette's.
+/// `Len` carries no arbitrary DIP, so a widget can express only the palette's lengths.
 ///
-/// Asserted as a property of the type rather than of a lint: there is no `Len` variant
-/// carrying an arbitrary DIP, so the exhaustive match below is the whole vocabulary.
+/// The exhaustive match below is the whole vocabulary: a raw-DIP variant added to `Len`
+/// stops this compiling.
 #[test]
 fn len_has_no_raw_dip_constructor() {
     let scope = Scope::root(AccentId(0), Density::Comfortable);
@@ -384,9 +368,7 @@ fn len_has_no_raw_dip_constructor() {
         Len::Times(Metric::RowH, 4.0),
         Len::Auto,
     ] {
-        // Exhaustive, so the vocabulary cannot grow a raw-DIP form without this failing to
-        // compile. `Times` is a count of a metric, which is why it is admissible: it can
-        // say "four rows" and still cannot say "twelve".
+        // `Times` is a count of a metric, so it can say "four rows" and cannot say "twelve".
         match len {
             Len::Metric(_) | Len::Zero | Len::Pct(_) | Len::Times(..) | Len::Auto => {}
         }
@@ -404,10 +386,9 @@ fn len_has_no_raw_dip_constructor() {
     );
 }
 
-/// Colour must not read the width axis, so a resize re-lowers styles and rebinds no paint.
+/// Colour does not read the width axis, so a resize re-lowers styles and rebinds no paint.
 ///
-/// The exhaustive product is small — a closed role enum by three classes — so this is the
-/// whole claim and not a sample of it.
+/// Every role is checked at every elevation, polarity and width class.
 #[test]
 fn colour_is_width_independent() {
     crate::role::tests::palette();
@@ -460,13 +441,10 @@ fn colour_is_width_independent() {
     }
 }
 
-/// A surface arranges its children **as it was told**, whatever chrome it carries.
+/// A surface arranges its children in the class it was given, whatever chrome it carries.
 ///
-/// The regression this exists for: chrome and layout class were once the same field, so a
-/// container could only adopt a class if it did not already have one — and a card, whose
-/// chrome happened to be a column, laid `card().row(..)` out as a column with nothing to
-/// say so. A silently wrong layout is the worst available failure, because it reads as a
-/// design decision.
+/// Chrome and layout class are separate fields, so the class always wins: a card whose chrome
+/// is a column still lays `card().row(..)` out along x.
 #[test]
 fn a_surface_arranges_its_children_as_it_was_told() {
     let mut patch = fixture();
@@ -503,10 +481,7 @@ fn a_surface_arranges_its_children_as_it_was_told() {
     );
 }
 
-/// And the chrome survives the class it was given.
-///
-/// The other half of the same fix: making the class always win must not throw away the
-/// padding, the scope push or the fill that made it a surface.
+/// A surface keeps its padding, scope push and fill whichever layout class it takes.
 #[test]
 fn a_surface_keeps_its_chrome_whichever_class_it_takes() {
     let mut patch = fixture();
@@ -532,10 +507,8 @@ fn a_surface_keeps_its_chrome_whichever_class_it_takes() {
         (child.rect.x0 - surface.rect.x0 - padding).abs() < 0.5,
         "the surface's padding must survive being told to be a row"
     );
-    // And its own fill seed is still there. Whether that fill resolves one rung up is the
-    // scope push, which `a_surface_elevates_the_scope_its_children_resolve_against` owns —
-    // asserting it again here would be the same claim in two places, and a child painted
-    // with the same role at the same rung is *supposed* to match.
+    // The surface's own fill seed survives too. The rung it resolves at is asserted by
+    // `a_surface_elevates_the_scope_its_children_resolve_against`.
     let painted = patch
         .ops()
         .iter()
@@ -549,14 +522,13 @@ fn a_surface_keeps_its_chrome_whichever_class_it_takes() {
             )
         })
         .count();
-    // Three, and the third is the point: a card's hairline is an outer box in the stroke
-    // colour with the fill inset over it, because the alphabet has no outlined rectangle.
-    // If this ever reads 2, the surface lost its edge.
+    // A card's hairline is an outer box in the stroke colour with the fill inset over it,
+    // because the sprite alphabet has no outlined rectangle: two paints for the card and
+    // one for the child.
     assert_eq!(painted, 3, "the card's ring and fill, and the child's");
 }
 
-/// Motion is a property of the channel, declared by the seed — so two call sites cannot
-/// disagree about the same control.
+/// Motion is declared by the seed, so a channel's default is the same at every call site.
 #[test]
 fn motion_is_per_channel_and_not_per_call_site() {
     assert_eq!(Motion::default(), Motion::Snap);
@@ -564,11 +536,10 @@ fn motion_is_per_channel_and_not_per_call_site() {
 
 // ── unmount ──────────────────────────────────────────────────────────────────────
 
-/// Dropping a mount releases **every** row the walk claimed.
+/// Dropping a mount releases every row the walk claimed.
 ///
-/// This is where a leak would be invisible: the nodes go away on screen whatever happens,
-/// so a control row or a laid-out run left behind shows up only as a table that grows for
-/// the life of the process.
+/// The scene nodes go away regardless, so a retained control row, style recipe or shaped run
+/// shows up only as a table that grows for the life of the process.
 #[test]
 fn unmounting_releases_every_row_it_claimed() {
     let mut patch = fixture();
@@ -598,9 +569,8 @@ fn unmounting_releases_every_row_it_claimed() {
         (0, 0, 0),
         "an unmount must release the style rows, the control rows and the runs"
     );
-    // Everything else the walk claimed goes the same way, and through the row that named it
-    // rather than through a scan: a table left holding a dead node's row is what makes
-    // unmounting one list row cost the whole screen.
+    // Every other table the walk claimed is released through the row that named it rather
+    // than through a scan, so unmounting one list row costs that row and not the screen.
     Host::with(|h| {
         assert_eq!(h.values.len(), 0);
         assert_eq!(h.scrolls.len(), 0);
@@ -611,8 +581,7 @@ fn unmounting_releases_every_row_it_claimed() {
         "an unmount must release the style recipes"
     );
 
-    // One destroy op, because it cascades on the far side: a partial destroy is not
-    // expressible, so a subtree cannot be half-gone.
+    // One destroy op: it cascades on the far side, so a subtree cannot be half-gone.
     let drops = patch
         .ops()
         .iter()
@@ -621,7 +590,7 @@ fn unmounting_releases_every_row_it_claimed() {
     assert_eq!(drops, 1);
 }
 
-/// And the slots come back, so a list that churns does not grow the tables.
+/// Released slots are reused, so a list that churns does not grow the tables.
 #[test]
 fn released_rows_are_reused_rather_than_appended() {
     let mut patch = fixture();
@@ -644,11 +613,10 @@ fn released_rows_are_reused_rather_than_appended() {
 
 // ── variants ─────────────────────────────────────────────────────────────────────
 
-/// A variant is a row, and the row decides the visual count.
+/// A variant is a row, and the row decides how many sprites are minted.
 ///
-/// This is the claim that keeps a variant from becoming a function with a body: a ghost has
-/// no fill and no stroke, so it *mints* neither — rather than minting two invisible sprites
-/// and trusting a branch to have skipped them.
+/// A ghost declares no fill and no stroke, so it mints neither rather than minting two
+/// invisible sprites.
 #[test]
 fn a_variant_row_decides_what_is_minted() {
     fn sprites(patch: &SinkPatch) -> usize {
@@ -684,12 +652,11 @@ fn a_variant_row_decides_what_is_minted() {
 
 // ── value controls ───────────────────────────────────────────────────────────────
 
-/// A control's moving part is a **child** of it, and the control has to find it anyway.
+/// A control claims the moving part its children declared, and the room the solve measured.
 ///
-/// The regression this closes had no visible symptom at mount: a slider rendered, its
-/// handlers fired, and every structural assertion passed — but the front-side row carried no
-/// thumb, so the router computed a value it could not show and the invariant that pixels move
-/// in the tick that saw the event was quietly false for every control that has a value.
+/// The thumb is a child of the control, so the front-side row is where the router finds it.
+/// A row with no thumb leaves the router computing a value it cannot show, which is a slider
+/// that renders and fires its handlers while nothing moves.
 #[test]
 fn a_control_claims_the_moving_part_its_children_declared() {
     let mut patch = fixture();
@@ -718,13 +685,12 @@ fn a_control_claims_the_moving_part_its_children_declared() {
     );
 }
 
-/// A fraction is finished against the travel, not bound to an offset raw.
+/// A fraction is multiplied by the travel before it reaches the offset.
 ///
-/// `Prop::OffsetX` is in DIPs. Binding `0..=1` straight to it moves a thumb by one DIP, which
-/// renders as a control that does not work — and reads, in a screenshot, as a design choice.
+/// `Prop::OffsetX` is in DIPs, so a `0..=1` fraction bound to it raw moves a thumb by one DIP.
 ///
-/// A **toggle** is the case this thread finishes: a press has no value to read off a pointer,
-/// so its knob follows the application's own channel and the app thread is the writer.
+/// A toggle's knob is finished on this thread: a press reads no value off the pointer, so the
+/// knob follows the application's own channel and the app thread is its writer.
 #[test]
 fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
     let mut patch = fixture();
@@ -746,15 +712,14 @@ fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
     );
 }
 
-/// A part the **router** drives is not written by this thread at all.
+/// A part the router drives is not written from this thread after its mount seed.
 ///
-/// The one channel with two interested writers, and the split that keeps it to one: the app
-/// ships the room the solve measured and the front side multiplies. Binding it here as well
-/// would fight a live drag with a geometry correction, and the correction would win — a
-/// resize mid-slide would snap the thumb back to where the application last wrote it.
+/// The channel has one writer: the app thread ships the room the solve measured and the
+/// front side multiplies. A second writer here would correct geometry against a live drag,
+/// snapping the thumb back to the application's last value mid-slide.
 #[test]
 fn a_slid_part_is_left_to_the_thread_that_moves_it() {
-    // A **slid** part, whose property is an offset finished against a room the solve gives.
+    // A slid part: its property is an offset finished against the room the solve gives.
     let mut patch = fixture();
     let value = crate::signal::Cell::new(0.25_f64);
     let _slider = mount(
@@ -773,13 +738,12 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
         front.travel > 0.0 && front.thumb.is_some(),
         "the router is shipped the part and the room it moves in"
     );
-    // The mount **does** seed the part: a control has to render at its value before anyone
-    // touches it, and until the control mounts there is nobody else to do it.
+    // The mount seeds the part, because a control renders at its value before the router has
+    // anything to report.
     assert!(!binds(&patch, windows_scene::Prop::OffsetX).is_empty());
 
-    // From here the router owns it, and this is the hazard the split exists for: the
-    // application writing its own cell back — which is exactly what `on_commit` does — must
-    // not reach the property, or a resize mid-drag would fight a contact and win.
+    // From here the router owns it: an application write to the same cell, which is what
+    // `on_commit` does, must not reach the property.
     patch.clear();
     value.set(0.75);
     crate::signal::flush();
@@ -793,9 +757,7 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
         (crate::widget::offset_of(1.0, front.travel, false) - front.travel).abs() < f32::EPSILON
     );
 
-    // And a **turned** part, whose property is an angle — the case that had its own copy of
-    // the arithmetic before, and the one where the fight was reachable by turning a knob and
-    // letting go.
+    // A turned part: its property is an angle, finished through the same function.
     let mut patch = fixture();
     let angle = crate::signal::Cell::new(0.25_f64);
     let _knob = mount(
@@ -813,7 +775,7 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
     );
 }
 
-/// Everything this thread bound to `prop`, however it bound it.
+/// Returns every op this thread bound to `want`, whatever the binding kind.
 fn binds(patch: &SinkPatch, want: windows_scene::Prop) -> Vec<&Op> {
     patch
         .ops()
@@ -822,7 +784,7 @@ fn binds(patch: &SinkPatch, want: windows_scene::Prop) -> Vec<&Op> {
         .collect()
 }
 
-/// Every `OffsetX` this thread set, in the order it set them.
+/// Returns every scalar `OffsetX` this thread set, in the order it set them.
 fn offsets_bound(patch: &SinkPatch) -> Vec<f32> {
     patch
         .ops()
@@ -840,9 +802,8 @@ fn offsets_bound(patch: &SinkPatch) -> Vec<f32> {
 
 /// A read-only widget declares no hit entry, and therefore no control row.
 ///
-/// A meter is the dense case: one hit entry each is one more rect every pointer sample is
-/// resolved against, one more control row and one more front-side row — for a widget nothing
-/// can click.
+/// Meters are dense on screen, and each hit entry is one more rect every pointer sample is
+/// resolved against, plus a control row and a front-side row.
 #[test]
 fn a_meter_is_not_a_control() {
     let mut patch = fixture();
@@ -866,10 +827,10 @@ fn a_meter_is_not_a_control() {
 
 // ── presence ─────────────────────────────────────────────────────────────────────
 
-/// A constant `.when(false)` contributes **nothing**: no node, no style, no run.
+/// A constant `.when(false)` contributes nothing: no node, no style, no shaped run.
 ///
-/// Hiding it instead is the plausible-looking version of this, and it costs a visual, a
-/// style, a mount row and — for a label — a shaped run, all for something nobody can see.
+/// Hiding the element instead would cost a visual, a style, a mount row and, for a label,
+/// a shaped run.
 #[test]
 fn a_constantly_absent_element_is_never_mounted() {
     let mut patch = fixture();
@@ -898,10 +859,10 @@ fn a_constantly_absent_element_is_never_mounted() {
 
 // ── structure ────────────────────────────────────────────────────────────────────
 
-/// A keyed list reorders survivors rather than rebuilding them.
+/// A keyed list reorders survivors rather than reminting them, so a reorder is moves only.
 ///
-/// Step four is what makes recycling free, and it is the difference between a filter
-/// keystroke costing a move per row and costing a whole tree.
+/// A filter keystroke therefore costs one move per row that changed place, not a rebuilt
+/// subtree.
 #[test]
 fn a_keyed_list_moves_survivors_rather_than_reminting_them() {
     let mut patch = fixture();
@@ -964,11 +925,10 @@ fn an_absent_branch_mints_nothing() {
 
 // ── text ─────────────────────────────────────────────────────────────────────────
 
-/// A run that can break is one sprite per line; everything else is one sprite.
+/// A run that can break costs one sprite per line; a single-line run costs one sprite.
 ///
-/// Both halves matter. A coverage tile is one line's, so a wrapping caption genuinely needs
-/// several — and a label that paid the same price would put a group behind every string on
-/// the screen.
+/// A coverage tile covers one line, so a wrapping caption needs several, and a `Flow::Line`
+/// run needs no group behind it.
 #[test]
 fn only_a_wrapping_run_costs_a_sprite_per_line() {
     let mut patch = fixture();
@@ -982,14 +942,10 @@ fn only_a_wrapping_run_costs_a_sprite_per_line() {
     assert_eq!(minted, 1, "a non-wrapping run is one visual");
 }
 
-/// A warm mount allocates **nothing**, and collecting children is where that is easiest to
-/// lose.
+/// Collecting a container's children uses the arena's own buffers, not a temporary `Vec`.
 ///
-/// The regression this closes had no visible symptom: a temporary `Vec` per container is
-/// correct, passes every structural assertion, and costs one allocation per container per
-/// mount — so a twelve-row list realized during a fling allocated twelve times a frame on
-/// the one path that must not allocate at all. What it shows up as is the arena's own
-/// buffers being at high-water mark while the heap is not.
+/// The mount walk runs for every row a list realizes during a fling and may not allocate,
+/// and a per-container temporary would cost one allocation per container per mount.
 #[test]
 fn collecting_children_uses_the_arenas_own_buffer() {
     let mut patch = fixture();
@@ -1012,8 +968,7 @@ fn collecting_children_uses_the_arenas_own_buffer() {
     assert_eq!(Build::with(|b| b.pending.len()), 0);
     drop(first);
 
-    // The same shape again grows neither buffer, which is the whole claim: a realized row
-    // costs the walk and nothing else.
+    // The same shape again grows neither buffer, so a realized row costs the walk alone.
     let second = mount(screen(), root());
     flush(&mut patch);
     assert_eq!(
@@ -1024,15 +979,11 @@ fn collecting_children_uses_the_arenas_own_buffer() {
     drop(second);
 }
 
-/// A **warm** mount allocates nothing, counted rather than argued.
+/// A warm mount allocates nothing, measured with the allocation counter.
 ///
-/// Every other claim about the arena is structural — a buffer that did not grow, a stack that
-/// came back empty — and every one of them held while the walk itself allocated three `Vec`s
-/// per node. Nothing short of counting catches that, because a temporary is invisible to a
-/// capacity check: it is allocated and freed inside the call.
-///
-/// The counter is per thread and read either side of the statement, so what it reports is
-/// this mount's own allocations and not whatever else the harness was running.
+/// A capacity check cannot see a temporary allocated and freed inside the call, so the count
+/// is what this asserts on. The counter is per thread and read either side of the mount
+/// statement, so it reports this mount's own allocations.
 #[test]
 fn a_warm_mount_allocates_nothing() {
     let mut patch = fixture();
@@ -1045,7 +996,7 @@ fn a_warm_mount_allocates_nothing() {
     };
 
     // The first mount grows the arena, the tables and the shaper's own buffers to high-water
-    // mark. That is the cost this design pays once and never again.
+    // mark, which is the once-per-shape cost the count below excludes.
     let warm = mount(screen(), root());
     flush(&mut patch);
     drop(warm);
@@ -1063,7 +1014,7 @@ fn a_warm_mount_allocates_nothing() {
     );
 }
 
-/// And explicit placement appends within the buffer rather than through a temporary.
+/// Explicit grid placement appends into the arena's buffer rather than through a temporary.
 #[test]
 fn explicit_placement_appends_without_a_temporary() {
     let mut patch = fixture();
@@ -1085,12 +1036,10 @@ fn explicit_placement_appends_without_a_temporary() {
 
 // ── scroll ───────────────────────────────────────────────────────────────────────
 
-/// A scroll container delegates to a tracker: **two bindings and one tracker**, and the
-/// viewport itself never moves.
+/// A scroll container binds its content and its thumb to one tracker, and never the viewport.
 ///
-/// The viewport is what clips, so an offset on it would take the clip with it — and a
-/// thumb positioned per frame was a measured cost in the stack this replaces, which is why
-/// it rides the same tracker instead.
+/// The viewport carries the clip, so an offset on it would move the clip with the content.
+/// The thumb rides the same tracker, so no frame positions it from the app thread.
 #[test]
 fn a_scroll_container_binds_its_content_and_its_thumb_to_one_tracker() {
     let mut patch = fixture();
@@ -1134,7 +1083,7 @@ fn a_scroll_container_binds_its_content_and_its_thumb_to_one_tracker() {
         "the viewport clips, so it must not be the thing that moves"
     );
 
-    // And the extent reached the tracker, from a solve rather than from a guess.
+    // The extent reached the tracker, and it came from the solve.
     assert!(
         patch.ops().iter().any(|op| matches!(
             op,
@@ -1149,8 +1098,8 @@ fn a_scroll_container_binds_its_content_and_its_thumb_to_one_tracker() {
 
 /// A second flush with nothing moved re-publishes nothing.
 ///
-/// This is the claim that keeps scrolling off the app thread entirely: a scroll that is
-/// *scrolling* moves compositor-side, and this step speaks only when the extents change.
+/// Scrolling moves compositor-side, and this step emits only when the extents change, so a
+/// scroll in flight costs the app thread nothing.
 #[test]
 fn a_settled_scroll_container_emits_nothing() {
     let mut patch = fixture();
@@ -1170,9 +1119,8 @@ fn a_settled_scroll_container_emits_nothing() {
 
 /// Content taller than its viewport overflows, whether or not its children pin a minimum.
 ///
-/// A flex child shrinks to its parent by default, so a scroll container whose children state
-/// only a height had no travel at all — a scrollbar that worked wherever a `min_height`
-/// happened to be written and nowhere else.
+/// A flex child shrinks to its parent by default, so a scroll container's content opts out
+/// of that shrink; otherwise a child stating only a height leaves the container no travel.
 #[test]
 fn a_scroll_containers_content_is_not_squeezed_into_its_viewport() {
     let mut patch = fixture();
@@ -1195,12 +1143,11 @@ fn a_scroll_containers_content_is_not_squeezed_into_its_viewport() {
     );
 }
 
-/// A scroll container's tracker is **created**, and created after its viewport is sized.
+/// A scroll container's tracker is created, and created after its viewport is sized.
 ///
-/// Both halves are the bug this asserts against. A tracker that is only *minted* is a
-/// binding onto nothing, and one created before the solve takes its hit region from a
-/// zero-size visual — which hit-tests nothing while reporting success, so the surface
-/// silently ignores every wheel notch for the life of the window.
+/// A tracker that is only minted is a binding onto nothing. One created before the solve
+/// takes its hit region from a zero-size visual, which hit-tests nothing while reporting
+/// success, so the surface ignores every wheel notch for the life of the window.
 #[test]
 fn a_scroll_containers_tracker_is_created_after_its_viewport_is_sized() {
     let mut patch = fixture();
@@ -1244,20 +1191,17 @@ fn a_scroll_containers_tracker_is_created_after_its_viewport_is_sized() {
     );
 }
 
-/// The scrollbar is above the content, grabbable, and pinned.
+/// The scrollbar is minted above the content, wins the hit array, and does not scroll.
 ///
-/// Three claims, each a defect the shape prevents. Child order is paint order **and** the
-/// order the hit array is scanned in, so a bar minted at the bottom of its viewport is
-/// painted under the list and every grab on it resolves to the row behind it. And the rail
-/// is *inside* the container it reports on without moving with it, so a rect that resolved
-/// through that container's offset would slide off the surface as far as the content
-/// scrolled.
+/// Child order is paint order and the order the hit array is scanned in, so a bar minted at
+/// the bottom of its viewport is painted under the list and every grab on it resolves to the
+/// row behind it. The rail sits inside the container it reports on, so a rect resolved
+/// through that container's offset slides off the surface as far as the content scrolls.
 #[test]
 fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
     let mut patch = fixture();
-    // One card is a target, so the array carries something that *does* resolve through the
-    // viewport's offset — which is what makes the rail's opting out an assertion rather
-    // than a restatement of "nothing scrolls here".
+    // One card is a target, so the hit array carries an entry that does resolve through the
+    // viewport's offset for the rail's opt-out to be measured against.
     let card = || plate().height(Metric::CardMinH);
     let _scroll = mount(
         crate::layout::scroll((card().on_click(|| {}), card(), card(), card()))
@@ -1290,8 +1234,8 @@ fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
         "the scrollbar was minted under the content it reports on"
     );
 
-    // Hit order: the array is scanned from the end, so a later entry wins a point both
-    // cover — and the rail sits inside the viewport's own box everywhere.
+    // Hit order: the array is scanned from the end, so a later entry wins a point both cover,
+    // and the rail sits inside the viewport's own box everywhere.
     let entries = patch.hit_entries();
     let entry = |id| entries.iter().position(|e| e.id == id);
     let rail_at = entry(grab).expect("the rail is not in the hit array");
@@ -1305,7 +1249,7 @@ fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
         windows_scene::NodeId::NONE,
         "the rail moves with the content it reports on"
     );
-    // And the card beside it does, so the flag is an opt-out from something real.
+    // The card beside it does resolve through the offset, so the rail's flag is an opt-out.
     let scrolled = entries
         .iter()
         .filter(|entry| entry.scroll_src != windows_scene::NodeId::NONE)
@@ -1317,10 +1261,10 @@ fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
     );
 }
 
-/// A surface with nothing to scroll has no rail target.
+/// A surface with nothing to scroll declares no rail hit entry.
 ///
-/// Left on, it takes every press on the right ten DIPs of the content — a button at the
-/// edge of a row that cannot be clicked, and nothing on screen to say why.
+/// A rail entry left in place takes every press on the right edge of the content, where no
+/// scrollbar is drawn.
 #[test]
 fn a_surface_that_does_not_overflow_has_no_grab_target() {
     let mut patch = fixture();
@@ -1343,10 +1287,10 @@ fn a_surface_that_does_not_overflow_has_no_grab_target() {
     );
 }
 
-/// An on-demand thumb is concealed from the mount, not shown and faded.
+/// An on-demand thumb is bound to zero opacity at mount rather than shown and faded out.
 ///
-/// A surface whose content fits never overflows, so a thumb that appeared for one frame to
-/// say so is a flash on every screen that opens.
+/// Content that fits never overflows, so a thumb visible for the first frame is a flash on
+/// every screen that opens.
 #[test]
 fn an_on_demand_thumb_starts_concealed() {
     let mut patch = fixture();
@@ -1368,13 +1312,11 @@ fn an_on_demand_thumb_starts_concealed() {
     );
 }
 
-/// A grid that moved re-sends every run, and the ordinary publish does not.
+/// A moved pixel grid re-sends every run, and a settled publish sends none.
 ///
-/// Neither a pixel-grid change nor a rebuilt device moves a single DIP, so the width gate
-/// that makes publishing cheap answers "nothing to do" for precisely the case where every
-/// coverage tile is rasterized for a grid that is gone. Both halves are asserted, because
-/// the first without the second is a test that passes on a publish that re-sends everything
-/// every frame.
+/// Neither a pixel-grid change nor a rebuilt device moves a DIP, so the width gate that makes
+/// the ordinary publish cheap reports nothing to do while every coverage tile is rasterized
+/// for a grid that is gone.
 #[test]
 fn a_moved_pixel_grid_re_sends_every_run() {
     let mut patch = fixture();
@@ -1398,12 +1340,12 @@ fn a_moved_pixel_grid_re_sends_every_run() {
     };
     assert!(runs(&patch) > 0, "the label never emitted a run at all");
 
-    // Settled: the ordinary publish is silent, which is what makes it cheap.
+    // Settled: the ordinary publish is silent.
     patch.clear();
     flush(&mut patch);
     assert_eq!(runs(&patch), 0, "a settled label re-published its run");
 
-    // And the answer to a grid that moved is not silent.
+    // A grid that moved is not.
     patch.clear();
     Host::with(Host::reemit_text);
     flush(&mut patch);
@@ -1413,16 +1355,14 @@ fn a_moved_pixel_grid_re_sends_every_run() {
     );
 }
 
-/// Every control declares a gesture; nothing else does.
+/// Every control declares a gesture, and nothing else does.
 ///
-/// `control()` sets `HitFlags::GESTURE` — whose whole meaning is "has a gesture
-/// declaration" — and nothing minted one, so a plain button entered the hit array claiming
-/// something that was not there. Downstream that is a press with no release: the router
-/// binds a contact only where its target declared, and reports an up only where it bound.
+/// `control()` sets `HitFlags::GESTURE`, which claims a gesture declaration behind the entry.
+/// The router binds a contact only where its target declared one and reports an up only where
+/// it bound, so an entry claiming a declaration it does not have is a press with no release.
 ///
-/// The second half is the gate, and it is why this is not simply "always declare one": this
-/// walk also runs for nodes that exist only for automation, and a recogniser behind every
-/// static label is a cost with no consumer.
+/// The walk also runs for nodes that exist only for automation, where a recogniser has no
+/// consumer, so a label declares none.
 #[test]
 fn a_control_declares_the_default_gesture_and_a_label_declares_none() {
     let mut patch = fixture();
@@ -1459,19 +1399,18 @@ fn a_control_declares_the_default_gesture_and_a_label_declares_none() {
 
 // ── virtualization ───────────────────────────────────────────────────────────────
 
-/// A thousand-row list, in a viewport that shows about ten of them.
+/// Specifies a thousand-row list, in a viewport that shows about ten of them.
 const LIST: crate::layout::ListSpec = crate::layout::ListSpec {
     count: 1000,
     row_h: Metric::RowH,
     overscan: 2,
 };
 
-/// Settles a mounted list, and hands back the tracker driving it.
+/// Settles a mounted list and returns the tracker driving it.
 ///
-/// **Two flushes, and that is the mechanism rather than the test being careful.** A
-/// viewport's height is a solve output, so the first flush is what measures it and the
-/// realization window it implies is resolved on the tick after — which is what a running
-/// window does on mount and on every resize.
+/// Two flushes, because a viewport's height is a solve output: the first flush measures it
+/// and the realization window it implies is resolved on the tick after. A running window
+/// mounts and resizes the same way.
 fn settle(patch: &mut SinkPatch) -> windows_scene::Id<windows_scene::Tracker> {
     flush(patch);
     crate::signal::flush();
@@ -1485,7 +1424,7 @@ fn settle(patch: &mut SinkPatch) -> windows_scene::Id<windows_scene::Tracker> {
     })
 }
 
-/// Mounts a virtualized list and hands back the tracker driving it.
+/// Mounts a virtualized list and returns the tracker driving it.
 fn virtualized(patch: &mut SinkPatch) -> windows_scene::Id<windows_scene::Tracker> {
     let _held = mount(
         crate::layout::list(
@@ -1504,16 +1443,16 @@ fn virtualized(patch: &mut SinkPatch) -> windows_scene::Id<windows_scene::Tracke
     settle(patch)
 }
 
-/// How many rows a list has realized, counted off the nodes the mount walk claimed.
+/// Returns how many rows the list realized, counted off the nodes the mount walk claimed.
 fn realized_rows() -> usize {
     Host::with(|h| h.mounts.iter().count())
 }
 
-/// The travel the solve gave the tracker, read off what the publish last settled on.
+/// Returns the travel the solve gave the tracker, read off the scroll row's last publish.
 ///
-/// Off the row rather than off the patch, because a flush **replaces** the caller's buffer
-/// rather than appending to it, and the extent settles on the flush that measured the
-/// viewport rather than on the one after it.
+/// A flush replaces the caller's buffer rather than appending to it, and the extent settles
+/// on the flush that measured the viewport rather than on the one after it, so the row is the
+/// only place it survives.
 fn published_extent() -> f32 {
     Host::with(|h| {
         h.scrolls
@@ -1524,12 +1463,10 @@ fn published_extent() -> f32 {
     })
 }
 
-/// The whole claim of virtualization: a thousand rows cost a screen's worth of nodes, and
-/// the ones that exist are placed at their own index rather than laid out in sequence.
+/// A thousand rows cost a screen's worth of nodes, each placed at its own index.
 ///
-/// Placement is what makes the realized set free to be several disjoint runs — and what
-/// keeps the content's extent the whole list's, so the maximum position is the constant
-/// uniform extents promise rather than something that moves as the window does.
+/// Placement by index lets the realized set be several disjoint runs, and keeps the content's
+/// extent the whole list's, so the maximum position does not move as the window does.
 #[test]
 fn a_virtualized_list_realizes_a_screen_and_places_what_it_realized() {
     let mut patch = fixture();
@@ -1554,9 +1491,8 @@ fn a_virtualized_list_realizes_a_screen_and_places_what_it_realized() {
             _ => None,
         })
         .collect();
-    // Every row sits on a row-height boundary, and the set reaches at least the second
-    // screen's worth — which a sequence of laid-out children would also do, so the boundary
-    // is the half that distinguishes them.
+    // Every row sits on a row-height boundary. A sequence of laid-out children would also
+    // reach past the fifth row, so the boundary is what separates placement from layout.
     assert!(
         offsets.iter().any(|y| *y > row_h * 4.0),
         "no row was placed past the fifth: {offsets:?}"
@@ -1577,12 +1513,11 @@ fn a_virtualized_list_realizes_a_screen_and_places_what_it_realized() {
     );
 }
 
-/// A reported position realizes the rows it implies **in the tick it arrived in**, and the
-/// extent does not move because of it.
+/// A reported position realizes the rows under it in the tick it arrived in, and leaves the
+/// extent alone.
 ///
-/// The second half is the one that is easy to lose: a list whose content height followed its
-/// realized set would move the maximum position on every frame of a fling, which is content
-/// sliding under the user's finger.
+/// A content height that followed the realized set would move the maximum position on every
+/// frame of a fling, sliding the content under the user's finger.
 #[test]
 fn a_reported_position_realizes_the_rows_under_it() {
     let mut patch = fixture();
@@ -1602,9 +1537,9 @@ fn a_reported_position_realizes_the_rows_under_it() {
     crate::signal::flush();
     flush(&mut patch);
 
-    // Within a couple of rows of the resting count: a window at the very top has its upper
-    // overscan clipped away and one in the middle does not, so the two are close rather than
-    // equal — and what matters is that neither grows with how far the list was scrolled.
+    // A window at the very top has its upper overscan clipped away and one in the middle does
+    // not, so the counts sit within the overscan of each other rather than equal. Neither
+    // grows with how far the list was scrolled.
     let after = realized_rows();
     assert!(
         after.abs_diff(before) <= LIST.overscan,
@@ -1636,11 +1571,11 @@ fn a_reported_position_realizes_the_rows_under_it() {
     );
 }
 
-/// At the instant inertia begins the destination is already known, so the rows it lands on
-/// are realized while the compositor animates — and the rows still on screen stay.
+/// A fling realizes the rows at its destination while keeping the rows it is leaving.
 ///
-/// A window that jumped to the destination instead would blank what the user is looking at,
-/// which is the failure destination prefetch exists to prevent rather than to cause.
+/// The destination is known at the instant inertia begins, so those rows are realized while
+/// the compositor animates. A window that moved to the destination instead would blank the
+/// rows still on screen.
 #[test]
 fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
     let mut patch = fixture();
@@ -1668,8 +1603,8 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
         flinging < resting * 5,
         "a fling realized {flinging} rows, which is not a bounded corridor"
     );
-    // Both ends exist at once: the destination was realized **beside** where the content
-    // still is, never instead of it.
+    // Both ends exist at once: the destination was realized beside where the content still
+    // is, not instead of it.
     let offsets: Vec<f32> = patch
         .ops()
         .iter()
@@ -1687,7 +1622,7 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
         "nothing was realized where the fling lands: {offsets:?}"
     );
 
-    // And when it settles, the prefetch is given back.
+    // The prefetch is released once the tracker reports idle.
     patch.clear();
     crate::layout::scroll_observe(&[windows_scene::SceneEvent::TrackerPhase {
         tracker,
@@ -1702,10 +1637,10 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
     );
 }
 
-/// A realized index the caller did not supply gets its space and nothing in it.
+/// A realized index the caller did not supply reserves its space and holds nothing.
 ///
-/// The row is where it will be when the data arrives, so the extent and every row below it
-/// are already right — and no invented content claims to be the data.
+/// The placeholder sits where the row will be when the data arrives, so the extent and every
+/// row below it are already right, and nothing invented stands in for the data.
 #[test]
 fn an_unsupplied_row_reserves_its_space() {
     let mut patch = fixture();
@@ -1731,21 +1666,20 @@ fn an_unsupplied_row_reserves_its_space() {
     );
 }
 
-// ── modifiers say what they do, in any order ─────────────────────────────────────
+// ── modifier order ───────────────────────────────────────────────────────────────
 
-/// Declining an inflation does not depend on being called after the thing that declared a
-/// target — and does not conjure one where there is none.
+/// `no_inflate` reads the same before or after the handler that declares a hit target, and
+/// declares no target of its own.
 ///
-/// Every other modifier here is order-independent by construction, which is what the arena's
-/// intrusive chains are for. One that quietly was not is worse than one that never worked:
-/// it works in the example and not at the call site that wrote the chain the other way round.
+/// The arena's intrusive chains make modifiers order-independent, so a chain written either
+/// way round produces the same hit entry.
 #[test]
 fn declining_an_inflation_reads_the_same_in_either_order() {
     fn inflates(view: View) -> Option<bool> {
         let mut patch = fixture();
         let _held = mount(view, root());
         flush(&mut patch);
-        // Off the hit array itself, which is the only thing the router ever consults.
+        // Read off the hit array, which is what the router consults.
         patch
             .hit_entries()
             .first()
@@ -1753,16 +1687,16 @@ fn declining_an_inflation_reads_the_same_in_either_order() {
     }
     assert_eq!(inflates(plate().no_inflate().on_click(|| {})), Some(false));
     assert_eq!(inflates(plate().on_click(|| {}).no_inflate()), Some(false));
-    // And on its own it is not a target at all: a control row and a slot in the array every
-    // pointer sample is resolved against is the opposite of what this asks for.
+    // On its own it is no target at all, so it costs neither a control row nor a slot in the
+    // array every pointer sample is resolved against.
     assert_eq!(inflates(plate().no_inflate()), None);
 }
 
-/// A value handler declares a target, so it is not dropped in silence.
+/// A value handler declares the hit target it needs, so it reaches the dispatch table.
 ///
 /// The mount moves handlers into the dense table only for a node that has a hit entry. A
-/// handler on one that does not is taken out of the arena and freed — which reads, at the
-/// call site, as a control that does nothing.
+/// handler on a node without one is freed with the arena and never reaches the table it is
+/// dispatched from, which reads at the call site as a control that does nothing.
 #[test]
 fn a_value_handler_declares_the_target_it_needs() {
     let mut patch = fixture();
@@ -1782,7 +1716,7 @@ fn a_value_handler_declares_the_target_it_needs() {
 
 // ── a style that follows a value follows its own scope ───────────────────────────
 
-/// A restyle re-lowers against the node's **own** scope, not the root's.
+/// A restyle re-lowers against the node's own scope, not the root's.
 ///
 /// A surface pushes a rung, and re-lowering from the root would lose the elevation silently,
 /// because the answer is still a valid style.
@@ -1812,10 +1746,10 @@ fn a_restyle_lowers_against_the_node_that_owns_it() {
     );
 }
 
-/// The width class is the solve's, and is never stored in the recipe it re-lowers from.
+/// The width class belongs to the solve and is never stored in the recipe re-lowering reads.
 ///
-/// The whole of the collapse: two owners of one class, one of them a frame stale, was what
-/// made a container's own re-lower disagree with the layout it was laid out under.
+/// A second copy of the class in the recipe is a frame stale, so a container's own re-lower
+/// would disagree with the layout it was laid out under.
 #[test]
 fn a_recipe_holds_no_width_class() {
     let mut patch = fixture();
@@ -1836,15 +1770,14 @@ fn a_recipe_holds_no_width_class() {
 
 // ── width variants ───────────────────────────────────────────────────────────────
 //
-// The fixture's window is 800 DIPs wide and the containers below fill it, so the class is
-// chosen by moving the *thresholds* rather than the width. That keeps every case in one
-// window and makes the class each test is asserting about readable at its call site.
+// The fixture's window is 800 DIPs wide and the containers below fill it, so each test picks
+// a class by moving the thresholds rather than the window width. The class under test is then
+// readable from the thresholds at the call site.
 
 /// A width variant re-arranges a container without unmounting anything.
 ///
-/// Both halves matter and only one of them is visible: the arrangement is the feature, and
-/// the mount surviving is what makes it safe to evaluate during a resize drag. A `when()`
-/// here would drop the subtree's owner every time a window edge crossed the threshold.
+/// The mount surviving is what makes a variant safe to evaluate during a resize drag: a
+/// `when()` would drop the subtree's owner every time a window edge crossed the threshold.
 #[test]
 fn a_width_variant_re_arranges_without_unmounting() {
     let arrange = |bounds: [f32; 2]| {
@@ -1892,21 +1825,18 @@ fn a_width_variant_re_arranges_without_unmounting() {
 
 /// A single-line run's box is its own coverage, whatever its container does to its siblings.
 ///
-/// The regression, and it is the one bug in this file that was **visible from across the
-/// room**: a `Flow::Line` run has no line sprite of its own — the node *is* the sprite, which
-/// is what keeps a static label at one visual — so a container stretching its children
-/// stretched the coverage tile with it. The tile's brush fills, so every short label came out
-/// smeared horizontally to the width of the longest line beside it. A wrapping run was immune,
-/// because it owns line sprites and sizes each to its own tile, which is exactly why the
-/// screen that found this had one legible caption under a row of smears.
+/// A `Flow::Line` run has no line sprite of its own: the node is the sprite, which keeps a
+/// static label at one visual. A container that stretched its children would stretch the
+/// coverage tile with it, and the tile's brush fills, so a short label would smear
+/// horizontally to the width of the longest line beside it. A wrapping run owns line sprites
+/// and sizes each to its own tile, so it takes its width from the text either way.
 ///
-/// Asserted between two runs rather than against an absolute width: under the defect every
-/// run in the column reports the container's width, so "they differ" is the whole claim and
-/// it needs no number from the text engine.
+/// The two runs are compared with each other rather than against an absolute width, so the
+/// assertion needs no number from the text engine.
 #[test]
 fn a_single_line_run_is_as_wide_as_its_own_text() {
     let mut patch = fixture();
-    // `stack` stretches its children, which is the default and the case that broke.
+    // `stack` stretches its children, which is the default.
     let _held = mount(
         stack((
             crate::widget::text("a much longer line of text than the other one"),
@@ -1935,13 +1865,12 @@ fn a_single_line_run_is_as_wide_as_its_own_text() {
     );
 }
 
-/// A track sized by a fraction of its container is that fraction, and not zero.
+/// A track sized by a fraction of its container is that fraction, not zero.
 ///
-/// The regression: a fixed track resolved through `Len::dips`, which answers `None` for the
-/// two lengths with no intrinsic value — a percentage and `Auto` — and the `unwrap_or(0.0)`
-/// beside it turned both into a **zero-width column**. A grid with a collapsed track lays out
-/// perfectly cleanly, so there is nothing to see except content that is not where it was
-/// asked to be.
+/// `Len::dips` answers `None` for the two lengths with no intrinsic value, a percentage and
+/// `Auto`, so a fixed track resolves those against the container rather than collapsing to
+/// zero. A grid with a collapsed track lays out cleanly and shows only content that is not
+/// where it was placed.
 #[test]
 fn a_fractional_track_is_a_fraction_of_its_container() {
     use crate::layout::Track;
@@ -1970,13 +1899,11 @@ fn a_fractional_track_is_a_fraction_of_its_container() {
     );
 }
 
-/// A class-gated column list is *the* template at that class, not an addition to the one
-/// below it.
+/// A class-gated column list replaces the template below it rather than extending it.
 ///
-/// Without the clear, `.cols(..).cols_when(..)` concatenates: the wide arm gets three tracks
-/// for two declarations, and the second child lands a third of the way across instead of
-/// half. That reads as a design decision rather than as a bug, which is why it is asserted
-/// against a position and not against a track count.
+/// `.cols(..).cols_when(..)` clears before it appends, so the wide arm holds two tracks and
+/// not three. The assertion is on the second child's position, which is where a concatenated
+/// track list shows up.
 #[test]
 fn a_class_gated_column_list_replaces_the_one_below_it() {
     use crate::layout::Track;
@@ -2047,19 +1974,17 @@ fn hide_when_removes_the_box_and_not_the_node() {
     );
 }
 
-/// The **first** solve applies the class, including when it resolves to the middle one.
+/// The first solve applies the class it resolved, including when that class is `Medium`.
 ///
-/// The regression: `windows-scene` defaulted an unclassified node to `Medium` while the
-/// scope a recipe is lowered at defaults to `Wide`, so a container that classified *to*
-/// `Medium` produced no transition on its first layout and its subtree kept the styles the
-/// mount had lowered at `Wide`. Nothing about the second frame is wrong, which is what makes
-/// it worth a test: the window simply opens in the wrong arrangement.
+/// A class matching the solver's own default for an unclassified node produces no transition,
+/// so it has to reach the lowered styles on the first layout. Without that the window opens
+/// in the arrangement the mount lowered at and corrects itself on the next solve.
 #[test]
 fn the_first_solve_applies_the_class_it_resolved() {
     let mut patch = fixture();
     let _held = mount(
         crate::layout::responsive(
-            // 800 against these is Medium — the value the two crates used to disagree on.
+            // 800 against these thresholds is Medium.
             [600.0, 1000.0],
             stack(
                 plate()
@@ -2085,15 +2010,14 @@ fn the_first_solve_applies_the_class_it_resolved() {
 
 // ── the wash matches what it covers ──────────────────────────────────────────────
 
-/// Every washed control's wash is as round as the control under it.
+/// Every washed control's wash carries the corner radius of the control under it.
 ///
-/// A wash is a crossfade over the surface it covers, so a radius it does not share is a
-/// square highlight on a round control — visible only when hovered, which is exactly when
-/// nobody is looking at a screenshot.
+/// A wash crossfades over the surface it covers, so a radius it does not share paints a
+/// square highlight on a round control while hovered.
 #[test]
 fn a_wash_is_as_round_as_the_control_it_covers() {
     // Built inside the loop: the arena clears after each mount, so an element minted before
-    // one and used after it names a slot that is no longer there.
+    // one and used after it names a slot the clear has freed.
     let cases: [(&str, fn() -> View); 3] = [
         ("button", || crate::widget::button("x").erase()),
         ("knob", || {
@@ -2136,11 +2060,10 @@ fn a_wash_is_as_round_as_the_control_it_covers() {
 
 // ── what automation is told ─────────────────────────────────────────────────────
 //
-// The synthesis had no tests at all, which is how every one of the defects below reached
-// a running build: each is a thing the framework half could not have caught, because the
-// framework half was verified against hand-written seeds.
+// The seeds below are synthesised from the mount rows themselves, so what a client reads
+// is decided here rather than by the seeds a caller hands to `uia::Tree`.
 
-/// The seeds this mount produced, sorted, with their names resolved.
+/// Returns the seeds this mount produced, with their names resolved out of the blob.
 fn seeds() -> Vec<(crate::widget::UiaRole, String, crate::uia::Value)> {
     let mut out = crate::uia::Seeds::default();
     Host::with(|h| h.uia_seeds(&mut out));
@@ -2154,15 +2077,17 @@ fn seeds() -> Vec<(crate::widget::UiaRole, String, crate::uia::Value)> {
         .collect()
 }
 
-/// The published tree this mount would produce.
+/// Returns the published tree this mount would produce.
 fn tree(patch: &SinkPatch) -> crate::uia::Tree {
     let mut out = crate::uia::Seeds::default();
     Host::with(|h| h.uia_seeds(&mut out));
     crate::uia::Tree::build(patch.hit_entries(), &out)
 }
 
-/// A button's label is a **child element**, not text on its own node, so a name derived
-/// from the control's own row is empty for every button in the stack.
+/// A control takes its name from the text its subtree laid out.
+///
+/// A button's label is a child element rather than text on the control's own node, so a name
+/// read off that node alone is empty.
 #[test]
 fn a_control_is_named_by_the_text_its_subtree_laid_out() {
     let mut patch = fixture();
@@ -2180,7 +2105,9 @@ fn a_control_is_named_by_the_text_its_subtree_laid_out() {
     );
 }
 
-/// Static text declared no peer at all, so a screen of labels, headings and read-outs read
+/// Static text is an automation element, and publishes its body as a text document.
+///
+/// A run with no peer of its own leaves a screen of labels, headings and read-outs reading
 /// to a client as an empty window.
 #[test]
 fn static_text_is_an_element_and_publishes_its_own_body() {
@@ -2211,8 +2138,9 @@ fn static_text_is_an_element_and_publishes_its_own_body() {
     );
 }
 
-/// A slider carries no text of its own. Without this its name is empty, which is the
-/// difference between a usable screen and an unusable one.
+/// A control with no text of its own takes the name of the run before it.
+///
+/// A slider carries no text, so without its neighbouring run its published name is empty.
 #[test]
 fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
     let mut patch = fixture();
@@ -2245,8 +2173,10 @@ fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
     assert_eq!(label.role, crate::widget::UiaRole::Text);
 }
 
-/// The rule is narrow on purpose: it must not reach across a row or claim a heading two
-/// controls up, because a wrong name is worse than none.
+/// A control with its own text keeps it, and one whose predecessor is not a run takes none.
+///
+/// The neighbour rule reaches one element back, so it cannot relabel a named control or
+/// claim a heading two controls up.
 #[test]
 fn a_control_that_has_a_name_keeps_it_and_one_with_no_run_before_it_gets_none() {
     let mut patch = fixture();
@@ -2281,8 +2211,10 @@ fn a_control_that_has_a_name_keeps_it_and_one_with_no_run_before_it_gets_none() 
     );
 }
 
-/// A name is a **copy** in the published blob, so a label that re-reads leaves the tree
-/// holding the old string — with no event, because the name is not a live property.
+/// A label that re-reads marks the published tree stale.
+///
+/// A name is a copy in the published blob rather than a live property, so a changed string
+/// raises no event and the tree holds the old one until the next publish.
 #[test]
 fn a_label_that_changes_marks_the_accessible_tree_stale() {
     let mut patch = fixture();
@@ -2310,11 +2242,10 @@ fn a_label_that_changes_marks_the_accessible_tree_stale() {
     );
 }
 
-/// A readout shows its value, and follows it.
+/// A readout renders its value, and follows it.
 ///
 /// [`shown`](crate::widget::shown) formats through `Display` straight into the run's buffer,
-/// so there is no `String` between the value and the glyphs — and therefore nothing but this
-/// to prove the two are still connected.
+/// so no `String` sits between the value and the glyphs.
 #[test]
 fn a_shown_readout_renders_its_value_and_follows_it() {
     let mut patch = fixture();
@@ -2339,13 +2270,12 @@ fn a_shown_readout_renders_its_value_and_follows_it() {
     );
 }
 
-/// A readout whose **value** moves at display rate but whose **text** does not.
+/// A readout whose value moves but whose formatted text does not allocates nothing.
 ///
-/// The case the whole write-in-place seam exists for, and the one a dragged control is:
-/// `-6.031` and `-6.028` both format to `-6.0 dB`. The table already declines to reshape a
-/// string that did not move, so the only thing left to prove is that discovering it did not
-/// move is free — a source answering with a `String` allocated, formatted, copied and freed
-/// every frame to learn nothing.
+/// `-6.031` and `-6.028` both format to `-6.0 dB`. The table declines to reshape a string
+/// that did not move, and discovering that it did not move costs no allocation: the source
+/// writes in place rather than answering with a `String`. A dragged control takes this path
+/// at display rate.
 #[test]
 fn a_readout_whose_text_does_not_move_allocates_nothing() {
     use core::fmt::Write;
@@ -2359,9 +2289,8 @@ fn a_readout_whose_text_does_not_move_allocates_nothing() {
         root(),
     );
     flush(&mut patch);
-    // One warm-up, because the claim is about steady state: the scratch buffer and the
-    // scheduler's own queues each reach their high-water mark once, and a seam that
-    // allocated *only* there would be doing its job.
+    // One warm-up: the scratch buffer and the scheduler's own queues each reach their
+    // high-water mark once, and the count below is of the steady state after that.
     level.set(-6.030);
     crate::signal::flush();
 
@@ -2376,12 +2305,10 @@ fn a_readout_whose_text_does_not_move_allocates_nothing() {
     );
 }
 
-/// A run bound to a **memo** follows it, and not only a run bound to a cell.
+/// A run bound to a memo follows it, as a run bound to a cell does.
 ///
-/// The shape a panel's title row has: one memo over the selection, minted once when the panel
-/// is built and never rebuilt, read by two runs that say different things about presence. If
-/// only the cell-bound path propagated, a panel would keep saying "nothing selected" while
-/// its own body showed the subject — which is what this was written to catch.
+/// A memo is minted once and never rebuilt, so a run's binding tracks the memo rather than
+/// the cell underneath it.
 #[test]
 fn a_run_bound_to_a_memo_follows_it() {
     let mut patch = fixture();
@@ -2426,14 +2353,12 @@ fn a_run_bound_to_a_memo_follows_it() {
     );
 }
 
-/// A hidden part with a **measurable leaf** inside it lays out as hidden, all the way down.
+/// A hidden subtree lays out as hidden all the way down, including a measurable leaf.
 ///
-/// The regression: taffy descends into a hidden subtree with `RunMode::PerformHiddenLayout`,
-/// where a measure function may not be called — and this crate decided by each node's own
-/// display, so the first childless descendant of a hidden container was handed to the leaf
-/// path and walked into taffy's `unreachable!()`. It needs a text run inside to reproduce:
-/// a hidden node whose children are all themselves boxes never reaches a measure at all,
-/// which is why the mechanism's own tests missed it and the first real screen found it.
+/// Taffy descends into a hidden subtree with `RunMode::PerformHiddenLayout`, where a measure
+/// function may not be called, so the hidden decision follows the run mode rather than each
+/// node's own display. A text run inside is what reaches the leaf path: a hidden node whose
+/// descendants are all boxes never reaches a measure at all.
 #[test]
 fn a_hidden_subtree_does_not_measure_its_leaves() {
     let mut patch = fixture();
@@ -2455,17 +2380,14 @@ fn a_hidden_subtree_does_not_measure_its_leaves() {
 
 // ── what a structural adapter contributes to its parent's layout ─────────────────
 //
-// The four below are one regression, and it survived because the mechanism's own tests
-// asserted that a keyed list *recycles* — never what one looks like. An adapter used to mint
-// a `Preset::Bare` group and parent its rows to it, and `Preset::Bare` is `Style::DEFAULT`,
-// which is a content-sized flex **row**. So a list laid out horizontally whatever its
-// container was, and an arm could not fill the box it was placed in.
+// An adapter parents its rows and arms straight to the container it was passed to, and adds
+// only a zero-size anchor for identity. A group of its own would impose that group's style on
+// everything below it: `Preset::Bare` is `Style::DEFAULT`, a content-sized flex row, so rows
+// would march across whatever their container was and an arm could not fill its box.
 
 /// A keyed list is laid out by the container it was passed to.
 ///
-/// The rows share a left edge and descend, because the container is a column. Under the
-/// wrapper they shared a *top* edge and marched across instead — which is a layout nobody
-/// wrote, imposed by a node nobody could name.
+/// The container here is a column, so its rows share a left edge and descend.
 #[test]
 fn a_keyed_list_lays_out_under_its_container() {
     let mut patch = fixture();
@@ -2506,11 +2428,10 @@ fn a_keyed_list_lays_out_under_its_container() {
     }
 }
 
-/// The anchor occupies nothing.
+/// An adapter's anchor occupies no space in its parent's layout.
 ///
-/// It is in the parent's child list for its **identity** and for nothing else, so a list of
-/// three rows must measure exactly as three rows. A wrapper that still had a box would show
-/// up here as a gap the author cannot remove.
+/// The anchor is in the parent's child list to carry identity, so a list of two rows measures
+/// as exactly two rows and leaves no gap the author cannot remove.
 #[test]
 fn an_adapters_anchor_takes_no_space() {
     let mut patch = fixture();
@@ -2549,9 +2470,8 @@ fn an_adapters_anchor_takes_no_space() {
 
 /// A `switch` arm fills the box it was placed in.
 ///
-/// The wrapper carried `flex_grow: 0`, so an arm was content-sized inside a container that
-/// had already been told to give it everything — and the author's own `.grow()` landed on
-/// the stack around the switch, where it looked like it had been honoured.
+/// The arm is a child of the container, so a `.grow()` on the arm reaches that container's
+/// own sizing rather than stopping at an intervening node with `flex_grow: 0`.
 #[test]
 fn a_switch_arm_fills_the_box_it_was_placed_in() {
     let mut patch = fixture();
@@ -2575,12 +2495,11 @@ fn a_switch_arm_fills_the_box_it_was_placed_in() {
     );
 }
 
-/// Two adjacent branches keep their order across being empty.
+/// Two adjacent branches keep their declared order across both being empty.
 ///
-/// **This is why the anchor exists.** Both arms are absent at mount, so both adapters would
-/// otherwise share one predecessor — and whichever filled *second* would be placed at the
-/// same position as the first and land above it. Here the second one fills first, which is
-/// exactly the order that used to come out backwards.
+/// The anchor gives each adapter its own predecessor. Without one, two arms absent at mount
+/// would share a predecessor, and whichever filled second would be placed at the same
+/// position as the first and land above it. Here the second branch fills first.
 #[test]
 fn two_adjacent_branches_keep_their_order_across_being_empty() {
     let mut patch = fixture();
@@ -2621,18 +2540,12 @@ fn two_adjacent_branches_keep_their_order_across_being_empty() {
     );
 }
 
-/// A wrapping run breaks against the track it was placed in, and **grows down** when it
-/// does.
+/// A wrapping run breaks against the track it was placed in, and grows down when it does.
 ///
-/// The pane's prose is the first place in a real screen where a caption is longer than its
-/// column. Both halves are asserted, because the width alone is not evidence of anything: a
-/// run laid out as a single line still has its *node* clamped by the track, and reads as
-/// correct right up until you look at it. What gives it away is the height — one line's for
-/// a paragraph — and glyphs drawn straight through the panel's edge and off the window.
-///
-/// The regression behind it: `Preset::Text` was `Style::DEFAULT`, which is a flex **row**,
-/// and a wrapping run owns a sprite per line. So a paragraph's lines laid out beside each
-/// other. The height is what says which way they go, which is why it is the assertion.
+/// The width alone settles nothing: a run laid out as a single line still has its node
+/// clamped by the track, and draws its glyphs straight through the column's edge. The height
+/// is what separates the two, because a wrapping run owns a sprite per line and `Preset::Text`
+/// stacks those down rather than across.
 #[test]
 fn a_wrapping_run_breaks_against_its_column() {
     use crate::layout::Track;
@@ -2671,18 +2584,18 @@ fn a_wrapping_run_breaks_against_its_column() {
     );
 }
 
-/// One line of a caption, at the fixture's scope. Read from the palette rather than written
-/// down, so the assertion moves with the type ramp instead of pinning it.
+/// Returns one caption line's height at the fixture's scope, read from the palette's ramp.
+///
+/// Reading it rather than writing it down keeps the assertions that use it moving with the
+/// type ramp instead of pinning it.
 fn run_line_height() -> f32 {
     Host::with(|h| crate::role::typography(crate::role::TypeRole::Caption, h.root_scope).size)
 }
 
-/// The same, with the prose inside a `switch` arm.
+/// A wrapping run inside a `switch` arm breaks against its column.
 ///
-/// The pane's two presentations are a branch, so every caption in it reaches layout through
-/// an adapter. An arm is a child of the container now, which is what makes this the same
-/// question as the test above rather than a different one — and it is worth asserting
-/// separately, because it was the arrangement that first drew through the window's edge.
+/// An arm is a child of the container, so a caption reaching layout through an adapter is
+/// measured against the same track as one placed directly.
 #[test]
 fn a_wrapping_run_inside_an_arm_breaks_against_its_column() {
     use crate::layout::Track;
@@ -2724,12 +2637,11 @@ fn a_wrapping_run_inside_an_arm_breaks_against_its_column() {
     );
 }
 
-/// A wrapping run breaks against the room its container's **padding** leaves it.
+/// A wrapping run breaks against the room its containers' padding leaves it.
 ///
-/// The pane nests a padded section inside a padded surface, so the prose has two insets
-/// between it and the column. Measuring against the column instead overflows by exactly
-/// those insets — which does not look like a measure bug, it looks like text running off the
-/// window's edge.
+/// A padded section inside a padded surface puts two insets between the prose and the column,
+/// and measuring against the column instead overflows by exactly those insets, which shows up
+/// as text running off the window's edge.
 #[test]
 fn a_wrapping_run_breaks_inside_its_containers_padding() {
     use crate::layout::Track;
@@ -2772,19 +2684,15 @@ fn a_wrapping_run_breaks_inside_its_containers_padding() {
     );
 }
 
-
-/// The two intrinsic probes ask opposite questions, and a wrapping run answers them
-/// differently.
+/// A run that can break answers taffy's two intrinsic probes differently.
 ///
-/// Asserted at the measure seam rather than through a layout, because this is where the
-/// defect was: `MeasureIn::available` flattened both of taffy's intrinsic probes into
-/// "indefinite", so a paragraph answered its one-line width to *how narrow can you be*. The
-/// numbers are read from the engine rather than written down, so the assertion moves with
-/// the type ramp.
+/// `MeasureIn::available` carries `MinContent` and `MaxContent` apart rather than flattening
+/// both to indefinite, so a paragraph does not answer its one-line width to min-content. This
+/// is asserted at the measure seam, and the widths come from the engine rather than being
+/// written down, so it moves with the type ramp.
 ///
-/// A single-line run is the control. It has no break opportunity, so its narrowest width
-/// genuinely is its widest — and a test that only looked at prose could not tell a correct
-/// answer from a flattened one.
+/// The single-line run is the control: it has no break opportunity, so its narrowest width is
+/// its widest and both probes give one answer.
 #[test]
 fn the_two_intrinsic_probes_differ_for_a_run_that_can_break() {
     let mut patch = fixture();
@@ -2818,11 +2726,12 @@ fn the_two_intrinsic_probes_differ_for_a_run_that_can_break() {
         "the paragraph answered {} DIPs to both probes, so its min-content is its whole line",
         prose_min.x
     );
-    // Narrower *and taller*: a run measured at its longest word occupies several lines, and
-    // a width reported without the height that goes with it is a box that clips its own text.
+    // Narrower and taller: a run measured at its longest word occupies several lines, and a
+    // width reported without the matching height is a box that clips its own text.
     assert!(
         prose_min.y > prose_max.y,
-        "the paragraph reported one line's height ({}) at min-content", prose_min.y
+        "the paragraph reported one line's height ({}) at min-content",
+        prose_min.y
     );
 
     let (label_min, label_max) = (probe(keys[1], MinContent), probe(keys[1], MaxContent));
@@ -2832,16 +2741,13 @@ fn the_two_intrinsic_probes_differ_for_a_run_that_can_break() {
     );
 }
 
-/// A scroll container inside a hidden subtree waits for a box before it creates its tracker.
+/// A scroll container inside a hidden subtree defers its tracker until it is shown, and
+/// creates one then.
 ///
-/// `hide_if` and `when` are `Display::None` and deliberately **not** an unmount, so the
-/// subtree stays mounted and is solved at zero. A `VisualInteractionSource` takes its hit
-/// region from the viewport's size at the moment it is created, so one created there
-/// hit-tests nothing — which is what `Scene::tracker` asserts about, and which reached a
-/// running build as a start-up panic rather than as a surface that quietly ignored the wheel.
-///
-/// Both halves are asserted. That it does not create one while hidden is the defect; that it
-/// creates one when shown is what stops the fix from being "never scroll again".
+/// `hide_if` and `when` are `Display::None` rather than an unmount, so the subtree stays
+/// mounted and is solved at zero. A `VisualInteractionSource` takes its hit region from the
+/// viewport's size at the moment it is created, so one created there hit-tests nothing;
+/// `Scene::tracker` rejects a zero-size viewport rather than accepting it.
 #[test]
 fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
     let hidden = crate::signal::Cell::new(true);
@@ -2886,14 +2792,13 @@ fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
     );
 }
 
-// ── reading back where the solve put something ───────────────────────────────────
+// ── reading back the boxes the solve produced ────────────────────────────────────
 
-/// A probe reports its node's box, and reports it as a signal.
+/// A probe reports its node's solved box, as a signal.
 ///
-/// The case behind it is a gutter beside independently-sized rows: the wires meet the rows
-/// at their resolved centres, and no container can hold both halves. Asserted on rows of
-/// *different* heights, because a probe that reported a uniform stride would satisfy a
-/// same-height test while being useless for the only thing it exists for.
+/// A gutter drawn beside independently-sized rows meets each row at its resolved centre, and
+/// no container holds both halves. The rows here are given different heights, so a probe
+/// reporting a uniform stride rather than each node's own box fails.
 #[test]
 fn a_probe_reports_where_the_solve_put_its_node() {
     let (first, second) = (crate::layout::probe(), crate::layout::probe());
@@ -2927,20 +2832,25 @@ fn a_probe_reports_where_the_solve_put_its_node() {
     );
 }
 
-/// A probe that did not move writes nothing, and one that moved writes once.
+/// A probe writes only when its node's box moves.
 ///
-/// The equality gate is what keeps a probe off the per-frame path: a screen that solves and
-/// moves nothing must not wake whatever is derived from one. Asserted through a `Memo`'s
-/// recompute count, because that is what a consumer actually pays.
+/// The equality gate keeps a probe off the per-frame path: a solve that moves nothing wakes
+/// nothing derived from it. The count is a `Memo`'s recomputes, which is what a consumer of
+/// the probe pays.
 #[test]
 fn a_probe_publishes_only_when_its_node_moves() {
     let tall = crate::signal::Cell::new(false);
     let where_ = crate::layout::probe();
     let mut patch = fixture();
     let _held = mount(
-        stack(plate().height(Metric::RowH).no_shrink().when(move || !tall.get()))
-            .probed(where_)
-            .width(Len::Pct(1.0)),
+        stack(
+            plate()
+                .height(Metric::RowH)
+                .no_shrink()
+                .when(move || !tall.get()),
+        )
+        .probed(where_)
+        .width(Len::Pct(1.0)),
         root(),
     );
     flush(&mut patch);
@@ -2980,9 +2890,9 @@ fn a_probe_publishes_only_when_its_node_moves() {
 
 /// A probe attached inside a subtree that unmounts is released with it.
 ///
-/// Both halves die at different moments — the cell with the scope that made it, the row with
-/// the mount walk — so the publish must survive either order. The assertion is that the
-/// flush after the unmount returns at all: writing a disposed cell panics.
+/// The cell dies with the scope that made it and the row with the mount walk, so the publish
+/// tolerates either order. Writing a disposed cell panics, so the flush after the unmount
+/// returning at all is half the assertion.
 #[test]
 fn a_probe_survives_its_subtree_unmounting() {
     let shown = crate::signal::Cell::new(true);
@@ -3003,7 +2913,10 @@ fn a_probe_survives_its_subtree_unmounting() {
         root(),
     );
     flush(&mut patch);
-    assert!(where_.get().size.y > 0.0, "the probed node was never solved");
+    assert!(
+        where_.get().size.y > 0.0,
+        "the probed node was never solved"
+    );
 
     shown.set(false);
     crate::signal::flush();
