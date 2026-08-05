@@ -23,7 +23,8 @@ use std::cell::RefCell;
 use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
-    GroupId, Ids, Mask, MeasureIn, MeasureKey, Measured, Model, NodeId, RunId, Slots, SpriteId,
+    Avail, GroupId, Ids, Mask, MeasureIn, MeasureKey, Measured, Model, NodeId, RunId, Slots,
+    SpriteId,
     taffy,
 };
 use windows_text::{FontLadder, FontSpec, SegBuffers, ShapedRun, TextEngine};
@@ -72,7 +73,13 @@ impl From<&TextSource> for Source {
         match source {
             TextSource::Static(s) => Self::Static(s),
             TextSource::Owned(s) => Self::Owned(s.clone()),
-            TextSource::Dynamic(read) => Self::Owned(read()),
+            // The one allocation a reactive run makes at mount, and it is a buffer it keeps:
+            // every change after this is written into it in place.
+            TextSource::Dynamic(_) => {
+                let mut owned = String::new();
+                source.append(&mut owned);
+                Self::Owned(owned)
+            }
         }
     }
 }
@@ -219,6 +226,13 @@ pub(crate) fn try_with<R>(f: impl FnOnce(&mut Table) -> R) -> Option<R> {
 /// The class is an **input** rather than something read from ambient state, so a
 /// measurement is taken under the width the container actually resolved and not under
 /// whatever was current when the node was built.
+///
+/// **The three availability states are answered separately**, and for a run that can break
+/// they are three different numbers. A min-content probe asks how narrow the run can be,
+/// which is its longest unbreakable span; a max-content probe asks how wide it would like
+/// to be, which is its one-line width. Answering the one-line width to both is what lets
+/// flex shrink a paragraph below its own longest word, and the symptom is a break in the
+/// middle of a word.
 pub(crate) fn measure(input: MeasureIn) -> Vector2 {
     with(|table| {
         let Table {
@@ -229,11 +243,32 @@ pub(crate) fn measure(input: MeasureIn) -> Vector2 {
             return Vector2 { x: 0.0, y: 0.0 };
         };
         entry.sync(engine, input.class);
-        entry.run.measure(input.available.0)
+        match input.available.0 {
+            // Unbounded, which is what a run laid out at its natural width is. A
+            // single-line run answers this to every probe, and correctly: it has no break
+            // opportunity, so its narrowest width *is* its widest.
+            Avail::MaxContent => entry.run.measure(None),
+            Avail::Definite(w) => entry.run.measure(Some(w)),
+            // Measured at the longest unbreakable span, so the height is the one that span
+            // implies rather than the one-line height a bare `min_width` would leave beside
+            // it. A wrapping run at min-content is several lines tall, and a caller given
+            // the width without the height gets a box that clips its own text.
+            Avail::MinContent => entry.run.measure(Some(entry.run.min_width())),
+        }
     })
 }
 
 impl Table {
+    /// A run's longest unbreakable span, in DIPs.
+    ///
+    /// The number behind [`Avail::MinContent`], read back so a test can assert the floor
+    /// rather than write down a width that moves with the type ramp.
+    pub(crate) fn min_width_of(&self, key: MeasureKey) -> f32 {
+        self.entries
+            .get(key)
+            .map_or(0.0, |entry| entry.run.min_width())
+    }
+
     /// The string a run was laid out from.
     ///
     /// What automation derives an accessible name from: a widget's name is its own text
@@ -312,17 +347,22 @@ impl Table {
     /// Event rate by construction: changing a line's string is structural — reshape,
     /// re-rasterize, re-point — and text that changes at display rate belongs in a
     /// presentation region.
-    /// Re-points a run's text, answering whether the string actually moved.
-    pub(crate) fn set_text(&mut self, key: MeasureKey, text: &str) -> bool {
-        let Some(entry) = self.entries.get_mut(key) else {
-            return false;
-        };
+    /// Re-points a run's text, answering the node whose measure has to be re-asked — or
+    /// `None` where the string did not move.
+    ///
+    /// The node and not a `bool`, because marking the entry stale is only half of it.
+    /// `stale` is read by [`Entry::sync`], `sync` runs from the measure function, and the
+    /// measure function runs only for a node taffy considers dirty. Nothing about re-pointing
+    /// a string makes it dirty — the measure *context* is a key that never changes — so the
+    /// caller has to say so, and this is what it needs to say it about.
+    pub(crate) fn set_text(&mut self, key: MeasureKey, text: &str) -> Option<NodeId> {
+        let entry = self.entries.get_mut(key)?;
         if entry.text.as_str() == text {
-            return false;
+            return None;
         }
         entry.text.set(text);
         entry.stale = true;
-        true
+        Some(entry.node())
     }
 
     /// Releases a run and the resource slots it held.
@@ -416,14 +456,18 @@ impl Entry {
         let _ = engine.reshape(&mut self.run, self.text.as_str(), &font, self.flow);
     }
 
-    /// Fixes this run at the width it was given and re-emits what moved.
-    fn publish(&mut self, engine: &TextEngine, model: &mut Model) -> bool {
-        // The box layout gave *this* run: the laid-out label sprite, or the column the
-        // lines sit in. Both are the node whose style measured it.
-        let node = match self.target {
+    /// The node whose style measured this run: the laid-out label sprite, or the column the
+    /// lines sit in.
+    fn node(&self) -> NodeId {
+        match self.target {
             Target::Line { sprite, .. } => sprite.node(),
             Target::Wrapped { group, .. } => group.node(),
-        };
+        }
+    }
+
+    /// Fixes this run at the width it was given and re-emits what moved.
+    fn publish(&mut self, engine: &TextEngine, model: &mut Model) -> bool {
+        let node = self.node();
         let width = model.solved(node).size.x;
         if width <= 0.0 {
             return false;

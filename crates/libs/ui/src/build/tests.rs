@@ -29,14 +29,11 @@ pub(crate) fn fixture() -> SinkPatch {
         super::text::install(FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]))
             .expect("DirectWrite is available on the platform floor");
     }
-    let root = taffy::Style {
-        size: taffy::Size {
-            width: taffy::Dimension::percent(1.0),
-            height: taffy::Dimension::percent(1.0),
-        },
-        ..taffy::Style::DEFAULT
-    };
-    let mut model = Model::new(root);
+    // The **driver's** root, not one written here: a fixture that roots differently tests an
+    // arrangement no window ever has. This one was a flex row, so a mounted child took its
+    // content width — which is how six scroll tests came to assert about a viewport zero DIPs
+    // wide, whose interaction source hit-tests nothing.
+    let mut model = Model::new(crate::layout::root());
     model.set_window(Vector2 { x: 800.0, y: 600.0 });
     Host::install(
         model,
@@ -910,10 +907,7 @@ fn a_keyed_list_moves_survivors_rather_than_reminting_them() {
     let mut patch = fixture();
     let items = crate::signal::Cell::new(vec![1_u32, 2, 3]);
     let _list = mount(
-        stack(each(
-            move || items.get().into_iter().map(|k| (k, k)).collect(),
-            |_| plate(),
-        )),
+        stack(each(move || items.get(), |item| item, |_| plate())),
         root(),
     );
     flush(&mut patch);
@@ -2294,9 +2288,9 @@ fn a_label_that_changes_marks_the_accessible_tree_stale() {
     let mut patch = fixture();
     let caption = crate::signal::Cell::new("Off".to_owned());
     let _text = mount(
-        crate::widget::text(crate::widget::TextSource::Dynamic(Box::new(move || {
-            caption.get()
-        }))),
+        crate::widget::text(crate::widget::reactive(move |out| {
+            caption.with(|s| out.push_str(s));
+        })),
         root(),
     );
     flush(&mut patch);
@@ -2313,6 +2307,122 @@ fn a_label_that_changes_marks_the_accessible_tree_stale() {
     assert!(
         named.iter().any(|(_, name, _)| name == "On"),
         "and the next publish carries the new one: {named:?}"
+    );
+}
+
+/// A readout shows its value, and follows it.
+///
+/// [`shown`](crate::widget::shown) formats through `Display` straight into the run's buffer,
+/// so there is no `String` between the value and the glyphs — and therefore nothing but this
+/// to prove the two are still connected.
+#[test]
+fn a_shown_readout_renders_its_value_and_follows_it() {
+    let mut patch = fixture();
+    let count = crate::signal::Cell::new(7_usize);
+    let _text = mount(
+        crate::widget::mono(crate::widget::shown(move || count.get())),
+        root(),
+    );
+    flush(&mut patch);
+    assert!(
+        seeds().iter().any(|(_, name, _)| name == "7"),
+        "the readout must show the value it was given: {:?}",
+        seeds()
+    );
+
+    count.set(12);
+    crate::signal::flush();
+    assert!(
+        seeds().iter().any(|(_, name, _)| name == "12"),
+        "and follow it: {:?}",
+        seeds()
+    );
+}
+
+/// A readout whose **value** moves at display rate but whose **text** does not.
+///
+/// The case the whole write-in-place seam exists for, and the one a dragged control is:
+/// `-6.031` and `-6.028` both format to `-6.0 dB`. The table already declines to reshape a
+/// string that did not move, so the only thing left to prove is that discovering it did not
+/// move is free — a source answering with a `String` allocated, formatted, copied and freed
+/// every frame to learn nothing.
+#[test]
+fn a_readout_whose_text_does_not_move_allocates_nothing() {
+    use core::fmt::Write;
+
+    let mut patch = fixture();
+    let level = crate::signal::Cell::new(-6.031_f64);
+    let _text = mount(
+        crate::widget::mono(crate::widget::reactive(move |out| {
+            let _ = write!(out, "{:.1} dB", level.get());
+        })),
+        root(),
+    );
+    flush(&mut patch);
+    // One warm-up, because the claim is about steady state: the scratch buffer and the
+    // scheduler's own queues each reach their high-water mark once, and a seam that
+    // allocated *only* there would be doing its job.
+    level.set(-6.030);
+    crate::signal::flush();
+
+    let before = crate::counting::allocations();
+    level.set(-6.028);
+    crate::signal::flush();
+    let during = crate::counting::allocations() - before;
+
+    assert_eq!(
+        during, 0,
+        "a readout settling on the same text allocated {during} times"
+    );
+}
+
+/// A run bound to a **memo** follows it, and not only a run bound to a cell.
+///
+/// The shape a panel's title row has: one memo over the selection, minted once when the panel
+/// is built and never rebuilt, read by two runs that say different things about presence. If
+/// only the cell-bound path propagated, a panel would keep saying "nothing selected" while
+/// its own body showed the subject — which is what this was written to catch.
+#[test]
+fn a_run_bound_to_a_memo_follows_it() {
+    let mut patch = fixture();
+    let selection = crate::signal::Cell::new(None::<u32>);
+    let selected = crate::signal::Memo::new(move || selection.get());
+    let runs = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let counter = std::rc::Rc::clone(&runs);
+    let _held = mount(
+        stack(crate::widget::text(crate::widget::reactive(move |out| {
+            counter.set(counter.get() + 1);
+            selected.with(|s| {
+                out.push_str(match s {
+                    Some(_) => "a much longer line of text than the other one",
+                    None => "x",
+                });
+            });
+        })))
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    crate::signal::flush();
+    flush(&mut patch);
+    let run = Host::with(|h| {
+        h.mounts
+            .iter()
+            .map(|(_, m)| m.node)
+            .nth(1)
+            .expect("the run")
+    });
+    let absent = Host::with(|h| h.model().solved(run).size.x);
+
+    selection.set(Some(1));
+    crate::signal::flush();
+    flush(&mut patch);
+    let present = Host::with(|h| h.model().solved(run).size.x);
+
+    assert!(
+        present > absent,
+        "the run measured {absent} DIPs before the memo moved and {present} after, so the \
+         memo's change never reached it (the binding ran {} times)",
+        runs.get()
     );
 }
 
@@ -2341,4 +2451,566 @@ fn a_hidden_subtree_does_not_measure_its_leaves() {
     );
     // The assertion is that this returns at all.
     flush(&mut patch);
+}
+
+// ── what a structural adapter contributes to its parent's layout ─────────────────
+//
+// The four below are one regression, and it survived because the mechanism's own tests
+// asserted that a keyed list *recycles* — never what one looks like. An adapter used to mint
+// a `Preset::Bare` group and parent its rows to it, and `Preset::Bare` is `Style::DEFAULT`,
+// which is a content-sized flex **row**. So a list laid out horizontally whatever its
+// container was, and an arm could not fill the box it was placed in.
+
+/// A keyed list is laid out by the container it was passed to.
+///
+/// The rows share a left edge and descend, because the container is a column. Under the
+/// wrapper they shared a *top* edge and marched across instead — which is a layout nobody
+/// wrote, imposed by a node nobody could name.
+#[test]
+fn a_keyed_list_lays_out_under_its_container() {
+    let mut patch = fixture();
+    let _list = mount(
+        stack(each(
+            || (0_u32..3).collect(),
+            |item| item,
+            |_| plate().height(Metric::CardMinH),
+        ))
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    // The stack, its adapter's anchor, then the three rows in mount order.
+    let rows = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        [
+            h.model().solved(nodes[2]),
+            h.model().solved(nodes[3]),
+            h.model().solved(nodes[4]),
+        ]
+    });
+    for pair in rows.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        assert!(
+            (a.rect.x0 - b.rect.x0).abs() < 1.0,
+            "a column's rows share a left edge: {} then {}",
+            a.rect.x0,
+            b.rect.x0
+        );
+        assert!(
+            b.rect.y0 > a.rect.y0,
+            "and they descend: {} then {}",
+            a.rect.y0,
+            b.rect.y0
+        );
+    }
+}
+
+/// The anchor occupies nothing.
+///
+/// It is in the parent's child list for its **identity** and for nothing else, so a list of
+/// three rows must measure exactly as three rows. A wrapper that still had a box would show
+/// up here as a gap the author cannot remove.
+#[test]
+fn an_adapters_anchor_takes_no_space() {
+    let mut patch = fixture();
+    let _list = mount(
+        stack(each(
+            || (0_u32..2).collect(),
+            |item| item,
+            |_| plate().height(Metric::CardMinH),
+        ))
+        .gap(Len::Zero)
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let (anchor, first, second) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        (
+            h.model().solved(nodes[1]),
+            h.model().solved(nodes[2]),
+            h.model().solved(nodes[3]),
+        )
+    });
+    assert_eq!(
+        anchor.size,
+        windows_numerics::Vector2 { x: 0.0, y: 0.0 },
+        "the anchor is hidden, so it has no size at all"
+    );
+    assert!(
+        (second.rect.y0 - first.rect.y1).abs() < 1.0,
+        "at zero gap the rows abut: {} then {}",
+        first.rect.y1,
+        second.rect.y0
+    );
+}
+
+/// A `switch` arm fills the box it was placed in.
+///
+/// The wrapper carried `flex_grow: 0`, so an arm was content-sized inside a container that
+/// had already been told to give it everything — and the author's own `.grow()` landed on
+/// the stack around the switch, where it looked like it had been honoured.
+#[test]
+fn a_switch_arm_fills_the_box_it_was_placed_in() {
+    let mut patch = fixture();
+    let _held = mount(
+        stack(switch(|| 0_u8, |_| plate().grow()))
+            .height(Len::Pct(1.0))
+            .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let (container, arm) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        (h.model().solved(nodes[0]), h.model().solved(nodes[2]))
+    });
+    assert!(
+        (arm.size.y - container.size.y).abs() < 1.0,
+        "the arm must take the container's height: {} of {}",
+        arm.size.y,
+        container.size.y
+    );
+}
+
+/// Two adjacent branches keep their order across being empty.
+///
+/// **This is why the anchor exists.** Both arms are absent at mount, so both adapters would
+/// otherwise share one predecessor — and whichever filled *second* would be placed at the
+/// same position as the first and land above it. Here the second one fills first, which is
+/// exactly the order that used to come out backwards.
+#[test]
+fn two_adjacent_branches_keep_their_order_across_being_empty() {
+    let mut patch = fixture();
+    let (first, second) = (
+        crate::signal::Cell::new(false),
+        crate::signal::Cell::new(false),
+    );
+    let _held = mount(
+        stack((
+            when(first, || plate().height(Metric::CardMinH)),
+            when(second, || plate().height(Metric::CardMinH)),
+        ))
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    // The lower one appears first, so nothing about the order can come from mount order.
+    second.set(true);
+    crate::signal::flush();
+    flush(&mut patch);
+    first.set(true);
+    crate::signal::flush();
+    flush(&mut patch);
+
+    let (lower, upper) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        // The stack, two anchors, then `second`'s arm and `first`'s arm in the order they
+        // were filled.
+        (h.model().solved(nodes[3]), h.model().solved(nodes[4]))
+    });
+    assert!(
+        upper.rect.y0 < lower.rect.y0,
+        "the branch written first must lay out above the one written second, whichever \
+         filled first: {} against {}",
+        upper.rect.y0,
+        lower.rect.y0
+    );
+}
+
+/// A wrapping run breaks against the track it was placed in, and **grows down** when it
+/// does.
+///
+/// The pane's prose is the first place in a real screen where a caption is longer than its
+/// column. Both halves are asserted, because the width alone is not evidence of anything: a
+/// run laid out as a single line still has its *node* clamped by the track, and reads as
+/// correct right up until you look at it. What gives it away is the height — one line's for
+/// a paragraph — and glyphs drawn straight through the panel's edge and off the window.
+///
+/// The regression behind it: `Preset::Text` was `Style::DEFAULT`, which is a flex **row**,
+/// and a wrapping run owns a sprite per line. So a paragraph's lines laid out beside each
+/// other. The height is what says which way they go, which is why it is the assertion.
+#[test]
+fn a_wrapping_run_breaks_against_its_column() {
+    use crate::layout::Track;
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::grid((
+            plate().height(Metric::CardMinH),
+            stack(crate::widget::caption(
+                "Latency, initialization time and total CPU belong here — the figures the \
+                 config format cannot tell you. They are left blank rather than invented.",
+            )),
+        ))
+        .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
+        .gap(Len::Zero)
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let (column, run) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        (h.model().solved(nodes[2]), h.model().solved(nodes[3]))
+    });
+    // A quarter of the fixture's 800-DIP window.
+    assert!(
+        column.size.x <= 200.0 + 1.0,
+        "the prose column measured {} DIPs against a 200-DIP track, so it wrapped against \
+         nothing and drew through the edge",
+        column.size.x
+    );
+    // That sentence is far longer than a 200-DIP line holds, so it cannot be one.
+    assert!(
+        run.size.y > 2.0 * run_line_height(),
+        "the run is {} DIPs tall — a paragraph laid out as a single line",
+        run.size.y
+    );
+}
+
+/// One line of a caption, at the fixture's scope. Read from the palette rather than written
+/// down, so the assertion moves with the type ramp instead of pinning it.
+fn run_line_height() -> f32 {
+    Host::with(|h| crate::role::typography(crate::role::TypeRole::Caption, h.root_scope).size)
+}
+
+/// The same, with the prose inside a `switch` arm.
+///
+/// The pane's two presentations are a branch, so every caption in it reaches layout through
+/// an adapter. An arm is a child of the container now, which is what makes this the same
+/// question as the test above rather than a different one — and it is worth asserting
+/// separately, because it was the arrangement that first drew through the window's edge.
+#[test]
+fn a_wrapping_run_inside_an_arm_breaks_against_its_column() {
+    use crate::layout::Track;
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::grid((
+            plate().height(Metric::CardMinH),
+            stack(switch(
+                || 0_u8,
+                |_| {
+                    stack(crate::widget::caption(
+                        "Latency, initialization time and total CPU belong here — the figures \
+                         the config format cannot tell you. They are left blank rather than \
+                         invented.",
+                    ))
+                },
+            )),
+        ))
+        .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
+        .gap(Len::Zero)
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let (column, arm) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        (h.model().solved(nodes[2]), h.model().solved(nodes[4]))
+    });
+    assert!(
+        column.size.x <= 200.0 + 1.0,
+        "the column measured {} DIPs against a 200-DIP track",
+        column.size.x
+    );
+    assert!(
+        arm.size.x <= 200.0 + 1.0,
+        "the arm measured {} DIPs inside a 200-DIP column, so its prose drew through the edge",
+        arm.size.x
+    );
+}
+
+/// A wrapping run breaks against the room its container's **padding** leaves it.
+///
+/// The pane nests a padded section inside a padded surface, so the prose has two insets
+/// between it and the column. Measuring against the column instead overflows by exactly
+/// those insets — which does not look like a measure bug, it looks like text running off the
+/// window's edge.
+#[test]
+fn a_wrapping_run_breaks_inside_its_containers_padding() {
+    use crate::layout::Track;
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::grid((
+            plate().height(Metric::CardMinH),
+            stack(
+                stack(crate::widget::caption(
+                    "Latency, initialization time and total CPU belong here — the figures the \
+                 config format cannot tell you. They are left blank rather than invented.",
+                ))
+                .padding(Len::Metric(Metric::SpaceMd)),
+            )
+            .padding(Len::Metric(Metric::SpaceLg)),
+        ))
+        .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
+        .gap(Len::Zero)
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let run = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        h.model()
+            .solved(*nodes.last().expect("the run is the deepest node"))
+    });
+    let space = Host::with(|h| {
+        (
+            crate::role::metric(Metric::SpaceLg, h.root_scope),
+            crate::role::metric(Metric::SpaceMd, h.root_scope),
+        )
+    });
+    let room = 200.0 - 2.0 * space.0 - 2.0 * space.1;
+    assert!(
+        run.size.x <= room + 1.0,
+        "the run measured {} DIPs against the {room} its two paddings left it",
+        run.size.x
+    );
+}
+
+
+/// The two intrinsic probes ask opposite questions, and a wrapping run answers them
+/// differently.
+///
+/// Asserted at the measure seam rather than through a layout, because this is where the
+/// defect was: `MeasureIn::available` flattened both of taffy's intrinsic probes into
+/// "indefinite", so a paragraph answered its one-line width to *how narrow can you be*. The
+/// numbers are read from the engine rather than written down, so the assertion moves with
+/// the type ramp.
+///
+/// A single-line run is the control. It has no break opportunity, so its narrowest width
+/// genuinely is its widest — and a test that only looked at prose could not tell a correct
+/// answer from a flattened one.
+#[test]
+fn the_two_intrinsic_probes_differ_for_a_run_that_can_break() {
+    let mut patch = fixture();
+    let _held = mount(
+        stack((
+            crate::widget::caption(
+                "Latency, initialization time and total CPU belong here — the figures the \
+                 config format cannot tell you.",
+            ),
+            crate::widget::label("Bypassed"),
+        )),
+        root(),
+    );
+    flush(&mut patch);
+
+    let keys: Vec<_> = Host::with(|h| h.mounts.iter().filter_map(|(_, m)| m.text).collect());
+    assert_eq!(keys.len(), 2, "the two runs registered");
+    let probe = |key, avail| {
+        text::measure(windows_scene::MeasureIn {
+            key,
+            class: crate::role::WidthClass::Wide,
+            known: (None, None),
+            available: (avail, windows_scene::Avail::MaxContent),
+        })
+    };
+    use windows_scene::Avail::{MaxContent, MinContent};
+
+    let (prose_min, prose_max) = (probe(keys[0], MinContent), probe(keys[0], MaxContent));
+    assert!(
+        prose_min.x < prose_max.x,
+        "the paragraph answered {} DIPs to both probes, so its min-content is its whole line",
+        prose_min.x
+    );
+    // Narrower *and taller*: a run measured at its longest word occupies several lines, and
+    // a width reported without the height that goes with it is a box that clips its own text.
+    assert!(
+        prose_min.y > prose_max.y,
+        "the paragraph reported one line's height ({}) at min-content", prose_min.y
+    );
+
+    let (label_min, label_max) = (probe(keys[1], MinContent), probe(keys[1], MaxContent));
+    assert_eq!(
+        label_min, label_max,
+        "a single-line run has no break opportunity, so both probes are one answer"
+    );
+}
+
+/// A scroll container inside a hidden subtree waits for a box before it creates its tracker.
+///
+/// `hide_if` and `when` are `Display::None` and deliberately **not** an unmount, so the
+/// subtree stays mounted and is solved at zero. A `VisualInteractionSource` takes its hit
+/// region from the viewport's size at the moment it is created, so one created there
+/// hit-tests nothing — which is what `Scene::tracker` asserts about, and which reached a
+/// running build as a start-up panic rather than as a surface that quietly ignored the wheel.
+///
+/// Both halves are asserted. That it does not create one while hidden is the defect; that it
+/// creates one when shown is what stops the fix from being "never scroll again".
+#[test]
+fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
+    let hidden = crate::signal::Cell::new(true);
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::scroll(plate().height(Metric::CardMinH))
+            .height(Metric::CardMinH)
+            .hide_if(move || hidden.get()),
+        root(),
+    );
+    flush(&mut patch);
+
+    let creates = |patch: &SinkPatch| {
+        patch
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::Tracker {
+                        op: windows_scene::TrackerOp::Create { .. },
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        creates(&patch),
+        0,
+        "a tracker was created against a viewport laid out at zero"
+    );
+
+    patch.clear();
+    hidden.set(false);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(
+        creates(&patch),
+        1,
+        "the viewport has a box now and its tracker was never created"
+    );
+}
+
+// ── reading back where the solve put something ───────────────────────────────────
+
+/// A probe reports its node's box, and reports it as a signal.
+///
+/// The case behind it is a gutter beside independently-sized rows: the wires meet the rows
+/// at their resolved centres, and no container can hold both halves. Asserted on rows of
+/// *different* heights, because a probe that reported a uniform stride would satisfy a
+/// same-height test while being useless for the only thing it exists for.
+#[test]
+fn a_probe_reports_where_the_solve_put_its_node() {
+    let (first, second) = (crate::layout::probe(), crate::layout::probe());
+    let mut patch = fixture();
+    let _held = mount(
+        stack((
+            plate().height(Metric::RowH).probed(first),
+            plate().height(Metric::CardMinH).probed(second),
+        ))
+        .gap(Len::Zero),
+        root(),
+    );
+    flush(&mut patch);
+
+    let (a, b) = (first.get(), second.get());
+    assert!(a.size.y > 0.0, "the first row was never reported");
+    assert_eq!(
+        b.rect.y0, a.rect.y1,
+        "the second row does not begin where the first ended, so these are not the boxes \
+         the solve produced"
+    );
+    assert!(
+        b.size.y > a.size.y,
+        "both rows reported {} DIPs — a probe reporting a uniform stride is no use to the \
+         thing it exists for",
+        a.size.y
+    );
+    assert_eq!(
+        a.size.x, b.size.x,
+        "the rows stretch to one column, so their widths agree"
+    );
+}
+
+/// A probe that did not move writes nothing, and one that moved writes once.
+///
+/// The equality gate is what keeps a probe off the per-frame path: a screen that solves and
+/// moves nothing must not wake whatever is derived from one. Asserted through a `Memo`'s
+/// recompute count, because that is what a consumer actually pays.
+#[test]
+fn a_probe_publishes_only_when_its_node_moves() {
+    let tall = crate::signal::Cell::new(false);
+    let where_ = crate::layout::probe();
+    let mut patch = fixture();
+    let _held = mount(
+        stack(plate().height(Metric::RowH).no_shrink().when(move || !tall.get()))
+            .probed(where_)
+            .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let counted = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let seen = crate::signal::Memo::new({
+        let counted = std::rc::Rc::clone(&counted);
+        move || {
+            counted.set(counted.get() + 1);
+            where_.get().size.y
+        }
+    });
+    seen.get();
+    let after_first = counted.get();
+
+    // A flush that changes nothing must not disturb it.
+    flush(&mut patch);
+    crate::signal::flush();
+    seen.get();
+    assert_eq!(
+        counted.get(),
+        after_first,
+        "a solve that moved nothing still published a box"
+    );
+
+    // A flush that does change the box must.
+    tall.set(true);
+    crate::signal::flush();
+    flush(&mut patch);
+    crate::signal::flush();
+    seen.get();
+    assert!(
+        counted.get() > after_first,
+        "the node's height changed and the probe never said so"
+    );
+}
+
+/// A probe attached inside a subtree that unmounts is released with it.
+///
+/// Both halves die at different moments — the cell with the scope that made it, the row with
+/// the mount walk — so the publish must survive either order. The assertion is that the
+/// flush after the unmount returns at all: writing a disposed cell panics.
+#[test]
+fn a_probe_survives_its_subtree_unmounting() {
+    let shown = crate::signal::Cell::new(true);
+    let where_ = crate::layout::probe();
+    let mut patch = fixture();
+    let _held = mount(
+        stack(switch(
+            move || shown.get(),
+            move |on| {
+                if *on {
+                    plate().height(Metric::RowH).probed(where_).erase()
+                } else {
+                    crate::widget::caption("gone").erase()
+                }
+            },
+        ))
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+    assert!(where_.get().size.y > 0.0, "the probed node was never solved");
+
+    shown.set(false);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(
+        Host::with(|h| h.probes.iter().count()),
+        0,
+        "the probe row outlived the subtree that declared it"
+    );
 }

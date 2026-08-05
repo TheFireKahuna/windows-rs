@@ -33,10 +33,13 @@ pub(crate) struct Mount;
 pub(crate) struct Value;
 #[derive(Debug)]
 pub(crate) struct Scroll;
+#[derive(Debug)]
+pub(crate) struct Probe;
 
 pub(crate) type MountId = Id<Mount>;
 pub(crate) type ValueId = Id<Value>;
 pub(crate) type ScrollId = Id<Scroll>;
+pub(crate) type ProbeId = Id<Probe>;
 
 /// One mounted node, and everything it has to release.
 pub(crate) struct MountRow {
@@ -57,6 +60,7 @@ pub(crate) struct MountRow {
     /// whole screen, which is the opposite of what a keyed list is for.
     pub values: ValueId,
     pub scroll: Option<ScrollId>,
+    pub probe: Option<ProbeId>,
 }
 
 /// One interactive node, addressed by the index inside its [`ControlId`].
@@ -209,6 +213,9 @@ pub struct Host {
     pub(crate) trackers: Vec<TrackerSpec>,
     pub(crate) scroll_ids: Ids<Scroll>,
     pub(crate) scrolls: Slots<Scroll, ScrollRow>,
+    /// Nodes an application asked to be told the box of. Empty on almost every screen.
+    pub(crate) probe_ids: Ids<Probe>,
+    pub(crate) probes: Slots<Probe, ProbeRow>,
     /// Which control is which window command, for the caption band to resolve a point
     /// through. Filled at mount by [`El::caption`](super::El::caption).
     pub(crate) caption: crate::caption::Registry,
@@ -226,7 +233,7 @@ pub struct TrackerSpec {
     pub axes: windows_scene::Axes,
 }
 
-pub(crate) use crate::layout::ScrollRow;
+pub(crate) use crate::layout::{ProbeRow, ScrollRow};
 
 thread_local! {
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
@@ -288,6 +295,8 @@ impl Host {
             trackers: Vec::new(),
             scroll_ids: Ids::new(),
             scrolls: Slots::new(),
+            probe_ids: Ids::new(),
+            probes: Slots::new(),
             caption: crate::caption::Registry::default(),
             overlays: Vec::new(),
         };
@@ -397,7 +406,8 @@ impl Host {
                 .tip
                 .as_ref()
                 .map_or_else(Default::default, |(tip, _)| {
-                    let text = crate::signal::untracked(|| tip.read(str::to_owned));
+                    let mut text = String::new();
+                    crate::signal::untracked(|| tip.append(&mut text));
                     out.intern(&text)
                 });
             let value = match (control.uia, control.front.drive) {
@@ -553,6 +563,45 @@ impl Host {
     /// The container a grabbed thumb names.
     pub(crate) fn scroll_by_grab(&mut self, control: ControlId, f: impl FnOnce(&mut ScrollRow)) {
         self.scroll_where(|row| row.grab == Some(control), f);
+    }
+
+    /// Records a probed node against the mount row that owns it, so it is released when that
+    /// subtree unmounts rather than left reporting a node that no longer exists.
+    pub(crate) fn mint_probe(&mut self, row: MountId, probe: ProbeRow) {
+        let at = self.probes.insert(&mut self.probe_ids, probe);
+        if let Some(row) = self.mounts.get_mut(row) {
+            row.probe = Some(at);
+        }
+    }
+
+    /// Publishes the box every probed node was solved into, for the ones that moved.
+    ///
+    /// **Writing a cell here is safe and calling application code here is not.** A write
+    /// marks the graph and raises the frame request; it runs no effect and no memo, so it
+    /// cannot re-enter the host's borrow. What reads the value runs on the next tick, which
+    /// is the one-tick contract the probe documents.
+    ///
+    /// A cell whose owner has already been disposed is **skipped**, not written: the two
+    /// halves of a probe die at two different moments — the cell with the scope that made
+    /// it, the row with the mount walk that recorded it — and `Cell::set` panics on a
+    /// disposed handle. Depending on which drop runs first would be depending on the
+    /// unmount order of two unrelated things.
+    fn publish_probes(&mut self) {
+        for at in self.probes.positions() {
+            let Some(id) = self.probes.id_at(at) else {
+                continue;
+            };
+            let Some(probe) = self.probes.get(id) else {
+                continue;
+            };
+            let (node, cell) = (probe.node, probe.cell);
+            let now = crate::layout::Placed::from(self.model.solved(node));
+            // `set` and never `update`: its equality gate is what keeps a probe off the
+            // per-frame path, so a solve that moved nothing wakes nothing derived from one.
+            if cell.alive() {
+                cell.set(now);
+            }
+        }
     }
 
     /// Records a scroll container against the mount row that owns it, whose tracker dies
@@ -813,6 +862,9 @@ impl Host {
             while let Some(row) = self.values.remove(&mut self.value_ids, value) {
                 value = row.next;
             }
+            if let Some(probe) = row.probe {
+                self.probes.remove(&mut self.probe_ids, probe);
+            }
             // A tracker outliving its viewport would be a compositor object with nothing to
             // be sourced from, so it is dropped with the row that named it.
             if let Some(scroll) = row
@@ -868,6 +920,10 @@ impl Host {
         // Values bind compositor properties and dirty no layout, so they are published here
         // for ordering and contribute nothing to whether a re-solve is owed.
         self.publish_values();
+        // Probes contribute nothing either, and for a stronger reason: what they write is
+        // read on the next tick, so a probe that moved something would be a solve reacting to
+        // a solve and this loop would have no reason to terminate.
+        self.publish_probes();
         text | scrolls
     }
 
@@ -1032,9 +1088,25 @@ impl Host {
         // moment it is created, and the solve above is what gave the viewport one. Created
         // at mount it hit-tests nothing, reports success, and the surface silently ignores
         // every wheel notch for the life of the window.
-        for spec in core::mem::take(&mut self.trackers) {
+        //
+        // **A viewport with no area is not ready, and waiting is the whole answer.** A
+        // scroll container inside a hidden subtree is laid out at zero — `hide_when` and
+        // `when` are both `Display::None`, which is deliberately not an unmount — so the
+        // solve above gives it nothing to be sourced from. Creating one there is the same
+        // defect as creating one at mount, except that it trips the assertion instead of
+        // going quiet. Retried every flush, which costs one `solved` read per pending spec
+        // on a list that is empty in the steady state, and the retry lands on the flush
+        // that reveals the subtree because revealing it is a style change.
+        let mut pending = core::mem::take(&mut self.trackers);
+        pending.retain(|spec| {
+            let size = self.model.solved(spec.viewport.node()).size;
+            if size.x <= 0.0 || size.y <= 0.0 {
+                return true;
+            }
             self.model.create_tracker(spec.id, spec.viewport, spec.axes);
-        }
+            false
+        });
+        self.trackers = pending;
         let mut moved = false;
         for at in self.scrolls.positions() {
             let Some(id) = self.scrolls.id_at(at) else {
@@ -1047,7 +1119,17 @@ impl Host {
                 (scroll.tracker, scroll.viewport, scroll.thumb, scroll.last);
             let (content, state, rail, grab) =
                 (scroll.content, scroll.state, scroll.rail, scroll.grab);
-            let viewport_h = self.model.solved(viewport).size.y;
+            let box_ = self.model.solved(viewport).size;
+            // A viewport with no area has not been laid out — a hidden subtree is solved at
+            // zero — and everything below would be computed from that zero and then recorded
+            // as published. The bounds would go to a tracker that does not exist yet and be
+            // dropped, `last` would say they had been sent, and the gate below would never
+            // send them again once it did. So an unmeasured container publishes nothing and
+            // remembers nothing, and the flush that gives it a box is the one that speaks.
+            if box_.x <= 0.0 || box_.y <= 0.0 {
+                continue;
+            }
+            let viewport_h = box_.y;
             // The realization window is a fraction of this, so a viewport that has just been
             // measured is the one signal a virtualized list cannot compute for itself.
             state.resized(viewport_h);

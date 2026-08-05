@@ -341,7 +341,9 @@ impl Overlays {
         // for a value nothing rebinds. This is the one place in the widget layer where a
         // `TextSource` is resolved eagerly, and the reason is that its lifetime is shorter
         // than the thing it describes.
-        let text = text.read(str::to_owned);
+        let mut owned = String::new();
+        text.append(&mut owned);
+        let text = owned;
         let overlay = self.open(spec, focus, || tip_body(text));
         self.dwell.tip = Some((target, overlay));
     }

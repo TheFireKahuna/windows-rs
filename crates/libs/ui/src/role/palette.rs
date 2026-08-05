@@ -104,6 +104,19 @@ pub fn metric(metric: Metric, scope: Scope) -> f32 {
     current().metric(metric, scope)
 }
 
+/// The brightest the palette authors, in cd/m².
+///
+/// Scope-free, because it is a property of the authored table rather than of anywhere it is
+/// used: it is what the output transform's shoulder is asked to reach, and the six speculars
+/// that go above diffuse white are the only things that depend on it.
+///
+/// Read from the palette rather than passed in, so the transform a window builds and the
+/// values the palette authors cannot be answering to two different peaks.
+#[must_use]
+pub fn content_peak_nits() -> f32 {
+    current().content_peak_nits()
+}
+
 // ── washes: derived, never stored ───────────────────────────────────────────────
 //
 // A stroke, a scrim and a hover tint are the same colour at a fraction of opacity. Deriving

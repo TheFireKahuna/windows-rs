@@ -208,18 +208,16 @@ impl Controls {
         let (was_hover, was_pressed) = (self.hovered, self.pressed);
         self.hovered = hover;
         self.pressed = pressed;
-        for id in [was_hover, was_pressed, hover, pressed].into_iter().flatten() {
+        for id in [was_hover, was_pressed, hover, pressed]
+            .into_iter()
+            .flatten()
+        {
             self.wash(id, front)?;
         }
         Ok(())
     }
 
-    fn one(
-        &mut self,
-        report: &Report,
-        front: &mut Front<'_>,
-        out: &mut Vec<Intent>,
-    ) -> Result<()> {
+    fn one(&mut self, report: &Report, front: &mut Front<'_>, out: &mut Vec<Intent>) -> Result<()> {
         match *report {
             // More than one of these can arrive from a single service, in the order the
             // pointer crossed them. They are all published, and what a three-millisecond

@@ -23,4 +23,4 @@ pub use seed::{
 // front thread's control table, and naming both after the chrome they serve meant the crate
 // carried two types of one name and an alias to tell them apart.
 pub use state::{ChromeRow, Controls, Front, Intent, What};
-pub use text::{Flow, Shaped, TextSource, bound, reactive};
+pub use text::{Flow, Shaped, TextSource, Written, reactive, shown};

@@ -20,14 +20,17 @@ struct Recorder {
 
 impl Recorder {
     fn run(list: &mut Keyed<char>, next: &str) -> Self {
-        let items: Vec<(char, ())> = next.chars().map(|key| (key, ())).collect();
+        // The item **is** the key here, which is the case the projection exists for: no
+        // pair to build, and nothing stored twice.
+        let items: Vec<char> = next.chars().collect();
         let out = Rc::new(RefCell::new(Self::default()));
         let (removed, built, placed) = (Rc::clone(&out), Rc::clone(&out), Rc::clone(&out));
         list.reconcile(
             &items,
+            |item| item,
             move |key| removed.borrow_mut().removed.push(*key),
-            move |key, ()| built.borrow_mut().built.push(*key),
-            move |key, (), step, after| placed.borrow_mut().steps.push((*key, step, after)),
+            move |key, _| built.borrow_mut().built.push(*key),
+            move |key, _, step, after| placed.borrow_mut().steps.push((*key, step, after)),
         );
         Rc::try_unwrap(out)
             .unwrap_or_else(|_| unreachable!("the callbacks are dropped by now"))
@@ -150,18 +153,18 @@ fn a_departing_row_disposes_its_scope_and_a_surviving_one_does_not() {
 
     let build = |cells: &Rc<RefCell<Vec<(char, Cell<i32>)>>>| {
         let cells = Rc::clone(cells);
-        move |key: &char, _: &()| {
+        move |key: &char, _: &char| {
             // Created inside the row's own scope, so the row owns it.
             cells.borrow_mut().push((*key, Cell::new(0_i32)));
         }
     };
 
-    let items: Vec<(char, ())> = "abc".chars().map(|k| (k, ())).collect();
-    list.reconcile(&items, |_| {}, build(&cells), |_, _, _, _| {});
+    let items: Vec<char> = "abc".chars().collect();
+    list.reconcile(&items, |item| item, |_| {}, build(&cells), |_, _, _, _| {});
     assert_eq!(live_nodes(), baseline + 3);
 
-    let items: Vec<(char, ())> = "ac".chars().map(|k| (k, ())).collect();
-    list.reconcile(&items, |_| {}, build(&cells), |_, _, _, _| {});
+    let items: Vec<char> = "ac".chars().collect();
+    list.reconcile(&items, |item| item, |_| {}, build(&cells), |_, _, _, _| {});
     assert_eq!(
         live_nodes(),
         baseline + 2,
@@ -189,11 +192,12 @@ fn a_list_reconciled_from_inside_an_effect_does_not_grow_its_scope() {
     let (owner, ()) = Owner::scope(|| {
         let mut list: Keyed<u32> = Keyed::new();
         for round in 0..100_u32 {
-            let items: Vec<(u32, ())> = (round..round + 3).map(|key| (key, ())).collect();
+            let items: Vec<u32> = (round..round + 3).collect();
             list.reconcile(
                 &items,
+                |item| item,
                 |_| {},
-                |_, ()| {
+                |_, _| {
                     let _ = Cell::new(0_i32);
                 },
                 |_, _, _, _| {},

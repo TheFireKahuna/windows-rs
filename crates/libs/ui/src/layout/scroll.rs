@@ -477,7 +477,7 @@ where
     // Keyed by index, and carrying it: the key is what recycles a row and the value is what
     // places it, and a row's placement has to survive the reconcile that moved it.
     let rows = crate::build::each_into(
-        move |out: &mut Vec<(usize, (usize, Option<T>))>| {
+        move |out: &mut Vec<(usize, Option<T>)>| {
             let realized = realized.get();
             let mut supplied = supplied.borrow_mut();
             supplied.clear();
@@ -492,10 +492,13 @@ where
                         Some(&(at, _)) if at == index => supplied.next().map(|(_, item)| item),
                         _ => None,
                     };
-                    out.push((index, (index, item)));
+                    out.push((index, item));
                 }
             }
         },
+        // The index **is** the key, and it is also what places the row — which is why the
+        // pair form stored it twice here. One field, projected.
+        |(index, _): &(usize, Option<T>)| index,
         // A realized index the caller did not supply gets its space and nothing in it. That
         // is the honest placeholder: the row is where it will be when the data arrives, and
         // no invented content claims to be the data.

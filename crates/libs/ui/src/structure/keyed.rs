@@ -174,6 +174,10 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
 
     /// Reconciles to `next`.
     ///
+    /// - `key` projects an item to its identity. A **borrow** and not a value, so a key that
+    ///   is not `Copy` costs nothing to read four times, and so the identity may live inside
+    ///   the item rather than beside it. Where the item *is* its own key, this is `|item|
+    ///   item`.
     /// - `remove` is called for every departing key, before anything is built.
     /// - `build` is called for every arriving key, **inside that key's own scope**, so
     ///   everything it creates is disposed when the key later leaves.
@@ -185,7 +189,8 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
     /// costs the callbacks and the hash lookups and nothing else.
     pub fn reconcile<T>(
         &mut self,
-        next: &[(K, T)],
+        next: &[T],
+        key: impl Fn(&T) -> &K,
         mut remove: impl FnMut(&K),
         mut build: impl FnMut(&K, &T),
         mut place: impl FnMut(&K, &T, Step, Option<usize>),
@@ -202,8 +207,8 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
         // ── 1. destroy ──────────────────────────────────────────────────────────
         // Stamp every key that survives, then sweep the old order for what was not
         // stamped. One pass per side, and no set to allocate.
-        for (key, _) in next {
-            if let Some(row) = rows.get_mut(key) {
+        for item in next {
+            if let Some(row) = rows.get_mut(key(item)) {
                 row.epoch = epoch;
             }
         }
@@ -219,7 +224,8 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
         // ── 2. create, and record where each survivor came from ─────────────────
         scratch.previous.clear();
         scratch.positions.clear();
-        for (position, (key, item)) in next.iter().enumerate() {
+        for (position, item) in next.iter().enumerate() {
+            let key = key(item);
             if let Some(row) = rows.get(key) {
                 scratch.previous.push(row.at);
                 scratch.positions.push(position);
@@ -252,7 +258,8 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
         // ── 4. place, front to back ─────────────────────────────────────────────
         let mut keep = scratch.keep.iter().copied().peekable();
         let mut survivor = 0;
-        for (position, (key, item)) in next.iter().enumerate() {
+        for (position, item) in next.iter().enumerate() {
+            let key = key(item);
             let after = position.checked_sub(1);
             // `positions` lists the survivors in new order, so a position that is not the
             // next one in it was built in step 2. Reading survivorship from the scratch
@@ -274,6 +281,6 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
             place(key, item, step, after);
         }
 
-        keys.extend(next.iter().map(|(key, _)| key.clone()));
+        keys.extend(next.iter().map(|item| key(item).clone()));
     }
 }

@@ -169,9 +169,18 @@ mod tests {
 
         assert_eq!(hit(&hits, 80.0, 16.0), CaptionHit::Drag, "between them");
         assert_eq!(hit(&hits, 30.0, 16.0), CaptionHit::Client, "the control");
-        assert_eq!(hit(&hits, 120.0, 16.0), CaptionHit::Button(CaptionButton::Minimize));
-        assert_eq!(hit(&hits, 170.0, 16.0), CaptionHit::Button(CaptionButton::Maximize));
-        assert_eq!(hit(&hits, 210.0, 16.0), CaptionHit::Button(CaptionButton::Close));
+        assert_eq!(
+            hit(&hits, 120.0, 16.0),
+            CaptionHit::Button(CaptionButton::Minimize)
+        );
+        assert_eq!(
+            hit(&hits, 170.0, 16.0),
+            CaptionHit::Button(CaptionButton::Maximize)
+        );
+        assert_eq!(
+            hit(&hits, 210.0, 16.0),
+            CaptionHit::Button(CaptionButton::Close)
+        );
     }
 
     /// A bar that declares no command has no command, however interactive it is.
@@ -182,9 +191,14 @@ mod tests {
     #[test]
     fn an_undeclared_control_is_never_a_command() {
         let _patch = fixture();
-        let _mount = mount(row((button("one"), button("two"))), Host::with(|h| h.model().root()));
+        let _mount = mount(
+            row((button("one"), button("two"))),
+            Host::with(|h| h.model().root()),
+        );
 
-        assert!(Host::with(|h| BUTTONS.iter().all(|&b| h.caption.id(b).is_none())));
+        assert!(Host::with(|h| BUTTONS
+            .iter()
+            .all(|&b| h.caption.id(b).is_none())));
 
         let mut hits = HitTable::default();
         hits.replace(&[entry(ControlId::default(), 0.0, 60.0)]);

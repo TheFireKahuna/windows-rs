@@ -137,6 +137,12 @@ pub(crate) struct Slot {
     /// what every other modifier here already guarantees. It is folded in at mount, and only
     /// where a hit entry was declared — so declining an inflation never *creates* a target.
     pub no_inflate: bool,
+    /// Where the solve is to report this node's box, or `None` for the overwhelming majority
+    /// that nobody asks about.
+    ///
+    /// A [`Cell`](crate::signal::Cell) and not a node id, because the reporting direction is
+    /// the point: the application never learns a `NodeId` and never reaches the model.
+    pub probe: Option<crate::signal::Cell<crate::layout::Placed>>,
 }
 
 impl Default for Slot {
@@ -166,6 +172,7 @@ impl Default for Slot {
             present: true,
             placed: false,
             no_inflate: false,
+            probe: None,
         }
     }
 }
@@ -300,12 +307,16 @@ pub(crate) enum Act {
     /// Presence that varies, as `Display::None` rather than as an unmount — so a subtree
     /// whose state the user is in the middle of survives the condition flipping.
     HideWhen(Box<dyn Fn() -> bool>),
-    /// One override that follows a value.
+    /// Overrides that follow a value, written into the lowering's buffer.
     ///
     /// A **style** and not a channel, which is the distinction that matters: a size layout
     /// has to see must go through the solve, where binding it would move the node and leave
     /// everything below it where it was.
-    Restyle(Box<dyn Fn() -> Over>),
+    ///
+    /// Writing into a buffer rather than returning one override is what lets a column
+    /// template be bound — `ClearColumns` and a track each — and what lets a node carry two
+    /// of these without them taking turns.
+    Restyle(Box<dyn Fn(&mut Vec<Over>)>),
     /// Disabled is model state: it swaps base roles and drops the hit flags.
     DisabledWhen(Box<dyn Fn() -> bool>),
     /// Selection is model state too — a discrete paint swap at event rate, not a wash.

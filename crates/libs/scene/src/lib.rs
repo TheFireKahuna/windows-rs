@@ -41,7 +41,8 @@ pub use hit_build::{
 };
 pub use id::{Id, Ids, Slots};
 pub use layout::{
-    LayoutKind, LayoutTree, Measure, MeasureCtx, MeasureIn, MeasureKey, Rect, Restyle, Solved, snap,
+    Avail, LayoutKind, LayoutTree, Measure, MeasureCtx, MeasureIn, MeasureKey, Rect, Restyle,
+    Solved, snap,
 };
 pub use model::{Model, SlotRoot};
 pub use patch::{Attach, Op, PatchPool, SinkPatch, Span};

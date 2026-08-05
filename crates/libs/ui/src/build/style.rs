@@ -140,16 +140,16 @@ pub(crate) fn pin_width(node: NodeId, class: WidthClass, width: f32) -> Option<t
     })
 }
 
-/// This node's style with one override appended, at the class the last solve resolved.
+/// This node's style with the bound overrides appended, at the class the last solve resolved.
 ///
 /// What a style that follows a value re-lowers through: taking the class from the solve
 /// rather than from a captured scope is what keeps a bound style and a classified container
 /// from disagreeing.
-pub(crate) fn lower_with(
-    node: NodeId,
-    class: WidthClass,
-    extra: Option<Over>,
-) -> Option<taffy::Style> {
+///
+/// **Every** bound override for the node at once, which is why the node has one effect
+/// rather than one per act: lowering from the recipe plus a single override discards the
+/// others, so two bound styles on one node used to take turns winning.
+pub(crate) fn lower_with(node: NodeId, class: WidthClass, extra: &[Over]) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get(node)?;
         Some(crate::layout::lower_with(

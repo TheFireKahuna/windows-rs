@@ -42,6 +42,14 @@ pub mod widget;
 #[deny(unsafe_code)]
 pub mod caption;
 
+// Start-up and the frame. The ordered tick and the five process-wide installs, for the same
+// reason the caption is here: every application on this stack needs exactly one of each, the
+// order is a correctness rule at every seam, and a second transcription of either is a second
+// chance to get it wrong. No `unsafe` — every Windows surface it reaches belongs to the
+// window, the scene or the router, and it holds none of them open.
+#[deny(unsafe_code)]
+pub mod driver;
+
 // Flyouts, popups, menus and tooltips. Positioned against an anchor rather than by a
 // parent's layout, above everything, with a defined way to go away — and no `unsafe` and no
 // Windows surface, because every mechanism it needs is one the layers below already own: a

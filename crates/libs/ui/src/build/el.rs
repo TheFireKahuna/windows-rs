@@ -253,8 +253,8 @@ impl<K> El<K> {
         row: impl Fn() -> Metric + 'static,
         n: impl Fn() -> f32 + 'static,
     ) -> Self {
-        self.act(Act::Restyle(Box::new(move || {
-            Over::Height(Len::Times(row(), n().max(0.0)))
+        self.act(Act::Restyle(Box::new(move |out| {
+            out.push(Over::Height(Len::Times(row(), n().max(0.0))));
         })))
     }
 
@@ -266,12 +266,12 @@ impl<K> El<K> {
     /// list*, never its key — so this is written once and re-lowered only when the metric
     /// behind it moves, which is a density change and nothing else.
     pub(crate) fn band_rows(self, index: f32, row: impl Fn() -> Metric + 'static) -> Self {
-        self.act(Act::Restyle(Box::new(move || {
+        self.act(Act::Restyle(Box::new(move |out| {
             let row = row();
-            Over::Band {
+            out.push(Over::Band {
                 at: Len::Times(row, index),
                 height: Len::Metric(row),
-            }
+            });
         })))
     }
 
@@ -463,6 +463,38 @@ impl<K> El<K> {
         self
     }
 
+    /// The column template while `cond`, replacing whatever was stated otherwise.
+    ///
+    /// [`cols_when`](Self::cols_when)'s sibling, for the template that follows **application
+    /// state** rather than the window's width — a pane the user collapsed, a gutter they
+    /// turned off. Both are the same statement about the same container, and only the source
+    /// of the answer differs, which is why they are two methods and not two mechanisms: each
+    /// clears the template and states its tracks, and the lowering resolves them in the order
+    /// they were written.
+    ///
+    /// Like the width variants, **this changes styles and never structure**. The track that
+    /// goes away takes no owner with it, so a value half-typed into a field in the collapsed
+    /// column is still there when it comes back — which is the whole reason a collapse is a
+    /// template change rather than a [`when`](Self::when).
+    ///
+    /// Stated after `cols_when` where both apply: the class rules are the recipe and this is
+    /// the bound override on top of it, so this one wins while its condition holds.
+    #[must_use]
+    pub fn cols_if<M>(
+        self,
+        cond: impl Signal<bool, M> + 'static,
+        tracks: impl IntoIterator<Item = Track>,
+    ) -> Self {
+        let tracks: Vec<Track> = tracks.into_iter().collect();
+        self.act(Act::Restyle(Box::new(move |out| {
+            if !cond.read() {
+                return;
+            }
+            out.push(Over::ClearColumns);
+            out.extend(tracks.iter().copied().map(Over::Column));
+        })))
+    }
+
     /// Not laid out and not drawn at `class`.
     ///
     /// `Display::None`, and deliberately not [`when`](Self::when): the subtree stays mounted,
@@ -471,6 +503,18 @@ impl<K> El<K> {
     #[must_use]
     pub fn hide_when(self, class: WidthClass) -> Self {
         self.over_at(class, Over::Hidden)
+    }
+
+    /// Not laid out and not drawn while `cond`.
+    ///
+    /// [`hide_when`](Self::hide_when)'s sibling, on the same terms: `Display::None`, the
+    /// subtree stays mounted, and nothing is disposed. The inverse of
+    /// [`when`](Self::when) — which is the same `Display::None` mechanism read the other way
+    /// round — so that "hidden while" and "shown while" are both sayable without a `!` at the
+    /// call site inverting the sense of a signal that reads as a fact.
+    #[must_use]
+    pub fn hide_if<M>(self, cond: impl Signal<bool, M> + 'static) -> Self {
+        self.act(Act::HideWhen(Box::new(move || cond.read())))
     }
 
     // ── layout: container properties ─────────────────────────────────────────────
@@ -770,6 +814,24 @@ impl<K> El<K> {
 
     pub(crate) fn elevate(self, elevation: Elevation) -> Self {
         self.slot_mut(|s| s.elevate = Some(elevation))
+    }
+
+    /// Report this node's solved box through `probe`.
+    ///
+    /// For the geometry that has to **agree** with a layout it is not inside — a gutter's
+    /// wires meeting independently-sized rows, a connector between two cards. Everything
+    /// that can be expressed as containment should be: a container places its children, and
+    /// this is the seam for the case where no container could hold both halves.
+    ///
+    /// The value arrives **one tick later**, which is the contract and not a defect. See
+    /// [the module note](crate::layout::Probe).
+    ///
+    /// Attaching two probes to one node keeps the last, in the order the modifiers were
+    /// written. A probe on more than one node is the reverse mistake and is not detectable
+    /// here — each node writes the same cell and the reader sees whichever solved last.
+    #[must_use]
+    pub fn probed(self, probe: crate::layout::Probe) -> Self {
+        self.slot_mut(|s| s.probe = Some(probe.cell()))
     }
 
     /// Opt out of touch inflation. For a dense field of targets, where inflating past the

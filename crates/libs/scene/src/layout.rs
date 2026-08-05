@@ -120,6 +120,48 @@ pub enum MeasureCtx {
 /// run it named a miss rather than a read of that slot's next occupant.
 pub type MeasureKey = Id<crate::sink::Measured>;
 
+/// How much room an axis has, in taffy's own three states.
+///
+/// **Three and not two.** Flattening the two intrinsic probes into "indefinite" is what makes
+/// a wrapping run report its one-line width to a min-content question — and flex then shrinks
+/// it below its own longest word, which reads as a break in the middle of a word. The two
+/// probes are asking opposite questions and a measurement that cannot tell them apart can
+/// only answer one of them right.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Avail {
+    /// This much room, in DIPs.
+    Definite(f32),
+    /// *How narrow can you be?* — the largest indivisible piece of the content.
+    MinContent,
+    /// *How wide would you like to be?* — the content with nothing forced to break.
+    MaxContent,
+}
+
+impl Avail {
+    /// The room in DIPs, or `None` for either intrinsic probe.
+    ///
+    /// For a measurement whose answer genuinely does not depend on which probe it is — a
+    /// fixed-size leaf, a single-line run that never breaks. Anything that *can* break must
+    /// match on the variant instead.
+    #[must_use]
+    pub const fn definite(self) -> Option<f32> {
+        match self {
+            Self::Definite(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+impl From<AvailableSpace> for Avail {
+    fn from(space: AvailableSpace) -> Self {
+        match space {
+            AvailableSpace::Definite(v) => Self::Definite(v),
+            AvailableSpace::MinContent => Self::MinContent,
+            AvailableSpace::MaxContent => Self::MaxContent,
+        }
+    }
+}
+
 /// What a measurement is given.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct MeasureIn {
@@ -130,8 +172,8 @@ pub struct MeasureIn {
     pub class: WidthClass,
     /// Whichever dimensions layout has already fixed.
     pub known: (Option<f32>, Option<f32>),
-    /// The space available on each axis, or `None` for an indefinite one.
-    pub available: (Option<f32>, Option<f32>),
+    /// The room on each axis, and **which question is being asked** where there is no number.
+    pub available: (Avail, Avail),
 }
 
 /// Measures what this crate cannot: shaped text, and anything else whose size is content.
@@ -380,6 +422,22 @@ impl LayoutTree {
         }
     }
 
+    /// Says that a measured node's **input** moved, though its context did not.
+    ///
+    /// [`set_measure`](Self::set_measure) cannot express this and must not try: a run's
+    /// context is a key that is stable for its whole life, so a label whose string changed
+    /// pushes an identical context and is told nothing happened. Everything else that
+    /// invalidates a layout is a field this type owns and compares — a style, a hidden flag,
+    /// a child list. A measure's input is the one thing it holds no copy of, so the owner of
+    /// that input is the only one who can say it moved.
+    ///
+    /// Without it, a text run bound to a signal reshapes only when something *else* dirties
+    /// its node — which is why a list row or a rebuilt branch looked correct and a long-lived
+    /// caption bound to the same signal never changed at all.
+    pub fn remeasure(&mut self, node: NodeId) {
+        self.mark_dirty(TaffyId::from(node.index()));
+    }
+
     /// Replaces a node's children, in paint order.
     ///
     /// **Every child is pointed back at `node`, including when the order did not change.** A
@@ -568,10 +626,7 @@ impl LayoutTree {
                                 key,
                                 class,
                                 known: (known.width, known.height),
-                                available: (
-                                    available.width.into_option(),
-                                    available.height.into_option(),
-                                ),
+                                available: (available.width.into(), available.height.into()),
                             })
                         })
                     }

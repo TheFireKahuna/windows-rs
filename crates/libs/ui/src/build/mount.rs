@@ -25,6 +25,7 @@ use crate::widget::{
     Chrome, ChromeRow, Flow, Interaction, ModelState, Motion, RoleSet, StatePolicy, TextSource,
     UiaRole, Wash,
 };
+use windows_scene::taffy;
 use windows_scene::{
     Anim, Bind, Cap, ControlId, Corners, Exit, GeomId, GroupId, HitDecl, HitFlags, Join, Mask,
     MeasureCtx, MeasureKey, NodeId, Paint, PathVerb, Prop, SpriteId, Tuning, Value,
@@ -265,23 +266,54 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // ── style, and the recipe that can re-lower it ────────────────────────────────
     // The scope is stored class-free: `at.scope` carries the class in force where this node
     // was built, and the solve supplies the current one through the restyle seam.
-    let recipe = Recipe {
-        preset: slot.preset,
-        over: OverStore::collect(b.chain_over(slot.over).map(|entry| entry.rule)),
-        scope: at.scope,
+    //
+    // **An adapter's node is an anchor, never a box.** Its rows are the enclosing
+    // container's children, and this node exists only so the position they insert at has an
+    // identity — so it takes one const style and carries no recipe. `restyle` answering
+    // `None` leaves such a node alone, which is exactly right for one with no style to
+    // re-lower: the saving is a `lower()` and a table entry per list.
+    //
+    // `Display::None` written into the style, and **not** `Model::hide`. The flag exists so
+    // that hiding is reversible without knowing what a node's display was; an anchor is
+    // never revealed and has no other display. What matters here is the difference in what
+    // the *parent* does: a hidden node is still one of its flex items, so a column gaps
+    // around it and the list sits one gap short of its box. `Display::None` takes it out of
+    // the item list altogether.
+    let style = if slot.adapter.is_some() {
+        Some(taffy::Style {
+            display: taffy::Display::None,
+            ..taffy::Style::DEFAULT
+        })
+    } else {
+        let recipe = Recipe {
+            preset: slot.preset,
+            over: OverStore::collect(b.chain_over(slot.over).map(|entry| entry.rule)),
+            scope: at.scope,
+        };
+        let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), at.scope);
+        super::style::with(|table| table.place(node, recipe));
+        Some(style)
     };
-    let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), at.scope);
-    super::style::with(|table| table.place(node, recipe));
     let row = Host::with(|h| {
-        h.model().style(node, &style);
-        h.mint_mount(MountRow {
+        if let Some(style) = &style {
+            h.model().style(node, style);
+        }
+        let row = h.mint_mount(MountRow {
             node,
             next: MountId::NONE,
             control: None,
             text: None,
             values: ValueId::NONE,
             scroll: None,
-        })
+            probe: None,
+        });
+        if let Some(cell) = slot.probe {
+            h.mint_probe(
+                row,
+                crate::layout::ProbeRow { node, cell },
+            );
+        }
+        row
     });
     rows.push(row);
 
@@ -378,10 +410,15 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     if let Some(adapter) = slot.adapter
         && let Some(install) = b.adapters[adapter as usize].install.take()
     {
-        let group = group.expect("a node with an adapter is a group");
+        // The **enclosing** container and this node's own position in it, not the group
+        // minted above: rows and arms are laid out by the container the list was passed to,
+        // and this node is only the anchor they insert after. `at.scope` rather than
+        // `inner` for the same reason — an adapter pushes no scope, and the two are equal
+        // in every case an adapter can be in.
         install(Site {
-            parent: group,
-            scope: inner,
+            parent: at.parent,
+            after: Some(node),
+            scope: at.scope,
         });
     }
 
@@ -858,40 +895,55 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
     }
 }
 
-/// Installs the effects behind a style that follows a value.
+/// Installs the effect behind a style that follows a value.
 ///
-/// Each re-lowers from the node's **own recipe** with one override appended, rather than
-/// from a style it has to remember, and at the class the last solve resolved for the node
-/// rather than one captured here — so neither the recipe nor the class can fall out of date.
+/// It re-lowers from the node's **own recipe** with the bound overrides appended, rather
+/// than from a style it has to remember, and at the class the last solve resolved for the
+/// node rather than one captured here — so neither the recipe nor the class can fall out of
+/// date.
+///
+/// **One effect per node, not one per act.** Lowering starts from the recipe every time, so
+/// an effect that appended only its own override published a style with every *other* bound
+/// override missing, and two of them on one node took turns. Collecting them means a node's
+/// style is written once per change and is always the whole of it. The buffer is held by the
+/// effect and reaches its high-water mark once.
 fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId) {
+    let mut acts = Vec::new();
     let mut at = slot.acts.head;
     while at != NIL {
         let entry = &mut b.acts[at as usize];
         let next = entry.next;
-        let act = match entry.act.take() {
-            Some(act @ (Act::HideWhen(_) | Act::Restyle(_))) => act,
+        match entry.act.take() {
+            Some(act @ (Act::HideWhen(_) | Act::Restyle(_))) => acts.push(act),
             // Put back: this pass owns two variants, and the control pass owns the rest.
-            other => {
-                entry.act = other;
-                at = next;
-                continue;
-            }
-        };
+            other => entry.act = other,
+        }
         at = next;
-        // Installed outside every borrow, because creating an effect runs it.
-        Effect::new(move || {
-            let extra = match &act {
-                Act::HideWhen(hidden) => hidden().then_some(Over::Hidden),
-                Act::Restyle(over) => Some(over()),
-                _ => None,
-            };
-            let class = Host::with(|h| h.model().solved(node).class);
-            let Some(style) = super::style::lower_with(node, class, extra) else {
-                return;
-            };
-            Host::with(|h| h.model().style(node, &style));
-        });
     }
+    if acts.is_empty() {
+        return;
+    }
+    let mut extra: Vec<Over> = Vec::new();
+    // Installed outside every borrow, because creating an effect runs it.
+    Effect::new(move || {
+        extra.clear();
+        for act in &acts {
+            match act {
+                Act::HideWhen(hidden) => {
+                    if hidden() {
+                        extra.push(Over::Hidden);
+                    }
+                }
+                Act::Restyle(fill) => fill(&mut extra),
+                _ => {}
+            }
+        }
+        let class = Host::with(|h| h.model().solved(node).class);
+        let Some(style) = super::style::lower_with(node, class, &extra) else {
+            return;
+        };
+        Host::with(|h| h.model().style(node, &style));
+    });
 }
 
 const fn uia_flag(role: UiaRole) -> HitFlags {
@@ -1059,21 +1111,40 @@ fn mount_text(
     });
     // A constant string is already in the table, so only a reactive one needs an effect —
     // the same gate every other value goes through, in the same place.
+    //
+    // The scratch buffer is the effect's own and outlives every run of it, so it reaches its
+    // high-water mark once. That is what makes an unchanged readout cost a format and a
+    // compare: `set_text` already declines to reshape a string that did not move, and a
+    // buffer allocated afresh each time would have paid a malloc to learn the same thing.
     if let Some(TextSource::Dynamic(read)) = source {
-        Effect::new(move || set_text(key, &read()));
+        let mut scratch = String::new();
+        Effect::new(move || {
+            scratch.clear();
+            read(&mut scratch);
+            set_text(key, &scratch);
+        });
     }
     key
 }
 
 fn set_text(key: MeasureKey, text: &str) {
-    let moved = super::text::with(|table| table.set_text(key, text));
-    // An accessible name is a **copy**, taken into the published tree's own string blob,
-    // so a string that changes here is one the tree is now wrong about. Marking the tree
-    // stale is what republishes it — and text that changes faster than event rate does not
-    // live in the retained tree at all, so this cannot be a per-frame cost.
-    if moved {
-        Host::with(|h| h.uia_restale());
-    }
+    let Some(node) = super::text::with(|table| table.set_text(key, text)) else {
+        return;
+    };
+    Host::with(|h| {
+        // The measure's **input** moved and its context did not, which is the one
+        // invalidation the model holds no copy of and therefore cannot notice. Without this
+        // the run stays stale forever: `sync` reshapes from the measure function, and the
+        // measure function runs for a dirty node. A row in a list or an arm of a branch is
+        // dirtied by being built, which is why those looked right — and a caption that
+        // outlives its own value never was.
+        h.model().remeasure(node);
+        // An accessible name is a **copy**, taken into the published tree's own string blob,
+        // so a string that changes here is one the tree is now wrong about. Marking the tree
+        // stale is what republishes it — and text that changes faster than event rate does
+        // not live in the retained tree at all, so this cannot be a per-frame cost.
+        h.uia_restale();
+    });
 }
 
 const _: () = {

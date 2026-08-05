@@ -31,7 +31,8 @@ use windows_scene::NodeId;
 ///
 /// Built by [`each`]; it exists to be passed to a container.
 pub struct Each<K, T> {
-    fill: Box<dyn Fn(&mut Vec<(K, T)>)>,
+    fill: Box<dyn Fn(&mut Vec<T>)>,
+    key: Box<dyn Fn(&T) -> &K>,
     /// Erased to [`View`] here rather than carried as a kind: a list of one widget kind and
     /// a list of another are the same list, and a marker that survived to the container
     /// would make them different types for no property anyone can use.
@@ -42,9 +43,14 @@ pub struct Each<K, T> {
 ///
 /// `items` is read inside an effect, so it tracks whatever it reads and the list reconciles
 /// when that moves. The `Vec` it returns is the one heap allocation on the path, and it is
-/// visible here rather than hidden per row.
+/// visible here rather than hidden per row — [`each_into`] is the form without it.
+///
+/// `key` **projects** the identity out of the item rather than being carried beside it. A
+/// list whose items are their own keys writes `|item| item` and stores each one once; the
+/// pair form this replaced stored every key twice, at both of its call sites.
 pub fn each<K, T, V>(
-    items: impl Fn() -> Vec<(K, T)> + 'static,
+    items: impl Fn() -> Vec<T> + 'static,
+    key: impl Fn(&T) -> &K + 'static,
     view: impl Fn(&T) -> El<V> + 'static,
 ) -> Each<K, T>
 where
@@ -52,16 +58,19 @@ where
     T: 'static,
     V: 'static,
 {
-    each_into(move |out| *out = items(), view)
+    each_into(move |out| *out = items(), key, view)
 }
 
 /// The same, filling a buffer the adapter keeps.
 ///
-/// What a list reconciling **every frame of a fling** needs: the buffer reaches its
-/// high-water mark once and the realization path allocates nothing after it. A caller who
-/// builds a fresh `Vec` per read has no reason to reach for this.
-pub(crate) fn each_into<K, T, V>(
-    fill: impl Fn(&mut Vec<(K, T)>) + 'static,
+/// What a list reconciling **every frame of a fling** needs, and what any list on a path
+/// that must not allocate needs: the buffer reaches its high-water mark once and nothing
+/// after it allocates. A caller who is building a fresh `Vec` per read anyway has no reason
+/// to reach for this — but a caller who is copying one out of state it already holds does,
+/// and that is most of them.
+pub fn each_into<K, T, V>(
+    fill: impl Fn(&mut Vec<T>) + 'static,
+    key: impl Fn(&T) -> &K + 'static,
     view: impl Fn(&T) -> El<V> + 'static,
 ) -> Each<K, T>
 where
@@ -71,6 +80,7 @@ where
 {
     Each {
         fill: Box::new(fill),
+        key: Box::new(key),
         view: Box::new(move |item| view(item).erase()),
     }
 }
@@ -81,27 +91,36 @@ where
     T: 'static,
 {
     fn append(self, out: &mut Children) {
-        let Self { fill, view } = self;
+        let Self { fill, key, view } = self;
         out.push(El::<Any>::at_index(adapter(move |site| {
             // Detached from whatever scope is running the reconcile, for the reason the
             // list itself is: rows belong to the list, and a list driven from an effect
             // would otherwise register every row it ever built as a child of that effect.
             let list = Rc::new(RefCell::new(Keyed::<K>::new()));
             let mounts = Rc::new(RefCell::new(FxHashMap::<K, Mount>::default()));
-            let next = Rc::new(RefCell::new(Vec::<(K, T)>::new()));
+            let next = Rc::new(RefCell::new(Vec::<T>::new()));
             Effect::new(move || {
                 let mut next = next.borrow_mut();
                 next.clear();
                 fill(&mut next);
                 let mut list = list.borrow_mut();
-                let mut previous: Option<NodeId> = None;
+                // The anchor, not the head of the container: rows share their parent with
+                // the container's static children now, so starting from `None` would put
+                // the first row above everything written before the list.
+                let mut previous: Option<NodeId> = site.after;
                 list.reconcile(
                     &next,
+                    &key,
                     |key| {
                         mounts.borrow_mut().remove(key);
                     },
                     |key, item| {
-                        let mount = super::mount_at(view(item), site.parent, None, site.scope);
+                        // Born at the anchor rather than at the head. The pass below places
+                        // every insert anyway, so this is only about where a new row exists
+                        // in between — and "somewhere inside this list" is the answer that
+                        // cannot be briefly wrong.
+                        let mount =
+                            super::mount_at(view(item), site.parent, site.after, site.scope);
                         mounts.borrow_mut().insert(key.clone(), mount);
                     },
                     |key, _, step, _| {
@@ -204,15 +223,26 @@ fn switch_adapter<K: PartialEq + 'static>(
                     mount.borrow_mut().take();
                 },
                 |key| {
-                    *mount.borrow_mut() =
-                        Some(super::mount_at(view(key), site.parent, None, site.scope));
+                    // The anchor is the whole of this arm's position — a branch has one
+                    // arm and therefore no reorder pass to correct it afterwards.
+                    *mount.borrow_mut() = Some(super::mount_at(
+                        view(key),
+                        site.parent,
+                        site.after,
+                        site.scope,
+                    ));
                 },
             );
         });
     })));
 }
 
-/// Appends the arena slot an adapter owns: a bare group with no children of its own.
+/// Appends the arena slot an adapter owns: its **anchor**, and nothing else.
+///
+/// The node this becomes is hidden at mount and never holds a child. What it holds is a
+/// position — see [`Site`] — so that rows and arms are laid out by the container the list was
+/// passed to rather than by a box the author never wrote, and so that two adjacent lists keep
+/// their order across being empty.
 fn adapter(install: impl FnOnce(Site) + 'static) -> u32 {
     Build::with(|b| {
         let at = b.push_slot(Slot {

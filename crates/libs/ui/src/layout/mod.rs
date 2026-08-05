@@ -7,10 +7,13 @@
 
 mod len;
 mod preset;
+mod probe;
 mod scroll;
 
 pub use len::{Align, Len, Track};
-pub use preset::{Over, Preset, Rule, lower, lower_with};
+pub use probe::{Placed, Probe, probe};
+pub(crate) use probe::ProbeRow;
+pub use preset::{Over, Preset, Rule, lower, lower_with, root};
 pub use scroll::{
     ListSpec, Realized, Reveal, ScrollDecl, ScrollState, THUMB_MARGIN, THUMB_MIN_H, THUMB_W,
     ThumbGeom, front as scroll_front, list, observe as scroll_observe, rail_style, realize, scroll,

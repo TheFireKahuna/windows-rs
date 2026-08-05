@@ -391,6 +391,18 @@ impl Model {
         self.solve_dirty = true;
     }
 
+    /// Says that a measured node's **input** moved, though its context did not.
+    ///
+    /// The one invalidation this type cannot notice for itself. Every other input to a
+    /// layout is a field it holds and compares; a measure's input belongs to whoever
+    /// produces it — a text run's string — and [`measure`](Self::measure) is handed a key
+    /// that is stable for the run's whole life, so pushing it again correctly reports that
+    /// nothing changed.
+    pub fn remeasure(&mut self, id: NodeId) {
+        self.layout.remeasure(id);
+        self.solve_dirty = true;
+    }
+
     /// What a node participates in, for the hit array. `None` removes it from routing
     /// entirely.
     pub fn hit(&mut self, id: NodeId, decl: Option<HitDecl>) {

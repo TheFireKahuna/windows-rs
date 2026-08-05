@@ -790,9 +790,9 @@ fn passing_through_a_described_control_never_reads_its_text() {
     let reads = std::rc::Rc::new(std::cell::Cell::new(0_u32));
     let counted = || {
         let reads = std::rc::Rc::clone(&reads);
-        crate::widget::reactive(move || {
+        crate::widget::reactive(move |out| {
             reads.set(reads.get() + 1);
-            "described".to_owned()
+            out.push_str("described");
         })
     };
     let (mount, ids) = strip(&mut patch, [counted(), counted(), counted()]);

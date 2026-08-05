@@ -174,6 +174,33 @@ impl From<Over> for Rule {
     }
 }
 
+/// The window root's style, and there is exactly one correct value for it.
+///
+/// The root **is** the client area: the model is told the window's size and solves against
+/// it, so anything but a full-extent box either leaves a strip of window nothing lays out in
+/// or overflows one. There is no decision here for an application to make, which is why
+/// [`Ui::run`](crate::driver::Ui::run) no longer asks for one.
+///
+/// A **stretching column**, and both halves are load-bearing. A row would give its children
+/// their content height, so a shell would size to what it contains instead of to the window
+/// — a chain that runs off the bottom edge, and a scroll viewport whose height resolves to
+/// zero before its tracker is created. Stretch is what gives a child the full inline extent,
+/// without which a scroll container's viewport is zero DIPs wide and its interaction source
+/// hit-tests nothing while reporting success.
+#[must_use]
+pub fn root() -> taffy::Style {
+    taffy::Style {
+        display: taffy::Display::Flex,
+        flex_direction: taffy::FlexDirection::Column,
+        align_items: Some(Align::Stretch.items()),
+        size: taffy::Size {
+            width: taffy::Dimension::percent(1.0),
+            height: taffy::Dimension::percent(1.0),
+        },
+        ..taffy::Style::DEFAULT
+    }
+}
+
 /// Lowers a recipe. The one place a `taffy::Style` is built.
 ///
 /// A flex class allocates nothing; a grid one allocates its track templates, because that is
@@ -182,25 +209,24 @@ impl From<Over> for Rule {
 /// to fix rather than this crate's.
 #[must_use]
 pub fn lower(preset: Preset, rules: &[Rule], scope: Scope) -> taffy::Style {
-    lower_with(preset, rules, None, scope)
+    lower_with(preset, rules, &[], scope)
 }
 
-/// The same, with one more override on the end.
+/// The same, with more overrides on the end.
 ///
 /// What a style that follows a value needs: it re-lowers from the node's **own** recipe, so a
 /// width class that moved in between is already in the answer and there is no second copy to
-/// fall out of date. Taking the extra here rather than appending to a copy is what keeps that
+/// fall out of date. Taking the extras here rather than appending to a copy is what keeps that
 /// re-lower allocation-free.
 ///
-/// The `extra` is unconditional by construction — it is this frame's value for a bound
-/// property, not a design decision that could belong to one class.
+/// A **slice** and not one override, because a column template is several: `ClearColumns`
+/// followed by a track each. One-override-per-effect made two bound styles on one node
+/// clobber each other, since each lowered from the recipe plus only its own.
+///
+/// The extras are unconditional by construction — they are this frame's values for bound
+/// properties, not design decisions that could belong to one class.
 #[must_use]
-pub fn lower_with(
-    preset: Preset,
-    rules: &[Rule],
-    extra: Option<Over>,
-    scope: Scope,
-) -> taffy::Style {
+pub fn lower_with(preset: Preset, rules: &[Rule], extra: &[Over], scope: Scope) -> taffy::Style {
     let active = || rules.iter().filter(|r| r.applies(scope)).map(|r| r.over);
     // The base first, from the last class that claimed it: a preset replaces the style
     // wholesale, so resolving it in sequence would discard every override written before it.
@@ -212,7 +238,7 @@ pub fn lower_with(
         .next_back()
         .unwrap_or(preset);
     let mut style = base(preset, scope);
-    for over in active().chain(extra) {
+    for over in active().chain(extra.iter().copied()) {
         apply(&mut style, over, scope);
     }
     style
@@ -281,7 +307,19 @@ fn base(preset: Preset, scope: Scope) -> taffy::Style {
             },
             ..taffy::Style::DEFAULT
         },
-        Preset::Text => taffy::Style::DEFAULT,
+        // A **column**, and the direction is the whole of what this preset is for.
+        //
+        // A single-line run is its own sprite and has no children, so nothing here reaches
+        // it. A wrapping one owns a sprite per line, and `Style::DEFAULT` is a flex *row* —
+        // which laid every line of a paragraph out side by side, so a caption came out one
+        // line tall and drew straight off the end of its column. The lines carry a definite
+        // size of their own, so stretch never touches them and the group's content height
+        // is their sum.
+        Preset::Text => taffy::Style {
+            display: taffy::Display::Flex,
+            flex_direction: taffy::FlexDirection::Column,
+            ..taffy::Style::DEFAULT
+        },
     }
 }
 

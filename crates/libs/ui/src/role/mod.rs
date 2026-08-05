@@ -39,7 +39,8 @@ mod palette;
 pub(crate) mod tests;
 
 pub use palette::{
-    Palette, accent_wash, ink, install, installed, metric, resolve, typography, veil,
+    Palette, accent_wash, content_peak_nits, ink, install, installed, metric, resolve, typography,
+    veil,
 };
 
 use core::sync::atomic::{AtomicU8, Ordering};
