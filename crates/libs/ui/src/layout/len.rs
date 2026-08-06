@@ -26,8 +26,10 @@ pub enum Len {
     /// A multiple of a metric: `n` of them, end to end.
     ///
     /// What a virtualized list states its extent in — forty unrealized rows occupy forty
-    /// row heights. The metric is still the palette's and `n` is a count, so this states no
-    /// arbitrary DIP length.
+    /// row heights.
+    ///
+    /// `n` must be a count of `m`. The product tracks the metric, so a ratio picked to reach
+    /// a DIP value at one density reaches a different one at the other.
     Times(Metric, f32),
     /// Sized by content.
     Auto,
@@ -100,12 +102,14 @@ impl Len {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Track {
     Fixed(Len),
-    /// A share of the leftover space.
+    /// A share of the leftover space, floored at zero: `minmax(0, n fr)`.
+    ///
+    /// A track with a floor of its own is [`MinMax`](Self::MinMax).
     Fr(f32),
     Auto,
     MinContent,
     MaxContent,
-    /// The responsive tile track: at least `min`, and a share of what is left.
+    /// At least `min`, and a share of what is left.
     MinMax(Len, f32),
 }
 
@@ -132,7 +136,9 @@ impl Track {
     pub fn sizing(self, scope: Scope) -> taffy::TrackSizingFunction {
         match self {
             Self::Fixed(l) => taffy::TrackSizingFunction::from(l.dimension(scope)),
-            Self::Fr(f) => taffy::TrackSizingFunction::from_fr(f),
+            // taffy's bare `n fr` carries an `auto` minimum, which floors the track at its own
+            // content.
+            Self::Fr(f) => Self::MinMax(Len::Zero, f).sizing(scope),
             Self::Auto => taffy::TrackSizingFunction::AUTO,
             Self::MinContent => taffy::TrackSizingFunction::MIN_CONTENT,
             Self::MaxContent => taffy::TrackSizingFunction::MAX_CONTENT,

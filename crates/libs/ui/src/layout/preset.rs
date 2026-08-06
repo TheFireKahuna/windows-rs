@@ -56,6 +56,13 @@ pub enum Over {
     MaxWidth(Len),
     MaxHeight(Len),
     Padding(Len),
+    /// Padding as horizontal and vertical, in that order.
+    ///
+    /// A control is wider than it is tall relative to its text, so the two axes take
+    /// different values and one uniform padding cannot state both. Both axes ride one
+    /// variant rather than two, because a recipe carries four rules inline and spills to the
+    /// heap beyond that — and a control already states four.
+    PaddingXY(Len, Len),
     Gap(Len),
     /// `flex_grow: 1` — absorb the slack.
     Grow,
@@ -111,6 +118,18 @@ pub enum Over {
         at: Len,
         height: Len,
     },
+    /// Taken out of flow, pinned to one edge of the containing block and stretched across it
+    /// on the other axis.
+    ///
+    /// The node's own [`Width`](Self::Width) or [`Height`](Self::Height) gives the extent on
+    /// the axis it pins along; the perpendicular axis takes both insets at zero. A node with
+    /// neither reads as zero-extent, because nothing else states one.
+    ///
+    /// Clears any [`Place`](Self::Place), and a `Place` applied afterwards is dropped: an
+    /// out-of-flow node is not in the track model, so the containing block is the whole
+    /// padding box rather than one cell of it. Order in the override list therefore does not
+    /// change the result.
+    Edge(Edge),
     /// Explicit grid placement, stated by the **container** on the child's behalf.
     Place {
         row: u16,
@@ -118,6 +137,18 @@ pub enum Over {
         row_span: u16,
         column_span: u16,
     },
+}
+
+/// The edge an out-of-flow node pins to, for [`Over::Edge`].
+///
+/// Four sides and no centre: an edge float stretches on the axis it does not name, so
+/// "centred on both axes" is not one of the placements this expresses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+    Top,
+    Bottom,
 }
 
 /// One override, and the width class it applies at.
@@ -334,6 +365,15 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
                 bottom: v,
             };
         }
+        Over::PaddingXY(x, y) => {
+            let (h, v) = (x.length_percentage(scope), y.length_percentage(scope));
+            style.padding = taffy::Rect {
+                left: h,
+                right: h,
+                top: v,
+                bottom: v,
+            };
+        }
         Over::Gap(l) => {
             let v = l.length_percentage(scope);
             style.gap = taffy::Size {
@@ -388,6 +428,47 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
                 None => style.grid_template_columns.push(track),
             }
         }
+        Over::Edge(edge) => {
+            style.position = taffy::Position::Absolute;
+            let (zero, auto) = (
+                taffy::LengthPercentageAuto::ZERO,
+                taffy::LengthPercentageAuto::AUTO,
+            );
+            // The pinned edge is zero and its opposite is auto, which is what makes the
+            // node's own size the extent on that axis; both are zero on the other axis, so
+            // it stretches.
+            style.inset = match edge {
+                Edge::Left => taffy::Rect {
+                    left: zero,
+                    right: auto,
+                    top: zero,
+                    bottom: zero,
+                },
+                Edge::Right => taffy::Rect {
+                    left: auto,
+                    right: zero,
+                    top: zero,
+                    bottom: zero,
+                },
+                Edge::Top => taffy::Rect {
+                    left: zero,
+                    right: zero,
+                    top: zero,
+                    bottom: auto,
+                },
+                Edge::Bottom => taffy::Rect {
+                    left: zero,
+                    right: zero,
+                    top: auto,
+                    bottom: zero,
+                },
+            };
+            style.grid_row = auto_placement();
+            style.grid_column = auto_placement();
+        }
+        // An out-of-flow node is not in the track model, so the placement its container
+        // states for the in-flow case does not confine it.
+        Over::Place { .. } if style.position == taffy::Position::Absolute => {}
         Over::Place {
             row,
             column,
@@ -397,6 +478,14 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
             style.grid_row = placement(row, row_span);
             style.grid_column = placement(column, column_span);
         }
+    }
+}
+
+/// Returns the placement that leaves a node to flow rather than seating it on a named line.
+fn auto_placement<S: taffy::CheapCloneStr>() -> taffy::Line<taffy::GridPlacement<S>> {
+    taffy::Line {
+        start: taffy::GridPlacement::Auto,
+        end: taffy::GridPlacement::Auto,
     }
 }
 

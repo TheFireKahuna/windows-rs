@@ -82,7 +82,7 @@ fn inner(s: impl Into<TextSource>, ramp: TypeRole) -> View {
 /// A bare filled rectangle. No scope push, so nothing inside it resolves differently.
 #[must_use]
 pub fn box_() -> View {
-    El::seed(Preset::Bare).chrome(roles::SURFACE, roles::SURFACE_PANEL, Metric::Radius)
+    El::seed(Preset::Bare).chrome(roles::SURFACE, roles::SURFACE_PANEL, Metric::RadiusSurface)
 }
 
 /// A raised surface: a scope push to `Raised`, its own padding, radius and hairline, and
@@ -93,7 +93,7 @@ pub fn card() -> View {
         .surface(
             crate::role::Elevation::Raised,
             roles::SURFACE_CARD,
-            Metric::Radius,
+            Metric::RadiusSurface,
         )
         .min_width(Metric::CardMinW)
         .min_height(Metric::CardMinH)
@@ -106,7 +106,7 @@ pub fn panel(key: &'static str) -> View {
         .surface(
             crate::role::Elevation::Base,
             roles::SURFACE_PANEL,
-            Metric::Radius,
+            Metric::RadiusSurface,
         )
         .key(key)
 }
@@ -118,7 +118,7 @@ pub fn flyout() -> View {
     El::seed(Preset::Bare).surface(
         crate::role::Elevation::Flyout,
         roles::SURFACE_FLYOUT,
-        Metric::Radius,
+        Metric::RadiusSurface,
     )
 }
 

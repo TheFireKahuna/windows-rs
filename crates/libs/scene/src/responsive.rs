@@ -29,6 +29,17 @@ pub enum WidthClass {
     Wide,
 }
 
+impl WidthClass {
+    /// Every class, narrowest first.
+    pub const ALL: [Self; 3] = [Self::Narrow, Self::Medium, Self::Wide];
+
+    /// Returns every class narrower than this one, narrowest first.
+    #[must_use]
+    pub fn below(self) -> impl Iterator<Item = Self> {
+        Self::ALL.into_iter().filter(move |class| *class < self)
+    }
+}
+
 /// The two thresholds a container classifies against: `[narrow_max, medium_max]`, in DIPs.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Bounds(pub [f32; 2]);

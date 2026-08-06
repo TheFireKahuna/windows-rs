@@ -242,7 +242,15 @@ pub enum Metric {
     SpaceSm,
     SpaceMd,
     SpaceLg,
+    /// The radius of a control: a button, a field, a segmented option, a menu option.
     Radius,
+    /// The radius of a surface: a card, a panel, a flyout, a plate.
+    ///
+    /// Separate from [`Metric::Radius`] because a surface and the controls sitting on it
+    /// round by different amounts. A scope cannot carry that difference: a control pushes
+    /// no elevation, so a control on a card resolves at the card's own scope and one value
+    /// answers both.
+    RadiusSurface,
     /// The radius of a fully rounded control.
     ///
     /// A real value in the scale, and a small one. A composition corner radius caps at half
@@ -251,6 +259,16 @@ pub enum Metric {
     RadiusPill,
     /// A control's row height, and the floor a touch target is inflated to.
     RowH,
+    // ── the band ladder: the horizontal strips a shell is built from ─────────────
+    /// A strip carrying text and no control: a status bar, a footnote rule.
+    BandSm,
+    /// A strip carrying controls: a toolbar, a section header, a card's own bar.
+    BandMd,
+    /// The window's own caption band.
+    BandLg,
+    /// A window command's width — the minimize, maximize and close controls of a custom
+    /// caption band.
+    CommandW,
     BorderW,
     CardMinW,
     CardMinH,

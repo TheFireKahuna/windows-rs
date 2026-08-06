@@ -1974,6 +1974,264 @@ fn hide_when_removes_the_box_and_not_the_node() {
     );
 }
 
+/// `float_when` takes the node out of flow, pins it to its edge and stretches the other axis.
+///
+/// The pinned node keeps its own width and the sibling beside it keeps the whole container,
+/// which is what separates a float from a second column.
+#[test]
+fn float_when_pins_the_node_and_leaves_its_sibling_the_container() {
+    use crate::layout::Edge;
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::responsive(
+            [900.0, 1000.0],
+            crate::layout::stack((
+                plate().height(Metric::CardMinH),
+                plate()
+                    .width(Metric::CardMinW)
+                    .float_when(windows_scene::WidthClass::Narrow, Edge::Right),
+            ))
+            .gap(Len::Zero),
+        )
+        .width(Len::Pct(1.0))
+        .height(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let (lane, flow, floated) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        (
+            h.model().solved(nodes[1]),
+            h.model().solved(nodes[2]),
+            h.model().solved(nodes[3]),
+        )
+    });
+    assert!(
+        (floated.rect.x1 - lane.rect.x1).abs() < 0.5,
+        "pinned to the right edge, so its trailing edge is the container's: {} against {}",
+        floated.rect.x1,
+        lane.rect.x1
+    );
+    assert!(
+        floated.size.x < lane.size.x,
+        "the float keeps its own width rather than filling the container"
+    );
+    assert!(
+        (floated.size.y - lane.size.y).abs() < 0.5,
+        "both insets are zero on the perpendicular axis, so it stretches: {} against {}",
+        floated.size.y,
+        lane.size.y
+    );
+    assert!(
+        (flow.size.x - lane.size.x).abs() < 0.5,
+        "an out-of-flow sibling takes no width from the one still in flow: {} against {}",
+        flow.size.x,
+        lane.size.x
+    );
+}
+
+/// A float is not confined by the placement its container states, in either order.
+///
+/// The lane states `at(row, column)` for the docked case and the pane floats at the narrow
+/// ones. Honouring both would seat the drawer in a track that exists only at another class.
+#[test]
+fn a_float_is_not_confined_by_its_containers_placement() {
+    use crate::layout::{Edge, Track};
+    /// Mounts a one-column grid whose second child is placed at column 1 and floats, and
+    /// answers that child's solved box together with the grid's.
+    fn boxes(float_first: bool) -> (windows_scene::Solved, windows_scene::Solved) {
+        let mut patch = fixture();
+        let pane = plate().width(Metric::CardMinW);
+        // The two orders the override list can carry: the child's own rule is pushed where
+        // it is written, and the container's `Place` when the child is added.
+        let pane = if float_first {
+            pane.float_when(windows_scene::WidthClass::Narrow, Edge::Right)
+        } else {
+            pane
+        };
+        let _held = mount(
+            crate::layout::responsive(
+                [900.0, 1000.0],
+                crate::layout::grid(())
+                    .at(0, 0, plate().height(Metric::CardMinH))
+                    .at(
+                        0,
+                        1,
+                        if float_first {
+                            pane
+                        } else {
+                            pane.float_when(windows_scene::WidthClass::Narrow, Edge::Right)
+                        },
+                    )
+                    .cols([Track::Fr(1.0)])
+                    .gap(Len::Zero),
+            )
+            .width(Len::Pct(1.0))
+            .height(Len::Pct(1.0)),
+            root(),
+        );
+        flush(&mut patch);
+        Host::with(|h| {
+            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            (h.model().solved(nodes[1]), h.model().solved(nodes[3]))
+        })
+    }
+
+    for float_first in [true, false] {
+        let (lane, floated) = boxes(float_first);
+        assert!(
+            (floated.rect.x1 - lane.rect.x1).abs() < 0.5,
+            "float_first={float_first}: the drawer landed at {} rather than the lane's own \
+             trailing edge {}, so a placement confined it",
+            floated.rect.x1,
+            lane.rect.x1
+        );
+        assert!(
+            (floated.size.y - lane.size.y).abs() < 0.5,
+            "float_first={float_first}: the drawer is {} DIPs tall against the lane's {}, so \
+             it was seated in a track rather than over the padding box",
+            floated.size.y,
+            lane.size.y
+        );
+    }
+}
+
+/// `float_below` floats at every class under its floor, and only there.
+///
+/// A class added to [`WidthClass`](windows_scene::WidthClass) must not leave the pane docked
+/// in it.
+#[test]
+fn float_below_floats_every_class_under_its_floor() {
+    use crate::layout::Edge;
+    /// Mounts a part floating below `Wide` in a container whose 800-DIP width classifies
+    /// against `bounds`, and answers whether that part is out of flow.
+    fn floats(bounds: [f32; 2]) -> bool {
+        let mut patch = fixture();
+        let _held = mount(
+            crate::layout::responsive(
+                bounds,
+                crate::layout::stack((
+                    plate().height(Metric::CardMinH),
+                    plate()
+                        .width(Metric::CardMinW)
+                        .float_below(windows_scene::WidthClass::Wide, Edge::Right),
+                ))
+                .gap(Len::Zero),
+            )
+            .width(Len::Pct(1.0))
+            .height(Len::Pct(1.0)),
+            root(),
+        );
+        flush(&mut patch);
+        Host::with(|h| {
+            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let (lane, floated) = (h.model().solved(nodes[1]), h.model().solved(nodes[3]));
+            // In flow the stack gives it the container's width and its own height; floated it
+            // is the other way round.
+            (floated.rect.x1 - lane.rect.x1).abs() < 0.5 && floated.size.x < lane.size.x
+        })
+    }
+
+    // The fixture's window is 800 DIPs, so each set of bounds picks one class for it.
+    assert!(
+        floats([900.0, 1000.0]),
+        "floating below Wide, so it must float at Narrow"
+    );
+    assert!(
+        floats([600.0, 1000.0]),
+        "floating below Wide, so it must float at Medium"
+    );
+    assert!(
+        !floats([400.0, 600.0]),
+        "the floor itself is not below it, so the pane docks at Wide"
+    );
+}
+
+/// `hide_below` hides at every class under its floor, and only there.
+///
+/// A class added to [`WidthClass`](windows_scene::WidthClass) must not leave a subtree
+/// visible in it.
+#[test]
+fn hide_below_hides_every_class_under_its_floor() {
+    /// Mounts a part hidden below `Wide` in a container whose 800-DIP width classifies
+    /// against `bounds`, and answers whether the part occupies space.
+    fn shown(bounds: [f32; 2]) -> bool {
+        let mut patch = fixture();
+        let _held = mount(
+            crate::layout::responsive(
+                bounds,
+                stack((
+                    plate().width(Metric::CardMinW).height(Metric::CardMinH),
+                    plate()
+                        .width(Metric::CardMinW)
+                        .height(Metric::CardMinH)
+                        .hide_below(windows_scene::WidthClass::Wide),
+                )),
+            )
+            .width(Len::Pct(1.0)),
+            root(),
+        );
+        flush(&mut patch);
+        Host::with(|h| {
+            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            h.model().solved(nodes[3]).size.y > 0.5
+        })
+    }
+
+    // The fixture's window is 800 DIPs, so each set of bounds picks one class for it.
+    assert!(
+        !shown([900.0, 1000.0]),
+        "hidden below Wide, so it must not lay out at Narrow"
+    );
+    assert!(
+        !shown([600.0, 1000.0]),
+        "hidden below Wide, so it must not lay out at Medium"
+    );
+    assert!(
+        shown([300.0, 400.0]),
+        "the floor itself is not below the floor: it must lay out at Wide"
+    );
+}
+
+/// A fractional track divides the container and is not floored by its own content.
+///
+/// A track floored at its content takes a scrolling column's full height as its minimum,
+/// which collapses every other track in the template.
+#[test]
+fn a_fractional_track_is_not_floored_by_its_own_content() {
+    use crate::layout::Track;
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::grid((
+            plate().height(Metric::CardMinH),
+            // Six card heights of content in a track entitled to half of four.
+            stack([0; 6].map(|_| plate().height(Metric::CardMinH))),
+        ))
+        .rows([Track::Fr(1.0), Track::Fr(1.0)])
+        .gap(Len::Zero)
+        .height(Len::Times(Metric::CardMinH, 4.0))
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    // Against the grid's own solved height rather than the height it stated: the root is the
+    // client area, so a grid taller than the window is shrunk to it before the tracks divide
+    // anything, and the claim is about the division and not about the total.
+    let (grid, tall) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        (h.model().solved(nodes[0]), h.model().solved(nodes[2]))
+    });
+    let half = grid.size.y / 2.0;
+    assert!(
+        (tall.rect.y0 - grid.rect.y0 - half).abs() < 1.0,
+        "the second track must begin at half the grid ({half} DIPs), not below its \
+         neighbour's content: it began {} DIPs down",
+        tall.rect.y0 - grid.rect.y0
+    );
+}
+
 /// The first solve applies the class it resolved, including when that class is `Medium`.
 ///
 /// A class matching the solver's own default for an unclassified node produces no transition,

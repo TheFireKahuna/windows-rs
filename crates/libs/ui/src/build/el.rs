@@ -12,7 +12,7 @@ use super::arena::{
     Act, Build, ChanSource, HitSeed, MaskSeed, Part, Slot, SpriteSeed, TextSeed, Unit,
 };
 use crate::gesture::{DragDecl, GestureDecl};
-use crate::layout::{Align, Len, Over, Preset, Rule, Track};
+use crate::layout::{Align, Edge, Len, Over, Preset, Rule, Track};
 use crate::role::{DataRole, Elevation, Metric, Role, Text, TypeRole, WidthClass};
 use crate::signal::Signal;
 use crate::widget::{Chrome, Flow, Interaction, Motion, RoleSet, StatePolicy, TextSource, UiaRole};
@@ -373,8 +373,14 @@ impl<K> El<K> {
     ///
     /// All four are overrides, so a call site restating any of them afterwards wins.
     pub(crate) fn control(self) -> Self {
+        // The two axes differ: the row height is what sets a control's height, so the
+        // vertical padding only has to clear the text inside it, while the horizontal one
+        // is what separates a label from the control's own edge.
         self.over(Over::MinHeight(Len::Metric(Metric::RowH)))
-            .over(Over::Padding(Len::Metric(Metric::SpaceMd)))
+            .over(Over::PaddingXY(
+                Len::Metric(Metric::SpaceMd),
+                Len::Metric(Metric::SpaceXs),
+            ))
             .over(Over::Gap(Len::Metric(Metric::SpaceSm)))
             .over(Over::Justify(Align::Center))
     }
@@ -497,9 +503,53 @@ impl<K> El<K> {
     ///
     /// `Display::None` rather than [`when`](Self::when), so the subtree stays mounted and its
     /// state is still there when the class moves back.
+    ///
+    /// Exactly one class. A subtree hidden below a threshold takes
+    /// [`hide_below`](Self::hide_below).
     #[must_use]
     pub fn hide_when(self, class: WidthClass) -> Self {
         self.over_at(class, Over::Hidden)
+    }
+
+    /// Hides this subtree at every class narrower than `class`: not laid out, and not drawn.
+    ///
+    /// `Display::None` on the terms [`hide_when`](Self::hide_when) states.
+    #[must_use]
+    pub fn hide_below(self, class: WidthClass) -> Self {
+        for narrower in class.below() {
+            self.over_at(narrower, Over::Hidden);
+        }
+        self
+    }
+
+    /// Floats this subtree at `class`: out of flow, pinned to `edge` of its container and
+    /// stretched across the other axis.
+    ///
+    /// The twin of [`hide_when`](Self::hide_when), and the same mechanism: a style, so the
+    /// subtree stays mounted and nothing inside it is disposed when the class moves. The node
+    /// keeps its own width or height for the axis it pins along, and takes its container's
+    /// padding box for the other.
+    ///
+    /// A float paints over its siblings rather than beside them, and the tree's order is its
+    /// z-order, so a floating child declared last covers the ones before it — in the hit
+    /// array as well as on screen.
+    ///
+    /// Exactly one class. A subtree that floats below a threshold takes
+    /// [`float_below`](Self::float_below).
+    #[must_use]
+    pub fn float_when(self, class: WidthClass, edge: Edge) -> Self {
+        self.over_at(class, Over::Edge(edge))
+    }
+
+    /// Floats this subtree at every class narrower than `class`.
+    ///
+    /// Out of flow on the terms [`float_when`](Self::float_when) states.
+    #[must_use]
+    pub fn float_below(self, class: WidthClass, edge: Edge) -> Self {
+        for narrower in class.below() {
+            self.over_at(narrower, Over::Edge(edge));
+        }
+        self
     }
 
     /// Hides this subtree while `cond` holds: not laid out, and not drawn.
