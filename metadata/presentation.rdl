@@ -106,7 +106,7 @@ mod Windows {
         interface ICompositionFramePresentStatistics: IPresentStatistics {
             fn GetContentTag(&self) -> usize;
             fn GetCompositionFrameId(&self) -> CompositionFrameId;
-            fn GetDisplayInstanceArray(&self, displayInstanceArrayCount: *mut u32, displayInstanceArray: *mut *const CompositionFrameDisplayInstance);
+            fn GetDisplayInstanceArray(&self, displayInstanceArrayCount: *mut u32, displayInstanceArray: *mut *mut CompositionFrameDisplayInstance);
         }
 
         #[guid(0xfb562f82_6292_470a_88b1_843661e7f20c)]

@@ -174,7 +174,7 @@ pub const AUTHORED_WINMD: &str = "target/authored.winmd";
 
 /// Compiles [`AUTHORED_METADATA`] to [`AUTHORED_WINMD`] and returns that path.
 ///
-/// The bundled winmds are inputs only so that the references in the RDL resolve
+/// The default metadata is referenced only so that the types the RDL names resolve
 /// (`HRESULT`, `HANDLE`, `ID2D1Geometry`, `IDispatcherQueueController`, …). The emitted
 /// winmd carries the authored namespaces alone, so a filter can name it beside `default`
 /// without defining a type twice.
@@ -186,17 +186,13 @@ pub const AUTHORED_WINMD: &str = "target/authored.winmd";
 ///
 /// Panics if the output directory cannot be created or the metadata does not compile.
 pub fn compile_authored_metadata() -> &'static str {
-    const RESOLVE: &[&str] = &[
-        "crates/libs/bindgen/default/Windows.Win32.winmd",
-        "crates/libs/bindgen/default/Windows.winmd",
-    ];
-
     if let Some(dir) = Path::new(AUTHORED_WINMD).parent() {
         std::fs::create_dir_all(dir).expect("failed to create the winmd output directory");
     }
 
     windows_rdl::reader()
-        .inputs(AUTHORED_METADATA.iter().copied().chain(RESOLVE.iter().copied()))
+        .inputs(AUTHORED_METADATA.iter().copied())
+        .reference_default()
         .output(AUTHORED_WINMD)
         .write()
         .unwrap_or_else(|e| panic!("failed to compile the authored metadata: {e}"));
