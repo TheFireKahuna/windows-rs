@@ -90,6 +90,8 @@ jobs:
         run:  cargo check -p windows-composition --no-default-features --features reactor
       - name: Check windows-core
         run:  cargo check -p windows-core --no-default-features
+      - name: Check windows-d2d
+        run:  cargo check -p windows-d2d --no-default-features
       - name: Check windows-default
         run:  cargo check -p windows-default --no-default-features
       - name: Check windows-future

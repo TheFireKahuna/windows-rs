@@ -28,16 +28,11 @@ pub const D3D11_RESOURCE_MISC_SHARED: D3D11_RESOURCE_MISC_FLAG = 2;
 pub const D3D11_RESOURCE_MISC_SHARED_DISPLAYABLE: D3D11_RESOURCE_MISC_FLAG = 1048576;
 pub const D3D11_RESOURCE_MISC_SHARED_NTHANDLE: D3D11_RESOURCE_MISC_FLAG = 2048;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct D3D11_SUBRESOURCE_DATA {
     pub pSysMem: *const core::ffi::c_void,
     pub SysMemPitch: u32,
     pub SysMemSlicePitch: u32,
-}
-impl Default for D3D11_SUBRESOURCE_DATA {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -104,13 +99,13 @@ impl ICompositionFramePresentStatistics {
     pub unsafe fn GetDisplayInstanceArray(
         &self,
         displayinstancearraycount: *mut u32,
-        displayinstancearray: *const *const CompositionFrameDisplayInstance,
+        displayinstancearray: *mut *mut CompositionFrameDisplayInstance,
     ) {
         unsafe {
             (windows_core::Interface::vtable(self).GetDisplayInstanceArray)(
                 windows_core::Interface::as_raw(self),
                 displayinstancearraycount as _,
-                displayinstancearray,
+                displayinstancearray as _,
             );
         }
     }
@@ -124,7 +119,7 @@ pub struct ICompositionFramePresentStatistics_Vtbl {
     pub GetDisplayInstanceArray: unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut u32,
-        *const *const CompositionFrameDisplayInstance,
+        *mut *mut CompositionFrameDisplayInstance,
     ),
 }
 pub trait ICompositionFramePresentStatistics_Impl: IPresentStatistics_Impl {
@@ -133,7 +128,7 @@ pub trait ICompositionFramePresentStatistics_Impl: IPresentStatistics_Impl {
     fn GetDisplayInstanceArray(
         &self,
         displayinstancearraycount: *mut u32,
-        displayinstancearray: *const *const CompositionFrameDisplayInstance,
+        displayinstancearray: *mut *mut CompositionFrameDisplayInstance,
     );
 }
 impl ICompositionFramePresentStatistics_Vtbl {
@@ -169,7 +164,7 @@ impl ICompositionFramePresentStatistics_Vtbl {
         >(
             this: *mut core::ffi::c_void,
             displayinstancearraycount: *mut u32,
-            displayinstancearray: *const *const CompositionFrameDisplayInstance,
+            displayinstancearray: *mut *mut CompositionFrameDisplayInstance,
         ) {
             unsafe {
                 let this: &Identity =
@@ -1562,16 +1557,11 @@ pub struct RECT {
     pub bottom: i32,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SECURITY_ATTRIBUTES {
     pub nLength: u32,
     pub lpSecurityDescriptor: *mut core::ffi::c_void,
     pub bInheritHandle: windows_core::BOOL,
-}
-impl Default for SECURITY_ATTRIBUTES {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

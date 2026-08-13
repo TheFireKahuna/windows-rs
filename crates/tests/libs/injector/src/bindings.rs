@@ -17,13 +17,6 @@ windows_core::link!("kernel32.dll" "system" fn WaitForSingleObject(hhandle : HAN
 pub const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
 pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: i32 = 2;
 pub const ERROR_NOT_READY: i32 = 21;
-#[cfg(target_arch = "x86")]
-pub type FARPROC = Option<unsafe extern "system" fn() -> i32>;
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "arm64ec",
-    target_arch = "x86_64"
-))]
 pub type FARPROC = Option<unsafe extern "system" fn() -> isize>;
 pub type HANDLE = *mut core::ffi::c_void;
 pub type HINSTANCE = *mut core::ffi::c_void;
@@ -1213,16 +1206,11 @@ pub const SDCO_NONE: SYNTHETIC_DEVICE_CREATION_OPTIONS = 0;
 pub const SDCO_PHYSICAL_SIZE: SYNTHETIC_DEVICE_CREATION_OPTIONS = 1;
 pub const SDCO_TOUCHPAD_GESTURE_ONLY: SYNTHETIC_DEVICE_CREATION_OPTIONS = 2;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SECURITY_ATTRIBUTES {
     pub nLength: u32,
     pub lpSecurityDescriptor: *mut core::ffi::c_void,
     pub bInheritHandle: windows_core::BOOL,
-}
-impl Default for SECURITY_ATTRIBUTES {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub const SM_CXVIRTUALSCREEN: i32 = 78;
 pub const SM_CYVIRTUALSCREEN: i32 = 79;

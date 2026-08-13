@@ -233,13 +233,6 @@ unsafe impl Send for DisplayInformation {}
 unsafe impl Sync for DisplayInformation {}
 pub const E_FAIL: windows_core::HRESULT = windows_core::HRESULT(0x80004005_u32 as _);
 pub const E_HANDLE: windows_core::HRESULT = windows_core::HRESULT(0x80070006_u32 as _);
-#[cfg(target_arch = "x86")]
-pub type FARPROC = Option<unsafe extern "system" fn() -> i32>;
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "arm64ec",
-    target_arch = "x86_64"
-))]
 pub type FARPROC = Option<unsafe extern "system" fn() -> isize>;
 pub const FEEDBACK_GESTURE_PRESSANDTAP: FEEDBACK_TYPE = 11;
 pub const FEEDBACK_MAX: FEEDBACK_TYPE = -1;
@@ -881,16 +874,11 @@ pub const SC_MAXIMIZE: i32 = 61488;
 pub const SC_MINIMIZE: i32 = 61472;
 pub const SC_RESTORE: i32 = 61728;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SECURITY_ATTRIBUTES {
     pub nLength: u32,
     pub lpSecurityDescriptor: *mut core::ffi::c_void,
     pub bInheritHandle: windows_core::BOOL,
-}
-impl Default for SECURITY_ATTRIBUTES {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub const SM_CXFRAME: i32 = 32;
 pub const SM_CXPADDEDBORDER: i32 = 92;

@@ -272,27 +272,15 @@ pub const ExpandCollapseState_Collapsed: ExpandCollapseState = 0;
 pub const ExpandCollapseState_Expanded: ExpandCollapseState = 1;
 pub const ExpandCollapseState_LeafNode: ExpandCollapseState = 3;
 pub const ExpandCollapseState_PartiallyExpanded: ExpandCollapseState = 2;
-#[cfg(target_arch = "x86")]
-pub type FARPROC = Option<unsafe extern "system" fn() -> i32>;
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "arm64ec",
-    target_arch = "x86_64"
-))]
 pub type FARPROC = Option<unsafe extern "system" fn() -> isize>;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FORMATETC {
     pub cfFormat: CLIPFORMAT,
     pub ptd: *mut DVTARGETDEVICE,
     pub dwAspect: u32,
     pub lindex: i32,
     pub tymed: u32,
-}
-impl Default for FORMATETC {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10655,15 +10643,10 @@ impl Default for VARIANT_0_0_0 {
     }
 }
 #[repr(C)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VARIANT_0_0_0_0 {
     pub pvRecord: *mut core::ffi::c_void,
     pub pRecInfo: core::mem::ManuallyDrop<Option<IRecordInfo>>,
-}
-impl Default for VARIANT_0_0_0_0 {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub type VARIANT_BOOL = i16;
 pub type VARTYPE = u16;

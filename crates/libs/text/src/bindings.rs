@@ -11,7 +11,7 @@ pub type DWRITE_AUTOMATIC_FONT_AXES = u32;
 pub const DWRITE_AUTOMATIC_FONT_AXES_OPTICAL_SIZE: DWRITE_AUTOMATIC_FONT_AXES = 1;
 pub type DWRITE_COLOR_F = D3DCOLORVALUE;
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DWRITE_COLOR_GLYPH_RUN {
     pub glyphRun: DWRITE_GLYPH_RUN,
     pub glyphRunDescription: *mut DWRITE_GLYPH_RUN_DESCRIPTION,
@@ -19,11 +19,6 @@ pub struct DWRITE_COLOR_GLYPH_RUN {
     pub baselineOriginY: f32,
     pub runColor: DWRITE_COLOR_F,
     pub paletteIndex: u16,
-}
-impl Default for DWRITE_COLOR_GLYPH_RUN {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub type DWRITE_CONTAINER_TYPE = i32;
 pub type DWRITE_FACTORY_TYPE = i32;
@@ -114,7 +109,7 @@ pub struct DWRITE_GLYPH_OFFSET {
     pub ascenderOffset: f32,
 }
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DWRITE_GLYPH_RUN {
     pub fontFace: core::mem::ManuallyDrop<Option<IDWriteFontFace>>,
     pub fontEmSize: f32,
@@ -125,24 +120,14 @@ pub struct DWRITE_GLYPH_RUN {
     pub isSideways: windows_core::BOOL,
     pub bidiLevel: u32,
 }
-impl Default for DWRITE_GLYPH_RUN {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
-}
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DWRITE_GLYPH_RUN_DESCRIPTION {
     pub localeName: *const u16,
     pub string: *const u16,
     pub stringLength: u32,
     pub clusterMap: *const u16,
     pub textPosition: u32,
-}
-impl Default for DWRITE_GLYPH_RUN_DESCRIPTION {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub type DWRITE_GRID_FIT_MODE = i32;
 pub const DWRITE_GRID_FIT_MODE_DEFAULT: DWRITE_GRID_FIT_MODE = 0;
@@ -220,7 +205,7 @@ pub type DWRITE_RENDERING_MODE = i32;
 pub type DWRITE_RENDERING_MODE1 = i32;
 pub const DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC: DWRITE_RENDERING_MODE1 = 5;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DWRITE_STRIKETHROUGH {
     pub width: f32,
     pub thickness: f32,
@@ -229,11 +214,6 @@ pub struct DWRITE_STRIKETHROUGH {
     pub flowDirection: DWRITE_FLOW_DIRECTION,
     pub localeName: *const u16,
     pub measuringMode: DWRITE_MEASURING_MODE,
-}
-impl Default for DWRITE_STRIKETHROUGH {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub const DWRITE_TEXTURE_ALIASED_1x1: DWRITE_TEXTURE_TYPE = 0;
 pub const DWRITE_TEXTURE_CLEARTYPE_3x1: DWRITE_TEXTURE_TYPE = 1;
@@ -281,7 +261,7 @@ pub const DWRITE_TRIMMING_GRANULARITY_CHARACTER: DWRITE_TRIMMING_GRANULARITY = 1
 pub const DWRITE_TRIMMING_GRANULARITY_NONE: DWRITE_TRIMMING_GRANULARITY = 0;
 pub const DWRITE_TRIMMING_GRANULARITY_WORD: DWRITE_TRIMMING_GRANULARITY = 2;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DWRITE_UNDERLINE {
     pub width: f32,
     pub thickness: f32,
@@ -291,11 +271,6 @@ pub struct DWRITE_UNDERLINE {
     pub flowDirection: DWRITE_FLOW_DIRECTION,
     pub localeName: *const u16,
     pub measuringMode: DWRITE_MEASURING_MODE,
-}
-impl Default for DWRITE_UNDERLINE {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub type DWRITE_VERTICAL_GLYPH_ORIENTATION = i32;
 pub type DWRITE_WORD_WRAPPING = i32;
@@ -2225,15 +2200,16 @@ impl IDWriteGlyphRunAnalysis {
         &self,
         texturetype: DWRITE_TEXTURE_TYPE,
         texturebounds: *const RECT,
-        alphavalues: &mut [u8],
+        alphavalues: *mut u8,
+        buffersize: u32,
     ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).CreateAlphaTexture)(
                 windows_core::Interface::as_raw(self),
                 texturetype,
                 texturebounds,
-                alphavalues.as_mut_ptr(),
-                alphavalues.len().try_into().unwrap(),
+                alphavalues as _,
+                buffersize,
             )
         }
     }
@@ -2347,13 +2323,18 @@ impl IDWriteLocalizedStrings {
             .map(|| result__)
         }
     }
-    pub unsafe fn GetString(&self, index: u32, stringbuffer: &mut [u16]) -> windows_core::HRESULT {
+    pub unsafe fn GetString(
+        &self,
+        index: u32,
+        stringbuffer: *mut u16,
+        size: u32,
+    ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).GetString)(
                 windows_core::Interface::as_raw(self),
                 index,
-                stringbuffer.as_mut_ptr(),
-                stringbuffer.len().try_into().unwrap(),
+                stringbuffer as _,
+                size,
             )
         }
     }
@@ -3083,18 +3064,15 @@ impl IDWriteTextLayout {
     }
     pub unsafe fn GetLineMetrics(
         &self,
-        linemetrics: Option<&mut [DWRITE_LINE_METRICS]>,
+        linemetrics: Option<*mut DWRITE_LINE_METRICS>,
+        maxlinecount: u32,
         actuallinecount: *mut u32,
     ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).GetLineMetrics)(
                 windows_core::Interface::as_raw(self),
-                linemetrics
-                    .as_deref()
-                    .map_or(core::ptr::null_mut(), |slice| slice.as_ptr().cast_mut()),
-                linemetrics
-                    .as_deref()
-                    .map_or(0, |slice| slice.len().try_into().unwrap()),
+                linemetrics.unwrap_or(core::mem::zeroed()) as _,
+                maxlinecount,
                 actuallinecount as _,
             )
         }
@@ -3174,7 +3152,8 @@ impl IDWriteTextLayout {
         textlength: u32,
         originx: f32,
         originy: f32,
-        hittestmetrics: Option<&mut [DWRITE_HIT_TEST_METRICS]>,
+        hittestmetrics: Option<*mut DWRITE_HIT_TEST_METRICS>,
+        maxhittestmetricscount: u32,
         actualhittestmetricscount: *mut u32,
     ) -> windows_core::HRESULT {
         unsafe {
@@ -3184,12 +3163,8 @@ impl IDWriteTextLayout {
                 textlength,
                 originx,
                 originy,
-                hittestmetrics
-                    .as_deref()
-                    .map_or(core::ptr::null_mut(), |slice| slice.as_ptr().cast_mut()),
-                hittestmetrics
-                    .as_deref()
-                    .map_or(0, |slice| slice.len().try_into().unwrap()),
+                hittestmetrics.unwrap_or(core::mem::zeroed()) as _,
+                maxhittestmetricscount,
                 actualhittestmetricscount as _,
             )
         }
@@ -3550,18 +3525,15 @@ impl IDWriteTextLayout3 {
     }
     pub unsafe fn GetLineMetrics(
         &self,
-        linemetrics: Option<&mut [DWRITE_LINE_METRICS1]>,
+        linemetrics: Option<*mut DWRITE_LINE_METRICS1>,
+        maxlinecount: u32,
         actuallinecount: *mut u32,
     ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).GetLineMetrics)(
                 windows_core::Interface::as_raw(self),
-                linemetrics
-                    .as_deref()
-                    .map_or(core::ptr::null_mut(), |slice| slice.as_ptr().cast_mut()),
-                linemetrics
-                    .as_deref()
-                    .map_or(0, |slice| slice.len().try_into().unwrap()),
+                linemetrics.unwrap_or(core::mem::zeroed()) as _,
+                maxlinecount,
                 actuallinecount as _,
             )
         }
@@ -3633,15 +3605,16 @@ impl IDWriteTextLayout4 {
     pub unsafe fn GetFontAxisValues(
         &self,
         currentposition: u32,
-        fontaxisvalues: &mut [DWRITE_FONT_AXIS_VALUE],
+        fontaxisvalues: *mut DWRITE_FONT_AXIS_VALUE,
+        fontaxisvaluecount: u32,
         textrange: Option<*mut DWRITE_TEXT_RANGE>,
     ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).GetFontAxisValues)(
                 windows_core::Interface::as_raw(self),
                 currentposition,
-                fontaxisvalues.as_mut_ptr(),
-                fontaxisvalues.len().try_into().unwrap(),
+                fontaxisvalues as _,
+                fontaxisvaluecount,
                 textrange.unwrap_or(core::mem::zeroed()) as _,
             )
         }

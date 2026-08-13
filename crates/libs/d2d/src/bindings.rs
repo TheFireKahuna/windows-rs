@@ -127,15 +127,10 @@ pub const D2D1_LINE_JOIN_BEVEL: D2D1_LINE_JOIN = 1;
 pub const D2D1_LINE_JOIN_MITER: D2D1_LINE_JOIN = 0;
 pub const D2D1_LINE_JOIN_ROUND: D2D1_LINE_JOIN = 2;
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct D2D1_MAPPED_RECT {
     pub pitch: u32,
     pub bits: *mut u8,
-}
-impl Default for D2D1_MAPPED_RECT {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub type D2D1_MAP_OPTIONS = u32;
 pub const D2D1_MAP_OPTIONS_READ: D2D1_MAP_OPTIONS = 1;
@@ -259,7 +254,7 @@ pub struct DWRITE_GLYPH_OFFSET {
     pub ascenderOffset: f32,
 }
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DWRITE_GLYPH_RUN {
     pub fontFace: core::mem::ManuallyDrop<Option<IDWriteFontFace>>,
     pub fontEmSize: f32,
@@ -270,24 +265,14 @@ pub struct DWRITE_GLYPH_RUN {
     pub isSideways: windows_core::BOOL,
     pub bidiLevel: u32,
 }
-impl Default for DWRITE_GLYPH_RUN {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
-}
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DWRITE_GLYPH_RUN_DESCRIPTION {
     pub localeName: *const u16,
     pub string: *const u16,
     pub stringLength: u32,
     pub clusterMap: *const u16,
     pub textPosition: u32,
-}
-impl Default for DWRITE_GLYPH_RUN_DESCRIPTION {
-    fn default() -> Self {
-        unsafe { core::mem::zeroed() }
-    }
 }
 pub type DWRITE_MEASURING_MODE = i32;
 pub const DWRITE_MEASURING_MODE_NATURAL: DWRITE_MEASURING_MODE = 0;
@@ -1939,12 +1924,16 @@ windows_core::imp::interface_hierarchy!(
     ID2D1GradientStopCollection
 );
 impl ID2D1GradientStopCollection1 {
-    pub unsafe fn GetGradientStops1(&self, gradientstops: &mut [D2D1_GRADIENT_STOP]) {
+    pub unsafe fn GetGradientStops1(
+        &self,
+        gradientstops: *mut D2D1_GRADIENT_STOP,
+        gradientstopscount: u32,
+    ) {
         unsafe {
             (windows_core::Interface::vtable(self).GetGradientStops1)(
                 windows_core::Interface::as_raw(self),
-                gradientstops.as_mut_ptr(),
-                gradientstops.len().try_into().unwrap(),
+                gradientstops as _,
+                gradientstopscount,
             );
         }
     }
@@ -3349,18 +3338,19 @@ impl IDXGIDevice {
     pub unsafe fn CreateSurface(
         &self,
         pdesc: *const DXGI_SURFACE_DESC,
+        numsurfaces: u32,
         usage: DXGI_USAGE,
         psharedresource: Option<*const DXGI_SHARED_RESOURCE>,
-        ppsurface: &mut [Option<IDXGISurface>],
+        ppsurface: *mut Option<IDXGISurface>,
     ) -> windows_core::HRESULT {
         unsafe {
             (windows_core::Interface::vtable(self).CreateSurface)(
                 windows_core::Interface::as_raw(self),
                 pdesc,
-                ppsurface.len().try_into().unwrap(),
+                numsurfaces,
                 usage,
                 psharedresource.unwrap_or(core::mem::zeroed()) as _,
-                core::mem::transmute(ppsurface.as_mut_ptr()),
+                core::mem::transmute(ppsurface),
             )
         }
     }
