@@ -150,7 +150,7 @@ impl ShapedRun {
         unsafe {
             let _ = self
                 .layout()
-                .HitTestTextRange(range.start, length, 0.0, 0.0, None, &mut count);
+                .HitTestTextRange(range.start, length, 0.0, 0.0, None, 0, &mut count);
         }
         if count == 0 {
             return;
@@ -165,11 +165,18 @@ impl ShapedRun {
             &mut heap
         };
 
-        // SAFETY: the slice is sized from the count the probe reported, and the counter is
-        // a stack local outliving the call.
+        // SAFETY: the buffer is sized from the count the probe reported and is passed with
+        // that length, and the counter is a stack local outliving the call.
         if unsafe {
-            self.layout()
-                .HitTestTextRange(range.start, length, 0.0, 0.0, Some(raw), &mut count)
+            self.layout().HitTestTextRange(
+                range.start,
+                length,
+                0.0,
+                0.0,
+                Some(raw.as_mut_ptr()),
+                raw.len() as u32,
+                &mut count,
+            )
         }
         .is_err()
         {

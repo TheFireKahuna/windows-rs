@@ -340,17 +340,12 @@ fn decode(item: &IPresentStatistics) -> Option<PresentStatistic> {
     if kind == PresentStatisticsKind_CompositionFrame {
         let frame = item.cast::<ICompositionFramePresentStatistics>().ok()?;
         let mut count = 0u32;
-        let mut instances: *const CompositionFrameDisplayInstance = core::ptr::null();
-        // Both are written by the callee, and the array parameter is generated as
-        // `*const *const` — the outer indirection loses its `mut` because nothing in
-        // the metadata marks it as an out-parameter. Taken from a mutable place and
-        // then cast, rather than passed as `&instances`, so the pointer the callee
-        // writes through carries write provenance.
+        let mut instances: *mut CompositionFrameDisplayInstance = core::ptr::null_mut();
         // SAFETY: `frame` is live, both destinations are stack locals that outlive the
         // call, and the array `instances` comes to point at is owned by `frame` and
         // valid until it drops — which is after the read below.
         unsafe {
-            frame.GetDisplayInstanceArray(&raw mut count, (&raw mut instances).cast_const());
+            frame.GetDisplayInstanceArray(&raw mut count, &raw mut instances);
         }
         if count == 0 || instances.is_null() {
             return None;

@@ -411,7 +411,7 @@ impl ShapedRun {
         // expected insufficient-buffer error, so its result is dropped.
         // SAFETY: the call takes only a stack-local counter.
         unsafe {
-            let _ = self.layout.GetLineMetrics(None, &mut count);
+            let _ = self.layout.GetLineMetrics(None, 0, &mut count);
         }
         // Reused across harvests, so a paragraph re-flowing under a resize drag allocates
         // once.
@@ -419,11 +419,15 @@ impl ShapedRun {
         self.raw_lines
             .resize(count as usize, DWRITE_LINE_METRICS::default());
         if count > 0 {
-            // SAFETY: the slice is sized from the count the probe reported, and the
-            // counter is a stack local outliving the call.
+            // SAFETY: the buffer is sized from the count the probe reported and is passed
+            // with that length, and the counter is a stack local outliving the call.
             unsafe {
                 self.layout
-                    .GetLineMetrics(Some(&mut self.raw_lines), &mut count)
+                    .GetLineMetrics(
+                        Some(self.raw_lines.as_mut_ptr()),
+                        self.raw_lines.len() as u32,
+                        &mut count,
+                    )
                     .ok()?;
             }
         }

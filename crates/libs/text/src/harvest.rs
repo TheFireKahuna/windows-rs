@@ -125,7 +125,9 @@ impl Collector {
             let names = face.GetFamilyNames()?;
             let len = names.GetStringLength(0)? as usize;
             let mut buffer = vec![0u16; len + 1];
-            names.GetString(0, &mut buffer).ok()?;
+            names
+                .GetString(0, buffer.as_mut_ptr(), buffer.len() as u32)
+                .ok()?;
             Ok(FaceKey {
                 family: String::from_utf16_lossy(&buffer[..len]).into(),
                 weight: face.GetWeight().clamp(1, 999) as u16,
