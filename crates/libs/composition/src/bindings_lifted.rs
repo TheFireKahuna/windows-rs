@@ -655,24 +655,6 @@ windows_core::imp::interface_hierarchy!(
     windows_core::IUnknown,
     windows_core::IInspectable
 );
-impl windows_core::RuntimeName for ICompositionAnimationBase {
-    const NAME: &'static str = "Microsoft.UI.Composition.ICompositionAnimationBase";
-}
-pub trait ICompositionAnimationBase_Impl: windows_core::IUnknownImpl {}
-impl ICompositionAnimationBase_Vtbl {
-    pub const fn new<Identity: ICompositionAnimationBase_Impl, const OFFSET: isize>() -> Self {
-        Self {
-            base__: windows_core::IInspectable_Vtbl::new::<
-                Identity,
-                ICompositionAnimationBase,
-                OFFSET,
-            >(),
-        }
-    }
-    pub fn matches(iid: &windows_core::GUID) -> bool {
-        iid == &<ICompositionAnimationBase as windows_core::Interface>::IID
-    }
-}
 #[repr(C)]
 pub struct ICompositionAnimationBase_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,

@@ -404,18 +404,8 @@ Windows.UI.Composition.Interactions.InteractionTrackerPositionUpdateOption
 Windows.UI.Composition.Interactions.IInteractionTrackerStatics2::{SetBindingMode, GetBindingMode}
 Windows.UI.Composition.Interactions.InteractionBindingAxisModes
 
-// Three interfaces here are IMPLEMENTED rather than called — the tracker's owner, and the
-// pair that presents a Direct2D geometry to the compositor — so they need `_Impl`
-// scaffolding and nothing else does. Naming them narrows that scaffolding to these three
-// instead of emitting it for every interface in the filter.
---implement
-    Windows.UI.Composition.Interactions.IInteractionTrackerOwner
-    Windows.Graphics.IGeometrySource2D
-    Windows.Win32.IGeometrySource2DInterop
-
---filter
-
-// The owner interface is named in `--implement` above and NOT here: naming it in the filter
+// The owner interface is implemented rather than called, so `tool_composition` names it
+// among the interfaces it asks for `_Impl` scaffolding and NOT here: naming it in the filter
 // too would emit the caller-side projection of six callbacks this crate only ever receives.
 // The args types carry the values those callbacks report; a class with no interface named
 // beside it would deliver six callbacks that can read nothing.

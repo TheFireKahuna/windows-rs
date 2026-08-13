@@ -15,10 +15,19 @@ fn main() {
     // supplies ICompositorDesktopInterop and the HWND/BOOL types used to host a visual
     // tree in a plain window. Flat + minimal keeps the crate's own surface small and
     // namespace-free (see docs/crates/windows-composition.md).
+    // Three interfaces are IMPLEMENTED rather than called — the tracker's owner, and the
+    // pair that presents a Direct2D geometry to the compositor — so they need `_Impl`
+    // scaffolding and nothing else does. Naming them narrows that scaffolding to these
+    // three instead of emitting it for every interface in the filter.
     builder()
         .input_default()
         .input(authored)
         .output("crates/libs/composition/src/bindings.rs")
+        .implements([
+            "Windows.UI.Composition.Interactions.IInteractionTrackerOwner",
+            "Windows.Graphics.IGeometrySource2D",
+            "Windows.Win32.IGeometrySource2DInterop",
+        ])
         .minimal()
         .dead_code()
         .flat()
@@ -37,6 +46,9 @@ fn main() {
             "crates/libs/default/Windows.winmd",
         ])
         .output("crates/libs/composition/src/bindings_lifted.rs")
+        // Only the owner: the geometry pair sits in a system-only region of the filter, so
+        // the lifted bindings do not carry it.
+        .implements(["Microsoft.UI.Composition.Interactions.IInteractionTrackerOwner"])
         .minimal()
         .dead_code()
         .flat()
