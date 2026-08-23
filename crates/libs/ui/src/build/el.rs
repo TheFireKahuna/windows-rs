@@ -599,6 +599,30 @@ impl<K> El<K> {
         })))
     }
 
+    /// States the column template from whatever `tracks` writes, re-read whenever a signal
+    /// it reads changes.
+    ///
+    /// [`cols_if`](Self::cols_if) keys a template it was handed on a condition; this one
+    /// **computes** the template. What needs it is a track whose extent is a value rather
+    /// than a case — a graph column sized from a channel count, a rail sized from what it
+    /// holds — where enumerating one arm per value is the whole domain of the value.
+    ///
+    /// `tracks` fills a buffer this element keeps, so a re-read allocates nothing after the
+    /// first. It clears the template accumulated below it and states its own, exactly as
+    /// `cols_if` does, and like every restyle it changes styles and never structure: a track
+    /// that resizes drops no owner, so state in the column it sizes is untouched.
+    #[must_use]
+    pub fn cols_from(self, tracks: impl Fn(&mut Vec<Track>) + 'static) -> Self {
+        let buf = core::cell::RefCell::new(Vec::new());
+        self.act(Act::Restyle(Box::new(move |out| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            tracks(&mut buf);
+            out.push(Over::ClearColumns);
+            out.extend(buf.iter().copied().map(Over::Column));
+        })))
+    }
+
     /// Hides this subtree at `class`: not laid out, and not drawn.
     ///
     /// `Display::None` rather than [`when`](Self::when), so the subtree stays mounted and its

@@ -1949,6 +1949,63 @@ fn a_class_gated_column_list_replaces_the_one_below_it() {
     );
 }
 
+/// A computed column template follows the value it is computed from.
+///
+/// `cols_from` is the case `cols_if` cannot state: the first track's extent is a number, so
+/// there is no condition to key an arm on and no finite set of arms to write. The assertion
+/// is on where the second child begins, which is the first track's width — first at the value
+/// the signal held at mount, then at the value it moved to.
+#[test]
+fn a_computed_column_template_follows_the_value_it_reads() {
+    use crate::layout::Track;
+    let rows = crate::signal::Cell::new(2.0_f32);
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::grid((
+            plate().height(Metric::CardMinH),
+            plate().height(Metric::CardMinH),
+        ))
+        .cols_from(move |out| {
+            out.push(Track::Fixed(Len::Times(Metric::RowH, rows.get())));
+            out.push(Track::Fr(1.0));
+        })
+        .gap(Len::Zero)
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let second = || {
+        Host::with(|h| {
+            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let (a, b) = (h.model().solved(nodes[1]), h.model().solved(nodes[2]));
+            b.rect.x0 - a.rect.x0
+        })
+    };
+    let row_h = crate::role::metric(
+        Metric::RowH,
+        crate::role::Scope::root(crate::role::AccentId(0), crate::role::Density::Comfortable),
+    );
+    assert!(
+        (second() - row_h * 2.0).abs() < 1.0,
+        "the computed track was not two row heights wide: the second child began {} DIPs \
+         across, against {}",
+        second(),
+        row_h * 2.0
+    );
+
+    rows.set(5.0);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert!(
+        (second() - row_h * 5.0).abs() < 1.0,
+        "the track did not follow its signal: the second child began {} DIPs across, against \
+         {}",
+        second(),
+        row_h * 5.0
+    );
+}
+
 /// `hide_when` takes the node out of the layout and leaves it in the tree.
 #[test]
 fn hide_when_removes_the_box_and_not_the_node() {
