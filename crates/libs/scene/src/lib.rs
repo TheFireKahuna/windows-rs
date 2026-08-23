@@ -66,7 +66,8 @@ use core::marker::PhantomData;
 use std::cell::RefCell;
 use std::rc::Rc;
 use windows_composition::{
-    ContainerVisual, DesktopWindowTarget, Stretch, Visual, VisualInteractionSource,
+    CompositionSurfaceBrush, ContainerVisual, DesktopWindowTarget, Stretch, Visual,
+    VisualInteractionSource,
 };
 use windows_numerics::{Vector2, Vector3};
 use windows_window::{Wake, Window};
@@ -418,6 +419,7 @@ impl Scene {
         // keyed by nothing this side holds, so the model is told and re-emits it.
         if grid_moved {
             set_dip_space(&self.window, env);
+            self.rescale_regions(env);
             self.events
                 .borrow_mut()
                 .push(SceneEvent::ScaleChanged { scale: env.scale() }, &self.wake);
@@ -514,10 +516,28 @@ impl Scene {
         // The buffer is already at device resolution, so `Stretch::None` samples it one texel
         // per physical pixel — every pixel guarantee a presented region makes rests on that.
         let brush = back.brush(&surface, Stretch::None);
+        scale_region(&brush, env);
         if let Some(res) = self.res.regions.get_mut(region) {
             res.value = Some(brush);
         }
         self.rebind_region(region, back, env)
+    }
+
+    /// Re-scales every bound region's brush after the pixel grid moved.
+    ///
+    /// A brush is not cache-backed and carries no generation, so nothing else re-derives it:
+    /// the sprites rebind to the same object and would keep the factor of the display the
+    /// region was bound on. A region moved to a 200% display would then draw at half size in
+    /// its own box, with the rest of the tree correct around it.
+    fn rescale_regions(&self, env: Env) {
+        for at in self.res.regions.positions() {
+            let Some(id) = self.res.regions.id_at(at) else {
+                continue;
+            };
+            if let Some(brush) = self.res.region(id) {
+                scale_region(brush, env);
+            }
+        }
     }
 
     /// Releases a region's buffer and rebinds every sprite painting with it.
@@ -646,6 +666,21 @@ fn set_dip_space(root: &ContainerVisual, env: Env) {
     });
     let dips = 1.0 / scale;
     root.set_relative_size_adjustment(Vector2 { x: dips, y: dips });
+}
+
+/// Maps a region's buffer one texel to one physical pixel inside a visual measured in DIPs.
+///
+/// A sprite's box is in DIPs and the whole tree hangs under a root carrying the display
+/// scale ([`set_dip_space`]), so a brush left at unit scale paints one texel per *DIP* and
+/// the region comes out magnified by the scale factor — a grid drawn for a 1.5× display
+/// lands half again too large and clipped at the box. `1 / scale` puts the buffer back on
+/// the pixels it was drawn for, which is the same correction a nine-grid inset takes.
+///
+/// The offset is zero: the region owns the whole surface, where an atlas cell would carry
+/// its origin here.
+fn scale_region(brush: &CompositionSurfaceBrush, env: Env) {
+    let dips = 1.0 / env.scale();
+    brush.set_source_transform(Vector2::zero(), Vector2 { x: dips, y: dips });
 }
 
 /// Returns the `E_INVALIDARG` error, which is how this crate refuses an id or a binding it
