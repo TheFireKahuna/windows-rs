@@ -267,6 +267,18 @@ pub enum Metric {
     RadiusPill,
     /// A control's row height, and the floor a touch target is inflated to.
     RowH,
+    /// A switch's track: the capsule its knob rides in.
+    ///
+    /// Under [`RowH`](Self::RowH). A switch marks what a row already says rather than being
+    /// what the row is sized for, and one as tall as the row reads as a second button beside
+    /// whatever else the row carries.
+    ///
+    /// It is the switch's one free variable. How long the track is and how much of it the
+    /// knob fills are proportions of this — a switch is one shape, and its inset is both
+    /// where the knob rests and what its travel is measured between, so a caller free to set
+    /// them separately can put a knob outside the track it rides in. A slider's groove is a
+    /// different shape and does not read this rung.
+    TrackH,
     // ── the band ladder: the horizontal strips a shell is built from ─────────────
     /// A strip carrying text and no control: a status bar, a footnote rule.
     BandSm,

@@ -10,7 +10,7 @@
 //! `taffy::Style`.
 
 mod adapt;
-mod arena;
+pub(crate) mod arena;
 mod children;
 mod el;
 mod host;

@@ -7,7 +7,7 @@
 pub mod roles;
 
 mod kind;
-mod seed;
+pub(crate) mod seed;
 mod state;
 mod text;
 
@@ -17,7 +17,7 @@ pub use kind::{
 };
 pub use seed::{
     CHIP_PLATE, box_, button, caption, card, chip, field, flyout, icon_button, knob, label, meter,
-    micro, mono, panel, path, segmented, select, slider, text, title, toggle,
+    micro, mono, note, panel, path, pills, segmented, select, slider, text, title, toggle,
 };
 // `ChromeRow` is one row of a widget's colour table; `Controls` is the front thread's table
 // of live controls.

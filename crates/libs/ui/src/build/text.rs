@@ -89,17 +89,51 @@ impl Source {
         }
     }
 
-    /// Re-points at `text`, reusing the buffer where there is one.
-    fn set(&mut self, text: &str) {
-        match self {
-            Self::Owned(owned) => {
-                owned.clear();
-                owned.push_str(text);
-            }
-            // A static run given a dynamic string: the first change is where it becomes
-            // owned, and every one after that reuses this buffer.
-            Self::Static(_) => *self = Self::Owned(text.to_owned()),
+    /// Returns whether this already holds `text` cased for `caps`.
+    ///
+    /// Compares against the case-folded stream rather than folding into a buffer first, so
+    /// the common answer — a reactive run whose value moved and whose text did not — costs a
+    /// comparison and no allocation.
+    fn holds(&self, text: &str, caps: bool) -> bool {
+        if caps {
+            self.as_str()
+                .chars()
+                .eq(text.chars().flat_map(char::to_uppercase))
+        } else {
+            self.as_str() == text
         }
+    }
+
+    /// Re-points at `text`, cased for `caps`, reusing the buffer where there is one.
+    fn set(&mut self, text: &str, caps: bool) {
+        // A static run given a dynamic string: the first change is where it becomes owned,
+        // and every one after that reuses this buffer.
+        if let Self::Static(_) = self {
+            *self = Self::Owned(String::new());
+        }
+        let Self::Owned(owned) = self else {
+            return;
+        };
+        owned.clear();
+        if caps {
+            owned.extend(text.chars().flat_map(char::to_uppercase));
+        } else {
+            owned.push_str(text);
+        }
+    }
+
+    /// Upper-cases what this holds where `caps` says the rung is set in capitals, and
+    /// answers with what it held before, where that was a different string.
+    ///
+    /// The mint-side fold. The folded form is the one allocation a capitalised label makes
+    /// over the life of the run; the author's form is handed back rather than copied, so a
+    /// static label's accessible name is still a borrow.
+    fn fold(&mut self, caps: bool) -> Option<Self> {
+        if !caps || self.as_str().chars().all(|c| !c.is_lowercase()) {
+            return None;
+        }
+        let folded = Self::Owned(self.as_str().chars().flat_map(char::to_uppercase).collect());
+        Some(core::mem::replace(self, folded))
     }
 }
 
@@ -110,6 +144,16 @@ pub(crate) struct Entry {
     text: Source,
     ramp: TypeRole,
     flow: Flow,
+    /// Whether this run is set in capitals. Held so a changed string is folded the same way
+    /// the mounted one was.
+    caps: bool,
+    /// What the author wrote, held only where capitalising changed it.
+    ///
+    /// Casing is a typographic treatment and not a rename, so automation announces this and
+    /// the shaper draws [`Entry::text`]. Without it a reader says a badge one letter at a
+    /// time. `None` on every run whose two forms are the same string, which is all of them
+    /// but the capitalised ones.
+    spoken: Option<Source>,
     scope: Scope,
     /// What the run was last laid out under. A width class change moves the type ramp, so
     /// this is what distinguishes a reshape from a re-pin.
@@ -141,6 +185,8 @@ pub(crate) struct Mint {
     pub text: Source,
     pub ramp: TypeRole,
     pub flow: Flow,
+    /// Whether the run is set in capitals. The widget's choice, not the rung's.
+    pub caps: bool,
     pub scope: Scope,
     pub ink: Option<crate::role::Text>,
     /// The sprite a single line draws into. Ignored where `group` says it wraps.
@@ -256,13 +302,26 @@ pub(crate) fn measure(input: MeasureIn) -> Vector2 {
     })
 }
 
+impl Entry {
+    /// Returns the string this run was laid out from, capitals and all.
+    ///
+    /// Test-only: what a run draws is otherwise readable only off the rasterized glyphs, and
+    /// the drawn casing is a claim worth pinning.
+    #[cfg(test)]
+    pub(crate) fn shaped_str(&self) -> &str {
+        self.text.as_str()
+    }
+}
+
 impl Table {
     /// Returns the string a run was laid out from.
     ///
     /// What automation derives an accessible name from: a widget's name is its own text
     /// unless it was given one, and this is where its own text is.
     pub(crate) fn str_of(&self, key: MeasureKey) -> Option<&str> {
-        self.entries.get(key).map(|entry| entry.text.as_str())
+        self.entries
+            .get(key)
+            .map(|entry| entry.spoken.as_ref().unwrap_or(&entry.text).as_str())
     }
 
     /// Registers a run and hands back the key layout will name it by.
@@ -277,14 +336,16 @@ impl Table {
     /// run.
     pub(crate) fn mint(&mut self, mint: Mint) -> MeasureKey {
         let Mint {
-            text,
+            mut text,
             ramp,
             flow,
+            caps,
             scope,
             ink,
             sprite,
             group,
         } = mint;
+        let spoken = text.fold(caps);
         let font = crate::role::typography(ramp, scope);
         let target = match group {
             Some(group) => Target::Wrapped {
@@ -300,6 +361,8 @@ impl Table {
             entry.text = text;
             entry.ramp = ramp;
             entry.flow = flow;
+            entry.caps = caps;
+            entry.spoken = spoken;
             entry.scope = scope;
             entry.font = font;
             entry.ink = ink;
@@ -318,6 +381,8 @@ impl Table {
             text,
             ramp,
             flow,
+            caps,
+            spoken,
             scope,
             font,
             ink,
@@ -347,10 +412,19 @@ impl Table {
     /// caller has to mark it — and this is the node to mark.
     pub(crate) fn set_text(&mut self, key: MeasureKey, text: &str) -> Option<NodeId> {
         let entry = self.entries.get_mut(key)?;
-        if entry.text.as_str() == text {
+        let caps = entry.caps;
+        if entry.text.holds(text, caps) {
             return None;
         }
-        entry.text.set(text);
+        entry.text.set(text, caps);
+        // Written into the buffer this run already owns, on the same terms as the shaped
+        // form: a capitalised run that follows a value reshapes and re-announces together.
+        if caps {
+            entry
+                .spoken
+                .get_or_insert(Source::Owned(String::new()))
+                .set(text, false);
+        }
         entry.stale = true;
         Some(entry.node())
     }

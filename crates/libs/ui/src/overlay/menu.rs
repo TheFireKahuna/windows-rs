@@ -213,6 +213,7 @@ fn row(item: MenuItem) -> View {
             TypeRole::Body,
             None,
             crate::widget::Flow::Line,
+            false,
         ));
 
     // The label is also the accessible name, which is what `answers` matches on, so

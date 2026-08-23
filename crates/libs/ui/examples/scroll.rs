@@ -298,6 +298,7 @@ impl Palette for Reference {
             Metric::SpaceLg => 20.0 * tight,
             Metric::Radius | Metric::RadiusSurface | Metric::RadiusPill => 8.0,
             Metric::RowH => (32.0 * tight).max(24.0),
+            Metric::TrackH => 20.0 * tight,
             Metric::BandSm => 28.0 * tight,
             Metric::BandMd => 44.0 * tight,
             Metric::BandLg => 48.0 * tight,

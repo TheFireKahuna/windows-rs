@@ -309,6 +309,13 @@ pub(crate) struct TextSeed {
     /// text colour does not have to reach into the text seed to say so.
     pub ink: Option<Text>,
     pub flow: Flow,
+    /// Whether the run is set in capitals.
+    ///
+    /// The widget's, not the rung's: the same rung sets a section heading, a badge and a
+    /// segment name, and the reference capitalises the first two. Casing changes which
+    /// characters are shaped, so it cannot ride the [`FontSpec`](windows_text::FontSpec) the
+    /// rung resolves to.
+    pub caps: bool,
 }
 
 /// Something the application asked to happen, held until mount moves it into the host's

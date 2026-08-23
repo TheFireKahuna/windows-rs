@@ -396,6 +396,7 @@ fn text_measures_under_the_resolved_type_ramp() {
             ramp,
             Some(Text::Primary),
             Flow::Line,
+            false,
         );
         let _mount = mount(label, root());
         flush(&mut patch);
@@ -2583,6 +2584,52 @@ fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
     assert_eq!(label.role, crate::widget::UiaRole::Text);
 }
 
+/// A capitalised run draws in capitals and announces what the author wrote.
+///
+/// Casing is a typographic treatment of the label rung, not a rename. A reader given the
+/// drawn form says a heading one letter at a time.
+#[test]
+fn a_capitalised_run_announces_the_authors_casing() {
+    let mut patch = fixture();
+    let value = crate::signal::Cell::new(0.5_f64);
+    let _row = mount(
+        stack((
+            crate::widget::label("Gain adjust"),
+            crate::widget::slider(value, crate::widget::Range::UNIT).width(Metric::CardMinW),
+        )),
+        root(),
+    );
+    flush(&mut patch);
+
+    // The shaped form: what the run was laid out from, which is the only place the drawn
+    // casing can be read back without rasterizing.
+    let shaped = Host::with(|_| {
+        crate::build::text::with(|table| {
+            table
+                .entries
+                .iter()
+                .map(|(_, entry)| entry.shaped_str().to_owned())
+                .find(|s| s.eq_ignore_ascii_case("gain adjust"))
+        })
+    })
+    .expect("the label is in the table");
+    assert_eq!(shaped, "GAIN ADJUST", "the label rung draws in capitals");
+
+    let tree = tree(&patch);
+    let slider = (0..tree.len())
+        .find(|&at| {
+            tree.col(at)
+                .is_some_and(|c| c.role == crate::widget::UiaRole::Slider)
+        })
+        .expect("the slider is published");
+    let col = tree.col(slider).expect("a column");
+    assert_eq!(
+        String::from_utf16_lossy(tree.text(col.name)),
+        "Gain adjust",
+        "and announces the string the author wrote"
+    );
+}
+
 /// A control with its own text keeps it, and one whose predecessor is not a run takes none.
 ///
 /// The neighbour rule reaches one element back, so it cannot relabel a named control or
@@ -3783,10 +3830,16 @@ fn a_toggles_track_keeps_its_box_among_siblings() {
     let bare = track_box(crate::widget::toggle(on));
     // What the widget asks for, through the same metric it states it in. Read after the
     // first fixture, which is what installs the palette a metric resolves against.
-    let row_h = crate::role::metric(Metric::RowH, Scope::root(AccentId(0), Density::Comfortable));
+    let track = crate::role::metric(
+        Metric::TrackH,
+        Scope::root(AccentId(0), Density::Comfortable),
+    );
+    // The widget's own proportion, not a copy of it: the claim is that layout gives the track
+    // the box the widget asked for, and a restated number tests two copies against each other
+    // instead.
     let want = Vector2 {
-        x: row_h * 0.8 * 2.0,
-        y: row_h * 0.8,
+        x: track * crate::widget::seed::TRACK_ASPECT,
+        y: track,
     };
     // The shape of a chain row's header: a spacer takes the slack, and the toggle sits
     // between a label and a fixed-width disclosure.

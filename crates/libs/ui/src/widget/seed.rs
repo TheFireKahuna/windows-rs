@@ -6,6 +6,7 @@
 //! A composition is a function returning a tree of these. It is where `badge`, `nav`, `tabs`
 //! and every screen an application assembles for itself live, and it adds nothing here.
 
+use crate::build::arena::FULL;
 use crate::build::{Button, El, Path, View};
 use crate::gesture::{DragDecl, GestureDecl};
 use crate::layout::{Align, Len, Over, Preset};
@@ -22,26 +23,41 @@ use windows_scene::{GeomId, HitFlags};
 /// Body copy.
 #[must_use]
 pub fn text(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::Body, Text::Primary, Flow::Line)
+    run(s, TypeRole::Body, Text::Primary, Flow::Line, false)
 }
 
 /// A heading.
 #[must_use]
 pub fn title(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::Title, Text::Primary, Flow::Line)
+    run(s, TypeRole::Title, Text::Primary, Flow::Line, false)
 }
 
 /// A field's or a group's name, set secondary to the thing it labels.
+///
+/// The one text widget set in capitals. It names a region of a surface rather than carrying
+/// a value, and its rung is tracked to suit that.
 #[must_use]
 pub fn label(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::Label, Text::Secondary, Flow::Line)
+    run(s, TypeRole::Label, Text::Secondary, Flow::Line, true)
 }
 
 /// Supporting prose. It wraps, so it is the one text widget that mounts as a group: a
 /// coverage tile covers one line, and a run that can break needs a sprite per line.
 #[must_use]
 pub fn caption(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::Caption, Text::Tertiary, Flow::Wrap)
+    run(s, TypeRole::Caption, Text::Tertiary, Flow::Wrap, false)
+}
+
+/// A short statement set beside something else: a figure's name on a band, a unit after a
+/// read-out, the word a state is reported in.
+///
+/// The [`caption`] rung on one line. Every other rung is a line and only that one wraps, so
+/// this is what the reading rung offers a row whose items are laid out across it: a wrapping
+/// run in a row measures at its longest word and breaks inside it, which is a name split over
+/// two lines in a band one line deep.
+#[must_use]
+pub fn note(s: impl Into<TextSource>) -> View {
+    run(s, TypeRole::Caption, Text::Tertiary, Flow::Line, false)
 }
 
 /// Annotation on a data surface: a unit, an index, a channel name, a coefficient.
@@ -50,13 +66,13 @@ pub fn caption(s: impl Into<TextSource>) -> View {
 /// outweigh it.
 #[must_use]
 pub fn micro(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::Micro, Text::Tertiary, Flow::Line)
+    run(s, TypeRole::Micro, Text::Tertiary, Flow::Line, false)
 }
 
 /// A read-out, in tabular figures, so its digits do not shift width as it changes.
 #[must_use]
 pub fn mono(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::Mono, Text::Primary, Flow::Line)
+    run(s, TypeRole::Mono, Text::Primary, Flow::Line, false)
 }
 
 /// Builds a text run: the shared body of the five text widgets and of every label inside a
@@ -64,9 +80,9 @@ pub fn mono(s: impl Into<TextSource>) -> View {
 ///
 /// `ink` is stated here and overridden at mount by the enclosing widget's chrome row where
 /// there is one, so a button's variant reaches its text without the text naming a variant.
-fn run(s: impl Into<TextSource>, ramp: TypeRole, ink: Text, flow: Flow) -> View {
+fn run(s: impl Into<TextSource>, ramp: TypeRole, ink: Text, flow: Flow, caps: bool) -> View {
     El::seed(Preset::Text)
-        .text_seed(s.into(), ramp, Some(ink), flow)
+        .text_seed(s.into(), ramp, Some(ink), flow, caps)
         // `UIA` and nothing else: a run has no gesture, takes no focus and routes no
         // pointer, so the hit scan skips it on one flags test. With no entry at all it
         // would have no automation peer, and a screen of text would read as empty.
@@ -77,8 +93,8 @@ fn run(s: impl Into<TextSource>, ramp: TypeRole, ink: Text, flow: Flow) -> View 
 ///
 /// It mints no automation peer: the control it sits in derives its accessible name from this
 /// text, so a peer would have a reader announce the control's name twice.
-fn inner(s: impl Into<TextSource>, ramp: TypeRole) -> View {
-    El::seed(Preset::Text).text_seed(s.into(), ramp, None, Flow::Line)
+fn inner(s: impl Into<TextSource>, ramp: TypeRole, caps: bool) -> View {
+    El::seed(Preset::Text).text_seed(s.into(), ramp, None, Flow::Line, caps)
 }
 
 // ── surfaces ─────────────────────────────────────────────────────────────────────
@@ -138,22 +154,33 @@ pub fn chip(role: DataRole, s: impl Into<TextSource>) -> View {
         .plate(Metric::Radius, Role::Data(role), CHIP_PLATE)
         // A container and not a run: a run's box is its coverage tile, so padding one leaves
         // the glyphs drawn against a tile sized without it and the plate hugs them.
-        .row(ink_run(s, TypeRole::Label, Role::Data(role)))
+        .row(ink_run(s, TypeRole::Label, Role::Data(role), true))
+        // Wider than it is tall, and by the widest step in the scale on the inline axis: a
+        // badge is read as a shape before it is read as a word, and a plate at the glyphs'
+        // own extent is a highlight behind text rather than a chip. The text is short, upper
+        // case and tracked, so the shape is nearly all inset.
+        .padding_xy(Metric::SpaceMd, Metric::SpaceXs)
         // `UIA` and nothing else, as a text run takes: a chip names something, and routes no
         // pointer of its own.
         .hit(HitFlags::UIA, UiaRole::Text)
 }
 
 /// A text run painted in `role`, for a widget whose text colour is chromatic.
-fn ink_run(s: impl Into<TextSource>, ramp: TypeRole, role: Role) -> View {
-    El::seed(Preset::Text).text_seed_in(s.into(), ramp, role)
+fn ink_run(s: impl Into<TextSource>, ramp: TypeRole, role: Role, caps: bool) -> View {
+    El::seed(Preset::Text).text_seed_in(s.into(), ramp, role, caps)
 }
 
 /// How much of its role a [`chip`]'s plate paints.
 ///
 /// Low enough that the text over it, which is the same hue at full strength, still separates
 /// from it.
-pub const CHIP_PLATE: f32 = 0.15;
+///
+/// A fraction of the light the compositor blends, and that is why it is far below the value
+/// the same plate is written with in 8-bit sRGB. A design reference stating 15% alpha over a
+/// near-black ground renders a plate whose *linear* share of the hue is around a fifteenth,
+/// because the encoding is a curve: the fraction that reproduces it here is measured off the
+/// rendered plate rather than copied from the declaration.
+pub const CHIP_PLATE: f32 = 0.07;
 
 /// A detached surface above everything. The overlay layer anchors and dismisses it; this is
 /// only what it looks like.
@@ -173,7 +200,7 @@ pub fn flyout() -> View {
 pub fn button(text: impl Into<TextSource>) -> El<Button> {
     control(UiaRole::Button)
         .chrome(roles::BUTTON, roles::DEFAULT, Metric::Radius)
-        .row(inner(text, TypeRole::Body))
+        .row(inner(text, TypeRole::Body, false))
 }
 
 /// A press with no text, so [`name`](El::name) is required: there is nothing to derive an
@@ -185,17 +212,29 @@ pub fn icon_button(icon: GeomId) -> El<Button> {
         .row(path(icon).ink())
 }
 
-/// A switch's height, in row heights.
-///
-/// Under a row. A switch marks what a row already says rather than being what the row is
-/// sized for, and one as tall as the row reads as a second button beside the disclosure.
-const TOGGLE_ROWS: f32 = 0.8;
-
-/// How long a track is, as a multiple of its own height.
+/// How long a switch's track is, as a multiple of [`Metric::TrackH`].
 ///
 /// Enough for the knob and most of a knob's width of travel, which is what reads as a switch
-/// rather than as an indicator dot.
-const TRACK_ASPECT: f32 = 2.0;
+/// rather than as an indicator dot. A proportion and not a rung: the palette says how big a
+/// switch is, and this says what shape one is.
+pub(crate) const TRACK_ASPECT: f32 = 1.7;
+
+/// The knob's diameter on a switch, as a fraction of the track's height.
+///
+/// Above [`KNOB_OF_TRACK`], which is a groove's. A groove is a line the thumb rides along and
+/// the track either side of it is the value; a switch is a capsule the knob nearly fills, and
+/// the sliver of track left at the ends is what says which end it is at.
+pub(crate) const TOGGLE_KNOB_OF_TRACK: f32 = 0.8;
+
+/// The fill a switch takes when it is on.
+///
+/// Read out of [`roles::TRACK_ON`] rather than named again here, so the row that says what an
+/// on switch is is the row this paints.
+const TRACK_ON_FILL: Role = match roles::TRACK[roles::TRACK_ON as usize].fill {
+    Some(fill) => Role::Fill(fill),
+    // The row is authored with a fill. Stated so the constant is total.
+    None => Role::Fill(Fill::Accent),
+};
 
 /// A two-state switch. The knob is a sprite sprung between the ends of its track, so the
 /// transition is a compositor animation and costs no frame after the one that started it.
@@ -205,17 +244,40 @@ const TRACK_ASPECT: f32 = 2.0;
 /// switch is shorter than a row, the knob is wider than what that padding leaves — the layout
 /// shrinks it into a lens — and it rests at the start of a track its travel is measured from
 /// the start of.
+///
+/// Every one of those numbers comes off [`Metric::TrackH`]. A caller restating the box
+/// therefore moves the track and leaves the knob where the palette put it, which is why the
+/// whole shape is stated here rather than left to a call site.
 #[must_use]
 pub fn toggle<M>(on: impl Signal<bool, M> + Copy + 'static) -> View {
     control::<crate::build::Any>(UiaRole::CheckBox)
         .chrome(roles::TRACK, roles::TRACK_OFF, Metric::RadiusPill)
         .selected(on)
         .interaction(Interaction::Press)
-        .row(knob_sprite(TOGGLE_ROWS).along(false, move || f32::from(u8::from(on.read()))))
+        .row((
+            // The on state's fill, as a covering plate whose opacity carries the state. A
+            // variant is resolved at mount, so the alternative is rebuilding the control on
+            // every press; and the state swap `selected` performs resolves a *wash*, which
+            // is what a selected row takes and not what a switch that is on is.
+            //
+            // It is out of flow, so it neither takes the track's padding nor displaces the
+            // knob beside it. The interaction wash is emitted below a node's children, so an
+            // on switch does not lighten under the pointer — which is what the design
+            // reference does too: the switch reports its own state and nothing else.
+            El::<crate::build::Any>::seed(Preset::Bare)
+                .plate(Metric::RadiusPill, TRACK_ON_FILL, FULL)
+                .cover()
+                .opacity(move || f32::from(u8::from(on.read()))),
+            knob_sprite(1.0, TOGGLE_KNOB_OF_TRACK)
+                .along(false, move || f32::from(u8::from(on.read()))),
+        ))
         .min_height(Len::Zero)
-        .height(Len::Times(Metric::RowH, TOGGLE_ROWS))
-        .width(Len::Times(Metric::RowH, TOGGLE_ROWS * TRACK_ASPECT))
-        .padding(Len::Times(Metric::RowH, TOGGLE_ROWS * KNOB_INSET_OF_TRACK))
+        .height(Metric::TrackH)
+        .width(Len::Times(Metric::TrackH, TRACK_ASPECT))
+        .padding(Len::Times(
+            Metric::TrackH,
+            knob_inset_of(TOGGLE_KNOB_OF_TRACK),
+        ))
         .justify(Align::Start)
         .align(Align::Center)
         // A switch is one fixed shape. Shrinkable, a tight row takes the width off the track
@@ -232,11 +294,14 @@ pub fn slider<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> V
         .interaction(Interaction::Slide(range))
         .gesture(GestureDecl::slider(range.vertical))
         .state(accent_wash())
-        .row(knob_sprite(1.0).along(range.vertical, move || range.fraction(value.read())))
+        .row(
+            knob_sprite(1.0, KNOB_OF_TRACK)
+                .along(range.vertical, move || range.fraction(value.read())),
+        )
         // The same inset and the same justification a toggle states, and for the same
         // reason: the thumb rests at the near inset and travels to the far one. A groove is
         // a row tall, so the fractions here are of the row rather than of a shorter track.
-        .padding(Len::Times(Metric::RowH, KNOB_INSET_OF_TRACK))
+        .padding(Len::Times(Metric::RowH, knob_inset_of(KNOB_OF_TRACK)))
         .justify(Align::Start)
         .align(Align::Center)
 }
@@ -287,13 +352,61 @@ pub fn segmented<T>(value: Cell<T>, options: &'static [(&'static str, T)]) -> Vi
 where
     T: Copy + PartialEq + 'static,
 {
+    rail(
+        value,
+        options,
+        Metric::Radius,
+        Metric::SpaceSm,
+        TypeRole::Caption,
+    )
+}
+
+/// The same choice, drawn as a stadium: a rounded rail with a rounded slab inside it.
+///
+/// The shape is the difference and it carries a meaning. A [`segmented`] names a value on a
+/// surface already full of controls, so it takes the control corner every button beside it
+/// takes. A pill rail names *which of two things the window is*, sits alone in a band, and is
+/// read at a glance — which is what the roomier option inset and the fully round ends are
+/// for. [`Metric::RadiusPill`] is a palette rung and names a segment rail among its
+/// consumers, so this reaches an authored value rather than a shape stated here.
+#[must_use]
+pub fn pills<T>(value: Cell<T>, options: &'static [(&'static str, T)]) -> View
+where
+    T: Copy + PartialEq + 'static,
+{
+    rail(
+        value,
+        options,
+        Metric::RadiusPill,
+        Metric::SpaceMd,
+        TypeRole::Body,
+    )
+}
+
+/// Builds a rail of exclusive options at `radius`, with `inset` either side of each label,
+/// naming them on `ramp`.
+///
+/// An option names a value and is set in mixed case, so the rung is a reading rung and never
+/// [`TypeRole::Label`]: a rail of capitals reads as a row of headings over an empty surface.
+/// The two rails differ by one rung, which is the same difference their insets and their
+/// corners carry.
+fn rail<T>(
+    value: Cell<T>,
+    options: &'static [(&'static str, T)],
+    radius: Metric,
+    inset: Metric,
+    ramp: TypeRole,
+) -> View
+where
+    T: Copy + PartialEq + 'static,
+{
     // The one allocation in the widget set: a child count that comes from a slice cannot be
     // a tuple, which is what static structure elsewhere uses.
     let kids: Vec<View> = options
         .iter()
         .map(|&(name, option)| {
             control::<crate::build::Any>(UiaRole::Button)
-                .chrome(roles::OPTION, 0, Metric::Radius)
+                .chrome(roles::OPTION, 0, radius)
                 .selected(move || value.get() == option)
                 .on_click(move || value.set(option))
                 // The group is one row tall and stretches its options, so an option that
@@ -302,12 +415,12 @@ where
                 .min_height(Len::Zero)
                 // Horizontal only. The option's height is the track's, so vertical padding
                 // would be a second claim on it; the label is centred in what it gets.
-                .over(Over::PaddingXY(Len::Metric(Metric::SpaceSm), Len::Zero))
-                .row(inner(name, TypeRole::Label))
+                .over(Over::PaddingXY(Len::Metric(inset), Len::Zero))
+                .row(inner(name, ramp, false))
         })
         .collect();
     El::seed(Preset::Bare)
-        .chrome(roles::GROOVE, 0, Metric::Radius)
+        .chrome(roles::GROOVE, 0, radius)
         .row(kids)
         .height(Metric::RowH)
         .padding(Len::Times(Metric::HairlineW, GROOVE_INSET_PX))
@@ -330,7 +443,7 @@ pub fn field(value: impl Into<TextSource>) -> View {
             UiaRole::Edit,
         )
         .state(ink_wash())
-        .row(inner(value, TypeRole::Body))
+        .row(inner(value, TypeRole::Body, false))
 }
 
 /// A button that opens a list of options.
@@ -345,7 +458,7 @@ pub fn select(text: impl Into<TextSource>, body: impl Fn() -> View + 'static) ->
         // a body handed in without one draws its text straight over whatever it opened above.
         // `El::flyout` stays bare for the cases that want to state their own.
         .flyout(move || flyout().stack(body()).erase())
-        .row(inner(text, TypeRole::Body))
+        .row(inner(text, TypeRole::Body, false))
 }
 
 /// A read-only level.
@@ -381,20 +494,26 @@ fn control<K>(uia: UiaRole) -> El<K> {
         .state(ink_wash())
 }
 
-/// The knob's diameter, as a fraction of the track's height.
+/// The knob's diameter on a groove, as a fraction of the track's height.
 ///
 /// Under the whole of it, so the knob is inset from the track on the cross axis at every
 /// density rather than at one.
 const KNOB_OF_TRACK: f32 = 0.6;
 
-/// How far the knob sits from the track's edge, as a fraction of the track's height.
+/// Returns how far a knob of diameter `of_track` sits from its track's edge, as a fraction of
+/// the track's height.
 ///
 /// Half of what that height leaves once the knob has taken its share, so the gap is the same
 /// on all four sides. The track states it as padding, which is both what the knob rests at
-/// and what its travel is measured between, so one constant sets both.
-const KNOB_INSET_OF_TRACK: f32 = (1.0 - KNOB_OF_TRACK) * 0.5;
+/// and what its travel is measured between, so one call sets both.
+const fn knob_inset_of(of_track: f32) -> f32 {
+    (1.0 - of_track) * 0.5
+}
 
-/// The moving part of a track `track_rows` row heights tall.
+/// The moving part of a track `track_rows` row heights tall, at `of_track` of its height.
+///
+/// `track_rows` is in row heights because a groove is a row tall. A switch states its own box
+/// off [`Metric::TrackH`] and passes one, so the fraction it hands in is of that box.
 ///
 /// It states a definite square box. Without one it solves to nothing: a bare node has no
 /// intrinsic size, so the knob is invisible and the travel `along` computes — the room the
@@ -407,8 +526,8 @@ const KNOB_INSET_OF_TRACK: f32 = (1.0 - KNOB_OF_TRACK) * 0.5;
 /// the control is on, and a knob in the surface colour reads as a hole punched through it
 /// rather than as the part that moves. Not [`Text::OnAccent`] either — that is the ink a
 /// palette picks to *read on* the accent, which in a dark scheme is the dark end.
-fn knob_sprite(track_rows: f32) -> View {
-    let rows = track_rows * KNOB_OF_TRACK;
+fn knob_sprite(track_rows: f32, of_track: f32) -> View {
+    let rows = track_rows * of_track;
     let side = Len::Times(Metric::RowH, rows);
     El::<crate::build::Any>::seed(Preset::Bare)
         .thumb(

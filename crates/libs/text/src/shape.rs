@@ -141,12 +141,23 @@ impl TextEngine {
             let layout =
                 self.factory
                     .CreateTextLayout(&scratch[..], &format, UNBOUNDED, UNBOUNDED)?;
+            let all = DWRITE_TEXT_RANGE {
+                startPosition: 0,
+                length: len,
+            };
             if let Some(typo) = self.typography(spec.features) {
-                let all = DWRITE_TEXT_RANGE {
-                    startPosition: 0,
-                    length: len,
-                };
                 layout.SetTypography(&typo, all).ok()?;
+            }
+            // Trailing only, so the advance lands between glyphs the way the reference's
+            // tracking does. A leading share would inset the run from its own origin, which
+            // moves where a centred label sits rather than how far apart its letters are.
+            // The last glyph carries its share too: a measured width that dropped it would
+            // seat the run half a step off centre.
+            if spec.tracking != 0.0 {
+                let layout1: IDWriteTextLayout1 = layout.cast()?;
+                layout1
+                    .SetCharacterSpacing(0.0, spec.tracking_dips(), 0.0, all)
+                    .ok()?;
             }
             Ok((layout, len))
         }
@@ -586,6 +597,25 @@ mod tests {
         assert!(
             advances.windows(2).all(|w| (w[0] - w[1]).abs() < 0.001),
             "a read-out shifts as its digits change: {advances:?}"
+        );
+    }
+
+    #[test]
+    fn tracking_adds_one_em_fraction_to_every_advance() {
+        let (engine, spec) = engine();
+        let em = 0.05;
+        let plain = shaped(&engine, "LABEL", &spec, Flow::Line, 400.0);
+        let tracked = shaped(&engine, "LABEL", &spec.tracking(em), Flow::Line, 400.0);
+        let (plain_bufs, _) = segs_of(&plain, 0);
+        let (tracked_bufs, _) = segs_of(&tracked, 0);
+
+        let a = plain_bufs.segs[0].advances.of(&plain_bufs.advances);
+        let b = tracked_bufs.segs[0].advances.of(&tracked_bufs.advances);
+        assert_eq!(a.len(), b.len());
+        let step = em * spec.size;
+        assert!(
+            a.iter().zip(b).all(|(p, t)| (t - p - step).abs() < 0.01),
+            "tracking did not reach the advances: {a:?} then {b:?}"
         );
     }
 

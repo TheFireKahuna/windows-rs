@@ -267,6 +267,12 @@ pub struct FontSpec {
     pub style: FontStyle,
     pub stretch: FontStretch,
     pub features: FontFeatures,
+    /// Extra advance after every glyph, as a fraction of the em size.
+    ///
+    /// A fraction rather than DIPs, so one authored value holds its proportion at every size
+    /// the rung resolves to. Positive opens the run out; the shaper clamps nothing, and a
+    /// negative value below what the face can give back collapses glyphs onto each other.
+    pub tracking: f32,
 }
 
 impl FontSpec {
@@ -280,6 +286,7 @@ impl FontSpec {
             style: FontStyle::Normal,
             stretch: FontStretch::Normal,
             features: FontFeatures::NONE,
+            tracking: 0.0,
         }
     }
 
@@ -305,6 +312,21 @@ impl FontSpec {
     #[must_use]
     pub const fn features(self, features: FontFeatures) -> Self {
         Self { features, ..self }
+    }
+
+    /// Returns the same spec tracked by `em`, a fraction of the em size.
+    #[must_use]
+    pub const fn tracking(self, em: f32) -> Self {
+        Self {
+            tracking: em,
+            ..self
+        }
+    }
+
+    /// Returns the extra advance one glyph carries, in DIPs.
+    #[must_use]
+    pub fn tracking_dips(self) -> f32 {
+        self.tracking * self.size
     }
 }
 

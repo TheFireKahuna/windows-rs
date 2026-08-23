@@ -191,6 +191,7 @@ impl<K> El<K> {
         ramp: TypeRole,
         ink: Option<Text>,
         flow: Flow,
+        caps: bool,
     ) -> Self {
         let text = Build::with(|b| {
             b.push_text(TextSeed {
@@ -198,6 +199,7 @@ impl<K> El<K> {
                 ramp,
                 ink,
                 flow,
+                caps,
             })
         });
         self.sprite(
@@ -212,13 +214,20 @@ impl<K> El<K> {
     /// The node carries no chrome row of its own, which is what lets the role stated here
     /// reach the sprite: a label takes its enclosing row's text colour only where there is
     /// one.
-    pub(crate) fn text_seed_in(self, source: TextSource, ramp: TypeRole, role: Role) -> Self {
+    pub(crate) fn text_seed_in(
+        self,
+        source: TextSource,
+        ramp: TypeRole,
+        role: Role,
+        caps: bool,
+    ) -> Self {
         let text = Build::with(|b| {
             b.push_text(TextSeed {
                 source: Some(source),
                 ramp,
                 ink: None,
                 flow: Flow::Line,
+                caps,
             })
         });
         self.sprite(MaskSeed::Run { text }, role, Part::Label)
@@ -734,6 +743,17 @@ impl<K> El<K> {
     #[must_use]
     pub fn padding(self, l: impl Into<Len>) -> Self {
         self.over(Over::Padding(l.into()))
+    }
+
+    /// Insets this container's content by `x` either side and `y` above and below.
+    ///
+    /// What a run of text read across takes: the inset that ends the line has to clear the
+    /// surface's corner while the one above it only has to separate the content from the
+    /// edge, and a uniform inset large enough for the first makes the box taller than its
+    /// content asked for.
+    #[must_use]
+    pub fn padding_xy(self, x: impl Into<Len>, y: impl Into<Len>) -> Self {
+        self.over(Over::PaddingXY(x.into(), y.into()))
     }
 
     /// Sets the space between adjacent children.
