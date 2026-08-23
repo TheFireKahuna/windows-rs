@@ -103,10 +103,16 @@ impl RoleSet {
             // No stroke: the resting stroke is what separates an unfilled surface from the
             // ground behind it, and a selected surface is a solid fill. Kept, it draws the
             // groove's own edge around the fill that replaced it.
+            //
+            // The text takes the accent too, so selection is carried by one hue across the
+            // fill and the label rather than by a fill under whatever ink the row states.
+            // A resting row's ink runs from primary to tertiary, and a selected option, a
+            // selected rail item and a selected row would otherwise each announce selection
+            // at a different strength.
             ModelState::Selected => Self {
                 fill: Some(Fill::Selected),
+                text: Text::Accent,
                 stroke: None,
-                ..self
             },
             ModelState::Disabled => Self {
                 text: Text::Disabled,

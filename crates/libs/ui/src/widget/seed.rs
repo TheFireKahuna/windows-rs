@@ -8,7 +8,7 @@
 
 use crate::build::{Button, El, Path, View};
 use crate::gesture::{DragDecl, GestureDecl};
-use crate::layout::{Align, Len, Preset};
+use crate::layout::{Align, Len, Over, Preset};
 use crate::role::{DataRole, Fill, Metric, Role, Text, TypeRole};
 use crate::signal::{Cell, Signal};
 use crate::widget::{Flow, Interaction, Range, StatePolicy, TextSource, UiaRole, Wash, roles};
@@ -266,11 +266,22 @@ pub fn knob<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> Vie
         )
 }
 
-/// One choice of several, laid out as a row.
+/// How far the track insets its options, in device pixels.
+///
+/// Two, which is the smallest inset that reads as a rail holding the selected option rather
+/// than as a fill flush against it. Below the spacing scale on purpose: [`Metric::SpaceXs`]
+/// is the tightest gap between two separate things, and this is the seam inside one control.
+const GROOVE_INSET_PX: f32 = 2.0;
+
+/// One choice of several, laid out as a row inside a groove.
 ///
 /// Selection is [`ModelState`](super::ModelState) — a discrete paint swap at event rate —
 /// rather than a variant, because it is state any control can be in and not something only
 /// this widget has.
+///
+/// The options sit at zero gap in a track of their own. A picker is one control naming one
+/// value, and options separated by the row gap read as that many buttons; the track is what
+/// says the choice is exclusive, and it is what the selected option's fill slides within.
 #[must_use]
 pub fn segmented<T>(value: Cell<T>, options: &'static [(&'static str, T)]) -> View
 where
@@ -285,11 +296,25 @@ where
                 .chrome(roles::OPTION, 0, Metric::Radius)
                 .selected(move || value.get() == option)
                 .on_click(move || value.set(option))
+                // The group is one row tall and stretches its options, so an option that
+                // also carried the row height as a floor would push the track past it by
+                // twice the inset.
+                .min_height(Len::Zero)
+                // Horizontal only. The option's height is the track's, so vertical padding
+                // would be a second claim on it; the label is centred in what it gets.
+                .over(Over::PaddingXY(Len::Metric(Metric::SpaceSm), Len::Zero))
                 .row(inner(name, TypeRole::Label))
         })
         .collect();
     El::seed(Preset::Bare)
+        .chrome(roles::GROOVE, 0, Metric::Radius)
         .row(kids)
+        .height(Metric::RowH)
+        .padding(Len::Times(Metric::HairlineW, GROOVE_INSET_PX))
+        .gap(Len::Zero)
+        // Stretch, so every option is the track's height and the selected fill is a band
+        // across it rather than a chip floating inside it.
+        .align(Align::Stretch)
         // An automation container and nothing else: the options route the pointer.
         .hit(HitFlags::NONE, UiaRole::List)
 }

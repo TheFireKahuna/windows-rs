@@ -213,6 +213,14 @@ pub fn mount_at(el: View, parent: GroupId, after: Option<NodeId>, scope: Scope) 
 #[derive(Default)]
 struct Claim {
     thumb: Option<SpriteId>,
+    /// The first label sprite this subtree minted, which the enclosing control repaints when
+    /// its chrome row changes.
+    ///
+    /// Collected on the way back up for the same reason the thumb and the accessible name
+    /// are: a control's label is rarely its own sprite. Read off the control's own row
+    /// instead, `ControlRow::label` is `None` for every button in the tree and the row's
+    /// text colour reaches nothing.
+    label: Option<SpriteId>,
     /// The value row a [`Travel`](super::arena::Unit::Travel) channel opened, waiting for the
     /// track it runs in: the enclosing control, which is not known until that control mounts.
     value: Option<ValueId>,
@@ -229,6 +237,7 @@ impl Claim {
     /// Takes what a subtree offered, without displacing what this node already found.
     fn absorb(&mut self, inner: Self) {
         self.thumb = self.thumb.or(inner.thumb);
+        self.label = self.label.or(inner.label);
         self.value = self.value.or(inner.value);
         self.text = self.text.or(inner.text);
     }
@@ -550,7 +559,13 @@ impl Parts {
     fn set(&mut self, part: Part, id: SpriteId, claim: &mut Claim) {
         match part {
             Part::Fill => self.fill = Some(id),
-            Part::Label => self.label = Some(id),
+            // Recorded here *and* offered upward. This node needs it to place its own
+            // glyphs; the control enclosing it needs it to repaint the run when its chrome
+            // row moves, and for `button` and `segmented` alike that control is the parent.
+            Part::Label => {
+                self.label = Some(id);
+                claim.label = claim.label.or(Some(id));
+            }
             Part::Border => self.border = Some(id),
             Part::Wash => self.wash = Some(id),
             Part::Thumb => claim.thumb = claim.thumb.or(Some(id)),
@@ -791,10 +806,12 @@ fn mount_control(
 ) -> Option<ControlId> {
     let hit = slot.hit?;
 
+    // This node's own run where it has one, otherwise the first its subtree offered.
+    let label = parts.label.or(claim.label);
     let mut control = ControlRow {
         node,
         fill: parts.fill,
-        label: parts.label,
+        label,
         border: parts.border,
         front: ChromeRow {
             // Filled in once the id exists. The row and its identity are minted in one
@@ -857,10 +874,23 @@ fn mount_control(
         .or_else(|| flags.contains(HitFlags::GESTURE).then(GestureDecl::default));
     let value = claim.value;
     let caption = slot.caption;
+    let chrome = slot.chrome;
     let id = Host::with(move |h| {
         let id = h.mint_control(control);
         if let Some(row) = h.mounts.get_mut(row) {
             row.control = Some(id);
+        }
+        // The resting row's ink, applied here because a run seed bakes its colour at build
+        // time and the chrome row it belongs to is not known until now. Without it a mount
+        // and the first `set_state` disagree, and a control's label reads primary until
+        // something selects or disables it.
+        if let Some(roles) = chrome.map(Chrome::roles) {
+            super::host::paint(
+                h.model(),
+                label,
+                Some(Role::Text(roles.text)),
+                scope.for_paint(),
+            );
         }
         // The front thread's half, shipped as numbers and ids: its own copy stays here so a
         // solve that changed this control's room can re-send a corrected one.

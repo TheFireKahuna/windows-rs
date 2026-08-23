@@ -10,7 +10,7 @@ use crate::role::{Fill, Stroke, Text};
 pub const DEFAULT: u8 = 0;
 /// The accent-filled row of [`BUTTON`].
 pub const ACCENT: u8 = 1;
-/// The tinted row of [`BUTTON`]: an accent-subtle fill under accent text and stroke.
+/// The tinted row of [`BUTTON`]: an accent-subtle fill under accent text.
 pub const ACCENT_SUBTLE: u8 = 2;
 /// The unfilled row of [`BUTTON`]: no fill and no stroke.
 pub const GHOST: u8 = 3;
@@ -27,10 +27,15 @@ pub const BUTTON: &[RoleSet] = &[
         text: Text::OnAccent,
         stroke: None,
     },
+    // No stroke, and that is a requirement rather than a preference. A stroked surface is
+    // an outer box in the stroke colour with the fill inset by a hairline over it, so the
+    // fill is what hides the stroke everywhere but the ring — and this row's fill is a
+    // wash. Given a stroke, the whole control reads as the solid accent the tint exists to
+    // avoid.
     RoleSet {
         fill: Some(Fill::AccentSubtle),
         text: Text::Accent,
-        stroke: Some(Stroke::Accent),
+        stroke: None,
     },
     RoleSet {
         fill: None,
@@ -102,8 +107,22 @@ pub const FIELD: &[RoleSet] = &[RoleSet {
 
 /// The single row one option of a segmented picker reads. Selection is
 /// [`ModelState`](super::ModelState) rather than a row, since any control can be selected.
+///
+/// Tertiary at rest: the options a picker is not on name the alternatives to the one it is
+/// on, and set at the strength of ordinary secondary text they read as three live values.
 pub const OPTION: &[RoleSet] = &[RoleSet {
     fill: None,
+    text: Text::Tertiary,
+    stroke: None,
+}];
+
+/// The single row a groove reads: a segmented picker's track, and no outline.
+///
+/// [`Fill::Pressed`] is the sunken rung of the surface ladder, which is what a groove is —
+/// the same value a control resolves while it is held down, resolved here as a resting
+/// surface rather than as a state.
+pub const GROOVE: &[RoleSet] = &[RoleSet {
+    fill: Some(Fill::Pressed),
     text: Text::Secondary,
     stroke: None,
 }];
@@ -127,6 +146,32 @@ mod tests {
         }
         for at in [TRACK_OFF, TRACK_ON] {
             assert!((at as usize) < TRACK.len());
+        }
+    }
+
+    /// No row pairs a wash fill with a stroke.
+    ///
+    /// The two sprites a stroked surface expands to are an outer box in the stroke colour
+    /// and the fill inset by a hairline over it, so the fill is the only thing hiding the
+    /// stroke away from the ring. A translucent fill hides nothing and the control reads as
+    /// a solid stroke-coloured slab.
+    #[test]
+    fn no_row_puts_a_wash_over_a_stroke() {
+        let wash = |fill: Option<Fill>| matches!(fill, Some(Fill::Selected | Fill::AccentSubtle));
+        for (name, table) in [
+            ("BUTTON", BUTTON),
+            ("SURFACE", SURFACE),
+            ("TRACK", TRACK),
+            ("FIELD", FIELD),
+            ("OPTION", OPTION),
+            ("GROOVE", GROOVE),
+        ] {
+            for (at, row) in table.iter().enumerate() {
+                assert!(
+                    !(wash(row.fill) && row.stroke.is_some()),
+                    "{name}[{at}] puts a wash fill over a stroke"
+                );
+            }
         }
     }
 

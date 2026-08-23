@@ -1341,7 +1341,7 @@ impl Host {
 ///
 /// A part whose state carries no role keeps the colour it had: there is no paint that clears
 /// a sprite.
-fn paint(model: &mut Model, id: Option<SpriteId>, role: Option<Role>, scope: Scope) {
+pub(crate) fn paint(model: &mut Model, id: Option<SpriteId>, role: Option<Role>, scope: Scope) {
     let Some(id) = id else { return };
     // A state whose row drops a part clears that part rather than leaving the previous
     // state's paint on it. Reachable where one state supplies a fill and another does not —
