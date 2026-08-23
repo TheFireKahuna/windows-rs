@@ -915,6 +915,22 @@ impl<K> El<K> {
             .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
     }
 
+    /// Declares a two-axis drag and the handler it reports to.
+    ///
+    /// One call and not two: a handler on a node that declared no policy would never be
+    /// reached, and a policy with no handler moves nothing. `f` receives every sample of the
+    /// drag and then exactly one end — [`Dragging::Committed`](crate::widget::Dragging) on a
+    /// release, [`Dragging::Canceled`](crate::widget::Dragging) on a contact taken away.
+    ///
+    /// A contact that never passes `decl`'s threshold ends as a click, so a node carrying
+    /// both this and [`on_click`](Self::on_click) runs one of them and never both.
+    #[must_use]
+    pub fn on_drag(self, decl: DragDecl, f: impl Fn(crate::widget::Dragging) + 'static) -> Self {
+        self.drag(decl)
+            .act(Act::Drag(Box::new(f)))
+            .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
+    }
+
     /// Runs `f` with the value the control settled on.
     ///
     /// A canceled contact restores the value it had and commits nothing, which is the drag

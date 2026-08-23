@@ -21,5 +21,5 @@ pub use seed::{
 };
 // `ChromeRow` is one row of a widget's colour table; `Controls` is the front thread's table
 // of live controls.
-pub use state::{ChromeRow, Controls, Front, Intent, What};
+pub use state::{ChromeRow, Controls, Dragging, Front, Intent, What};
 pub use text::{Flow, Shaped, TextSource, Written, reactive, shown};

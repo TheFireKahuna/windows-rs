@@ -44,6 +44,22 @@ pub fn geometry(verbs: &[PathVerb]) -> GeomId {
     Host::with(|h| h.model().geometry(verbs))
 }
 
+/// Returns the window's own scope: the palette's root, at the process polarity and the
+/// accent and density the application installed.
+///
+/// What geometry authored in DIPs resolves its own metrics against. A sprite's verbs are
+/// sprite-local DIPs and no container states them, so a wire's lane spacing cannot arrive as
+/// a [`Len`](crate::layout::Len) — it is resolved here, from the same palette every
+/// container reads.
+///
+/// It carries the **root** width class. A consumer drawing against a probed box narrows it
+/// with [`Scope::at_width`](crate::role::Scope::at_width) and the class that box reported, so
+/// both halves of one row come out at one density.
+#[must_use]
+pub fn root_scope() -> Scope {
+    Host::with(|h| h.root_scope)
+}
+
 /// Re-points the geometry `id` names. Every sprite sharing the id moves together, whichever
 /// construction each one uses, so a curve's fill, stroke and glow cannot diverge.
 pub fn set_geometry(id: GeomId, verbs: &[PathVerb]) {
@@ -827,6 +843,9 @@ fn mount_control(
             rest: 0.0,
             travel: 0.0,
             drive: slot.interaction,
+            // Corrected below, once the act chain has been walked: the flag follows the
+            // handler, so a policy declared with no handler raises nothing.
+            drags: false,
             fraction: 0.0,
         },
         chrome: slot.chrome,
@@ -835,6 +854,7 @@ fn mount_control(
         click: None,
         change: None,
         commit: None,
+        drag: None,
         tip: None,
         flyout: None,
         uia: slot.uia,
@@ -853,6 +873,10 @@ fn mount_control(
             Some(Act::Click(f)) => control.click = Some(f),
             Some(Act::ChangeF64(f)) => control.change = Some(f),
             Some(Act::CommitF64(f)) => control.commit = Some(f),
+            Some(Act::Drag(f)) => {
+                control.drag = Some(f);
+                control.front.drags = true;
+            }
             Some(Act::Tip(t, side)) => control.tip = Some((std::rc::Rc::new(t), side)),
             Some(Act::Flyout(f)) => control.flyout = Some(f),
             Some(Act::DisabledWhen(f)) => disabled = Some(f),
@@ -1063,6 +1087,7 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
             rest: 0.0,
             travel: 0.0,
             drive: None,
+            drags: false,
             fraction: 0.0,
         },
         chrome: None,
@@ -1071,6 +1096,7 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
         click: None,
         change: None,
         commit: None,
+        drag: None,
         tip: None,
         flyout: None,
         uia: UiaRole::None,
@@ -1199,6 +1225,11 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: MountId, claim:
                 None => Host::with(|h| h.model().bind(node, prop, Bind::Set(constant))),
             },
             Some(ChanSource::Dynamic(read)) => {
+                // The first value a channel produces is the state it mounts in, not a
+                // transition into it. Animating it would sweep every bound property up from
+                // whatever the compositor happens to hold — a meter would fill on mount, and
+                // a layer declared invisible would fade *out* of a value it never had.
+                let mounted = std::cell::Cell::new(false);
                 Effect::new(move || {
                     let next = read();
                     if let Some(id) = value {
@@ -1207,6 +1238,7 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: MountId, claim:
                     }
                     let bind = match motion {
                         Motion::Snap => Bind::Set(next),
+                        Motion::Chrome if !mounted.replace(true) => Bind::Set(next),
                         Motion::Chrome => Bind::Animate(Anim::Spring {
                             to: next,
                             tuning: Tuning::Chrome,

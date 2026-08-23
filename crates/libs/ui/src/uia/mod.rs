@@ -340,6 +340,10 @@ impl Uia {
                 crate::widget::What::Tapped => {
                     self.pending.push(Raise::Invoked(intent.target));
                 }
+                // A two-axis drag carries no value and invokes nothing: what it moves is the
+                // application's own subject, and the property that changed is announced by
+                // whatever the handler writes.
+                crate::widget::What::Dragged(_) | crate::widget::What::DragEnded { .. } => {}
             }
         }
     }

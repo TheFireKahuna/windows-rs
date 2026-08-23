@@ -320,6 +320,9 @@ pub(crate) enum Act {
     Click(Box<dyn Fn()>),
     ChangeF64(Box<dyn Fn(f64)>),
     CommitF64(Box<dyn Fn(f64)>),
+    /// A two-axis drag's handler. Declared beside the policy it acts on, so a handler
+    /// cannot exist for a node that never declared a drag.
+    Drag(Box<dyn Fn(crate::widget::Dragging)>),
     Tip(TextSource, crate::overlay::Side),
     /// `Rc` from the start, because the row it lands in holds one: the overlay layer has to
     /// take the body *out* of the host's borrow before running it. Boxing here and

@@ -341,7 +341,10 @@ pub fn field(value: impl Into<TextSource>) -> View {
 pub fn select(text: impl Into<TextSource>, body: impl Fn() -> View + 'static) -> El<Button> {
     control(UiaRole::ComboBox)
         .chrome(roles::BUTTON, roles::DEFAULT, Metric::Radius)
-        .flyout(body)
+        // The plate is the picker's, not the body's. A menu is always a detached surface, and
+        // a body handed in without one draws its text straight over whatever it opened above.
+        // `El::flyout` stays bare for the cases that want to state their own.
+        .flyout(move || flyout().stack(body()).erase())
         .row(inner(text, TypeRole::Body))
 }
 

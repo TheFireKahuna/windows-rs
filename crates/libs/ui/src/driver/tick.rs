@@ -199,6 +199,9 @@ impl Frame {
         let census = *scene.census();
         drop(scene);
         Host::with(|h| h.dispatch(&self.intents));
+        // After the dispatch: a menu option's handler lives in the very overlay the choice
+        // closes, so closing it any earlier would dispose the control the intent names.
+        self.overlays.after_dispatch(self.router.focus_mut());
 
         // Last, so what an observer is handed is what the whole tick settled on rather than a
         // stage of it.

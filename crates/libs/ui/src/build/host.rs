@@ -97,6 +97,8 @@ pub(crate) struct ControlRow {
     pub click: Option<Box<dyn Fn()>>,
     pub change: Option<Box<dyn Fn(f64)>>,
     pub commit: Option<Box<dyn Fn(f64)>>,
+    /// The two-axis drag's handler, where the application declared one.
+    pub drag: Option<Box<dyn Fn(crate::widget::Dragging)>>,
     /// The hover description and the side it opens on.
     ///
     /// `Rc` rather than `Box` for both this and [`flyout`](Self::flyout): building either
@@ -521,6 +523,20 @@ impl Host {
                         commit(v);
                     }
                 }
+                crate::widget::What::Dragged(update) => {
+                    if let Some(drag) = control.drag.as_ref() {
+                        drag(crate::widget::Dragging::Moved(update));
+                    }
+                }
+                crate::widget::What::DragEnded { commit } => {
+                    if let Some(drag) = control.drag.as_ref() {
+                        drag(if commit {
+                            crate::widget::Dragging::Committed
+                        } else {
+                            crate::widget::Dragging::Canceled
+                        });
+                    }
+                }
             }
         }
     }
@@ -632,10 +648,7 @@ impl Host {
     /// A scan, not an index: a settled layout keeps this table under eight rows
     /// ([06 §9.2](../../../../gui/spec/06-PRESENT.md)), and it is walked only for the
     /// pointer reports that landed on a control at all.
-    pub(crate) fn region_of(
-        &mut self,
-        id: ControlId,
-    ) -> Option<&mut crate::present::RegionRow> {
+    pub(crate) fn region_of(&mut self, id: ControlId) -> Option<&mut crate::present::RegionRow> {
         self.regions
             .positions()
             .filter_map(|at| self.regions.id_at(at))
@@ -1087,6 +1100,7 @@ impl Host {
                 rest: 0.0,
                 travel: 0.0,
                 drive: None,
+                drags: false,
                 fraction: 0.0,
             },
             chrome: None,
@@ -1095,6 +1109,7 @@ impl Host {
             click: None,
             change: None,
             commit: None,
+            drag: None,
             tip: None,
             flyout: None,
             uia: UiaRole::None,

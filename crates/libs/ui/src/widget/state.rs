@@ -11,6 +11,7 @@
 //! interaction path.
 
 use super::{Interaction, Range, TURN_SPAN, angle_of, detent_delta, fraction_of, offset_of};
+use crate::gesture::{DragPhase, DragUpdate};
 use crate::input::Report;
 use windows_scene::{
     Anim, Backends, Bind, Control, ControlId, Env, NodeId, Prop, Result, Scene, Slots, SpriteId,
@@ -53,6 +54,12 @@ pub struct ChromeRow {
     pub travel: f32,
     /// What a pointer means here. `None` is a press and nothing else.
     pub drive: Option<Interaction>,
+    /// Whether the application declared a handler for this control's two-axis drag.
+    ///
+    /// A flag and not the handler: the handler is application code and stays on the app
+    /// thread. This side needs only to know whether a drag on this control is worth raising,
+    /// and whether a release ends a drag or is a tap.
+    pub drags: bool,
     /// Where this control's value stands, `0..=1`.
     ///
     /// Seeded by the mount and advanced here. A turned control has no absolute position on
@@ -77,6 +84,46 @@ pub enum What {
     Changed(f64),
     /// The value it settled on. A canceled contact commits nothing.
     Committed(f64),
+    /// A two-axis drag moved. Raised only for a control that declared a handler for one.
+    Dragged(DragUpdate),
+    /// A two-axis drag ended. `commit` is false for a contact that was taken away, whose
+    /// pre-drag value stands.
+    DragEnded { commit: bool },
+}
+
+/// Returns the drag state a sample leaves behind: the control it is on, and whether the
+/// gesture has passed its threshold at any point.
+///
+/// `decided` is **sticky**. A drag that has locked an axis stays locked for the rest of the
+/// contact, so a release after it ends the drag rather than being a tap — and the phase of
+/// the last sample alone cannot answer that, because a locked drag reports zero displacement
+/// on the axis it does not own and can sample as though nothing moved.
+///
+/// Split out because it is the one decision on this path that touches no pixels: everything
+/// else here writes the scene, and a compositor is not available to a test.
+fn dragging_after(
+    held: Option<(ControlId, bool)>,
+    target: ControlId,
+    phase: DragPhase,
+) -> (ControlId, bool) {
+    let was = held.is_some_and(|(id, decided)| id == target && decided);
+    (target, was || phase != DragPhase::Undecided)
+}
+
+/// What a declared two-axis drag reports to the application.
+///
+/// One enum rather than a handler per phase: a drag is a sequence with exactly one end, and
+/// two callbacks would let a caller register the moves and forget the release.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum Dragging {
+    /// The contact moved. The update carries the phase, the displacement **projected onto
+    /// the locked axis**, and whether this sample is the one that decided that axis.
+    Moved(DragUpdate),
+    /// The contact lifted: the drag's value takes effect.
+    Committed,
+    /// The contact was taken away: nothing takes effect, and what stood before the drag
+    /// stands.
+    Canceled,
 }
 
 /// The front thread's control table and the interaction state over it.
@@ -103,6 +150,12 @@ pub struct Controls {
     /// this fraction rather than accumulated onto the last one — which would drift by the
     /// samples the recogniser coalesced. A cancel restores the same fraction.
     grabbed: Option<(ControlId, f32)>,
+    /// The control a declared two-axis drag is running on, and whether it ever passed the
+    /// threshold.
+    ///
+    /// The flag is what separates a release that ends a drag from one that is a tap: below
+    /// the threshold a drag has no axis and no meaning, so a nudge while clicking is a click.
+    dragged: Option<(ControlId, bool)>,
 }
 
 impl Controls {
@@ -230,6 +283,8 @@ impl Controls {
                 self.pressed = Some(target);
                 // Where the value stood when the contact landed: a turn is measured from it.
                 self.grabbed = self.rows.get(target).map(|row| (target, row.fraction));
+                // A fresh contact starts undecided, whatever the last one ended as.
+                self.dragged = None;
                 self.hide_ring(front)?;
                 self.wash(target, front)?;
             }
@@ -238,6 +293,18 @@ impl Controls {
                 self.grabbed = None;
                 self.wash(target, front)?;
                 if !was {
+                    return Ok(());
+                }
+                // A drag that passed the threshold ends here and is not also a tap: the two
+                // are the same contact, and raising both would run the click handler at the
+                // end of every reorder.
+                if let Some((_, decided)) = self.dragged.take().filter(|&(id, _)| id == target)
+                    && decided
+                {
+                    out.push(Intent {
+                        target,
+                        what: What::DragEnded { commit: true },
+                    });
                     return Ok(());
                 }
                 match self.rows.get(target).and_then(|row| row.drive) {
@@ -274,6 +341,14 @@ impl Controls {
                 {
                     self.drive(target, fraction, front)?;
                 }
+                if let Some((_, decided)) = self.dragged.take().filter(|&(id, _)| id == target)
+                    && decided
+                {
+                    out.push(Intent {
+                        target,
+                        what: What::DragEnded { commit: false },
+                    });
+                }
                 self.wash(target, front)?;
             }
             // The thumb moves here, in this tick, before the number is queued.
@@ -290,6 +365,17 @@ impl Controls {
             // A knob is dragged rather than slid: the update carries displacement from the
             // contact's origin, so it applies to the fraction held in `grabbed`.
             Report::Dragged { target, update, .. } => {
+                // A control the application declared a drag handler for gets the update as
+                // it stands. Nothing here moves a pixel for it: what a two-axis drag displaces
+                // is the application's own subject — a row's position in a list, a scope over
+                // channels — which this table holds no geometry for.
+                if self.rows.get(target).is_some_and(|r| r.drags) {
+                    self.dragged = Some(dragging_after(self.dragged, target, update.phase));
+                    out.push(Intent {
+                        target,
+                        what: What::Dragged(update),
+                    });
+                }
                 if let Some(Interaction::Turn(range)) = self.rows.get(target).and_then(|r| r.drive)
                 {
                     let Some((_, from)) = self.grabbed.filter(|&(id, _)| id == target) else {
@@ -498,4 +584,47 @@ const fn spring(to: Value) -> Bind {
 
 const fn chrome(to: f32) -> Bind {
     spring(Value::Scalar(to))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gesture::Axis;
+
+    /// Two distinct control ids, minted rather than constructed: a slot and a generation are
+    /// the arena's to assign and this crate cannot spell one.
+    fn two() -> (ControlId, ControlId) {
+        let mut ids = windows_scene::Ids::<Control>::new();
+        (ids.mint(), ids.mint())
+    }
+
+    #[test]
+    fn a_drag_below_the_threshold_is_still_a_click() {
+        let (a, _) = two();
+        assert_eq!(dragging_after(None, a, DragPhase::Undecided), (a, false));
+    }
+
+    #[test]
+    fn a_decided_drag_stays_decided_through_the_rest_of_the_contact() {
+        let (a, _) = two();
+        let after = dragging_after(None, a, DragPhase::Locked(Axis::Vertical));
+        assert_eq!(after, (a, true));
+        // A locked drag reports zero on the axis it does not own, so a sample can look
+        // undecided; the lock is never revisited and neither is this.
+        assert_eq!(
+            dragging_after(Some(after), a, DragPhase::Undecided),
+            (a, true)
+        );
+    }
+
+    #[test]
+    fn a_contact_on_another_control_starts_undecided() {
+        let (a, b) = two();
+        let after = dragging_after(None, a, DragPhase::Locked(Axis::Horizontal));
+        assert_eq!(
+            dragging_after(Some(after), b, DragPhase::Undecided),
+            (b, false),
+            "one control's lock does not carry to the next"
+        );
+    }
 }

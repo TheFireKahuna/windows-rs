@@ -195,6 +195,92 @@ fn a_reactive_channel_tracks_its_cell() {
     assert!(bound, "a cell write must reach the sink it was bound to");
 }
 
+/// A channel's first value is a state, not a transition into one.
+///
+/// Animating it would sweep every bound property up from whatever the compositor happens to
+/// hold — a meter would fill on mount — and a value the compositor never held is one a
+/// natural-motion spring cannot reliably start from, which is what left a layer declared
+/// invisible unable to come back.
+#[test]
+fn a_channel_lands_on_its_first_value_and_animates_to_every_later_one() {
+    let mut patch = fixture();
+    let alpha = crate::signal::Cell::new(0.0_f32);
+    let _mount = mount(plate().opacity(alpha), root());
+    flush(&mut patch);
+
+    let kinds: Vec<&str> = binds(&patch, windows_scene::Prop::Opacity)
+        .iter()
+        .map(|op| match op {
+            Op::Bind {
+                bind: windows_scene::Bind::Set(_),
+                ..
+            } => "set",
+            _ => "animate",
+        })
+        .collect();
+    assert_eq!(kinds, vec!["set"], "the mount lands, it does not fade in");
+
+    patch.clear();
+    alpha.set(1.0);
+    crate::signal::flush();
+    flush(&mut patch);
+    let kinds: Vec<&str> = binds(&patch, windows_scene::Prop::Opacity)
+        .iter()
+        .map(|op| match op {
+            Op::Bind {
+                bind: windows_scene::Bind::Set(_),
+                ..
+            } => "set",
+            _ => "animate",
+        })
+        .collect();
+    assert_eq!(kinds, vec!["animate"], "and every value after it is a move");
+}
+
+/// A channel that fades to zero comes back.
+///
+/// The tier crossfade in a channel graph is exactly this shape — one layer's opacity to zero
+/// while another's comes up — and a value that cannot return leaves the layer dark for the
+/// rest of the session.
+#[test]
+fn an_opacity_that_reaches_zero_binds_again_on_the_way_back() {
+    let mut patch = fixture();
+    let alpha = crate::signal::Cell::new(1.0_f32);
+    let _mount = mount(plate().opacity(alpha), root());
+    flush(&mut patch);
+
+    let to = |patch: &SinkPatch| -> Vec<f32> {
+        patch
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                Op::Bind {
+                    prop: windows_scene::Prop::Opacity,
+                    bind:
+                        windows_scene::Bind::Animate(windows_scene::Anim::Spring {
+                            to: windows_scene::Value::Scalar(v),
+                            ..
+                        }),
+                    ..
+                } => Some(*v),
+                _ => None,
+            })
+            .collect()
+    };
+
+    patch.clear();
+    alpha.set(0.0);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(to(&patch), vec![0.0], "the fade out is bound");
+
+    patch.clear();
+    alpha.set(1.0);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(to(&patch), vec![1.0], "and so is the fade back in");
+}
+
 /// An interactive control mints exactly one extra visual, and parks it at zero opacity.
 ///
 /// The wash crossfades compositor-side, so hover costs one visual and no app-thread work.

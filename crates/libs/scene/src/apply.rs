@@ -653,8 +653,14 @@ impl Scene {
         let Some(animation) = self.animation(id, desc, anim, patch, back) else {
             return;
         };
+        // Where the channel is going, for the shadow. A key-framed animation states no single
+        // settling value, so it leaves the shadow alone.
+        let to = match anim {
+            Anim::Spring { to, .. } => Some(to),
+            Anim::Frames { .. } => None,
+        };
         if let Some(node) = self.nodes.get_mut(id) {
-            prop::start(node, desc, &animation, Held::Playing);
+            prop::start(node, desc, &animation, Held::Playing, to);
             self.census.animations += 1;
         }
     }
@@ -726,7 +732,7 @@ impl Scene {
             .as_animation();
         if let Some(node) = self.nodes.get_mut(id) {
             // Permanent: nothing but an explicit stop leaves `Bound`.
-            prop::start(node, desc, &expression, Held::Bound);
+            prop::start(node, desc, &expression, Held::Bound, None);
             self.census.animations += 1;
         }
     }

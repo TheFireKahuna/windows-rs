@@ -29,8 +29,8 @@ pub use children::{Children, IntoChildren};
 pub use el::{Any, Button, El, Path, Region, View};
 pub use host::Host;
 pub(crate) use host::Placement;
-pub use mount::{Mount, Stop, geometry, mount, mount_at, ramp, set_geometry, set_ramp};
 pub(crate) use mount::region_sink;
+pub use mount::{Mount, Stop, geometry, mount, mount_at, ramp, root_scope, set_geometry, set_ramp};
 
 /// Names where a structural adapter builds: the group its rows or arms become children of,
 /// the sibling they sit after, and the scope they resolve against.

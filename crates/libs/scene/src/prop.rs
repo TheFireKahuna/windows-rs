@@ -205,7 +205,20 @@ fn stop_overlapping(node: &Node, d: &PropDesc) {
 /// `held` is [`Held::Playing`] for a one-shot animation, or [`Held::Bound`] for a tracker
 /// expression that owns the channel until it is stopped; [`set`] reads that state before
 /// writing. Does nothing when the node carries no object of `d.owner`.
-pub(crate) fn start(node: &mut Node, d: &PropDesc, animation: &CompositionAnimation, held: Held) {
+///
+/// `to` is where a one-shot animation is going, and the shadow is moved there. **The shadow
+/// is the channel's value, whichever mechanism is carrying it.** Leaving it behind is a
+/// correctness bug in two directions: the next retarget measures its travel from a value the
+/// channel left long ago — so a fade back in is given the period of a move that is not
+/// happening — and any later [`write_group`] pushes that stale value onto the compositor,
+/// undoing the animation. `None` for a tracker expression, which has no target to settle at.
+pub(crate) fn start(
+    node: &mut Node,
+    d: &PropDesc,
+    animation: &CompositionAnimation,
+    held: Held,
+    to: Option<Value>,
+) {
     let Some(object) = animatable(node, d.owner) else {
         return;
     };
@@ -213,6 +226,9 @@ pub(crate) fn start(node: &mut Node, d: &PropDesc, animation: &CompositionAnimat
     // group's names, and the compositor would keep both.
     stop_overlapping(node, d);
     object.start(d.path, animation);
+    if let Some(to) = to {
+        write_shadow(node, d, to);
+    }
     set_held(node, d.group, held);
 }
 

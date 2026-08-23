@@ -279,6 +279,9 @@ pub struct Overlays {
     open: Vec<Open>,
     generation: u32,
     dwell: tip::Dwell,
+    /// The depth an invoked choice asked to truncate to, held until the application has run
+    /// the handler that choice named. See [`Overlays::after_dispatch`].
+    closing: Option<usize>,
 }
 
 impl Overlays {
@@ -637,12 +640,41 @@ impl Overlays {
 
     /// Opens the flyout `target` declared, or closes the one it already has open, so a
     /// picker's own button shuts it.
+    ///
+    /// A control **inside** an open flyout that declares no flyout of its own is a terminal
+    /// choice — a menu option — so invoking it closes the flyout it was chosen from, and every
+    /// submenu above it. A press *outside* cannot arrive here: a [`Kind::Flyout`] contributes
+    /// a blocker, and a press on that blocker is consumed as a dismiss rather than a tap. A
+    /// [`Kind::Popup`] is left alone, because a button in a dialog is not a choice **from**
+    /// the dialog and closing it would dismiss the dialog on its first control.
     fn tapped(&mut self, target: ControlId, focus: &mut FocusRing) {
         if let Some(overlay) = self.opened_by(target) {
             self.close(overlay, focus);
             return;
         }
+        if Host::with(|host| host.flyout_of(target)).is_none() {
+            // Recorded, not performed. The flyout's body **owns** the handler this intent
+            // names, and the overlay service runs before the application is dispatched to, so
+            // closing here would dispose the control the intent points at and the choice would
+            // be discarded as a stale id.
+            self.closing = self
+                .open
+                .iter()
+                .position(|open| open.kind == Kind::Flyout)
+                .or(self.closing);
+            return;
+        }
         self.open_flyout(target, Spec::flyout(target), focus);
+    }
+
+    /// Closes what an invoked choice asked to close, once the application has acted on it.
+    ///
+    /// Called after `Host::dispatch`, which is the one point at which a menu option's handler
+    /// has run and its overlay is no longer owed to anything.
+    pub fn after_dispatch(&mut self, focus: &mut FocusRing) {
+        if let Some(at) = self.closing.take() {
+            self.truncate(at, focus);
+        }
     }
 
     /// Opens `target`'s declared flyout with `spec`, doing nothing where it declared none.

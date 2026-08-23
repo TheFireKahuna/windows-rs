@@ -47,6 +47,13 @@ pub struct DragUpdate {
     /// A locked drag reports zero on the axis it does not own, so a consumer cannot
     /// accidentally act on the other one.
     pub delta: Point,
+    /// Where the contact went down, in client DIPs.
+    pub from: Point,
+    /// Where it is now, in client DIPs. Not projected: a consumer that resolves a position
+    /// against a box — which lane of a channel graph the pointer is over, which row it is
+    /// between — needs the point the hit array is scanned in, and a displacement cannot
+    /// answer that without knowing where it started.
+    pub at: Point,
     /// Whether this sample is the one that decided the axis, which is when the label
     /// appears.
     pub decided: bool,
@@ -146,6 +153,8 @@ impl Drag {
                 DragPhase::Free => raw,
             },
             decided,
+            from: self.origin,
+            at,
         }
     }
 
