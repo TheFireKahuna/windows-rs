@@ -44,6 +44,15 @@ pub fn caption(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Caption, Text::Tertiary, Flow::Wrap)
 }
 
+/// Annotation on a data surface: a unit, an index, a channel name, a coefficient.
+///
+/// Tertiary, because it names something that is itself on the surface and must not
+/// outweigh it.
+#[must_use]
+pub fn micro(s: impl Into<TextSource>) -> View {
+    run(s, TypeRole::Micro, Text::Tertiary, Flow::Line)
+}
+
 /// A read-out, in tabular figures, so its digits do not shift width as it changes.
 #[must_use]
 pub fn mono(s: impl Into<TextSource>) -> View {

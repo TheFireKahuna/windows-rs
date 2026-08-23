@@ -230,6 +230,13 @@ pub enum TypeRole {
     BodyStrong,
     Caption,
     Label,
+    /// Annotation on a data surface: a unit beside a figure, an index on a tile, a channel
+    /// name on a wire, a coefficient on a crossing.
+    ///
+    /// The rung below [`Caption`], and the smallest the ramp offers. It exists because a
+    /// plot's own labelling competes with the plot for room, and setting it at the caption
+    /// size is what makes a dense surface read as crowded.
+    Micro,
     /// Tabular figures. What a read-out is set in, so its digits do not shift width as it
     /// changes.
     Mono,

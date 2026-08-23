@@ -3185,3 +3185,59 @@ fn a_probe_survives_its_subtree_unmounting() {
         "the probe row outlived the subtree that declared it"
     );
 }
+
+/// A probed path revealed by `when` is given its container's whole inner width.
+///
+/// The chain row's shape: an accent edge beside a grown column, whose body is mounted when
+/// the row opens rather than being there all along. Both halves a figure is drawn from are
+/// asserted — the width a `Len::Pct(1.0)` leaf resolves against, and the box the probe
+/// reports it at — so a figure that renders short of its box is not this.
+#[test]
+fn a_probed_path_revealed_by_when_fills_the_column_it_opens_in() {
+    let (column, figure) = (crate::layout::probe(), crate::layout::probe());
+    let open = crate::signal::Cell::new(false);
+    let mut patch = fixture();
+    let _held = mount(
+        crate::widget::card()
+            .row((
+                plate().width(Len::Times(Metric::HairlineW, 3.0)),
+                stack((
+                    crate::widget::label("header"),
+                    when(open, move || {
+                        crate::widget::path(super::geometry(&[]))
+                            .stroke(crate::role::DataRole(0), Metric::HairlineW)
+                            .probed(figure)
+                            .width(Len::Pct(1.0))
+                            .height(Len::Times(Metric::RowH, 2.0))
+                            .erase()
+                    }),
+                ))
+                .probed(column)
+                .padding(Metric::SpaceSm)
+                .grow(),
+            ))
+            .padding(Len::Zero)
+            .gap(Len::Zero)
+            .align(crate::layout::Align::Stretch)
+            .min_height(Metric::RowH),
+        root(),
+    );
+    flush(&mut patch);
+    assert_eq!(
+        figure.get().size.x,
+        0.0,
+        "the body is shut, so its figure has no box at all"
+    );
+
+    open.set(true);
+    crate::signal::flush();
+    flush(&mut patch);
+
+    let padding = 2.0 * crate::role::metric(Metric::SpaceSm, Host::with(|h| h.root_scope));
+    let (column, figure) = (column.get().size.x, figure.get().size.x);
+    assert!(column > padding, "the column solved to {column}");
+    assert!(
+        (figure - (column - padding)).abs() < 0.5,
+        "the figure was given {figure} DIPs of a {column}-DIP column padded by {padding}"
+    );
+}

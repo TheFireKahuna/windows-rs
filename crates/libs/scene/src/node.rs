@@ -12,6 +12,7 @@ use windows_composition::{
     CompositionPathGeometry, CompositionSpriteShape, CompositionSurfaceBrush, DropShadow,
     RectangleClip, ShapeVisual, SpriteVisual, Visual,
 };
+use windows_numerics::Vector2;
 
 /// How many channels a node's own visual carries: offset, size and scale as pairs, plus a
 /// rotation, a centre pair and an opacity.
@@ -196,6 +197,26 @@ pub(crate) struct ShapeState {
     pub(crate) stroke: [f32; STROKE_CHANS],
 }
 
+impl ShapeState {
+    /// Restates both extents for a `size` DIP box at `scale`.
+    pub(crate) fn resize(&self, size: Vector2, scale: f32) {
+        resize_shape(&self.host, &self.captured, size, scale);
+    }
+}
+
+/// Restates a captured shape's two extents for a `size` DIP box at `scale`.
+///
+/// `host` is sized `size * scale` and not `size`. A `ShapeVisual` clips its shapes to its
+/// own size, and the shape inside carries the scale — a visual surface captures content and
+/// not the source visual's transform, so the scale cannot live on `host` itself. Sized in
+/// DIPs, `host` cuts the figure at `1 / scale` of its extent on both axes.
+///
+/// The two extents are stated together so neither can be restated without the other.
+pub(crate) fn resize_shape(host: &ShapeVisual, captured: &Captured, size: Vector2, scale: f32) {
+    captured.resize(size, scale);
+    host.set_size(size.x * scale, size.y * scale);
+}
+
 /// The blur a [`Paint::Captured`] glow rides on.
 pub(crate) struct ShadowState {
     pub(crate) shadow: DropShadow,
@@ -254,10 +275,45 @@ impl Node {
     }
 
     /// Returns the node's own box, in DIPs.
-    pub(crate) fn size(&self) -> windows_numerics::Vector2 {
-        windows_numerics::Vector2 {
+    pub(crate) fn size(&self) -> Vector2 {
+        Vector2 {
             x: self.core[2],
             y: self.core[3],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_composition::{Compositor, DispatcherQueueController};
+
+    /// A captured shape's host is sized in the shape's space, not in DIPs.
+    ///
+    /// The host clips what it holds, and the shape inside it carries the display scale, so a
+    /// host sized in DIPs draws `1 / scale` of the figure — two thirds of it at 150% — while
+    /// reporting no error and leaving the layout, the probe and the verbs all correct.
+    ///
+    /// A live `Compositor`, because the size is a property of a composition object and
+    /// nothing on this side shadows it. No window and no device are involved.
+    #[test]
+    fn a_captured_shapes_host_is_sized_in_the_shapes_own_space() {
+        // Bound first and so dropped last: a compositor needs its thread's queue to outlive
+        // it.
+        let _queue = DispatcherQueueController::create_on_current_thread().unwrap();
+        let compositor = Compositor::new().unwrap();
+
+        let host = compositor.create_shape_visual();
+        let size = Vector2 { x: 800.0, y: 100.0 };
+        let scale = 1.5;
+        let captured = compositor.capture(&crate::base_of_shape(&host), size, scale);
+        resize_shape(&host, &captured, size, scale);
+
+        let got = host.size();
+        assert_eq!(
+            (got.x, got.y),
+            (size.x * scale, size.y * scale),
+            "the host is {got:?} for a {size:?} box at {scale}, so it clips its own shape"
+        );
     }
 }

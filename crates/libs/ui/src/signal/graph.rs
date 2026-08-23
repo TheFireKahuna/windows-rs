@@ -87,6 +87,13 @@ enum Kind {
     Source(Rc<dyn Any>),
     Memo(Rc<dyn MemoCell>),
     Effect(Rc<RefCell<dyn FnMut()>>),
+    /// A node parked for reuse, holding nothing.
+    ///
+    /// A payload may own an [`Owner`](super::Owner) — a `Branch`'s arm and a `Keyed`'s row
+    /// both do — so dropping one disposes a scope. A parked node keeps its `deps` and `subs`
+    /// capacity and never its payload, which is what lets [`Graph::mint`] overwrite the kind
+    /// of a reused node without that overwrite re-entering the graph it has borrowed.
+    Parked,
 }
 
 struct Node {
@@ -254,7 +261,8 @@ impl Graph {
         self.order += 1;
         let order = self.order;
         // A parked node keeps its `deps` and `subs` capacity, which is what makes the second
-        // mount of a screen allocation-free.
+        // mount of a screen allocation-free. Its kind is [`Kind::Parked`], so the assignment
+        // below drops nothing.
         let node = match self.spare.pop() {
             Some(mut node) => {
                 node.state = State::Dirty;
@@ -735,15 +743,26 @@ pub(super) fn dispose_scope(id: OwnerId) {
 
 /// Disposes one node: drops its outgoing edges, releases its payload, and frees its slot.
 pub(super) fn dispose(id: SignalId) {
+    // The payload is taken out under the graph's borrow and dropped after it is released.
+    // A payload can own an `Owner`, and dropping one disposes that scope — which borrows the
+    // graph again. Dropping it in place would therefore panic inside a `Drop`, which aborts.
+    let payload = dispose_taking_payload(id);
+    drop(payload);
+}
+
+/// Disposes node `id` and returns its payload for the caller to drop.
+///
+/// Split from [`dispose`] so the payload outlives the graph borrow this takes.
+fn dispose_taking_payload(id: SignalId) -> Option<Kind> {
     // Fallible for the same reason `dispose_scope` is: this is reached from a `Drop`.
     try_with(|g| {
         if g.node(id).is_none() {
-            return;
+            return None;
         }
         clear_deps(g, id);
         shared::release(id);
         let Some(mut node) = g.nodes.remove(&mut g.node_ids, id.id) else {
-            return;
+            return None;
         };
         // A subscriber that outlives its source is legal: it is never woken again, and its
         // stale edge is pruned by the generation check the next time it is walked. What
@@ -752,10 +771,13 @@ pub(super) fn dispose(id: SignalId) {
         node.subs.clear();
         node.state = State::Clean;
         node.queued = false;
-        // Parked with its buffers. Vacancy is the store's fact, so a node needs no `Free`
-        // variant of its own.
+        // Parked with its buffers and without its payload. Vacancy is the store's fact, so a
+        // node needs no `Free` variant of its own.
+        let payload = core::mem::replace(&mut node.kind, Kind::Parked);
         g.spare.push(node);
-    });
+        Some(payload)
+    })
+    .flatten()
 }
 
 /// Returns how many signal nodes are live on this thread.

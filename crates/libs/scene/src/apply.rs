@@ -609,8 +609,7 @@ impl Scene {
         };
         let size = node.size();
         if let Some(shape) = node.shape.as_ref() {
-            shape.host.set_size(size.x, size.y);
-            shape.captured.resize(size, scale);
+            shape.resize(size, scale);
         }
         if let Some(shadow) = node.shadow.as_ref() {
             shadow.captured.resize(size, scale);

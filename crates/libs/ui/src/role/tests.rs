@@ -70,6 +70,7 @@ impl Palette for Reference {
             TypeRole::Title => 20.0,
             TypeRole::Body | TypeRole::BodyStrong | TypeRole::Mono => 14.0,
             TypeRole::Caption | TypeRole::Label => 12.0,
+            TypeRole::Micro => 10.0,
         };
         let size = match scope.density {
             Density::Comfortable => size,

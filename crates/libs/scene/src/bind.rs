@@ -230,7 +230,6 @@ impl Realizer<'_> {
         let scale = self.env.scale();
 
         let host = self.back.compositor.create_shape_visual();
-        host.set_size(size.x, size.y);
         let shape = self.back.compositor.create_sprite_shape(&geometry);
         // Opaque white: the capture is a mask, so its colour comes from the paint beside it,
         // and white is the multiplicative identity that leaves that paint alone.
@@ -268,14 +267,18 @@ impl Realizer<'_> {
             .shape
             .as_ref()
             .map_or(([0.0, 1.0], [1.0, 0.0]), |s| (s.trim, s.stroke));
-        node.shape = Some(ShapeState {
+        let state = ShapeState {
             host,
             captured,
             shape,
             geometry,
             trim,
             stroke,
-        });
+        };
+        // Sizes both extents from one rule, which is what keeps the host out of DIP space:
+        // the shape above is scaled, and a host sized in DIPs would clip it.
+        state.resize(size, scale);
+        node.shape = Some(state);
         Some(brush)
     }
 

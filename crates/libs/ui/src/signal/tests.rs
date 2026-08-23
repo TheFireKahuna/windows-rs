@@ -452,3 +452,35 @@ fn a_write_from_inside_a_flush_asks_for_no_further_frame() {
         assert_eq!(watched.count("reader"), 2, "and still having propagated");
     });
 }
+
+/// A cell's payload can own an [`Owner`], and disposing that owner borrows the graph.
+///
+/// Parking a disposed node with its payload still in it defers that drop to whenever the
+/// node is reused — which is inside `mint`, under the graph's own borrow. The panic lands
+/// in a `Drop`, so it aborts rather than unwinding, and it reproduces only when a scope is
+/// disposed and another is created in the same flush: a `switch` inside a `switch` arm.
+#[test]
+fn a_parked_node_holds_no_payload_to_drop_when_it_is_reused() {
+    let log = Ref::new(Log::default());
+
+    // Scope one: a cell owning a nested scope. Dropping the scope disposes the cell, and
+    // dropping the cell drops the nested owner, which disposes that scope in turn.
+    let (outer, _) = Owner::scope(|| {
+        let (inner, ()) = Owner::scope(|| ());
+        Cell::new(Some(inner))
+    });
+    drop(outer);
+
+    // Scope two: minting reuses the node parked above. The assertion is that this returns
+    // at all — the defect aborts the process here rather than failing.
+    let (second, cell) = Owner::scope({
+        let log = Ref::clone(&log);
+        move || {
+            log.push("built");
+            Cell::new(7_u32)
+        }
+    });
+    assert_eq!(cell.get(), 7);
+    assert_eq!(log.count("built"), 1);
+    drop(second);
+}
