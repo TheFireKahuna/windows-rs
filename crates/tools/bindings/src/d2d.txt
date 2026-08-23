@@ -54,7 +54,7 @@
 // a tile-allocation size, and zero is rejected outright (D1146), so the only way to
 // change precision without inventing a tile size is to read what Direct2D chose and put
 // it back.
-    ID2D1DeviceContext::{CreateBitmap, CreateBitmapFromDxgiSurface, SetTarget, DrawBitmap, CreateBitmapBrush, CreateGradientStopCollection, SetPrimitiveBlend, GetRenderingControls, SetRenderingControls, SetUnitMode, IsDxgiFormatSupported, IsBufferPrecisionSupported, PushLayer, DrawGlyphRun}
+    ID2D1DeviceContext::{CreateBitmap, CreateBitmapFromDxgiSurface, SetTarget, DrawBitmap, DrawImage, CreateEffect, CreateBitmapBrush, CreateGradientStopCollection, SetPrimitiveBlend, GetRenderingControls, SetRenderingControls, SetUnitMode, IsDxgiFormatSupported, IsBufferPrecisionSupported, PushLayer, DrawGlyphRun}
     ID2D1DeviceContext1::{CreateFilledGeometryRealization, CreateStrokedGeometryRealization, DrawGeometryRealization}
     ID2D1DeviceContext2::{}
     ID2D1DeviceContext3::{CreateSpriteBatch, DrawSpriteBatch}
@@ -172,10 +172,11 @@
     D2D1_STROKE_STYLE_PROPERTIES1
 
 // ── Bitmaps and sprite batches ────────────────────────────────────────────────
-// Blits are `DrawBitmap`; effect outputs are `DrawImage`. There is no general image
-// draw: `DrawImage` accepts any `ID2D1Image` and runs Direct2D's image command graph
-// to discover what it was handed, which for a bitmap is an order of magnitude of
-// pure overhead (2473 samples against 108, for six blits a frame).
+// Blits are `DrawBitmap`; effect outputs are `DrawImage`. There is still no general
+// image draw: `DrawImage` accepts any `ID2D1Image` and runs Direct2D's image command
+// graph to discover what it was handed, which for a bitmap is an order of magnitude of
+// pure overhead (2473 samples against 108, for six blits a frame). The wrapper takes an
+// effect and nothing else, so a bitmap cannot reach it.
 //
 // `Map` and `CopyFromBitmap` exist for readback: a CPU-readable staging bitmap is how
 // the parity rig and the FP16 round-trip test observe what was actually drawn,
@@ -203,20 +204,42 @@
     ID2D1SpriteBatch::{AddSprites, SetSprites, GetSpriteCount, Clear}
     D2D1_SPRITE_OPTIONS_NONE
 
-// ── Effects: deliberately not here ────────────────────────────────────────────
-// Nothing in this stack builds an effect graph, so `ID2D1Effect`, `ID2D1Properties` and
-// the effect CLSIDs are absent rather than carried unused. What stays is the buffer
-// precision the device sets at construction, which is the part that matters: Direct2D
-// makes no guarantee about if or where it materializes a graph's intermediates, and
-// their default precision is limited-range — so a graph built without it would silently
-// clamp exactly the extended-range values this stack exists to carry. Setting it before
-// any caller sees the context means a graph added later inherits it and cannot be built
-// without it.
+// ── Effects: one, and it is the blur ──────────────────────────────────────────
+// The buffer precision the device sets at construction is what makes any of this safe:
+// Direct2D makes no guarantee about if or where it materializes a graph's
+// intermediates, and their default precision is limited-range — so a graph built
+// without it would silently clamp exactly the extended-range values this stack exists
+// to carry. It is set before any caller sees the context, so a graph inherits it and
+// cannot be built without it.
+//
+// A Gaussian blur is the one effect carried, because it is the one thing no arrangement
+// of the primitives above can produce. A widened stroke has a hard edge, and a figure
+// reduced and carried back up bilinearly is a tent kernel that shows its own footprint
+// as facets along a diagonal. Both are approximations of this, and this is available.
+//
+// `ID2D1Properties` is named for `SetValue` alone: an effect's parameters have no typed
+// setters, so a property is written as an index, a type tag and its bytes.
 //
 // Two doors stay shut on purpose. The colour-management effect scales G2084 input by 125
 // during degamma, and PQ appears in this stack only inside an ICtCp value, never as a
 // surface encoding.
     D2D1_BUFFER_PRECISION
+    ID2D1Image
+    ID2D1Properties::SetValue
+    ID2D1Effect::{SetInput, GetOutput}
+    CLSID_D2D1GaussianBlur
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION
+    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION
+    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE
+// Quality rather than speed or balanced: the two cheaper paths downsample before
+// blurring, which is the artefact this exists instead of.
+    D2D1_GAUSSIANBLUR_OPTIMIZATION_QUALITY
+// Soft: the source is transparent outside its own bitmap, so the blur is allowed to
+// spread past the edge instead of clamping the edge value outward as a smear.
+    D2D1_BORDER_MODE_SOFT
+    D2D1_PROPERTY_TYPE_FLOAT
+    D2D1_PROPERTY_TYPE_ENUM
+    D2D1_COMPOSITE_MODE_SOURCE_OVER
 
 // ── The Direct3D 11 device pair ───────────────────────────────────────────────
 // The full descending ladder is what `D3D11CreateDevice` is meant to be given. It

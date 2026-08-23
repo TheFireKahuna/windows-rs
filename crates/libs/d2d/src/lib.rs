@@ -15,6 +15,10 @@
     dead_code,
     non_snake_case,
     non_camel_case_types,
+    // An effect CLSID is a name Direct2D gives, and the generator carries names verbatim:
+    // renaming one to Rust's casing would leave the constant unsearchable against the
+    // documentation that defines it.
+    non_upper_case_globals,
     clippy::missing_transmute_annotations,
     clippy::upper_case_acronyms,
     clippy::too_many_arguments
@@ -22,6 +26,7 @@
 mod bindings;
 
 mod batch;
+mod blur;
 mod brush;
 mod device;
 mod geometry;
@@ -58,6 +63,7 @@ pub(crate) const FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
 pub(crate) const FLATTEN: f32 = 0.25;
 
 pub use batch::{Interp, SpriteBatch};
+pub use blur::Blur;
 pub use brush::{
     Brush, BrushRef, Cap, Extend, Join, Radial, Ramp, Solid, Stop, Stroke, StrokeSpec, StrokeStyle,
     Tile,

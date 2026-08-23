@@ -121,7 +121,7 @@ impl Drop for Pass<'_> {
 /// whole box. A `Draw` is not `Send`, and it decides nothing about when to draw; that
 /// belongs to whoever opened the pass.
 pub struct Draw<'p> {
-    ctx: &'p ID2D1DeviceContext6,
+    pub(crate) ctx: &'p ID2D1DeviceContext6,
     opacity: Opacity,
     dpi: f32,
     layers: Cell<u32>,
