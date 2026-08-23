@@ -19,16 +19,18 @@ use super::style::{OverStore, Recipe};
 use super::{El, Site, View};
 use crate::gesture::GestureDecl;
 use crate::layout::{Len, Over, Preset, Rule};
-use crate::role::{Metric, Role, Scope};
+use crate::role::{DataRole, Metric, Role, Scope};
 use crate::signal::Effect;
 use crate::widget::{
     Chrome, ChromeRow, Flow, Interaction, ModelState, Motion, RoleSet, StatePolicy, TextSource,
     UiaRole, Wash,
 };
+use core::cell::RefCell;
+use windows_color::Radiance;
 use windows_scene::taffy;
 use windows_scene::{
     Anim, Bind, Cap, ControlId, Corners, Exit, GeomId, GroupId, HitDecl, HitFlags, Join, Mask,
-    MeasureCtx, MeasureKey, NodeId, Paint, PathVerb, Prop, SpriteId, Tuning, Value,
+    MeasureCtx, MeasureKey, NodeId, Paint, PathVerb, Prop, RampId, Spread, SpriteId, Tuning, Value,
 };
 
 /// Mints path geometry from `verbs`, in sprite-local DIPs.
@@ -46,6 +48,61 @@ pub fn geometry(verbs: &[PathVerb]) -> GeomId {
 /// construction each one uses, so a curve's fill, stroke and glow cannot diverge.
 pub fn set_geometry(id: GeomId, verbs: &[PathVerb]) {
     Host::with(|h| h.model().set_geometry(id, verbs));
+}
+
+/// One stop of a gradient: where it sits, in which role, and how much of that role.
+///
+/// A [`DataRole`] and not a [`Role`](crate::role::Role), because a gradient is a resource
+/// rather than a sprite inside a tree and so has no scope to resolve against. A data role is
+/// the one kind that needs none.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Stop {
+    /// Where the stop sits along the ramp, `0..=1`.
+    pub at: f32,
+    /// The chromatic role this stop paints.
+    pub role: DataRole,
+    /// How much of that role, as an alpha in `0..=1`.
+    pub strength: f32,
+}
+
+/// Mints a gradient over `stops`, spread across whatever box paints with it.
+///
+/// The stops are resolved here, so no colour reaches the caller — the same rule a sprite's
+/// role follows, at the one place a resource rather than a node carries it.
+///
+/// The ramp rasterizes to a strip that is stretched to fill, so it costs nothing on a resize
+/// and one id serves every box that shares its stops.
+#[must_use]
+pub fn ramp(stops: &[Stop], spread: Spread) -> RampId {
+    with_resolved(stops, |resolved| {
+        Host::with(|h| h.model().ramp(resolved, spread))
+    })
+}
+
+/// Re-points the gradient `id` names. Every sprite painting with it changes together.
+pub fn set_ramp(id: RampId, stops: &[Stop], spread: Spread) {
+    with_resolved(stops, |resolved| {
+        Host::with(|h| h.model().set_ramp(id, resolved, spread));
+    });
+}
+
+/// Resolves `stops` into a scratch buffer and hands it to `f`.
+///
+/// One buffer per thread, reused: minting a ramp is an event-rate operation, and a `Vec` per
+/// call would put an allocation on the path a chain of rows takes when its document arrives.
+fn with_resolved<T>(stops: &[Stop], f: impl FnOnce(&[(f32, Radiance)]) -> T) -> T {
+    thread_local! {
+        static SCRATCH: RefCell<Vec<(f32, Radiance)>> = const { RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with(|scratch| {
+        let mut resolved = scratch.borrow_mut();
+        resolved.clear();
+        resolved.extend(stops.iter().map(|stop| {
+            let light = crate::role::data(stop.role);
+            (stop.at, light.with_alpha(light.a * stop.strength))
+        }));
+        f(&resolved)
+    })
 }
 
 /// A hover wash's opacity, and a press's.
@@ -229,8 +286,21 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     let seed_count = b.seed_count(slot.seeds);
     // Chrome is a table row and not sprites yet, so a variant with no fill costs one visual
     // fewer rather than one invisible one.
+    //
+    // Counted over the states this node can reach, not over its resting row alone.
+    // `ModelState::Selected` supplies a fill whatever the row says, so a ghost control that
+    // can be selected needs the sprite the row itself does not ask for — without it,
+    // selection has nowhere to paint and the control looks identical in both states. A node
+    // that never declares selection still costs the resting row's sprites and no more.
+    let selects = selectable(b, &slot);
     let chrome_count = roles.map_or(0, |r| {
-        usize::from(r.fill.is_some()) + usize::from(r.stroke.is_some())
+        let reachable = if selects {
+            r.in_state(ModelState::Selected)
+        } else {
+            r
+        };
+        usize::from(r.fill.is_some() || reachable.fill.is_some())
+            + usize::from(r.stroke.is_some() || reachable.stroke.is_some())
     });
     // A run that can break needs one sprite per line, so it is a group whatever else it is.
     let run = run_seed(b, &slot);
@@ -312,7 +382,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // ── the node's own sprites, where it is not one itself ────────────────────────
     let mut previous: Option<NodeId> = None;
     if let Some(group) = group {
-        for (part, seed) in chrome_seeds(roles, slot.chrome, inner) {
+        for (part, seed) in chrome_seeds(roles, slot.chrome, inner, selects) {
             let sprite = Host::with(|h| h.model().sprite(group, previous));
             cover(sprite.node(), inner, chrome_inset(part));
             emit_sprite(sprite, &seed, None, inner, roles);
@@ -463,22 +533,47 @@ fn chrome_seeds(
     roles: Option<RoleSet>,
     chrome: Option<Chrome>,
     scope: Scope,
+    selectable: bool,
 ) -> impl Iterator<Item = (Part, SpriteSeed)> {
     let radius = chrome.map_or(0.0, |c| crate::role::metric(c.radius, scope));
     let hairline = crate::role::metric(Metric::HairlineW, scope);
-    let stroke = roles.and_then(|r| r.stroke).map(move |role| {
+    // A part the resting row does not carry but a reachable state does is minted transparent
+    // and painted when that state arrives, because `set_state` swaps a sprite's paint and
+    // cannot mint one. A node that never reaches the state carries neither.
+    let reachable = roles.map(|r| {
+        if selectable {
+            r.in_state(ModelState::Selected)
+        } else {
+            r
+        }
+    });
+    let part_of = move |rest: Option<Role>, on: Option<Role>| {
+        rest.or(on)
+            .map(|role| (role, f32::from(u8::from(rest.is_some()))))
+    };
+    let stroke = part_of(
+        roles.and_then(|r| r.stroke).map(Role::Stroke),
+        reachable.and_then(|r| r.stroke).map(Role::Stroke),
+    )
+    .map(move |(role, strength)| {
         (
             Part::Border,
             SpriteSeed {
                 mask: MaskSeed::Radius { dips: radius },
-                role: Role::Stroke(role),
+                role,
+                strength,
+                ramp: None,
                 part: Part::Border,
                 next: NIL,
             },
         )
     });
     let inset = if stroke.is_some() { hairline } else { 0.0 };
-    let fill = roles.and_then(|r| r.fill).map(move |role| {
+    let fill = part_of(
+        roles.and_then(|r| r.fill).map(Role::Fill),
+        reachable.and_then(|r| r.fill).map(Role::Fill),
+    )
+    .map(move |(role, strength)| {
         (
             Part::Fill,
             SpriteSeed {
@@ -487,7 +582,9 @@ fn chrome_seeds(
                 mask: MaskSeed::Radius {
                     dips: (radius - inset).max(0.0),
                 },
-                role: Role::Fill(role),
+                role,
+                strength,
+                ramp: None,
                 part: Part::Fill,
                 next: NIL,
             },
@@ -533,7 +630,12 @@ fn emit_sprite(
     scope: Scope,
     roles: Option<RoleSet>,
 ) {
-    let light = crate::role::resolve(role_of(seed, roles), scope.for_paint());
+    let resolved = crate::role::resolve(role_of(seed, roles), scope.for_paint());
+    // The strength scales the role's own alpha rather than replacing it: a hairline resolves
+    // to a wash already, and a sprite at full strength must leave that wash where it is.
+    let light = resolved.with_alpha(resolved.a * seed.strength);
+    // A ramp carries its own stops, resolved where it was minted, so nothing above is read.
+    let paint = seed.ramp.map_or(Paint::Solid(light), Paint::Ramp);
     // One borrow: the stroke resource, the mask and the paint are three model calls about
     // one sprite, and the walk takes this borrow once per sprite already.
     Host::with(|h| {
@@ -555,8 +657,24 @@ fn emit_sprite(
             },
         };
         h.model().mask(id, mask);
-        h.model().paint(id, Paint::Solid(light));
+        h.model().paint(id, paint);
     });
+}
+
+/// Returns whether this node ever resolves in [`ModelState::Selected`].
+///
+/// Read off the act chain rather than off a flag on the slot: `El::selected` is the one
+/// declaration that reaches this state, and it records an act.
+fn selectable(b: &Build, slot: &Slot) -> bool {
+    let mut at = slot.acts.head;
+    while at != NIL {
+        let entry = &b.acts[at as usize];
+        if matches!(entry.act, Some(Act::SelectedWhen(_))) {
+            return true;
+        }
+        at = entry.next;
+    }
+    false
 }
 
 /// Returns a sprite's role: its own, unless it is the label of a widget whose chrome row
@@ -641,8 +759,10 @@ fn mount_control(
             hover: HOVER_ALPHA,
             press: PRESS_ALPHA,
             thumb: claim.thumb.map(SpriteId::node),
-            // The room is a solve output, so it arrives with the first publish rather than
-            // here. Until then a fraction moves the part nowhere, which is where it starts.
+            // The inset and the room are both solve outputs, so they arrive with the first
+            // publish rather than here. Until then a fraction moves the part nowhere, which
+            // is where it starts.
+            rest: 0.0,
             travel: 0.0,
             drive: slot.interaction,
             fraction: 0.0,
@@ -865,6 +985,7 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
             hover: 0.0,
             press: 0.0,
             thumb: None,
+            rest: 0.0,
             travel: 0.0,
             drive: None,
             fraction: 0.0,
@@ -987,6 +1108,7 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: MountId, claim:
                     motion,
                     vertical: prop == Prop::OffsetY,
                     fraction: 0.0,
+                    rest: 0.0,
                     travel: 0.0,
                     front_driven: false,
                     row,

@@ -45,10 +45,11 @@ pub struct ChromeRow {
     /// Resolved wash opacities.
     pub hover: f32,
     pub press: f32,
-    /// The node a value moves, and the travel the last solve measured for it. Holding both
-    /// keeps the move to one multiply and keeps the router from asking the app thread for
-    /// geometry.
+    /// The node a value moves, the inset it rests at, and the travel the last solve measured
+    /// between those insets. Holding all three keeps the move to one multiply and one add,
+    /// and keeps the router from asking the app thread for geometry.
     pub thumb: Option<NodeId>,
+    pub rest: f32,
     pub travel: f32,
     /// What a pointer means here. `None` is a press and nothing else.
     pub drive: Option<Interaction>,
@@ -134,7 +135,7 @@ impl Controls {
             self.rows.place(row.id, ChromeRow { fraction, ..row });
             // Only where travel moved: an unchanged row costs no retarget, and a fresh one
             // keeps the position the mount gave it.
-            if held.is_some_and(|old| old.travel != row.travel) {
+            if held.is_some_and(|old| (old.rest, old.travel) != (row.rest, row.travel)) {
                 self.drive(row.id, fraction, front)?;
             }
         }
@@ -378,7 +379,8 @@ impl Controls {
             return Ok(());
         };
         row.fraction = fraction.clamp(0.0, 1.0);
-        let (fraction, thumb, travel, drive) = (row.fraction, row.thumb, row.travel, row.drive);
+        let (fraction, thumb, rest, travel, drive) =
+            (row.fraction, row.thumb, row.rest, row.travel, row.drive);
         let (Some(thumb), Some(drive)) = (thumb, drive) else {
             return Ok(());
         };
@@ -398,7 +400,7 @@ impl Controls {
                 } else {
                     Prop::OffsetX
                 },
-                chrome(offset_of(fraction, travel, range.vertical)),
+                chrome(rest + offset_of(fraction, travel, range.vertical)),
             ),
         }
     }

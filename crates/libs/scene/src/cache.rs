@@ -9,7 +9,7 @@
 //! [`Cache`] owns eviction, generation checking, surface allocation, the draw bracket and
 //! the device-loss arm. A family supplies its key, its extent and its draw through [`Cell`].
 
-use crate::quant::{Q, extent_px, snap_detail};
+use crate::quant::{Q, snap_detail};
 use crate::sink::Corners;
 use rustc_hash::FxHashMap;
 use windows_color::Scrgb;
@@ -311,8 +311,8 @@ impl<K: Cell> Cache<K> {
 pub struct BoxKey {
     /// Quarter-pixel radii, in the order the corners are drawn.
     radius: [i32; 4],
-    /// The cell's pixel extent: the corner profile plus a pixel of margin on each side,
-    /// which is the flat interior the nine-grid's insets stretch from.
+    /// The cell's pixel extent: two insets and the one flat pixel between them, which is
+    /// what the nine-grid's middle slice stretches from.
     px: (u32, u32),
     inset: u32,
 }
@@ -322,17 +322,21 @@ impl BoxKey {
     #[must_use]
     pub fn new(radius: Corners, scale: f32) -> Self {
         let quarter = |r: f32| (snap_detail(r, scale) * scale * 4.0).round() as i32;
-        // A pixel of margin past the largest radius, so the nine-grid's centre is a whole
-        // pixel of flat interior for the stretch to sample.
-        let inset = extent_px(radius.max(), scale) + 1;
+        let corners = [
+            quarter(radius.tl),
+            quarter(radius.tr),
+            quarter(radius.br),
+            quarter(radius.bl),
+        ];
+        // Rounded up to the pixel the widest arc ends inside, so the middle pixel the
+        // nine-grid stretches carries no part of a curve. One pixel wider would cost the
+        // profile a pixel of radius for nothing: a box has to hold two insets, so a control
+        // asking to be fully round is cut down by whatever the raster wastes.
+        let widest = corners.into_iter().max().unwrap_or(0).max(0) as u32;
+        let inset = widest.div_ceil(4).max(1);
         let side = inset * 2 + 1;
         Self {
-            radius: [
-                quarter(radius.tl),
-                quarter(radius.tr),
-                quarter(radius.br),
-                quarter(radius.bl),
-            ],
+            radius: corners,
             px: (side, side),
             inset,
         }
@@ -507,6 +511,35 @@ mod tests {
             assert_eq!(a, b, "a hundredth of a DIP forked the cache at {scale}x");
             let (w, h) = a.px();
             assert!(w > 0 && h > 0);
+        }
+    }
+
+    /// A box cell's inset covers its whole arc, and wastes no pixel past it.
+    ///
+    /// Both halves are load-bearing. An inset short of the arc leaves the tail of the curve
+    /// in the middle slice, which stretches it across the box and smears the edge. An inset
+    /// past the arc costs the profile radius it could have had: the box has to hold two
+    /// insets, so every wasted pixel is two pixels of diameter a control asking to be fully
+    /// round does not get.
+    #[test]
+    fn a_box_cells_inset_covers_its_arc_and_wastes_nothing_past_it() {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for radius in [0.0_f32, 1.0, 2.5, 6.0, 7.7, 7.92, 11.0, 24.0] {
+                let key = BoxKey::new(Corners::all(radius), scale);
+                let arc = crate::quant::snap_detail(radius, scale) * scale;
+                let inset = key.inset_px();
+                assert!(
+                    inset >= arc,
+                    "{radius} at {scale}x: inset {inset} is inside an arc of {arc}"
+                );
+                assert!(
+                    inset <= arc.max(1.0).ceil(),
+                    "{radius} at {scale}x: inset {inset} wastes a pixel past an arc of {arc}"
+                );
+                // Two insets and the one flat pixel the middle slice stretches from.
+                let side = inset as u32 * 2 + 1;
+                assert_eq!(key.px(), (side, side));
+            }
         }
     }
 

@@ -8,8 +8,8 @@
 
 use crate::build::{Button, El, Path, View};
 use crate::gesture::{DragDecl, GestureDecl};
-use crate::layout::Preset;
-use crate::role::{Fill, Metric, Role, Text, TypeRole};
+use crate::layout::{Align, Len, Preset};
+use crate::role::{DataRole, Fill, Metric, Role, Text, TypeRole};
 use crate::signal::{Cell, Signal};
 use crate::widget::{Flow, Interaction, Range, StatePolicy, TextSource, UiaRole, Wash, roles};
 use windows_scene::{GeomId, HitFlags};
@@ -120,6 +120,41 @@ pub fn panel(key: &'static str) -> View {
         .key(key)
 }
 
+/// A value in a chromatic role: a plate in that role, under text in it.
+///
+/// What names a thing by its own colour — a processor kind's badge, a band's index, a
+/// channel's name on its wire. It takes a [`DataRole`] and not a colour, so the authored
+/// triple behind it stays in the application's palette table.
+///
+/// The plate is the role at [`CHIP_PLATE`] and the text is the role as resolved. One role and
+/// two strengths, rather than a second token per kind: a plate is the hue at a fraction of
+/// itself by construction, so a kind cannot carry a badge from one row and a plate from
+/// another.
+///
+/// It pushes no scope, so a chip on a card resolves against the card.
+#[must_use]
+pub fn chip(role: DataRole, s: impl Into<TextSource>) -> View {
+    El::<crate::build::Any>::seed(Preset::Bare)
+        .plate(Metric::Radius, Role::Data(role), CHIP_PLATE)
+        // A container and not a run: a run's box is its coverage tile, so padding one leaves
+        // the glyphs drawn against a tile sized without it and the plate hugs them.
+        .row(ink_run(s, TypeRole::Label, Role::Data(role)))
+        // `UIA` and nothing else, as a text run takes: a chip names something, and routes no
+        // pointer of its own.
+        .hit(HitFlags::UIA, UiaRole::Text)
+}
+
+/// A text run painted in `role`, for a widget whose text colour is chromatic.
+fn ink_run(s: impl Into<TextSource>, ramp: TypeRole, role: Role) -> View {
+    El::seed(Preset::Text).text_seed_in(s.into(), ramp, role)
+}
+
+/// How much of its role a [`chip`]'s plate paints.
+///
+/// Low enough that the text over it, which is the same hue at full strength, still separates
+/// from it.
+pub const CHIP_PLATE: f32 = 0.15;
+
 /// A detached surface above everything. The overlay layer anchors and dismisses it; this is
 /// only what it looks like.
 #[must_use]
@@ -150,15 +185,42 @@ pub fn icon_button(icon: GeomId) -> El<Button> {
         .row(path(icon).ink())
 }
 
+/// A switch's height, in row heights.
+///
+/// Under a row. A switch marks what a row already says rather than being what the row is
+/// sized for, and one as tall as the row reads as a second button beside the disclosure.
+const TOGGLE_ROWS: f32 = 0.8;
+
+/// How long a track is, as a multiple of its own height.
+///
+/// Enough for the knob and most of a knob's width of travel, which is what reads as a switch
+/// rather than as an indicator dot.
+const TRACK_ASPECT: f32 = 2.0;
+
 /// A two-state switch. The knob is a sprite sprung between the ends of its track, so the
 /// transition is a compositor animation and costs no frame after the one that started it.
+///
+/// It states its whole box, which is the one control here that has to. A control's defaults
+/// are a row's: a floor of one row height, a label's padding, and its content centred. A
+/// switch is shorter than a row, the knob is wider than what that padding leaves — the layout
+/// shrinks it into a lens — and it rests at the start of a track its travel is measured from
+/// the start of.
 #[must_use]
 pub fn toggle<M>(on: impl Signal<bool, M> + Copy + 'static) -> View {
     control::<crate::build::Any>(UiaRole::CheckBox)
         .chrome(roles::TRACK, roles::TRACK_OFF, Metric::RadiusPill)
         .selected(on)
         .interaction(Interaction::Press)
-        .row(knob_sprite().along(false, move || f32::from(u8::from(on.read()))))
+        .row(knob_sprite(TOGGLE_ROWS).along(false, move || f32::from(u8::from(on.read()))))
+        .min_height(Len::Zero)
+        .height(Len::Times(Metric::RowH, TOGGLE_ROWS))
+        .width(Len::Times(Metric::RowH, TOGGLE_ROWS * TRACK_ASPECT))
+        .padding(Len::Times(Metric::RowH, TOGGLE_ROWS * KNOB_INSET_OF_TRACK))
+        .justify(Align::Start)
+        .align(Align::Center)
+        // A switch is one fixed shape. Shrinkable, a tight row takes the width off the track
+        // first, and a track under twice its own radius renders as a lens.
+        .no_shrink()
 }
 
 /// A value along a track. The thumb moves front-side in the tick that saw the contact,
@@ -170,7 +232,13 @@ pub fn slider<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> V
         .interaction(Interaction::Slide(range))
         .gesture(GestureDecl::slider(range.vertical))
         .state(accent_wash())
-        .row(knob_sprite().along(range.vertical, move || range.fraction(value.read())))
+        .row(knob_sprite(1.0).along(range.vertical, move || range.fraction(value.read())))
+        // The same inset and the same justification a toggle states, and for the same
+        // reason: the thumb rests at the near inset and travels to the far one. A groove is
+        // a row tall, so the fractions here are of the row rather than of a shorter track.
+        .padding(Len::Times(Metric::RowH, KNOB_INSET_OF_TRACK))
+        .justify(Align::Start)
+        .align(Align::Center)
 }
 
 /// A value turned rather than slid.
@@ -285,9 +353,42 @@ fn control<K>(uia: UiaRole) -> El<K> {
         .state(ink_wash())
 }
 
-/// The moving part of a toggle or a slider.
-fn knob_sprite() -> View {
-    El::<crate::build::Any>::seed(Preset::Bare).thumb(Metric::RadiusPill, Role::Fill(Fill::Surface))
+/// The knob's diameter, as a fraction of the track's height.
+///
+/// Under the whole of it, so the knob is inset from the track on the cross axis at every
+/// density rather than at one.
+const KNOB_OF_TRACK: f32 = 0.6;
+
+/// How far the knob sits from the track's edge, as a fraction of the track's height.
+///
+/// Half of what that height leaves once the knob has taken its share, so the gap is the same
+/// on all four sides. The track states it as padding, which is both what the knob rests at
+/// and what its travel is measured between, so one constant sets both.
+const KNOB_INSET_OF_TRACK: f32 = (1.0 - KNOB_OF_TRACK) * 0.5;
+
+/// The moving part of a track `track_rows` row heights tall.
+///
+/// It states a definite square box. Without one it solves to nothing: a bare node has no
+/// intrinsic size, so the knob is invisible and the travel `along` computes — the room the
+/// track's insets leave, less the knob's own box — is the whole track.
+///
+/// Its radius is half that box, from the same constant, so the knob is a circle by
+/// construction rather than by a radius stated beside a size that could drift from it.
+///
+/// It paints in [`Text::Primary`] and not in a surface: the track under it is the accent once
+/// the control is on, and a knob in the surface colour reads as a hole punched through it
+/// rather than as the part that moves. Not [`Text::OnAccent`] either — that is the ink a
+/// palette picks to *read on* the accent, which in a dark scheme is the dark end.
+fn knob_sprite(track_rows: f32) -> View {
+    let rows = track_rows * KNOB_OF_TRACK;
+    let side = Len::Times(Metric::RowH, rows);
+    El::<crate::build::Any>::seed(Preset::Bare)
+        .thumb(
+            Len::Times(Metric::RowH, rows * 0.5),
+            Role::Text(Text::Primary),
+        )
+        .width(side)
+        .height(side)
 }
 
 const fn ink_wash() -> StatePolicy {

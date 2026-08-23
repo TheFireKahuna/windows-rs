@@ -13,12 +13,12 @@ use super::arena::{
 };
 use crate::gesture::{DragDecl, GestureDecl};
 use crate::layout::{Align, Edge, Len, Over, Preset, Rule, Track};
-use crate::role::{DataRole, Elevation, Metric, Role, Text, TypeRole, WidthClass};
+use crate::role::{DataRole, Elevation, Fill, Metric, Role, Text, TypeRole, WidthClass};
 use crate::signal::Signal;
 use crate::widget::{Chrome, Flow, Interaction, Motion, RoleSet, StatePolicy, TextSource, UiaRole};
 use core::marker::PhantomData;
 use windows_numerics::Vector2;
-use windows_scene::{Bounds, Exit, GeomId, HitFlags, Prop, Value};
+use windows_scene::{Bounds, Exit, GeomId, HitFlags, Prop, RampId, Value};
 
 /// The default kind: no methods beyond the universal surface.
 #[derive(Copy, Clone, Debug)]
@@ -118,12 +118,23 @@ impl<K> El<K> {
     }
 
     pub(crate) fn sprite(self, mask: MaskSeed, role: Role, part: Part) -> Self {
+        self.sprite_at(mask, role, part, super::arena::FULL)
+    }
+
+    /// Adds a sprite painting `strength` of `role`.
+    ///
+    /// `strength` must be in `0.0..=1.0`. It is the sprite's own, not a second role: a plate
+    /// under text of the same hue is that hue at a fraction of it, and a palette answers one
+    /// value per role.
+    pub(crate) fn sprite_at(self, mask: MaskSeed, role: Role, part: Part, strength: f32) -> Self {
         Build::with(|b| {
             b.push_seed(
                 self.at,
                 SpriteSeed {
                     mask,
                     role,
+                    strength,
+                    ramp: None,
                     part,
                     next: super::arena::NIL,
                 },
@@ -191,6 +202,23 @@ impl<K> El<K> {
         )
     }
 
+    /// Records a shaped run painted in `role` rather than in a foreground rung.
+    ///
+    /// The node carries no chrome row of its own, which is what lets the role stated here
+    /// reach the sprite: a label takes its enclosing row's text colour only where there is
+    /// one.
+    pub(crate) fn text_seed_in(self, source: TextSource, ramp: TypeRole, role: Role) -> Self {
+        let text = Build::with(|b| {
+            b.push_text(TextSeed {
+                source: Some(source),
+                ramp,
+                ink: None,
+                flow: Flow::Line,
+            })
+        });
+        self.sprite(MaskSeed::Run { text }, role, Part::Label)
+    }
+
     /// Records the role table, variant index and corner radius this node's surface resolves
     /// from.
     pub(crate) fn chrome(self, roles: &'static [RoleSet], variant: u8, radius: Metric) -> Self {
@@ -235,13 +263,62 @@ impl<K> El<K> {
     ///
     /// Marked [`Part::Thumb`] rather than a fill, so the router moves exactly this sprite and
     /// the state driver re-resolves the rest of the control without it.
-    pub(crate) fn thumb(self, radius: Metric, role: Role) -> Self {
+    ///
+    /// `radius` is a [`Len`] and not a [`Metric`], because a round part's radius is half its
+    /// own box rather than a rung of the radius scale. A metric above half is capped per axis
+    /// by the platform, and the four corners then meet in the middle.
+    pub(crate) fn thumb(self, radius: impl Into<Len>, role: Role) -> Self {
         self.sprite(
+            MaskSeed::Box {
+                radius: Some(radius.into()),
+            },
+            role,
+            Part::Thumb,
+        )
+    }
+
+    /// Washes this node in the gradient `id` names, inside a `radius` corner.
+    ///
+    /// [`Part::Static`] rather than a fill: the wash sits over the surface's own fill and an
+    /// interaction state must not re-resolve it into a flat colour. It is emitted after the
+    /// chrome, so it lands above that fill and below anything the node contains.
+    ///
+    /// The node keeps whatever fill it already had. A wash is a tint over a surface, not the
+    /// surface — which is what lets it fade out across a card instead of ending at a seam.
+    #[must_use]
+    pub fn washed(self, id: RampId, radius: Metric) -> Self {
+        Build::with(|b| {
+            b.push_seed(
+                self.at,
+                SpriteSeed {
+                    mask: MaskSeed::Box {
+                        radius: Some(Len::Metric(radius)),
+                    },
+                    // Unread while `ramp` is set, and stated rather than left arbitrary so the
+                    // seed is meaningful if a ramp is ever cleared from one.
+                    role: Role::Fill(Fill::Surface),
+                    strength: super::arena::FULL,
+                    ramp: Some(id),
+                    part: Part::Static,
+                    next: super::arena::NIL,
+                },
+            );
+        });
+        self
+    }
+
+    /// Adds the plate a chromatic value sits on: a rounded box painting `strength` of `role`.
+    ///
+    /// [`Part::Static`] rather than [`Part::Fill`]: the plate is the value's own colour and an
+    /// interaction state must not re-resolve it into a surface.
+    pub(crate) fn plate(self, radius: Metric, role: Role, strength: f32) -> Self {
+        self.sprite_at(
             MaskSeed::Box {
                 radius: Some(Len::Metric(radius)),
             },
             role,
-            Part::Thumb,
+            Part::Static,
+            strength,
         )
     }
 
@@ -994,6 +1071,22 @@ impl El<Path> {
     pub fn ink(self) -> Self {
         self.sprite(
             MaskSeed::Shape { stroke: None },
+            Role::Text(Text::Primary),
+            Part::Label,
+        )
+    }
+
+    /// Outlines this node's geometry in the **enclosing widget's** foreground, `width` wide.
+    ///
+    /// [`ink`](Self::ink)'s outline form, and what an outline icon takes: a glyph inside a
+    /// button follows that button's text colour, so a variant that moves the text moves the
+    /// icon with it. A filled silhouette cannot express a waveform or a crossover.
+    #[must_use]
+    pub fn ink_stroke(self, width: impl Into<Len>) -> Self {
+        self.sprite(
+            MaskSeed::Shape {
+                stroke: Some(width.into()),
+            },
             Role::Text(Text::Primary),
             Part::Label,
         )

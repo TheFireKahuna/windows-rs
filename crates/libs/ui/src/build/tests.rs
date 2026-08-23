@@ -20,6 +20,14 @@ use windows_text::FontLadder;
 /// The palette is process-wide and installs once; the engine and the host are per thread, and
 /// tests run on their own, so each gets a tree and an engine of its own to assert against.
 pub(crate) fn fixture() -> SinkPatch {
+    fixture_at(96.0)
+}
+
+/// [`fixture`] at a stated DPI.
+///
+/// The raster caches are cut in physical pixels, so a mask that is exact at one scale can be
+/// degenerate at another. A test that only ever runs at 96 cannot see it.
+pub(crate) fn fixture_at(dpi: f32) -> SinkPatch {
     crate::role::tests::palette();
     if !super::text::installed() {
         // The real engine, over the two inbox faces the palette names, so every width
@@ -35,7 +43,7 @@ pub(crate) fn fixture() -> SinkPatch {
     Host::install(
         model,
         Env::new(
-            96.0,
+            dpi,
             OutputTransform::for_display(DisplayCapability::Sdr, 1000.0),
         ),
         Scope::root(AccentId(0), Density::Comfortable),
@@ -698,17 +706,18 @@ fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
     let _toggle = mount(crate::widget::toggle(on).width(Metric::CardMinW), root());
     flush(&mut patch);
 
-    let travel = Host::with(|h| {
+    let (rest, travel) = Host::with(|h| {
         h.controls
             .iter()
             .next()
-            .map_or(0.0, |(_, c)| c.front.travel)
+            .map_or((0.0, 0.0), |(_, c)| (c.front.rest, c.front.travel))
     });
     assert!(travel > 0.0, "a knob in a sized track has room to move");
+    let far = rest + travel;
     let offsets = offsets_bound(&patch);
     assert!(
-        offsets.iter().any(|&v| (v - travel).abs() < 0.5),
-        "a knob at the top of its range sits at the end of its travel ({travel}): {offsets:?}"
+        offsets.iter().any(|&v| (v - far).abs() < 0.5),
+        "a knob at the top of its range sits at the far inset ({far}): {offsets:?}"
     );
 }
 
@@ -3239,5 +3248,432 @@ fn a_probed_path_revealed_by_when_fills_the_column_it_opens_in() {
     assert!(
         (figure - (column - padding)).abs() < 0.5,
         "the figure was given {figure} DIPs of a {column}-DIP column padded by {padding}"
+    );
+}
+
+/// A sprite's strength scales the role's own alpha rather than replacing it.
+///
+/// A hairline resolves to a wash already. Replacing its alpha with the strength would make
+/// every border in the interface opaque at full strength, which is a plausible-looking
+/// regression: the ring stays where it is and only gets heavier.
+#[test]
+fn a_sprites_strength_scales_the_roles_own_alpha() {
+    let mut patch = fixture();
+    let full = El::<Any>::seed(crate::layout::Preset::Bare).sprite(
+        MaskSeed::Box { radius: None },
+        Role::Stroke(Stroke::Subtle),
+        Part::Fill,
+    );
+    let half = El::<Any>::seed(crate::layout::Preset::Bare).sprite_at(
+        MaskSeed::Box { radius: None },
+        Role::Stroke(Stroke::Subtle),
+        Part::Fill,
+        0.5,
+    );
+    let _mount = mount(stack((full, half)), root());
+    flush(&mut patch);
+
+    let alphas: Vec<f32> = patch
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            Op::Paint {
+                paint: Paint::Solid(light),
+                ..
+            } => Some(light.a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(alphas.len(), 2, "one sprite each");
+    let subtle = crate::role::resolve(
+        Role::Stroke(Stroke::Subtle),
+        Scope::root(AccentId(0), Density::Comfortable).for_paint(),
+    )
+    .a;
+    assert!(
+        (alphas[0] - subtle).abs() < 1e-6,
+        "full strength must leave the role's wash where it is, got {}",
+        alphas[0]
+    );
+    assert!(
+        (alphas[1] - subtle * 0.5).abs() < 1e-6,
+        "a strength scales that wash, got {}",
+        alphas[1]
+    );
+}
+
+/// A ghost control that can be selected mints the sprite selection paints into.
+///
+/// Its resting row carries no fill, so counting sprites off that row alone leaves selection
+/// with nowhere to go: the control looks identical selected and not, which is what a nav rail
+/// and a segmented picker are entirely made of.
+#[test]
+fn a_selectable_ghost_mints_the_fill_its_selected_state_needs() {
+    let mut patch = fixture();
+    let paints = |patch: &SinkPatch| {
+        patch
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::Paint {
+                        paint: Paint::Solid(_),
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+
+    let plain = mount(stack(crate::widget::button("plain").ghost()), root());
+    flush(&mut patch);
+    let without = paints(&patch);
+    patch.clear();
+    drop(plain);
+
+    let picks = mount(
+        stack(crate::widget::button("picks").ghost().selected(|| false)),
+        root(),
+    );
+    flush(&mut patch);
+    let with = paints(&patch);
+    drop(picks);
+
+    // Exactly one more sprite: the fill the selected row supplies and the ghost row does not.
+    // A ghost that never declares selection must not pay for a sprite it can never show.
+    assert_eq!(
+        with,
+        without + 1,
+        "declaring selection costs one sprite, and declaring none costs zero"
+    );
+}
+
+/// A scroll container clips its pixels, not only its hits.
+///
+/// The solve marks an overflow container `bounded`, and the hit array reads that flag. Until
+/// the placement pass emitted a clip alongside it, nothing did on the drawing side: a long
+/// list bounded what the pointer could reach and painted straight over the bands below it.
+#[test]
+fn a_scroll_container_clips_what_it_draws() {
+    let mut patch = fixture();
+    let _mount = mount(
+        crate::layout::scroll(stack((plate(), plate(), plate()))).height(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    let clipped = patch.ops().iter().any(|op| {
+        matches!(
+            op,
+            Op::Clip {
+                clip: windows_scene::Clip::Rect { r, b, .. },
+                ..
+            } if *r > 0.0 && *b > 0.0
+        )
+    });
+    assert!(
+        clipped,
+        "the viewport must publish a clip at its own box, or its content draws outside it"
+    );
+}
+
+/// A toggle's knob has extent, and its track is long enough to round as a stadium.
+///
+/// A bare node has no intrinsic size, so a knob that states none solves to nothing: it is
+/// invisible, and the travel `along` computes — the track's extent less the knob's — is the
+/// whole track. The existing travel assertion passes either way, which is how a switch
+/// shipped as one flat blob.
+#[test]
+fn a_toggles_knob_has_extent_inside_its_track() {
+    let mut patch = fixture();
+    let on = crate::signal::Cell::new(true);
+    let _toggle = mount(crate::widget::toggle(on), root());
+    flush(&mut patch);
+
+    let scope = Scope::root(AccentId(0), Density::Comfortable);
+    let row = crate::role::metric(Metric::RowH, scope);
+    let travel = Host::with(|h| {
+        h.controls
+            .iter()
+            .next()
+            .map_or(0.0, |(_, c)| c.front.travel)
+    });
+    assert!(
+        travel > 0.0,
+        "a knob in a sized track has room to move, got {travel}"
+    );
+    // The track's own width, which is what the travel would equal if the knob had no extent.
+    let width = row * 1.7;
+    assert!(
+        travel < width - 1.0,
+        "the knob must take room out of its own travel: travel {travel} against a {width} track"
+    );
+    // The contract a pill radius carries: a control one row tall must be fully rounded by it.
+    // Above half a row the platform's per-axis cap differs between the axes and the corners
+    // meet in the middle, which renders the switch as a lens.
+    assert!(
+        crate::role::metric(Metric::RadiusPill, scope) * 2.0 <= row + 1e-3,
+        "a pill radius above half a row cannot round a row-tall track as a stadium"
+    );
+}
+
+/// A toggle that is on leaves its knob at the end of its travel, and nothing writes over it.
+///
+/// The knob's position is an `OffsetX` the app thread binds from the value; the placement
+/// pass binds a whole `Offset` for every node the solve moved. Both land on the same channel,
+/// so the one that runs last decides where the knob sits.
+#[test]
+fn a_toggle_that_is_on_leaves_its_knob_at_the_end_of_its_travel() {
+    let mut patch = fixture();
+    let on = crate::signal::Cell::new(true);
+    let _toggle = mount(crate::widget::toggle(on), root());
+    flush(&mut patch);
+
+    let (rest, travel, thumb, node) = Host::with(|h| {
+        h.controls
+            .iter()
+            .next()
+            .map_or((0.0, 0.0, None, windows_scene::NodeId::NONE), |(_, c)| {
+                (c.front.rest, c.front.travel, c.front.thumb, c.node)
+            })
+    });
+    let thumb = thumb.expect("a toggle mints a knob");
+    assert!(travel > 0.0, "the knob has room to move");
+    assert!(rest > 0.0, "the knob is inset from the track's own edge");
+
+    // The last write to the knob's own x, in patch order.
+    let mut last = None;
+    for op in patch.ops() {
+        match op {
+            Op::Bind {
+                id,
+                prop: windows_scene::Prop::Offset,
+                bind: windows_scene::Bind::Set(windows_scene::Value::Vec2(v)),
+            } if *id == thumb => last = Some(v.x),
+            Op::Bind {
+                id,
+                prop: windows_scene::Prop::OffsetX,
+                bind: windows_scene::Bind::Set(windows_scene::Value::Scalar(x)),
+            } if *id == thumb => last = Some(*x),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        last,
+        Some(rest + travel),
+        "the knob's x must settle one inset short of the track's far edge"
+    );
+    // The gap the knob leaves at the far end is the one it rests at, so the two ends of the
+    // switch look the same and neither shows the knob overhanging the track.
+    let (track, knob) = Host::with(|h| (h.model().solved(node).size, h.model().solved(thumb).size));
+    assert!(
+        ((track.x - (rest + travel) - knob.x) - rest).abs() <= 0.5,
+        "the knob is inset by {rest} at the near end and {} at the far one",
+        track.x - (rest + travel) - knob.x
+    );
+}
+
+/// Flipping a toggle springs its knob rather than putting it at the far end in one frame.
+///
+/// The knob's channel is the only thing about a switch that moves: the track's fill is a
+/// discrete paint swap at event rate, so a knob that snapped would leave the control with no
+/// motion at all.
+#[test]
+fn flipping_a_toggle_springs_its_knob() {
+    let mut patch = fixture();
+    let on = crate::signal::Cell::new(false);
+    let _toggle = mount(crate::widget::toggle(on), root());
+    flush(&mut patch);
+
+    patch.clear();
+    on.set(true);
+    crate::signal::flush();
+    flush(&mut patch);
+    let sprung = patch.ops().iter().any(|op| {
+        matches!(
+            op,
+            Op::Bind {
+                prop: windows_scene::Prop::OffsetX,
+                bind: windows_scene::Bind::Animate(windows_scene::Anim::Spring {
+                    tuning: windows_scene::Tuning::Chrome,
+                    ..
+                }),
+                ..
+            }
+        )
+    });
+    assert!(sprung, "a flipped toggle springs its knob");
+}
+
+/// The knob's box and its travel survive a fractional display scale.
+///
+/// Layout snaps to the physical grid, so a knob sized as a fraction of the row height lands
+/// on a different DIP extent at 1.5 than at 1.0 — and its travel is the difference between
+/// two snapped boxes. A widget checked only at 96 DPI cannot see a knob that comes out
+/// mid-track on the display the application actually runs on.
+#[test]
+fn a_toggles_knob_lands_at_its_travel_at_a_fractional_scale() {
+    let mut patch = fixture_at(144.0);
+    let on = crate::signal::Cell::new(true);
+    let _toggle = mount(crate::widget::toggle(on), root());
+    flush(&mut patch);
+
+    let (rest, travel, thumb) = Host::with(|h| {
+        h.controls.iter().next().map_or((0.0, 0.0, None), |(_, c)| {
+            (c.front.rest, c.front.travel, c.front.thumb)
+        })
+    });
+    let thumb = thumb.expect("a toggle mints a knob");
+    let mut last = None;
+    for op in patch.ops() {
+        match op {
+            Op::Bind {
+                id,
+                prop: windows_scene::Prop::Offset,
+                bind: windows_scene::Bind::Set(windows_scene::Value::Vec2(v)),
+            } if *id == thumb => last = Some(v.x),
+            Op::Bind {
+                id,
+                prop: windows_scene::Prop::OffsetX,
+                bind: windows_scene::Bind::Set(windows_scene::Value::Scalar(x)),
+            } if *id == thumb => last = Some(*x),
+            _ => {}
+        }
+    }
+    assert!(travel > 0.0, "the knob has room to move at 1.5");
+    assert_eq!(
+        last,
+        Some(rest + travel),
+        "the knob's x must settle one inset short of the track's far edge"
+    );
+}
+
+/// A washed surface paints a gradient over its own fill, resolved through the palette.
+///
+/// The stops name roles and strengths, so no colour crosses the authoring seam — the rule a
+/// sprite's role already follows, at the one place a resource rather than a node carries it.
+#[test]
+fn a_wash_paints_a_ramp_over_the_surface_it_covers() {
+    let mut patch = fixture();
+    let hue = crate::role::DataRole(1);
+    let id = ramp(
+        &[
+            Stop {
+                at: 0.0,
+                role: hue,
+                strength: 0.06,
+            },
+            Stop {
+                at: 1.0,
+                role: hue,
+                strength: 0.0,
+            },
+        ],
+        windows_scene::Spread::Horizontal,
+    );
+    let _mount = mount(
+        crate::widget::card().washed(id, Metric::RadiusSurface),
+        root(),
+    );
+    flush(&mut patch);
+
+    let ramps = patch
+        .ops()
+        .iter()
+        .filter(|op| {
+            matches!(
+                op,
+                Op::Paint {
+                    paint: Paint::Ramp(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(ramps, 1, "the wash is one sprite painting the ramp");
+    // The card keeps its own fill: a wash is a tint over a surface, not the surface.
+    let solids = patch
+        .ops()
+        .iter()
+        .filter(|op| {
+            matches!(
+                op,
+                Op::Paint {
+                    paint: Paint::Solid(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(solids >= 2, "the card's own fill and hairline survive it");
+}
+
+/// A toggle's track keeps its own box, bare and among siblings.
+///
+/// The widget states `RowH × 1.7` by `RowH` and nothing overrides it, but a flex row shrinks
+/// a child that states no basis, and a track squeezed towards square rounds as a stadium
+/// however small its radius and leaves its knob barely any travel. Both symptoms read as
+/// mask bugs, so the box is asserted where it is decided.
+///
+/// At 144 DPI, the scale the application runs at: layout snaps to the physical grid, so a
+/// box measured only at 96 is not the box that ships.
+#[test]
+fn a_toggles_track_keeps_its_box_among_siblings() {
+    let track_box = |view: View| {
+        let mut patch = fixture_at(144.0);
+        let mount = mount(view, root());
+        flush(&mut patch);
+        let node = Host::with(|h| {
+            h.controls
+                .iter()
+                .find(|(_, c)| c.uia == crate::widget::UiaRole::CheckBox)
+                .map(|(_, c)| c.node)
+        })
+        .expect("a toggle mints a control");
+        let size = Host::with(|h| h.model().solved(node).size);
+        drop(mount);
+        size
+    };
+
+    let on = crate::signal::Cell::new(true);
+    let bare = track_box(crate::widget::toggle(on));
+    // What the widget asks for, through the same metric it states it in. Read after the
+    // first fixture, which is what installs the palette a metric resolves against.
+    let row_h = crate::role::metric(Metric::RowH, Scope::root(AccentId(0), Density::Comfortable));
+    let want = Vector2 {
+        x: row_h * 0.8 * 2.0,
+        y: row_h * 0.8,
+    };
+    // The shape of a chain row's header: a spacer takes the slack, and the toggle sits
+    // between a label and a fixed-width disclosure.
+    let among = track_box(
+        crate::layout::row((
+            crate::widget::title("Parametric EQ"),
+            crate::layout::spacer(),
+            crate::widget::label("All"),
+            crate::widget::toggle(on),
+            crate::widget::button("")
+                .ghost()
+                .width(Len::Times(Metric::RowH, 1.0))
+                .height(Len::Times(Metric::RowH, 1.0)),
+        ))
+        .gap(Len::Metric(Metric::SpaceSm))
+        .padding(Len::Metric(Metric::SpaceSm))
+        .align(crate::layout::Align::Center),
+    );
+
+    let close = |got: Vector2, what: &str| {
+        assert!(
+            (got.x - want.x).abs() <= 1.0 && (got.y - want.y).abs() <= 1.0,
+            "the {what} toggle solved to {got:?}, not the {want:?} it asks for"
+        );
+    };
+    close(bare, "bare");
+    close(among, "sibling");
+    // The two agree: a row full of neighbours does not take the track's width off it.
+    assert!(
+        (bare.x - among.x).abs() <= 1.0 && (bare.y - among.y).abs() <= 1.0,
+        "the track is {bare:?} alone and {among:?} among siblings"
     );
 }

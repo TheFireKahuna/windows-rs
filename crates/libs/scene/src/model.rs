@@ -764,12 +764,20 @@ impl Model {
     /// The diff against the previous solve is what bounds the op count. The front half's
     /// idempotent early return would accept the ops either way, but every live node would
     /// put two on the wire every pass.
+    ///
+    /// **Each op is diffed on the field it carries**, not on the record. `rect` is absolute,
+    /// so one node moving changes it for the whole subtree below, and a record-wide diff
+    /// re-states every descendant's offset. That is not only op traffic: [`Prop::Offset`]
+    /// carries both axes, so re-stating it overwrites a [`Prop::OffsetX`] a value writer
+    /// owns, and a switch's knob returns to the middle of its track on the next window
+    /// resize.
     fn emit_placements(&mut self) -> bool {
         let mut moved = false;
         self.previous.resize(self.solved.len(), Solved::default());
         for index in 0..self.solved.len() {
             let now = self.solved[index];
-            if now == self.previous[index] {
+            let before = self.previous[index];
+            if now == before {
                 continue;
             }
             self.previous[index] = now;
@@ -781,16 +789,44 @@ impl Model {
             }
             moved = true;
             let id = node.id;
-            self.pending.push_op(Op::Bind {
-                id,
-                prop: Prop::Offset,
-                bind: Bind::Set(Value::Vec2(now.local)),
-            });
-            self.pending.push_op(Op::Bind {
-                id,
-                prop: Prop::Size,
-                bind: Bind::Set(Value::Vec2(now.size)),
-            });
+            if now.local != before.local {
+                self.pending.push_op(Op::Bind {
+                    id,
+                    prop: Prop::Offset,
+                    bind: Bind::Set(Value::Vec2(now.local)),
+                });
+            }
+            if now.size != before.size {
+                self.pending.push_op(Op::Bind {
+                    id,
+                    prop: Prop::Size,
+                    bind: Bind::Set(Value::Vec2(now.size)),
+                });
+            }
+            // A container that clips its own overflow clips its **pixels** here and its hits
+            // in the hit array, from the one `bounded` flag the solve set. Without this a
+            // scroll viewport bounds what the pointer can reach and nothing at all about what
+            // is drawn, so its content paints straight over whatever sits below it.
+            //
+            // Emitted whenever the clip's own inputs moved, and cleared when the node stops
+            // being bounded: a clip is a property of the node rather than of the op, so a
+            // stale one would outlive the style that asked for it.
+            if now.size != before.size || now.bounded != before.bounded {
+                self.pending.push_op(Op::Clip {
+                    id,
+                    clip: if now.bounded {
+                        Clip::Rect {
+                            l: 0.0,
+                            t: 0.0,
+                            r: now.size.x,
+                            b: now.size.y,
+                            radius: Corners::default(),
+                        }
+                    } else {
+                        Clip::None
+                    },
+                });
+            }
         }
         moved
     }
@@ -1165,6 +1201,50 @@ mod tests {
                 bind: Bind::Set(Value::Vec2(v)),
             } if *id == menu.node() && *v == (Vector2 { x: 120.0, y: 40.0 })
         )));
+    }
+
+    /// A node carried along by its parent restates no offset of its own.
+    ///
+    /// `Solved::rect` is absolute, so one node moving changes it for every node below. Diffed
+    /// as a whole record, that re-states each descendant's offset — and `Prop::Offset` writes
+    /// both axes, so it takes back whatever a value writer put on `Prop::OffsetX`. A switch
+    /// left its knob in the middle of its track on the first window resize this way.
+    #[test]
+    fn a_node_carried_by_its_parent_restates_no_offset_of_its_own() {
+        let mut model = Model::new(root_style());
+        model.set_window(Vector2 { x: 400.0, y: 300.0 });
+        let root = model.root();
+        let spacer = model.group(root, None);
+        let carrier = model.group(root, Some(spacer.node()));
+        let rider = model.sprite(carrier, None);
+        model.style(spacer.node(), &box_style(10.0, 10.0));
+        model.style(carrier.node(), &box_style(40.0, 20.0));
+        model.style(rider.node(), &box_style(8.0, 8.0));
+
+        let mut patch = SinkPatch::new();
+        model.flush(&mut patch, env());
+        let before = model.solved(rider.node());
+
+        // The spacer widens, so everything after it slides.
+        model.style(spacer.node(), &box_style(30.0, 10.0));
+        model.flush(&mut patch, env());
+        let after = model.solved(rider.node());
+        assert_ne!(
+            after.rect.x0, before.rect.x0,
+            "the rider did not move at all"
+        );
+        assert_eq!(after.local, before.local, "it moved inside its parent too");
+        assert!(
+            !patch.ops().iter().any(|op| matches!(
+                op,
+                Op::Bind {
+                    id,
+                    prop: Prop::Offset,
+                    ..
+                } if *id == rider.node()
+            )),
+            "the rider restated an offset it did not change"
+        );
     }
 
     #[test]

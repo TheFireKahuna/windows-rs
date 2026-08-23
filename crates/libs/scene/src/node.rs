@@ -101,6 +101,12 @@ pub(crate) struct Painted {
     /// mask and paint read. A chain gone stale rebinds down exactly the path its first bind
     /// took.
     pub(crate) built_at: crate::cache::Gen,
+    /// The nine-grid insets a [`Mask::Box`] was realized with, in the raster's own pixels.
+    ///
+    /// A function of the box as well as the radius, so it is what a resize is checked
+    /// against: a box that crossed twice its own radius needs the mask rebuilt, and one that
+    /// merely moved does not. `(0.0, 0.0)` for every other mask.
+    pub(crate) insets: (f32, f32),
 }
 
 impl Painted {

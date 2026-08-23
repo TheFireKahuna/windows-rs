@@ -132,6 +132,8 @@ pub(crate) struct ValueRow {
     pub vertical: bool,
     /// The last fraction anybody published, whether the app's channel or the router's.
     pub fraction: f32,
+    /// Where the part sits at zero, in DIPs along its axis: the inset the track rests it at.
+    pub rest: f32,
     /// The travel it was last published against, so a solve that moved nothing emits
     /// nothing.
     pub travel: f32,
@@ -155,7 +157,7 @@ impl ValueRow {
     fn number(&self) -> f32 {
         match self.unit {
             crate::build::arena::Unit::Turn => crate::widget::angle_of(self.fraction),
-            _ => crate::widget::offset_of(self.fraction, self.travel, self.vertical),
+            _ => self.rest + crate::widget::offset_of(self.fraction, self.travel, self.vertical),
         }
     }
 }
@@ -742,11 +744,19 @@ impl Host {
             }
             let (node, track, vertical) = (value.node, value.track, value.vertical);
             let axis = |v: Vector2| if vertical { v.y } else { v.x };
-            let travel =
-                (axis(self.model.solved(track).size) - axis(self.model.solved(node).size)).max(0.0);
-            // Exact compare: `travel` is recomputed from the same two rects, so anything that
-            // moved at all is a different float and a tolerance would hide small real moves.
-            if travel == value.travel {
+            // The part is laid out at the start of the track, so the offset layout gave it is
+            // the track's own inset. A track is inset equally at both ends, so the room the
+            // part has is what is left once that inset is taken from each end and the part's
+            // own box from the middle. Measured against the track's outer box instead, a part
+            // at its maximum runs past the far inset by the width of the near one.
+            let rest = axis(self.model.solved(node).local);
+            let travel = (axis(self.model.solved(track).size)
+                - rest * 2.0
+                - axis(self.model.solved(node).size))
+            .max(0.0);
+            // Exact compare: both are recomputed from the same rects, so anything that moved
+            // at all is a different float and a tolerance would hide small real moves.
+            if (rest, travel) == (value.rest, value.travel) {
                 continue;
             }
             let (prop, fraction, control, front_driven) = (
@@ -756,6 +766,7 @@ impl Host {
                 value.front_driven,
             );
             if let Some(value) = self.values.get_mut(id) {
+                value.rest = rest;
                 value.travel = travel;
             }
             if !front_driven {
@@ -763,12 +774,13 @@ impl Host {
                     node,
                     prop,
                     crate::widget::Motion::Snap,
-                    crate::widget::offset_of(fraction, travel, vertical),
+                    rest + crate::widget::offset_of(fraction, travel, vertical),
                 );
             }
             if let Some(id) = control
                 && let Some(control) = self.control_mut(id)
             {
+                control.front.rest = rest;
                 control.front.travel = travel;
                 let front = control.front;
                 self.chrome.push(front);
@@ -955,6 +967,7 @@ impl Host {
                 hover: 0.0,
                 press: 0.0,
                 thumb: None,
+                rest: 0.0,
                 travel: 0.0,
                 drive: None,
                 fraction: 0.0,
@@ -1212,7 +1225,12 @@ impl Host {
 /// A part whose state carries no role keeps the colour it had: there is no paint that clears
 /// a sprite.
 fn paint(model: &mut Model, id: Option<SpriteId>, role: Option<Role>, scope: Scope) {
-    if let (Some(id), Some(role)) = (id, role) {
-        model.paint(id, Paint::Solid(crate::role::resolve(role, scope)));
-    }
+    let Some(id) = id else { return };
+    // A state whose row drops a part clears that part rather than leaving the previous
+    // state's paint on it. Reachable where one state supplies a fill and another does not —
+    // a ghost control that can be selected — and leaving it would make selection a latch.
+    let light = role.map_or(windows_color::Radiance::TRANSPARENT, |role| {
+        crate::role::resolve(role, scope)
+    });
+    model.paint(id, Paint::Solid(light));
 }

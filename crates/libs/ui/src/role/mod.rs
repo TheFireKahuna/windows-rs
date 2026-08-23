@@ -29,8 +29,8 @@ mod palette;
 pub(crate) mod tests;
 
 pub use palette::{
-    Palette, accent_wash, content_peak_nits, ink, install, installed, metric, resolve, typography,
-    veil,
+    Palette, accent_wash, content_peak_nits, data, ink, install, installed, metric, resolve,
+    typography, veil,
 };
 
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -258,11 +258,12 @@ pub enum Metric {
     /// no elevation, so a control on a card resolves at the card's own scope and one value
     /// answers both.
     RadiusSurface,
-    /// The radius of a fully rounded control.
+    /// The radius of a pill: a switch's track, a chip, a segment rail.
     ///
-    /// A real value in the scale, and a small one. A composition corner radius caps at half
-    /// the box, so a pill authored as a large sentinel renders a tall box as a football
-    /// rather than as a stadium.
+    /// A real value in the scale, and one a palette keeps **below half** the control's height
+    /// on purpose. A pill is a rounded rectangle with a flat top and bottom; at a half the two
+    /// corner arcs meet and it reads as an oval instead. A large sentinel meaning "as round as
+    /// possible" is the mistake this rung exists to prevent.
     RadiusPill,
     /// A control's row height, and the floor a touch target is inflated to.
     RowH,

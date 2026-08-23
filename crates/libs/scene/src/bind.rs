@@ -17,7 +17,7 @@ use crate::env::Env;
 use crate::node::{Node, Painted, Route, ShadowState, ShapeState};
 use crate::prop;
 use crate::res::Resources;
-use crate::sink::{Cap, GeomId, Join, Mask, Paint, Prop, SpriteId, StrokeStyle};
+use crate::sink::{Cap, Corners, GeomId, Join, Mask, Paint, Prop, SpriteId, StrokeStyle};
 use windows_color::{Radiance, Scrgb};
 use windows_composition::{
     BorderMode, Brush, Color, CompositionBrush, CompositionSurfaceBrush, StrokeCap, StrokeJoin,
@@ -77,7 +77,7 @@ impl Realizer<'_> {
         };
 
         let paint_brush = self.paint(node, &paint, glow)?;
-        let (mask_brush, route) = self.mask(node, &mask, dashes.as_slice())?;
+        let (mask_brush, route, insets) = self.mask(node, &mask, dashes.as_slice())?;
 
         // A shape leaving the clip route takes its clip with it, or it is masked twice by
         // itself and an outward stroke is cut in half along the fill's own outline.
@@ -123,30 +123,42 @@ impl Realizer<'_> {
             dashes,
             route,
             built_at: self.generation,
+            insets,
         });
         Ok(())
     }
 
-    /// Builds the alpha half of the chain, and reports the route it took.
+    /// Builds the alpha half of the chain, the route it took, and the nine-grid insets it
+    /// used.
+    ///
+    /// The insets are `(0.0, 0.0)` for every mask but a rounded box. They come back to the
+    /// caller rather than being written here because the caller replaces the whole `Painted`.
     fn mask(
         &mut self,
         node: &mut Node,
         mask: &Mask,
         dashes: &[f32],
-    ) -> Result<(Option<CompositionBrush>, Route)> {
+    ) -> Result<(Option<CompositionBrush>, Route, (f32, f32))> {
         match *mask {
             // No mask: the paint's own alpha is the shape.
-            Mask::None => Ok((None, Route::Clip)),
+            Mask::None => Ok((None, Route::Clip, NO_INSETS)),
 
             Mask::Box { radius } => {
-                let key = BoxKey::new(radius, self.env.scale());
-                let inset = key.inset_px() / self.env.scale();
+                // The profile is clamped against the box before the raster is cut, not after.
+                // A nine-grid does not clamp its own insets: where two opposite insets exceed
+                // the extent the corner slices overlap, and a pill comes out as a lens and a
+                // circle as a diamond. Trimming the *insets* instead leaves the raster's arc
+                // longer than the slice reading it, so the tail of the curve lands in the
+                // stretched middle and smears — same shape, different cause. Cutting a
+                // smaller profile is one more cache key and the corners stay exact.
+                let key = BoxKey::new(fit(radius, node.size(), self.env.scale()), self.env.scale());
+                let (inset, inset_scale) = nine_slice(&key, self.env.scale());
                 let Some(cell) =
                     self.cells
                         .boxes
                         .brush(self.back, self.env, self.generation, &key)?
                 else {
-                    return Ok((None, Route::Clip));
+                    return Ok((None, Route::Clip, NO_INSETS));
                 };
                 // Nine-slice, so one raster serves any width and height with exact corners.
                 // It reaches the mask slot as the base brush type, which is what that slot
@@ -154,22 +166,28 @@ impl Realizer<'_> {
                 let nine = self.back.compositor.create_nine_grid_brush();
                 nine.set_source(cell);
                 nine.set_insets(inset, inset, inset, inset);
-                Ok((Some(nine.as_brush()), Route::Clip))
+                nine.set_inset_scales(inset_scale);
+                Ok((Some(nine.as_brush()), Route::Clip, (inset, inset)))
             }
 
-            Mask::Run(run) => Ok((self.res.runs.value(run).map(Brush::as_brush), Route::Clip)),
+            Mask::Run(run) => Ok((
+                self.res.runs.value(run).map(Brush::as_brush),
+                Route::Clip,
+                NO_INSETS,
+            )),
 
             Mask::Shape { geom, stroke } => {
                 let clip_taken = node.clip.is_some();
                 match route(stroke, draws_on(node), clip_taken) {
                     Route::Clip => {
                         self.geometric_clip(node, geom);
-                        Ok((None, Route::Clip))
+                        Ok((None, Route::Clip, NO_INSETS))
                     }
                     Route::Capture => Ok((
                         self.shape_capture(node, geom, stroke, dashes)
                             .map(|b| b.as_brush()),
                         Route::Capture,
+                        NO_INSETS,
                     )),
                 }
             }
@@ -385,5 +403,151 @@ impl crate::Scene {
             cells: &mut self.cells,
         }
         .sprite(node, glow.as_ref())
+    }
+}
+
+/// The insets a mask that is not a rounded box realizes with.
+pub(crate) const NO_INSETS: (f32, f32) = (0.0, 0.0);
+
+/// Returns the nine-grid inset and inset scale that paint `key`'s raster one raster pixel to
+/// one physical pixel.
+///
+/// **The inset cuts the source**, so it is stated in the raster's own units, and the raster
+/// is allocated in physical pixels. A smaller number leaves the tail of the arc outside the
+/// corner slice, in the middle one, which stretches it across the box.
+///
+/// What the compositor paints is `inset × inset_scale` in the *visual's* units, and the
+/// visual hangs under a root carrying the display scale. At the default scale of one, a
+/// corner cut at `n` pixels is painted `n` DIPs — `n · scale` pixels — and a box shorter than
+/// twice that has its opposite corners overlap, which is a stadium whatever radius it asked
+/// for. `1 / scale` is what puts the corner back on the pixels it was drawn for.
+pub(crate) fn nine_slice(key: &BoxKey, scale: f32) -> (f32, f32) {
+    (key.inset_px(), 1.0 / scale)
+}
+
+/// Returns `radius` clamped to what a `size` box can carry, in DIPs.
+///
+/// A nine-grid does not clamp its own insets, and an inset covers the whole arc: the raster
+/// is two insets and the one flat pixel the middle slice stretches from. So a box has to
+/// hold `2·inset + 1` pixels on its shorter axis, and a profile that asks for more is cut
+/// down until it does. A fully round control is therefore always one pixel short of a
+/// semicircle, which is the flat pixel.
+///
+/// The cap is solved in pixels, because that is the grid the raster is cut on: a cap taken
+/// in DIPs is snapped back up to a whole pixel when the key is built, and a radius that
+/// rounds up past its own cap overlaps the opposite corner by one pixel — a notch, not a
+/// curve.
+///
+/// A box with no extent yet — what a sprite reads before its first size bind — keeps the
+/// profile it asked for: its size arrives in the same patch and rebuilds this.
+pub(crate) fn fit(radius: Corners, size: Vector2, scale: f32) -> Corners {
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return radius;
+    }
+    let scale = scale.max(1.0);
+    // Floored: a box covering a fraction of its last pixel cannot carry a profile cut for
+    // the whole one.
+    let extent = (size.x.min(size.y) * scale).floor();
+    let cap = ((extent - 1.0) * 0.5).floor().max(0.0) / scale;
+    Corners {
+        tl: radius.tl.min(cap),
+        tr: radius.tr.min(cap),
+        br: radius.br.min(cap),
+        bl: radius.bl.min(cap),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fit, nine_slice};
+    use crate::cache::BoxKey;
+    use crate::quant::snap_detail;
+    use crate::sink::Corners;
+    use windows_numerics::Vector2;
+
+    /// A rounded box's corner is cut whole and painted at the size it was drawn.
+    ///
+    /// Two numbers reach the nine-grid and each has its own failure. An inset short of the
+    /// arc leaves the tail of the curve in the middle slice, which stretches it across the
+    /// box and smears the edge. An inset scale that does not undo the display scale paints
+    /// the corner wider than the raster drew it, and a box under twice that comes out a
+    /// stadium. Neither shows up as an error, and both look like a radius that was ignored.
+    #[test]
+    fn a_nine_grid_corner_is_cut_whole_and_painted_at_the_size_it_was_drawn() {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for radius in [1.0_f32, 2.5, 6.0, 7.92, 11.0] {
+                let key = BoxKey::new(Corners::all(radius), scale);
+                let (inset, inset_scale) = nine_slice(&key, scale);
+                let arc = snap_detail(radius, scale) * scale;
+                assert!(
+                    inset >= arc,
+                    "{radius} at {scale}x: an inset of {inset} cuts inside an arc of {arc}"
+                );
+                // The corner covers `inset * inset_scale` DIPs, and the raster drew it
+                // `inset_px` pixels across.
+                let painted = inset * inset_scale * scale;
+                assert!(
+                    (painted - key.inset_px()).abs() < 1.0e-3,
+                    "{radius} at {scale}x: a corner drawn at {} px is painted at {painted}",
+                    key.inset_px()
+                );
+            }
+        }
+    }
+
+    /// A rounded box's profile never exceeds half the box it is cut for.
+    ///
+    /// The compositor does not clamp a nine-grid's insets: where two opposite insets exceed
+    /// the extent the corner slices overlap. A pill exactly twice its own radius tall — a
+    /// fully rounded control — comes out as a lens, and a circle as a diamond.
+    #[test]
+    fn a_rounded_profile_is_cut_to_fit_the_box_it_masks() {
+        let at = |x: f32, y: f32| Vector2 { x, y };
+        // What the box has to hold: two insets and the flat pixel between them, counted
+        // through the key that cuts the raster rather than through a second formula.
+        let fits = |r: f32, extent: f32, scale: f32| {
+            let inset = crate::cache::BoxKey::new(Corners::all(r), scale).inset_px();
+            inset * 2.0 + 1.0 <= (extent * scale).floor()
+        };
+
+        // Roomy: the profile is what it asked for.
+        assert_eq!(
+            fit(Corners::all(10.0), at(120.0, 40.0), 1.5),
+            Corners::all(10.0)
+        );
+        // A pill exactly twice its radius tall — a fully rounded control, and the case that
+        // rendered as a lens.
+        let pill = fit(Corners::all(11.0), at(37.4, 22.0), 1.5).tl;
+        assert!(fits(pill, 22.0, 1.5), "pill radius {pill} does not fit 22");
+        // A knob asking to be a circle in a box that is not square, which rendered with its
+        // corners cut into notches.
+        let knob = fit(Corners::all(7.7), at(13.333374, 15.333344), 1.5).tl;
+        assert!(
+            fits(knob, 13.333374, 1.5),
+            "knob radius {knob} does not fit 13.33"
+        );
+        // The cap is the *shorter* axis: a wide, short box rounds by its height.
+        assert!(fit(Corners::all(40.0), at(400.0, 20.0), 1.5).tl < 10.0);
+        // What a control asking to be fully round is left with: the cut costs it the one
+        // flat pixel the middle slice stretches, and never more.
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for extent in [15.0_f32, 20.0, 22.0, 13.333374] {
+                let cut = fit(Corners::all(extent), at(extent, extent), scale).tl;
+                assert!(
+                    fits(cut, extent, scale),
+                    "{extent} at {scale}x cut to {cut}"
+                );
+                let short = (extent * scale).floor();
+                assert!(
+                    cut * scale >= (short - 1.0) * 0.5 - 0.5,
+                    "{extent} at {scale}x was cut to {cut}, well under half its box"
+                );
+            }
+        }
+        // A box with no extent yet keeps its profile: the size arrives in the same patch.
+        assert_eq!(
+            fit(Corners::all(11.0), at(0.0, 0.0), 1.5),
+            Corners::all(11.0)
+        );
     }
 }

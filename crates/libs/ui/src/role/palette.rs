@@ -141,6 +141,20 @@ pub fn content_peak_nits() -> f32 {
     current().content_peak_nits()
 }
 
+/// Returns the light a chromatic role resolves to.
+///
+/// No [`Scope`]: a data role is chromatic and shared between polarities, so it is the one
+/// role that resolves the same everywhere. That is what lets a gradient be minted where there
+/// is no scope to resolve against — a resource, rather than a sprite inside a tree.
+///
+/// # Panics
+///
+/// If no palette has been installed.
+#[must_use]
+pub fn data(role: DataRole) -> Radiance {
+    current().data(role)
+}
+
 // ── washes: derived, never stored ───────────────────────────────────────────────
 //
 // A hairline, a scrim and a hover tint are one resolved colour at a fraction of opacity.

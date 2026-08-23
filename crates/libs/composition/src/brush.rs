@@ -47,11 +47,27 @@ impl Brush for CompositionColorBrush {
 pub struct CompositionNineGridBrush(pub(crate) bindings::CompositionNineGridBrush);
 
 impl CompositionNineGridBrush {
-    /// Sets the left, top, right, and bottom inset widths, in DIPs.
+    /// Sets the left, top, right, and bottom inset widths, **in the source surface's own
+    /// pixels**.
+    ///
+    /// The inset cuts the *source*, so it is measured where the source's content is: a
+    /// surface brush's pixels. What the same inset covers on the painted visual is that
+    /// value times the matching [inset scale](Self::set_inset_scales), so a source cut in
+    /// physical pixels and painted onto a visual in DIPs needs a scale to agree.
     pub fn set_insets(&self, left: f32, top: f32, right: f32, bottom: f32) {
         self.0
             .SetInsetsWithValues(left, top, right, bottom)
             .unwrap();
+    }
+
+    /// Sets the factor carrying every inset from the source's space into the painted
+    /// visual's, on all four edges. Defaults to `1.0`.
+    ///
+    /// A visual under a DIP-space root is scaled by the display factor, so a corner cut at
+    /// `n` source pixels is painted `n` DIPs wide and comes out `n * scale` pixels across.
+    /// A scale of `1 / scale` is what renders the source's pixels one for one.
+    pub fn set_inset_scales(&self, scale: f32) {
+        self.0.SetInsetScales(scale).unwrap();
     }
 
     /// Sets whether the center of the grid is left unpainted (hollow).

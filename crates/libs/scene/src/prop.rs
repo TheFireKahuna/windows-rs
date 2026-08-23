@@ -182,6 +182,24 @@ pub(crate) fn set_held(node: &mut Node, group: u8, state: Held) {
     node.state = (node.state & !(0b11 << shift)) | ((state as u64) << shift);
 }
 
+/// Stops every animation whose channels overlap the ones `d` names.
+///
+/// A group holds a composite name and its per-channel names — `Offset`, `Offset.X`,
+/// `Offset.Y` — and the compositor treats each as a target of its own: an animation left on
+/// `Offset.X` keeps that channel while a stop aimed at `Offset` reaches the other. Two
+/// disjoint channels are left alone, so a spring on one axis survives a write to the other.
+fn stop_overlapping(node: &Node, d: &PropDesc) {
+    let Some(object) = animatable(node, d.owner) else {
+        return;
+    };
+    let end = d.chan + d.span;
+    for row in &PROPS {
+        if row.group == d.group && row.chan < end && d.chan < row.chan + row.span {
+            object.stop(row.path);
+        }
+    }
+}
+
 /// Starts `animation` on the channel `d` names and records the state the channel enters.
 ///
 /// `held` is [`Held::Playing`] for a one-shot animation, or [`Held::Bound`] for a tracker
@@ -191,6 +209,9 @@ pub(crate) fn start(node: &mut Node, d: &PropDesc, animation: &CompositionAnimat
     let Some(object) = animatable(node, d.owner) else {
         return;
     };
+    // The channels this animation is about to own may already be driven under another of the
+    // group's names, and the compositor would keep both.
+    stop_overlapping(node, d);
     object.start(d.path, animation);
     set_held(node, d.group, held);
 }
@@ -231,11 +252,7 @@ pub(crate) fn set(node: &mut Node, prop: Prop, value: Value) -> bool {
         // What the compositor reached is not knowable, so an equal-valued set must write.
         Held::Stale => {}
         // The animation would keep writing after this set, so it is stopped first.
-        Held::Playing => {
-            if let Some(object) = animatable(node, d.owner) {
-                object.stop(d.path);
-            }
-        }
+        Held::Playing => stop_overlapping(node, d),
     }
     if !write_shadow(node, d, value) {
         return false;

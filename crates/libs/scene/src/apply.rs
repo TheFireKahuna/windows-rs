@@ -302,6 +302,7 @@ impl Scene {
             // Behind any generation that has ever moved, so a sprite declared before its
             // first realization cannot be mistaken for a fresh one.
             built_at: Gen::default(),
+            insets: (0.0, 0.0),
         });
         if let Some((mask, dashes)) = mask {
             painted.mask = mask;
@@ -574,7 +575,7 @@ impl Scene {
                     .get_mut(id)
                     .is_some_and(|node| prop::set(node, prop, value));
                 if written {
-                    self.resize_captures(id, prop, env);
+                    self.resize_captures(id, prop, back, env);
                 }
                 self.census.count(written);
             }
@@ -599,7 +600,7 @@ impl Scene {
     ///
     /// Only a size change can invalidate a capture, so `prop` is tested first: a move, an
     /// opacity and a rotation land through the same setter and none of them moves the region.
-    fn resize_captures(&mut self, id: NodeId, prop: Prop, env: Env) {
+    fn resize_captures(&mut self, id: NodeId, prop: Prop, back: &Backends, env: Env) {
         if !matches!(prop, Prop::Size | Prop::SizeX | Prop::SizeY) {
             return;
         }
@@ -614,6 +615,37 @@ impl Scene {
         if let Some(shadow) = node.shadow.as_ref() {
             shadow.captured.resize(size, scale);
         }
+        self.reclamp_box_mask(id, back, env);
+    }
+
+    /// Rebuilds a rounded-box mask whose nine-grid insets the new box has changed.
+    ///
+    /// The insets are clamped against the extent, so a box that crossed twice its own radius
+    /// needs a different brush. Gated on the clamp actually moving, because every node's size
+    /// is re-bound on every solve and rebuilding the chain there would put a brush rebuild on
+    /// the resize path for every rounded surface in the tree.
+    fn reclamp_box_mask(&mut self, id: NodeId, back: &Backends, env: Env) {
+        let Some(node) = self.nodes.get(id) else {
+            return;
+        };
+        let Some(painted) = node.painted.as_ref() else {
+            return;
+        };
+        let Mask::Box { radius } = painted.mask else {
+            return;
+        };
+        let inset = crate::cache::BoxKey::new(
+            crate::bind::fit(radius, node.size(), env.scale()),
+            env.scale(),
+        )
+        .inset_px()
+            / env.scale();
+        if (inset, inset) == painted.insets {
+            return;
+        }
+        // The declaration is unchanged, so this re-realizes the chain the node already holds
+        // rather than declaring a new one.
+        let _ = self.rebind(SpriteId(id), back, env);
     }
 
     fn animate(&mut self, id: NodeId, prop: Prop, anim: Anim, patch: &SinkPatch, back: &Backends) {

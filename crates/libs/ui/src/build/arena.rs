@@ -26,7 +26,7 @@ use crate::layout::{Len, Over, Preset, Rule};
 use crate::role::{Elevation, Role, Text, TypeRole};
 use crate::widget::{Chrome, Flow, Interaction, Motion, StatePolicy, TextSource, UiaRole};
 use std::cell::RefCell;
-use windows_scene::{Bounds, Exit, GeomId, HitFlags, Prop, Value};
+use windows_scene::{Bounds, Exit, GeomId, HitFlags, Prop, RampId, Value};
 
 /// The end of a chain, and the absence of a slot.
 pub(crate) const NIL: u32 = u32::MAX;
@@ -191,10 +191,24 @@ pub(crate) struct HitSeed {
 pub(crate) struct SpriteSeed {
     pub mask: MaskSeed,
     pub role: Role,
+    /// How much of the resolved role this sprite paints, as an alpha in `0.0..=1.0`.
+    ///
+    /// A plate under text of the same hue is that hue at a fraction of it; a role resolves to
+    /// one value, so the fraction is the sprite's and not the palette's. Every sprite the
+    /// chrome table expands to carries [`FULL`].
+    pub strength: f32,
+    /// The gradient this sprite paints, if it paints one.
+    ///
+    /// `Some` replaces the role: a ramp carries its own stops, each already resolved, so the
+    /// role and the strength beside it say nothing about what is drawn.
+    pub ramp: Option<RampId>,
     /// Which interaction slot this sprite's colour re-resolves through.
     pub part: Part,
     pub next: u32,
 }
+
+/// A sprite that paints its role as resolved. What everything but a plate carries.
+pub(crate) const FULL: f32 = 1.0;
 
 /// Which of a control's parts a sprite is, so interaction can re-resolve exactly the ones
 /// that change and leave the rest alone.
