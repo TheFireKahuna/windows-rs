@@ -26,7 +26,7 @@ use crate::layout::{Len, Over, Preset, Rule};
 use crate::role::{Elevation, Role, Text, TypeRole};
 use crate::widget::{Chrome, Flow, Interaction, Motion, StatePolicy, TextSource, UiaRole};
 use std::cell::RefCell;
-use windows_scene::{Bounds, Exit, GeomId, HitFlags, Prop, RampId, Value};
+use windows_scene::{Bounds, Exit, GeomId, HitFlags, Prop, RampId, RegionId, Value};
 
 /// The end of a chain, and the absence of a slot.
 pub(crate) const NIL: u32 = u32::MAX;
@@ -107,6 +107,9 @@ pub(crate) struct Slot {
     /// A scroll container. The tracker is minted at mount, because only then is there a
     /// group for it to be sourced from.
     pub scroll: Option<crate::layout::ScrollDecl>,
+    /// A presentation region, as an index into [`Build::regions`]. Out of line because a
+    /// renderer's builder is a boxed closure and this slot is `Copy`.
+    pub region: Option<u32>,
     /// The automation-id segment. `&'static str`, so nothing is built at mount.
     pub key: Option<&'static str>,
     pub name: Option<&'static str>,
@@ -161,6 +164,7 @@ impl Default for Slot {
             elevate: None,
             responsive: None,
             scroll: None,
+            region: None,
             key: None,
             name: None,
             caption: None,
@@ -202,6 +206,13 @@ pub(crate) struct SpriteSeed {
     /// `Some` replaces the role: a ramp carries its own stops, each already resolved, so the
     /// role and the strength beside it say nothing about what is drawn.
     pub ramp: Option<RampId>,
+    /// The presented buffer this sprite paints, if it paints one.
+    ///
+    /// `Some` replaces both the role and the ramp: the pixels are the present thread's and
+    /// nothing on this side says what is in them. At most one of the two is ever set — a
+    /// ramp is minted by a modifier and a region by its own seed, and neither reaches the
+    /// other's node.
+    pub region: Option<RegionId>,
     /// Which interaction slot this sprite's colour re-resolves through.
     pub part: Part,
     pub next: u32,
@@ -369,6 +380,8 @@ pub(crate) struct Build {
     pub acts: Vec<ActSeed>,
     pub texts: Vec<TextSeed>,
     pub adapters: Vec<Adapter>,
+    /// Presentation regions, out of line. See [`Slot::region`].
+    pub regions: Vec<crate::present::RegionSeed>,
     /// Gesture declarations, out of line. See [`Slot::gesture`].
     pub gestures: Vec<GestureDecl>,
 }
@@ -406,6 +419,10 @@ impl Build {
         self.acts.clear();
         self.texts.clear();
         self.adapters.clear();
+        // Drops the renderer builder of any region whose chain was built and then discarded,
+        // which is what keeps a losing `switch` arm from leaving one registered for a node
+        // that never mounted.
+        self.regions.clear();
         self.gestures.clear();
     }
 
@@ -523,6 +540,12 @@ impl Build {
     pub(crate) fn push_adapter(&mut self, adapter: Adapter) -> u32 {
         let at = self.adapters.len() as u32;
         self.adapters.push(adapter);
+        at
+    }
+
+    pub(crate) fn push_region(&mut self, region: crate::present::RegionSeed) -> u32 {
+        let at = self.regions.len() as u32;
+        self.regions.push(region);
         at
     }
 

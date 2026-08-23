@@ -111,6 +111,11 @@ impl Frame {
             Host::with(Host::reemit_text);
         }
 
+        // ⓪′ what the present thread reported. Before the flush, so a region binds in the
+        // tick its handle arrived in: the flush below can unmount it, and binding a brush
+        // over a handle that is already closing is what the ordering rules out.
+        crate::present::bind(&mut scene, &self.backends, env)?;
+
         // ① everything the writes since the last tick implied, ② the structure and geometry
         // that fell out of it, ③ the composition writes that realize it.
         signal::flush();
@@ -169,6 +174,11 @@ impl Frame {
         };
         self.controls
             .tick(&self.reports, &mut front, &mut self.intents)?;
+        // Beside the front table rather than after the application: a region's pixels are
+        // published by writing its input and bumping its epoch, so this *is* the visual for
+        // a contact inside one, and the intent it queues is told to the application in the
+        // same batch as every other control's.
+        crate::present::pick(&self.reports, front.scene.hits(), &mut self.intents);
         // The thumb's reveal and a thumb being dragged, against the array the patch above
         // published — so a grab resolves on this frame's geometry rather than the last's.
         layout::scroll_front(&self.events, &self.reports, &mut front)?;

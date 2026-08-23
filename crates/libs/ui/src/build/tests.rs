@@ -3677,3 +3677,226 @@ fn a_toggles_track_keeps_its_box_among_siblings() {
         "the track is {bare:?} alone and {among:?} among siblings"
     );
 }
+
+/// A region paints its buffer and never a colour.
+///
+/// The sprite carries a role, because a seed states one, but that role must not reach the
+/// paint: a region whose sprite resolved to a solid would cover its own buffer with the
+/// surface fill and read as a flat rectangle — the same symptom as a renderer that never
+/// bound, and indistinguishable from it on screen.
+#[test]
+fn a_region_paints_its_buffer_rather_than_its_role() {
+    let mut patch = fixture();
+    let live = crate::present::Live::new().expect("the epoch's wake event");
+    let _mount = mount(
+        crate::present::region(windows_present::Queue::Solo, &live, |_| {
+            unreachable!("no present thread is installed in a fixture, so nothing builds")
+        })
+        .grow(),
+        root(),
+    );
+    flush(&mut patch);
+
+    let presented = patch
+        .ops()
+        .iter()
+        .filter(|op| {
+            matches!(
+                op,
+                Op::Paint {
+                    paint: Paint::Presented(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(presented, 1, "the region is one sprite painting its buffer");
+}
+
+/// A region with no box stays pending rather than allocating buffers against zero.
+///
+/// A node solves to no area before its first real solve, and inside anything the layout has
+/// collapsed. Buffers taken from that box would be one texel across for the life of the
+/// window, and nothing afterwards resizes them: the extent is only re-sent when it *moves*,
+/// and a region mounted at zero has already recorded zero as sent. So the flush that gives
+/// the node a box has to be the flush that mounts it.
+#[test]
+fn a_region_with_no_box_defers_its_buffers_until_it_has_one() {
+    let mut patch = fixture();
+    let live = crate::present::Live::new().expect("the epoch's wake event");
+    // Collapsed before the mount, so the first solve is the one with no area to give.
+    Host::with(|h| h.set_window(Vector2 { x: 0.0, y: 0.0 }));
+    let _mount = mount(
+        crate::present::region(windows_present::Queue::Solo, &live, |_| {
+            unreachable!("no present thread is installed in a fixture, so nothing builds")
+        })
+        .grow(),
+        root(),
+    );
+    flush(&mut patch);
+    assert_eq!(
+        Host::with(|h| crate::present::tests::census(h)),
+        (1, 1),
+        "the region is declared, and with no box it has not been mounted"
+    );
+
+    Host::with(|h| h.set_window(Vector2 { x: 800.0, y: 600.0 }));
+    flush(&mut patch);
+    assert_eq!(
+        Host::with(|h| crate::present::tests::census(h)),
+        (1, 0),
+        "the flush that gives the region a box is the flush that mounts it"
+    );
+}
+
+/// A contact inside a region resolves to a part, and the renderer is told directly.
+///
+/// The whole point of the path: the decision is written into the region's own input and its
+/// epoch is bumped on this thread, so the next present carries the new pixels without the
+/// application thread being involved at all.
+///
+/// The region is inset, and the part rects are narrow enough that the client point lands on
+/// no part unless the region's origin is subtracted first. A pick that skipped that step
+/// would resolve to nothing here rather than to the wrong part, which is the failure a
+/// wider fixture would hide.
+#[test]
+fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
+    use windows_present::{Part, Rect, SubId};
+
+    let mut patch = fixture();
+    let live = crate::present::Live::new().expect("the epoch\'s wake event");
+    let inset = crate::role::metric(Metric::SpaceLg, Host::with(|h| h.root_scope));
+    let _mount = mount(
+        stack(
+            crate::present::region(windows_present::Queue::Solo, &live, |_| {
+                unreachable!("no present thread is installed in a fixture")
+            })
+            .grow()
+            .erase(),
+        )
+        .padding(Metric::SpaceLg)
+        .grow(),
+        root(),
+    );
+    flush(&mut patch);
+
+    let mut hits = windows_scene::HitTable::default();
+    hits.replace(patch.hit_entries());
+    let id = Host::with(|h| crate::present::tests::control(h)).expect("the region is a control");
+
+    // Region-local, and deliberately narrow: at ten DIPs across, a point resolved in client
+    // space misses both.
+    live.parts.publish(&[
+        Part {
+            id: SubId(0),
+            rect: Rect::new(0.0, 0.0, 10.0, 40.0),
+        },
+        Part {
+            id: SubId(1),
+            rect: Rect::new(10.0, 0.0, 20.0, 40.0),
+        },
+    ]);
+
+    let mut intents = Vec::new();
+    let at = windows_scene::Point {
+        x: inset + 15.0,
+        y: inset + 5.0,
+    };
+    crate::present::pick(
+        &[crate::input::Report::HoverChanged {
+            from: None,
+            to: Some(id),
+            at,
+            qpc: 0,
+        }],
+        &hits,
+        &mut intents,
+    );
+    assert_eq!(
+        live.input.hover(),
+        Some(SubId(1)),
+        "the point is in the second part, once the region\'s own origin is taken off"
+    );
+    assert_eq!(
+        live.input.cursor(),
+        Some((15.0, 5.0)),
+        "the cursor is published in the region\'s own DIPs"
+    );
+    assert!(
+        intents.is_empty(),
+        "a hover changes pixels and no document, so nothing is queued for the application"
+    );
+
+    // Leaving clears both. A readout drawn at the last position the pointer held while it is
+    // elsewhere states a measurement nobody is taking.
+    crate::present::pick(
+        &[crate::input::Report::HoverChanged {
+            from: Some(id),
+            to: None,
+            at,
+            qpc: 0,
+        }],
+        &hits,
+        &mut intents,
+    );
+    assert_eq!(live.input.hover(), None);
+    assert_eq!(live.input.cursor(), None);
+}
+
+/// A gesture that finishes inside a region clears the active part and tells the application
+/// which part it finished on.
+///
+/// Two separate obligations. The renderer learns immediately, through the input, so its next
+/// frame stops drawing the part as held; the application learns through the ordinary intent
+/// queue, on its own schedule, because the document edit is its business and not the frame
+/// clock\'s.
+#[test]
+fn a_release_inside_a_region_clears_the_gesture_and_queues_one_intent() {
+    use windows_present::{Part, Rect, SubId};
+
+    let mut patch = fixture();
+    let live = crate::present::Live::new().expect("the epoch\'s wake event");
+    let _mount = mount(
+        crate::present::region(windows_present::Queue::Solo, &live, |_| {
+            unreachable!("no present thread is installed in a fixture")
+        })
+        .grow()
+        .erase(),
+        root(),
+    );
+    flush(&mut patch);
+
+    let mut hits = windows_scene::HitTable::default();
+    hits.replace(patch.hit_entries());
+    let id = Host::with(|h| crate::present::tests::control(h)).expect("the region is a control");
+    live.parts.publish(&[Part {
+        id: SubId(3),
+        rect: Rect::new(0.0, 0.0, 100.0, 100.0),
+    }]);
+
+    let mut intents = Vec::new();
+    crate::present::pick(
+        &[crate::input::Report::Released {
+            target: id,
+            contact: 0,
+            at: windows_scene::Point { x: 50.0, y: 50.0 },
+        }],
+        &hits,
+        &mut intents,
+    );
+    assert_eq!(
+        live.input.active(),
+        None,
+        "the gesture is over, so nothing is held"
+    );
+    assert_eq!(
+        intents.len(),
+        1,
+        "the application is told once, after the pixels were committed to"
+    );
+    assert_eq!(
+        intents[0].what,
+        crate::widget::What::Committed(3.0),
+        "the intent names the part the gesture finished on"
+    );
+}

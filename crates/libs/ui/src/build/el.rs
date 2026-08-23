@@ -26,6 +26,10 @@ pub struct Any;
 /// A geometry sprite. Owns `fill` / `stroke` / `ink` / `trim`.
 #[derive(Copy, Clone, Debug)]
 pub struct Path;
+/// A presentation region: one sprite painting a buffer the present thread draws. Owns
+/// `radius`, and no colour method at all — nothing on this side says what is in the pixels.
+#[derive(Copy, Clone, Debug)]
+pub struct Region;
 /// A widget reading the button role table. Owns the variant methods.
 ///
 /// The kind restricts those methods to elements whose chrome row comes from the button
@@ -135,6 +139,7 @@ impl<K> El<K> {
                     role,
                     strength,
                     ramp: None,
+                    region: None,
                     part,
                     next: super::arena::NIL,
                 },
@@ -299,6 +304,7 @@ impl<K> El<K> {
                     role: Role::Fill(Fill::Surface),
                     strength: super::arena::FULL,
                     ramp: Some(id),
+                    region: None,
                     part: Part::Static,
                     next: super::arena::NIL,
                 },
@@ -325,6 +331,23 @@ impl<K> El<K> {
     /// Names the geometry this node's shape sprites draw.
     pub(crate) fn geom(self, geom: GeomId) -> Self {
         self.slot_mut(|s| s.geom = Some(geom))
+    }
+
+    /// Re-rounds the region sprite this node already carries.
+    ///
+    /// The sprite is the node's only one, so the mask is rewritten in place rather than a
+    /// second one added over it: two boxes at different radii leave the wider one's corners
+    /// showing behind the narrower one's.
+    pub(crate) fn region_radius(self, radius: Len) -> Self {
+        Build::with(|b| {
+            let head = b.nodes[self.at as usize].seeds.head;
+            if head != super::arena::NIL {
+                b.seeds[head as usize].mask = MaskSeed::Box {
+                    radius: Some(radius),
+                };
+            }
+        });
+        self
     }
 
     /// Sets the height to `n` of the row height `row` names, both re-read on every restyle.
@@ -966,6 +989,23 @@ impl<K> El<K> {
         self.slot_mut(|s| s.probe = Some(probe.cell()))
     }
 
+    /// Takes this node out of flow and covers its container's box with it.
+    ///
+    /// The one way an author states "under everything else here": the covering node paints
+    /// first because it is declared first, and the siblings after it are laid out over it as
+    /// though it were not there. What a presentation region takes, so the chrome its own
+    /// region owns sits over its pixels rather than beside them.
+    ///
+    /// Absolute at inset zero, which is exactly the pair the chrome sprites already use.
+    /// `border` is never set on a style this crate produces, so the container's padding box
+    /// is its border box and a zero inset covers the node rather than the space inside its
+    /// padding — a covering child therefore ignores the padding that insets its siblings,
+    /// which is the point of it.
+    #[must_use]
+    pub fn cover(self) -> Self {
+        self.over(Over::Absolute).over(Over::Inset(Len::Zero))
+    }
+
     /// Opts this node out of touch inflation, for a dense field of targets where inflating
     /// past the drawn rect makes two neighbours both claim one point.
     ///
@@ -996,6 +1036,49 @@ impl El<Any> {
         Self::seed(Preset::Bare)
             .scrolls(decl)
             .contain(Preset::Scroll, content)
+    }
+}
+
+impl El<Region> {
+    /// Seeds a presentation region: the node that carries the declaration, and the one
+    /// sprite that paints its buffer.
+    ///
+    /// The sprite is minted here rather than by a modifier, because a region with no sprite
+    /// is a hole in the layout that draws nothing and reports no error. The role it carries
+    /// is never resolved — a presented paint replaces it — and is stated only so the seed is
+    /// meaningful to read.
+    pub(crate) fn region_seed(seed: crate::present::RegionSeed) -> Self {
+        let sink = seed.sink;
+        let at = Build::with(|b| b.push_region(seed));
+        Self::seed(crate::present::PRESET)
+            .slot_mut(|s| s.region = Some(at))
+            // One hit entry for the whole region, declared like any control's, so capture,
+            // cancel, the recogniser pool and inertia are unchanged and only *which part* of
+            // it a contact landed on is new. `Graph` because what is inside is data a client
+            // reads rather than a container it walks.
+            .hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, UiaRole::Graph)
+            .region_sprite(sink)
+    }
+
+    fn region_sprite(self, sink: windows_scene::RegionId) -> Self {
+        Build::with(|b| {
+            b.push_seed(
+                self.at,
+                SpriteSeed {
+                    mask: MaskSeed::Box { radius: None },
+                    role: Role::Fill(Fill::Surface),
+                    strength: super::arena::FULL,
+                    ramp: None,
+                    region: Some(sink),
+                    // Not interaction-sensitive: a region's pixels are the present thread's,
+                    // and a hover inside one is picked against its parts rather than by
+                    // re-resolving a colour here.
+                    part: Part::Static,
+                    next: super::arena::NIL,
+                },
+            );
+        });
+        self
     }
 }
 

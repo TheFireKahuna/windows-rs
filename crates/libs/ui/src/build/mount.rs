@@ -50,6 +50,12 @@ pub fn set_geometry(id: GeomId, verbs: &[PathVerb]) {
     Host::with(|h| h.model().set_geometry(id, verbs));
 }
 
+/// Mints the sink a presentation region's sprite paints. The buffer arrives out of band,
+/// from the present thread, so the slot exists before anything fills it.
+pub(crate) fn region_sink() -> windows_scene::RegionId {
+    Host::with(|h| h.model().region())
+}
+
 /// One stop of a gradient: where it sits, in which role, and how much of that role.
 ///
 /// A [`DataRole`] and not a [`Role`](crate::role::Role), because a gradient is a resource
@@ -371,6 +377,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             values: ValueId::NONE,
             scroll: None,
             probe: None,
+            region: None,
         });
         if let Some(cell) = slot.probe {
             h.mint_probe(row, crate::layout::ProbeRow { node, cell });
@@ -461,6 +468,36 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         let group = group.expect("a scroll container is a group");
         let content = previous.expect("a scroll container has a content group");
         mount_scroll(group, content, decl, inner, row);
+    }
+
+    // After the sprite that paints it exists, so a region is never registered for a node the
+    // walk went on to fail to give one. Taken out of the arena, so the builder reaches the
+    // present thread exactly once.
+    if let Some(at) = slot.region
+        && let Some(build) = b.regions[at as usize].build.take()
+    {
+        let seed = &b.regions[at as usize];
+        let (sink, key, queue, live) = (seed.sink, seed.key, seed.queue, seed.live.clone());
+        Host::with(|h| {
+            // After `mount_control` above, so the row already names the control the region's
+            // hit entry minted — which is the id every pointer report about this region
+            // carries, and the only handle the picking path has to find it by.
+            let control = h.mounts.get(row).and_then(|row| row.control);
+            h.mint_region(
+                row,
+                crate::present::RegionRow {
+                    node,
+                    sink,
+                    key,
+                    queue,
+                    live,
+                    control,
+                    picked: crate::present::Picked::new(),
+                    build: Some(build),
+                    extent: None,
+                },
+            );
+        });
     }
 
     if let Some(bounds) = slot.responsive {
@@ -563,6 +600,7 @@ fn chrome_seeds(
                 role,
                 strength,
                 ramp: None,
+                region: None,
                 part: Part::Border,
                 next: NIL,
             },
@@ -585,6 +623,7 @@ fn chrome_seeds(
                 role,
                 strength,
                 ramp: None,
+                region: None,
                 part: Part::Fill,
                 next: NIL,
             },
@@ -634,8 +673,14 @@ fn emit_sprite(
     // The strength scales the role's own alpha rather than replacing it: a hairline resolves
     // to a wash already, and a sprite at full strength must leave that wash where it is.
     let light = resolved.with_alpha(resolved.a * seed.strength);
-    // A ramp carries its own stops, resolved where it was minted, so nothing above is read.
-    let paint = seed.ramp.map_or(Paint::Solid(light), Paint::Ramp);
+    // A ramp carries its own stops, resolved where it was minted, and a region's pixels are
+    // the present thread's, so neither reads the value resolved above. The region is tested
+    // first because it is the stronger claim: its buffer replaces everything this side could
+    // paint, where a ramp still describes colour.
+    let paint = match (seed.region, seed.ramp) {
+        (Some(region), _) => Paint::Presented(region),
+        (None, ramp) => ramp.map_or(Paint::Solid(light), Paint::Ramp),
+    };
     // One borrow: the stroke resource, the mask and the paint are three model calls about
     // one sprite, and the walk takes this borrow once per sprite already.
     Host::with(|h| {

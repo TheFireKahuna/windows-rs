@@ -47,6 +47,12 @@ pub mod caption;
 #[deny(unsafe_code)]
 pub mod driver;
 
+// Presentation regions: the one per-frame path, declared as a node. The buffers, the thread
+// and the renderer trait belong to `windows-present` and the brush to `windows-scene`; what
+// is here is the declaration and the lifecycle that follows the node. Binding a surface
+// handle is raw, which is why this is not under the driver's `deny(unsafe_code)`.
+pub mod present;
+
 // Flyouts, popups, menus and tooltips: positioned against an anchor rather than by a
 // parent's layout, drawn above everything, and dismissed on a defined trigger. Each
 // mechanism belongs to a layer below — a detached root in `windows-scene`, a blocker entry

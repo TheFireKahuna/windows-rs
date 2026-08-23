@@ -203,6 +203,17 @@ impl Ui {
             backdrop,
         )?));
         let router = crate::input::Router::new(&bell, &window, pacer.wake())?;
+        // After the scene, because a binding it delivers is applied to that scene, and before
+        // the mount, because a shell that declares a region on its first build has to find a
+        // present thread to mount it on. The visibility watch is what stops the loop drawing
+        // and presenting into a window nobody can see; without it the thread has no way to
+        // learn the window was minimized.
+        crate::present::install(
+            windows_present::Tuning::default(),
+            output_of(&window).ok_or_else(closed)?,
+            window.watch().ok(),
+            pacer.wake(),
+        )?;
 
         let mut model = Model::new(crate::layout::root());
         model.set_window(client_dips(&window).ok_or_else(closed)?);
@@ -234,8 +245,8 @@ impl Ui {
             move |state| nonclient.post(state)
         });
 
-        // Held for the life of the process: dropping it unmounts the tree.
-        let _mounted = mount(root);
+        // Held until the pump returns: dropping it unmounts the tree.
+        let mounted = mount(root);
 
         // `Cell::set` marks the graph and returns; nothing schedules a frame on its own,
         // since the pump is blocked and the pacer is parked unless something has asked for
@@ -277,6 +288,14 @@ impl Ui {
         // `WM_FRAME`, an input contact, a system question about the window. Nothing here
         // polls, and an idle window costs no wakes at all.
         windows_window::run();
+
+        // Explicit and in this order. The unmount walk asks the present thread to destroy
+        // every region, and each destruction releases a surface handle the scene is still
+        // binding — so the tree comes down first, and only then is the thread stopped. Left
+        // to drop order, the locals here would go the other way round and the thread would
+        // be joined with regions still mounted on it.
+        drop(mounted);
+        crate::present::uninstall();
 
         match failed.borrow_mut().take() {
             Some(error) => Err(error),
@@ -346,8 +365,17 @@ fn client_dips(window: &Window) -> Option<Vector2> {
 /// DIP laid out against it and every colour transformed through it would be wrong in a way
 /// nothing downstream can detect.
 pub(crate) fn env_of(window: &Window) -> Option<Env> {
-    Some(Env::new(
-        window.metrics()?.dpi as f32,
-        OutputTransform::for_display(window.color_capability()?, crate::role::content_peak_nits()),
+    Some(Env::new(window.metrics()?.dpi as f32, output_of(window)?))
+}
+
+/// Returns the transform that carries authored light to the display the window is on.
+///
+/// Split out because the present thread takes one directly: a region draws through the same
+/// transform the retained side does, and reaching it from an [`Env`] would mean the number
+/// travelling through a type that also carries a DPI the present thread has no use for.
+pub(crate) fn output_of(window: &Window) -> Option<OutputTransform> {
+    Some(OutputTransform::for_display(
+        window.color_capability()?,
+        crate::role::content_peak_nits(),
     ))
 }

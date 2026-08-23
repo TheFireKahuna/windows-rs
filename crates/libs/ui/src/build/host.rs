@@ -35,11 +35,17 @@ pub(crate) struct Value;
 pub(crate) struct Scroll;
 #[derive(Debug)]
 pub(crate) struct Probe;
+/// Names the family of presentation-region rows. `Present` and not `Region`, because
+/// [`RegionId`](windows_scene::RegionId) already names the *sink* a region paints and one
+/// name for the row and the resource would read as one identity.
+#[derive(Debug)]
+pub(crate) struct Present;
 
 pub(crate) type MountId = Id<Mount>;
 pub(crate) type ValueId = Id<Value>;
 pub(crate) type ScrollId = Id<Scroll>;
 pub(crate) type ProbeId = Id<Probe>;
+pub(crate) type PresentId = Id<Present>;
 
 /// Records one mounted node and every table row it has to release.
 pub(crate) struct MountRow {
@@ -61,6 +67,7 @@ pub(crate) struct MountRow {
     pub values: ValueId,
     pub scroll: Option<ScrollId>,
     pub probe: Option<ProbeId>,
+    pub region: Option<PresentId>,
 }
 
 /// Holds one interactive node, addressed by the index inside its [`ControlId`].
@@ -216,6 +223,8 @@ pub struct Host {
     /// Nodes an application asked for the solved box of. Empty on most screens.
     pub(crate) probe_ids: Ids<Probe>,
     pub(crate) probes: Slots<Probe, ProbeRow>,
+    pub(crate) region_ids: Ids<Present>,
+    pub(crate) regions: Slots<Present, crate::present::RegionRow>,
     /// Which control is which window command, for the caption band to resolve a point
     /// through. Filled at mount by [`El::caption`](super::El::caption).
     pub(crate) caption: crate::caption::Registry,
@@ -296,6 +305,8 @@ impl Host {
             scrolls: Slots::new(),
             probe_ids: Ids::new(),
             probes: Slots::new(),
+            region_ids: Ids::new(),
+            regions: Slots::new(),
             caption: crate::caption::Registry::default(),
             overlays: Vec::new(),
         };
@@ -596,6 +607,99 @@ impl Host {
         }
     }
 
+    /// Records a presentation region against the mount row that owns it, so it is unmounted
+    /// from the present thread when that row goes.
+    pub(crate) fn mint_region(&mut self, row: MountId, region: crate::present::RegionRow) {
+        let at = self.regions.insert(&mut self.region_ids, region);
+        if let Some(row) = self.mounts.get_mut(row) {
+            row.region = Some(at);
+        }
+    }
+
+    /// Returns the control the first mounted region occupies. What a test names its target
+    /// with; the id is otherwise never handed out.
+    #[cfg(test)]
+    pub(crate) fn first_region_control(&self) -> Option<ControlId> {
+        self.regions
+            .positions()
+            .filter_map(|at| self.regions.id_at(at))
+            .filter_map(|id| self.regions.get(id))
+            .find_map(|row| row.control)
+    }
+
+    /// Returns the region the control `id` names, or `None` where that control is not one.
+    ///
+    /// A scan, not an index: a settled layout keeps this table under eight rows
+    /// ([06 §9.2](../../../../gui/spec/06-PRESENT.md)), and it is walked only for the
+    /// pointer reports that landed on a control at all.
+    pub(crate) fn region_of(
+        &mut self,
+        id: ControlId,
+    ) -> Option<&mut crate::present::RegionRow> {
+        self.regions
+            .positions()
+            .filter_map(|at| self.regions.id_at(at))
+            .find(|&row| self.regions.get(row).is_some_and(|r| r.control == Some(id)))
+            .and_then(|row| self.regions.get_mut(row))
+    }
+
+    /// Returns the sink the region `key` names, or `None` where that region has unmounted.
+    ///
+    /// A binding can arrive for a region this side has already dropped: the two threads tear
+    /// one down in opposite orders, so the answer is a miss rather than an assertion.
+    pub(crate) fn region_sink(
+        &self,
+        key: windows_present::RegionKey,
+    ) -> Option<windows_scene::RegionId> {
+        self.regions
+            .positions()
+            .filter_map(|at| self.regions.id_at(at))
+            .filter_map(|id| self.regions.get(id))
+            .find(|row| row.key == key)
+            .map(|row| row.sink)
+    }
+
+    /// Returns how many regions are mounted and how many of them satisfy `f`. What a test
+    /// asks about the region table, which is otherwise private to the flush.
+    #[cfg(test)]
+    pub(crate) fn regions_count(
+        &self,
+        f: impl Fn(&crate::present::RegionRow) -> bool,
+    ) -> (usize, usize) {
+        let rows = self
+            .regions
+            .positions()
+            .filter_map(|at| self.regions.id_at(at))
+            .filter_map(|id| self.regions.get(id));
+        rows.fold((0, 0), |(all, some), row| {
+            (all + 1, some + usize::from(f(row)))
+        })
+    }
+
+    /// Mounts every region that has a box and no buffers, and resizes every one whose box
+    /// moved.
+    ///
+    /// Publishes nothing back into the solve: an extent is read from a solved box and never
+    /// stated into one, so this cannot make [`flush`](Self::flush)'s sequence fail to
+    /// terminate. It contributes nothing to whether a re-solve is owed, for that reason.
+    fn publish_regions(&mut self) {
+        let dpi = self.env.dpi();
+        for at in self.regions.positions() {
+            let Some(id) = self.regions.id_at(at) else {
+                continue;
+            };
+            let Some(node) = self.regions.get(id).map(|row| row.node) else {
+                continue;
+            };
+            // Read before the row is borrowed mutably: the solve is the model's and the row
+            // is this table's, and one borrow cannot span both.
+            let size = self.model.solved(node).size;
+            if let Some(row) = self.regions.get_mut(id) {
+                crate::present::publish(row, size, dpi);
+            }
+        }
+    }
+
     /// Records a scroll container against the mount row that owns it, so its tracker is
     /// dropped when that row unmounts.
     pub(crate) fn mint_scroll(&mut self, row: MountId, scroll: ScrollRow) {
@@ -861,6 +965,16 @@ impl Host {
             if let Some(probe) = row.probe {
                 self.probes.remove(&mut self.probe_ids, probe);
             }
+            // The present thread is told first and the sink is released after: the region
+            // owns the surface handle behind the brush this side is painting with, so the
+            // unmount that closes it must be asked for before the claim on the sink goes.
+            if let Some(region) = row
+                .region
+                .and_then(|at| self.regions.remove(&mut self.region_ids, at))
+            {
+                crate::present::drop_region(&region);
+                self.model.release(region.sink);
+            }
             // A tracker is sourced from its viewport's visual, so it is dropped with the row
             // that named it.
             if let Some(scroll) = row
@@ -922,6 +1036,9 @@ impl Host {
         // counting one would make a solve react to a solve and the sequence in `flush` would
         // have no reason to terminate.
         self.publish_probes();
+        // Neither do regions: an extent goes out to the present thread and nothing comes
+        // back into the solve.
+        self.publish_regions();
         text | scrolls
     }
 
