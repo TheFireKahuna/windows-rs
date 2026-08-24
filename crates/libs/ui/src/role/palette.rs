@@ -1,7 +1,7 @@
 //! The installed palette, and the total functions that resolve a role, a metric or a type
 //! rung through it.
 
-use super::{DataRole, Fill, Metric, Role, Scope, Stroke, Text, TypeRole};
+use super::{DataRole, Emission, Fill, Metric, Role, Scope, Stroke, Text, TypeRole};
 use std::sync::OnceLock;
 use windows_color::Radiance;
 use windows_text::FontSpec;
@@ -35,6 +35,16 @@ pub trait Palette: Send + Sync + 'static {
     ///
     /// No [`Scope`]: a data role is chromatic and shared between polarities.
     fn data(&self, role: DataRole) -> Radiance;
+    /// Returns how much light `role` spends outside the silhouette it paints.
+    ///
+    /// The whole [`Role`] rather than one of the four sub-enums, because emission crosses
+    /// them: a processor kind's colour emits wherever it is painted, and the accent under a
+    /// call to action emits as a fill.
+    ///
+    /// Total like the rest: a role that carries no light answers [`Emission::NONE`] rather
+    /// than nothing. May not read `scope.width`, for the reason the colour methods may not.
+    fn emission(&self, role: Role, scope: Scope) -> Emission;
+
     /// Returns the font a rung of the type ramp resolves to in `scope`.
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec;
     /// Returns a scalar the palette owns, in DIPs unless the name says otherwise.
@@ -103,6 +113,20 @@ pub fn resolve(role: Role, scope: Scope) -> Radiance {
         Role::Stroke(stroke) => palette.stroke(stroke, scope),
         Role::Data(data) => palette.data(data),
     }
+}
+
+/// Returns how much light `role` spends past its own silhouette.
+///
+/// The emissive tier's one reader. A surface that draws its own pixels — a presentation
+/// region, which has no [`Scope`] on the thread it draws on — reads this where it *can*
+/// resolve a scope and pins the answer, the way it already pins a type rung.
+///
+/// # Panics
+///
+/// If no palette has been installed.
+#[must_use]
+pub fn emission(role: Role, scope: Scope) -> Emission {
+    current().emission(role, scope)
 }
 
 /// Returns the font for a rung of the type ramp, resolved through the same scope the colours

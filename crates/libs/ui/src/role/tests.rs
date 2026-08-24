@@ -64,6 +64,12 @@ impl Palette for Reference {
         light(84.0, 0.12, f32::from(role.0) * 31.0 % 360.0)
     }
 
+    /// No light at any rung. A reference palette states an appearance and nothing about
+    /// what emits — a glow is the application's claim about its own data.
+    fn emission(&self, _role: Role, _scope: Scope) -> Emission {
+        Emission::NONE
+    }
+
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec {
         let size = match role {
             TypeRole::Display => 32.0,

@@ -434,6 +434,14 @@ impl Model {
         self.pending.push_op(Op::Paint { id, paint });
     }
 
+    /// Sets, or with `None` removes, the halo a sprite casts behind itself.
+    ///
+    /// The silhouette is the sprite's own alpha, so this states nothing about shape and a
+    /// sprite whose mask changes keeps a halo that follows it.
+    pub fn halo(&mut self, id: SpriteId, halo: Option<Halo>) {
+        self.pending.push_op(Op::Halo { id, halo });
+    }
+
     /// Binds a channel: a set, an animation, a tracker expression, or a release.
     pub fn bind(&mut self, id: NodeId, prop: Prop, bind: Bind) {
         self.pending.push_op(Op::Bind { id, prop, bind });

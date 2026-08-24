@@ -5,7 +5,7 @@
 //! what backs `SpriteId` and `GroupId`.
 
 use crate::id::Slots;
-use crate::sink::{Clip, Mask, NodeId, NodeKind, Paint};
+use crate::sink::{Clip, Halo, Mask, NodeId, NodeKind, Paint};
 use crate::tree::{Forest, Links};
 use windows_composition::{
     Captured, CompositionBrush, CompositionGeometricClip, CompositionMaskBrush,
@@ -93,6 +93,9 @@ pub(crate) struct Painted {
     pub(crate) paint_brush: Option<CompositionSurfaceBrush>,
     pub(crate) mask: Mask,
     pub(crate) paint: Paint,
+    /// The halo declared for this sprite, kept so a device-loss rebind rebuilds it from the
+    /// declaration rather than from the compositor object it lost.
+    pub(crate) halo: Option<Halo>,
     pub(crate) dashes: Dashes,
     /// Which construction realized the mask, so a route change can be detected rather than
     /// guessed.
@@ -223,12 +226,16 @@ pub(crate) fn resize_shape(host: &ShapeVisual, captured: &Captured, size: Vector
     host.set_size(size.x * scale, size.y * scale);
 }
 
-/// The blur a [`Paint::Captured`] glow rides on.
+/// The blur a [`Paint::Captured`] glow or a [`Halo`](crate::Halo) rides on.
 pub(crate) struct ShadowState {
     pub(crate) shadow: DropShadow,
-    /// The silhouette being blurred, kept so a box that moves can correct its extent: the
-    /// halo is a capture of the box.
-    pub(crate) captured: Captured,
+    /// The silhouette being blurred, kept so a box that moves can correct its extent: a
+    /// captured glow's halo is a capture of the box.
+    ///
+    /// `None` for a [`Halo`](crate::Halo), whose silhouette is the sprite's own brush and
+    /// therefore already the right size at every extent — the compositor derives it, so
+    /// there is nothing here to resize.
+    pub(crate) captured: Option<Captured>,
     pub(crate) chans: [f32; SHADOW_CHANS],
 }
 

@@ -78,6 +78,7 @@ impl Scene {
                 self.declare(id, Some((mask, dashes)), None, back, env)
             }
             Op::Paint { id, paint } => self.declare(id, None, Some(paint), back, env),
+            Op::Halo { id, halo } => self.set_halo(id, halo, back, env),
             Op::Bind { id, prop, bind } => {
                 self.check_not_front_owned(id, prop);
                 self.bind_channel(id, prop, bind, patch, back, env)
@@ -297,6 +298,7 @@ impl Scene {
             mask: Mask::None,
             // A sprite with no paint yet is transparent rather than a guessed colour.
             paint: Paint::Solid(Radiance::TRANSPARENT),
+            halo: None,
             dashes: Dashes::default(),
             route: Route::Clip,
             // Behind any generation that has ever moved, so a sprite declared before its
@@ -612,10 +614,45 @@ impl Scene {
         if let Some(shape) = node.shape.as_ref() {
             shape.resize(size, scale);
         }
-        if let Some(shadow) = node.shadow.as_ref() {
-            shadow.captured.resize(size, scale);
+        if let Some(captured) = node.shadow.as_ref().and_then(|s| s.captured.as_ref()) {
+            captured.resize(size, scale);
         }
         self.reclamp_box_mask(id, back, env);
+    }
+
+    /// Records the halo a sprite casts and realizes it.
+    ///
+    /// Its own path rather than a third argument to [`declare`](Self::declare), because a
+    /// halo holds no resource: it retains nothing, releases nothing, and the skip test
+    /// there compares a declaration a halo is deliberately not part of. What it shares with
+    /// `declare` is the realizer, so device loss and this op rebuild the shadow the same
+    /// way.
+    fn set_halo(
+        &mut self,
+        id: SpriteId,
+        halo: Option<Halo>,
+        back: &Backends,
+        env: Env,
+    ) -> Result<()> {
+        let Some(target) = self.nodes.get_mut(id.node()) else {
+            return Ok(());
+        };
+        debug_assert!(
+            target.kind == NodeKind::Sprite,
+            "a halo was addressed to a group"
+        );
+        // A halo declared before the sprite has a mask or a paint waits, exactly as those
+        // two wait for each other: the ops arrive in any order and a half-declared sprite
+        // is not an error.
+        let Some(painted) = target.painted.as_mut() else {
+            return Ok(());
+        };
+        if painted.halo == halo {
+            self.census.props_skipped += 1;
+            return Ok(());
+        }
+        painted.halo = halo;
+        self.rebind(id, back, env)
     }
 
     /// Rebuilds a rounded-box mask whose nine-grid insets the new box has changed.

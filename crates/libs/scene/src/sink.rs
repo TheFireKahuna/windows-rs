@@ -242,6 +242,32 @@ impl Paint {
     }
 }
 
+/// A halo cast behind a sprite, from the silhouette the sprite already paints.
+///
+/// The compositor derives the shape from the alpha of the sprite's own brush, so a halo
+/// costs no visual, no capture and no second mask — which is what separates it from
+/// [`Paint::Captured`], whose silhouette belongs to another node.
+///
+/// The tint decides what it reads as. Authored above the surface under it a halo blooms,
+/// and below it the same object casts; there is no second mechanism for the darker one.
+///
+/// A halo escapes the sprite's own box, because a visual's size implies no clip on its
+/// shadow. It does not escape an **explicit** clip on any ancestor, so a halo inside a
+/// group that rounds its own corners is cut at that group.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Halo {
+    /// The Gaussian's σ, in DIPs. Animates, through [`Prop::BlurRadius`].
+    pub blur: f32,
+    /// The halo's colour, as authored scene light. Its resolve is eight-bit, so a tint
+    /// above diffuse white lands at the display's white rather than above it.
+    pub tint: Radiance,
+    /// How far the halo is displaced from the sprite, in DIPs. At zero it is a glow.
+    ///
+    /// Part of the declaration rather than a channel: an offset that moved would be a
+    /// light source travelling across the window, which nothing in this design does.
+    pub offset: Vector2,
+}
+
 /// Where a node is and how it is transformed. Every field is a sink.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Xform {

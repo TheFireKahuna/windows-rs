@@ -2093,6 +2093,62 @@ fn a_computed_column_template_follows_the_value_it_reads() {
     );
 }
 
+/// A computed column template survives the container resolving its own width class.
+///
+/// The two lowerings — the one a bound style act pushes, and the one the solve asks for when
+/// a class moves — both start from the node's recipe, so the recipe has to hold what the act
+/// wrote. Without that, a classified container keeps its template only until the first solve
+/// resolves a class other than the one the act ran at, and a two-track grid silently becomes
+/// the single auto-placed column a grid with no template is.
+///
+/// The classifier is inside the grid's own subtree here, so the grid resolves a class at all;
+/// the bounds put it at `Narrow`, which is not the class an unsolved node reads.
+#[test]
+fn a_computed_column_template_survives_a_class_change() {
+    use crate::layout::Track;
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::responsive(
+            [1000.0, 2000.0],
+            crate::layout::grid((
+                plate().height(Metric::CardMinH),
+                plate().height(Metric::CardMinH),
+            ))
+            .cols_from(move |out| {
+                out.push(Track::Fixed(Len::Times(Metric::RowH, 3.0)));
+                out.push(Track::Fr(1.0));
+            })
+            .gap(Len::Zero)
+            .width(Len::Pct(1.0)),
+        )
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+
+    // The classifier, the grid, then its two cells.
+    let (first, second) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        (h.model().solved(nodes[2]), h.model().solved(nodes[3]))
+    });
+    assert_eq!(
+        first.class,
+        windows_scene::WidthClass::Narrow,
+        "the fixture's window must classify narrow at these bounds for the test to mean          anything"
+    );
+    let row_h = crate::role::metric(
+        Metric::RowH,
+        crate::role::Scope::root(crate::role::AccentId(0), crate::role::Density::Comfortable)
+            .at_width(windows_scene::WidthClass::Narrow),
+    );
+    let track = second.rect.x0 - first.rect.x0;
+    assert!(
+        (track - row_h * 3.0).abs() < 1.0,
+        "the computed template did not survive the class the solve resolved: the second          cell began {track} DIPs across, against {}",
+        row_h * 3.0
+    );
+}
+
 /// `hide_when` takes the node out of the layout and leaves it in the tree.
 #[test]
 fn hide_when_removes_the_box_and_not_the_node() {

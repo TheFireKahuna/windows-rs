@@ -81,9 +81,22 @@ impl DropShadow {
 impl SpriteVisual {
     /// Casts `shadow` behind this visual.
     pub fn set_shadow(&self, shadow: &DropShadow) {
+        self.sprite2().SetShadow(&shadow.0).unwrap();
+    }
+
+    /// Removes whatever shadow this visual was casting.
+    ///
+    /// Separate from [`set_shadow`](Self::set_shadow) rather than an `Option` on it: the
+    /// property accepts a null and the two calls do different things to the object the
+    /// visual was holding, so a caller that means "none" says so.
+    pub fn clear_shadow(&self) {
+        self.sprite2().SetShadow(None).unwrap();
+    }
+
+    /// Narrows this visual to the interface carrying the shadow property.
+    fn sprite2(&self) -> bindings::ISpriteVisual2 {
         let visual: &Visual = self;
-        let sprite: bindings::ISpriteVisual2 = visual.0.cast().unwrap();
-        sprite.SetShadow(&shadow.0).unwrap();
+        visual.0.cast().unwrap()
     }
 }
 

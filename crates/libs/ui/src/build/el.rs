@@ -322,6 +322,52 @@ impl<K> El<K> {
         self
     }
 
+    /// Casts a halo behind this node in `role`: its own silhouette, blurred to whatever
+    /// light the palette says that role spends.
+    ///
+    /// **For a surface casting light in a role it does not itself paint** — a card whose fill
+    /// is a surface and whose light is its processor kind's, a call to action whose light is
+    /// the accent's. A sprite that paints a role *as ink* is lit where the role is resolved
+    /// and needs nothing here, which is why a label and a badge never name one.
+    ///
+    /// It takes a role and nothing else: how far a role's light reaches is the palette's to
+    /// author, and a σ passed in here would be exactly the ad-hoc brightening at draw sites
+    /// the emissive tier exists to replace. A node whose role spends no light is an authoring
+    /// mistake rather than a no-op.
+    ///
+    /// The compositor derives the shape from the alpha the node already paints, so a halo
+    /// costs **no visual and no capture** — which is what makes one affordable on every card
+    /// in a chain. It casts from the node's fill, or from its glyphs where it paints no fill.
+    ///
+    /// A halo escapes the node's own box but not an explicit clip on an ancestor, so a halo
+    /// inside a container that rounds its own corners is cut at that container.
+    ///
+    /// **The blur is fixed once and never animates.** Re-blurring is the one per-frame cost
+    /// the platform charges for a shadow, so a state that widened the light would pay it on
+    /// every frame of every transition, on every element the transition touched. A state
+    /// spends more of the light instead, through [`halo_lit`](Self::halo_lit).
+    #[must_use]
+    pub fn halo(self, role: Role) -> Self {
+        Build::with(|b| {
+            b.nodes[self.at as usize].halo = Some(super::arena::HaloSeed { role });
+        });
+        self
+    }
+
+    /// Binds how much of its light the halo is currently spending, in `0.0..=1.0`.
+    ///
+    /// The one channel a state may move. The palette says how far a role's light reaches and
+    /// how much of the role's alpha it carries; a state says how much of that is switched on.
+    /// Opacity is a compositor property over an already-blurred silhouette, so a transition
+    /// re-rasterizes nothing.
+    ///
+    /// Means nothing on a node with no [`halo`](Self::halo): the channel belongs to the
+    /// shadow, and the scene refuses a property whose owner the node does not carry.
+    #[must_use]
+    pub fn halo_lit<M>(self, lit: impl Signal<f32, M> + 'static) -> Self {
+        self.channel(Prop::ShadowOpacity, Motion::Chrome, Unit::Direct, lit)
+    }
+
     /// Adds the plate a chromatic value sits on: a rounded box painting `strength` of `role`.
     ///
     /// [`Part::Static`] rather than [`Part::Fill`]: the plate is the value's own colour and an
@@ -1029,7 +1075,14 @@ impl<K> El<K> {
         self.slot_mut(|s| s.state = policy)
     }
 
-    pub(crate) fn elevate(self, elevation: Elevation) -> Self {
+    /// Pushes a rung of the surface ladder for this node and everything inside it.
+    ///
+    /// A composition names it the way it names a [`Role`] or a [`Metric`]: which rung a
+    /// surface sits on is a fact about the arrangement, and the palette is still the only
+    /// thing that says what the rung *is*. A chassis panel and the plane it sits on are the
+    /// same widget at two rungs, and nothing here states a colour to tell them apart.
+    #[must_use]
+    pub fn elevate(self, elevation: Elevation) -> Self {
         self.slot_mut(|s| s.elevate = Some(elevation))
     }
 
@@ -1201,6 +1254,38 @@ impl El<Path> {
                 stroke: Some(width.into()),
             },
             Role::Data(role),
+            Part::Border,
+        )
+    }
+
+    /// Fills this node's geometry in one of the palette's line roles.
+    ///
+    /// The third of the three things a path can be painted with, and the one a surface's own
+    /// edge takes. [`fill`](Self::fill) is a data role and states what the geometry *means*;
+    /// [`ink`](Self::ink) is the enclosing widget's foreground and reads as its content; a
+    /// hairline is neither — the light falling on a surface belongs to the palette, and an
+    /// application that had to reach for a data role to draw one would be naming a colour.
+    #[must_use]
+    pub fn line(self, role: crate::role::Stroke) -> Self {
+        self.sprite(
+            MaskSeed::Shape { stroke: None },
+            Role::Stroke(role),
+            Part::Border,
+        )
+    }
+
+    /// Outlines this node's geometry in one of the palette's line roles, `width` wide.
+    ///
+    /// [`line`](Self::line)'s outline form, and what a hairline actually takes: a rule one
+    /// device pixel across is a stroke rather than a filled sliver, and building it as a
+    /// sliver puts a shape a pixel tall through the geometry snap, which is where it goes.
+    #[must_use]
+    pub fn line_stroke(self, role: crate::role::Stroke, width: impl Into<Len>) -> Self {
+        self.sprite(
+            MaskSeed::Shape {
+                stroke: Some(width.into()),
+            },
+            Role::Stroke(role),
             Part::Border,
         )
     }

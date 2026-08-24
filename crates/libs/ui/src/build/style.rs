@@ -75,6 +75,16 @@ pub(crate) struct Recipe {
     pub over: OverStore,
     /// Class-free: the width axis comes from the solve, never from here.
     pub scope: Scope,
+    /// What the node's bound style acts last produced, in the order they wrote it.
+    ///
+    /// A bound override is a value rather than a design decision, so it is not in
+    /// [`over`](Self::over) and no rule can express it. It still has to be here: both
+    /// lowerings start from this recipe, and one that could not see these would answer a
+    /// style with the node's column template — or its bound width, or its hidden flag —
+    /// missing. A container that resolved a class after its bound acts first ran is exactly
+    /// that case, and it is the ordinary one: the class is a solve output, so **every**
+    /// classified container resolves it after the mount that ran them.
+    pub bound: Box<[Over]>,
 }
 
 thread_local! {
@@ -107,9 +117,35 @@ pub(crate) fn try_with<R>(f: impl FnOnce(&mut Slots<Node, Recipe>) -> R) -> Opti
 pub(crate) fn restyle(node: NodeId, class: WidthClass) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get(node)?;
-        Some(crate::layout::lower(
+        Some(crate::layout::lower_with(
             recipe.preset,
             recipe.over.as_slice(),
+            &recipe.bound,
+            recipe.scope.at_width(class),
+        ))
+    })
+}
+
+/// Records what a node's bound style acts produced, and lowers the style they imply.
+///
+/// `extra` must carry **every** bound override for the node, which is why the node has one
+/// effect rather than one per act: lowering from the recipe plus a single override discards
+/// the others, and two bound styles on one node would take turns winning.
+///
+/// Taking the class from the solve rather than from a captured scope is what keeps a bound
+/// style and a classified container from disagreeing on the tick the acts run.
+///
+/// The two halves are one call because they must not be able to disagree: a lowering that
+/// used `extra` without recording it leaves [`restyle`] answering a style without it, and the
+/// symptom is a template that survives until the container's class first moves.
+pub(crate) fn bind(node: NodeId, class: WidthClass, extra: &[Over]) -> Option<taffy::Style> {
+    with(|table| {
+        let recipe = table.get_mut(node)?;
+        recipe.bound = extra.into();
+        Some(crate::layout::lower_with(
+            recipe.preset,
+            recipe.over.as_slice(),
+            extra,
             recipe.scope.at_width(class),
         ))
     })
@@ -131,34 +167,13 @@ pub(crate) fn restyle(node: NodeId, class: WidthClass) -> Option<taffy::Style> {
 pub(crate) fn pin_width(node: NodeId, class: WidthClass, width: f32) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get(node)?;
-        let mut style = crate::layout::lower(
+        let mut style = crate::layout::lower_with(
             recipe.preset,
             recipe.over.as_slice(),
+            &recipe.bound,
             recipe.scope.at_width(class),
         );
         style.size.width = taffy::Dimension::length(width);
         Some(style)
-    })
-}
-
-/// Lowers this node's style with `extra` appended, at the class the last solve resolved.
-/// `None` where the node has no recipe.
-///
-/// What a style that follows a value re-lowers through. Taking the class from the solve
-/// rather than from a captured scope is what keeps a bound style and a classified container
-/// from disagreeing.
-///
-/// `extra` must carry **every** bound override for the node, which is why the node has one
-/// effect rather than one per act: lowering from the recipe plus a single override discards
-/// the others, and two bound styles on one node would take turns winning.
-pub(crate) fn lower_with(node: NodeId, class: WidthClass, extra: &[Over]) -> Option<taffy::Style> {
-    with(|table| {
-        let recipe = table.get(node)?;
-        Some(crate::layout::lower_with(
-            recipe.preset,
-            recipe.over.as_slice(),
-            extra,
-            recipe.scope.at_width(class),
-        ))
     })
 }

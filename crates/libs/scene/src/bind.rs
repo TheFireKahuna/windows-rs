@@ -17,11 +17,11 @@ use crate::env::Env;
 use crate::node::{Node, Painted, Route, ShadowState, ShapeState};
 use crate::prop;
 use crate::res::Resources;
-use crate::sink::{Cap, Corners, GeomId, Join, Mask, Paint, Prop, SpriteId, StrokeStyle};
+use crate::sink::{Cap, Corners, GeomId, Halo, Join, Mask, Paint, Prop, SpriteId, StrokeStyle};
 use windows_color::{Radiance, Scrgb};
 use windows_composition::{
-    BorderMode, Brush, Color, CompositionBrush, CompositionSurfaceBrush, StrokeCap, StrokeJoin,
-    Visual,
+    BorderMode, Brush, Color, CompositionBrush, CompositionSurfaceBrush, ShadowSource, StrokeCap,
+    StrokeJoin, Visual,
 };
 use windows_core::Result;
 use windows_numerics::Vector2;
@@ -68,15 +68,18 @@ impl Realizer<'_> {
     /// `glow` is the captured group's visual. The caller resolves it, because it belongs to
     /// a different node.
     pub(crate) fn sprite(&mut self, node: &mut Node, glow: Option<&Visual>) -> Result<()> {
-        let Some((mask, paint, dashes, owned_clip)) = node
+        let Some((mask, paint, halo, dashes, owned_clip)) = node
             .painted
             .as_ref()
-            .map(|p| (p.mask, p.paint, p.dashes, p.owns_the_clip()))
+            .map(|p| (p.mask, p.paint, p.halo, p.dashes, p.owns_the_clip()))
         else {
             return Ok(());
         };
 
         let paint_brush = self.paint(node, &paint, glow)?;
+        // After the paint, because a captured glow claims the same slot on the node and the
+        // two must not take turns owning it. A sprite declares one or the other.
+        self.halo(node, &paint, halo);
         let (mask_brush, route, insets) = self.mask(node, &mask, dashes.as_slice())?;
 
         // A shape leaving the clip route takes its clip with it, or it is masked twice by
@@ -120,6 +123,7 @@ impl Realizer<'_> {
             paint_brush,
             mask,
             paint,
+            halo,
             dashes,
             route,
             built_at: self.generation,
@@ -300,6 +304,52 @@ impl Realizer<'_> {
         Some(brush)
     }
 
+    /// Casts, or removes, the halo declared for this sprite.
+    ///
+    /// The silhouette is the sprite's own brush alpha, stated through
+    /// [`ShadowSource::VisualAlpha`]: with no source policy the platform's default
+    /// silhouette is a rectangle the size of the visual, which would square off every
+    /// rounded box in the tree.
+    ///
+    /// A sprite painting [`Paint::Captured`] is left alone. That paint casts a shadow of
+    /// its own onto the same slot, and a node holds one, so the two are exclusive by
+    /// construction rather than by whichever ran last.
+    fn halo(&mut self, node: &mut Node, paint: &Paint, halo: Option<Halo>) {
+        if matches!(paint, Paint::Captured { .. }) {
+            debug_assert!(
+                halo.is_none(),
+                "a captured glow and a halo were declared on one sprite"
+            );
+            return;
+        }
+        let Some(sprite) = node.sprite.clone() else {
+            return;
+        };
+        let Some(halo) = halo else {
+            sprite.clear_shadow();
+            node.shadow = None;
+            return;
+        };
+        let shadow = self.back.compositor.create_drop_shadow();
+        shadow.set_source(ShadowSource::VisualAlpha);
+        shadow.set_blur_radius(halo.blur);
+        shadow.set_offset(halo.offset.x, halo.offset.y, 0.0);
+        // Eight-bit, like every shadow colour, so the authored tint goes through the display
+        // transform here and agrees with the sprite it sits behind.
+        shadow.set_color(color_of(self.env.apply(halo.tint)));
+        sprite.set_shadow(&shadow);
+        // The blur a channel already animated survives a rebind: a device loss mid-hover
+        // must not snap the halo back to its authored width.
+        let chans = node.shadow.as_ref().map_or([halo.blur, 1.0], |s| s.chans);
+        shadow.set_blur_radius(chans[0]);
+        shadow.set_opacity(chans[1]);
+        node.shadow = Some(ShadowState {
+            shadow,
+            captured: None,
+            chans,
+        });
+    }
+
     /// Captures a subtree, blurs it, tints it, and casts it behind the sprite.
     ///
     /// The halo under a curve stroke is a capture of that stroke, so the blur radius and the
@@ -335,7 +385,7 @@ impl Realizer<'_> {
         let chans = node.shadow.as_ref().map_or([blur, 1.0], |s| s.chans);
         node.shadow = Some(ShadowState {
             shadow,
-            captured,
+            captured: Some(captured),
             chans,
         });
         Some(brush)

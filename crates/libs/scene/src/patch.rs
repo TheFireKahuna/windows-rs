@@ -81,6 +81,15 @@ pub enum Op {
         id: SpriteId,
         paint: Paint,
     },
+    /// Declares the halo a sprite casts, or removes it with `None`.
+    ///
+    /// Its own op rather than a field of [`Paint`](Op::Paint): a halo is cast by whatever
+    /// the sprite paints and says nothing about what that is, so re-tinting a halo must not
+    /// re-declare — and therefore re-realize — the brush chain under it.
+    Halo {
+        id: SpriteId,
+        halo: Option<Halo>,
+    },
     /// Bounds what a node's subtree may draw inside.
     ///
     /// Addressed to a [`NodeId`] because groups clip and a group carries no mask or paint.

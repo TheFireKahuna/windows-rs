@@ -29,8 +29,8 @@ mod palette;
 pub(crate) mod tests;
 
 pub use palette::{
-    Palette, accent_wash, content_peak_nits, data, ink, install, installed, metric, resolve,
-    typography, veil,
+    Palette, accent_wash, content_peak_nits, data, emission, ink, install, installed, metric,
+    resolve, typography, veil,
 };
 
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -219,6 +219,97 @@ pub enum Role {
     Fill(Fill),
     Stroke(Stroke),
     Data(DataRole),
+}
+
+/// One silhouette's worth of a role's light.
+#[derive(Copy, Clone, PartialEq, Debug, Default)]
+pub struct Light {
+    /// The Gaussian's σ, in DIPs.
+    pub sigma: f32,
+    /// How much of the role's own alpha the light carries, in `0.0..=1.0`.
+    pub strength: f32,
+}
+
+impl Light {
+    /// No light at all.
+    pub const NONE: Self = Self {
+        sigma: 0.0,
+        strength: 0.0,
+    };
+
+    /// Returns `sigma` DIPs of light at `strength` of the role's alpha.
+    #[must_use]
+    pub const fn new(sigma: f32, strength: f32) -> Self {
+        Self { sigma, strength }
+    }
+
+    /// Returns whether this puts anything on screen.
+    ///
+    /// Either term at zero draws nothing, and a halo declared for it would be a composition
+    /// object per sprite rendering no pixels.
+    #[must_use]
+    pub fn is_lit(self) -> bool {
+        self.sigma > 0.0 && self.strength > 0.0
+    }
+}
+
+/// How far a role's colour reaches past the silhouette it paints.
+///
+/// The **emissive tier**, distinct from the surface and ink tiers because it says nothing
+/// about what colour a thing is — only how much light that colour spends outside itself.
+/// Authored per role in the palette rather than per draw site, so a processor kind's badge
+/// and the same kind's card cannot disagree about what that kind's light is.
+///
+/// A consumer with a reason it can name from *data* — a routed crossing's coefficient, a
+/// selected row — scales what the palette authored. One that merely wants more light does
+/// not: that is the ad-hoc brightening the tier exists to replace.
+///
+/// # Why two lights and not one
+///
+/// A drop shadow carries **no spread**, and a role's light lands differently on ink than on a
+/// filled area because of it. A design system with spread states one blur for both and shrinks
+/// the area's silhouette before blurring; without it, an area needs a tighter, dimmer blur to
+/// avoid a hard rim, and ink needs a wider one to spread past its own stems. The difference is
+/// the platform's rather than the designer's, which is why it is stated here once instead of
+/// being compensated for at every call site.
+#[derive(Copy, Clone, PartialEq, Debug, Default)]
+pub struct Emission {
+    /// Light where the silhouette is **ink**: glyphs, a hairline, a stroked path.
+    pub ink: Light,
+    /// Light where the silhouette is a **filled area**: a card, a plate, a button.
+    pub area: Light,
+}
+
+impl Emission {
+    /// A role that spends no light. What every role answers until the palette says otherwise.
+    pub const NONE: Self = Self {
+        ink: Light::NONE,
+        area: Light::NONE,
+    };
+
+    /// Returns a role's light over each silhouette.
+    #[must_use]
+    pub const fn new(ink: Light, area: Light) -> Self {
+        Self { ink, area }
+    }
+
+    /// Returns the light this role spends over `of`.
+    #[must_use]
+    pub const fn of(self, of: Silhouette) -> Light {
+        match of {
+            Silhouette::Ink => self.ink,
+            Silhouette::Area => self.area,
+        }
+    }
+}
+
+/// What a halo is blurring, which decides which of a role's two lights it spends.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Silhouette {
+    /// Glyphs, a hairline, a stroked path — thin, and mostly edge.
+    Ink,
+    /// A card, a plate, a button — solid, and mostly interior.
+    Area,
 }
 
 /// A rung of the type ramp.

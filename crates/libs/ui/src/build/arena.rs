@@ -102,6 +102,8 @@ pub(crate) struct Slot {
     pub geom: Option<GeomId>,
     /// A surface pushes a rung of the ladder for everything inside it.
     pub elevate: Option<Elevation>,
+    /// The halo this node casts behind its fill, if it casts one.
+    pub halo: Option<HaloSeed>,
     /// Classifies its own inline size for its subtree.
     pub responsive: Option<Bounds>,
     /// A scroll container. The tracker is minted at mount, because only then is there a
@@ -162,6 +164,7 @@ impl Default for Slot {
             interaction: None,
             geom: None,
             elevate: None,
+            halo: None,
             responsive: None,
             scroll: None,
             region: None,
@@ -220,6 +223,16 @@ pub(crate) struct SpriteSeed {
 
 /// A sprite that paints its role as resolved. What everything but a plate carries.
 pub(crate) const FULL: f32 = 1.0;
+
+/// A halo a node casts, in a role it does not itself paint.
+///
+/// One field, and that is the point: how much light a role spends is the palette's, and the
+/// silhouette is whatever the node already paints — so a variant that changes that fill's
+/// shape moves the halo with it and nothing here restates a corner or a sigma.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct HaloSeed {
+    pub role: Role,
+}
 
 /// Which of a control's parts a sprite is, so interaction can re-resolve exactly the ones
 /// that change and leave the rest alone.

@@ -13,13 +13,13 @@
 //! that closure borrows the host, so the arena is taken out of its thread-local for the walk
 //! and every model call takes a fresh borrow.
 
-use super::arena::{Act, Build, ChanSource, MaskSeed, NIL, Part, Slot, SpriteSeed};
+use super::arena::{Act, Build, ChanSource, HaloSeed, MaskSeed, NIL, Part, Slot, SpriteSeed};
 use super::host::{ControlRow, Host, MountId, MountRow, ValueId, ValueRow};
 use super::style::{OverStore, Recipe};
 use super::{El, Site, View};
 use crate::gesture::GestureDecl;
 use crate::layout::{Len, Over, Preset, Rule};
-use crate::role::{DataRole, Metric, Role, Scope};
+use crate::role::{DataRole, Metric, Role, Scope, Silhouette};
 use crate::signal::Effect;
 use crate::widget::{
     Chrome, ChromeRow, Flow, Interaction, ModelState, Motion, RoleSet, StatePolicy, TextSource,
@@ -27,10 +27,12 @@ use crate::widget::{
 };
 use core::cell::RefCell;
 use windows_color::Radiance;
+use windows_numerics::Vector2;
 use windows_scene::taffy;
 use windows_scene::{
-    Anim, Bind, Cap, ControlId, Corners, Exit, GeomId, GroupId, HitDecl, HitFlags, Join, Mask,
-    MeasureCtx, MeasureKey, NodeId, Paint, PathVerb, Prop, RampId, Spread, SpriteId, Tuning, Value,
+    Anim, Bind, Cap, ControlId, Corners, Exit, GeomId, GroupId, Halo, HitDecl, HitFlags, Join,
+    Mask, MeasureCtx, MeasureKey, NodeId, Paint, PathVerb, Prop, RampId, Spread, SpriteId, Tuning,
+    Value,
 };
 
 /// Mints path geometry from `verbs`, in sprite-local DIPs.
@@ -385,6 +387,8 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             preset: slot.preset,
             over: OverStore::collect(b.chain_over(slot.over).map(|entry| entry.rule)),
             scope: at.scope,
+            // Empty until the node's bound style acts first run, which is after this mount.
+            bound: Box::default(),
         };
         let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), at.scope);
         super::style::with(|table| table.place(node, recipe));
@@ -443,13 +447,19 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         parts.wash = Some(sprite);
     }
 
+    // ── the halo, cast by the fill ────────────────────────────────────────────────
+    // After the fill exists, because the silhouette is what that sprite paints.
+    if let Some(seed) = slot.halo {
+        mount_halo(seed, parts.fill.or(parts.label), inner);
+    }
+
     // ── styles that follow a value ────────────────────────────────────────────────
     // Its own pass over the act chain, taking only its own variants: a spacer has a style
     // that moves and no hit entry at all, so this cannot be folded into the control pass.
     mount_style_acts(b, &slot, node);
 
     // ── channels: one reactive lowering ───────────────────────────────────────────
-    mount_channels(b, &slot, node, row, &mut own_claim);
+    mount_channels(b, &slot, node, parts.fill, row, &mut own_claim);
 
     // ── measured text ─────────────────────────────────────────────────────────────
     if let Some((text, _)) = run {
@@ -556,6 +566,36 @@ fn run_seed(b: &Build, slot: &Slot) -> Option<(u32, Flow)> {
         MaskSeed::Run { text } => Some((text, b.texts[text as usize].flow)),
         _ => None,
     })
+}
+
+/// Casts `seed`'s halo from the sprite carrying the node's own ink: its fill, or its glyphs
+/// where it paints no fill.
+///
+/// The fallback is what lets a label glow. A run's coverage tile *is* an alpha profile, so
+/// the compositor derives a halo from a word the same way it derives one from a box, and a
+/// lit legend needs no second mechanism.
+///
+/// A node with neither has no silhouette to cast, and a halo declared on one is an authoring
+/// mistake rather than a no-op: the modifier is on a variant that paints nothing.
+fn mount_halo(seed: HaloSeed, source: Option<SpriteId>, scope: Scope) {
+    let Some(fill) = source else {
+        debug_assert!(false, "a halo was declared on a node that paints nothing");
+        return;
+    };
+    let paint = scope.for_paint();
+    let light = crate::role::resolve(seed.role, paint);
+    // A stated halo is always a filled silhouette: it is a *surface* casting light, and a
+    // node painting the role as ink is lit where the role resolves and never states one.
+    let halo = halo_of(
+        crate::role::emission(seed.role, paint),
+        Silhouette::Area,
+        light,
+    );
+    debug_assert!(
+        halo.is_some(),
+        "a halo was declared in a role the palette gives no light"
+    );
+    Host::with(|h| h.model().halo(fill, halo));
 }
 
 /// Which sprite plays which part, so a state change re-paints exactly what changed.
@@ -700,10 +740,22 @@ fn emit_sprite(
     scope: Scope,
     roles: Option<RoleSet>,
 ) {
-    let resolved = crate::role::resolve(role_of(seed, roles), scope.for_paint());
+    let role = role_of(seed, roles);
+    let resolved = crate::role::resolve(role, scope.for_paint());
     // The strength scales the role's own alpha rather than replacing it: a hairline resolves
     // to a wash already, and a sprite at full strength must leave that wash where it is.
     let light = resolved.with_alpha(resolved.a * seed.strength);
+    // A role's own light, cast where the role is resolved, so a kind's badge and a kind's
+    // card cannot be lit differently. Only where the sprite paints the role as **ink**: a
+    // glyph's light is intrinsic to the glyph, where a filled shape's belongs to the surface
+    // it is part of — which is why a card states its halo and a label never has to.
+    //
+    // Scaled by the sprite's strength, so a plate painting a fraction of its role blooms at
+    // a fraction of its role's light.
+    let emission = match seed.part {
+        Part::Label => crate::role::emission(role, scope.for_paint()),
+        _ => crate::role::Emission::NONE,
+    };
     // A ramp carries its own stops, resolved where it was minted, and a region's pixels are
     // the present thread's, so neither reads the value resolved above. The region is tested
     // first because it is the stronger claim: its buffer replaces everything this side could
@@ -734,7 +786,30 @@ fn emit_sprite(
         };
         h.model().mask(id, mask);
         h.model().paint(id, paint);
+        // Declared even when dark: a sprite re-emitted into a role that stopped emitting has
+        // to lose the halo the previous role gave it, and `None` is how that is said.
+        h.model()
+            .halo(id, halo_of(emission, Silhouette::Ink, light));
     });
+}
+
+/// Returns the halo `emission` states for a sprite painting `light`, or `None` where the role
+/// spends none.
+///
+/// The tint is the sprite's own resolved light at the emission's strength, not a colour of
+/// its own: a role emits *itself*, and a second authored colour here would be a way for a
+/// halo to disagree with the thing casting it.
+fn halo_of(
+    emission: crate::role::Emission,
+    of: Silhouette,
+    light: Radiance,
+) -> Option<Halo> {
+    let spend = emission.of(of);
+    spend.is_lit().then(|| Halo {
+        blur: spend.sigma,
+        tint: light.with_alpha(light.a * spend.strength),
+        offset: Vector2 { x: 0.0, y: 0.0 },
+    })
 }
 
 /// Returns whether this node ever resolves in [`ModelState::Selected`].
@@ -1150,7 +1225,11 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId) {
             }
         }
         let class = Host::with(|h| h.model().solved(node).class);
-        let Some(style) = super::style::lower_with(node, class, &extra) else {
+        // `bind` records these against the node as well as lowering them. Without that record
+        // the next class the solve resolves for this container re-lowers it from its recipe
+        // alone, and everything written here — a column template, a bound width, a hidden
+        // flag — is gone from the style the layout then runs on.
+        let Some(style) = super::style::bind(node, class, &extra) else {
             return;
         };
         Host::with(|h| h.model().style(node, &style));
@@ -1187,13 +1266,28 @@ fn uia_only(flags: HitFlags) -> HitFlags {
 /// A constant becomes one `Bind::Set` at mount and produces no graph node, no `Effect` and
 /// no allocation, so static content costs one sprite and nothing else. Anything else becomes
 /// exactly one effect, and the boxed reader moves into it.
-fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, row: MountId, claim: &mut Claim) {
+fn mount_channels(
+    b: &mut Build,
+    slot: &Slot,
+    node: NodeId,
+    fill: Option<SpriteId>,
+    row: MountId,
+    claim: &mut Claim,
+) {
     let mut at = slot.chans.head;
     while at != NIL {
         let entry = &mut b.chans[at as usize];
         let (prop, motion, unit) = (entry.prop, entry.motion, entry.unit);
         let source = entry.source.take();
         at = entry.next;
+        // A shadow's channels belong to the sprite casting it, which on a container is its
+        // fill and not the group the author wrote the modifier on. Retargeted here rather
+        // than at the seam: the scene refuses a property its node cannot own, so without
+        // this a card's halo would simply never widen.
+        let node = match prop {
+            Prop::BlurRadius | Prop::ShadowOpacity => fill.map_or(node, SpriteId::node),
+            _ => node,
+        };
         // A value is finished by whichever thread moves the part, this one or the router's.
         // A slid one also waits on the room it is a fraction of, which is a solve output.
         let value = unit.is_value().then(|| {

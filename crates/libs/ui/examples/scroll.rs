@@ -31,8 +31,8 @@ use windows_ui::driver::{Ui, observe};
 use windows_ui::input::Report;
 use windows_ui::layout::{ListSpec, list};
 use windows_ui::role::{
-    AccentId, DataRole, Density, Fill, Metric, Palette, Polarity, Scope, Stroke, Text, TypeRole,
-    WidthClass,
+    AccentId, DataRole, Density, Emission, Fill, Metric, Palette, Polarity, Role, Scope, Stroke,
+    Text, TypeRole, WidthClass,
 };
 use windows_ui::widget::label;
 use windows_window::Window;
@@ -263,6 +263,12 @@ impl Palette for Reference {
 
     fn data(&self, role: DataRole) -> Radiance {
         light(84.0, 0.12, f32::from(role.0) * 31.0 % 360.0)
+    }
+
+    /// No light at any rung. A reference palette states an appearance and nothing about
+    /// what emits — a glow is the application's claim about its own data.
+    fn emission(&self, _role: Role, _scope: Scope) -> Emission {
+        Emission::NONE
     }
 
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec {
