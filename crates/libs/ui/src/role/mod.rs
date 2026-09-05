@@ -389,6 +389,14 @@ pub enum Metric {
     PaneMinW,
     /// Maximum width of a docked detail pane; surplus width belongs to the main surface.
     PaneMaxW,
+    /// Maximum inline size of an inspector drawer.
+    PaneDrawerMaxW,
+    /// Distance from a window region's bottom edge to its reopen tab.
+    EdgeTabInset,
+    /// Cross-axis padding of a vertical edge tab.
+    EdgeTabPadX,
+    /// Inline padding of a vertical edge tab.
+    EdgeTabPadY,
     /// One device pixel at the current scale, expressed in DIPs by the palette.
     HairlineW,
 }

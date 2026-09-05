@@ -199,6 +199,7 @@ impl<K> El<K> {
                 ramp,
                 ink,
                 flow,
+                vertical: false,
                 caps,
             })
         });
@@ -207,6 +208,23 @@ impl<K> El<K> {
             Role::Text(ink.unwrap_or(Text::Primary)),
             Part::Label,
         )
+    }
+
+    pub(crate) fn vertical_text(self) -> Self {
+        Build::with(|b| {
+            let text = b
+                .chain_seeds(b.nodes[self.at as usize].seeds)
+                .find_map(|s| {
+                    if let MaskSeed::Run { text } = s.mask {
+                        Some(text)
+                    } else {
+                        None
+                    }
+                })
+                .expect("vertical text requires a run");
+            b.texts[text as usize].vertical = true;
+        });
+        self
     }
 
     /// Records a shaped run painted in `role` rather than in a foreground rung.
@@ -227,6 +245,7 @@ impl<K> El<K> {
                 ramp,
                 ink: None,
                 flow: Flow::Line,
+                vertical: false,
                 caps,
             })
         });
@@ -416,7 +435,7 @@ impl<K> El<K> {
         n: impl Fn() -> f32 + 'static,
     ) -> Self {
         self.act(Act::Restyle(Box::new(move |out| {
-            out.push(Over::Height(Len::Times(row(), n().max(0.0))));
+            out.push(Rule::always(Over::Height(Len::Times(row(), n().max(0.0)))));
         })))
     }
 
@@ -429,10 +448,10 @@ impl<K> El<K> {
     pub(crate) fn band_rows(self, index: f32, row: impl Fn() -> Metric + 'static) -> Self {
         self.act(Act::Restyle(Box::new(move |out| {
             let row = row();
-            out.push(Over::Band {
+            out.push(Rule::always(Over::Band {
                 at: Len::Times(row, index),
                 height: Len::Metric(row),
-            });
+            }));
         })))
     }
 
@@ -649,8 +668,8 @@ impl<K> El<K> {
             if !cond.read() {
                 return;
             }
-            out.push(Over::ClearColumns);
-            out.extend(tracks.iter().copied().map(Over::Column));
+            out.push(Rule::always(Over::ClearColumns));
+            out.extend(tracks.iter().copied().map(Over::Column).map(Rule::always));
         })))
     }
 
@@ -673,8 +692,8 @@ impl<K> El<K> {
             let mut buf = buf.borrow_mut();
             buf.clear();
             tracks(&mut buf);
-            out.push(Over::ClearColumns);
-            out.extend(buf.iter().copied().map(Over::Column));
+            out.push(Rule::always(Over::ClearColumns));
+            out.extend(buf.iter().copied().map(Over::Column).map(Rule::always));
         })))
     }
 
@@ -739,6 +758,35 @@ impl<K> El<K> {
     #[must_use]
     pub fn hide_if<M>(self, cond: impl Signal<bool, M> + 'static) -> Self {
         self.act(Act::HideWhen(Box::new(move || cond.read())))
+    }
+
+    /// Hides this retained subtree only at `class` while `cond` holds.
+    /// The solve retains the class gate across resizes; no width enters the signal graph.
+    #[must_use]
+    pub fn hide_if_when<M>(self, class: WidthClass, cond: impl Signal<bool, M> + 'static) -> Self {
+        self.act(Act::Restyle(Box::new(move |out| {
+            if cond.read() {
+                out.push(Rule::at(class, Over::Hidden));
+            }
+        })))
+    }
+
+    /// Sets the inline size at one width class.
+    #[must_use]
+    pub fn width_when(self, class: WidthClass, width: impl Into<Len>) -> Self {
+        self.over_at(class, Over::Width(width.into()))
+    }
+
+    /// Sets the inline size floor at one width class.
+    #[must_use]
+    pub fn min_width_when(self, class: WidthClass, width: impl Into<Len>) -> Self {
+        self.over_at(class, Over::MinWidth(width.into()))
+    }
+
+    /// Sets the inline size ceiling at one width class.
+    #[must_use]
+    pub fn max_width_when(self, class: WidthClass, width: impl Into<Len>) -> Self {
+        self.over_at(class, Over::MaxWidth(width.into()))
     }
 
     // ── layout: container properties ─────────────────────────────────────────────
@@ -969,6 +1017,14 @@ impl<K> El<K> {
     pub fn on_click(self, f: impl Fn() + 'static) -> Self {
         self.act(Act::Click(Box::new(f)))
             .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
+    }
+
+    /// Handles Escape left unclaimed by the focus ring's overlay scopes.
+    /// Declare once on the active screen root. Hidden and unmounted screens do not
+    /// receive it; the callback runs outside the host borrow and adds no focus stop.
+    #[must_use]
+    pub fn on_unhandled_escape(self, f: impl Fn() + 'static) -> Self {
+        self.act(Act::Escape(std::rc::Rc::new(f)))
     }
 
     /// Runs `f` for every value the control produces while it is being moved.

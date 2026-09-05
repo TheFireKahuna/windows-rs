@@ -50,6 +50,7 @@ pub(crate) type PresentId = Id<Present>;
 /// Records one mounted node and every table row it has to release.
 pub(crate) struct MountRow {
     pub node: NodeId,
+    pub escape: Option<Rc<dyn Fn()>>,
     /// The next row of the same mounted subtree, or [`Id::NONE`] at the end of the chain.
     ///
     /// A chain rather than a `Vec`, so a list row realized during a fling records its rows
@@ -546,6 +547,26 @@ impl Host {
 
     pub(crate) fn mint_mount(&mut self, row: MountRow) -> MountId {
         self.mounts.insert(&mut self.mount_ids, row)
+    }
+
+    pub(crate) fn set_escape(&mut self, row: MountId, f: Rc<dyn Fn()>) {
+        if let Some(row) = self.mounts.get_mut(row) {
+            row.escape = Some(f);
+        }
+    }
+
+    /// Takes a callable copy so invoking application code never borrows this host.
+    pub(crate) fn escape_handler(&self) -> Option<Rc<dyn Fn()>> {
+        self.mounts
+            .positions()
+            .filter_map(|at| self.mounts.id_at(at))
+            .filter_map(|id| self.mounts.get(id))
+            .find_map(|row| {
+                let size = self.model.solved(row.node).size;
+                (size.x > 0.0 && size.y > 0.0)
+                    .then(|| row.escape.clone())
+                    .flatten()
+            })
     }
 
     /// Runs `f` against the first scroll container `pick` accepts.

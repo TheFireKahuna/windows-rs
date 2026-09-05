@@ -337,7 +337,8 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     });
     // A run that can break needs one sprite per line, so it is a group whatever else it is.
     let run = run_seed(b, &slot);
-    let wraps = run.is_some_and(|(_, flow)| flow == Flow::Wrap);
+    let wraps =
+        run.is_some_and(|(text, flow)| flow == Flow::Wrap || b.texts[text as usize].vertical);
     let leaf = seed_count == 1
         && chrome_count == 0
         && slot.kids.len == 0
@@ -400,6 +401,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         }
         let row = h.mint_mount(MountRow {
             node,
+            escape: None,
             next: MountId::NONE,
             control: None,
             text: None,
@@ -456,7 +458,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // ── styles that follow a value ────────────────────────────────────────────────
     // Its own pass over the act chain, taking only its own variants: a spacer has a style
     // that moves and no hit entry at all, so this cannot be folded into the control pass.
-    mount_style_acts(b, &slot, node);
+    mount_style_acts(b, &slot, node, row);
 
     // ── channels: one reactive lowering ───────────────────────────────────────────
     mount_channels(b, &slot, node, parts.fill, row, &mut own_claim);
@@ -956,7 +958,7 @@ fn mount_control(
             Some(Act::Flyout(f)) => control.flyout = Some(f),
             Some(Act::DisabledWhen(f)) => disabled = Some(f),
             Some(Act::SelectedWhen(f)) => selected = Some(f),
-            Some(Act::HideWhen(_) | Act::Restyle(_)) | None => {}
+            Some(Act::HideWhen(_) | Act::Restyle(_) | Act::Escape(_)) | None => {}
         }
     }
 
@@ -1185,15 +1187,16 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
 /// override missing, and two of them on one node would take turns. Collected, a node's style
 /// is written once per change and is always the whole of it. The scratch buffer belongs to
 /// the effect and reaches its high-water mark once.
-fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId) {
+fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: MountId) {
     let mut acts = Vec::new();
     let mut at = slot.acts.head;
     while at != NIL {
         let entry = &mut b.acts[at as usize];
         let next = entry.next;
         match entry.act.take() {
+            Some(Act::Escape(f)) => Host::with(|h| h.set_escape(row, f)),
             Some(act @ (Act::HideWhen(_) | Act::Restyle(_))) => acts.push(act),
-            // Put back: this pass owns two variants, and the control pass owns the rest.
+            // Put back: the control pass owns the remaining variants.
             other => entry.act = other,
         }
         at = next;
@@ -1201,7 +1204,7 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId) {
     if acts.is_empty() {
         return;
     }
-    let mut extra: Vec<Over> = Vec::new();
+    let mut extra: Vec<Rule> = Vec::new();
     // Installed outside every borrow, because creating an effect runs it.
     Effect::new(move || {
         extra.clear();
@@ -1209,7 +1212,7 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId) {
             match act {
                 Act::HideWhen(hidden) => {
                     if hidden() {
-                        extra.push(Over::Hidden);
+                        extra.push(Rule::always(Over::Hidden));
                     }
                 }
                 Act::Restyle(fill) => fill(&mut extra),
@@ -1402,10 +1405,11 @@ fn mount_text(
                 ramp,
                 flow,
                 caps,
+                vertical: seed.vertical,
                 scope,
                 ink,
                 sprite: sprite.unwrap_or_default(),
-                group: group.filter(|_| flow == Flow::Wrap),
+                group: group.filter(|_| flow == Flow::Wrap || seed.vertical),
             })
         });
         if let Some(row) = h.mounts.get_mut(row) {

@@ -117,6 +117,10 @@ impl Palette for Reference {
             Metric::PlotMinH => 180.0,
             Metric::PaneMinW => 360.0,
             Metric::PaneMaxW => 540.0,
+            Metric::PaneDrawerMaxW => 420.0,
+            Metric::EdgeTabInset => 28.0,
+            Metric::EdgeTabPadX => 6.0,
+            Metric::EdgeTabPadY => 12.0,
         }
     }
 

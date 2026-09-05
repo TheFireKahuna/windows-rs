@@ -41,6 +41,12 @@ pub fn label(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Label, Text::Secondary, Flow::Line, true)
 }
 
+/// A single label read from top to bottom, with its measured axes exchanged.
+#[must_use]
+pub fn vertical_label(s: impl Into<TextSource>) -> View {
+    label(s).vertical_text()
+}
+
 /// Supporting prose. It wraps, so it is the one text widget that mounts as a group: a
 /// coverage tile covers one line, and a run that can break needs a sprite per line.
 #[must_use]
@@ -132,6 +138,18 @@ pub fn panel(key: &'static str) -> View {
             crate::role::Elevation::Base,
             roles::SURFACE_PANEL,
             Metric::RadiusSurface,
+        )
+        .key(key)
+}
+
+/// A square-edged surface that meets adjoining regions without rounded gaps.
+#[must_use]
+pub fn sheet(key: &'static str) -> View {
+    El::seed(Preset::Bare)
+        .sprite(
+            crate::build::arena::MaskSeed::Box { radius: None },
+            Role::Fill(Fill::Surface),
+            crate::build::arena::Part::Fill,
         )
         .key(key)
 }

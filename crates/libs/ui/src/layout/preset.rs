@@ -244,11 +244,16 @@ pub fn lower(preset: Preset, rules: &[Rule], scope: Scope) -> taffy::Style {
 /// call produces the whole style, so every extra a node needs must arrive in one call or the
 /// last style pushed is the only one that survives.
 ///
-/// The extras apply at every width class: they carry this frame's values for bound
-/// properties rather than class-gated design decisions.
+/// Bound rules retain their class gates when the solve reclassifies a container.
 #[must_use]
-pub fn lower_with(preset: Preset, rules: &[Rule], extra: &[Over], scope: Scope) -> taffy::Style {
-    let active = || rules.iter().filter(|r| r.applies(scope)).map(|r| r.over);
+pub fn lower_with(preset: Preset, rules: &[Rule], extra: &[Rule], scope: Scope) -> taffy::Style {
+    let active = || {
+        rules
+            .iter()
+            .chain(extra)
+            .filter(|r| r.applies(scope))
+            .map(|r| r.over)
+    };
     // The base first, from the last active rule naming one: a preset replaces the style
     // wholesale, so resolving it in sequence would discard every override written before it.
     let preset = active()
@@ -259,7 +264,7 @@ pub fn lower_with(preset: Preset, rules: &[Rule], extra: &[Over], scope: Scope) 
         .next_back()
         .unwrap_or(preset);
     let mut style = base(preset, scope);
-    for over in active().chain(extra.iter().copied()) {
+    for over in active() {
         apply(&mut style, over, scope);
     }
     style

@@ -75,6 +75,68 @@ fn plate() -> View {
     )
 }
 
+#[test]
+fn vertical_labels_keep_their_rotated_extent_after_publish_and_updates() {
+    for dpi in [96.0, 144.0, 192.0] {
+        let mut patch = fixture_at(dpi);
+        let word = crate::signal::Cell::new("Inspector");
+        let held = mount(
+            stack((
+                crate::widget::vertical_label(crate::widget::shown(move || word.get())),
+                crate::widget::label(crate::widget::shown(move || word.get())),
+            ))
+            .align(crate::layout::Align::Start),
+            root(),
+        );
+        for (value, width) in [
+            ("Inspector", 600.0),
+            ("Longer inspector label", 900.0),
+            ("", 320.0),
+            ("I", 700.0),
+        ] {
+            word.set(value);
+            Host::with(|h| h.model().set_window(Vector2 { x: width, y: 600.0 }));
+            crate::signal::flush();
+            flush(&mut patch);
+            let sizes = || {
+                Host::with(|h| {
+                    let nodes: Vec<_> = h
+                        .mounts
+                        .iter()
+                        .filter(|(_, m)| m.text.is_some())
+                        .map(|(_, m)| m.node)
+                        .collect();
+                    let key = h.mounts.iter().filter_map(|(_, m)| m.text).nth(1).unwrap();
+                    let intrinsic = text::measure(windows_scene::MeasureIn {
+                        key,
+                        class: h.model().solved(nodes[1]).class,
+                        known: (None, None),
+                        available: (
+                            windows_scene::Avail::MaxContent,
+                            windows_scene::Avail::MaxContent,
+                        ),
+                    });
+                    (h.model().solved(nodes[0]).size, intrinsic)
+                })
+            };
+            let (v, h) = sizes();
+            if !value.is_empty() {
+                assert!(v.x > 0.0 && v.y > 0.0);
+                assert!((v.y - h.x).abs() < 2.0, "{dpi}: {v:?} vs {h:?}");
+                assert!((v.x - h.y).abs() < 2.0, "{dpi}: {v:?} vs {h:?}");
+            }
+            patch.clear();
+            flush(&mut patch);
+            assert!(
+                patch.ops().is_empty(),
+                "settled vertical text must emit nothing"
+            );
+            assert_eq!(sizes().0, v);
+        }
+        drop(held);
+    }
+}
+
 // ── lowering ─────────────────────────────────────────────────────────────────────
 
 /// A slot with one sprite and no children lowers to that sprite: one visual, no group.
@@ -2181,6 +2243,37 @@ fn hide_when_removes_the_box_and_not_the_node() {
         mounts, 4,
         "hiding is a style, so the node it hid is still mounted"
     );
+}
+
+#[test]
+fn unhandled_escape_follows_screen_visibility_and_mount_lifetime() {
+    let mut patch = fixture();
+    let hidden = crate::signal::Cell::new(false);
+    let calls = std::rc::Rc::new(core::cell::Cell::new(0));
+    let held = mount(
+        stack(()).grow().hide_if(hidden).on_unhandled_escape({
+            let calls = calls.clone();
+            move || {
+                // Re-entering the host is legal: the handler is taken out first.
+                Host::with(|_| ());
+                calls.set(calls.get() + 1);
+            }
+        }),
+        root(),
+    );
+    flush(&mut patch);
+    Host::with(|h| h.escape_handler()).unwrap()();
+    assert_eq!(calls.get(), 1);
+    hidden.set(true);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert!(Host::with(|h| h.escape_handler()).is_none());
+    hidden.set(false);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert!(Host::with(|h| h.escape_handler()).is_some());
+    drop(held);
+    assert!(Host::with(|h| h.escape_handler()).is_none());
 }
 
 /// `float_when` takes the node out of flow, pins it to its edge and stretches the other axis.

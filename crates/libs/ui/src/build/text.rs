@@ -30,7 +30,7 @@ use windows_text::{FontLadder, FontSpec, SegBuffers, ShapedRun, TextEngine};
 /// Where one entry's lines are drawn.
 ///
 /// A coverage tile covers **one line**, so a run that can break needs one sprite per line.
-/// Only the wrapping case pays for a group and a vector, so a static label costs one visual.
+/// Wrapping and vertical text use a group; a horizontal static label costs one visual.
 /// Which case an entry takes is decided by the widget's seed rather than by its content.
 enum Target {
     /// One line, always: the node is the sprite.
@@ -38,11 +38,17 @@ enum Target {
         sprite: SpriteId,
         run: Option<RunId>,
     },
-    /// One sprite per line, laid out in a column under the node.
-    Wrapped { group: GroupId, lines: Vec<Line> },
+    /// One sprite per line. A vertical label adds a box with exchanged axes around
+    /// its rotated sprite, so layout and paint describe the same extent.
+    Wrapped {
+        group: GroupId,
+        lines: Vec<Line>,
+        vertical: bool,
+    },
 }
 
 struct Line {
+    layout: NodeId,
     sprite: SpriteId,
     run: RunId,
     size: Vector2,
@@ -182,6 +188,7 @@ pub(crate) struct Entry {
 ///
 /// One argument rather than seven positional ones, all decided at the same call site.
 pub(crate) struct Mint {
+    pub vertical: bool,
     pub text: Source,
     pub ramp: TypeRole,
     pub flow: Flow,
@@ -287,6 +294,13 @@ pub(crate) fn measure(input: MeasureIn) -> Vector2 {
             return Vector2 { x: 0.0, y: 0.0 };
         };
         entry.sync(engine, input.class);
+        if matches!(entry.target, Target::Wrapped { vertical: true, .. }) {
+            let size = entry.run.measure(None);
+            return Vector2 {
+                x: size.y,
+                y: size.x,
+            };
+        }
         match input.available.0 {
             // Unbounded: the run at its natural width. A single-line run answers this to
             // every probe, since it has no break opportunity and its narrowest width is its
@@ -336,6 +350,7 @@ impl Table {
     /// run.
     pub(crate) fn mint(&mut self, mint: Mint) -> MeasureKey {
         let Mint {
+            vertical,
             mut text,
             ramp,
             flow,
@@ -351,6 +366,7 @@ impl Table {
             Some(group) => Target::Wrapped {
                 group,
                 lines: Vec::new(),
+                vertical,
             },
             None => Target::Line { sprite, run: None },
         };
@@ -535,7 +551,19 @@ impl Entry {
     /// Fixes this run at the width it was given and re-emits what moved.
     fn publish(&mut self, engine: &TextEngine, model: &mut Model) -> bool {
         let node = self.node();
-        let width = model.solved(node).size.x;
+        // Once a vertical run has a line box, layout derives its extent from that
+        // child and may skip the parent's measure callback on a text update.
+        if matches!(self.target, Target::Wrapped { vertical: true, .. }) {
+            self.sync(engine, model.solved(node).class);
+        }
+        let size = model.solved(node).size;
+        let width = if matches!(self.target, Target::Wrapped { vertical: true, .. }) {
+            // The preceding text may have been empty. Its zero-height box cannot
+            // supply the inline extent of the replacement run.
+            self.run.measure(None).x.max(1.0)
+        } else {
+            size.x
+        };
         if width <= 0.0 {
             return false;
         }
@@ -600,10 +628,22 @@ impl Entry {
                 publish_line(model, *sprite, run, shaped);
                 true
             }
-            Target::Wrapped { group, lines } => {
+            Target::Wrapped {
+                group,
+                lines,
+                vertical,
+            } => {
                 let light =
                     crate::role::resolve(crate::role::Role::Text(self.ink), self.scope.for_paint());
-                publish_lines(engine, model, &mut self.run, *group, lines, light)
+                publish_lines(
+                    engine,
+                    model,
+                    &mut self.run,
+                    *group,
+                    lines,
+                    light,
+                    *vertical,
+                )
             }
         }
     }
@@ -650,6 +690,7 @@ fn publish_lines(
     group: GroupId,
     lines: &mut Vec<Line>,
     light: windows_color::Radiance,
+    vertical: bool,
 ) -> bool {
     // Harvesting fills the line table and pinning makes it stale, so the walk happens once
     // here rather than at each reader below.
@@ -657,7 +698,7 @@ fn publish_lines(
     let count = run.lines().len();
     while lines.len() > count {
         let line = lines.pop().expect("the vector is longer than the run");
-        model.destroy(line.sprite.node(), windows_scene::Exit::None);
+        model.destroy(line.layout, windows_scene::Exit::None);
         model.release(line.run);
     }
     for index in 0..count {
@@ -667,16 +708,48 @@ fn publish_lines(
             model.set_run(line.run, shaped.segs, shaped.ink);
             if line.size != size {
                 line.size = size;
-                model.style(line.sprite.node(), &line_style(size));
+                model.style(line.sprite.node(), &oriented_line_style(size, vertical));
+                if vertical {
+                    model.style(
+                        line.layout,
+                        &line_style(Vector2 {
+                            x: size.y,
+                            y: size.x,
+                        }),
+                    );
+                }
             }
         } else {
-            let after = lines.last().map(|line| line.sprite.node());
-            let sprite = model.sprite(group, after);
+            let after = lines.last().map(|line| line.layout);
+            let (sprite, layout) = if vertical {
+                let box_ = model.group(group, after);
+                model.style(
+                    box_.node(),
+                    &line_style(Vector2 {
+                        x: size.y,
+                        y: size.x,
+                    }),
+                );
+                (model.sprite(box_, None), box_.node())
+            } else {
+                let sprite = model.sprite(group, after);
+                (sprite, sprite.node())
+            };
             let id = model.run(shaped.segs, shaped.ink);
             model.mask(sprite, Mask::Run(id));
             model.paint(sprite, windows_scene::Paint::Solid(light));
-            model.style(sprite.node(), &line_style(size));
+            model.style(sprite.node(), &oriented_line_style(size, vertical));
+            if vertical {
+                model.bind(
+                    sprite.node(),
+                    windows_scene::Prop::RotationAngle,
+                    windows_scene::Bind::Set(windows_scene::Value::Scalar(
+                        core::f32::consts::FRAC_PI_2,
+                    )),
+                );
+            }
             lines.push(Line {
+                layout,
                 sprite,
                 run: id,
                 size,
@@ -691,6 +764,18 @@ fn publish_lines(
 /// Built here rather than through the [`Over`](crate::layout::Over) vocabulary because the
 /// number is the text engine's rather than an author's. This is the lowering resolving a
 /// measurement rather than a widget expressing a size, and `Len` cannot say it.
+fn oriented_line_style(size: Vector2, vertical: bool) -> taffy::Style {
+    let mut style = line_style(size);
+    if vertical {
+        // Rotation is about the origin. Moving right by the line's height keeps
+        // the whole tile inside the measured, axis-swapped parent.
+        style.position = taffy::Position::Absolute;
+        style.inset.left = taffy::LengthPercentageAuto::length(size.y);
+        style.inset.top = taffy::LengthPercentageAuto::length(0.0);
+    }
+    style
+}
+
 fn line_style(size: Vector2) -> taffy::Style {
     taffy::Style {
         size: taffy::Size {

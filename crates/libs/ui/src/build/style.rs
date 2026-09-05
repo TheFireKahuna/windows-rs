@@ -77,14 +77,14 @@ pub(crate) struct Recipe {
     pub scope: Scope,
     /// What the node's bound style acts last produced, in the order they wrote it.
     ///
-    /// A bound override is a value rather than a design decision, so it is not in
-    /// [`over`](Self::over) and no rule can express it. It still has to be here: both
+    /// These rules follow signals and therefore cannot live in the static
+    /// [`over`](Self::over) recipe. They retain class gates across reclassification. Both
     /// lowerings start from this recipe, and one that could not see these would answer a
     /// style with the node's column template — or its bound width, or its hidden flag —
     /// missing. A container that resolved a class after its bound acts first ran is exactly
     /// that case, and it is the ordinary one: the class is a solve output, so **every**
     /// classified container resolves it after the mount that ran them.
-    pub bound: Box<[Over]>,
+    pub bound: Box<[Rule]>,
 }
 
 thread_local! {
@@ -138,7 +138,7 @@ pub(crate) fn restyle(node: NodeId, class: WidthClass) -> Option<taffy::Style> {
 /// The two halves are one call because they must not be able to disagree: a lowering that
 /// used `extra` without recording it leaves [`restyle`] answering a style without it, and the
 /// symptom is a template that survives until the container's class first moves.
-pub(crate) fn bind(node: NodeId, class: WidthClass, extra: &[Over]) -> Option<taffy::Style> {
+pub(crate) fn bind(node: NodeId, class: WidthClass, extra: &[Rule]) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get_mut(node)?;
         recipe.bound = extra.into();

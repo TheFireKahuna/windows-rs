@@ -22,7 +22,7 @@
 )]
 
 use crate::gesture::GestureDecl;
-use crate::layout::{Len, Over, Preset, Rule};
+use crate::layout::{Len, Preset, Rule};
 use crate::role::{Elevation, Role, Text, TypeRole};
 use crate::widget::{Chrome, Flow, Interaction, Motion, StatePolicy, TextSource, UiaRole};
 use std::cell::RefCell;
@@ -322,6 +322,7 @@ pub(crate) struct TextSeed {
     /// text colour does not have to reach into the text seed to say so.
     pub ink: Option<Text>,
     pub flow: Flow,
+    pub vertical: bool,
     /// Whether the run is set in capitals.
     ///
     /// The widget's, not the rung's: the same rung sets a section heading, a badge and a
@@ -337,6 +338,7 @@ pub(crate) struct TextSeed {
 /// Handlers never cross the thread seam: they live in an app-thread table and reach the
 /// front thread as a presence bit in [`HitFlags`], which is what keeps `SinkPatch: Send`.
 pub(crate) enum Act {
+    Escape(std::rc::Rc<dyn Fn()>),
     Click(Box<dyn Fn()>),
     ChangeF64(Box<dyn Fn(f64)>),
     CommitF64(Box<dyn Fn(f64)>),
@@ -360,7 +362,7 @@ pub(crate) enum Act {
     /// Writing into a buffer rather than returning one override is what lets a column
     /// template be bound — `ClearColumns` and a track each — and what lets a node carry two
     /// of these without them taking turns.
-    Restyle(Box<dyn Fn(&mut Vec<Over>)>),
+    Restyle(Box<dyn Fn(&mut Vec<Rule>)>),
     /// Disabled is model state: it swaps base roles and drops the hit flags.
     DisabledWhen(Box<dyn Fn() -> bool>),
     /// Selection is model state too — a discrete paint swap at event rate, not a wash.

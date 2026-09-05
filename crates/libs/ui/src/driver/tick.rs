@@ -199,6 +199,16 @@ impl Frame {
         let census = *scene.census();
         drop(scene);
         Host::with(|h| h.dispatch(&self.intents));
+        // Overlay scopes turn Escape into their own report before it reaches this
+        // fallback. Thus one press closes the overlay or the screen's inspector.
+        for report in &self.reports {
+            if matches!(report, Report::Key { event, .. }
+                if event.kind == crate::input::KeyKind::Down && event.key as i32 == crate::VK_ESCAPE)
+                && let Some(handler) = Host::with(|h| h.escape_handler())
+            {
+                handler();
+            }
+        }
         // After the dispatch: a menu option's handler lives in the very overlay the choice
         // closes, so closing it any earlier would dispose the control the intent names.
         self.overlays.after_dispatch(self.router.focus_mut());
