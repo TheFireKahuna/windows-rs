@@ -603,6 +603,34 @@ impl Scene {
                 axis,
                 affine,
             } => self.track_channel(id, prop, tracker, axis, affine),
+            Bind::FollowOffset {
+                source,
+                vertical,
+                affine,
+                clamp,
+            } => {
+                if !matches!(prop, Prop::TrimStart | Prop::TrimEnd)
+                    || source == id
+                    || !affine.m.is_finite()
+                    || !affine.c.is_finite()
+                    || !clamp[0].is_finite()
+                    || !clamp[1].is_finite()
+                    || clamp[0] > clamp[1]
+                {
+                    return Err(crate::invalid_arg());
+                }
+                if let Some(source) = self.nodes.get(source) {
+                    let expression = self
+                        .motion
+                        .templates
+                        .follow_offset(&source.visual, vertical, affine, clamp)
+                        .as_animation();
+                    if let Some(node) = self.nodes.get_mut(id) {
+                        prop::start(node, desc, &expression, Held::Bound, None);
+                        self.census.animations += 1;
+                    }
+                }
+            }
             Bind::Stop => self.stop(id, prop),
         }
         Ok(())

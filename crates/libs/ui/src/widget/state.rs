@@ -50,6 +50,8 @@ pub struct ChromeRow {
     /// between those insets. Holding all three keeps the move to one multiply and one add,
     /// and keeps the router from asking the app thread for geometry.
     pub thumb: Option<NodeId>,
+    /// Retained value stroke and its normalized origin.
+    pub trail: Option<(NodeId, f32)>,
     pub rest: f32,
     pub travel: f32,
     /// What a pointer means here. `None` is a press and nothing else.
@@ -66,6 +68,28 @@ pub struct ChromeRow {
     /// the pointer — a drag reports displacement from its origin and a dial reports detents —
     /// so its value accumulates on the front thread.
     pub fraction: f32,
+    /// Last application-authored fraction. Geometry-only updates repeat it, so adopting
+    /// new geometry can preserve a newer pointer value without swallowing an external edit.
+    pub source_fraction: f32,
+}
+
+/// The hit target includes the half-thumb gutters; the value range does not.
+fn slider_value_at(along: f32, span: f32, travel: f32, range: Range) -> f64 {
+    let fraction = if travel > 0.0 {
+        fraction_of((along - (span - travel) * 0.5) / travel, range.vertical)
+    } else {
+        0.0
+    };
+    range.at(fraction)
+}
+
+impl ChromeRow {
+    fn adopted(self, previous: Option<Self>) -> Self {
+        let fraction = previous
+            .filter(|old| old.source_fraction == self.source_fraction)
+            .map_or(self.source_fraction, |old| old.fraction);
+        Self { fraction, ..self }
+    }
 }
 
 /// What the application is asked to do, raised after the pixels have already moved.
@@ -168,9 +192,9 @@ impl Controls {
     /// Adopts the rows a mount produced or a solve corrected, as drained by the app thread
     /// alongside its patch.
     ///
-    /// A re-adopted row carries corrected geometry, never a corrected value: where the table
-    /// already holds the control, its own fraction is kept, so a window resize does not snap
-    /// a knob back to where the application last wrote it.
+    /// A geometry-only update preserves the pointer's fraction. A changed source fraction
+    /// adopts the application's value, so another control or a document load reaches this
+    /// control through the same front-side writer as a pointer.
     ///
     /// A row whose travel moved is re-driven here. This table is the only writer of the
     /// properties the router owns, so changed geometry reaches the pixels through this call
@@ -184,12 +208,49 @@ impl Controls {
             // `Slots` compares the generation, so a row for a control whose slot has since
             // been recycled misses and is placed fresh.
             let held = self.rows.get(row.id).copied();
-            let fraction = held.map_or(row.fraction, |old| old.fraction);
-            self.rows.place(row.id, ChromeRow { fraction, ..row });
-            // Only where travel moved: an unchanged row costs no retarget, and a fresh one
-            // keeps the position the mount gave it.
-            if held.is_some_and(|old| (old.rest, old.travel) != (row.rest, row.travel)) {
-                self.drive(row.id, fraction, front)?;
+            let row = row.adopted(held);
+            if held.is_none_or(|old| {
+                (old.trail, old.thumb, old.rest, old.travel)
+                    != (row.trail, row.thumb, row.rest, row.travel)
+            }) {
+                if let (Some((trail, origin)), Some(source), Some(Interaction::Slide(range))) =
+                    (row.trail, row.thumb, row.drive)
+                {
+                    let m = if row.travel > 0.0 {
+                        1.0 / row.travel
+                    } else {
+                        0.0
+                    };
+                    for (prop, clamp) in [
+                        (Prop::TrimStart, [0.0, origin]),
+                        (Prop::TrimEnd, [origin, 1.0]),
+                    ] {
+                        front.retarget(
+                            trail,
+                            prop,
+                            Bind::FollowOffset {
+                                source,
+                                vertical: range.vertical,
+                                affine: windows_scene::Affine {
+                                    m,
+                                    c: -row.rest * m,
+                                },
+                                clamp,
+                            },
+                        )?;
+                    }
+                }
+            }
+            self.rows.place(row.id, row);
+            if held.is_none_or(|old| {
+                (old.rest, old.travel, old.fraction) != (row.rest, row.travel, row.fraction)
+            }) {
+                self.drive(
+                    row.id,
+                    row.fraction,
+                    held.is_some_and(|old| old.fraction == row.fraction),
+                    front,
+                )?;
             }
         }
         Ok(())
@@ -279,7 +340,7 @@ impl Controls {
                     self.wash(to, front)?;
                 }
             }
-            Report::Pressed { target, .. } => {
+            Report::Pressed { target, sample, .. } => {
                 self.pressed = Some(target);
                 // Where the value stood when the contact landed: a turn is measured from it.
                 self.grabbed = self.rows.get(target).map(|row| (target, row.fraction));
@@ -287,6 +348,14 @@ impl Controls {
                 self.dragged = None;
                 self.hide_ring(front)?;
                 self.wash(target, front)?;
+                if let Some(Interaction::Slide(range)) = self.rows.get(target).and_then(|r| r.drive)
+                {
+                    let value = self.slide(target, sample.raw, range, false, front)?;
+                    out.push(Intent {
+                        target,
+                        what: What::Changed(value),
+                    });
+                }
             }
             Report::Released { target, at, .. } => {
                 let was = self.pressed.take() == Some(target);
@@ -315,7 +384,7 @@ impl Controls {
                         what: What::Tapped,
                     }),
                     Some(Interaction::Slide(range)) => {
-                        let value = self.slide(target, at, range, front)?;
+                        let value = self.slide(target, at, range, false, front)?;
                         out.push(Intent {
                             target,
                             what: What::Committed(value),
@@ -339,7 +408,7 @@ impl Controls {
                 if let Some((grabbed, fraction)) = self.grabbed.take()
                     && grabbed == target
                 {
-                    self.drive(target, fraction, front)?;
+                    self.drive(target, fraction, false, front)?;
                 }
                 if let Some((_, decided)) = self.dragged.take().filter(|&(id, _)| id == target)
                     && decided
@@ -355,7 +424,7 @@ impl Controls {
             Report::Moved { target, sample, .. } => {
                 if let Some(Interaction::Slide(range)) = self.rows.get(target).and_then(|r| r.drive)
                 {
-                    let value = self.slide(target, sample.raw, range, front)?;
+                    let value = self.slide(target, sample.raw, range, true, front)?;
                     out.push(Intent {
                         target,
                         what: What::Changed(value),
@@ -460,11 +529,24 @@ impl Controls {
     ///
     /// A control with no thumb or no [`Interaction`] is left alone: its part follows the
     /// application's own channel, whose writer is the app thread.
-    fn drive(&mut self, id: ControlId, fraction: f32, front: &mut Front<'_>) -> Result<()> {
+    fn drive(
+        &mut self,
+        id: ControlId,
+        fraction: f32,
+        snap: bool,
+        front: &mut Front<'_>,
+    ) -> Result<()> {
         let Some(row) = self.rows.get_mut(id) else {
             return Ok(());
         };
         row.fraction = fraction.clamp(0.0, 1.0);
+        let motion = |v| {
+            if snap {
+                Bind::Set(Value::Scalar(v))
+            } else {
+                chrome(v)
+            }
+        };
         let (fraction, thumb, rest, travel, drive) =
             (row.fraction, row.thumb, row.rest, row.travel, row.drive);
         let (Some(thumb), Some(drive)) = (thumb, drive) else {
@@ -477,7 +559,7 @@ impl Controls {
             // A turned part rotates through the constant sweep; a slid one travels the
             // extent the last solve measured for it.
             Interaction::Turn(_) => {
-                front.retarget(thumb, Prop::RotationAngle, chrome(angle_of(fraction)))
+                front.retarget(thumb, Prop::RotationAngle, motion(angle_of(fraction)))
             }
             Interaction::Slide(range) => front.retarget(
                 thumb,
@@ -486,7 +568,7 @@ impl Controls {
                 } else {
                     Prop::OffsetX
                 },
-                chrome(rest + offset_of(fraction, travel, range.vertical)),
+                motion(rest + offset_of(fraction, travel, range.vertical)),
             ),
         }
     }
@@ -502,6 +584,7 @@ impl Controls {
         id: ControlId,
         at: windows_scene::Point,
         range: Range,
+        snap: bool,
         front: &mut Front<'_>,
     ) -> Result<f64> {
         let Some(entry) = front.scene.hits().entry(id).copied() else {
@@ -512,13 +595,10 @@ impl Controls {
         } else {
             (at.x - entry.x0, entry.x1 - entry.x0)
         };
-        let fraction = if span > 0.0 {
-            fraction_of(along / span, range.vertical)
-        } else {
-            0.0
-        };
-        self.drive(id, fraction, front)?;
-        Ok(range.at(fraction))
+        let travel = self.rows.get(id).map_or(0.0, |row| row.travel);
+        let value = slider_value_at(along, span, travel, range);
+        self.drive(id, range.fraction(value), snap, front)?;
+        Ok(value)
     }
 
     /// Clamps `fraction`, moves the part, and returns the value, for a control whose input
@@ -531,7 +611,7 @@ impl Controls {
         front: &mut Front<'_>,
     ) -> Result<f64> {
         let fraction = fraction.clamp(0.0, 1.0);
-        self.drive(id, fraction, front)?;
+        self.drive(id, fraction, false, front)?;
         Ok(range.at(fraction))
     }
 
@@ -596,6 +676,60 @@ mod tests {
     fn two() -> (ControlId, ControlId) {
         let mut ids = windows_scene::Ids::<Control>::new();
         (ids.mint(), ids.mint())
+    }
+
+    #[test]
+    fn slider_pointer_maps_the_visible_rail_and_snaps_the_reported_value() {
+        let horizontal = Range::new(-24.0, 24.0).step(0.1);
+        assert_eq!(slider_value_at(13.0, 126.0, 100.0, horizontal), -24.0);
+        assert_eq!(slider_value_at(63.0, 126.0, 100.0, horizontal), 0.0);
+        assert_eq!(slider_value_at(113.0, 126.0, 100.0, horizontal), 24.0);
+        assert_eq!(slider_value_at(-20.0, 126.0, 100.0, horizontal), -24.0);
+        assert_eq!(slider_value_at(140.0, 126.0, 100.0, horizontal), 24.0);
+        assert!((slider_value_at(70.0, 126.0, 100.0, horizontal) - 3.4).abs() < 1e-10);
+        let vertical = Range {
+            vertical: true,
+            ..horizontal
+        };
+        assert_eq!(slider_value_at(13.0, 126.0, 100.0, vertical), 24.0);
+        assert_eq!(slider_value_at(113.0, 126.0, 100.0, vertical), -24.0);
+        assert!(slider_value_at(0.0, 0.0, 0.0, horizontal).is_finite());
+    }
+
+    #[test]
+    fn source_edits_and_geometry_updates_have_distinct_value_ownership() {
+        let (id, _) = two();
+        let source = ChromeRow {
+            id,
+            wash: None,
+            hover: 0.0,
+            press: 0.0,
+            thumb: None,
+            trail: None,
+            rest: 0.0,
+            travel: 100.0,
+            drive: Some(Interaction::Slide(Range::UNIT)),
+            drags: false,
+            fraction: 0.25,
+            source_fraction: 0.25,
+        };
+        assert_eq!(source.adopted(None).fraction, 0.25);
+        let dragged = ChromeRow {
+            fraction: 0.75,
+            ..source
+        };
+        let resized = ChromeRow {
+            travel: 200.0,
+            ..source
+        }
+        .adopted(Some(dragged));
+        assert_eq!((resized.fraction, resized.travel), (0.75, 200.0));
+        let edited = ChromeRow {
+            source_fraction: 0.5,
+            ..source
+        }
+        .adopted(Some(resized));
+        assert_eq!(edited.fraction, 0.5);
     }
 
     #[test]

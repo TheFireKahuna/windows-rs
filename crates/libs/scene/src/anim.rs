@@ -3,7 +3,7 @@
 //! Springs are templates, one per (value kind × tuning) for the whole process: a
 //! natural-motion animation starts from the target property's current value and resets its
 //! velocity, whichever object drives it, so retargeting a shared instance plays the same
-//! motion as a freshly built one. Nine spring objects serve every sink.
+//! motion as a freshly built one. Six spring objects serve every sink.
 //!
 //! A key-frame animation carries its frames and the platform offers no way to clear them, so
 //! one is built per start and released when its scoped batch reports. That is once per
@@ -77,6 +77,7 @@ pub(crate) struct Templates {
     /// `value * m + c`. `m` and `c` are scalar parameters, so the strings are constants and
     /// one instance per axis serves every binding.
     track: [ExpressionAnimation; 3],
+    follow: [ExpressionAnimation; 2],
     linear: CompositionEasingFunction,
 }
 
@@ -119,6 +120,10 @@ impl Templates {
                 compositor.create_expression_animation(TRACK_X),
                 compositor.create_expression_animation(TRACK_Y),
                 compositor.create_expression_animation(TRACK_SCALE),
+            ],
+            follow: [
+                compositor.create_expression_animation("Clamp(v.Offset.X * m + c, lo, hi)"),
+                compositor.create_expression_animation("Clamp(v.Offset.Y * m + c, lo, hi)"),
             ],
             linear: compositor.create_linear_easing_function(),
         }
@@ -190,6 +195,22 @@ impl Templates {
         expression.set_reference_parameter("t", tracker);
         expression.set_scalar_parameter("m", m);
         expression.set_scalar_parameter("c", c);
+        expression
+    }
+
+    pub(crate) fn follow_offset(
+        &self,
+        source: &Visual,
+        vertical: bool,
+        affine: crate::sink::Affine,
+        clamp: [f32; 2],
+    ) -> &ExpressionAnimation {
+        let expression = &self.follow[usize::from(vertical)];
+        expression.set_reference_parameter("v", source);
+        expression.set_scalar_parameter("m", affine.m);
+        expression.set_scalar_parameter("c", affine.c);
+        expression.set_scalar_parameter("lo", clamp[0]);
+        expression.set_scalar_parameter("hi", clamp[1]);
         expression
     }
 

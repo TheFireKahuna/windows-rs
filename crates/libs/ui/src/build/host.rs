@@ -848,6 +848,17 @@ impl Host {
             value.control = Some(control);
             value.track = track;
             value.front_driven = front_driven;
+            let fraction = value.fraction;
+            self.publish_fraction(control, fraction);
+        }
+    }
+
+    fn publish_fraction(&mut self, id: ControlId, fraction: f32) {
+        if let Some(control) = self.control_mut(id) {
+            control.front.fraction = fraction;
+            control.front.source_fraction = fraction;
+            let front = control.front;
+            self.chrome.push(front);
         }
     }
 
@@ -855,13 +866,18 @@ impl Host {
     /// travel the last solve gave a slid part, or the constant sweep of a turned one.
     ///
     /// The only place on this thread that turns a fraction into a property. A part the router
-    /// drives records the fraction and binds nothing, so that channel keeps one writer.
+    /// drives receives the fraction through its chrome row and binds nothing here, so that
+    /// channel keeps one writer.
     pub(crate) fn set_fraction(&mut self, id: ValueId, fraction: f32) {
         let Some(value) = self.value_mut(id) else {
             return;
         };
         value.fraction = fraction.clamp(0.0, 1.0);
         if value.front_driven {
+            let (control, fraction) = (value.control, value.fraction);
+            if let Some(control) = control {
+                self.publish_fraction(control, fraction);
+            }
             return;
         }
         let (node, prop, motion) = (value.node, value.prop, value.motion);
@@ -1162,11 +1178,13 @@ impl Host {
                 hover: 0.0,
                 press: 0.0,
                 thumb: None,
+                trail: None,
                 rest: 0.0,
                 travel: 0.0,
                 drive: None,
                 drags: false,
                 fraction: 0.0,
+                source_fraction: 0.0,
             },
             chrome: None,
             scope: self.root_scope,

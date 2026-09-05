@@ -535,9 +535,9 @@ impl Value {
     }
 }
 
-/// How a channel is driven: written, animated or bound to a tracker — and released.
+/// How a channel is driven: written, animated or derived from a tracker/visual — and released.
 ///
-/// The three driving forms are closed, so the compiler checks the set. All three address one
+/// The driving forms are closed, so the compiler checks the set. All address one
 /// property set the same way, so there is one validity check and one re-issue loop after
 /// device loss.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -552,6 +552,14 @@ pub enum Bind {
         tracker: TrackerId,
         axis: TrackerAxis,
         affine: Affine,
+    },
+    /// A trim endpoint derived from another visual's animated offset. The clamp lets an
+    /// indicator grow from an origin while sharing exactly one animated position.
+    FollowOffset {
+        source: NodeId,
+        vertical: bool,
+        affine: Affine,
+        clamp: [f32; 2],
     },
     /// Hands the property back, leaving it wherever it had reached.
     Stop,

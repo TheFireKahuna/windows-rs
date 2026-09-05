@@ -235,6 +235,7 @@ pub fn mount_at(el: View, parent: GroupId, after: Option<NodeId>, scope: Scope) 
 #[derive(Default)]
 struct Claim {
     thumb: Option<SpriteId>,
+    trail: Option<(SpriteId, f32)>,
     /// The first label sprite this subtree minted, which the enclosing control repaints when
     /// its chrome row changes.
     ///
@@ -259,6 +260,7 @@ impl Claim {
     /// Takes what a subtree offered, without displacing what this node already found.
     fn absorb(&mut self, inner: Self) {
         self.thumb = self.thumb.or(inner.thumb);
+        self.trail = self.trail.or(inner.trail);
         self.label = self.label.or(inner.label);
         self.value = self.value.or(inner.value);
         self.text = self.text.or(inner.text);
@@ -678,6 +680,7 @@ impl Parts {
             Part::Border => self.border = Some(id),
             Part::Wash => self.wash = Some(id),
             Part::Thumb => claim.thumb = claim.thumb.or(Some(id)),
+            Part::Trail { origin } => claim.trail = Some((id, origin)),
             Part::Static => {}
         }
     }
@@ -995,6 +998,7 @@ fn mount_control(
             hover: HOVER_ALPHA,
             press: PRESS_ALPHA,
             thumb: claim.thumb.map(SpriteId::node),
+            trail: claim.trail.map(|(id, origin)| (id.node(), origin)),
             // The inset and the room are both solve outputs, so they arrive with the first
             // publish rather than here. Until then a fraction moves the part nowhere, which
             // is where it starts.
@@ -1005,6 +1009,7 @@ fn mount_control(
             // handler, so a policy declared with no handler raises nothing.
             drags: false,
             fraction: 0.0,
+            source_fraction: 0.0,
         },
         chrome: slot.chrome,
         scope,
@@ -1235,11 +1240,13 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
             hover: 0.0,
             press: 0.0,
             thumb: None,
+            trail: None,
             rest: 0.0,
             travel: 0.0,
             drive: None,
             drags: false,
             fraction: 0.0,
+            source_fraction: 0.0,
         },
         chrome: None,
         scope,

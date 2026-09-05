@@ -397,6 +397,10 @@ pub enum Metric {
     CardMinH,
     /// Diameter of a rotary editor dial.
     DialSize,
+    /// Thickness of a slider rail, independent of its pointer target.
+    SliderRailH,
+    /// Diameter of a slider thumb.
+    SliderThumb,
     /// Minimum height of a measurement plot, independent of the control row height.
     PlotMinH,
     /// Minimum width of a docked detail pane.

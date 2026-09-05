@@ -6,7 +6,7 @@
 //! A composition is a function returning a tree of these. It is where `badge`, `nav`, `tabs`
 //! and every screen an application assembles for itself live, and it adds nothing here.
 
-use crate::build::arena::FULL;
+use crate::build::arena::{FULL, MaskSeed, Part};
 use crate::build::{Button, El, Path, View};
 use crate::gesture::{DragDecl, GestureDecl};
 use crate::layout::{Align, Len, Over, Preset};
@@ -81,6 +81,12 @@ pub fn mono(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Mono, Text::Primary, Flow::Line, false)
 }
 
+/// A prominent instrument readout, using the display rung of the type ramp.
+#[must_use]
+pub fn display(s: impl Into<TextSource>) -> View {
+    run(s, TypeRole::Display, Text::Primary, Flow::Line, false)
+}
+
 /// Builds a text run: the shared body of the five text widgets and of every label inside a
 /// control.
 ///
@@ -147,9 +153,9 @@ pub fn panel(key: &'static str) -> View {
 pub fn sheet(key: &'static str) -> View {
     El::seed(Preset::Bare)
         .sprite(
-            crate::build::arena::MaskSeed::Box { radius: None },
+            MaskSeed::Box { radius: None },
             Role::Fill(Fill::Surface),
-            crate::build::arena::Part::Fill,
+            Part::Fill,
         )
         .key(key)
 }
@@ -313,23 +319,182 @@ pub fn toggle<M>(on: impl Signal<bool, M> + Copy + 'static) -> View {
         .no_shrink()
 }
 
+/// Paint and origin of a slider's retained value stroke.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SliderStyle {
+    /// Value the fill grows from; the range minimum when absent.
+    pub origin: Option<f64>,
+    /// A fixed gradient across the whole rail; trimmed rather than rescaled.
+    pub ramp: Option<windows_scene::RampId>,
+}
+
 /// A value along a track. The thumb moves front-side in the tick that saw the contact,
 /// and the number reaches the application afterwards.
 #[must_use]
-pub fn slider<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> View {
-    control::<crate::build::Any>(UiaRole::Slider)
-        .chrome(roles::TRACK, roles::TRACK_OFF, Metric::RadiusPill)
+pub fn slider<M>(
+    value: impl Signal<f64, M> + Copy + 'static,
+    range: Range,
+    style: SliderStyle,
+) -> View {
+    let extent = crate::layout::probe();
+    let geometry = crate::build::geometry(&[]);
+    let marker = crate::build::geometry(&[]);
+    let fraction = range.fraction(style.origin.unwrap_or(range.min));
+    let origin = if range.vertical {
+        1.0 - fraction
+    } else {
+        fraction
+    };
+    crate::signal::Effect::new(move || {
+        let size = extent.get().size;
+        let (a, b) = if range.vertical {
+            (
+                windows_numerics::Vector2 {
+                    x: size.x * 0.5,
+                    y: 0.0,
+                },
+                windows_numerics::Vector2 {
+                    x: size.x * 0.5,
+                    y: size.y,
+                },
+            )
+        } else {
+            (
+                windows_numerics::Vector2 {
+                    x: 0.0,
+                    y: size.y * 0.5,
+                },
+                windows_numerics::Vector2 {
+                    x: size.x,
+                    y: size.y * 0.5,
+                },
+            )
+        };
+        let half_tick = crate::role::metric(Metric::SliderThumb, crate::build::root_scope()) * 0.55;
+        let (tick_a, tick_b) = if range.vertical {
+            (
+                windows_numerics::Vector2 {
+                    x: size.x * 0.5 - half_tick,
+                    y: size.y * origin,
+                },
+                windows_numerics::Vector2 {
+                    x: size.x * 0.5 + half_tick,
+                    y: size.y * origin,
+                },
+            )
+        } else {
+            (
+                windows_numerics::Vector2 {
+                    x: size.x * origin,
+                    y: size.y * 0.5 - half_tick,
+                },
+                windows_numerics::Vector2 {
+                    x: size.x * origin,
+                    y: size.y * 0.5 + half_tick,
+                },
+            )
+        };
+        crate::build::set_geometry(
+            marker,
+            &[
+                windows_scene::PathVerb::Move {
+                    to: tick_a,
+                    filled: false,
+                },
+                windows_scene::PathVerb::Line(tick_b),
+                windows_scene::PathVerb::End { closed: false },
+            ],
+        );
+        crate::build::set_geometry(
+            geometry,
+            &[
+                windows_scene::PathVerb::Move {
+                    to: a,
+                    filled: false,
+                },
+                windows_scene::PathVerb::Line(b),
+                windows_scene::PathVerb::End { closed: false },
+            ],
+        );
+    });
+    let trail = path(geometry)
+        .slider_trail(origin, style.ramp)
+        .probed(extent)
+        .width(Len::Pct(1.0))
+        .height(Len::Pct(1.0))
+        .erase();
+
+    let tick = path(marker)
+        .ink_stroke(Metric::HairlineW)
+        .opacity(if style.origin.is_some() { 0.15 } else { 0.0 })
+        .cover();
+    let rail = El::<crate::build::Any>::seed(Preset::Bare).sprite(
+        MaskSeed::Box {
+            radius: Some(Metric::Radius.into()),
+        },
+        Role::Fill(Fill::Pressed),
+        Part::Static,
+    );
+    let rail = if range.vertical {
+        crate::layout::row(
+            crate::layout::grid((
+                rail.width(Metric::SliderRailH).height(Len::Pct(1.0)),
+                trail.cover(),
+                tick,
+            ))
+            .cols([crate::layout::Track::Fr(1.0)])
+            .rows([crate::layout::Track::Fr(1.0)])
+            .justify(Align::Center)
+            .width(Metric::RowH)
+            .height(Len::Pct(1.0)),
+        )
+        .justify(Align::Center)
+        .padding_xy(Len::Zero, Metric::SliderThumb)
+    } else {
+        crate::layout::row(
+            crate::layout::grid((
+                rail.height(Metric::SliderRailH).width(Len::Pct(1.0)),
+                trail.cover(),
+                tick,
+            ))
+            .cols([crate::layout::Track::Fr(1.0)])
+            .rows([crate::layout::Track::Fr(1.0)])
+            .align(Align::Center)
+            .height(Metric::RowH)
+            .width(Len::Pct(1.0)),
+        )
+        .align(Align::Center)
+        .padding_xy(Metric::SliderThumb, Len::Zero)
+    }
+    .cover();
+    let thumb = El::<crate::build::Any>::seed(Preset::Bare)
+        .thumb(
+            Len::Times(Metric::SliderThumb, 0.5),
+            Role::Text(Text::Primary),
+        )
+        .width(Metric::SliderThumb)
+        .height(Metric::SliderThumb)
+        .no_shrink()
+        .along(range.vertical, move || range.fraction(value.read()));
+    let control = control::<crate::build::Any>(UiaRole::Slider)
+        .chrome(roles::OPTION, 0, Metric::RadiusPill)
         .interaction(Interaction::Slide(range))
         .gesture(GestureDecl::slider(range.vertical))
-        .state(accent_wash())
-        .row(
-            knob_sprite(1.0, KNOB_OF_TRACK)
-                .along(range.vertical, move || range.fraction(value.read())),
-        )
-        // The same inset and the same justification a toggle states, and for the same
-        // reason: the thumb rests at the near inset and travels to the far one. A groove is
-        // a row tall, so the fractions here are of the row rather than of a shorter track.
-        .padding(Len::Times(Metric::RowH, knob_inset_of(KNOB_OF_TRACK)))
+        .state(accent_wash());
+    let inset = Len::Times(Metric::SliderThumb, 0.5);
+    let control = if range.vertical {
+        control
+            .stack((rail, thumb))
+            .width(Metric::RowH)
+            .padding_xy(Len::Zero, inset)
+    } else {
+        control
+            .row((rail, thumb))
+            .height(Metric::RowH)
+            .padding_xy(inset, Len::Zero)
+    };
+    control
+        .gap(Len::Zero)
         .justify(Align::Start)
         .align(Align::Center)
 }
@@ -521,12 +686,6 @@ fn control<K>(uia: UiaRole) -> El<K> {
         .hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, uia)
         .state(ink_wash())
 }
-
-/// The knob's diameter on a groove, as a fraction of the track's height.
-///
-/// Under the whole of it, so the knob is inset from the track on the cross axis at every
-/// density rather than at one.
-const KNOB_OF_TRACK: f32 = 0.6;
 
 /// Returns how far a knob of diameter `of_track` sits from its track's edge, as a fraction of
 /// the track's height.

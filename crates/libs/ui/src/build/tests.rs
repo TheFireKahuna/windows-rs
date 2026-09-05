@@ -959,7 +959,12 @@ fn a_control_claims_the_moving_part_its_children_declared() {
     let mut patch = fixture();
     let value = crate::signal::Cell::new(0.5_f64);
     let _slider = mount(
-        crate::widget::slider(value, crate::widget::Range::UNIT).width(Metric::CardMinW),
+        crate::widget::slider(
+            value,
+            crate::widget::Range::UNIT,
+            crate::widget::SliderStyle::default(),
+        )
+        .width(Metric::CardMinW),
         root(),
     );
     flush(&mut patch);
@@ -1021,7 +1026,12 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
     let mut patch = fixture();
     let value = crate::signal::Cell::new(0.25_f64);
     let _slider = mount(
-        crate::widget::slider(value, crate::widget::Range::UNIT).width(Metric::CardMinW),
+        crate::widget::slider(
+            value,
+            crate::widget::Range::UNIT,
+            crate::widget::SliderStyle::default(),
+        )
+        .width(Metric::CardMinW),
         root(),
     );
     flush(&mut patch);
@@ -1036,6 +1046,10 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
         front.travel > 0.0 && front.thumb.is_some(),
         "the router is shipped the part and the room it moves in"
     );
+    assert_eq!(
+        front.fraction, 0.25,
+        "the initial value reaches the input owner"
+    );
     // The mount seeds the part, because a control renders at its value before the router has
     // anything to report.
     assert!(!binds(&patch, windows_scene::Prop::OffsetX).is_empty());
@@ -1049,6 +1063,11 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
     assert!(
         binds(&patch, windows_scene::Prop::OffsetX).is_empty(),
         "an owned part must not be written from this thread"
+    );
+    let changed = Host::with(|h| h.control(front.id).unwrap().front);
+    assert_eq!(
+        changed.fraction, 0.75,
+        "an external edit reaches the input owner"
     );
     // The number it will land on is still this thread's own, from the same function.
     assert!(
@@ -2724,7 +2743,11 @@ fn a_wash_is_as_round_as_the_control_it_covers() {
             crate::widget::knob(0.5_f64, crate::widget::Range::UNIT)
         }),
         ("slider", || {
-            crate::widget::slider(0.5_f64, crate::widget::Range::UNIT)
+            crate::widget::slider(
+                0.5_f64,
+                crate::widget::Range::UNIT,
+                crate::widget::SliderStyle::default(),
+            )
         }),
     ];
     for (name, view) in cases {
@@ -2848,7 +2871,12 @@ fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
     let _row = mount(
         stack((
             crate::widget::label("Gain"),
-            crate::widget::slider(value, crate::widget::Range::UNIT).width(Metric::CardMinW),
+            crate::widget::slider(
+                value,
+                crate::widget::Range::UNIT,
+                crate::widget::SliderStyle::default(),
+            )
+            .width(Metric::CardMinW),
         )),
         root(),
     );
@@ -2884,7 +2912,12 @@ fn a_capitalised_run_announces_the_authors_casing() {
     let _row = mount(
         stack((
             crate::widget::label("Gain adjust"),
-            crate::widget::slider(value, crate::widget::Range::UNIT).width(Metric::CardMinW),
+            crate::widget::slider(
+                value,
+                crate::widget::Range::UNIT,
+                crate::widget::SliderStyle::default(),
+            )
+            .width(Metric::CardMinW),
         )),
         root(),
     );
@@ -2931,7 +2964,12 @@ fn a_control_that_has_a_name_keeps_it_and_one_with_no_run_before_it_gets_none() 
         stack((
             crate::widget::label("Gain"),
             crate::widget::button("Reset"),
-            crate::widget::slider(value, crate::widget::Range::UNIT).width(Metric::CardMinW),
+            crate::widget::slider(
+                value,
+                crate::widget::Range::UNIT,
+                crate::widget::SliderStyle::default(),
+            )
+            .width(Metric::CardMinW),
         )),
         root(),
     );
@@ -4574,4 +4612,53 @@ fn a_drawer_shadow_is_retained_across_width_classes() {
         flush(&mut patch);
         assert!(patch.ops().is_empty());
     }
+}
+
+#[test]
+fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
+    let mut patch = fixture();
+    let value = crate::signal::Cell::new(-12.0_f64);
+    let _held = mount(
+        crate::widget::slider(
+            value,
+            crate::widget::Range::new(-24.0, 24.0),
+            crate::widget::SliderStyle {
+                origin: Some(0.0),
+                ramp: None,
+            },
+        )
+        .width(Metric::CardMinW),
+        root(),
+    );
+    flush(&mut patch);
+    let before = Host::with(|h| h.take_chrome())
+        .into_iter()
+        .find(|r| r.trail.is_some())
+        .unwrap();
+    let (trail, origin) = before.trail.unwrap();
+    assert_eq!(origin, 0.5);
+    assert!(before.thumb.is_some());
+    crate::signal::flush();
+    flush(&mut patch);
+    patch.clear();
+    value.set(12.0);
+    crate::signal::flush();
+    flush(&mut patch);
+    let rows = Host::with(|h| h.take_chrome());
+    assert!(
+        rows.iter()
+            .any(|r| r.id == before.id && r.source_fraction == 0.75 && r.trail == before.trail)
+    );
+    assert!(
+        !patch
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::New { .. } | Op::Res { .. }))
+    );
+    assert!(
+        !patch
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::Bind { id, .. } if *id == trail))
+    );
 }

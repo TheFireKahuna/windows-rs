@@ -234,7 +234,7 @@ pub(crate) enum HaloSeed {
 
 /// Which of a control's parts a sprite is, so interaction can re-resolve exactly the ones
 /// that change and leave the rest alone.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum Part {
     /// Not interaction-sensitive.
     Static,
@@ -243,6 +243,10 @@ pub(crate) enum Part {
     Border,
     /// The part a value moves: a slider's thumb, a toggle's knob, a meter's level.
     Thumb,
+    /// A slider value stroke, trimmed by the same owner that moves its thumb.
+    Trail {
+        origin: f32,
+    },
     /// The wash a hover or a press fades in. Minted by the lowering, never by a widget.
     Wash,
 }

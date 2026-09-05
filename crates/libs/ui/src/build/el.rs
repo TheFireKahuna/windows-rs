@@ -1371,6 +1371,26 @@ impl El<Path> {
         });
         self
     }
+    pub(crate) fn slider_trail(self, origin: f32, ramp: Option<RampId>) -> Self {
+        Build::with(|b| {
+            b.push_seed(
+                self.at,
+                SpriteSeed {
+                    mask: MaskSeed::Shape {
+                        stroke: Some(Metric::SliderRailH.into()),
+                    },
+                    role: Role::Fill(Fill::Accent),
+                    strength: super::arena::FULL,
+                    ramp,
+                    region: None,
+                    part: Part::Trail { origin },
+                    next: super::arena::NIL,
+                },
+            )
+        });
+        self
+    }
+
     /// Fills this node's geometry in a chromatic, application-defined role.
     #[must_use]
     pub fn fill(self, role: DataRole) -> Self {
@@ -1455,7 +1475,7 @@ impl El<Path> {
         )
     }
 
-    /// Binds the end of the draw-on window. A channel and not a field, so it animates.
+    /// Binds the visible end of the path, in normalized path length.
     #[must_use]
     pub fn trim<M>(self, end: impl Signal<f32, M> + 'static) -> Self {
         self.channel(Prop::TrimEnd, Motion::Chrome, Unit::Direct, end)

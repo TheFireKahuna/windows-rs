@@ -128,6 +128,8 @@ impl Palette for Reference {
             Metric::HairlineW => 0.5,
             Metric::CardMinW => 240.0,
             Metric::DialSize => 128.0 * tight,
+            Metric::SliderRailH => 5.0 * tight,
+            Metric::SliderThumb => 13.0 * tight,
             Metric::CardMinH => 160.0,
             Metric::PlotMinH => 180.0,
             Metric::PaneMinW => 360.0,
