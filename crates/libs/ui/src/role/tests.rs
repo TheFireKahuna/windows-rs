@@ -66,8 +66,14 @@ impl Palette for Reference {
 
     /// No light at any rung. A reference palette states an appearance and nothing about
     /// what emits — a glow is the application's claim about its own data.
-    fn emission(&self, _role: Role, _scope: Scope) -> Emission {
-        Emission::NONE
+    fn emission(&self, role: Role, _scope: Scope) -> Emission {
+        // Reserved instrument witnesses: different ink/area profiles catch a path
+        // accidentally mounting its halo as a filled rectangle.
+        if matches!(role, Role::Data(DataRole(0xfffe | 0xffff))) {
+            Emission::new(Light::new(9.0, 0.8), Light::new(2.0, 0.1))
+        } else {
+            Emission::NONE
+        }
     }
 
     fn shadow(&self, _scope: Scope) -> super::Shadow {
@@ -121,6 +127,7 @@ impl Palette for Reference {
             Metric::BorderW => 1.0,
             Metric::HairlineW => 0.5,
             Metric::CardMinW => 240.0,
+            Metric::DialSize => 128.0 * tight,
             Metric::CardMinH => 160.0,
             Metric::PlotMinH => 180.0,
             Metric::PaneMinW => 360.0,

@@ -228,6 +228,7 @@ pub(crate) const FULL: f32 = 1.0;
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum HaloSeed {
     Glow(Role),
+    Reactive(u32),
     Shadow(crate::layout::Edge),
 }
 
@@ -412,6 +413,8 @@ pub(crate) struct Build {
     pub regions: Vec<crate::present::RegionSeed>,
     /// Gesture declarations, out of line. See [`Slot::gesture`].
     pub gestures: Vec<GestureDecl>,
+    /// Event-rate halo roles. Static halos keep their role inline in the slot.
+    pub halo_roles: Vec<Option<Box<dyn Fn() -> Role>>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -452,6 +455,7 @@ impl Build {
         // that never mounted.
         self.regions.clear();
         self.gestures.clear();
+        self.halo_roles.clear();
     }
 
     /// Edits this node's gesture declaration, minting a default one where there is none.

@@ -377,9 +377,17 @@ impl<K> El<K> {
     /// every frame of every transition, on every element the transition touched. A state
     /// spends more of the light instead, through [`halo_lit`](Self::halo_lit).
     #[must_use]
-    pub fn halo(self, role: Role) -> Self {
+    pub fn halo<M>(self, role: impl Signal<Role, M> + 'static) -> Self {
+        let fixed = role.is_constant().then(|| role.read());
         Build::with(|b| {
-            b.nodes[self.at as usize].halo = Some(super::arena::HaloSeed::Glow(role));
+            let seed = if let Some(role) = fixed {
+                super::arena::HaloSeed::Glow(role)
+            } else {
+                let index = b.halo_roles.len() as u32;
+                b.halo_roles.push(Some(Box::new(move || role.read())));
+                super::arena::HaloSeed::Reactive(index)
+            };
+            b.nodes[self.at as usize].halo = Some(seed);
         });
         self
     }
@@ -1128,6 +1136,12 @@ impl<K> El<K> {
         self.channel(Prop::RotationAngle, Motion::Chrome, Unit::Direct, radians)
     }
 
+    /// Sets the rotation centre in local DIPs. Layout changes snap the pivot.
+    #[must_use]
+    pub fn pivot<M>(self, point: impl Signal<Vector2, M> + 'static) -> Self {
+        self.channel(Prop::Center, Motion::Snap, Unit::Direct, point)
+    }
+
     /// Binds how far a turned part is through its sweep, `0..=1`.
     ///
     /// The twin of [`along`](Self::along), and typed for the same reason. It opens a value
@@ -1336,6 +1350,27 @@ impl El<Button> {
 }
 
 impl El<Path> {
+    /// Outlines the path with a retained HDR gradient.
+    #[must_use]
+    pub fn stroke_ramp(self, id: RampId, width: impl Into<Len>) -> Self {
+        Build::with(|b| {
+            b.push_seed(
+                self.at,
+                SpriteSeed {
+                    mask: MaskSeed::Shape {
+                        stroke: Some(width.into()),
+                    },
+                    role: Role::Fill(Fill::Surface),
+                    strength: super::arena::FULL,
+                    ramp: Some(id),
+                    region: None,
+                    part: Part::Border,
+                    next: super::arena::NIL,
+                },
+            );
+        });
+        self
+    }
     /// Fills this node's geometry in a chromatic, application-defined role.
     #[must_use]
     pub fn fill(self, role: DataRole) -> Self {

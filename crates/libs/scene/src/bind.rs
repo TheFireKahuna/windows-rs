@@ -252,6 +252,7 @@ impl Realizer<'_> {
         let scale = self.env.scale();
 
         let host = self.back.compositor.create_shape_visual();
+        crate::base_of_shape(&host).set_border_mode(BorderMode::Soft);
         let shape = self.back.compositor.create_sprite_shape(&geometry);
         // Opaque white: the capture is a mask, so its colour comes from the paint beside it,
         // and white is the multiplicative identity that leaves that paint alone.

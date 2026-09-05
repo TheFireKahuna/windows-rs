@@ -400,7 +400,7 @@ pub enum Join {
 /// Not a direction: [`Radial`](Self::Radial) has none. The four linear forms rasterize to a
 /// strip and the radial one to a square tile, and every one of them is stretched to fill, so
 /// none carries the sprite's extent and a resize costs nothing.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub enum Spread {
     #[default]
     Horizontal,
@@ -410,6 +410,11 @@ pub enum Spread {
     /// Outward from the centre. Stretched to fill, so a square profile becomes the
     /// ellipse of whatever box it lands in — which is what a glow is.
     Radial,
+    /// Clockwise around a normalized centre, starting at `start` radians.
+    Conic {
+        center: [f32; 2],
+        start: f32,
+    },
 }
 
 impl Spread {
@@ -424,7 +429,7 @@ impl Spread {
             Self::Vertical => Some(([0.5, 0.0], [0.5, 1.0])),
             Self::DiagonalDown => Some(([0.0, 0.0], [1.0, 1.0])),
             Self::DiagonalUp => Some(([0.0, 1.0], [1.0, 0.0])),
-            Self::Radial => None,
+            Self::Radial | Self::Conic { .. } => None,
         }
     }
 }

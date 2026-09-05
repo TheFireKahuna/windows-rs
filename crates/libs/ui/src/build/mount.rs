@@ -462,7 +462,19 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // ── the halo, cast by the fill ────────────────────────────────────────────────
     // After the fill exists, because the silhouette is what that sprite paints.
     if let Some(seed) = slot.halo {
-        mount_halo(seed, parts.fill.or(parts.label), inner);
+        let silhouette = if parts.fill.is_some() {
+            Silhouette::Area
+        } else {
+            Silhouette::Ink
+        };
+        let source = parts.fill.or(parts.label).or(parts.border);
+        if let HaloSeed::Reactive(index) = seed {
+            if let Some(read) = b.halo_roles[index as usize].take() {
+                Effect::new(move || mount_halo(HaloSeed::Glow(read()), source, inner, silhouette));
+            }
+        } else {
+            mount_halo(seed, source, inner, silhouette);
+        }
     }
 
     // ── styles that follow a value ────────────────────────────────────────────────
@@ -589,17 +601,18 @@ fn run_seed(b: &Build, slot: &Slot) -> Option<(u32, Flow)> {
 ///
 /// A node with neither has no silhouette to cast, and a halo declared on one is an authoring
 /// mistake rather than a no-op: the modifier is on a variant that paints nothing.
-fn mount_halo(seed: HaloSeed, source: Option<SpriteId>, scope: Scope) {
+fn mount_halo(seed: HaloSeed, source: Option<SpriteId>, scope: Scope, silhouette: Silhouette) {
     let Some(fill) = source else {
         debug_assert!(false, "a halo was declared on a node that paints nothing");
         return;
     };
     let paint = scope.for_paint();
     let halo = match seed {
+        HaloSeed::Reactive(_) => unreachable!("reactive halo role is resolved by its effect"),
         HaloSeed::Glow(role) => {
             let halo = halo_of(
                 crate::role::emission(role, paint),
-                Silhouette::Area,
+                silhouette,
                 crate::role::resolve(role, paint),
             );
             debug_assert!(

@@ -395,6 +395,8 @@ pub enum Metric {
     BorderW,
     CardMinW,
     CardMinH,
+    /// Diameter of a rotary editor dial.
+    DialSize,
     /// Minimum height of a measurement plot, independent of the control row height.
     PlotMinH,
     /// Minimum width of a docked detail pane.

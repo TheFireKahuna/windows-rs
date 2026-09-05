@@ -23,6 +23,94 @@ pub(crate) fn fixture() -> SinkPatch {
     fixture_at(96.0)
 }
 
+#[test]
+fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
+    use crate::role::DataRole;
+    use windows_scene::{Anim, Bind, PathVerb, Prop, Spread, Value};
+    let mut patch = fixture();
+    let value = crate::signal::Cell::new(0.25_f32);
+    let glow = crate::signal::Cell::new(Role::Data(DataRole(0xfffe)));
+    let geometry = geometry(&[
+        PathVerb::Move {
+            to: Vector2 { x: 0.0, y: 0.0 },
+            filled: false,
+        },
+        PathVerb::Line(Vector2 { x: 20.0, y: 20.0 }),
+        PathVerb::End { closed: false },
+    ]);
+    let gradient = ramp(
+        &[
+            Stop {
+                at: 0.0,
+                role: DataRole(1),
+                strength: 1.0,
+            },
+            Stop {
+                at: 1.0,
+                role: DataRole(2),
+                strength: 1.0,
+            },
+        ],
+        Spread::Conic {
+            center: [0.5, 0.56],
+            start: 0.0,
+        },
+    );
+    let (owner, held) = crate::signal::Owner::scope(|| {
+        mount(
+            crate::widget::path(geometry)
+                .stroke_ramp(gradient, Metric::HairlineW)
+                .width(Metric::DialSize)
+                .height(Metric::DialSize)
+                .pivot(Vector2 { x: 64.0, y: 71.68 })
+                .trim(move || value.get())
+                .rotation(move || value.get() * 4.0)
+                .halo(glow),
+            root(),
+        )
+    });
+    flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(op,
+        Op::Halo { halo: Some(halo), .. } if halo.blur == 9.0)));
+    patch.clear();
+    value.set(0.75);
+    glow.set(Role::Data(DataRole(0xffff)));
+    crate::signal::flush();
+    flush(&mut patch);
+    for (property, target) in [(Prop::TrimEnd, 0.75), (Prop::RotationAngle, 3.0)] {
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Bind { prop, bind: Bind::Animate(Anim::Spring { to: Value::Scalar(v), .. }), .. }
+            if *prop == property && *v == target)));
+    }
+    assert!(
+        patch
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::Halo { halo: Some(_), .. }))
+    );
+    assert!(
+        !patch
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::New { .. } | Op::Res { .. }))
+    );
+    patch.clear();
+    flush(&mut patch);
+    assert!(patch.ops().is_empty());
+    drop(owner);
+    drop(held);
+    flush(&mut patch);
+    patch.clear();
+    value.set(0.1);
+    glow.set(Role::Data(DataRole(0xfffe)));
+    crate::signal::flush();
+    flush(&mut patch);
+    assert!(
+        patch.ops().is_empty(),
+        "unmounted instrument effects must be disposed"
+    );
+}
+
 /// [`fixture`] at a stated DPI.
 ///
 /// The raster caches are cut in physical pixels, so a mask that is exact at one scale can be

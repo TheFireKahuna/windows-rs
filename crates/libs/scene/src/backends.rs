@@ -210,6 +210,32 @@ impl Backends {
         stops: &[(f32, Radiance)],
         spread: Spread,
     ) -> Result<Option<CompositionDrawingSurface>> {
+        if let Spread::Conic { center, start } = spread {
+            // A smooth colour field, independent of path coverage and display scale.
+            // Minted only with the ramp resource, never on gain edits or animation ticks.
+            const SIDE: u32 = 256;
+            let pixels: Vec<_> = (0..SIDE * SIDE)
+                .map(|i| {
+                    let x = (i % SIDE) as f32 + 0.5 - center[0] * SIDE as f32;
+                    let y = (i / SIDE) as f32 + 0.5 - center[1] * SIDE as f32;
+                    let at = (y.atan2(x) - start).rem_euclid(core::f32::consts::TAU)
+                        / core::f32::consts::TAU;
+                    env.apply(Radiance::sample(stops, at))
+                })
+                .collect();
+            let source = self.gpu.pixels((SIDE, SIDE), &pixels)?;
+            let surface = self.surface((SIDE as i32, SIDE as i32))?;
+            return self.draw(&surface, 96.0, |d| {
+                d.clear(Scrgb::TRANSPARENT);
+                d.blit(
+                    &source,
+                    windows_d2d::Rect::new(0.0, 0.0, SIDE as f32, SIDE as f32),
+                    None,
+                    windows_d2d::Interp::Linear,
+                );
+                Ok(())
+            });
+        }
         // Along the axis for the two cardinal directions; square for a diagonal, which has
         // no single axis to lay a strip along, and for a radial, which has none at all.
         //
@@ -221,6 +247,7 @@ impl Backends {
             Spread::Vertical => (1, 256),
             Spread::DiagonalDown | Spread::DiagonalUp => (128, 128),
             Spread::Radial => (64, 64),
+            Spread::Conic { .. } => unreachable!("conic ramp was rasterized above"),
         };
         let surface = self.surface(px)?;
 

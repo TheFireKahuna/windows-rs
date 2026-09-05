@@ -80,6 +80,33 @@ impl Target {
 }
 
 impl Gpu {
+    /// Uploads already-transformed scRGB pixels into an FP16 target at 96 DPI.
+    /// Input colour is straight alpha; the stored bitmap is premultiplied.
+    pub fn pixels(&self, px: (u32, u32), pixels: &[Scrgb]) -> Result<Target> {
+        assert_eq!(pixels.len(), px.0 as usize * px.1 as usize);
+        let mut packed = Vec::with_capacity(pixels.len() * 4);
+        for p in pixels {
+            packed.extend([p.r * p.a, p.g * p.a, p.b * p.a, p.a].map(to_half));
+        }
+        let bitmap = unsafe {
+            self.ctx().CreateBitmap(
+                D2D_SIZE_U {
+                    width: px.0,
+                    height: px.1,
+                },
+                Some(packed.as_ptr().cast()),
+                px.0 * 8,
+                &properties(96.0, Opacity::Translucent),
+            )?
+        };
+        Ok(Target {
+            bitmap,
+            px,
+            dpi: 96.0,
+            opacity: Opacity::Translucent,
+        })
+    }
+
     /// Allocates an offscreen target at an **exact pixel size**, rendered by retargeting the
     /// caller's own open bracket.
     ///
@@ -242,9 +269,33 @@ fn half_to_f32(bits: u16) -> f32 {
     }
 }
 
+/// Finite scene light, rounded to nearest-even and saturated at FP16's finite limit.
+fn to_half(value: f32) -> u16 {
+    let sign = ((value.to_bits() >> 16) & 0x8000) as u16;
+    let magnitude = value.abs().min(65504.0);
+    if magnitude < 1.0 / 16384.0 {
+        return sign | (magnitude * 16_777_216.0).round_ties_even() as u16;
+    }
+    let bits = magnitude.to_bits();
+    let rounded = bits + 0x0fff + ((bits >> 13) & 1);
+    sign | ((rounded >> 13) - 0x1c000) as u16
+}
+
 #[cfg(test)]
 mod tests {
-    use super::half_to_f32;
+    use super::{half_to_f32, to_half};
+
+    #[test]
+    fn every_finite_half_survives_upload_roundtrip() {
+        for bits in 0..=u16::MAX {
+            if bits & 0x7c00 != 0x7c00 {
+                assert_eq!(to_half(half_to_f32(bits)), bits);
+            }
+        }
+        assert_eq!(to_half(1.000_488_3), 0x3c00);
+        assert_eq!(to_half(1.001_464_8), 0x3c02);
+        assert_eq!(to_half(100_000.0), 0x7bff);
+    }
 
     #[test]
     fn halves_decode() {
