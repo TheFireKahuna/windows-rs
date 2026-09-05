@@ -114,6 +114,9 @@ impl Palette for Reference {
             Metric::HairlineW => 0.5,
             Metric::CardMinW => 240.0,
             Metric::CardMinH => 160.0,
+            Metric::PlotMinH => 180.0,
+            Metric::PaneMinW => 360.0,
+            Metric::PaneMaxW => 540.0,
         }
     }
 

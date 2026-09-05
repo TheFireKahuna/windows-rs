@@ -111,6 +111,9 @@ pub enum Track {
     MaxContent,
     /// At least `min`, and a share of what is left.
     MinMax(Len, f32),
+    /// CSS `minmax(min, max)` with a length maximum, including a percentage.
+    /// If the maximum resolves below the minimum, the minimum wins.
+    Bounded(Len, Len),
 }
 
 impl From<Metric> for Track {
@@ -145,6 +148,10 @@ impl Track {
             Self::MinMax(min, fr) => minmax(
                 taffy::MinTrackSizingFunction::from(min.dimension(scope)),
                 taffy::MaxTrackSizingFunction::from_fr(fr),
+            ),
+            Self::Bounded(min, max) => minmax(
+                taffy::MinTrackSizingFunction::from(min.dimension(scope)),
+                taffy::MaxTrackSizingFunction::from(max.dimension(scope)),
             ),
         }
     }

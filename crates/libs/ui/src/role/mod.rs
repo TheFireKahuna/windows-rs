@@ -383,6 +383,12 @@ pub enum Metric {
     BorderW,
     CardMinW,
     CardMinH,
+    /// Minimum height of a measurement plot, independent of the control row height.
+    PlotMinH,
+    /// Minimum width of a docked detail pane.
+    PaneMinW,
+    /// Maximum width of a docked detail pane; surplus width belongs to the main surface.
+    PaneMaxW,
     /// One device pixel at the current scale, expressed in DIPs by the palette.
     HairlineW,
 }
