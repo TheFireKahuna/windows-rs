@@ -224,14 +224,11 @@ pub(crate) struct SpriteSeed {
 /// A sprite that paints its role as resolved. What everything but a plate carries.
 pub(crate) const FULL: f32 = 1.0;
 
-/// A halo a node casts, in a role it does not itself paint.
-///
-/// One field, and that is the point: how much light a role spends is the palette's, and the
-/// silhouette is whatever the node already paints — so a variant that changes that fill's
-/// shape moves the halo with it and nothing here restates a corner or a sigma.
+/// One compositor shadow source: emitted role light or palette-owned occlusion.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct HaloSeed {
-    pub role: Role,
+pub(crate) enum HaloSeed {
+    Glow(Role),
+    Shadow(crate::layout::Edge),
 }
 
 /// Which of a control's parts a sprite is, so interaction can re-resolve exactly the ones
@@ -256,7 +253,7 @@ pub(crate) enum MaskSeed {
     /// A rounded rect whose radius is already resolved, for the one case where it is
     /// derived rather than named: a chrome fill sits a hairline inside its own border, so
     /// its radius is the surface's less that hairline and is not a [`Metric`] anybody owns.
-    Radius { dips: f32 },
+    Radius { dips: windows_scene::Corners },
     /// One shaped run, from the text side buffer at this index.
     Run { text: u32 },
     /// The slot's own geometry, filled or outlined.

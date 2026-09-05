@@ -221,6 +221,16 @@ pub fn button(text: impl Into<TextSource>) -> El<Button> {
         .row(inner(text, TypeRole::Body, false))
 }
 
+/// A button joined flush to a containing edge. Placement remains the caller's job;
+/// its fill, border and interaction wash share the two exposed corners.
+#[must_use]
+pub fn edge_button(text: impl Into<TextSource>, edge: crate::layout::Edge) -> El<Button> {
+    control(UiaRole::Button)
+        .chrome(roles::BUTTON, roles::DEFAULT, Metric::EdgeTabRadius)
+        .attached(edge)
+        .row(inner(text, TypeRole::Body, false))
+}
+
 /// A press with no text, so [`name`](El::name) is required: there is nothing to derive an
 /// accessible name from.
 #[must_use]

@@ -47,6 +47,8 @@ pub trait Palette: Send + Sync + 'static {
 
     /// Returns the font a rung of the type ramp resolves to in `scope`.
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec;
+    /// Returns a detached surface's shadow. Width is pinned as for surface colours.
+    fn shadow(&self, scope: Scope) -> super::Shadow;
     /// Returns a scalar the palette owns, in DIPs unless the name says otherwise.
     fn metric(&self, metric: Metric, scope: Scope) -> f32;
 
@@ -212,4 +214,10 @@ pub fn veil(alpha: f32, scope: Scope) -> Radiance {
 #[must_use]
 pub fn accent_wash(alpha: f32, scope: Scope) -> Radiance {
     resolve(Role::Fill(Fill::Accent), scope).with_alpha(alpha)
+}
+
+/// Returns the palette's detached-surface shadow, with the paint width pinned.
+#[must_use]
+pub fn shadow(scope: Scope) -> super::Shadow {
+    current().shadow(scope.for_paint())
 }

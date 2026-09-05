@@ -133,6 +133,8 @@ pub struct Chrome {
     pub roles: &'static [RoleSet],
     pub variant: u8,
     pub radius: Metric,
+    /// The flush edge has square corners and no border.
+    pub attached: Option<crate::layout::Edge>,
 }
 
 impl Chrome {

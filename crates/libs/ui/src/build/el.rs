@@ -260,7 +260,18 @@ impl<K> El<K> {
                 roles,
                 variant,
                 radius,
+                attached: None,
             });
+        })
+    }
+
+    /// Joins this surface to an edge without changing its layout or hit box.
+    pub(crate) fn attached(self, edge: Edge) -> Self {
+        self.slot_mut(|s| {
+            s.chrome
+                .as_mut()
+                .expect("attached surface has chrome")
+                .attached = Some(edge)
         })
     }
 
@@ -368,9 +379,17 @@ impl<K> El<K> {
     #[must_use]
     pub fn halo(self, role: Role) -> Self {
         Build::with(|b| {
-            b.nodes[self.at as usize].halo = Some(super::arena::HaloSeed { role });
+            b.nodes[self.at as usize].halo = Some(super::arena::HaloSeed::Glow(role));
         });
         self
+    }
+
+    /// Casts the palette's occlusion outward from `edge`, using this surface's fill.
+    /// Shares the halo slot with emissive light; the last declaration owns it. Its fixed
+    /// blur and offset are resolved once, and require no capture or per-frame app work.
+    #[must_use]
+    pub fn shadowed(self, edge: Edge) -> Self {
+        self.slot_mut(|s| s.halo = Some(super::arena::HaloSeed::Shadow(edge)))
     }
 
     /// Binds how much of its light the halo is currently spending, in `0.0..=1.0`.
@@ -695,6 +714,12 @@ impl<K> El<K> {
             out.push(Rule::always(Over::ClearColumns));
             out.extend(buf.iter().copied().map(Over::Column).map(Rule::always));
         })))
+    }
+
+    /// Clips pixels and hit-testing to this node's solved box, without a scroll tracker.
+    #[must_use]
+    pub fn clip(self) -> Self {
+        self.over(Over::Clip)
     }
 
     /// Hides this subtree at `class`: not laid out, and not drawn.

@@ -30,7 +30,7 @@ pub(crate) mod tests;
 
 pub use palette::{
     Palette, accent_wash, content_peak_nits, data, emission, ink, install, installed, metric,
-    resolve, typography, veil,
+    resolve, shadow, typography, veil,
 };
 
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -312,6 +312,18 @@ pub enum Silhouette {
     Area,
 }
 
+/// A detached surface's occlusion, resolved once through the palette.
+/// The edge supplies the direction; neither blur nor offset animates.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Shadow {
+    /// Gaussian sigma in DIPs.
+    pub blur: f32,
+    /// Distance cast outward from the named edge, in DIPs.
+    pub offset: f32,
+    /// Scene light and opacity of the shadow.
+    pub tint: windows_color::Radiance,
+}
+
 /// A rung of the type ramp.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TypeRole {
@@ -391,6 +403,8 @@ pub enum Metric {
     PaneMaxW,
     /// Maximum inline size of an inspector drawer.
     PaneDrawerMaxW,
+    /// Corner radius of a tab attached to a surface edge.
+    EdgeTabRadius,
     /// Distance from a window region's bottom edge to its reopen tab.
     EdgeTabInset,
     /// Cross-axis padding of a vertical edge tab.

@@ -79,24 +79,23 @@ impl Bounds {
             return previous;
         }
         let [narrow, medium] = self.0;
-        let threshold = if fresh > previous {
-            // Rising: the threshold just cleared is the top of the class being left.
-            match previous {
-                WidthClass::Narrow => narrow,
-                _ => medium,
+        // A resize can skip a whole class (maximize/restore). Holding the previous
+        // class near the destination's boundary would then retain a class whose own
+        // boundary was crossed hundreds of DIPs ago. Apply the band to both thresholds.
+        if fresh > previous {
+            if width >= medium + HYSTERESIS_DIPS {
+                WidthClass::Wide
+            } else if width >= narrow + HYSTERESIS_DIPS {
+                WidthClass::Medium
+            } else {
+                previous
             }
+        } else if !width.is_finite() || width <= narrow - HYSTERESIS_DIPS {
+            WidthClass::Narrow
+        } else if width <= medium - HYSTERESIS_DIPS {
+            WidthClass::Medium
         } else {
-            // Falling: the threshold just fallen below is the top of the class being
-            // entered.
-            match fresh {
-                WidthClass::Narrow => narrow,
-                _ => medium,
-            }
-        };
-        if (width - threshold).abs() < HYSTERESIS_DIPS {
             previous
-        } else {
-            fresh
         }
     }
 }
@@ -106,6 +105,18 @@ mod tests {
     use super::*;
 
     const BOUNDS: Bounds = Bounds([600.0, 1000.0]);
+
+    #[test]
+    fn jumps_hold_only_the_class_adjacent_to_a_boundary() {
+        for width in [590.0, 600.0, 610.0] {
+            assert_eq!(BOUNDS.reclassify(width, WidthClass::Wide), WidthClass::Medium);
+        }
+        for width in [990.0, 1000.0, 1010.0] {
+            assert_eq!(BOUNDS.reclassify(width, WidthClass::Narrow), WidthClass::Medium);
+        }
+        assert_eq!(BOUNDS.reclassify(580.0, WidthClass::Wide), WidthClass::Narrow);
+        assert_eq!(BOUNDS.reclassify(1020.0, WidthClass::Narrow), WidthClass::Wide);
+    }
 
     #[test]
     fn a_cold_classification_reads_the_thresholds() {

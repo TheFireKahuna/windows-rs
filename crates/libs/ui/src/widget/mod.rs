@@ -16,9 +16,9 @@ pub use kind::{
     UiaRole, Wash, angle_of, detent_delta, fraction_of, offset_of,
 };
 pub use seed::{
-    CHIP_PLATE, box_, button, caption, card, chip, field, flyout, icon_button, knob, label, meter,
-    micro, mono, note, panel, path, pills, segmented, select, sheet, slider, text, title, toggle,
-    vertical_label,
+    CHIP_PLATE, box_, button, caption, card, chip, edge_button, field, flyout, icon_button, knob,
+    label, meter, micro, mono, note, panel, path, pills, segmented, select, sheet, slider, text,
+    title, toggle, vertical_label,
 };
 // `ChromeRow` is one row of a widget's colour table; `Controls` is the front thread's table
 // of live controls.

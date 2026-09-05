@@ -18,7 +18,7 @@ use super::host::{ControlRow, Host, MountId, MountRow, ValueId, ValueRow};
 use super::style::{OverStore, Recipe};
 use super::{El, Site, View};
 use crate::gesture::GestureDecl;
-use crate::layout::{Len, Over, Preset, Rule};
+use crate::layout::{Edge, Len, Over, Preset, Rule};
 use crate::role::{DataRole, Metric, Role, Scope, Silhouette};
 use crate::signal::Effect;
 use crate::widget::{
@@ -422,7 +422,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     if let Some(group) = group {
         for (part, seed) in chrome_seeds(roles, slot.chrome, inner, selects) {
             let sprite = Host::with(|h| h.model().sprite(group, previous));
-            cover(sprite.node(), inner, chrome_inset(part));
+            cover_chrome(sprite.node(), inner, part, slot.chrome);
             emit_sprite(sprite, &seed, None, inner, roles);
             parts.set(part, sprite, &mut own_claim);
             previous = Some(sprite.node());
@@ -444,7 +444,12 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         let group = group.expect("a control with a wash is never a bare sprite");
         let sprite = Host::with(|h| h.model().sprite(group, previous));
         cover(sprite.node(), inner, Len::Zero);
-        emit_wash(sprite, hover, inner, radius_of(b, &slot, inner));
+        emit_wash(
+            sprite,
+            hover,
+            inner,
+            surface_corners(radius_of(b, &slot, inner), slot.chrome),
+        );
         previous = Some(sprite.node());
         parts.wash = Some(sprite);
     }
@@ -585,18 +590,46 @@ fn mount_halo(seed: HaloSeed, source: Option<SpriteId>, scope: Scope) {
         return;
     };
     let paint = scope.for_paint();
-    let light = crate::role::resolve(seed.role, paint);
-    // A stated halo is always a filled silhouette: it is a *surface* casting light, and a
-    // node painting the role as ink is lit where the role resolves and never states one.
-    let halo = halo_of(
-        crate::role::emission(seed.role, paint),
-        Silhouette::Area,
-        light,
-    );
-    debug_assert!(
-        halo.is_some(),
-        "a halo was declared in a role the palette gives no light"
-    );
+    let halo = match seed {
+        HaloSeed::Glow(role) => {
+            let halo = halo_of(
+                crate::role::emission(role, paint),
+                Silhouette::Area,
+                crate::role::resolve(role, paint),
+            );
+            debug_assert!(
+                halo.is_some(),
+                "a halo was declared in a role the palette gives no light"
+            );
+            halo
+        }
+        HaloSeed::Shadow(edge) => {
+            let shadow = crate::role::shadow(paint);
+            let offset = match edge {
+                Edge::Left => Vector2 {
+                    x: -shadow.offset,
+                    y: 0.0,
+                },
+                Edge::Right => Vector2 {
+                    x: shadow.offset,
+                    y: 0.0,
+                },
+                Edge::Top => Vector2 {
+                    x: 0.0,
+                    y: -shadow.offset,
+                },
+                Edge::Bottom => Vector2 {
+                    x: 0.0,
+                    y: shadow.offset,
+                },
+            };
+            Some(Halo {
+                blur: shadow.blur,
+                tint: shadow.tint,
+                offset,
+            })
+        }
+    };
     Host::with(|h| h.model().halo(fill, halo));
 }
 
@@ -669,7 +702,9 @@ fn chrome_seeds(
         (
             Part::Border,
             SpriteSeed {
-                mask: MaskSeed::Radius { dips: radius },
+                mask: MaskSeed::Radius {
+                    dips: surface_corners(radius, chrome),
+                },
                 role,
                 strength,
                 ramp: None,
@@ -691,7 +726,7 @@ fn chrome_seeds(
                 // Concentric with the ring it sits in, so the hairline is one width all the
                 // way round instead of pinching at the corners.
                 mask: MaskSeed::Radius {
-                    dips: (radius - inset).max(0.0),
+                    dips: surface_corners((radius - inset).max(0.0), chrome),
                 },
                 role,
                 strength,
@@ -705,13 +740,52 @@ fn chrome_seeds(
     stroke.into_iter().chain(fill)
 }
 
-/// Returns how far a chrome sprite is inset from the node it covers.
-const fn chrome_inset(part: Part) -> Len {
-    match part {
-        // The fill sits inside the ring the border draws.
-        Part::Fill => Len::Metric(Metric::HairlineW),
-        _ => Len::Zero,
+/// The attached side shares its neighbour's edge, including the interaction wash.
+fn surface_corners(radius: f32, chrome: Option<Chrome>) -> Corners {
+    let mut corners = Corners::all(radius);
+    match chrome.and_then(|c| c.attached) {
+        Some(Edge::Left) => {
+            corners.tl = 0.0;
+            corners.bl = 0.0;
+        }
+        Some(Edge::Right) => {
+            corners.tr = 0.0;
+            corners.br = 0.0;
+        }
+        Some(Edge::Top) => {
+            corners.tl = 0.0;
+            corners.tr = 0.0;
+        }
+        Some(Edge::Bottom) => {
+            corners.bl = 0.0;
+            corners.br = 0.0;
+        }
+        None => {}
     }
+    corners
+}
+
+/// Extends the fill to the attached edge so no border remains against its neighbour.
+fn cover_chrome(node: NodeId, scope: Scope, part: Part, chrome: Option<Chrome>) {
+    let inset = if part == Part::Fill {
+        Len::Metric(Metric::HairlineW)
+    } else {
+        Len::Zero
+    };
+    let attached = chrome.and_then(|c| c.attached);
+    let style = crate::layout::lower(
+        Preset::Bare,
+        &[
+            Rule::always(Over::Absolute),
+            Rule::always(Over::Inset(inset)),
+            Rule::always(Over::InsetEdge(
+                attached.unwrap_or(Edge::Right),
+                if attached.is_some() { Len::Zero } else { inset },
+            )),
+        ],
+        scope,
+    );
+    Host::with(|h| h.model().style(node, &style));
 }
 
 /// Styles a sprite as chrome for its parent rather than as a laid-out child of it.
@@ -773,9 +847,7 @@ fn emit_sprite(
             MaskSeed::Box { radius } => Mask::Box {
                 radius: Corners::all(radius.and_then(|r| r.dips(scope)).unwrap_or(0.0)),
             },
-            MaskSeed::Radius { dips } => Mask::Box {
-                radius: Corners::all(dips),
-            },
+            MaskSeed::Radius { dips } => Mask::Box { radius: dips },
             // A run's coverage tile is minted when its text is shaped, which cannot happen
             // until layout has said how wide it is. Until then the sprite draws nothing.
             MaskSeed::Run { .. } | MaskSeed::Bare => Mask::None,
@@ -846,18 +918,13 @@ fn role_of(seed: &SpriteSeed, roles: Option<RoleSet>) -> Role {
 /// press share one channel and one spring rather than two colours. A colour animation is not
 /// available: a sprite's colour is an FP16 cell, a composition colour brush is 8-bit, and no
 /// brush interpolates between two FP16 sources.
-fn emit_wash(id: SpriteId, wash: Wash, scope: Scope, radius: f32) {
+fn emit_wash(id: SpriteId, wash: Wash, scope: Scope, radius: Corners) {
     let light = match wash {
         Wash::Ink => crate::role::ink(1.0, scope),
         Wash::Accent => crate::role::accent_wash(1.0, scope),
     };
     Host::with(|h| {
-        h.model().mask(
-            id,
-            Mask::Box {
-                radius: Corners::all(radius),
-            },
-        );
+        h.model().mask(id, Mask::Box { radius });
         h.model().paint(id, Paint::Solid(light));
         // Parked at zero with a `Set` and not a spring: a control that has never been
         // hovered must not play an animation to arrive at invisible.
@@ -876,7 +943,7 @@ fn radius_of(b: &Build, slot: &Slot, scope: Scope) -> f32 {
         .find(|s| s.part == Part::Fill)
         .and_then(|s| match s.mask {
             MaskSeed::Box { radius } => radius.and_then(|r| r.dips(scope)),
-            MaskSeed::Radius { dips } => Some(dips),
+            MaskSeed::Radius { dips } => Some(dips.max()),
             _ => None,
         })
         .unwrap_or(0.0)

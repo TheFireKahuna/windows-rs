@@ -4340,3 +4340,150 @@ fn a_release_inside_a_region_clears_the_gesture_and_queues_one_intent() {
         "the intent names the part the gesture finished on"
     );
 }
+
+/// An attached button's resting border and hover wash must end at the same square edge.
+#[test]
+fn edge_buttons_join_without_a_border_or_rounded_gap() {
+    use crate::layout::Edge;
+    use windows_scene::{Corners, Mask};
+    for dpi in [96.0, 144.0, 192.0] {
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            let mut patch = fixture_at(dpi);
+            let _held = mount(
+                crate::widget::edge_button("", edge)
+                    .width(Metric::CardMinW)
+                    .height(Metric::RowH),
+                root(),
+            );
+            flush(&mut patch);
+            let boxes: Vec<_> = patch
+                .ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Mask {
+                        id,
+                        mask: Mask::Box { radius },
+                        ..
+                    } => Some((*id, *radius)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(boxes.len(), 3, "border, fill and interaction wash");
+            let radius = crate::role::metric(Metric::EdgeTabRadius, Host::with(|h| h.root_scope));
+            let mut expected = Corners::all(radius);
+            match edge {
+                Edge::Left => {
+                    expected.tl = 0.0;
+                    expected.bl = 0.0;
+                }
+                Edge::Right => {
+                    expected.tr = 0.0;
+                    expected.br = 0.0;
+                }
+                Edge::Top => {
+                    expected.tl = 0.0;
+                    expected.tr = 0.0;
+                }
+                Edge::Bottom => {
+                    expected.bl = 0.0;
+                    expected.br = 0.0;
+                }
+            }
+            assert_eq!(boxes[0].1, expected);
+            assert_eq!(boxes[2].1, expected);
+            let (outer, fill) = Host::with(|h| {
+                (
+                    h.model().solved(boxes[0].0.node()).rect,
+                    h.model().solved(boxes[1].0.node()).rect,
+                )
+            });
+            let gaps = [
+                fill.x0 - outer.x0,
+                outer.x1 - fill.x1,
+                fill.y0 - outer.y0,
+                outer.y1 - fill.y1,
+            ];
+            let attached = match edge {
+                Edge::Left => 0,
+                Edge::Right => 1,
+                Edge::Top => 2,
+                Edge::Bottom => 3,
+            };
+            for (side, gap) in gaps.into_iter().enumerate() {
+                if side == attached {
+                    assert_eq!(gap, 0.0);
+                } else {
+                    let hairline =
+                        crate::role::metric(Metric::HairlineW, Host::with(|h| h.root_scope));
+                    assert!(
+                        (gap - hairline).abs() <= 0.5 * 96.0 / dpi + 0.001,
+                        "exposed border differs from its snapped hairline at {dpi} DPI"
+                    );
+                }
+            }
+            patch.clear();
+            flush(&mut patch);
+            assert!(patch.ops().is_empty());
+        }
+    }
+}
+
+/// A responsive shadow changes visibility without reallocating or re-blurring its source.
+#[test]
+fn a_drawer_shadow_is_retained_across_width_classes() {
+    use crate::layout::{Edge, responsive};
+    use crate::role::WidthClass;
+    let mut patch = fixture();
+    let _held = mount(
+        responsive(
+            [1100.0, 1400.0],
+            stack(crate::widget::sheet("shadow")
+                .shadowed(Edge::Left)
+                .cover()
+                .hide_when(WidthClass::Wide))
+                .width(Len::Pct(1.0))
+                .height(Len::Pct(1.0)),
+        )
+        .width(Len::Pct(1.0))
+        .height(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+    let halos: Vec<_> = patch
+        .ops()
+        .iter()
+        .filter_map(|op| match op {
+            Op::Halo {
+                id,
+                halo: Some(halo),
+            } => Some((*id, *halo)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(halos.len(), 1);
+    let (sprite, halo) = halos[0];
+    assert_eq!(halo.blur, 18.0);
+    assert_eq!(halo.offset, Vector2 { x: -14.0, y: 0.0 });
+    assert_eq!(halo.tint, Radiance::new(0.0, 0.0, 0.0, 0.45));
+    for (width, shown) in [
+        (1500.0, false),
+        (1000.0, true),
+        (1500.0, false),
+        (1100.0, true),
+    ] {
+        patch.clear();
+        Host::with(|h| h.model().set_window(Vector2 { x: width, y: 600.0 }));
+        flush(&mut patch);
+        let size = Host::with(|h| h.model().solved(sprite.node()).size);
+        assert_eq!(size.x > 0.0 && size.y > 0.0, shown, "{width}: {size:?}");
+        assert!(
+            !patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Halo { .. } | Op::New { .. }))
+        );
+        patch.clear();
+        flush(&mut patch);
+        assert!(patch.ops().is_empty());
+    }
+}

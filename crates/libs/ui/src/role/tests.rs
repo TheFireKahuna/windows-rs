@@ -70,6 +70,14 @@ impl Palette for Reference {
         Emission::NONE
     }
 
+    fn shadow(&self, _scope: Scope) -> super::Shadow {
+        super::Shadow {
+            blur: 18.0,
+            offset: 14.0,
+            tint: Radiance::new(0.0, 0.0, 0.0, 0.45),
+        }
+    }
+
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec {
         let size = match role {
             TypeRole::Display => 32.0,
@@ -118,6 +126,7 @@ impl Palette for Reference {
             Metric::PaneMinW => 360.0,
             Metric::PaneMaxW => 540.0,
             Metric::PaneDrawerMaxW => 420.0,
+            Metric::EdgeTabRadius => 6.0,
             Metric::EdgeTabInset => 28.0,
             Metric::EdgeTabPadX => 6.0,
             Metric::EdgeTabPadY => 12.0,

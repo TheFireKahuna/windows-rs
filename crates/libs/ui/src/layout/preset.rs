@@ -108,6 +108,10 @@ pub enum Over {
     Absolute,
     /// All four insets at once.
     Inset(Len),
+    /// One inset, overriding that side of a preceding uniform inset.
+    InsetEdge(Edge, Len),
+    /// Clips descendants to the solved box without creating a scroll source.
+    Clip,
     /// A uniform row, placed out of flow at a fixed offset down its container.
     ///
     /// Stated by the container on the child's behalf, as [`Place`](Self::Place) is. What a
@@ -388,6 +392,9 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
         }
         Over::Grow => style.flex_grow = 1.0,
         Over::NoShrink => style.flex_shrink = 0.0,
+        Over::Clip => {
+            style.overflow = taffy::Point { x: taffy::Overflow::Hidden, y: taffy::Overflow::Hidden };
+        }
         Over::Absolute => style.position = taffy::Position::Absolute,
         Over::Inset(l) => {
             let v = l.length_percentage_auto(scope);
@@ -397,6 +404,15 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
                 top: v,
                 bottom: v,
             };
+        }
+        Over::InsetEdge(edge, len) => {
+            let value = len.length_percentage_auto(scope);
+            match edge {
+                Edge::Left => style.inset.left = value,
+                Edge::Right => style.inset.right = value,
+                Edge::Top => style.inset.top = value,
+                Edge::Bottom => style.inset.bottom = value,
+            }
         }
         Over::Band { at, height } => {
             style.position = taffy::Position::Absolute;
