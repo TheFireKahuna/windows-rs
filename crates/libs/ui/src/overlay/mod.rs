@@ -167,10 +167,20 @@ enum Opened {
 pub struct Spec {
     kind: Kind,
     anchor: Anchor,
+    viewport: Option<[crate::layout::Len; 4]>,
     dismiss: DismissPolicy,
     /// Played as the subtree is destroyed.
     exit: Exit,
+    slide: Option<Slide>,
     opened: Opened,
+}
+
+/// A popup moves as one compositor group, by a multiple of its measured size.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct Slide {
+    pub by: Vector2,
+    pub ms: u32,
+    pub easing: windows_scene::Easing,
 }
 
 impl Spec {
@@ -181,6 +191,8 @@ impl Spec {
         Self {
             kind: Kind::Flyout,
             anchor: Anchor::below(invoker),
+            viewport: None,
+            slide: None,
             dismiss: Kind::Flyout.dismiss(),
             exit: Exit::Fade { ms: 90 },
             opened: Opened::Invoked,
@@ -193,6 +205,8 @@ impl Spec {
         Self {
             kind: Kind::Popup,
             anchor: Anchor::centered(),
+            viewport: None,
+            slide: None,
             dismiss: Kind::Popup.dismiss(),
             exit: Exit::Fade { ms: 120 },
             opened: Opened::Invoked,
@@ -209,6 +223,27 @@ impl Spec {
     #[must_use]
     pub const fn anchor(self, anchor: Anchor) -> Self {
         Self { anchor, ..self }
+    }
+
+    /// Constrains the popup to the window minus `[left, top, right, bottom]` insets.
+    /// The viewport sizes from window input before layout; placement never feeds its size.
+    #[must_use]
+    pub const fn viewport(self, insets: [crate::layout::Len; 4]) -> Self {
+        Self {
+            viewport: Some(insets),
+            ..self
+        }
+    }
+
+    /// Slides the whole popup from `by` times its size, and back there on dismissal.
+    /// Input stays on its blocker until the compositor reports entry complete.
+    #[must_use]
+    pub const fn slide(self, by: Vector2, ms: u32, easing: windows_scene::Easing) -> Self {
+        Self {
+            slide: Some(Slide { by, ms, easing }),
+            exit: Exit::Slide { by, ms, easing },
+            ..self
+        }
     }
 
     /// Returns this spec with `dismiss` replacing the kind's implied policy.
@@ -233,11 +268,36 @@ impl Spec {
     }
 }
 
+/// Event-rate changes from mounted popup declarations. A mount id rejects stale opens.
+pub(crate) enum Request {
+    Show {
+        key: crate::build::MountId,
+        spec: Spec,
+        body: std::rc::Rc<dyn Fn() -> View>,
+        closed: std::rc::Rc<dyn Fn()>,
+    },
+    Close(crate::build::MountId),
+}
+
+impl Request {
+    pub(crate) fn key(&self) -> crate::build::MountId {
+        match self {
+            Self::Show { key, .. } | Self::Close(key) => *key,
+        }
+    }
+}
+
+struct Binding {
+    key: crate::build::MountId,
+    closed: std::rc::Rc<dyn Fn()>,
+}
+
 /// One open overlay.
 ///
 /// Private, along with its fields. The `tip` child module is the only other reader.
 struct Open {
     generation: u32,
+    binding: Option<Binding>,
     kind: Kind,
     dismiss: DismissPolicy,
     root: GroupId,
@@ -282,6 +342,7 @@ pub struct Overlays {
     /// The depth an invoked choice asked to truncate to, held until the application has run
     /// the handler that choice named. See [`Overlays::after_dispatch`].
     closing: Option<usize>,
+    last_window: Option<Vector2>,
 }
 
 impl Overlays {
@@ -341,6 +402,9 @@ impl Overlays {
                 crate::build::Placement {
                     root,
                     anchor: spec.anchor,
+                    viewport: spec.viewport,
+                    bounds: None,
+                    entry: None,
                     at: Vector2 { x: 0.0, y: 0.0 },
                 },
             );
@@ -368,6 +432,7 @@ impl Overlays {
         let generation = self.generation;
         self.open.push(Open {
             generation,
+            binding: None,
             kind: spec.kind,
             dismiss: spec.dismiss,
             root,
@@ -381,7 +446,11 @@ impl Overlays {
 
         // Outside every host borrow above: `body` is application code that builds elements,
         // reads signals, and runs any `Effect` it creates immediately.
-        let (owner, mount) = Owner::scope(|| mount_at(body(), root, None, at_scope));
+        let (owner, mount) =
+            Owner::scope(|| mount_at(body().exit(spec.exit), root, None, at_scope));
+        if let Some(slide) = spec.slide {
+            Host::with(|h| h.open_overlay_entry(at, mount.node(), slide));
+        }
         let open = &mut self.open[at as usize];
         open.owner = Some(owner);
         open.mount = Some(mount);
@@ -389,6 +458,48 @@ impl Overlays {
         OverlayId {
             depth: at,
             generation,
+        }
+    }
+
+    /// Applies the popup declarations changed by the preceding signal flush.
+    pub fn sync(&mut self, focus: &mut FocusRing) {
+        let window = Host::with(|h| h.model.window());
+        let resized = self.last_window.is_some_and(|previous| previous != window);
+        self.last_window = Some(window);
+        let requests = Host::with(|h| core::mem::take(&mut h.popup_requests));
+        for request in requests {
+            let key = request.key();
+            let existing = self
+                .open
+                .iter()
+                .position(|open| open.binding.as_ref().is_some_and(|b| b.key == key));
+            match request {
+                Request::Show {
+                    mut spec,
+                    body,
+                    closed,
+                    ..
+                } => {
+                    if resized {
+                        spec.slide = None;
+                    }
+                    if existing.is_none() && Host::with(|h| h.mounts.get(key).is_some()) {
+                        let id = self.open(spec, focus, move || body());
+                        self.open[id.depth as usize].binding = Some(Binding { key, closed });
+                    }
+                }
+                Request::Close(_) => {
+                    if let Some(at) = existing {
+                        // A condition change (not a dismissal) preserves the application's
+                        // resting intent, including a drawer closed by a window resize.
+                        self.open[at].binding = None;
+                        if resized && let Some(mount) = self.open[at].mount.as_mut() {
+                            mount.set_exit(Exit::None);
+                        }
+                        self.truncate(at, focus);
+                    }
+                }
+            }
         }
     }
 
@@ -435,7 +546,14 @@ impl Overlays {
         self.cancel_dwell();
         let mut restore = None;
         while self.open.len() > at {
-            let Some(open) = self.open.pop() else { break };
+            let Some(mut open) = self.open.pop() else {
+                break;
+            };
+            if let Some(mount) = open.mount.as_mut()
+                && Host::with(|h| h.model.input_suspended(mount.node()))
+            {
+                mount.set_exit(Exit::None);
+            }
             if let Some(scope) = open.scope {
                 // Overwritten as the walk goes outward, so the outermost close is the one
                 // whose restore target survives: that is the invoker focus came from.
@@ -455,6 +573,9 @@ impl Overlays {
                 host.close_overlay_slot(open.root, open.blocker);
                 host.release_overlays_from(depth);
             });
+            if let Some(binding) = open.binding {
+                (binding.closed)();
+            }
         }
         if let Some(restore) = restore {
             _ = focus.focus(Some(restore));
@@ -690,6 +811,13 @@ impl Overlays {
     /// Applies scene events to the stack. Only [`SceneEvent::DelayElapsed`] is acted on.
     pub fn scene(&mut self, events: &[SceneEvent], focus: &mut FocusRing) {
         for event in events {
+            if let SceneEvent::AnimationCompleted {
+                node,
+                prop: windows_scene::Prop::Offset,
+            } = *event
+            {
+                Host::with(|h| h.complete_overlay_entry(node));
+            }
             if let SceneEvent::DelayElapsed { delay } = *event {
                 self.dwell_elapsed(delay, focus);
             }

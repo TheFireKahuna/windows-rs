@@ -50,6 +50,7 @@ const CHROME_REF_TRAVEL: f32 = 120.0;
 pub(crate) struct Motion {
     pub(crate) templates: Templates,
     pub(crate) ghosts: Vec<Ghost>,
+    pub(crate) playbacks: Vec<Playback>,
     /// Pending delays, looked up by a linear scan on id. A handful at most — a hovered
     /// submenu, a tooltip — and empty in the steady state.
     pub(crate) delays: Vec<Delay>,
@@ -60,6 +61,7 @@ impl Motion {
         Self {
             templates: Templates::new(compositor),
             ghosts: Vec::new(),
+            playbacks: Vec::new(),
             delays: Vec::new(),
         }
     }
@@ -356,6 +358,16 @@ impl crate::Scene {
     }
 }
 
+/// Keeps finite keyframes and their completion subscription alive without ticking during playback.
+pub(crate) struct Playback {
+    pub(crate) node: crate::NodeId,
+    pub(crate) prop: crate::Prop,
+    pub(crate) done: Rc<CoreCell<bool>>,
+    pub(crate) _animation: CompositionAnimation,
+    pub(crate) _batch: CompositionScopedBatch,
+    pub(crate) _revoker: EventRevoker,
+}
+
 /// A dying subtree, held on screen only long enough to play its exit.
 ///
 /// The subtree is flattened into one capture and that capture is mounted as a top-level
@@ -364,8 +376,10 @@ impl crate::Scene {
 pub(crate) struct Ghost {
     /// The flattened capture, on screen for as long as the exit plays. Held because nothing
     /// else does: the ghost is unparented from the model's tree by construction.
-    #[expect(dead_code, reason = "the only owner of the detached capture")]
     pub(crate) visual: Visual,
+    parent: windows_composition::VisualCollection,
+    pub(crate) visuals_held: u32,
+    pub(crate) visuals_minted: u32,
     /// Set by the scoped batch's completion signal, which is the only report that the exit
     /// has actually played.
     done: Rc<CoreCell<bool>>,
@@ -374,8 +388,14 @@ pub(crate) struct Ghost {
     _revoker: EventRevoker,
     /// Held so the batch is not collected before it reports.
     _batch: CompositionScopedBatch,
-    /// Keeps the frame clock awake while the exit is in flight.
-    _tick: windows_window::Tick,
+    /// Acquired by Completed, released with the ghost on the next scene apply.
+    _tick: Rc<CoreCell<Option<windows_window::Tick>>>,
+}
+
+impl Drop for Ghost {
+    fn drop(&mut self) {
+        let _ = self.parent.try_remove(&self.visual);
+    }
 }
 
 impl Ghost {
@@ -405,7 +425,7 @@ impl crate::Scene {
         id: crate::sink::NodeId,
         exit: crate::sink::Exit,
         back: &crate::Backends,
-        env: crate::Env,
+        _env: crate::Env,
     ) -> Result<Option<Ghost>> {
         use crate::sink::Exit;
         if exit == Exit::None {
@@ -426,16 +446,98 @@ impl crate::Scene {
 
         // A ghost is a snapshot of a subtree already being destroyed, so its region never
         // moves: the brush holds the surface and nothing will ask it to resize.
-        let captured = back.compositor.capture(&source, size, env.scale());
+        fn capture_extent(
+            nodes: &crate::id::Slots<crate::sink::Node, Node>,
+            id: crate::NodeId,
+        ) -> (u32, f32) {
+            let Some(node) = nodes.get(id) else {
+                return (0, 0.0);
+            };
+            let mut count = 1;
+            let mut margin = node.shadow.as_ref().map_or(0.0, |s| {
+                s.chans[0].max(0.0) * 3.0 + s.offset.x.abs().max(s.offset.y.abs())
+            });
+            let mut child = node.links.first;
+            while let Some(row) = nodes.get(child) {
+                let (held, pad) = capture_extent(nodes, child);
+                count += held;
+                margin = margin.max(pad);
+                child = row.links.next;
+            }
+            (count, margin)
+        }
+        let (source_count, pad) = capture_extent(&self.nodes, id);
+        let extent = Vector2 {
+            x: size.x + pad * 2.0,
+            y: size.y + pad * 2.0,
+        };
+        // The source subtree's geometry is in DIPs. Its window scale is inherited by
+        // the new sprite; multiplying the capture region by that scale would shrink it.
+        let captured = back.compositor.capture(&source, extent, 1.0);
+        captured
+            .surface
+            .set_source_offset(Vector2 { x: -pad, y: -pad });
         let sprite = back.compositor.create_sprite_visual();
         sprite.set_brush(&captured.brush);
-        sprite.set_size(size.x, size.y);
-        let offset = source.offset();
+        sprite.set_size(extent.x, extent.y);
+        let mut offset = source.offset();
+        let mut parent = self
+            .nodes
+            .get(id)
+            .map_or(crate::NodeId::NONE, |n| n.links.parent);
+        while let Some(node) = self.nodes.get(parent) {
+            offset.x += node.core[0];
+            offset.y += node.core[1];
+            parent = node.links.parent;
+        }
+        // Inherited clips stay fixed while the snapshot slides inside them.
+        let mut bounds: Option<crate::Rect> = None;
+        let mut parent = self
+            .nodes
+            .get(id)
+            .map_or(crate::NodeId::NONE, |n| n.links.parent);
+        while let Some(node) = self.nodes.get(parent) {
+            if let crate::Clip::Rect { l, t, r, b, .. } = node.declared_clip {
+                let mut origin = Vector2 {
+                    x: node.core[0],
+                    y: node.core[1],
+                };
+                let mut ancestor = node.links.parent;
+                while let Some(row) = self.nodes.get(ancestor) {
+                    origin.x += row.core[0];
+                    origin.y += row.core[1];
+                    ancestor = row.links.parent;
+                }
+                let rect = crate::Rect::new(origin.x + l, origin.y + t, origin.x + r, origin.y + b);
+                bounds = Some(bounds.map_or(rect, |old| {
+                    crate::Rect::new(
+                        old.x0.max(rect.x0),
+                        old.y0.max(rect.y0),
+                        old.x1.min(rect.x1),
+                        old.y1.min(rect.y1),
+                    )
+                }));
+            }
+            parent = node.links.parent;
+        }
+        offset.x -= pad;
+        offset.y -= pad;
         sprite.set_offset(offset.x, offset.y, offset.z);
-        // A ghost outlives the node it was captured from, so it hangs in the window's own
-        // container rather than in the subtree being torn down, and at the top because it
-        // plays over whatever replaced it.
-        let visual = crate::base_of_sprite(&sprite);
+        let visuals_minted = 1 + u32::from(bounds.is_some());
+        let visual = if let Some(rect) = bounds {
+            let clip_host = back.compositor.create_container_visual();
+            let clip = back.compositor.create_rectangle_clip();
+            clip.set_sides(rect.x0, rect.y0, rect.x1.max(rect.x0), rect.y1.max(rect.y0));
+            clip_host.set_clip(Some(&clip));
+            clip_host
+                .children()
+                .insert_at_top(&crate::base_of_sprite(&sprite));
+            crate::base_of_group(&clip_host)
+        } else {
+            crate::base_of_sprite(&sprite)
+        };
+        // A ghost outlives its source tree and plays above its replacement. Only an
+        // inherited clip costs a stationary parent; an unclipped exit is one sprite.
         self.overlay_children().insert_at_top(&visual);
 
         let done = Rc::new(CoreCell::new(false));
@@ -450,6 +552,21 @@ impl crate::Scene {
                 animation.set_duration(Duration::from_millis(u64::from(ms)));
                 sprite.start_animation("Opacity", &animation);
             }
+            Exit::Slide { by, ms, easing } => {
+                let animation = back.compositor.create_vector3_key_frame_animation();
+                animation.insert_key_frame(0.0, offset);
+                animation.insert_key_frame_with_easing(
+                    1.0,
+                    Vector3 {
+                        x: offset.x + by.x * size.x,
+                        y: offset.y + by.y * size.y,
+                        z: offset.z,
+                    },
+                    &self.motion.templates.easing(&back.compositor, easing),
+                );
+                animation.set_duration(Duration::from_millis(u64::from(ms)));
+                sprite.start_animation("Offset", &animation);
+            }
             Exit::Scale { to, ms } => {
                 let animation = back.compositor.create_vector3_key_frame_animation();
                 animation.insert_key_frame(0.0, sprite.scale());
@@ -463,8 +580,8 @@ impl crate::Scene {
                 );
                 animation.set_duration(Duration::from_millis(u64::from(ms)));
                 sprite.set_center_point(Vector3 {
-                    x: size.x * 0.5,
-                    y: size.y * 0.5,
+                    x: pad + size.x * 0.5,
+                    y: pad + size.y * 0.5,
                     z: 0.0,
                 });
                 sprite.start_animation("Scale", &animation);
@@ -472,16 +589,25 @@ impl crate::Scene {
         }
         // A batch subscribed to but never sealed keeps swallowing later animations, and one
         // sealed with no subscriber never reports. The pair is armed together or not at all.
-        let revoker = batch.on_completed(move || signal.set(true))?;
+        let tick = Rc::new(CoreCell::new(None));
+        let completed_tick = tick.clone();
+        let wake = self.wake.clone();
+        let revoker = batch.on_completed(move || {
+            signal.set(true);
+            completed_tick.set(Some(wake.tick()));
+        })?;
         batch.try_end()?;
         self.census.animations += 1;
 
         Ok(Some(Ghost {
             visual,
+            parent: self.overlay_children(),
+            visuals_held: source_count + visuals_minted,
+            visuals_minted,
             done,
             _revoker: revoker,
             _batch: batch,
-            _tick: self.wake.tick(),
+            _tick: tick,
         }))
     }
 }
@@ -489,6 +615,38 @@ impl crate::Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn releasing_a_ghost_removes_its_visual_from_the_compositor_collection() {
+        let _queue =
+            windows_composition::DispatcherQueueController::create_on_current_thread().unwrap();
+        let compositor = Compositor::new().unwrap();
+        let host = compositor.create_container_visual();
+        let parent = host.children();
+        let sprite = compositor.create_sprite_visual();
+        let visual = crate::base_of_sprite(&sprite);
+        parent.insert_at_top(&visual);
+        let batch = compositor.create_scoped_batch(BatchKind::Animation);
+        let revoker = batch.on_completed(|| {}).unwrap();
+        batch.try_end().unwrap();
+        let ghost = Ghost {
+            visual,
+            parent: parent.clone(),
+            visuals_held: 1,
+            visuals_minted: 1,
+            done: Rc::new(CoreCell::new(true)),
+            _batch: batch,
+            _revoker: revoker,
+            _tick: Rc::new(CoreCell::new(None)),
+        };
+        assert_eq!(parent.count(), 1);
+        drop(ghost);
+        assert_eq!(
+            parent.count(),
+            0,
+            "the collection keeps a strong reference until explicitly removed"
+        );
+    }
 
     #[test]
     fn the_two_tunings_are_independent_values() {

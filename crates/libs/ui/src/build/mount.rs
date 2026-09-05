@@ -160,6 +160,10 @@ pub struct Mount {
 }
 
 impl Mount {
+    pub(crate) fn set_exit(&mut self, exit: Exit) {
+        self.exit = exit;
+    }
+
     /// Returns the node this subtree is rooted at.
     #[must_use]
     pub const fn node(&self) -> NodeId {
@@ -402,6 +406,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         let row = h.mint_mount(MountRow {
             node,
             escape: None,
+            popup: false,
             next: MountId::NONE,
             control: None,
             text: None,
@@ -873,11 +878,7 @@ fn emit_sprite(
 /// The tint is the sprite's own resolved light at the emission's strength, not a colour of
 /// its own: a role emits *itself*, and a second authored colour here would be a way for a
 /// halo to disagree with the thing casting it.
-fn halo_of(
-    emission: crate::role::Emission,
-    of: Silhouette,
-    light: Radiance,
-) -> Option<Halo> {
+fn halo_of(emission: crate::role::Emission, of: Silhouette, light: Radiance) -> Option<Halo> {
     let spend = emission.of(of);
     spend.is_lit().then(|| Halo {
         blur: spend.sigma,
@@ -1025,7 +1026,8 @@ fn mount_control(
             Some(Act::Flyout(f)) => control.flyout = Some(f),
             Some(Act::DisabledWhen(f)) => disabled = Some(f),
             Some(Act::SelectedWhen(f)) => selected = Some(f),
-            Some(Act::HideWhen(_) | Act::Restyle(_) | Act::Escape(_)) | None => {}
+            Some(Act::HideWhen(_) | Act::Restyle(_) | Act::Escape(_) | Act::Popup { .. })
+            | None => {}
         }
     }
 
@@ -1262,6 +1264,28 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: MountId) {
         let next = entry.next;
         match entry.act.take() {
             Some(Act::Escape(f)) => Host::with(|h| h.set_escape(row, f)),
+            Some(Act::Popup {
+                shown,
+                spec,
+                body,
+                closed,
+            }) => {
+                Host::with(|h| h.mounts.get_mut(row).expect("mounted row").popup = true);
+                Effect::new(move || {
+                    let next = shown();
+                    let request = if next {
+                        crate::overlay::Request::Show {
+                            key: row,
+                            spec,
+                            body: body.clone(),
+                            closed: closed.clone(),
+                        }
+                    } else {
+                        crate::overlay::Request::Close(row)
+                    };
+                    Host::with(|h| h.request_popup(request));
+                });
+            }
             Some(act @ (Act::HideWhen(_) | Act::Restyle(_))) => acts.push(act),
             // Put back: the control pass owns the remaining variants.
             other => entry.act = other,

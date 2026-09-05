@@ -78,6 +78,8 @@ use windows_window::{Wake, Window};
 /// layout crosses in neither direction: it becomes bind and hit ops inside the patch.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum SceneEvent {
+    /// A finite key-frame binding's scoped batch completed. Node generations reject stale reports.
+    AnimationCompleted { node: NodeId, prop: Prop },
     /// Reports a tracker's position and scale.
     ///
     /// The only accurate read of a tracker: it evaluates in another process, and its getter
@@ -291,6 +293,13 @@ impl Scene {
     /// captured from.
     pub(crate) fn overlay_children(&self) -> windows_composition::VisualCollection {
         self.overlays.children()
+    }
+
+    /// Ends transient exit snapshots when the window's geometry changes.
+    pub fn cancel_exits(&mut self) {
+        for ghost in self.motion.ghosts.drain(..) {
+            self.census.visuals_live -= ghost.visuals_held;
+        }
     }
 
     /// Returns the hit array, which every consumer resolves a contact through.

@@ -229,6 +229,7 @@ pub(crate) fn resize_shape(host: &ShapeVisual, captured: &Captured, size: Vector
 /// The blur a [`Paint::Captured`] glow or a [`Halo`](crate::Halo) rides on.
 pub(crate) struct ShadowState {
     pub(crate) shadow: DropShadow,
+    pub(crate) offset: Vector2,
     /// The silhouette being blurred, kept so a box that moves can correct its extent: a
     /// captured glow's halo is a capture of the box.
     ///

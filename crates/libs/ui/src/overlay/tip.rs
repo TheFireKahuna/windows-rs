@@ -304,6 +304,8 @@ impl Overlays {
         // machine, so `Spec` exposes no public constructor for the kind and one opened from
         // outside would have nothing to close it.
         let spec = Spec {
+            viewport: None,
+            slide: None,
             kind: Kind::Tooltip,
             // Centred on the control it describes, clear of the pointer, on the side the
             // author named, and flipped to the opposite one near a window edge.

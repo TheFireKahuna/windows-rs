@@ -228,6 +228,24 @@ pub fn root() -> taffy::Style {
     }
 }
 
+/// A clipped popup viewport, sized from window input before any child is measured.
+pub(crate) fn viewport_style(size: windows_numerics::Vector2) -> taffy::Style {
+    taffy::Style {
+        display: taffy::Display::Flex,
+        flex_direction: taffy::FlexDirection::Column,
+        align_items: Some(Align::End.items()),
+        size: taffy::Size {
+            width: taffy::Dimension::length(size.x),
+            height: taffy::Dimension::length(size.y),
+        },
+        overflow: taffy::Point {
+            x: taffy::Overflow::Hidden,
+            y: taffy::Overflow::Hidden,
+        },
+        ..taffy::Style::DEFAULT
+    }
+}
+
 /// Lowers a recipe to a style. The one place a `taffy::Style` is built.
 ///
 /// A flex class allocates nothing. A grid class allocates its track templates — one `Vec`
@@ -393,7 +411,10 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
         Over::Grow => style.flex_grow = 1.0,
         Over::NoShrink => style.flex_shrink = 0.0,
         Over::Clip => {
-            style.overflow = taffy::Point { x: taffy::Overflow::Hidden, y: taffy::Overflow::Hidden };
+            style.overflow = taffy::Point {
+                x: taffy::Overflow::Hidden,
+                y: taffy::Overflow::Hidden,
+            };
         }
         Over::Absolute => style.position = taffy::Position::Absolute,
         Over::Inset(l) => {

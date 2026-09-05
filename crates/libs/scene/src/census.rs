@@ -87,7 +87,8 @@ impl Census {
     /// A woken tick that answers `false` is a frame something asked for and did not need.
     #[must_use]
     pub fn changed_since(&self, previous: &Self) -> bool {
-        self.ops_applied != previous.ops_applied
+        self.visuals_live != previous.visuals_live
+            || self.ops_applied != previous.ops_applied
             || self.props_written != previous.props_written
             || self.animations != previous.animations
             || self.visuals_minted != previous.visuals_minted

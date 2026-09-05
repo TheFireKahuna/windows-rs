@@ -1096,3 +1096,377 @@ fn dropping_the_stack_releases_a_pending_delay() {
     drop(mount);
     flush(&mut patch);
 }
+
+#[test]
+fn a_declared_popup_preserves_intent_on_resize_and_disposes_on_dismissal() {
+    use crate::role::Metric;
+    use crate::signal::{Cell, flush as flush_signals};
+    let mut patch = fixture();
+    let wanted = Cell::new(false);
+    let narrow = Cell::new(true);
+    let host = mount(
+        button("Inspector")
+            .popup_when(
+                move || wanted.get() && narrow.get(),
+                Spec::popup().exit(Exit::Fade { ms: 200 }),
+                move || wanted.set(false),
+                || {
+                    let _local = Cell::new(1_u32);
+                    body()
+                },
+            )
+            .width(Metric::CardMinW),
+        root(),
+    );
+    flush(&mut patch);
+    let invoker = entries(&patch)[0].id;
+    let baseline = live_nodes();
+    let mut focus = FocusRing::default();
+    _ = focus.focus(Some(invoker));
+    let mut overlays = Overlays::new();
+    for _ in 0..3 {
+        wanted.set(true);
+        flush_signals();
+        overlays.sync(&mut focus);
+        assert_eq!(overlays.depth(), 1);
+        assert!(live_nodes() > baseline);
+        narrow.set(false);
+        flush_signals();
+        overlays.sync(&mut focus);
+        assert!(overlays.is_empty());
+        assert!(wanted.get(), "resize must preserve narrow intent");
+        assert_eq!(live_nodes(), baseline);
+        narrow.set(true);
+        flush_signals();
+        overlays.sync(&mut focus);
+        assert_eq!(overlays.depth(), 1);
+        patch.clear();
+        overlays.close_top(&mut focus);
+        assert!(!wanted.get());
+        assert_eq!(focus.current(), Some(invoker));
+        flush(&mut patch);
+        assert!(patch.ops().iter().any(|op| matches!(
+            op,
+            windows_scene::Op::Drop {
+                exit: Exit::Fade { ms: 200 },
+                ..
+            }
+        )));
+    }
+    wanted.set(true);
+    flush_signals();
+    overlays.sync(&mut focus);
+    drop(host);
+    overlays.sync(&mut focus);
+    assert!(overlays.is_empty());
+    assert!(wanted.get(), "unmount is not a user dismissal");
+}
+
+#[test]
+fn a_drawer_viewport_sizes_from_window_input_and_clips_its_shadow() {
+    use crate::layout::{Edge, Len, probe};
+    use crate::role::Metric;
+    let mut patch = fixture();
+    let mut focus = FocusRing::default();
+    let mut overlays = Overlays::new();
+    let pane = probe();
+    let id = overlays.open(
+        Spec::popup().anchor(Anchor::window(Side::Right)).viewport([
+            Len::Metric(Metric::RowH),
+            Len::Metric(Metric::BandLg),
+            Len::Zero,
+            Len::Metric(Metric::BandSm),
+        ]),
+        &mut focus,
+        || {
+            crate::widget::sheet("drawer")
+                .shadowed(Edge::Left)
+                .width(Len::Pct(0.82))
+                .max_width(Metric::PaneDrawerMaxW)
+                .height(Len::Pct(1.0))
+                .probed(pane)
+        },
+    );
+    for width in [1100.0, 1500.0, 500.0] {
+        Host::with(|h| h.set_window(Vector2 { x: width, y: 640.0 }));
+        flush(&mut patch);
+        let measured = pane.get();
+        let (left, top, bottom) = Host::with(|h| {
+            (
+                crate::role::metric(Metric::RowH, h.root_scope),
+                crate::role::metric(Metric::BandLg, h.root_scope),
+                crate::role::metric(Metric::BandSm, h.root_scope),
+            )
+        });
+        assert!((measured.size.x - ((width - left) * 0.82).min(420.0)).abs() < 1.0);
+        assert_eq!(measured.rect.x1, width);
+        assert_eq!(measured.rect.y0, top);
+        assert_eq!(measured.rect.y1, 640.0 - bottom);
+        let root = overlays.open[id.depth as usize].root;
+        assert!(Host::with(|h| h.model().solved(root.node()).bounded));
+    }
+    overlays.close(id, &mut focus);
+}
+
+fn sliding_popup() -> Spec {
+    Spec::popup()
+        .anchor(Anchor::window(Side::Right))
+        .viewport([crate::layout::Len::Zero; 4])
+        .slide(
+            Vector2 { x: 1.0, y: 0.0 },
+            200,
+            windows_scene::Easing::Cubic {
+                c1: Vector2 { x: 0.16, y: 1.0 },
+                c2: Vector2 { x: 0.3, y: 1.0 },
+            },
+        )
+}
+
+#[test]
+fn a_slide_waits_for_the_compositor_and_never_emits_per_frame_updates() {
+    use crate::layout::{Len, scroll, stack};
+    use windows_scene::{Anim, Bind, Iterations, Op, Prop};
+    let mut patch = fixture();
+    let (_invoker, anchor) = invoker(&mut patch);
+    let mut focus = FocusRing::default();
+    _ = focus.focus(Some(anchor));
+    let mut overlays = Overlays::new();
+    let id = overlays.open(sliding_popup(), &mut focus, || {
+        scroll(
+            stack((button("Alpha"), button("Beta")))
+                .height(Len::Times(crate::role::Metric::RowH, 37.5)),
+        )
+        .width(Len::Times(crate::role::Metric::RowH, 12.5))
+        .height(Len::Pct(1.0))
+    });
+    let node = overlays.open[id.depth as usize]
+        .mount
+        .as_ref()
+        .unwrap()
+        .node();
+    flush(&mut patch);
+    let animation = patch
+        .ops()
+        .iter()
+        .find_map(|op| match *op {
+            Op::Bind {
+                id,
+                prop: Prop::Offset,
+                bind:
+                    Bind::Animate(Anim::Frames {
+                        frames,
+                        duration_ms,
+                        iterations,
+                    }),
+            } if id == node => Some((frames, duration_ms, iterations)),
+            _ => None,
+        })
+        .expect("one group enters");
+    assert_eq!((animation.1, animation.2), (200, Iterations::Count(1)));
+    assert_eq!(
+        entries(&patch)
+            .iter()
+            .filter(|e| e.flags.contains(HitFlags::BLOCKER))
+            .count(),
+        1
+    );
+    assert!(
+        !patch.ops().iter().any(|op| matches!(
+            op,
+            Op::Tracker {
+                op: windows_scene::TrackerOp::Create { .. },
+                ..
+            }
+        )),
+        "a moving viewport cannot own a live gesture source"
+    );
+    assert!(Host::with(|h| h.model.input_suspended(node)));
+    for _ in 0..5 {
+        patch.clear();
+        flush(&mut patch);
+        assert!(patch.ops().is_empty(), "entry must advance entirely in DWM");
+    }
+    overlays.scene(
+        &[SceneEvent::AnimationCompleted {
+            node,
+            prop: Prop::Offset,
+        }],
+        &mut focus,
+    );
+    flush(&mut patch);
+    assert!(!Host::with(|h| h.model.input_suspended(node)));
+    assert!(
+        patch.ops().iter().any(|op| matches!(
+            op,
+            Op::Tracker {
+                op: windows_scene::TrackerOp::Create { .. },
+                ..
+            }
+        )),
+        "scroll source activates after entry"
+    );
+    assert!(
+        patch.ops().iter().any(|op| matches!(op,
+        Op::Tracker { op: windows_scene::TrackerOp::Bounds { max, .. }, .. } if max.y > 0.0)),
+        "deferred creation must publish bounds too, or the new tracker stays at zero"
+    );
+    let table = hits(&patch);
+    assert!(
+        matches!(focus.step(&table, true), Move::To { .. }),
+        "keyboard enters the popup"
+    );
+    patch.clear();
+    overlays.close(id, &mut focus);
+    flush(&mut patch);
+    assert_eq!(focus.current(), Some(anchor));
+    assert!(patch.ops().iter().any(|op| matches!(
+        op,
+        Op::Drop {
+            exit: Exit::Slide { ms: 200, .. },
+            ..
+        }
+    )));
+    assert!(
+        !entries(&patch)
+            .iter()
+            .any(|e| e.flags.contains(HitFlags::BLOCKER)),
+        "exit pixels own no input"
+    );
+}
+
+#[test]
+fn resizing_an_entering_popup_snaps_and_a_stale_completion_cannot_release_a_reopen() {
+    use crate::layout::Len;
+    use windows_scene::{Bind, Op, Prop};
+    let mut patch = fixture();
+    let mut focus = FocusRing::default();
+    let mut overlays = Overlays::new();
+    let open = |overlays: &mut Overlays, focus: &mut FocusRing| {
+        overlays.open(sliding_popup(), focus, || {
+            body()
+                .width(Len::Times(crate::role::Metric::RowH, 12.5))
+                .height(Len::Pct(1.0))
+        })
+    };
+    let id = open(&mut overlays, &mut focus);
+    let node = overlays.open[id.depth as usize]
+        .mount
+        .as_ref()
+        .unwrap()
+        .node();
+    flush(&mut patch);
+    patch.clear();
+    // Height-only resize changes no horizontal local offset. It must still stop entry.
+    Host::with(|h| h.set_window(Vector2 { x: 800.0, y: 640.0 }));
+    flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(op,
+        Op::Bind { id, prop: Prop::Offset, bind: Bind::Set(_) } if *id == node)));
+    assert!(!Host::with(|h| h.model.input_suspended(node)));
+    overlays.close(id, &mut focus);
+    let second = open(&mut overlays, &mut focus);
+    let fresh = overlays.open[second.depth as usize]
+        .mount
+        .as_ref()
+        .unwrap()
+        .node();
+    flush(&mut patch);
+    assert_ne!(node, fresh);
+    overlays.scene(
+        &[SceneEvent::AnimationCompleted {
+            node,
+            prop: Prop::Offset,
+        }],
+        &mut focus,
+    );
+    assert!(Host::with(|h| h.model.input_suspended(fresh)));
+    patch.clear();
+    overlays.close(second, &mut focus);
+    flush(&mut patch);
+    assert!(
+        !patch.ops().iter().any(|op| matches!(
+            op,
+            Op::Drop {
+                exit: Exit::Slide { .. },
+                ..
+            }
+        )),
+        "an interrupted entry closes immediately instead of jumping to a resting snapshot"
+    );
+}
+
+#[test]
+fn a_window_presentation_switch_snaps_both_ways_and_keeps_the_next_dismissal_animated() {
+    use crate::signal::{Cell, flush as flush_signals};
+    use windows_scene::{Bind, Op};
+    let mut patch = fixture();
+    let window = Host::window_size();
+    let wanted = Cell::new(true);
+    let (_owner, _mount) = Owner::scope(|| {
+        mount(
+            button("Inspector").popup_when(
+                move || window.get().x < 1000.0 && wanted.get(),
+                sliding_popup(),
+                move || wanted.set(false),
+                body,
+            ),
+            root(),
+        )
+    });
+    let mut focus = FocusRing::default();
+    let mut overlays = Overlays::new();
+    overlays.sync(&mut focus);
+    flush(&mut patch);
+    assert_eq!(overlays.depth(), 1);
+    let node = overlays.open[0].mount.as_ref().unwrap().node();
+    overlays.scene(
+        &[SceneEvent::AnimationCompleted {
+            node,
+            prop: windows_scene::Prop::Offset,
+        }],
+        &mut focus,
+    );
+    patch.clear();
+    Host::with(|h| {
+        h.set_window(Vector2 {
+            x: 1200.0,
+            y: 600.0,
+        })
+    });
+    flush_signals();
+    overlays.sync(&mut focus);
+    flush(&mut patch);
+    assert!(overlays.is_empty());
+    assert!(wanted.get());
+    assert!(!patch.ops().iter().any(|op| matches!(
+        op,
+        Op::Drop {
+            exit: Exit::Slide { .. },
+            ..
+        }
+    )));
+    patch.clear();
+    Host::with(|h| h.set_window(Vector2 { x: 800.0, y: 600.0 }));
+    flush_signals();
+    overlays.sync(&mut focus);
+    flush(&mut patch);
+    assert_eq!(overlays.depth(), 1);
+    assert!(!patch.ops().iter().any(|op| matches!(
+        op,
+        Op::Bind {
+            bind: Bind::Animate(_),
+            ..
+        }
+    )));
+    patch.clear();
+    wanted.set(false);
+    flush_signals();
+    overlays.sync(&mut focus);
+    flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(
+        op,
+        Op::Drop {
+            exit: Exit::Slide { ms: 200, .. },
+            ..
+        }
+    )));
+}

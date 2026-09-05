@@ -346,6 +346,7 @@ impl Realizer<'_> {
         node.shadow = Some(ShadowState {
             shadow,
             captured: None,
+            offset: halo.offset,
             chans,
         });
     }
@@ -386,6 +387,7 @@ impl Realizer<'_> {
         node.shadow = Some(ShadowState {
             shadow,
             captured: Some(captured),
+            offset: Vector2 { x: 0.0, y: 0.0 },
             chans,
         });
         Some(brush)

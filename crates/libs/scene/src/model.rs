@@ -29,6 +29,7 @@ struct ModelNode {
     links: Links,
     hit: Option<HitDecl>,
     live: bool,
+    input_suspended: bool,
 }
 
 /// The app thread's half of the scene: structure, layout, and the patch.
@@ -300,6 +301,7 @@ impl Model {
         self.nodes[index] = ModelNode {
             id,
             live: true,
+            input_suspended: false,
             ..ModelNode::default()
         };
         // A reused slot must not be compared against its previous occupant's placement.
@@ -403,8 +405,28 @@ impl Model {
         self.solve_dirty = true;
     }
 
-    /// Declares what a node participates in, for the hit array. `None` removes it from
-    /// routing entirely.
+    /// Suspends all input and automation in a subtree without changing its layout or paint.
+    /// A popup keeps its separate blocker while its moving content cannot be targeted.
+    pub fn suspend_input(&mut self, id: NodeId, suspended: bool) {
+        if self.ids.is_live(id) && self.nodes[id.index()].input_suspended != suspended {
+            self.nodes[id.index()].input_suspended = suspended;
+            self.hits_dirty = true;
+        }
+    }
+
+    /// Returns whether this node or an ancestor is waiting for its entry to finish.
+    pub fn input_suspended(&self, mut id: NodeId) -> bool {
+        while self.ids.is_live(id) {
+            let node = &self.nodes[id.index()];
+            if node.input_suspended {
+                return true;
+            }
+            id = node.links.parent;
+        }
+        false
+    }
+
+    /// Declares what a node participates in, for the hit array. `None` removes it from routing.
     pub fn hit(&mut self, id: NodeId, decl: Option<HitDecl>) {
         if let Some(node) = self.nodes.get_mut(id.index())
             && node.hit != decl
@@ -872,6 +894,9 @@ impl Model {
         }
         let (decl, first) = {
             let node = &self.nodes[id.index()];
+            if node.input_suspended {
+                return;
+            }
             (node.hit, node.links.first)
         };
         let solved = self.solved.get(id.index()).copied().unwrap_or_default();

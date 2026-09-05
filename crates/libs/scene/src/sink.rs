@@ -621,6 +621,12 @@ pub enum Exit {
         to: f32,
         ms: u32,
     },
+    /// Moves the flattened subtree by a multiple of its own size.
+    Slide {
+        by: Vector2,
+        ms: u32,
+        easing: Easing,
+    },
 }
 
 // ── trackers ────────────────────────────────────────────────────────────────────

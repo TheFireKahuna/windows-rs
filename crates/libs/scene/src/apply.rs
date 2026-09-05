@@ -45,7 +45,17 @@ impl Scene {
         self.sync(back, env)?;
         // Exits that the compositor has reported complete. Swept at the top of a tick, so a
         // ghost is released on its batch's own completion signal and never on a timer.
-        self.motion.ghosts.retain(|ghost| !ghost.finished());
+        self.motion.ghosts.retain(|ghost| {
+            if ghost.finished() {
+                self.census.visuals_live -= ghost.visuals_held;
+                false
+            } else {
+                true
+            }
+        });
+        self.motion
+            .playbacks
+            .retain(|playback| !playback.done.get());
 
         for index in 0..patch.ops().len() {
             let op = patch.ops()[index];
@@ -212,12 +222,14 @@ impl Scene {
 
     /// Destroys a node *and its subtree*, releasing every resource on the way down.
     fn drop_node(&mut self, id: NodeId, exit: Exit, back: &Backends, env: Env) -> Result<()> {
-        self.unlink(id);
         if exit != Exit::None
             && let Some(ghost) = self.ghost(id, exit, back, env)?
         {
+            self.census.visuals_live += ghost.visuals_held;
+            self.census.visuals_minted += u64::from(ghost.visuals_minted);
             self.motion.ghosts.push(ghost);
         }
+        self.unlink(id);
         self.destroy_subtree(id);
         self.release_front_claims();
         Ok(())
@@ -227,6 +239,7 @@ impl Scene {
     ///
     /// Recurses over the child chain; the depth it reaches is layout nesting.
     fn destroy_subtree(&mut self, id: NodeId) {
+        self.motion.playbacks.retain(|playback| playback.node != id);
         let mut child = self.nodes.get(id).map_or(NodeId::NONE, |n| n.links.first);
         while let Some(node) = self.nodes.get(child) {
             let next = node.links.next;
@@ -570,6 +583,9 @@ impl Scene {
             }
         }
 
+        self.motion
+            .playbacks
+            .retain(|p| p.node != id || !prop::overlaps(prop::desc(p.prop), prop::desc(prop)));
         match bind {
             Bind::Set(value) => {
                 let written = self
@@ -581,7 +597,7 @@ impl Scene {
                 }
                 self.census.count(written);
             }
-            Bind::Animate(anim) => self.animate(id, prop, anim, patch, back),
+            Bind::Animate(anim) => self.animate(id, prop, anim, patch, back)?,
             Bind::Track {
                 tracker,
                 axis,
@@ -685,11 +701,32 @@ impl Scene {
         let _ = self.rebind(SpriteId(id), back, env);
     }
 
-    fn animate(&mut self, id: NodeId, prop: Prop, anim: Anim, patch: &SinkPatch, back: &Backends) {
+    fn animate(
+        &mut self,
+        id: NodeId,
+        prop: Prop,
+        anim: Anim,
+        patch: &SinkPatch,
+        back: &Backends,
+    ) -> Result<()> {
         let desc = prop::desc(prop);
         let Some(animation) = self.animation(id, desc, anim, patch, back) else {
-            return;
+            return Ok(());
         };
+        self.motion
+            .playbacks
+            .retain(|p| p.node != id || p.prop != prop);
+        let batch = matches!(
+            anim,
+            Anim::Frames {
+                iterations: Iterations::Count(_),
+                ..
+            }
+        )
+        .then(|| {
+            back.compositor
+                .create_scoped_batch(windows_composition::BatchKind::Animation)
+        });
         // Where the channel is going, for the shadow. A key-framed animation states no single
         // settling value, so it leaves the shadow alone.
         let to = match anim {
@@ -700,6 +737,29 @@ impl Scene {
             prop::start(node, desc, &animation, Held::Playing, to);
             self.census.animations += 1;
         }
+        if let Some(batch) = batch {
+            let done = std::rc::Rc::new(core::cell::Cell::new(false));
+            let signal = done.clone();
+            let events = self.events.clone();
+            let wake = self.wake.clone();
+            let revoker = batch.on_completed(move || {
+                signal.set(true);
+                events.borrow_mut().push(
+                    crate::SceneEvent::AnimationCompleted { node: id, prop },
+                    &wake,
+                );
+            })?;
+            batch.try_end()?;
+            self.motion.playbacks.push(crate::anim::Playback {
+                node: id,
+                prop,
+                done,
+                _animation: animation,
+                _batch: batch,
+                _revoker: revoker,
+            });
+        }
+        Ok(())
     }
 
     /// Builds the animation an [`Anim`] describes, against the shared templates.

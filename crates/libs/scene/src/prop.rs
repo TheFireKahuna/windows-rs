@@ -57,10 +57,6 @@ pub(crate) struct PropDesc {
     pub(crate) chan: u8,
     /// How many channels this row covers, starting at `chan`: one for a scalar row, two for
     /// a composite. Checked against the owner's shadow width, so no row can address past it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by the shadow-bounds proof")
-    )]
     pub(crate) span: u8,
     pub(crate) kind: ValueKind,
     pub(crate) anim: Slot,
@@ -192,12 +188,16 @@ fn stop_overlapping(node: &Node, d: &PropDesc) {
     let Some(object) = animatable(node, d.owner) else {
         return;
     };
-    let end = d.chan + d.span;
     for row in &PROPS {
-        if row.group == d.group && row.chan < end && d.chan < row.chan + row.span {
+        if overlaps(row, d) {
             object.stop(row.path);
         }
     }
+}
+
+/// Returns whether two declarations write any of the same property channels.
+pub(crate) fn overlaps(a: &PropDesc, b: &PropDesc) -> bool {
+    a.group == b.group && a.chan < b.chan + b.span && b.chan < a.chan + a.span
 }
 
 /// Starts `animation` on the channel `d` names and records the state the channel enters.

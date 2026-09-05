@@ -51,6 +51,7 @@ pub(crate) type PresentId = Id<Present>;
 pub(crate) struct MountRow {
     pub node: NodeId,
     pub escape: Option<Rc<dyn Fn()>>,
+    pub popup: bool,
     /// The next row of the same mounted subtree, or [`Id::NONE`] at the end of the chain.
     ///
     /// A chain rather than a `Vec`, so a list row realized during a fling records its rows
@@ -181,13 +182,28 @@ impl ValueRow {
 pub(crate) struct Placement {
     pub root: GroupId,
     pub anchor: crate::overlay::Anchor,
+    pub viewport: Option<[crate::layout::Len; 4]>,
+    pub bounds: Option<windows_scene::Rect>,
+    pub entry: Option<OverlayEntry>,
     /// What was last published, so a pass that moved nothing emits nothing.
     pub at: Vector2,
+}
+
+pub(crate) struct OverlayEntry {
+    node: NodeId,
+    slide: crate::overlay::Slide,
+    started: bool,
+    finished: bool,
+    window: Vector2,
+    rect: Option<windows_scene::Rect>,
 }
 
 /// Owns the model and the tables the app thread's half of the widget layer builds into.
 pub struct Host {
     pub(crate) model: Model,
+    window_size: crate::signal::Cell<Vector2>,
+    _window_owner: crate::signal::Owner,
+    pub(crate) popup_requests: Vec<crate::overlay::Request>,
     pub(crate) env: Env,
     pub(crate) root_scope: Scope,
     /// Mints mount-row ids.
@@ -289,7 +305,12 @@ impl Host {
     pub fn install(mut model: Model, env: Env, root_scope: Scope) {
         model.on_measure(|input: MeasureIn| super::text::measure(input));
         model.on_restyle(|node, class| super::style::restyle(node, class));
+        let (window_owner, window_size) =
+            crate::signal::Owner::scope(|| crate::signal::Cell::new(model.window()));
         let host = Self {
+            window_size,
+            _window_owner: window_owner,
+            popup_requests: Vec::new(),
             model,
             env,
             root_scope,
@@ -315,6 +336,22 @@ impl Host {
             overlays: Vec::new(),
         };
         HOST.with(|slot| *slot.borrow_mut() = Some(host));
+    }
+
+    /// The window's client extent in DIPs, written only from window resize input.
+    /// Structural window presentations may read it; container layouts use responsive rules.
+    #[must_use]
+    pub fn window_size() -> crate::signal::Cell<Vector2> {
+        Self::with(|host| host.window_size)
+    }
+
+    pub(crate) fn request_popup(&mut self, request: crate::overlay::Request) {
+        let key = request.key();
+        if let Some(pending) = self.popup_requests.iter_mut().find(|r| r.key() == key) {
+            *pending = request;
+        } else {
+            self.popup_requests.push(request);
+        }
     }
 
     /// Runs `f` against the thread's host.
@@ -982,6 +1019,9 @@ impl Host {
     pub(crate) fn unmount(&mut self, node: NodeId, exit: Exit, rows: MountId) {
         let mut at = rows;
         while let Some(row) = self.mounts.remove(&mut self.mount_ids, at) {
+            if row.popup {
+                self.request_popup(crate::overlay::Request::Close(at));
+            }
             // Fallible: this can run while the thread tears its locals down, and the style
             // table is a thread-local going the same way.
             super::style::try_with(|table| {
@@ -998,7 +1038,9 @@ impl Host {
                 value = row.next;
             }
             if let Some(probe) = row.probe {
-                self.probes.remove(&mut self.probe_ids, probe);
+                if let Some(probe) = self.probes.remove(&mut self.probe_ids, probe) {
+                    probe.cell.set(crate::layout::Placed::default());
+                }
             }
             // The present thread is told first and the sink is released after: the region
             // owns the surface handle behind the brush this side is painting with, so the
@@ -1049,6 +1091,7 @@ impl Host {
     ///    terminates.
     pub fn flush(&mut self, patch: &mut SinkPatch) {
         let env = self.env;
+        self.size_overlay_viewports();
         self.model.solve(env);
         if self.publish_geometry() {
             self.model.solve(env);
@@ -1056,6 +1099,8 @@ impl Host {
         if self.place_overlays() {
             self.model.solve(env);
         }
+        self.publish_overlay_entries();
+        self.publish_probes();
         self.model.flush(patch, env);
     }
 
@@ -1067,10 +1112,7 @@ impl Host {
         // Values bind compositor properties and dirty no layout, so they are published here
         // for ordering and contribute nothing to whether a re-solve is owed.
         self.publish_values();
-        // Probes contribute nothing either: what they write is read on the next tick, so
-        // counting one would make a solve react to a solve and the sequence in `flush` would
-        // have no reason to terminate.
-        self.publish_probes();
+        // Probes publish after overlay placement in `flush`, when absolute rects are final.
         // Neither do regions: an extent goes out to the present thread and nothing comes
         // back into the solve.
         self.publish_regions();
@@ -1094,6 +1136,7 @@ impl Host {
     /// destroyed by the mount going out of scope, which is where its exit transition is.
     pub(crate) fn close_overlay_slot(&mut self, root: GroupId, blocker: Option<ControlId>) {
         self.model.close_slot(root);
+        self.model.destroy(root.node(), Exit::None);
         if let Some(blocker) = blocker {
             self.release_control(blocker);
         }
@@ -1196,6 +1239,107 @@ impl Host {
     ///
     /// An overlay moves when it opens, when its anchor moves and when the window resizes
     /// under it, so this is not a per-frame cost.
+    pub(crate) fn open_overlay_entry(
+        &mut self,
+        depth: u32,
+        node: NodeId,
+        slide: crate::overlay::Slide,
+    ) {
+        self.model.suspend_input(node, true);
+        self.overlays[depth as usize].entry = Some(OverlayEntry {
+            node,
+            slide,
+            started: false,
+            finished: false,
+            window: self.model.window(),
+            rect: None,
+        });
+    }
+
+    pub(crate) fn complete_overlay_entry(&mut self, node: NodeId) {
+        for placement in &mut self.overlays {
+            if let Some(entry) = &mut placement.entry
+                && entry.node == node
+                && entry.started
+            {
+                entry.finished = true;
+                self.model.suspend_input(node, false);
+            }
+        }
+    }
+
+    // Only the first solved box starts motion. Changed geometry snaps in one event-rate write.
+    fn publish_overlay_entries(&mut self) {
+        use windows_scene::{Bind, Easing, Iterations, Prop, Value};
+        let window = self.model.window();
+        for placement in &mut self.overlays {
+            let Some(entry) = &mut placement.entry else {
+                continue;
+            };
+            if entry.finished {
+                continue;
+            }
+            let solved = self.model.solved(entry.node);
+            if solved.size.x <= 0.0 || solved.size.y <= 0.0 {
+                continue;
+            }
+            if window != entry.window || entry.rect.is_some_and(|rect| rect != solved.rect) {
+                self.model.bind(
+                    entry.node,
+                    Prop::Offset,
+                    Bind::Set(Value::Vec2(solved.local)),
+                );
+                self.model.suspend_input(entry.node, false);
+                entry.finished = true;
+            } else if !entry.started {
+                let from = Vector2 {
+                    x: solved.local.x + entry.slide.by.x * solved.size.x,
+                    y: solved.local.y + entry.slide.by.y * solved.size.y,
+                };
+                let anim = self.model.frames(
+                    &[
+                        (0.0, Value::Vec2(from), Easing::Linear),
+                        (1.0, Value::Vec2(solved.local), entry.slide.easing),
+                    ],
+                    entry.slide.ms,
+                    Iterations::Count(1),
+                );
+                self.model
+                    .bind(entry.node, Prop::Offset, Bind::Animate(anim));
+                entry.started = true;
+                entry.rect = Some(solved.rect);
+            }
+        }
+    }
+
+    fn size_overlay_viewports(&mut self) {
+        let window = self.model.window();
+        for placement in &mut self.overlays {
+            let Some(insets) = placement.viewport else {
+                continue;
+            };
+            let [left, top, right, bottom] =
+                insets.map(|len| len.dips(self.root_scope).unwrap_or(0.0).max(0.0));
+            let bounds = windows_scene::Rect::new(
+                left,
+                top,
+                (window.x - right).max(left),
+                (window.y - bottom).max(top),
+            );
+            if placement.bounds == Some(bounds) {
+                continue;
+            }
+            placement.bounds = Some(bounds);
+            self.model.style(
+                placement.root.node(),
+                &crate::layout::viewport_style(Vector2 {
+                    x: bounds.x1 - bounds.x0,
+                    y: bounds.y1 - bounds.y0,
+                }),
+            );
+        }
+    }
+
     fn place_overlays(&mut self) -> bool {
         use crate::overlay::{AnchorTo, place};
         let window = self.model.window();
@@ -1222,7 +1366,9 @@ impl Host {
                     self.model.solved(control.node).rect
                 }
                 AnchorTo::Point(at) => windows_scene::Rect::new(at.x, at.y, at.x, at.y),
-                AnchorTo::Window => windows_scene::Rect::new(0.0, 0.0, window.x, window.y),
+                AnchorTo::Window => self.overlays[index]
+                    .bounds
+                    .unwrap_or(windows_scene::Rect::new(0.0, 0.0, window.x, window.y)),
             };
             let at = place(size, against, anchor, window);
             if at == last {
@@ -1257,6 +1403,9 @@ impl Host {
         let mut pending = core::mem::take(&mut self.trackers);
         pending.retain(|spec| {
             let size = self.model.solved(spec.viewport.node()).size;
+            if self.model.input_suspended(spec.viewport.node()) {
+                return true;
+            }
             if size.x <= 0.0 || size.y <= 0.0 {
                 return true;
             }
@@ -1293,7 +1442,7 @@ impl Host {
             // went to a tracker that does not exist yet. The equality gate would then never
             // send them again. An unmeasured container publishes nothing and remembers
             // nothing, so the flush that gives it a box is the one that publishes.
-            if box_.x <= 0.0 || box_.y <= 0.0 {
+            if box_.x <= 0.0 || box_.y <= 0.0 || self.model.input_suspended(viewport) {
                 continue;
             }
             let viewport_h = box_.y;
@@ -1370,6 +1519,7 @@ impl Host {
 
     /// Sets the window's size in DIPs, from the window's own resize message.
     pub fn set_window(&mut self, size: Vector2) {
+        self.window_size.set(size);
         self.model.set_window(size);
     }
 

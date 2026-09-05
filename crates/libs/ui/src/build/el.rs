@@ -796,6 +796,25 @@ impl<K> El<K> {
         })))
     }
 
+    /// Opens a popup while `shown` holds, owned by this mounted node. User dismissal
+    /// calls `closed`; a false condition or an unmount closes without changing app intent.
+    /// Content is rebuilt under an overlay owner on each open and disposed on close.
+    #[must_use]
+    pub fn popup_when<M>(
+        self,
+        shown: impl Signal<bool, M> + 'static,
+        spec: crate::overlay::Spec,
+        closed: impl Fn() + 'static,
+        body: impl Fn() -> View + 'static,
+    ) -> Self {
+        self.act(Act::Popup {
+            shown: Box::new(move || shown.read()),
+            spec,
+            body: std::rc::Rc::new(body),
+            closed: std::rc::Rc::new(closed),
+        })
+    }
+
     /// Sets the inline size at one width class.
     #[must_use]
     pub fn width_when(self, class: WidthClass, width: impl Into<Len>) -> Self {

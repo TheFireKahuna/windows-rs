@@ -83,6 +83,7 @@ impl Frame {
         // its root is the composition target's, sized from the window by the compositor
         // itself, so the ground tracks a drag-resize whether or not this runs.
         if let Some((width, height)) = self.resized.take() {
+            scene.cancel_exits();
             let scale = env.scale();
             Host::with(|h| {
                 h.set_window(Vector2 {
@@ -119,6 +120,7 @@ impl Frame {
         // ① everything the writes since the last tick implied, ② the structure and geometry
         // that fell out of it, ③ the composition writes that realize it.
         signal::flush();
+        self.overlays.sync(self.router.focus_mut());
         Host::with(|h| h.flush(&mut self.patch));
         scene.apply(&mut self.patch, &self.backends, env)?;
         self.patch.clear();

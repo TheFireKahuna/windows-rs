@@ -335,6 +335,12 @@ pub(crate) struct TextSeed {
 /// Handlers never cross the thread seam: they live in an app-thread table and reach the
 /// front thread as a presence bit in [`HitFlags`], which is what keeps `SinkPatch: Send`.
 pub(crate) enum Act {
+    Popup {
+        shown: Box<dyn Fn() -> bool>,
+        spec: crate::overlay::Spec,
+        body: std::rc::Rc<dyn Fn() -> super::View>,
+        closed: std::rc::Rc<dyn Fn()>,
+    },
     Escape(std::rc::Rc<dyn Fn()>),
     Click(Box<dyn Fn()>),
     ChangeF64(Box<dyn Fn(f64)>),
