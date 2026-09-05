@@ -137,6 +137,58 @@ fn vertical_labels_keep_their_rotated_extent_after_publish_and_updates() {
     }
 }
 
+#[test]
+fn dynamic_labels_fit_replacement_text_without_previous_width_padding() {
+    for dpi in [96.0, 144.0, 192.0] {
+        let mut patch = fixture_at(dpi);
+        let word = crate::signal::Cell::new("Inspector");
+        let held = mount(
+            stack(crate::widget::label(crate::widget::shown(move || {
+                word.get()
+            })))
+            .align(crate::layout::Align::Start),
+            root(),
+        );
+        for value in [
+            "Inspector",
+            "Longer inspector label",
+            "",
+            "I",
+            "Replacement",
+        ] {
+            word.set(value);
+            crate::signal::flush();
+            flush(&mut patch);
+            Host::with(|h| {
+                let (node, key) = h
+                    .mounts
+                    .iter()
+                    .find_map(|(_, m)| m.text.map(|k| (m.node, k)))
+                    .unwrap();
+                let actual = h.model().solved(node);
+                let expected = text::measure(windows_scene::MeasureIn {
+                    key,
+                    class: actual.class,
+                    known: (None, None),
+                    available: (
+                        windows_scene::Avail::MaxContent,
+                        windows_scene::Avail::MaxContent,
+                    ),
+                });
+                assert!(
+                    (actual.size.x - expected.x).abs() < 2.0,
+                    "{dpi}: {value:?}: {:?} vs {expected:?}",
+                    actual.size
+                );
+            });
+            patch.clear();
+            flush(&mut patch);
+            assert!(patch.ops().is_empty(), "settled label must emit nothing");
+        }
+        drop(held);
+    }
+}
+
 // ── lowering ─────────────────────────────────────────────────────────────────────
 
 /// A slot with one sprite and no children lowers to that sprite: one visual, no group.

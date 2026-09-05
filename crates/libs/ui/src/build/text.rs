@@ -551,16 +551,24 @@ impl Entry {
     /// Fixes this run at the width it was given and re-emits what moved.
     fn publish(&mut self, engine: &TextEngine, model: &mut Model) -> bool {
         let node = self.node();
-        // Once a vertical run has a line box, layout derives its extent from that
-        // child and may skip the parent's measure callback on a text update.
-        if matches!(self.target, Target::Wrapped { vertical: true, .. }) {
+        let intrinsic = matches!(
+            self.target,
+            Target::Line { .. } | Target::Wrapped { vertical: true, .. }
+        );
+        // Published line boxes have definite sizes, so layout may skip their
+        // measure callback even when the text or font has changed.
+        if intrinsic {
             self.sync(engine, model.solved(node).class);
         }
         let size = model.solved(node).size;
-        let width = if matches!(self.target, Target::Wrapped { vertical: true, .. }) {
-            // The preceding text may have been empty. Its zero-height box cannot
-            // supply the inline extent of the replacement run.
-            self.run.measure(None).x.max(1.0)
+        let width = if intrinsic {
+            // Pin to the replacement's advance. The preceding line's box can be
+            // empty or narrower; pinning there counts overflow as extra ink padding.
+            if self.pinned.is_finite() {
+                self.pinned
+            } else {
+                self.run.measure(None).x.max(1.0)
+            }
         } else {
             size.x
         };
@@ -602,8 +610,8 @@ impl Entry {
             return false;
         };
         let ink = self.ink_w;
-        // Ordered so `NaN` — no coverage emitted yet — takes the same exit a zero does.
-        if !(ink > 0.0) {
+        // Zero clears the width of a label whose replacement is empty.
+        if !ink.is_finite() {
             return false;
         }
         if (ink - model.solved(node).size.x).abs() < 0.01 {
