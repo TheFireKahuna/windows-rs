@@ -3294,6 +3294,24 @@ fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
         "a tracker was created against a viewport laid out at zero"
     );
 
+    let content = Host::with(|h| h.scrolls.iter().next().unwrap().1.content);
+    let content_binding = |patch: &SinkPatch| {
+        patch.ops().iter().position(|op| {
+            matches!(
+                op,
+                Op::Bind {
+                    id,
+                    prop: windows_scene::Prop::OffsetY,
+                    bind: windows_scene::Bind::Track { .. },
+                } if *id == content
+            )
+        })
+    };
+    assert!(
+        content_binding(&patch).is_none(),
+        "a hidden scroll bound its content before its tracker existed"
+    );
+
     patch.clear();
     hidden.set(false);
     crate::signal::flush();
@@ -3302,6 +3320,31 @@ fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
         creates(&patch),
         1,
         "the viewport has a box now and its tracker was never created"
+    );
+    let created = patch
+        .ops()
+        .iter()
+        .position(|op| {
+            matches!(
+                op,
+                Op::Tracker {
+                    op: windows_scene::TrackerOp::Create { .. },
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    assert!(
+        content_binding(&patch).expect("revealing the scroll did not bind its content") > created,
+        "the content binding preceded tracker creation and would be dropped by the scene"
+    );
+
+    patch.clear();
+    flush(&mut patch);
+    assert_eq!(creates(&patch), 0, "idle recreated the tracker");
+    assert!(
+        content_binding(&patch).is_none(),
+        "idle rebound the content"
     );
 }
 

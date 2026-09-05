@@ -241,6 +241,7 @@ pub struct Host {
 pub struct TrackerSpec {
     pub id: windows_scene::TrackerId<windows_scene::Observed>,
     pub viewport: GroupId,
+    pub content: NodeId,
     pub axes: windows_scene::Axes,
 }
 
@@ -1239,6 +1240,17 @@ impl Host {
                 return true;
             }
             self.model.create_tracker(spec.id, spec.viewport, spec.axes);
+            // A binding to a tracker that does not exist is discarded by the scene.
+            // Publish it with creation, including when a hidden viewport is first shown.
+            self.model.bind(
+                spec.content,
+                Prop::OffsetY,
+                windows_scene::Bind::Track {
+                    tracker: spec.id,
+                    axis: windows_scene::TrackerAxis::PositionY,
+                    affine: windows_scene::Affine::CONTENT,
+                },
+            );
             false
         });
         self.trackers = pending;

@@ -1076,17 +1076,9 @@ fn mount_scroll(
         h.trackers.push(super::host::TrackerSpec {
             id: tracker,
             viewport,
+            content,
             axes: windows_scene::Axes::VERTICAL,
         });
-        h.model().bind(
-            content,
-            Prop::OffsetY,
-            Bind::Track {
-                tracker,
-                axis: windows_scene::TrackerAxis::PositionY,
-                affine: windows_scene::Affine::CONTENT,
-            },
-        );
         // The scrollbar lives in the viewport rather than in the content, so it does not
         // scroll with what it reports on, and above the content, because child order is paint
         // order and the order the hit array is scanned in. Below it, the bar paints under
