@@ -1489,7 +1489,9 @@ impl Host {
             let viewport_h = box_.y;
             // The realization window is a fraction of the viewport height, which a
             // virtualized list cannot compute for itself.
-            state.resized(viewport_h);
+            if let Some(state) = state {
+                state.resized(viewport_h);
+            }
             let geom = crate::layout::thumb_geom(viewport_h, self.model.solved(content).size.y);
             // Before the gate below, because a container whose content fits publishes the
             // same geometry it was minted with and would otherwise never reach the front

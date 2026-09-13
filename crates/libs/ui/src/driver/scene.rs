@@ -178,7 +178,7 @@ impl<'a> Thread<'a> {
         self.wakes += 1;
 
         // ⓪ what the compositor reported, before anything else reads it: the thumb reveal
-        // below wants this pass's tracker phases, and the app thread wants them all.
+        // below wants tracker phases; only observed scroll state needs them on the app thread.
         self.events.clear();
         self.scene.drain_events(&mut self.events);
 
@@ -364,7 +364,11 @@ impl<'a> Thread<'a> {
                     .copied(),
             );
         }
-        up.events.append(&mut self.events);
+        up.events.extend(
+            self.events
+                .drain(..)
+                .filter(|event| self.scrolls.app_observes(event)),
+        );
         Ok(())
     }
 

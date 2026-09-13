@@ -21,8 +21,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 use windows_numerics::Vector2;
 use windows_present::{Extent, Queue, RegionKey};
-use windows_scene::{Census, 
-    ControlId, Env, HitTable, NodeId, Observed, RegionId, SceneEvent, SinkPatch, SpriteId,
+use windows_scene::{
+    Census, ControlId, Env, HitTable, NodeId, Observed, RegionId, SceneEvent, SinkPatch, SpriteId,
     TrackerId,
 };
 use windows_window::{CaptionState, Event};
@@ -449,6 +449,8 @@ pub(crate) enum ScrollOp {
 /// One scroll container, as the thread routing a contact over it needs it.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ScrollFront {
+    /// Application state is consumed by virtualization or an explicit observer.
+    pub observe: bool,
     pub id: ScrollId,
     pub tracker: TrackerId<Observed>,
     pub thumb: Option<SpriteId>,

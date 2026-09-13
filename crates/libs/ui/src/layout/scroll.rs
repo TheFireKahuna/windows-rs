@@ -187,11 +187,12 @@ pub fn thumb_style(geom: ThumbGeom) -> windows_scene::taffy::Style {
 ///
 /// The state travels with the reveal policy so that a list and the mount reporting into it
 /// share one [`ScrollState`]; a second handle would be a second answer to where the content
-/// is.
+/// is. Ordinary containers hold no application state; their position stays in the
+/// scene-side shadow shared with input hit testing.
 #[derive(Copy, Clone, Debug)]
 pub struct ScrollDecl {
     pub reveal: Reveal,
-    pub state: ScrollState,
+    pub state: Option<ScrollState>,
 }
 
 /// Returns a scrolling container over `children`, with the default reveal policy.
@@ -209,7 +210,7 @@ pub fn scroll_with(reveal: Reveal, children: impl IntoChildren) -> View {
     scroll_state(
         ScrollDecl {
             reveal,
-            state: ScrollState::new(),
+            state: None,
         },
         super::stack(children),
     )
@@ -553,7 +554,7 @@ where
     scroll_state(
         ScrollDecl {
             reveal: Reveal::default(),
-            state,
+            state: Some(state),
         },
         El::<Any>::seed_bare()
             .height_rows(move || spec.get().row_h, move || spec.get().count as f32)
@@ -577,7 +578,7 @@ pub(crate) struct ScrollRow {
     /// The rail's, which is what a grab names. Minted only where there is a thumb.
     pub grab: Option<ControlId>,
     pub reveal: Reveal,
-    pub state: ScrollState,
+    pub state: Option<ScrollState>,
     /// What was last published, so a solve that moved nothing emits nothing.
     pub last: ThumbGeom,
     /// Whether the half that moves the thumb has been told this container exists.
@@ -630,6 +631,22 @@ impl ScrollTable {
         }
     }
 
+    /// Only a scroll with application-owned state needs its tracker reports upstream.
+    /// Scene-side hit offsets, request completion and thumb reveal are already serviced.
+    pub(crate) fn app_observes(&self, event: &SceneEvent) -> bool {
+        let tracker = match *event {
+            SceneEvent::TrackerValues { tracker, .. }
+            | SceneEvent::TrackerPhase { tracker, .. }
+            | SceneEvent::InertiaStarting { tracker, .. }
+            | SceneEvent::RequestIgnored { tracker, .. } => tracker,
+            _ => return true,
+        };
+        self.rows
+            .iter()
+            .find(|row| row.front.tracker.id() == tracker)
+            .is_none_or(|row| row.front.observe)
+    }
+
     /// Returns how many containers the table holds.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
@@ -666,6 +683,7 @@ impl ScrollRow {
             grab: self.grab,
             reveal: self.reveal,
             last: self.last,
+            observe: self.state.is_some(),
         }
     }
 }
@@ -683,14 +701,26 @@ pub fn observe(events: &[SceneEvent]) {
             match *event {
                 SceneEvent::TrackerValues {
                     tracker, position, ..
-                } => host.scroll_by_tracker(tracker, |row| row.state.moved(position.y)),
+                } => host.scroll_by_tracker(tracker, |row| {
+                    if let Some(state) = row.state {
+                        state.moved(position.y);
+                    }
+                }),
                 SceneEvent::InertiaStarting {
                     tracker, modified, ..
-                } => host.scroll_by_tracker(tracker, |row| row.state.flinging_to(modified.y)),
+                } => host.scroll_by_tracker(tracker, |row| {
+                    if let Some(state) = row.state {
+                        state.flinging_to(modified.y);
+                    }
+                }),
                 SceneEvent::TrackerPhase {
                     tracker,
                     phase: windows_scene::Phase::Idle,
-                } => host.scroll_by_tracker(tracker, |row| row.state.settled()),
+                } => host.scroll_by_tracker(tracker, |row| {
+                    if let Some(state) = row.state {
+                        state.settled();
+                    }
+                }),
                 _ => {}
             }
         }
@@ -869,6 +899,95 @@ mod tests {
     use super::*;
     use crate::build::{mount, tests::fixture};
     use crate::layout::Len;
+
+    #[test]
+    fn only_virtual_lists_forward_tracker_reports_to_the_app() {
+        let mut patch = fixture();
+        let mut down = crate::seam::Down::default();
+        let mut table = ScrollTable::default();
+        let root = Host::with(|h| h.model().root());
+        let ordinary = mount(
+            scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
+            root,
+        );
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        table.apply_ops(&mut down.scrolls);
+        let tracker = table.rows[0].front.tracker.id();
+        let events = [
+            SceneEvent::TrackerValues {
+                tracker,
+                position: Vector2 { x: 0.0, y: 100.0 },
+                scale: 1.0,
+            },
+            SceneEvent::TrackerPhase {
+                tracker,
+                phase: windows_scene::Phase::Idle,
+            },
+            SceneEvent::InertiaStarting {
+                tracker,
+                natural: Vector2::default(),
+                modified: Vector2::default(),
+                from_impulse: false,
+            },
+            SceneEvent::RequestIgnored {
+                tracker,
+                request: 1,
+            },
+        ];
+        assert!(events.iter().all(|e| !table.app_observes(e)));
+        assert!(table.app_observes(&SceneEvent::DeviceRebuilt));
+        drop(ordinary);
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        table.apply_ops(&mut down.scrolls);
+        assert!(
+            events.iter().all(|e| table.app_observes(e)),
+            "unknown trackers remain available to other consumers"
+        );
+        let _list = mount(
+            list(
+                || SPEC,
+                |runs, items| {
+                    for run in runs.runs() {
+                        for i in run {
+                            items.push((i, i));
+                        }
+                    }
+                },
+                |_| El::<Any>::seed_bare(),
+            ),
+            root,
+        );
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        table.apply_ops(&mut down.scrolls);
+        let tracker = table.rows[0].front.tracker.id();
+        let moved = SceneEvent::TrackerValues {
+            tracker,
+            position: Vector2 { x: 0.0, y: 400.0 },
+            scale: 1.0,
+        };
+        assert!(table.app_observes(&moved));
+        observe(&[moved]);
+        Host::with(|h| {
+            h.scroll_by_tracker(tracker, |row| {
+                assert_eq!(
+                    row.state
+                        .expect("virtualization owns scroll state")
+                        .offset
+                        .get(),
+                    400.0
+                );
+            })
+        });
+    }
 
     /// A container reaches the table that moves its thumb once, and leaves it when it
     /// unmounts.
