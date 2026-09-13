@@ -90,21 +90,33 @@ fn no_color_brush() {
 fn d2d_buffer_precision() {
     // Direct2D splits an effect graph into sections and gives no guarantee about where it
     // places an intermediate texture. An intermediate defaults to limited range, which
-    // clamps the extended-range values the graph carries, so a file that constructs an
-    // effect also sets the buffer precision.
+    // clamps the extended-range values the graph carries. The precision is a property of
+    // the device context, set once where the context is made, so the rule has two halves:
+    // every file that creates a context sets 16BPC_FLOAT on it, and an effect is
+    // constructed only inside the crate that makes those contexts, so no effect can run on
+    // a context that skipped the first half.
     let sources = framework();
-    let found: Vec<String> = sources
+    let mut found: Vec<String> = sources
         .iter()
+        .filter(|source| !source.find("CreateDeviceContext").is_empty())
         .filter(|source| {
-            !source.find("CreateEffect").is_empty() || !source.find("ID2D1Effect").is_empty()
+            source.find("SetRenderingControls").is_empty()
+                || source.find("D2D1_BUFFER_PRECISION_16BPC_FLOAT").is_empty()
         })
-        .filter(|source| source.find("SetRenderingControls").is_empty())
-        .map(|source| format!("  {}: constructs a D2D effect", source.path))
+        .map(|source| format!("  {}: creates a device context without 16BPC_FLOAT", source.path))
         .collect();
+    found.extend(
+        sources
+            .iter()
+            .filter(|source| !source.path.starts_with("crates/libs/d2d/src/"))
+            .filter(|source| {
+                !source.find("CreateEffect").is_empty() || !source.find("ID2D1Effect").is_empty()
+            })
+            .map(|source| format!("  {}: constructs a D2D effect outside windows-d2d", source.path)),
+    );
     deny(
         "d2d_buffer_precision",
-        "an effect graph without an explicit 16BPC_FLOAT buffer precision clamps its own \
-         intermediates",
+        "an effect graph runs at the precision its context was given, so a context is made          at 16BPC_FLOAT and an effect is made only on one of those",
         &found,
     );
 }
