@@ -13,25 +13,11 @@
 //! bar's controls leave over. [`controls`] answers with the same [`ControlId`]s every other
 //! control carries, so a window command hovers and presses down the path a button uses.
 //!
-//! ```no_run
-//! # use windows_ui::{caption, widget::{button, Controls, Front}};
-//! # use windows_window::{CaptionButton, CaptionHit, CaptionState, Window};
-//! # fn f(window: &Window, hits: &windows_scene::HitTable, controls: &mut Controls,
-//! #      front: &mut Front<'_>, state: CaptionState) -> windows_core::Result<()> {
-//! // Declared where the bar is authored.
-//! let close = button("\u{2715}").ghost().caption(CaptionButton::Close);
-//!
-//! // Answered from the array the same mount built.
-//! let _: CaptionHit = caption::hit(hits, 12.0, 8.0);
-//!
-//! // And the state the window forwards, applied through the ordinary control path.
-//! let (hover, pressed) = caption::controls(state);
-//! controls.nonclient(hover, pressed, front)?;
-//! # Ok(()) }
-//! ```
+//! An application declares a command where it authors the bar, with
+//! [`El::caption`](crate::build::El::caption). Both answers here are the driver's, resolved
+//! against the [`Registry`] copy the answering thread holds.
 
-use crate::build::Host;
-use windows_scene::{ContactKind, ControlId, HitTable, Point};
+use windows_scene::{ContactKind, ControlId, HitTable, Point, ScrollOffsets};
 use windows_window::{CaptionButton, CaptionHit, CaptionState};
 
 /// Lists the three commands in the order [`slot`] indexes them.
@@ -54,7 +40,10 @@ const fn slot(button: CaptionButton) -> usize {
 /// Nothing clears an entry when a bar unmounts. A [`ControlId`] is generational, so an id left
 /// by an unmounted bar can never equal a live hit's id, and a bar that remounts overwrites its
 /// own entries as it goes.
-#[derive(Default)]
+///
+/// `Copy`, because the thread that answers `WM_NCHITTEST` holds its own copy rather than
+/// reaching the table the mount writes: three ids are cheaper to carry than a hop.
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Registry([Option<ControlId>; 3]);
 
 impl Registry {
@@ -62,12 +51,24 @@ impl Registry {
         self.0[slot(button)] = Some(id);
     }
 
-    fn id(&self, button: CaptionButton) -> Option<ControlId> {
+    pub(crate) fn id(&self, button: CaptionButton) -> Option<ControlId> {
         self.0[slot(button)]
     }
 
     fn button(&self, id: ControlId) -> Option<CaptionButton> {
         BUTTONS.into_iter().find(|&b| self.id(b) == Some(id))
+    }
+}
+
+impl From<Registry> for [Option<ControlId>; 3] {
+    fn from(registry: Registry) -> Self {
+        registry.0
+    }
+}
+
+impl From<[Option<ControlId>; 3]> for Registry {
+    fn from(ids: [Option<ControlId>; 3]) -> Self {
+        Self(ids)
     }
 }
 
@@ -77,47 +78,56 @@ impl Registry {
 /// Answers [`Window::on_caption_hit`]. `x` and `y` are client-space DIPs, the space the window
 /// reports and the layout solves in, so this converts no coordinates.
 ///
+/// `registry` is the copy the answering thread holds, so this resolves a point without a hop
+/// to the thread the bar mounted on.
+///
 /// [`Window::on_caption_hit`]: windows_window::Window::on_caption_hit
 #[must_use]
-pub fn hit(hits: &HitTable, x: f32, y: f32) -> CaptionHit {
+pub(crate) fn hit(
+    hits: &HitTable,
+    offsets: &dyn ScrollOffsets,
+    registry: &Registry,
+    x: f32,
+    y: f32,
+) -> CaptionHit {
     // A point over nothing interactive is the drag strip: the strip is whatever the bar's own
     // controls leave over, not a second rect stated beside them.
-    let Some(found) = hits.hit(Point { x, y }, ContactKind::Mouse) else {
+    let Some(found) = hits.hit_with(Point { x, y }, ContactKind::Mouse, offsets) else {
         return CaptionHit::Drag;
     };
-    match Host::try_with(|h| h.caption.button(found.id)) {
-        Some(Some(button)) => CaptionHit::Button(button),
-        // An ordinary control, or a re-entrant call that could not borrow the host. Both
-        // answer for the client: the array has already reported something interactive here,
-        // and dragging the window from on top of a control would swallow the press.
-        _ => CaptionHit::Client,
+    match registry.button(found.id) {
+        Some(button) => CaptionHit::Button(button),
+        // An ordinary control answers for the client: the array has already reported
+        // something interactive here, and dragging the window from on top of a control would
+        // swallow the press.
+        None => CaptionHit::Client,
     }
 }
 
 /// Resolves the hovered and pressed commands in `state` to the controls that draw them.
 ///
-/// Feeds [`Controls::nonclient`]. Either half is `None` when `state` names no command, when no
-/// mounted bar declared that command, or when the call is re-entrant on the host.
+/// Feeds [`Controls::nonclient`]. Either half is `None` when `state` names no command, or when
+/// no mounted bar declared that command.
 ///
 /// [`Controls::nonclient`]: crate::widget::Controls::nonclient
 #[must_use]
-pub fn controls(state: CaptionState) -> (Option<ControlId>, Option<ControlId>) {
-    Host::try_with(|h| {
-        (
-            state.hover.and_then(|b| h.caption.id(b)),
-            state.pressed.and_then(|b| h.caption.id(b)),
-        )
-    })
-    .unwrap_or((None, None))
+pub(crate) fn controls(
+    registry: &Registry,
+    state: CaptionState,
+) -> (Option<ControlId>, Option<ControlId>) {
+    (
+        state.hover.and_then(|b| registry.id(b)),
+        state.pressed.and_then(|b| registry.id(b)),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::{mount, tests::fixture};
+    use crate::build::{Host, mount, tests::fixture};
     use crate::layout::row;
     use crate::widget::button;
-    use windows_scene::{HitEntry, HitFlags, NO_ENTRY, NodeId};
+    use windows_scene::{HitEntry, HitFlags, NO_ENTRY, NodeId, ShadowOffsets};
 
     /// A bar with the three commands and one ordinary control in it.
     fn bar() -> crate::build::View {
@@ -154,8 +164,9 @@ mod tests {
         let _patch = fixture();
         let _mount = mount(bar(), Host::with(|h| h.model().root()));
 
-        let ids = Host::with(|h| BUTTONS.map(|b| h.caption.id(b)));
-        let [min, max, close] = ids.map(|id| id.expect("each command registered at mount"));
+        let registry = Host::with(|h| h.caption);
+        let [min, max, close] =
+            BUTTONS.map(|b| registry.id(b).expect("each command registered at mount"));
         assert!(
             min != max && max != close && min != close,
             "three commands, three identities"
@@ -170,18 +181,26 @@ mod tests {
             entry(close, 192.0, 238.0),
         ]);
 
-        assert_eq!(hit(&hits, 80.0, 16.0), CaptionHit::Drag, "between them");
-        assert_eq!(hit(&hits, 30.0, 16.0), CaptionHit::Client, "the control");
         assert_eq!(
-            hit(&hits, 120.0, 16.0),
+            hit(&hits, &ShadowOffsets::new(), &registry, 80.0, 16.0),
+            CaptionHit::Drag,
+            "between them"
+        );
+        assert_eq!(
+            hit(&hits, &ShadowOffsets::new(), &registry, 30.0, 16.0),
+            CaptionHit::Client,
+            "the control"
+        );
+        assert_eq!(
+            hit(&hits, &ShadowOffsets::new(), &registry, 120.0, 16.0),
             CaptionHit::Button(CaptionButton::Minimize)
         );
         assert_eq!(
-            hit(&hits, 170.0, 16.0),
+            hit(&hits, &ShadowOffsets::new(), &registry, 170.0, 16.0),
             CaptionHit::Button(CaptionButton::Maximize)
         );
         assert_eq!(
-            hit(&hits, 210.0, 16.0),
+            hit(&hits, &ShadowOffsets::new(), &registry, 210.0, 16.0),
             CaptionHit::Button(CaptionButton::Close)
         );
     }
@@ -199,14 +218,13 @@ mod tests {
             Host::with(|h| h.model().root()),
         );
 
-        assert!(Host::with(|h| BUTTONS
-            .iter()
-            .all(|&b| h.caption.id(b).is_none())));
+        let registry = Host::with(|h| h.caption);
+        assert!(BUTTONS.iter().all(|&b| registry.id(b).is_none()));
 
         let mut hits = HitTable::default();
         hits.replace(&[entry(ControlId::default(), 0.0, 60.0)]);
-        assert_eq!(hit(&hits, 30.0, 16.0), CaptionHit::Client);
-        assert_eq!(hit(&hits, 90.0, 16.0), CaptionHit::Drag);
+        assert_eq!(hit(&hits, &ShadowOffsets::new(), &registry, 30.0, 16.0), CaptionHit::Client);
+        assert_eq!(hit(&hits, &ShadowOffsets::new(), &registry, 90.0, 16.0), CaptionHit::Drag);
     }
 
     /// Maps a forwarded [`CaptionState`] onto control ids, so a command lights through the
@@ -215,15 +233,53 @@ mod tests {
     fn caption_state_names_the_controls_it_lights() {
         let _patch = fixture();
         let _mount = mount(bar(), Host::with(|h| h.model().root()));
-        let close = Host::with(|h| h.caption.id(CaptionButton::Close));
+        let registry = Host::with(|h| h.caption);
+        let close = registry.id(CaptionButton::Close);
 
-        assert_eq!(controls(CaptionState::default()), (None, None));
+        assert_eq!(controls(&registry, CaptionState::default()), (None, None));
         assert_eq!(
-            controls(CaptionState {
-                hover: Some(CaptionButton::Close),
-                pressed: Some(CaptionButton::Close),
-            }),
+            controls(
+                &registry,
+                CaptionState {
+                    hover: Some(CaptionButton::Close),
+                    pressed: Some(CaptionButton::Close),
+                }
+            ),
             (close, close)
+        );
+    }
+
+    /// Resolves a command from a registry copy alone, with no host on the thread.
+    ///
+    /// The copy is what the answering thread holds, so a point has to reach a command
+    /// through it and through the hit array and nothing else.
+    #[test]
+    fn a_registry_copy_resolves_a_command_without_a_host() {
+        let close = ControlId::default();
+        let registry = Registry::from([None, None, Some(close)]);
+
+        let mut hits = HitTable::default();
+        hits.replace(&[entry(close, 192.0, 238.0)]);
+
+        assert_eq!(
+            hit(&hits, &ShadowOffsets::new(), &registry, 210.0, 16.0),
+            CaptionHit::Button(CaptionButton::Close)
+        );
+        assert_eq!(hit(&hits, &ShadowOffsets::new(), &registry, 90.0, 16.0), CaptionHit::Drag);
+        assert_eq!(
+            controls(
+                &registry,
+                CaptionState {
+                    hover: Some(CaptionButton::Close),
+                    pressed: None,
+                }
+            ),
+            (Some(close), None)
+        );
+        assert_eq!(
+            <[Option<ControlId>; 3]>::from(registry),
+            [None, None, Some(close)],
+            "the three ids the seam carries"
         );
     }
 }

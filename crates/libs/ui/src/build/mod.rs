@@ -28,7 +28,7 @@ pub use adapt::{Each, Switch, When, each, each_into, switch, when};
 pub use children::{Children, IntoChildren};
 pub use el::{Any, Button, El, Path, Region, View};
 pub use host::Host;
-pub(crate) use host::{MountId, Placement};
+pub(crate) use host::{MountId, Placement, ScrollId};
 pub(crate) use mount::region_sink;
 pub use mount::{Mount, Stop, geometry, mount, mount_at, ramp, root_scope, set_geometry, set_ramp};
 

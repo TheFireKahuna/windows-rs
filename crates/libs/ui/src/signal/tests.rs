@@ -6,6 +6,7 @@
 use super::*;
 use std::cell::RefCell as Slot;
 use std::rc::Rc as Ref;
+use std::sync::Arc;
 
 /// Records what ran, in order.
 #[derive(Default)]
@@ -336,7 +337,7 @@ fn producer_writes_hold_one_frame_request_until_each_drain() {
         .expect("window");
     let pacer = window.pacer().expect("pacer");
     let wake = pacer.wake();
-    let registration = super::arm_posts(wake.clone());
+    let registration = arm_posts(wake.clone());
     let (_owner, level) = Owner::scope(|| Cell::new(0_u32));
     for value in [1, 2] {
         std::thread::spawn(move || {
@@ -512,4 +513,70 @@ fn a_parked_node_holds_no_payload_to_drop_when_it_is_reused() {
     assert_eq!(cell.get(), 7);
     assert_eq!(log.count("built"), 1);
     drop(second);
+}
+
+#[test]
+fn a_ring_routed_burst_rings_the_graphs_thread_once() {
+    let ring = Arc::new(crate::seam::Ring::new().expect("an event is available"));
+    let _registration = arm_posts(Arc::clone(&ring));
+    let (_owner, level) = Owner::scope(|| Cell::new(0_u32));
+
+    ring.arm();
+    std::thread::spawn(move || {
+        for value in 1..=8 {
+            level.post(value);
+        }
+    })
+    .join()
+    .expect("producer");
+    assert!(ring.event().take(), "a burst did not ring the sleeper");
+
+    // The doorbell is armed again with the burst still pending, so a further post that did
+    // not go through the empty-to-pending gate would reach the kernel a second time.
+    ring.arm();
+    std::thread::spawn(move || level.post(9))
+        .join()
+        .expect("producer");
+    assert!(!ring.event().take(), "a pending burst rang twice");
+    ring.disarm();
+
+    flush();
+    assert_eq!(level.peek(), 9, "writes coalesce to the last one");
+
+    ring.arm();
+    std::thread::spawn(move || level.post(10))
+        .join()
+        .expect("producer");
+    assert!(ring.event().take(), "a post after the drain did not ring");
+}
+
+#[test]
+fn releasing_the_last_staged_write_releases_the_ring() {
+    let ring = Arc::new(crate::seam::Ring::new().expect("an event is available"));
+    let _registration = arm_posts(Arc::clone(&ring));
+
+    let stale = {
+        let (owner, cell) = Owner::scope(|| Cell::new(0_u32));
+        ring.arm();
+        std::thread::spawn(move || cell.post(1))
+            .join()
+            .expect("producer");
+        assert!(ring.event().take(), "the staged write did not ring");
+        // Disposal drops the staged write, which is the graph's only pending one.
+        drop(owner);
+        cell
+    };
+
+    // Nothing is pending, so the next write is an empty-to-pending transition again and
+    // rings without a flush having run.
+    let (_owner, fresh) = Owner::scope(|| Cell::new(0_u32));
+    ring.arm();
+    std::thread::spawn(move || fresh.post(2))
+        .join()
+        .expect("producer");
+    assert!(ring.event().take(), "a disposed write left the ring held");
+
+    let _ = stale;
+    flush();
+    assert_eq!(fresh.peek(), 2);
 }

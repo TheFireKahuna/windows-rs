@@ -99,10 +99,7 @@ impl Scene {
                 self.hits.replace(patch.hits(entries));
                 Ok(())
             }
-            Op::Delay { id, ms } => {
-                self.start_delay(id, ms);
-                Ok(())
-            }
+            Op::Delay { id, ms } => self.start_delay(id, ms, back),
             Op::CancelDelay { id } => {
                 self.cancel_delay(id);
                 Ok(())
@@ -769,13 +766,11 @@ impl Scene {
             let done = std::rc::Rc::new(core::cell::Cell::new(false));
             let signal = done.clone();
             let events = self.events.clone();
-            let wake = self.wake.clone();
             let revoker = batch.on_completed(move || {
                 signal.set(true);
-                events.borrow_mut().push(
-                    crate::SceneEvent::AnimationCompleted { node: id, prop },
-                    &wake,
-                );
+                events
+                    .borrow_mut()
+                    .push(crate::SceneEvent::AnimationCompleted { node: id, prop });
             })?;
             batch.try_end()?;
             self.motion.playbacks.push(crate::anim::Playback {

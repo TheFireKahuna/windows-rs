@@ -40,12 +40,14 @@ use windows_present::{
     Bound, Epoch, Extent, Frame, Gpu, Presenter, Queue, RegionInput, RegionKey, RegionParts,
     RegionSpec,
 };
-use windows_scene::{ControlId, RegionId};
-use windows_window::{Tick, Wake};
+use windows_scene::{Backends, ControlId, Env, RegionId, Scene};
+use windows_window::Tick;
 
 use crate::build::{El, Region};
 use crate::layout::{Len, Preset};
 use crate::role::Metric;
+use crate::seam::RegionOp;
+use crate::signal::PostWake;
 
 /// Builds the [`Frame`] a region draws with, on the present thread and with that thread's
 /// `Gpu`.
@@ -181,8 +183,6 @@ pub(crate) struct RegionRow {
     /// seed always mints one, because a surface the pointer cannot reach cannot be picked
     /// inside either.
     pub control: Option<ControlId>,
-    /// The part copy this side picks against, and the version it holds.
-    pub picked: Picked,
     /// `Some` until the region is mounted on the present thread, which is the first flush
     /// that gives the node a box.
     pub build: Option<Build>,
@@ -192,11 +192,124 @@ pub(crate) struct RegionRow {
     pub extent: Option<Extent>,
 }
 
+/// One mounted region, as the half that binds its surface needs it.
+pub(crate) struct RegionFront {
+    pub key: RegionKey,
+    pub sink: RegionId,
+    /// Whether a surface handle is bound to [`sink`](Self::sink), so a drop clears only a
+    /// binding that was made.
+    pub bound: bool,
+}
+
+/// One binding waiting for the region it names.
+///
+/// A binding can arrive a batch before the mount that declares its row: the present thread
+/// posts the handle as soon as the buffers exist, and the row reaches this side with the
+/// batch the app half is still filling.
+struct Pending {
+    key: RegionKey,
+    bound: Bound,
+    /// Whether this binding has already waited one batch. A binding whose row is absent
+    /// after the batch that follows names a region that never mounted, and is dropped.
+    retried: bool,
+}
+
+/// Every mounted region, and the bindings not yet resolved against one.
+///
+/// Held by the tick rather than reached through the app half's tables, so binding a surface
+/// costs a scan of a table a settled layout keeps under eight rows long and no hop.
+#[derive(Default)]
+pub(crate) struct Regions {
+    rows: Vec<RegionFront>,
+    pending: Vec<Pending>,
+}
+
+impl Regions {
+    fn row(&mut self, key: RegionKey) -> Option<&mut RegionFront> {
+        self.rows.iter_mut().find(|row| row.key == key)
+    }
+
+    /// Appends a drop for every region still mounted, for the thread shutting down to apply
+    /// through [`apply`] so each is released in the order a mount's own drop would take.
+    pub(crate) fn drops_into(&self, out: &mut Vec<RegionOp>) {
+        out.extend(self.rows.iter().map(|row| RegionOp::Drop { key: row.key }));
+    }
+}
+
+/// Applies one batch of region edits, in the order the app half emitted them.
+///
+/// A mount inserts the row **before** the present thread is asked to build the renderer, so
+/// the binding that build produces finds a row to resolve against. A drop clears the sink
+/// **before** the region is unmounted, because the region owns the surface handle behind the
+/// brush this side paints with, and the handle must not close under a bound brush.
+///
+/// The first failure is returned and the rest of the batch still runs: an edit refused for
+/// one region must not leave another's mount unsent.
+///
+/// # Errors
+///
+/// The compositor refused to release a surface, or a sprite painting with a dropped region
+/// could not be rebound.
+pub(crate) fn apply(
+    regions: &mut Regions,
+    ops: &mut Vec<RegionOp>,
+    scene: &mut Scene,
+    back: &Backends,
+    env: Env,
+) -> Result<()> {
+    let mut failed: Option<windows_core::Error> = None;
+    for op in ops.drain(..) {
+        match op {
+            RegionOp::Mount {
+                key,
+                sink,
+                live,
+                extent,
+                queue,
+                build,
+                ..
+            } => {
+                regions.rows.push(RegionFront {
+                    key,
+                    sink,
+                    bound: false,
+                });
+                let spec = RegionSpec { key, queue, extent };
+                let (epoch, input) = (Arc::clone(&live.epoch), Arc::clone(&live.input));
+                // The build closure is consumed whether or not a present thread is
+                // installed, so a region declared without one is inert rather than mounted
+                // by the next batch.
+                with(|reg| reg.presenter.mount(spec, epoch, input, build));
+            }
+            RegionOp::Resize { key, extent } => {
+                // In place: the surface handle survives a resize, so the binding this side
+                // already applied is untouched and no frame is dropped. Destroy-and-create
+                // would reallocate the buffers and re-issue a handle that is already bound.
+                with(|reg| reg.presenter.resize(key, extent));
+            }
+            RegionOp::Drop { key } => {
+                if let Some(at) = regions.rows.iter().position(|row| row.key == key) {
+                    let row = &regions.rows[at];
+                    if row.bound
+                        && let Err(error) = scene.clear_region(row.sink, back, env)
+                    {
+                        failed.get_or_insert(error);
+                    }
+                    regions.rows.remove(at);
+                }
+                with(|reg| reg.presenter.unmount(key));
+            }
+        }
+    }
+    failed.map_or(Ok(()), Err)
+}
+
 /// What the present thread told this side about one region, and the frame it asked for.
 ///
-/// The [`Tick`] rides with the message rather than being taken when it is read: the request
-/// has to outlive the post, or the pacer's count falls to zero and the frame that would
-/// apply the binding is never served.
+/// Where the binder wakes a pacer, its [`Tick`] rides with the message rather than being
+/// taken when it is read: the request has to outlive the post, or the pacer's count falls to
+/// zero and the frame that would apply the binding is never served. Where it rings a
+/// doorbell, the ring itself is the whole request and nothing rides.
 struct Binding {
     key: RegionKey,
     bound: Bound,
@@ -220,8 +333,9 @@ thread_local! {
 
 /// Starts the present thread and installs it for this UI thread.
 ///
-/// `wake` is the frame clock: a binding arriving from the present thread has to be applied
-/// on this one, so it asks for the frame that will apply it.
+/// `wake` is how the thread that applies bindings is woken: a window thread's frame clock,
+/// which the binding then holds a frame request on, or the doorbell of a thread parked on
+/// its own mailboxes.
 ///
 /// Called once, by the driver. Installing a second replaces the first, which stops the
 /// thread the first was running.
@@ -233,9 +347,10 @@ pub(crate) fn install(
     tuning: windows_present::Tuning,
     out: windows_color::OutputTransform,
     visibility: Option<windows_window::Watch>,
-    wake: Wake,
+    wake: impl Into<PostWake>,
 ) -> Result<()> {
     let (tx, inbox) = channel::<Binding>();
+    let wake = wake.into();
     let presenter = Presenter::spawn(
         tuning,
         out,
@@ -246,16 +361,24 @@ pub(crate) fn install(
     Ok(())
 }
 
-/// Sends one binding and asks for the frame that will apply it.
+/// Sends one binding and wakes the thread that applies it.
 ///
-/// Runs on the present thread. A closed inbox means the UI thread is gone, so the send is
-/// dropped rather than reported: there is nothing left to report it to.
-fn post(tx: &Sender<Binding>, wake: &Wake, key: RegionKey, bound: Bound) {
+/// Runs on the present thread. A closed inbox means the applying thread is gone, so the send
+/// is dropped rather than reported: there is nothing left to report it to. The ring follows
+/// the send, so a sleeper that wakes finds the binding already in its inbox.
+fn post(tx: &Sender<Binding>, wake: &PostWake, key: RegionKey, bound: Bound) {
+    let tick = match wake {
+        PostWake::Pacer(pacer) => Some(pacer.tick()),
+        PostWake::Ring(_) => None,
+    };
     let _ = tx.send(Binding {
         key,
         bound,
-        _tick: Some(wake.tick()),
+        _tick: tick,
     });
+    if let PostWake::Ring(ring) = wake {
+        ring.ring();
+    }
 }
 
 /// Stops the present thread. Called by the driver as the window goes away, so the regions
@@ -276,111 +399,79 @@ fn with<R>(f: impl FnOnce(&Registry) -> R) -> Option<R> {
         .flatten()
 }
 
-/// Mounts `row` if it is pending and now has a box, or resizes it if its box moved.
-///
-/// Returns nothing and re-solves nothing: a region's extent is read from the solve and never
-/// feeds back into it, so this cannot make the flush's sequence fail to terminate.
-///
-/// A box with no area is not ready. A region inside a subtree `when` or `hide_below` has
-/// made `Display::None` is laid out at zero, and buffers allocated against that would be one
-/// texel across for the life of the window — the extent gate is what defers it to the flush
-/// that reveals the subtree, since revealing it is a style change.
-pub(crate) fn publish(row: &mut RegionRow, size: windows_numerics::Vector2, dpi: f32) {
-    if size.x <= 0.0 || size.y <= 0.0 {
-        return;
-    }
-    let extent = Extent::new(size.x, size.y, dpi);
-    if let Some(build) = row.build.take() {
-        let spec = RegionSpec {
-            key: row.key,
-            queue: row.queue,
-            extent,
-        };
-        let (epoch, input) = (Arc::clone(&row.live.epoch), Arc::clone(&row.live.input));
-        // The build closure is consumed whether or not a present thread is installed, so a
-        // region declared without one is inert rather than mounted on the next flush.
-        with(|reg| reg.presenter.mount(spec, epoch, input, build));
-        row.extent = Some(extent);
-        return;
-    }
-    if row.extent == Some(extent) {
-        return;
-    }
-    // In place: the surface handle survives a resize, so the binding this side already
-    // applied is untouched and no frame is dropped. Destroy-and-create would reallocate the
-    // buffers and re-issue a handle that is already bound.
-    with(|reg| reg.presenter.resize(row.key, extent));
-    row.extent = Some(extent);
-}
-
-/// Destroys the region `row` names, after the front thread has released its binding.
-pub(crate) fn drop_region(row: &RegionRow) {
-    with(|reg| reg.presenter.unmount(row.key));
-}
-
 /// Applies what the present thread reported since the last tick.
 ///
-/// Called by the driver at the top of the tick. It lives here and not there because binding
-/// a surface handle is the one `unsafe` call the region path makes, and the driver denies
-/// unsafe outright.
+/// Called by the driver at the top of the tick, before [`apply`] takes that tick's batch. It
+/// lives here and not there because binding a surface handle is the one `unsafe` call the
+/// region path makes, and the driver denies unsafe outright.
 ///
-/// A binding can arrive for a region this side has already dropped — the two threads tear a
-/// region down in opposite orders — so an unresolvable key is skipped rather than asserted
-/// on.
+/// A binding whose row is absent is kept and retried once: the present thread posts a handle
+/// as soon as the buffers exist, which can be a batch before the mount that declares the row
+/// reaches this side. A binding still unresolved after the batch that follows names a region
+/// that never mounted, or one already dropped — the two threads tear a region down in
+/// opposite orders — and is dropped rather than asserted on.
+///
+/// The first failure is returned and the rest of the batch still runs.
 ///
 /// # Errors
 ///
 /// The compositor refused the handle, or a sprite painting with the region could not be
 /// rebound.
 pub(crate) fn bind(
-    scene: &mut windows_scene::Scene,
-    back: &windows_scene::Backends,
-    env: windows_scene::Env,
+    regions: &mut Regions,
+    scene: &mut Scene,
+    back: &Backends,
+    env: Env,
 ) -> Result<()> {
-    thread_local! {
-        /// One buffer per thread, reused. A binding arrives once per region and the buffer
-        /// is empty in the steady state, so this allocates once and never again.
-        static DRAINED: RefCell<Vec<(RegionKey, Bound)>> = const { RefCell::new(Vec::new()) };
-    }
-    // Drained into a buffer before any of it is applied: the inbox's borrow is the
-    // registry's, and applying a binding reaches the host, which can unmount a region and
-    // re-enter that borrow.
-    let mut taken = DRAINED.take();
-    taken.clear();
     with(|reg| {
         while let Ok(binding) = reg.inbox.try_recv() {
-            taken.push((binding.key, binding.bound));
+            regions.pending.push(Pending {
+                key: binding.key,
+                bound: binding.bound,
+                retried: false,
+            });
         }
     });
-    let result = apply(&taken, scene, back, env);
-    DRAINED.set(taken);
-    result
-}
-
-fn apply(
-    bindings: &[(RegionKey, Bound)],
-    scene: &mut windows_scene::Scene,
-    back: &windows_scene::Backends,
-    env: windows_scene::Env,
-) -> Result<()> {
-    for &(key, bound) in bindings {
-        let Some(sink) = crate::build::Host::with(|h| h.region_sink(key)) else {
-            continue;
+    if regions.pending.is_empty() {
+        return Ok(());
+    }
+    let mut failed: Option<windows_core::Error> = None;
+    // Taken out of the table, because resolving a binding writes the row it names. The
+    // buffer is empty in the steady state, so the swap allocates nothing per tick.
+    let mut pending = core::mem::take(&mut regions.pending);
+    pending.retain_mut(|entry| {
+        let Some(row) = regions.row(entry.key) else {
+            // Kept for one batch, then dropped: the mount that would declare this row rides
+            // the batch applied straight after this call.
+            let keep = !entry.retried;
+            entry.retried = true;
+            return keep;
         };
-        match bound {
+        let result = match entry.bound {
             // SAFETY: the handle is a composition surface handle the region owns, and it
             // stays live until that region unmounts — which asks this side to release the
             // binding first, through `Released`.
             Bound::Surface { handle, .. } => unsafe {
-                scene.set_region(sink, handle as *mut _, back, env)?;
+                let result = scene.set_region(row.sink, handle as *mut _, back, env);
+                row.bound = result.is_ok();
+                result
             },
             // Both mean the handle is about to close, and both leave the region drawing
             // nothing rather than sampling a brush over a dead one. They are distinct to the
             // producer and identical here.
-            Bound::Released | Bound::Failed => scene.clear_region(sink, back, env)?,
+            Bound::Released | Bound::Failed => {
+                row.bound = false;
+                scene.clear_region(row.sink, back, env)
+            }
+        };
+        if let Err(error) = result {
+            failed.get_or_insert(error);
         }
-    }
-    Ok(())
+        false
+    });
+    // The buffer goes back with the entries still waiting in it, keeping its allocation.
+    regions.pending = pending;
+    failed.map_or(Ok(()), Err)
 }
 
 impl El<Region> {
@@ -395,7 +486,7 @@ impl El<Region> {
     }
 }
 
-pub use pick::{Picked, pick};
+pub(crate) use pick::{Picks, pick};
 
 mod pick;
 
@@ -413,7 +504,100 @@ impl RegionRow {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::RegionRow;
+    use super::{Picks, RegionRow};
+    use crate::build::{Host, mount, tests::fixture};
+    use windows_scene::ControlId;
+    use crate::seam::{Down, RegionOp};
+    use windows_numerics::Vector2;
+
+    /// Returns what the host has produced since the last call, as one batch.
+    fn filled() -> Down {
+        let mut down = Down::default();
+        Host::with(|h| h.fill(&mut down));
+        down
+    }
+
+    /// Names each edit, so a failure says which op the batch carried.
+    fn kinds(ops: &[RegionOp]) -> Vec<&'static str> {
+        ops.iter()
+            .map(|op| match op {
+                RegionOp::Mount { .. } => "mount",
+                RegionOp::Resize { .. } => "resize",
+                RegionOp::Drop { .. } => "drop",
+            })
+            .collect()
+    }
+
+    /// A region emits one mount when it first has a box, a resize only when that box moves,
+    /// and a drop when it unmounts.
+    ///
+    /// The gate is the whole of what makes a region's buffers correct. A second mount would
+    /// hand the present thread a builder it has already consumed, and a resize per flush
+    /// would reallocate the buffers of every region on every frame.
+    #[test]
+    fn a_region_emits_one_mount_then_a_resize_only_when_its_box_moves() {
+        let mut patch = fixture();
+        let live = super::Live::new().expect("the epoch's wake event");
+        // Collapsed before the mount, so the first solve is the one with no area to give.
+        Host::with(|h| h.set_window(Vector2 { x: 0.0, y: 0.0 }));
+        let held = mount(
+            super::region(windows_present::Queue::Solo, &live, |_| {
+                unreachable!("no present thread is installed in a fixture")
+            })
+            .grow(),
+            Host::with(|h| h.model().root()),
+        );
+
+        Host::with(|h| h.flush(&mut patch));
+        assert!(
+            filled().regions.is_empty(),
+            "a region with no box asked for buffers"
+        );
+
+        Host::with(|h| h.set_window(Vector2 { x: 800.0, y: 600.0 }));
+        Host::with(|h| h.flush(&mut patch));
+        let mounted = filled();
+        assert_eq!(kinds(&mounted.regions), ["mount"]);
+
+        Host::with(|h| h.flush(&mut patch));
+        assert!(
+            filled().regions.is_empty(),
+            "a solve that moved nothing re-sent an extent"
+        );
+
+        Host::with(|h| h.set_window(Vector2 { x: 400.0, y: 300.0 }));
+        Host::with(|h| h.flush(&mut patch));
+        assert_eq!(kinds(&filled().regions), ["resize"]);
+
+        drop(held);
+        Host::with(|h| h.flush(&mut patch));
+        assert_eq!(kinds(&filled().regions), ["drop"]);
+    }
+
+    /// The pick table follows the same edits: a region the pointer can reach goes in when it
+    /// mounts and out when it drops.
+    #[test]
+    fn the_pick_table_follows_the_region_edits() {
+        let mut patch = fixture();
+        let live = super::Live::new().expect("the epoch's wake event");
+        let held = mount(
+            super::region(windows_present::Queue::Solo, &live, |_| {
+                unreachable!("no present thread is installed in a fixture")
+            })
+            .grow(),
+            Host::with(|h| h.model().root()),
+        );
+        Host::with(|h| h.flush(&mut patch));
+
+        let mut picks = Picks::default();
+        picks.apply(&filled().regions);
+        assert_eq!(picks.len(), 1, "the mounted region cannot be picked inside");
+
+        drop(held);
+        Host::with(|h| h.flush(&mut patch));
+        picks.apply(&filled().regions);
+        assert_eq!(picks.len(), 0, "the dropped region is still pickable");
+    }
 
     /// Returns how many regions are mounted, and how many of those are still waiting for a
     /// box.
@@ -422,7 +606,7 @@ pub(crate) mod tests {
     /// and would pass for a region that never mounted at all. Read off the rows rather than
     /// off the present thread, because a fixture installs none: what is under test is the
     /// gate this side applies.
-    pub(crate) fn census(host: &crate::build::Host) -> (usize, usize) {
+    pub(crate) fn census(host: &Host) -> (usize, usize) {
         host.regions_count(RegionRow::is_pending)
     }
 
@@ -430,8 +614,7 @@ pub(crate) mod tests {
     ///
     /// The id is minted by the mount walk and never handed to the application, so a test
     /// driving a report at a region has no other way to name its target.
-    pub(crate) fn control(host: &crate::build::Host) -> Option<windows_scene::ControlId> {
+    pub(crate) fn control(host: &Host) -> Option<ControlId> {
         host.first_region_control()
     }
 }
-

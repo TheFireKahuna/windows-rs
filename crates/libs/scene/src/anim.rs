@@ -14,11 +14,11 @@ use crate::sink::{Easing, Iterations, Tuning, Value};
 use core::cell::Cell as CoreCell;
 use core::time::Duration;
 use std::rc::Rc;
-use std::time::Instant;
 use windows_composition::{
     Animatable, Animation, BatchKind, CompositionAnimation, CompositionEasingFunction,
-    CompositionScopedBatch, Compositor, ExpressionAnimation, SpringScalarNaturalMotionAnimation,
-    SpringVector2NaturalMotionAnimation, SpringVector3NaturalMotionAnimation, Visual,
+    CompositionPropertySet, CompositionScopedBatch, Compositor, ExpressionAnimation,
+    SpringScalarNaturalMotionAnimation, SpringVector2NaturalMotionAnimation,
+    SpringVector3NaturalMotionAnimation, Visual,
 };
 use windows_core::{EventRevoker, Result};
 use windows_numerics::{Vector2, Vector3};
@@ -51,8 +51,8 @@ pub(crate) struct Motion {
     pub(crate) templates: Templates,
     pub(crate) ghosts: Vec<Ghost>,
     pub(crate) playbacks: Vec<Playback>,
-    /// Pending delays, looked up by a linear scan on id. A handful at most — a hovered
-    /// submenu, a tooltip — and empty in the steady state.
+    /// Delays waiting on the compositor, looked up by a linear scan on id. A handful at
+    /// most — a hovered submenu, a tooltip — and empty in the steady state.
     pub(crate) delays: Vec<Delay>,
 }
 
@@ -64,6 +64,19 @@ impl Motion {
             playbacks: Vec::new(),
             delays: Vec::new(),
         }
+    }
+
+    /// Cancels the delay registered under `id`, if there is one.
+    ///
+    /// Dropping the record unsubscribes its completion, so a cancelled delay never reports.
+    pub(crate) fn cancel_delay(&mut self, id: crate::sink::DelayId) {
+        self.delays.retain(|delay| delay.id != id);
+    }
+
+    /// Releases every delay whose batch has reported. A batch reports once, so a released
+    /// delay cannot be waited on again.
+    pub(crate) fn retire_delays(&mut self) {
+        self.delays.retain(|delay| !delay.finished());
     }
 }
 
@@ -333,49 +346,121 @@ fn secs(seconds: f32) -> Duration {
     Duration::from_secs_f64(f64::from(seconds.max(0.0)))
 }
 
-/// A timed reveal in flight: a deadline compared against the frame clock.
+/// The scratch key a delay's animation moves. Nothing binds it: the value is written only
+/// so that the batch has a piece of work whose completion it can report.
+const DELAY_KEY: &str = "Elapsed";
+
+/// How long a delay's animation runs once its wait is over, in milliseconds.
 ///
-/// A delay costs an instant and a clock request — no property set, no animation, no scoped
-/// batch, no subscription. Nothing fires it: the deadline is read on a frame the scene is
-/// already servicing, so a delay is observed at a frame boundary and adds no clock of its
-/// own.
+/// The batch reports at the end of the run rather than at the end of the wait, so this is
+/// added to every delay.
+const DELAY_RUN_MS: u64 = 1;
+
+/// A timed reveal in flight: an animation that starts after the delay, inside a scoped batch
+/// subscribed to its completion.
 ///
-/// Unlike a [`Ghost`], a delay has no animation whose completion matters, so it carries no
-/// scoped batch — only elapsed time decides it.
+/// Nothing on this thread measures the wait. The animation moves a scratch property no
+/// visual reads, so its only observable effect is the batch's completion, which the
+/// compositor raises once the delay has run.
 pub(crate) struct Delay {
     pub(crate) id: crate::sink::DelayId,
-    /// Monotonic, so nothing a user or a time service does to the wall clock moves it.
-    due: Instant,
-    /// Keeps the frame clock awake until the delay is dropped, so the deadline is reached
-    /// on a frame rather than waited for.
-    _tick: windows_window::Tick,
+    /// Set by the scoped batch's completion signal, which is the only report that the delay
+    /// has run.
+    done: Rc<CoreCell<bool>>,
+    /// The animation's target. An animation whose target has been collected is dropped by
+    /// the compositor, and the batch then never reports.
+    _scratch: CompositionPropertySet,
+    /// Held so the batch is not collected before it reports.
+    _batch: CompositionScopedBatch,
+    /// Held so the completion subscription outlives the animation. Dropping it unsubscribes,
+    /// which is what makes a cancelled delay silent.
+    _revoker: EventRevoker,
 }
 
 impl Delay {
-    /// Returns whether `now` has reached the deadline.
-    pub(crate) fn elapsed(&self, now: Instant) -> bool {
-        now >= self.due
+    /// Returns whether the compositor has reported this delay's animation complete.
+    pub(crate) fn finished(&self) -> bool {
+        self.done.get()
     }
 }
 
+/// Arms a delay of `ms` on `compositor` and calls `elapsed` once it has run.
+///
+/// `elapsed` runs on the thread the compositor was created on, from its dispatcher queue.
+/// Dropping the returned [`Delay`] unsubscribes, so `elapsed` runs at most once and never
+/// after the record is gone.
+///
+/// # Errors
+///
+/// Fails if the completion subscription cannot be made or the batch cannot be sealed.
+pub(crate) fn arm_delay(
+    compositor: &Compositor,
+    id: crate::sink::DelayId,
+    ms: u32,
+    mut elapsed: impl FnMut() + 'static,
+) -> Result<Delay> {
+    // One property set per delay: two delays sharing a key would be two animations on one
+    // property, and starting the second ends the first, which reports as its delay running.
+    let scratch = compositor.create_property_set();
+    scratch.insert_vector2(DELAY_KEY, Vector2 { x: 0.0, y: 0.0 });
+    let batch = compositor.create_scoped_batch(BatchKind::Animation);
+    let animation = compositor.create_vector2_key_frame_animation();
+    animation.insert_key_frame(1.0, Vector2 { x: 1.0, y: 1.0 });
+    animation.set_delay(Duration::from_millis(u64::from(ms)));
+    animation.set_duration(Duration::from_millis(DELAY_RUN_MS));
+    scratch.start_animation(DELAY_KEY, &animation);
+
+    let done = Rc::new(CoreCell::new(false));
+    let signal = Rc::clone(&done);
+    // A batch subscribed to but never sealed keeps swallowing later animations, and one
+    // sealed with no subscriber never reports. The pair is armed together or not at all.
+    let revoker = batch.on_completed(move || {
+        signal.set(true);
+        elapsed();
+    })?;
+    batch.try_end()?;
+
+    Ok(Delay {
+        id,
+        done,
+        _scratch: scratch,
+        _batch: batch,
+        _revoker: revoker,
+    })
+}
+
 impl crate::Scene {
-    /// Starts a timed reveal under `id`, due `ms` from now.
+    /// Starts a timed reveal under `id`, reported as
+    /// [`SceneEvent::DelayElapsed`](crate::SceneEvent::DelayElapsed) once `ms` has passed.
     ///
-    /// Any delay already registered under `id` is dropped first, so a tooltip swapping
-    /// between targets neither reports the old deadline nor waits a second time.
-    pub(crate) fn start_delay(&mut self, id: crate::sink::DelayId, ms: u32) {
-        self.cancel_delay(id);
-        self.motion.delays.push(Delay {
-            id,
-            due: Instant::now() + Duration::from_millis(u64::from(ms)),
-            _tick: self.wake.tick(),
-        });
+    /// Any delay already registered under `id` is cancelled first, so a tooltip swapping
+    /// between targets neither reports the old delay nor waits a second time.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the delay's batch cannot be armed.
+    pub(crate) fn start_delay(
+        &mut self,
+        id: crate::sink::DelayId,
+        ms: u32,
+        back: &crate::Backends,
+    ) -> Result<()> {
+        self.motion.cancel_delay(id);
+        let events = Rc::clone(&self.events);
+        let delay = arm_delay(&back.compositor, id, ms, move || {
+            events
+                .borrow_mut()
+                .push(crate::SceneEvent::DelayElapsed { delay: id });
+        })?;
+        self.motion.delays.push(delay);
+        self.census.animations += 1;
+        Ok(())
     }
 
-    /// Cancels the delay registered under `id`. It holds only a deadline and a clock
-    /// request, so dropping it is the whole unwind and a cancelled delay never reports.
+    /// Cancels the delay registered under `id`. Dropping the record unsubscribes its
+    /// completion, so a cancelled delay never reports.
     pub(crate) fn cancel_delay(&mut self, id: crate::sink::DelayId) {
-        self.motion.delays.retain(|delay| delay.id != id);
+        self.motion.cancel_delay(id);
     }
 }
 
@@ -409,8 +494,6 @@ pub(crate) struct Ghost {
     _revoker: EventRevoker,
     /// Held so the batch is not collected before it reports.
     _batch: CompositionScopedBatch,
-    /// Acquired by Completed, released with the ghost on the next scene apply.
-    _tick: Rc<CoreCell<Option<windows_window::Tick>>>,
 }
 
 impl Drop for Ghost {
@@ -610,12 +693,8 @@ impl crate::Scene {
         }
         // A batch subscribed to but never sealed keeps swallowing later animations, and one
         // sealed with no subscriber never reports. The pair is armed together or not at all.
-        let tick = Rc::new(CoreCell::new(None));
-        let completed_tick = tick.clone();
-        let wake = self.wake.clone();
         let revoker = batch.on_completed(move || {
             signal.set(true);
-            completed_tick.set(Some(wake.tick()));
         })?;
         batch.try_end()?;
         self.census.animations += 1;
@@ -628,7 +707,6 @@ impl crate::Scene {
             done,
             _revoker: revoker,
             _batch: batch,
-            _tick: tick,
         }))
     }
 }
@@ -658,7 +736,6 @@ mod tests {
             done: Rc::new(CoreCell::new(true)),
             _batch: batch,
             _revoker: revoker,
-            _tick: Rc::new(CoreCell::new(None)),
         };
         assert_eq!(parent.count(), 1);
         drop(ghost);
@@ -667,6 +744,82 @@ mod tests {
             0,
             "the collection keeps a strong reference until explicitly removed"
         );
+    }
+
+    /// Pumps the thread's messages for roughly `ms`, which is how a completion raised on
+    /// the dispatcher queue reaches the handler outside a running application.
+    fn pump_for(ms: u32) {
+        for _ in 0..ms.div_ceil(5) {
+            windows_window::pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Builds a compositor on a queue of its own, or `None` where the session has no
+    /// dispatcher queue and a compositor cannot be created.
+    fn device() -> Option<(windows_composition::DispatcherQueueController, Compositor)> {
+        let queue = windows_composition::DispatcherQueueController::create_on_current_thread()
+            .inspect_err(|_| eprintln!("skipped: no dispatcher queue in this session"))
+            .ok()?;
+        Some((queue, Compositor::new().expect("a compositor")))
+    }
+
+    #[test]
+    fn a_delay_reports_once_when_its_wait_is_over() {
+        let Some((_queue, compositor)) = device() else {
+            return;
+        };
+        let reports = Rc::new(CoreCell::new(0u32));
+        let counter = Rc::clone(&reports);
+        let delay = arm_delay(&compositor, crate::sink::DelayId::NONE, 50, move || {
+            counter.set(counter.get() + 1);
+        })
+        .expect("an armed delay");
+        assert_eq!(reports.get(), 0, "a delay does not report before its wait");
+        pump_for(1_000);
+        assert_eq!(reports.get(), 1);
+        assert!(delay.finished());
+    }
+
+    #[test]
+    fn a_cancelled_delay_never_reports() {
+        let Some((_queue, compositor)) = device() else {
+            return;
+        };
+        let reports = Rc::new(CoreCell::new(0u32));
+        let counter = Rc::clone(&reports);
+        let delay = arm_delay(&compositor, crate::sink::DelayId::NONE, 50, move || {
+            counter.set(counter.get() + 1);
+        })
+        .expect("an armed delay");
+        drop(delay);
+        pump_for(1_000);
+        assert_eq!(reports.get(), 0);
+    }
+
+    #[test]
+    fn re_arming_one_id_leaves_one_delay_and_reports_once() {
+        let Some((_queue, compositor)) = device() else {
+            return;
+        };
+        let id = crate::sink::DelayId::NONE;
+        let reports = Rc::new(CoreCell::new(0u32));
+        let mut motion = Motion::new(&compositor);
+        for _ in 0..2 {
+            let counter = Rc::clone(&reports);
+            motion.cancel_delay(id);
+            motion.delays.push(
+                arm_delay(&compositor, id, 50, move || {
+                    counter.set(counter.get() + 1);
+                })
+                .expect("an armed delay"),
+            );
+        }
+        assert_eq!(motion.delays.len(), 1, "the first arm was cancelled");
+        pump_for(1_000);
+        assert_eq!(reports.get(), 1);
+        motion.retire_delays();
+        assert!(motion.delays.is_empty(), "a reported delay is released");
     }
 
     #[test]

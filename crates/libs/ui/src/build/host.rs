@@ -13,10 +13,12 @@
 
 use crate::gesture::GestureDecl;
 use crate::role::{Role, Scope};
+use crate::seam::{Down, RegionOp, ScrollOp};
 use crate::widget::{Chrome, ModelState, TextSource, UiaRole};
 use std::cell::RefCell;
 use std::rc::Rc;
 use windows_numerics::Vector2;
+use windows_present::Extent;
 use windows_scene::{
     ControlId, Env, Exit, GroupId, Id, Ids, MeasureIn, MeasureKey, Model, NodeId, Paint, Prop,
     SinkPatch, Slots, SpriteId, Tracker,
@@ -247,6 +249,18 @@ pub struct Host {
     /// Which control is which window command, for the caption band to resolve a point
     /// through. Filled at mount by [`El::caption`](super::El::caption).
     pub(crate) caption: crate::caption::Registry,
+    /// The registry as [`fill`](Self::fill) last sent it, so an unchanged one is not resent.
+    ///
+    /// Compared rather than flagged at the write site: the registry is written from the
+    /// mount walk, and three id compares per fill is cheaper than a flag every writer has to
+    /// remember to set.
+    caption_sent: crate::caption::Registry,
+    /// Region edits this flush produced, drained by [`fill`](Self::fill).
+    pending_regions: Vec<RegionOp>,
+    /// Scroll-container edits this flush produced, drained by [`fill`](Self::fill).
+    pending_scrolls: Vec<ScrollOp>,
+    /// What this host's seam has done, carried out by every [`fill`](Self::fill).
+    census: crate::seam::AppCensus,
     /// Open overlays, in the order they opened. A stack rather than a slotted table: overlays
     /// nest — a submenu sits above its menu and cannot outlive it — so closing one takes
     /// everything above it, and an index stays valid for exactly as long as that holds.
@@ -333,6 +347,10 @@ impl Host {
             region_ids: Ids::new(),
             regions: Slots::new(),
             caption: crate::caption::Registry::default(),
+            caption_sent: crate::caption::Registry::default(),
+            pending_regions: Vec::new(),
+            pending_scrolls: Vec::new(),
+            census: crate::seam::AppCensus::default(),
             overlays: Vec::new(),
         };
         HOST.with(|slot| *slot.borrow_mut() = Some(host));
@@ -405,18 +423,30 @@ impl Host {
         HOST.with(|slot| slot.borrow().is_some())
     }
 
-    /// Takes the gesture declarations mounted since the last drain, for the router to install.
-    pub fn take_gestures(&mut self) -> Vec<(ControlId, GestureDecl)> {
-        core::mem::take(&mut self.gestures)
-    }
-
-    /// Takes the front-side rows minted since the last drain, to be adopted alongside the
-    /// patch.
+    /// Moves everything this side produced since the last fill into `down`.
     ///
-    /// A row carries only numbers and ids, so it crosses as plain `Send` data. The handlers
-    /// stay in the control row on this thread, the only one that may call them.
-    pub fn take_chrome(&mut self) -> Vec<crate::widget::ChromeRow> {
-        core::mem::take(&mut self.chrome)
+    /// Called straight after [`flush`](Self::flush), which is what fills the region and
+    /// scroll edits; the chrome rows, gesture declarations and released ids accumulate from
+    /// the mount walk as well. Every row carries only numbers and ids, so what crosses is
+    /// plain `Send` data and the handlers stay on this thread, the only one that may call
+    /// them.
+    ///
+    /// Appends rather than moves the buffers, so both sides keep their capacity and a fill
+    /// on a `Down` the consumer has not drained adds to that batch rather than replacing it.
+    ///
+    /// The caption registry is sent only when it differs from what the last fill sent: the
+    /// three ids change when a title bar mounts and at no other time.
+    pub(crate) fn fill(&mut self, down: &mut Down) {
+        down.chrome.append(&mut self.chrome);
+        down.gestures.append(&mut self.gestures);
+        down.released.append(&mut self.released);
+        down.regions.append(&mut self.pending_regions);
+        down.scrolls.append(&mut self.pending_scrolls);
+        if self.caption != self.caption_sent {
+            self.caption_sent = self.caption;
+            down.caption = Some(self.caption.into());
+        }
+        down.census = self.census;
     }
 
     /// Fills `out` with the automation facts layout does not already carry.
@@ -528,14 +558,6 @@ impl Host {
         self.uia_stale.set(true);
     }
 
-    /// Takes the controls released since the last drain, for the front table to forget.
-    ///
-    /// The generational id already makes a stale report a miss; draining is what bounds the
-    /// front table, which would otherwise keep a row per control that ever existed.
-    pub fn take_released(&mut self) -> Vec<ControlId> {
-        core::mem::take(&mut self.released)
-    }
-
     /// Calls the handler each intent names.
     ///
     /// An intent queued before its control unmounted is skipped: the generation half of the
@@ -634,17 +656,6 @@ impl Host {
         self.scroll_where(|row| row.tracker.id() == tracker, f);
     }
 
-    /// Runs `f` against the container whose viewport carries `control`, which is what a hover
-    /// names.
-    pub(crate) fn scroll_by_control(&mut self, control: ControlId, f: impl FnOnce(&mut ScrollRow)) {
-        self.scroll_where(|row| row.control == Some(control), f);
-    }
-
-    /// Runs `f` against the container whose thumb is grabbed by `control`.
-    pub(crate) fn scroll_by_grab(&mut self, control: ControlId, f: impl FnOnce(&mut ScrollRow)) {
-        self.scroll_where(|row| row.grab == Some(control), f);
-    }
-
     /// Records a probed node against the mount row that owns it, so it is released when that
     /// subtree unmounts rather than left reporting a destroyed node.
     pub(crate) fn mint_probe(&mut self, row: MountId, probe: ProbeRow) {
@@ -702,35 +713,6 @@ impl Host {
             .find_map(|row| row.control)
     }
 
-    /// Returns the region the control `id` names, or `None` where that control is not one.
-    ///
-    /// A scan, not an index: a settled layout keeps this table under eight rows
-    /// ([06 §9.2](../../../../gui/spec/06-PRESENT.md)), and it is walked only for the
-    /// pointer reports that landed on a control at all.
-    pub(crate) fn region_of(&mut self, id: ControlId) -> Option<&mut crate::present::RegionRow> {
-        self.regions
-            .positions()
-            .filter_map(|at| self.regions.id_at(at))
-            .find(|&row| self.regions.get(row).is_some_and(|r| r.control == Some(id)))
-            .and_then(|row| self.regions.get_mut(row))
-    }
-
-    /// Returns the sink the region `key` names, or `None` where that region has unmounted.
-    ///
-    /// A binding can arrive for a region this side has already dropped: the two threads tear
-    /// one down in opposite orders, so the answer is a miss rather than an assertion.
-    pub(crate) fn region_sink(
-        &self,
-        key: windows_present::RegionKey,
-    ) -> Option<windows_scene::RegionId> {
-        self.regions
-            .positions()
-            .filter_map(|at| self.regions.id_at(at))
-            .filter_map(|id| self.regions.get(id))
-            .find(|row| row.key == key)
-            .map(|row| row.sink)
-    }
-
     /// Returns how many regions are mounted and how many of them satisfy `f`. What a test
     /// asks about the region table, which is otherwise private to the flush.
     #[cfg(test)]
@@ -748,12 +730,17 @@ impl Host {
         })
     }
 
-    /// Mounts every region that has a box and no buffers, and resizes every one whose box
-    /// moved.
+    /// Emits a mount for every region that has a box and no buffers, and a resize for every
+    /// one whose box moved.
     ///
     /// Publishes nothing back into the solve: an extent is read from a solved box and never
     /// stated into one, so this cannot make [`flush`](Self::flush)'s sequence fail to
     /// terminate. It contributes nothing to whether a re-solve is owed, for that reason.
+    ///
+    /// A box with no area is not ready. A region inside a subtree `when` or `hide_below` has
+    /// made `Display::None` is laid out at zero, and buffers allocated against that would be
+    /// one texel across for the life of the window — the extent gate is what defers the
+    /// mount to the flush that reveals the subtree, since revealing it is a style change.
     fn publish_regions(&mut self) {
         let dpi = self.env.dpi();
         for at in self.regions.positions() {
@@ -766,9 +753,38 @@ impl Host {
             // Read before the row is borrowed mutably: the solve is the model's and the row
             // is this table's, and one borrow cannot span both.
             let size = self.model.solved(node).size;
-            if let Some(row) = self.regions.get_mut(id) {
-                crate::present::publish(row, size, dpi);
+            if size.x <= 0.0 || size.y <= 0.0 {
+                continue;
             }
+            let extent = Extent::new(size.x, size.y, dpi);
+            let Some(row) = self.regions.get_mut(id) else {
+                continue;
+            };
+            let op = match row.build.take() {
+                Some(build) => {
+                    row.extent = Some(extent);
+                    RegionOp::Mount {
+                        key: row.key,
+                        sink: row.sink,
+                        control: row.control,
+                        live: row.live.clone(),
+                        extent,
+                        queue: row.queue,
+                        build,
+                    }
+                }
+                // The recorded extent is the only account of whether the box moved, so a
+                // solve that moved nothing emits nothing.
+                None if row.extent == Some(extent) => continue,
+                None => {
+                    row.extent = Some(extent);
+                    RegionOp::Resize {
+                        key: row.key,
+                        extent,
+                    }
+                }
+            };
+            self.pending_regions.push(op);
         }
     }
 
@@ -1062,22 +1078,23 @@ impl Host {
                     probe.cell.set(crate::layout::Placed::default());
                 }
             }
-            // The present thread is told first and the sink is released after: the region
-            // owns the surface handle behind the brush this side is painting with, so the
-            // unmount that closes it must be asked for before the claim on the sink goes.
+            // The drop is emitted first and the sink is released after: the region owns the
+            // surface handle behind the brush this side is painting with, so the unmount
+            // that closes it must be asked for before the claim on the sink goes.
             if let Some(region) = row
                 .region
                 .and_then(|at| self.regions.remove(&mut self.region_ids, at))
             {
-                crate::present::drop_region(&region);
+                self.pending_regions
+                    .push(RegionOp::Drop { key: region.key });
                 self.model.release(region.sink);
             }
             // A tracker is sourced from its viewport's visual, so it is dropped with the row
             // that named it.
-            if let Some(scroll) = row
-                .scroll
-                .and_then(|at| self.scrolls.remove(&mut self.scroll_ids, at))
+            if let Some(id) = row.scroll
+                && let Some(scroll) = self.scrolls.remove(&mut self.scroll_ids, id)
             {
+                self.pending_scrolls.push(ScrollOp::Drop(id));
                 self.model.drop_tracker(scroll.tracker);
                 // The thumb's control is minted beside the tracker rather than by the mount
                 // walk, so releasing it here is what keeps its id from outliving the sprite
@@ -1110,6 +1127,7 @@ impl Host {
     ///    resizes one, so the third solve computes the sizes the second did and the sequence
     ///    terminates.
     pub fn flush(&mut self, patch: &mut SinkPatch) {
+        self.census.flushes += 1;
         let env = self.env;
         self.size_overlay_viewports();
         self.model.solve(env);
@@ -1458,6 +1476,7 @@ impl Host {
                 (scroll.tracker, scroll.viewport, scroll.thumb, scroll.last);
             let (content, state, rail, grab) =
                 (scroll.content, scroll.state, scroll.rail, scroll.grab);
+            let (added, describe) = (scroll.front_added, scroll.describe(id));
             let box_ = self.model.solved(viewport).size;
             // A viewport with no area has not been laid out — a hidden subtree solves at zero
             // — and publishing from that zero would record `last` as sent while the bounds
@@ -1472,12 +1491,22 @@ impl Host {
             // virtualized list cannot compute for itself.
             state.resized(viewport_h);
             let geom = crate::layout::thumb_geom(viewport_h, self.model.solved(content).size.y);
+            // Before the gate below, because a container whose content fits publishes the
+            // same geometry it was minted with and would otherwise never reach the front
+            // table at all — leaving its thumb's reveal with nothing to act on.
+            if !added {
+                if let Some(scroll) = self.scrolls.get_mut(id) {
+                    scroll.front_added = true;
+                }
+                self.pending_scrolls.push(ScrollOp::Add(describe));
+            }
             if geom == last {
                 continue;
             }
             if let Some(scroll) = self.scrolls.get_mut(id) {
                 scroll.last = geom;
             }
+            self.pending_scrolls.push(ScrollOp::Geom { id, geom });
             moved = true;
             // The position may travel outside these bounds during a manipulation or inertia;
             // that overpan is the bounce.
@@ -1570,4 +1599,110 @@ pub(crate) fn paint(model: &mut Model, id: Option<SpriteId>, role: Option<Role>,
         crate::role::resolve(role, scope)
     });
     model.paint(id, Paint::Solid(light));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::{mount, tests::fixture};
+    use crate::seam::Down;
+
+    /// A fill hands every buffer over and leaves the host with none of it.
+    ///
+    /// Both halves matter. A fill that copied rather than moved would re-send every control
+    /// on the next tick, and the front table would adopt a row per tick for the life of the
+    /// window.
+    #[test]
+    fn a_fill_hands_over_every_buffer_and_empties_the_host() {
+        let mut patch = fixture();
+        let held = mount(
+            crate::widget::button("press me"),
+            Host::with(|h| h.model().root()),
+        );
+        Host::with(|h| h.flush(&mut patch));
+
+        let mut down = Down::default();
+        Host::with(|h| h.fill(&mut down));
+        assert!(!down.chrome.is_empty(), "the control minted no front row");
+        assert_eq!(down.gestures.len(), 1, "a button declares one gesture");
+        assert!(down.released.is_empty(), "nothing has unmounted yet");
+        // A delta, because the fixture has already flushed: what the census counts is every
+        // flush this host has run, not every flush since the last fill.
+        let flushes = down.census.flushes;
+
+        let mut second = Down::default();
+        Host::with(|h| h.fill(&mut second));
+        assert!(
+            second.chrome.is_empty() && second.gestures.is_empty(),
+            "the host kept what it had already handed over"
+        );
+
+        drop(held);
+        Host::with(|h| h.flush(&mut patch));
+        let mut third = Down::default();
+        Host::with(|h| h.fill(&mut third));
+        assert_eq!(
+            third.released.len(),
+            1,
+            "the unmounted control was not released"
+        );
+        assert_eq!(
+            third.census.flushes,
+            flushes + 1,
+            "the flush went uncounted"
+        );
+    }
+
+    /// A fill appends, so a batch the consumer has not drained grows rather than being
+    /// replaced, and the buffer keeps its capacity.
+    #[test]
+    fn a_fill_appends_to_an_undrained_batch() {
+        let mut patch = fixture();
+        let _held = mount(
+            crate::widget::button("one"),
+            Host::with(|h| h.model().root()),
+        );
+        Host::with(|h| h.flush(&mut patch));
+        let mut down = Down::default();
+        Host::with(|h| h.fill(&mut down));
+        let first = down.gestures.len();
+
+        let _second = mount(
+            crate::widget::button("two"),
+            Host::with(|h| h.model().root()),
+        );
+        Host::with(|h| h.flush(&mut patch));
+        Host::with(|h| h.fill(&mut down));
+        assert_eq!(
+            down.gestures.len(),
+            first + 1,
+            "the second mount replaced the first batch instead of joining it"
+        );
+    }
+
+    /// The window commands cross once, on the fill after the bar mounted, and not again.
+    #[test]
+    fn the_caption_registry_crosses_only_when_it_changes() {
+        let mut patch = fixture();
+        let _held = mount(
+            crate::layout::row(
+                crate::widget::button("\u{2715}").caption(windows_window::CaptionButton::Close),
+            ),
+            Host::with(|h| h.model().root()),
+        );
+        Host::with(|h| h.flush(&mut patch));
+
+        let mut down = Down::default();
+        Host::with(|h| h.fill(&mut down));
+        let ids = down.caption.expect("the bar declared a command");
+        assert!(
+            ids.iter().any(Option::is_some),
+            "no command reached the seam"
+        );
+
+        down.clear();
+        Host::with(|h| h.flush(&mut patch));
+        Host::with(|h| h.fill(&mut down));
+        assert_eq!(down.caption, None, "an unchanged registry was resent");
+    }
 }

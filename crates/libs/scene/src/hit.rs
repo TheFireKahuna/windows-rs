@@ -1,8 +1,10 @@
 //! Queries the flat hit array. **Front half.**
 //!
-//! The array is built on the app thread and queried here, because a query resolves through
-//! live scroll offsets and those are held by the trackers. Pointer routing, wheel routing,
-//! gesture targeting, keyboard focus order, the window's own caption hit test and
+//! The array is built on the app thread and queried wherever a contact arrives. A query
+//! resolves through live scroll offsets, which a table either records for itself through
+//! [`HitTable::set_scroll`] or reads from the trackers' shadow words through
+//! [`ShadowOffsets`]; [`ScrollOffsets`] is the seam between the two. Pointer routing, wheel
+//! routing, gesture targeting, keyboard focus order, the window's own caption hit test and
 //! automation's element-from-point all resolve through this array, and a presentation
 //! region's parts extend it rather than forking it.
 //!
@@ -13,6 +15,8 @@
 
 use crate::hit_build::{HitEntry, HitFlags, NO_ENTRY};
 use crate::sink::{NodeId, Point};
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use windows_numerics::Vector2;
 
 /// Names the input device a contact came from. Only touch and pen inflate a target.
@@ -136,15 +140,118 @@ pub fn scan(
     best.map(|(index, _, q)| (index, q))
 }
 
+/// Supplies the live offset of a scroll container to a query.
+///
+/// A query moves the point rather than the rects, so every entry carrying a `scroll_src`
+/// asks this for that viewport's offset. An implementation answers with zero for a viewport
+/// it holds nothing for, which is what an unscrolled container reads as.
+pub trait ScrollOffsets {
+    /// Returns `viewport`'s live offset, or zero where it holds none.
+    fn offset(&self, viewport: NodeId) -> Vector2;
+}
+
+/// The offsets a table was told directly, through [`HitTable::set_scroll`].
+///
+/// Searched linearly; a window holds a handful of scrolling surfaces.
+#[derive(Debug, Default)]
+struct Scrolls(Vec<(NodeId, Vector2)>);
+
+impl ScrollOffsets for Scrolls {
+    fn offset(&self, viewport: NodeId) -> Vector2 {
+        match self.0.iter().find(|(id, _)| *id == viewport) {
+            Some(&(_, offset)) => offset,
+            None => Vector2::zero(),
+        }
+    }
+}
+
+/// Packs an offset into the word a tracker shadow holds: `x` in the high half, `y` in the
+/// low half.
+#[must_use]
+pub const fn pack_offset(x: f32, y: f32) -> u64 {
+    ((x.to_bits() as u64) << 32) | y.to_bits() as u64
+}
+
+/// Unpacks the word [`pack_offset`] produced, into `(x, y)`.
+#[must_use]
+pub const fn unpack_offset(packed: u64) -> (f32, f32) {
+    (
+        f32::from_bits((packed >> 32) as u32),
+        f32::from_bits(packed as u32),
+    )
+}
+
+/// Resolves a query's scroll offsets from the trackers' shadow words.
+///
+/// A shadow is written by the thread the tracker reports on and read here, so a table
+/// holding a copy of that thread's array queries against current offsets with no lock and no
+/// message. The whole offset is one word, so a reader sees both axes of one reported
+/// position and never one axis of two.
+///
+/// Searched linearly; a window holds a handful of scrolling surfaces.
+#[derive(Debug, Default)]
+pub struct ShadowOffsets(Vec<(NodeId, Arc<AtomicU64>)>);
+
+impl ShadowOffsets {
+    /// Returns a table routing no shadow, having allocated nothing.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Routes `viewport`'s offset through `shadow`, replacing any shadow already held for it.
+    pub fn insert(&mut self, viewport: NodeId, shadow: Arc<AtomicU64>) {
+        match self.0.iter_mut().find(|(id, _)| *id == viewport) {
+            Some((_, existing)) => *existing = shadow,
+            None => self.0.push((viewport, shadow)),
+        }
+    }
+
+    /// Forgets `viewport`'s shadow, after which it resolves as unscrolled.
+    /// Forgets every shadow, keeping the table's capacity.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn remove(&mut self, viewport: NodeId) {
+        self.0.retain(|(id, _)| *id != viewport);
+    }
+
+    /// Returns how many shadows the table routes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` where the table routes no shadow.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl ScrollOffsets for ShadowOffsets {
+    fn offset(&self, viewport: NodeId) -> Vector2 {
+        match self.0.iter().find(|(id, _)| *id == viewport) {
+            Some((_, shadow)) => {
+                // acquire: pairs with the release in the tracker's values-changed handler,
+                // so the word read here is a position that handler finished writing.
+                let (x, y) = unpack_offset(shadow.load(Ordering::Acquire));
+                Vector2 { x, y }
+            }
+            None => Vector2::zero(),
+        }
+    }
+}
+
 /// Holds the hit array with the scroll offsets and memo a query resolves through.
 #[derive(Debug, Default)]
 pub struct HitTable {
     entries: Vec<HitEntry>,
     /// Bumped on every rebuild, which invalidates the memo.
     epoch: u64,
-    /// The live offset of each scroll container, as its tracker last reported it. Searched
-    /// linearly; a window holds a handful of scrolling surfaces.
-    scrolls: Vec<(NodeId, Vector2)>,
+    /// The live offset of each scroll container, as its tracker last reported it.
+    scrolls: Scrolls,
     /// Control id to entry index, sorted for binary search. A consumer holds an id rather
     /// than a position, and a value control asks for its own rect on every pointer move.
     /// Rebuilt whole with the array and never edited in place.
@@ -162,6 +269,13 @@ struct Memo {
 }
 
 impl HitTable {
+    /// Returns the rebuild count. Two tables copied from the same source at the same epoch
+    /// hold the same entries, so a consumer keeping a copy compares this before copying.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Replaces every entry, rebuilds the id index, bumps the epoch and drops the memo.
     pub fn replace(&mut self, entries: &[HitEntry]) {
         self.entries.clear();
@@ -172,6 +286,17 @@ impl HitTable {
         self.by_id.sort_unstable_by_key(|&(id, _)| id);
         self.epoch = self.epoch.wrapping_add(1);
         self.memo.set(None);
+    }
+
+    /// Replaces every entry with `other`'s, as [`replace`](HitTable::replace) does.
+    ///
+    /// The scroll offsets are not copied: a table filled this way is a snapshot queried on
+    /// another thread, where an offset copied from the source table is stale by the time it
+    /// would be read, and [`hit_with`](HitTable::hit_with) supplies live ones instead.
+    ///
+    /// Allocates nothing once both tables have reached the same working size.
+    pub fn copy_from(&mut self, other: &Self) {
+        self.replace(&other.entries);
     }
 
     /// Returns the entry `id` declared, or `None` where it declared none.
@@ -190,9 +315,9 @@ impl HitTable {
     /// and every call into it and callback out of it is asynchronous, so the value the
     /// handler carries is the only current one.
     pub fn set_scroll(&mut self, node: NodeId, offset: Vector2) {
-        match self.scrolls.iter_mut().find(|(id, _)| *id == node) {
+        match self.scrolls.0.iter_mut().find(|(id, _)| *id == node) {
             Some((_, existing)) => *existing = offset,
-            None => self.scrolls.push((node, offset)),
+            None => self.scrolls.0.push((node, offset)),
         }
         // A scroll moves content under the pointer without the array changing, so the memo
         // is dropped even though the epoch does not move.
@@ -201,7 +326,7 @@ impl HitTable {
 
     /// Forgets a scroll container's offset and drops the memo.
     pub fn clear_scroll(&mut self, node: NodeId) {
-        self.scrolls.retain(|(id, _)| *id != node);
+        self.scrolls.0.retain(|(id, _)| *id != node);
         self.memo.set(None);
     }
 
@@ -233,6 +358,25 @@ impl HitTable {
     /// since the scan is back-to-front and takes the first hit, so it supplies a floor and
     /// the skipped tail holds most of the entries.
     pub fn hit(&self, p: Point, contact: ContactKind) -> Option<Hit> {
+        self.hit_with(p, contact, &self.scrolls)
+    }
+
+    /// Returns what is under `p` resolved through `offsets`, and records it as the next memo.
+    ///
+    /// The form [`hit`](HitTable::hit) is written in: it supplies the offsets the table was
+    /// told through [`set_scroll`](HitTable::set_scroll), and a table holding a copy of
+    /// another thread's array supplies a [`ShadowOffsets`] instead.
+    ///
+    /// The memo bounds the scan and does not short-circuit it, for the reason
+    /// [`hit`](HitTable::hit) states. It is keyed on the array's epoch alone, so a caller
+    /// alternating two offset sources over one table would answer the second from a memo the
+    /// first recorded.
+    pub fn hit_with(
+        &self,
+        p: Point,
+        contact: ContactKind,
+        offsets: &dyn ScrollOffsets,
+    ) -> Option<Hit> {
         let floor = match self.memo.get() {
             Some(memo)
                 if memo.epoch == self.epoch
@@ -245,17 +389,14 @@ impl HitTable {
             }
             _ => 0,
         };
-        let (index, local) = scan(&self.entries, |node| self.offset(node), floor, p, contact)?;
+        let (index, local) = scan(
+            &self.entries,
+            |node| offsets.offset(node),
+            floor,
+            p,
+            contact,
+        )?;
         Some(self.record(index, local))
-    }
-
-    /// Returns `scroll`'s live offset in the form [`scan`] takes, or zero where none was
-    /// recorded.
-    fn offset(&self, scroll: NodeId) -> Vector2 {
-        match self.scrolls.iter().find(|(id, _)| *id == scroll) {
-            Some(&(_, offset)) => offset,
-            None => Vector2::zero(),
-        }
     }
 
     fn record(&self, index: usize, local: Point) -> Hit {
@@ -504,6 +645,174 @@ mod tests {
 
         table.set_scroll(NodeId::raw(4, 1), Vector2 { x: 0.0, y: 10.0 });
         assert!(table.memo.get().is_none(), "a scroll left a stale memo");
+    }
+
+    #[test]
+    fn a_copy_answers_every_query_the_source_does() {
+        let mut source = HitTable::default();
+        let mut child = entry(2, (40.0, 40.0, 200.0, 200.0), HitFlags::INTERACTIVE);
+        child.clip_parent = 0;
+        let mut inflated = entry(3, (300.0, 0.0, 310.0, 10.0), HitFlags::INTERACTIVE);
+        inflated.touch_inflate = 8.0;
+        source.replace(&[
+            entry(
+                1,
+                (0.0, 0.0, 100.0, 100.0),
+                HitFlags::INTERACTIVE | HitFlags::CLIP,
+            ),
+            child,
+            inflated,
+        ]);
+
+        let mut copy = HitTable::default();
+        copy.copy_from(&source);
+        assert_eq!(copy.entries(), source.entries());
+        assert_eq!(
+            copy.entry(ControlId::raw(2, 1)),
+            source.entry(ControlId::raw(2, 1))
+        );
+
+        for x in (0..320).step_by(7) {
+            for y in (0..220).step_by(11) {
+                let p = at(x as f32, y as f32);
+                for contact in [ContactKind::Mouse, ContactKind::Touch] {
+                    assert_eq!(
+                        copy.hit(p, contact).map(|hit| hit.id),
+                        source.hit(p, contact).map(|hit| hit.id),
+                        "at ({x}, {y}) for {contact:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_into_a_filled_table_leaves_nothing_of_the_old_one() {
+        let mut source = HitTable::default();
+        source.replace(&[entry(1, (0.0, 0.0, 10.0, 10.0), HitFlags::INTERACTIVE)]);
+        let mut copy = HitTable::default();
+        copy.replace(&[
+            entry(7, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE),
+            entry(8, (0.0, 0.0, 100.0, 100.0), HitFlags::INTERACTIVE),
+        ]);
+        // A query first, so the copy has a memo to invalidate.
+        assert!(copy.hit(at(50.0, 50.0), ContactKind::Mouse).is_some());
+
+        copy.copy_from(&source);
+        assert_eq!(copy.len(), 1);
+        assert!(copy.entry(ControlId::raw(7, 1)).is_none());
+        assert!(copy.hit(at(50.0, 50.0), ContactKind::Mouse).is_none());
+        assert_eq!(
+            copy.hit(at(5.0, 5.0), ContactKind::Mouse)
+                .unwrap()
+                .id
+                .index(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_packed_offset_round_trips_through_its_word() {
+        for (x, y) in [
+            (0.0, 0.0),
+            (0.0, -200.0),
+            (12.5, 240.75),
+            (-1.0, f32::MAX),
+            (f32::MIN, 1.0e-30),
+        ] {
+            assert_eq!(unpack_offset(pack_offset(x, y)), (x, y));
+        }
+        // The halves do not bleed into each other: x is the high word, y the low.
+        assert_eq!(pack_offset(0.0, 0.0), 0);
+        assert_eq!(pack_offset(1.0, 0.0), (1.0f32.to_bits() as u64) << 32);
+        assert_eq!(pack_offset(0.0, 1.0), 1.0f32.to_bits() as u64);
+    }
+
+    /// The scrolled-viewport scene the offset tests share: a clipping viewport with one row
+    /// placed 200 DIPs below it, so the row is reachable only once the offset moves it.
+    fn scrolled() -> (HitTable, NodeId) {
+        let mut table = HitTable::default();
+        let scroller = NodeId::raw(4, 1);
+        let viewport = entry(
+            1,
+            (0.0, 0.0, 100.0, 100.0),
+            HitFlags::SCROLL | HitFlags::CLIP,
+        );
+        let mut row = entry(2, (0.0, 200.0, 100.0, 240.0), HitFlags::INTERACTIVE);
+        row.scroll_src = scroller;
+        row.clip_parent = 0;
+        table.replace(&[viewport, row]);
+        (table, scroller)
+    }
+
+    #[test]
+    fn a_shadow_resolves_a_scrolled_viewport_as_a_recorded_offset_does() {
+        let (mut told, scroller) = scrolled();
+        let (shadowed, _) = scrolled();
+
+        let shadow = Arc::new(AtomicU64::new(pack_offset(0.0, 0.0)));
+        let mut offsets = ShadowOffsets::new();
+        offsets.insert(scroller, Arc::clone(&shadow));
+
+        for y in [0.0f32, 40.0, 120.0, 200.0, 239.0] {
+            told.set_scroll(scroller, Vector2 { x: 0.0, y });
+            shadow.store(pack_offset(0.0, y), Ordering::Release);
+            for probe in (0..100).step_by(9) {
+                let p = at(50.0, probe as f32);
+                assert_eq!(
+                    shadowed
+                        .hit_with(p, ContactKind::Mouse, &offsets)
+                        .map(|h| h.id),
+                    told.hit(p, ContactKind::Mouse).map(|h| h.id),
+                    "scrolled to {y}, probed at {probe}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_removed_shadow_resolves_as_unscrolled() {
+        let (table, scroller) = scrolled();
+        let shadow = Arc::new(AtomicU64::new(pack_offset(0.0, 200.0)));
+        let mut offsets = ShadowOffsets::new();
+        offsets.insert(scroller, Arc::clone(&shadow));
+        assert_eq!(
+            table
+                .hit_with(at(50.0, 20.0), ContactKind::Mouse, &offsets)
+                .unwrap()
+                .id
+                .index(),
+            2
+        );
+
+        offsets.remove(scroller);
+        assert!(offsets.is_empty());
+        assert_eq!(offsets.offset(scroller), Vector2::zero());
+        assert_eq!(
+            table
+                .hit_with(at(50.0, 20.0), ContactKind::Mouse, &offsets)
+                .unwrap()
+                .id
+                .index(),
+            1
+        );
+    }
+
+    #[test]
+    fn inserting_a_second_shadow_for_one_viewport_replaces_the_first() {
+        let (table, scroller) = scrolled();
+        let mut offsets = ShadowOffsets::new();
+        offsets.insert(scroller, Arc::new(AtomicU64::new(pack_offset(0.0, 0.0))));
+        offsets.insert(scroller, Arc::new(AtomicU64::new(pack_offset(0.0, 200.0))));
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(
+            table
+                .hit_with(at(50.0, 20.0), ContactKind::Mouse, &offsets)
+                .unwrap()
+                .id
+                .index(),
+            2
+        );
     }
 
     #[test]

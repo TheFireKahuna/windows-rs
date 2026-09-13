@@ -24,10 +24,10 @@ use windows_color::{Ictcp, Radiance};
 use windows_composition::Compositor;
 use windows_core::Result;
 use windows_d2d::Gpu;
-use windows_scene::{BackdropSpec, Backends, Census, SceneEvent};
+use windows_scene::{BackdropSpec, Backends};
 use windows_text::{FamilyId, FontLadder, FontSpec};
 use windows_ui::build::mount;
-use windows_ui::driver::{Ui, observe};
+use windows_ui::driver::{Observed, Ui, observe};
 use windows_ui::input::Report;
 use windows_ui::layout::{ListSpec, list};
 use windows_ui::role::{
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
 
     observe({
         let seen = Rc::clone(&seen);
-        move |events, reports, census| seen.tick(events, reports, census)
+        move |observed| seen.tick(observed)
     });
 
     let window = Window::new("windows-ui — scroll and virtualization")
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
             )
         },
         BackdropSpec::default(),
-        |root, _window| {
+        |ctx| {
             mount(
                 list(
                     || ListSpec::uniform(ROWS, Metric::RowH),
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
                 // The root is a full-client stretching column, so the list states its share
                 // of the main axis and nothing about the window's extent.
                 .grow(),
-                root,
+                ctx.root,
             )
         },
     )?;
@@ -135,36 +135,29 @@ fn main() -> Result<()> {
 /// by reference.
 #[derive(Default)]
 struct Seen {
-    ticks: Cell<u32>,
-    values: Cell<u32>,
-    inertia: Cell<u32>,
+    ticks: Cell<u64>,
+    scene_wakes: Cell<u64>,
+    scene_applies: Cell<u64>,
+    app_flushes: Cell<u64>,
     wheel_reports: Cell<u32>,
     drags: Cell<u32>,
     /// Highest realized-row count seen during the run.
     realized_max: Cell<usize>,
-    /// Realized-row count at the last tick that drained no scene events.
+    /// Realized-row count at the last tick.
     realized_rest: Cell<usize>,
-    reached: Cell<f32>,
     /// Trackers alive at the last tick. Zero is a scroll container bound to nothing.
     trackers: Cell<u32>,
 }
 
 impl Seen {
-    /// Records one tick. Reads its arguments and holds none of them, so the census allocates
-    /// nothing on the frame path.
-    fn tick(&self, events: &[SceneEvent], reports: &[Report], census: Census) {
-        self.ticks.set(self.ticks.get() + 1);
-        for event in events {
-            match *event {
-                SceneEvent::TrackerValues { position, .. } => {
-                    self.values.set(self.values.get() + 1);
-                    self.reached.set(self.reached.get().max(position.y));
-                }
-                SceneEvent::InertiaStarting { .. } => self.inertia.set(self.inertia.get() + 1),
-                _ => {}
-            }
-        }
-        for report in reports {
+    /// Records one input tick. Reads its argument and holds none of it, so the census
+    /// allocates nothing on the frame path.
+    fn tick(&self, seen: Observed<'_>) {
+        self.ticks.set(seen.ticks);
+        self.scene_wakes.set(seen.scene_wakes);
+        self.scene_applies.set(seen.scene_applies);
+        self.app_flushes.set(seen.app.flushes);
+        for report in seen.reports {
             match report {
                 Report::Wheel { .. } => self.wheel_reports.set(self.wheel_reports.get() + 1),
                 Report::Dragged { .. } => self.drags.set(self.drags.get() + 1),
@@ -173,19 +166,18 @@ impl Seen {
         }
         // This window's whole tree is the list, so the visual count is the realized set plus a
         // viewport, a content group and a thumb.
-        let realized = census.visuals_live as usize;
+        let realized = seen.census.visuals_live as usize;
         self.realized_max.set(self.realized_max.get().max(realized));
-        if events.is_empty() {
-            self.realized_rest.set(realized);
-        }
-        self.trackers.set(census.trackers_live);
+        self.realized_rest.set(realized);
+        self.trackers.set(seen.census.trackers_live);
     }
 
     fn report(&self) {
         println!("\n── what the run did ──");
-        println!("  front-thread ticks           {}", self.ticks.get());
-        println!("  tracker value reports        {}", self.values.get());
-        println!("  inertia entries              {}", self.inertia.get());
+        println!("  input-thread ticks           {}", self.ticks.get());
+        println!("  scene-thread wakes           {}", self.scene_wakes.get());
+        println!("  scene-thread applies         {}", self.scene_applies.get());
+        println!("  app-thread flushes           {}", self.app_flushes.get());
         println!("  thumb drag samples           {}", self.drags.get());
         println!(
             "  Report::Wheel on the front   {}   (a scroll container's wheel is the \
@@ -196,10 +188,6 @@ impl Seen {
             "  realized rows   at rest {}   peak {}   of {ROWS}",
             self.realized_rest.get(),
             self.realized_max.get()
-        );
-        println!(
-            "  furthest position reached    {:.0} DIP",
-            self.reached.get()
         );
         println!(
             "  trackers live                {}   (zero is a scroll container bound to nothing)",
@@ -333,6 +321,8 @@ impl Palette for Reference {
             Metric::EdgeTabInset => 28.0,
             Metric::EdgeTabPadX => 6.0,
             Metric::EdgeTabPadY => 12.0,
+            // A palette for one list: every other metric takes a plain reading.
+            _ => 16.0 * tight,
         }
     }
 

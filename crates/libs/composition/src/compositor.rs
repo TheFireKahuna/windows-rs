@@ -43,8 +43,24 @@ impl Compositor {
         window: &windows_window::Window,
         is_topmost: bool,
     ) -> Result<DesktopWindowTarget> {
-        // SAFETY: `window` owns a live `HWND` for as long as the borrow lasts.
-        unsafe { self.create_desktop_window_target_for_hwnd(window.hwnd(), is_topmost) }
+        self.create_desktop_window_target_for(window.handle(), is_topmost)
+    }
+
+    /// Creates a window target for a window another thread owns.
+    ///
+    /// The compositor and the window need not share a thread: the target is agile, and the
+    /// system resolves the handle per call. What the token's contract asks is that this
+    /// thread finishes with the target before the window closes, which the caller's own
+    /// join order supplies.
+    #[cfg(feature = "system")]
+    pub fn create_desktop_window_target_for(
+        &self,
+        window: windows_window::Hwnd,
+        is_topmost: bool,
+    ) -> Result<DesktopWindowTarget> {
+        // SAFETY: the token names a window whose owner outlives this call by the token's
+        // contract, and the call reads nothing through the handle.
+        unsafe { self.create_desktop_window_target_for_hwnd(window.raw(), is_topmost) }
     }
 
     /// Creates a composition target for a raw window handle.

@@ -55,6 +55,7 @@
     PostMessageW
     SendMessageW
     PostQuitMessage
+    WM_CLOSE
     WM_DESTROY
     WM_NCDESTROY
     WM_QUIT
@@ -187,6 +188,7 @@
     DispatcherQueueOptions
     DQTYPE_THREAD_CURRENT
     DQTAT_COM_NONE
+    DQTAT_COM_ASTA
     Windows.System.DispatcherQueue
     Windows.System.IDispatcherQueueStatics::GetForCurrentThread
     Windows.System.DispatcherQueueController
@@ -198,6 +200,11 @@
     SetEvent
     WaitForSingleObject
     WaitForMultipleObjects
+// A wait that also returns for this thread's queued messages: what a thread that owns a
+// compositor blocks in, since its dispatcher queue runs on that thread's message queue.
+    MsgWaitForMultipleObjectsEx
+    QS_ALLINPUT
+    MWMO_INPUTAVAILABLE
     WAIT_OBJECT_0
     WAIT_TIMEOUT
     WAIT_FAILED

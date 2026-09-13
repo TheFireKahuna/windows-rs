@@ -204,7 +204,10 @@ thread_local! {
 /// Without a waker a write schedules nothing: [`Cell::set`](super::Cell::set) marks nodes
 /// and queues effects, and nothing downstream runs until a caller invokes [`flush`]. A host
 /// that blocks its loop between frames learns through this callback that a frame is owed.
-/// The driver's `arm_posts` registration requests frames for producer-thread writes.
+/// The driver's `arm_posts` registration wakes the graph's thread for producer-thread writes
+/// instead. On the app thread that waker need only raise a flag: a write made on the thread
+/// that flushes is drained by the loop's own next flush, so nothing has to cross a seam to
+/// schedule it.
 ///
 /// The callback runs on the empty-to-non-empty transition and at no other time, so a burst
 /// of writes asks once. A write made from inside a flush does not call it: that flush picks
@@ -214,9 +217,13 @@ pub fn set_waker(f: impl Fn() + 'static) {
     WAKER.with(|w| *w.borrow_mut() = Some(Box::new(f)));
 }
 
-/// Routes producer writes to this graph's window until the registration drops.
-pub(crate) fn arm_posts(wake: windows_window::Wake) -> shared::PostWake {
-    shared::arm(with(|g| g.id), wake)
+/// Routes producer writes to this graph's thread until the returned guard drops.
+///
+/// `how` names how that thread is reached: a [`Wake`](windows_window::Wake) for a graph
+/// flushed from a window's pump, an [`Arc<Ring>`](crate::seam::Ring) for one flushed from a
+/// loop parked on a doorbell.
+pub(crate) fn arm_posts(how: impl Into<shared::PostWake>) -> shared::PostGuard {
+    shared::arm(with(|g| g.id), how.into())
 }
 
 /// Calls the waker, holding no borrow of either the graph or the waker slot while it runs.
@@ -603,16 +610,19 @@ fn run_effect(id: SignalId, f: &Rc<RefCell<dyn FnMut()>>) {
 ///
 /// A call made while a flush is running returns immediately, leaving the work to the
 /// running flush.
-pub fn flush() {
+pub fn flush() -> bool {
     if with(|g| core::mem::replace(&mut g.flushing, true)) {
         // A write from inside an effect appends to the queue the running flush picks up on
         // its next pass. Starting a second flush here would run effects out of creation
         // order.
-        return;
+        return false;
     }
 
+    // Whether a staged write landed or an effect ran: a host deciding whether the model is
+    // worth solving asks this rather than solving on every wake.
+    let mut worked = false;
     for pass in 0..MAX_PASSES {
-        apply_staged();
+        worked |= apply_staged();
 
         let empty = with(|g| {
             debug_assert!(g.running.is_empty());
@@ -627,6 +637,7 @@ pub fn flush() {
         if empty {
             break;
         }
+        worked = true;
 
         let mut i = 0;
         while let Some(id) = with(|g| g.running.get(i).copied()) {
@@ -673,12 +684,15 @@ pub fn flush() {
     }
 
     with(|g| g.flushing = false);
+    worked
 }
 
 /// Applies whatever producer threads staged, coalesced to at most one write per cell.
-fn apply_staged() {
+/// Returns whether anything was staged.
+fn apply_staged() -> bool {
     let (graph, mut staged) = with(|g| (g.id, core::mem::take(&mut g.staged)));
     shared::take(graph, &mut staged);
+    let any = !staged.is_empty();
     for (id, apply) in staged.drain(..) {
         let Some(value) = peek_source(id) else {
             continue;
@@ -691,6 +705,7 @@ fn apply_staged() {
     }
     // Back with its capacity, so a steady producer stages and drains without allocating.
     with(|g| g.staged = staged);
+    any
 }
 
 // ── scopes ──────────────────────────────────────────────────────────────────────

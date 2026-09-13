@@ -24,8 +24,8 @@
 
 use super::{Anchor, Kind, OverlayId, Overlays, Spec};
 use crate::build::{Host, View};
-use crate::input::FocusRing;
-use windows_scene::{ControlId, DelayId, Exit, HitFlags, HitTable};
+use crate::seam::FocusOp;
+use windows_scene::{ControlId, DelayId, Exit, HitFlags};
 
 /// How long a pointer must rest on a target before its description appears, in milliseconds.
 ///
@@ -99,12 +99,7 @@ impl Overlays {
     ///
     /// Nothing is opened from a crossing. The intermediate targets of one sweep are targets
     /// the pointer passed through, so the reveal is decided once in [`settle`](Self::settle).
-    pub(super) fn hovered(
-        &mut self,
-        to: Option<ControlId>,
-        hits: &HitTable,
-        focus: &mut FocusRing,
-    ) {
+    pub(super) fn hovered(&mut self, to: Option<ControlId>, focus: &mut Vec<FocusOp>) {
         // Recorded first and unconditionally, so the batch's last crossing is the one left
         // as the answer even when the pointer went away and came back inside the batch.
         self.dwell.settled = Settled::At(to);
@@ -118,7 +113,7 @@ impl Overlays {
         {
             return;
         }
-        self.close_stale_submenus(to, hits, focus);
+        self.close_stale_submenus(to, focus);
     }
 
     /// Resolves one tick's crossings into at most one reveal.
@@ -127,7 +122,7 @@ impl Overlays {
     /// pointer came to rest on is owed a delay or a description: answering a sweep across a
     /// strip of described controls per crossing would arm and tear down a delay for each,
     /// or mount and destroy a tooltip that was never on screen for a frame.
-    pub(super) fn settle(&mut self, focus: &mut FocusRing) {
+    pub(super) fn settle(&mut self, focus: &mut Vec<FocusOp>) {
         let Settled::At(to) = core::mem::take(&mut self.dwell.settled) else {
             return;
         };
@@ -188,19 +183,14 @@ impl Overlays {
 
     /// Closes any hover-opened overlay the pointer has left.
     ///
-    /// Containment is resolved through the hit array, which orders every overlay's entries
-    /// after that overlay's own blocker, so counting the blockers ahead of a target gives the
-    /// depth the target sits at. A control-to-overlay table stamped at mount would be stale
-    /// for any row a keyed list realized after its overlay opened.
+    /// Containment is resolved through the array the last solve built, which orders every
+    /// overlay's entries after that overlay's own blocker, so counting the blockers ahead of
+    /// a target gives the depth the target sits at. A control-to-overlay table stamped at
+    /// mount would be stale for any row a keyed list realized after its overlay opened.
     ///
     /// Returns before the scan unless a dwell-opened overlay is open, so the hover path pays
     /// for it only when one is.
-    fn close_stale_submenus(
-        &mut self,
-        to: Option<ControlId>,
-        hits: &HitTable,
-        focus: &mut FocusRing,
-    ) {
+    fn close_stale_submenus(&mut self, to: Option<ControlId>, focus: &mut Vec<FocusOp>) {
         // A hover-opened overlay that takes focus, which is a submenu and only a submenu. A
         // description is hover-opened too and is excluded by the focus test: leaving one
         // describable control for another swaps its content rather than closing it, and a
@@ -209,15 +199,17 @@ impl Overlays {
         if !self.open.iter().any(is_submenu) {
             return;
         }
-        let entries = hits.entries();
-        let at = to.and_then(|target| entries.iter().position(|entry| entry.id == target));
         // The depth the pointer is now inside: a blocker precedes its own overlay's entries,
         // so the count of blockers ahead of the target is how deep the target sits.
-        let inside = at.map_or(0, |at| {
-            entries[..at]
-                .iter()
-                .filter(|entry| entry.flags.contains(HitFlags::BLOCKER))
-                .count()
+        let inside = Host::with(|host| {
+            let entries = host.model.last_hits();
+            let at = to.and_then(|target| entries.iter().position(|entry| entry.id == target));
+            at.map_or(0, |at| {
+                entries[..at]
+                    .iter()
+                    .filter(|entry| entry.flags.contains(HitFlags::BLOCKER))
+                    .count()
+            })
         });
         // The first hover-opened overlay above that depth, and everything above it.
         //
@@ -233,7 +225,7 @@ impl Overlays {
 
     /// Opens whatever the pending dwell was waiting for. A `delay` that is not the pending
     /// one belongs to another requester and is ignored.
-    pub(super) fn dwell_elapsed(&mut self, delay: DelayId, focus: &mut FocusRing) {
+    pub(super) fn dwell_elapsed(&mut self, delay: DelayId, focus: &mut Vec<FocusOp>) {
         let Some((target, opens, pending)) = self.dwell.pending else {
             return;
         };
@@ -266,7 +258,7 @@ impl Overlays {
     ///
     /// The single exit for a description: a press, a leave, `Esc`, focus moving and a
     /// capture loss all route here.
-    pub(super) fn hide_tip(&mut self, focus: &mut FocusRing) {
+    pub(super) fn hide_tip(&mut self, focus: &mut Vec<FocusOp>) {
         // Clears a reveal this tick's crossings had not performed yet. A press arriving in
         // the same batch as the hover that reached the control means the pointer is being
         // used rather than rested on.
@@ -290,7 +282,7 @@ impl Overlays {
         target: ControlId,
         text: &crate::widget::TextSource,
         side: super::Side,
-        focus: &mut FocusRing,
+        focus: &mut Vec<FocusOp>,
     ) {
         // On the axis the side is on, so the gap separates the two boxes rather than sliding
         // the description along the control's own edge. `place` reverses it on a flip, so

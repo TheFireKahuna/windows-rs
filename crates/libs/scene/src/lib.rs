@@ -1,6 +1,6 @@
 #![doc = include_str!("../readme.md")]
 
-// ── app half · Send · no COM ────────────────────────────────────────────────────
+// ── app half · owned by the app thread · no COM ─────────────────────────────────
 mod env;
 mod hit_build;
 mod id;
@@ -14,7 +14,7 @@ mod sink;
 // ── both halves ─────────────────────────────────────────────────────────────────
 mod tree;
 
-// ── front half · !Send · owns every composition object ──────────────────────────
+// ── scene half · !Send · owns every composition object ──────────────────────────
 mod anim;
 mod apply;
 mod backdrop;
@@ -34,7 +34,9 @@ pub use backends::Backends;
 pub use cache::{BoxKey, Cache, Cell, Gen, GenMask, SolidKey};
 pub use census::{Audit, Census};
 pub use env::Env;
-pub use hit::{ContactKind, Hit, HitTable, scan};
+pub use hit::{
+    ContactKind, Hit, HitTable, ScrollOffsets, ShadowOffsets, pack_offset, scan, unpack_offset,
+};
 pub use hit_build::{
     ControlId, HitBuilder, HitDecl, HitEntry, HitFlags, NO_ENTRY, TOUCH_TARGET_DIPS,
     default_inflation,
@@ -70,7 +72,6 @@ use windows_composition::{
     VisualInteractionSource,
 };
 use windows_numerics::{Vector2, Vector3};
-use windows_window::{Wake, Window};
 
 /// Carries what the front half reports upward.
 ///
@@ -109,11 +110,11 @@ pub enum SceneEvent {
     /// [`TrackerValues`](Self::TrackerValues); re-applying it moves the tracker twice once
     /// the manipulation ends.
     RequestIgnored { tracker: Id<Tracker>, request: i32 },
-    /// Reports that a timed reveal reached its deadline, such as a submenu's hover-open or
-    /// a tooltip's show.
+    /// Reports that a timed reveal has run, such as a submenu's hover-open or a tooltip's
+    /// show.
     ///
-    /// Raised on the first frame at or past the deadline; no timer fires, because the
-    /// deadline is compared while the scene is already awake. A cancelled delay is never
+    /// Raised from the completion of the delay's own compositor animation, so nothing on
+    /// this thread measures the wait and no timer fires. A cancelled delay is never
     /// reported.
     DelayElapsed { delay: DelayId },
     /// Reports that the device was lost and everything under it has been rebuilt.
@@ -183,9 +184,6 @@ pub struct Scene {
     pub(crate) trackers: Slots<Tracker, TrackerState>,
     pub(crate) hits: HitTable,
     events: EventQueue,
-    /// Held, unlike the [`Backends`] and the [`Env`], because an exit animation's `Tick`
-    /// outlives the call that started it.
-    pub(crate) wake: Wake,
     pub(crate) census: Census,
     /// Channels [`retarget`](Scene::retarget) has claimed for the front thread.
     ///
@@ -199,30 +197,25 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// Builds a scene hosted on `window`, drawn with `back`.
+    /// Brings up the retained tree for a window another thread owns.
     ///
-    /// `back` is borrowed to mint the target, the root and the backdrop, and is not stored:
-    /// every later operation states it again. `wake` is the window's own frame clock, which
-    /// exit animations hold open while they play. `env` paints the backdrop, whose colours
-    /// are the display's, before the window is shown; nothing caches it, and
-    /// [`apply`](Self::apply) states it again.
-    ///
-    /// The calling thread must pump `window`'s messages: every tracker callback lands there,
-    /// and that is where changes publish.
+    /// The thread calling this owns the compositor in `back` and every object created here,
+    /// and it is the thread every later call on the scene must come from. The window's own
+    /// thread keeps the pump and the input; the token names the window to the target and
+    /// nothing else.
     ///
     /// # Errors
     ///
-    /// Fails when the compositor cannot mint the window target or the backdrop's surfaces.
-    pub fn new(
-        window: &Window,
+    /// The window target or the backdrop could not be created.
+    pub fn new_at(
+        window: windows_window::Hwnd,
         back: &Backends,
-        wake: Wake,
         env: Env,
         backdrop: BackdropSpec,
     ) -> Result<Self> {
         let target = back
             .compositor
-            .create_desktop_window_target(window, false)?;
+            .create_desktop_window_target_for(window, false)?;
         let motion = Motion::new(&back.compositor);
 
         let root_visual = back.compositor.create_container_visual();
@@ -272,7 +265,6 @@ impl Scene {
             trackers: Slots::default(),
             hits: HitTable::default(),
             events: Rc::new(RefCell::new(Events::default())),
-            wake,
             census: Census::default(),
             #[cfg(debug_assertions)]
             front_owned: rustc_hash::FxHashSet::default(),
@@ -351,21 +343,10 @@ impl Scene {
         // a tracker position twice is not idempotent, so only the range appended here is
         // reconciled.
         let appended = out.len();
-        // Delays that came due. Swept here rather than in `apply`, because the tick a delay
-        // lands on may carry no patch at all. Each expiry drops its own `Tick`, so the frame
-        // clock parks when the last one expires. The clock is read once per sweep and only
-        // while a delay is pending, so two delays due together report on the same frame.
-        if !self.motion.delays.is_empty() {
-            let now = std::time::Instant::now();
-            self.motion.delays.retain(|delay| {
-                let elapsed = delay.elapsed(now);
-                if elapsed {
-                    out.push(SceneEvent::DelayElapsed { delay: delay.id });
-                }
-                !elapsed
-            });
-        }
         self.events.borrow_mut().drain(out);
+        // Released after the drain, because the report that retires a delay is an event its
+        // own completion pushed.
+        self.motion.retire_delays();
         for event in &out[appended..] {
             match *event {
                 SceneEvent::TrackerValues {
@@ -431,7 +412,7 @@ impl Scene {
             self.rescale_regions(env);
             self.events
                 .borrow_mut()
-                .push(SceneEvent::ScaleChanged { scale: env.scale() }, &self.wake);
+                .push(SceneEvent::ScaleChanged { scale: env.scale() });
         }
         // The backdrop is outside the cell cache, so no generation reaches it: the same
         // authored light lands on a different display as a different value, and only a
@@ -461,7 +442,7 @@ impl Scene {
         self.refresh(back, env)?;
         self.events
             .borrow_mut()
-            .push(SceneEvent::DeviceRebuilt, &self.wake);
+            .push(SceneEvent::DeviceRebuilt);
         Ok(())
     }
 
@@ -600,12 +581,9 @@ impl Scene {
 
         let tracker = if owned {
             let queue = Rc::clone(&self.events);
-            let wake = self.wake.clone();
             back.compositor
                 .create_interaction_tracker_with_owner(move |event| {
-                    queue
-                        .borrow_mut()
-                        .push(tracker::translate(id, event), &wake);
+                    queue.borrow_mut().push(tracker::translate(id, event));
                 })?
         } else {
             back.compositor.create_interaction_tracker()?

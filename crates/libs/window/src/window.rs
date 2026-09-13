@@ -649,7 +649,7 @@ impl WindowBuilder {
         register_class()?;
         // Before the window: `DisplayInformation::GetForWindow` requires a dispatcher queue
         // on the calling thread, and so does a system compositor.
-        ensure_dispatcher_queue()?;
+        ensure_dispatcher_queue(Apartment::Existing)?;
 
         let mut style = WS_OVERLAPPEDWINDOW as u32;
         if !self.resizable {
@@ -893,11 +893,27 @@ const _: () = assert!(
     "a droppable QUEUE registers a thread-local destructor that fail-fasts at process exit"
 );
 
+/// Which apartment a thread's dispatcher queue is created in.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Apartment {
+    /// The queue joins the apartment the thread already has: a window's thread, whose
+    /// apartment the application chose before it had a window to create.
+    Existing,
+    /// The queue initializes an application single-threaded apartment for the thread: a
+    /// thread made for a compositor and nothing else, which has no apartment yet.
+    Asta,
+}
+
 /// Ensures the calling thread has a dispatcher queue, minting one only if it has none.
 ///
 /// A second controller on one thread fails, and the queue a `Compositor` or a
-/// `DisplayInformation` finds is whichever the thread already has.
-fn ensure_dispatcher_queue() -> Result<()> {
+/// `DisplayInformation` finds is whichever the thread already has. The controller is kept
+/// for the thread's life and never released, for the reason on `QUEUE`.
+///
+/// # Errors
+///
+/// The controller could not be created.
+pub fn ensure_dispatcher_queue(apartment: Apartment) -> Result<()> {
     QUEUE.with(|queue| {
         if queue.get().is_some() {
             return Ok(());
@@ -908,9 +924,10 @@ fn ensure_dispatcher_queue() -> Result<()> {
             let options = DispatcherQueueOptions {
                 dwSize: size_of::<DispatcherQueueOptions>() as u32,
                 threadType: DQTYPE_THREAD_CURRENT,
-                // The queue joins this thread's existing apartment, which the application has
-                // already chosen by the time it has a window to create.
-                apartmentType: DQTAT_COM_NONE,
+                apartmentType: match apartment {
+                    Apartment::Existing => DQTAT_COM_NONE,
+                    Apartment::Asta => DQTAT_COM_ASTA,
+                },
             };
             // SAFETY: the options are a stack local of the stated size and so is the
             // out-parameter; ownership of the controller transfers on success.

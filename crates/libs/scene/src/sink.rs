@@ -68,9 +68,8 @@ pub type RegionId = Id<Region>;
 
 /// A pending timed reveal, such as a submenu's hover-open or a tooltip's show.
 ///
-/// A delay is a monotonic deadline compared on a frame the scene is already servicing:
-/// nothing fires and nothing wakes. Its cost is the frame-clock request held open for its
-/// duration.
+/// A delay is a compositor animation with that much lead inside a scoped batch, and the
+/// batch completing is the report. No thread holds a clock for it.
 pub type DelayId = Id<Delay>;
 
 /// A node that paints. The newtype is the enforcement: a paint addressed to a group is a type

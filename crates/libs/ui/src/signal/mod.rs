@@ -30,10 +30,11 @@
 //!
 //! # Threads
 //!
-//! The graph belongs to the app thread. [`Cell`] is `Send` when its value is, so a producer
-//! may hold one and call [`Cell::post`]. `Cell` is not `Sync`, and [`Memo`] and [`Effect`]
-//! are neither, so a handle cannot reach a graph on another thread by being shared into a
-//! closure.
+//! The graph belongs to the thread that flushes it. [`Cell`] is `Send` when its value is, so
+//! a producer may hold one and call [`Cell::post`] from anywhere: the write is staged and
+//! that thread is rung, and the write lands at the top of its next flush. `Cell` is not
+//! `Sync`, and [`Memo`] and [`Effect`] are neither, so a handle cannot reach a graph on
+//! another thread by being shared into a closure.
 
 mod epoch;
 mod graph;
@@ -44,6 +45,7 @@ mod tests;
 pub use epoch::Epoch;
 pub use graph::{SignalId, flush, live_nodes, set_waker, untracked};
 pub(crate) use graph::arm_posts;
+pub(crate) use shared::{PostGuard, PostWake};
 
 use core::any::Any;
 use core::cell::RefCell;

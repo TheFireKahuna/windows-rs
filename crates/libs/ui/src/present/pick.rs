@@ -30,9 +30,85 @@
 use windows_present::{Part, SubId};
 use windows_scene::{ControlId, HitTable};
 
-use crate::build::Host;
 use crate::input::Report;
+use crate::seam::RegionPick;
+#[cfg(test)]
+use crate::seam::RegionOp;
 use crate::widget::{Intent, What};
+
+/// One region the pointer can be picked inside, with the part copy this side scans.
+pub(crate) struct PickRow {
+    pub pick: RegionPick,
+    pub picked: Picked,
+}
+
+/// Every region the pointer can be picked inside, as the thread routing a contact holds them.
+///
+/// Kept beside the table the compositor half holds rather than inside it: the part copy is
+/// this side's scratch, and one copy of it is one answer to which part the pointer is on.
+#[derive(Default)]
+pub(crate) struct Picks {
+    rows: Vec<PickRow>,
+}
+
+impl Picks {
+    /// Applies one batch of region edits, in the order the app half emitted them.
+    ///
+    /// A region declared with no hit entry is not inserted: nothing can be picked inside a
+    /// surface the pointer cannot reach.
+    #[cfg(test)]
+    pub(crate) fn apply(&mut self, ops: &[RegionOp]) {
+        for op in ops {
+            match *op {
+                RegionOp::Mount {
+                    key,
+                    control: Some(control),
+                    ref live,
+                    ..
+                } => self.rows.push(PickRow {
+                    pick: RegionPick {
+                        key,
+                        control,
+                        live: live.clone(),
+                    },
+                    picked: Picked::new(),
+                }),
+                RegionOp::Mount { .. } | RegionOp::Resize { .. } => {}
+                RegionOp::Drop { key } => self.rows.retain(|row| row.pick.key != key),
+            }
+        }
+    }
+
+    /// Makes the table hold exactly `picks`: rows whose region is gone are removed, new
+    /// regions are added, and a region already held keeps the part copy it has scanned.
+    pub(crate) fn sync(&mut self, picks: &[RegionPick]) {
+        self.rows
+            .retain(|row| picks.iter().any(|pick| pick.key == row.pick.key));
+        for pick in picks {
+            if !self.rows.iter().any(|row| row.pick.key == pick.key) {
+                self.rows.push(PickRow {
+                    pick: pick.clone(),
+                    picked: Picked::new(),
+                });
+            }
+        }
+    }
+
+    /// Returns how many regions the pointer can be picked inside.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Returns the row the control `id` names, or `None` where that control is not a region.
+    ///
+    /// A miss is the common case — most reports name an ordinary control — so this is a scan
+    /// of a table a settled layout keeps under eight rows long, and it runs only for the
+    /// pointer reports [`pick`] acts on.
+    fn of(&mut self, id: ControlId) -> Option<&mut PickRow> {
+        self.rows.iter_mut().find(|row| row.pick.control == id)
+    }
+}
 
 /// A region's own copy of the published part geometry, and the version it holds.
 ///
@@ -40,7 +116,7 @@ use crate::widget::{Intent, What};
 /// every frame, and a copy that reached its high-water mark once allocates nothing after
 /// that.
 #[derive(Default)]
-pub struct Picked {
+pub(crate) struct Picked {
     /// The version [`parts`](Self::parts) was copied at. [`u64::MAX`] until the first copy,
     /// which is a version a publish counter cannot reach, so a renderer that published
     /// before this side ever looked is copied rather than skipped.
@@ -51,7 +127,7 @@ pub struct Picked {
 impl Picked {
     /// Creates a copy holding nothing, at a version no publish can have produced.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             seen: u64::MAX,
             parts: Vec::new(),
@@ -89,7 +165,7 @@ impl Picked {
 /// `out` receives one intent per part a gesture finished on, which is how the application
 /// learns what was edited. Nothing is queued for a hover: a hover changes pixels and no
 /// document, and an intent per pointer sample would put the app thread on the frame clock.
-pub fn pick(reports: &[Report], hits: &HitTable, out: &mut Vec<Intent>) {
+pub(crate) fn pick(reports: &[Report], hits: &HitTable, picks: &mut Picks, out: &mut Vec<Intent>) {
     for report in reports {
         match *report {
             // Both edges, in one pass. Leaving the region clears its hover, and a fast flick
@@ -97,22 +173,22 @@ pub fn pick(reports: &[Report], hits: &HitTable, out: &mut Vec<Intent>) {
             // arrive in the order the pointer crossed them.
             Report::HoverChanged { from, to, at, .. } => {
                 if let Some(from) = from {
-                    clear_hover(from);
+                    clear_hover(picks, from);
                 }
                 if let Some(to) = to {
-                    hover(to, (at.x, at.y), hits);
+                    hover(picks, to, (at.x, at.y), hits);
                 }
             }
             Report::Moved {
                 target, ref sample, ..
-            } => hover(target, (sample.raw.x, sample.raw.y), hits),
+            } => hover(picks, target, (sample.raw.x, sample.raw.y), hits),
             Report::Pressed {
                 target, ref sample, ..
-            } => press(target, (sample.raw.x, sample.raw.y), hits),
+            } => press(picks, target, (sample.raw.x, sample.raw.y), hits),
             // A release commits: the part under the contact stops being active, and the
             // application is told which part the gesture finished on.
             Report::Released { target, at, .. } => {
-                if let Some(sub) = release(target, (at.x, at.y), hits) {
+                if let Some(sub) = release(picks, target, (at.x, at.y), hits) {
                     out.push(Intent {
                         target,
                         what: What::Committed(f64::from(sub.0)),
@@ -122,10 +198,10 @@ pub fn pick(reports: &[Report], hits: &HitTable, out: &mut Vec<Intent>) {
             // A cancel restores and commits nothing, so it clears the active part and queues
             // no intent — the same contract a slider's canceled drag has.
             Report::Canceled { target, .. } => {
-                with_region(target, |row| {
-                    row.live.input.set_active(None);
-                    row.live.epoch.bump();
-                });
+                if let Some(row) = picks.of(target) {
+                    row.pick.live.input.set_active(None);
+                    row.pick.live.epoch.bump();
+                }
             }
             _ => {}
         }
@@ -133,62 +209,49 @@ pub fn pick(reports: &[Report], hits: &HitTable, out: &mut Vec<Intent>) {
 }
 
 /// Publishes the hovered part and the cursor for the region `id` names.
-fn hover(id: ControlId, at: (f32, f32), hits: &HitTable) {
-    with_region(id, |row| {
-        let Some(local) = local_of(id, at, hits) else {
-            return;
-        };
-        let sub = row.picked.at(&row.live.parts, local);
-        row.live.input.set_hover(sub);
-        row.live.input.set_cursor(Some(local));
-        row.live.epoch.bump();
-    });
+fn hover(picks: &mut Picks, id: ControlId, at: (f32, f32), hits: &HitTable) {
+    let Some(local) = local_of(id, at, hits) else {
+        return;
+    };
+    let Some(row) = picks.of(id) else { return };
+    let sub = row.picked.at(&row.pick.live.parts, local);
+    row.pick.live.input.set_hover(sub);
+    row.pick.live.input.set_cursor(Some(local));
+    row.pick.live.epoch.bump();
 }
 
 /// Clears the hover and the cursor for the region `id` names.
 ///
 /// The cursor goes with the hover: a readout drawn at the last position the pointer held
 /// while it is somewhere else entirely states a measurement that is not being taken.
-fn clear_hover(id: ControlId) {
-    with_region(id, |row| {
-        row.live.input.set_hover(None);
-        row.live.input.set_cursor(None);
-        row.live.epoch.bump();
-    });
+fn clear_hover(picks: &mut Picks, id: ControlId) {
+    if let Some(row) = picks.of(id) {
+        row.pick.live.input.set_hover(None);
+        row.pick.live.input.set_cursor(None);
+        row.pick.live.epoch.bump();
+    }
 }
 
 /// Publishes the part an in-flight gesture is on.
-fn press(id: ControlId, at: (f32, f32), hits: &HitTable) {
-    with_region(id, |row| {
-        let Some(local) = local_of(id, at, hits) else {
-            return;
-        };
-        let sub = row.picked.at(&row.live.parts, local);
-        row.live.input.set_active(sub);
-        row.live.input.set_cursor(Some(local));
-        row.live.epoch.bump();
-    });
+fn press(picks: &mut Picks, id: ControlId, at: (f32, f32), hits: &HitTable) {
+    let Some(local) = local_of(id, at, hits) else {
+        return;
+    };
+    let Some(row) = picks.of(id) else { return };
+    let sub = row.picked.at(&row.pick.live.parts, local);
+    row.pick.live.input.set_active(sub);
+    row.pick.live.input.set_cursor(Some(local));
+    row.pick.live.epoch.bump();
 }
 
 /// Clears the active part and returns the one the gesture finished on.
-fn release(id: ControlId, at: (f32, f32), hits: &HitTable) -> Option<SubId> {
-    with_region(id, |row| {
-        let local = local_of(id, at, hits)?;
-        let sub = row.picked.at(&row.live.parts, local);
-        row.live.input.set_active(None);
-        row.live.epoch.bump();
-        sub
-    })
-    .flatten()
-}
-
-/// Runs `f` against the region the control `id` names, if that control is one.
-///
-/// A miss is the common case — most reports name an ordinary control — so this is a scan of
-/// a table a settled layout keeps under eight rows long, and it runs only for the pointer
-/// reports above.
-fn with_region<R>(id: ControlId, f: impl FnOnce(&mut super::RegionRow) -> R) -> Option<R> {
-    Host::with(|h| h.region_of(id).map(f))
+fn release(picks: &mut Picks, id: ControlId, at: (f32, f32), hits: &HitTable) -> Option<SubId> {
+    let local = local_of(id, at, hits)?;
+    let row = picks.of(id)?;
+    let sub = row.picked.at(&row.pick.live.parts, local);
+    row.pick.live.input.set_active(None);
+    row.pick.live.epoch.bump();
+    sub
 }
 
 /// Converts a client-DIP point into the region's own space.

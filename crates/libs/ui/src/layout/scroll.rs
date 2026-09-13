@@ -13,16 +13,18 @@ use crate::build::{Any, El, Host, IntoChildren, View};
 use crate::gesture::{Commit, DragAxes, DragDecl, DragPhase, GestureDecl};
 use crate::input::Report;
 use crate::role::Metric;
+use crate::seam::{ScrollFront, ScrollOp};
 use crate::signal::{Cell, Memo};
 use crate::widget::Front;
 use core::cell::RefCell;
 use core::ops::Range;
+use core::sync::atomic::Ordering;
 use std::rc::Rc;
 use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
     Anim, Bind, ControlId, GroupId, HitDecl, HitFlags, NodeId, Prop, SceneEvent, SpriteId,
-    TrackerRequest, Tuning, Value,
+    TrackerRequest, Tuning, Value, unpack_offset,
 };
 
 use super::Preset;
@@ -561,8 +563,8 @@ where
 
 // ── the front thread's half ──────────────────────────────────────────────────────
 
-/// One scroll container, as the tick needs it. Held by the host beside the mount that owns
-/// the tracker, so a container unmounting takes its row with it.
+/// One scroll container, as the app half needs it. Held by the host beside the mount that
+/// owns the tracker, so a container unmounting takes its row with it.
 pub(crate) struct ScrollRow {
     pub tracker: windows_scene::TrackerId<windows_scene::Observed>,
     pub viewport: NodeId,
@@ -578,10 +580,94 @@ pub(crate) struct ScrollRow {
     pub state: ScrollState,
     /// What was last published, so a solve that moved nothing emits nothing.
     pub last: ThumbGeom,
+    /// Whether the half that moves the thumb has been told this container exists.
+    pub front_added: bool,
+}
+
+// ── the table the thumb is moved from ────────────────────────────────────────────
+
+/// One scroll container, as the half that moves its thumb holds it.
+struct ScrollLive {
+    front: ScrollFront,
     /// Where the content stood when the current thumb grab began.
-    pub grabbed_at: Option<f32>,
+    grabbed_at: Option<f32>,
     /// What the thumb's opacity was last retargeted to, so an unchanged reason emits nothing.
-    pub shown: bool,
+    shown: bool,
+}
+
+/// Every scroll container, as the half that moves thumbs holds them.
+///
+/// Built from the edits the app half emits and never from its tables, so a reveal and a grab
+/// cost a scan of a handful of rows and no hop.
+#[derive(Default)]
+pub(crate) struct ScrollTable {
+    rows: Vec<ScrollLive>,
+}
+
+impl ScrollTable {
+    /// Applies one batch of container edits, in the order the app half emitted them.
+    ///
+    /// A thumb declared [`Reveal::Always`] is opaque from its mount, so its row starts shown
+    /// and the first edge that would show it again emits nothing.
+    pub(crate) fn apply_ops(&mut self, ops: &mut Vec<ScrollOp>) {
+        for op in ops.drain(..) {
+            match op {
+                ScrollOp::Add(front) => {
+                    let shown = front.reveal == Reveal::Always;
+                    self.rows.push(ScrollLive {
+                        front,
+                        grabbed_at: None,
+                        shown,
+                    });
+                }
+                ScrollOp::Geom { id, geom } => {
+                    if let Some(row) = self.rows.iter_mut().find(|row| row.front.id == id) {
+                        row.front.last = geom;
+                    }
+                }
+                ScrollOp::Drop(id) => self.rows.retain(|row| row.front.id != id),
+            }
+        }
+    }
+
+    /// Returns how many containers the table holds.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Returns the first container's thumb geometry, which is what a grab maps through.
+    #[cfg(test)]
+    fn geom_of_first(&self) -> Option<ThumbGeom> {
+        self.rows.first().map(|row| row.front.last)
+    }
+
+    /// Runs `f` against the first container `pick` accepts.
+    ///
+    /// A linear scan rather than a map: a screen has a handful of scroll surfaces, and this
+    /// is walked from every tracker report of every fling.
+    fn where_(&mut self, pick: impl Fn(&ScrollFront) -> bool, f: impl FnOnce(&mut ScrollLive)) {
+        if let Some(row) = self.rows.iter_mut().find(|row| pick(&row.front)) {
+            f(row);
+        }
+    }
+}
+
+impl ScrollRow {
+    /// Returns what the half that moves this container's thumb needs of it.
+    ///
+    /// `id` is the row's own, which is the name every later edit to this container carries.
+    pub(crate) fn describe(&self, id: crate::build::ScrollId) -> ScrollFront {
+        ScrollFront {
+            id,
+            tracker: self.tracker,
+            thumb: self.thumb,
+            control: self.control,
+            grab: self.grab,
+            reveal: self.reveal,
+            last: self.last,
+        }
+    }
 }
 
 /// Records what the trackers reported into each container's [`ScrollState`].
@@ -622,53 +708,65 @@ pub fn observe(events: &[SceneEvent]) {
 ///
 /// The compositor refused a retarget or a tracker request. The first failure is returned;
 /// the rest of the tick still runs.
-pub fn front(events: &[SceneEvent], reports: &[Report], front: &mut Front<'_>) -> Result<()> {
+pub(crate) fn front(
+    events: &[SceneEvent],
+    reports: &[Report],
+    table: &mut ScrollTable,
+    front: &mut Front<'_>,
+) -> Result<()> {
     if events.is_empty() && reports.is_empty() {
         return Ok(());
     }
     // The first failure is kept and the rest of the tick still runs: a refused retarget on
     // one surface must not leave another's grab half-applied.
     let mut failed: Option<windows_core::Error> = None;
-    Host::with(|host| {
-        for event in events {
-            let (tracker, moving) = match *event {
-                SceneEvent::TrackerPhase { tracker, phase } => {
-                    (tracker, phase != windows_scene::Phase::Idle)
-                }
-                _ => continue,
-            };
-            host.scroll_by_tracker(tracker, |row| {
+    for event in events {
+        let (tracker, moving) = match *event {
+            SceneEvent::TrackerPhase { tracker, phase } => {
+                (tracker, phase != windows_scene::Phase::Idle)
+            }
+            _ => continue,
+        };
+        table.where_(
+            |row| row.tracker.id() == tracker,
+            |row| {
                 if let Err(error) = reveal(row, moving, front) {
                     failed.get_or_insert(error);
                 }
-            });
-        }
-        for report in reports {
-            match *report {
-                Report::HoverChanged { from, to, .. } => {
-                    for (id, over) in [(from, false), (to, true)] {
-                        let Some(id) = id else { continue };
-                        host.scroll_by_control(id, |row| {
+            },
+        );
+    }
+    for report in reports {
+        match *report {
+            Report::HoverChanged { from, to, .. } => {
+                for (id, over) in [(from, false), (to, true)] {
+                    let Some(id) = id else { continue };
+                    table.where_(
+                        |row| row.control == Some(id),
+                        |row| {
                             if let Err(error) = reveal(row, over, front) {
                                 failed.get_or_insert(error);
                             }
-                        });
-                    }
+                        },
+                    );
                 }
-                Report::Dragged { target, update, .. } => host.scroll_by_grab(target, |row| {
+            }
+            Report::Dragged { target, update, .. } => table.where_(
+                |row| row.grab == Some(target),
+                |row| {
                     if let Err(error) = drag(row, update.phase, update.delta.y, front) {
                         failed.get_or_insert(error);
                     }
-                }),
-                // A released or cancelled grab forgets where it started, so the next one
-                // measures from where the content actually is.
-                Report::Released { target, .. } | Report::Canceled { target, .. } => {
-                    host.scroll_by_grab(target, |row| row.grabbed_at = None);
-                }
-                _ => {}
+                },
+            ),
+            // A released or cancelled grab forgets where it started, so the next one
+            // measures from where the content actually is.
+            Report::Released { target, .. } | Report::Canceled { target, .. } => {
+                table.where_(|row| row.grab == Some(target), |row| row.grabbed_at = None);
             }
+            _ => {}
         }
-    });
+    }
     failed.map_or(Ok(()), Err)
 }
 
@@ -676,14 +774,14 @@ pub fn front(events: &[SceneEvent], reports: &[Report], front: &mut Front<'_>) -
 ///
 /// Only [`Reveal::OnDemand`] retargets, and only on an edge: `Always` is opaque from the
 /// mount and `Never` has no thumb, so neither reaches the compositor here.
-fn reveal(row: &mut ScrollRow, show: bool, front: &mut Front<'_>) -> Result<()> {
-    let Some(thumb) = row.thumb else {
+fn reveal(row: &mut ScrollLive, show: bool, front: &mut Front<'_>) -> Result<()> {
+    let Some(thumb) = row.front.thumb else {
         return Ok(());
     };
     // A grabbed thumb stays lit however the pointer wanders, and a moving one stays lit
     // whatever the pointer is doing.
     let show = show || row.grabbed_at.is_some();
-    if row.reveal != Reveal::OnDemand || show == row.shown {
+    if row.front.reveal != Reveal::OnDemand || show == row.shown {
         return Ok(());
     }
     row.shown = show;
@@ -706,16 +804,33 @@ fn reveal(row: &mut ScrollRow, show: bool, front: &mut Front<'_>) -> Result<()> 
 /// The displacement is from the contact's origin, so the content position is resolved from
 /// where it stood when the grab began rather than accumulated — a dropped sample then costs
 /// nothing, where an accumulated one would drift for the rest of the drag.
-fn drag(row: &mut ScrollRow, phase: DragPhase, dy: f32, front: &mut Front<'_>) -> Result<()> {
+///
+/// The origin is read from the tracker's published word rather than from the container's
+/// signal, which is the app half's. A tracker with no word is one the compositor has not
+/// created, and it has nothing to be dragged from.
+fn drag(row: &mut ScrollLive, phase: DragPhase, dy: f32, front: &mut Front<'_>) -> Result<()> {
     if phase == DragPhase::Undecided {
         return Ok(());
     }
-    let from = *row.grabbed_at.get_or_insert_with(|| row.state.offset());
-    let thumb_y = thumb_y_for_scroll(from, row.last) + dy;
-    let to = scroll_for_thumb_y(thumb_y, row.last);
+    let from = if let Some(from) = row.grabbed_at {
+        from
+    } else {
+        let Some(shadow) = front.scene.tracker_shadow(row.front.tracker) else {
+            return Ok(());
+        };
+        // acquire: pairs with the release store the scene makes when it records a reported
+        // position, so both halves of the word read here are that one report's.
+        let (_, y) = unpack_offset(shadow.load(Ordering::Acquire));
+        *row.grabbed_at.insert(y)
+    };
+    let thumb_y = thumb_y_for_scroll(from, row.front.last) + dy;
+    let to = scroll_for_thumb_y(thumb_y, row.front.last);
     front
         .scene
-        .request(row.tracker, TrackerRequest::To(Vector2 { x: 0.0, y: to }))
+        .request(
+            row.front.tracker,
+            TrackerRequest::To(Vector2 { x: 0.0, y: to }),
+        )
         .map(|_| ())
 }
 
@@ -752,6 +867,96 @@ pub(crate) fn grab_hit(id: ControlId) -> HitDecl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::build::{mount, tests::fixture};
+    use crate::layout::Len;
+
+    /// A container reaches the table that moves its thumb once, and leaves it when it
+    /// unmounts.
+    ///
+    /// The add is emitted before the geometry gate, so a container whose content fits is in
+    /// the table too: its thumb still has a reveal, and a row that never arrived would leave
+    /// every hover over that surface acting on nothing.
+    #[test]
+    fn a_container_is_added_once_and_dropped_when_it_unmounts() {
+        let mut patch = fixture();
+        let mut down = crate::seam::Down::default();
+        let mut table = ScrollTable::default();
+
+        let held = mount(
+            scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
+            Host::with(|h| h.model().root()),
+        );
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        assert!(
+            down.scrolls
+                .iter()
+                .filter(|op| matches!(op, ScrollOp::Add(_)))
+                .count()
+                == 1,
+            "a container was added other than once"
+        );
+        table.apply_ops(&mut down.scrolls);
+        assert_eq!(table.len(), 1);
+
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        table.apply_ops(&mut down.scrolls);
+        assert_eq!(table.len(), 1, "a settled container was added twice");
+
+        drop(held);
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        table.apply_ops(&mut down.scrolls);
+        assert_eq!(table.len(), 0, "the unmounted container kept its row");
+    }
+
+    /// A container whose extents moved emits the new thumb geometry, and the table takes it.
+    #[test]
+    fn a_moved_extent_emits_the_geometry_the_table_grabs_against() {
+        let mut patch = fixture();
+        let mut down = crate::seam::Down::default();
+        let mut table = ScrollTable::default();
+
+        let _held = mount(
+            scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
+            Host::with(|h| h.model().root()),
+        );
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        table.apply_ops(&mut down.scrolls);
+        let first = table.geom_of_first().expect("one container");
+        assert!(
+            first.overflow,
+            "4000 DIP of content in a window that is not"
+        );
+
+        Host::with(|h| h.set_window(Vector2 { x: 400.0, y: 200.0 }));
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        assert!(
+            down.scrolls
+                .iter()
+                .any(|op| matches!(op, ScrollOp::Geom { .. })),
+            "a shorter viewport moved no thumb geometry"
+        );
+        table.apply_ops(&mut down.scrolls);
+        assert_ne!(
+            table.geom_of_first().expect("one container"),
+            first,
+            "the table kept the geometry the old viewport gave it"
+        );
+    }
 
     const SPEC: ListSpec = ListSpec {
         count: 100,

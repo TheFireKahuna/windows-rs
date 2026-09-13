@@ -1,7 +1,7 @@
 //! The frame pacer: a thread that posts [`WM_FRAME`] to one window once per composition
 //! frame, for as long as at least one [`Tick`] is held and the window can be seen.
 
-use crate::Window;
+use crate::{Hwnd, Window};
 use crate::bindings::*;
 use crate::clock::{self, Observed};
 use crate::event::{Event, wait_any};
@@ -205,10 +205,14 @@ impl Window {
             return Err(Error::new(E_HANDLE, "the window already has a pacer"));
         }
         let worker = Arc::clone(&inner);
-        let target = Target(self.hwnd());
+        // The handle outlives the thread because `Pacer` borrows the window and joins on drop.
+        // It can still name a *destroyed* window — `WM_DESTROY` parks the pacer, but a wait
+        // that returned a frame just before it is already past the check — so the post below
+        // is allowed to fail.
+        let target = self.handle();
         let thread = std::thread::Builder::new()
             .name("frame-pacer".into())
-            .spawn(move || run(&worker, &target))
+            .spawn(move || run(&worker, target))
             .inspect_err(|_| self.release_frame_gate())
             .map_err(|e| Error::new(E_FAIL, e.to_string()))?;
         Ok(Pacer {
@@ -258,18 +262,7 @@ impl core::fmt::Debug for Pacer<'_> {
     }
 }
 
-/// The window handle, moved into the pacer thread. Never dereferenced here — it is an
-/// opaque token `PostMessageW` resolves itself.
-struct Target(*mut core::ffi::c_void);
-
-// SAFETY: `PostMessageW` is callable from any thread, and the handle outlives this thread
-// because `Pacer` borrows the window and joins on drop. It can still name a *destroyed*
-// window — `WM_DESTROY` parks the pacer, but a wait that returned a frame just before it is
-// already past the check — so the post is allowed to fail and nothing is read back through it.
-unsafe impl Send for Target {}
-unsafe impl Sync for Target {}
-
-fn run(s: &Arc<Clock>, target: &Target) {
+fn run(s: &Arc<Clock>, target: Hwnd) {
     // The display's half of whether anything can be seen. Latched by the clock's own occluded
     // return and cleared by one probe after an edge: only the clock reports the display
     // coming back.
@@ -323,16 +316,10 @@ fn run(s: &Arc<Clock>, target: &Target) {
 
         // One message in flight: if one is pending the pump has not reached it yet, and a
         // second would only make it do the same work twice.
-        if !s.posted.swap(true, Ordering::AcqRel) {
-            // SAFETY: `Pacer` borrows the window and joins this thread on drop, so the handle
-            // value is still this window's for the whole call, and `PostMessageW` is callable
-            // from any thread. A post to a window already destroyed fails and is handled below.
-            let posted = unsafe { PostMessageW(target.0, WM_FRAME, 0, 0) };
-            if !posted.as_bool() {
-                // A full queue, or a window already gone. The gate re-opens: left closed, it
-                // would stop the pacer posting for the rest of its life.
-                s.posted.store(false, Ordering::Release);
-            }
+        if !s.posted.swap(true, Ordering::AcqRel) && !target.post(WM_FRAME, 0, 0) {
+            // A full queue, or a window already gone. The gate re-opens: left closed, it
+            // would stop the pacer posting for the rest of its life.
+            s.posted.store(false, Ordering::Release);
         }
     }
 }

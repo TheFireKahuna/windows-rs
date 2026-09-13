@@ -8,7 +8,7 @@
 //! Nothing here holds a composition object: the types are ids, plain values and spans.
 
 use crate::env::Env;
-use crate::hit_build::{HitBuilder, HitDecl};
+use crate::hit_build::{HitBuilder, HitDecl, HitEntry};
 use crate::id::{Id, Ids};
 use crate::layout::{LayoutKind, LayoutTree, Measure, MeasureCtx, Restyle, Solved};
 use crate::patch::{Attach, Op, SinkPatch, Span};
@@ -55,6 +55,12 @@ pub struct Model {
     scratch: Vec<NodeId>,
     /// Slot roots, in the order they opened. They occupy the end of the hit array.
     slots: Vec<SlotRootEntry>,
+    /// The array the last hit rebuild emitted, kept after the patch carrying it is handed
+    /// over.
+    ///
+    /// The capacity is kept across rebuilds, so it allocates only while the array is still
+    /// growing towards its working size.
+    last_hits: Vec<HitEntry>,
 
     window: Vector2,
     /// The environment the last solve ran under.
@@ -137,6 +143,7 @@ impl Model {
             dirty_children: Vec::new(),
             scratch: Vec::new(),
             slots: Vec::new(),
+            last_hits: Vec::new(),
             window: Vector2 { x: 0.0, y: 0.0 },
             env: None,
             solve_dirty: true,
@@ -630,9 +637,8 @@ impl Model {
     /// Starts a delay of `ms`, reported back as
     /// [`SceneEvent::DelayElapsed`](crate::SceneEvent::DelayElapsed).
     ///
-    /// A delay is a monotonic deadline compared on the frame clock, not a timer, so it adds
-    /// no clock of its own. A pending delay holds the frame clock awake for its duration,
-    /// and that request is its whole cost.
+    /// A delay is a compositor animation with `ms` of lead inside a scoped batch, and the
+    /// batch completing is the report. It adds no clock and holds no frame request.
     ///
     /// Re-issuing a live id restarts it, so a tooltip swapping between targets neither
     /// leaks a delay nor re-delays.
@@ -881,11 +887,27 @@ impl Model {
         }
         self.hits = builder;
 
+        self.last_hits.clear();
+        self.last_hits.extend_from_slice(self.pending.hit_entries());
+
         let entries = Span::new(
             0,
             u32::try_from(self.pending.hits_len()).unwrap_or(u32::MAX),
         );
         self.pending.push_op(Op::Hits { entries });
+    }
+
+    /// Returns the hit array in z-order, as the last solve built it.
+    ///
+    /// The app side's view of what the front half holds once the patch carrying this array
+    /// has been applied. A caller reads it to reason about the array's own order — how many
+    /// blocker entries stand ahead of a target — rather than to answer a contact, which the
+    /// front half's [`HitTable`](crate::HitTable) does.
+    ///
+    /// Empty until the first solve, and unchanged by a solve that rebuilt no array.
+    #[must_use]
+    pub fn last_hits(&self) -> &[HitEntry] {
+        &self.last_hits
     }
 
     fn walk_hits(&mut self, builder: &mut HitBuilder, id: NodeId, depth: usize) {
@@ -1150,6 +1172,53 @@ mod tests {
             "content, then blocker, then the overlay"
         );
         assert!(entries[1].flags.contains(HitFlags::BLOCKER));
+    }
+
+    #[test]
+    fn the_retained_array_is_what_the_flushed_patch_carried() {
+        let mut model = Model::new(root_style());
+        model.set_window(Vector2 { x: 400.0, y: 300.0 });
+        assert!(model.last_hits().is_empty(), "nothing has been solved yet");
+
+        let button = model.group(model.root(), None);
+        model.style(button.node(), &box_style(80.0, 24.0));
+        model.hit(
+            button.node(),
+            Some(HitDecl {
+                flags: HitFlags::INTERACTIVE,
+                id: ControlId::raw(1, 1),
+                touch_inflate: None,
+            }),
+        );
+        let root = model.orphan_group();
+        let menu = model.open_slot(root, Some(ControlId::raw(3, 1)));
+        model.style(menu.node(), &box_style(80.0, 60.0));
+        model.hit(
+            menu.node(),
+            Some(HitDecl {
+                flags: HitFlags::INTERACTIVE,
+                id: ControlId::raw(2, 1),
+                touch_inflate: None,
+            }),
+        );
+
+        let mut patch = SinkPatch::new();
+        model.flush(&mut patch, env());
+        assert_eq!(model.last_hits(), patch.hit_entries());
+        assert!(!model.last_hits().is_empty());
+
+        // The array survives the patch going back to the pool, which is the whole point of
+        // retaining it: the app side reads it after the buffer has been handed over.
+        let retained: Vec<HitEntry> = model.last_hits().to_vec();
+        patch.clear();
+        assert_eq!(model.last_hits(), retained.as_slice());
+
+        // And a rebuild replaces it whole.
+        model.hit(menu.node(), None);
+        let mut second = SinkPatch::new();
+        model.flush(&mut second, env());
+        assert_eq!(model.last_hits(), second.hit_entries());
+        assert_ne!(model.last_hits(), retained.as_slice());
     }
 
     #[test]

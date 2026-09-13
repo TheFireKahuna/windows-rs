@@ -37,12 +37,13 @@ pub use tip::{SUBMENU_DELAY_MS, TIP_DELAY_MS, TIP_EXIT_MS};
 
 use crate::build::{Host, Mount, View, mount_at};
 use crate::gesture::Recognised;
-use crate::input::{FocusRing, FocusScope, KeyKind, Move, Report, ScopeId};
+use crate::input::{KeyKind, Report, ScopeId};
+use crate::seam::FocusOp;
 use crate::signal::Owner;
 use crate::widget::{Intent, What};
 use crate::{VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP};
 use windows_numerics::Vector2;
-use windows_scene::{ControlId, Exit, GroupId, HitTable, SceneEvent};
+use windows_scene::{ControlId, Exit, GroupId, HitFlags, SceneEvent};
 
 /// Returns the character `key` types ahead on, or `None` where it is not a type-ahead key.
 ///
@@ -314,6 +315,9 @@ struct Open {
     owner: Option<Owner>,
     /// Dropped on close, which unmounts the subtree and destroys it with its exit.
     mount: Option<Mount>,
+    /// The item the last type-ahead in this overlay landed on, which the next one cycles
+    /// from, so repeated presses of one letter walk the items beginning with it.
+    last_typeahead: Option<ControlId>,
 }
 
 impl Open {
@@ -338,6 +342,9 @@ impl Open {
 pub struct Overlays {
     open: Vec<Open>,
     generation: u32,
+    /// Names the focus scopes this stack opens. The ring mints none: it is the input half's,
+    /// and an op carrying its own scope name is applied without a reply.
+    scopes: u32,
     dwell: tip::Dwell,
     /// The depth an invoked choice asked to truncate to, held until the application has run
     /// the handler that choice named. See [`Overlays::after_dispatch`].
@@ -380,14 +387,14 @@ impl Overlays {
 
     /// Opens an overlay, building `body` under a fresh detached root, and returns its id.
     ///
-    /// A kind that takes focus also contributes a full-window blocker entry and pushes a
-    /// focus scope named by that blocker, recording the current focus as the scope's restore
+    /// A kind that takes focus also contributes a full-window blocker entry and emits a
+    /// [`FocusOp::PushScope`] named by that blocker, with the invoker as the scope's restore
     /// target. `body` runs outside every host borrow, so it may build elements, read signals
     /// and create effects that run immediately.
-    pub fn open(
+    pub(crate) fn open(
         &mut self,
         spec: Spec,
-        focus: &mut FocusRing,
+        focus: &mut Vec<FocusOp>,
         body: impl FnOnce() -> View,
     ) -> OverlayId {
         // The depth this one opens at, which is also its placement row. Both stacks are
@@ -411,22 +418,27 @@ impl Overlays {
             (blocker, root, host.root_scope)
         });
 
-        // Mapped over the blocker rather than asking `takes_focus` again: a focus scope is
-        // named by its own first entry in the hit array, and that entry is the blocker, so
-        // deriving the scope from the blocker is what guarantees every scope has one.
-        let scope = blocker.map(|from| {
-            focus.push_scope(FocusScope {
-                trap: spec.kind.takes_focus() == Some(true),
-                // Captured at open, so closing puts focus back where the user left it.
-                restore_to: focus.current(),
-                from,
-            })
-        });
-
         let invoker = match spec.anchor.to {
             AnchorTo::Control(control) => Some(control),
             _ => None,
         };
+
+        // Mapped over the blocker rather than asking `takes_focus` again: a focus scope is
+        // named by its own first entry in the hit array, and that entry is the blocker, so
+        // deriving the scope from the blocker is what guarantees every scope has one.
+        let scope = blocker.map(|from| {
+            self.scopes = self.scopes.wrapping_add(1);
+            let scope = ScopeId(self.scopes);
+            focus.push(FocusOp::PushScope {
+                scope,
+                trap: spec.kind.takes_focus() == Some(true),
+                from,
+                // An overlay anchored to a point or to the window names no restore target,
+                // and the half holding the ring fills in the focus this one interrupted.
+                restore_to: invoker,
+            });
+            scope
+        });
 
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -442,6 +454,7 @@ impl Overlays {
             opened: spec.opened,
             owner: None,
             mount: None,
+            last_typeahead: None,
         });
 
         // Outside every host borrow above: `body` is application code that builds elements,
@@ -462,7 +475,7 @@ impl Overlays {
     }
 
     /// Applies the popup declarations changed by the preceding signal flush.
-    pub fn sync(&mut self, focus: &mut FocusRing) {
+    pub(crate) fn sync(&mut self, focus: &mut Vec<FocusOp>) {
         let window = Host::with(|h| h.model.window());
         let resized = self.last_window.is_some_and(|previous| previous != window);
         self.last_window = Some(window);
@@ -508,7 +521,7 @@ impl Overlays {
     /// An id whose generation does not match the one at that depth closes nothing, so a
     /// close queued behind the close of the overlay above it is a miss rather than closing
     /// whatever has since taken the depth.
-    pub fn close(&mut self, overlay: OverlayId, focus: &mut FocusRing) {
+    pub(crate) fn close(&mut self, overlay: OverlayId, focus: &mut Vec<FocusOp>) {
         if self
             .open
             .get(overlay.depth as usize)
@@ -520,23 +533,17 @@ impl Overlays {
     }
 
     /// Closes the topmost overlay, which is what `Esc` and a light-dismiss press do.
-    pub fn close_top(&mut self, focus: &mut FocusRing) {
+    pub(crate) fn close_top(&mut self, focus: &mut Vec<FocusOp>) {
         if !self.open.is_empty() {
             self.truncate(self.open.len() - 1, focus);
         }
-    }
-
-    /// Closes every overlay. Called when the window loses focus, and by a screen as it
-    /// unmounts, since a drop alone cannot release the focus scopes.
-    pub fn close_all(&mut self, focus: &mut FocusRing) {
-        self.truncate(0, focus);
     }
 
     /// Drops every overlay at or above `at`, innermost first.
     ///
     /// Innermost first, which is the order the focus ring and the hit array both assume: a
     /// submenu is gone before the menu that anchored it.
-    fn truncate(&mut self, at: usize, focus: &mut FocusRing) {
+    fn truncate(&mut self, at: usize, focus: &mut Vec<FocusOp>) {
         if at >= self.open.len() {
             return;
         }
@@ -544,7 +551,6 @@ impl Overlays {
         // outliving its menu would hold the frame clock awake for its full duration and then
         // open a submenu against a row that has gone.
         self.cancel_dwell();
-        let mut restore = None;
         while self.open.len() > at {
             let Some(mut open) = self.open.pop() else {
                 break;
@@ -555,9 +561,9 @@ impl Overlays {
                 mount.set_exit(Exit::None);
             }
             if let Some(scope) = open.scope {
-                // Overwritten as the walk goes outward, so the outermost close is the one
-                // whose restore target survives: that is the invoker focus came from.
-                restore = focus.pop_scope(scope);
+                // Innermost first, so the outermost pop is the last one applied and its
+                // restore target is where focus ends: the invoker it was opened from.
+                focus.push(FocusOp::PopScope(scope));
             }
             // The depth just vacated, which is this overlay's own id and its placement row.
             let depth = self.open.len() as u32;
@@ -577,31 +583,24 @@ impl Overlays {
                 (binding.closed)();
             }
         }
-        if let Some(restore) = restore {
-            _ = focus.focus(Some(restore));
-        }
     }
 
     /// Applies the keyboard vocabulary an open overlay owns. Runs before the front table
     /// consumes the tick.
     ///
-    /// Appends the [`Report::FocusChanged`] a keystroke produced to `reports`, so the focus
-    /// ring moves in the same pass a pointer's move would, and appends an [`Intent`] for an
+    /// Appends the focus edit a keystroke implied to `focus`, and an [`Intent`] for an
     /// invoke to `intents`, so `Enter` on a menu item reaches the handler a tap reaches.
-    pub fn keys(
+    pub(crate) fn keys(
         &mut self,
-        reports: &mut Vec<Report>,
-        hits: &HitTable,
-        focus: &mut FocusRing,
+        reports: &[Report],
+        focus: &mut Vec<FocusOp>,
         intents: &mut Vec<Intent>,
     ) {
         if self.open.is_empty() {
             return;
         }
-        // By index: the loop appends to `reports`, and a report this call produced must not
-        // then be read back as input.
-        for at in 0..reports.len() {
-            let Report::Key { target, event } = reports[at] else {
+        for report in reports {
+            let Report::Key { target, event } = *report else {
                 continue;
             };
             if event.kind != KeyKind::Down {
@@ -620,7 +619,7 @@ impl Overlays {
                 .last()
                 .is_some_and(|open| open.kind.takes_focus().is_some())
             {
-                self.key(target, event, hits, focus, reports, intents);
+                self.key(target, event, focus, intents);
             }
         }
     }
@@ -628,15 +627,14 @@ impl Overlays {
     /// Applies a tick's reports and intents to the stack. Runs after the front table has
     /// consumed them, so the press that opens an overlay here has already lit its button and
     /// no intent is the cause of a visual.
-    pub fn service(
+    pub(crate) fn service(
         &mut self,
         reports: &[Report],
         intents: &[Intent],
-        hits: &HitTable,
-        focus: &mut FocusRing,
+        focus: &mut Vec<FocusOp>,
     ) {
         for report in reports {
-            self.report(report, hits, focus);
+            self.report(report, focus);
         }
         for intent in intents {
             if intent.what == What::Tapped {
@@ -648,7 +646,7 @@ impl Overlays {
         self.settle(focus);
     }
 
-    fn report(&mut self, report: &Report, hits: &HitTable, focus: &mut FocusRing) {
+    fn report(&mut self, report: &Report, focus: &mut Vec<FocusOp>) {
         match *report {
             // A press on a blocker, already consumed by the router. The array puts a blocker
             // directly under the overlay it belongs to, so this closes that overlay and
@@ -689,7 +687,7 @@ impl Overlays {
             }
             // Any press at all hides a tooltip, whether or not it was over one.
             Report::Pressed { .. } | Report::FocusChanged { .. } => self.hide_tip(focus),
-            Report::HoverChanged { to, .. } => self.hovered(to, hits, focus),
+            Report::HoverChanged { to, .. } => self.hovered(to, focus),
             // A right tap opens the target's flyout at the press point rather than under the
             // control, so a context menu opens where the pointer was when it was pressed.
             Report::Gesture {
@@ -707,29 +705,23 @@ impl Overlays {
     /// Handles one keystroke while a focus-taking overlay is topmost.
     ///
     /// `Tab` and `Esc` never reach here, because the router takes both before any control
-    /// sees them. What is left is the menu vocabulary, and every arm resolves through the
-    /// focus ring: `Down` is `Tab`, `Up` is `Shift-Tab`, and type-ahead walks the same
-    /// candidates in the same order, so there is no item cursor to keep in step with the
-    /// ring.
+    /// sees them. What is left is the menu vocabulary: `Down` is `Tab`, `Up` is `Shift-Tab`,
+    /// and `Home` and `End` are the ends of the scope. Each is emitted as the focus edit it
+    /// means rather than performed, because the ring belongs to the half that routes input.
     fn key(
         &mut self,
         target: Option<ControlId>,
         event: crate::input::KeyEvent,
-        hits: &HitTable,
-        focus: &mut FocusRing,
-        reports: &mut Vec<Report>,
+        focus: &mut Vec<FocusOp>,
         intents: &mut Vec<Intent>,
     ) {
-        let moved = match i32::from(event.key) {
-            VK_DOWN => focus.step(hits, true),
-            VK_UP => focus.step(hits, false),
-            VK_HOME => focus.step_to_end(hits, false),
-            VK_END => focus.step_to_end(hits, true),
+        match i32::from(event.key) {
+            VK_DOWN => focus.push(FocusOp::Step { forward: true }),
+            VK_UP => focus.push(FocusOp::Step { forward: false }),
+            VK_HOME => focus.push(FocusOp::StepToEnd { last: false }),
+            VK_END => focus.push(FocusOp::StepToEnd { last: true }),
             // One level up, which is what `Esc` does through the router.
-            VK_LEFT => {
-                self.close_top(focus);
-                return;
-            }
+            VK_LEFT => self.close_top(focus),
             // Invoke through the ordinary tap path, so a row carrying a flyout opens its
             // submenu the same way a pointer tap on that row does.
             VK_RETURN | VK_RIGHT => {
@@ -739,24 +731,53 @@ impl Overlays {
                         what: What::Tapped,
                     });
                 }
-                return;
             }
             // Type-ahead off the virtual key, which is what the router delivers: the
             // unshifted latin and digit ranges, not a general text path.
             key => {
-                let Some(letter) = type_ahead(key) else {
-                    return;
-                };
-                focus.step_to(hits, |id| {
-                    Host::with(|host| menu::answers(host.name_of(id), letter))
-                })
+                if let Some(letter) = type_ahead(key) {
+                    self.type_ahead(letter, focus);
+                }
             }
-        };
-        if let Move::To { from, to } = moved {
-            // Into the same list the front table is about to read, so the focus ring lands
-            // on the new item in this pass.
-            reports.push(Report::FocusChanged { from, to: Some(to) });
         }
+    }
+
+    /// Focuses the next item of the topmost overlay whose accessible name begins with
+    /// `letter`, and emits nothing where none does.
+    ///
+    /// The candidates are the hit array's entries after that overlay's blocker filtered to
+    /// `INTERACTIVE`, which is the order [`FocusOp::Step`] walks. The cycle runs from the item
+    /// this overlay last typed onto rather than from the focused control, because the focused
+    /// control is held by the half that routes input and cannot be read here.
+    fn type_ahead(&mut self, letter: char, focus: &mut Vec<FocusOp>) {
+        let Some(open) = self.open.last() else { return };
+        let Some(blocker) = open.blocker else { return };
+        let from = open.last_typeahead;
+        let found = Host::with(|host| {
+            let entries = host.model.last_hits();
+            // The scope begins at its blocker and every entry of the overlay's own subtree
+            // follows it, so the search is bounded to the overlay by that one position.
+            let start = entries.iter().position(|entry| entry.id == blocker)?;
+            let items = &entries[start + 1..];
+            if items.is_empty() {
+                return None;
+            }
+            let at = from.and_then(|id| items.iter().position(|entry| entry.id == id));
+            let after = at.map_or(0, |at| at + 1);
+            (0..items.len())
+                .map(|step| items[(after + step) % items.len()])
+                .find(|entry| {
+                    entry.flags.contains(HitFlags::INTERACTIVE)
+                        && !entry.flags.contains(HitFlags::BLOCKER)
+                        && menu::answers(host.name_of(entry.id), letter)
+                })
+                .map(|entry| entry.id)
+        });
+        let Some(id) = found else { return };
+        if let Some(open) = self.open.last_mut() {
+            open.last_typeahead = Some(id);
+        }
+        focus.push(FocusOp::Focus(Some(id)));
     }
 
     /// Opens the flyout `target` declared, or closes the one it already has open, so a
@@ -768,7 +789,7 @@ impl Overlays {
     /// a blocker, and a press on that blocker is consumed as a dismiss rather than a tap. A
     /// [`Kind::Popup`] is left alone, because a button in a dialog is not a choice **from**
     /// the dialog and closing it would dismiss the dialog on its first control.
-    fn tapped(&mut self, target: ControlId, focus: &mut FocusRing) {
+    fn tapped(&mut self, target: ControlId, focus: &mut Vec<FocusOp>) {
         if let Some(overlay) = self.opened_by(target) {
             self.close(overlay, focus);
             return;
@@ -792,14 +813,14 @@ impl Overlays {
     ///
     /// Called after `Host::dispatch`, which is the one point at which a menu option's handler
     /// has run and its overlay is no longer owed to anything.
-    pub fn after_dispatch(&mut self, focus: &mut FocusRing) {
+    pub(crate) fn after_dispatch(&mut self, focus: &mut Vec<FocusOp>) {
         if let Some(at) = self.closing.take() {
             self.truncate(at, focus);
         }
     }
 
     /// Opens `target`'s declared flyout with `spec`, doing nothing where it declared none.
-    fn open_flyout(&mut self, target: ControlId, spec: Spec, focus: &mut FocusRing) {
+    fn open_flyout(&mut self, target: ControlId, spec: Spec, focus: &mut Vec<FocusOp>) {
         // Taken out of the host borrow before it runs: building the body is application
         // code.
         let Some(body) = Host::with(|host| host.flyout_of(target)) else {
@@ -809,7 +830,7 @@ impl Overlays {
     }
 
     /// Applies scene events to the stack. Only [`SceneEvent::DelayElapsed`] is acted on.
-    pub fn scene(&mut self, events: &[SceneEvent], focus: &mut FocusRing) {
+    pub(crate) fn scene(&mut self, events: &[SceneEvent], focus: &mut Vec<FocusOp>) {
         for event in events {
             if let SceneEvent::AnimationCompleted {
                 node,
@@ -830,11 +851,10 @@ impl Drop for Overlays {
     /// subtrees and the signals under them. Does not panic, because this can run while the
     /// thread is tearing its locals down, like [`Mount`]'s own drop.
     ///
-    /// A focus scope is not released here, because it lives on the caller's [`FocusRing`]
-    /// and a destructor cannot reach one. [`close_all`](Self::close_all) is the full
-    /// teardown and is what an unmounting screen calls. A scope left behind names a hit
-    /// entry that has just gone, and [`FocusRing`] resolves a scope it cannot find to
-    /// nothing, so `Tab` goes inert rather than walking the whole window.
+    /// A focus scope is not released here: a scope closes by an op emitted into the tick's
+    /// focus buffer, and a destructor has no buffer to emit into. A scope left
+    /// behind names a hit entry that has just gone, and a scope whose entry is absent bounds
+    /// navigation to nothing, so `Tab` goes inert rather than walking the whole window.
     fn drop(&mut self) {
         // A pending delay outlives the stack: its id stays claimed and its `Tick` holds the
         // frame clock awake. Nothing else releases either.

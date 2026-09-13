@@ -10,9 +10,12 @@
 //! by explicit position requests is created as [`Passive`](crate::Passive), which `request`
 //! does not accept, so it cannot be given callbacks it does not read.
 
+use crate::hit::pack_offset;
 use crate::sink::{NodeId, Tracker as TrackerFamily, TrackerRequest};
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::rc::Rc;
+use std::sync::Arc;
 use windows_composition::{
     ChainingMode, Clamping, InteractionTracker, RedirectionMode, RequestId, ScaleAnimationPolicy,
     SourceMode, TrackerEvent, VisualInteractionSource, WheelMode,
@@ -48,6 +51,12 @@ pub(crate) struct TrackerState {
     /// tracker runs in another process and its own getter answers with whatever was last
     /// set.
     pub(crate) position: Vector3,
+    /// The reported position again, packed into one word for readers on other threads.
+    ///
+    /// A hit test resolving a scrolled entry needs this tracker's offset and runs wherever
+    /// the contact arrived, so the value is published rather than asked for. One word
+    /// carries both axes, so a reader never sees x from one report and y from the next.
+    pub(crate) shadow: Arc<AtomicU64>,
     pub(crate) scale: f32,
     pub(crate) phase: Phase,
     pending: [Option<(i32, TrackerRequest)>; PENDING],
@@ -64,6 +73,7 @@ impl TrackerState {
                 y: 0.0,
                 z: 0.0,
             },
+            shadow: Arc::new(AtomicU64::new(pack_offset(0.0, 0.0))),
             scale: 1.0,
             phase: Phase::Idle,
             pending: [None; PENDING],
@@ -132,11 +142,48 @@ impl TrackerState {
         }
     }
 
-    /// Records the reported values and clears the pending set.
+    /// Records the reported values, publishes the position to the shadow, and clears the
+    /// pending set.
     pub(crate) fn values_changed(&mut self, position: Vector3, scale: f32) {
         self.position = position;
+        // release: pairs with the acquire in `ShadowOffsets::offset`, so a reader on another
+        // thread sees this position rather than a word being written.
+        self.shadow
+            .store(pack_offset(position.x, position.y), Ordering::Release);
         self.scale = scale;
         self.pending = [None; PENDING];
+    }
+
+    /// Returns the word this tracker publishes its reported position into.
+    pub(crate) fn shadow(&self) -> &Arc<AtomicU64> {
+        &self.shadow
+    }
+}
+
+impl crate::Scene {
+    /// Returns the word `id` publishes its reported position into, or `None` where no such
+    /// tracker is live.
+    ///
+    /// Held by a hit test that runs off this thread: it reads the word rather than asking
+    /// the scene, and the handle keeps the word alive past the tracker's own drop.
+    #[must_use]
+    pub fn tracker_shadow<O>(&self, id: crate::sink::TrackerId<O>) -> Option<Arc<AtomicU64>> {
+        self.trackers
+            .get(id.raw)
+            .map(|state| Arc::clone(state.shadow()))
+    }
+
+    /// Appends every live tracker's viewport and shadow to `out`.
+    ///
+    /// What a thread that hit-tests against a copy of the array installs into its
+    /// [`ShadowOffsets`](crate::ShadowOffsets): the set changes only when a tracker is created
+    /// or dropped, so a caller lists it on those edges and reads the atomics between them.
+    pub fn tracker_shadows(&self, out: &mut Vec<(NodeId, Arc<AtomicU64>)>) {
+        for (_, state) in self.trackers.iter() {
+            if let Some(viewport) = state.viewport {
+                out.push((viewport, Arc::clone(&state.shadow)));
+            }
+        }
     }
 }
 
@@ -179,36 +226,25 @@ pub(crate) fn configure_source(
     )
 }
 
-/// The queue a tracker's owner callbacks push into, drained on the front thread's tick.
+/// The queue a tracker's owner callbacks push into, drained by the thread that owns the
+/// scene on its next pass.
 ///
-/// Shared rather than owned because the callback is a COM object the compositor holds past
-/// the borrow that created it. Nothing here is `Send`: the callbacks arrive on the thread
-/// that created the compositor, which is the thread the tree lives on.
-///
-/// The queue holds a [`Tick`](windows_window::Tick) while anything is in it. Inertia reports
-/// from the compositor with no input behind it, so without the tick the queue would be read
-/// at whatever unrelated wake came next — for a virtualized list, a fling landing on rows the
-/// list never realized. [`drain`](Events::drain) releases the tick, so a tracker that has
-/// stopped reporting parks the clock.
+/// A callback lands through the owning thread's own message queue, so by the time that
+/// thread is back in its loop the event is already here: nothing has to wake it.
 #[derive(Default)]
 pub(crate) struct Events {
     queued: Vec<crate::SceneEvent>,
-    tick: Option<windows_window::Tick>,
 }
 
 impl Events {
-    /// Queues an event, taking a tick if the queue was empty.
-    pub(crate) fn push(&mut self, event: crate::SceneEvent, wake: &windows_window::Wake) {
+    /// Queues an event.
+    pub(crate) fn push(&mut self, event: crate::SceneEvent) {
         self.queued.push(event);
-        if self.tick.is_none() {
-            self.tick = Some(wake.tick());
-        }
     }
 
-    /// Moves the queued events onto `out` and releases the tick.
+    /// Moves the queued events onto `out`.
     pub(crate) fn drain(&mut self, out: &mut Vec<crate::SceneEvent>) {
         out.append(&mut self.queued);
-        self.tick = None;
     }
 }
 

@@ -15,10 +15,10 @@ pub(crate) use probe::ProbeRow;
 pub use probe::{Placed, Probe, probe};
 pub use scroll::{
     ListSpec, Realized, Reveal, ScrollDecl, ScrollState, THUMB_MARGIN, THUMB_MIN_H, THUMB_W,
-    ThumbGeom, front as scroll_front, list, observe as scroll_observe, rail_style, realize, scroll,
-    scroll_for_thumb_y, scroll_with, thumb_geom, thumb_style, thumb_y_for_scroll, window,
+    ThumbGeom, list, observe as scroll_observe, rail_style, realize, scroll, scroll_for_thumb_y,
+    scroll_with, thumb_geom, thumb_style, thumb_y_for_scroll, window,
 };
-pub(crate) use scroll::{ScrollRow, grab_decl, grab_hit};
+pub(crate) use scroll::{ScrollRow, ScrollTable, front as scroll_front, grab_decl, grab_hit};
 
 use crate::build::{El, IntoChildren, View};
 

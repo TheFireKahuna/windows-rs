@@ -1,6 +1,6 @@
 //! The window's own ground. **Front half.**
 //!
-//! Minted inside [`Scene::new`](crate::Scene::new), before the window is shown, and not an
+//! Minted inside [`Scene::new_at`](crate::Scene::new_at), before the window is shown, and not an
 //! arena node: it sits under everything the model names, layout cannot reach it, and it is
 //! not in the hit array. An application configures it and may move its glows; it does not
 //! compose it.

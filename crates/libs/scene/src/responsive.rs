@@ -109,13 +109,25 @@ mod tests {
     #[test]
     fn jumps_hold_only_the_class_adjacent_to_a_boundary() {
         for width in [590.0, 600.0, 610.0] {
-            assert_eq!(BOUNDS.reclassify(width, WidthClass::Wide), WidthClass::Medium);
+            assert_eq!(
+                BOUNDS.reclassify(width, WidthClass::Wide),
+                WidthClass::Medium
+            );
         }
         for width in [990.0, 1000.0, 1010.0] {
-            assert_eq!(BOUNDS.reclassify(width, WidthClass::Narrow), WidthClass::Medium);
+            assert_eq!(
+                BOUNDS.reclassify(width, WidthClass::Narrow),
+                WidthClass::Medium
+            );
         }
-        assert_eq!(BOUNDS.reclassify(580.0, WidthClass::Wide), WidthClass::Narrow);
-        assert_eq!(BOUNDS.reclassify(1020.0, WidthClass::Narrow), WidthClass::Wide);
+        assert_eq!(
+            BOUNDS.reclassify(580.0, WidthClass::Wide),
+            WidthClass::Narrow
+        );
+        assert_eq!(
+            BOUNDS.reclassify(1020.0, WidthClass::Narrow),
+            WidthClass::Wide
+        );
     }
 
     #[test]

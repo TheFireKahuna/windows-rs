@@ -1,61 +1,59 @@
-//! Start-up and the frame: the process-wide installs, the window, and the tick that runs
-//! inside its window procedure.
+//! Start-up and the threads: the process-wide installs, the window, and the four threads a
+//! running window is made of.
+//!
+//! # The threads
+//!
+//! ```text
+//! input   the window's own thread: the pump, the doorbell, the router, the caption's answers.
+//!         Resolves contacts against a copy of the hit array, moves nothing on screen, and
+//!         hands its reports to the scene thread. Ticks on the frame clock only while a
+//!         contact or an inertia is live.
+//! scene   owns the compositor and the retained tree. Applies a patch when it arrives and
+//!         turns a report into a retarget when it arrives; has no clock of its own.
+//! app     owns the signal graph, the model and the overlay stack; parks on a doorbell and
+//!         wakes on a write. Has no clock.
+//! present owns the presentation regions and draws them off the compositor clock; posts to
+//!         nobody but the scene thread's binder.
+//! ```
+//!
+//! Every crossing between them is a mailbox over a buffer allocated once, and every wait is
+//! on a doorbell or the compositor's own clock. An idle window costs no wakes on any of them.
 //!
 //! # Why the order lives here
 //!
-//! A tick is twelve steps and the order is a correctness rule at every seam. Input runs
-//! after the patch is applied, or a press resolves against the previous frame's geometry.
-//! The front table runs before the overlay service, or a menu opens before the press that
-//! opened it has lit its button. The scene's borrow is released before the application is
-//! dispatched to, or a handler asking the caption what is under a point re-enters a borrow
-//! it already holds. None of that is visible in a signature.
-//!
-//! Start-up carries one constraint that is not about order: the shaping engine's font ladder
-//! must be the same instance the rasterizing half holds, because two ladders agree on face 0
-//! and disagree on everything after it, and the symptom is a read-out drawn in the wrong face
-//! rather than an error. [`Ui::run`] reads the ladder off the [`Backends`] it is given.
+//! Within each thread's pass the step order is a correctness rule at every seam, and each
+//! ordering comment names what breaks if the line moves. Start-up carries one constraint that
+//! is not about order: the shaping engine's font ladder must be the same instance the
+//! rasterizing engine holds, because two ladders agree on face 0 and disagree on everything
+//! after it. The scene thread builds the [`Backends`] and publishes their ladder before the
+//! app thread starts.
 //!
 //! # What stays the application's
 //!
 //! The compositor and the GPU. This crate declares into a retained tree and never builds one,
 //! which is what keeps `windows-composition` and `windows-d2d` out of its dependencies, so
-//! the application constructs the [`Backends`] and hands it over.
-//!
-//! # What happens per wake
-//!
-//! ```text
-//! WM_FRAME ──▶ Scene::drain_events  what the trackers and the batches reported
-//!          ──▶ scroll_observe       reported positions become signals            (app side)
-//!          ──▶ Overlays::scene      a dwell that came due opens what it owed
-//!          ──▶ signal::flush()      resolve memos, run effects
-//!          ──▶ Host::flush(patch)   structure + solve + emit ops
-//!          ──▶ Scene::apply(patch)  ops become composition writes                (front side)
-//!          ──▶ Router::tick(hits)   input, against the array the patch just built
-//!          ──▶ Overlays::keys       the menu vocabulary, into the same buffers
-//!          ──▶ scroll_front         the thumb's reveal, and a thumb being dragged
-//!          ──▶ Overlays::service    what this tick's reports mean for the stack
-//! ```
-//!
-//! Nothing here polls. The pacer wakes on the compositor clock, and only while something has
-//! asked for a frame, so an idle window costs no wakes. A fling asks for its own frames: the
-//! queue a tracker callback pushes into holds the clock open until it is drained.
+//! the application constructs the [`Backends`] — on the scene thread, through the closure it
+//! hands over.
 
-mod tick;
+mod app;
+mod input;
+mod links;
+mod scene;
 
-use crate::build::{Host, Mount};
+use crate::build::Mount;
 use crate::input::Report;
 use crate::role::{AccentId, Density, Palette, Scope};
-use crate::signal;
-use std::cell::{Cell, RefCell};
+pub use crate::seam::AppCensus;
+use core::sync::atomic::Ordering;
+use input::Frame;
+use std::cell::RefCell;
 use std::rc::Rc;
-use tick::Frame;
+use std::sync::Arc;
 use windows_color::OutputTransform;
 use windows_core::{Error, Result};
 use windows_numerics::Vector2;
-use windows_scene::{
-    BackdropSpec, Backends, Census, Env, GroupId, Model, Scene, SceneEvent, SinkPatch,
-};
-use windows_window::{CaptionHit, CaptionState, E_HANDLE, Handoff, Tick, Window, WindowBuilder};
+use windows_scene::{BackdropSpec, Backends, Census, Env, GroupId};
+use windows_window::{CaptionHit, CaptionState, E_HANDLE, Handoff, Watch, Window, WindowBuilder};
 
 /// The process-wide installs, and the root [`Scope`] they produce.
 ///
@@ -70,6 +68,17 @@ use windows_window::{CaptionHit, CaptionState, E_HANDLE, Handoff, Tick, Window, 
 #[derive(Copy, Clone)]
 pub struct Ui {
     root_scope: Scope,
+}
+
+/// What the application's tree builder is handed, on the app thread.
+pub struct AppCtx {
+    /// The group the application mounts under: a full-client stretching column, so a shell
+    /// states `grow` and nothing about the window's own extent.
+    pub root: GroupId,
+    /// The window's visibility, for a producer that should stop while nobody can see it.
+    pub watch: Watch,
+    /// The client area the window opened at, in DIPs.
+    pub window_dips: Vector2,
 }
 
 impl Ui {
@@ -94,42 +103,38 @@ impl Ui {
         self.root_scope
     }
 
-    /// Creates the window, brings up the retained tree, mounts, and pumps until quit.
+    /// Creates the window, starts the scene and app threads, and pumps until quit.
     ///
-    /// `backends` is called after the window exists, because both halves of it require
-    /// what the window's creation set up: a system compositor needs a dispatcher queue on the
-    /// calling thread, and the GPU is chosen for the display the window opened on.
+    /// `backends` runs on the scene thread once the window exists: a system compositor needs
+    /// a dispatcher queue on the calling thread, and the scene thread has made its own.
     ///
-    /// `mount` receives the root group and the live window once everything it could reach exists. The
-    /// window lets an application register visibility or lifetime wakes with its own reactor. The
-    /// [`Mount`] it returns is held until this call returns — dropping one unmounts its tree.
-    /// It mounts into a full-client stretching column
-    /// ([`layout::root`](crate::layout::root)), so a shell states `grow` and nothing about
-    /// the window's own extent.
+    /// `mount` runs on the app thread once the scene exists. The [`Mount`] it returns is held
+    /// there until this call returns — dropping one unmounts its tree.
     ///
-    /// `on_resize`, `on_caption_hit` and `on_caption_state` are attached here, after `window`
-    /// is configured, so those three handlers are the driver's. `on_message` is **chained**:
-    /// a caller's own handler survives and answers first, and the tick and the doorbell see
-    /// whatever it returned `None` for. Everything else about the window is the caller's.
+    /// `on_resize`, `on_scale_changed`, `on_caption_hit` and `on_caption_state` are attached
+    /// here, after `window` is configured, so those four handlers are the driver's.
+    /// `on_message` is **chained**: a caller's own handler survives and answers first, and the
+    /// tick and the doorbell see whatever it returned `None` for. Everything else about the
+    /// window is the caller's.
     ///
     /// # Errors
     ///
-    /// The window could not be created, the backends could not be built, the scene could not
-    /// be brought up, or a tick failed. A tick runs inside the window procedure and has no
-    /// call stack this side owns to return up, so its failure is recorded there, the loop is
-    /// stopped, and the error surfaces here.
+    /// The window could not be created, a thread could not be started, the backends or the
+    /// scene could not be brought up, or a thread failed. A failure on a worker thread closes
+    /// the window, so the pump returns, and surfaces here after both workers are joined.
     pub fn run(
         self,
         window: WindowBuilder,
-        backends: impl FnOnce() -> Result<Backends>,
+        backends: impl FnOnce() -> Result<Backends> + Send + 'static,
         backdrop: BackdropSpec,
-        mount: impl FnOnce(GroupId, &Window) -> Mount,
+        mount: impl FnOnce(AppCtx) -> Mount + Send + 'static,
     ) -> Result<()> {
         let bell = Rc::new(crate::input::Doorbell::new());
         // The client extent, in pixels, posted whenever the system changes it and taken by
-        // the next tick, which restates the layout's window from it. A tick that never
-        // learns it solves forever against the size the window opened at.
+        // the next tick, which forwards it in DIPs. Likewise a scale change, which carries
+        // nothing: the tick re-reads the display and forwards what differs.
         let resized: Rc<Handoff<(i32, i32)>> = Rc::new(Handoff::new());
+        let rescaled: Rc<Handoff<()>> = Rc::new(Handoff::new());
         // The tick, reachable from the window procedure. Empty until everything it needs
         // exists, which is after the window whose handler reaches it. That handler holds a
         // weak reference: the frame owns the window, and two strong ones would be a cycle
@@ -137,13 +142,11 @@ impl Ui {
         let frame: Rc<RefCell<Option<Frame>>> = Rc::new(RefCell::new(None));
         // Where a failed tick lands. It has no call stack this side owns to return up.
         let failed: Rc<RefCell<Option<Error>>> = Rc::new(RefCell::new(None));
-        // The frame request the signal graph raises when a write gives it work to do.
-        let pending: Rc<Cell<Option<Tick>>> = Rc::new(Cell::new(None));
 
         let window = window
             // The tick, and the doorbell for every other message. `WM_FRAME` is answered
             // inside the window procedure rather than after the pump returns, so a
-            // drag-resize keeps drawing: the system's sizing loop pumps this message and
+            // drag-resize keeps routing: the system's sizing loop pumps this message and
             // does not return until the contact lifts.
             //
             // Chained, so a caller's own handler survives being handed to this method and
@@ -164,8 +167,6 @@ impl Ui {
                         && let Some(frame) = slot.as_mut()
                         && let Err(error) = frame.tick()
                     {
-                        // A tick that failed this way fails again next frame, so the loop
-                        // stops and the error is carried out of `run`.
                         *failed.borrow_mut() = Some(error);
                         windows_window::quit();
                     }
@@ -176,70 +177,90 @@ impl Ui {
                 let resized = Rc::clone(&resized);
                 move |width, height| resized.post((width, height))
             })
+            .on_scale_changed({
+                let rescaled = Rc::clone(&rescaled);
+                move |_| rescaled.post(())
+            })
             .create()?;
         // Shared with the tick, which outlives every stack frame here.
         let window = Rc::new(window);
 
-        let backends = backends()?;
-        // The shaping engine is this thread's, and takes the ladder the rasterizing half
-        // already holds rather than a second one built the same way. Two ladders agree on
-        // face 0 and disagree on everything after it, and the symptom is a run drawn in the
-        // wrong face.
-        crate::build::text::install(backends.ladder().clone())?;
-
         let pacer = window.pacer()?;
-        let _posted = signal::arm_posts(pacer.wake());
         resized.arm(pacer.wake());
-        // Shared, because the caption's hit test runs inside the window procedure and has to
-        // reach the one hit array from there. The tick takes the borrow and drops it before
-        // returning, so the two never overlap; the `try_borrow` in that handler answers
-        // `Drag` rather than panicking on a re-entry.
-        // Both queries answer for the window's current display, so a window closed under
-        // start-up fails here rather than bringing the scene up against invented numbers.
+        rescaled.arm(pacer.wake());
+        // Every query below answers for the window's current display, so a window closed
+        // under start-up fails here rather than starting threads against invented numbers.
         let env = env_of(&window).ok_or_else(closed)?;
-        let scene = Rc::new(RefCell::new(Scene::new(
-            &window,
-            &backends,
-            pacer.wake(),
-            env,
-            backdrop,
-        )?));
+        let output = output_of(&window).ok_or_else(closed)?;
+        let window_dips = client_dips(&window).ok_or_else(closed)?;
+        let links = Arc::new(links::Links::new(window.handle())?);
+
+        // The scene thread first: it builds the backends whose font ladder the app thread's
+        // shaping engine is made over, and it publishes that ladder before it signals ready.
+        let scene_thread = std::thread::Builder::new()
+            .name("ui-scene".into())
+            .spawn({
+                let links = Arc::clone(&links);
+                let start = scene::Start {
+                    backends: Box::new(backends),
+                    backdrop,
+                    env,
+                    output,
+                    watch: window.watch()?,
+                    scene_watch: window.watch()?,
+                };
+                move || scene::run(links, start)
+            })
+            .map_err(spawn_failed)?;
+        links.scene_ready.wait(windows_window::clock::INFINITE);
+        if let Some(error) = links.failure() {
+            _ = scene_thread.join();
+            return Err(error);
+        }
+
+        let app_thread = std::thread::Builder::new()
+            .name("ui-app".into())
+            .spawn({
+                let links = Arc::clone(&links);
+                let start = app::Start {
+                    mount: Box::new(mount),
+                    root_scope: self.root_scope,
+                    env,
+                    window_dips,
+                    watch: window.watch()?,
+                };
+                move || app::run(links, start)
+            })
+            .map_err(spawn_failed)?;
+
         let router = crate::input::Router::new(&bell, &window, pacer.wake())?;
-        // After the scene, because a binding it delivers is applied to that scene, and before
-        // the mount, because a shell that declares a region on its first build has to find a
-        // present thread to mount it on. The visibility watch is what stops the loop drawing
-        // and presenting into a window nobody can see; without it the thread has no way to
-        // learn the window was minimized.
-        crate::present::install(
-            windows_present::Tuning::default(),
-            output_of(&window).ok_or_else(closed)?,
-            window.watch().ok(),
-            pacer.wake(),
-        )?;
 
-        let mut model = Model::new(crate::layout::root());
-        model.set_window(client_dips(&window).ok_or_else(closed)?);
-        // Taken before the model is handed over: the host keeps it privately from here on,
-        // and the root is what the application mounts under.
-        let root = model.root();
-        Host::install(model, env, self.root_scope);
-
-        // What is at a point in the caption band, answered from the hit array the last patch
-        // built, so the drag strip is whatever the bar's controls leave over rather than a
+        // What is at a point in the caption band, answered from the array copy this thread
+        // holds, so the drag strip is whatever the bar's controls leave over rather than a
         // second rect stated beside them. The result is discarded because a window with no
         // custom caption has no band to answer for.
         let _ = window.on_caption_hit({
-            let scene = Rc::clone(&scene);
+            let frame = Rc::downgrade(&frame);
             move |x, y| {
-                scene
-                    .try_borrow()
-                    .map_or(CaptionHit::Drag, |s| crate::caption::hit(s.hits(), x, y))
+                // Fallible: a tick holds the frame while it runs, and a re-entrant question
+                // answers `Drag` rather than panicking in the window procedure.
+                match frame.upgrade().as_ref().map(|cell| cell.try_borrow()) {
+                    Some(Ok(slot)) => slot.as_ref().map_or(CaptionHit::Drag, |frame| {
+                        crate::caption::hit(
+                            &frame.hits,
+                            frame.router.shadows(),
+                            &frame.caption,
+                            x,
+                            y,
+                        )
+                    }),
+                    _ => CaptionHit::Drag,
+                }
             }
         });
         // Hover and press over a window command, which the router never sees: once the hit
-        // test names one, its pointer stream is the system's. Recorded here and applied in the
-        // tick, because this runs inside the window procedure where nothing that draws is
-        // reachable.
+        // test names one, its pointer stream is the system's. Recorded here and forwarded by
+        // the tick, because this runs inside the window procedure.
         let nonclient: Rc<Handoff<CaptionState>> = Rc::new(Handoff::new());
         nonclient.arm(pacer.wake());
         let _ = window.on_caption_state({
@@ -247,58 +268,56 @@ impl Ui {
             move |state| nonclient.post(state)
         });
 
-        // Held until the pump returns: dropping it unmounts the tree.
-        let mounted = mount(root, &window);
-
-        // `Cell::set` marks the graph and returns; nothing schedules a frame on its own,
-        // since the pump is blocked and the pacer is parked unless something has asked for
-        // one. This waker is that request, raised on the edge only — once per burst of
-        // writes, and never from inside a flush.
-        signal::set_waker({
-            let pending = Rc::clone(&pending);
-            let wake = pacer.wake();
-            move || pending.set(Some(wake.tick()))
-        });
-
         *frame.borrow_mut() = Some(Frame {
             window: Rc::clone(&window),
-            scene,
-            backends,
+            links: Arc::clone(&links),
             router,
-            // Held for the life of the window rather than made per tick, which is what keeps
-            // the input path allocation-free once the high-water mark is reached.
-            controls: crate::widget::Controls::new(),
-            overlays: crate::overlay::Overlays::new(),
-            patch: SinkPatch::new(),
-            events: Vec::new(),
+            hits: windows_scene::HitTable::default(),
+            picks: crate::present::Picks::default(),
+            caption: crate::caption::Registry::default(),
+            focus: Vec::new(),
             reports: Vec::new(),
             intents: Vec::new(),
             resized,
+            rescaled,
             nonclient,
-            pending,
+            out: Some(Box::default()),
+            wake: pacer.wake(),
+            holding: None,
+            sent_env: Some(env),
+            census: Census::default(),
+            scene_wakes: 0,
+            scene_applies: 0,
+            app: AppCensus::default(),
+            ticks: 0,
         });
 
-        // Composed before the window is shown: `ShowWindow` on an empty tree shows a frame
-        // of whatever has not been painted yet. Called directly rather than posted, because
-        // no pump is running yet to deliver a frame.
-        if let Some(frame) = frame.borrow_mut().as_mut() {
-            frame.tick()?;
-        }
+        // Shown once the scene thread has applied the first patch: `ShowWindow` over an
+        // empty tree shows a frame of whatever has not been painted yet. Bounded, so an
+        // application whose first build never emits shows its empty window rather than
+        // nothing at all.
+        links.first_frame.wait(FIRST_FRAME_MS);
         window.show();
 
         // Parked, on `GetMessage`. Every wake is a message somebody posted: the pacer's
-        // `WM_FRAME`, an input contact, a system question about the window. Nothing here
-        // polls, and an idle window costs no wakes at all.
+        // `WM_FRAME`, an input contact, a system question about the window, the scene
+        // thread's nudge to take a batch.
         windows_window::run();
 
-        // Explicit and in this order. The unmount walk asks the present thread to destroy
-        // every region, and each destruction releases a surface handle the scene is still
-        // binding — so the tree comes down first, and only then is the thread stopped. Left
-        // to drop order, the locals here would go the other way round and the thread would
-        // be joined with regions still mounted on it.
-        drop(mounted);
-        crate::present::uninstall();
+        // The app thread first: its tree comes down on its own thread and the destroys ride
+        // one last batch. Then the scene thread, which applies that batch, releases every
+        // region and stops the present thread before its compositor goes.
+        links.stop_app.store(true, Ordering::Release);
+        links.app_ring.ring();
+        _ = app_thread.join();
+        links.stop_scene.store(true, Ordering::Release);
+        links.scene_ring.ring();
+        _ = scene_thread.join();
+        drop(frame);
 
+        if let Some(error) = links.failure() {
+            return Err(error);
+        }
         match failed.borrow_mut().take() {
             Some(error) => Err(error),
             None => Ok(()),
@@ -306,40 +325,62 @@ impl Ui {
     }
 }
 
-/// The error a closed window answers with, for the two start-up queries that need it.
+/// How long the window waits for the first patch before showing anyway.
+const FIRST_FRAME_MS: u32 = 5_000;
+
+/// The error a closed window answers with, for the start-up queries that need it.
 fn closed() -> Error {
     Error::new(E_HANDLE, "the window is closed")
 }
 
-type Observer = Box<dyn FnMut(&[SceneEvent], &[Report], Census)>;
+fn spawn_failed(error: std::io::Error) -> Error {
+    Error::new(E_HANDLE, error.to_string())
+}
+
+/// What one input tick settled on, and the latest each other thread reported about itself.
+#[derive(Copy, Clone)]
+pub struct Observed<'a> {
+    /// The reports this tick produced, in order.
+    pub reports: &'a [Report],
+    /// The scene's tallies as of its last batch to the input thread.
+    pub census: Census,
+    /// How many times the scene thread has woken and how many patches it has applied.
+    pub scene_wakes: u64,
+    pub scene_applies: u64,
+    /// The app thread's tallies as of its last batch.
+    pub app: AppCensus,
+    /// Input ticks so far, this one included.
+    pub ticks: u64,
+}
+
+type Observer = Box<dyn FnMut(Observed<'_>)>;
 
 thread_local! {
-    /// What every tick reports to, where a caller installed one.
+    /// What every input tick reports to, where a caller installed one.
     static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
 }
 
-/// Installs a function run at the end of every tick, with what that tick saw.
+/// Installs a function run at the end of every input tick, with what that tick saw.
 ///
-/// The sixth process-wide install, and the only one that is optional. It exists so that a
-/// census, a harness or a profile reads the **real** tick rather than a copy of it: the step
-/// order in [`Frame::tick`] is a correctness rule at every seam, and a second loop written to
-/// observe it drifts from the one that ships without either side failing.
+/// The one optional process-wide install. It exists so that a census, a harness or a profile
+/// reads the **real** tick rather than a copy of it. Installed on the thread that will own the
+/// window, before [`Ui::run`].
 ///
 /// The arguments are the tick's own buffers and are not held past the call, so an observer
 /// that counts allocates nothing. Installing a second replaces the first.
-pub fn observe(f: impl FnMut(&[SceneEvent], &[Report], Census) + 'static) {
+pub fn observe(f: impl FnMut(Observed<'_>) + 'static) {
     OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
 }
 
 /// Reports one tick, where an observer is installed and is not already running.
-pub(crate) fn observed(events: &[SceneEvent], reports: &[Report], census: Census) {
+pub(crate) fn observed(seen: Observed<'_>) {
     // Fallibly, so an observer reaching back into the tick is a dropped report rather than a
     // panic inside the window procedure.
     let _ = OBSERVER.try_with(|slot| {
         if let Ok(mut slot) = slot.try_borrow_mut()
             && let Some(observer) = slot.as_mut()
         {
-            observer(events, reports, census);
+            observer(seen);
         }
     });
 }
@@ -358,7 +399,7 @@ fn client_dips(window: &Window) -> Option<Vector2> {
 /// Returns the window's account of the display it is on: its DPI, and the output transform
 /// for the display's colour capability. `None` once the window is closed.
 ///
-/// Built per tick and never held: the window and its monitor own both, so a cached copy is
+/// Read per tick and never held: the window and its monitor own both, so a cached copy is
 /// one a display hop leaves stale. The content peak comes from the installed palette rather
 /// than a parameter, because it is a property of the authored table.
 ///

@@ -1,5 +1,6 @@
-//! The wake source the window's threads park on: a Windows auto-reset event, and the
-//! multi-handle wait that takes several of them.
+//! The wake source the window's threads park on: a Windows auto-reset event, the
+//! multi-handle wait that takes several of them, and the wait a message-pumping thread makes
+//! so its queue is served alongside them.
 
 use crate::bindings::*;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
@@ -93,5 +94,90 @@ pub(crate) fn wait_any(handles: &[BorrowedHandle<'_>]) {
             false.into(),
             INFINITE,
         );
+    }
+}
+
+/// What [`pump_until`] returned for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Pumped {
+    /// The handle at this index into the caller's slice was signalled. No message was pumped.
+    Signalled(u32),
+    /// Messages arrived and were dispatched. Nothing the caller passed fired.
+    Messages,
+    /// A quit message was dispatched. The caller's loop ends.
+    Quit,
+    /// The wait itself failed: an invalid handle in the slice. The caller's loop ends rather
+    /// than spinning on a wait that will fail again.
+    Failed,
+}
+
+/// Blocks until one of `handles` is signalled or this thread has messages, and dispatches
+/// the messages when it does.
+///
+/// What a thread that owns a compositor but no window blocks in: a dispatcher queue publishes
+/// at the end of a work item and delivers compositor callbacks through the thread's own
+/// message queue, so that queue has to be served whenever it is non-empty, and the thread's
+/// own wake sources have to interrupt the same wait rather than be seen a message later.
+///
+/// `MWMO_INPUTAVAILABLE` makes a message that arrived before this call count, so a message
+/// posted between two calls is not left waiting for the next unrelated wake.
+pub fn pump_until(handles: &[BorrowedHandle<'_>]) -> Pumped {
+    let count = handles.len() as u32;
+    // SAFETY: `BorrowedHandle` is a transparent wrapper over the raw handle, so the slice is
+    // the contiguous array the call takes, and the borrows keep every owner alive across it.
+    let woke = unsafe {
+        MsgWaitForMultipleObjectsEx(
+            count,
+            handles.as_ptr().cast(),
+            INFINITE,
+            QS_ALLINPUT as u32,
+            MWMO_INPUTAVAILABLE as u32,
+        )
+    };
+    // The message slot is the one after the caller's handles, as the clock's is for the
+    // compositor clock wait.
+    let messages = WAIT_OBJECT_0 as u32 + count;
+    match woke {
+        w if w == messages => {
+            if crate::pump() {
+                Pumped::Messages
+            } else {
+                Pumped::Quit
+            }
+        }
+        w if w < messages => Pumped::Signalled(w - WAIT_OBJECT_0 as u32),
+        _ => Pumped::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_signalled_handle_is_reported_by_index_without_pumping() {
+        let first = Event::auto_reset().expect("an event is available");
+        let second = Event::auto_reset().expect("an event is available");
+        second.signal();
+        assert_eq!(
+            pump_until(&[first.as_handle(), second.as_handle()]),
+            Pumped::Signalled(1)
+        );
+        assert!(!second.take(), "the wait did not consume the auto-reset signal");
+    }
+
+    #[test]
+    fn a_quit_message_ends_the_loop() {
+        let event = Event::auto_reset().expect("an event is available");
+        // SAFETY: takes no pointer; posts to this thread's own queue.
+        unsafe { PostQuitMessage(0) };
+        assert_eq!(pump_until(&[event.as_handle()]), Pumped::Quit);
+        // `pump` reposts the quit it removed, so a second wait answers the same. Consume it
+        // so no later test on this thread inherits it.
+        assert_eq!(pump_until(&[event.as_handle()]), Pumped::Quit);
+        let mut message = MSG::default();
+        // SAFETY: the destination is a stack local.
+        _ = unsafe { PeekMessageW(&mut message, core::ptr::null_mut(), 0, 0, PM_REMOVE as u32) };
     }
 }

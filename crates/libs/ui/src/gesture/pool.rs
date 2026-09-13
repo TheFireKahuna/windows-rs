@@ -29,8 +29,9 @@ pub struct Bound {
     /// Whether a manipulation has actually begun, so a contact that never passed the
     /// recogniser's own threshold is not reported as one that did.
     pub manipulating: bool,
-    /// Whether the contact has lifted and its motion is still being pumped.
-    pub inertial: bool,
+    /// Whether the contact has lifted and its motion is still being pumped. Written only by
+    /// [`RecognizerPool::set_inertial`], which is what keeps the pool's inertial index exact.
+    inertial: bool,
     /// Whether the contact arrived without the digitizer's confidence. Such a contact
     /// **never starts a gesture** — nothing is fed to its recogniser — and that is the whole
     /// of palm rejection on this stack.
@@ -44,6 +45,12 @@ impl Bound {
     pub fn recognizer(&self) -> &Recognizer {
         &self.recognizer
     }
+
+    /// Returns whether the contact has lifted and its motion is still being pumped.
+    #[must_use]
+    pub const fn is_inertial(&self) -> bool {
+        self.inertial
+    }
 }
 
 /// The recognisers, bound and free.
@@ -53,6 +60,12 @@ pub struct RecognizerPool {
     /// Keyed by the system's pointer id — the one structure in this crate not keyed by a
     /// dense index this crate minted.
     bound: FxHashMap<u32, Bound>,
+    /// The ids whose binding is inertial. Exact at every mutation of that flag, so the tick
+    /// that pumps inertia neither scans `bound` nor allocates.
+    inertial: Vec<u32>,
+    /// Ids held across a pass that releases bindings, so the borrow of `bound` ends before
+    /// the first release. Kept for its capacity.
+    scratch: Vec<u32>,
     events: Events,
     minted: u32,
 }
@@ -71,6 +84,8 @@ impl RecognizerPool {
             free: Vec::new(),
             ptp_free: Vec::new(),
             bound: FxHashMap::default(),
+            inertial: Vec::new(),
+            scratch: Vec::new(),
             events: Events::new(),
             minted: 0,
         }
@@ -155,7 +170,56 @@ impl RecognizerPool {
     /// Returns whether anything is still in inertia, which is what keeps a frame requested.
     #[must_use]
     pub fn any_inertial(&self) -> bool {
-        self.bound.values().any(|bound| bound.inertial)
+        !self.inertial.is_empty()
+    }
+
+    /// Sets whether `id`'s motion is still being pumped, and keeps the inertial index exact.
+    ///
+    /// The sole writer of [`Bound::is_inertial`]. Does nothing if `id` is not bound, and
+    /// nothing if the flag already reads `on`, so a repeated set cannot double-enter the
+    /// index.
+    pub(crate) fn set_inertial(&mut self, id: u32, on: bool) {
+        let Some(bound) = self.bound.get_mut(&id) else {
+            return;
+        };
+        if bound.inertial == on {
+            return;
+        }
+        bound.inertial = on;
+        if on {
+            self.inertial.push(id);
+        } else {
+            self.drop_inertial(id);
+        }
+    }
+
+    /// Copies the ids still in inertia into `out`, replacing what it held.
+    ///
+    /// `out` keeps its capacity, so a caller that hands back the same buffer each tick
+    /// allocates only on the first one.
+    pub(crate) fn inertial_into(&self, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend_from_slice(&self.inertial);
+    }
+
+    /// Collects every contact bound to `target` into `out`, replacing what it held.
+    ///
+    /// `out` keeps its capacity. Costs one pass over the bound contacts.
+    pub(crate) fn bound_to(&self, target: ControlId, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend(
+            self.bound
+                .iter()
+                .filter(|(_, bound)| bound.target == target)
+                .map(|(id, _)| *id),
+        );
+    }
+
+    /// Drops `id` from the inertial index, if it is there.
+    fn drop_inertial(&mut self, id: u32) {
+        if let Some(at) = self.inertial.iter().position(|&held| held == id) {
+            self.inertial.swap_remove(at);
+        }
     }
 
     /// Ends a contact and returns its recogniser to the pool.
@@ -167,6 +231,9 @@ impl RecognizerPool {
         let Some(bound) = self.bound.remove(&id) else {
             return;
         };
+        if bound.inertial {
+            self.drop_inertial(id);
+        }
         // A failure here is a recogniser that is already finished, which is exactly the
         // state being asked for.
         _ = bound.recognizer.complete();
@@ -183,10 +250,13 @@ impl RecognizerPool {
 
     /// Ends every contact. What a lost capture and a window losing focus both do.
     pub fn release_all(&mut self, abort: bool) {
-        let ids: Vec<u32> = self.bound.keys().copied().collect();
-        for id in ids {
+        let mut ids = core::mem::take(&mut self.scratch);
+        ids.extend(self.bound.keys().copied());
+        for &id in &ids {
             self.release(id, abort);
         }
+        ids.clear();
+        self.scratch = ids;
     }
 
     /// Returns a free recogniser of the kind `ptype` needs, minting one if the list is
@@ -208,5 +278,112 @@ impl RecognizerPool {
             Recognizer::gesture(&self.events)?
         };
         Ok(FrontHandle::new(recognizer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Binds one mouse contact and returns its id.
+    fn bind(pool: &mut RecognizerPool, id: u32) {
+        pool.bind(
+            id,
+            PointerType::Mouse,
+            ControlId::FIRST,
+            GestureDecl::default(),
+            Point { x: 0.0, y: 0.0 },
+            false,
+        )
+        .expect("a recogniser could not be constructed");
+    }
+
+    /// Returns what the index holds, through the copy the router tick takes.
+    fn index(pool: &RecognizerPool) -> Vec<u32> {
+        let mut out = Vec::new();
+        pool.inertial_into(&mut out);
+        out
+    }
+
+    #[test]
+    fn a_fresh_binding_is_not_inertial() {
+        let mut pool = RecognizerPool::new();
+        bind(&mut pool, 7);
+        assert!(!pool.any_inertial());
+        assert!(index(&pool).is_empty());
+    }
+
+    #[test]
+    fn setting_the_flag_enters_the_index_and_clearing_it_leaves() {
+        let mut pool = RecognizerPool::new();
+        bind(&mut pool, 7);
+        pool.set_inertial(7, true);
+        assert!(pool.any_inertial());
+        assert!(pool.get(7).expect("binding lost").is_inertial());
+        assert_eq!(index(&pool), vec![7]);
+        pool.set_inertial(7, false);
+        assert!(!pool.any_inertial());
+        assert!(index(&pool).is_empty());
+    }
+
+    #[test]
+    fn setting_the_flag_twice_enters_the_index_once() {
+        let mut pool = RecognizerPool::new();
+        bind(&mut pool, 7);
+        pool.set_inertial(7, true);
+        pool.set_inertial(7, true);
+        assert_eq!(index(&pool), vec![7]);
+    }
+
+    #[test]
+    fn releasing_an_inertial_contact_leaves_the_index() {
+        let mut pool = RecognizerPool::new();
+        bind(&mut pool, 7);
+        pool.set_inertial(7, true);
+        pool.release(7, false);
+        assert!(!pool.any_inertial());
+        assert!(index(&pool).is_empty());
+    }
+
+    #[test]
+    fn releasing_one_of_two_leaves_the_other_pumping() {
+        let mut pool = RecognizerPool::new();
+        bind(&mut pool, 7);
+        bind(&mut pool, 8);
+        pool.set_inertial(7, true);
+        pool.set_inertial(8, true);
+        pool.release(7, false);
+        assert!(pool.any_inertial());
+        assert_eq!(index(&pool), vec![8]);
+    }
+
+    #[test]
+    fn releasing_everything_empties_the_index() {
+        let mut pool = RecognizerPool::new();
+        bind(&mut pool, 7);
+        bind(&mut pool, 8);
+        pool.set_inertial(8, true);
+        pool.release_all(false);
+        assert_eq!(pool.live(), 0);
+        assert!(!pool.any_inertial());
+        assert!(index(&pool).is_empty());
+    }
+
+    #[test]
+    fn an_unbound_id_cannot_enter_the_index() {
+        let mut pool = RecognizerPool::new();
+        pool.set_inertial(7, true);
+        assert!(!pool.any_inertial());
+    }
+
+    #[test]
+    fn the_contacts_on_a_target_are_collected_without_the_others() {
+        let mut pool = RecognizerPool::new();
+        bind(&mut pool, 7);
+        let mut out = Vec::new();
+        pool.bound_to(ControlId::FIRST, &mut out);
+        assert_eq!(out, vec![7]);
+        pool.bound_to(ControlId::NONE, &mut out);
+        assert!(out.is_empty());
     }
 }

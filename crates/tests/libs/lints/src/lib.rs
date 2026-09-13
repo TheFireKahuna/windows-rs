@@ -26,6 +26,21 @@ pub struct Source {
 }
 
 impl Source {
+    /// Builds a source from `path` and the file text, with comments and `#[cfg(test)]`
+    /// modules blanked out.
+    ///
+    /// `path` must be relative to the workspace root and spelled with forward slashes,
+    /// because that is what [`Source::under`] and every allowlist match against.
+    #[must_use]
+    pub fn new(path: impl Into<String>, raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        Self {
+            code: strip_tests(&strip_comments(&raw)),
+            path: path.into(),
+            raw,
+        }
+    }
+
     /// Returns the one-based line that byte offset `at` falls on.
     ///
     /// [`Source::code`] blanks comments and test modules in place rather than removing
@@ -55,6 +70,39 @@ impl Source {
                     .to_owned(),
             ));
             at = offset + needle.len();
+        }
+        out
+    }
+
+    /// Returns every occurrence of `needle` that stands as a whole identifier, as
+    /// `(line, text)`.
+    ///
+    /// A match is kept only when neither the byte before it nor the byte after it can
+    /// continue a Rust identifier, so a needle of `Model` answers `Model` and `&Model` but
+    /// not `ModelState` or `patch_model`.
+    #[must_use]
+    pub fn find_word(&self, needle: &str) -> Vec<(usize, String)> {
+        let bytes = self.code.as_bytes();
+        let ident = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        let mut out = Vec::new();
+        let mut at = 0;
+        while let Some(found) = self.code[at..].find(needle) {
+            let offset = at + found;
+            let end = offset + needle.len();
+            at = end;
+            if ident(offset.checked_sub(1).and_then(|i| bytes.get(i))) || ident(bytes.get(end)) {
+                continue;
+            }
+            let line = self.line(offset);
+            out.push((
+                line,
+                self.raw
+                    .lines()
+                    .nth(line - 1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned(),
+            ));
         }
         out
     }

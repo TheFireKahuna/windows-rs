@@ -120,9 +120,9 @@ pub enum Op {
     /// Starts a timed reveal, reported back as
     /// [`SceneEvent::DelayElapsed`](crate::SceneEvent::DelayElapsed).
     ///
-    /// The deadline is monotonic and read on the frame clock rather than armed on a timer,
-    /// so it is observed on a frame the scene was servicing anyway and wakes none of its
-    /// own. Re-issuing a live id restarts the deadline.
+    /// The wait is a compositor animation with `ms` of lead inside a scoped batch, and the
+    /// batch's completion is the report, so no thread holds a clock for it. Re-issuing a live
+    /// id restarts the wait.
     Delay {
         id: DelayId,
         ms: u32,

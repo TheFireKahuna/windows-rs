@@ -164,8 +164,8 @@ impl MenuItem {
 /// case folded. An absent or empty name answers nothing.
 ///
 /// Matching runs against the accessible name rather than a list of items kept beside the
-/// menu, so type-ahead walks the same candidates the focus ring does and the two cannot
-/// disagree once an item is disabled. A menu row states its label as its name.
+/// menu, so type-ahead walks the same hit-array entries arrow navigation does and the two
+/// cannot disagree once an item is disabled. A menu row states its label as its name.
 #[must_use]
 pub fn answers(name: Option<&str>, key: char) -> bool {
     let Some(name) = name else { return false };
@@ -178,8 +178,8 @@ pub fn answers(name: Option<&str>, key: char) -> bool {
         == Some(key)
 }
 
-/// Returns a menu's body, for [`El::flyout`](crate::build::El::flyout) or for
-/// [`Overlays::open`](super::Overlays::open).
+/// Returns a menu's body, for [`El::flyout`](crate::build::El::flyout) or for an overlay
+/// opened directly.
 ///
 /// `items` runs immediately and is never stored, so it is bounded by neither `'static` nor
 /// `Fn`. Taking a closure rather than a list is what lets a menu that reports state read that
@@ -294,8 +294,8 @@ mod tests {
 
     #[test]
     fn type_ahead_matches_a_name_by_its_first_letter_either_case() {
-        // The candidate order and the wrapping belong to `FocusRing::step_to`; `answers` is
-        // only the predicate that order is filtered by.
+        // The candidate order and the wrapping belong to `Overlays::type_ahead`; `answers`
+        // is only the predicate that order is filtered by.
         assert!(answers(Some("Copy"), 'c'));
         assert!(answers(Some("Copy"), 'C'), "case folds");
         assert!(!answers(Some("Copy"), 'z'));

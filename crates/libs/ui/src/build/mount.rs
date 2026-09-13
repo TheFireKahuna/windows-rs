@@ -554,7 +554,6 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
                     queue,
                     live,
                     control,
-                    picked: crate::present::Picked::new(),
                     build: Some(build),
                     extent: None,
                 },
@@ -1221,8 +1220,7 @@ fn mount_scroll(
                 reveal,
                 state: decl.state,
                 last: crate::layout::ThumbGeom::default(),
-                grabbed_at: None,
-                shown: reveal == crate::layout::Reveal::Always,
+                front_added: false,
             },
         );
     });

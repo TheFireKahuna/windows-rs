@@ -78,7 +78,7 @@ use crate::rotary::{Rotary, Rotation};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use windows_core::Result;
-use windows_scene::{ControlId, Env, HitFlags, HitTable, Point};
+use windows_scene::{ShadowOffsets, ControlId, Env, HitFlags, HitTable, Point};
 
 /// How many coalesced entries one service reads back.
 ///
@@ -254,9 +254,19 @@ pub struct Router {
     wake: Wake,
     /// Held while a gesture or inertia is live. The doorbell holds its own for the ring.
     running: Option<Tick>,
+    /// The live scroll offset of every viewport, as the thread owning the trackers publishes
+    /// it. A hit test against the array copy this thread holds resolves scroll through these
+    /// rather than through offsets the table itself was told, which only the scene's own
+    /// table is.
+    shadows: ShadowOffsets,
     // ── scratch, so a frame allocates nothing after the first ─────────────────────
     moved: Vec<u32>,
     recognised: Vec<Recognised>,
+    /// The ids the pool reports as inertial, copied out once per tick so the pump can hold
+    /// `&mut self` while it walks them.
+    inertial_ids: Vec<u32>,
+    /// The ids bound to one target, for the unmount that aborts them.
+    target_ids: Vec<u32>,
     /// The coalesced-history buffer, allocated once. `POINTER_INFO` is ~100 bytes, so this
     /// holds ~13 KB for the window's life and a contact's motion allocates nothing.
     history: Vec<POINTER_INFO>,
@@ -307,8 +317,11 @@ impl Router {
             capability: Capability::read(window, &late),
             wake,
             running: None,
+            shadows: ShadowOffsets::default(),
             moved: Vec::with_capacity(16),
             recognised: Vec::with_capacity(32),
+            inertial_ids: Vec::with_capacity(8),
+            target_ids: Vec::with_capacity(8),
             history: vec![POINTER_INFO::default(); HISTORY_MAX],
             census: InputCensus::default(),
         })
@@ -368,6 +381,17 @@ impl Router {
     }
 
     /// Returns the focus ring for mutation, as an overlay opens or closes a scope.
+    /// The scroll shadows every hit test on this thread resolves through. The owner of the
+    /// array copy installs the current set here whenever a tracker is created or dropped.
+    pub fn shadows_mut(&mut self) -> &mut ShadowOffsets {
+        &mut self.shadows
+    }
+
+    /// The scroll shadows, for a hit test made outside the router against the same array.
+    pub fn shadows(&self) -> &ShadowOffsets {
+        &self.shadows
+    }
+
     pub const fn focus_mut(&mut self) -> &mut FocusRing {
         &mut self.focus
     }
@@ -381,18 +405,14 @@ impl Router {
     /// because a gesture whose target has gone cannot commit anything.
     pub fn forget(&mut self, target: ControlId) {
         self.decls.remove(&target);
-        if self.pool.holds(target) {
-            let ids: Vec<u32> = self
-                .pool
-                .iter_mut()
-                .filter(|(_, bound)| bound.target == target)
-                .map(|(id, _)| id)
-                .collect();
-            for id in ids {
-                self.pool.release(id, true);
-                self.census.aborts += 1;
-            }
+        let mut ids = core::mem::take(&mut self.target_ids);
+        self.pool.bound_to(target, &mut ids);
+        for &id in &ids {
+            self.pool.release(id, true);
+            self.census.aborts += 1;
         }
+        ids.clear();
+        self.target_ids = ids;
         self.focus.clear_tab_index(target);
     }
 
@@ -517,7 +537,7 @@ impl Router {
         let pressed = self.reader.at_transition(&event, &self.coords, env);
         let at = pressed.raw;
         self.census.discrete_hits += 1;
-        let Some(hit) = hits.hit(at, event.ptype.contact()) else {
+        let Some(hit) = hits.hit_with(at, event.ptype.contact(), &self.shadows) else {
             // A press on nothing still takes focus away, so clicking the background dismisses
             // a text caret.
             if let Some((from, to)) = self.focus.focus(None) {
@@ -634,9 +654,7 @@ impl Router {
             .pool
             .get(event.id)
             .is_some_and(|bound| bound.recognizer().is_inertial());
-        if let Some(bound) = self.pool.get_mut(event.id) {
-            bound.inertial = inertial;
-        }
+        self.pool.set_inertial(event.id, inertial);
         if !inertial {
             self.pool.release(event.id, false);
         }
@@ -675,7 +693,7 @@ impl Router {
     ) -> Result<()> {
         let at = self.coords.client(env, event.id, event.x_px, event.y_px);
         self.census.discrete_hits += 1;
-        let hit = hits.hit(at, event.ptype.contact());
+        let hit = hits.hit_with(at, event.ptype.contact(), &self.shadows);
         // A scroll surface's wheel belongs to its tracker: the source's `PointerWheelConfig`
         // takes it, and handling it front-side here would be a second scroll path.
         if hit.is_some_and(|hit| hit.flags.contains(HitFlags::SCROLL)) {
@@ -709,7 +727,7 @@ impl Router {
                 VK_TAB => {
                     match self.focus.step(hits, !event.mods.shift) {
                         Move::To { from, to } => {
-                            out.push(Report::FocusChanged { from, to: Some(to) })
+                            out.push(Report::FocusChanged { from, to: Some(to) });
                         }
                         // Off the end of a scope that does not trap: dismiss it and let the
                         // owner step again outside.
@@ -833,6 +851,9 @@ impl Router {
             return;
         };
         let target = bound.target;
+        // Applied after the loop: the pool's index writer needs the pool, and `bound` borrows
+        // it for the length of the walk.
+        let mut inertial = None;
         for event in recognised.drain(..) {
             match event {
                 Recognised::ManipulationStarted { .. } => bound.manipulating = true,
@@ -843,10 +864,10 @@ impl Router {
                         _ = bound.recognizer().pivot(pivot);
                     }
                 }
-                Recognised::InertiaStarting { .. } => bound.inertial = true,
+                Recognised::InertiaStarting { .. } => inertial = Some(true),
                 Recognised::ManipulationCompleted { .. } => {
                     bound.manipulating = false;
-                    bound.inertial = false;
+                    inertial = Some(false);
                 }
                 _ => {}
             }
@@ -856,6 +877,9 @@ impl Router {
                 contact: id,
                 event,
             });
+        }
+        if let Some(on) = inertial {
+            self.pool.set_inertial(id, on);
         }
         self.recognised = recognised;
     }
@@ -930,7 +954,9 @@ impl Router {
     /// the target differs from the current hover.
     fn cross(&mut self, hits: &HitTable, sample: &Sample, out: &mut Vec<Report>) {
         self.census.hover_hits += 1;
-        let to = hits.hit(sample.raw, sample.kind()).map(|hit| hit.id);
+        let to = hits
+            .hit_with(sample.raw, sample.kind(), &self.shadows)
+            .map(|hit| hit.id);
         if to == self.hover {
             return;
         }
@@ -970,7 +996,7 @@ impl Router {
             };
             let target = match target {
                 Some(at) => hits
-                    .hit(at, windows_scene::ContactKind::Touch)
+                    .hit_with(at, windows_scene::ContactKind::Touch, &self.shadows)
                     .map(|h| h.id),
                 None => self.focus.current(),
             };
@@ -1024,30 +1050,25 @@ impl Router {
     // ── 4. inertia, on the same clock as everything else ──────────────────────────
 
     fn pump(&mut self, out: &mut Vec<Report>) -> Result<()> {
+        let mut ids = core::mem::take(&mut self.inertial_ids);
         if self.bell.take_stop_inertia() {
             // A system stop request ends every running motion without committing what it was
             // on its way to.
-            let ids: Vec<u32> = self
-                .pool
-                .iter_mut()
-                .filter(|(_, bound)| bound.inertial)
-                .map(|(id, _)| id)
-                .collect();
-            for id in ids {
+            self.pool.inertial_into(&mut ids);
+            for &id in &ids {
                 self.pool.release(id, true);
                 self.census.aborts += 1;
             }
         }
 
-        let inertial: Vec<u32> = self
-            .pool
-            .iter_mut()
-            .filter(|(_, bound)| bound.inertial)
-            .map(|(id, _)| id)
-            .collect();
-        for id in inertial {
-            if let Some(bound) = self.pool.get(id) {
-                bound.recognizer().inertia()?;
+        self.pool.inertial_into(&mut ids);
+        let mut fed = Ok(());
+        for &id in &ids {
+            if let Some(bound) = self.pool.get(id)
+                && let Err(error) = bound.recognizer().inertia()
+            {
+                fed = Err(error);
+                break;
             }
             self.collect(id, out);
             // A recogniser whose inertia has run out has nothing left to pump; the contact
@@ -1060,7 +1081,10 @@ impl Router {
                 self.pool.release(id, false);
             }
         }
-        Ok(())
+        // Returned after the scratch is back, so a refused sample does not cost the buffer.
+        ids.clear();
+        self.inertial_ids = ids;
+        fed
     }
 
     // ── 5. requesting the next tick ───────────────────────────────────────────────

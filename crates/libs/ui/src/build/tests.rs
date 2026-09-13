@@ -152,6 +152,20 @@ fn root() -> windows_scene::GroupId {
     Host::with(|h| h.model().root())
 }
 
+/// Returns everything the host has produced since the last call, as one batch.
+fn filled() -> crate::seam::Down {
+    let mut down = crate::seam::Down::default();
+    Host::with(|h| h.fill(&mut down));
+    down
+}
+
+/// Returns the pick table the regions declared so far, as the tick builds it.
+fn picks() -> crate::present::Picks {
+    let mut picks = crate::present::Picks::default();
+    picks.apply(&filled().regions);
+    picks
+}
+
 /// Returns a bare rounded box, the smallest view that mints a sprite.
 fn plate() -> View {
     El::<Any>::seed(crate::layout::Preset::Bare).sprite(
@@ -1685,7 +1699,7 @@ fn a_control_declares_the_default_gesture_and_a_label_declares_none() {
     let mut patch = fixture();
     let _held = mount(crate::widget::button("press me"), root());
     flush(&mut patch);
-    let declared = Host::with(|h| h.take_gestures());
+    let declared = filled().gestures;
     assert_eq!(
         declared.len(),
         1,
@@ -1709,7 +1723,7 @@ fn a_control_declares_the_default_gesture_and_a_label_declares_none() {
     let _held = mount(crate::widget::label("just words"), root());
     flush(&mut patch);
     assert!(
-        Host::with(|h| h.take_gestures()).is_empty(),
+        filled().gestures.is_empty(),
         "a static label was given a recogniser it can never use"
     );
 }
@@ -4383,6 +4397,7 @@ fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
     let mut hits = windows_scene::HitTable::default();
     hits.replace(patch.hit_entries());
     let id = Host::with(|h| crate::present::tests::control(h)).expect("the region is a control");
+    let mut picks = picks();
 
     // Region-local, and deliberately narrow: at ten DIPs across, a point resolved in client
     // space misses both.
@@ -4410,6 +4425,7 @@ fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
             qpc: 0,
         }],
         &hits,
+        &mut picks,
         &mut intents,
     );
     assert_eq!(
@@ -4437,6 +4453,7 @@ fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
             qpc: 0,
         }],
         &hits,
+        &mut picks,
         &mut intents,
     );
     assert_eq!(live.input.hover(), None);
@@ -4469,6 +4486,7 @@ fn a_release_inside_a_region_clears_the_gesture_and_queues_one_intent() {
     let mut hits = windows_scene::HitTable::default();
     hits.replace(patch.hit_entries());
     let id = Host::with(|h| crate::present::tests::control(h)).expect("the region is a control");
+    let mut picks = picks();
     live.parts.publish(&[Part {
         id: SubId(3),
         rect: Rect::new(0.0, 0.0, 100.0, 100.0),
@@ -4482,6 +4500,7 @@ fn a_release_inside_a_region_clears_the_gesture_and_queues_one_intent() {
             at: windows_scene::Point { x: 50.0, y: 50.0 },
         }],
         &hits,
+        &mut picks,
         &mut intents,
     );
     assert_eq!(
@@ -4667,7 +4686,8 @@ fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
         root(),
     );
     flush(&mut patch);
-    let before = Host::with(|h| h.take_chrome())
+    let before = filled()
+        .chrome
         .into_iter()
         .find(|r| r.trail.is_some())
         .unwrap();
@@ -4680,7 +4700,7 @@ fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
     value.set(12.0);
     crate::signal::flush();
     flush(&mut patch);
-    let rows = Host::with(|h| h.take_chrome());
+    let rows = filled().chrome;
     assert!(
         rows.iter()
             .any(|r| r.id == before.id && r.source_fraction == 0.75 && r.trail == before.trail)

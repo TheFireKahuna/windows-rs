@@ -1,4 +1,4 @@
-//! Twelve source rules over the framework crates, each stating what the source may not
+//! Thirteen source rules over the framework crates, each stating what the source may not
 //! contain.
 //!
 //! A rule matches the hand-written source with comments and `#[cfg(test)]` modules blanked
@@ -471,5 +471,238 @@ fn no_reactor_dep() {
         "nothing in this stack hosts XAML, so nothing may depend on the reconciler that \
          does",
         &found,
+    );
+}
+
+// ── 13 ──────────────────────────────────────────────────────────────────────────
+
+/// A forbidden token, matched either anywhere it appears or only as a whole identifier.
+enum Needle {
+    /// Matched as a substring, so it carries whatever punctuation disambiguates it.
+    Text(&'static str),
+    /// Matched only where neither neighbour continues an identifier.
+    Word(&'static str),
+}
+
+impl Needle {
+    /// Returns every hit of this needle in `source`, as `(line, text)`.
+    fn find(&self, source: &Source) -> Vec<(usize, String)> {
+        match self {
+            Self::Text(needle) => source.find(needle),
+            Self::Word(needle) => source.find_word(needle),
+        }
+    }
+}
+
+/// The files the input thread and the scene thread own. Neither may reach the app half.
+const THREAD_OWNED: [&str; 6] = [
+    "crates/libs/ui/src/driver/input.rs",
+    "crates/libs/ui/src/driver/scene.rs",
+    "crates/libs/ui/src/input/",
+    "crates/libs/ui/src/widget/state.rs",
+    "crates/libs/ui/src/caption.rs",
+    "crates/libs/ui/src/present/pick.rs",
+];
+
+/// What a thread-owned file may not name: the host, the signal graph, the build lowering,
+/// the overlay stack, the model, the overlay table.
+const THREAD_FORBIDDEN: [Needle; 6] = [
+    Needle::Text("Host::"),
+    Needle::Text("signal::"),
+    Needle::Text("build::"),
+    Needle::Text("overlay::"),
+    Needle::Word("Model"),
+    Needle::Word("Overlays"),
+];
+
+/// The files the app half owns. None may reach a compositor object, the scene, the
+/// backends, the focus ring, the present registry or the front table.
+const APP_OWNED: [&str; 4] = [
+    "crates/libs/ui/src/build/",
+    "crates/libs/ui/src/signal/",
+    "crates/libs/ui/src/overlay/",
+    "crates/libs/ui/src/driver/app.rs",
+];
+
+/// What an app-half file may not name.
+///
+/// `Scene` and `Front` are spelled with the punctuation that makes each a type rather than
+/// a prefix, so `SceneEvent` and `FrontHandle` do not answer.
+const APP_FORBIDDEN: [Needle; 9] = [
+    Needle::Text("Scene::"),
+    Needle::Text("&Scene"),
+    Needle::Text("&mut Scene"),
+    Needle::Text(": Scene"),
+    Needle::Text("Backends"),
+    Needle::Text("Compositor"),
+    Needle::Text("FocusRing"),
+    Needle::Text("REGISTRY"),
+    Needle::Text("widget::Front"),
+];
+
+/// The clock the scene may not hold: its timing arrives with a frame, not from a read.
+const SCENE_FORBIDDEN: [Needle; 2] = [
+    Needle::Text("Instant::now"),
+    Needle::Text("std::time::Instant"),
+];
+
+/// The files exempted while the thread split lands, each naming the unit that clears it.
+///
+/// Every entry names a file a rewrite already owns, so the exemption is an ordering rather
+/// than a permission. `thread_ownership_allow_list_is_shrinking` fails on an entry whose
+/// file has gone, which is what forces the list down as the units land.
+const ALLOW_UNTIL_SPLIT: &[&str] = &[];
+
+/// Collects every forbidden needle found in the sources under `files`, outside `allow`.
+///
+/// A `tests.rs` file is skipped. Each one is declared under `#[cfg(test)]` at its parent
+/// module, so its whole body is a test module that `strip_tests` cannot reach, and a test
+/// names the two halves it drives against each other.
+fn owned(sources: &[Source], files: &[&str], needles: &[Needle], allow: &[&str]) -> Vec<String> {
+    sources
+        .iter()
+        .filter(|source| source.under(files))
+        .filter(|source| !source.under(allow))
+        .filter(|source| !source.path.ends_with("/tests.rs"))
+        .flat_map(|source| {
+            needles.iter().flat_map(move |needle| {
+                needle
+                    .find(source)
+                    .into_iter()
+                    .map(move |(line, text)| format!("  {}:{line}: {text}", source.path))
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn thread_ownership() {
+    // `windows-ui` runs on three threads and the source is what keeps them apart. The input
+    // thread and the scene thread service a window and a frame; neither may reach the host,
+    // the signal graph, the build lowering or the overlay stack. The app half holds no
+    // compositor object, no scene, no backends, no focus ring and no present registry, so
+    // nothing it names carries thread affinity. `windows-scene` reads no clock: a delay is
+    // due when the frame it was scheduled against arrives.
+    //
+    // A file that is not present is absent from the collection, so the rule reaches each of
+    // the three driver modules the moment it lands.
+    let sources = framework();
+
+    let found = owned(
+        &sources,
+        &THREAD_OWNED,
+        &THREAD_FORBIDDEN,
+        ALLOW_UNTIL_SPLIT,
+    );
+    deny(
+        "thread_ownership",
+        "the input and scene threads service a window and a frame; the host, the signal \
+         graph, the build lowering and the overlay stack live on the app thread",
+        &found,
+    );
+
+    let found = owned(&sources, &APP_OWNED, &APP_FORBIDDEN, ALLOW_UNTIL_SPLIT);
+    deny(
+        "thread_ownership",
+        "the app half names nothing carrying thread affinity: no compositor object, no \
+         scene, no backends, no focus ring, no present registry and no front table",
+        &found,
+    );
+
+    let found = owned(
+        &sources,
+        &["crates/libs/scene/src/"],
+        &SCENE_FORBIDDEN,
+        ALLOW_UNTIL_SPLIT,
+    );
+    deny(
+        "thread_ownership",
+        "the scene holds no clock: a delay is due when the frame it was scheduled against \
+         arrives, not when a wall-clock read says so",
+        &found,
+    );
+}
+
+#[test]
+fn thread_ownership_allow_list_is_shrinking() {
+    // An exemption outlives the file it names only by being forgotten, so a path that has
+    // gone fails here and the entry goes with it.
+    let root = root();
+    let stale: Vec<String> = ALLOW_UNTIL_SPLIT
+        .iter()
+        .filter(|rel| !root.join(rel).exists())
+        .map(|rel| format!("  {rel}: exempted by thread_ownership but not present"))
+        .collect();
+    deny(
+        "thread_ownership_allow_list_is_shrinking",
+        "every path the thread-ownership exemption names must exist, or the exemption \
+         covers nothing",
+        &stale,
+    );
+}
+
+#[test]
+fn thread_ownership_matcher_bites() {
+    // The rule's own coverage, over sources built in memory: an input-thread file reaching
+    // the host is reported, and the names that merely begin with a forbidden one are not.
+    let reaching = Source::new(
+        "crates/libs/ui/src/input/service.rs",
+        "fn dispatch() {\n    Host::with(|h| h.model().root());\n}\n",
+    );
+    let found = owned(
+        &[reaching],
+        &THREAD_OWNED,
+        &THREAD_FORBIDDEN,
+        ALLOW_UNTIL_SPLIT,
+    );
+    assert_eq!(
+        found.len(),
+        1,
+        "\nthread_ownership — an input-thread file naming Host:: must be reported\n\n{}\n",
+        found.join("\n")
+    );
+
+    let prefixes = Source::new(
+        "crates/libs/ui/src/build/mount.rs",
+        "fn take(events: &[SceneEvent], front: FrontHandle<ModelState>) {}\n",
+    );
+    let found = owned(&[prefixes], &APP_OWNED, &APP_FORBIDDEN, ALLOW_UNTIL_SPLIT);
+    assert!(
+        found.is_empty(),
+        "\nthread_ownership — SceneEvent, FrontHandle and ModelState are not the forbidden \
+         names\n\n{}\n",
+        found.join("\n")
+    );
+
+    // A comment is blanked before matching, so prose that names a forbidden type does not
+    // answer for the code beneath it.
+    let commented = Source::new(
+        "crates/libs/ui/src/signal/graph.rs",
+        "// The Compositor holds the clock.\nfn arm() {}\n",
+    );
+    let found = owned(&[commented], &APP_OWNED, &APP_FORBIDDEN, ALLOW_UNTIL_SPLIT);
+    assert!(
+        found.is_empty(),
+        "\nthread_ownership — a comment is not source\n\n{}\n",
+        found.join("\n")
+    );
+
+    // `Model` and `Overlays` are word matches, so the app half's own types answer while a
+    // longer name built from either does not.
+    let named = Source::new(
+        "crates/libs/ui/src/widget/state.rs",
+        "fn sync(model: &mut Model, all: &Overlays) {}\n",
+    );
+    let found = owned(
+        &[named],
+        &THREAD_OWNED,
+        &THREAD_FORBIDDEN,
+        ALLOW_UNTIL_SPLIT,
+    );
+    assert_eq!(
+        found.len(),
+        2,
+        "\nthread_ownership — Model and Overlays must both be reported\n\n{}\n",
+        found.join("\n")
     );
 }

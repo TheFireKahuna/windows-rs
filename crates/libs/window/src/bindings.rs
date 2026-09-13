@@ -32,6 +32,7 @@ windows_core::link!("user32.dll" "system" fn IsMouseInPointerEnabled() -> window
 windows_core::link!("user32.dll" "system" fn IsWindowVisible(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn IsZoomed(hwnd : HWND) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn LoadCursorW(hinstance : HINSTANCE, lpcursorname : windows_core::PCWSTR) -> HCURSOR);
+windows_core::link!("user32.dll" "system" fn MsgWaitForMultipleObjectsEx(ncount : u32, phandles : *const HANDLE, dwmilliseconds : u32, dwwakemask : u32, dwflags : u32) -> u32);
 windows_core::link!("user32.dll" "system" fn PeekMessageW(lpmsg : *mut MSG, hwnd : HWND, wmsgfiltermin : u32, wmsgfiltermax : u32, wremovemsg : u32) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn PostMessageW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> windows_core::BOOL);
 windows_core::link!("user32.dll" "system" fn PostQuitMessage(nexitcode : i32));
@@ -107,6 +108,7 @@ pub type DISPATCHERQUEUE_THREAD_APARTMENTTYPE = i32;
 pub type DISPATCHERQUEUE_THREAD_TYPE = i32;
 pub type DPI_AWARENESS_CONTEXT = *mut core::ffi::c_void;
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: DPI_AWARENESS_CONTEXT = -4 as _;
+pub const DQTAT_COM_ASTA: DISPATCHERQUEUE_THREAD_APARTMENTTYPE = 1;
 pub const DQTAT_COM_NONE: DISPATCHERQUEUE_THREAD_APARTMENTTYPE = 0;
 pub const DQTYPE_THREAD_CURRENT: DISPATCHERQUEUE_THREAD_TYPE = 2;
 pub const DWMWA_BORDER_COLOR: DWMWINDOWATTRIBUTE = 34;
@@ -795,6 +797,7 @@ pub struct MSG {
     pub time: u32,
     pub pt: POINT,
 }
+pub const MWMO_INPUTAVAILABLE: i32 = 4;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NCCALCSIZE_PARAMS {
@@ -861,6 +864,7 @@ impl windows_core::RuntimeType for Point {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.Foundation.Point;f4;f4)");
 }
+pub const QS_ALLINPUT: i32 = 7423;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RECT {
@@ -992,6 +996,7 @@ pub struct WINDOWPOS {
     pub flags: u32,
 }
 pub const WM_ACTIVATE: i32 = 6;
+pub const WM_CLOSE: i32 = 16;
 pub const WM_DESTROY: i32 = 2;
 pub const WM_DPICHANGED: i32 = 736;
 pub const WM_ERASEBKGND: i32 = 20;

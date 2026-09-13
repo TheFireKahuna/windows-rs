@@ -47,6 +47,12 @@ pub mod caption;
 #[deny(unsafe_code)]
 pub mod driver;
 
+// The thread seams: single-slot mailboxes over buffers allocated once, and the doorbells the
+// input, scene and app threads park on. Nothing here allocates once the buffers exist, and no
+// thread waits on another. A mailbox hands a box across threads through one atomic pointer,
+// which is why this is not under `deny(unsafe_code)`.
+pub(crate) mod seam;
+
 // Presentation regions: the one per-frame path, declared as a node. The buffers, the thread
 // and the renderer trait belong to `windows-present` and the brush to `windows-scene`; what
 // is here is the declaration and the lifecycle that follows the node. Binding a surface
