@@ -231,7 +231,13 @@ impl Host {
                 .unwrap_or(0.0);
             let width = (solved.size.x - inset * 2.0).max(1.0);
             let caret = geometry.caret(row.selection);
-            row.scroll = row.scroll.min(caret.x).max(caret.x - width).max(0.0);
+            // Shorter source text or a wider field must release obsolete scroll.
+            row.scroll = row
+                .scroll
+                .min(caret.x)
+                .max(caret.x - width)
+                .max(0.0)
+                .min((line.size.x - width).max(0.0));
             geometry.origin = Vector2 {
                 x: inset - row.scroll,
                 y: (solved.size.y - line.size.y) * 0.5,
@@ -446,6 +452,62 @@ mod tests {
         assert_eq!(editor.selection().affinity, Affinity::Upstream);
         drop(mounted);
         assert!(Host::with(|h| h.fields.get(source.id).is_none()));
+    }
+
+    #[test]
+    fn shorter_source_on_blur_releases_horizontal_scroll() {
+        let mut patch = fixture();
+        let root = Host::with(|h| h.model().root());
+        let _mounted = mount(
+            crate::widget::field("1234.56789123456789").width(crate::layout::Len::Pct(0.1)),
+            root,
+        );
+        Host::with(|h| h.flush(&mut patch));
+        let source = Host::with(|h| h.field_sources[0].clone());
+        let mut editor = Editor::new(source.id, source.scope, &source.text);
+        editor.publish(true, false);
+        editor.focus(true);
+        Host::with(|h| {
+            for update in editor.updates.drain(..) {
+                h.field_update(&update);
+            }
+            h.flush(&mut patch);
+        });
+        editor.layout(Host::with(|h| {
+            h.fields.get(source.id).unwrap().geometry.clone().unwrap()
+        }));
+        editor.command(Command::End { select: false });
+        Host::with(|h| {
+            for update in editor.updates.drain(..) {
+                h.field_update(&update);
+            }
+            h.flush(&mut patch);
+            assert!(h.fields.get(source.id).unwrap().scroll > 0.0);
+        });
+        editor.source(
+            editor.revision,
+            "1235".encode_utf16().collect::<Vec<_>>().into(),
+        );
+        assert!(
+            editor.updates.is_empty(),
+            "source stays deferred while editing"
+        );
+        editor.focus(false);
+        Host::with(|h| {
+            for update in editor.updates.drain(..) {
+                assert!(
+                    update.commit.is_none(),
+                    "formatting does not commit an edit"
+                );
+                h.field_update(&update);
+            }
+            h.flush(&mut patch);
+            let row = h.fields.get(source.id).unwrap();
+            assert_eq!(String::from_utf16_lossy(&row.text), "1235");
+            assert_eq!(row.scroll, 0.0, "short text starts at the field inset");
+            let geometry = row.geometry.as_ref().unwrap();
+            assert_eq!(geometry.origin.x, geometry.viewport.x);
+        });
     }
 
     #[test]
