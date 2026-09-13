@@ -48,13 +48,13 @@ const LEVELS: [D3D_FEATURE_LEVEL; 7] = [
 ];
 
 impl Gpu {
-    /// Creates the window thread's device.
+    /// Creates the retained scene's device with optional driver threading disabled.
     pub fn for_window() -> Result<Self> {
-        Self::new(0)
+        Self::new(D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS)
     }
 
-    /// Creates a present thread's device, suppressing the display driver's own worker pool,
-    /// which the driver otherwise creates per device.
+    /// Creates a present thread's device with optional driver threading disabled.
+    /// The driver may still create workers for other purposes.
     pub fn for_presentation() -> Result<Self> {
         Self::new(D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS)
     }
