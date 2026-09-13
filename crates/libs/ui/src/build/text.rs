@@ -167,7 +167,7 @@ pub(crate) struct Entry {
     /// The foreground the lines are painted in. Held because a wrapping run mints its own
     /// sprites as it breaks, and a sprite minted after the walk has no other way to learn
     /// what colour its widget resolved.
-    ink: crate::role::Text,
+    ink: crate::role::Role,
     target: Target,
     /// The width the glyphs stand at. `NaN` until the first pin, so the first
     /// publish always emits.
@@ -195,7 +195,7 @@ pub(crate) struct Mint {
     /// Whether the run is set in capitals. The widget's choice, not the rung's.
     pub caps: bool,
     pub scope: Scope,
-    pub ink: Option<crate::role::Text>,
+    pub ink: Option<crate::role::Role>,
     /// The sprite a single line draws into. Ignored where `group` says it wraps.
     pub sprite: SpriteId,
     /// The column a wrapping run mints its lines under.
@@ -448,7 +448,7 @@ impl Table {
             },
             None => Target::Line { sprite, run: None },
         };
-        let ink = ink.unwrap_or(crate::role::Text::Primary);
+        let ink = ink.unwrap_or(crate::role::Role::Text(crate::role::Text::Primary));
         let engine = self.engine.as_ref().expect(ENGINE);
         if let Some(mut entry) = self.spare.pop() {
             let _ = engine.reshape(&mut entry.run, text.as_str(), &font, flow);
@@ -716,8 +716,7 @@ impl Entry {
                 lines,
                 vertical,
             } => {
-                let light =
-                    crate::role::resolve(crate::role::Role::Text(self.ink), self.scope.for_paint());
+                let light = crate::role::resolve(self.ink, self.scope.for_paint());
                 publish_lines(
                     engine,
                     model,
@@ -876,7 +875,7 @@ mod tests {
     use crate::build::{Host, mount};
     use crate::layout::{Align, Len, Track, grid};
     use crate::signal::Cell;
-    use crate::widget::{button, item_title, shown};
+    use crate::widget::{TextStyle, button, shown, styled_text};
 
     #[test]
     fn item_titles_trim_reflow_and_update_without_remounting_or_idle_writes() {
@@ -888,9 +887,16 @@ mod tests {
             let root = Host::with(|h| h.model().root());
             let held = mount(
                 grid((
-                    item_title(shown(move || word.get()))
-                        .min_width(Len::Zero)
-                        .height(crate::role::Metric::RowH),
+                    styled_text(
+                        shown(move || word.get()),
+                        TextStyle {
+                            flow: Flow::Ellipsis,
+                            ..TextStyle::new(TypeRole::Title)
+                        },
+                    )
+                    .clip()
+                    .min_width(Len::Zero)
+                    .height(crate::role::Metric::RowH),
                     button("Bypass"),
                 ))
                 .cols([Track::MinMax(Len::Zero, 1.0), Track::Auto])
@@ -916,7 +922,7 @@ mod tests {
                         let (key, entry) = table
                             .entries
                             .iter()
-                            .find(|(_, e)| e.ramp == TypeRole::ItemTitle)
+                            .find(|(_, e)| e.ramp == TypeRole::Title)
                             .unwrap();
                         assert_eq!(
                             table.str_of(key),

@@ -193,7 +193,7 @@ impl<K> El<K> {
         self,
         source: TextSource,
         ramp: TypeRole,
-        ink: Option<Text>,
+        ink: Option<Role>,
         flow: Flow,
         caps: bool,
     ) -> Self {
@@ -209,12 +209,16 @@ impl<K> El<K> {
         });
         self.sprite(
             MaskSeed::Run { text },
-            Role::Text(ink.unwrap_or(Text::Primary)),
+            ink.unwrap_or(Role::Text(Text::Primary)),
             Part::Label,
         )
     }
 
-    pub(crate) fn vertical_text(self) -> Self {
+    /// Rotates a text element's layout axes.
+    ///
+    /// # Panics
+    /// If this element contains no text run.
+    pub fn vertical_text(self) -> Self {
         Build::with(|b| {
             let text = b
                 .chain_seeds(b.nodes[self.at as usize].seeds)
@@ -229,31 +233,6 @@ impl<K> El<K> {
             b.texts[text as usize].vertical = true;
         });
         self
-    }
-
-    /// Records a shaped run painted in `role` rather than in a foreground rung.
-    ///
-    /// The node carries no chrome row of its own, which is what lets the role stated here
-    /// reach the sprite: a label takes its enclosing row's text colour only where there is
-    /// one.
-    pub(crate) fn text_seed_in(
-        self,
-        source: TextSource,
-        ramp: TypeRole,
-        role: Role,
-        caps: bool,
-    ) -> Self {
-        let text = Build::with(|b| {
-            b.push_text(TextSeed {
-                source: Some(source),
-                ramp,
-                ink: None,
-                flow: Flow::Line,
-                vertical: false,
-                caps,
-            })
-        });
-        self.sprite(MaskSeed::Run { text }, role, Part::Label)
     }
 
     /// Records the role table, variant index and corner radius this node's surface resolves
@@ -422,7 +401,7 @@ impl<K> El<K> {
     ///
     /// [`Part::Static`] rather than [`Part::Fill`]: the plate is the value's own colour and an
     /// interaction state must not re-resolve it into a surface.
-    pub(crate) fn plate(self, radius: Metric, role: Role, strength: f32) -> Self {
+    pub fn plate(self, radius: Metric, role: Role, strength: f32) -> Self {
         self.sprite_at(
             MaskSeed::Box {
                 radius: Some(Len::Metric(radius)),

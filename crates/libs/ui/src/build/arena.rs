@@ -23,7 +23,7 @@
 
 use crate::gesture::GestureDecl;
 use crate::layout::{Len, Preset, Rule};
-use crate::role::{Elevation, Role, Text, TypeRole};
+use crate::role::{Elevation, Role, TypeRole};
 use crate::widget::{Chrome, Flow, Interaction, Motion, StatePolicy, TextSource, UiaRole};
 use std::cell::RefCell;
 use windows_scene::{Bounds, Exit, GeomId, HitFlags, Prop, RampId, RegionId, Value};
@@ -324,7 +324,7 @@ pub(crate) struct TextSeed {
     pub ramp: TypeRole,
     /// `None` takes the enclosing widget's own chrome row, so a variant that changes the
     /// text colour does not have to reach into the text seed to say so.
-    pub ink: Option<Text>,
+    pub ink: Option<Role>,
     pub flow: Flow,
     pub vertical: bool,
     /// Whether the run is set in capitals.

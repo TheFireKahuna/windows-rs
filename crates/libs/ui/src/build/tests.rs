@@ -132,8 +132,8 @@ fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
         mount(
             crate::widget::path(geometry)
                 .stroke_ramp(gradient, Metric::HairlineW)
-                .width(Metric::DialSize)
-                .height(Metric::DialSize)
+                .width(crate::role::tests::EXTENT)
+                .height(crate::role::tests::EXTENT)
                 .pivot(Vector2 { x: 64.0, y: 71.68 })
                 .trim(move || value.get())
                 .rotation(move || value.get() * 4.0)
@@ -723,7 +723,7 @@ fn text_measures_under_the_resolved_type_ramp() {
         let label = El::<Any>::seed(crate::layout::Preset::Text).text_seed(
             crate::widget::TextSource::Static("hello"),
             ramp,
-            Some(Text::Primary),
+            Some(Role::Text(Text::Primary)),
             Flow::Line,
             false,
         );
@@ -2449,21 +2449,24 @@ fn computed_rows_replace_the_template_without_remounting_children() {
     let _held = mount(
         grid((plate(), plate()))
             .rows([Track::Fr(1.0)])
-            .rows_from(move |out| out.extend([
-                Track::Fixed(Len::Pct(fraction.get())), Track::Fr(1.0),
-            ]))
+            .rows_from(move |out| {
+                out.extend([Track::Fixed(Len::Pct(fraction.get())), Track::Fr(1.0)])
+            })
             .cols([Track::Fr(1.0)])
             .gap(Len::Zero)
             .height(Len::Pct(1.0))
-            .width(Len::Pct(1.0)), root(),
+            .width(Len::Pct(1.0)),
+        root(),
     );
     flush(&mut patch);
-    let snapshot = || Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
-        let a = h.model().solved(nodes[0]);
-        let b = h.model().solved(nodes[2]);
-        (nodes, (b.rect.y0 - a.rect.y0) / a.size.y)
-    });
+    let snapshot = || {
+        Host::with(|h| {
+            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let a = h.model().solved(nodes[0]);
+            let b = h.model().solved(nodes[2]);
+            (nodes, (b.rect.y0 - a.rect.y0) / a.size.y)
+        })
+    };
     let (before, y) = snapshot();
     assert!((y - 0.25).abs() < 0.01);
     fraction.set(0.75);
@@ -2480,15 +2483,24 @@ fn keyed_tiles_fill_multiple_columns() {
     let _held = mount(
         crate::layout::tiles(
             Len::Times(Metric::CardMinW, 0.75),
-            each_into(|out| out.extend(0..4), |i| i, |_| plate().min_width(Len::Zero)),
-        ).width(Len::Times(Metric::CardMinW, 2.0)), root(),
+            each_into(
+                |out| out.extend(0..4),
+                |i| i,
+                |_| plate().min_width(Len::Zero),
+            ),
+        )
+        .width(Len::Times(Metric::CardMinW, 2.0)),
+        root(),
     );
     flush(&mut patch);
     let (a, b) = Host::with(|h| {
         let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
         (h.model().solved(nodes[2]), h.model().solved(nodes[3]))
     });
-    assert!(b.rect.x0 > a.rect.x0, "tiles did not share a row: {a:?} {b:?}");
+    assert!(
+        b.rect.x0 > a.rect.x0,
+        "tiles did not share a row: {a:?} {b:?}"
+    );
     assert!((b.rect.y0 - a.rect.y0).abs() < 1.0);
 }
 
@@ -3089,7 +3101,13 @@ fn a_capitalised_run_announces_the_authors_casing() {
     let value = crate::signal::Cell::new(0.5_f64);
     let _row = mount(
         stack((
-            crate::widget::label("Gain adjust"),
+            crate::widget::styled_text(
+                "Gain adjust",
+                crate::widget::TextStyle {
+                    caps: true,
+                    ..crate::widget::TextStyle::new(TypeRole::Label)
+                },
+            ),
             crate::widget::slider(
                 value,
                 crate::widget::Range::UNIT,
@@ -3113,7 +3131,7 @@ fn a_capitalised_run_announces_the_authors_casing() {
         })
     })
     .expect("the label is in the table");
-    assert_eq!(shaped, "GAIN ADJUST", "the label rung draws in capitals");
+    assert_eq!(shaped, "GAIN ADJUST", "the recipe requests capitals");
 
     let tree = tree(&patch);
     let slider = (0..tree.len())
@@ -3573,11 +3591,17 @@ fn source_text_preserves_lines_wraps_and_settles_after_replacement() {
         lines.y > size().y,
         "source newlines must create distinct baselines"
     );
-    value.set(format!("original_path = \"C:/{}\"", "long-directory/".repeat(16)));
+    value.set(format!(
+        "original_path = \"C:/{}\"",
+        "long-directory/".repeat(16)
+    ));
     crate::signal::flush();
     flush(&mut patch);
     assert!(size().x <= 201.0);
-    assert!(size().y > lines.y, "long source must wrap inside its column");
+    assert!(
+        size().y > lines.y,
+        "long source must wrap inside its column"
+    );
     patch.clear();
     flush(&mut patch);
     assert!(
@@ -4763,7 +4787,7 @@ fn edge_buttons_join_without_a_border_or_rounded_gap() {
         for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
             let mut patch = fixture_at(dpi);
             let _held = mount(
-                crate::widget::edge_button("", edge)
+                crate::widget::edge_button("", edge, crate::role::tests::CORNER)
                     .width(Metric::CardMinW)
                     .height(Metric::RowH),
                 root(),
@@ -4782,7 +4806,8 @@ fn edge_buttons_join_without_a_border_or_rounded_gap() {
                 })
                 .collect();
             assert_eq!(boxes.len(), 3, "border, fill and interaction wash");
-            let radius = crate::role::metric(Metric::EdgeTabRadius, Host::with(|h| h.root_scope));
+            let radius =
+                crate::role::metric(crate::role::tests::CORNER, Host::with(|h| h.root_scope));
             let mut expected = Corners::all(radius);
             match edge {
                 Edge::Left => {
@@ -4951,4 +4976,140 @@ fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
             .iter()
             .any(|op| matches!(op, Op::Bind { id, .. } if *id == trail))
     );
+}
+
+#[test]
+fn application_tokens_restyle_nested_scopes_without_remounting_or_idle_writes() {
+    use crate::role::{ScopedToken, WidthClass};
+    use crate::widget::{TextStyle, styled_text};
+    use windows_text::{FamilyId, FontSpec};
+    static WIDTH: ScopedToken<f32> = ScopedToken::new("test-width", |s| match s.width {
+        WidthClass::Narrow => 111.0,
+        WidthClass::Medium => 222.0,
+        WidthClass::Wide => 333.0,
+    });
+    static TYPE: ScopedToken<FontSpec> = ScopedToken::new("test-type", |s| {
+        FontSpec::new(
+            FamilyId(0),
+            match s.width {
+                WidthClass::Narrow => 12.0,
+                WidthClass::Medium => 18.0,
+                WidthClass::Wide => 24.0,
+            },
+        )
+    });
+    for dpi in [96.0, 144.0, 192.0] {
+        let mut patch = fixture_at(dpi);
+        let _held = mount(
+            crate::layout::responsive(
+                [600.0, 1000.0],
+                stack((
+                    plate().width(Metric::Custom(&WIDTH)).height(Metric::RowH),
+                    styled_text(
+                        "Responsive typography",
+                        TextStyle::new(TypeRole::Custom(&TYPE)),
+                    ),
+                    crate::layout::responsive(
+                        [600.0, 1000.0],
+                        plate().width(Metric::Custom(&WIDTH)).height(Metric::RowH),
+                    )
+                    .width(Len::Pct(0.4)),
+                )),
+            )
+            .width(Len::Pct(1.0)),
+            root(),
+        );
+        flush(&mut patch);
+        let ids = Host::with(|h| h.mounts.iter().map(|(_, m)| m.node).collect::<Vec<_>>());
+        let mut narrow_text_width = None;
+        for (width, expected, text_scale) in [
+            (500.0, 111.0, 1.0),
+            (800.0, 222.0, 1.5),
+            (1200.0, 333.0, 2.0),
+            (500.0, 111.0, 1.0),
+        ] {
+            patch.clear();
+            Host::with(|h| h.model().set_window(Vector2 { x: width, y: 700.0 }));
+            flush(&mut patch);
+            Host::with(|h| {
+                let now = h.mounts.iter().map(|(_, m)| m.node).collect::<Vec<_>>();
+                assert_eq!(ids, now, "resize retains every node");
+                let measured = h.model().solved(ids[2]);
+                assert!(
+                    (measured.size.x - expected).abs() < 1.0,
+                    "{dpi}/{width}: {:?}",
+                    measured.size
+                );
+                let nested = h.model().solved(ids[5]);
+                assert!(
+                    (nested.size.x - 111.0).abs() < 1.0,
+                    "nested scope stays narrow"
+                );
+                let text_width = h.model().solved(ids[3]).size.x;
+                let narrow = *narrow_text_width.get_or_insert(text_width);
+                assert!(
+                    (text_width - narrow * text_scale).abs() < 2.0,
+                    "typography follows the solved class: {text_width} / {narrow}"
+                );
+            });
+            assert!(
+                !patch
+                    .ops()
+                    .iter()
+                    .any(|op| matches!(op, Op::New { .. } | Op::Paint { .. })),
+                "a resize neither remounts nor rebinds paint"
+            );
+            patch.clear();
+            flush(&mut patch);
+            assert!(
+                patch.ops().is_empty(),
+                "unchanged tokens emit no idle writes"
+            );
+        }
+    }
+}
+
+#[test]
+fn application_text_ink_survives_wrapping_and_ellipsis() {
+    use crate::widget::{TextStyle, shown, styled_text};
+    let ink = Role::Data(crate::role::DataRole(123));
+    for flow in [Flow::Wrap, Flow::Ellipsis] {
+        let mut patch = fixture();
+        let value = crate::signal::Cell::new("A chromatic application label");
+        let _held = mount(
+            styled_text(
+                shown(move || value.get()),
+                TextStyle {
+                    ink: Some(ink),
+                    flow,
+                    ..TextStyle::new(TypeRole::Body)
+                },
+            )
+            .width(Len::Pct(1.0)),
+            root(),
+        );
+        let expected = crate::role::resolve(ink, root_scope());
+        let mut paints = 0;
+        for width in [800.0, 80.0] {
+            Host::with(|h| h.model().set_window(Vector2 { x: width, y: 600.0 }));
+            flush(&mut patch);
+            for op in patch.ops() {
+                if let Op::Paint {
+                    paint: Paint::Solid(light),
+                    ..
+                } = op
+                {
+                    assert_eq!(
+                        *light, expected,
+                        "{flow:?}: a line lost its application colour"
+                    );
+                    paints += 1;
+                }
+            }
+            patch.clear();
+            value.set("A much longer chromatic application label for reflow");
+            crate::signal::flush();
+        }
+        assert!(paints > 0);
+    }
 }

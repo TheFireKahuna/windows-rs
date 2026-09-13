@@ -86,14 +86,11 @@ impl Palette for Reference {
 
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec {
         let size = match role {
+            TypeRole::Custom(token) => return token.resolve(scope),
             TypeRole::Display => 32.0,
-            TypeRole::Title | TypeRole::WindowTitle | TypeRole::ItemTitle => 20.0,
-            TypeRole::Body | TypeRole::BodyStrong | TypeRole::Mono | TypeRole::MenuItem => 14.0,
-            TypeRole::Caption
-            | TypeRole::Label
-            | TypeRole::Badge
-            | TypeRole::Tag
-            | TypeRole::MenuHeading => 12.0,
+            TypeRole::Title => 20.0,
+            TypeRole::Body | TypeRole::BodyStrong | TypeRole::Mono => 14.0,
+            TypeRole::Caption | TypeRole::Label => 12.0,
             TypeRole::Micro => 10.0,
         };
         let size = match scope.density {
@@ -101,7 +98,7 @@ impl Palette for Reference {
             Density::Compact => size - 1.0,
         };
         let weight = match role {
-            TypeRole::Title | TypeRole::WindowTitle | TypeRole::BodyStrong => 600,
+            TypeRole::Title | TypeRole::BodyStrong => 600,
             _ => 400,
         };
         FontSpec::new(FamilyId(u16::from(role == TypeRole::Mono)), size).weight(weight)
@@ -114,6 +111,7 @@ impl Palette for Reference {
             _ => 1.0,
         };
         match metric {
+            Metric::Custom(token) => token.resolve(scope),
             Metric::SpaceXs => 4.0 * tight,
             Metric::SpaceSm => 8.0 * tight,
             Metric::SpaceMd => 12.0 * tight,
@@ -124,38 +122,12 @@ impl Palette for Reference {
             // Never below the touch floor, whatever the density says.
             Metric::RowH => (32.0 * tight).max(24.0),
             Metric::TrackH => 20.0 * tight,
-            Metric::BandSm => 28.0 * tight,
-            Metric::BandMd => 44.0 * tight,
-            Metric::BandLg => 48.0 * tight,
-            Metric::CommandW => 46.0 * tight,
-            Metric::CommandH => 32.0 * tight,
-            Metric::DialSize => 128.0 * tight,
             Metric::SliderRailH => 5.0 * tight,
             Metric::SliderThumb => 13.0 * tight,
-            Metric::CommandIcon => 10.0 * tight,
-            Metric::CaptionControlH => 28.0 * tight,
-            Metric::BrandIcon => 20.0 * tight,
-            Metric::RailW => 48.0 * tight,
-            Metric::RailItemH => 36.0 * tight,
-            Metric::RailIcon => 16.0 * tight,
-            Metric::RailInset => 6.0 * tight,
-            Metric::RailGap => 2.0 * tight,
             Metric::BorderW => 1.0,
             Metric::HairlineW => 0.5,
             Metric::CardMinW => 240.0,
             Metric::CardMinH => 160.0,
-            Metric::PlotMinH => 180.0,
-            Metric::EditorPlotH => 220.0,
-            Metric::GraphicPlotH => 200.0,
-            Metric::ThumbnailH => 44.0,
-            Metric::PaneMinW => 360.0,
-            Metric::GutterPitch => 30.0,
-            Metric::PaneMaxW => 540.0,
-            Metric::PaneDrawerMaxW => 420.0,
-            Metric::EdgeTabRadius => 6.0,
-            Metric::EdgeTabInset => 28.0,
-            Metric::EdgeTabPadX => 6.0,
-            Metric::EdgeTabPadY => 12.0,
         }
     }
 
@@ -406,3 +378,17 @@ fn a_polarity_flip_is_reported_only_when_it_moved() {
     }));
     assert!(set_polarity(start), "and back");
 }
+
+macro_rules! test_metric {
+    ($name:ident, $value:expr) => {
+        pub(crate) const $name: Metric = {
+            static TOKEN: ScopedToken<f32> = ScopedToken::new(stringify!($name), |_| $value);
+            Metric::Custom(&TOKEN)
+        };
+    };
+}
+test_metric!(EXTENT, 128.0);
+test_metric!(CORNER, 6.0);
+test_metric!(TOP_BAND, 48.0);
+test_metric!(BOTTOM_BAND, 28.0);
+test_metric!(MAX_WIDTH, 420.0);

@@ -138,20 +138,26 @@ pub fn emission(role: Role, scope: Scope) -> Emission {
 ///
 /// # Panics
 ///
-/// If no palette has been installed.
+/// If a built-in role resolves before a palette has been installed.
 #[must_use]
 pub fn typography(role: TypeRole, scope: Scope) -> FontSpec {
-    current().typography(role, scope)
+    match role {
+        TypeRole::Custom(token) => token.resolve(scope),
+        _ => current().typography(role, scope),
+    }
 }
 
 /// Returns a spacing, radius, row height or border width, in DIPs.
 ///
 /// # Panics
 ///
-/// If no palette has been installed.
+/// If a built-in metric resolves before a palette has been installed.
 #[must_use]
 pub fn metric(metric: Metric, scope: Scope) -> f32 {
-    current().metric(metric, scope)
+    match metric {
+        Metric::Custom(token) => token.resolve(scope),
+        _ => current().metric(metric, scope),
+    }
 }
 
 /// Returns the brightest value the palette authors in `gamut`'s primaries, in cd/m².

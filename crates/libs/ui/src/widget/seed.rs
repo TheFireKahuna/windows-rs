@@ -10,10 +10,59 @@ use crate::build::arena::{FULL, MaskSeed, Part};
 use crate::build::{Button, El, Path, View};
 use crate::gesture::{DragDecl, GestureDecl};
 use crate::layout::{Align, Len, Over, Preset};
-use crate::role::{DataRole, Fill, Metric, Role, Text, TypeRole};
+use crate::role::{Fill, Metric, Role, Text, TypeRole};
 use crate::signal::{Cell, Signal};
 use crate::widget::{Flow, Interaction, Range, StatePolicy, TextSource, UiaRole, Wash, roles};
 use windows_scene::{GeomId, HitFlags};
+
+/// Text appearance chosen by an application recipe. Typography remains unresolved until layout.
+#[derive(Copy, Clone, Debug)]
+pub struct TextStyle {
+    pub typography: TypeRole,
+    /// Standalone ink. An enclosing control's chrome governs the label colour;
+    /// `None` otherwise uses primary text.
+    pub ink: Option<Role>,
+    pub flow: Flow,
+    pub caps: bool,
+}
+
+impl TextStyle {
+    /// A primary, single-line run with the supplied typography token.
+    pub const fn new(typography: TypeRole) -> Self {
+        Self {
+            typography,
+            ink: Some(Role::Text(Text::Primary)),
+            flow: Flow::Line,
+            caps: false,
+        }
+    }
+}
+
+/// A compound text element with one automation peer. Add its runs with `control_text`;
+/// the group derives one accessible name from those runs.
+#[must_use]
+pub fn text_group() -> View {
+    El::seed(Preset::Bare).hit(HitFlags::UIA, UiaRole::Text)
+}
+
+/// A text element with its own accessible name, using an application-owned recipe.
+#[must_use]
+pub fn styled_text(s: impl Into<TextSource>, style: TextStyle) -> View {
+    control_text(s, style).hit(HitFlags::UIA, UiaRole::Text)
+}
+
+/// Text inside a control or compound text element. Its enclosing element owns the
+/// automation peer and derives its accessible name from this run.
+#[must_use]
+pub fn control_text(s: impl Into<TextSource>, style: TextStyle) -> View {
+    El::seed(Preset::Text).text_seed(
+        s.into(),
+        style.typography,
+        style.ink,
+        style.flow,
+        style.caps,
+    )
+}
 
 // ── text ─────────────────────────────────────────────────────────────────────────
 //
@@ -32,43 +81,11 @@ pub fn title(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Title, Text::Primary, Flow::Line, false)
 }
 
-/// Application identity in the window caption.
-#[must_use]
-pub fn window_title(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::WindowTitle, Text::Primary, Flow::Line, false)
-}
-
-/// An item's name, trimmed to its allocated width without changing its accessible name.
-#[must_use]
-pub fn item_title(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::ItemTitle, Text::Primary, Flow::Ellipsis, false).clip()
-}
-
-/// A compact value beside an item's name.
-#[must_use]
-pub fn tag(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::Tag, Text::Tertiary, Flow::Line, false)
-}
-
-/// A menu's heading, set in quiet capitals.
-#[must_use]
-pub fn menu_heading(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::MenuHeading, Text::Tertiary, Flow::Line, true)
-}
-
-/// A menu command naming a channel or other technical value.
-#[must_use]
-pub fn menu_button(s: impl Into<TextSource>) -> El<Button> {
-    button("").row(inner(s, TypeRole::MenuItem, false))
-}
-
 /// A field's or a group's name, set secondary to the thing it labels.
 ///
-/// Set in capitals. It names a region of a surface rather than carrying
-/// a value, and its rung is tracked to suit that.
 #[must_use]
 pub fn label(s: impl Into<TextSource>) -> View {
-    run(s, TypeRole::Label, Text::Secondary, Flow::Line, true)
+    run(s, TypeRole::Label, Text::Secondary, Flow::Line, false)
 }
 
 /// A single label read from top to bottom, with its measured axes exchanged.
@@ -130,7 +147,7 @@ pub fn display(s: impl Into<TextSource>) -> View {
 /// there is one, so a button's variant reaches its text without the text naming a variant.
 fn run(s: impl Into<TextSource>, ramp: TypeRole, ink: Text, flow: Flow, caps: bool) -> View {
     El::seed(Preset::Text)
-        .text_seed(s.into(), ramp, Some(ink), flow, caps)
+        .text_seed(s.into(), ramp, Some(Role::Text(ink)), flow, caps)
         // `UIA` and nothing else: a run has no gesture, takes no focus and routes no
         // pointer, so the hit scan skips it on one flags test. With no entry at all it
         // would have no automation peer, and a screen of text would read as empty.
@@ -196,52 +213,6 @@ pub fn sheet(key: &'static str) -> View {
         .key(key)
 }
 
-/// A value in a chromatic role: a plate in that role, under text in it.
-///
-/// What names a thing by its own colour — a processor kind's badge, a band's index, a
-/// channel's name on its wire. It takes a [`DataRole`] and not a colour, so the authored
-/// triple behind it stays in the application's palette table.
-///
-/// The plate is the role at [`CHIP_PLATE`] and the text is the role as resolved. One role and
-/// two strengths, rather than a second token per kind: a plate is the hue at a fraction of
-/// itself by construction, so a kind cannot carry a badge from one row and a plate from
-/// another.
-///
-/// It pushes no scope, so a chip on a card resolves against the card.
-#[must_use]
-pub fn chip(role: DataRole, s: impl Into<TextSource>) -> View {
-    El::<crate::build::Any>::seed(Preset::Bare)
-        .plate(Metric::Radius, Role::Data(role), CHIP_PLATE)
-        // A container and not a run: a run's box is its coverage tile, so padding one leaves
-        // the glyphs drawn against a tile sized without it and the plate hugs them.
-        .row(ink_run(s, TypeRole::Badge, Role::Data(role), true))
-        // Wider than it is tall, and by the widest step in the scale on the inline axis: a
-        // badge is read as a shape before it is read as a word, and a plate at the glyphs'
-        // own extent is a highlight behind text rather than a chip. The text is short, upper
-        // case and tracked, so the shape is nearly all inset.
-        .padding_xy(Metric::SpaceMd, Metric::SpaceXs)
-        // `UIA` and nothing else, as a text run takes: a chip names something, and routes no
-        // pointer of its own.
-        .hit(HitFlags::UIA, UiaRole::Text)
-}
-
-/// A text run painted in `role`, for a widget whose text colour is chromatic.
-fn ink_run(s: impl Into<TextSource>, ramp: TypeRole, role: Role, caps: bool) -> View {
-    El::seed(Preset::Text).text_seed_in(s.into(), ramp, role, caps)
-}
-
-/// How much of its role a [`chip`]'s plate paints.
-///
-/// Low enough that the text over it, which is the same hue at full strength, still separates
-/// from it.
-///
-/// A fraction of the light the compositor blends, and that is why it is far below the value
-/// the same plate is written with in 8-bit sRGB. A design reference stating 15% alpha over a
-/// near-black ground renders a plate whose *linear* share of the hue is around a fifteenth,
-/// because the encoding is a curve: the fraction that reproduces it here is measured off the
-/// rendered plate rather than copied from the declaration.
-pub const CHIP_PLATE: f32 = 0.07;
-
 /// A detached surface above everything. The overlay layer anchors and dismisses it; this is
 /// only what it looks like.
 #[must_use]
@@ -266,9 +237,13 @@ pub fn button(text: impl Into<TextSource>) -> El<Button> {
 /// A button joined flush to a containing edge. Placement remains the caller's job;
 /// its fill, border and interaction wash share the two exposed corners.
 #[must_use]
-pub fn edge_button(text: impl Into<TextSource>, edge: crate::layout::Edge) -> El<Button> {
+pub fn edge_button(
+    text: impl Into<TextSource>,
+    edge: crate::layout::Edge,
+    radius: Metric,
+) -> El<Button> {
     control(UiaRole::Button)
-        .chrome(roles::BUTTON, roles::DEFAULT, Metric::EdgeTabRadius)
+        .chrome(roles::BUTTON, roles::DEFAULT, radius)
         .attached(edge)
         .row(inner(text, TypeRole::Body, false))
 }

@@ -209,14 +209,11 @@ impl Palette for Reference {
 
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec {
         let size = match role {
+            TypeRole::Custom(token) => return token.resolve(scope),
             TypeRole::Display => 32.0,
-            TypeRole::Title | TypeRole::WindowTitle | TypeRole::ItemTitle => 20.0,
-            TypeRole::Body | TypeRole::BodyStrong | TypeRole::Mono | TypeRole::MenuItem => 14.0,
-            TypeRole::Caption
-            | TypeRole::Label
-            | TypeRole::Badge
-            | TypeRole::Tag
-            | TypeRole::MenuHeading => 12.0,
+            TypeRole::Title => 20.0,
+            TypeRole::Body | TypeRole::BodyStrong | TypeRole::Mono => 14.0,
+            TypeRole::Caption | TypeRole::Label => 12.0,
             TypeRole::Micro => 10.0,
         };
         let size = match scope.density {
@@ -238,6 +235,7 @@ impl Palette for Reference {
             _ => 1.0,
         };
         match metric {
+            Metric::Custom(token) => token.resolve(scope),
             Metric::SpaceXs => 4.0 * tight,
             Metric::SpaceSm => 8.0 * tight,
             Metric::SpaceMd => 12.0 * tight,
@@ -245,26 +243,12 @@ impl Palette for Reference {
             Metric::Radius | Metric::RadiusSurface | Metric::RadiusPill => 8.0,
             Metric::RowH => (32.0 * tight).max(24.0),
             Metric::TrackH => 20.0 * tight,
-            Metric::BandSm => 28.0 * tight,
-            Metric::BandMd => 44.0 * tight,
-            Metric::BandLg => 48.0 * tight,
-            Metric::CommandW => 46.0 * tight,
             Metric::BorderW => 1.0,
             Metric::HairlineW => 0.5,
             Metric::CardMinW => 240.0,
             Metric::CardMinH => 160.0,
-            Metric::PlotMinH => 180.0,
-            Metric::EditorPlotH => 220.0,
-            Metric::PaneMinW => 360.0,
-            Metric::GutterPitch => 30.0,
-            Metric::PaneMaxW => 540.0,
-            Metric::PaneDrawerMaxW => 420.0,
-            Metric::EdgeTabRadius => 6.0,
-            Metric::EdgeTabInset => 28.0,
-            Metric::EdgeTabPadX => 6.0,
-            Metric::EdgeTabPadY => 12.0,
-            // A palette for one list: every other metric takes a plain reading.
-            _ => 16.0 * tight,
+            Metric::SliderRailH => 5.0 * tight,
+            Metric::SliderThumb => 13.0 * tight,
         }
     }
 

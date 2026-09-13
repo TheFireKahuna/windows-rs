@@ -1519,7 +1519,7 @@ fn mount_text(
 ) -> MeasureKey {
     let seed = &mut b.texts[text as usize];
     let (ramp, flow, caps, source) = (seed.ramp, seed.flow, seed.caps, seed.source.take());
-    let ink = seed.ink.or(roles.map(|r| r.text));
+    let ink = roles.map(|r| Role::Text(r.text)).or(seed.ink);
     // Snapshotted once, here. A `&'static str` crosses as a borrow rather than as a copy, so
     // a screen of chrome labels allocates nothing.
     //

@@ -1243,16 +1243,16 @@ fn a_drawer_viewport_sizes_from_window_input_and_clips_its_shadow() {
     let id = overlays.open(
         Spec::popup().anchor(Anchor::window(Side::Right)).viewport([
             Len::Metric(Metric::RowH),
-            Len::Metric(Metric::BandLg),
+            Len::Metric(crate::role::tests::TOP_BAND),
             Len::Zero,
-            Len::Metric(Metric::BandSm),
+            Len::Metric(crate::role::tests::BOTTOM_BAND),
         ]),
         &mut focus.ops,
         || {
             crate::widget::sheet("drawer")
                 .shadowed(Edge::Left)
                 .width(Len::Pct(0.82))
-                .max_width(Metric::PaneDrawerMaxW)
+                .max_width(crate::role::tests::MAX_WIDTH)
                 .height(Len::Pct(1.0))
                 .probed(pane)
         },
@@ -1264,8 +1264,8 @@ fn a_drawer_viewport_sizes_from_window_input_and_clips_its_shadow() {
         let (left, top, bottom) = Host::with(|h| {
             (
                 crate::role::metric(Metric::RowH, h.root_scope),
-                crate::role::metric(Metric::BandLg, h.root_scope),
-                crate::role::metric(Metric::BandSm, h.root_scope),
+                crate::role::metric(crate::role::tests::TOP_BAND, h.root_scope),
+                crate::role::metric(crate::role::tests::BOTTOM_BAND, h.root_scope),
             )
         });
         assert!((measured.size.x - ((width - left) * 0.82).min(420.0)).abs() < 1.0);

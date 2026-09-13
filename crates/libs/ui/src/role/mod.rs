@@ -23,6 +23,8 @@
 //! the way to the compositor.
 
 mod palette;
+mod token;
+pub use token::ScopedToken;
 // The reference palette installs into a process-wide `OnceLock`, so the lowering's tests
 // reach this module rather than install a second palette that would lose the race.
 #[cfg(test)]
@@ -206,7 +208,7 @@ pub enum Stroke {
 
 /// A chromatic, application-defined role.
 ///
-/// The one extensible arm, and the only one carrying no [`Polarity`]: a band hue, a series
+/// The chromatic extension, carrying no [`Polarity`]: a band hue, a series
 /// colour and the spectrum ramp mean the same thing in light and dark. This crate never
 /// interprets the number.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -329,18 +331,6 @@ pub struct Shadow {
 pub enum TypeRole {
     Display,
     Title,
-    /// Application identity in the window caption, independent of content headings.
-    WindowTitle,
-    /// A single item's name, independent of window and section headings.
-    ItemTitle,
-    /// A short chromatic identifier on a chip.
-    Badge,
-    /// A compact value beside an item's name.
-    Tag,
-    /// A menu's quiet uppercase heading.
-    MenuHeading,
-    /// A menu option naming a channel or other technical value.
-    MenuItem,
     Body,
     BodyStrong,
     Caption,
@@ -355,6 +345,8 @@ pub enum TypeRole {
     /// Tabular figures. What a read-out is set in, so its digits do not shift width as it
     /// changes.
     Mono,
+    /// An application-owned token, resolved in the same scope as built-in roles.
+    Custom(&'static ScopedToken<windows_text::FontSpec>),
 }
 
 /// A scalar the palette owns, in DIPs unless the name says otherwise.
@@ -364,8 +356,6 @@ pub enum Metric {
     SpaceSm,
     SpaceMd,
     SpaceLg,
-    /// Channel-graph lane pitch, independent of control height and density.
-    GutterPitch,
     /// The radius of a control: a button, a field, a segmented option, a menu option.
     Radius,
     /// The radius of a surface: a card, a panel, a flyout, a plate.
@@ -375,12 +365,9 @@ pub enum Metric {
     /// no elevation, so a control on a card resolves at the card's own scope and one value
     /// answers both.
     RadiusSurface,
-    /// The radius of a pill: a switch's track, a chip, a segment rail.
+    /// The radius of a pill: a switch's track or a segment rail.
     ///
-    /// A real value in the scale, and one a palette keeps **below half** the control's height
-    /// on purpose. A pill is a rounded rectangle with a flat top and bottom; at a half the two
-    /// corner arcs meet and it reads as an oval instead. A large sentinel meaning "as round as
-    /// possible" is the mistake this rung exists to prevent.
+    /// The palette supplies a radius; geometry caps it at half the box.
     RadiusPill,
     /// A control's row height, and the floor a touch target is inflated to.
     RowH,
@@ -396,67 +383,17 @@ pub enum Metric {
     /// them separately can put a knob outside the track it rides in. A slider's groove is a
     /// different shape and does not read this rung.
     TrackH,
-    // ── the band ladder: the horizontal strips a shell is built from ─────────────
-    /// A strip carrying text and no control: a status bar, a footnote rule.
-    BandSm,
-    /// A strip carrying controls: a toolbar, a section header, a card's own bar.
-    BandMd,
-    /// The window's own caption band.
-    BandLg,
-    /// A window command's width — the minimize, maximize and close controls of a custom
-    /// caption band.
-    CommandW,
-    /// Height of a custom caption's window command.
-    CommandH,
-    /// Glyph box inside a window command, independent of its hit target.
-    CommandIcon,
-    /// Height of endpoint and mode controls in the caption.
-    CaptionControlH,
-    /// Application identity mark in the caption.
-    BrandIcon,
-    /// Collapsed navigation rail width.
-    RailW,
-    /// Navigation destination target height.
-    RailItemH,
-    /// Navigation destination glyph box.
-    RailIcon,
-    /// Horizontal inset of navigation destinations.
-    RailInset,
-    /// Separation between navigation destinations.
-    RailGap,
     BorderW,
     CardMinW,
     CardMinH,
-    /// Diameter of a rotary editor's dial, independent of its surrounding control rows.
-    DialSize,
     /// Thickness of a slider's rail, independent of its pointer target.
     SliderRailH,
     /// Diameter of a slider's thumb.
     SliderThumb,
-    /// Minimum height of a measurement plot, independent of the control row height.
-    PlotMinH,
-    /// Height of a response editor, independent of control density.
-    EditorPlotH,
-    /// Graphic-EQ row plot, including its frequency strip.
-    GraphicPlotH,
-    /// Height of a compact response preview inside a detail tile.
-    ThumbnailH,
-    /// Minimum width of a docked detail pane.
-    PaneMinW,
-    /// Maximum width of a docked detail pane; surplus width belongs to the main surface.
-    PaneMaxW,
-    /// Maximum inline size of an inspector drawer.
-    PaneDrawerMaxW,
-    /// Corner radius of a tab attached to a surface edge.
-    EdgeTabRadius,
-    /// Distance from a window region's bottom edge to its reopen tab.
-    EdgeTabInset,
-    /// Cross-axis padding of a vertical edge tab.
-    EdgeTabPadX,
-    /// Inline padding of a vertical edge tab.
-    EdgeTabPadY,
     /// One device pixel at the current scale, expressed in DIPs by the palette.
     HairlineW,
+    /// An application-owned token, resolved in the same scope as built-in roles.
+    Custom(&'static ScopedToken<f32>),
 }
 
 /// The process polarity. Read at every [`Scope::root`] and every [`Scope::repolarized`].
