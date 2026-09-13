@@ -364,6 +364,8 @@ pub enum Metric {
     SpaceSm,
     SpaceMd,
     SpaceLg,
+    /// Channel-graph lane pitch, independent of control height and density.
+    GutterPitch,
     /// The radius of a control: a button, a field, a segmented option, a menu option.
     Radius,
     /// The radius of a surface: a card, a panel, a flyout, a plate.

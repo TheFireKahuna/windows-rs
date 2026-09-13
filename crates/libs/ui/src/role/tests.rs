@@ -149,6 +149,7 @@ impl Palette for Reference {
             Metric::GraphicPlotH => 200.0,
             Metric::ThumbnailH => 44.0,
             Metric::PaneMinW => 360.0,
+            Metric::GutterPitch => 30.0,
             Metric::PaneMaxW => 540.0,
             Metric::PaneDrawerMaxW => 420.0,
             Metric::EdgeTabRadius => 6.0,

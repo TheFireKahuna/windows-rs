@@ -256,6 +256,7 @@ impl Palette for Reference {
             Metric::PlotMinH => 180.0,
             Metric::EditorPlotH => 220.0,
             Metric::PaneMinW => 360.0,
+            Metric::GutterPitch => 30.0,
             Metric::PaneMaxW => 540.0,
             Metric::PaneDrawerMaxW => 420.0,
             Metric::EdgeTabRadius => 6.0,
