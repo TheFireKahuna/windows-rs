@@ -573,7 +573,7 @@ impl Scene {
                 Absent::Refuse => {
                     debug_assert!(
                         false,
-                        "a channel was bound before the object that carries it existed"
+                        "a channel {prop:?} was bound on {id:?} before the object that carries it existed"
                     );
                     return Ok(());
                 }

@@ -40,6 +40,9 @@ mod input;
 mod links;
 mod scene;
 
+#[cfg(feature = "test-support")]
+pub mod testing;
+
 use crate::build::Mount;
 use crate::input::Report;
 use crate::role::{AccentId, Density, Palette, Scope};

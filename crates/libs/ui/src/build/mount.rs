@@ -1428,16 +1428,23 @@ fn mount_channels(
                 // transition into it. Animating it would sweep every bound property up from
                 // whatever the compositor happens to hold — a meter would fill on mount, and
                 // a layer declared invisible would fade *out* of a value it never had.
-                let mounted = std::cell::Cell::new(false);
+                let previous = std::cell::Cell::new(None);
                 Effect::new(move || {
                     let next = read();
                     if let Some(id) = value {
                         Host::with(|h| h.set_fraction(id, scalar(next)));
                         return;
                     }
+                    // Dependencies can change without changing this channel: editing an
+                    // enabled processor must not restart its card's opacity spring.
+                    // Read first so equal output still refreshes dependency tracking.
+                    let before = previous.replace(Some(next));
+                    if before == Some(next) {
+                        return;
+                    }
                     let bind = match motion {
                         Motion::Snap => Bind::Set(next),
-                        Motion::Chrome if !mounted.replace(true) => Bind::Set(next),
+                        Motion::Chrome if before.is_none() => Bind::Set(next),
                         Motion::Chrome => Bind::Animate(Anim::Spring {
                             to: next,
                             tuning: Tuning::Chrome,

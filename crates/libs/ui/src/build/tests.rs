@@ -453,6 +453,47 @@ fn a_channel_lands_on_its_first_value_and_animates_to_every_later_one() {
     assert_eq!(kinds, vec!["animate"], "and every value after it is a move");
 }
 
+/// Editing data used by a channel must not restart unchanged chrome animations.
+#[test]
+fn unchanged_channel_output_does_not_retarget_and_keeps_tracking() {
+    let mut patch = fixture();
+    let state = crate::signal::Cell::new((true, 0_u32));
+    let alternate = crate::signal::Cell::new(1.0_f32);
+    let _mount = mount(
+        plate().opacity(move || {
+            let (enabled, _) = state.get();
+            if enabled { 1.0 } else { alternate.get() }
+        }),
+        root(),
+    );
+    flush(&mut patch);
+
+    // An edit changes the source but leaves the card enabled. Switching sources
+    // at the same opacity must also track the newly read dependency.
+    for next in [(true, 1), (true, 2), (false, 2)] {
+        patch.clear();
+        state.set(next);
+        crate::signal::flush();
+        flush(&mut patch);
+        assert!(binds(&patch, windows_scene::Prop::Opacity).is_empty());
+    }
+
+    patch.clear();
+    alternate.set(0.45);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert!(matches!(
+        binds(&patch, windows_scene::Prop::Opacity).as_slice(),
+        [Op::Bind {
+            bind: windows_scene::Bind::Animate(windows_scene::Anim::Spring {
+                to: windows_scene::Value::Scalar(0.45),
+                ..
+            }),
+            ..
+        }]
+    ));
+}
+
 /// A channel that fades to zero comes back.
 ///
 /// The tier crossfade in a channel graph is exactly this shape — one layer's opacity to zero
@@ -3801,6 +3842,36 @@ fn navigation_releases_probes_owned_by_nested_branches() {
     crate::signal::flush();
     flush(&mut patch);
     assert_eq!(Host::with(|h| h.probes.iter().count()), 1);
+}
+
+#[test]
+fn disposing_the_application_owner_releases_dynamic_value_rows_before_final_flush() {
+    let mut patch = fixture();
+    let (owner, held) = crate::signal::Owner::scope(|| {
+        mount(
+            stack(when(
+                || true,
+                || {
+                    let value = crate::signal::Cell::new(true);
+                    crate::widget::toggle(value)
+                },
+            )),
+            root(),
+        )
+    });
+    flush(&mut patch);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert!(Host::with(|h| h.values.iter().count()) > 0);
+    patch.clear();
+    drop(owner);
+    drop(held);
+    assert_eq!(Host::with(|h| h.values.iter().count()), 0);
+    flush(&mut patch);
+    assert!(
+        !patch.ops().iter().any(|op| matches!(op, Op::Bind { .. })),
+        "the final flush must not bind destroyed controls"
+    );
 }
 
 /// A probed path revealed by `when` is given its container's whole inner width.

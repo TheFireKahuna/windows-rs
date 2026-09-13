@@ -433,6 +433,8 @@ pub enum Metric {
     SliderThumb,
     /// Minimum height of a measurement plot, independent of the control row height.
     PlotMinH,
+    /// Height of a response editor, independent of control density.
+    EditorPlotH,
     /// Minimum width of a docked detail pane.
     PaneMinW,
     /// Maximum width of a docked detail pane; surplus width belongs to the main surface.

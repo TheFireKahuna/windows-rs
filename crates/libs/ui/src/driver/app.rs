@@ -7,8 +7,8 @@
 //! object, and nothing here can stall a gesture: by the time an intent reaches this thread
 //! the visual it describes has already happened.
 
-use super::links::{Guard, Links};
 use super::AppCtx;
+use super::links::{Guard, Links};
 use crate::build::{Host, Mount};
 use crate::input::{KeyKind, Report};
 use crate::layout;
@@ -53,6 +53,8 @@ struct Thread<'a> {
     links: &'a Links,
     /// Held for the life of the mount: dropping it unmounts the tree.
     mounted: Option<Mount>,
+    /// Owns the root effects and every dynamically mounted branch beneath them.
+    owner: Option<signal::Owner>,
     overlays: Overlays,
     /// Set by the signal waker when a write on this thread gave the graph work, so the loop
     /// runs another pass rather than parking over it.
@@ -64,6 +66,8 @@ struct Thread<'a> {
     /// not flushed again while one is held: a flush swaps the model's pending ops with the
     /// buffer it is given, so flushing into a full buffer would drop what it holds.
     held: Option<Box<Down>>,
+    /// Work retained in the host until a spare lets it cross to the scene thread.
+    pending_flush: bool,
     env: Env,
     census: AppCensus,
     /// Whether the first pass is still owed: the mount's own ops are pending in the model
@@ -76,11 +80,9 @@ impl<'a> Thread<'a> {
     fn start(links: &'a Links, start: Start) -> Result<Self> {
         // The shaping engine is this thread's, over the ladder the scene thread's rasterizing
         // engine holds: two engines over one ladder agree on every face id.
-        let ladder = links
-            .ladder
-            .get()
-            .cloned()
-            .ok_or_else(|| Error::new(windows_window::E_HANDLE, "the scene thread never started"))?;
+        let ladder = links.ladder.get().cloned().ok_or_else(|| {
+            Error::new(windows_window::E_HANDLE, "the scene thread never started")
+        })?;
         crate::build::text::install(ladder)?;
 
         let mut model = Model::new(layout::root());
@@ -100,20 +102,24 @@ impl<'a> Thread<'a> {
         });
         let posts = signal::arm_posts(PostWake::Ring(Arc::clone(&links.app_ring)));
 
-        let mounted = (start.mount)(AppCtx {
-            root,
-            watch: start.watch,
-            window_dips: start.window_dips,
+        let (owner, mounted) = signal::Owner::scope(|| {
+            (start.mount)(AppCtx {
+                root,
+                watch: start.watch,
+                window_dips: start.window_dips,
+            })
         });
 
         Ok(Self {
             links,
             mounted: Some(mounted),
+            owner: Some(owner),
             overlays: Overlays::new(),
             dirty,
             focus: Vec::new(),
             intents: Vec::new(),
             held: None,
+            pending_flush: false,
             env: start.env,
             census: AppCensus::default(),
             first: true,
@@ -139,6 +145,9 @@ impl<'a> Thread<'a> {
         // The tree comes down on this thread, where the host lives, and its destroys ride
         // one last batch so the scene thread releases every visual and region before it
         // stops.
+        // Dispose dynamic mounts before destroying their parent visuals. Otherwise their
+        // value rows survive into the final geometry publish and bind destroyed nodes.
+        self.owner = None;
         self.mounted = None;
         self.overlays = Overlays::new();
         self.emit(true);
@@ -154,7 +163,11 @@ impl<'a> Thread<'a> {
             up.clear();
             _ = self.links.up_spare.put(up);
             // Rung only if the scene thread was holding a batch for want of this spare.
-            if self.links.scene_wants_up_spare.swap(false, Ordering::AcqRel) {
+            if self
+                .links
+                .scene_wants_up_spare
+                .swap(false, Ordering::AcqRel)
+            {
                 self.links.scene_ring.ring();
             }
             work = true;
@@ -163,9 +176,7 @@ impl<'a> Thread<'a> {
         // write the flush itself makes — a probe publishing — asks for another pass rather
         // than being folded into this one and forgotten.
         work |= self.dirty.replace(false);
-        work |= signal::flush();
-        self.overlays.sync(&mut self.focus);
-        work |= !self.focus.is_empty();
+        work |= reconcile(&mut self.overlays, &mut self.focus);
         // A wake that brought no work — a spare handed back, a ring for a write the flush
         // found already applied — solves nothing and sends nothing.
         self.emit(work);
@@ -236,6 +247,7 @@ impl<'a> Thread<'a> {
     /// thread rings when it returns the spare. A flush that produced nothing hands the buffer
     /// straight back rather than crossing with it.
     fn emit(&mut self, work: bool) {
+        self.pending_flush |= work;
         if let Some(held) = self.held.take() {
             match self.links.down.put(held) {
                 Ok(()) => self.links.scene_ring.ring(),
@@ -245,18 +257,26 @@ impl<'a> Thread<'a> {
                 }
             }
         }
-        if !work {
+        if !self.pending_flush {
             return;
         }
-        let Some(mut down) = self.links.down_spare.take() else {
-            self.census.skipped_flushes += 1;
-            // release: the flag follows this pass's reads of the mailbox, so the scene thread
-            // returning the spare and then reading the flag sees it.
+        let down = self.links.down_spare.take().or_else(|| {
+            // Arm before rechecking: the scene may return the spare between the
+            // first take and this store. Either this take gets it or its return
+            // rings the app. Pending work alone never spins the app loop.
             self.links
                 .app_wants_down_spare
                 .store(true, Ordering::Release);
+            self.links.down_spare.take()
+        });
+        let Some(mut down) = down else {
+            self.census.skipped_flushes += 1;
             return;
         };
+        self.links
+            .app_wants_down_spare
+            .store(false, Ordering::Release);
+        self.pending_flush = false;
         self.census.flushes += 1;
         Host::with(|h| {
             h.flush(&mut down.patch);
@@ -272,5 +292,66 @@ impl<'a> Thread<'a> {
             Ok(()) => self.links.scene_ring.ring(),
             Err(down) => self.held = Some(down),
         }
+    }
+}
+
+/// The declaration pass shared by the app thread and headless layout tests.
+pub(super) fn reconcile(overlays: &mut Overlays, focus: &mut Vec<FocusOp>) -> bool {
+    let work = signal::flush();
+    overlays.sync(focus);
+    work | !focus.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_returned_spare_flushes_pending_geometry_without_another_edit() {
+        let _patch = crate::build::tests::fixture();
+        let window = windows_window::Window::new("pending geometry witness")
+            .hidden()
+            .create()
+            .expect("window");
+        let links = Links::new(window.handle()).expect("mailboxes");
+        let spare = links.down_spare.take().expect("initial spare");
+        let mut thread = Thread {
+            links: &links,
+            mounted: None,
+            owner: None,
+            overlays: Overlays::new(),
+            dirty: Rc::new(Cell::new(false)),
+            focus: Vec::new(),
+            intents: Vec::new(),
+            held: None,
+            pending_flush: false,
+            env: Host::with(|h| h.env),
+            census: AppCensus::default(),
+            first: false,
+            _posts: signal::arm_posts(PostWake::Ring(Arc::clone(&links.app_ring))),
+        };
+        let (owner, _) = signal::Owner::scope(|| crate::build::geometry(&[]));
+        thread.emit(true);
+        assert!(thread.pending_flush);
+        assert!(links.app_wants_down_spare.load(Ordering::Acquire));
+        assert!(links.down.take().is_none());
+
+        assert!(links.down_spare.put(spare).is_ok());
+        thread.emit(false); // The return brings no new model or signal work.
+        let mut down = links.down.take().expect("the deferred geometry was sent");
+        assert!(down.patch.ops().iter().any(|op| matches!(
+            op,
+            windows_scene::Op::Res {
+                op: windows_scene::ResOp::Geom { .. },
+                ..
+            }
+        )));
+        assert!(!thread.pending_flush);
+        assert!(!links.app_wants_down_spare.load(Ordering::Acquire));
+        down.clear();
+        assert!(links.down_spare.put(down).is_ok());
+        thread.emit(false);
+        assert!(links.down.take().is_none(), "idle emits nothing");
+        drop(owner);
     }
 }
