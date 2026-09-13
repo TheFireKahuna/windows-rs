@@ -2369,6 +2369,57 @@ fn a_computed_column_template_follows_the_value_it_reads() {
     );
 }
 
+#[test]
+fn computed_rows_replace_the_template_without_remounting_children() {
+    use crate::layout::{Track, grid};
+    let mut patch = fixture();
+    let fraction = crate::signal::Cell::new(0.25_f32);
+    let _held = mount(
+        grid((plate(), plate()))
+            .rows([Track::Fr(1.0)])
+            .rows_from(move |out| out.extend([
+                Track::Fixed(Len::Pct(fraction.get())), Track::Fr(1.0),
+            ]))
+            .cols([Track::Fr(1.0)])
+            .gap(Len::Zero)
+            .height(Len::Pct(1.0))
+            .width(Len::Pct(1.0)), root(),
+    );
+    flush(&mut patch);
+    let snapshot = || Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let a = h.model().solved(nodes[0]);
+        let b = h.model().solved(nodes[2]);
+        (nodes, (b.rect.y0 - a.rect.y0) / a.size.y)
+    });
+    let (before, y) = snapshot();
+    assert!((y - 0.25).abs() < 0.01);
+    fraction.set(0.75);
+    crate::signal::flush();
+    flush(&mut patch);
+    let (after, y) = snapshot();
+    assert_eq!(before, after);
+    assert!((y - 0.75).abs() < 0.01);
+}
+
+#[test]
+fn keyed_tiles_fill_multiple_columns() {
+    let mut patch = fixture();
+    let _held = mount(
+        crate::layout::tiles(
+            Len::Times(Metric::CardMinW, 0.75),
+            each_into(|out| out.extend(0..4), |i| i, |_| plate().min_width(Len::Zero)),
+        ).width(Len::Times(Metric::CardMinW, 2.0)), root(),
+    );
+    flush(&mut patch);
+    let (a, b) = Host::with(|h| {
+        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        (h.model().solved(nodes[2]), h.model().solved(nodes[3]))
+    });
+    assert!(b.rect.x0 > a.rect.x0, "tiles did not share a row: {a:?} {b:?}");
+    assert!((b.rect.y0 - a.rect.y0).abs() < 1.0);
+}
+
 /// A computed column template survives the container resolving its own width class.
 ///
 /// The two lowerings — the one a bound style act pushes, and the one the solve asks for when

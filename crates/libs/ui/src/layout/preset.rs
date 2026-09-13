@@ -91,6 +91,8 @@ pub enum Over {
     /// `.cols(..).cols_when(Wide, ..)` concatenates, and the wide arm gets five tracks for
     /// two declarations.
     ClearColumns,
+    /// Clears the row template before a reactive replacement.
+    ClearRows,
     /// The layout class this recipe re-bases on.
     ///
     /// Not applied in sequence like every other override: a preset **is** the base, so
@@ -458,6 +460,7 @@ fn apply(style: &mut taffy::Style, over: Over, scope: Scope) {
             .grid_template_columns
             .push(taffy::GridTemplateComponent::Single(t.sizing(scope))),
         Over::ClearColumns => style.grid_template_columns.clear(),
+        Over::ClearRows => style.grid_template_rows.clear(),
         // Resolved before the base was built, and it is the base.
         Over::Class(_) => {}
         // In place, because `Preset::Tiles` already put one track there and every caller

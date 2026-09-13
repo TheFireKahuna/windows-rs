@@ -714,13 +714,29 @@ impl<K> El<K> {
     /// that resizes drops no owner, so state in the column it sizes is untouched.
     #[must_use]
     pub fn cols_from(self, tracks: impl Fn(&mut Vec<Track>) + 'static) -> Self {
+        self.tracks_from(tracks, Over::ClearColumns, Over::Column)
+    }
+
+    /// Replaces the row template when a signal read by `tracks` changes.
+    /// Keeps child owners and the track buffer, like [`cols_from`](Self::cols_from).
+    #[must_use]
+    pub fn rows_from(self, tracks: impl Fn(&mut Vec<Track>) + 'static) -> Self {
+        self.tracks_from(tracks, Over::ClearRows, Over::Row)
+    }
+
+    fn tracks_from(
+        self,
+        tracks: impl Fn(&mut Vec<Track>) + 'static,
+        clear: Over,
+        track: fn(Track) -> Over,
+    ) -> Self {
         let buf = core::cell::RefCell::new(Vec::new());
         self.act(Act::Restyle(Box::new(move |out| {
             let mut buf = buf.borrow_mut();
             buf.clear();
             tracks(&mut buf);
-            out.push(Rule::always(Over::ClearColumns));
-            out.extend(buf.iter().copied().map(Over::Column).map(Rule::always));
+            out.push(Rule::always(clear));
+            out.extend(buf.iter().copied().map(track).map(Rule::always));
         })))
     }
 
