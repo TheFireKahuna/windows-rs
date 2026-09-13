@@ -16,7 +16,7 @@ pub use kind::{
     UiaRole, Wash, angle_of, detent_delta, fraction_of, offset_of,
 };
 pub use seed::{
-    CHIP_PLATE, SliderStyle, box_, button, caption, card, chip, display, edge_button, field,
+    CHIP_PLATE, SliderStyle, box_, button, caption, card, chip, code, display, edge_button, field,
     flyout, icon_button, item_title, knob, label, menu_button, menu_heading, meter, micro, mono,
     note, panel, path, pills, segmented, select, sheet, slider, tag, text, title, toggle,
     vertical_label, window_title,

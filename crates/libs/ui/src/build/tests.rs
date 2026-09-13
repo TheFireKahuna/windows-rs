@@ -3546,6 +3546,46 @@ fn a_wrapping_run_breaks_against_its_column() {
     );
 }
 
+#[test]
+fn source_text_preserves_lines_wraps_and_settles_after_replacement() {
+    let mut patch = fixture();
+    let value = crate::signal::Cell::new("[[block]]\nq = 4.125".to_string());
+    let _held = mount(
+        stack(crate::widget::code(crate::widget::reactive(move |out| {
+            value.with(|s| out.push_str(s));
+        })))
+        .width(Len::Pct(0.25))
+        .min_width(Len::Zero),
+        root(),
+    );
+    let size = || {
+        Host::with(|h| {
+            let node = h.mounts.iter().nth(1).unwrap().1.node;
+            h.model().solved(node).size
+        })
+    };
+    flush(&mut patch);
+    let lines = size();
+    value.set("[[block]]".into());
+    crate::signal::flush();
+    flush(&mut patch);
+    assert!(
+        lines.y > size().y,
+        "source newlines must create distinct baselines"
+    );
+    value.set(format!("original_path = \"C:/{}\"", "long-directory/".repeat(16)));
+    crate::signal::flush();
+    flush(&mut patch);
+    assert!(size().x <= 201.0);
+    assert!(size().y > lines.y, "long source must wrap inside its column");
+    patch.clear();
+    flush(&mut patch);
+    assert!(
+        patch.ops().is_empty(),
+        "unchanged source must emit no retained work"
+    );
+}
+
 /// Returns one caption line's height at the fixture's scope, read from the palette's ramp.
 ///
 /// Reading it rather than writing it down keeps the assertions that use it moving with the

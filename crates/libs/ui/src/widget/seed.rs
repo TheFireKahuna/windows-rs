@@ -111,6 +111,12 @@ pub fn mono(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Mono, Text::Primary, Flow::Line, false)
 }
 
+/// Read-only source text: monospaced, preserving line breaks and wrapping to its container.
+#[must_use]
+pub fn code(s: impl Into<TextSource>) -> View {
+    run(s, TypeRole::Mono, Text::Primary, Flow::Wrap, false)
+}
+
 /// A prominent instrument readout, using the display rung of the type ramp.
 #[must_use]
 pub fn display(s: impl Into<TextSource>) -> View {
