@@ -555,11 +555,8 @@ impl Entry {
             self.target,
             Target::Line { .. } | Target::Wrapped { vertical: true, .. }
         );
-        // Published line boxes have definite sizes, so layout may skip their
-        // measure callback even when the text or font has changed.
-        if intrinsic {
-            self.sync(engine, model.solved(node).class);
-        }
+        // A definite box can skip measurement even when its source or font changed.
+        self.sync(engine, model.solved(node).class);
         let size = model.solved(node).size;
         let width = if intrinsic {
             // Pin to the replacement's advance. The preceding line's box can be
@@ -792,5 +789,102 @@ fn line_style(size: Vector2) -> taffy::Style {
         },
         flex_shrink: 0.0,
         ..taffy::Style::DEFAULT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::{Host, mount};
+    use crate::layout::{Align, Len, Track, grid};
+    use crate::signal::Cell;
+    use crate::widget::{button, item_title, shown};
+
+    #[test]
+    fn item_titles_trim_reflow_and_update_without_remounting_or_idle_writes() {
+        const LONG: &str =
+            "Headphone calibration for the listening position — 音楽 🎧 with headroom";
+        for dpi in [96.0, 144.0, 192.0] {
+            let mut patch = crate::build::tests::fixture_at(dpi);
+            let word = Cell::new(LONG);
+            let root = Host::with(|h| h.model().root());
+            let held = mount(
+                grid((
+                    item_title(shown(move || word.get()))
+                        .min_width(Len::Zero)
+                        .height(crate::role::Metric::RowH),
+                    button("Bypass"),
+                ))
+                .cols([Track::MinMax(Len::Zero, 1.0), Track::Auto])
+                .width(Len::Pct(1.0))
+                .align(Align::Center),
+                root,
+            );
+            let mut retained = None;
+            let mut narrow_count = 0;
+            for (value, width) in [
+                (LONG, 250.0),
+                (LONG, 1200.0),
+                ("", 250.0),
+                ("短い 🎧", 250.0),
+                (LONG, 250.0),
+            ] {
+                word.set(value);
+                crate::signal::flush();
+                Host::with(|h| {
+                    h.model().set_window(Vector2 { x: width, y: 600.0 });
+                    h.flush(&mut patch);
+                    with(|table| {
+                        let (key, entry) = table
+                            .entries
+                            .iter()
+                            .find(|(_, e)| e.ramp == TypeRole::ItemTitle)
+                            .unwrap();
+                        assert_eq!(
+                            table.str_of(key),
+                            Some(value),
+                            "automation keeps the full name"
+                        );
+                        let Target::Wrapped { group, lines, .. } = &entry.target else {
+                            panic!("an item title needs an allocated box around its glyph tile");
+                        };
+                        assert_eq!(lines.len(), 1, "ellipsis never wraps");
+                        let line = &lines[0];
+                        let ids = (line.sprite, line.run);
+                        assert_eq!(
+                            *retained.get_or_insert(ids),
+                            ids,
+                            "the sprite and coverage slot survive edits"
+                        );
+                        let allocated = h.model().solved(group.node()).size.x;
+                        assert!(allocated < width, "the control retains its track");
+                        assert!(
+                            line.size.x <= allocated + 2.0,
+                            "{dpi}: glyphs exceed {allocated}: {:?}",
+                            line.size
+                        );
+                        let mut glyphs = SegBuffers::default();
+                        entry.run.segments(0, &mut glyphs);
+                        if value == LONG && width == 250.0 {
+                            narrow_count = glyphs.glyphs.len();
+                        } else if width == 1200.0 {
+                            assert!(
+                                glyphs.glyphs.len() > narrow_count,
+                                "widening restores the trimmed suffix"
+                            );
+                        } else if value.is_empty() {
+                            assert!(
+                                glyphs.glyphs.is_empty(),
+                                "a definite box must still publish source changes"
+                            );
+                        }
+                    });
+                    patch.clear();
+                    h.flush(&mut patch);
+                    assert!(patch.is_empty(), "settled text emits no scene work");
+                });
+            }
+            drop(held);
+        }
     }
 }

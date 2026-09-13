@@ -87,9 +87,13 @@ impl Palette for Reference {
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec {
         let size = match role {
             TypeRole::Display => 32.0,
-            TypeRole::Title | TypeRole::WindowTitle => 20.0,
-            TypeRole::Body | TypeRole::BodyStrong | TypeRole::Mono => 14.0,
-            TypeRole::Caption | TypeRole::Label => 12.0,
+            TypeRole::Title | TypeRole::WindowTitle | TypeRole::ItemTitle => 20.0,
+            TypeRole::Body | TypeRole::BodyStrong | TypeRole::Mono | TypeRole::MenuItem => 14.0,
+            TypeRole::Caption
+            | TypeRole::Label
+            | TypeRole::Badge
+            | TypeRole::Tag
+            | TypeRole::MenuHeading => 12.0,
             TypeRole::Micro => 10.0,
         };
         let size = match scope.density {

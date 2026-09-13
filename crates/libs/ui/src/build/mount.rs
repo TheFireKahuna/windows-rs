@@ -341,17 +341,18 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         usize::from(r.fill.is_some() || reachable.fill.is_some())
             + usize::from(r.stroke.is_some() || reachable.stroke.is_some())
     });
-    // A run that can break needs one sprite per line, so it is a group whatever else it is.
+    // Wrapped and trimmed runs take the group's allocated width; their glyph tiles keep
+    // their own coverage extents inside it.
     let run = run_seed(b, &slot);
-    let wraps =
-        run.is_some_and(|(text, flow)| flow == Flow::Wrap || b.texts[text as usize].vertical);
+    let grouped =
+        run.is_some_and(|(text, flow)| flow != Flow::Line || b.texts[text as usize].vertical);
     let leaf = seed_count == 1
         && chrome_count == 0
         && slot.kids.len == 0
         && slot.adapter.is_none()
         && slot.responsive.is_none()
         && slot.state == StatePolicy::None
-        && !wraps;
+        && !grouped;
 
     // Collected locally, then either consumed by this node — if it is a control — or handed
     // up. Two nested controls therefore cannot claim one thumb.
@@ -435,7 +436,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             previous = Some(sprite.node());
         }
         // A wrapping run has no sprite of its own: its lines are minted as they are shaped.
-        if !wraps {
+        if !grouped {
             for &seed in b.chain_seeds(slot.seeds) {
                 let sprite = Host::with(|h| h.model().sprite(group, previous));
                 cover(sprite.node(), inner, Len::Zero);
@@ -489,7 +490,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
 
     // ── measured text ─────────────────────────────────────────────────────────────
     if let Some((text, _)) = run {
-        let target = if wraps {
+        let target = if grouped {
             None
         } else {
             Some(parts.label.expect("a run seed mints its own sprite"))
@@ -1520,7 +1521,7 @@ fn mount_text(
                 scope,
                 ink,
                 sprite: sprite.unwrap_or_default(),
-                group: group.filter(|_| flow == Flow::Wrap || seed.vertical),
+                group: group.filter(|_| flow != Flow::Line || seed.vertical),
             })
         });
         if let Some(row) = h.mounts.get_mut(row) {

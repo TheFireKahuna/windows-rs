@@ -17,7 +17,7 @@ use windows_scene::{GeomId, HitFlags};
 
 // ── text ─────────────────────────────────────────────────────────────────────────
 //
-// Five rungs of one ladder. Each carries its own role and type ramp, and none takes a colour
+// Each text seed carries its own role and type ramp, and none takes a colour
 // or a size.
 
 /// Body copy.
@@ -38,9 +38,33 @@ pub fn window_title(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::WindowTitle, Text::Primary, Flow::Line, false)
 }
 
+/// An item's name, trimmed to its allocated width without changing its accessible name.
+#[must_use]
+pub fn item_title(s: impl Into<TextSource>) -> View {
+    run(s, TypeRole::ItemTitle, Text::Primary, Flow::Ellipsis, false).clip()
+}
+
+/// A compact value beside an item's name.
+#[must_use]
+pub fn tag(s: impl Into<TextSource>) -> View {
+    run(s, TypeRole::Tag, Text::Tertiary, Flow::Line, false)
+}
+
+/// A menu's heading, set in quiet capitals.
+#[must_use]
+pub fn menu_heading(s: impl Into<TextSource>) -> View {
+    run(s, TypeRole::MenuHeading, Text::Tertiary, Flow::Line, true)
+}
+
+/// A menu command naming a channel or other technical value.
+#[must_use]
+pub fn menu_button(s: impl Into<TextSource>) -> El<Button> {
+    button("").row(inner(s, TypeRole::MenuItem, false))
+}
+
 /// A field's or a group's name, set secondary to the thing it labels.
 ///
-/// The one text widget set in capitals. It names a region of a surface rather than carrying
+/// Set in capitals. It names a region of a surface rather than carrying
 /// a value, and its rung is tracked to suit that.
 #[must_use]
 pub fn label(s: impl Into<TextSource>) -> View {
@@ -53,8 +77,8 @@ pub fn vertical_label(s: impl Into<TextSource>) -> View {
     label(s).vertical_text()
 }
 
-/// Supporting prose. It wraps, so it is the one text widget that mounts as a group: a
-/// coverage tile covers one line, and a run that can break needs a sprite per line.
+/// Supporting prose. A coverage tile covers one line, so wrapping mounts a group with
+/// one sprite per line.
 #[must_use]
 pub fn caption(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Caption, Text::Tertiary, Flow::Wrap, false)
@@ -93,7 +117,7 @@ pub fn display(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Display, Text::Primary, Flow::Line, false)
 }
 
-/// Builds a text run: the shared body of the five text widgets and of every label inside a
+/// Builds a text run: the shared body of the text widgets and of every label inside a
 /// control.
 ///
 /// `ink` is stated here and overridden at mount by the enclosing widget's chrome row where
@@ -184,7 +208,7 @@ pub fn chip(role: DataRole, s: impl Into<TextSource>) -> View {
         .plate(Metric::Radius, Role::Data(role), CHIP_PLATE)
         // A container and not a run: a run's box is its coverage tile, so padding one leaves
         // the glyphs drawn against a tile sized without it and the plate hugs them.
-        .row(ink_run(s, TypeRole::Label, Role::Data(role), true))
+        .row(ink_run(s, TypeRole::Badge, Role::Data(role), true))
         // Wider than it is tall, and by the widest step in the scale on the inline axis: a
         // badge is read as a shape before it is read as a word, and a plate at the glyphs'
         // own extent is a highlight behind text rather than a chip. The text is short, upper

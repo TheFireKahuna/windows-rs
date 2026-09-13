@@ -331,6 +331,16 @@ pub enum TypeRole {
     Title,
     /// Application identity in the window caption, independent of content headings.
     WindowTitle,
+    /// A single item's name, independent of window and section headings.
+    ItemTitle,
+    /// A short chromatic identifier on a chip.
+    Badge,
+    /// A compact value beside an item's name.
+    Tag,
+    /// A menu's quiet uppercase heading.
+    MenuHeading,
+    /// A menu option naming a channel or other technical value.
+    MenuItem,
     Body,
     BodyStrong,
     Caption,
