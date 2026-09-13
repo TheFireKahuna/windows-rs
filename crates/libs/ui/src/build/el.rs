@@ -1369,18 +1369,26 @@ impl El<Path> {
     /// Outlines the path with a retained HDR gradient.
     #[must_use]
     pub fn stroke_ramp(self, id: RampId, width: impl Into<Len>) -> Self {
+        self.path_ramp(id, Some(width.into()), Part::Border)
+    }
+
+    /// Fills this node's geometry with a retained HDR gradient.
+    #[must_use]
+    pub fn fill_ramp(self, id: RampId) -> Self {
+        self.path_ramp(id, None, Part::Fill)
+    }
+
+    fn path_ramp(self, id: RampId, stroke: Option<Len>, part: Part) -> Self {
         Build::with(|b| {
             b.push_seed(
                 self.at,
                 SpriteSeed {
-                    mask: MaskSeed::Shape {
-                        stroke: Some(width.into()),
-                    },
+                    mask: MaskSeed::Shape { stroke },
                     role: Role::Fill(Fill::Surface),
                     strength: super::arena::FULL,
                     ramp: Some(id),
                     region: None,
-                    part: Part::Border,
+                    part,
                     next: super::arena::NIL,
                 },
             );

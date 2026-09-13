@@ -24,6 +24,78 @@ pub(crate) fn fixture() -> SinkPatch {
 }
 
 #[test]
+fn a_gradient_fill_keeps_its_geometry_mask_and_resources_on_edit() {
+    use windows_scene::{Mask, PathVerb, ResOp, Spread};
+    let mut patch = fixture();
+    let hue = crate::role::DataRole(1);
+    let verts = [
+        PathVerb::Move {
+            to: Vector2 { x: 0.0, y: 0.0 },
+            filled: true,
+        },
+        PathVerb::Line(Vector2 { x: 80.0, y: 40.0 }),
+        PathVerb::Line(Vector2 { x: 0.0, y: 40.0 }),
+        PathVerb::End { closed: true },
+    ];
+    let geom = geometry(&verts);
+    let stops = [
+        Stop {
+            at: 0.0,
+            role: hue,
+            strength: 0.1,
+        },
+        Stop {
+            at: 1.0,
+            role: hue,
+            strength: 0.0,
+        },
+    ];
+    let fade = ramp(&stops, Spread::Vertical);
+    let _mount = mount(
+        crate::widget::path(geom)
+            .fill_ramp(fade)
+            .width(Metric::RowH)
+            .height(Metric::RowH),
+        root(),
+    );
+    flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(op, Op::Mask { mask: Mask::Shape { geom: id, stroke: None }, .. } if *id == geom)));
+    assert!(
+        patch
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::Paint { paint: Paint::Ramp(id), .. } if *id == fade))
+    );
+    patch.clear();
+    set_ramp(
+        fade,
+        &[
+            Stop {
+                at: 0.25,
+                ..stops[0]
+            },
+            stops[1],
+        ],
+        Spread::Vertical,
+    );
+    flush(&mut patch);
+    assert!(patch.ops().iter().any(|op| matches!(
+        op,
+        Op::Res {
+            op: ResOp::Ramp { .. },
+            ..
+        }
+    )));
+    assert!(!patch.ops().iter().any(|op| matches!(op, Op::New { .. })));
+    patch.clear();
+    flush(&mut patch);
+    assert!(
+        patch.ops().is_empty(),
+        "an unchanged gradient has no idle work"
+    );
+}
+
+#[test]
 fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
     use crate::role::DataRole;
     use windows_scene::{Anim, Bind, PathVerb, Prop, Spread, Value};

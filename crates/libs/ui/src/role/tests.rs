@@ -146,6 +146,7 @@ impl Palette for Reference {
             Metric::CardMinH => 160.0,
             Metric::PlotMinH => 180.0,
             Metric::EditorPlotH => 220.0,
+            Metric::GraphicPlotH => 200.0,
             Metric::PaneMinW => 360.0,
             Metric::PaneMaxW => 540.0,
             Metric::PaneDrawerMaxW => 420.0,
