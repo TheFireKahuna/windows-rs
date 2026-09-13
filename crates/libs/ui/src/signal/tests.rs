@@ -330,6 +330,35 @@ fn a_staged_write_against_a_disposed_cell_is_dropped() {
 }
 
 #[test]
+fn producer_writes_hold_one_frame_request_until_each_drain() {
+    let window = windows_window::Window::new("signal post witness")
+        .create()
+        .expect("window");
+    let pacer = window.pacer().expect("pacer");
+    let wake = pacer.wake();
+    let registration = super::arm_posts(wake.clone());
+    let (_owner, level) = Owner::scope(|| Cell::new(0_u32));
+    for value in [1, 2] {
+        std::thread::spawn(move || {
+            level.post(value);
+            level.post(value);
+        })
+        .join()
+        .expect("producer");
+        assert_eq!(wake.requesters(), 1, "one request per pending burst");
+        flush();
+        assert_eq!(level.peek(), value);
+        assert_eq!(wake.requesters(), 0, "drained graph parks the pacer");
+    }
+    std::thread::spawn(move || level.post(3))
+        .join()
+        .expect("producer");
+    drop(registration);
+    assert_eq!(wake.requesters(), 0, "unmount releases an outstanding request");
+    flush();
+}
+
+#[test]
 fn a_constant_is_distinguishable_from_a_signal_without_reading_it() {
     // A constant is told apart from a signal without reading it, so binding one creates no
     // graph node.

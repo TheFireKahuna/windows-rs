@@ -6,20 +6,23 @@
 //! ring once per frame keeps the intermediate samples legacy coalescing discards.
 //!
 //! Every arm here writes a ring slot or a bit and returns. It performs no hit test, touches
-//! no tree state, mutates no interaction state and allocates nothing: the cost of hover is
+//! no tree state and mutates no interaction state: the cost of hover is
 //! (moves × tree size), and the frame clock bounds the first factor. A source lint enforces
 //! the shape — a window procedure's pointer arms may not hit-test, reach into a tree, or
-//! allocate.
+//! run application work.
 //!
-//! One syscall is made here. A discrete transition — down, up, button change, cancel —
-//! records where it happened, because `GetPointerInfo` answers for the pointer's current
-//! position and by tick time the contact has moved on; a press target chosen from that is a
-//! mis-click. Motion makes no call at all: it sets a bit.
+//! Discrete transitions retain their Win32 position and, for down, up and wheel, a WinRT
+//! point. The system's message data may be gone after the pump retrieves another message;
+//! keeping only an id makes a short touch impossible to finish. The ring storage is fixed;
+//! the platform owns each point's allocation, released when its ring record is consumed.
+//! Motion still sets a bit without constructing a point here.
 
+use super::coords::{Coords, PointerSpace, Unit};
 use super::service::Service;
 use crate::bindings::*;
 use core::cell::Cell;
 use std::rc::Rc;
+use windows_core::{ComObject, Result};
 use windows_window::{Tick, Wake};
 
 /// How many discrete transitions one frame may carry.
@@ -178,7 +181,7 @@ impl PointerFlags {
 }
 
 /// One discrete pointer transition, recorded where and when it happened.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PointerEvent {
     pub id: u32,
     pub kind: EventKind,
@@ -195,6 +198,20 @@ pub struct PointerEvent {
     /// Whether the wheel was horizontal.
     pub horizontal: bool,
     pub time: u32,
+    /// The recogniser's point, retained before the pump retrieves another message and the
+    /// system may retire this pointer. Aborts and button changes need no recogniser point.
+    point: Option<Result<PointerPoint>>,
+}
+
+impl PointerEvent {
+    /// Reads the retained point of a down, up or wheel, including any capture failure.
+    pub(super) fn point(&self) -> Result<&PointerPoint> {
+        self.point
+            .as_ref()
+            .expect("this transition carries a point")
+            .as_ref()
+            .map_err(Clone::clone)
+    }
 }
 
 /// Names which keyboard transition a record carries.
@@ -244,7 +261,7 @@ pub struct KeyEvent {
 /// One ring holds both kinds, because the order between a keystroke and a contact is
 /// observable: a `Tab` that moves focus and a press that changes it resolve in the order the
 /// user made them.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputEvent {
     Pointer(PointerEvent),
     Key(KeyEvent),
@@ -283,6 +300,12 @@ pub struct DoorbellHealth {
 /// Installed into the window at creation and shared with the [`Router`](super::Router) that
 /// drains it on the frame clock.
 pub struct Doorbell {
+    hwnd: Cell<HWND>,
+    /// One coordinate authority for captured transitions and the router's move batches.
+    pub(super) space: ComObject<PointerSpace>,
+    pub(super) transform: IPointerPointTransform,
+    /// Calibration watermark, never used as the current window scale.
+    scale: Cell<f32>,
     /// The ring, allocated once at construction. An empty slot is `None`: there is no
     /// [`InputEvent`] meaning "no transition", and inventing one would be a variant every
     /// match has to handle.
@@ -321,7 +344,13 @@ impl Doorbell {
     /// Creates a doorbell with an empty ring and nothing pending.
     #[must_use]
     pub fn new() -> Self {
+        let space = ComObject::new(PointerSpace::new());
+        let transform = space.to_interface();
         Self {
+            hwnd: Cell::new(core::ptr::null_mut()),
+            space,
+            transform,
+            scale: Cell::new(0.0),
             slots: (0..RING_CAPACITY).map(|_| Cell::new(None)).collect(),
             head: Cell::new(0),
             tail: Cell::new(0),
@@ -342,6 +371,7 @@ impl Doorbell {
     /// exists before the window, and a pacer cannot exist before the window it posts to.
     /// Anything that arrives in between is recorded and consumed by the first tick.
     pub fn pace(&self, window: &windows_window::Window, wake: Wake) {
+        self.hwnd.set(window.hwnd());
         self.service.attach(window.hwnd());
         self.wake.set(Some(wake));
     }
@@ -438,6 +468,7 @@ impl Doorbell {
             wheel: 0,
             horizontal: false,
             time: info.dwTime,
+            point: matches!(kind, EventKind::Down | EventKind::Up).then(|| self.point(id, &info)),
         }));
         self.skip_frame(id);
         Some(0)
@@ -457,6 +488,7 @@ impl Doorbell {
             wheel: 0,
             horizontal: false,
             time: 0,
+            point: None,
         }));
     }
 
@@ -548,8 +580,32 @@ impl Doorbell {
             wheel: notches,
             horizontal,
             time: if read { info.dwTime } else { 0 },
+            point: Some(self.point(id, &info)),
         }));
         Some(0)
+    }
+
+    /// Captures a point while its message owns the platform's pointer information.
+    fn point(&self, id: u32, info: &POINTER_INFO) -> Result<PointerPoint> {
+        let hwnd = self.hwnd.get();
+        if !hwnd.is_null() {
+            let scale = windows_window::Metrics::for_window(hwnd).scale;
+            if self.scale.replace(scale) != scale {
+                self.space.forget();
+            }
+            if self.space.unit() == Unit::Unmeasured {
+                let raw = PointerPoint::GetCurrentPoint(id)?.RawPosition()?;
+                let at = Coords::new(hwnd).client_at_scale(
+                    scale,
+                    id,
+                    info.ptPixelLocationRaw.x,
+                    info.ptPixelLocationRaw.y,
+                );
+                self.space
+                    .calibrate(windows_scene::Point { x: raw.x, y: raw.y }, at);
+            }
+        }
+        PointerPoint::GetCurrentPointTransformed(id, &self.transform)
     }
 
     fn key(&self, kind: KeyKind, wparam: usize, lparam: isize) -> Option<isize> {

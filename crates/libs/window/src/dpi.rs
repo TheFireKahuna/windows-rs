@@ -35,7 +35,15 @@ pub struct Metrics {
 
 impl Metrics {
     /// Measures `hwnd`'s DPI and everything the frame derives from it.
-    pub(crate) fn for_window(hwnd: HWND) -> Self {
+    ///
+    /// `hwnd` must name the live window whose metrics are needed. Message handlers can use
+    /// this when they have its handle but cannot borrow its owning [`crate::Window`].
+    #[must_use]
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "HWND is an opaque handle validated by user32, never a pointer dereferenced here"
+    )]
+    pub fn for_window(hwnd: HWND) -> Self {
         // A window being created, or one whose monitor went away, can report zero. Unity
         // keeps every derived metric positive, which the hit test depends on.
         // SAFETY: `hwnd` is the window this is computed for, live for the call.

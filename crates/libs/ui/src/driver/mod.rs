@@ -100,7 +100,8 @@ impl Ui {
     /// what the window's creation set up: a system compositor needs a dispatcher queue on the
     /// calling thread, and the GPU is chosen for the display the window opened on.
     ///
-    /// `mount` is called with the root group once everything it could reach exists, and the
+    /// `mount` receives the root group and the live window once everything it could reach exists. The
+    /// window lets an application register visibility or lifetime wakes with its own reactor. The
     /// [`Mount`] it returns is held until this call returns — dropping one unmounts its tree.
     /// It mounts into a full-client stretching column
     /// ([`layout::root`](crate::layout::root)), so a shell states `grow` and nothing about
@@ -122,7 +123,7 @@ impl Ui {
         window: WindowBuilder,
         backends: impl FnOnce() -> Result<Backends>,
         backdrop: BackdropSpec,
-        mount: impl FnOnce(GroupId) -> Mount,
+        mount: impl FnOnce(GroupId, &Window) -> Mount,
     ) -> Result<()> {
         let bell = Rc::new(crate::input::Doorbell::new());
         // The client extent, in pixels, posted whenever the system changes it and taken by
@@ -187,6 +188,7 @@ impl Ui {
         crate::build::text::install(backends.ladder().clone())?;
 
         let pacer = window.pacer()?;
+        let _posted = signal::arm_posts(pacer.wake());
         resized.arm(pacer.wake());
         // Shared, because the caption's hit test runs inside the window procedure and has to
         // reach the one hit array from there. The tick takes the borrow and drops it before
@@ -246,7 +248,7 @@ impl Ui {
         });
 
         // Held until the pump returns: dropping it unmounts the tree.
-        let mounted = mount(root);
+        let mounted = mount(root, &window);
 
         // `Cell::set` marks the graph and returns; nothing schedules a frame on its own,
         // since the pump is blocked and the pacer is parked unless something has asked for

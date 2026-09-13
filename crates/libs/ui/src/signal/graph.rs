@@ -204,8 +204,7 @@ thread_local! {
 /// Without a waker a write schedules nothing: [`Cell::set`](super::Cell::set) marks nodes
 /// and queues effects, and nothing downstream runs until a caller invokes [`flush`]. A host
 /// that blocks its loop between frames learns through this callback that a frame is owed.
-/// [`written`](super::written) is the matching signal for a producer thread's write, and
-/// the two are separate because that one wakes a thread and this one asks for a frame.
+/// The driver's `arm_posts` registration requests frames for producer-thread writes.
 ///
 /// The callback runs on the empty-to-non-empty transition and at no other time, so a burst
 /// of writes asks once. A write made from inside a flush does not call it: that flush picks
@@ -213,6 +212,11 @@ thread_local! {
 /// signals.
 pub fn set_waker(f: impl Fn() + 'static) {
     WAKER.with(|w| *w.borrow_mut() = Some(Box::new(f)));
+}
+
+/// Routes producer writes to this graph's window until the registration drops.
+pub(crate) fn arm_posts(wake: windows_window::Wake) -> shared::PostWake {
+    shared::arm(with(|g| g.id), wake)
 }
 
 /// Calls the waker, holding no borrow of either the graph or the waker slot while it runs.

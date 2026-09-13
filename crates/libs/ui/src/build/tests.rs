@@ -3755,6 +3755,40 @@ fn a_probe_survives_its_subtree_unmounting() {
     );
 }
 
+#[test]
+fn navigation_releases_probes_owned_by_nested_branches() {
+    let shown = crate::signal::Cell::new(true);
+    let mut patch = fixture();
+    let _held = mount(
+        stack(when(
+            move || shown.get(),
+            || {
+                stack(when(
+                    || true,
+                    || {
+                        let location = crate::layout::probe();
+                        plate().height(Metric::RowH).probed(location)
+                    },
+                ))
+            },
+        ))
+        .width(Len::Pct(1.0)),
+        root(),
+    );
+    flush(&mut patch);
+    assert_eq!(Host::with(|h| h.probes.iter().count()), 1);
+
+    shown.set(false);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(Host::with(|h| h.probes.iter().count()), 0);
+
+    shown.set(true);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(Host::with(|h| h.probes.iter().count()), 1);
+}
+
 /// A probed path revealed by `when` is given its container's whole inner width.
 ///
 /// The chain row's shape: an accent edge beside a grown column, whose body is mounted when
@@ -4563,12 +4597,14 @@ fn a_drawer_shadow_is_retained_across_width_classes() {
     let _held = mount(
         responsive(
             [1100.0, 1400.0],
-            stack(crate::widget::sheet("shadow")
-                .shadowed(Edge::Left)
-                .cover()
-                .hide_when(WidthClass::Wide))
-                .width(Len::Pct(1.0))
-                .height(Len::Pct(1.0)),
+            stack(
+                crate::widget::sheet("shadow")
+                    .shadowed(Edge::Left)
+                    .cover()
+                    .hide_when(WidthClass::Wide),
+            )
+            .width(Len::Pct(1.0))
+            .height(Len::Pct(1.0)),
         )
         .width(Len::Pct(1.0))
         .height(Len::Pct(1.0)),

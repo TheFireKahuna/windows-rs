@@ -38,6 +38,7 @@ windows-window = { workspace = true }
 rustc-hash = { workspace = true }
 
 [dev-dependencies]
+injector = { path = "../../tests/libs/injector" }
 # The scroll example drives a real tracker, which is a composition object on a real device.
 # Both are deliberately absent above: this crate declares into a retained tree and never
 # builds one, and keeping them dev-only is what says so.

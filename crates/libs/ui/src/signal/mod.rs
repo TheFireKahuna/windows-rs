@@ -43,7 +43,7 @@ mod tests;
 
 pub use epoch::Epoch;
 pub use graph::{SignalId, flush, live_nodes, set_waker, untracked};
-pub use shared::written;
+pub(crate) use graph::arm_posts;
 
 use core::any::Any;
 use core::cell::RefCell;
@@ -178,8 +178,8 @@ impl<T: PartialEq + Send + 'static> Cell<T> {
     ///
     /// On the thread that owns the graph this is [`set`](Self::set). Anywhere else the
     /// write is staged and applied at the app thread's next [`flush`], coalesced so that a
-    /// producer outrunning the app thread overwrites its own pending value and wakes that
-    /// thread once. [`written`] is the event the app thread waits on.
+    /// producer outrunning the app thread overwrites its own pending value and requests
+    /// one frame from the host's pacer until the graph drains the write.
     ///
     /// A staged write allocates one box. A display-rate producer publishes through an
     /// [`Epoch`], which carries no value and allocates nothing.

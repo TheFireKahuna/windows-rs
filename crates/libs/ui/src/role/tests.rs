@@ -87,7 +87,7 @@ impl Palette for Reference {
     fn typography(&self, role: TypeRole, scope: Scope) -> FontSpec {
         let size = match role {
             TypeRole::Display => 32.0,
-            TypeRole::Title => 20.0,
+            TypeRole::Title | TypeRole::WindowTitle => 20.0,
             TypeRole::Body | TypeRole::BodyStrong | TypeRole::Mono => 14.0,
             TypeRole::Caption | TypeRole::Label => 12.0,
             TypeRole::Micro => 10.0,
@@ -97,7 +97,7 @@ impl Palette for Reference {
             Density::Compact => size - 1.0,
         };
         let weight = match role {
-            TypeRole::Title | TypeRole::BodyStrong => 600,
+            TypeRole::Title | TypeRole::WindowTitle | TypeRole::BodyStrong => 600,
             _ => 400,
         };
         FontSpec::new(FamilyId(u16::from(role == TypeRole::Mono)), size).weight(weight)
@@ -124,12 +124,21 @@ impl Palette for Reference {
             Metric::BandMd => 44.0 * tight,
             Metric::BandLg => 48.0 * tight,
             Metric::CommandW => 46.0 * tight,
-            Metric::BorderW => 1.0,
-            Metric::HairlineW => 0.5,
-            Metric::CardMinW => 240.0,
+            Metric::CommandH => 32.0 * tight,
             Metric::DialSize => 128.0 * tight,
             Metric::SliderRailH => 5.0 * tight,
             Metric::SliderThumb => 13.0 * tight,
+            Metric::CommandIcon => 10.0 * tight,
+            Metric::CaptionControlH => 28.0 * tight,
+            Metric::BrandIcon => 20.0 * tight,
+            Metric::RailW => 48.0 * tight,
+            Metric::RailItemH => 36.0 * tight,
+            Metric::RailIcon => 16.0 * tight,
+            Metric::RailInset => 6.0 * tight,
+            Metric::RailGap => 2.0 * tight,
+            Metric::BorderW => 1.0,
+            Metric::HairlineW => 0.5,
+            Metric::CardMinW => 240.0,
             Metric::CardMinH => 160.0,
             Metric::PlotMinH => 180.0,
             Metric::PaneMinW => 360.0,

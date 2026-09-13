@@ -329,6 +329,8 @@ pub struct Shadow {
 pub enum TypeRole {
     Display,
     Title,
+    /// Application identity in the window caption, independent of content headings.
+    WindowTitle,
     Body,
     BodyStrong,
     Caption,
@@ -392,14 +394,32 @@ pub enum Metric {
     /// A window command's width — the minimize, maximize and close controls of a custom
     /// caption band.
     CommandW,
+    /// Height of a custom caption's window command.
+    CommandH,
+    /// Glyph box inside a window command, independent of its hit target.
+    CommandIcon,
+    /// Height of endpoint and mode controls in the caption.
+    CaptionControlH,
+    /// Application identity mark in the caption.
+    BrandIcon,
+    /// Collapsed navigation rail width.
+    RailW,
+    /// Navigation destination target height.
+    RailItemH,
+    /// Navigation destination glyph box.
+    RailIcon,
+    /// Horizontal inset of navigation destinations.
+    RailInset,
+    /// Separation between navigation destinations.
+    RailGap,
     BorderW,
     CardMinW,
     CardMinH,
-    /// Diameter of a rotary editor dial.
+    /// Diameter of a rotary editor's dial, independent of its surrounding control rows.
     DialSize,
-    /// Thickness of a slider rail, independent of its pointer target.
+    /// Thickness of a slider's rail, independent of its pointer target.
     SliderRailH,
-    /// Diameter of a slider thumb.
+    /// Diameter of a slider's thumb.
     SliderThumb,
     /// Minimum height of a measurement plot, independent of the control row height.
     PlotMinH,

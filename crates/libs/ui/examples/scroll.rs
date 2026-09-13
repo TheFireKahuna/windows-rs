@@ -105,7 +105,7 @@ fn main() -> Result<()> {
             )
         },
         BackdropSpec::default(),
-        |root| {
+        |root, _window| {
             mount(
                 list(
                     || ListSpec::uniform(ROWS, Metric::RowH),

@@ -42,10 +42,14 @@ impl Coords {
     /// right for a window whose content the system is scaling.
     #[must_use]
     pub fn client(&self, env: Env, id: u32, x_px: i32, y_px: i32) -> Point {
+        self.client_at_scale(env.scale(), id, x_px, y_px)
+    }
+
+    /// The message-time equivalent of [`Self::client`], using the window's current metrics.
+    pub(crate) fn client_at_scale(&self, scale: f32, id: u32, x_px: i32, y_px: i32) -> Point {
         let (x, y) = self
             .transform(id, x_px, y_px)
             .unwrap_or_else(|| self.screen_to_client(x_px, y_px));
-        let scale = env.scale();
         Point {
             x: x / scale,
             y: y / scale,

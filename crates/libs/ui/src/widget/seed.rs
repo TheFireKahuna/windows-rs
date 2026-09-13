@@ -32,6 +32,12 @@ pub fn title(s: impl Into<TextSource>) -> View {
     run(s, TypeRole::Title, Text::Primary, Flow::Line, false)
 }
 
+/// Application identity in the window caption.
+#[must_use]
+pub fn window_title(s: impl Into<TextSource>) -> View {
+    run(s, TypeRole::WindowTitle, Text::Primary, Flow::Line, false)
+}
+
 /// A field's or a group's name, set secondary to the thing it labels.
 ///
 /// The one text widget set in capitals. It names a region of a surface rather than carrying

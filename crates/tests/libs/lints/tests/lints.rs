@@ -175,7 +175,9 @@ fn no_scrgb_construction() {
 #[test]
 fn wndproc_is_doorbell() {
     // A pointer message's handler signals the frame-clock consumer and returns: it does
-    // not hit-test, walk the tree or allocate. Hover costs (pointer moves × tree size),
+    // not hit-test, walk the tree or allocate application containers. The platform's
+    // discrete PointerPoint capture must happen while its message is current. Hover
+    // constructs no point and costs (pointer moves × tree size),
     // and only the frame clock bounds the number of moves that reach the tree.
     let sources = framework();
     let found: Vec<String> = sources
@@ -208,8 +210,8 @@ fn wndproc_is_doorbell() {
         .collect();
     deny(
         "wndproc_is_doorbell",
-        "a pointer arm rings a bell and returns; hit testing and allocation belong to the \
-         frame-clock consumer",
+        "a pointer arm captures its message and returns; hit testing and application \
+         allocation belong to the service tick",
         &found,
     );
 }

@@ -77,7 +77,7 @@ use crate::gesture::{DragUpdate, Events, GestureDecl, Recognised, RecognizerPool
 use crate::rotary::{Rotary, Rotation};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
-use windows_core::{ComObject, Result};
+use windows_core::Result;
 use windows_scene::{ControlId, Env, HitFlags, HitTable, Point};
 
 /// How many coalesced entries one service reads back.
@@ -230,9 +230,6 @@ pub struct Router {
     hwnd: HWND,
     coords: Coords,
     reader: Reader,
-    /// The space the recogniser is asked to report in, and the interface handle it is handed.
-    space: ComObject<PointerSpace>,
-    transform: IPointerPointTransform,
     pool: RecognizerPool,
     /// A clone of the pool's queue, so draining it does not conflict with iterating the pool.
     events: Events,
@@ -285,8 +282,6 @@ impl Router {
         }
         let hwnd = window.hwnd();
         let late = Late::resolve();
-        let space = ComObject::new(PointerSpace::new());
-        let transform = space.to_interface();
         let pool = RecognizerPool::new();
         // The queue every recogniser in the pool is wired to. Cloned so that draining it and
         // iterating the pool do not borrow one field twice; the queue is an `Rc` inside, so
@@ -298,8 +293,6 @@ impl Router {
             hwnd,
             coords: Coords::new(hwnd),
             reader: Reader::new(late),
-            space,
-            transform,
             pool,
             events,
             focus: FocusRing::default(),
@@ -365,7 +358,7 @@ impl Router {
     /// Returns the unit the WinRT pointer statics were measured to answer in.
     #[must_use]
     pub fn measured_unit(&self) -> Unit {
-        self.space.unit()
+        self.bell.space.unit()
     }
 
     /// Returns the focus ring. Focus order is the hit array's, filtered to `INTERACTIVE`.
@@ -448,9 +441,8 @@ impl Router {
 
     /// Brings the router up to date with `env` and keeps it as the next tick's watermark.
     ///
-    /// Any change to the environment makes the hover answer stale. A scale change also puts
-    /// every contact on a different pixel grid, so the measured recogniser factor is
-    /// discarded and the next contact measures it again.
+    /// Any change to the environment makes the hover answer stale. The doorbell calibrates
+    /// the recogniser's space at capture time, before a transition enters the ring.
     fn sync(&mut self, env: Env) {
         let Some(last) = self.env.replace(env) else {
             return;
@@ -459,9 +451,6 @@ impl Router {
             return;
         }
         self.hover_stale = true;
-        if last.scale() != env.scale() {
-            self.space.forget();
-        }
     }
 
     // ── 1. the ring, in order ─────────────────────────────────────────────────────
@@ -596,20 +585,9 @@ impl Router {
             .bind(event.id, event.ptype, hit.id, decl, at, rejected)?;
         self.census.bindings += 1;
         if !rejected {
-            // Measured before the point that is fed, so the first gesture of a session is
-            // transformed by a factor that was read rather than assumed. Both readings are of
-            // one contact: `raw` through the platform's space and `at` through this crate's
-            // screen-to-client conversion, so their ratio is the conversion between the two
-            // spaces and nothing else.
-            if self.space.unit() == Unit::Unmeasured
-                && let Ok(raw) =
-                    PointerPoint::GetCurrentPoint(event.id).and_then(|point| point.RawPosition())
-            {
-                self.space.calibrate(Point { x: raw.x, y: raw.y }, at);
-            }
-            let point = PointerPoint::GetCurrentPointTransformed(event.id, &self.transform)?;
+            let point = event.point()?;
             if let Some(bound) = self.pool.get(event.id) {
-                bound.recognizer().down(&point)?;
+                bound.recognizer().down(point)?;
             }
             self.collect(event.id, out);
         }
@@ -643,10 +621,10 @@ impl Router {
         let fed = if rejected {
             Ok(())
         } else {
-            PointerPoint::GetCurrentPointTransformed(event.id, &self.transform).and_then(|point| {
+            event.point().and_then(|point| {
                 self.pool
                     .get(event.id)
-                    .map_or(Ok(()), |bound| bound.recognizer().up(&point))
+                    .map_or(Ok(()), |bound| bound.recognizer().up(point))
             })
         };
         self.collect(event.id, out);
@@ -707,10 +685,10 @@ impl Router {
             && let Some(bound) = self.pool.get(event.id)
             && bound.target == hit.id
         {
-            let point = PointerPoint::GetCurrentPointTransformed(event.id, &self.transform)?;
+            let point = event.point()?;
             bound
                 .recognizer()
-                .wheel(&point, event.flags.buttons() & 2 != 0, false)?;
+                .wheel(point, event.flags.buttons() & 2 != 0, false)?;
             self.collect(event.id, out);
             return Ok(());
         }
@@ -781,7 +759,7 @@ impl Router {
             }
             // `ProcessMoveEvents` takes the intermediate points, so a drag consumes every
             // sample in the batch, in order, rather than the one a message happened to carry.
-            let batch = PointerPoint::GetIntermediatePointsTransformed(id, &self.transform)?;
+            let batch = PointerPoint::GetIntermediatePointsTransformed(id, &self.bell.transform)?;
             bound.recognizer().moves(&batch)?;
 
             // The drag policy folds the whole batch into one report. The axis a two-axis drag

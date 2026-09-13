@@ -9,9 +9,8 @@
 //! - **Writes coalesce.** The staging table is indexed by node, so a producer that outruns
 //!   the app thread overwrites its own pending write. Memory is bounded by the number of
 //!   live cells, not by the write rate.
-//! - **At most one wake is in flight.** The event is signalled on the empty-to-pending
-//!   transition only, so a producer writing at any rate wakes the app thread once per
-//!   flush.
+//! - **At most one frame request is held per graph.** Its pacer is requested on the
+//!   empty-to-pending transition and released when that graph drains the writes.
 //!
 //! Each cross-thread write costs one box, because the receiving side cannot name the
 //! value's type. A display-rate producer publishes through an [`Epoch`](super::Epoch),
@@ -20,7 +19,7 @@
 use super::graph::{Signal, SignalId};
 use core::any::Any;
 use std::sync::{LazyLock, Mutex};
-use windows_window::Event;
+use windows_window::{Tick, Wake};
 
 /// A staged write: puts its value into the cell's payload and returns whether the value
 /// moved.
@@ -41,45 +40,41 @@ struct Pending {
     slots: windows_scene::Slots<Signal, Apply>,
     /// Which slots are occupied, so a drain costs O(pending) rather than O(cells).
     dirty: Vec<SignalId>,
+    wake: Option<Wake>,
+    tick: Option<Tick>,
 }
 
-struct Shared {
-    inbox: Mutex<Inbox>,
-    event: Event,
-}
+static SHARED: LazyLock<Mutex<Inbox>> = LazyLock::new(|| Mutex::new(Inbox::default()));
 
-static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
-    inbox: Mutex::new(Inbox::default()),
-    // The app thread waits on this event; without it, a producer's write could be observed
-    // only by polling, so there is no degraded mode to fall back to.
-    event: Event::auto_reset().expect("an event is available"),
-});
+pub(crate) struct PostWake(u32);
 
-/// Returns the event signalled when a producer's write lands, for the app thread to name
-/// alongside its other wake sources.
-///
-/// Auto-reset, and signalled only on the empty-to-pending transition, so a burst of writes
-/// releases the waiter once.
-#[must_use]
-pub fn written() -> &'static Event {
-    &SHARED.event
-}
-
-/// Stages a write against `id`, replacing any write already pending for it, and signals
-/// [`written`] where nothing was pending for `id`'s graph.
-pub(super) fn post(id: SignalId, apply: Apply) {
-    let wake = {
+impl Drop for PostWake {
+    fn drop(&mut self) {
         let mut inbox = lock();
-        let pending = inbox.pending(id.graph);
-        let first = pending.dirty.is_empty();
-        if pending.slots.get(id.id).is_none() {
-            pending.dirty.push(id);
-        }
-        pending.slots.place(id.id, apply);
-        first
-    };
-    if wake {
-        SHARED.event.signal();
+        let pending = inbox.pending(self.0);
+        pending.tick = None;
+        pending.wake = None;
+    }
+}
+
+pub(super) fn arm(graph: u32, wake: Wake) -> PostWake {
+    let mut inbox = lock();
+    let pending = inbox.pending(graph);
+    pending.tick = (!pending.dirty.is_empty()).then(|| wake.tick());
+    pending.wake = Some(wake);
+    PostWake(graph)
+}
+
+/// Stages a write and holds one frame request until this graph drains it.
+pub(super) fn post(id: SignalId, apply: Apply) {
+    let mut inbox = lock();
+    let pending = inbox.pending(id.graph);
+    if pending.slots.get(id.id).is_none() {
+        pending.dirty.push(id);
+    }
+    pending.slots.place(id.id, apply);
+    if pending.tick.is_none() {
+        pending.tick = pending.wake.as_ref().map(Wake::tick);
     }
 }
 
@@ -100,6 +95,7 @@ pub(super) fn take(graph: u32, out: &mut Vec<(SignalId, Apply)>) {
         }
     }
     pending.dirty = dirty;
+    pending.tick = None;
 }
 
 /// Discards anything staged against `id`, which has been disposed.
@@ -113,6 +109,9 @@ pub(super) fn release(id: SignalId) {
         && let Some(at) = pending.dirty.iter().position(|dirty| *dirty == id)
     {
         pending.dirty.swap_remove(at);
+    }
+    if pending.dirty.is_empty() {
+        pending.tick = None;
     }
 }
 
@@ -131,5 +130,5 @@ impl Inbox {
 /// A producer panicking mid-`post` leaves the table structurally sound: the slot it was
 /// writing is either replaced or not, so a poisoned lock is taken rather than propagated.
 fn lock() -> std::sync::MutexGuard<'static, Inbox> {
-    SHARED.inbox.lock().unwrap_or_else(|e| e.into_inner())
+    SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }

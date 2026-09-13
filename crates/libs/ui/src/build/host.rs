@@ -1054,7 +1054,11 @@ impl Host {
                 value = row.next;
             }
             if let Some(probe) = row.probe {
-                if let Some(probe) = self.probes.remove(&mut self.probe_ids, probe) {
+                if let Some(probe) = self.probes.remove(&mut self.probe_ids, probe)
+                    && probe.cell.alive()
+                {
+                    // An enclosing branch can dispose the probe's owner before dropping
+                    // its nested mount. Only a surviving observer needs the empty box.
                     probe.cell.set(crate::layout::Placed::default());
                 }
             }
