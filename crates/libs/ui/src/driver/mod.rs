@@ -374,8 +374,9 @@ pub(crate) fn env_of(window: &Window) -> Option<Env> {
 /// transform the retained side does, and reaching it from an [`Env`] would mean the number
 /// travelling through a type that also carries a DPI the present thread has no use for.
 pub(crate) fn output_of(window: &Window) -> Option<OutputTransform> {
+    let cap = window.color_capability()?;
     Some(OutputTransform::for_display(
-        window.color_capability()?,
-        crate::role::content_peak_nits(),
+        cap,
+        crate::role::content_peak_nits(&cap.gamut()),
     ))
 }

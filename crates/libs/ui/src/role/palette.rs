@@ -3,7 +3,7 @@
 
 use super::{DataRole, Emission, Fill, Metric, Role, Scope, Stroke, Text, TypeRole};
 use std::sync::OnceLock;
-use windows_color::Radiance;
+use windows_color::{Gamut, Radiance};
 use windows_text::FontSpec;
 
 /// What the application supplies. This crate never interprets a value it returns.
@@ -52,11 +52,13 @@ pub trait Palette: Send + Sync + 'static {
     /// Returns a scalar the palette owns, in DIPs unless the name says otherwise.
     fn metric(&self, metric: Metric, scope: Scope) -> f32;
 
-    /// Returns the brightest channel this palette authors, in cd/m².
+    /// Returns the brightest channel this palette authors in `gamut`'s primaries, in
+    /// cd/m².
     ///
     /// The output transform's shoulder is built to reach this value, and anything authored
-    /// above it clips.
-    fn content_peak_nits(&self) -> f32;
+    /// above it clips. Taken in the primaries of the display the transform is for, because
+    /// a channel's height depends on the primaries it is expressed in.
+    fn content_peak_nits(&self, gamut: &Gamut) -> f32;
 }
 
 /// The installed palette. Written once; every resolve is one acquire load and a branch.
@@ -152,19 +154,19 @@ pub fn metric(metric: Metric, scope: Scope) -> f32 {
     current().metric(metric, scope)
 }
 
-/// Returns the brightest value the palette authors, in cd/m².
+/// Returns the brightest value the palette authors in `gamut`'s primaries, in cd/m².
 ///
-/// Scope-free: it is a property of the authored table rather than of any site that uses it,
-/// and it is what the output transform's shoulder is built to reach. Read from the palette
-/// rather than passed in, so the transform a window builds and the values the palette authors
-/// answer to one peak.
+/// Scope-free: it is a property of the authored table and of the display's primaries rather
+/// than of any site that uses it, and it is what the output transform's shoulder is built to
+/// reach. Read from the palette rather than passed in, so the transform a window builds and
+/// the values the palette authors answer to one peak.
 ///
 /// # Panics
 ///
 /// If no palette has been installed.
 #[must_use]
-pub fn content_peak_nits() -> f32 {
-    current().content_peak_nits()
+pub fn content_peak_nits(gamut: &Gamut) -> f32 {
+    current().content_peak_nits(gamut)
 }
 
 /// Returns the light a chromatic role resolves to.

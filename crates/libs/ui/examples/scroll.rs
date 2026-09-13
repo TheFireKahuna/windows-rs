@@ -332,7 +332,7 @@ impl Palette for Reference {
         }
     }
 
-    fn content_peak_nits(&self) -> f32 {
+    fn content_peak_nits(&self, _gamut: &windows_color::Gamut) -> f32 {
         290.0
     }
 }

@@ -62,6 +62,18 @@ pub enum DisplayCapability {
     },
 }
 
+impl DisplayCapability {
+    /// Returns the primaries the display presents in: Rec.709 on the SDR arm, and the
+    /// panel's own on the others.
+    #[must_use]
+    pub fn gamut(&self) -> Gamut {
+        match self {
+            Self::Sdr => Gamut::REC709,
+            Self::WideGamut { gamut } | Self::HighDynamicRange { gamut, .. } => *gamut,
+        }
+    }
+}
+
 /// The exposure, tone, gamut and encode stages resolved for one display capability.
 ///
 /// A plain value with no global state: construct one per display-capability change and
@@ -94,11 +106,12 @@ impl OutputTransform {
     /// Resolves a display capability into a transform.
     ///
     /// `content_peak_nits` must be the brightest *channel* the application's palette
-    /// authors — [`Radiance::peak_nits`] maximised over the resolved palette — which
-    /// for a saturated colour is well above that colour's ICtCp intensity. It decides
-    /// whether the shoulder engages, so a value below the true peak lets content above
-    /// the display's ceiling reach the compositor and be clipped per channel. The debug
-    /// assertion in [`OutputTransform::apply`] reports that case.
+    /// authors in `cap`'s own primaries — [`Radiance::peak_nits_in`] over
+    /// [`cap.gamut()`](DisplayCapability::gamut), maximised over the resolved palette —
+    /// which for a saturated colour is well above that colour's ICtCp intensity. It
+    /// decides whether the shoulder engages, so a value below the true peak lets
+    /// content above the display's ceiling reach the compositor and be clipped per
+    /// channel. The debug assertion in [`OutputTransform::apply`] reports that case.
     #[must_use]
     pub fn for_display(cap: DisplayCapability, content_peak_nits: f32) -> Self {
         let (exposure, encode, gamut, ceiling) = match cap {

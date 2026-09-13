@@ -59,22 +59,35 @@ impl Radiance {
 
     /// Returns the brightest channel any display will be asked to present, in cd/m².
     ///
-    /// An application maximises this over its resolved palette to declare its content
-    /// peak to [`OutputTransform::for_display`].
+    /// Returns the brightest of this light's channels in **Rec.709**, in cd/m².
+    ///
+    /// The peak on the SDR arm, and the value a palette is fitted against before any
+    /// display is known. It is the peak in one container and bounds no other: the
+    /// matrix into a display's primaries has negative off-diagonal terms, so the same
+    /// light's channel in a panel's own primaries can run above its Rec.709 one.
+    /// [`peak_nits_in`](Self::peak_nits_in) takes the peak in the display's.
+    #[must_use]
+    pub fn peak_nits(self) -> f32 {
+        self.peak_nits_in(&Gamut::REC709)
+    }
+
+    /// Returns the brightest of this light's channels in `gamut`'s primaries, in cd/m².
+    ///
+    /// An application maximises this over its resolved palette, in the primaries of the
+    /// display it is about to present on, to declare its content peak to
+    /// [`OutputTransform::for_display`].
     ///
     /// It is **not** the colour's ICtCp intensity. A saturated colour carries a channel
     /// well above the achromatic luminance it was authored at, and a display's
-    /// container bounds channels.
-    ///
-    /// It is taken in **Rec.709**, not in this type's own Rec.2020 basis, because the
-    /// working-space peak does not bound the presented one: the matrix into a display's
-    /// primaries has negative off-diagonal terms, so a saturated colour's presented
-    /// channel runs above its working one. Rec.709 is the narrowest standard container,
-    /// so a peak taken there bounds every wider display too. Over-declaring costs a
-    /// little unnecessary compression; under-declaring lets the compositor clip.
+    /// container bounds channels. It is taken in the display's primaries and not in
+    /// this type's own Rec.2020 basis, because the working-space peak does not bound
+    /// the presented one: the matrix into a display's primaries has negative
+    /// off-diagonal terms, so a saturated colour's presented channel runs above its
+    /// working one. Over-declaring costs a little unnecessary compression;
+    /// under-declaring lets the compositor clip.
     #[must_use]
-    pub fn peak_nits(self) -> f32 {
-        let v = matrix::apply(&Gamut::REC709.matrix_from_2020(), [self.r, self.g, self.b]);
+    pub fn peak_nits_in(self, gamut: &Gamut) -> f32 {
+        let v = matrix::apply(&gamut.matrix_from_2020(), [self.r, self.g, self.b]);
         v[0].max(v[1]).max(v[2])
     }
 
