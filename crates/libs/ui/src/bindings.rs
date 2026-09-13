@@ -54,6 +54,44 @@ windows_core::imp::interface_hierarchy!(
     windows_core::IUnknown,
     windows_core::IInspectable
 );
+impl CoreFrameworkInputView {
+    pub fn GetForUIContext<P0>(context: P0) -> windows_core::Result<Self>
+    where
+        P0: windows_core::Param<UIContext>,
+    {
+        Self::ICoreFrameworkInputViewStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).GetForUIContext)(
+                windows_core::Interface::as_raw(this),
+                context.param().abi(),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    pub fn GetForCurrentView() -> windows_core::Result<Self> {
+        Self::ICoreFrameworkInputViewStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).GetForCurrentView)(
+                windows_core::Interface::as_raw(this),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    fn ICoreFrameworkInputViewStatics<
+        R,
+        F: FnOnce(&ICoreFrameworkInputViewStatics) -> windows_core::Result<R>,
+    >(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<
+            CoreFrameworkInputView,
+            ICoreFrameworkInputViewStatics,
+        > = windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
 impl windows_core::RuntimeType for CoreFrameworkInputView {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_class::<Self, ICoreFrameworkInputView>();
@@ -75,12 +113,95 @@ unsafe impl Send for CoreFrameworkInputView {}
 unsafe impl Sync for CoreFrameworkInputView {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreFrameworkInputViewAnimationStartingEventArgs(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CoreFrameworkInputViewAnimationStartingEventArgs,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for CoreFrameworkInputViewAnimationStartingEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::for_class::<
+        Self,
+        ICoreFrameworkInputViewAnimationStartingEventArgs,
+    >();
+}
+unsafe impl windows_core::Interface for CoreFrameworkInputViewAnimationStartingEventArgs {
+    type Vtable =
+        <ICoreFrameworkInputViewAnimationStartingEventArgs as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICoreFrameworkInputViewAnimationStartingEventArgs as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CoreFrameworkInputViewAnimationStartingEventArgs {
+    type Target = ICoreFrameworkInputViewAnimationStartingEventArgs;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CoreFrameworkInputViewAnimationStartingEventArgs {
+    const NAME: &'static str =
+        "Windows.UI.ViewManagement.Core.CoreFrameworkInputViewAnimationStartingEventArgs";
+}
+unsafe impl Send for CoreFrameworkInputViewAnimationStartingEventArgs {}
+unsafe impl Sync for CoreFrameworkInputViewAnimationStartingEventArgs {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreFrameworkInputViewOcclusionsChangedEventArgs(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CoreFrameworkInputViewOcclusionsChangedEventArgs,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for CoreFrameworkInputViewOcclusionsChangedEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::for_class::<
+        Self,
+        ICoreFrameworkInputViewOcclusionsChangedEventArgs,
+    >();
+}
+unsafe impl windows_core::Interface for CoreFrameworkInputViewOcclusionsChangedEventArgs {
+    type Vtable =
+        <ICoreFrameworkInputViewOcclusionsChangedEventArgs as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICoreFrameworkInputViewOcclusionsChangedEventArgs as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CoreFrameworkInputViewOcclusionsChangedEventArgs {
+    type Target = ICoreFrameworkInputViewOcclusionsChangedEventArgs;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CoreFrameworkInputViewOcclusionsChangedEventArgs {
+    const NAME: &'static str =
+        "Windows.UI.ViewManagement.Core.CoreFrameworkInputViewOcclusionsChangedEventArgs";
+}
+unsafe impl Send for CoreFrameworkInputViewOcclusionsChangedEventArgs {}
+unsafe impl Sync for CoreFrameworkInputViewOcclusionsChangedEventArgs {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreInputView(windows_core::IUnknown);
 windows_core::imp::interface_hierarchy!(
     CoreInputView,
     windows_core::IUnknown,
     windows_core::IInspectable
 );
+impl CoreInputView {
+    pub fn GetForCurrentView() -> windows_core::Result<Self> {
+        Self::ICoreInputViewStatics(|this| unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(this).GetForCurrentView)(
+                windows_core::Interface::as_raw(this),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        })
+    }
+    fn ICoreInputViewStatics<R, F: FnOnce(&ICoreInputViewStatics) -> windows_core::Result<R>>(
+        callback: F,
+    ) -> windows_core::Result<R> {
+        static SHARED: windows_core::imp::FactoryCache<CoreInputView, ICoreInputViewStatics> =
+            windows_core::imp::FactoryCache::new();
+        SHARED.call(callback)
+    }
+}
 impl windows_core::RuntimeType for CoreInputView {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_class::<Self, ICoreInputView>();
@@ -162,6 +283,85 @@ impl windows_core::TypeKind for CoreInputViewOcclusionKind {
 impl windows_core::RuntimeType for CoreInputViewOcclusionKind {
     const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
         b"enum(Windows.UI.ViewManagement.Core.CoreInputViewOcclusionKind;i4)",
+    );
+}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreInputViewOcclusionsChangedEventArgs(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CoreInputViewOcclusionsChangedEventArgs,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for CoreInputViewOcclusionsChangedEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::for_class::<
+        Self,
+        ICoreInputViewOcclusionsChangedEventArgs,
+    >();
+}
+unsafe impl windows_core::Interface for CoreInputViewOcclusionsChangedEventArgs {
+    type Vtable = <ICoreInputViewOcclusionsChangedEventArgs as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICoreInputViewOcclusionsChangedEventArgs as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CoreInputViewOcclusionsChangedEventArgs {
+    type Target = ICoreInputViewOcclusionsChangedEventArgs;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CoreInputViewOcclusionsChangedEventArgs {
+    const NAME: &'static str =
+        "Windows.UI.ViewManagement.Core.CoreInputViewOcclusionsChangedEventArgs";
+}
+unsafe impl Send for CoreInputViewOcclusionsChangedEventArgs {}
+unsafe impl Sync for CoreInputViewOcclusionsChangedEventArgs {}
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreInputViewTransferringXYFocusEventArgs(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    CoreInputViewTransferringXYFocusEventArgs,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for CoreInputViewTransferringXYFocusEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::for_class::<
+        Self,
+        ICoreInputViewTransferringXYFocusEventArgs,
+    >();
+}
+unsafe impl windows_core::Interface for CoreInputViewTransferringXYFocusEventArgs {
+    type Vtable = <ICoreInputViewTransferringXYFocusEventArgs as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID =
+        <ICoreInputViewTransferringXYFocusEventArgs as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for CoreInputViewTransferringXYFocusEventArgs {
+    type Target = ICoreInputViewTransferringXYFocusEventArgs;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for CoreInputViewTransferringXYFocusEventArgs {
+    const NAME: &'static str =
+        "Windows.UI.ViewManagement.Core.CoreInputViewTransferringXYFocusEventArgs";
+}
+unsafe impl Send for CoreInputViewTransferringXYFocusEventArgs {}
+unsafe impl Sync for CoreInputViewTransferringXYFocusEventArgs {}
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CoreInputViewXYFocusTransferDirection(pub i32);
+impl CoreInputViewXYFocusTransferDirection {
+    pub const Up: Self = Self(0);
+    pub const Right: Self = Self(1);
+    pub const Down: Self = Self(2);
+    pub const Left: Self = Self(3);
+}
+impl windows_core::TypeKind for CoreInputViewXYFocusTransferDirection {
+    type TypeKind = windows_core::CopyType;
+}
+impl windows_core::RuntimeType for CoreInputViewXYFocusTransferDirection {
+    const SIGNATURE: windows_core::imp::ConstBuffer = windows_core::imp::ConstBuffer::from_slice(
+        b"enum(Windows.UI.ViewManagement.Core.CoreInputViewXYFocusTransferDirection;i4)",
     );
 }
 #[repr(C)]
@@ -440,9 +640,193 @@ impl windows_core::RuntimeType for ICoreFrameworkInputView {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
+impl ICoreFrameworkInputView {
+    pub fn PrimaryViewAnimationStarting<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(
+                windows_core::Ref<CoreFrameworkInputView>,
+                windows_core::Ref<CoreFrameworkInputViewAnimationStartingEventArgs>,
+            ) + 'static,
+    {
+        let handler: TypedEventHandler<
+            CoreFrameworkInputView,
+            CoreFrameworkInputViewAnimationStartingEventArgs,
+        > = {
+            let com = windows_core::imp::DelegateBox::<
+                TypedEventHandler<
+                    CoreFrameworkInputView,
+                    CoreFrameworkInputViewAnimationStartingEventArgs,
+                >,
+                F,
+            >::new(
+                &TypedEventHandlerBox::<
+                    CoreFrameworkInputView,
+                    CoreFrameworkInputViewAnimationStartingEventArgs,
+                    F,
+                >::VTABLE,
+                handler,
+            );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).PrimaryViewAnimationStarting)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemovePrimaryViewAnimationStarting,
+            ))
+        }
+    }
+    pub fn OcclusionsChanged<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(
+                windows_core::Ref<CoreFrameworkInputView>,
+                windows_core::Ref<CoreFrameworkInputViewOcclusionsChangedEventArgs>,
+            ) + 'static,
+    {
+        let handler: TypedEventHandler<
+            CoreFrameworkInputView,
+            CoreFrameworkInputViewOcclusionsChangedEventArgs,
+        > = {
+            let com = windows_core::imp::DelegateBox::<
+                TypedEventHandler<
+                    CoreFrameworkInputView,
+                    CoreFrameworkInputViewOcclusionsChangedEventArgs,
+                >,
+                F,
+            >::new(
+                &TypedEventHandlerBox::<
+                    CoreFrameworkInputView,
+                    CoreFrameworkInputViewOcclusionsChangedEventArgs,
+                    F,
+                >::VTABLE,
+                handler,
+            );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).OcclusionsChanged)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemoveOcclusionsChanged,
+            ))
+        }
+    }
+}
 #[repr(C)]
 pub struct ICoreFrameworkInputView_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
+    pub PrimaryViewAnimationStarting: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemovePrimaryViewAnimationStarting:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+    pub OcclusionsChanged: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveOcclusionsChanged:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICoreFrameworkInputViewAnimationStartingEventArgs,
+    ICoreFrameworkInputViewAnimationStartingEventArgs_Vtbl,
+    0xc0ec901c_bba4_501b_ae8b_65c9e756a719
+);
+impl windows_core::RuntimeType for ICoreFrameworkInputViewAnimationStartingEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICoreFrameworkInputViewAnimationStartingEventArgs_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+}
+windows_core::imp::define_interface!(
+    ICoreFrameworkInputViewOcclusionsChangedEventArgs,
+    ICoreFrameworkInputViewOcclusionsChangedEventArgs_Vtbl,
+    0xf36f4949_c82c_53d1_a75d_2b2baf0d9b0d
+);
+impl windows_core::RuntimeType for ICoreFrameworkInputViewOcclusionsChangedEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICoreFrameworkInputViewOcclusionsChangedEventArgs {
+    pub fn Occlusions(
+        &self,
+    ) -> windows_core::Result<windows_collections::IVectorView<CoreInputViewOcclusion>> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Occlusions)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub fn Handled(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Handled)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct ICoreFrameworkInputViewOcclusionsChangedEventArgs_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub Occlusions: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub Handled:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICoreFrameworkInputViewStatics,
+    ICoreFrameworkInputViewStatics_Vtbl,
+    0x6eebd9b6_eac2_5f8b_975f_772ee3e42eeb
+);
+impl windows_core::RuntimeType for ICoreFrameworkInputViewStatics {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICoreFrameworkInputViewStatics_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub GetForUIContext: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub GetForCurrentView: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ICoreInputView,
@@ -453,9 +837,223 @@ impl windows_core::RuntimeType for ICoreInputView {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
+impl ICoreInputView {
+    pub fn OcclusionsChanged<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(
+                windows_core::Ref<CoreInputView>,
+                windows_core::Ref<CoreInputViewOcclusionsChangedEventArgs>,
+            ) + 'static,
+    {
+        let handler: TypedEventHandler<CoreInputView, CoreInputViewOcclusionsChangedEventArgs> = {
+            let com =
+                windows_core::imp::DelegateBox::<
+                    TypedEventHandler<CoreInputView, CoreInputViewOcclusionsChangedEventArgs>,
+                    F,
+                >::new(
+                    &TypedEventHandlerBox::<
+                        CoreInputView,
+                        CoreInputViewOcclusionsChangedEventArgs,
+                        F,
+                    >::VTABLE,
+                    handler,
+                );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).OcclusionsChanged)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemoveOcclusionsChanged,
+            ))
+        }
+    }
+    pub fn GetCoreInputViewOcclusions(
+        &self,
+    ) -> windows_core::Result<windows_collections::IVectorView<CoreInputViewOcclusion>> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).GetCoreInputViewOcclusions)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub fn TryShowPrimaryView(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TryShowPrimaryView)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub fn TryHidePrimaryView(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TryHidePrimaryView)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct ICoreInputView_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
+    pub OcclusionsChanged: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveOcclusionsChanged:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+    pub GetCoreInputViewOcclusions: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub TryShowPrimaryView:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+    pub TryHidePrimaryView:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICoreInputView2,
+    ICoreInputView2_Vtbl,
+    0x0ed726c1_e09a_4ae8_aedf_dfa4857d1a01
+);
+impl windows_core::RuntimeType for ICoreInputView2 {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICoreInputView2 {
+    pub fn XYFocusTransferringFromPrimaryView<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(
+                windows_core::Ref<CoreInputView>,
+                windows_core::Ref<CoreInputViewTransferringXYFocusEventArgs>,
+            ) + 'static,
+    {
+        let handler: TypedEventHandler<CoreInputView, CoreInputViewTransferringXYFocusEventArgs> = {
+            let com =
+                windows_core::imp::DelegateBox::<
+                    TypedEventHandler<CoreInputView, CoreInputViewTransferringXYFocusEventArgs>,
+                    F,
+                >::new(
+                    &TypedEventHandlerBox::<
+                        CoreInputView,
+                        CoreInputViewTransferringXYFocusEventArgs,
+                        F,
+                    >::VTABLE,
+                    handler,
+                );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self)
+                .XYFocusTransferringFromPrimaryView)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemoveXYFocusTransferringFromPrimaryView,
+            ))
+        }
+    }
+    pub fn XYFocusTransferredToPrimaryView<F>(
+        &self,
+        handler: F,
+    ) -> windows_core::Result<windows_core::EventRevoker>
+    where
+        F: Fn(windows_core::Ref<CoreInputView>, windows_core::Ref<windows_core::IInspectable>)
+            + 'static,
+    {
+        let handler: TypedEventHandler<CoreInputView, windows_core::IInspectable> = {
+            let com = windows_core::imp::DelegateBox::<
+                TypedEventHandler<CoreInputView, windows_core::IInspectable>,
+                F,
+            >::new(
+                &TypedEventHandlerBox::<CoreInputView, windows_core::IInspectable, F>::VTABLE,
+                handler,
+            );
+            unsafe { core::mem::transmute(windows_core::imp::box_new(com)) }
+        };
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            let token__ = (windows_core::Interface::vtable(self).XYFocusTransferredToPrimaryView)(
+                windows_core::Interface::as_raw(self),
+                windows_core::Interface::as_raw(&handler),
+                &mut result__,
+            )
+            .map(|| result__)?;
+            Ok(windows_core::EventRevoker::new(
+                self.clone(),
+                token__,
+                windows_core::Interface::vtable(self).RemoveXYFocusTransferredToPrimaryView,
+            ))
+        }
+    }
+    pub fn TryTransferXYFocusToPrimaryView(
+        &self,
+        origin: Rect,
+        direction: CoreInputViewXYFocusTransferDirection,
+    ) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).TryTransferXYFocusToPrimaryView)(
+                windows_core::Interface::as_raw(self),
+                origin,
+                direction,
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
+#[repr(C)]
+pub struct ICoreInputView2_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub XYFocusTransferringFromPrimaryView: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveXYFocusTransferringFromPrimaryView:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+    pub XYFocusTransferredToPrimaryView: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i64,
+    ) -> windows_core::HRESULT,
+    pub RemoveXYFocusTransferredToPrimaryView:
+        unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> windows_core::HRESULT,
+    pub TryTransferXYFocusToPrimaryView: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        Rect,
+        CoreInputViewXYFocusTransferDirection,
+        *mut bool,
+    ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
     ICoreInputViewOcclusion,
@@ -466,8 +1064,120 @@ impl windows_core::RuntimeType for ICoreInputViewOcclusion {
     const SIGNATURE: windows_core::imp::ConstBuffer =
         windows_core::imp::ConstBuffer::for_interface::<Self>();
 }
+impl ICoreInputViewOcclusion {
+    pub fn OccludingRect(&self) -> windows_core::Result<Rect> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).OccludingRect)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub fn OcclusionKind(&self) -> windows_core::Result<CoreInputViewOcclusionKind> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).OcclusionKind)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+}
 #[repr(C)]
 pub struct ICoreInputViewOcclusion_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub OccludingRect:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut Rect) -> windows_core::HRESULT,
+    pub OcclusionKind: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut CoreInputViewOcclusionKind,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICoreInputViewOcclusionsChangedEventArgs,
+    ICoreInputViewOcclusionsChangedEventArgs_Vtbl,
+    0xbe1027e8_b3ee_4df7_9554_89cdc66082c2
+);
+impl windows_core::RuntimeType for ICoreInputViewOcclusionsChangedEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+impl ICoreInputViewOcclusionsChangedEventArgs {
+    pub fn Occlusions(
+        &self,
+    ) -> windows_core::Result<windows_collections::IVectorView<CoreInputViewOcclusion>> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Occlusions)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .and_then(|| windows_core::Type::from_abi(result__))
+        }
+    }
+    pub fn Handled(&self) -> windows_core::Result<bool> {
+        unsafe {
+            let mut result__ = core::mem::zeroed();
+            (windows_core::Interface::vtable(self).Handled)(
+                windows_core::Interface::as_raw(self),
+                &mut result__,
+            )
+            .map(|| result__)
+        }
+    }
+    pub fn SetHandled(&self, value: bool) -> windows_core::Result<()> {
+        unsafe {
+            (windows_core::Interface::vtable(self).SetHandled)(
+                windows_core::Interface::as_raw(self),
+                value,
+            )
+            .ok()
+        }
+    }
+}
+#[repr(C)]
+pub struct ICoreInputViewOcclusionsChangedEventArgs_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub Occlusions: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub Handled:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut bool) -> windows_core::HRESULT,
+    pub SetHandled:
+        unsafe extern "system" fn(*mut core::ffi::c_void, bool) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICoreInputViewStatics,
+    ICoreInputViewStatics_Vtbl,
+    0x7d9b97cd_edbe_49cf_a54f_337de052907f
+);
+impl windows_core::RuntimeType for ICoreInputViewStatics {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICoreInputViewStatics_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
+    pub GetForCurrentView: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ICoreInputViewTransferringXYFocusEventArgs,
+    ICoreInputViewTransferringXYFocusEventArgs_Vtbl,
+    0x04de169f_ba02_4850_8b55_d82d03ba6d7f
+);
+impl windows_core::RuntimeType for ICoreInputViewTransferringXYFocusEventArgs {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct ICoreInputViewTransferringXYFocusEventArgs_Vtbl {
     pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
@@ -6747,88 +7457,6 @@ windows_core::imp::define_interface!(
     0x22d44c94_a419_4542_a272_ae26093ececf
 );
 windows_core::imp::interface_hierarchy!(ITextStoreACPSink, windows_core::IUnknown);
-impl ITextStoreACPSink {
-    pub unsafe fn OnTextChange(
-        &self,
-        dwflags: u32,
-        pchange: *const TS_TEXTCHANGE,
-    ) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).OnTextChange)(
-                windows_core::Interface::as_raw(self),
-                dwflags,
-                pchange,
-            )
-        }
-    }
-    pub unsafe fn OnSelectionChange(&self) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).OnSelectionChange)(
-                windows_core::Interface::as_raw(self),
-            )
-        }
-    }
-    pub unsafe fn OnLayoutChange(
-        &self,
-        lcode: TsLayoutCode,
-        vcview: TsViewCookie,
-    ) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).OnLayoutChange)(
-                windows_core::Interface::as_raw(self),
-                lcode,
-                vcview,
-            )
-        }
-    }
-    pub unsafe fn OnStatusChange(&self, dwflags: u32) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).OnStatusChange)(
-                windows_core::Interface::as_raw(self),
-                dwflags,
-            )
-        }
-    }
-    pub unsafe fn OnAttrsChange(
-        &self,
-        acpstart: i32,
-        acpend: i32,
-        cattrs: u32,
-        paattrs: *const TS_ATTRID,
-    ) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).OnAttrsChange)(
-                windows_core::Interface::as_raw(self),
-                acpstart,
-                acpend,
-                cattrs,
-                paattrs,
-            )
-        }
-    }
-    pub unsafe fn OnLockGranted(&self, dwlockflags: u32) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).OnLockGranted)(
-                windows_core::Interface::as_raw(self),
-                dwlockflags,
-            )
-        }
-    }
-    pub unsafe fn OnStartEditTransaction(&self) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).OnStartEditTransaction)(
-                windows_core::Interface::as_raw(self),
-            )
-        }
-    }
-    pub unsafe fn OnEndEditTransaction(&self) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).OnEndEditTransaction)(
-                windows_core::Interface::as_raw(self),
-            )
-        }
-    }
-}
 #[repr(C)]
 pub struct ITextStoreACPSink_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -6860,6 +7488,168 @@ pub struct ITextStoreACPSink_Vtbl {
     pub OnEndEditTransaction:
         unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
 }
+pub trait ITextStoreACPSink_Impl: windows_core::IUnknownImpl {
+    fn OnTextChange(&self, dwflags: u32, pchange: *const TS_TEXTCHANGE)
+    -> windows_core::Result<()>;
+    fn OnSelectionChange(&self) -> windows_core::Result<()>;
+    fn OnLayoutChange(&self, lcode: TsLayoutCode, vcview: TsViewCookie)
+    -> windows_core::Result<()>;
+    fn OnStatusChange(&self, dwflags: u32) -> windows_core::Result<()>;
+    fn OnAttrsChange(
+        &self,
+        acpstart: i32,
+        acpend: i32,
+        cattrs: u32,
+        paattrs: *const TS_ATTRID,
+    ) -> windows_core::Result<()>;
+    fn OnLockGranted(&self, dwlockflags: u32) -> windows_core::Result<()>;
+    fn OnStartEditTransaction(&self) -> windows_core::Result<()>;
+    fn OnEndEditTransaction(&self) -> windows_core::Result<()>;
+}
+impl ITextStoreACPSink_Vtbl {
+    pub const fn new<Identity: ITextStoreACPSink_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn OnTextChange<
+            Identity: ITextStoreACPSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            dwflags: u32,
+            pchange: *const TS_TEXTCHANGE,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextStoreACPSink_Impl::OnTextChange(
+                    this,
+                    core::mem::transmute_copy(&dwflags),
+                    core::mem::transmute_copy(&pchange),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn OnSelectionChange<
+            Identity: ITextStoreACPSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextStoreACPSink_Impl::OnSelectionChange(this).into()
+            }
+        }
+        unsafe extern "system" fn OnLayoutChange<
+            Identity: ITextStoreACPSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            lcode: TsLayoutCode,
+            vcview: TsViewCookie,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextStoreACPSink_Impl::OnLayoutChange(
+                    this,
+                    core::mem::transmute_copy(&lcode),
+                    core::mem::transmute_copy(&vcview),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn OnStatusChange<
+            Identity: ITextStoreACPSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            dwflags: u32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextStoreACPSink_Impl::OnStatusChange(this, core::mem::transmute_copy(&dwflags))
+                    .into()
+            }
+        }
+        unsafe extern "system" fn OnAttrsChange<
+            Identity: ITextStoreACPSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            acpstart: i32,
+            acpend: i32,
+            cattrs: u32,
+            paattrs: *const TS_ATTRID,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextStoreACPSink_Impl::OnAttrsChange(
+                    this,
+                    core::mem::transmute_copy(&acpstart),
+                    core::mem::transmute_copy(&acpend),
+                    core::mem::transmute_copy(&cattrs),
+                    core::mem::transmute_copy(&paattrs),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn OnLockGranted<
+            Identity: ITextStoreACPSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            dwlockflags: u32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextStoreACPSink_Impl::OnLockGranted(this, core::mem::transmute_copy(&dwlockflags))
+                    .into()
+            }
+        }
+        unsafe extern "system" fn OnStartEditTransaction<
+            Identity: ITextStoreACPSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextStoreACPSink_Impl::OnStartEditTransaction(this).into()
+            }
+        }
+        unsafe extern "system" fn OnEndEditTransaction<
+            Identity: ITextStoreACPSink_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITextStoreACPSink_Impl::OnEndEditTransaction(this).into()
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            OnTextChange: OnTextChange::<Identity, OFFSET>,
+            OnSelectionChange: OnSelectionChange::<Identity, OFFSET>,
+            OnLayoutChange: OnLayoutChange::<Identity, OFFSET>,
+            OnStatusChange: OnStatusChange::<Identity, OFFSET>,
+            OnAttrsChange: OnAttrsChange::<Identity, OFFSET>,
+            OnLockGranted: OnLockGranted::<Identity, OFFSET>,
+            OnStartEditTransaction: OnStartEditTransaction::<Identity, OFFSET>,
+            OnEndEditTransaction: OnEndEditTransaction::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<ITextStoreACPSink as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for ITextStoreACPSink {}
 windows_core::imp::define_interface!(
     ITfCompartmentMgr,
     ITfCompartmentMgr_Vtbl,
@@ -7209,6 +7999,57 @@ pub struct ITfContext_Vtbl {
         TfEditCookie,
         *mut core::ffi::c_void,
         *mut *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    ITfContextComposition,
+    ITfContextComposition_Vtbl,
+    0xd40c8aae_ac92_4fc7_9a11_0ee0e23aa39b
+);
+windows_core::imp::interface_hierarchy!(ITfContextComposition, windows_core::IUnknown);
+#[repr(C)]
+pub struct ITfContextComposition_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    StartComposition: usize,
+    EnumCompositions: usize,
+    FindComposition: usize,
+    TakeOwnership: usize,
+}
+windows_core::imp::define_interface!(
+    ITfContextOwnerCompositionServices,
+    ITfContextOwnerCompositionServices_Vtbl,
+    0x86462810_593b_4916_9764_19c08e9ce110
+);
+impl core::ops::Deref for ITfContextOwnerCompositionServices {
+    type Target = ITfContextComposition;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+windows_core::imp::interface_hierarchy!(
+    ITfContextOwnerCompositionServices,
+    windows_core::IUnknown,
+    ITfContextComposition
+);
+impl ITfContextOwnerCompositionServices {
+    pub unsafe fn TerminateComposition<P0>(&self, pcomposition: P0) -> windows_core::HRESULT
+    where
+        P0: windows_core::Param<ITfCompositionView>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).TerminateComposition)(
+                windows_core::Interface::as_raw(self),
+                pcomposition.param().abi(),
+            )
+        }
+    }
+}
+#[repr(C)]
+pub struct ITfContextOwnerCompositionServices_Vtbl {
+    pub base__: ITfContextComposition_Vtbl,
+    pub TerminateComposition: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
 windows_core::imp::define_interface!(
@@ -7652,64 +8493,6 @@ windows_core::imp::define_interface!(
     0xfde1eaee_6924_4cdf_91e7_da38cff5559d
 );
 windows_core::imp::interface_hierarchy!(ITfInputScope, windows_core::IUnknown);
-impl ITfInputScope {
-    pub unsafe fn GetInputScopes(
-        &self,
-        pprginputscopes: *mut *mut InputScope,
-        pccount: *mut u32,
-    ) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).GetInputScopes)(
-                windows_core::Interface::as_raw(self),
-                pprginputscopes as _,
-                pccount as _,
-            )
-        }
-    }
-    pub unsafe fn GetPhrase(
-        &self,
-        ppbstrphrases: *mut *mut windows_core::BSTR,
-        pccount: *mut u32,
-    ) -> windows_core::HRESULT {
-        unsafe {
-            (windows_core::Interface::vtable(self).GetPhrase)(
-                windows_core::Interface::as_raw(self),
-                ppbstrphrases as _,
-                pccount as _,
-            )
-        }
-    }
-    pub unsafe fn GetRegularExpression(&self) -> windows_core::Result<windows_core::BSTR> {
-        unsafe {
-            let mut result__ = core::mem::zeroed();
-            (windows_core::Interface::vtable(self).GetRegularExpression)(
-                windows_core::Interface::as_raw(self),
-                &mut result__,
-            )
-            .map(|| core::mem::transmute(result__))
-        }
-    }
-    pub unsafe fn GetSRGS(&self) -> windows_core::Result<windows_core::BSTR> {
-        unsafe {
-            let mut result__ = core::mem::zeroed();
-            (windows_core::Interface::vtable(self).GetSRGS)(
-                windows_core::Interface::as_raw(self),
-                &mut result__,
-            )
-            .map(|| core::mem::transmute(result__))
-        }
-    }
-    pub unsafe fn GetXML(&self) -> windows_core::Result<windows_core::BSTR> {
-        unsafe {
-            let mut result__ = core::mem::zeroed();
-            (windows_core::Interface::vtable(self).GetXML)(
-                windows_core::Interface::as_raw(self),
-                &mut result__,
-            )
-            .map(|| core::mem::transmute(result__))
-        }
-    }
-}
 #[repr(C)]
 pub struct ITfInputScope_Vtbl {
     pub base__: windows_core::IUnknown_Vtbl,
@@ -7736,6 +8519,123 @@ pub struct ITfInputScope_Vtbl {
         *mut *mut core::ffi::c_void,
     ) -> windows_core::HRESULT,
 }
+pub trait ITfInputScope_Impl: windows_core::IUnknownImpl {
+    fn GetInputScopes(
+        &self,
+        pprginputscopes: *mut *mut InputScope,
+        pccount: *mut u32,
+    ) -> windows_core::Result<()>;
+    fn GetPhrase(
+        &self,
+        ppbstrphrases: *mut *mut windows_core::BSTR,
+        pccount: *mut u32,
+    ) -> windows_core::Result<()>;
+    fn GetRegularExpression(&self) -> windows_core::Result<windows_core::BSTR>;
+    fn GetSRGS(&self) -> windows_core::Result<windows_core::BSTR>;
+    fn GetXML(&self) -> windows_core::Result<windows_core::BSTR>;
+}
+impl ITfInputScope_Vtbl {
+    pub const fn new<Identity: ITfInputScope_Impl, const OFFSET: isize>() -> Self {
+        unsafe extern "system" fn GetInputScopes<
+            Identity: ITfInputScope_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pprginputscopes: *mut *mut InputScope,
+            pccount: *mut u32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITfInputScope_Impl::GetInputScopes(
+                    this,
+                    core::mem::transmute_copy(&pprginputscopes),
+                    core::mem::transmute_copy(&pccount),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn GetPhrase<Identity: ITfInputScope_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            ppbstrphrases: *mut *mut *mut core::ffi::c_void,
+            pccount: *mut u32,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                ITfInputScope_Impl::GetPhrase(
+                    this,
+                    core::mem::transmute_copy(&ppbstrphrases),
+                    core::mem::transmute_copy(&pccount),
+                )
+                .into()
+            }
+        }
+        unsafe extern "system" fn GetRegularExpression<
+            Identity: ITfInputScope_Impl,
+            const OFFSET: isize,
+        >(
+            this: *mut core::ffi::c_void,
+            pbstrregexp: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITfInputScope_Impl::GetRegularExpression(this) {
+                    Ok(ok__) => {
+                        pbstrregexp.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetSRGS<Identity: ITfInputScope_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            pbstrsrgs: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITfInputScope_Impl::GetSRGS(this) {
+                    Ok(ok__) => {
+                        pbstrsrgs.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        unsafe extern "system" fn GetXML<Identity: ITfInputScope_Impl, const OFFSET: isize>(
+            this: *mut core::ffi::c_void,
+            pbstrxml: *mut *mut core::ffi::c_void,
+        ) -> windows_core::HRESULT {
+            unsafe {
+                let this: &Identity =
+                    &*((this as *const *const ()).offset(OFFSET) as *const Identity);
+                match ITfInputScope_Impl::GetXML(this) {
+                    Ok(ok__) => {
+                        pbstrxml.write(core::mem::transmute(ok__));
+                        windows_core::HRESULT(0)
+                    }
+                    Err(err) => err.into(),
+                }
+            }
+        }
+        Self {
+            base__: windows_core::IUnknown_Vtbl::new::<Identity, OFFSET>(),
+            GetInputScopes: GetInputScopes::<Identity, OFFSET>,
+            GetPhrase: GetPhrase::<Identity, OFFSET>,
+            GetRegularExpression: GetRegularExpression::<Identity, OFFSET>,
+            GetSRGS: GetSRGS::<Identity, OFFSET>,
+            GetXML: GetXML::<Identity, OFFSET>,
+        }
+    }
+    pub fn matches(iid: &windows_core::GUID) -> bool {
+        iid == &<ITfInputScope as windows_core::Interface>::IID
+    }
+}
+impl windows_core::RuntimeName for ITfInputScope {}
 windows_core::imp::define_interface!(
     ITfKeyEventSink,
     ITfKeyEventSink_Vtbl,
@@ -8735,6 +9635,19 @@ pub struct ITouchCapabilities_Vtbl {
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> windows_core::HRESULT,
     pub Contacts:
         unsafe extern "system" fn(*mut core::ffi::c_void, *mut u32) -> windows_core::HRESULT,
+}
+windows_core::imp::define_interface!(
+    IUIContext,
+    IUIContext_Vtbl,
+    0xbb5cfacd_5bd8_59d0_a59e_1c17a4d6d243
+);
+impl windows_core::RuntimeType for IUIContext {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_interface::<Self>();
+}
+#[repr(C)]
+pub struct IUIContext_Vtbl {
+    pub base__: windows_core::IInspectable_Vtbl,
 }
 windows_core::imp::define_interface!(
     IUIViewSettings,
@@ -10480,6 +11393,33 @@ pub const UIA_WindowWindowInteractionStatePropertyId: i32 = 30076;
 pub const UIA_WindowWindowVisualStatePropertyId: i32 = 30075;
 pub const UIA_Window_WindowClosedEventId: i32 = 20017;
 pub const UIA_Window_WindowOpenedEventId: i32 = 20016;
+#[repr(transparent)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UIContext(windows_core::IUnknown);
+windows_core::imp::interface_hierarchy!(
+    UIContext,
+    windows_core::IUnknown,
+    windows_core::IInspectable
+);
+impl windows_core::RuntimeType for UIContext {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::for_class::<Self, IUIContext>();
+}
+unsafe impl windows_core::Interface for UIContext {
+    type Vtable = <IUIContext as windows_core::Interface>::Vtable;
+    const IID: windows_core::GUID = <IUIContext as windows_core::Interface>::IID;
+}
+impl core::ops::Deref for UIContext {
+    type Target = IUIContext;
+    fn deref(&self) -> &Self::Target {
+        unsafe { core::mem::transmute(self) }
+    }
+}
+impl windows_core::RuntimeName for UIContext {
+    const NAME: &'static str = "Windows.UI.UIContext";
+}
+unsafe impl Send for UIContext {}
+unsafe impl Sync for UIContext {}
 #[repr(transparent)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UIViewSettings(windows_core::IUnknown);

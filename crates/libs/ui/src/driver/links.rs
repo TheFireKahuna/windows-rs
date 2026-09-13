@@ -41,6 +41,8 @@ pub(super) struct Links {
     /// Set by the input thread when the pump has returned; each worker checks it after
     /// every wake and drains once more before leaving.
     pub stop_app: AtomicBool,
+    pub uia_listening: AtomicBool,
+    pub uia_requested: AtomicBool,
     pub stop_scene: AtomicBool,
 
     /// Set by a producer that had a batch to send and no spare to send it in; the consumer
@@ -87,6 +89,8 @@ impl Links {
             scene_ring: Arc::new(Ring::new()?),
             app_ring: Arc::new(Ring::new()?),
             stop_app: AtomicBool::new(false),
+            uia_listening: AtomicBool::new(false),
+            uia_requested: AtomicBool::new(false),
             stop_scene: AtomicBool::new(false),
             app_wants_down_spare: AtomicBool::new(false),
             scene_wants_up_spare: AtomicBool::new(false),
@@ -150,7 +154,8 @@ pub(super) struct Guard<'a> {
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.links.fail_with(&format!("the {} thread panicked", self.name));
+            self.links
+                .fail_with(&format!("the {} thread panicked", self.name));
         }
         for event in self.release {
             event.signal();

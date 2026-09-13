@@ -31,6 +31,7 @@ mod counting;
 pub mod build;
 #[deny(unsafe_code)]
 pub mod layout;
+pub mod text_input;
 #[deny(unsafe_code)]
 pub mod widget;
 

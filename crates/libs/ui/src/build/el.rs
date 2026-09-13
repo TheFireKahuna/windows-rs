@@ -38,6 +38,10 @@ pub struct Region;
 #[derive(Copy, Clone, Debug)]
 pub struct Button;
 
+/// A single-line editor. Its commit callback accepts text rather than a drag value.
+#[derive(Copy, Clone, Debug)]
+pub struct Field;
+
 /// A node under construction: an index into the thread's build arena.
 ///
 /// `Copy`, with no refcount behind it, so a `move ||` closure captures one without cloning —
@@ -1095,16 +1099,6 @@ impl<K> El<K> {
         self.act(Act::Escape(std::rc::Rc::new(f)))
     }
 
-    /// Runs `f` for every value the control produces while it is being moved.
-    ///
-    /// Declares a hit entry, for the reason [`tip`](Self::tip) does: a handler on a node with
-    /// no hit entry has nothing routing to it, and the mount would drop it in silence.
-    #[must_use]
-    pub fn on_change(self, f: impl Fn(f64) + 'static) -> Self {
-        self.act(Act::ChangeF64(Box::new(f)))
-            .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
-    }
-
     /// Declares a two-axis drag and the handler it reports to.
     ///
     /// One call and not two: a handler on a node that declared no policy would never be
@@ -1118,16 +1112,6 @@ impl<K> El<K> {
     pub fn on_drag(self, decl: DragDecl, f: impl Fn(crate::widget::Dragging) + 'static) -> Self {
         self.drag(decl)
             .act(Act::Drag(Box::new(f)))
-            .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
-    }
-
-    /// Runs `f` with the value the control settled on.
-    ///
-    /// A canceled contact restores the value it had and commits nothing, which is the drag
-    /// policy's rule rather than this method's.
-    #[must_use]
-    pub fn on_commit(self, f: impl Fn(f64) + 'static) -> Self {
-        self.act(Act::CommitF64(Box::new(f)))
             .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
     }
 
@@ -1509,5 +1493,47 @@ impl El<Path> {
     #[must_use]
     pub fn stroke_width<M>(self, w: impl Signal<f32, M> + 'static) -> Self {
         self.channel(Prop::StrokeThickness, Motion::Chrome, Unit::Direct, w)
+    }
+}
+
+impl El<Any> {
+    /// Runs `f` for every value the control produces while it is being moved.
+    ///
+    /// Declares a hit entry, for the reason [`tip`](Self::tip) does: a handler on a node with
+    /// no hit entry has nothing routing to it, and the mount would drop it in silence.
+    #[must_use]
+    pub fn on_change(self, f: impl Fn(f64) + 'static) -> Self {
+        self.act(Act::ChangeF64(Box::new(f)))
+            .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
+    }
+
+    /// Runs `f` with the value the control settled on.
+    ///
+    /// A canceled contact restores the value it had and commits nothing, which is the drag
+    /// policy's rule rather than this method's.
+    #[must_use]
+    pub fn on_commit(self, f: impl Fn(f64) + 'static) -> Self {
+        self.act(Act::CommitF64(Box::new(f)))
+            .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
+    }
+}
+
+impl El<Field> {
+    pub(crate) fn field_source(self, source: TextSource) -> Self {
+        self.slot_mut(|s| s.field_scope = Some(crate::text_input::InputScope::Default))
+            .act(Act::FieldSource(source))
+    }
+
+    /// Declares the text-service input scope. Number does not parse or filter the value.
+    #[must_use]
+    pub fn scope(self, scope: crate::text_input::InputScope) -> Self {
+        self.slot_mut(|s| s.field_scope = Some(scope))
+    }
+
+    /// Receives every completed text edit, after its retained visual has been applied.
+    /// IME preedit and selection changes do not commit. Enter and blur do not recommit.
+    #[must_use]
+    pub fn on_commit(self, f: impl Fn(&str) + 'static) -> Self {
+        self.act(Act::CommitText(std::rc::Rc::new(f)))
     }
 }

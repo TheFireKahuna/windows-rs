@@ -120,9 +120,8 @@ static ROWS: [Row; 13] = [
     Row {
         control_type: UIA_EditControlTypeId,
         localized: "edit",
-        // No `TEXT`: an editable document belongs to text services, and a pattern is
-        // advertised only where every call it takes is answered.
-        patterns: P.or(Patterns::VALUE),
+        // Queries read the published document; writes return through the editor queue.
+        patterns: P.or(Patterns::VALUE).or(Patterns::TEXT),
         content: true,
     },
     Row {

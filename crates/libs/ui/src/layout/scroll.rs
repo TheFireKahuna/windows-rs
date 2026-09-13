@@ -606,6 +606,59 @@ pub(crate) struct ScrollTable {
 }
 
 impl ScrollTable {
+    pub(crate) fn reveal_field(
+        &mut self,
+        request: crate::text_input::Reveal,
+        front: &mut Front<'_>,
+    ) -> Result<()> {
+        let Some(entry) = front.scene.hits().entry(request.id).copied() else {
+            return Ok(());
+        };
+        let Some(row) = self
+            .rows
+            .iter()
+            .find(|row| row.front.viewport == entry.scroll_src)
+        else {
+            return Ok(());
+        };
+        let Some(viewport) = front
+            .scene
+            .hits()
+            .entries()
+            .iter()
+            .find(|h| Some(h.id) == row.front.control)
+        else {
+            return Ok(());
+        };
+        let top = viewport.y0;
+        let bottom = viewport.y1;
+        let bottom = request
+            .occlusion
+            .filter(|r| r.x0 < entry.x1 && entry.x0 < r.x1)
+            .map_or(bottom, |r| bottom.min(r.y0));
+        let Some(shadow) = front.scene.tracker_shadow(row.front.tracker) else {
+            return Ok(());
+        };
+        let (x, y) = unpack_offset(shadow.load(Ordering::Acquire));
+        let delta = if entry.y1 - y > bottom {
+            entry.y1 - y - bottom
+        } else if entry.y0 - y < top {
+            entry.y0 - y - top
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            front.scene.request(
+                row.front.tracker,
+                TrackerRequest::To(Vector2 {
+                    x,
+                    y: (y + delta).max(0.0),
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Applies one batch of container edits, in the order the app half emitted them.
     ///
     /// A thumb declared [`Reveal::Always`] is opaque from its mount, so its row starts shown
@@ -676,6 +729,7 @@ impl ScrollRow {
     /// `id` is the row's own, which is the name every later edit to this container carries.
     pub(crate) fn describe(&self, id: crate::build::ScrollId) -> ScrollFront {
         ScrollFront {
+            viewport: self.viewport,
             id,
             tracker: self.tracker,
             thumb: self.thumb,

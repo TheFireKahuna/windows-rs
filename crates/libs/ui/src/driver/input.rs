@@ -37,6 +37,11 @@ pub(super) struct Frame {
     pub window: Rc<Window>,
     pub links: Arc<Links>,
     pub router: Router,
+    pub text: crate::text_input::TextInput,
+    pub settings_changed: Rc<std::cell::Cell<bool>>,
+    pub uia: Rc<std::cell::RefCell<crate::uia::Uia>>,
+    pub uia_actions: Vec<crate::uia::Action>,
+    pub text_actions: Vec<crate::uia::action::TextAction>,
     /// The hit array as the scene thread last published it. The caption's hit handler reads
     /// it from the window procedure through the frame's own cell, fallibly.
     pub hits: HitTable,
@@ -93,6 +98,9 @@ impl Frame {
         // Taken before the router runs, so a press lands on the geometry that is on screen
         // rather than the geometry that was.
         if let Some(mut inbound) = self.links.input_down.take() {
+            if inbound.text_geometry_changed {
+                self.text.tsf.layout_changed();
+            }
             if inbound.hits_changed {
                 self.hits.copy_from(&inbound.hits);
             }
@@ -101,6 +109,7 @@ impl Frame {
             }
             for &target in &inbound.released {
                 self.router.forget(target);
+                self.text.forget(target)?;
             }
             if inbound.regions_changed {
                 self.picks.sync(&inbound.regions);
@@ -114,6 +123,15 @@ impl Frame {
                 for tracker in &inbound.trackers {
                     shadows.insert(tracker.viewport, Arc::clone(&tracker.shadow));
                 }
+            }
+            for source in &inbound.field_sources {
+                self.text.source(source);
+            }
+            for layout in &inbound.field_layouts {
+                self.text.layout(layout);
+            }
+            if let Some(seeds) = inbound.seeds.as_ref() {
+                self.uia.borrow_mut().publish(self.hits.entries(), seeds);
             }
             self.focus.append(&mut inbound.focus);
             self.census = inbound.census;
@@ -133,6 +151,52 @@ impl Frame {
             }
         }
 
+        if self.uia.borrow().listening() && !self.links.uia_listening.swap(true, Ordering::AcqRel) {
+            self.links.uia_requested.store(true, Ordering::Release);
+            self.links.app_ring.ring();
+        }
+        self.uia.borrow_mut().drain(&mut self.uia_actions);
+        for action in self.uia_actions.drain(..) {
+            match action {
+                crate::uia::Action::Focus(id) => self.focus.push(FocusOp::Focus(Some(id))),
+                crate::uia::Action::Reveal(id) => {
+                    if let Some(out) = self.out.as_mut() {
+                        out.reveals.push(crate::text_input::Reveal {
+                            id,
+                            occlusion: self.text.touch.docked,
+                        });
+                    }
+                }
+                action => {
+                    if let Some(out) = self.out.as_mut() {
+                        out.automation.push(action);
+                    }
+                }
+            }
+        }
+        self.uia.borrow().text_actions(&mut self.text_actions);
+        for action in self.text_actions.drain(..) {
+            let id = match &action {
+                crate::uia::action::TextAction::Replace(id, ..)
+                | crate::uia::action::TextAction::Select(id, ..) => *id,
+            };
+            // A provider snapshot can precede disable/hide/unmount. Execution uses the
+            // adopted hit generation and eligibility, just like physical input.
+            if self
+                .hits
+                .entry(id)
+                .is_some_and(|entry| entry.flags.contains(windows_scene::HitFlags::INTERACTIVE))
+            {
+                self.text.automation(action);
+            }
+        }
+
+        if self.settings_changed.replace(false) {
+            crate::text_input::settings::refresh();
+            if let Some(editor) = self.text.docs.borrow_mut().active_mut() {
+                editor.publish(false, false);
+            }
+        }
         // ① input, against the array above.
         self.reports.clear();
         self.router.tick(&self.hits, env, &mut self.reports)?;
@@ -146,10 +210,52 @@ impl Frame {
             self.focus.clear();
         }
 
+        if self.router.focus_mut().current().is_some_and(|id| {
+            !self
+                .hits
+                .entries()
+                .iter()
+                .any(|e| e.id == id && e.flags.contains(windows_scene::HitFlags::INTERACTIVE))
+        }) {
+            self.router
+                .focus_mut()
+                .apply(&[FocusOp::Focus(None)], &self.hits, &mut self.reports);
+        }
+        self.text
+            .geometry(&self.hits, self.router.shadows(), env.scale());
+        self.text.reports(
+            &mut self.reports,
+            &self.hits,
+            self.router.shadows(),
+            env.scale(),
+        )?;
+        let occlusion_changed = self.text.touch.take();
+        if let Some(out) = self.out.as_mut() {
+            self.text.flush(&mut out.text);
+            if occlusion_changed
+                || self
+                    .reports
+                    .iter()
+                    .any(|r| matches!(r, Report::FocusChanged { .. }))
+            {
+                if let Some(id) = self.text.docs.borrow().active {
+                    out.reveals.push(crate::text_input::Reveal {
+                        id,
+                        occlusion: self.text.touch.docked,
+                    });
+                }
+            }
+        }
+
         // ③ a contact inside a region writes that region's input and bumps its epoch here,
         // on this thread: the present thread reads both, and no other thread is in the way.
         self.intents.clear();
-        present::pick(&self.reports, &self.hits, &mut self.picks, &mut self.intents);
+        present::pick(
+            &self.reports,
+            &self.hits,
+            &mut self.picks,
+            &mut self.intents,
+        );
 
         // ④ what the scene thread turns into pixels, and the window facts that arrived with
         // it. Appended to the batch this thread holds; handed over only when the spare is
@@ -158,7 +264,9 @@ impl Frame {
         let rescaled = self.rescaled.take().is_some();
         let nonclient = self.nonclient.take();
         let env_moved = rescaled || self.sent_env != Some(env);
-        let quiet = self.reports.is_empty()
+        let quiet = self.out.as_ref().is_none_or(|out| {
+            out.text.is_empty() && out.reveals.is_empty() && out.automation.is_empty()
+        }) && self.reports.is_empty()
             && self.intents.is_empty()
             && resized.is_none()
             && nonclient.is_none()
@@ -186,6 +294,20 @@ impl Frame {
             self.hand_over();
         }
 
+        if self.uia.borrow().listening() {
+            let mut uia = self.uia.borrow_mut();
+            uia.set_focus(self.router.focus_mut().current());
+            if let Some(origin) = crate::input::Coords::new(self.window.hwnd()).origin() {
+                uia.set_window(origin, env.scale());
+            }
+            for entry in self.hits.entries() {
+                uia.set_scroll(
+                    entry.scroll_src,
+                    windows_scene::ScrollOffsets::offset(self.router.shadows(), entry.scroll_src),
+                );
+            }
+            uia.flush();
+        }
         // Last, so what an observer is handed is what the whole tick settled on.
         observed(Observed {
             reports: &self.reports,

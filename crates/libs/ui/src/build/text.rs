@@ -338,6 +338,84 @@ impl Table {
             .map(|entry| entry.spoken.as_ref().unwrap_or(&entry.text).as_str())
     }
 
+    pub(crate) fn password_display(
+        &self,
+        key: MeasureKey,
+        value: &str,
+        run: &mut Option<ShapedRun>,
+        map: &mut Vec<(u32, u32)>,
+    ) -> String {
+        let entry = self
+            .entries
+            .get(key)
+            .expect("a mounted field owns its text entry");
+        let engine = self.engine.as_ref().expect("app shaping is installed");
+        if let Some(run) = run {
+            engine
+                .reshape(run, value, &entry.font, Flow::Line)
+                .expect("DirectWrite password segmentation");
+        } else {
+            *run = Some(
+                engine
+                    .shape(value, &entry.font, Flow::Line)
+                    .expect("DirectWrite password segmentation"),
+            );
+        }
+        let run = run.as_ref().unwrap();
+        map.clear();
+        let mut at = 0;
+        while at < run.len() {
+            let (_, hit) = run.caret(at, false);
+            let end = (hit.position + hit.length).max(at + 1).min(run.len());
+            map.push((at, end));
+            at = end;
+        }
+        "●".repeat(map.len())
+    }
+
+    pub(crate) fn field_font(&self, key: MeasureKey) -> Option<(NodeId, FontSpec)> {
+        self.entries
+            .get(key)
+            .map(|entry| (entry.node(), entry.font.clone()))
+    }
+
+    pub(crate) fn field_geometry(
+        &self,
+        key: MeasureKey,
+        revision: u64,
+    ) -> Option<(NodeId, crate::text_input::Geometry)> {
+        let entry = self.entries.get(key)?;
+        let mut geometry = crate::text_input::Geometry {
+            revision,
+            ..Default::default()
+        };
+        let run = &entry.run;
+        let mut at = 0;
+        let mut clusters = Vec::new();
+        while at < run.len() {
+            let (leading, hit) = run.caret(at, false);
+            let end = (hit.position + hit.length).max(at + 1).min(run.len());
+            let (trailing, _) = run.caret(end - 1, true);
+            clusters.push(crate::text_input::Cluster {
+                start: at,
+                end,
+                rect: hit.rect,
+                leading: leading.x,
+                trailing: trailing.x,
+            });
+            at = end;
+        }
+        geometry.clusters = clusters.into();
+        let (end, hit) = run.caret(run.len(), false);
+        geometry.end = windows_text::Rect {
+            x: end.x,
+            y: end.y,
+            w: 0.0,
+            h: hit.rect.h,
+        };
+        Some((entry.node(), geometry))
+    }
+
     /// Registers a run and hands back the key layout will name it by.
     ///
     /// A released slot keeps its laid-out run, so this **reshapes** a parked entry rather

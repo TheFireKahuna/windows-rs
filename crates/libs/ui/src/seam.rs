@@ -205,6 +205,9 @@ impl<T> Drop for Mailbox<T> {
 /// [`clear`](Self::clear).
 #[derive(Default)]
 pub(crate) struct Down {
+    pub field_sources: Vec<crate::text_input::Source>,
+    pub field_layouts: Vec<crate::text_input::Layout>,
+    pub field_commits: Vec<crate::text_input::Commit>,
     pub patch: SinkPatch,
     pub chrome: Vec<ChromeRow>,
     pub gestures: Vec<(ControlId, GestureDecl)>,
@@ -221,7 +224,10 @@ pub(crate) struct Down {
 impl Down {
     /// Returns whether the batch carries nothing the scene thread would act on.
     pub(crate) fn is_empty(&self) -> bool {
-        self.patch.is_empty()
+        self.field_sources.is_empty()
+            && self.field_layouts.is_empty()
+            && self.field_commits.is_empty()
+            && self.patch.is_empty()
             && self.chrome.is_empty()
             && self.gestures.is_empty()
             && self.released.is_empty()
@@ -234,6 +240,9 @@ impl Down {
 
     /// Empties every buffer, keeping its allocation, and resets the scalars.
     pub(crate) fn clear(&mut self) {
+        self.field_sources.clear();
+        self.field_layouts.clear();
+        self.field_commits.clear();
         self.patch.clear();
         self.chrome.clear();
         self.gestures.clear();
@@ -267,6 +276,8 @@ const _: () = {
 /// what the app thread took.
 #[derive(Default)]
 pub(crate) struct Up {
+    pub text: Vec<crate::text_input::Update>,
+    pub field_commits: Vec<crate::text_input::Commit>,
     pub events: Vec<SceneEvent>,
     pub intents: Vec<Intent>,
     pub reports: Vec<Report>,
@@ -278,6 +289,8 @@ pub(crate) struct Up {
 impl Up {
     /// Empties every buffer, keeping its allocation, and resets the scalars.
     pub(crate) fn clear(&mut self) {
+        self.text.clear();
+        self.field_commits.clear();
         self.events.clear();
         self.intents.clear();
         self.reports.clear();
@@ -300,6 +313,9 @@ const _: () = {
 /// held buffer keeps growing until a [`Mailbox::put`] lands.
 #[derive(Default)]
 pub(crate) struct ToScene {
+    pub automation: Vec<crate::uia::Action>,
+    pub reveals: Vec<crate::text_input::Reveal>,
+    pub text: Vec<crate::text_input::Update>,
     pub reports: Vec<Report>,
     /// What a pick inside a region committed, queued on the input thread and carried to the
     /// application through the scene thread's own batch.
@@ -313,6 +329,9 @@ pub(crate) struct ToScene {
 impl ToScene {
     /// Empties every buffer, keeping its allocation, and resets the scalars.
     pub(crate) fn clear(&mut self) {
+        self.automation.clear();
+        self.reveals.clear();
+        self.text.clear();
         self.reports.clear();
         self.intents.clear();
         self.nonclient = None;
@@ -341,6 +360,10 @@ const _: () = {
 /// rebuild.
 #[derive(Default)]
 pub(crate) struct InputDown {
+    pub text_geometry_changed: bool,
+    pub seeds: Option<Seeds>,
+    pub field_sources: Vec<crate::text_input::Source>,
+    pub field_layouts: Vec<crate::text_input::Layout>,
     pub hits: HitTable,
     pub hits_changed: bool,
     pub gestures: Vec<(ControlId, GestureDecl)>,
@@ -367,6 +390,10 @@ pub(crate) struct InputDown {
 impl InputDown {
     /// Empties every buffer, keeping its allocation, and resets the scalars.
     pub(crate) fn clear(&mut self) {
+        self.text_geometry_changed = false;
+        self.seeds = None;
+        self.field_sources.clear();
+        self.field_layouts.clear();
         self.hits.replace(&[]);
         self.hits_changed = false;
         self.gestures.clear();
@@ -449,6 +476,7 @@ pub(crate) enum ScrollOp {
 /// One scroll container, as the thread routing a contact over it needs it.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ScrollFront {
+    pub viewport: NodeId,
     /// Application state is consumed by virtualization or an explicit observer.
     pub observe: bool,
     pub id: ScrollId,

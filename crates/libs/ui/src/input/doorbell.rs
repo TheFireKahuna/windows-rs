@@ -48,6 +48,7 @@ pub enum EventKind {
     /// Ends the contact without an up: the gesture aborts and no value is committed.
     Cancel,
     CaptureLost,
+    Deactivated,
     Wheel,
 }
 
@@ -430,8 +431,12 @@ impl Doorbell {
             // A window that loses focus loses every contact with it, since the input that
             // would have ended them goes elsewhere. Recorded as a lost capture and not
             // consumed, so the application's own focus handling still runs.
+            0x0018 | 0x000a if wparam == 0 => {
+                self.transition_now(EventKind::Deactivated);
+                None
+            }
             WM_KILLFOCUS => {
-                self.transition_now(EventKind::CaptureLost);
+                self.transition_now(EventKind::Deactivated);
                 None
             }
             _ => None,
@@ -714,7 +719,7 @@ impl Doorbell {
                     slot.buttons.set(flags.buttons());
                 }
             }
-            EventKind::Up | EventKind::Cancel | EventKind::CaptureLost => {
+            EventKind::Up | EventKind::Cancel | EventKind::CaptureLost | EventKind::Deactivated => {
                 if let Some(slot) = self.slot(id) {
                     slot.down.set(false);
                     // Kept live until the tick has consumed the up, so the frame that ends a

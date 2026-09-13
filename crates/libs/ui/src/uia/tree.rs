@@ -36,6 +36,8 @@ pub enum Value {
     Range(Range),
     /// A string, whose body is the element's own text.
     Text,
+    /// An editable single-line document, published separately from its accessible name.
+    EditableText,
 }
 
 /// One element's structural columns, held beside its [`HitEntry`] at the same index.
@@ -119,9 +121,20 @@ pub struct Part {
 ///
 /// `Send`, because the rows hold ids and `&'static str`s and every string has already been
 /// resolved into the blob on the thread that owns the text table.
+#[derive(Clone, Debug)]
+pub(crate) struct FieldText {
+    pub id: ControlId,
+    pub revision: u64,
+    pub text: std::sync::Arc<[u16]>,
+    pub selection: crate::text_input::Selection,
+    pub geometry: Option<std::sync::Arc<crate::text_input::Geometry>>,
+    pub password: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct Seeds {
     pub rows: Vec<Seed>,
+    pub(crate) fields: Vec<FieldText>,
     pub blob: Vec<u16>,
 }
 
@@ -155,6 +168,7 @@ impl Seeds {
     /// Empties the rows and the blob, keeping both allocations for the next publish.
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.fields.clear();
         self.blob.clear();
     }
 
@@ -168,6 +182,7 @@ impl Seeds {
 /// The published tree. Immutable but for [`live`](Self::live), and shared by `Arc`.
 #[derive(Debug)]
 pub struct Tree {
+    fields: Box<[FieldText]>,
     entries: Box<[HitEntry]>,
     cols: Box<[Col]>,
     blob: Box<[u16]>,
@@ -182,11 +197,16 @@ pub struct Tree {
 }
 
 impl Tree {
+    pub(crate) fn field(&self, id: ControlId) -> Option<&FieldText> {
+        self.fields.iter().find(|f| f.id == id)
+    }
+
     /// Returns a tree with no elements: what a window holds before anything is published,
     /// and what it publishes while no client is attached.
     #[must_use]
     pub fn empty() -> Self {
         Self {
+            fields: Box::default(),
             entries: Box::default(),
             cols: Box::default(),
             blob: Box::default(),
@@ -270,6 +290,7 @@ impl Tree {
         }
 
         Self {
+            fields: seeds.fields.clone().into_boxed_slice(),
             entries: out.into_boxed_slice(),
             cols,
             blob: seeds.blob.clone().into_boxed_slice(),

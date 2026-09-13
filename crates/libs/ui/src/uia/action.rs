@@ -104,3 +104,10 @@ mod tests {
         );
     }
 }
+
+/// Variable-length editing requests have their own queue; numeric actions remain Copy.
+#[derive(Debug)]
+pub(crate) enum TextAction {
+    Replace(ControlId, u64, Vec<u16>),
+    Select(ControlId, u64, crate::text_input::Selection),
+}

@@ -29,6 +29,18 @@ pub struct Coords {
 }
 
 impl Coords {
+    /// Client origin in screen pixels, shared by TSF and immutable UIA publication.
+    pub(crate) fn origin(&self) -> Option<windows_numerics::Vector2> {
+        let mut point = POINT::default();
+        if !unsafe { ScreenToClient(self.hwnd, &mut point) }.as_bool() {
+            return None;
+        }
+        Some(windows_numerics::Vector2 {
+            x: -point.x as f32,
+            y: -point.y as f32,
+        })
+    }
+
     /// Creates a conversion for `hwnd`.
     #[must_use]
     pub const fn new(hwnd: HWND) -> Self {

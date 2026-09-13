@@ -663,8 +663,10 @@ where
 
 /// A text-editable field. Text services own the caret; this declares the target.
 #[must_use]
-pub fn field(value: impl Into<TextSource>) -> View {
-    El::seed(Preset::Bare)
+pub fn field(value: impl Into<TextSource>) -> El<crate::build::Field> {
+    El::<crate::build::Field>::seed(Preset::Bare)
+        .height(Metric::RowH)
+        .min_width(Len::Times(Metric::RowH, 4.0))
         .chrome(roles::FIELD, 0, Metric::Radius)
         .control()
         .hit(
@@ -672,7 +674,8 @@ pub fn field(value: impl Into<TextSource>) -> View {
             UiaRole::Edit,
         )
         .state(ink_wash())
-        .row(inner(value, TypeRole::Body, false))
+        .row(inner("", TypeRole::Body, false))
+        .field_source(value.into())
 }
 
 /// A button that opens a list of options.

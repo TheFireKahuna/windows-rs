@@ -133,6 +133,7 @@ impl Ui {
         mount: impl FnOnce(AppCtx) -> Mount + Send + 'static,
     ) -> Result<()> {
         let bell = Rc::new(crate::input::Doorbell::new());
+        let uia = Rc::new(RefCell::new(crate::uia::Uia::new()));
         // The client extent, in pixels, posted whenever the system changes it and taken by
         // the next tick, which forwards it in DIPs. Likewise a scale change, which carries
         // nothing: the tick re-reads the display and forwards what differs.
@@ -144,6 +145,7 @@ impl Ui {
         // that never lets either go.
         let frame: Rc<RefCell<Option<Frame>>> = Rc::new(RefCell::new(None));
         // Where a failed tick lands. It has no call stack this side owns to return up.
+        let settings_changed = Rc::new(std::cell::Cell::new(false));
         let failed: Rc<RefCell<Option<Error>>> = Rc::new(RefCell::new(None));
 
         let window = window
@@ -156,9 +158,25 @@ impl Ui {
             // answers first. Replacing it would discard it without a diagnostic.
             .chain_message({
                 let bell = Rc::clone(&bell);
+                let uia = Rc::clone(&uia);
+                let settings_changed = Rc::clone(&settings_changed);
+                let rescaled = Rc::clone(&rescaled);
                 let frame = Rc::downgrade(&frame);
                 let failed = Rc::clone(&failed);
                 move |_, message, wparam, lparam| {
+                    if message == 0x001a {
+                        settings_changed.set(true);
+                        rescaled.post(());
+                    }
+                    if message == 0x0003 {
+                        rescaled.post(());
+                    }
+                    if message == 0x003d {
+                        return uia.borrow_mut().get_object(wparam, lparam);
+                    }
+                    if message == 0x0002 {
+                        uia.borrow_mut().detach();
+                    }
                     if message != windows_window::WM_FRAME {
                         return bell.wndproc(message, wparam, lparam);
                     }
@@ -187,6 +205,29 @@ impl Ui {
             .create()?;
         // Shared with the tick, which outlives every stack frame here.
         let window = Rc::new(window);
+
+        uia.borrow_mut().attach(window.hwnd());
+        let text = crate::text_input::TextInput::new(&window)?;
+        let tsf = Rc::clone(&text.tsf);
+        // Removed-key pretranslation also runs in the system's nested pumps. Drain earlier
+        // discrete input before offering this key, so TSF sees the click/Tab's focus.
+        // Release Frame before calling a TIP: it can synchronously enter our store.
+        let key_filter = window.key_filter({
+            let frame = Rc::downgrade(&frame);
+            let failed = Rc::clone(&failed);
+            move |message| {
+                if let Some(cell) = frame.upgrade()
+                    && let Ok(mut slot) = cell.try_borrow_mut()
+                    && let Some(frame) = slot.as_mut()
+                    && let Err(error) = frame.tick()
+                {
+                    *failed.borrow_mut() = Some(error);
+                    windows_window::quit();
+                    return true;
+                }
+                tsf.filter(message)
+            }
+        })?;
 
         let pacer = window.pacer()?;
         resized.arm(pacer.wake());
@@ -275,6 +316,11 @@ impl Ui {
             window: Rc::clone(&window),
             links: Arc::clone(&links),
             router,
+            text,
+            settings_changed,
+            uia,
+            uia_actions: Vec::new(),
+            text_actions: Vec::new(),
             hits: windows_scene::HitTable::default(),
             picks: crate::present::Picks::default(),
             caption: crate::caption::Registry::default(),
@@ -316,6 +362,7 @@ impl Ui {
         links.stop_scene.store(true, Ordering::Release);
         links.scene_ring.ring();
         _ = scene_thread.join();
+        drop(key_filter);
         drop(frame);
 
         if let Some(error) = links.failure() {

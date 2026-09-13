@@ -33,7 +33,9 @@
     Windows.Win32.ITextProvider
     Windows.Win32.ITextRangeProvider
     Windows.Win32.ITextStoreACP
+    Windows.Win32.ITextStoreACPSink
     Windows.Win32.ITfContextOwnerCompositionSink
+    Windows.Win32.ITfInputScope
 // The recogniser asks the application to transform its own points, which is how the
 // gesture and the hit test come to agree on a space by construction rather than by two
 // conversions that have to be kept equal.
@@ -245,6 +247,15 @@
 // what declares an input scope — and are named here so the crate's one Windows surface
 // stays in one file; nothing calls them until the editor exists.
     Windows.UI.ViewManagement.Core.CoreInputView
+    Windows.UI.ViewManagement.Core.ICoreInputView
+    Windows.UI.ViewManagement.Core.ICoreInputViewStatics
+    Windows.UI.ViewManagement.Core.ICoreInputView2
+    Windows.UI.ViewManagement.Core.ICoreInputViewOcclusion
+    Windows.UI.ViewManagement.Core.CoreInputViewOcclusionsChangedEventArgs
+    Windows.UI.ViewManagement.Core.ICoreInputViewOcclusionsChangedEventArgs
+    Windows.UI.ViewManagement.Core.ICoreFrameworkInputView
+    Windows.UI.ViewManagement.Core.ICoreFrameworkInputViewOcclusionsChangedEventArgs
+    Windows.UI.ViewManagement.Core.ICoreFrameworkInputViewStatics
     Windows.UI.ViewManagement.Core.CoreFrameworkInputView
     Windows.UI.ViewManagement.Core.CoreInputViewKind
     Windows.UI.ViewManagement.Core.CoreInputViewOcclusion
@@ -274,6 +285,7 @@
     ITfThreadMgr2
     ITfDocumentMgr
     ITfContext
+    ITfContextOwnerCompositionServices
     ITfSource
     ITfKeystrokeMgr
     ITfRangeACP

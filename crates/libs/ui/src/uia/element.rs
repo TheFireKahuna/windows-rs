@@ -75,6 +75,7 @@ pub struct Shared {
     /// the tree rather than in it, so a band drag republishes no element.
     pub regions: Regions,
     pub actions: Queue,
+    pub(crate) text_actions: Mutex<Vec<super::action::TextAction>>,
     /// Latched by the first `WM_GETOBJECT` and cleared only by [`disconnect`].
     /// `UiaClientsAreListening` is a hint; having been asked for a provider is not.
     pub queried: AtomicBool,
@@ -93,6 +94,18 @@ struct SendProvider(IRawElementProviderSimple);
 unsafe impl Send for SendProvider {}
 
 impl Shared {
+    pub(crate) fn edit(&self, action: super::action::TextAction) {
+        let first = {
+            let mut queue = self.text_actions.lock().unwrap_or_else(|e| e.into_inner());
+            let first = queue.is_empty();
+            queue.push(action);
+            first
+        };
+        if first {
+            self.wake();
+        }
+    }
+
     /// Records the window every provider answers for.
     pub fn attach(&self, hwnd: HWND) {
         self.hwnd.store(hwnd as isize, Relaxed);
@@ -396,6 +409,7 @@ impl Element {
             .col(col.parent as usize)
             .map_or(UiaRole::None, |up| up.role);
         match id {
+            _ if id == 30019 => variant::bool(tree.field(self.id()).is_some_and(|f| f.password)),
             _ if id == UIA_NamePropertyId => variant::wide(tree.text(col.name)),
             _ if id == UIA_HelpTextPropertyId => variant::wide(tree.text(col.help)),
             _ if id == UIA_LabeledByPropertyId => match tree.entry(col.labelled_by as usize) {

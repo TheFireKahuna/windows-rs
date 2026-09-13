@@ -78,7 +78,7 @@ use crate::rotary::{Rotary, Rotation};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 use windows_core::Result;
-use windows_scene::{ShadowOffsets, ControlId, Env, HitFlags, HitTable, Point};
+use windows_scene::{ControlId, Env, HitFlags, HitTable, Point, ShadowOffsets};
 
 /// How many coalesced entries one service reads back.
 ///
@@ -512,6 +512,16 @@ impl Router {
             // Releasing capture on an up posts this message back, so a loss with nothing
             // bound is ignored: treating it as a cancel would abort the gesture that had
             // just completed normally.
+            EventKind::Deactivated => {
+                self.pool.release_all(true);
+                self.capture = None;
+                self.events.clear();
+                out.push(Report::CaptureLost);
+                if let Some((from, to)) = self.focus.focus(None) {
+                    out.push(Report::FocusChanged { from, to });
+                }
+                Ok(())
+            }
             EventKind::CaptureLost if self.pool.live() > 0 || self.capture.is_some() => {
                 self.pool.release_all(true);
                 self.census.aborts += 1;

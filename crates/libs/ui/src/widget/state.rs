@@ -281,6 +281,47 @@ impl Controls {
     /// # Errors
     ///
     /// A retarget was refused by the compositor.
+    pub(crate) fn automation(
+        &mut self,
+        actions: &[crate::uia::Action],
+        front: &mut Front<'_>,
+        out: &mut Vec<Intent>,
+    ) -> Result<()> {
+        use crate::uia::Action;
+        for &action in actions {
+            match action {
+                Action::SetValue(target, value) => {
+                    if let Some(Interaction::Slide(range) | Interaction::Turn(range)) =
+                        self.rows.get(target).and_then(|row| row.drive)
+                    {
+                        self.drive(target, range.fraction(value), true, front)?;
+                        out.push(Intent {
+                            target,
+                            what: What::Changed(value),
+                        });
+                        out.push(Intent {
+                            target,
+                            what: What::Committed(value),
+                        });
+                    }
+                }
+                Action::Invoke(target)
+                | Action::Toggle(target)
+                | Action::Select(target)
+                | Action::Expand(target, _) => {
+                    if self.rows.get(target).is_some() {
+                        out.push(Intent {
+                            target,
+                            what: What::Tapped,
+                        });
+                    }
+                }
+                Action::Focus(_) | Action::Reveal(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn tick(
         &mut self,
         reports: &[Report],

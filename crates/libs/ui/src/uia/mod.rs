@@ -24,7 +24,7 @@
 //! | [`roles`] | one `const` row per role |
 //! | [`action`] / [`events`] | the two queues that cross back |
 
-mod action;
+pub(crate) mod action;
 mod element;
 mod events;
 mod live;
@@ -33,7 +33,7 @@ mod region;
 mod roles;
 mod slot;
 mod text;
-mod tree;
+pub(crate) mod tree;
 mod variant;
 
 pub use action::Action;
@@ -75,6 +75,8 @@ pub struct Uia {
     /// The value each live region last announced, so a value that lands on the same step
     /// announces nothing.
     announced: Vec<(ControlId, f64)>,
+    text_changes: Vec<(ControlId, Arc<[u16]>, Arc<[u16]>)>,
+    selection_changes: Vec<ControlId>,
     /// Presentation regions whose parts this tick may have to re-join.
     regions: Vec<region::Watched>,
 }
@@ -86,6 +88,16 @@ impl Default for Uia {
 }
 
 impl Uia {
+    pub(crate) fn text_actions(&self, out: &mut Vec<action::TextAction>) {
+        out.append(
+            &mut self
+                .shared
+                .text_actions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+    }
+
     /// Creates automation state with no window attached and an empty tree.
     #[must_use]
     pub fn new() -> Self {
@@ -94,6 +106,8 @@ impl Uia {
             current: Arc::new(Tree::empty()),
             pending: Pending::default(),
             announced: Vec::new(),
+            text_changes: Vec::new(),
+            selection_changes: Vec::new(),
             regions: Vec::new(),
         }
     }
@@ -166,6 +180,20 @@ impl Uia {
             return;
         }
         let tree = Tree::build(entries, seeds);
+        for field in &seeds.fields {
+            if field.password {
+                continue;
+            }
+            if let Some(old) = self.current.field(field.id) {
+                if old.text != field.text {
+                    self.text_changes
+                        .push((field.id, old.text.clone(), field.text.clone()));
+                }
+                if old.selection != field.selection {
+                    self.selection_changes.push(field.id);
+                }
+            }
+        }
         self.adopt(Arc::new(tree));
         self.pending.push(Raise::Structure);
     }
@@ -391,6 +419,38 @@ impl Uia {
     /// reads back is the one the event describes and no raise re-enters an input handler
     /// that is still running.
     pub fn flush(&mut self) {
+        if events::listening() {
+            use windows_core::Interface;
+            for (id, from, to) in self.text_changes.drain(..) {
+                if let Some(provider) = element::provider_for(&self.shared, id) {
+                    // The property call borrows both BSTRs; clear their VARIANT owners
+                    // afterwards. Publication preceded this callback boundary.
+                    let mut a = variant::wide(&from);
+                    let mut b = variant::wide(&to);
+                    unsafe {
+                        let _ = crate::bindings::UiaRaiseAutomationPropertyChangedEvent(
+                            provider.as_raw(),
+                            30045,
+                            core::ptr::read(&a),
+                            core::ptr::read(&b),
+                        );
+                        let _ = VariantClear(&mut a);
+                        let _ = VariantClear(&mut b);
+                        let _ = crate::bindings::UiaRaiseAutomationEvent(provider.as_raw(), 20015);
+                    }
+                }
+            }
+            for id in self.selection_changes.drain(..) {
+                if let Some(provider) = element::provider_for(&self.shared, id) {
+                    unsafe {
+                        let _ = crate::bindings::UiaRaiseAutomationEvent(provider.as_raw(), 20014);
+                    }
+                }
+            }
+        } else {
+            self.text_changes.clear();
+            self.selection_changes.clear();
+        }
         if self.pending.is_empty() {
             return;
         }
@@ -480,3 +540,5 @@ impl Uia {
 mod com_tests;
 #[cfg(test)]
 mod tests;
+
+windows_core::link!("oleaut32.dll" "system" fn VariantClear(value: *mut crate::bindings::VARIANT) -> windows_core::HRESULT);

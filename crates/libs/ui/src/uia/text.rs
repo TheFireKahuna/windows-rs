@@ -55,16 +55,55 @@ impl Range {
     /// replace the text while a client still holds a range over the old one. A stale
     /// endpoint then reads as a short range instead of panicking or slicing another
     /// element's string.
-    fn body(&self) -> Result<(Arc<Tree>, Vec<u16>, u32, u32)> {
+    fn body(&self) -> Result<(Arc<Tree>, Arc<[u16]>, u32, u32)> {
         let shared = self.shared.upgrade().ok_or_else(gone)?;
         let tree = super::element::tree_of(&shared);
         let at = tree.index_of(self.owner).ok_or_else(gone)?;
         let col = tree.col(at).ok_or_else(gone)?;
-        let text = tree.text(col.name).to_vec();
+        let text = tree.field(self.owner).map_or_else(
+            || Arc::from(tree.text(col.name)),
+            |field| Arc::clone(&field.text),
+        );
         let len = text.len() as u32;
         let start = self.start.load(Relaxed).min(len);
         let end = self.end.load(Relaxed).clamp(start, len);
         Ok((tree, text, start, end))
+    }
+
+    fn walk(
+        &self,
+        tree: &Tree,
+        text: &[u16],
+        from: u32,
+        unit: TextUnit,
+        count: i32,
+    ) -> Result<(u32, i32)> {
+        let Some(field) = tree
+            .field(self.owner)
+            .filter(|_| unit == TextUnit_Character)
+        else {
+            return Ok(walk(text, from, unit, count));
+        };
+        let geometry = field
+            .geometry
+            .as_ref()
+            .filter(|g| g.revision == field.revision)
+            .ok_or_else(none)?;
+        let mut at = from.min(text.len() as u32);
+        let mut moved = 0;
+        for _ in 0..count.unsigned_abs() {
+            let next = if count > 0 {
+                geometry.next(at)
+            } else {
+                geometry.previous(at)
+            };
+            if next == at {
+                break;
+            }
+            at = next;
+            moved += if count > 0 { 1 } else { -1 };
+        }
+        Ok((at, moved))
     }
 
     fn span(&self) -> (u32, u32) {
@@ -100,7 +139,7 @@ fn walk(text: &[u16], from: u32, unit: TextUnit, count: i32) -> (u32, i32) {
     let forward = count > 0;
     let mut at = from.min(len);
     let mut moved = 0;
-    for _ in 0..count.abs() {
+    for _ in 0..count.unsigned_abs() {
         let next = match unit {
             _ if unit == TextUnit_Character => {
                 if forward {
@@ -221,9 +260,26 @@ impl crate::bindings::ITextRangeProvider_Impl for Range_Impl {
     }
 
     fn ExpandToEnclosingUnit(&self, unit: TextUnit) -> Result<()> {
-        let (_, text, start, _) = self.body()?;
-        let (from, _) = walk(&text, start, unit, -1);
-        let (to, _) = walk(&text, from, unit, 1);
+        let (tree, text, start, _) = self.body()?;
+        if unit == TextUnit_Character {
+            if let Some(field) = tree.field(self.owner) {
+                let g = field
+                    .geometry
+                    .as_ref()
+                    .filter(|g| g.revision == field.revision)
+                    .ok_or_else(none)?;
+                let at = start.min(text.len().saturating_sub(1) as u32);
+                let from = g
+                    .clusters
+                    .iter()
+                    .find(|c| c.start <= at && at < c.end)
+                    .map_or(0, |c| c.start);
+                self.set(from, g.next(from));
+                return Ok(());
+            }
+        }
+        let (from, _) = self.walk(&tree, &text, start, unit, -1)?;
+        let (to, _) = self.walk(&tree, &text, from, unit, 1)?;
         self.set(from, to);
         Ok(())
     }
@@ -285,6 +341,37 @@ impl crate::bindings::ITextRangeProvider_Impl for Range_Impl {
         let entry = tree.entry(at).ok_or_else(gone)?;
         let (origin, scale) = tree.live.window();
         let offset = tree.live.scroll(entry.scroll_src);
+        if let Some(field) = tree.field(self.owner) {
+            let g = field
+                .geometry
+                .as_ref()
+                .filter(|g| g.revision == field.revision)
+                .ok_or_else(none)?;
+            let (start, end) = self.span();
+            let mut rects = Vec::new();
+            g.rects(start..end, &mut rects);
+            if start == end {
+                rects.push(g.caret(crate::text_input::Selection {
+                    caret: start,
+                    ..Default::default()
+                }));
+            }
+            let mut values = Vec::with_capacity(rects.len() * 4);
+            for r in rects {
+                let left = (r.x + g.origin.x).max(g.viewport.x);
+                let right = (r.x + r.w + g.origin.x).min(g.viewport.x + g.viewport.w);
+                if right < left {
+                    continue;
+                }
+                values.extend_from_slice(&[
+                    f64::from(origin.x + (entry.x0 - offset.x + left) * scale),
+                    f64::from(origin.y + (entry.y0 - offset.y + r.y + g.origin.y) * scale),
+                    f64::from((right - left) * scale),
+                    f64::from(r.h * scale),
+                ]);
+            }
+            return Ok(super::variant::rect_array(&values));
+        }
         Ok(super::variant::rect_array(&[
             f64::from(origin.x + (entry.x0 - offset.x) * scale),
             f64::from(origin.y + (entry.y0 - offset.y) * scale),
@@ -308,11 +395,11 @@ impl crate::bindings::ITextRangeProvider_Impl for Range_Impl {
     }
 
     fn Move(&self, unit: TextUnit, count: i32) -> Result<i32> {
-        let (_, text, start, _) = self.body()?;
-        let (from, moved) = walk(&text, start, unit, count);
+        let (tree, text, start, _) = self.body()?;
+        let (from, moved) = self.walk(&tree, &text, start, unit, count)?;
         // `Move` leaves the range degenerate and then expands it to the unit, which is the
         // documented behaviour and what lets a client page through a word at a time.
-        let (to, _) = walk(&text, from, unit, 1);
+        let (to, _) = self.walk(&tree, &text, from, unit, 1)?;
         self.set(from, to);
         Ok(moved)
     }
@@ -323,9 +410,9 @@ impl crate::bindings::ITextRangeProvider_Impl for Range_Impl {
         unit: TextUnit,
         count: i32,
     ) -> Result<i32> {
-        let (_, text, ..) = self.body()?;
+        let (tree, text, ..) = self.body()?;
         let span = self.span();
-        let (to, moved) = walk(&text, endpoint(span, which), unit, count);
+        let (to, moved) = self.walk(&tree, &text, endpoint(span, which), unit, count)?;
         let (start, end) = with_endpoint(span, which, to);
         self.set(start, end);
         Ok(moved)
@@ -344,9 +431,26 @@ impl crate::bindings::ITextRangeProvider_Impl for Range_Impl {
     }
 
     fn Select(&self) -> Result<()> {
-        // Selection follows the user's own drag and no client can set it, so this refuses
-        // rather than reporting a selection it did not make.
-        Err(none())
+        let shared = self.shared.upgrade().ok_or_else(gone)?;
+        let tree = super::element::tree_of(&shared);
+        let field = tree
+            .field(self.owner)
+            .filter(|f| !f.password)
+            .ok_or_else(none)?;
+        let (anchor, caret) = self.span();
+        if caret as usize > field.text.len() {
+            return Err(none());
+        }
+        shared.edit(super::action::TextAction::Select(
+            self.owner,
+            field.revision,
+            crate::text_input::Selection {
+                anchor,
+                caret,
+                affinity: Default::default(),
+            },
+        ));
+        Ok(())
     }
 
     fn AddToSelection(&self) -> Result<()> {
@@ -394,9 +498,18 @@ fn fold(text: &[u16]) -> Vec<u16> {
 
 impl crate::bindings::ITextProvider_Impl for Element_Impl {
     fn GetSelection(&self) -> Result<*mut SAFEARRAY> {
-        // What is selected lives with the surface that draws the highlight. An empty array
-        // reports nothing selected, where a failure would report selection unsupported.
-        Ok(super::variant::provider_array(&[]))
+        let at = self.at()?;
+        if let Some(field) = at.tree.field(self.id()).filter(|f| !f.password) {
+            let range = field.selection.range();
+            return Ok(super::variant::range_array(&[Range::new(
+                &at.shared,
+                self.id(),
+                range.start,
+                range.end,
+            )
+            .into()]));
+        }
+        Ok(super::variant::range_array(&[]))
     }
 
     fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> {
@@ -409,7 +522,21 @@ impl crate::bindings::ITextProvider_Impl for Element_Impl {
         Err(none())
     }
 
-    fn RangeFromPoint(&self, _: &UiaPoint) -> Result<ITextRangeProvider> {
+    fn RangeFromPoint(&self, point: &UiaPoint) -> Result<ITextRangeProvider> {
+        let at = self.at()?;
+        if let Some(field) = at.tree.field(self.id()) {
+            let g = field
+                .geometry
+                .as_ref()
+                .filter(|g| g.revision == field.revision)
+                .ok_or_else(none)?;
+            let entry = at.tree.entry(at.at).ok_or_else(gone)?;
+            let (origin, scale) = at.tree.live.window();
+            let offset = at.tree.live.scroll(entry.scroll_src);
+            let (index, _) =
+                g.hit((point.x as f32 - origin.x) / scale - entry.x0 + offset.x - g.origin.x);
+            return Ok(Range::new(&at.shared, self.id(), index, index).into());
+        }
         // Point-to-offset needs cluster geometry, which belongs to the text engine on the
         // front thread. A degenerate range at the start is the documented fallback, and is
         // what a client anchors a walk on.
@@ -436,7 +563,7 @@ fn owner(this: &Element_Impl) -> Result<(Arc<Shared>, ControlId)> {
         shared, tree, at, ..
     } = this.at()?;
     match tree.col(at).map(|col| col.value) {
-        Some(Value::Text) => Ok((shared, this.id())),
+        Some(Value::Text | Value::EditableText) => Ok((shared, this.id())),
         _ => Err(none()),
     }
 }
@@ -446,7 +573,10 @@ fn document(this: &Element_Impl) -> Result<ITextRangeProvider> {
     let (shared, id) = owner(this)?;
     let tree = super::element::tree_of(&shared);
     let at = tree.index_of(id).ok_or_else(gone)?;
-    let len = tree.col(at).map_or(0, |col| col.name.len);
+    let len = tree.field(id).map_or_else(
+        || tree.col(at).map_or(0, |col| col.name.len),
+        |f| f.text.len() as u32,
+    );
     Ok(Range::new(&shared, id, 0, len).into())
 }
 
@@ -496,5 +626,69 @@ mod tests {
     #[test]
     fn folding_is_case_insensitive_over_the_range_it_claims() {
         assert_eq!(fold(&utf16("Gain ÀB")), utf16("gain àb"));
+    }
+    #[test]
+    fn editable_character_walk_uses_published_clusters_and_rejects_stale_layout() {
+        use crate::text_input::{Cluster, Geometry};
+        let id = ControlId::default();
+        let units: Arc<[u16]> = utf16("á😀").into();
+        let clusters: Arc<[Cluster]> = [(0, 2), (2, 4)]
+            .into_iter()
+            .map(|(start, end)| Cluster {
+                start,
+                end,
+                rect: windows_text::Rect {
+                    x: start as f32,
+                    y: 0.0,
+                    w: 2.0,
+                    h: 12.0,
+                },
+                leading: start as f32,
+                trailing: end as f32,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let mut seeds = super::super::tree::Seeds::default();
+        seeds.fields.push(super::super::tree::FieldText {
+            id,
+            revision: 1,
+            text: units.clone(),
+            selection: Default::default(),
+            password: false,
+            geometry: Some(Arc::new(Geometry {
+                revision: 1,
+                clusters,
+                ..Default::default()
+            })),
+        });
+        let tree = Tree::build(&[], &seeds);
+        let range = Range {
+            shared: Weak::new(),
+            owner: id,
+            start: AtomicU32::new(0),
+            end: AtomicU32::new(4),
+        };
+        assert_eq!(
+            range.walk(&tree, &units, 0, TextUnit_Character, 1).unwrap(),
+            (2, 1)
+        );
+        assert_eq!(
+            range.walk(&tree, &units, 2, TextUnit_Character, 1).unwrap(),
+            (4, 1)
+        );
+        assert_eq!(
+            range
+                .walk(&tree, &units, 4, TextUnit_Character, i32::MIN)
+                .unwrap(),
+            (0, -2)
+        );
+        seeds.fields[0].revision = 2;
+        let stale = Tree::build(&[], &seeds);
+        assert!(
+            range
+                .walk(&stale, &units, 0, TextUnit_Character, 1)
+                .is_err()
+        );
+        assert_eq!(walk(&units, 0, TextUnit_Character, i32::MIN), (0, 0));
     }
 }

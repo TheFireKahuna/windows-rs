@@ -34,7 +34,7 @@ impl Element_Impl {
         let at = self.at().ok()?;
         match at.tree.col(at.at)?.value {
             Value::Range(range) => Some((at, range)),
-            Value::None | Value::Text => None,
+            Value::None | Value::Text | Value::EditableText => None,
         }
     }
 
@@ -107,6 +107,22 @@ impl crate::bindings::IToggleProvider_Impl for Element_Impl {
 
 impl crate::bindings::IValueProvider_Impl for Element_Impl {
     fn SetValue(&self, value: &PCWSTR) -> Result<()> {
+        let at = self.at()?;
+        if at.tree.field(self.id()).is_some() {
+            if !self.enabled() {
+                return Err(disabled());
+            }
+            if value.is_null() {
+                return Err(invalid());
+            }
+            let text = unsafe { value.to_string() }.map_err(|_| invalid())?;
+            at.shared.edit(super::action::TextAction::Replace(
+                self.id(),
+                at.tree.field(self.id()).unwrap().revision,
+                text.encode_utf16().collect(),
+            ));
+            return Ok(());
+        }
         // Only a numeric element takes a write, which is what `IsReadOnly` reports. The
         // write is refused rather than accepted and dropped, so a client cannot read the
         // old value back after an `S_OK`. A text-valued element is read-only through this
@@ -131,6 +147,12 @@ impl crate::bindings::IValueProvider_Impl for Element_Impl {
         let col = tree.col(at).ok_or_else(gone)?;
         // A text element answers with its own body. A numeric one formats to the precision
         // its step implies, so the announced value carries no float noise.
+        if let Some(field) = tree.field(self.id()) {
+            if field.password {
+                return Err(readonly());
+            }
+            return Ok(super::variant::bstr(&field.text));
+        }
         if col.value == Value::Text {
             return Ok(super::variant::bstr(tree.text(col.name)));
         }
@@ -141,7 +163,10 @@ impl crate::bindings::IValueProvider_Impl for Element_Impl {
 
     fn IsReadOnly(&self) -> Result<BOOL> {
         let At { tree, at, .. } = self.at()?;
-        let editable = matches!(tree.col(at).map(|col| col.value), Some(Value::Range(_)));
+        let editable = matches!(
+            tree.col(at).map(|col| col.value),
+            Some(Value::Range(_) | Value::EditableText)
+        );
         Ok(BOOL::from(!editable || !self.enabled()))
     }
 }

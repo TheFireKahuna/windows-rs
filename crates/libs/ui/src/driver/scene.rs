@@ -66,6 +66,7 @@ struct Thread<'a> {
     /// The window commands, as the app thread last published them, for the caption's
     /// hover and press.
     caption: caption::Registry,
+    text_focused: Option<windows_scene::ControlId>,
     /// The regions the input thread can pick inside, kept in step with the region ops so
     /// the whole list can be sent when it changes.
     picks: Vec<RegionPick>,
@@ -117,6 +118,7 @@ impl<'a> Thread<'a> {
             regions: Regions::default(),
             scrolls: ScrollTable::default(),
             caption: caption::Registry::default(),
+            text_focused: None,
             picks: Vec::new(),
             env: start.env,
             watch: start.scene_watch,
@@ -259,6 +261,11 @@ impl<'a> Thread<'a> {
                 out.hits_changed = true;
                 self.hits_epoch = epoch;
             }
+            if down.seeds.is_some() {
+                out.seeds = down.seeds.take();
+            }
+            out.field_sources.append(&mut down.field_sources);
+            out.field_layouts.append(&mut down.field_layouts);
             out.gestures.append(&mut down.gestures);
             out.released.append(&mut down.released);
             out.focus.append(&mut down.focus);
@@ -288,6 +295,9 @@ impl<'a> Thread<'a> {
             out.scene_applies = self.applies;
             out.app = down.census;
         }
+        if let Some(up) = self.up.as_mut() {
+            up.field_commits.append(&mut down.field_commits);
+        }
         self.app = down.census;
         self.counted = false;
 
@@ -295,7 +305,11 @@ impl<'a> Thread<'a> {
         // The spare goes back, and the app thread is rung only if it skipped a flush for want
         // of one: a ring for a spare nobody was waiting for is a wake that finds nothing.
         _ = self.links.down_spare.put(down);
-        if self.links.app_wants_down_spare.swap(false, Ordering::AcqRel) {
+        if self
+            .links
+            .app_wants_down_spare
+            .swap(false, Ordering::AcqRel)
+        {
             self.links.app_ring.ring();
         }
 
@@ -310,6 +324,26 @@ impl<'a> Thread<'a> {
     /// learn from them.
     fn route(&mut self, inbound: Option<&ToScene>) -> Result<()> {
         let reports: &[Report] = inbound.map_or(&[], |inbound| &inbound.reports);
+        for report in reports {
+            if let Report::FocusChanged { to, .. } = report {
+                self.text_focused = to.filter(|id| {
+                    self.scene
+                        .hits()
+                        .entry(*id)
+                        .is_some_and(|e| e.flags.contains(windows_scene::HitFlags::TEXT))
+                });
+            }
+        }
+        if self.text_focused.is_some()
+            && self
+                .events
+                .iter()
+                .any(|e| matches!(e, SceneEvent::TrackerValues { .. }))
+        {
+            if let Some(out) = self.to_input.as_mut() {
+                out.text_geometry_changed = true;
+            }
+        }
         let Some(up) = self.up.as_mut() else {
             return Ok(());
         };
@@ -340,11 +374,21 @@ impl<'a> Thread<'a> {
         // The pixels those reports move, and only then what the application is asked to do.
         // No intent causes a visual: by the time one exists, the visual has happened.
         self.controls.tick(reports, &mut front, &mut up.intents)?;
+        if let Some(inbound) = inbound {
+            self.controls
+                .automation(&inbound.automation, &mut front, &mut up.intents)?;
+        }
+        if let Some(inbound) = inbound {
+            for &reveal in &inbound.reveals {
+                self.scrolls.reveal_field(reveal, &mut front)?;
+            }
+        }
         // The thumb's reveal and a thumb being dragged, against the array the last patch
         // published, and against this pass's tracker phases.
         layout::scroll_front(&self.events, reports, &mut self.scrolls, &mut front)?;
 
         if let Some(inbound) = inbound {
+            up.text.extend_from_slice(&inbound.text);
             up.intents.extend_from_slice(&inbound.intents);
             // The per-sample reports stay here: the front table has consumed them, and an
             // intent per sample would put the app thread on the pointer's report rate.
@@ -376,7 +420,11 @@ impl<'a> Thread<'a> {
     /// asks the window for a tick to take it.
     fn send_input(&mut self) {
         let carries = self.to_input.as_ref().is_some_and(|out| {
-            out.hits_changed
+            out.text_geometry_changed
+                || out.seeds.is_some()
+                || !out.field_sources.is_empty()
+                || !out.field_layouts.is_empty()
+                || out.hits_changed
                 || !out.gestures.is_empty()
                 || !out.released.is_empty()
                 || !out.focus.is_empty()
@@ -417,7 +465,9 @@ impl<'a> Thread<'a> {
     /// Hands the app thread its batch if it carries anything and the spare is back.
     fn send_up(&mut self) {
         let carries = self.up.as_ref().is_some_and(|up| {
-            !up.events.is_empty()
+            !up.text.is_empty()
+                || !up.field_commits.is_empty()
+                || !up.events.is_empty()
                 || !up.intents.is_empty()
                 || !up.reports.is_empty()
                 || up.window.is_some()

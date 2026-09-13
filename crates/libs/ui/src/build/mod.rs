@@ -13,6 +13,7 @@ mod adapt;
 pub(crate) mod arena;
 mod children;
 mod el;
+pub(crate) mod field;
 mod host;
 mod mount;
 mod style;
@@ -26,7 +27,7 @@ pub mod text;
 
 pub use adapt::{Each, Switch, When, each, each_into, switch, when};
 pub use children::{Children, IntoChildren};
-pub use el::{Any, Button, El, Path, Region, View};
+pub use el::{Any, Button, El, Field, Path, Region, View};
 pub use host::Host;
 pub(crate) use host::{MountId, Placement, ScrollId};
 pub(crate) use mount::region_sink;

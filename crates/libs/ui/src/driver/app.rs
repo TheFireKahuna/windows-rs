@@ -132,7 +132,7 @@ impl<'a> Thread<'a> {
             let ring = &self.links.app_ring;
             ring.arm();
             let stopping = self.links.stop_app.load(Ordering::Acquire);
-            if !stopping && !ring.take_pending() && !self.dirty.get() {
+            if !stopping && !self.first && !ring.take_pending() && !self.dirty.get() {
                 ring.wait();
             } else {
                 ring.disarm();
@@ -156,7 +156,7 @@ impl<'a> Thread<'a> {
 
     /// One pass: what arrived, what it implied, and one batch out.
     fn pass(&mut self) {
-        let mut work = self.first;
+        let mut work = self.first || self.links.uia_requested.load(Ordering::Acquire);
         self.first = false;
         if let Some(mut up) = self.links.up.take() {
             self.inbound(&mut up);
@@ -184,6 +184,35 @@ impl<'a> Thread<'a> {
 
     /// Applies one batch from the scene thread.
     fn inbound(&mut self, up: &mut crate::seam::Up) {
+        for update in &up.text {
+            Host::with(|h| h.field_update(update));
+        }
+        for commit in &up.field_commits {
+            let callback = Host::with(|h| {
+                let row = h.fields.get_mut(commit.id)?;
+                if row
+                    .delivered_revision
+                    .is_some_and(|revision| revision >= commit.revision)
+                {
+                    return None;
+                }
+                row.delivered_revision = Some(commit.revision);
+                row.callback_revision = Some(commit.revision);
+                row.callback.clone()
+            });
+            if let Some(callback) = callback {
+                callback(&commit.text);
+                // Effects are deferred by the signal graph. Drain this callback's source
+                // writes while its causal revision is still installed, before a later
+                // callback can overwrite the source or inherit the wrong revision.
+                signal::flush();
+            }
+            Host::with(|h| {
+                if let Some(row) = h.fields.get_mut(commit.id) {
+                    row.callback_revision = None;
+                }
+            });
+        }
         // Geometry facts first, so the solve below runs on the extent and the display the
         // reports came from.
         if let Some(window) = up.window {
@@ -281,6 +310,13 @@ impl<'a> Thread<'a> {
         Host::with(|h| {
             h.flush(&mut down.patch);
             h.fill(&mut down);
+            if self.links.uia_listening.load(Ordering::Acquire)
+                && (h.uia_stale() || self.links.uia_requested.swap(false, Ordering::AcqRel))
+            {
+                let seeds = down.seeds.get_or_insert_with(Default::default);
+                h.uia_seeds(seeds);
+                h.uia_published();
+            }
         });
         down.focus.append(&mut self.focus);
         down.census = self.census;
@@ -352,6 +388,79 @@ mod tests {
         assert!(links.down_spare.put(down).is_ok());
         thread.emit(false);
         assert!(links.down.take().is_none(), "idle emits nothing");
+        drop(owner);
+    }
+    #[test]
+    fn field_callback_effect_keeps_its_causal_revision_and_deduplicates() {
+        let _patch = crate::build::tests::fixture();
+        let window = windows_window::Window::new("field callback witness")
+            .hidden()
+            .create()
+            .unwrap();
+        let links = Links::new(window.handle()).unwrap();
+        let mut thread = Thread {
+            links: &links,
+            mounted: None,
+            owner: None,
+            overlays: Overlays::new(),
+            dirty: Rc::new(Cell::new(false)),
+            focus: Vec::new(),
+            intents: Vec::new(),
+            held: None,
+            pending_flush: false,
+            env: Host::with(|h| h.env),
+            census: AppCensus::default(),
+            first: false,
+            _posts: signal::arm_posts(PostWake::Ring(Arc::clone(&links.app_ring))),
+        };
+        let calls = Rc::new(Cell::new(0));
+        let root = Host::with(|h| h.model().root());
+        let (owner, mounted) = signal::Owner::scope({
+            let calls = calls.clone();
+            move || {
+                let source = signal::Cell::new(String::new());
+                crate::build::mount(
+                    crate::widget::field(crate::widget::TextSource::Dynamic(Box::new(
+                        move |out| source.with(|s| out.push_str(s)),
+                    )))
+                    .on_commit(move |text| {
+                        calls.set(calls.get() + 1);
+                        source.set(text.to_uppercase());
+                    }),
+                    root,
+                )
+            }
+        });
+        let id = Host::with(|h| {
+            let id = h.field_sources[0].id;
+            h.field_sources.clear();
+            h.fields.get_mut(id).unwrap().revision = 2;
+            id
+        });
+        let mut up = crate::seam::Up::default();
+        up.field_commits.push(crate::text_input::Commit {
+            id,
+            revision: 1,
+            text: Arc::from("a"),
+        });
+        thread.inbound(&mut up);
+        Host::with(|h| {
+            let replacement = &h.field_sources[0];
+            assert_eq!(
+                replacement.based_on, 1,
+                "deferred effects must not inherit revision 2"
+            );
+            assert_eq!(&*replacement.text, &[65]);
+        });
+        thread.inbound(&mut up);
+        assert_eq!(calls.get(), 1);
+        drop(mounted);
+        thread.inbound(&mut up);
+        assert_eq!(
+            calls.get(),
+            1,
+            "unmounted generations cannot receive callbacks"
+        );
         drop(owner);
     }
 }

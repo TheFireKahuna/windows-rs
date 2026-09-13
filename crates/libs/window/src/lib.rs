@@ -18,6 +18,7 @@ mod event;
 mod feedback;
 mod handoff;
 mod hwnd;
+mod key_filter;
 mod pace;
 mod visibility;
 mod window;
@@ -43,7 +44,10 @@ pub use event::{Event, Pumped, pump_until};
 pub use feedback::{Feedback, FeedbackPolicy};
 pub use handoff::Handoff;
 pub use hwnd::Hwnd;
+pub use key_filter::{KeyFilter, KeyMessage};
 pub use pace::{Pacer, PacerHealth, Tick, WM_FRAME, Wake};
 pub use visibility::{Visibility, Watch};
-pub use window::{Apartment, MoveSize, Window, WindowBuilder, ensure_dispatcher_queue, pump, quit, run};
+pub use window::{
+    Apartment, MoveSize, Window, WindowBuilder, ensure_dispatcher_queue, pump, quit, run,
+};
 pub use windows_core::Result;

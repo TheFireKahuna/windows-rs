@@ -77,6 +77,7 @@ impl Link {
 /// a side buffer this points into.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Slot {
+    pub field_scope: Option<crate::text_input::InputScope>,
     pub preset: Preset,
     pub over: Link,
     pub seeds: Link,
@@ -151,6 +152,7 @@ pub(crate) struct Slot {
 impl Default for Slot {
     fn default() -> Self {
         Self {
+            field_scope: None,
             preset: Preset::Bare,
             over: Link::EMPTY,
             seeds: Link::EMPTY,
@@ -340,6 +342,8 @@ pub(crate) struct TextSeed {
 /// Handlers never cross the thread seam: they live in an app-thread table and reach the
 /// front thread as a presence bit in [`HitFlags`], which is what keeps `SinkPatch: Send`.
 pub(crate) enum Act {
+    FieldSource(TextSource),
+    CommitText(std::rc::Rc<dyn Fn(&str)>),
     Popup {
         shown: Box<dyn Fn() -> bool>,
         spec: crate::overlay::Spec,

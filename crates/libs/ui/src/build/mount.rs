@@ -519,7 +519,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // After the children, because a control's moving part is one of them. Nothing above
     // depends on the row existing, and the hit array is a declaration rather than an order.
     if slot.hit.is_some() {
-        mount_control(b, &slot, node, parts, own_claim, inner, row);
+        mount_control(b, &slot, node, group, parts, own_claim, inner, row);
     } else {
         // Not a control, so what the subtree offered belongs to whichever control encloses
         // this node.
@@ -976,6 +976,7 @@ fn mount_control(
     b: &mut Build,
     slot: &Slot,
     node: NodeId,
+    group: Option<GroupId>,
     parts: Parts,
     claim: Claim,
     scope: Scope,
@@ -1026,6 +1027,8 @@ fn mount_control(
         key: slot.key,
     };
 
+    let mut field_source = None;
+    let mut text_commit = None;
     let mut disabled = None;
     let mut selected = None;
     let mut at = slot.acts.head;
@@ -1033,6 +1036,8 @@ fn mount_control(
         let entry = &mut b.acts[at as usize];
         at = entry.next;
         match entry.act.take() {
+            Some(Act::FieldSource(s)) => field_source = Some(s),
+            Some(Act::CommitText(f)) => text_commit = Some(f),
             Some(Act::Click(f)) => control.click = Some(f),
             Some(Act::ChangeF64(f)) => control.change = Some(f),
             Some(Act::CommitF64(f)) => control.commit = Some(f),
@@ -1110,6 +1115,18 @@ fn mount_control(
         }
         id
     });
+
+    if let (Some(source), Some(group), Some(key), Some(input_scope)) =
+        (field_source, group, claim.text, slot.field_scope)
+    {
+        Host::with(|h| h.install_field(id, group, key, input_scope, scope, text_commit));
+        let mut scratch = String::new();
+        Effect::new(move || {
+            scratch.clear();
+            source.append(&mut scratch);
+            Host::with(|h| h.field_source(id, &scratch));
+        });
+    }
 
     // Model state, so a discrete paint swap at event rate rather than a wash. Both arms go
     // through one setter, so the last of them to run in a frame wins, in the order the

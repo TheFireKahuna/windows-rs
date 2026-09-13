@@ -217,6 +217,10 @@ pub struct Host {
     pub(crate) mounts: Slots<Mount, MountRow>,
     pub(crate) control_ids: Ids<windows_scene::Control>,
     pub(crate) controls: Slots<windows_scene::Control, ControlRow>,
+    pub(crate) fields: Slots<windows_scene::Control, super::field::Row>,
+    pub(crate) field_sources: Vec<crate::text_input::Source>,
+    pub(crate) field_layouts: Vec<crate::text_input::Layout>,
+    pub(crate) field_commits: Vec<crate::text_input::Commit>,
     /// What each target declared about the gestures it accepts, drained by the owner of the
     /// router. The declaration lives on the front thread from then on, so deciding whether a
     /// gesture applies needs no call into this thread.
@@ -332,6 +336,10 @@ impl Host {
             mounts: Slots::new(),
             control_ids: Ids::new(),
             controls: Slots::new(),
+            fields: Slots::new(),
+            field_sources: Vec::new(),
+            field_layouts: Vec::new(),
+            field_commits: Vec::new(),
             gestures: Vec::new(),
             chrome: Vec::new(),
             states: Vec::new(),
@@ -437,6 +445,9 @@ impl Host {
     /// The caption registry is sent only when it differs from what the last fill sent: the
     /// three ids change when a title bar mounts and at no other time.
     pub(crate) fn fill(&mut self, down: &mut Down) {
+        down.field_sources.append(&mut self.field_sources);
+        down.field_layouts.append(&mut self.field_layouts);
+        down.field_commits.append(&mut self.field_commits);
         down.chrome.append(&mut self.chrome);
         down.gestures.append(&mut self.gestures);
         down.released.append(&mut self.released);
@@ -470,6 +481,7 @@ impl Host {
                 Some(explicit) => out.intern(explicit),
                 // Interned rather than borrowed, so an explicit name and a derived one — which
                 // is not `'static` — take one path.
+                None if self.fields.get(id).is_some() => Default::default(),
                 None => control
                     .text
                     .and_then(|key| super::text::with(|table| table.str_of(key).map(str::to_owned)))
@@ -497,13 +509,17 @@ impl Host {
                 // A static run publishes its own body as a text document, which is what a
                 // screen reader reads a read-only selectable surface through.
                 (UiaRole::Text, _) => Value::Text,
+                (UiaRole::Edit, _) if self.fields.get(id).is_some() => Value::EditableText,
                 _ => Value::None,
             };
             let mut flags = ColFlags::NONE;
             if control.flyout.is_some() {
                 flags = flags | ColFlags::EXPANDS;
             }
-            if control.click.is_some() || control.front.drive.is_some() {
+            if control.click.is_some()
+                || control.front.drive.is_some()
+                || self.fields.get(id).is_some()
+            {
                 flags = flags | ColFlags::FOCUSABLE;
             }
             let mut state = State::default();
@@ -522,6 +538,25 @@ impl Host {
                 value,
                 flags,
                 state,
+            });
+        }
+        for (id, row) in self.fields.iter() {
+            let password = row.scope == crate::text_input::InputScope::Password;
+            out.fields.push(crate::uia::tree::FieldText {
+                id,
+                revision: row.revision,
+                text: if password {
+                    std::sync::Arc::from([])
+                } else {
+                    row.text.clone()
+                },
+                selection: if password {
+                    Default::default()
+                } else {
+                    row.selection
+                },
+                geometry: if password { None } else { row.geometry.clone() },
+                password,
             });
         }
         out.sort();
@@ -820,6 +855,10 @@ impl Host {
     /// Queues the id for [`take_released`](Self::take_released), which is what bounds the
     /// front table; a stale report there is already a miss through the generational id.
     fn release_control(&mut self, id: ControlId) {
+        self.fields.take(id);
+        self.field_sources.retain(|s| s.id != id);
+        self.field_layouts.retain(|s| s.id != id);
+        self.field_commits.retain(|s| s.id != id);
         if self.controls.remove(&mut self.control_ids, id).is_some() {
             self.released.push(id);
             self.uia_stale.set(true);
@@ -1137,6 +1176,7 @@ impl Host {
         if self.place_overlays() {
             self.model.solve(env);
         }
+        self.publish_fields();
         self.publish_overlay_entries();
         self.publish_probes();
         self.model.flush(patch, env);
