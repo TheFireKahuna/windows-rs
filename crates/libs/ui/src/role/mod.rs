@@ -437,6 +437,8 @@ pub enum Metric {
     EditorPlotH,
     /// Graphic-EQ row plot, including its frequency strip.
     GraphicPlotH,
+    /// Height of a compact response preview inside a detail tile.
+    ThumbnailH,
     /// Minimum width of a docked detail pane.
     PaneMinW,
     /// Maximum width of a docked detail pane; surplus width belongs to the main surface.
