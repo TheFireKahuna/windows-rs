@@ -403,7 +403,7 @@ impl Realizer<'_> {
 fn draws_on(node: &Node) -> bool {
     [Prop::TrimStart, Prop::TrimEnd, Prop::DashOffset]
         .iter()
-        .any(|&p| prop::held(node, prop::desc(p).group) != prop::Held::Free)
+        .any(|&p| prop::held(node, prop::desc(p)) != prop::Held::Free)
 }
 
 fn cap_of(cap: Cap) -> StrokeCap {

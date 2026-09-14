@@ -876,10 +876,10 @@ impl Scene {
             return Ok(false);
         }
         // The shape state does not exist yet, so `draws_on` cannot see the channel about to
-        // be bound. Marking the group stale is what makes the rebind below observe a live
+        // be bound. Marking the channel stale is what makes the rebind below observe a live
         // channel and take the capture.
         if let Some(node) = self.nodes.get_mut(id) {
-            prop::set_held(node, prop::desc(Prop::TrimEnd).group, Held::Stale);
+            prop::set_held(node, prop::desc(Prop::TrimEnd), Held::Stale);
         }
         self.rebind(SpriteId(id), back, env)?;
         Ok(true)

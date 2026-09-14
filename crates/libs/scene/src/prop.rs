@@ -50,8 +50,8 @@ pub(crate) struct PropDesc {
     /// Stated per row: which subchannel names resolve varies by property.
     pub(crate) path: &'static str,
     pub(crate) owner: Owner,
-    /// The composite this channel belongs to. Binding state is two bits per group, and
-    /// [`write_group`] pushes a whole group at once.
+    /// The composite this channel belongs to. [`write_group`] pushes a whole group at once;
+    /// ownership is tracked per channel so a write to one axis preserves the other's driver.
     pub(crate) group: u8,
     /// This channel's slot in the owner's shadow.
     pub(crate) chan: u8,
@@ -87,11 +87,11 @@ macro_rules! props {
 
 /// How many rows [`PROPS`] holds, one per [`Prop`] variant.
 pub(crate) const PROP_COUNT: usize = 32;
-/// How many property groups the rows cover. Each holds two bits of binding state in
-/// `Node::state`.
+/// How many property groups the rows cover.
 pub(crate) const GROUP_COUNT: usize = 20;
 
-const _: () = assert!(GROUP_COUNT * 2 <= u64::BITS as usize);
+const STATE_CHANS: usize = CORE_CHANS + CLIP_CHANS + TRIM_CHANS + STROKE_CHANS + SHADOW_CHANS;
+const _: () = assert!(STATE_CHANS * 2 <= u64::BITS as usize);
 
 props! {
     // ── the visual ────────────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ pub(crate) fn desc(prop: Prop) -> &'static PropDesc {
     &PROPS[prop as usize]
 }
 
-/// Records which writer owns a property group's channels.
+/// Records which writer may still own a property channel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum Held {
@@ -167,15 +167,39 @@ impl Held {
     }
 }
 
-/// Returns the binding state of `group` on `node`.
-pub(crate) fn held(node: &Node, group: u8) -> Held {
-    Held::from_bits(node.state >> (u64::from(group) * 2))
+/// The first pair of state bits for a row, using the owner's shadow channel numbering.
+fn state_shift(d: &PropDesc) -> u32 {
+    let base = match d.owner {
+        Owner::Visual => 0,
+        Owner::Clip => CORE_CHANS,
+        Owner::Trim => CORE_CHANS + CLIP_CHANS,
+        Owner::Stroke => CORE_CHANS + CLIP_CHANS + TRIM_CHANS,
+        Owner::Shadow => CORE_CHANS + CLIP_CHANS + TRIM_CHANS + STROKE_CHANS,
+    };
+    ((base + usize::from(d.chan)) * 2) as u32
 }
 
-/// Records `state` as the binding state of `group` on `node`.
-pub(crate) fn set_held(node: &mut Node, group: u8, state: Held) {
-    let shift = u64::from(group) * 2;
-    node.state = (node.state & !(0b11 << shift)) | ((state as u64) << shift);
+/// Returns the strongest ownership of the channels a row addresses.
+pub(crate) fn held(node: &Node, d: &PropDesc) -> Held {
+    let bits = node.state >> state_shift(d);
+    let first = bits & 0b11;
+    Held::from_bits(if d.span == 2 {
+        first.max((bits >> 2) & 0b11)
+    } else {
+        first
+    })
+}
+
+/// Records ownership only for the channels a row addresses.
+pub(crate) fn set_held(node: &mut Node, d: &PropDesc, state: Held) {
+    let shift = state_shift(d);
+    let mask = if d.span == 2 { 0b1111 } else { 0b11 };
+    let bits = if d.span == 2 {
+        (state as u64) * 0b0101
+    } else {
+        state as u64
+    };
+    node.state = (node.state & !(mask << shift)) | (bits << shift);
 }
 
 /// Stops every animation whose channels overlap the ones `d` names.
@@ -229,10 +253,10 @@ pub(crate) fn start(
     if let Some(to) = to {
         write_shadow(node, d, to);
     }
-    set_held(node, d.group, held);
+    set_held(node, d, held);
 }
 
-/// Stops the animation on the channel `d` names and leaves its group [`Held::Stale`].
+/// Stops the animation on the channel `d` names and leaves its channels [`Held::Stale`].
 ///
 /// [`Held::Stale`] rather than [`Held::Free`] because the value the compositor reached is
 /// not knowable, so the next [`set`] must write even where the shadow already matches.
@@ -240,14 +264,14 @@ pub(crate) fn stop(node: &mut Node, d: &PropDesc) {
     if let Some(object) = animatable(node, d.owner) {
         object.stop(d.path);
     }
-    set_held(node, d.group, Held::Stale);
+    set_held(node, d, Held::Stale);
 }
 
 /// Writes `value` into one channel. Returns whether it reached a composition object.
 ///
 /// Every channel write goes through here — a bound set, a declared clip, a device-loss
 /// re-issue, a snap out of an animation — so [`Held`] is honoured in one place. Returns
-/// `false` when the group is [`Held::Bound`], when the shadow already holds `value`, when
+/// `false` when any addressed channel is [`Held::Bound`], when the shadow already holds `value`, when
 /// `value`'s kind does not match the row, and when the node carries no object of the row's
 /// owner.
 pub(crate) fn set(node: &mut Node, prop: Prop, value: Value) -> bool {
@@ -256,7 +280,7 @@ pub(crate) fn set(node: &mut Node, prop: Prop, value: Value) -> bool {
     if value.kind() != d.kind {
         return false;
     }
-    match held(node, d.group) {
+    match held(node, d) {
         // A tracker expression owns the channel; a set must not displace it.
         Held::Bound => return false,
         // The shadow is authoritative, so an unchanged value stops here.
@@ -274,7 +298,7 @@ pub(crate) fn set(node: &mut Node, prop: Prop, value: Value) -> bool {
         return false;
     }
     write_group(node, d.group);
-    set_held(node, d.group, Held::Free);
+    set_held(node, d, Held::Free);
     true
 }
 
@@ -571,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn every_group_is_within_the_packed_state_word() {
+    fn every_row_is_within_the_packed_state_word() {
         for row in PROPS {
             assert!(
                 usize::from(row.group) < GROUP_COUNT,
@@ -579,6 +603,7 @@ mod tests {
                 row.path,
                 row.group
             );
+            assert!(state_shift(&row) + u32::from(row.span) * 2 <= 64);
         }
     }
 
@@ -633,17 +658,76 @@ mod tests {
     }
 
     #[test]
-    fn binding_state_is_two_bits_per_group_and_they_do_not_overlap() {
-        let mut node_state = 0u64;
-        for group in 0..GROUP_COUNT as u8 {
-            let shift = u64::from(group) * 2;
-            node_state = (node_state & !(0b11 << shift)) | ((Held::Bound as u64) << shift);
+    fn packed_ownership_overlaps_only_where_property_channels_overlap() {
+        for a in &PROPS {
+            let a_mask = ((1u64 << (a.span * 2)) - 1) << state_shift(a);
+            for b in &PROPS {
+                let b_mask = ((1u64 << (b.span * 2)) - 1) << state_shift(b);
+                assert_eq!(
+                    a_mask & b_mask != 0,
+                    overlaps(a, b),
+                    "{} / {}",
+                    a.path,
+                    b.path
+                );
+            }
         }
-        for group in 0..GROUP_COUNT as u8 {
-            assert_eq!(
-                Held::from_bits(node_state >> (u64::from(group) * 2)),
-                Held::Bound
+    }
+
+    #[test]
+    fn layout_on_one_axis_preserves_the_other_axes_animation_ownership() {
+        use crate::sink::NodeKind;
+        use windows_composition::{Animation, Compositor, DispatcherQueueController};
+
+        let _queue =
+            DispatcherQueueController::create_on_current_thread().expect("a dispatcher queue");
+        let compositor = Compositor::new().expect("a compositor");
+        let sprite = compositor.create_sprite_visual();
+        let mut node = Node::new(
+            crate::base_of_sprite(&sprite),
+            Some(sprite),
+            NodeKind::Sprite,
+        );
+        let spring = compositor.create_spring_scalar_animation();
+        spring.set_final_value(40.0);
+        let animation = spring.as_animation();
+
+        for (pair, x, y) in [
+            (Prop::Offset, Prop::OffsetX, Prop::OffsetY),
+            (Prop::Size, Prop::SizeX, Prop::SizeY),
+            (Prop::Scale, Prop::ScaleX, Prop::ScaleY),
+            (Prop::Center, Prop::CenterX, Prop::CenterY),
+        ] {
+            start(
+                &mut node,
+                desc(x),
+                &animation,
+                Held::Playing,
+                Some(Value::Scalar(40.0)),
             );
+            assert!(set(&mut node, y, Value::Scalar(12.0)));
+            assert_eq!(held(&node, desc(x)), Held::Playing);
+            assert_eq!(held(&node, desc(y)), Held::Free);
+            assert!(
+                set(&mut node, x, Value::Scalar(40.0)),
+                "the snap must stop the old spring"
+            );
+            assert!(
+                !set(&mut node, x, Value::Scalar(40.0)),
+                "an unchanged settled value writes nothing"
+            );
+
+            start(&mut node, desc(x), &animation, Held::Bound, None);
+            assert!(set(&mut node, y, Value::Scalar(24.0)));
+            assert!(!set(
+                &mut node,
+                pair,
+                Value::Vec2(Vector2 { x: 40.0, y: 24.0 })
+            ));
+            assert_eq!(held(&node, desc(x)), Held::Bound);
+            stop(&mut node, desc(x));
+            assert!(set(&mut node, x, Value::Scalar(40.0)));
+            assert_eq!(held(&node, desc(pair)), Held::Free);
         }
     }
 }

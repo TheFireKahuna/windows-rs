@@ -248,7 +248,7 @@ impl Controls {
                 self.drive(
                     row.id,
                     row.fraction,
-                    held.is_some_and(|old| old.fraction == row.fraction),
+                    held.is_none_or(|old| old.fraction == row.fraction),
                     front,
                 )?;
             }

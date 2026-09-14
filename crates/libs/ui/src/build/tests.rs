@@ -4929,6 +4929,65 @@ fn a_drawer_shadow_is_retained_across_width_classes() {
 }
 
 #[test]
+fn slider_thumb_centres_and_fill_share_the_rail_at_every_gain() {
+    for dpi in [96.0, 144.0, 192.0] {
+        let mut patch = fixture_at(dpi);
+        let value = crate::signal::Cell::new(-4.0_f64);
+        let _held = mount(
+            crate::widget::slider(
+                value,
+                crate::widget::Range::new(-24.0, 24.0).step(0.1),
+                crate::widget::SliderStyle {
+                    origin: Some(0.0),
+                    ramp: None,
+                },
+            )
+            .width(Len::Pct(1.0)),
+            root(),
+        );
+        for width in [240.0, 601.0, 940.0, 240.0] {
+            Host::with(|h| h.set_window(Vector2 { x: width, y: 100.0 }));
+            for db in [-24.0, -18.0, -12.0, -6.0, -4.0, 0.0, 6.0, 12.0, 18.0, 24.0] {
+                value.set(db);
+                for _ in 0..4 {
+                    patch.clear();
+                    crate::signal::flush();
+                    flush(&mut patch);
+                }
+                Host::with(|h| {
+                    let c = h
+                        .controls
+                        .iter()
+                        .find(|(_, c)| c.front.trail.is_some())
+                        .unwrap()
+                        .1;
+                    let front = c.front;
+                    let node = c.node;
+                    let (trail, origin) = front.trail.unwrap();
+                    let control = h.model().solved(node);
+                    let thumb = h.model().solved(front.thumb.unwrap());
+                    let rail = h.model().solved(trail);
+                    let fraction = ((db + 24.0) / 48.0) as f32;
+                    let centre = control.rect.x0
+                        + front.rest
+                        + front.travel * front.source_fraction
+                        + thumb.size.x * 0.5;
+                    let expected = rail.rect.x0 + rail.size.x * fraction;
+                    assert_eq!(origin, 0.5);
+                    assert!((front.source_fraction - fraction).abs() < 1e-6);
+                    assert!(
+                        (centre - expected).abs() <= 96.0 / dpi,
+                        "{db} dB at {width} DIP/{dpi} DPI: thumb {centre}, rail {expected}"
+                    );
+                    assert!((front.travel - rail.size.x).abs() <= 96.0 / dpi);
+                });
+                assert!(patch.ops().is_empty(), "settled slider emitted idle writes");
+            }
+        }
+    }
+}
+
+#[test]
 fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
     let mut patch = fixture();
     let value = crate::signal::Cell::new(-12.0_f64);

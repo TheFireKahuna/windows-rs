@@ -252,7 +252,7 @@ pub(crate) struct Node {
     pub(crate) links: Links,
     /// The shadow of the visual's own channels.
     pub(crate) core: [f32; CORE_CHANS],
-    /// Two bits of binding state per property group.
+    /// Two bits of binding state per scalar channel, packed across the owners' shadows.
     pub(crate) state: u64,
     pub(crate) painted: Option<Painted>,
     /// The clip object the *sink* established, if any. A clip-route shape mask puts its own
