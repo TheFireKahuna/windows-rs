@@ -202,6 +202,16 @@ pub fn mount<K>(el: El<K>, parent: GroupId) -> Mount {
 /// Panics if `el` was built before an earlier mount: the arena is cleared after each mount,
 /// so the slot the element indexes is gone.
 pub fn mount_at(el: View, parent: GroupId, after: Option<NodeId>, scope: Scope) -> Mount {
+    mount_scoped(el, parent, after, scope, None)
+}
+
+pub(crate) fn mount_scoped(
+    el: View,
+    parent: GroupId,
+    after: Option<NodeId>,
+    scope: Scope,
+    hover_scope: Option<ControlId>,
+) -> Mount {
     let mut build = Build::take();
     // The one place a stale element can be named, so the message names the call site that
     // held the `El` across a mount rather than leaving a raw bounds panic in the arena.
@@ -213,7 +223,10 @@ pub fn mount_at(el: View, parent: GroupId, after: Option<NodeId>, scope: Scope) 
     let mut rows = Rows::default();
     let node = walk(
         &mut build,
-        Where::new(el.at, parent, after, scope),
+        Where {
+            hover_scope,
+            ..Where::new(el.at, parent, after, scope)
+        },
         &mut rows,
         &mut Claim::default(),
     );
@@ -275,6 +288,7 @@ struct Where {
     parent: GroupId,
     after: Option<NodeId>,
     scope: Scope,
+    hover_scope: Option<ControlId>,
 }
 
 impl Where {
@@ -284,6 +298,7 @@ impl Where {
             parent,
             after,
             scope,
+            hover_scope: None,
         }
     }
 }
@@ -501,6 +516,12 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         own_claim.text.get_or_insert(key);
     }
 
+    // The observer's identity is needed by children before its control parts are complete.
+    let observer = slot
+        .hover_scope
+        .map(|_| Host::with(|h| h.reserve_control()));
+    let hover_scope = observer.or(at.hover_scope);
+
     // ── children ──────────────────────────────────────────────────────────────────
     if slot.kids.len > 0 {
         let group = group.expect("a node with children is a group");
@@ -508,7 +529,10 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             let kid = b.kids[(slot.kids.at + index) as usize];
             previous = Some(walk(
                 b,
-                Where::new(kid, group, previous, inner),
+                Where {
+                    hover_scope,
+                    ..Where::new(kid, group, previous, inner)
+                },
                 rows,
                 &mut own_claim,
             ));
@@ -519,7 +543,18 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // After the children, because a control's moving part is one of them. Nothing above
     // depends on the row existing, and the hit array is a declaration rather than an order.
     if slot.hit.is_some() {
-        mount_control(b, &slot, node, group, parts, own_claim, inner, row);
+        mount_control(
+            b,
+            &slot,
+            node,
+            group,
+            parts,
+            own_claim,
+            inner,
+            row,
+            observer,
+            hover_scope,
+        );
     } else {
         // Not a control, so what the subtree offered belongs to whichever control encloses
         // this node.
@@ -580,6 +615,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             parent: at.parent,
             after: Some(node),
             scope: at.scope,
+            hover_scope,
         });
     }
 
@@ -981,6 +1017,8 @@ fn mount_control(
     claim: Claim,
     scope: Scope,
     row: MountId,
+    observer: Option<ControlId>,
+    hover_scope: Option<ControlId>,
 ) -> Option<ControlId> {
     let hit = slot.hit?;
 
@@ -996,6 +1034,7 @@ fn mount_control(
             // borrow, so the two halves cannot disagree about what a control is.
             id: ControlId::default(),
             wash: parts.wash,
+            hover_scope,
             hover: HOVER_ALPHA,
             press: PRESS_ALPHA,
             thumb: claim.thumb.map(SpriteId::node),
@@ -1016,6 +1055,7 @@ fn mount_control(
         scope,
         state: ModelState::Rest,
         click: None,
+        hovered: slot.hover_scope,
         change: None,
         commit: None,
         drag: None,
@@ -1069,7 +1109,12 @@ fn mount_control(
     let caption = slot.caption;
     let chrome = slot.chrome;
     let id = Host::with(move |h| {
-        let id = h.mint_control(control);
+        let id = if let Some(id) = observer {
+            h.place_control(id, control);
+            id
+        } else {
+            h.mint_control(control)
+        };
         if let Some(row) = h.mounts.get_mut(row) {
             row.control = Some(id);
         }
@@ -1253,6 +1298,7 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
         front: ChromeRow {
             id: ControlId::default(),
             wash: None,
+            hover_scope: None,
             hover: 0.0,
             press: 0.0,
             thumb: None,
@@ -1268,6 +1314,7 @@ fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
         scope,
         state: ModelState::Rest,
         click: None,
+        hovered: None,
         change: None,
         commit: None,
         drag: None,

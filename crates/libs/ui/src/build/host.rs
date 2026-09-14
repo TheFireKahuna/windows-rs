@@ -99,6 +99,7 @@ pub(crate) struct ControlRow {
     pub scope: Scope,
     pub state: ModelState,
     pub click: Option<Box<dyn Fn()>>,
+    pub hovered: Option<crate::signal::Cell<bool>>,
     pub change: Option<Box<dyn Fn(f64)>>,
     pub commit: Option<Box<dyn Fn(f64)>>,
     /// The two-axis drag's handler, where the application declared one.
@@ -604,6 +605,11 @@ impl Host {
                 continue;
             };
             match intent.what {
+                crate::widget::What::Hovered(value) => {
+                    if let Some(cell) = control.hovered.filter(|cell| cell.alive()) {
+                        cell.set(value);
+                    }
+                }
                 crate::widget::What::Tapped => {
                     if let Some(click) = control.click.as_ref() {
                         click();
@@ -841,6 +847,15 @@ impl Host {
         self.controls.insert(&mut self.control_ids, control)
     }
 
+    pub(crate) fn reserve_control(&mut self) -> ControlId {
+        self.control_ids.mint()
+    }
+
+    pub(crate) fn place_control(&mut self, id: ControlId, control: ControlRow) {
+        self.uia_stale.set(true);
+        self.controls.place(id, control);
+    }
+
     /// Returns the control `id` names, or `None` where the id is stale.
     pub(crate) fn control(&self, id: ControlId) -> Option<&ControlRow> {
         self.controls.get(id)
@@ -859,7 +874,10 @@ impl Host {
         self.field_sources.retain(|s| s.id != id);
         self.field_layouts.retain(|s| s.id != id);
         self.field_commits.retain(|s| s.id != id);
-        if self.controls.remove(&mut self.control_ids, id).is_some() {
+        if let Some(control) = self.controls.remove(&mut self.control_ids, id) {
+            if let Some(cell) = control.hovered.filter(|cell| cell.alive()) {
+                cell.set(false);
+            }
             self.released.push(id);
             self.uia_stale.set(true);
         }
@@ -1237,6 +1255,7 @@ impl Host {
             front: crate::widget::ChromeRow {
                 id: ControlId::default(),
                 wash: None,
+                hover_scope: None,
                 hover: 0.0,
                 press: 0.0,
                 thumb: None,
@@ -1252,6 +1271,7 @@ impl Host {
             scope: self.root_scope,
             state: ModelState::Rest,
             click: None,
+            hovered: None,
             change: None,
             commit: None,
             drag: None,

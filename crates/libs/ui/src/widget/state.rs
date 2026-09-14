@@ -41,6 +41,8 @@ impl Front<'_> {
 #[derive(Copy, Clone, Debug)]
 pub struct ChromeRow {
     pub id: ControlId,
+    /// Nearest declared semantic hover scope, inherited through mounted children.
+    pub hover_scope: Option<ControlId>,
     /// The sprite whose opacity hover and press ride. `None` for a control with no wash.
     pub wash: Option<SpriteId>,
     /// Resolved wash opacities.
@@ -102,6 +104,8 @@ pub struct Intent {
 /// What an [`Intent`] asks of the application.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum What {
+    /// Entry or exit of an explicitly observed hover scope.
+    Hovered(bool),
     /// A press and a release on the same control.
     Tapped,
     /// A value while it is being moved.
@@ -161,6 +165,7 @@ pub struct Controls {
     /// counter, so it can place a row but never mint an id.
     rows: Slots<Control, ChromeRow>,
     hovered: Option<ControlId>,
+    observed_hover: Option<ControlId>,
     pressed: Option<ControlId>,
     /// The window's focus ring: one visual, sprung between controls. Focus is singular, so
     /// the ring is per window rather than per control, and moving it between two controls is
@@ -265,6 +270,27 @@ impl Controls {
         if self.pressed == Some(id) {
             self.pressed = None;
         }
+        if self.observed_hover == Some(id) {
+            self.observed_hover = None;
+        }
+    }
+
+    fn observe_hover(&mut self, target: Option<ControlId>, out: &mut Vec<Intent>) {
+        let next = target
+            .and_then(|id| self.rows.get(id)?.hover_scope)
+            .filter(|id| self.rows.get(*id).is_some());
+        if self.observed_hover == next {
+            return;
+        }
+        for (target, value) in [(self.observed_hover, false), (next, true)] {
+            if let Some(target) = target {
+                out.push(Intent {
+                    target,
+                    what: What::Hovered(value),
+                });
+            }
+        }
+        self.observed_hover = next;
     }
 
     /// Records the window's focus ring visual, minted once by the window's owner.
@@ -374,6 +400,7 @@ impl Controls {
             // retarget replaces it.
             Report::HoverChanged { from, to, .. } => {
                 self.hovered = to;
+                self.observe_hover(to, out);
                 if let Some(from) = from {
                     self.wash(from, front)?;
                 }
@@ -720,6 +747,96 @@ mod tests {
     }
 
     #[test]
+    fn semantic_hover_reports_scope_edges_and_ignores_child_crossings() {
+        let mut ids = windows_scene::Ids::<Control>::new();
+        let [scope, a, b, other, ordinary] = core::array::from_fn(|_| ids.mint());
+        let mut controls = Controls::default();
+        for (id, hover_scope) in [
+            (scope, Some(scope)),
+            (a, Some(scope)),
+            (b, Some(scope)),
+            (other, Some(other)),
+            (ordinary, None),
+        ] {
+            controls.rows.place(
+                id,
+                ChromeRow {
+                    id,
+                    hover_scope,
+                    wash: None,
+                    hover: 0.0,
+                    press: 0.0,
+                    thumb: None,
+                    trail: None,
+                    rest: 0.0,
+                    travel: 0.0,
+                    drive: None,
+                    drags: false,
+                    fraction: 0.0,
+                    source_fraction: 0.0,
+                },
+            );
+        }
+        let mut out = Vec::with_capacity(2);
+        controls.observe_hover(Some(a), &mut out);
+        assert_eq!(
+            out,
+            [Intent {
+                target: scope,
+                what: What::Hovered(true)
+            }]
+        );
+        out.clear();
+        for _ in 0..1000 {
+            controls.observe_hover(Some(b), &mut out);
+            controls.observe_hover(Some(a), &mut out);
+        }
+        assert!(out.is_empty(), "child crossings must stay scene-side");
+        controls.release(a);
+        controls.observe_hover(Some(b), &mut out);
+        assert!(
+            out.is_empty(),
+            "replacing a hovered child preserves the scope"
+        );
+        controls.observe_hover(Some(other), &mut out);
+        assert_eq!(
+            out,
+            [
+                Intent {
+                    target: scope,
+                    what: What::Hovered(false)
+                },
+                Intent {
+                    target: other,
+                    what: What::Hovered(true)
+                }
+            ]
+        );
+        out.clear();
+        controls.observe_hover(Some(ordinary), &mut out);
+        assert_eq!(
+            out,
+            [Intent {
+                target: other,
+                what: What::Hovered(false)
+            }]
+        );
+        out.clear();
+        controls.observe_hover(None, &mut out);
+        controls.observe_hover(Some(ordinary), &mut out);
+        assert!(out.is_empty());
+        controls.observe_hover(Some(b), &mut out);
+        out.clear();
+        controls.release(scope);
+        controls.observe_hover(Some(b), &mut out);
+        assert!(
+            out.is_empty(),
+            "a released scope cannot receive another event"
+        );
+        assert_eq!(out.capacity(), 2);
+    }
+
+    #[test]
     fn slider_pointer_maps_the_visible_rail_and_snaps_the_reported_value() {
         let horizontal = Range::new(-24.0, 24.0).step(0.1);
         assert_eq!(slider_value_at(13.0, 126.0, 100.0, horizontal), -24.0);
@@ -741,6 +858,7 @@ mod tests {
     fn source_edits_and_geometry_updates_have_distinct_value_ownership() {
         let (id, _) = two();
         let source = ChromeRow {
+            hover_scope: None,
             id,
             wash: None,
             hover: 0.0,

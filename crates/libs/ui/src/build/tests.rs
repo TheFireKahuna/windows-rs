@@ -224,6 +224,79 @@ fn root() -> windows_scene::GroupId {
     Host::with(|h| h.model().root())
 }
 
+#[test]
+#[cfg(feature = "test-support")]
+fn hover_scope_reaches_dynamic_children_and_clears_on_unmount() {
+    use crate::signal::{Cell, Owner};
+    use crate::widget::{Intent, What, button};
+    let mut patch = fixture();
+    let (_owner, (hovered, added)) = Owner::scope(|| (Cell::new(false), Cell::new(false)));
+    let (content, mounted) = Owner::scope(|| {
+        mount(
+            stack((
+                button("First").key("first"),
+                switch(
+                    move || added.get(),
+                    |added| {
+                        button(if *added { "Added" } else { "Initial" })
+                            .key("dynamic")
+                            .erase()
+                    },
+                ),
+            ))
+            .hover_scope(hovered),
+            root(),
+        )
+    });
+    let mut driver = crate::driver::testing::LayoutDriver::default();
+    for _ in 0..8 {
+        patch.clear();
+        driver.flush(&mut patch);
+    }
+    let observer = Host::with(|h| {
+        h.controls
+            .iter()
+            .find_map(|(id, row)| row.hovered.map(|_| id))
+    })
+    .unwrap();
+    for change in [false, true] {
+        added.set(change);
+        for _ in 0..8 {
+            patch.clear();
+            driver.flush(&mut patch);
+        }
+        Host::with(|h| {
+            for name in ["first", "dynamic"] {
+                let row = h
+                    .controls
+                    .iter()
+                    .find(|(_, row)| row.key == Some(name))
+                    .unwrap()
+                    .1;
+                assert_eq!(row.front.hover_scope, Some(observer));
+            }
+            h.dispatch(&[Intent {
+                target: observer,
+                what: What::Hovered(true),
+            }]);
+        });
+        assert!(hovered.get());
+    }
+    drop(content);
+    drop(mounted);
+    assert!(!hovered.get(), "a surviving observer cell must be cleared");
+    Host::with(|h| {
+        h.dispatch(&[Intent {
+            target: observer,
+            what: What::Hovered(true),
+        }])
+    });
+    assert!(
+        !hovered.get(),
+        "an event queued before unmount must be ignored"
+    );
+}
+
 /// Returns everything the host has produced since the last call, as one batch.
 fn filled() -> crate::seam::Down {
     let mut down = crate::seam::Down::default();

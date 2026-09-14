@@ -1070,6 +1070,18 @@ impl<K> El<K> {
             .slot_mut(|s| add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE))
     }
 
+    /// Reports entry and exit of this subtree through `hovered`, including its controls.
+    /// Nested hover scopes claim their own hover. Child-to-child moves within one scope
+    /// stay scene-side. Adds no gesture or focus stop; unmount clears a surviving cell.
+    /// `hovered` must belong to this scope alone and remain live while it is mounted.
+    #[must_use]
+    pub fn hover_scope(self, hovered: crate::signal::Cell<bool>) -> Self {
+        self.slot_mut(|s| {
+            s.hover_scope = Some(hovered);
+            add_flags(s, HitFlags::INTERACTIVE);
+        })
+    }
+
     /// Handles Escape left unclaimed by the focus ring's overlay scopes.
     /// Declare once on the active screen root. Hidden and unmounted screens do not
     /// receive it; the callback runs outside the host borrow and adds no focus stop.

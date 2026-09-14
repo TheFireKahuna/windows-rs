@@ -49,4 +49,5 @@ pub struct Site {
     /// The adapter's anchor: the node a first row or arm is placed after.
     pub after: Option<windows_scene::NodeId>,
     pub scope: crate::role::Scope,
+    pub(crate) hover_scope: Option<windows_scene::ControlId>,
 }

@@ -112,8 +112,13 @@ where
                         // Born at the anchor rather than at the head, so a new row exists
                         // inside this list from the moment it is mounted. The pass below
                         // places every insert afterwards.
-                        let mount =
-                            super::mount_at(view(item), site.parent, site.after, site.scope);
+                        let mount = super::mount::mount_scoped(
+                            view(item),
+                            site.parent,
+                            site.after,
+                            site.scope,
+                            site.hover_scope,
+                        );
                         mounts.borrow_mut().insert(key.clone(), mount);
                     },
                     |key, _, step, _| {
@@ -216,11 +221,12 @@ fn switch_adapter<K: PartialEq + 'static>(
                 |key| {
                     // The anchor is the whole of this arm's position: a branch has one arm
                     // and no reorder pass to correct it afterwards.
-                    *mount.borrow_mut() = Some(super::mount_at(
+                    *mount.borrow_mut() = Some(super::mount::mount_scoped(
                         view(key),
                         site.parent,
                         site.after,
                         site.scope,
+                        site.hover_scope,
                     ));
                 },
             );

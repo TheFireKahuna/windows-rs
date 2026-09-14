@@ -147,6 +147,7 @@ pub(crate) struct Slot {
     /// A [`Cell`](crate::signal::Cell) and not a node id, so the reporting runs one way: the
     /// application never learns a `NodeId` and never reaches the model.
     pub probe: Option<crate::signal::Cell<crate::layout::Placed>>,
+    pub hover_scope: Option<crate::signal::Cell<bool>>,
 }
 
 impl Default for Slot {
@@ -180,6 +181,7 @@ impl Default for Slot {
             placed: false,
             no_inflate: false,
             probe: None,
+            hover_scope: None,
         }
     }
 }
