@@ -1293,6 +1293,40 @@ fn sliding_popup() -> Spec {
 }
 
 #[test]
+fn a_scrolling_flyout_keeps_its_rail_above_the_choices() {
+    use crate::layout::{Len, Reveal, scroll_with, stack};
+    use crate::role::Metric;
+    let mut patch = fixture();
+    let (_invoker, anchor) = invoker(&mut patch);
+    let mut focus = Ring::default();
+    let mut overlays = Overlays::new();
+    let id = overlays.open(Spec::flyout(anchor), &mut focus.ops, || {
+        flyout().stack(
+            scroll_with(
+                Reveal::Always,
+                stack((button("Alpha"), button("Beta"), button("Gamma"), button("Delta"))),
+            )
+            .height(Len::Times(Metric::RowH, 2.0))
+            .width(Len::Times(Metric::RowH, 11.0)),
+        )
+    });
+    flush(&mut patch);
+    let (grab, rect) = Host::with(|h| {
+        let row = h.scrolls.iter().next().unwrap().1;
+        (row.grab.unwrap(), h.model.solved(row.rail.unwrap().node()).rect)
+    });
+    let table = hits(&patch);
+    let hit = table
+        .hit(
+            Vector2 { x: (rect.x0 + rect.x1) * 0.5, y: (rect.y0 + rect.y1) * 0.5 },
+            windows_scene::ContactKind::Mouse,
+        )
+        .unwrap();
+    assert_eq!(hit.id, grab, "rail must win over choices after overlay placement");
+    overlays.close(id, &mut focus.ops);
+}
+
+#[test]
 fn a_slide_waits_for_the_compositor_and_never_emits_per_frame_updates() {
     use crate::layout::{Len, scroll, stack};
     use windows_scene::{Anim, Bind, Iterations, Op, Prop};

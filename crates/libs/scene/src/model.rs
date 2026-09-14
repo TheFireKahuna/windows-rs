@@ -283,6 +283,8 @@ impl Model {
             after,
         });
         self.solve_dirty = true;
+        // Coincident siblings can change hit priority without changing any solved box.
+        self.hits_dirty = true;
     }
 
     /// Destroys a node **and its subtree**, with `exit` naming how it leaves the screen.
@@ -1172,6 +1174,41 @@ mod tests {
             "content, then blocker, then the overlay"
         );
         assert!(entries[1].flags.contains(HitFlags::BLOCKER));
+    }
+
+    #[test]
+    fn reordering_coincident_controls_refreshes_hit_priority_and_then_parks() {
+        let mut model = Model::new(root_style());
+        model.set_window(Vector2 { x: 400.0, y: 300.0 });
+        let root = model.root();
+        let a = model.group(root, None);
+        let b = model.group(root, Some(a.node()));
+        for (node, index) in [(a.node(), 1), (b.node(), 2)] {
+            let mut style = box_style(100.0, 100.0);
+            style.position = taffy::Position::Absolute;
+            model.style(node, &style);
+            model.hit(node, Some(HitDecl {
+                flags: HitFlags::INTERACTIVE,
+                id: ControlId::raw(index, 1),
+                touch_inflate: None,
+            }));
+        }
+        let mut patch = SinkPatch::new();
+        model.flush(&mut patch, env());
+        let mut table = crate::HitTable::default();
+        table.replace(patch.hit_entries());
+        let point = crate::Point { x: 50.0, y: 50.0 };
+        assert_eq!(table.hit(point, crate::ContactKind::Mouse).unwrap().id, ControlId::raw(2, 1));
+        patch.clear();
+        model.place(a.node(), root, Some(b.node()));
+        model.flush(&mut patch, env());
+        assert!(patch.ops().iter().any(|op| matches!(op, Op::Hits { .. })));
+        assert!(!patch.ops().iter().any(|op| matches!(op, Op::New { .. } | Op::Drop { .. })));
+        table.replace(patch.hit_entries());
+        assert_eq!(table.hit(point, crate::ContactKind::Mouse).unwrap().id, ControlId::raw(1, 1));
+        patch.clear();
+        model.flush(&mut patch, env());
+        assert!(patch.is_empty());
     }
 
     #[test]

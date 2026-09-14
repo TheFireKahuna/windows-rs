@@ -429,7 +429,9 @@ impl Controls {
                 let was = self.pressed.take() == Some(target);
                 self.grabbed = None;
                 self.wash(target, front)?;
-                if !was {
+                // Scroll rails belong to the scroll front and carry no chrome row. Their
+                // release must not become a menu choice or an application click.
+                if !was || self.rows.get(target).is_none() {
                     return Ok(());
                 }
                 // A drag that passed the threshold ends here and is not also a tap: the two
