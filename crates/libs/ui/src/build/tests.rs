@@ -5109,6 +5109,7 @@ fn slider_thumb_centres_and_fill_share_the_rail_at_every_gain() {
                     crate::widget::SliderStyle {
                         origin: Some(0.0),
                         ramp: None,
+                        ..Default::default()
                     },
                 )
                 .width(Len::Pct(1.0));
@@ -5168,6 +5169,7 @@ fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
                 crate::widget::SliderStyle {
                     origin: Some(0.0),
                     ramp: None,
+                    ..Default::default()
                 },
             )
             .width(Metric::CardMinW);

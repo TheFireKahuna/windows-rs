@@ -47,12 +47,29 @@ impl TextStyle {
 }
 
 /// Paint and origin of a slider's retained value stroke.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug)]
 pub struct SliderStyle {
     /// Value the fill grows from; the range minimum when absent.
     pub origin: Option<f64>,
     /// A fixed gradient across the whole rail; trimmed rather than rescaled.
     pub ramp: Option<windows_scene::RampId>,
+    pub rail: Metric,
+    pub thumb: Metric,
+    pub height: Metric,
+    pub mark_origin: bool,
+}
+
+impl Default for SliderStyle {
+    fn default() -> Self {
+        Self {
+            origin: None,
+            ramp: None,
+            rail: Metric::SliderRailH,
+            thumb: Metric::SliderThumb,
+            height: Metric::RowH,
+            mark_origin: true,
+        }
+    }
 }
 
 /// Construction-time dimensions and typography for a retained choice rail.
@@ -361,6 +378,36 @@ pub fn slider<'a, M>(
     range: Range,
     style: SliderStyle,
 ) -> Element<'a, Scalar> {
+    if value.is_constant() {
+        slider_source(
+            ui,
+            super::ScalarValue {
+                value: value.read(),
+                epoch: 0,
+            },
+            range,
+            style,
+        )
+    } else {
+        slider_source(
+            ui,
+            move || super::ScalarValue {
+                value: value.read(),
+                epoch: 0,
+            },
+            range,
+            style,
+        )
+    }
+}
+
+/// A stock slider with the same epoch-aware source contract as a custom scalar.
+pub fn slider_source<'a, M>(
+    ui: &'a mut Ui<'_>,
+    value: impl Signal<super::ScalarValue, M> + Copy + 'static,
+    range: Range,
+    style: SliderStyle,
+) -> Element<'a, Scalar> {
     let extent = crate::layout::probe();
     let fraction = range.fraction(style.origin.unwrap_or(range.min));
     let origin = if range.vertical {
@@ -383,7 +430,7 @@ pub fn slider<'a, M>(
             } else {
                 (size.x, size.y * 0.5)
             };
-            let half = crate::role::metric(Metric::SliderThumb, scope) * 0.55;
+            let half = crate::role::metric(style.thumb, scope) * 0.55;
             for (out, a, b) in [
                 (rail, at(0.0, cross), at(length, cross)),
                 (
@@ -395,13 +442,13 @@ pub fn slider<'a, M>(
                 out.push(windows_scene::PathVerb::Segment { from: a, to: b });
             }
         });
-    let inset = Len::Times(Metric::SliderThumb, 0.5);
+    let inset = Len::Times(style.thumb, 0.5);
     ui.control(
         Some(Chrome::new(roles::OPTION[0], Metric::RadiusPill)),
         UiaRole::Slider,
         |_| {},
     )
-    .slide(value, range)
+    .slide_source(value, range)
     .wash(Wash::Accent)
     .layout(|l| {
         l.flow = Some(if range.vertical {
@@ -410,10 +457,10 @@ pub fn slider<'a, M>(
             Preset::Row
         });
         if range.vertical {
-            l.width = Some(Metric::RowH.into());
+            l.width = Some(style.height.into());
             l.padding = Some([Len::Zero, inset]);
         } else {
-            l.height = Some(Metric::RowH.into());
+            l.height = Some(style.height.into());
             l.padding = Some([inset, Len::Zero]);
         }
     })
@@ -429,10 +476,10 @@ pub fn slider<'a, M>(
                 if range.vertical {
                     Len::Zero
                 } else {
-                    Metric::SliderThumb.into()
+                    style.thumb.into()
                 },
                 if range.vertical {
-                    Metric::SliderThumb.into()
+                    style.thumb.into()
                 } else {
                     Len::Zero
                 },
@@ -442,50 +489,50 @@ pub fn slider<'a, M>(
                     .cols([crate::layout::Track::Fr(1.0)])
                     .rows([crate::layout::Track::Fr(1.0)])
                     .width(if range.vertical {
-                        Metric::RowH.into()
+                        style.height.into()
                     } else {
                         Len::Pct(1.0)
                     })
                     .height(if range.vertical {
                         Len::Pct(1.0)
                     } else {
-                        Metric::RowH.into()
+                        style.height.into()
                     })
                     .align(Align::Center)
                     .justify(Align::Center)
                     .children(|ui| {
                         ui.plate(Metric::Radius, Role::Fill(Fill::Pressed), 1.0)
                             .width(if range.vertical {
-                                Metric::SliderRailH.into()
+                                style.rail.into()
                             } else {
                                 Len::Pct(1.0)
                             })
                             .height(if range.vertical {
                                 Len::Pct(1.0)
                             } else {
-                                Metric::SliderRailH.into()
+                                style.rail.into()
                             });
                         ui.path(geometry)
-                            .slider_trail(origin, style.ramp)
+                            .slider_trail(origin, style.ramp, style.rail)
                             .probed(extent)
                             .width(Len::Pct(1.0))
                             .height(Len::Pct(1.0))
                             .cover();
                         ui.path(marker)
                             .ink_stroke(Metric::HairlineW)
-                            .opacity(if style.origin.is_some() { 0.15 } else { 0.0 })
+                            .opacity(if style.origin.is_some() && style.mark_origin {
+                                0.15
+                            } else {
+                                0.0
+                            })
                             .cover();
                     });
             });
-        ui.plate(
-            Len::Times(Metric::SliderThumb, 0.5),
-            Role::Text(Text::Primary),
-            1.0,
-        )
-        .width(Metric::SliderThumb)
-        .height(Metric::SliderThumb)
-        .no_shrink()
-        .thumb();
+        ui.plate(Len::Times(style.thumb, 0.5), Role::Text(Text::Primary), 1.0)
+            .width(style.thumb)
+            .height(style.thumb)
+            .no_shrink()
+            .thumb();
     })
 }
 pub fn knob<'a, M>(

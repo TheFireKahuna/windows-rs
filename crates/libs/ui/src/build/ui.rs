@@ -1307,14 +1307,19 @@ impl Element<'_, Path> {
             Value::Scalar,
         )
     }
-    pub(crate) fn slider_trail(self, origin: f32, ramp: Option<windows_scene::RampId>) -> Self {
+    pub(crate) fn slider_trail(
+        self,
+        origin: f32,
+        ramp: Option<windows_scene::RampId>,
+        width: impl Into<Len>,
+    ) -> Self {
         let source = ramp.map_or(
             PaintSource::Role(Role::Fill(crate::role::Fill::Accent)),
             PaintSource::Gradient,
         );
         self.decorate(
             PaintMask::Shape {
-                stroke: Some(crate::role::Metric::SliderRailH.into()),
+                stroke: Some(width.into()),
             },
             source,
             Part::Trail { origin },

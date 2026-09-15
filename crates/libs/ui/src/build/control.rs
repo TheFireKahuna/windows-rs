@@ -575,6 +575,16 @@ impl<'a> Element<'a> {
             crate::widget::ScalarValue { value, epoch: 0 }
         })
     }
+    /// A slider source whose epoch invalidates gestures when its document is replaced.
+    pub fn slide_source<M>(
+        self,
+        value: impl Signal<crate::widget::ScalarValue, M> + 'static,
+        range: crate::widget::Range,
+    ) -> Element<'a, Scalar> {
+        self.scalar_source(crate::widget::Interaction::Slide(range), value, |value| {
+            value
+        })
+    }
     fn scalar_source<T: Copy + 'static, M>(
         mut self,
         drive: crate::widget::Interaction,
