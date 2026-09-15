@@ -272,16 +272,16 @@ impl Spec {
 /// Event-rate changes from mounted popup declarations. A mount id rejects stale opens.
 pub(crate) enum Request {
     Show {
-        key: crate::build::MountId,
+        key: windows_scene::NodeId,
         spec: Spec,
         body: std::rc::Rc<dyn Fn() -> View>,
         closed: std::rc::Rc<dyn Fn()>,
     },
-    Close(crate::build::MountId),
+    Close(windows_scene::NodeId),
 }
 
 impl Request {
-    pub(crate) fn key(&self) -> crate::build::MountId {
+    pub(crate) fn key(&self) -> windows_scene::NodeId {
         match self {
             Self::Show { key, .. } | Self::Close(key) => *key,
         }
@@ -289,7 +289,7 @@ impl Request {
 }
 
 struct Binding {
-    key: crate::build::MountId,
+    key: windows_scene::NodeId,
     closed: std::rc::Rc<dyn Fn()>,
 }
 

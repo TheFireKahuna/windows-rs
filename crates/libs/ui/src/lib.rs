@@ -87,3 +87,5 @@ pub use front::FrontHandle;
 // The generated Windows bindings this crate's public types are expressed in.
 pub use bindings::*;
 pub use windows_core::Result;
+
+pub use build::{Element, Node, Ui};

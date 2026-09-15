@@ -920,6 +920,7 @@ mod tests {
             &windows_d2d::Gpu::for_window()?,
             windows_text::FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]),
         )?;
+        Host::install_text(back.ladder().clone())?;
         let mut scene = Scene::new_at(
             window.handle(),
             &back,

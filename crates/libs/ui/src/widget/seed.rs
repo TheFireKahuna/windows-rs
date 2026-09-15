@@ -8,7 +8,7 @@
 
 use crate::build::arena::{FULL, MaskSeed, Part};
 use crate::build::{Button, El, Path, View};
-use crate::layout::{Align, Len, Over, Preset};
+use crate::layout::{Align, Len, Preset};
 use crate::role::{Fill, Metric, Role, Text, TypeRole};
 use crate::signal::{Cell, Signal};
 use crate::widget::{Flow, Interaction, Range, StatePolicy, TextSource, UiaRole, Wash, roles};
@@ -622,7 +622,7 @@ where
                 .min_height(Len::Zero)
                 // Horizontal only. The option's height is the track's, so vertical padding
                 // would be a second claim on it; the label is centred in what it gets.
-                .over(Over::PaddingXY(Len::Metric(inset), Len::Zero))
+                .layout(|l| l.padding = Some([Len::Metric(inset), Len::Zero]))
                 .row(inner(name, ramp, false))
         })
         .collect();

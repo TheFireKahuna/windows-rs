@@ -135,7 +135,10 @@ fn independent_hosts_retheme_existing_recipes_and_preserve_state() {
                         Host::with(|h| h.set_theme(theme, windows_scene::BackdropSpec::default()));
                         flush(&mut patch);
                         assert!(patch.ops().is_empty(), "an unchanged theme parks");
-                        assert!(filled().theme.is_none(), "an equal transaction sends no wake");
+                        assert!(
+                            filled().theme.is_none(),
+                            "an equal transaction sends no wake"
+                        );
                     }
                     held
                 });
@@ -159,23 +162,55 @@ fn choice_dispatch_preserves_canonical_selection_when_an_edit_is_declined() {
         let mut patch = fixture();
         let selected = crate::signal::Cell::new(0_u8);
         let attempts = crate::signal::Cell::new(0_u8);
-        let _held = mount(crate::widget::segmented((move || selected.get(), move |next| {
-            attempts.set(attempts.get() + 1);
-            if next != 2 { selected.set(next); }
-        }), &[("First", 0), ("Second", 1), ("Unavailable", 2)]), root());
+        let _held = mount(
+            crate::widget::segmented(
+                (
+                    move || selected.get(),
+                    move |next| {
+                        attempts.set(attempts.get() + 1);
+                        if next != 2 {
+                            selected.set(next);
+                        }
+                    },
+                ),
+                &[("First", 0), ("Second", 1), ("Unavailable", 2)],
+            ),
+            root(),
+        );
         crate::signal::flush();
         flush(&mut patch);
-        let ids = Host::with(|h| h.controls.iter().filter(|(_, c)| c.uia == crate::widget::UiaRole::RadioButton).map(|(id, _)| id).collect::<Vec<_>>());
+        let ids = Host::with(|h| {
+            h.controls
+                .iter()
+                .filter(|(_, c)| c.uia == crate::widget::UiaRole::RadioButton)
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        });
         for (at, expected) in [(1, 1), (2, 1)] {
-            Host::with(|h| h.dispatch(&[crate::widget::Intent { target: ids[at], what: crate::widget::What::Tapped }]));
+            Host::with(|h| {
+                h.dispatch(&[crate::widget::Intent {
+                    target: ids[at],
+                    what: crate::widget::What::Tapped,
+                }])
+            });
             crate::signal::flush();
             assert_eq!(selected.get(), expected);
-            Host::with(|h| assert_eq!(h.control(ids[1]).unwrap().state, crate::widget::ModelState::Selected));
+            Host::with(|h| {
+                assert_eq!(
+                    h.control(ids[1]).unwrap().state,
+                    crate::widget::ModelState::Selected
+                )
+            });
         }
         assert_eq!(attempts.get(), 2);
         selected.set(0);
         crate::signal::flush();
-        Host::with(|h| assert_eq!(h.control(ids[0]).unwrap().state, crate::widget::ModelState::Selected));
+        Host::with(|h| {
+            assert_eq!(
+                h.control(ids[0]).unwrap().state,
+                crate::widget::ModelState::Selected
+            )
+        });
     });
 }
 
@@ -348,12 +383,6 @@ fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
 /// The raster caches are cut in physical pixels, so a mask that is exact at one scale can be
 /// degenerate at another. A test that only ever runs at 96 cannot see it.
 pub(crate) fn fixture_at(dpi: f32) -> SinkPatch {
-    if !super::text::installed() {
-        // The real engine, over the two inbox faces the palette names, so every width
-        // asserted below is DirectWrite's own advance rather than an invented one.
-        super::text::install(FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]))
-            .expect("DirectWrite is available on the platform floor");
-    }
     // The driver's own root, so a mount here is arranged exactly as a window arranges it. A
     // root written here instead can differ — a flex row gives a mounted child its content
     // width, which leaves a scroll viewport zero DIPs wide and hit-testing nothing.
@@ -371,6 +400,7 @@ pub(crate) fn fixture_at(dpi: f32) -> SinkPatch {
             Density::Comfortable,
         ),
     );
+    Host::install_text(FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"])).unwrap();
     // The root's own `New` op rides the first flush. Draining it leaves the patch carrying
     // only what the test itself mounts.
     let mut patch = SinkPatch::new();
@@ -517,9 +547,9 @@ fn vertical_labels_keep_their_rotated_extent_after_publish_and_updates() {
                         .map(|(_, m)| m.node)
                         .collect();
                     let key = h.mounts.iter().filter_map(|(_, m)| m.text).nth(1).unwrap();
-                    let intrinsic = text::measure(windows_scene::MeasureIn {
+                    let intrinsic = h.text.measure(windows_scene::MeasureIn {
                         key,
-                        class: h.model().solved(nodes[1]).class,
+                        class: h.model.solved(nodes[1]).class,
                         known: (None, None),
                         available: (
                             windows_scene::Avail::MaxContent,
@@ -576,7 +606,7 @@ fn dynamic_labels_fit_replacement_text_without_previous_width_padding() {
                     .find_map(|(_, m)| m.text.map(|k| (m.node, k)))
                     .unwrap();
                 let actual = h.model().solved(node);
-                let expected = text::measure(windows_scene::MeasureIn {
+                let expected = h.text.measure(windows_scene::MeasureIn {
                     key,
                     class: actual.class,
                     known: (None, None),
@@ -696,7 +726,18 @@ fn a_constant_channel_produces_no_effect() {
 fn a_reactive_channel_tracks_its_cell() {
     let mut patch = fixture();
     let alpha = crate::signal::Cell::new(0.25_f32);
-    let _mount = mount(plate().opacity(alpha), root());
+    let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+    let read_count = reads.clone();
+    let mounted = mount(
+        plate()
+            .opacity(|| panic!("replaced writer ran"))
+            .opacity(move || {
+                read_count.set(read_count.get() + 1);
+                alpha.get()
+            }),
+        root(),
+    );
+    assert_eq!(reads.get(), 0, "creation does not execute UI bindings");
     flush(&mut patch);
     patch.clear();
 
@@ -717,6 +758,19 @@ fn a_reactive_channel_tracks_its_cell() {
         )
     });
     assert!(bound, "a cell write must reach the sink it was bound to");
+    let retired = mounted.node();
+    drop(mounted);
+    let replacement = mount(plate(), root());
+    assert_eq!(retired.index(), replacement.node().index());
+    assert_ne!(retired, replacement.node());
+    let before = reads.get();
+    alpha.set(0.5);
+    crate::signal::flush();
+    assert_eq!(
+        reads.get(),
+        before,
+        "a retired binding must not read its source"
+    );
 }
 
 /// A channel's first value is a state, not a transition into one.
@@ -938,13 +992,11 @@ fn a_metric_override_lowers_through_the_palette() {
         AccentId(0),
         Density::Comfortable,
     );
-    let style = crate::layout::lower(
-        crate::layout::Preset::Bare,
-        &[crate::layout::Rule::always(crate::layout::Over::Width(
-            Len::Metric(Metric::CardMinW),
-        ))],
-        scope,
-    );
+    let style = crate::layout::Layout {
+        width: Some(Len::Metric(Metric::CardMinW)),
+        ..Default::default()
+    }
+    .lower(crate::layout::Preset::Bare, None, scope);
     assert_eq!(
         style.size.width,
         taffy::Dimension::length(crate::role::metric(Metric::CardMinW, scope)),
@@ -1225,24 +1277,14 @@ fn unmounting_releases_every_row_it_claimed() {
     let mount = mount(crate::widget::button("Save"), root());
     flush(&mut patch);
 
-    let (mounts, controls, runs) = Host::with(|h| {
-        (
-            h.mounts.len(),
-            h.controls.len(),
-            text::with(|t| t.entries.len()),
-        )
-    });
+    let (mounts, controls, runs) =
+        Host::with(|h| (h.mounts.len(), h.controls.len(), h.text.entries.len()));
     assert!(mounts > 0 && controls == 1 && runs == 1);
 
     drop(mount);
     flush(&mut patch);
-    let (mounts, controls, runs) = Host::with(|h| {
-        (
-            h.mounts.len(),
-            h.controls.len(),
-            text::with(|t| t.entries.len()),
-        )
-    });
+    let (mounts, controls, runs) =
+        Host::with(|h| (h.mounts.len(), h.controls.len(), h.text.entries.len()));
     assert_eq!(
         (mounts, controls, runs),
         (0, 0, 0),
@@ -1254,7 +1296,7 @@ fn unmounting_releases_every_row_it_claimed() {
         assert_eq!(h.scrolls.len(), 0);
     });
     assert_eq!(
-        style::with(|table| table.len()),
+        Host::with(|h| h.styles.len()),
         0,
         "an unmount must release the style recipes"
     );
@@ -1268,33 +1310,6 @@ fn unmounting_releases_every_row_it_claimed() {
     assert_eq!(drops, 1);
 }
 
-/// Released slots are reused, so a list that churns does not grow the tables.
-#[test]
-fn released_rows_are_reused_rather_than_appended() {
-    let mut patch = fixture();
-    for _ in 0..8 {
-        let mount = mount(crate::widget::button("x"), root());
-        flush(&mut patch);
-        drop(mount);
-        flush(&mut patch);
-    }
-    let (mounts, controls) = Host::with(|h| (h.mounts.slots(), h.controls.slots()));
-    assert_eq!(
-        controls, 1,
-        "eight mounts of one control must occupy one control slot, not eight"
-    );
-    assert!(
-        mounts <= 2,
-        "a button is one node and its label, so eight mounts must reuse the same rows"
-    );
-}
-
-// ── variants ─────────────────────────────────────────────────────────────────────
-
-/// A variant is a row, and the row decides how many sprites are minted.
-///
-/// A ghost declares no fill and no stroke, so it mints neither rather than minting two
-/// invisible sprites.
 #[test]
 fn a_variant_row_decides_what_is_minted() {
     fn sprites(patch: &SinkPatch) -> usize {
@@ -1538,7 +1553,7 @@ fn a_constantly_absent_element_is_never_mounted() {
         .count();
     assert_eq!(minted, 3, "the container and the two present children");
     assert_eq!(
-        text::with(|t| t.entries.len()),
+        Host::with(|h| h.text.entries.len()),
         0,
         "an absent label must not shape its string"
     );
@@ -2419,7 +2434,8 @@ fn a_restyle_lowers_against_the_node_that_owns_it() {
     flush(&mut patch);
 
     let root_scope = Host::with(|h| h.root_scope);
-    let elevated = style::with(|table| {
+    let elevated = Host::with(|h| {
+        let table = &h.styles;
         table
             .iter()
             .find(|(_, recipe)| recipe.scope.elevation != root_scope.elevation)
@@ -2427,7 +2443,7 @@ fn a_restyle_lowers_against_the_node_that_owns_it() {
     })
     .expect("a card elevates the scope its children resolve against");
     assert_eq!(
-        style::with(|table| table.get(elevated).map(|recipe| recipe.scope)).map(|s| s.elevation),
+        Host::with(|h| h.styles.get(elevated).map(|recipe| recipe.scope)).map(|s| s.elevation),
         Some(root_scope.elevate(Elevation::Raised).elevation),
         "a restyle must read the node's own recipe rather than the root scope"
     );
@@ -2448,7 +2464,8 @@ fn a_recipe_holds_no_width_class() {
 
     let root_width = Host::with(|h| h.root_scope.width);
     assert!(
-        style::with(|table| table
+        Host::with(|h| h
+            .styles
             .iter()
             .all(|(_, recipe)| recipe.scope.width == root_width)),
         "a recipe stored a resolved class, which is the copy that goes stale"
@@ -2627,65 +2644,73 @@ fn a_class_gated_column_list_replaces_the_one_below_it() {
     );
 }
 
-/// A computed column template follows the value it is computed from.
-///
-/// `cols_from` is the case `cols_if` cannot state: the first track's extent is a number, so
-/// there is no condition to key an arm on and no finite set of arms to write. The assertion
-/// is on where the second child begins, which is the first track's width — first at the value
-/// the signal held at mount, then at the value it moved to.
+/// Computation, sparse class overrides and empty templates share one declaration.
 #[test]
-fn a_computed_column_template_follows_the_value_it_reads() {
-    use crate::layout::Track;
-    let rows = crate::signal::Cell::new(2.0_f32);
+fn computed_layout_replacement_and_responsive_inheritance_preserve_nodes() {
+    use crate::layout::{Track, grid, responsive};
+    use crate::role::WidthClass::{Narrow, Wide};
     let mut patch = fixture();
+    let rows = crate::signal::Cell::new(2.0_f32);
     let _held = mount(
-        crate::layout::grid((
-            plate().height(Metric::CardMinH),
-            plate().height(Metric::CardMinH),
-        ))
-        .cols_from(move |out| {
-            out.push(Track::Fixed(Len::Times(Metric::RowH, rows.get())));
-            out.push(Track::Fr(1.0));
-        })
-        .gap(Len::Zero)
+        responsive(
+            [1000.0, 2000.0],
+            grid((
+                plate().height(Metric::CardMinH),
+                plate().height(Metric::CardMinH),
+            ))
+            .layout_from(|_| panic!("replaced layout writer ran"))
+            .layout_from(move |layout| {
+                let columns = layout.columns();
+                columns.clear();
+                columns.extend([
+                    Track::Fixed(Len::Times(Metric::RowH, rows.get())),
+                    Track::Fr(1.0),
+                ]);
+            })
+            .cols_when(Narrow, [Track::Fr(1.0), Track::Fr(1.0)])
+            .cols_when(Wide, [])
+            .gap(Len::Zero)
+            .width(Len::Pct(1.0)),
+        )
         .width(Len::Pct(1.0)),
         root(),
     );
-    flush(&mut patch);
-
-    let second = || {
+    let mut identities = None;
+    for (width, count) in [
+        (1500.0, 2.0),
+        (800.0, 5.0),
+        (1500.0, 5.0),
+        (2500.0, 5.0),
+        (1500.0, 2.0),
+    ] {
+        rows.set(count);
+        Host::with(|h| h.set_window(Vector2 { x: width, y: 600.0 }));
+        crate::signal::flush();
+        flush(&mut patch);
         Host::with(|h| {
             let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
-            let (a, b) = (h.model().solved(nodes[1]), h.model().solved(nodes[2]));
-            b.rect.x0 - a.rect.x0
-        })
-    };
-    let row_h = crate::role::metric(
-        Metric::RowH,
-        crate::role::Scope::root(
-            crate::role::tests::palette(),
-            crate::role::AccentId(0),
-            crate::role::Density::Comfortable,
-        ),
-    );
-    assert!(
-        (second() - row_h * 2.0).abs() < 1.0,
-        "the computed track was not two row heights wide: the second child began {} DIPs \
-         across, against {}",
-        second(),
-        row_h * 2.0
-    );
-
-    rows.set(5.0);
-    crate::signal::flush();
-    flush(&mut patch);
-    assert!(
-        (second() - row_h * 5.0).abs() < 1.0,
-        "the track did not follow its signal: the second child began {} DIPs across, against \
-         {}",
-        second(),
-        row_h * 5.0
-    );
+            if let Some(before) = &identities {
+                assert_eq!(before, &nodes);
+            }
+            let (a, b) = (h.model.solved(nodes[2]), h.model.solved(nodes[3]));
+            let expected = match a.class {
+                Narrow => width / 2.0,
+                Wide => 0.0,
+                class => crate::role::metric(Metric::RowH, h.root_scope.at_width(class)) * count,
+            };
+            assert!(
+                (b.rect.x0 - a.rect.x0 - expected).abs() < 1.0,
+                "width {width}, count {count}"
+            );
+            if a.class == Wide {
+                assert!(
+                    b.rect.y0 > a.rect.y0,
+                    "empty template uses implicit placement"
+                );
+            }
+            identities = Some(nodes);
+        });
+    }
 }
 
 #[test]
@@ -2696,7 +2721,9 @@ fn computed_rows_replace_the_template_without_remounting_children() {
     let _held = mount(
         grid((plate(), plate()))
             .rows([Track::Fr(1.0)])
-            .rows_from(move |out| {
+            .layout_from(move |layout| {
+                let out = layout.rows();
+                out.clear();
                 out.extend([Track::Fixed(Len::Pct(fraction.get())), Track::Fr(1.0)])
             })
             .cols([Track::Fr(1.0)])
@@ -2749,66 +2776,6 @@ fn keyed_tiles_fill_multiple_columns() {
         "tiles did not share a row: {a:?} {b:?}"
     );
     assert!((b.rect.y0 - a.rect.y0).abs() < 1.0);
-}
-
-/// A computed column template survives the container resolving its own width class.
-///
-/// The two lowerings — the one a bound style act pushes, and the one the solve asks for when
-/// a class moves — both start from the node's recipe, so the recipe has to hold what the act
-/// wrote. Without that, a classified container keeps its template only until the first solve
-/// resolves a class other than the one the act ran at, and a two-track grid silently becomes
-/// the single auto-placed column a grid with no template is.
-///
-/// The classifier is inside the grid's own subtree here, so the grid resolves a class at all;
-/// the bounds put it at `Narrow`, which is not the class an unsolved node reads.
-#[test]
-fn a_computed_column_template_survives_a_class_change() {
-    use crate::layout::Track;
-    let mut patch = fixture();
-    let _held = mount(
-        crate::layout::responsive(
-            [1000.0, 2000.0],
-            crate::layout::grid((
-                plate().height(Metric::CardMinH),
-                plate().height(Metric::CardMinH),
-            ))
-            .cols_from(move |out| {
-                out.push(Track::Fixed(Len::Times(Metric::RowH, 3.0)));
-                out.push(Track::Fr(1.0));
-            })
-            .gap(Len::Zero)
-            .width(Len::Pct(1.0)),
-        )
-        .width(Len::Pct(1.0)),
-        root(),
-    );
-    flush(&mut patch);
-
-    // The classifier, the grid, then its two cells.
-    let (first, second) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
-        (h.model().solved(nodes[2]), h.model().solved(nodes[3]))
-    });
-    assert_eq!(
-        first.class,
-        windows_scene::WidthClass::Narrow,
-        "the fixture's window must classify narrow at these bounds for the test to mean          anything"
-    );
-    let row_h = crate::role::metric(
-        Metric::RowH,
-        crate::role::Scope::root(
-            crate::role::tests::palette(),
-            crate::role::AccentId(0),
-            crate::role::Density::Comfortable,
-        )
-        .at_width(windows_scene::WidthClass::Narrow),
-    );
-    let track = second.rect.x0 - first.rect.x0;
-    assert!(
-        (track - row_h * 3.0).abs() < 1.0,
-        "the computed template did not survive the class the solve resolved: the second          cell began {track} DIPs across, against {}",
-        row_h * 3.0
-    );
 }
 
 /// `hide_when` takes the node out of the layout and leaves it in the tree.
@@ -3377,14 +3344,12 @@ fn a_capitalised_run_announces_the_authors_casing() {
 
         // The shaped form: what the run was laid out from, which is the only place the drawn
         // casing can be read back without rasterizing.
-        let shaped = Host::with(|_| {
-            crate::build::text::with(|table| {
-                table
-                    .entries
-                    .iter()
-                    .map(|(_, entry)| entry.shaped_str().to_owned())
-                    .find(|s| s.eq_ignore_ascii_case("gain adjust"))
-            })
+        let shaped = Host::with(|h| {
+            h.text
+                .entries
+                .iter()
+                .map(|(_, entry)| entry.shaped_str().to_owned())
+                .find(|s| s.eq_ignore_ascii_case("gain adjust"))
         })
         .expect("the label is in the table");
         assert_eq!(shaped, "GAIN ADJUST", "the recipe requests capitals");
@@ -3996,11 +3961,13 @@ fn the_two_intrinsic_probes_differ_for_a_run_that_can_break() {
     let keys: Vec<_> = Host::with(|h| h.mounts.iter().filter_map(|(_, m)| m.text).collect());
     assert_eq!(keys.len(), 2, "the two runs registered");
     let probe = |key, avail| {
-        text::measure(windows_scene::MeasureIn {
-            key,
-            class: crate::role::WidthClass::Wide,
-            known: (None, None),
-            available: (avail, windows_scene::Avail::MaxContent),
+        Host::with(|h| {
+            h.text.measure(windows_scene::MeasureIn {
+                key,
+                class: crate::role::WidthClass::Wide,
+                known: (None, None),
+                available: (avail, windows_scene::Avail::MaxContent),
+            })
         })
     };
     use windows_scene::Avail::{MaxContent, MinContent};
@@ -4711,15 +4678,15 @@ fn a_sprites_strength_scales_the_roles_own_alpha() {
 #[test]
 fn a_selectable_ghost_mints_the_fill_its_selected_state_needs() {
     let mut patch = fixture();
-    let paints = |patch: &SinkPatch| {
+    let sprites = |patch: &SinkPatch| {
         patch
             .ops()
             .iter()
             .filter(|op| {
                 matches!(
                     op,
-                    Op::Paint {
-                        paint: Paint::Solid(_),
+                    Op::New {
+                        kind: windows_scene::NodeKind::Sprite,
                         ..
                     }
                 )
@@ -4729,7 +4696,7 @@ fn a_selectable_ghost_mints_the_fill_its_selected_state_needs() {
 
     let plain = mount(stack(crate::widget::button("plain").ghost()), root());
     flush(&mut patch);
-    let without = paints(&patch);
+    let without = sprites(&patch);
     patch.clear();
     drop(plain);
 
@@ -4738,7 +4705,7 @@ fn a_selectable_ghost_mints_the_fill_its_selected_state_needs() {
         root(),
     );
     flush(&mut patch);
-    let with = paints(&patch);
+    let with = sprites(&patch);
     drop(picks);
 
     // Exactly one more sprite: the fill the selected row supplies and the ghost row does not.

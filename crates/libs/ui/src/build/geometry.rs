@@ -81,12 +81,12 @@ pub(super) fn mount(node: windows_scene::NodeId, scope: Scope, mut draw: Draw) {
     });
 }
 
-pub(super) struct Lease<T>(pub windows_scene::Id<T>, pub std::rc::Rc<()>);
+pub(super) struct Lease<T>(pub windows_scene::Id<T>, pub u64);
 
 impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
         Host::try_with(|host| {
-            if std::rc::Rc::ptr_eq(&host.identity, &self.1) {
+            if host.identity == self.1 {
                 host.model().release(self.0);
             }
         });

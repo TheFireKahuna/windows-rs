@@ -10,27 +10,13 @@
 use crate::env::Env;
 use crate::hit_build::{HitBuilder, HitDecl, HitEntry};
 use crate::id::{Id, Ids};
-use crate::layout::{LayoutKind, LayoutTree, Measure, MeasureCtx, Restyle, Solved};
+use crate::layout::{LayoutKind, LayoutServices, LayoutTree, MeasureCtx, Solved};
 use crate::patch::{Attach, Op, SinkPatch, Span};
 use crate::responsive::Bounds;
 use crate::sink::*;
-use crate::tree::{self, Forest, Links};
 use windows_color::Radiance;
 use windows_numerics::Vector2;
 use windows_text::GlyphSeg;
-
-/// One node, app-side.
-#[derive(Debug, Default)]
-struct ModelNode {
-    /// The live id of whatever occupies this slot. A placement is emitted from the slot,
-    /// not from a walk, and a reused slot must not address itself by the previous
-    /// occupant's generation.
-    id: NodeId,
-    links: Links,
-    hit: Option<HitDecl>,
-    live: bool,
-    input_suspended: bool,
-}
 
 /// The app thread's half of the scene: structure, layout, and the patch.
 ///
@@ -41,7 +27,6 @@ pub struct Model {
     res_ids: Ids<()>,
     tracker_ids: Ids<Tracker>,
     delay_ids: Ids<Delay>,
-    nodes: Vec<ModelNode>,
     layout: LayoutTree,
     hits: HitBuilder,
     root: GroupId,
@@ -49,10 +34,6 @@ pub struct Model {
     pending: SinkPatch,
     solved: Vec<Solved>,
     previous: Vec<Solved>,
-    /// Parents whose child order the layout tree has not been told about yet.
-    dirty_children: Vec<NodeId>,
-    /// Scratch for one parent's children, reused across every parent in a pass.
-    scratch: Vec<NodeId>,
     /// Slot roots, in the order they opened. They occupy the end of the hit array.
     slots: Vec<SlotRootEntry>,
     /// The array the last hit rebuild emitted, kept after the patch carrying it is handed
@@ -99,26 +80,10 @@ struct SlotRootEntry {
     offset: Vector2,
 }
 
-impl Forest for Model {
-    fn links(&self, id: NodeId) -> Option<&Links> {
-        self.nodes
-            .get(id.index())
-            .filter(|node| node.id == id)
-            .map(|node| &node.links)
-    }
-
-    fn links_mut(&mut self, id: NodeId) -> Option<&mut Links> {
-        self.nodes
-            .get_mut(id.index())
-            .filter(|node| node.id == id)
-            .map(|node| &mut node.links)
-    }
-}
-
 impl core::fmt::Debug for Model {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Model")
-            .field("nodes", &self.nodes.len())
+            .field("nodes", &self.layout.nodes.len())
             .field("pending_ops", &self.pending.len())
             .field("window", &(self.window.x, self.window.y))
             .finish_non_exhaustive()
@@ -133,15 +98,12 @@ impl Model {
             res_ids: Ids::new(),
             tracker_ids: Ids::new(),
             delay_ids: Ids::new(),
-            nodes: Vec::new(),
             layout: LayoutTree::new(),
             hits: HitBuilder::default(),
             root: GroupId(NodeId::NONE),
             pending: SinkPatch::new(),
             solved: Vec::new(),
             previous: Vec::new(),
-            dirty_children: Vec::new(),
-            scratch: Vec::new(),
             slots: Vec::new(),
             last_hits: Vec::new(),
             window: Vector2 { x: 0.0, y: 0.0 },
@@ -159,21 +121,6 @@ impl Model {
     #[must_use]
     pub const fn root(&self) -> GroupId {
         self.root
-    }
-
-    /// Installs the callback that measures content-sized nodes — shaped text, and anything
-    /// else whose size this crate cannot know.
-    pub fn on_measure(&mut self, measure: impl Measure + 'static) {
-        self.layout.on_measure(measure);
-    }
-
-    /// Installs the callback that re-lowers a style whose metrics depend on the class in
-    /// scope.
-    ///
-    /// Called during the solve for the subtree of a container that just changed class, so
-    /// layout runs on the styles that class implies and no second pass corrects them.
-    pub fn on_restyle(&mut self, restyle: impl Restyle + 'static) {
-        self.layout.on_restyle(restyle);
     }
 
     /// Returns the window's size in DIPs, as the last
@@ -275,8 +222,8 @@ impl Model {
         if !self.ids.is_live(id) {
             return;
         }
-        self.unlink(id);
-        self.link(id, parent.0, after);
+        self.layout.unlink(id);
+        self.layout.link(id, parent.0, after);
         self.pending.push_op(Op::Move {
             id,
             parent: parent.0,
@@ -295,7 +242,7 @@ impl Model {
         if !self.ids.is_live(id) {
             return;
         }
-        self.unlink(id);
+        self.layout.unlink(id);
         self.pending.push_op(Op::Drop { id, exit });
         self.release_subtree(id);
         self.solve_dirty = true;
@@ -304,23 +251,13 @@ impl Model {
     fn mint(&mut self, kind: NodeKind, parent: Attach, after: Option<NodeId>) -> NodeId {
         let id: NodeId = self.ids.mint();
         let index = id.index();
-        if index >= self.nodes.len() {
-            self.nodes.resize_with(index + 1, ModelNode::default);
-        }
-        self.nodes[index] = ModelNode {
-            id,
-            live: true,
-            input_suspended: false,
-            ..ModelNode::default()
-        };
         // A reused slot must not be compared against its previous occupant's placement.
         if index < self.previous.len() {
             self.previous[index] = Solved::default();
         }
         self.layout.create(id, LayoutKind::Container);
-        // The model's own forest holds only node-to-node edges; the two parentless
-        // attachments are the front half's to seat, and carry no parent here.
-        self.link(id, parent.node().unwrap_or(NodeId::NONE), after);
+        self.layout
+            .link(id, parent.node().unwrap_or(NodeId::NONE), after);
         self.pending.push_op(Op::New {
             id,
             kind,
@@ -331,41 +268,14 @@ impl Model {
         id
     }
 
-    fn link(&mut self, id: NodeId, parent: NodeId, after: Option<NodeId>) {
-        if parent.is_none() {
-            self.nodes[id.index()].links.parent = parent;
-            return;
-        }
-        tree::link(self, id, parent, after);
-        self.mark_children_dirty(parent);
-    }
-
-    fn unlink(&mut self, id: NodeId) {
-        let parent = self.nodes[id.index()].links.parent;
-        if parent.is_none() {
-            return;
-        }
-        tree::unlink(self, id);
-        self.mark_children_dirty(parent);
-    }
-
-    fn mark_children_dirty(&mut self, parent: NodeId) {
-        if !parent.is_none() && !self.dirty_children.contains(&parent) {
-            self.dirty_children.push(parent);
-        }
-    }
-
     /// Releases a subtree's ids without emitting an op per node: the destroy cascades on
     /// the far side, so this only reclaims what the model itself is holding.
     fn release_subtree(&mut self, id: NodeId) {
-        let mut child = self.nodes[id.index()].links.first;
-        while !child.is_none() {
-            let next = self.nodes[child.index()].links.next;
+        for index in (0..self.layout.nodes[id.index()].children.len()).rev() {
+            let child = self.layout.child(id, index);
             self.release_subtree(child);
-            child = next;
         }
         self.layout.destroy(id);
-        self.nodes[id.index()] = ModelNode::default();
         self.ids.release(id);
     }
 
@@ -417,8 +327,8 @@ impl Model {
     /// Suspends all input and automation in a subtree without changing its layout or paint.
     /// A popup keeps its separate blocker while its moving content cannot be targeted.
     pub fn suspend_input(&mut self, id: NodeId, suspended: bool) {
-        if self.ids.is_live(id) && self.nodes[id.index()].input_suspended != suspended {
-            self.nodes[id.index()].input_suspended = suspended;
+        if self.ids.is_live(id) && self.layout.nodes[id.index()].input_suspended != suspended {
+            self.layout.nodes[id.index()].input_suspended = suspended;
             self.hits_dirty = true;
         }
     }
@@ -426,18 +336,22 @@ impl Model {
     /// Returns whether this node or an ancestor is waiting for its entry to finish.
     pub fn input_suspended(&self, mut id: NodeId) -> bool {
         while self.ids.is_live(id) {
-            let node = &self.nodes[id.index()];
+            let node = &self.layout.nodes[id.index()];
             if node.input_suspended {
                 return true;
             }
-            id = node.links.parent;
+            id = node.parent.map_or(NodeId::NONE, |parent| {
+                self.layout.nodes[usize::from(parent)].id
+            });
         }
         false
     }
 
     /// Declares what a node participates in, for the hit array. `None` removes it from routing.
     pub fn hit(&mut self, id: NodeId, decl: Option<HitDecl>) {
-        if let Some(node) = self.nodes.get_mut(id.index())
+        if let Some(node) = self.layout.nodes.get_mut(id.index())
+            && node.id == id
+            && node.live
             && node.hit != decl
         {
             node.hit = decl;
@@ -725,8 +639,8 @@ impl Model {
     /// `env` is the same value [`Scene::apply`](crate::Scene::apply) is given, so every edge
     /// this solve snaps lands on the grid the rasters on the far side of the seam are built
     /// for.
-    pub fn flush(&mut self, patch: &mut SinkPatch, env: Env) {
-        self.solve(env);
+    pub fn flush(&mut self, patch: &mut SinkPatch, env: Env, services: &mut LayoutServices<'_>) {
+        self.solve(env, services);
         // Stamped with what it was solved under, so the far side can tell geometry
         // snapped to this pixel grid from geometry snapped to another.
         self.pending.env = Some(env);
@@ -745,26 +659,37 @@ impl Model {
     ///
     /// Idempotent: a second call with nothing changed does nothing, and
     /// [`flush`](Model::flush) calls it unconditionally.
-    pub fn solve(&mut self, env: Env) {
+    pub fn solve(&mut self, env: Env, services: &mut LayoutServices<'_>) {
         // A pixel grid that moved re-snaps every edge in the tree, so it is a solve.
         if self.env.replace(env).is_some_and(|last| last != env) {
             self.solve_dirty = true;
         }
-        self.push_dirty_children();
 
         if self.solve_dirty {
             let (window, scale) = (self.window, env.scale());
             self.layout.begin(&mut self.solved);
             let origin = Vector2 { x: 0.0, y: 0.0 };
-            self.layout
-                .solve_root(self.root.0, window, origin, scale, &mut self.solved);
+            self.layout.solve_root(
+                self.root.0,
+                window,
+                origin,
+                scale,
+                &mut self.solved,
+                services,
+            );
             // Then every open overlay, each its own root, each measured against the window
             // box and gathered at where it was placed. By index, because the slot list and
             // the layout tree are disjoint fields of the same borrow.
             for index in 0..self.slots.len() {
                 let slot = self.slots[index];
-                self.layout
-                    .solve_root(slot.root.0, window, slot.offset, scale, &mut self.solved);
+                self.layout.solve_root(
+                    slot.root.0,
+                    window,
+                    slot.offset,
+                    scale,
+                    &mut self.solved,
+                    services,
+                );
             }
             // A solve that moved something changes the array too, so the rebuild follows the
             // placements rather than the pass.
@@ -775,26 +700,6 @@ impl Model {
             self.build_hits();
             self.hits_dirty = false;
         }
-    }
-
-    fn push_dirty_children(&mut self) {
-        let mut scratch = core::mem::take(&mut self.scratch);
-        for index in 0..self.dirty_children.len() {
-            let parent = self.dirty_children[index];
-            if !self.ids.is_live(parent) {
-                continue;
-            }
-            scratch.clear();
-            let mut child = self.nodes[parent.index()].links.first;
-            while !child.is_none() {
-                scratch.push(child);
-                child = self.nodes[child.index()].links.next;
-            }
-            self.layout.set_children(parent, &scratch);
-        }
-        self.dirty_children.clear();
-        scratch.clear();
-        self.scratch = scratch;
     }
 
     /// Emits an offset and a size for the nodes that moved, and returns whether any did.
@@ -819,7 +724,7 @@ impl Model {
                 continue;
             }
             self.previous[index] = now;
-            let Some(node) = self.nodes.get(index) else {
+            let Some(node) = self.layout.nodes.get(index) else {
                 continue;
             };
             if !node.live {
@@ -916,23 +821,20 @@ impl Model {
         if !self.ids.is_live(id) {
             return;
         }
-        let (decl, first) = {
-            let node = &self.nodes[id.index()];
+        let (decl, count) = {
+            let node = &self.layout.nodes[id.index()];
             if node.input_suspended {
                 return;
             }
-            (node.hit, node.links.first)
+            (node.hit, node.children.len())
         };
         let solved = self.solved.get(id.index()).copied().unwrap_or_default();
         {
             let out = self.pending.hits_mut();
             builder.push(out, depth, id, &solved, decl);
         }
-        let mut child = first;
-        while !child.is_none() {
-            let next = self.nodes[child.index()].links.next;
-            self.walk_hits(builder, child, depth + 1);
-            child = next;
+        for index in 0..count {
+            self.walk_hits(builder, self.layout.child(id, index), depth + 1);
         }
     }
 
@@ -990,13 +892,13 @@ mod tests {
         model.paint(sprite, Paint::Solid(Radiance::new(1.0, 1.0, 1.0, 1.0)));
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert!(!patch.is_empty());
         assert!(model.pending.is_empty(), "the model kept a drained buffer");
 
         // A second flush with nothing changed emits nothing.
         let mut second = SinkPatch::new();
-        model.flush(&mut second, env());
+        model.flush(&mut second, env(), &mut Default::default());
         assert!(second.is_empty());
     }
 
@@ -1013,14 +915,14 @@ mod tests {
             None,
             "an unflushed patch claims no environment"
         );
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert_eq!(patch.env(), Some(env()));
 
         // Even a pass that emitted nothing carries it: an output transform can move without
         // moving a rect and still has to reach the front half, and the stamp is how an empty
         // patch names the display it is empty *for*.
         let mut second = SinkPatch::new();
-        model.flush(&mut second, env());
+        model.flush(&mut second, env(), &mut Default::default());
         assert!(second.is_empty());
         assert_eq!(second.env(), Some(env()));
 
@@ -1041,7 +943,7 @@ mod tests {
             OutputTransform::for_display(DisplayCapability::Sdr, 203.0),
         );
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, hidpi);
+        model.flush(&mut patch, hidpi, &mut Default::default());
         assert_ne!(patch.env(), Some(env()));
         assert_eq!(hidpi.scale(), 2.0);
     }
@@ -1060,7 +962,7 @@ mod tests {
         model.style(c.node(), &box_style(30.0, 10.0));
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         // Paint order is a, c, b — `c` was inserted directly above `a`.
         assert_eq!(model.solved(a.node()).rect.x0, 0.0);
         assert_eq!(model.solved(c.node()).rect.x0, 10.0);
@@ -1076,10 +978,10 @@ mod tests {
         let grandchild = model.sprite(parent, None);
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
 
         model.destroy(parent.node(), Exit::Fade { ms: 120 });
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         let drops = patch
             .ops()
             .iter()
@@ -1114,7 +1016,7 @@ mod tests {
         model.hit(button.node(), decl(HitFlags::INTERACTIVE));
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert!(patch.ops().iter().any(|op| matches!(op, Op::Bind { .. })));
 
         // Hover: one flag, on one entry.
@@ -1122,7 +1024,7 @@ mod tests {
             button.node(),
             decl(HitFlags::INTERACTIVE | HitFlags::GESTURE),
         );
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert!(
             patch.ops().iter().all(|op| matches!(op, Op::Hits { .. })),
             "a hit declaration change emitted more than the array: {:?}",
@@ -1130,7 +1032,7 @@ mod tests {
         );
 
         // And a pass with nothing at all changed emits nothing.
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert!(patch.is_empty());
     }
 
@@ -1165,7 +1067,7 @@ mod tests {
         );
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         let entries = patch.hit_entries();
         let ids: Vec<usize> = entries.iter().map(|e| e.id.index()).collect();
         assert_eq!(
@@ -1187,27 +1089,41 @@ mod tests {
             let mut style = box_style(100.0, 100.0);
             style.position = taffy::Position::Absolute;
             model.style(node, &style);
-            model.hit(node, Some(HitDecl {
-                flags: HitFlags::INTERACTIVE,
-                id: ControlId::raw(index, 1),
-                touch_inflate: None,
-            }));
+            model.hit(
+                node,
+                Some(HitDecl {
+                    flags: HitFlags::INTERACTIVE,
+                    id: ControlId::raw(index, 1),
+                    touch_inflate: None,
+                }),
+            );
         }
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         let mut table = crate::HitTable::default();
         table.replace(patch.hit_entries());
         let point = crate::Point { x: 50.0, y: 50.0 };
-        assert_eq!(table.hit(point, crate::ContactKind::Mouse).unwrap().id, ControlId::raw(2, 1));
+        assert_eq!(
+            table.hit(point, crate::ContactKind::Mouse).unwrap().id,
+            ControlId::raw(2, 1)
+        );
         patch.clear();
         model.place(a.node(), root, Some(b.node()));
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert!(patch.ops().iter().any(|op| matches!(op, Op::Hits { .. })));
-        assert!(!patch.ops().iter().any(|op| matches!(op, Op::New { .. } | Op::Drop { .. })));
+        assert!(
+            !patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::New { .. } | Op::Drop { .. }))
+        );
         table.replace(patch.hit_entries());
-        assert_eq!(table.hit(point, crate::ContactKind::Mouse).unwrap().id, ControlId::raw(1, 1));
+        assert_eq!(
+            table.hit(point, crate::ContactKind::Mouse).unwrap().id,
+            ControlId::raw(1, 1)
+        );
         patch.clear();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert!(patch.is_empty());
     }
 
@@ -1240,7 +1156,7 @@ mod tests {
         );
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert_eq!(model.last_hits(), patch.hit_entries());
         assert!(!model.last_hits().is_empty());
 
@@ -1253,7 +1169,7 @@ mod tests {
         // And a rebuild replaces it whole.
         model.hit(menu.node(), None);
         let mut second = SinkPatch::new();
-        model.flush(&mut second, env());
+        model.flush(&mut second, env(), &mut Default::default());
         assert_eq!(model.last_hits(), second.hit_entries());
         assert_ne!(model.last_hits(), retained.as_slice());
     }
@@ -1269,7 +1185,7 @@ mod tests {
         model.cancel_delay(delay);
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         let delays: Vec<Op> = patch
             .ops()
             .iter()
@@ -1307,7 +1223,7 @@ mod tests {
         model.style(item.node(), &box_style(80.0, 20.0));
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert_eq!(model.solved(menu.node()).size, Vector2 { x: 80.0, y: 60.0 });
 
         // Placed: the subtree's rects move with it, absolutely, and the array reads them.
@@ -1316,7 +1232,7 @@ mod tests {
             !model.place_slot(menu, Vector2 { x: 120.0, y: 40.0 }),
             "placing where it already is is not a solve"
         );
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
 
         assert_eq!(model.solved(menu.node()).rect.x0, 120.0);
         assert_eq!(model.solved(item.node()).rect.y0, 40.0);
@@ -1361,12 +1277,12 @@ mod tests {
         model.style(rider.node(), &box_style(8.0, 8.0));
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         let before = model.solved(rider.node());
 
         // The spacer widens, so everything after it slides.
         model.style(spacer.node(), &box_style(30.0, 10.0));
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         let after = model.solved(rider.node());
         assert_ne!(
             after.rect.x0, before.rect.x0,
@@ -1397,17 +1313,17 @@ mod tests {
         model.style(menu.node(), &box_style(80.0, 60.0));
 
         let mut patch = SinkPatch::new();
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert_eq!(patch.hit_entries().len(), 1, "the blocker");
 
         model.close_slot(menu);
         model.destroy(menu.node(), Exit::None);
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert!(patch.hit_entries().is_empty());
 
         // And a pass after it is empty: a closed slot is not solved, so it cannot keep
         // reporting that something moved.
-        model.flush(&mut patch, env());
+        model.flush(&mut patch, env(), &mut Default::default());
         assert!(patch.is_empty());
     }
 }

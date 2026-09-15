@@ -1304,7 +1304,12 @@ fn a_scrolling_flyout_keeps_its_rail_above_the_choices() {
         flyout().stack(
             scroll_with(
                 Reveal::Always,
-                stack((button("Alpha"), button("Beta"), button("Gamma"), button("Delta"))),
+                stack((
+                    button("Alpha"),
+                    button("Beta"),
+                    button("Gamma"),
+                    button("Delta"),
+                )),
             )
             .height(Len::Times(Metric::RowH, 2.0))
             .width(Len::Times(Metric::RowH, 11.0)),
@@ -1313,16 +1318,25 @@ fn a_scrolling_flyout_keeps_its_rail_above_the_choices() {
     flush(&mut patch);
     let (grab, rect) = Host::with(|h| {
         let row = h.scrolls.iter().next().unwrap().1;
-        (row.grab.unwrap(), h.model.solved(row.rail.unwrap().node()).rect)
+        (
+            row.grab.unwrap(),
+            h.model.solved(row.rail.unwrap().node()).rect,
+        )
     });
     let table = hits(&patch);
     let hit = table
         .hit(
-            Vector2 { x: (rect.x0 + rect.x1) * 0.5, y: (rect.y0 + rect.y1) * 0.5 },
+            Vector2 {
+                x: (rect.x0 + rect.x1) * 0.5,
+                y: (rect.y0 + rect.y1) * 0.5,
+            },
             windows_scene::ContactKind::Mouse,
         )
         .unwrap();
-    assert_eq!(hit.id, grab, "rail must win over choices after overlay placement");
+    assert_eq!(
+        hit.id, grab,
+        "rail must win over choices after overlay placement"
+    );
     overlays.close(id, &mut focus.ops);
 }
 
@@ -1520,6 +1534,7 @@ fn a_window_presentation_switch_snaps_both_ways_and_keeps_the_next_dismissal_ani
     });
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
+    flush_signals();
     overlays.sync(&mut focus.ops);
     flush(&mut patch);
     assert_eq!(overlays.depth(), 1);

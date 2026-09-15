@@ -1,6 +1,6 @@
 //! App half of fields: callbacks and shaping. The working document remains input-owned.
 
-use super::{Host, text};
+use super::Host;
 use crate::role::{Fill, Role, Scope, Text};
 use crate::text_input::{Commit, Geometry, InputScope, Layout, Selection, Source, Update};
 use std::{rc::Rc, sync::Arc};
@@ -75,7 +75,7 @@ impl Host {
             },
         );
         // Text is absolute: editing a long value cannot widen its field or its neighbours.
-        if let Some((node, _)) = text::with(|t| t.field_geometry(key, 0)) {
+        if let Some((node, _)) = self.text.field_geometry(key, 0) {
             let mut style = taffy::Style::DEFAULT;
             style.position = taffy::Position::Absolute;
             self.model().style(node, &style);
@@ -156,18 +156,16 @@ impl Host {
             row.geometry = None;
             let original = String::from_utf16_lossy(value);
             let display = if row.scope == InputScope::Password {
-                text::with(|t| {
-                    t.password_display(
-                        row.key,
-                        &original,
-                        &mut row.password_run,
-                        &mut row.password_map,
-                    )
-                })
+                self.text.password_display(
+                    row.key,
+                    &original,
+                    &mut row.password_run,
+                    &mut row.password_map,
+                )
             } else {
                 original
             };
-            let node = text::with(|t| t.set_text(row.key, &display));
+            let node = self.text.set_text(row.key, &display);
             if let Some(node) = node {
                 self.model().remeasure(node);
             }
@@ -194,7 +192,7 @@ impl Host {
         let mut fields = core::mem::take(&mut self.fields);
         for (id, row) in fields.iter_mut() {
             let solved = self.model().solved(row.group.node());
-            let Some((node, font)) = text::with(|t| t.field_font(row.key)) else {
+            let Some((node, font)) = self.text.field_font(row.key) else {
                 continue;
             };
             if !row.dirty
@@ -212,8 +210,7 @@ impl Host {
             {
                 (**row.geometry.as_ref().unwrap()).clone()
             } else {
-                let Some((_, mut geometry)) =
-                    text::with(|t| t.field_geometry(row.key, row.revision))
+                let Some((_, mut geometry)) = self.text.field_geometry(row.key, row.revision)
                 else {
                     continue;
                 };

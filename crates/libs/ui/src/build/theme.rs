@@ -1,22 +1,34 @@
 //! Retained paint recipes and one window-owned theme transaction.
 use super::{
     Host,
-    arena::{HaloSeed, SpriteSeed},
-    host::MountId,
+    arena::{HaloSeed, MaskSeed, Part},
 };
-use crate::role::Scope;
-use crate::widget::{Chrome, RoleSet};
-use windows_scene::{BackdropSpec, Env, GeomId, NodeId, SpriteId};
+use crate::role::{Role, Scope, Silhouette};
+use crate::widget::Chrome;
+use windows_scene::{
+    BackdropSpec, ControlId, Env, GeomId, NodeId, Paint, RampId, RegionId, SpriteId,
+};
 
-#[derive(Clone)]
+/// A part has one paint source. Owner state never overwrites a gradient or region.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum PaintSource {
+    Role(Role),
+    Owner(ControlId),
+    Gradient(RampId),
+    Region(RegionId),
+}
+
+#[derive(Copy, Clone)]
 pub(crate) struct Appearance {
     pub id: SpriteId,
-    pub seed: SpriteSeed,
+    pub mask: MaskSeed,
+    pub source: PaintSource,
+    pub part: Part,
+    pub strength: f32,
     pub geom: Option<GeomId>,
     pub scope: Scope,
-    pub roles: Option<RoleSet>,
     pub chrome: Option<Chrome>,
-    pub halo: Option<(HaloSeed, crate::role::Silhouette)>,
+    pub halo: Option<(HaloSeed, Silhouette)>,
     pub next: NodeId,
     pub wash: bool,
 }
@@ -26,41 +38,121 @@ impl Appearance {
         self.scope = scope;
         let Some(chrome) = self.chrome else { return };
         if self.wash {
-            self.seed.mask = super::arena::MaskSeed::Radius {
+            self.mask = MaskSeed::Radius {
                 dips: super::mount::surface_corners(
                     crate::role::metric(chrome.radius, scope),
                     Some(chrome),
                 ),
             };
         } else if let Some((_, seed)) =
-            super::mount::chrome_seeds(self.roles, Some(chrome), scope, true)
-                .find(|(part, _)| *part == self.seed.part)
+            super::mount::chrome_seeds(Some(chrome.roles), Some(chrome), scope, true)
+                .find(|(part, _)| *part == self.part)
         {
-            self.seed = seed;
+            self.mask = seed.mask;
+        }
+    }
+
+    /// The same resolver publishes initial appearance, theme changes and owner-state changes.
+    pub(super) fn publish(&self, host: &mut Host, mask: bool) {
+        if mask {
+            super::mount::emit_mask(host, self.id, self.mask, self.geom, self.scope);
+        }
+        let role = match self.source {
+            PaintSource::Role(role) => Some((role, self.strength)),
+            PaintSource::Owner(id) => host.controls.get(id).and_then(|owner| {
+                let roles = owner.chrome?.in_state(owner.state);
+                let role = match self.part {
+                    Part::Fill => roles.fill.map(Role::Fill),
+                    Part::Border => roles.stroke.map(Role::Stroke),
+                    Part::Label => Some(Role::Text(roles.text)),
+                    _ => None,
+                };
+                role.map(|role| (role, 1.0))
+            }),
+            PaintSource::Gradient(_) | PaintSource::Region(_) => None,
+        };
+        let scope = self.scope.for_paint();
+        let light = role.map_or(windows_color::Radiance::TRANSPARENT, |(role, strength)| {
+            let light = crate::role::resolve(role, scope);
+            light.with_alpha(light.a * strength)
+        });
+        let paint = match self.source {
+            PaintSource::Gradient(id) => Paint::Ramp(id),
+            PaintSource::Region(id) => Paint::Presented(id),
+            _ => Paint::Solid(light),
+        };
+        host.model.paint(self.id, paint);
+        let emission = role
+            .filter(|_| self.part == Part::Label)
+            .map_or(crate::role::Emission::NONE, |(role, _)| {
+                crate::role::emission(role, scope)
+            });
+        host.model.halo(
+            self.id,
+            super::mount::halo_of(emission, Silhouette::Ink, light),
+        );
+        if let Some((halo, silhouette)) = self.halo {
+            super::mount::emit_halo(host, halo, self.id, self.scope, silhouette);
         }
     }
 }
 
 impl Host {
+    pub(crate) fn repaint_control(&mut self, id: ControlId) {
+        let Some(control) = self.controls.get(id).filter(|c| c.chrome.is_some()) else {
+            return;
+        };
+        let parts = [control.fill, control.label, control.border];
+        for id in parts.into_iter().flatten() {
+            if let Some(part) = self.appearances.get(id.node()).copied()
+                && matches!(part.source, PaintSource::Owner(_))
+            {
+                part.publish(self, false);
+            }
+        }
+    }
+
+    pub(crate) fn claim_control_paint(&mut self, id: ControlId) {
+        let Some(control) = self.controls.get(id).filter(|c| c.chrome.is_some()) else {
+            return;
+        };
+        for sprite in [control.fill, control.label, control.border]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(part) = self.appearances.get_mut(sprite.node())
+                && matches!(part.source, PaintSource::Role(_))
+            {
+                part.source = PaintSource::Owner(id);
+            }
+        }
+        if let Some(label) = self.controls.get(id).and_then(|c| c.label)
+            && let Some(part) = self.appearances.get(label.node()).copied()
+            && matches!(part.source, PaintSource::Owner(_))
+        {
+            part.publish(self, false);
+        }
+    }
+
     pub(crate) fn publish_masks(&mut self) {
         for index in self.appearances.positions() {
             let Some(id) = self.appearances.id_at(index) else {
                 continue;
             };
-            let mut paint = self.appearances.get(id).unwrap().clone();
+            let mut paint = *self.appearances.get(id).unwrap();
             let scope = paint.scope.at_width(self.model.solved(id).class);
             if scope == paint.scope {
                 continue;
             }
             paint.resolve(scope);
-            if !matches!(paint.seed.mask, super::arena::MaskSeed::Run { .. }) {
-                super::mount::emit_mask(self, paint.id, &paint.seed, paint.geom, scope);
+            if !matches!(paint.mask, super::arena::MaskSeed::Run { .. }) {
+                super::mount::emit_mask(self, paint.id, paint.mask, paint.geom, scope);
             }
             self.appearances.place(id, paint);
         }
     }
 
-    pub(crate) fn own_appearance(&mut self, id: SpriteId, owner: MountId, chrome: Option<Chrome>) {
+    pub(crate) fn own_appearance(&mut self, id: SpriteId, owner: NodeId, chrome: Option<Chrome>) {
         let Some(paint) = self.appearances.get_mut(id.node()) else {
             return;
         };
@@ -100,31 +192,19 @@ impl Host {
                 row.theme.set(row.theme.get().in_theme(root));
             }
         }
-        super::style::with(|table| {
-            for (id, recipe) in table.iter_mut() {
-                recipe.scope = recipe.scope.in_theme(root);
-                let style = recipe.lower(self.model.solved(id).class);
-                self.model.style(id, &style);
-            }
-        });
+        for (id, recipe) in self.styles.iter_mut() {
+            recipe.scope = recipe.scope.in_theme(root);
+            let style = recipe.lower(self.model.solved(id).class);
+            self.model.style(id, &style);
+        }
         // Copy each small recipe outside the table borrow; no callback or per-frame work.
         for index in self.appearances.positions() {
             let Some(id) = self.appearances.id_at(index) else {
                 continue;
             };
-            let mut paint = self.appearances.get(id).unwrap().clone();
+            let mut paint = *self.appearances.get(id).unwrap();
             paint.resolve(paint.scope.in_theme(root));
-            super::mount::emit_sprite_on(
-                self,
-                paint.id,
-                &paint.seed,
-                paint.geom,
-                paint.scope,
-                paint.roles,
-            );
-            if let Some((halo, silhouette)) = paint.halo {
-                super::mount::emit_halo(self, halo, paint.id, paint.scope, silhouette);
-            }
+            paint.publish(self, true);
             self.appearances.place(id, paint);
         }
         for (id, (stops, spread)) in self.ramps.iter() {
@@ -137,14 +217,13 @@ impl Host {
                 .collect();
             self.model.set_ramp(id, &resolved, *spread);
         }
-        super::text::with(|table| table.retheme(root, &mut self.model));
+        self.text.retheme(root, &mut self.model);
         self.retheme_fields(root);
         for (_, probe) in self.probes.iter_mut() {
             probe.scope = probe.scope.in_theme(root);
         }
         for (_, control) in self.controls.iter_mut() {
             control.scope = control.scope.in_theme(root);
-            control.repaint(&mut self.model);
         }
         for (_, scroll) in self.scrolls.iter() {
             if let Some(thumb) = scroll.thumb {

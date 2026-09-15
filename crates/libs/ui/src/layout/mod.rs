@@ -10,7 +10,8 @@ mod probe;
 mod scroll;
 
 pub use len::{Align, Len, Track};
-pub use preset::{Edge, Over, Preset, Rule, lower, lower_with, root};
+pub use preset::root;
+pub use preset::{Edge, Layout, Position, Preset};
 pub(crate) use probe::ProbeRow;
 pub use probe::{Placed, Probe, probe};
 pub use scroll::{

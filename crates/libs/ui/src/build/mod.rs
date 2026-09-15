@@ -13,6 +13,8 @@ mod adapt;
 pub(crate) mod arena;
 mod children;
 mod el;
+mod ui;
+pub use ui::{Element, Node, Ui};
 pub(crate) mod field;
 mod geometry;
 mod host;
@@ -22,17 +24,13 @@ pub use geometry::{local_geometries, local_geometry, path_with, paths_with};
 mod style;
 #[cfg(test)]
 pub(crate) mod tests;
-/// Holds the thread's shaping engine and the table of laid-out runs behind every label.
-///
-/// [`text::install`] is the one item an application calls, at start-up, with the ladder its
-/// `Backends` already holds. Everything else here is the lowering's.
-pub mod text;
+pub(crate) mod text;
 
 pub use adapt::{Each, Switch, When, each, each_into, switch, when};
 pub use children::{Children, IntoChildren};
 pub use el::{Any, Button, El, Field, Path, Region, View};
 pub use host::Host;
-pub(crate) use host::{MountId, Placement, ScrollId};
+pub(crate) use host::{Placement, ScrollId};
 pub(crate) use mount::region_sink;
 pub use mount::{Mount, Stop, geometry, mount, mount_at, ramp, root_scope, set_geometry, set_ramp};
 

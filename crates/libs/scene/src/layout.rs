@@ -8,6 +8,7 @@
 //! The one layout mode this crate adds is [`LayoutKind::Responsive`]: a container that
 //! classifies its own inline size into a [`WidthClass`] for its subtree.
 
+use crate::hit_build::HitDecl;
 use crate::id::Id;
 use crate::responsive::{Bounds, WidthClass};
 use crate::sink::NodeId;
@@ -180,37 +181,6 @@ pub struct MeasureIn {
     pub available: (Avail, Avail),
 }
 
-/// Measures what this crate cannot: shaped text, and anything else whose size is content.
-pub trait Measure: Send {
-    /// Returns the size in DIPs of the content `input` names.
-    fn measure(&mut self, input: MeasureIn) -> Vector2;
-}
-
-impl<F: FnMut(MeasureIn) -> Vector2 + Send> Measure for F {
-    fn measure(&mut self, input: MeasureIn) -> Vector2 {
-        self(input)
-    }
-}
-
-/// Re-lowers a style whose metrics depend on the class in scope.
-///
-/// The twin of [`Measure`]: this crate resolves the class, and the layer above resolves what
-/// a class *means*. Called during the solve, for the subtree of a container that just
-/// changed class, so layout runs on the styles that class implies.
-///
-/// **Runs inside the solve**, so an implementation must not re-enter the model and must not
-/// allocate.
-pub trait Restyle: Send {
-    /// Returns the style `node` takes at `class`, or `None` to leave its style alone.
-    fn restyle(&mut self, node: NodeId, class: WidthClass) -> Option<Style>;
-}
-
-impl<F: FnMut(NodeId, WidthClass) -> Option<Style> + Send> Restyle for F {
-    fn restyle(&mut self, node: NodeId, class: WidthClass) -> Option<Style> {
-        self(node, class)
-    }
-}
-
 /// How a node lays its children out.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub enum LayoutKind {
@@ -226,18 +196,18 @@ pub enum LayoutKind {
 }
 
 #[derive(Debug)]
-struct LayoutNode {
+pub(crate) struct LayoutNode {
     /// This slot's own id. A `TaffyId` is a bare index and carries no generation, so it
     /// cannot name a node back to the layer above.
-    id: NodeId,
+    pub(crate) id: NodeId,
     style: Style,
     kind: LayoutKind,
     measure: MeasureCtx,
-    children: Vec<TaffyId>,
+    pub(crate) children: Vec<TaffyId>,
     /// The node to walk up to when this one is dirtied. Taffy caches a node's output keyed
     /// on its *input*, so a change here that leaves a parent's input alone — hiding a
     /// child, re-measuring a leaf — leaves the parent's cached answer standing.
-    parent: Option<TaffyId>,
+    pub(crate) parent: Option<TaffyId>,
     cache: Cache,
     /// The class this node last resolved, for the hysteresis band. Unused on anything but a
     /// responsive node.
@@ -250,7 +220,9 @@ struct LayoutNode {
     hidden: bool,
     unrounded: Layout,
     solved: Layout,
-    live: bool,
+    pub(crate) live: bool,
+    pub(crate) hit: Option<HitDecl>,
+    pub(crate) input_suspended: bool,
 }
 
 impl Default for LayoutNode {
@@ -268,6 +240,8 @@ impl Default for LayoutNode {
             unrounded: Layout::with_order(0),
             solved: Layout::with_order(0),
             live: false,
+            hit: None,
+            input_suspended: false,
         }
     }
 }
@@ -277,51 +251,16 @@ impl Default for LayoutNode {
 /// A node and its style live from [`create`](Self::create) to [`destroy`](Self::destroy), so
 /// a pass neither rebuilds them nor discards the taffy cache that makes an unchanged subtree
 /// cost nothing.
+#[derive(Debug, Default)]
 pub struct LayoutTree {
-    nodes: Vec<LayoutNode>,
-    /// The class in scope while a subtree is being laid out. Written by a responsive node
-    /// before it delegates; read by every descendant's measurement.
-    ambient: WidthClass,
-    measure: Option<Box<dyn Measure>>,
-    restyle: Option<Box<dyn Restyle>>,
-}
-
-impl core::fmt::Debug for LayoutTree {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("LayoutTree")
-            .field("nodes", &self.nodes.len())
-            .field("ambient", &self.ambient)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for LayoutTree {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub(crate) nodes: Vec<LayoutNode>,
 }
 
 impl LayoutTree {
-    /// Returns an empty tree, with no measure and no restyle callback installed.
+    /// Returns an empty retained tree.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            nodes: Vec::new(),
-            ambient: WidthClass::default(),
-            measure: None,
-            restyle: None,
-        }
-    }
-
-    /// Installs the callback that measures content-sized nodes, replacing any previous one.
-    pub fn on_measure(&mut self, measure: impl Measure + 'static) {
-        self.measure = Some(Box::new(measure));
-    }
-
-    /// Installs the callback that re-lowers a class-dependent style, replacing any previous
-    /// one.
-    pub fn on_restyle(&mut self, restyle: impl Restyle + 'static) {
-        self.restyle = Some(Box::new(restyle));
+        Self { nodes: Vec::new() }
     }
 
     /// Clears `id`'s cache and every cache above it.
@@ -442,30 +381,44 @@ impl LayoutTree {
         self.mark_dirty(TaffyId::from(node.index()));
     }
 
-    /// Replaces a node's children, in paint order.
-    ///
-    /// **Every child is pointed back at `node`, including when the list compares equal.** A
-    /// `TaffyId` is a bare index, so a list of ids reused at the same positions compares
-    /// equal to one whose members are fresh nodes that [`create`](Self::create) reset,
-    /// parent included. A child left with no parent stops
-    /// [`mark_dirty`](Self::mark_dirty) at itself, and every ancestor keeps a cache that
-    /// predates the change.
-    pub fn set_children(&mut self, node: NodeId, children: &[NodeId]) {
-        let parent = TaffyId::from(node.index());
-        for &child in children {
-            self.slot(child).parent = Some(parent);
-        }
-        let slot = self.slot(node);
-        if slot.children.len() == children.len()
-            && core::iter::zip(&slot.children, children)
-                .all(|(&a, b)| a == TaffyId::from(b.index()))
-        {
+    pub(crate) fn child(&self, parent: NodeId, index: usize) -> NodeId {
+        self.nodes[usize::from(self.nodes[parent.index()].children[index])].id
+    }
+
+    pub(crate) fn link(&mut self, id: NodeId, parent: NodeId, after: Option<NodeId>) {
+        if parent.is_none() {
             return;
         }
-        slot.children.clear();
-        slot.children
-            .extend(children.iter().map(|c| TaffyId::from(c.index())));
-        self.mark_dirty(parent);
+        let children = &mut self.nodes[parent.index()].children;
+        let at = after.map_or(0, |after| {
+            children
+                .iter()
+                .position(|child| usize::from(*child) == after.index())
+                .expect("a node must be ordered against a sibling")
+                + 1
+        });
+        children.insert(at, TaffyId::from(id.index()));
+        self.nodes[id.index()].parent = Some(TaffyId::from(parent.index()));
+        self.mark_dirty(TaffyId::from(parent.index()));
+    }
+
+    pub(crate) fn unlink(&mut self, id: NodeId) {
+        if let Some(parent) = self.nodes[id.index()].parent.take() {
+            self.nodes[usize::from(parent)]
+                .children
+                .retain(|child| usize::from(*child) != id.index());
+            self.mark_dirty(parent);
+        }
+    }
+
+    #[cfg(test)]
+    fn set_children(&mut self, node: NodeId, children: &[NodeId]) {
+        while let Some(child) = self.nodes[node.index()].children.pop() {
+            self.nodes[usize::from(child)].parent = None;
+        }
+        for (index, &child) in children.iter().enumerate() {
+            self.link(child, node, index.checked_sub(1).map(|i| children[i]));
+        }
     }
 
     /// Empties `out` and sizes it to one entry per node.
@@ -498,11 +451,16 @@ impl LayoutTree {
         origin: Vector2,
         scale: f32,
         out: &mut Vec<Solved>,
+        services: &mut LayoutServices<'_>,
     ) {
-        self.ambient = WidthClass::default();
+        let mut solver = Solver {
+            nodes: &mut self.nodes,
+            ambient: WidthClass::default(),
+            services,
+        };
         let taffy_root = TaffyId::from(root.index());
         compute_root_layout(
-            self,
+            &mut solver,
             taffy_root,
             Size {
                 width: AvailableSpace::Definite(size.x),
@@ -511,7 +469,7 @@ impl LayoutTree {
         );
 
         let (ox, oy) = (snap(origin.x, scale), snap(origin.y, scale));
-        self.gather(taffy_root, ox, oy, scale, WidthClass::default(), out);
+        solver.gather(taffy_root, ox, oy, scale, WidthClass::default(), out);
         // A root has no parent to position it, so its offset within one is the origin it was
         // placed at. Taffy leaves that at zero; writing it here makes the placement reach the
         // compositor as the same offset bind every other node's does.
@@ -519,7 +477,24 @@ impl LayoutTree {
             solved.local = Vector2 { x: ox, y: oy };
         }
     }
+}
 
+/// Services borrowed from the UI host for one layout pass.
+#[derive(Default)]
+pub struct LayoutServices<'a> {
+    /// Shaping and intrinsic measurement; absent for geometry-only trees.
+    pub measure: Option<&'a mut dyn FnMut(MeasureIn) -> Vector2>,
+    /// Scope-dependent style resolution; absent when all styles are absolute.
+    pub restyle: Option<&'a mut dyn FnMut(NodeId, WidthClass) -> Option<Style>>,
+}
+
+struct Solver<'a, 's> {
+    nodes: &'a mut [LayoutNode],
+    ambient: WidthClass,
+    services: &'a mut LayoutServices<'s>,
+}
+
+impl Solver<'_, '_> {
     fn gather(
         &self,
         id: TaffyId,
@@ -592,12 +567,11 @@ impl LayoutTree {
         self.node_mut(id).cache.clear();
         // Taken out for the call and put back, so the callback does not borrow the tree the
         // node lookups around it borrow.
-        if let Some(mut restyle) = self.restyle.take() {
-            let node = self.node(id).id;
-            if let Some(style) = restyle.restyle(node, class) {
+        let node = self.node(id).id;
+        if let Some(restyle) = self.services.restyle.as_mut() {
+            if let Some(style) = restyle(node, class) {
                 self.node_mut(id).style = style;
             }
-            self.restyle = Some(restyle);
         }
         if matches!(self.node(id).kind, LayoutKind::Responsive(_)) {
             return;
@@ -609,16 +583,12 @@ impl LayoutTree {
     }
 
     fn measure_leaf(&mut self, id: TaffyId, inputs: LayoutInput) -> LayoutOutput {
-        let (style, ctx, class) = {
-            let node = self.node(id);
-            (node.style.clone(), node.measure, self.ambient)
-        };
-        // Taken out for the call and put back, so the closure handed to
-        // `compute_leaf_layout` holds the callback directly and borrows no part of the tree.
-        let mut measure = self.measure.take();
+        let node = &self.nodes[usize::from(id)];
+        let (style, ctx, class) = (&node.style, node.measure, self.ambient);
+        let measure = &mut self.services.measure;
         let output = compute_leaf_layout(
             inputs,
-            &style,
+            style,
             |_, _| 0.0,
             |known, available| {
                 let size = match ctx {
@@ -626,7 +596,7 @@ impl LayoutTree {
                     MeasureCtx::Fixed(size) => size,
                     MeasureCtx::Measured(key) => {
                         measure.as_mut().map_or(Vector2 { x: 0.0, y: 0.0 }, |m| {
-                            m.measure(MeasureIn {
+                            m(MeasureIn {
                                 key,
                                 class,
                                 known: (known.width, known.height),
@@ -641,7 +611,6 @@ impl LayoutTree {
                 }
             },
         );
-        self.measure = measure;
         output
     }
 
@@ -694,8 +663,11 @@ impl LayoutTree {
     }
 }
 
-impl TraversePartialTree for LayoutTree {
-    type ChildIter<'a> = core::iter::Copied<core::slice::Iter<'a, TaffyId>>;
+impl TraversePartialTree for Solver<'_, '_> {
+    type ChildIter<'a>
+        = core::iter::Copied<core::slice::Iter<'a, TaffyId>>
+    where
+        Self: 'a;
 
     fn child_ids(&self, parent: TaffyId) -> Self::ChildIter<'_> {
         self.node(parent).children.iter().copied()
@@ -710,9 +682,9 @@ impl TraversePartialTree for LayoutTree {
     }
 }
 
-impl TraverseTree for LayoutTree {}
+impl TraverseTree for Solver<'_, '_> {}
 
-impl CacheTree for LayoutTree {
+impl CacheTree for Solver<'_, '_> {
     fn cache_get(&self, id: TaffyId, inputs: &LayoutInput) -> Option<LayoutOutput> {
         self.node(id).cache.get(inputs)
     }
@@ -726,8 +698,11 @@ impl CacheTree for LayoutTree {
     }
 }
 
-impl LayoutPartialTree for LayoutTree {
-    type CoreContainerStyle<'a> = &'a Style;
+impl LayoutPartialTree for Solver<'_, '_> {
+    type CoreContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
     type CustomIdent = String;
 
     fn get_core_container_style(&self, id: TaffyId) -> Self::CoreContainerStyle<'_> {
@@ -769,9 +744,15 @@ impl LayoutPartialTree for LayoutTree {
     }
 }
 
-impl LayoutFlexboxContainer for LayoutTree {
-    type FlexboxContainerStyle<'a> = &'a Style;
-    type FlexboxItemStyle<'a> = &'a Style;
+impl LayoutFlexboxContainer for Solver<'_, '_> {
+    type FlexboxContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+    type FlexboxItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
 
     fn get_flexbox_container_style(&self, id: TaffyId) -> Self::FlexboxContainerStyle<'_> {
         &self.node(id).style
@@ -782,9 +763,15 @@ impl LayoutFlexboxContainer for LayoutTree {
     }
 }
 
-impl LayoutGridContainer for LayoutTree {
-    type GridContainerStyle<'a> = &'a Style;
-    type GridItemStyle<'a> = &'a Style;
+impl LayoutGridContainer for Solver<'_, '_> {
+    type GridContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+    type GridItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
 
     fn get_grid_container_style(&self, id: TaffyId) -> Self::GridContainerStyle<'_> {
         &self.node(id).style
@@ -795,9 +782,15 @@ impl LayoutGridContainer for LayoutTree {
     }
 }
 
-impl LayoutBlockContainer for LayoutTree {
-    type BlockContainerStyle<'a> = &'a Style;
-    type BlockItemStyle<'a> = &'a Style;
+impl LayoutBlockContainer for Solver<'_, '_> {
+    type BlockContainerStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
+    type BlockItemStyle<'a>
+        = &'a Style
+    where
+        Self: 'a;
 
     fn get_block_container_style(&self, id: TaffyId) -> Self::BlockContainerStyle<'_> {
         &self.node(id).style
@@ -808,7 +801,7 @@ impl LayoutBlockContainer for LayoutTree {
     }
 }
 
-impl RoundTree for LayoutTree {
+impl RoundTree for Solver<'_, '_> {
     fn get_unrounded_layout(&self, id: TaffyId) -> Layout {
         self.node(id).unrounded
     }
@@ -827,7 +820,14 @@ mod tests {
     impl LayoutTree {
         fn solve(&mut self, root: NodeId, size: Vector2, scale: f32, out: &mut Vec<Solved>) {
             self.begin(out);
-            self.solve_root(root, size, Vector2 { x: 0.0, y: 0.0 }, scale, out);
+            self.solve_root(
+                root,
+                size,
+                Vector2 { x: 0.0, y: 0.0 },
+                scale,
+                out,
+                &mut Default::default(),
+            );
         }
     }
 
@@ -916,7 +916,7 @@ mod tests {
         tree.set_hidden(grid, true);
         tree.set_hidden(grid, false);
         assert_eq!(
-            tree.node(TaffyId::from(grid.index())).style.display,
+            tree.nodes[grid.index()].style.display,
             Display::Grid,
             "hiding and showing rewrote the node's display"
         );
@@ -1019,29 +1019,31 @@ mod tests {
         tree.set_measure(leaf, MeasureCtx::Measured(MeasureKey::raw(7, 1)));
         tree.set_children(root, &[card]);
         tree.set_children(card, &[leaf]);
-        tree.on_measure(|input: MeasureIn| Vector2 {
+        let mut measure = |input: MeasureIn| Vector2 {
             x: 120.0,
             y: match input.class {
                 WidthClass::Wide => 20.0,
                 WidthClass::Medium => 40.0,
                 WidthClass::Narrow => 60.0,
             },
-        });
+        };
 
         let mut out = Vec::new();
-        tree.solve(
-            root,
-            Vector2 {
-                x: 1400.0,
-                y: 400.0,
-            },
-            1.0,
-            &mut out,
-        );
-        assert_eq!(out[leaf.index()].size.y, 20.0, "wide");
-
-        tree.solve(root, Vector2 { x: 480.0, y: 400.0 }, 1.0, &mut out);
-        assert_eq!(out[leaf.index()].size.y, 60.0, "narrow, after a class flip");
+        tree.begin(&mut out);
+        for (width, height) in [(1400.0, 20.0), (480.0, 60.0)] {
+            tree.solve_root(
+                root,
+                Vector2 { x: width, y: 400.0 },
+                Vector2::default(),
+                1.0,
+                &mut out,
+                &mut LayoutServices {
+                    measure: Some(&mut measure),
+                    restyle: None,
+                },
+            );
+            assert_eq!(out[leaf.index()].size.y, height);
+        }
     }
 
     #[test]
@@ -1086,7 +1088,7 @@ mod tests {
                 tree.set_style(group, &column);
                 tree.set_children(mid, &[group]);
                 tree.begin(out);
-                tree.solve_root(root, window, origin, 1.0, out);
+                tree.solve_root(root, window, origin, 1.0, out, &mut Default::default());
                 // Minted by the publish, which runs after that solve and takes its box from it.
                 tree.create(line, LayoutKind::Container);
                 tree.set_style(
@@ -1101,7 +1103,7 @@ mod tests {
                 );
                 tree.set_children(group, &[line]);
                 tree.begin(out);
-                tree.solve_root(root, window, origin, 1.0, out);
+                tree.solve_root(root, window, origin, 1.0, out, &mut Default::default());
             };
 
         let (group, line) = (NodeId::raw(3, 1), NodeId::raw(4, 1));
@@ -1146,13 +1148,21 @@ mod tests {
 
         let mut out = Vec::new();
         tree.begin(&mut out);
-        tree.solve_root(root, window, Vector2 { x: 0.0, y: 0.0 }, 1.0, &mut out);
+        tree.solve_root(
+            root,
+            window,
+            Vector2 { x: 0.0, y: 0.0 },
+            1.0,
+            &mut out,
+            &mut Default::default(),
+        );
         tree.solve_root(
             overlay,
             window,
             Vector2 { x: 210.0, y: 64.0 },
             1.0,
             &mut out,
+            &mut Default::default(),
         );
 
         // The window subtree survived the second root.
@@ -1244,43 +1254,41 @@ mod tests {
         // The nested container's own style resolves at the enclosing class, so it is
         // restyled; its subtree resolves at its own, which it re-resolves for itself.
         let (mut tree, root, [outer, child, inner, grandchild]) = nested_containers();
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = std::sync::Arc::clone(&seen);
-        tree.on_restyle(move |node: NodeId, class: WidthClass| {
-            record.lock().unwrap().push((node, class));
-            None
-        });
+        let mut seen = Vec::new();
 
         let mut out = Vec::new();
-        // Wide first: 1400 against [600, 1000].
-        tree.solve(
-            root,
-            Vector2 {
-                x: 1400.0,
-                y: 400.0,
-            },
-            1.0,
-            &mut out,
-        );
-        seen.lock().unwrap().clear();
-        // Then Narrow, which flips `outer`.
-        tree.solve(root, Vector2 { x: 300.0, y: 400.0 }, 1.0, &mut out);
+        tree.begin(&mut out);
+        for width in [1400.0, 300.0] {
+            seen.clear();
+            tree.solve_root(
+                root,
+                Vector2 { x: width, y: 400.0 },
+                Vector2::default(),
+                1.0,
+                &mut out,
+                &mut LayoutServices {
+                    measure: None,
+                    restyle: Some(&mut |node, class| {
+                        seen.push((node, class));
+                        None
+                    }),
+                },
+            );
+        }
 
-        let calls = seen.lock().unwrap();
-        let nodes: Vec<NodeId> = calls.iter().map(|(n, _)| *n).collect();
-        assert!(nodes.contains(&child), "a subtree node was not re-lowered");
-        assert!(
-            nodes.contains(&inner),
-            "a nested container's own style was not re-lowered"
-        );
-        assert!(
-            !nodes.contains(&grandchild),
-            "the walk descended past a nested container into a subtree it does not govern"
-        );
-        assert!(
-            !nodes.contains(&outer),
-            "a container re-lowered its own style at the class it hands down"
-        );
+        let calls = &seen;
+        for (node, expected) in [
+            (child, true),
+            (inner, true),
+            (grandchild, false),
+            (outer, false),
+        ] {
+            assert_eq!(
+                calls.iter().any(|&(id, _)| id == node),
+                expected,
+                "reclassification of {node:?}"
+            );
+        }
         assert!(
             calls.iter().all(|(_, c)| *c == WidthClass::Narrow),
             "the subtree was re-lowered at a class other than the one just resolved"

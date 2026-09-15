@@ -22,7 +22,7 @@
 )]
 
 use crate::gesture::GestureDecl;
-use crate::layout::{Len, Preset, Rule};
+use crate::layout::{Layout, Len, Preset};
 use crate::role::{Elevation, Metric, Role, TypeRole};
 use crate::widget::{Chrome, Flow, Interaction, Motion, StatePolicy, TextSource, UiaRole};
 use std::cell::RefCell;
@@ -90,7 +90,6 @@ pub(crate) struct Slot {
     pub geometry_job: Option<u32>,
     pub field_scope: Option<crate::text_input::InputScope>,
     pub preset: Preset,
-    pub over: Link,
     pub seeds: Link,
     pub chans: Link,
     pub acts: Link,
@@ -168,7 +167,6 @@ impl Default for Slot {
             geometry_job: None,
             field_scope: None,
             preset: Preset::Bare,
-            over: Link::EMPTY,
             seeds: Link::EMPTY,
             chans: Link::EMPTY,
             acts: Link::EMPTY,
@@ -215,25 +213,8 @@ pub(crate) struct HitSeed {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct SpriteSeed {
     pub mask: MaskSeed,
-    pub role: Role,
-    /// How much of the resolved role this sprite paints, as an alpha in `0.0..=1.0`.
-    ///
-    /// A plate under text of the same hue is that hue at a fraction of it; a role resolves to
-    /// one value, so the fraction is the sprite's and not the palette's. Every sprite the
-    /// chrome table expands to carries [`FULL`].
+    pub source: super::theme::PaintSource,
     pub strength: f32,
-    /// The gradient this sprite paints, if it paints one.
-    ///
-    /// `Some` replaces the role: a ramp carries its own stops, each already resolved, so the
-    /// role and the strength beside it say nothing about what is drawn.
-    pub ramp: Option<RampId>,
-    /// The presented buffer this sprite paints, if it paints one.
-    ///
-    /// `Some` replaces both the role and the ramp: the pixels are the present thread's and
-    /// nothing on this side says what is in them. At most one of the two is ever set — a
-    /// ramp is minted by a modifier and a region by its own seed, and neither reaches the
-    /// other's node.
-    pub region: Option<RegionId>,
     /// Which interaction slot this sprite's colour re-resolves through.
     pub part: Part,
     pub next: u32,
@@ -243,11 +224,9 @@ impl SpriteSeed {
     pub(crate) const fn new(mask: MaskSeed, role: Role, part: Part) -> Self {
         Self {
             mask,
-            role,
+            source: super::theme::PaintSource::Role(role),
             part,
             strength: FULL,
-            ramp: None,
-            region: None,
             next: NIL,
         }
     }
@@ -387,16 +366,8 @@ pub(crate) enum Act {
     /// Presence that varies, as `Display::None` rather than as an unmount — so a subtree
     /// whose state the user is in the middle of survives the condition flipping.
     HideWhen(Box<dyn Fn() -> bool>),
-    /// Overrides that follow a value, written into the lowering's buffer.
-    ///
-    /// A **style** and not a channel: a size layout has to see must go through the solve,
-    /// where binding it as a channel would move the node and leave everything below it where
-    /// it was.
-    ///
-    /// Writing into a buffer rather than returning one override is what lets a column
-    /// template be bound — `ClearColumns` and a track each — and what lets a node carry two
-    /// of these without them taking turns.
-    Restyle(Box<dyn Fn(&mut Vec<Rule>)>),
+    /// A computed declaration writer; its track buffers belong to the retained layout.
+    Restyle(Option<crate::role::WidthClass>, Box<dyn Fn(&mut Layout)>),
     /// Disabled is model state: it swaps base roles and drops the hit flags.
     DisabledWhen(Box<dyn Fn() -> bool>),
     /// Selection is model state too — a discrete paint swap at event rate, not a wash.
@@ -433,7 +404,7 @@ pub(crate) struct Build {
     /// everything above that mark into [`kids`](Self::kids) on the way out, so the run it
     /// records is contiguous and the buffer keeps its capacity.
     pub pending: Vec<u32>,
-    pub over: Vec<OverSeed>,
+    pub layouts: Vec<super::style::Declaration>,
     pub seeds: Vec<SpriteSeed>,
     pub chans: Vec<ChanSeed>,
     pub acts: Vec<ActSeed>,
@@ -446,12 +417,6 @@ pub(crate) struct Build {
     /// Event-rate halo roles. Static halos keep their role inline in the slot.
     pub geometry_jobs: Vec<Option<super::geometry::Draw>>,
     pub halo_roles: Vec<Option<Box<dyn Fn() -> Role>>>,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct OverSeed {
-    pub rule: Rule,
-    pub next: u32,
 }
 
 thread_local! {
@@ -476,7 +441,7 @@ impl Build {
         self.nodes.clear();
         self.kids.clear();
         self.pending.clear();
-        self.over.clear();
+        self.layouts.clear();
         self.seeds.clear();
         self.chans.clear();
         self.acts.clear();
@@ -516,16 +481,8 @@ impl Build {
     pub(crate) fn push_slot(&mut self, slot: Slot) -> u32 {
         let at = self.nodes.len() as u32;
         self.nodes.push(slot);
+        self.layouts.push(super::style::Declaration::default());
         at
-    }
-
-    pub(crate) fn push_over(&mut self, at: u32, rule: Rule) {
-        let entry = self.over.len() as u32;
-        self.over.push(OverSeed { rule, next: NIL });
-        let link = &mut self.nodes[at as usize].over;
-        if let Some(tail) = link.append(entry) {
-            self.over[tail as usize].next = entry;
-        }
     }
 
     pub(crate) fn push_seed(&mut self, at: u32, mut seed: SpriteSeed) {
@@ -538,7 +495,22 @@ impl Build {
         }
     }
 
-    pub(crate) fn push_chan(&mut self, at: u32, prop: Prop, motion: Motion, source: ChanSource) {
+    pub(crate) fn push_chan(
+        &mut self,
+        at: u32,
+        prop: Prop,
+        motion: Motion,
+        source: ChanSource,
+    ) -> Option<ChanSource> {
+        let mut index = self.nodes[at as usize].chans.head;
+        while index != NIL {
+            let entry = &mut self.chans[index as usize];
+            if entry.prop == prop {
+                entry.motion = motion;
+                return entry.source.replace(source);
+            }
+            index = entry.next;
+        }
         let entry = self.chans.len() as u32;
         self.chans.push(ChanSeed {
             prop,
@@ -550,6 +522,7 @@ impl Build {
         if let Some(tail) = link.append(entry) {
             self.chans[tail as usize].next = entry;
         }
+        None
     }
 
     pub(crate) fn push_act(&mut self, at: u32, act: Act) {
@@ -634,10 +607,6 @@ impl Build {
     /// the number before it needs the seeds, and collecting them to find out would allocate.
     pub(crate) fn seed_count(&self, link: Link) -> usize {
         self.chain_seeds(link).count()
-    }
-
-    pub(crate) fn chain_over(&self, link: Link) -> impl Iterator<Item = &OverSeed> + Clone {
-        chain(&self.over, link, |item| item.next)
     }
 
     pub(crate) fn chain_seeds(&self, link: Link) -> impl Iterator<Item = &SpriteSeed> + Clone {

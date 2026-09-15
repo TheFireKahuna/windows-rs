@@ -11,14 +11,9 @@
 //! * **`pin` says whether they moved.** A non-wrapping run laid out leading does not break,
 //!   so a window resize re-pins every label and re-rasterizes none of them.
 //!
-//! The table is a thread-local rather than a field of the host, because measure runs
-//! *inside* `Model::flush`'s own solve, where the host is already borrowed. An
-//! `Arc<Mutex<..>>` would not do either: a closure that captures nothing is `Send` whatever
-//! it reaches through, and a run holds a layout object that is not.
 
 use crate::role::{Scope, TypeRole};
 use crate::widget::{Flow, Shaped, TextSource};
-use std::cell::RefCell;
 use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
@@ -214,81 +209,35 @@ pub(crate) struct Table {
     /// second removal verb for a slot that is vacant and still holds something, which is a
     /// live flag beside a generation.
     spare: Vec<Entry>,
-    /// The thread's shaping engine.
-    ///
-    /// Here rather than in [`Host`](super::Host) because of the measure seam:
-    /// `Model::on_measure` takes a `Send` closure that captures nothing, so measure can reach
-    /// only this table's own thread-local, and a run cannot be reshaped without the engine
-    /// that laid it out.
+    /// Owned by this host and borrowed during measurement.
     engine: Option<TextEngine>,
 }
 
-thread_local! {
-    static TEXT: RefCell<Table> = RefCell::new(Table::default());
-}
+impl Table {
+    pub(crate) fn install(&mut self, fonts: FontLadder) -> Result<()> {
+        self.engine = Some(TextEngine::new(fonts)?);
+        Ok(())
+    }
 
-/// Installs this thread's shaping engine over `fonts`, once, before anything mounts.
-///
-/// `fonts` must be the ladder the rasterizing half already holds — `Backends::ladder()`. Two
-/// ladders interning independently agree on face `0` and disagree on everything after it,
-/// which draws a run in the wrong face rather than reporting an error.
-///
-/// # Errors
-///
-/// The DirectWrite factory or the font collection failing to open.
-///
-/// # Panics
-///
-/// If an engine is already installed on this thread.
-pub fn install(fonts: FontLadder) -> Result<()> {
-    let engine = TextEngine::new(fonts)?;
-    with(|table| {
-        assert!(
-            table.engine.is_none(),
-            "a text engine is already installed on this thread"
-        );
-        table.engine = Some(engine);
-    });
-    Ok(())
-}
-
-/// Returns whether this thread has a shaping engine installed.
-#[must_use]
-pub fn installed() -> bool {
-    with(|table| table.engine.is_some())
-}
-
-/// Runs `f` against the thread's text table.
-pub(crate) fn with<R>(f: impl FnOnce(&mut Table) -> R) -> R {
-    TEXT.with(|table| f(&mut table.borrow_mut()))
-}
-
-/// Runs `f` against the thread's text table, answering `None` where the thread's locals are
-/// being destroyed and the table cannot be reached. [`with`] panics there instead.
-pub(crate) fn try_with<R>(f: impl FnOnce(&mut Table) -> R) -> Option<R> {
-    TEXT.try_with(|table| f(&mut table.borrow_mut())).ok()
-}
-
-/// Measures the run `input` names, under the availability and width class the solve is
-/// probing with. What the solve asks of the layer that owns the text engine.
-///
-/// The class is an **input** rather than ambient state, so the measurement is taken under the
-/// width the container resolved rather than the one current when the node was built.
-///
-/// **The three availability states are answered separately**, and for a run that can break
-/// they are three different numbers. A min-content probe asks how narrow the run can be,
-/// which is its longest unbreakable span; a max-content probe asks its one-line width.
-/// Answering the one-line width to both lets flex shrink a paragraph below its own longest
-/// word, which breaks a word in the middle.
-///
-/// # Panics
-///
-/// If no shaping engine is installed on this thread.
-pub(crate) fn measure(input: MeasureIn) -> Vector2 {
-    with(|table| {
+    /// Measures the run `input` names, under the availability and width class the solve is
+    /// probing with. What the solve asks of the layer that owns the text engine.
+    ///
+    /// The class is an **input** rather than ambient state, so the measurement is taken under the
+    /// width the container resolved rather than the one current when the node was built.
+    ///
+    /// **The three availability states are answered separately**, and for a run that can break
+    /// they are three different numbers. A min-content probe asks how narrow the run can be,
+    /// which is its longest unbreakable span; a max-content probe asks its one-line width.
+    /// Answering the one-line width to both lets flex shrink a paragraph below its own longest
+    /// word, which breaks a word in the middle.
+    ///
+    /// # Panics
+    ///
+    /// If no shaping engine is installed on this thread.
+    pub(crate) fn measure(&mut self, input: MeasureIn) -> Vector2 {
         let Table {
             entries, engine, ..
-        } = table;
+        } = self;
         let engine = engine.as_ref().expect(ENGINE);
         let Some(entry) = entries.get_mut(input.key) else {
             return Vector2 { x: 0.0, y: 0.0 };
@@ -313,7 +262,7 @@ pub(crate) fn measure(input: MeasureIn) -> Vector2 {
             // the width without the height gets a box that clips its own text.
             Avail::MinContent => entry.run.measure(Some(entry.run.min_width())),
         }
-    })
+    }
 }
 
 impl Entry {
@@ -564,14 +513,14 @@ impl Table {
     /// # Panics
     ///
     /// If no shaping engine is installed on this thread.
-    pub(crate) fn publish(&mut self, model: &mut Model) -> bool {
+    pub(crate) fn publish(&mut self, model: &mut Model, styles: &super::style::Styles) -> bool {
         let Table {
             entries, engine, ..
         } = self;
         let engine = engine.as_ref().expect(ENGINE);
         let mut emitted = false;
         for (_, entry) in entries.iter_mut() {
-            emitted |= entry.publish(engine, model);
+            emitted |= entry.publish(engine, model, styles);
         }
         emitted
     }
@@ -639,7 +588,12 @@ impl Entry {
     }
 
     /// Fixes this run at the width it was given and re-emits what moved.
-    fn publish(&mut self, engine: &TextEngine, model: &mut Model) -> bool {
+    fn publish(
+        &mut self,
+        engine: &TextEngine,
+        model: &mut Model,
+        styles: &super::style::Styles,
+    ) -> bool {
         let node = self.node();
         let intrinsic = matches!(
             self.target,
@@ -673,7 +627,7 @@ impl Entry {
             }
         }
         // After the emit, so the extent compared against is this pass's own.
-        emitted | self.fit_line_box(model, node)
+        emitted | self.fit_line_box(model, node, styles)
     }
 
     /// Makes a single line's box exactly its coverage, and answers whether that moved a box.
@@ -692,7 +646,12 @@ impl Entry {
     /// just written, the comparison holds, and nothing is written again.
     /// [`Host::flush`](super::Host::flush) re-solves once after a publish and needs that of
     /// every publish.
-    fn fit_line_box(&mut self, model: &mut Model, node: NodeId) -> bool {
+    fn fit_line_box(
+        &mut self,
+        model: &mut Model,
+        node: NodeId,
+        styles: &super::style::Styles,
+    ) -> bool {
         let Target::Line { .. } = self.target else {
             return false;
         };
@@ -705,9 +664,11 @@ impl Entry {
             return false;
         }
         let class = model.solved(node).class;
-        let Some(style) = super::style::pin_width(node, class, ink) else {
+        let Some(recipe) = styles.get(node) else {
             return false;
         };
+        let mut style = recipe.lower(class);
+        style.size.width = taffy::Dimension::length(ink);
         model.style(node, &style);
         true
     }
@@ -756,7 +717,8 @@ fn emit(engine: &TextEngine, run: &mut ShapedRun, line: usize, out: &mut SegBuff
 }
 
 /// The message every missing-engine panic carries.
-const ENGINE: &str = "a text engine must be installed before anything mounts: call                       windows_ui::build::text::install once at start-up";
+const ENGINE: &str =
+    "a text engine must be installed before anything mounts: install it on the host at start-up";
 
 /// Points one sprite at a line's coverage.
 ///
@@ -855,7 +817,7 @@ fn publish_lines(
 
 /// Returns one line's box: exactly its coverage tile.
 ///
-/// Built here rather than through the [`Over`](crate::layout::Over) vocabulary because the
+/// Built here rather than through the [`Layout`](crate::layout::Layout) vocabulary because the
 /// number is the text engine's rather than an author's. This is the lowering resolving a
 /// measurement rather than a widget expressing a size, and `Len` cannot say it.
 fn oriented_line_style(size: Vector2, vertical: bool) -> taffy::Style {
@@ -932,7 +894,8 @@ mod tests {
                 });
                 Host::flush(&mut patch);
                 Host::with(|h| {
-                    with(|table| {
+                    {
+                        let table = &h.text;
                         let (key, entry) = table
                             .entries
                             .iter()
@@ -954,7 +917,7 @@ mod tests {
                             ids,
                             "the sprite and coverage slot survive edits"
                         );
-                        let allocated = h.model().solved(group.node()).size.x;
+                        let allocated = h.model.solved(group.node()).size.x;
                         assert!(allocated < width, "the control retains its track");
                         assert!(
                             line.size.x <= allocated + 2.0,
@@ -976,7 +939,7 @@ mod tests {
                                 "a definite box must still publish source changes"
                             );
                         }
-                    });
+                    }
                     patch.clear();
                 });
                 Host::flush(&mut patch);

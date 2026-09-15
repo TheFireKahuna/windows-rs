@@ -76,6 +76,7 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
                 &windows_d2d::Gpu::for_window()?,
                 windows_text::FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]),
             )?;
+            Host::install_text(back.ladder().clone())?;
             let mut scene = Scene::new_at(
                 window.handle(),
                 &back,
@@ -263,20 +264,38 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
             let before = crate::counting::allocations();
             for step in 0..1_000 {
                 out.clear();
-                controls.tick(&[drag(id, if step % 2 == 0 { 0.2 } else { 0.1 })], &mut front, &mut out)?;
+                controls.tick(
+                    &[drag(id, if step % 2 == 0 { 0.2 } else { 0.1 })],
+                    &mut front,
+                    &mut out,
+                )?;
             }
             let allocated = crate::counting::allocations() - before;
-            assert_eq!(front.scene.census().animations - animations, 2_000,
-                "the allocation probe must actually retarget both native parts");
+            assert_eq!(
+                front.scene.census().animations - animations,
+                2_000,
+                "the allocation probe must actually retarget both native parts"
+            );
             assert_eq!(allocated, 0, "warm scalar retargeting allocated");
             out.clear();
-            controls.tick(&[Report::Canceled { target: id, contact: 1 }], &mut front, &mut out)?;
+            controls.tick(
+                &[Report::Canceled {
+                    target: id,
+                    contact: 1,
+                }],
+                &mut front,
+                &mut out,
+            )?;
             publish(&mut down, &mut controls, &mut front)?;
             let before = crate::counting::allocations();
             for _ in 0..100 {
                 publish(&mut down, &mut controls, &mut front)?;
             }
-            assert_eq!(crate::counting::allocations() - before, 0, "unchanged flush/apply allocated");
+            assert_eq!(
+                crate::counting::allocations() - before,
+                0,
+                "unchanged flush/apply allocated"
+            );
             Ok(())
         });
     result

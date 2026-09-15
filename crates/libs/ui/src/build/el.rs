@@ -10,7 +10,7 @@
 
 use super::arena::{Act, Build, ChanSource, HitSeed, MaskSeed, Part, Slot, SpriteSeed, TextSeed};
 use crate::gesture::{DragDecl, GestureDecl};
-use crate::layout::{Align, Edge, Len, Over, Preset, Rule, Track};
+use crate::layout::{Align, Edge, Layout, Len, Position, Preset, Track};
 use crate::role::{DataRole, Elevation, Fill, Metric, Role, Text, TypeRole, WidthClass};
 use crate::signal::Signal;
 use crate::widget::{Chrome, Flow, Interaction, Motion, RoleSet, StatePolicy, TextSource, UiaRole};
@@ -92,14 +92,34 @@ impl<K> El<K> {
         }))
     }
 
-    pub(crate) fn over(self, over: Over) -> Self {
-        Build::with(|b| b.push_over(self.at, Rule::always(over)));
+    /// Writes named layout fields directly into this declaration.
+    pub fn layout(self, write: impl FnOnce(&mut Layout)) -> Self {
+        Build::with(|b| write(&mut b.layouts[self.at as usize].base));
         self
     }
 
-    /// Pushes `over` as a rule that applies at `class` only.
-    pub(crate) fn over_at(self, class: WidthClass, over: Over) -> Self {
-        Build::with(|b| b.push_over(self.at, Rule::at(class, over)));
+    /// Writes only the fields overridden at this width class.
+    pub fn layout_when(self, class: WidthClass, write: impl FnOnce(&mut Layout)) -> Self {
+        Build::with(|b| write(b.layouts[self.at as usize].at(Some(class))));
+        self
+    }
+
+    /// Updates declared fields when a signal read by `write` changes.
+    /// Assign every owned field on each invocation; track buffers are retained.
+    pub fn layout_from(self, write: impl Fn(&mut Layout) + 'static) -> Self {
+        let replaced = Build::with(|b| {
+            let mut at = b.nodes[self.at as usize].acts.head;
+            while at != super::arena::NIL {
+                let entry = &mut b.acts[at as usize];
+                if matches!(entry.act, Some(Act::Restyle(None, _))) {
+                    return entry.act.replace(Act::Restyle(None, Box::new(write)));
+                }
+                at = entry.next;
+            }
+            b.push_act(self.at, Act::Restyle(None, Box::new(write)));
+            None
+        });
+        drop(replaced);
         self
     }
 
@@ -286,7 +306,7 @@ impl<K> El<K> {
                 self.at,
                 SpriteSeed {
                     strength: super::arena::FULL,
-                    ramp: Some(id),
+                    source: super::theme::PaintSource::Gradient(id),
                     next: super::arena::NIL,
                     ..SpriteSeed::new(
                         MaskSeed::Box {
@@ -412,9 +432,7 @@ impl<K> El<K> {
         row: impl Fn() -> Metric + 'static,
         n: impl Fn() -> f32 + 'static,
     ) -> Self {
-        self.act(Act::Restyle(Box::new(move |out| {
-            out.push(Rule::always(Over::Height(Len::Times(row(), n().max(0.0)))));
-        })))
+        self.layout_from(move |layout| layout.height = Some(Len::Times(row(), n().max(0.0))))
     }
 
     /// Places this node as row `index` of a uniform list: out of flow, one row tall, `index`
@@ -424,13 +442,13 @@ impl<K> El<K> {
     /// `index` is fixed for the row's life, since a keyed reconcile moves a row's position in
     /// the list and never its key, so this re-lowers only when `row` answers differently.
     pub(crate) fn band_rows(self, index: f32, row: impl Fn() -> Metric + 'static) -> Self {
-        self.act(Act::Restyle(Box::new(move |out| {
+        self.layout_from(move |layout| {
             let row = row();
-            out.push(Rule::always(Over::Band {
+            layout.position = Some(Position::Band {
                 at: Len::Times(row, index),
                 height: Len::Metric(row),
-            }));
-        })))
+            });
+        })
     }
 
     /// Makes this container scroll: a tracker on its own box, and the content bound to it.
@@ -484,7 +502,7 @@ impl<K> El<K> {
     /// Lays `children` out as responsive tiles: `repeat(auto-fill, minmax(min, 1fr))`.
     #[must_use]
     pub fn tiles(self, min: impl Into<Len>, children: impl super::IntoChildren) -> Self {
-        self.over(Over::TileMin(min.into()))
+        self.layout(|layout| layout.tile_min = Some(min.into()))
             .contain(Preset::Tiles, children)
     }
 
@@ -514,7 +532,7 @@ impl<K> El<K> {
     pub(crate) fn surface(self, elevation: Elevation, variant: u8, radius: Metric) -> Self {
         self.elevate(elevation)
             .chrome(crate::widget::roles::SURFACE, variant, radius)
-            .over(Over::Padding(Len::Metric(Metric::SpaceLg)))
+            .layout(|l| l.padding = Some([Len::Metric(Metric::SpaceLg); 2]))
     }
 
     /// Applies control metrics: the palette's row height as a floor, control padding, a
@@ -525,13 +543,12 @@ impl<K> El<K> {
         // The two axes differ: the row height is what sets a control's height, so the
         // vertical padding only has to clear the text inside it, while the horizontal one
         // is what separates a label from the control's own edge.
-        self.over(Over::MinHeight(Len::Metric(Metric::RowH)))
-            .over(Over::PaddingXY(
-                Len::Metric(Metric::SpaceMd),
-                Len::Metric(Metric::SpaceXs),
-            ))
-            .over(Over::Gap(Len::Metric(Metric::SpaceSm)))
-            .over(Over::Justify(Align::Center))
+        self.layout(|layout| layout.min_height = Some(Len::Metric(Metric::RowH)))
+            .layout(|l| {
+                l.padding = Some([Len::Metric(Metric::SpaceMd), Len::Metric(Metric::SpaceXs)])
+            })
+            .layout(|l| l.gap = Some(Len::Metric(Metric::SpaceSm)))
+            .layout(|l| l.justify = Some(Align::Center))
     }
 
     /// Places `child` at grid `row` and `column`, and appends it to this node's children.
@@ -558,11 +575,13 @@ impl<K> El<K> {
     }
 
     fn place_child(self, row: u16, column: u16, dr: u16, dc: u16, child: View) -> Self {
-        child.over(Over::Place {
-            row,
-            column,
-            row_span: dr,
-            column_span: dc,
+        child.layout(|l| {
+            l.position = Some(Position::Grid {
+                row,
+                column,
+                row_span: dr,
+                column_span: dc,
+            })
         });
         Build::with(|b| b.push_kid(self.at, child.at));
         self
@@ -571,19 +590,13 @@ impl<K> El<K> {
     /// Appends `tracks` to this grid's row template.
     #[must_use]
     pub fn rows(self, tracks: impl IntoIterator<Item = Track>) -> Self {
-        for t in tracks {
-            self.over(Over::Row(t));
-        }
-        self
+        self.layout(|layout| layout.rows().extend(tracks))
     }
 
     /// Appends `tracks` to this grid's column template.
     #[must_use]
     pub fn cols(self, tracks: impl IntoIterator<Item = Track>) -> Self {
-        for t in tracks {
-            self.over(Over::Column(t));
-        }
-        self
+        self.layout(|layout| layout.columns().extend(tracks))
     }
 
     // ── layout: width variants ───────────────────────────────────────────────────
@@ -604,7 +617,7 @@ impl<K> El<K> {
     /// block axis.
     #[must_use]
     pub fn stack_when(self, class: WidthClass) -> Self {
-        self.over_at(class, Over::Class(Preset::Stack))
+        self.layout_when(class, |l| l.flow = Some(Preset::Stack))
     }
 
     /// Sets the column template at `class`, clearing whatever was stated for every class.
@@ -613,85 +626,17 @@ impl<K> El<K> {
     /// classes need no declaration: a grid with no template auto-places into a single column.
     #[must_use]
     pub fn cols_when(self, class: WidthClass, tracks: impl IntoIterator<Item = Track>) -> Self {
-        self.over_at(class, Over::ClearColumns);
-        for t in tracks {
-            self.over_at(class, Over::Column(t));
-        }
-        self
-    }
-
-    /// Sets the column template while `cond` holds, clearing whatever was stated otherwise.
-    ///
-    /// [`cols_when`](Self::cols_when) keys the same statement on the window's width; this one
-    /// keys it on application state — a pane the user collapsed, a gutter they turned off.
-    /// Each clears the template and states its tracks, and the lowering resolves them in the
-    /// order they were written.
-    ///
-    /// This changes styles and never structure: the track that goes away drops no owner, so
-    /// state inside the collapsed column is still there when it comes back.
-    ///
-    /// The class rules are the recipe and this is a bound override on top of it, so where
-    /// both apply this one wins while `cond` holds.
-    #[must_use]
-    pub fn cols_if<M>(
-        self,
-        cond: impl Signal<bool, M> + 'static,
-        tracks: impl IntoIterator<Item = Track>,
-    ) -> Self {
-        let tracks: Vec<Track> = tracks.into_iter().collect();
-        self.act(Act::Restyle(Box::new(move |out| {
-            if !cond.read() {
-                return;
-            }
-            out.push(Rule::always(Over::ClearColumns));
-            out.extend(tracks.iter().copied().map(Over::Column).map(Rule::always));
-        })))
-    }
-
-    /// States the column template from whatever `tracks` writes, re-read whenever a signal
-    /// it reads changes.
-    ///
-    /// [`cols_if`](Self::cols_if) keys a template it was handed on a condition; this one
-    /// **computes** the template. What needs it is a track whose extent is a value rather
-    /// than a case — a graph column sized from a channel count, a rail sized from what it
-    /// holds — where enumerating one arm per value is the whole domain of the value.
-    ///
-    /// `tracks` fills a buffer this element keeps, so a re-read allocates nothing after the
-    /// first. It clears the template accumulated below it and states its own, exactly as
-    /// `cols_if` does, and like every restyle it changes styles and never structure: a track
-    /// that resizes drops no owner, so state in the column it sizes is untouched.
-    #[must_use]
-    pub fn cols_from(self, tracks: impl Fn(&mut Vec<Track>) + 'static) -> Self {
-        self.tracks_from(tracks, Over::ClearColumns, Over::Column)
-    }
-
-    /// Replaces the row template when a signal read by `tracks` changes.
-    /// Keeps child owners and the track buffer, like [`cols_from`](Self::cols_from).
-    #[must_use]
-    pub fn rows_from(self, tracks: impl Fn(&mut Vec<Track>) + 'static) -> Self {
-        self.tracks_from(tracks, Over::ClearRows, Over::Row)
-    }
-
-    fn tracks_from(
-        self,
-        tracks: impl Fn(&mut Vec<Track>) + 'static,
-        clear: Over,
-        track: fn(Track) -> Over,
-    ) -> Self {
-        let buf = core::cell::RefCell::new(Vec::new());
-        self.act(Act::Restyle(Box::new(move |out| {
-            let mut buf = buf.borrow_mut();
-            buf.clear();
-            tracks(&mut buf);
-            out.push(Rule::always(clear));
-            out.extend(buf.iter().copied().map(track).map(Rule::always));
-        })))
+        self.layout_when(class, |l| {
+            let columns = l.columns();
+            columns.clear();
+            columns.extend(tracks);
+        })
     }
 
     /// Clips pixels and hit-testing to this node's solved box, without a scroll tracker.
     #[must_use]
     pub fn clip(self) -> Self {
-        self.over(Over::Clip)
+        self.layout(|layout| layout.clip = Some(true))
     }
 
     /// Hides this subtree at `class`: not laid out, and not drawn.
@@ -703,7 +648,7 @@ impl<K> El<K> {
     /// [`hide_below`](Self::hide_below).
     #[must_use]
     pub fn hide_when(self, class: WidthClass) -> Self {
-        self.over_at(class, Over::Hidden)
+        self.layout_when(class, |l| l.hidden = Some(true))
     }
 
     /// Hides this subtree at every class narrower than `class`: not laid out, and not drawn.
@@ -712,7 +657,7 @@ impl<K> El<K> {
     #[must_use]
     pub fn hide_below(self, class: WidthClass) -> Self {
         for narrower in class.below() {
-            self.over_at(narrower, Over::Hidden);
+            self.layout_when(narrower, |l| l.hidden = Some(true));
         }
         self
     }
@@ -733,7 +678,7 @@ impl<K> El<K> {
     /// [`float_below`](Self::float_below).
     #[must_use]
     pub fn float_when(self, class: WidthClass, edge: Edge) -> Self {
-        self.over_at(class, Over::Edge(edge))
+        self.layout_when(class, |l| l.position = Some(Position::Edge(edge)))
     }
 
     /// Floats this subtree at every class narrower than `class`.
@@ -742,7 +687,7 @@ impl<K> El<K> {
     #[must_use]
     pub fn float_below(self, class: WidthClass, edge: Edge) -> Self {
         for narrower in class.below() {
-            self.over_at(narrower, Over::Edge(edge));
+            self.layout_when(narrower, |l| l.position = Some(Position::Edge(edge)));
         }
         self
     }
@@ -761,11 +706,12 @@ impl<K> El<K> {
     /// The solve retains the class gate across resizes; no width enters the signal graph.
     #[must_use]
     pub fn hide_if_when<M>(self, class: WidthClass, cond: impl Signal<bool, M> + 'static) -> Self {
-        self.act(Act::Restyle(Box::new(move |out| {
-            if cond.read() {
-                out.push(Rule::at(class, Over::Hidden));
-            }
-        })))
+        self.act(Act::Restyle(
+            Some(class),
+            Box::new(move |layout| {
+                layout.hidden = Some(cond.read());
+            }),
+        ))
     }
 
     /// Opens a popup while `shown` holds, owned by this mounted node. User dismissal
@@ -790,19 +736,19 @@ impl<K> El<K> {
     /// Sets the inline size at one width class.
     #[must_use]
     pub fn width_when(self, class: WidthClass, width: impl Into<Len>) -> Self {
-        self.over_at(class, Over::Width(width.into()))
+        self.layout_when(class, |l| l.width = Some(width.into()))
     }
 
     /// Sets the inline size floor at one width class.
     #[must_use]
     pub fn min_width_when(self, class: WidthClass, width: impl Into<Len>) -> Self {
-        self.over_at(class, Over::MinWidth(width.into()))
+        self.layout_when(class, |l| l.min_width = Some(width.into()))
     }
 
     /// Sets the inline size ceiling at one width class.
     #[must_use]
     pub fn max_width_when(self, class: WidthClass, width: impl Into<Len>) -> Self {
-        self.over_at(class, Over::MaxWidth(width.into()))
+        self.layout_when(class, |l| l.max_width = Some(width.into()))
     }
 
     // ── layout: container properties ─────────────────────────────────────────────
@@ -810,49 +756,49 @@ impl<K> El<K> {
     /// Absorbs the slack left along the container's main axis.
     #[must_use]
     pub fn grow(self) -> Self {
-        self.over(Over::Grow)
+        self.layout(|layout| layout.grow = Some(1.0))
     }
 
     /// Keeps the stated size in a box too small for it.
     #[must_use]
     pub fn no_shrink(self) -> Self {
-        self.over(Over::NoShrink)
+        self.layout(|layout| layout.shrink = Some(0.0))
     }
 
     /// Sets a definite inline size.
     #[must_use]
     pub fn width(self, l: impl Into<Len>) -> Self {
-        self.over(Over::Width(l.into()))
+        self.layout(|layout| layout.width = Some(l.into()))
     }
 
     /// Sets a definite block size.
     #[must_use]
     pub fn height(self, l: impl Into<Len>) -> Self {
-        self.over(Over::Height(l.into()))
+        self.layout(|layout| layout.height = Some(l.into()))
     }
 
     /// Sets a floor on the inline size.
     #[must_use]
     pub fn min_width(self, l: impl Into<Len>) -> Self {
-        self.over(Over::MinWidth(l.into()))
+        self.layout(|layout| layout.min_width = Some(l.into()))
     }
 
     /// Sets a floor on the block size.
     #[must_use]
     pub fn min_height(self, l: impl Into<Len>) -> Self {
-        self.over(Over::MinHeight(l.into()))
+        self.layout(|layout| layout.min_height = Some(l.into()))
     }
 
     /// Sets a ceiling on the inline size.
     #[must_use]
     pub fn max_width(self, l: impl Into<Len>) -> Self {
-        self.over(Over::MaxWidth(l.into()))
+        self.layout(|layout| layout.max_width = Some(l.into()))
     }
 
     /// Insets this container's content on every side.
     #[must_use]
     pub fn padding(self, l: impl Into<Len>) -> Self {
-        self.over(Over::Padding(l.into()))
+        self.layout(|layout| layout.padding = Some([l.into(); 2]))
     }
 
     /// Insets this container's content by `x` either side and `y` above and below.
@@ -863,25 +809,25 @@ impl<K> El<K> {
     /// content asked for.
     #[must_use]
     pub fn padding_xy(self, x: impl Into<Len>, y: impl Into<Len>) -> Self {
-        self.over(Over::PaddingXY(x.into(), y.into()))
+        self.layout(|layout| layout.padding = Some([x.into(), y.into()]))
     }
 
     /// Sets the space between adjacent children.
     #[must_use]
     pub fn gap(self, l: impl Into<Len>) -> Self {
-        self.over(Over::Gap(l.into()))
+        self.layout(|layout| layout.gap = Some(l.into()))
     }
 
     /// Aligns **all** of this container's children on the cross axis.
     #[must_use]
     pub fn align(self, a: Align) -> Self {
-        self.over(Over::Align(a))
+        self.layout(|layout| layout.align = Some(a))
     }
 
     /// Distributes this container's children along the main axis.
     #[must_use]
     pub fn justify(self, a: Align) -> Self {
-        self.over(Over::Justify(a))
+        self.layout(|layout| layout.justify = Some(a))
     }
 
     /// Aligns this child on its container's cross axis, overriding what the container states
@@ -893,7 +839,7 @@ impl<K> El<K> {
     /// ([`at`](Self::at)) instead.
     #[must_use]
     pub fn align_self(self, a: Align) -> Self {
-        self.over(Over::AlignSelf(a))
+        self.layout(|layout| layout.align_self = Some(a))
     }
 
     /// Classifies this container's own inline size for its subtree: narrow at or below
@@ -1179,7 +1125,7 @@ impl<K> El<K> {
     /// which is the point of it.
     #[must_use]
     pub fn cover(self) -> Self {
-        self.over(Over::Absolute).over(Over::Inset(Len::Zero))
+        self.layout(|layout| layout.position = Some(Position::Absolute([Len::Zero; 4])))
     }
 
     /// Opts this node out of touch inflation, for a dense field of targets where inflating
@@ -1305,7 +1251,7 @@ impl El<Region> {
                 self.at,
                 SpriteSeed {
                     strength: super::arena::FULL,
-                    region: Some(sink),
+                    source: super::theme::PaintSource::Region(sink),
                     next: super::arena::NIL,
                     ..SpriteSeed::new(
                         MaskSeed::Box { radius: None },
@@ -1385,7 +1331,7 @@ impl El<Path> {
                 self.at,
                 SpriteSeed {
                     strength: super::arena::FULL,
-                    ramp: Some(id),
+                    source: super::theme::PaintSource::Gradient(id),
                     next: super::arena::NIL,
                     ..SpriteSeed::new(MaskSeed::Shape { stroke }, Role::Fill(Fill::Surface), part)
                 },
@@ -1399,7 +1345,10 @@ impl El<Path> {
                 self.at,
                 SpriteSeed {
                     strength: super::arena::FULL,
-                    ramp,
+                    source: ramp.map_or(
+                        super::theme::PaintSource::Role(Role::Fill(Fill::Accent)),
+                        super::theme::PaintSource::Gradient,
+                    ),
                     next: super::arena::NIL,
                     ..SpriteSeed::new(
                         MaskSeed::Shape {

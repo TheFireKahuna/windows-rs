@@ -333,14 +333,22 @@ impl Effect {
     /// Runs `f` now, and again whenever what it read changes.
     pub fn new(f: impl FnMut() + 'static) -> Self {
         Self {
-            id: graph::effect(Rc::new(RefCell::new(f)), graph::Phase::Update),
+            id: graph::effect(Rc::new(RefCell::new(f)), graph::Phase::Update, true),
+            marker: PhantomData,
+        }
+    }
+
+    /// UI bindings establish dependencies after the creation borrow has ended.
+    pub(crate) fn deferred(f: impl FnMut() + 'static) -> Self {
+        Self {
+            id: graph::effect(Rc::new(RefCell::new(f)), graph::Phase::Update, false),
             marker: PhantomData,
         }
     }
 
     pub(crate) fn geometry(f: impl FnMut() + 'static) -> Self {
         Self {
-            id: graph::effect(Rc::new(RefCell::new(f)), graph::Phase::Geometry),
+            id: graph::effect(Rc::new(RefCell::new(f)), graph::Phase::Geometry, false),
             marker: PhantomData,
         }
     }

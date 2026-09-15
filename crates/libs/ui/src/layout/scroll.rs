@@ -159,7 +159,7 @@ pub fn rail_style() -> windows_scene::taffy::Style {
 /// Returns the thumb's own box inside the rail: as tall as `geom` says, at the top of its
 /// travel.
 ///
-/// Built as a style rather than through the [`Over`](super::Over) vocabulary because the
+/// Built as a style rather than through the [`Layout`](super::Layout) vocabulary because the
 /// numbers are this component's own geometry, resolved from extents the solve produced, and
 /// [`Len`](super::Len) states no raw DIP. The thumb's offset is the tracker's alone: laying
 /// it out would leave layout and the tracker writing one channel between them.
@@ -825,7 +825,10 @@ pub(crate) fn front(
             Report::Redirect { target, pointer } => table.where_(
                 |row| row.control == Some(target),
                 |row| {
-                    if let Err(error) = front.scene.redirect_manipulation(row.front.tracker, &pointer) {
+                    if let Err(error) = front
+                        .scene
+                        .redirect_manipulation(row.front.tracker, &pointer)
+                    {
                         failed.get_or_insert(error);
                     }
                 },

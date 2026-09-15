@@ -413,9 +413,9 @@ pub(super) fn memo(cell: Rc<dyn MemoCell>) -> SignalId {
     with(|g| g.mint(Kind::Memo(cell)))
 }
 
-pub(super) fn effect(f: Rc<RefCell<dyn FnMut()>>, phase: Phase) -> SignalId {
+pub(super) fn effect(f: Rc<RefCell<dyn FnMut()>>, phase: Phase, immediate: bool) -> SignalId {
     let id = with(|g| g.mint(Kind::Effect(Rc::clone(&f), phase)));
-    if phase == Phase::Update {
+    if immediate {
         run_effect(id, &f);
     } else {
         with(|g| {

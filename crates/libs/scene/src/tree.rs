@@ -1,13 +1,6 @@
-//! The child list. **Both halves.**
+//! Scene-thread visual links, following native VisualCollection ordering.
 //!
-//! Each half keeps its own tree — the app's carries hit declarations and layout ids, the
-//! front's carries composition visuals — and they mirror each other. The splice is the same
-//! in both, so it lives here and both halves call it.
-//!
-//! Children are an intrusive chain: five ids give O(1) link and unlink with no allocation,
-//! against twenty-four bytes and a heap allocation per branch node for a `Vec`. The
-//! operations mirror `VisualCollection`'s — insert-at-bottom, insert-above and remove, and
-//! no insert-at-index.
+//! App-thread layout and hit traversal share the retained child vectors instead.
 
 use crate::sink::NodeId;
 

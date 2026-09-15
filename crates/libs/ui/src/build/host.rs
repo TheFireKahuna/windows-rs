@@ -20,17 +20,10 @@ use std::rc::Rc;
 use windows_numerics::Vector2;
 use windows_present::Extent;
 use windows_scene::{
-    ControlId, Env, Exit, GroupId, Id, Ids, MeasureIn, MeasureKey, Model, NodeId, Paint, Prop,
-    SinkPatch, Slots, SpriteId, Tracker,
+    ControlId, Env, Exit, GroupId, Id, Ids, MeasureKey, Model, NodeId, Paint, Prop, SinkPatch,
+    Slots, SpriteId, Tracker,
 };
 
-/// Names the family of mount rows, whose ids are [`MountId`].
-///
-/// [`Mount`], [`Scroll`] and [`Probe`] are markers rather than the row types
-/// themselves: an id belongs to a family, and one family can have more than one store — a
-/// control has a row here and a row on the front thread, over one set of ids.
-#[derive(Debug)]
-pub(crate) struct Mount;
 #[derive(Debug)]
 pub(crate) struct Scroll;
 #[derive(Debug)]
@@ -41,7 +34,6 @@ pub(crate) struct Probe;
 #[derive(Debug)]
 pub(crate) struct Present;
 
-pub(crate) type MountId = Id<Mount>;
 pub(crate) type ScrollId = Id<Scroll>;
 pub(crate) type ProbeId = Id<Probe>;
 pub(crate) type PresentId = Id<Present>;
@@ -57,13 +49,30 @@ pub(crate) struct MountRow {
     /// without allocating. The link is an id and not a bare index, so every step of a walk is
     /// checked: an index would reach a row without asking whether it is still the row that
     /// was linked.
-    pub next: MountId,
+    pub next: NodeId,
     pub control: Option<ControlId>,
     pub text: Option<MeasureKey>,
     pub paints: NodeId,
     pub scroll: Option<ScrollId>,
     pub probe: Option<ProbeId>,
     pub region: Option<PresentId>,
+}
+
+impl MountRow {
+    pub(crate) fn new(node: NodeId) -> Self {
+        Self {
+            node,
+            escape: None,
+            popup: false,
+            next: NodeId::NONE,
+            control: None,
+            text: None,
+            paints: NodeId::NONE,
+            scroll: None,
+            probe: None,
+            region: None,
+        }
+    }
 }
 
 /// Holds one interactive node, addressed by the index inside its [`ControlId`].
@@ -124,18 +133,6 @@ pub(crate) struct ControlRow {
 }
 
 impl ControlRow {
-    pub(crate) fn repaint(&self, model: &mut Model) {
-        let Some(chrome) = self.chrome else { return };
-        let roles = chrome.in_state(self.state);
-        for (id, role) in [
-            (self.fill, roles.fill.map(Role::Fill)),
-            (self.label, Some(Role::Text(roles.text))),
-            (self.border, roles.stroke.map(Role::Stroke)),
-        ] {
-            paint(model, id, role, self.scope.for_paint());
-        }
-    }
-
     pub(crate) fn new(node: NodeId, scope: Scope) -> Self {
         ControlRow {
             source_epoch: 0,
@@ -194,7 +191,9 @@ pub(crate) struct OverlayEntry {
 
 /// Owns the model and the tables the app thread's half of the widget layer builds into.
 pub struct Host {
-    pub(crate) identity: Rc<()>,
+    pub(crate) text: super::text::Table,
+    pub(crate) styles: super::style::Styles,
+    pub(crate) identity: u64,
     pub(crate) ramps: Slots<windows_scene::Ramp, (Vec<super::Stop>, windows_scene::Spread)>,
     pub(crate) model: Model,
     window_size: crate::signal::Cell<Vector2>,
@@ -206,13 +205,8 @@ pub struct Host {
     pub(crate) appearances: Slots<windows_scene::Node, super::theme::Appearance>,
     pub(crate) theme_update: Option<(Scope, windows_scene::BackdropSpec)>,
     pub(crate) theme_backdrop: Option<windows_scene::BackdropSpec>,
-    /// Mints mount-row ids.
-    ///
-    /// An `Ids` sits beside a store only where this thread owns that family's counter; a
-    /// store keyed by ids minted elsewhere — the recipe table, the front thread's chrome —
-    /// carries none.
-    pub(crate) mount_ids: Ids<Mount>,
-    pub(crate) mounts: Slots<Mount, MountRow>,
+    /// Logical creation membership, keyed by the node's existing generation.
+    pub(crate) mounts: Slots<windows_scene::Node, MountRow>,
     pub(crate) control_ids: Ids<windows_scene::Control>,
     pub(crate) controls: Slots<windows_scene::Control, ControlRow>,
     pub(crate) fields: Slots<windows_scene::Control, super::field::Row>,
@@ -309,21 +303,18 @@ impl Access {
     }
 }
 
+static NEXT_RUNTIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 impl Host {
-    /// Installs the app thread's host and wires the measure and restyle seams into the model.
-    ///
-    /// Both closures are `Send` and capture nothing: each reaches its table through that
-    /// table's own thread-local, which is what lets the text table hold laid-out runs, since
-    /// a run is thread-affine and an `Arc<Mutex<..>>` of one would not compile. Neither may
-    /// reach the host, whose borrow the solve is already inside.
-    pub fn install(mut model: Model, env: Env, root_scope: Scope) {
+    /// Installs one app-thread host with its own text and style stores.
+    pub fn install(model: Model, env: Env, root_scope: Scope) {
         crate::signal::assert_writable();
-        model.on_measure(|input: MeasureIn| super::text::measure(input));
-        model.on_restyle(|node, class| super::style::restyle(node, class));
         let (window_owner, window_size) =
             crate::signal::Owner::scope(|| crate::signal::Cell::new(model.window()));
         let host = Self {
-            identity: Rc::new(()),
+            text: super::text::Table::default(),
+            styles: Slots::new(),
+            identity: NEXT_RUNTIME.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ramps: Slots::new(),
             window_size,
             _window_owner: window_owner,
@@ -335,7 +326,6 @@ impl Host {
             appearances: Slots::new(),
             theme_update: None,
             theme_backdrop: None,
-            mount_ids: Ids::new(),
             mounts: Slots::new(),
             control_ids: Ids::new(),
             controls: Slots::new(),
@@ -363,6 +353,26 @@ impl Host {
             overlays: Vec::new(),
         };
         HOST.with(|slot| *slot.borrow_mut() = Some(host));
+    }
+
+    /// Schedules a node-owned binding without entering the host during construction.
+    pub(crate) fn binding(
+        &self,
+        node: NodeId,
+        mut update: impl FnMut() + 'static,
+    ) -> crate::signal::Effect {
+        let runtime = self.identity;
+        crate::signal::Effect::deferred(move || {
+            let live = Self::try_with(|h| runtime == h.identity && h.mounts.get(node).is_some());
+            if live == Some(true) {
+                update();
+            }
+        })
+    }
+
+    /// Installs the font ladder shared with the renderer on this runtime's text store.
+    pub fn install_text(fonts: windows_text::FontLadder) -> windows_core::Result<()> {
+        Self::with(|host| host.text.install(fonts))
     }
 
     /// The window's client extent in DIPs, written only from window resize input.
@@ -512,8 +522,8 @@ impl Host {
                 None if self.fields.get(id).is_some() => Default::default(),
                 None => control
                     .text
-                    .and_then(|key| super::text::with(|table| table.str_of(key).map(str::to_owned)))
-                    .map_or_else(Default::default, |text| out.intern(&text)),
+                    .and_then(|key| self.text.str_of(key))
+                    .map_or_else(Default::default, |text| out.intern(text)),
             };
             // A tooltip becomes the element's `HelpText`. Read untracked: this runs inside a
             // flush, and subscribing whatever effect is on the stack would rebuild a screen
@@ -698,11 +708,13 @@ impl Host {
 
     // ── identity ──────────────────────────────────────────────────────────────────
 
-    pub(crate) fn mint_mount(&mut self, row: MountRow) -> MountId {
-        self.mounts.insert(&mut self.mount_ids, row)
+    pub(crate) fn mint_mount(&mut self, row: MountRow) -> NodeId {
+        let node = row.node;
+        self.mounts.place(node, row);
+        node
     }
 
-    pub(crate) fn set_escape(&mut self, row: MountId, f: Rc<dyn Fn()>) {
+    pub(crate) fn set_escape(&mut self, row: NodeId, f: Rc<dyn Fn()>) {
         if let Some(row) = self.mounts.get_mut(row) {
             row.escape = Some(f);
         }
@@ -752,7 +764,7 @@ impl Host {
 
     /// Records a probed node against the mount row that owns it, so it is released when that
     /// subtree unmounts rather than left reporting a destroyed node.
-    pub(crate) fn mint_probe(&mut self, row: MountId, probe: ProbeRow) {
+    pub(crate) fn mint_probe(&mut self, row: NodeId, probe: ProbeRow) {
         let at = self.probes.insert(&mut self.probe_ids, probe);
         if let Some(row) = self.mounts.get_mut(row) {
             row.probe = Some(at);
@@ -790,7 +802,7 @@ impl Host {
 
     /// Records a presentation region against the mount row that owns it, so it is unmounted
     /// from the present thread when that row goes.
-    pub(crate) fn mint_region(&mut self, row: MountId, region: crate::present::RegionRow) {
+    pub(crate) fn mint_region(&mut self, row: NodeId, region: crate::present::RegionRow) {
         let at = self.regions.insert(&mut self.region_ids, region);
         if let Some(row) = self.mounts.get_mut(row) {
             row.region = Some(at);
@@ -886,7 +898,7 @@ impl Host {
 
     /// Records a scroll container against the mount row that owns it, so its tracker is
     /// dropped when that row unmounts.
-    pub(crate) fn mint_scroll(&mut self, row: MountId, scroll: ScrollRow) {
+    pub(crate) fn mint_scroll(&mut self, row: NodeId, scroll: ScrollRow) {
         let at = self.scrolls.insert(&mut self.scroll_ids, scroll);
         if let Some(row) = self.mounts.get_mut(row) {
             row.scroll = Some(at);
@@ -1004,7 +1016,7 @@ impl Host {
         // still has an automation peer that reports checked, selected or unavailable.
         self.states.push((id, state));
         control.state = state;
-        control.repaint(&mut self.model);
+        self.repaint_control(id);
     }
 
     // ── unmount ───────────────────────────────────────────────────────────────────
@@ -1014,27 +1026,23 @@ impl Host {
     /// One destroy call, which cascades on the far side. Every other release walks the chain
     /// the mount threaded and touches only what those rows name, so the cost is proportional
     /// to the subtree and unmounting one row of a long list is cheap.
-    pub(crate) fn unmount(&mut self, node: NodeId, exit: Exit, rows: MountId) {
+    pub(crate) fn unmount(&mut self, node: NodeId, exit: Exit, rows: NodeId) {
         let mut at = rows;
-        while let Some(row) = self.mounts.remove(&mut self.mount_ids, at) {
+        while let Some(row) = self.mounts.take(at) {
             self.geometry_jobs.take(row.node);
             if row.popup {
                 self.request_popup(crate::overlay::Request::Close(at));
             }
-            // Fallible: this can run while the thread tears its locals down, and the style
-            // table is a thread-local going the same way.
-            super::style::try_with(|table| {
-                table.take(row.node);
-            });
+            self.styles.take(row.node);
             if let Some(id) = row.control {
                 self.release_control(id);
             }
             if let Some(key) = row.text {
-                super::text::try_with(|table| table.release(key, &mut self.model));
+                self.text.release(key, &mut self.model);
             }
             let mut paint = row.paints;
             while let Some(row) = self.appearances.take(paint) {
-                super::style::try_with(|table| table.take(paint));
+                self.styles.take(paint);
                 paint = row.next;
             }
             if let Some(probe) = row.probe {
@@ -1096,17 +1104,29 @@ impl Host {
     ///    terminates.
     /// Finally, release the Host borrow to draw dirty paths from settled local boxes,
     /// then emit their geometry and the layout together in the scene batch.
+    fn solve(&mut self) {
+        let mut measure = |input| self.text.measure(input);
+        let mut restyle = |node, class| self.styles.get(node).map(|recipe| recipe.lower(class));
+        self.model.solve(
+            self.env,
+            &mut windows_scene::LayoutServices {
+                measure: Some(&mut measure),
+                restyle: Some(&mut restyle),
+            },
+        );
+    }
+
     pub fn flush(patch: &mut SinkPatch) {
+        crate::signal::flush();
         Self::with(|h| {
             h.census.flushes += 1;
-            let env = h.env;
             h.size_overlay_viewports();
-            h.model.solve(env);
+            h.solve();
             if h.publish_geometry() {
-                h.model.solve(env);
+                h.solve();
             }
             if h.place_overlays() {
-                h.model.solve(env);
+                h.solve();
             }
             h.publish_masks();
             h.publish_fields();
@@ -1137,13 +1157,24 @@ impl Host {
             }
         });
         crate::signal::flush_geometry();
-        Self::with(|h| h.model.flush(patch, h.env));
+        Self::with(|h| {
+            let mut measure = |input| h.text.measure(input);
+            let mut restyle = |node, class| h.styles.get(node).map(|recipe| recipe.lower(class));
+            h.model.flush(
+                patch,
+                h.env,
+                &mut windows_scene::LayoutServices {
+                    measure: Some(&mut measure),
+                    restyle: Some(&mut restyle),
+                },
+            );
+        });
     }
 
     /// Publishes everything whose value is a function of the solve, and returns whether any
     /// of it moved a box.
     fn publish_geometry(&mut self) -> bool {
-        let text = super::text::with(|table| table.publish(&mut self.model));
+        let text = self.text.publish(&mut self.model, &self.styles);
         let scrolls = self.publish_scrolls();
         // Values bind compositor properties and dirty no layout, so they are published here
         // for ordering and contribute nothing to whether a re-solve is owed.
@@ -1531,7 +1562,7 @@ impl Host {
     ///
     /// Costs one re-emit per live run, so it belongs on those two events and nowhere else.
     pub fn reemit_text(&mut self) {
-        super::text::with(|table| table.reemit(&mut self.model));
+        self.text.reemit(&mut self.model);
     }
 
     /// Sets the window's size in DIPs, from the window's own resize message.
@@ -1550,21 +1581,6 @@ impl Host {
     pub(crate) fn model(&mut self) -> &mut Model {
         &mut self.model
     }
-}
-
-/// Re-paints one part, or leaves it alone where either the sprite or the role is absent.
-///
-/// A part whose state carries no role keeps the colour it had: there is no paint that clears
-/// a sprite.
-pub(crate) fn paint(model: &mut Model, id: Option<SpriteId>, role: Option<Role>, scope: Scope) {
-    let Some(id) = id else { return };
-    // A state whose row drops a part clears that part rather than leaving the previous
-    // state's paint on it. Reachable where one state supplies a fill and another does not —
-    // a ghost control that can be selected — and leaving it would make selection a latch.
-    let light = role.map_or(windows_color::Radiance::TRANSPARENT, |role| {
-        crate::role::resolve(role, scope)
-    });
-    model.paint(id, Paint::Solid(light));
 }
 
 #[cfg(test)]

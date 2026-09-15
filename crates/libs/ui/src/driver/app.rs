@@ -83,7 +83,6 @@ impl<'a> Thread<'a> {
         let ladder = links.ladder.get().cloned().ok_or_else(|| {
             Error::new(windows_window::E_HANDLE, "the scene thread never started")
         })?;
-        crate::build::text::install(ladder)?;
 
         let mut model = Model::new(layout::root());
         model.set_window(start.window_dips);
@@ -91,6 +90,7 @@ impl<'a> Thread<'a> {
         // and the root is what the application mounts under.
         let root = model.root();
         Host::install(model, start.env, start.root_scope);
+        Host::install_text(ladder)?;
 
         // A write made on this thread between passes marks the graph and returns; this flag
         // is what makes the loop run again rather than park over the marked work. A write
@@ -435,6 +435,7 @@ mod tests {
                 )
             }
         });
+        signal::flush();
         let id = Host::with(|h| {
             let id = h.field_sources[0].id;
             h.field_sources.clear();

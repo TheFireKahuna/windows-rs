@@ -61,7 +61,7 @@ impl Len {
     /// Carries all five cases, so a percentage stays a percentage for the solve to resolve
     /// and `Auto` stays content-sized.
     #[must_use]
-    pub fn dimension(self, scope: Scope) -> taffy::Dimension {
+    pub(crate) fn dimension(self, scope: Scope) -> taffy::Dimension {
         match self {
             Self::Metric(m) => taffy::Dimension::length(metric(m, scope)),
             Self::Times(m, n) => taffy::Dimension::length(metric(m, scope) * n),
@@ -73,7 +73,7 @@ impl Len {
 
     /// Returns this length as a padding, border or gap, where `Auto` resolves to zero.
     #[must_use]
-    pub fn length_percentage(self, scope: Scope) -> taffy::LengthPercentage {
+    pub(crate) fn length_percentage(self, scope: Scope) -> taffy::LengthPercentage {
         match self {
             Self::Metric(m) => taffy::LengthPercentage::length(metric(m, scope)),
             Self::Times(m, n) => taffy::LengthPercentage::length(metric(m, scope) * n),
@@ -84,7 +84,7 @@ impl Len {
 
     /// Returns this length as a margin or an inset, where `Auto` centres.
     #[must_use]
-    pub fn length_percentage_auto(self, scope: Scope) -> taffy::LengthPercentageAuto {
+    pub(crate) fn length_percentage_auto(self, scope: Scope) -> taffy::LengthPercentageAuto {
         match self {
             Self::Metric(m) => taffy::LengthPercentageAuto::length(metric(m, scope)),
             Self::Times(m, n) => taffy::LengthPercentageAuto::length(metric(m, scope) * n),
@@ -136,7 +136,7 @@ impl Track {
     /// track is sized by content. [`Len::dips`] answers `None` for both of those, and a
     /// track built from it would be a zero-width column.
     #[must_use]
-    pub fn sizing(self, scope: Scope) -> taffy::TrackSizingFunction {
+    pub(crate) fn sizing(self, scope: Scope) -> taffy::TrackSizingFunction {
         match self {
             Self::Fixed(l) => taffy::TrackSizingFunction::from(l.dimension(scope)),
             // taffy's bare `n fr` carries an `auto` minimum, which floors the track at its own
@@ -177,7 +177,7 @@ impl Align {
     ///
     /// `SpaceBetween` has no cross-axis meaning and lowers to `STRETCH`.
     #[must_use]
-    pub const fn items(self) -> taffy::AlignItems {
+    pub(crate) const fn items(self) -> taffy::AlignItems {
         match self {
             Self::Start => taffy::AlignItems::START,
             Self::Center => taffy::AlignItems::CENTER,
@@ -188,7 +188,7 @@ impl Align {
 
     /// Returns the main-axis distribution for the container's content.
     #[must_use]
-    pub const fn content(self) -> taffy::AlignContent {
+    pub(crate) const fn content(self) -> taffy::AlignContent {
         match self {
             Self::Start => taffy::AlignContent::START,
             Self::Center => taffy::AlignContent::CENTER,

@@ -14,16 +14,14 @@
 //! and every model call takes a fresh borrow.
 
 use super::arena::{Act, Build, ChanSource, HaloSeed, MaskSeed, NIL, Part, Slot, SpriteSeed};
-use super::host::{ControlRow, Host, MountId, MountRow};
-use super::style::{OverStore, Recipe};
+use super::host::{ControlRow, Host, MountRow};
+use super::style::{Declaration, Recipe};
 use super::{El, Site, View};
 use crate::gesture::GestureDecl;
-use crate::layout::{Edge, Len, Over, Preset, Rule};
+use crate::layout::{Edge, Layout, Len, Position, Preset};
 use crate::role::{DataRole, Metric, Role, Scope, Silhouette};
-use crate::signal::Effect;
 use crate::widget::{
-    Chrome, ChromeRow, Flow, Interaction, ModelState, Motion, RoleSet, StatePolicy, TextSource,
-    UiaRole, Wash,
+    Chrome, Flow, ModelState, Motion, RoleSet, StatePolicy, TextSource, UiaRole, Wash,
 };
 use core::cell::RefCell;
 use windows_color::Radiance;
@@ -43,8 +41,7 @@ use windows_scene::{
 /// knob arc and a routing wire each have a shape that depends on the width.
 #[must_use]
 pub fn geometry(verbs: &[PathVerb]) -> GeomId {
-    let lease =
-        Host::with(|h| super::geometry::Lease(h.model().geometry(verbs), h.identity.clone()));
+    let lease = Host::with(|h| super::geometry::Lease(h.model().geometry(verbs), h.identity));
     let id = lease.0;
     crate::signal::Owner::retain(lease);
     id
@@ -107,13 +104,13 @@ pub fn ramp(stops: &[Stop], spread: Spread) -> RampId {
     });
     let lease = Host::with(|h| {
         h.ramps.place(id, (stops.to_vec(), spread));
-        super::geometry::Lease(id, h.identity.clone())
+        super::geometry::Lease(id, h.identity)
     });
     struct RampLease(super::geometry::Lease<windows_scene::Ramp>);
     impl Drop for RampLease {
         fn drop(&mut self) {
             Host::try_with(|h| {
-                if std::rc::Rc::ptr_eq(&h.identity, &self.0.1) {
+                if h.identity == self.0.1 {
                     h.ramps.take(self.0.0);
                 }
             });
@@ -183,10 +180,18 @@ pub struct Mount {
     exit: Exit,
     /// The head of this subtree's chain through the mount table. A chain and not a `Vec`,
     /// so realizing a list row during a fling allocates nothing.
-    rows: MountId,
+    rows: NodeId,
 }
 
 impl Mount {
+    pub(super) fn new(node: NodeId, rows: NodeId) -> Self {
+        Self {
+            node,
+            rows,
+            exit: Exit::None,
+        }
+    }
+
     pub(crate) fn set_exit(&mut self, exit: Exit) {
         self.exit = exit;
     }
@@ -341,12 +346,12 @@ impl Where {
 /// The chain of mount-table rows one walk claimed, threaded as it goes.
 #[derive(Default)]
 struct Rows {
-    head: MountId,
-    tail: MountId,
+    head: NodeId,
+    tail: NodeId,
 }
 
 impl Rows {
-    fn push(&mut self, at: MountId) {
+    fn push(&mut self, at: NodeId) {
         if self.head.is_none() {
             self.head = at;
         } else {
@@ -358,6 +363,12 @@ impl Rows {
         }
         self.tail = at;
     }
+}
+
+fn bind(node: NodeId, update: impl FnMut() + 'static) {
+    Host::with(|h| {
+        h.binding(node, update);
+    });
 }
 
 /// Emits one slot and its subtree, and returns the node it minted.
@@ -437,31 +448,18 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     } else {
         let recipe = Recipe {
             preset: slot.preset,
-            over: OverStore::collect(b.chain_over(slot.over).map(|entry| entry.rule)),
             scope,
-            // Empty until the node's bound style acts first run, which is after this mount.
-            bound: Box::default(),
+            layout: core::mem::take(&mut b.layouts[at.at as usize]),
         };
-        let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), scope);
-        super::style::with(|table| table.place(node, recipe));
+        let style = recipe.lower(scope.width);
+        Host::with(|h| h.styles.place(node, recipe));
         Some(style)
     };
     let row = Host::with(|h| {
         if let Some(style) = &style {
             h.model().style(node, style);
         }
-        let row = h.mint_mount(MountRow {
-            node,
-            escape: None,
-            popup: false,
-            next: MountId::NONE,
-            control: None,
-            text: None,
-            paints: NodeId::NONE,
-            scroll: None,
-            probe: None,
-            region: None,
-        });
+        let row = h.mint_mount(MountRow::new(node));
         if let Some(cell) = slot.probe {
             h.mint_probe(
                 row,
@@ -538,7 +536,9 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         let source = parts.fill.or(parts.label).or(parts.border);
         if let HaloSeed::Reactive(index) = seed {
             if let Some(read) = b.halo_roles[index as usize].take() {
-                Effect::new(move || mount_halo(HaloSeed::Glow(read()), source, inner, silhouette));
+                bind(node, move || {
+                    mount_halo(HaloSeed::Glow(read()), source, inner, silhouette)
+                });
             }
         } else {
             mount_halo(seed, source, inner, silhouette);
@@ -905,42 +905,43 @@ fn cover_chrome(node: NodeId, scope: Scope, part: Part, chrome: Option<Chrome>) 
     } else {
         Len::Zero
     };
-    let attached = chrome.and_then(|c| c.attached);
+    let mut insets = [inset; 4];
+    if let Some(edge) = chrome.and_then(|c| c.attached) {
+        insets[match edge {
+            Edge::Left => 0,
+            Edge::Right => 1,
+            Edge::Top => 2,
+            Edge::Bottom => 3,
+        }] = Len::Zero;
+    }
     let recipe = Recipe {
         preset: Preset::Bare,
         scope,
-        bound: Box::default(),
-        over: OverStore::collect(
-            [
-                Rule::always(Over::Absolute),
-                Rule::always(Over::Inset(inset)),
-                Rule::always(Over::InsetEdge(
-                    attached.unwrap_or(Edge::Right),
-                    if attached.is_some() { Len::Zero } else { inset },
-                )),
-            ]
-            .into_iter(),
-        ),
+        layout: Declaration {
+            base: Layout {
+                position: Some(Position::Absolute(insets)),
+                ..Layout::default()
+            },
+            ..Declaration::default()
+        },
     };
-    let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), scope);
-    super::style::with(|table| table.place(node, recipe));
-    Host::with(|h| h.model().style(node, &style));
+    let style = recipe.lower(scope.width);
+    Host::with(|h| {
+        h.styles.place(node, recipe);
+        h.model().style(node, &style);
+    });
 }
 
-/// Styles a sprite as chrome for its parent rather than as a laid-out child of it.
-///
-/// Absolute at `inset`. Because `border` is never set on any style this crate produces, the
-/// parent's padding box is its border box, so a zero inset covers the node exactly.
+/// Positions derived paint within its owner's box.
 fn cover(node: NodeId, scope: Scope, inset: Len) {
-    let style = crate::layout::lower(
-        Preset::Bare,
-        &[
-            Rule::always(Over::Absolute),
-            Rule::always(Over::Inset(inset)),
-        ],
-        scope,
-    );
-    Host::with(|h| h.model().style(node, &style));
+    let layout = Layout {
+        position: Some(Position::Absolute([inset; 4])),
+        ..Layout::default()
+    };
+    Host::with(|h| {
+        h.model()
+            .style(node, &layout.lower(Preset::Bare, None, scope))
+    });
 }
 
 /// Resolves one sprite's mask and paint and writes both to the model.
@@ -958,72 +959,38 @@ fn emit_sprite(
     Host::with(|h| {
         let scope = scope.in_theme(h.root_scope);
         let prior = h.appearances.get(id.node());
+        let source = match (seed.source, seed.part, roles) {
+            (super::theme::PaintSource::Role(_), Part::Label, Some(roles)) => {
+                super::theme::PaintSource::Role(Role::Text(roles.text))
+            }
+            (source, _, _) => source,
+        };
         let appearance = super::theme::Appearance {
             id,
-            seed: *seed,
+            mask: seed.mask,
+            source,
+            part: seed.part,
+            strength: seed.strength,
             geom,
             scope,
-            roles,
             next: prior.map_or(NodeId::NONE, |p| p.next),
             chrome: prior.and_then(|p| p.chrome),
             halo: prior.and_then(|p| p.halo),
             wash: prior.is_some_and(|p| p.wash),
         };
         h.appearances.place(id.node(), appearance);
-        emit_sprite_on(h, id, seed, geom, scope, roles);
+        appearance.publish(h, true);
     });
-}
-
-pub(super) fn emit_sprite_on(
-    h: &mut Host,
-    id: SpriteId,
-    seed: &SpriteSeed,
-    geom: Option<GeomId>,
-    scope: Scope,
-    roles: Option<RoleSet>,
-) {
-    let role = role_of(seed, roles);
-    let resolved = crate::role::resolve(role, scope.for_paint());
-    // The strength scales the role's own alpha rather than replacing it: a hairline resolves
-    // to a wash already, and a sprite at full strength must leave that wash where it is.
-    let light = resolved.with_alpha(resolved.a * seed.strength);
-    // A role's own light, cast where the role is resolved, so a kind's badge and a kind's
-    // card cannot be lit differently. Only where the sprite paints the role as **ink**: a
-    // glyph's light is intrinsic to the glyph, where a filled shape's belongs to the surface
-    // it is part of — which is why a card states its halo and a label never has to.
-    //
-    // Scaled by the sprite's strength, so a plate painting a fraction of its role blooms at
-    // a fraction of its role's light.
-    let emission = match seed.part {
-        Part::Label => crate::role::emission(role, scope.for_paint()),
-        _ => crate::role::Emission::NONE,
-    };
-    // A ramp carries its own stops, resolved where it was minted, and a region's pixels are
-    // the present thread's, so neither reads the value resolved above. The region is tested
-    // first because it is the stronger claim: its buffer replaces everything this side could
-    // paint, where a ramp still describes colour.
-    let paint = match (seed.region, seed.ramp) {
-        (Some(region), _) => Paint::Presented(region),
-        (None, ramp) => ramp.map_or(Paint::Solid(light), Paint::Ramp),
-    };
-    // One borrow: the stroke resource, the mask and the paint are three model calls about
-    // one sprite, and the walk takes this borrow once per sprite already.
-    emit_mask(h, id, seed, geom, scope);
-    h.model().paint(id, paint);
-    // Declared even when dark: a sprite re-emitted into a role that stopped emitting has
-    // to lose the halo the previous role gave it, and `None` is how that is said.
-    h.model()
-        .halo(id, halo_of(emission, Silhouette::Ink, light));
 }
 
 pub(super) fn emit_mask(
     h: &mut Host,
     id: SpriteId,
-    seed: &SpriteSeed,
+    mask: MaskSeed,
     geom: Option<GeomId>,
     scope: Scope,
 ) {
-    let mask = match seed.mask {
+    let mask = match mask {
         MaskSeed::Box { radius } => Mask::Box {
             radius: Corners::all(radius.and_then(|r| r.dips(scope)).unwrap_or(0.0)),
         },
@@ -1061,7 +1028,11 @@ pub(super) fn emit_mask(
 /// The tint is the sprite's own resolved light at the emission's strength, not a colour of
 /// its own: a role emits *itself*, and a second authored colour here would be a way for a
 /// halo to disagree with the thing casting it.
-fn halo_of(emission: crate::role::Emission, of: Silhouette, light: Radiance) -> Option<Halo> {
+pub(super) fn halo_of(
+    emission: crate::role::Emission,
+    of: Silhouette,
+    light: Radiance,
+) -> Option<Halo> {
     let spend = emission.of(of);
     spend.is_lit().then(|| Halo {
         blur: spend.sigma,
@@ -1084,16 +1055,6 @@ fn selectable(b: &Build, slot: &Slot) -> bool {
         at = entry.next;
     }
     false
-}
-
-/// Returns a sprite's role: its own, unless it is the label of a widget whose chrome row
-/// owns the text colour. A chrome variant therefore reaches the text without the text seed
-/// naming one.
-fn role_of(seed: &SpriteSeed, roles: Option<RoleSet>) -> Role {
-    match (seed.part, roles) {
-        (Part::Label, Some(roles)) => Role::Text(roles.text),
-        _ => seed.role,
-    }
 }
 
 /// Emits the wash sprite a hover or a press fades in.
@@ -1152,7 +1113,7 @@ fn mount_control(
     parts: Parts,
     claim: Claim,
     scope: Scope,
-    row: MountId,
+    row: NodeId,
     observer: Option<ControlId>,
     hover_scope: Option<ControlId>,
 ) -> Option<ControlId> {
@@ -1211,7 +1172,7 @@ fn mount_control(
             Some(Act::Flyout(f)) => control.flyout = Some(f),
             Some(Act::DisabledWhen(f)) => disabled = Some(f),
             Some(Act::SelectedWhen(f)) => selected = Some(f),
-            Some(Act::HideWhen(_) | Act::Restyle(_) | Act::Escape(_) | Act::Popup { .. })
+            Some(Act::HideWhen(_) | Act::Restyle(..) | Act::Escape(_) | Act::Popup { .. })
             | None => {}
         }
     }
@@ -1228,7 +1189,6 @@ fn mount_control(
         .gesture(slot.gesture)
         .or_else(|| flags.contains(HitFlags::GESTURE).then(GestureDecl::default));
     let caption = slot.caption;
-    let chrome = slot.chrome;
     let id = Host::with(move |h| {
         let id = if let Some(id) = observer {
             h.place_control(id, control);
@@ -1239,18 +1199,7 @@ fn mount_control(
         if let Some(row) = h.mounts.get_mut(row) {
             row.control = Some(id);
         }
-        // The resting row's ink, applied here because a run seed bakes its colour at build
-        // time and the chrome row it belongs to is not known until now. Without it a mount
-        // and the first `set_state` disagree, and a control's label reads primary until
-        // something selects or disables it.
-        if let Some(roles) = chrome.map(|chrome| chrome.roles) {
-            super::host::paint(
-                h.model(),
-                label,
-                Some(Role::Text(roles.text)),
-                scope.for_paint(),
-            );
-        }
+        h.claim_control_paint(id);
         // The front thread's half, shipped as numbers and ids: its own copy stays here so a
         // solve that changed this control's room can re-send a corrected one.
         if let Some(control) = h.control_mut(id) {
@@ -1276,7 +1225,7 @@ fn mount_control(
     });
 
     if let Some(read) = validation {
-        Effect::new(move || {
+        bind(node, move || {
             let message = read();
             Host::with(|h| {
                 if let Some(control) = h.control_mut(id) {
@@ -1287,7 +1236,7 @@ fn mount_control(
         });
     }
     if let Some(source) = scalar_source {
-        Effect::new(move || {
+        bind(node, move || {
             let (fraction, epoch) = source();
             Host::with(|h| h.publish_fraction(id, fraction, epoch));
         });
@@ -1298,7 +1247,7 @@ fn mount_control(
     {
         Host::with(|h| h.install_field(id, group, key, input_scope, scope, text_commit));
         let mut scratch = String::new();
-        Effect::new(move || {
+        bind(node, move || {
             scratch.clear();
             source.append(&mut scratch);
             Host::with(|h| h.field_source(id, &scratch));
@@ -1307,7 +1256,7 @@ fn mount_control(
 
     // One derived state: disablement takes precedence, regardless of effect order.
     if disabled.is_some() || selected.is_some() {
-        Effect::new(move || {
+        bind(node, move || {
             let off = disabled.as_ref().is_some_and(|read| read());
             let on = selected.as_ref().is_some_and(|read| read());
             Host::with(|h| {
@@ -1346,7 +1295,7 @@ fn mount_scroll(
     content: NodeId,
     decl: crate::layout::ScrollDecl,
     scope: Scope,
-    row: MountId,
+    row: NodeId,
 ) {
     let reveal = decl.reveal;
     Host::with(|h| {
@@ -1415,19 +1364,8 @@ fn mount_scroll(
     });
 }
 
-/// Installs the effect behind a style that follows a value.
-///
-/// The effect re-lowers from the node's own recipe with the bound overrides appended, rather
-/// than from a style it has to remember, and at the class the last solve resolved for the
-/// node rather than one captured here, so neither the recipe nor the class can fall out of
-/// date.
-///
-/// One effect per node rather than one per act: lowering starts from the recipe every time,
-/// so an effect appending only its own override would publish a style with every other bound
-/// override missing, and two of them on one node would take turns. Collected, a node's style
-/// is written once per change and is always the whole of it. The scratch buffer belongs to
-/// the effect and reaches its high-water mark once.
-fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: MountId) {
+/// Reactive writers update the retained declaration, including its reusable track buffers.
+fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: NodeId) {
     let mut acts = Vec::new();
     let mut at = slot.acts.head;
     while at != NIL {
@@ -1442,7 +1380,7 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: MountId) {
                 closed,
             }) => {
                 Host::with(|h| h.mounts.get_mut(row).expect("mounted row").popup = true);
-                Effect::new(move || {
+                bind(node, move || {
                     let next = shown();
                     let request = if next {
                         crate::overlay::Request::Show {
@@ -1457,7 +1395,7 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: MountId) {
                     Host::with(|h| h.request_popup(request));
                 });
             }
-            Some(act @ (Act::HideWhen(_) | Act::Restyle(_))) => acts.push(act),
+            Some(act @ (Act::HideWhen(_) | Act::Restyle(..))) => acts.push(act),
             // Put back: the control pass owns the remaining variants.
             other => entry.act = other,
         }
@@ -1466,30 +1404,20 @@ fn mount_style_acts(b: &mut Build, slot: &Slot, node: NodeId, row: MountId) {
     if acts.is_empty() {
         return;
     }
-    let mut extra: Vec<Rule> = Vec::new();
-    // Installed outside every borrow, because creating an effect runs it.
-    Effect::new(move || {
-        extra.clear();
-        for act in &acts {
-            match act {
-                Act::HideWhen(hidden) => {
-                    if hidden() {
-                        extra.push(Rule::always(Over::Hidden));
+    bind(node, move || {
+        Host::with(|h| {
+            let class = h.model.solved(node).class;
+            if let Some(recipe) = h.styles.get_mut(node) {
+                for act in &acts {
+                    match act {
+                        Act::HideWhen(hidden) => recipe.layout.base.hidden = Some(hidden()),
+                        Act::Restyle(class, write) => write(recipe.layout.at(*class)),
+                        _ => {}
                     }
                 }
-                Act::Restyle(fill) => fill(&mut extra),
-                _ => {}
+                h.model.style(node, &recipe.lower(class));
             }
-        }
-        let class = Host::with(|h| h.model().solved(node).class);
-        // `bind` records these against the node as well as lowering them. Without that record
-        // the next class the solve resolves for this container re-lowers it from its recipe
-        // alone, and everything written here — a column template, a bound width, a hidden
-        // flag — is gone from the style the layout then runs on.
-        let Some(style) = super::style::bind(node, class, &extra) else {
-            return;
-        };
-        Host::with(|h| h.model().style(node, &style));
+        });
     });
 }
 
@@ -1524,18 +1452,6 @@ fn uia_only(flags: HitFlags) -> HitFlags {
 /// no allocation, so static content costs one sprite and nothing else. Anything else becomes
 /// exactly one effect, and the boxed reader moves into it.
 fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteId>, scope: Scope) {
-    let (mut pivots, mut relative) = (0, false);
-    let mut at = slot.chans.head;
-    while at != NIL {
-        let entry = &b.chans[at as usize];
-        pivots += usize::from(entry.prop == Prop::Center);
-        relative |= matches!(entry.source, Some(ChanSource::RelativePivot(_)));
-        at = entry.next;
-    }
-    assert!(
-        !relative || pivots == 1,
-        "a relative pivot cannot have another writer"
-    );
     let mut at = slot.chans.head;
     while at != NIL {
         let entry = &mut b.chans[at as usize];
@@ -1546,7 +1462,7 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteI
         // fill and not the group the author wrote the modifier on. Retargeted here rather
         // than at the seam: the scene refuses a property its node cannot own, so without
         // this a card's halo would simply never widen.
-        let node = match prop {
+        let target = match prop {
             Prop::BlurRadius | Prop::ShadowOpacity => fill.map_or(node, SpriteId::node),
             _ => node,
         };
@@ -1563,7 +1479,7 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteI
                 );
             }),
             Some(ChanSource::Const(constant)) => {
-                Host::with(|h| h.model().bind(node, prop, Bind::Set(constant)))
+                Host::with(|h| h.model().bind(target, prop, Bind::Set(constant)))
             }
             Some(ChanSource::Dynamic(read)) => {
                 // The first value a channel produces is the state it mounts in, not a
@@ -1571,7 +1487,7 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteI
                 // whatever the compositor happens to hold — a meter would fill on mount, and
                 // a layer declared invisible would fade *out* of a value it never had.
                 let previous = std::cell::Cell::new(None);
-                Effect::new(move || {
+                bind(node, move || {
                     let next = read();
                     // Dependencies can change without changing this channel: editing an
                     // enabled processor must not restart its card's opacity spring.
@@ -1589,7 +1505,7 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteI
                             delay_ms: 0,
                         }),
                     };
-                    Host::with(|h| h.model().bind(node, prop, bind));
+                    Host::with(|h| h.model().bind(target, prop, bind));
                 });
             }
             None => {}
@@ -1614,7 +1530,7 @@ fn mount_text(
     text: u32,
     scope: Scope,
     roles: Option<RoleSet>,
-    row: MountId,
+    row: NodeId,
 ) -> MeasureKey {
     let seed = &mut b.texts[text as usize];
     let (ramp, flow, caps, source) = (seed.ramp, seed.flow, seed.caps, seed.source.take());
@@ -1632,18 +1548,16 @@ fn mount_text(
             .map_or(super::text::Source::Static(""), Into::into)
     });
     let key = Host::with(|h| {
-        let key = super::text::with(|table| {
-            table.mint(super::text::Mint {
-                text: initial,
-                ramp,
-                flow,
-                caps,
-                vertical: seed.vertical,
-                scope,
-                ink,
-                sprite: sprite.unwrap_or_default(),
-                group: group.filter(|_| flow != Flow::Line || seed.vertical),
-            })
+        let key = h.text.mint(super::text::Mint {
+            text: initial,
+            ramp,
+            flow,
+            caps,
+            vertical: seed.vertical,
+            scope,
+            ink,
+            sprite: sprite.unwrap_or_default(),
+            group: group.filter(|_| flow != Flow::Line || seed.vertical),
         });
         if let Some(row) = h.mounts.get_mut(row) {
             row.text = Some(key);
@@ -1659,7 +1573,7 @@ fn mount_text(
     // declines to reshape a string that did not move.
     if let Some(TextSource::Dynamic(read)) = source {
         let mut scratch = String::new();
-        Effect::new(move || {
+        bind(node, move || {
             scratch.clear();
             read(&mut scratch);
             set_text(key, &scratch);
@@ -1670,10 +1584,10 @@ fn mount_text(
 
 /// Replaces a run's text, re-measuring its node and marking the accessible tree stale.
 fn set_text(key: MeasureKey, text: &str) {
-    let Some(node) = super::text::with(|table| table.set_text(key, text)) else {
-        return;
-    };
     Host::with(|h| {
+        let Some(node) = h.text.set_text(key, text) else {
+            return;
+        };
         // The measure's input moved and its context did not, which the model holds no copy
         // of and therefore cannot notice. Without this the run stays stale: reshaping runs
         // from the measure function, and the measure function runs for a dirty node. A row in
