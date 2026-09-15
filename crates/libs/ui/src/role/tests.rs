@@ -144,8 +144,8 @@ static REFERENCE: Reference = Reference;
 /// Shared with the lowering's own tests rather than duplicated there: the palette is a
 /// process-wide `OnceLock`, so a second one would not install and the module that lost the
 /// race would assert against the other's answers.
-pub(crate) fn palette() {
-    install(&REFERENCE);
+pub(crate) fn palette() -> &'static dyn Palette {
+    &REFERENCE
 }
 
 /// Returns every scope the four varying axes produce, with the accent fixed. Totality is a
@@ -165,6 +165,7 @@ fn every_scope() -> impl Iterator<Item = Scope> {
         POLARITIES.into_iter().flat_map(move |polarity| {
             DENSITIES.into_iter().flat_map(move |density| {
                 WIDTHS.into_iter().map(move |width| Scope {
+                    palette: PaletteRef(&REFERENCE),
                     elevation,
                     polarity,
                     accent: AccentId(0),
@@ -209,7 +210,6 @@ fn every_role() -> impl Iterator<Item = Role> {
 
 #[test]
 fn every_role_in_every_scope_resolves_to_finite_light() {
-    palette();
     for scope in every_scope() {
         for role in every_role() {
             let light = resolve(role, scope);
@@ -227,8 +227,11 @@ fn every_role_in_every_scope_resolves_to_finite_light() {
 
 #[test]
 fn a_data_role_carries_no_polarity() {
-    palette();
-    let dark = Scope::root(AccentId(0), Density::Comfortable);
+    let dark = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let mut light_scope = dark;
     light_scope.polarity = Polarity::Light;
     for band in 0..8 {
@@ -243,8 +246,11 @@ fn a_data_role_carries_no_polarity() {
 
 #[test]
 fn a_chrome_role_does_carry_polarity() {
-    palette();
-    let dark = Scope::root(AccentId(0), Density::Comfortable);
+    let dark = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let mut light_scope = dark;
     light_scope.polarity = Polarity::Light;
     let role = Role::Text(Text::Primary);
@@ -253,8 +259,11 @@ fn a_chrome_role_does_carry_polarity() {
 
 #[test]
 fn elevating_a_scope_changes_the_surface_and_nothing_else_about_the_call() {
-    palette();
-    let base = Scope::root(AccentId(0), Density::Comfortable);
+    let base = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let raised = base.elevate(Elevation::Raised);
     assert_ne!(
         resolve(Role::Fill(Fill::Surface), base),
@@ -271,8 +280,12 @@ fn elevating_a_scope_changes_the_surface_and_nothing_else_about_the_call() {
 fn an_interaction_state_is_the_same_role_re_resolved() {
     // Hover, pressed and selected are not extra colour parameters. The application never
     // writes one; the scene ramps between two resolutions of the same scope.
-    palette();
-    let scope = Scope::root(AccentId(0), Density::Comfortable).elevate(Elevation::Raised);
+    let scope = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    )
+    .elevate(Elevation::Raised);
     let rest = resolve(Role::Fill(Fill::Surface), scope);
     let hover = resolve(Role::Fill(Fill::Hover), scope);
     assert_ne!(rest, hover);
@@ -281,8 +294,12 @@ fn an_interaction_state_is_the_same_role_re_resolved() {
 
 #[test]
 fn a_wash_is_derived_from_a_role_rather_than_stored() {
-    palette();
-    let scope = Scope::root(AccentId(0), Density::Comfortable).elevate(Elevation::Flyout);
+    let scope = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    )
+    .elevate(Elevation::Flyout);
 
     let ink = ink(0.25, scope);
     let text = resolve(Role::Text(Text::Primary), scope);
@@ -294,7 +311,11 @@ fn a_wash_is_derived_from_a_role_rather_than_stored() {
     let veil = veil(0.5, scope);
     let base = resolve(
         Role::Fill(Fill::Surface),
-        Scope::root(AccentId(0), Density::Comfortable),
+        Scope::root(
+            crate::role::tests::palette(),
+            AccentId(0),
+            Density::Comfortable,
+        ),
     );
     assert_eq!((veil.r, veil.g, veil.b), (base.r, base.g, base.b));
 
@@ -305,8 +326,11 @@ fn a_wash_is_derived_from_a_role_rather_than_stored() {
 
 #[test]
 fn density_and_width_are_separate_axes_and_both_reach_a_metric() {
-    palette();
-    let root = Scope::root(AccentId(0), Density::Comfortable);
+    let root = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let comfortable_wide = metric(Metric::SpaceMd, root);
     let compact_wide = metric(Metric::SpaceMd, root.at_density(Density::Compact));
     let comfortable_narrow = metric(Metric::SpaceMd, root.at_width(WidthClass::Narrow));
@@ -329,7 +353,6 @@ fn density_and_width_are_separate_axes_and_both_reach_a_metric() {
 
 #[test]
 fn a_row_height_never_drops_below_the_touch_floor() {
-    palette();
     for scope in every_scope() {
         assert!(
             metric(Metric::RowH, scope) >= 24.0,
@@ -342,7 +365,6 @@ fn a_row_height_never_drops_below_the_touch_floor() {
 fn a_pill_radius_is_a_real_value_and_not_a_sentinel() {
     // A composition corner radius caps at half the box, so a pill authored as some large
     // number renders as a football on a tall box rather than as a stadium.
-    palette();
     for scope in every_scope() {
         let pill = metric(Metric::RadiusPill, scope);
         assert!(
@@ -354,29 +376,16 @@ fn a_pill_radius_is_a_real_value_and_not_a_sentinel() {
 
 #[test]
 fn the_type_ramp_resolves_through_the_same_scope_the_colours_use() {
-    palette();
-    let root = Scope::root(AccentId(0), Density::Comfortable);
+    let root = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let body = typography(TypeRole::Body, root);
     let compact = typography(TypeRole::Body, root.at_density(Density::Compact));
     assert!(compact.size < body.size);
     assert!(typography(TypeRole::Title, root).weight > body.weight);
     assert!(typography(TypeRole::Display, root).size > typography(TypeRole::Title, root).size);
-}
-
-#[test]
-fn a_polarity_flip_is_reported_only_when_it_moved() {
-    // Step one of four; the return value tells the caller whether the other three are
-    // needed.
-    let start = polarity();
-    assert!(
-        !set_polarity(start),
-        "a flip to the current polarity is not a flip"
-    );
-    assert!(set_polarity(match start {
-        Polarity::Dark => Polarity::Light,
-        Polarity::Light => Polarity::Dark,
-    }));
-    assert!(set_polarity(start), "and back");
 }
 
 macro_rules! test_metric {

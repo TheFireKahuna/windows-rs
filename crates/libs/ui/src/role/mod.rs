@@ -25,17 +25,14 @@
 mod palette;
 mod token;
 pub use token::ScopedToken;
-// The reference palette installs into a process-wide `OnceLock`, so the lowering's tests
-// reach this module rather than install a second palette that would lose the race.
+// A reference palette for production lowering tests.
 #[cfg(test)]
 pub(crate) mod tests;
 
 pub use palette::{
-    Palette, accent_wash, content_peak_nits, data, emission, ink, install, installed, metric,
-    resolve, shadow, typography, veil,
+    Palette, accent_wash, content_peak_nits, data, emission, ink, metric, resolve, shadow,
+    typography, veil,
 };
-
-use core::sync::atomic::{AtomicU8, Ordering};
 
 pub use windows_scene::WidthClass;
 
@@ -56,7 +53,7 @@ pub enum Elevation {
     Flyout,
 }
 
-/// Which way round the palette runs. Process-global; see [`polarity`].
+/// Which way round this window's palette runs.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Polarity {
     #[default]
@@ -66,7 +63,7 @@ pub enum Polarity {
 
 /// How tight the layout is: the user's preference, not the container's situation.
 ///
-/// It applies to every scope at once, so no call site branches on it.
+/// It applies to every scope within its host, so no call site branches on it.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Density {
     #[default]
@@ -80,14 +77,15 @@ pub struct AccentId(pub u8);
 
 /// Everything a role resolves against.
 ///
-/// The five axes answer different questions. [`Density`] is what the user asked for and
-/// applies to every scope at once; [`WidthClass`] is how much room this container got, so one
+/// The scope axes answer different questions. [`Density`] is what the user asked for and
+/// applies throughout its host; [`WidthClass`] is how much room this container got, so one
 /// card is `Wide` in a full-width row and `Narrow` in a detail pane of the same window at the
 /// same instant. The palette resolves both in one function, so a rule such as "compact and
 /// narrow takes the tightest gap, but never below the touch floor" is stated once rather than
 /// as two conditionals per call site.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Scope {
+    pub palette: PaletteRef,
     /// Which rung of the surface ladder fills come from.
     pub elevation: Elevation,
     /// Which way round the palette runs.
@@ -101,16 +99,16 @@ pub struct Scope {
 }
 
 impl Scope {
-    /// Returns the window's own scope: [`Elevation::Base`], the current process
-    /// [`polarity`], and the given accent and density.
+    /// Returns a dark root scope with the given palette, accent and density.
     ///
     /// `width` starts at [`WidthClass::Wide`] and is replaced by the first responsive
     /// container that classifies itself.
     #[must_use]
-    pub fn root(accent: AccentId, density: Density) -> Self {
+    pub fn root(palette: &'static dyn Palette, accent: AccentId, density: Density) -> Self {
         Self {
+            palette: PaletteRef(palette),
             elevation: Elevation::Base,
-            polarity: polarity(),
+            polarity: Polarity::Dark,
             accent,
             density,
             width: WidthClass::Wide,
@@ -136,12 +134,12 @@ impl Scope {
         Self { density, ..self }
     }
 
-    /// Returns the same scope with the process polarity re-read. Step one of a theme flip.
-    #[must_use]
-    pub fn repolarized(self) -> Self {
+    /// Rebases window-owned axes, preserving lexical elevation and solved width.
+    pub const fn in_theme(self, root: Self) -> Self {
         Self {
-            polarity: polarity(),
-            ..self
+            elevation: self.elevation,
+            width: self.width,
+            ..root
         }
     }
 
@@ -221,6 +219,29 @@ pub enum Role {
     Fill(Fill),
     Stroke(Stroke),
     Data(DataRole),
+    /// Application-owned semantic paint and emission, resolved at width-independent scope.
+    Custom(&'static ScopedToken<(windows_color::Radiance, Emission)>),
+}
+
+impl From<DataRole> for Role {
+    fn from(role: DataRole) -> Self {
+        Self::Data(role)
+    }
+}
+impl From<Fill> for Role {
+    fn from(role: Fill) -> Self {
+        Self::Fill(role)
+    }
+}
+impl From<Stroke> for Role {
+    fn from(role: Stroke) -> Self {
+        Self::Stroke(role)
+    }
+}
+impl From<Text> for Role {
+    fn from(role: Text) -> Self {
+        Self::Text(role)
+    }
 }
 
 /// One silhouette's worth of a role's light.
@@ -396,30 +417,25 @@ pub enum Metric {
     Custom(&'static ScopedToken<f32>),
 }
 
-/// The process polarity. Read at every [`Scope::root`] and every [`Scope::repolarized`].
-static POLARITY: AtomicU8 = AtomicU8::new(0);
-
-/// The current process polarity.
-#[must_use]
-pub fn polarity() -> Polarity {
-    // Relaxed: the byte publishes nothing but itself, and a flip reaches the interface
-    // through the re-resolve and re-emit its caller performs rather than through this load.
-    match POLARITY.load(Ordering::Relaxed) {
-        0 => Polarity::Dark,
-        _ => Polarity::Light,
+/// Immutable palette identity carried by a window's scopes. No process-global install.
+#[derive(Copy, Clone)]
+pub struct PaletteRef(pub &'static dyn Palette);
+impl PartialEq for PaletteRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.type_id() == other.0.type_id() && core::ptr::addr_eq(self.0, other.0)
     }
 }
-
-/// Sets the process polarity, and returns whether it moved.
-///
-/// Step one of four. The caller completes the flip, and skipping any of the rest leaves half
-/// the interface in the other polarity: repolarize every live [`Scope`] so [`resolve`]
-/// answers from the other palette, bump the colour generation so rasterized cells are
-/// rebuilt, re-emit the whole patch so sprites rebind their paints, and invalidate the window
-/// backdrop, which is not in the retained tree.
-pub fn set_polarity(polarity: Polarity) -> bool {
-    let next = u8::from(polarity == Polarity::Light);
-    // Relaxed: the swap orders nothing but itself. What follows a flip is the caller's
-    // re-resolve and re-emit, not a read of this byte.
-    POLARITY.swap(next, Ordering::Relaxed) != next
+impl Eq for PaletteRef {}
+impl core::hash::Hash for PaletteRef {
+    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        self.0.type_id().hash(h);
+        (self.0 as *const dyn Palette as *const ()).hash(h);
+    }
+}
+impl core::fmt::Debug for PaletteRef {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Palette")
+            .field(&(self.0 as *const dyn Palette))
+            .finish()
+    }
 }

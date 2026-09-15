@@ -187,32 +187,7 @@ impl<'a> Thread<'a> {
         for update in &up.text {
             Host::with(|h| h.field_update(update));
         }
-        for commit in &up.field_commits {
-            let callback = Host::with(|h| {
-                let row = h.fields.get_mut(commit.id)?;
-                if row
-                    .delivered_revision
-                    .is_some_and(|revision| revision >= commit.revision)
-                {
-                    return None;
-                }
-                row.delivered_revision = Some(commit.revision);
-                row.callback_revision = Some(commit.revision);
-                row.callback.clone()
-            });
-            if let Some(callback) = callback {
-                callback(&commit.text);
-                // Effects are deferred by the signal graph. Drain this callback's source
-                // writes while its causal revision is still installed, before a later
-                // callback can overwrite the source or inherit the wrong revision.
-                signal::flush();
-            }
-            Host::with(|h| {
-                if let Some(row) = h.fields.get_mut(commit.id) {
-                    row.callback_revision = None;
-                }
-            });
-        }
+        deliver_field_commits(&up.field_commits);
         // Geometry facts first, so the solve below runs on the extent and the display the
         // reports came from.
         if let Some(window) = up.window {
@@ -336,6 +311,35 @@ pub(super) fn reconcile(overlays: &mut Overlays, focus: &mut Vec<FocusOp>) -> bo
     let work = signal::flush();
     overlays.sync(focus);
     work | !focus.is_empty()
+}
+
+pub(super) fn deliver_field_commits(commits: &[crate::text_input::Commit]) {
+    for commit in commits {
+        let callback = Host::with(|h| {
+            let row = h.fields.get_mut(commit.id)?;
+            if row
+                .delivered_revision
+                .is_some_and(|revision| revision >= commit.revision)
+            {
+                return None;
+            }
+            row.delivered_revision = Some(commit.revision);
+            row.callback_revision = Some(commit.revision);
+            row.callback.clone()
+        });
+        if let Some(callback) = callback {
+            callback(&commit.text);
+            // Effects are deferred by the signal graph. Drain this callback's source
+            // writes while its causal revision is still installed, before a later
+            // callback can overwrite the source or inherit the wrong revision.
+            signal::flush();
+        }
+        Host::with(|h| {
+            if let Some(row) = h.fields.get_mut(commit.id) {
+                row.callback_revision = None;
+            }
+        });
+    }
 }
 
 #[cfg(test)]

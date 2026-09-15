@@ -103,6 +103,16 @@ pub struct OutputTransform {
 }
 
 impl OutputTransform {
+    /// The display gamut this transform targets.
+    pub const fn gamut(self) -> Gamut { self.gamut }
+
+    /// Reuses the display capability with a newly declared authored content peak.
+    pub fn with_content_peak_nits(mut self, peak: f32) -> Self {
+        self.peak_limit = peak.max(REFERENCE_WHITE_NITS) * self.exposure;
+        self.knee = if self.peak_limit > self.white + self.head { self.white } else { f32::INFINITY };
+        self
+    }
+
     /// Resolves a display capability into a transform.
     ///
     /// `content_peak_nits` must be the brightest *channel* the application's palette

@@ -205,6 +205,7 @@ impl<T> Drop for Mailbox<T> {
 /// [`clear`](Self::clear).
 #[derive(Default)]
 pub(crate) struct Down {
+    pub theme: Option<(crate::role::Scope, windows_scene::BackdropSpec)>,
     pub field_sources: Vec<crate::text_input::Source>,
     pub field_layouts: Vec<crate::text_input::Layout>,
     pub field_commits: Vec<crate::text_input::Commit>,
@@ -227,6 +228,7 @@ impl Down {
         self.field_sources.is_empty()
             && self.field_layouts.is_empty()
             && self.field_commits.is_empty()
+            && self.theme.is_none()
             && self.patch.is_empty()
             && self.chrome.is_empty()
             && self.gestures.is_empty()
@@ -243,6 +245,7 @@ impl Down {
         self.field_sources.clear();
         self.field_layouts.clear();
         self.field_commits.clear();
+        self.theme = None;
         self.patch.clear();
         self.chrome.clear();
         self.gestures.clear();
@@ -360,6 +363,7 @@ const _: () = {
 /// rebuild.
 #[derive(Default)]
 pub(crate) struct InputDown {
+    pub scope: Option<crate::role::Scope>,
     pub text_geometry_changed: bool,
     pub seeds: Option<Seeds>,
     pub field_sources: Vec<crate::text_input::Source>,
@@ -390,6 +394,7 @@ pub(crate) struct InputDown {
 impl InputDown {
     /// Empties every buffer, keeping its allocation, and resets the scalars.
     pub(crate) fn clear(&mut self) {
+        self.scope = None;
         self.text_geometry_changed = false;
         self.seeds = None;
         self.field_sources.clear();
@@ -450,6 +455,7 @@ pub(crate) enum RegionOp {
         extent: Extent,
         queue: Queue,
         build: Build,
+        theme: crate::present::Theme,
     },
     /// The region's box moved, so its buffers are reallocated for `extent`.
     Resize {

@@ -311,6 +311,8 @@ impl<K: Cell> Cache<K> {
 pub struct BoxKey {
     /// Quarter-pixel radii, in the order the corners are drawn.
     radius: [i32; 4],
+    width: i32,
+    open: Option<crate::Side>,
     /// The cell's pixel extent: two insets and the one flat pixel between them, which is
     /// what the nine-grid's middle slice stretches from.
     px: (u32, u32),
@@ -321,6 +323,11 @@ impl BoxKey {
     /// Builds the key for corner profile `radius` at `scale`, snapping every dimension.
     #[must_use]
     pub fn new(radius: Corners, scale: f32) -> Self {
+        Self::outline(radius, -1.0, None, scale)
+    }
+
+    /// A shared outline profile. Zero width has no coverage.
+    pub fn outline(radius: Corners, width: f32, open: Option<crate::Side>, scale: f32) -> Self {
         let quarter = |r: f32| (snap_detail(r, scale) * scale * 4.0).round() as i32;
         let corners = [
             quarter(radius.tl),
@@ -333,10 +340,15 @@ impl BoxKey {
         // profile a pixel of radius for nothing: a box has to hold two insets, so a control
         // asking to be fully round is cut down by whatever the raster wastes.
         let widest = corners.into_iter().max().unwrap_or(0).max(0) as u32;
-        let inset = widest.div_ceil(4).max(1);
+        let inset = widest
+            .div_ceil(4)
+            .max((width.max(0.0) * scale).ceil() as u32)
+            .max(1);
         let side = inset * 2 + 1;
         Self {
             radius: corners,
+            open,
+            width: if width < 0.0 { -1 } else { quarter(width) },
             px: (side, side),
             inset,
         }
@@ -381,6 +393,30 @@ impl Cell for BoxKey {
         let (w, h) = (self.px.0 as f32 / scale, self.px.1 as f32 / scale);
         let box_ = Rect::new(0.0, 0.0, w, h);
 
+        if self.width == 0 {
+            return Ok(());
+        }
+        if self.width > 0 {
+            let width = self.width as f32 / (4.0 * scale);
+            let half = width * 0.5;
+            let centre = Rect::new(half, half, w - half, h - half);
+            let radii = [tl, tr, br, bl].map(|r| (r - half).max(0.0));
+            let path = res.gpu.path(|sink| {
+                sink.rounded_box(centre, radii);
+                Ok(())
+            })?;
+            let mut clip = box_;
+            match self.open {
+                Some(crate::Side::Left) => clip.left += width,
+                Some(crate::Side::Top) => clip.top += width,
+                Some(crate::Side::Right) => clip.right -= width,
+                Some(crate::Side::Bottom) => clip.bottom -= width,
+                None => {}
+            }
+            let _clip = d.clip(clip);
+            d.stroke(&path, &res.white, windows_d2d::Stroke::width(width));
+            return Ok(());
+        }
         if tl == tr && tr == br && br == bl {
             // A uniform profile has an analytic rounded rectangle, which Direct2D
             // rasterizes by the pixels it touches rather than by tessellating a mesh.
@@ -475,6 +511,58 @@ impl Cell for SolidKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_outline_coverage_has_a_transparent_center_at_each_dpi() -> Result<()> {
+        let gpu = Gpu::for_window()?;
+        let resources = BoxKey::resources(&gpu)?;
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for open in [
+                None,
+                Some(crate::Side::Top),
+                Some(crate::Side::Left),
+                Some(crate::Side::Right),
+                Some(crate::Side::Bottom),
+            ] {
+                for width in [0.0, 1.0, 2.0] {
+                    let key = BoxKey::outline(Corners::all(8.0), width, open, scale);
+                    let target = gpu.offscreen(key.px(), scale * 96.0, Opacity::Translucent)?;
+                    let mut pass = gpu.pass()?;
+                    key.draw(&pass.draw(&target), &resources)?;
+                    pass.end().expect("the production outline draw must finish");
+                    let pixels = gpu.read(&target)?;
+                    let (w, h) = key.px();
+                    assert_eq!(
+                        pixels.pixel(w / 2, h / 2)[3],
+                        0.0,
+                        "an outline never fills its center"
+                    );
+                    assert_eq!(
+                        pixels.pixel(0, 0)[3],
+                        0.0,
+                        "rounded corner coverage stays inside the profile"
+                    );
+                    for (side, x, y) in [
+                        (crate::Side::Top, w / 2, 0),
+                        (crate::Side::Bottom, w / 2, h - 1),
+                        (crate::Side::Left, 0, h / 2),
+                        (crate::Side::Right, w - 1, h / 2),
+                    ] {
+                        let alpha = pixels.pixel(x, y)[3];
+                        if width == 0.0 || open == Some(side) {
+                            assert_eq!(alpha, 0.0);
+                        } else {
+                            assert!(
+                                alpha > 0.75,
+                                "closed edge {side:?} at {scale}x has {alpha} coverage"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_generation_only_invalidates_what_reads_it() {

@@ -8,7 +8,6 @@
 
 use crate::build::arena::{FULL, MaskSeed, Part};
 use crate::build::{Button, El, Path, View};
-use crate::gesture::{DragDecl, GestureDecl};
 use crate::layout::{Align, Len, Over, Preset};
 use crate::role::{Fill, Metric, Role, Text, TypeRole};
 use crate::signal::{Cell, Signal};
@@ -27,6 +26,19 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
+    /// Overrides only the ink; typography remains a solve-time token.
+    pub const fn ink(mut self, ink: Role) -> Self {
+        self.ink = Some(ink);
+        self
+    }
+    pub const fn flow(mut self, flow: Flow) -> Self {
+        self.flow = flow;
+        self
+    }
+    pub const fn caps(mut self, caps: bool) -> Self {
+        self.caps = caps;
+        self
+    }
     /// A primary, single-line run with the supplied typography token.
     pub const fn new(typography: TypeRole) -> Self {
         Self {
@@ -229,9 +241,15 @@ pub fn flyout() -> View {
 /// A press. Four variants over one table, chosen on [`El<Button>`](Button).
 #[must_use]
 pub fn button(text: impl Into<TextSource>) -> El<Button> {
+    button_with(text, TextStyle::new(TypeRole::Body))
+}
+
+/// A button using application-owned typography and casing, with one label run.
+#[must_use]
+pub fn button_with(text: impl Into<TextSource>, style: TextStyle) -> El<Button> {
     control(UiaRole::Button)
         .chrome(roles::BUTTON, roles::DEFAULT, Metric::Radius)
-        .row(inner(text, TypeRole::Body, false))
+        .row(control_text(text, style))
 }
 
 /// A button joined flush to a containing edge. Placement remains the caller's job;
@@ -299,6 +317,9 @@ pub fn toggle<M>(on: impl Signal<bool, M> + Copy + 'static) -> View {
         .chrome(roles::TRACK, roles::TRACK_OFF, Metric::RadiusPill)
         .selected(on)
         .interaction(Interaction::Press)
+        .act(crate::build::arena::Act::ScalarSource(Box::new(
+            move || (f32::from(on.read()), 0),
+        )))
         .row((
             // The on state's fill, as a covering plate whose opacity carries the state. A
             // variant is resolved at mount, so the alternative is rebuilding the control on
@@ -313,8 +334,7 @@ pub fn toggle<M>(on: impl Signal<bool, M> + Copy + 'static) -> View {
                 .plate(Metric::RadiusPill, TRACK_ON_FILL, FULL)
                 .cover()
                 .opacity(move || f32::from(u8::from(on.read()))),
-            knob_sprite(1.0, TOGGLE_KNOB_OF_TRACK)
-                .along(false, move || f32::from(u8::from(on.read()))),
+            knob_sprite(1.0, TOGGLE_KNOB_OF_TRACK),
         ))
         .min_height(Len::Zero)
         .height(Metric::TrackH)
@@ -348,86 +368,40 @@ pub fn slider<M>(
     style: SliderStyle,
 ) -> View {
     let extent = crate::layout::probe();
-    let geometry = crate::build::geometry(&[]);
-    let marker = crate::build::geometry(&[]);
     let fraction = range.fraction(style.origin.unwrap_or(range.min));
     let origin = if range.vertical {
         1.0 - fraction
     } else {
         fraction
     };
-    crate::signal::Effect::new(move || {
-        let size = extent.get().size;
-        let (a, b) = if range.vertical {
-            (
-                windows_numerics::Vector2 {
-                    x: size.x * 0.5,
-                    y: 0.0,
-                },
-                windows_numerics::Vector2 {
-                    x: size.x * 0.5,
-                    y: size.y,
-                },
-            )
-        } else {
-            (
-                windows_numerics::Vector2 {
-                    x: 0.0,
-                    y: size.y * 0.5,
-                },
-                windows_numerics::Vector2 {
-                    x: size.x,
-                    y: size.y * 0.5,
-                },
-            )
-        };
-        let half_tick = crate::role::metric(Metric::SliderThumb, crate::build::root_scope()) * 0.55;
-        let (tick_a, tick_b) = if range.vertical {
-            (
-                windows_numerics::Vector2 {
-                    x: size.x * 0.5 - half_tick,
-                    y: size.y * origin,
-                },
-                windows_numerics::Vector2 {
-                    x: size.x * 0.5 + half_tick,
-                    y: size.y * origin,
-                },
-            )
-        } else {
-            (
-                windows_numerics::Vector2 {
-                    x: size.x * origin,
-                    y: size.y * 0.5 - half_tick,
-                },
-                windows_numerics::Vector2 {
-                    x: size.x * origin,
-                    y: size.y * 0.5 + half_tick,
-                },
-            )
-        };
-        crate::build::set_geometry(
-            marker,
-            &[
-                windows_scene::PathVerb::Move {
-                    to: tick_a,
-                    filled: false,
-                },
-                windows_scene::PathVerb::Line(tick_b),
-                windows_scene::PathVerb::End { closed: false },
-            ],
-        );
-        crate::build::set_geometry(
-            geometry,
-            &[
-                windows_scene::PathVerb::Move {
-                    to: a,
-                    filled: false,
-                },
-                windows_scene::PathVerb::Line(b),
-                windows_scene::PathVerb::End { closed: false },
-            ],
-        );
-    });
+    let [geometry, marker] =
+        crate::build::local_geometries(extent, [3; 2], move |[rail, marker], size, scope| {
+            use windows_numerics::Vector2;
+            use windows_scene::PathVerb;
+            let at = |along, cross| {
+                if range.vertical {
+                    Vector2 { x: cross, y: along }
+                } else {
+                    Vector2 { x: along, y: cross }
+                }
+            };
+            let (length, cross) = if range.vertical {
+                (size.y, size.x * 0.5)
+            } else {
+                (size.x, size.y * 0.5)
+            };
+            let half = crate::role::metric(Metric::SliderThumb, scope) * 0.55;
+            for (out, a, b) in [
+                (rail, at(0.0, cross), at(length, cross)),
+                (
+                    marker,
+                    at(length * origin, cross - half),
+                    at(length * origin, cross + half),
+                ),
+            ] {
+                out.push(PathVerb::Segment { from: a, to: b });
+            }
+        });
     let trail = path(geometry)
         .slider_trail(origin, style.ramp)
         .probed(extent)
@@ -485,12 +459,10 @@ pub fn slider<M>(
         )
         .width(Metric::SliderThumb)
         .height(Metric::SliderThumb)
-        .no_shrink()
-        .along(range.vertical, move || range.fraction(value.read()));
+        .no_shrink();
     let control = control::<crate::build::Any>(UiaRole::Slider)
         .chrome(roles::OPTION, 0, Metric::RadiusPill)
-        .interaction(Interaction::Slide(range))
-        .gesture(GestureDecl::slider(range.vertical))
+        .slide(value, range)
         .state(accent_wash());
     let inset = Len::Times(Metric::SliderThumb, 0.5);
     let control = if range.vertical {
@@ -522,8 +494,7 @@ pub fn slider<M>(
 pub fn knob<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> View {
     control::<crate::build::Any>(UiaRole::Slider)
         .chrome(roles::TRACK, roles::TRACK_OFF, Metric::RadiusPill)
-        .interaction(Interaction::Turn(range))
-        .drag(DragDecl::turn())
+        .turn(value, range)
         .state(accent_wash())
         .stack(
             El::<crate::build::Any>::seed(Preset::Bare)
@@ -531,7 +502,10 @@ pub fn knob<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> Vie
                 // A fraction and not an angle: whichever side is moving the part applies
                 // the sweep, through `angle_of`, so a committed value and a live drag land
                 // the knob in the same place.
-                .turns(move || range.fraction(value.read())),
+                .scalar_part(super::ScalarPart::Rotation {
+                    from: 0.0,
+                    to: super::TURN_SWEEP,
+                }),
         )
 }
 
@@ -541,6 +515,29 @@ pub fn knob<M>(value: impl Signal<f64, M> + Copy + 'static, range: Range) -> Vie
 /// than as a fill flush against it. Below the spacing scale on purpose: [`Metric::SpaceXs`]
 /// is the tightest gap between two separate things, and this is the seam inside one control.
 const GROOVE_INSET_PX: f32 = 2.0;
+
+/// A choice reads canonical state and dispatches a user selection. A Cell or a
+/// `(read, dispatch)` pair implements it; reducers need no shadow selection Cell.
+pub trait Choice<T> {
+    fn selected(&self) -> T;
+    fn choose(&self, value: T);
+}
+impl<T: Clone + PartialEq + 'static> Choice<T> for Cell<T> {
+    fn selected(&self) -> T {
+        self.get()
+    }
+    fn choose(&self, value: T) {
+        self.set(value);
+    }
+}
+impl<T, R: Fn() -> T, W: Fn(T)> Choice<T> for (R, W) {
+    fn selected(&self) -> T {
+        self.0()
+    }
+    fn choose(&self, value: T) {
+        self.1(value);
+    }
+}
 
 /// One choice of several, laid out as a row inside a groove.
 ///
@@ -552,7 +549,10 @@ const GROOVE_INSET_PX: f32 = 2.0;
 /// value, and options separated by the row gap read as that many buttons; the track is what
 /// says the choice is exclusive, and it is what the selected option's fill slides within.
 #[must_use]
-pub fn segmented<T>(value: Cell<T>, options: &'static [(&'static str, T)]) -> View
+pub fn segmented<T>(
+    value: impl Choice<T> + Copy + 'static,
+    options: &'static [(&'static str, T)],
+) -> View
 where
     T: Copy + PartialEq + 'static,
 {
@@ -574,7 +574,10 @@ where
 /// for. [`Metric::RadiusPill`] is a palette rung and names a segment rail among its
 /// consumers, so this reaches an authored value rather than a shape stated here.
 #[must_use]
-pub fn pills<T>(value: Cell<T>, options: &'static [(&'static str, T)]) -> View
+pub fn pills<T>(
+    value: impl Choice<T> + Copy + 'static,
+    options: &'static [(&'static str, T)],
+) -> View
 where
     T: Copy + PartialEq + 'static,
 {
@@ -595,7 +598,7 @@ where
 /// The two rails differ by one rung, which is the same difference their insets and their
 /// corners carry.
 fn rail<T>(
-    value: Cell<T>,
+    value: impl Choice<T> + Copy + 'static,
     options: &'static [(&'static str, T)],
     radius: Metric,
     inset: Metric,
@@ -609,10 +612,10 @@ where
     let kids: Vec<View> = options
         .iter()
         .map(|&(name, option)| {
-            control::<crate::build::Any>(UiaRole::Button)
+            control::<crate::build::Any>(UiaRole::RadioButton)
                 .chrome(roles::OPTION, 0, radius)
-                .selected(move || value.get() == option)
-                .on_click(move || value.set(option))
+                .selected(move || value.selected() == option)
+                .on_click(move || value.choose(option))
                 // The group is one row tall and stretches its options, so an option that
                 // also carried the row height as a floor would push the track past it by
                 // twice the inset.
@@ -639,6 +642,12 @@ where
 /// A text-editable field. Text services own the caret; this declares the target.
 #[must_use]
 pub fn field(value: impl Into<TextSource>) -> El<crate::build::Field> {
+    field_with(value, TextStyle::new(TypeRole::Body))
+}
+
+/// A text field with an application-owned text recipe; draft ownership stays in TSF.
+#[must_use]
+pub fn field_with(value: impl Into<TextSource>, style: TextStyle) -> El<crate::build::Field> {
     El::<crate::build::Field>::seed(Preset::Bare)
         .height(Metric::RowH)
         .min_width(Len::Times(Metric::RowH, 4.0))
@@ -649,7 +658,7 @@ pub fn field(value: impl Into<TextSource>) -> El<crate::build::Field> {
             UiaRole::Edit,
         )
         .state(ink_wash())
-        .row(inner("", TypeRole::Body, false))
+        .row(control_text("", style))
         .field_source(value.into())
 }
 

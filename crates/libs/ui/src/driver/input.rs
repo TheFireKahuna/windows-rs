@@ -31,6 +31,7 @@ use windows_window::{CaptionState, Handoff, Tick, Wake, Window};
 /// A message handler is `'static`, so none of these can be a local in
 /// [`Ui::run`](super::Ui::run) borrowed by it.
 pub(super) struct Frame {
+    pub scope: crate::role::Scope,
     /// The window, held rather than borrowed: the handler outlives every stack frame in
     /// [`Ui::run`](super::Ui::run). The window's own state holds a weak reference back to
     /// this frame, so the two do not keep each other alive.
@@ -88,16 +89,14 @@ impl Frame {
     pub(super) fn tick(&mut self) -> Result<()> {
         self.ticks += 1;
 
-        // A closed window answers for no display, and nothing routes on one.
-        let Some(env) = env_of(&self.window) else {
-            return Ok(());
-        };
-
         // ⓪ what the scene thread published since the last tick: the array a contact
         // resolves against, and the rows the router and the pick table are declared from.
         // Taken before the router runs, so a press lands on the geometry that is on screen
         // rather than the geometry that was.
         if let Some(mut inbound) = self.links.input_down.take() {
+            if let Some(scope) = inbound.scope {
+                self.scope = scope;
+            }
             if inbound.text_geometry_changed {
                 self.text.tsf.layout_changed();
             }
@@ -152,6 +151,10 @@ impl Frame {
                 self.links.scene_ring.ring();
             }
         }
+
+        let Some(env) = env_of(&self.window, self.scope) else {
+            return Ok(());
+        };
 
         if self.uia.borrow().listening() && !self.links.uia_listening.swap(true, Ordering::AcqRel) {
             self.links.uia_requested.store(true, Ordering::Release);
@@ -295,6 +298,10 @@ impl Frame {
             }
             self.hand_over();
         }
+
+        let Some(env) = env_of(&self.window, self.scope) else {
+            return Ok(());
+        };
 
         if self.uia.borrow().listening() {
             let mut uia = self.uia.borrow_mut();

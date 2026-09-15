@@ -159,6 +159,36 @@ impl Backends {
             let mut open = false;
             for verb in verbs {
                 match *verb {
+                    PathVerb::RoundRect {
+                        origin,
+                        size,
+                        radius,
+                    } => {
+                        if open {
+                            sink.close(windows_d2d::End::Open);
+                            open = false;
+                        }
+                        if size.x > 0.0 && size.y > 0.0 {
+                            sink.rounded_box(
+                                windows_d2d::Rect::new(
+                                    origin.x,
+                                    origin.y,
+                                    origin.x + size.x,
+                                    origin.y + size.y,
+                                ),
+                                [radius; 4],
+                            );
+                        }
+                    }
+                    PathVerb::Segment { from, to } => {
+                        if open {
+                            sink.close(windows_d2d::End::Open);
+                            open = false;
+                        }
+                        sink.figure(from, windows_d2d::Figure::Hollow)
+                            .lines(&[to])
+                            .close(windows_d2d::End::Open);
+                    }
                     PathVerb::Move { to, filled } => {
                         if open {
                             sink.close(windows_d2d::End::Open);

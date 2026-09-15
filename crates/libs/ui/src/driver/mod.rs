@@ -85,21 +85,20 @@ pub struct AppCtx {
 }
 
 impl Ui {
-    /// Installs `palette` and fixes the root scope. The first call an application makes into
-    /// this crate.
-    ///
-    /// # Panics
-    ///
-    /// If a different palette is already installed — see [`role::install`](crate::role::install).
+    /// Starts an independent window with explicitly selected theme axes.
+    pub const fn from_scope(root_scope: Scope) -> Self {
+        Self { root_scope }
+    }
+
+    /// Selects the palette and default dark root scope for this window.
     #[must_use]
-    pub fn install(palette: &'static dyn Palette, accent: AccentId, density: Density) -> Self {
-        crate::role::install(palette);
+    pub fn new(palette: &'static dyn Palette, accent: AccentId, density: Density) -> Self {
         Self {
-            root_scope: Scope::root(accent, density),
+            root_scope: Scope::root(palette, accent, density),
         }
     }
 
-    /// Returns the root scope fixed at [`install`](Self::install), for the numbers an
+    /// Returns the root scope fixed at [`new`](Self::new), for the numbers an
     /// application needs before its window exists.
     #[must_use]
     pub const fn root_scope(self) -> Scope {
@@ -234,8 +233,8 @@ impl Ui {
         rescaled.arm(pacer.wake());
         // Every query below answers for the window's current display, so a window closed
         // under start-up fails here rather than starting threads against invented numbers.
-        let env = env_of(&window).ok_or_else(closed)?;
-        let output = output_of(&window).ok_or_else(closed)?;
+        let env = env_of(&window, self.root_scope).ok_or_else(closed)?;
+        let output = output_of(&window, self.root_scope).ok_or_else(closed)?;
         let window_dips = client_dips(&window).ok_or_else(closed)?;
         let links = Arc::new(links::Links::new(window.handle())?);
 
@@ -246,6 +245,7 @@ impl Ui {
             .spawn({
                 let links = Arc::clone(&links);
                 let start = scene::Start {
+                    scope: self.root_scope,
                     backends: Box::new(backends),
                     backdrop,
                     env,
@@ -313,6 +313,7 @@ impl Ui {
         });
 
         *frame.borrow_mut() = Some(Frame {
+            scope: self.root_scope,
             window: Rc::clone(&window),
             links: Arc::clone(&links),
             router,
@@ -457,8 +458,11 @@ fn client_dips(window: &Window) -> Option<Vector2> {
 /// thing that answers for its display, so a default here is an invented measurement — every
 /// DIP laid out against it and every colour transformed through it would be wrong in a way
 /// nothing downstream can detect.
-pub(crate) fn env_of(window: &Window) -> Option<Env> {
-    Some(Env::new(window.metrics()?.dpi as f32, output_of(window)?))
+pub(crate) fn env_of(window: &Window, scope: Scope) -> Option<Env> {
+    Some(Env::new(
+        window.metrics()?.dpi as f32,
+        output_of(window, scope)?,
+    ))
 }
 
 /// Returns the transform that carries authored light to the display the window is on.
@@ -466,10 +470,10 @@ pub(crate) fn env_of(window: &Window) -> Option<Env> {
 /// Split out because the present thread takes one directly: a region draws through the same
 /// transform the retained side does, and reaching it from an [`Env`] would mean the number
 /// travelling through a type that also carries a DPI the present thread has no use for.
-pub(crate) fn output_of(window: &Window) -> Option<OutputTransform> {
+pub(crate) fn output_of(window: &Window, scope: Scope) -> Option<OutputTransform> {
     let cap = window.color_capability()?;
     Some(OutputTransform::for_display(
         cap,
-        crate::role::content_peak_nits(&cap.gamut()),
+        crate::role::content_peak_nits(&cap.gamut(), scope),
     ))
 }

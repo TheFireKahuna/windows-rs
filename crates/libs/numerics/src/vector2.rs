@@ -2,7 +2,7 @@ use super::*;
 
 impl Vector2 {
     /// Creates a vector from its `x` and `y` components.
-    pub fn new(x: f32, y: f32) -> Self {
+    pub const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
     /// Returns the vector `(0, 0)`.

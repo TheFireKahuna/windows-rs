@@ -14,7 +14,7 @@
 //! and every model call takes a fresh borrow.
 
 use super::arena::{Act, Build, ChanSource, HaloSeed, MaskSeed, NIL, Part, Slot, SpriteSeed};
-use super::host::{ControlRow, Host, MountId, MountRow, ValueId, ValueRow};
+use super::host::{ControlRow, Host, MountId, MountRow};
 use super::style::{OverStore, Recipe};
 use super::{El, Site, View};
 use crate::gesture::GestureDecl;
@@ -43,7 +43,11 @@ use windows_scene::{
 /// knob arc and a routing wire each have a shape that depends on the width.
 #[must_use]
 pub fn geometry(verbs: &[PathVerb]) -> GeomId {
-    Host::with(|h| h.model().geometry(verbs))
+    let lease =
+        Host::with(|h| super::geometry::Lease(h.model().geometry(verbs), h.identity.clone()));
+    let id = lease.0;
+    crate::signal::Owner::retain(lease);
+    id
 }
 
 /// Returns the window's own scope: the palette's root, at the process polarity and the
@@ -98,13 +102,36 @@ pub struct Stop {
 /// and one id serves every box that shares its stops.
 #[must_use]
 pub fn ramp(stops: &[Stop], spread: Spread) -> RampId {
-    with_resolved(stops, |resolved| {
+    let id = with_resolved(stops, |resolved| {
         Host::with(|h| h.model().ramp(resolved, spread))
-    })
+    });
+    let lease = Host::with(|h| {
+        h.ramps.place(id, (stops.to_vec(), spread));
+        super::geometry::Lease(id, h.identity.clone())
+    });
+    struct RampLease(super::geometry::Lease<windows_scene::Ramp>);
+    impl Drop for RampLease {
+        fn drop(&mut self) {
+            Host::try_with(|h| {
+                if std::rc::Rc::ptr_eq(&h.identity, &self.0.1) {
+                    h.ramps.take(self.0.0);
+                }
+            });
+        }
+    }
+    crate::signal::Owner::retain(RampLease(lease));
+    id
 }
 
 /// Re-points the gradient `id` names. Every sprite painting with it changes together.
 pub fn set_ramp(id: RampId, stops: &[Stop], spread: Spread) {
+    Host::with(|h| {
+        if let Some((held, axis)) = h.ramps.get_mut(id) {
+            held.clear();
+            held.extend_from_slice(stops);
+            *axis = spread;
+        }
+    });
     with_resolved(stops, |resolved| {
         Host::with(|h| h.model().set_ramp(id, resolved, spread));
     });
@@ -122,7 +149,7 @@ fn with_resolved<T>(stops: &[Stop], f: impl FnOnce(&[(f32, Radiance)]) -> T) -> 
         let mut resolved = scratch.borrow_mut();
         resolved.clear();
         resolved.extend(stops.iter().map(|stop| {
-            let light = crate::role::data(stop.role);
+            let light = crate::role::data(stop.role, root_scope());
             (stop.at, light.with_alpha(light.a * stop.strength))
         }));
         f(&resolved)
@@ -138,7 +165,7 @@ const PRESS_ALPHA: f32 = 0.12;
 
 /// A thumb's resting opacity: ink at a fraction, an opacity over whatever it sits on rather
 /// than a colour of its own.
-const THUMB_ALPHA: f32 = 0.30;
+pub(crate) const THUMB_ALPHA: f32 = 0.30;
 
 /// Owns a mounted subtree and unmounts it on drop.
 ///
@@ -247,6 +274,7 @@ pub(crate) fn mount_scoped(
 /// and the front thread computes a value it cannot show.
 #[derive(Default)]
 struct Claim {
+    scalar_parts: [Option<(NodeId, crate::widget::ScalarPart)>; 4],
     thumb: Option<SpriteId>,
     trail: Option<(SpriteId, f32)>,
     /// The first label sprite this subtree minted, which the enclosing control repaints when
@@ -257,9 +285,6 @@ struct Claim {
     /// instead, `ControlRow::label` is `None` for every button in the tree and the row's
     /// text colour reaches nothing.
     label: Option<SpriteId>,
-    /// The value row a [`Travel`](super::arena::Unit::Travel) channel opened, waiting for the
-    /// track it runs in: the enclosing control, which is not known until that control mounts.
-    value: Option<ValueId>,
     /// The first text this subtree laid out, which an enclosing control derives its
     /// accessible name from.
     ///
@@ -271,11 +296,21 @@ struct Claim {
 
 impl Claim {
     /// Takes what a subtree offered, without displacing what this node already found.
+    fn part(&mut self, part: (NodeId, crate::widget::ScalarPart)) {
+        *self
+            .scalar_parts
+            .iter_mut()
+            .find(|p| p.is_none())
+            .expect("a scalar control supports at most four parts") = Some(part);
+    }
     fn absorb(&mut self, inner: Self) {
+        for part in inner.scalar_parts.into_iter().flatten() {
+            self.part(part);
+        }
+
         self.thumb = self.thumb.or(inner.thumb);
         self.trail = self.trail.or(inner.trail);
         self.label = self.label.or(inner.label);
-        self.value = self.value.or(inner.value);
         self.text = self.text.or(inner.text);
     }
 }
@@ -331,7 +366,8 @@ impl Rows {
 /// releases. `claim` receives the parts this subtree did not consume itself.
 fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId {
     let slot = b.nodes[at.at as usize];
-    let inner = slot.elevate.map_or(at.scope, |e| at.scope.elevate(e));
+    let scope = at.scope.in_theme(Host::with(|h| h.root_scope));
+    let inner = slot.elevate.map_or(scope, |e| scope.elevate(e));
     let roles = slot.chrome.map(Chrome::roles);
 
     // Counted through the chain rather than collected: a `Vec` of seeds here is one
@@ -347,15 +383,8 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     // selection has nowhere to paint and the control looks identical in both states. A node
     // that never declares selection still costs the resting row's sprites and no more.
     let selects = selectable(b, &slot);
-    let chrome_count = roles.map_or(0, |r| {
-        let reachable = if selects {
-            r.in_state(ModelState::Selected)
-        } else {
-            r
-        };
-        usize::from(r.fill.is_some() || reachable.fill.is_some())
-            + usize::from(r.stroke.is_some() || reachable.stroke.is_some())
-    });
+    let chrome = slot.chrome;
+    let chrome_count = chrome_seeds(roles, chrome, inner, selects).count();
     // Wrapped and trimmed runs take the group's allocated width; their glyph tiles keep
     // their own coverage extents inside it.
     let run = run_seed(b, &slot);
@@ -409,11 +438,11 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
         let recipe = Recipe {
             preset: slot.preset,
             over: OverStore::collect(b.chain_over(slot.over).map(|entry| entry.rule)),
-            scope: at.scope,
+            scope,
             // Empty until the node's bound style acts first run, which is after this mount.
             bound: Box::default(),
         };
-        let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), at.scope);
+        let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), scope);
         super::style::with(|table| table.place(node, recipe));
         Some(style)
     };
@@ -428,17 +457,32 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             next: MountId::NONE,
             control: None,
             text: None,
-            values: ValueId::NONE,
+            paints: NodeId::NONE,
             scroll: None,
             probe: None,
             region: None,
         });
         if let Some(cell) = slot.probe {
-            h.mint_probe(row, crate::layout::ProbeRow { node, cell });
+            h.mint_probe(
+                row,
+                crate::layout::ProbeRow {
+                    node,
+                    cell,
+                    scope: inner,
+                },
+            );
         }
         row
     });
     rows.push(row);
+    if leaf {
+        Host::with(|h| {
+            if let Some(paint) = h.appearances.get(node) {
+                let id = paint.id;
+                h.own_appearance(id, row, None);
+            }
+        });
+    }
 
     // ── the node's own sprites, where it is not one itself ────────────────────────
     let mut previous: Option<NodeId> = None;
@@ -447,6 +491,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             let sprite = Host::with(|h| h.model().sprite(group, previous));
             cover_chrome(sprite.node(), inner, part, slot.chrome);
             emit_sprite(sprite, &seed, None, inner, roles);
+            Host::with(|h| h.own_appearance(sprite, row, slot.chrome));
             parts.set(part, sprite, &mut own_claim);
             previous = Some(sprite.node());
         }
@@ -456,6 +501,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
                 let sprite = Host::with(|h| h.model().sprite(group, previous));
                 cover(sprite.node(), inner, Len::Zero);
                 emit_sprite(sprite, &seed, slot.geom, inner, roles);
+                Host::with(|h| h.own_appearance(sprite, row, None));
                 parts.set(seed.part, sprite, &mut own_claim);
                 previous = Some(sprite.node());
             }
@@ -473,6 +519,10 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             inner,
             surface_corners(radius_of(b, &slot, inner), slot.chrome),
         );
+        Host::with(|h| {
+            h.own_appearance(sprite, row, slot.chrome);
+            h.appearances.get_mut(sprite.node()).unwrap().wash = true;
+        });
         previous = Some(sprite.node());
         parts.wash = Some(sprite);
     }
@@ -501,7 +551,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     mount_style_acts(b, &slot, node, row);
 
     // ── channels: one reactive lowering ───────────────────────────────────────────
-    mount_channels(b, &slot, node, parts.fill, row, &mut own_claim);
+    mount_channels(b, &slot, node, parts.fill);
 
     // ── measured text ─────────────────────────────────────────────────────────────
     if let Some((text, _)) = run {
@@ -537,6 +587,19 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
                 &mut own_claim,
             ));
         }
+    }
+
+    if let Some(part) = slot.scalar_part {
+        let mut channel = slot.chans.head;
+        while channel != NIL {
+            let entry = &b.chans[channel as usize];
+            assert!(
+                entry.prop != part.property(),
+                "a scalar part cannot also bind its driven property"
+            );
+            channel = entry.next;
+        }
+        own_claim.part((node, part));
     }
 
     // ── the control row, once the walk has found the parts it names ───────────────
@@ -583,6 +646,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
             h.mint_region(
                 row,
                 crate::present::RegionRow {
+                    theme: std::sync::Arc::new(crate::present::Published::new(inner)),
                     node,
                     sink,
                     key,
@@ -644,6 +708,22 @@ fn mount_halo(seed: HaloSeed, source: Option<SpriteId>, scope: Scope, silhouette
         debug_assert!(false, "a halo was declared on a node that paints nothing");
         return;
     };
+    Host::with(|h| {
+        let scope = scope.in_theme(h.root_scope);
+        if let Some(recipe) = h.appearances.get_mut(fill.node()) {
+            recipe.halo = Some((seed, silhouette));
+        }
+        emit_halo(h, seed, fill, scope, silhouette);
+    });
+}
+
+pub(super) fn emit_halo(
+    h: &mut Host,
+    seed: HaloSeed,
+    fill: SpriteId,
+    scope: Scope,
+    silhouette: Silhouette,
+) {
     let paint = scope.for_paint();
     let halo = match seed {
         HaloSeed::Reactive(_) => unreachable!("reactive halo role is resolved by its effect"),
@@ -686,7 +766,7 @@ fn mount_halo(seed: HaloSeed, source: Option<SpriteId>, scope: Scope, silhouette
             })
         }
     };
-    Host::with(|h| h.model().halo(fill, halo));
+    h.model().halo(fill, halo);
 }
 
 /// Which sprite plays which part, so a state change re-paints exactly what changed.
@@ -724,81 +804,71 @@ impl Parts {
 
 /// Returns the sprites a chrome row expands to, bottom first.
 ///
-/// A stroked surface is two boxes rather than one outlined box: the mask alphabet has no
-/// outlined rectangle, only outlined geometry, and geometry is authored in sprite-local DIPs
-/// and must be re-emitted whenever the box moves. An outer box in the stroke colour with the
-/// fill inset by a hairline over it draws the same ring, keeps the nine-grid's exact corners,
-/// is shared through the same raster cache, and costs nothing on a resize.
-fn chrome_seeds(
+/// Outline coverage uses a cached nine-grid with a transparent center. Parts needed by
+/// reachable states are allocated once, transparent until that state becomes active.
+pub(super) fn chrome_seeds(
     roles: Option<RoleSet>,
     chrome: Option<Chrome>,
     scope: Scope,
     selectable: bool,
 ) -> impl Iterator<Item = (Part, SpriteSeed)> {
     let radius = chrome.map_or(0.0, |c| crate::role::metric(c.radius, scope));
-    let hairline = crate::role::metric(Metric::HairlineW, scope);
-    // A part the resting row does not carry but a reachable state does is minted transparent
-    // and painted when that state arrives, because `set_state` swaps a sprite's paint and
-    // cannot mint one. A node that never reaches the state carries neither.
-    let reachable = roles.map(|r| {
-        if selectable {
-            r.in_state(ModelState::Selected)
-        } else {
-            r
-        }
-    });
-    let part_of = move |rest: Option<Role>, on: Option<Role>| {
-        rest.or(on)
-            .map(|role| (role, f32::from(u8::from(rest.is_some()))))
-    };
-    let stroke = part_of(
-        roles.and_then(|r| r.stroke).map(Role::Stroke),
-        reachable.and_then(|r| r.stroke).map(Role::Stroke),
-    )
-    .map(move |(role, strength)| {
-        (
-            Part::Border,
-            SpriteSeed {
-                mask: MaskSeed::Radius {
-                    dips: surface_corners(radius, chrome),
+    let width = crate::role::metric(Metric::HairlineW, scope);
+    let selected = selectable
+        .then(|| chrome.map(|c| c.in_state(ModelState::Selected)))
+        .flatten()
+        .or_else(|| {
+            selectable
+                .then(|| roles.map(|r| r.in_state(ModelState::Selected)))
+                .flatten()
+        });
+    let disabled = chrome.and_then(|c| c.disabled);
+    let stroke = roles
+        .and_then(|r| r.stroke)
+        .or_else(|| selected.and_then(|r| r.stroke))
+        .or_else(|| disabled.and_then(|r| r.stroke));
+    [Part::Border, Part::Fill]
+        .into_iter()
+        .filter_map(move |part| {
+            let role = |row: RoleSet| match part {
+                Part::Border => row.stroke.map(Role::Stroke),
+                _ => row.fill.map(Role::Fill),
+            };
+            let rest = roles.and_then(role);
+            let paint = rest
+                .or_else(|| selected.and_then(role))
+                .or_else(|| disabled.and_then(role))?;
+            let mask = if part == Part::Border {
+                MaskSeed::Outline {
+                    radius: surface_corners(radius, chrome),
+                    width,
+                    open: chrome.and_then(|c| c.attached).map(|edge| match edge {
+                        Edge::Left => windows_scene::Side::Left,
+                        Edge::Top => windows_scene::Side::Top,
+                        Edge::Right => windows_scene::Side::Right,
+                        Edge::Bottom => windows_scene::Side::Bottom,
+                    }),
+                }
+            } else {
+                MaskSeed::Radius {
+                    dips: surface_corners(
+                        (radius - if stroke.is_some() { width } else { 0.0 }).max(0.0),
+                        chrome,
+                    ),
+                }
+            };
+            Some((
+                part,
+                SpriteSeed {
+                    strength: f32::from(rest.is_some()),
+                    ..SpriteSeed::new(mask, paint, part)
                 },
-                role,
-                strength,
-                ramp: None,
-                region: None,
-                part: Part::Border,
-                next: NIL,
-            },
-        )
-    });
-    let inset = if stroke.is_some() { hairline } else { 0.0 };
-    let fill = part_of(
-        roles.and_then(|r| r.fill).map(Role::Fill),
-        reachable.and_then(|r| r.fill).map(Role::Fill),
-    )
-    .map(move |(role, strength)| {
-        (
-            Part::Fill,
-            SpriteSeed {
-                // Concentric with the ring it sits in, so the hairline is one width all the
-                // way round instead of pinching at the corners.
-                mask: MaskSeed::Radius {
-                    dips: surface_corners((radius - inset).max(0.0), chrome),
-                },
-                role,
-                strength,
-                ramp: None,
-                region: None,
-                part: Part::Fill,
-                next: NIL,
-            },
-        )
-    });
-    stroke.into_iter().chain(fill)
+            ))
+        })
 }
 
 /// The attached side shares its neighbour's edge, including the interaction wash.
-fn surface_corners(radius: f32, chrome: Option<Chrome>) -> Corners {
+pub(super) fn surface_corners(radius: f32, chrome: Option<Chrome>) -> Corners {
     let mut corners = Corners::all(radius);
     match chrome.and_then(|c| c.attached) {
         Some(Edge::Left) => {
@@ -830,18 +900,24 @@ fn cover_chrome(node: NodeId, scope: Scope, part: Part, chrome: Option<Chrome>) 
         Len::Zero
     };
     let attached = chrome.and_then(|c| c.attached);
-    let style = crate::layout::lower(
-        Preset::Bare,
-        &[
-            Rule::always(Over::Absolute),
-            Rule::always(Over::Inset(inset)),
-            Rule::always(Over::InsetEdge(
-                attached.unwrap_or(Edge::Right),
-                if attached.is_some() { Len::Zero } else { inset },
-            )),
-        ],
+    let recipe = Recipe {
+        preset: Preset::Bare,
         scope,
-    );
+        bound: Box::default(),
+        over: OverStore::collect(
+            [
+                Rule::always(Over::Absolute),
+                Rule::always(Over::Inset(inset)),
+                Rule::always(Over::InsetEdge(
+                    attached.unwrap_or(Edge::Right),
+                    if attached.is_some() { Len::Zero } else { inset },
+                )),
+            ]
+            .into_iter(),
+        ),
+    };
+    let style = crate::layout::lower(recipe.preset, recipe.over.as_slice(), scope);
+    super::style::with(|table| table.place(node, recipe));
     Host::with(|h| h.model().style(node, &style));
 }
 
@@ -867,6 +943,33 @@ fn cover(node: NodeId, scope: Scope, inset: Len) {
 /// `Radiance` nor [`Paint`] is reachable from a widget, so a widget cannot accept a colour.
 /// `for_paint` pins the scope's width axis, so a resize cannot re-key a single cell.
 fn emit_sprite(
+    id: SpriteId,
+    seed: &SpriteSeed,
+    geom: Option<GeomId>,
+    scope: Scope,
+    roles: Option<RoleSet>,
+) {
+    Host::with(|h| {
+        let scope = scope.in_theme(h.root_scope);
+        let prior = h.appearances.get(id.node());
+        let appearance = super::theme::Appearance {
+            id,
+            seed: *seed,
+            geom,
+            scope,
+            roles,
+            next: prior.map_or(NodeId::NONE, |p| p.next),
+            chrome: prior.and_then(|p| p.chrome),
+            halo: prior.and_then(|p| p.halo),
+            wash: prior.is_some_and(|p| p.wash),
+        };
+        h.appearances.place(id.node(), appearance);
+        emit_sprite_on(h, id, seed, geom, scope, roles);
+    });
+}
+
+pub(super) fn emit_sprite_on(
+    h: &mut Host,
     id: SpriteId,
     seed: &SpriteSeed,
     geom: Option<GeomId>,
@@ -899,29 +1002,51 @@ fn emit_sprite(
     };
     // One borrow: the stroke resource, the mask and the paint are three model calls about
     // one sprite, and the walk takes this borrow once per sprite already.
-    Host::with(|h| {
-        let mask = match seed.mask {
-            MaskSeed::Box { radius } => Mask::Box {
-                radius: Corners::all(radius.and_then(|r| r.dips(scope)).unwrap_or(0.0)),
-            },
-            MaskSeed::Radius { dips } => Mask::Box { radius: dips },
-            // A run's coverage tile is minted when its text is shaped, which cannot happen
-            // until layout has said how wide it is. Until then the sprite draws nothing.
-            MaskSeed::Run { .. } | MaskSeed::Bare => Mask::None,
-            MaskSeed::Shape { stroke } => Mask::Shape {
-                geom: geom.unwrap_or_default(),
-                stroke: stroke
-                    .and_then(|w| w.dips(scope))
-                    .map(|width| h.model().stroke(width, Cap::Round, Join::Round, &[])),
-            },
-        };
-        h.model().mask(id, mask);
-        h.model().paint(id, paint);
-        // Declared even when dark: a sprite re-emitted into a role that stopped emitting has
-        // to lose the halo the previous role gave it, and `None` is how that is said.
-        h.model()
-            .halo(id, halo_of(emission, Silhouette::Ink, light));
-    });
+    emit_mask(h, id, seed, geom, scope);
+    h.model().paint(id, paint);
+    // Declared even when dark: a sprite re-emitted into a role that stopped emitting has
+    // to lose the halo the previous role gave it, and `None` is how that is said.
+    h.model()
+        .halo(id, halo_of(emission, Silhouette::Ink, light));
+}
+
+pub(super) fn emit_mask(
+    h: &mut Host,
+    id: SpriteId,
+    seed: &SpriteSeed,
+    geom: Option<GeomId>,
+    scope: Scope,
+) {
+    let mask = match seed.mask {
+        MaskSeed::Box { radius } => Mask::Box {
+            radius: Corners::all(radius.and_then(|r| r.dips(scope)).unwrap_or(0.0)),
+        },
+        MaskSeed::Radius { dips } => Mask::Box { radius: dips },
+        MaskSeed::Outline {
+            radius,
+            width,
+            open,
+        } => Mask::Outline {
+            radius,
+            width,
+            open,
+        },
+        MaskSeed::Border { radius, width } => Mask::Outline {
+            radius: Corners::all(crate::role::metric(radius, scope)),
+            width: width.dips(scope).unwrap_or(0.0),
+            open: None,
+        },
+        // A run's coverage tile is minted when its text is shaped, which cannot happen
+        // until layout has said how wide it is. Until then the sprite draws nothing.
+        MaskSeed::Run { .. } | MaskSeed::Bare => Mask::None,
+        MaskSeed::Shape { stroke } => Mask::Shape {
+            geom: geom.unwrap_or_default(),
+            stroke: stroke
+                .and_then(|w| w.dips(scope))
+                .map(|width| h.model().stroke(width, Cap::Round, Join::Round, &[])),
+        },
+    };
+    h.model().mask(id, mask);
 }
 
 /// Returns the halo `emission` states for a sprite painting `light`, or `None` where the role
@@ -972,13 +1097,18 @@ fn role_of(seed: &SpriteSeed, roles: Option<RoleSet>) -> Role {
 /// available: a sprite's colour is an FP16 cell, a composition colour brush is 8-bit, and no
 /// brush interpolates between two FP16 sources.
 fn emit_wash(id: SpriteId, wash: Wash, scope: Scope, radius: Corners) {
-    let light = match wash {
-        Wash::Ink => crate::role::ink(1.0, scope),
-        Wash::Accent => crate::role::accent_wash(1.0, scope),
+    let role = match wash {
+        Wash::Ink => Role::Text(crate::role::Text::Primary),
+        Wash::Accent => Role::Fill(crate::role::Fill::Accent),
     };
+    emit_sprite(
+        id,
+        &SpriteSeed::new(MaskSeed::Radius { dips: radius }, role, Part::Static),
+        None,
+        scope,
+        None,
+    );
     Host::with(|h| {
-        h.model().mask(id, Mask::Box { radius });
-        h.model().paint(id, Paint::Solid(light));
         // Parked at zero with a `Set` and not a spring: a control that has never been
         // hovered must not play an animation to arrive at invisible.
         h.model()
@@ -1025,48 +1155,31 @@ fn mount_control(
     // This node's own run where it has one, otherwise the first its subtree offered.
     let label = parts.label.or(claim.label);
     let mut control = ControlRow {
-        node,
         fill: parts.fill,
         label,
         border: parts.border,
-        front: ChromeRow {
-            // Filled in once the id exists. The row and its identity are minted in one
-            // borrow, so the two halves cannot disagree about what a control is.
-            id: ControlId::default(),
+        front: crate::widget::ChromeRow {
             wash: parts.wash,
             hover_scope,
             hover: HOVER_ALPHA,
             press: PRESS_ALPHA,
+            scalar_parts: claim.scalar_parts,
             thumb: claim.thumb.map(SpriteId::node),
             trail: claim.trail.map(|(id, origin)| (id.node(), origin)),
-            // The inset and the room are both solve outputs, so they arrive with the first
-            // publish rather than here. Until then a fraction moves the part nowhere, which
-            // is where it starts.
-            rest: 0.0,
-            travel: 0.0,
             drive: slot.interaction,
-            // Corrected below, once the act chain has been walked: the flag follows the
-            // handler, so a policy declared with no handler raises nothing.
-            drags: false,
-            fraction: 0.0,
-            source_fraction: 0.0,
+            ..Default::default()
         },
         chrome: slot.chrome,
-        scope,
-        state: ModelState::Rest,
-        click: None,
         hovered: slot.hover_scope,
-        change: None,
-        commit: None,
-        drag: None,
-        tip: None,
-        flyout: None,
         uia: slot.uia,
         name: slot.name,
         text: claim.text,
         key: slot.key,
+        ..ControlRow::new(node, scope)
     };
 
+    let mut validation = None;
+    let mut scalar_source = None;
     let mut field_source = None;
     let mut text_commit = None;
     let mut disabled = None;
@@ -1076,10 +1189,13 @@ fn mount_control(
         let entry = &mut b.acts[at as usize];
         at = entry.next;
         match entry.act.take() {
+            Some(Act::Validation(f)) => validation = Some(f),
             Some(Act::FieldSource(s)) => field_source = Some(s),
             Some(Act::CommitText(f)) => text_commit = Some(f),
             Some(Act::Click(f)) => control.click = Some(f),
             Some(Act::ChangeF64(f)) => control.change = Some(f),
+            Some(Act::Cancel(f)) => control.cancel = Some(f),
+            Some(Act::ScalarSource(f)) => scalar_source = Some(f),
             Some(Act::CommitF64(f)) => control.commit = Some(f),
             Some(Act::Drag(f)) => {
                 control.drag = Some(f);
@@ -1105,7 +1221,6 @@ fn mount_control(
     let gesture = b
         .gesture(slot.gesture)
         .or_else(|| flags.contains(HitFlags::GESTURE).then(GestureDecl::default));
-    let value = claim.value;
     let caption = slot.caption;
     let chrome = slot.chrome;
     let id = Host::with(move |h| {
@@ -1137,13 +1252,6 @@ fn mount_control(
             let front = control.front;
             h.chrome.push(front);
         }
-        // The moving part's track is this control's own box, and this is the first moment
-        // both are known, along with which thread moves it. A control the router drives owns
-        // the channel from here, so this thread corrects its geometry by re-sending the room
-        // rather than by writing the property.
-        if let Some(value) = value {
-            h.own_value(value, id, node, front_driven(slot.interaction));
-        }
         h.model().hit(
             node,
             Some(HitDecl {
@@ -1161,6 +1269,24 @@ fn mount_control(
         id
     });
 
+    if let Some(read) = validation {
+        Effect::new(move || {
+            let message = read();
+            Host::with(|h| {
+                if let Some(control) = h.control_mut(id) {
+                    control.validation = message;
+                }
+                h.uia_restale();
+            });
+        });
+    }
+    if let Some(source) = scalar_source {
+        Effect::new(move || {
+            let (fraction, epoch) = source();
+            Host::with(|h| h.publish_fraction(id, fraction, epoch));
+        });
+    }
+
     if let (Some(source), Some(group), Some(key), Some(input_scope)) =
         (field_source, group, claim.text, slot.field_scope)
     {
@@ -1173,36 +1299,31 @@ fn mount_control(
         });
     }
 
-    // Model state, so a discrete paint swap at event rate rather than a wash. Both arms go
-    // through one setter, so the last of them to run in a frame wins, in the order the
-    // effects were created.
-    if let Some(disabled) = disabled {
+    // One derived state: disablement takes precedence, regardless of effect order.
+    if disabled.is_some() || selected.is_some() {
         Effect::new(move || {
-            let off = disabled();
-            let decl = HitDecl {
-                // A disabled control keeps its automation peer and loses everything that
-                // routes a pointer: a screen reader still finds it, a click does not.
-                flags: if off { uia_only(flags) } else { flags },
-                id,
-                touch_inflate: inflate,
-            };
+            let off = disabled.as_ref().is_some_and(|read| read());
+            let on = selected.as_ref().is_some_and(|read| read());
             Host::with(|h| {
-                h.model().hit(node, Some(decl));
+                h.model().hit(
+                    node,
+                    Some(HitDecl {
+                        flags: if off { uia_only(flags) } else { flags },
+                        id,
+                        touch_inflate: inflate,
+                    }),
+                );
                 h.set_state(
                     id,
                     if off {
                         Some(ModelState::Disabled)
+                    } else if on {
+                        Some(ModelState::Selected)
                     } else {
                         None
                     },
                 );
             });
-        });
-    }
-    if let Some(selected) = selected {
-        Effect::new(move || {
-            let on = selected();
-            Host::with(|h| h.set_state(id, on.then_some(ModelState::Selected)));
         });
     }
     Some(id)
@@ -1264,7 +1385,7 @@ fn mount_scroll(
             // would give that channel two owners. The hit entry itself is written by
             // `publish_scrolls`, because whether the rail is a target at all depends on
             // whether there is anything to scroll, which is a solve output.
-            let id = h.mint_control(thumb_control(rail.node(), scope));
+            let id = h.mint_control(ControlRow::new(rail.node(), scope));
             h.gestures.push((id, crate::layout::grab_decl()));
             (rail, thumb, id)
         });
@@ -1286,45 +1407,6 @@ fn mount_scroll(
             },
         );
     });
-}
-
-/// Builds the rail's control row: an identity for the hit array, and nothing that paints.
-fn thumb_control(node: NodeId, scope: Scope) -> ControlRow {
-    ControlRow {
-        node,
-        fill: None,
-        label: None,
-        border: None,
-        front: ChromeRow {
-            id: ControlId::default(),
-            wash: None,
-            hover_scope: None,
-            hover: 0.0,
-            press: 0.0,
-            thumb: None,
-            trail: None,
-            rest: 0.0,
-            travel: 0.0,
-            drive: None,
-            drags: false,
-            fraction: 0.0,
-            source_fraction: 0.0,
-        },
-        chrome: None,
-        scope,
-        state: ModelState::Rest,
-        click: None,
-        hovered: None,
-        change: None,
-        commit: None,
-        drag: None,
-        tip: None,
-        flyout: None,
-        uia: UiaRole::None,
-        name: None,
-        text: None,
-        key: None,
-    }
 }
 
 /// Installs the effect behind a style that follows a value.
@@ -1435,18 +1517,11 @@ fn uia_only(flags: HitFlags) -> HitFlags {
 /// A constant becomes one `Bind::Set` at mount and produces no graph node, no `Effect` and
 /// no allocation, so static content costs one sprite and nothing else. Anything else becomes
 /// exactly one effect, and the boxed reader moves into it.
-fn mount_channels(
-    b: &mut Build,
-    slot: &Slot,
-    node: NodeId,
-    fill: Option<SpriteId>,
-    row: MountId,
-    claim: &mut Claim,
-) {
+fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteId>) {
     let mut at = slot.chans.head;
     while at != NIL {
         let entry = &mut b.chans[at as usize];
-        let (prop, motion, unit) = (entry.prop, entry.motion, entry.unit);
+        let (prop, motion) = (entry.prop, entry.motion);
         let source = entry.source.take();
         at = entry.next;
         // A shadow's channels belong to the sprite casting it, which on a container is its
@@ -1457,36 +1532,10 @@ fn mount_channels(
             Prop::BlurRadius | Prop::ShadowOpacity => fill.map_or(node, SpriteId::node),
             _ => node,
         };
-        // A value is finished by whichever thread moves the part, this one or the router's.
-        // A slid one also waits on the room it is a fraction of, which is a solve output.
-        let value = unit.is_value().then(|| {
-            let id = Host::with(|h| {
-                h.mint_value(ValueRow {
-                    node,
-                    // Its own box until the enclosing control claims it, which gives zero
-                    // room until layout has said anything.
-                    track: node,
-                    control: None,
-                    unit,
-                    prop,
-                    motion,
-                    vertical: prop == Prop::OffsetY,
-                    fraction: 0.0,
-                    rest: 0.0,
-                    travel: 0.0,
-                    front_driven: false,
-                    row,
-                    next: ValueId::NONE,
-                })
-            });
-            claim.value = claim.value.or(Some(id));
-            id
-        });
         match source {
-            Some(ChanSource::Const(constant)) => match value {
-                Some(id) => Host::with(|h| h.set_fraction(id, scalar(constant))),
-                None => Host::with(|h| h.model().bind(node, prop, Bind::Set(constant))),
-            },
+            Some(ChanSource::Const(constant)) => {
+                Host::with(|h| h.model().bind(node, prop, Bind::Set(constant)))
+            }
             Some(ChanSource::Dynamic(read)) => {
                 // The first value a channel produces is the state it mounts in, not a
                 // transition into it. Animating it would sweep every bound property up from
@@ -1495,10 +1544,6 @@ fn mount_channels(
                 let previous = std::cell::Cell::new(None);
                 Effect::new(move || {
                     let next = read();
-                    if let Some(id) = value {
-                        Host::with(|h| h.set_fraction(id, scalar(next)));
-                        return;
-                    }
                     // Dependencies can change without changing this channel: editing an
                     // enabled processor must not restart its card's opacity spring.
                     // Read first so equal output still refreshes dependency tracking.
@@ -1521,28 +1566,6 @@ fn mount_channels(
             None => {}
         }
     }
-}
-
-/// Returns whether the router moves this control's part rather than the application.
-///
-/// A press has no value to move, so its part follows the app's own channel; a slide and a
-/// turn are read off the pointer, and from the first contact the router is the only writer.
-const fn front_driven(interaction: Option<Interaction>) -> bool {
-    matches!(
-        interaction,
-        Some(Interaction::Slide(_) | Interaction::Turn(_))
-    )
-}
-
-/// Returns a fraction's number. A value channel is scalar by construction — there is no
-/// two-component fraction — so any other variant is a widget seeding the wrong channel, and
-/// debug builds assert.
-fn scalar(value: Value) -> f32 {
-    if let Value::Scalar(v) = value {
-        return v;
-    }
-    debug_assert!(false, "a fraction is a scalar");
-    0.0
 }
 
 /// Registers a measured run and points layout at it.

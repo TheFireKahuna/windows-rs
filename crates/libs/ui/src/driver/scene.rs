@@ -24,6 +24,7 @@ use windows_window::{Apartment, Pumped, WM_FRAME, Watch, ensure_dispatcher_queue
 
 /// What the input thread hands the scene thread to start with.
 pub(super) struct Start {
+    pub scope: crate::role::Scope,
     pub backends: Box<dyn FnOnce() -> Result<Backends> + Send>,
     pub backdrop: BackdropSpec,
     pub env: Env,
@@ -57,6 +58,7 @@ pub(super) fn run(links: Arc<Links>, start: Start) -> Result<()> {
 }
 
 struct Thread<'a> {
+    scope: crate::role::Scope,
     links: &'a Links,
     backends: Backends,
     scene: Scene,
@@ -112,6 +114,7 @@ impl<'a> Thread<'a> {
         )?;
         Ok(Self {
             links,
+            scope: start.scope,
             backends,
             scene,
             controls: Controls::new(),
@@ -209,6 +212,26 @@ impl<'a> Thread<'a> {
     /// from it.
     fn apply(&mut self, mut down: Box<crate::seam::Down>) -> Result<()> {
         self.applies += 1;
+        let theme = down.theme.take();
+        let theme_scope = theme.as_ref().map(|(scope, _)| *scope);
+        if let Some((scope, backdrop)) = theme {
+            self.scope = scope;
+            self.env = Env::new(
+                self.env.dpi(),
+                self.env
+                    .output()
+                    .with_content_peak_nits(crate::role::content_peak_nits(
+                        &self.env.output().gamut(),
+                        scope,
+                    )),
+            );
+            present::relight(self.env.output());
+            self.scene
+                .set_backdrop(backdrop, &self.backends, self.env)?;
+            if let Some(out) = self.to_input.as_mut() {
+                out.scope = Some(scope);
+            }
+        }
         self.scene
             .apply(&mut down.patch, &self.backends, self.env)?;
 
@@ -238,6 +261,9 @@ impl<'a> Thread<'a> {
             &self.backends,
             self.env,
         )?;
+        if let Some(scope) = theme_scope {
+            self.regions.retheme(scope);
+        }
         {
             let mut front = Front {
                 scene: &mut self.scene,
@@ -355,7 +381,15 @@ impl<'a> Thread<'a> {
                 self.scene.cancel_exits();
                 up.window = Some(window);
             }
-            if let Some(env) = inbound.env {
+            if let Some(mut env) = inbound.env {
+                env = Env::new(
+                    env.dpi(),
+                    env.output()
+                        .with_content_peak_nits(crate::role::content_peak_nits(
+                            &env.output().gamut(),
+                            self.scope,
+                        )),
+                );
                 self.env = env;
                 up.env = Some(env);
             }
@@ -422,7 +456,8 @@ impl<'a> Thread<'a> {
     /// asks the window for a tick to take it.
     fn send_input(&mut self) {
         let carries = self.to_input.as_ref().is_some_and(|out| {
-            out.text_geometry_changed
+            out.scope.is_some()
+                || out.text_geometry_changed
                 || out.seeds.is_some()
                 || !out.field_sources.is_empty()
                 || !out.field_layouts.is_empty()

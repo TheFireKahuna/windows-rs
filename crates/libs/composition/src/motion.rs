@@ -7,7 +7,9 @@
 //! value is a function of live state that the app thread never computes.
 
 use super::*;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use windows_reference::ReferenceCache;
 use windows_time::TimeSpan;
 
 // Durations too large for a WinRT `TimeSpan` saturate rather than wrap.
@@ -143,8 +145,8 @@ macro_rules! spring {
         #[doc = $doc]
         ///
         /// Retarget a running spring with `set_final_value(v)` followed by
-        /// `start_animation(prop, anim)` on the **same cached object**: that allocates
-        /// nothing on the interaction path and carries whatever velocity the property
+        /// `start_animation(prop, anim)` on the **same cached object**: that reuses
+        /// released target boxes and carries whatever velocity the property
         /// already had. A value that must land immediately, with no motion, takes
         /// `stop_animation` plus a plain property set.
         ///
@@ -152,7 +154,10 @@ macro_rules! spring {
         /// automatically: set the final value explicitly at start, or it animates toward
         /// zero.
         #[derive(Clone)]
-        pub struct $name(pub(crate) bindings::$binding);
+        pub struct $name(
+            pub(crate) bindings::$binding,
+            Arc<Mutex<ReferenceCache<$value>>>,
+        );
 
         impl $name {
             /// Sets the damping ratio: below `1.0` overshoots and rings, `1.0` is
@@ -176,13 +181,28 @@ macro_rules! spring {
 
             /// Sets the value the spring settles at. Assigning it while the spring is
             /// running is what retargets it.
+            ///
+            /// Two target boxes are cached and shared by clones of this animation.
+            /// Reuse requires exclusive ownership; if Windows retains both, this call
+            /// allocates a fresh box rather than changing a value Windows still owns.
             pub fn set_final_value(&self, value: $value) {
                 // The property is an `IReference<T>` whose documented default is null,
                 // meaning "use the ending value of the property being animated". A spring
                 // left null as an implicit animation on this stack animates toward zero
                 // instead, so the target is always supplied and the null state unreachable.
                 let motion: bindings::$final_value = self.0.cast().unwrap();
-                motion.SetFinalValue(Some(value)).unwrap();
+                let value = self.1.lock().unwrap().get(value);
+                // Bypass the generated Option<T> convenience conversion, which allocates
+                // a new box. The cached interface has the exact IReference<T> ABI and
+                // owns its reference throughout the call; WinRT may retain it normally.
+                unsafe {
+                    (Interface::vtable(&motion).SetFinalValue)(
+                        Interface::as_raw(&motion),
+                        Interface::as_raw(&value),
+                    )
+                    .ok()
+                    .unwrap();
+                }
             }
 
             /// Sets the velocity the spring starts with, per second.
@@ -303,19 +323,28 @@ impl Compositor {
     /// Creates a spring over a scalar property.
     pub fn create_spring_scalar_animation(&self) -> SpringScalarNaturalMotionAnimation {
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
-        SpringScalarNaturalMotionAnimation(compositor.CreateSpringScalarAnimation().unwrap())
+        SpringScalarNaturalMotionAnimation(
+            compositor.CreateSpringScalarAnimation().unwrap(),
+            Arc::default(),
+        )
     }
 
     /// Creates a spring over a [`Vector2`] property.
     pub fn create_spring_vector2_animation(&self) -> SpringVector2NaturalMotionAnimation {
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
-        SpringVector2NaturalMotionAnimation(compositor.CreateSpringVector2Animation().unwrap())
+        SpringVector2NaturalMotionAnimation(
+            compositor.CreateSpringVector2Animation().unwrap(),
+            Arc::default(),
+        )
     }
 
     /// Creates a spring over a [`Vector3`] property.
     pub fn create_spring_vector3_animation(&self) -> SpringVector3NaturalMotionAnimation {
         let compositor: bindings::ICompositor4 = self.0.cast().unwrap();
-        SpringVector3NaturalMotionAnimation(compositor.CreateSpringVector3Animation().unwrap())
+        SpringVector3NaturalMotionAnimation(
+            compositor.CreateSpringVector3Animation().unwrap(),
+            Arc::default(),
+        )
     }
 
     /// Creates a step easing function that advances in `steps` equal jumps instead of

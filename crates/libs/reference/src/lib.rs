@@ -9,4 +9,4 @@ mod bindings;
 mod reference;
 
 #[cfg(all(windows, feature = "std"))]
-pub use reference::IReference;
+pub use reference::{IReference, ReferenceCache};

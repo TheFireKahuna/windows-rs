@@ -47,7 +47,7 @@ const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_POINTERWHEEL: u32 = 0x024E;
 
 fn main() -> Result<()> {
-    let ui = Ui::install(&REFERENCE, AccentId(0), Density::Comfortable);
+    let ui = Ui::new(&REFERENCE, AccentId(0), Density::Comfortable);
     let seen = Rc::new(Seen::default());
     // Raw wheel messages, counted before the doorbell. A notch the compositor took and a
     // notch that never arrived both read as zero front-thread reports; this count separates

@@ -8,6 +8,37 @@ use std::cell::RefCell as Slot;
 use std::rc::Rc as Ref;
 use std::sync::Arc;
 
+#[test]
+fn retained_resources_drop_in_order_outside_the_graph_borrow() {
+    struct Lease(Ref<Log>, &'static str, Cell<i32>);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.push(self.1);
+            self.2.set(self.2.peek() + 1);
+        }
+    }
+    let log = Ref::new(Log::default());
+    let before = live_nodes();
+    let (outer, count) = Owner::scope(|| Cell::new(0));
+    let (owner, resource) = Owner::scope(|| {
+        Owner::retain(Lease(Ref::clone(&log), "first", count));
+        Owner::retain(Lease(Ref::clone(&log), "second", count))
+    });
+    resource.with(|lease| assert_eq!(lease.1, "second"));
+    drop(owner);
+    assert_eq!(count.get(), 2);
+    assert_eq!(log.take(), ["second", "first"]);
+    assert!(graph::read_resource(resource.id).is_none());
+    let (replacement, _) = Owner::scope(|| Owner::retain(42));
+    assert!(
+        graph::read_resource(resource.id).is_none(),
+        "slot reuse revived a resource"
+    );
+    drop(replacement);
+    drop(outer);
+    assert_eq!(live_nodes(), before);
+}
+
 /// Records what ran, in order.
 #[derive(Default)]
 struct Log(Slot<Vec<&'static str>>);
@@ -355,7 +386,11 @@ fn producer_writes_hold_one_frame_request_until_each_drain() {
         .join()
         .expect("producer");
     drop(registration);
-    assert_eq!(wake.requesters(), 0, "unmount releases an outstanding request");
+    assert_eq!(
+        wake.requesters(),
+        0,
+        "unmount releases an outstanding request"
+    );
     flush();
 }
 

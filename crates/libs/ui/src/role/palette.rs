@@ -2,7 +2,6 @@
 //! rung through it.
 
 use super::{DataRole, Emission, Fill, Metric, Role, Scope, Stroke, Text, TypeRole};
-use std::sync::OnceLock;
 use windows_color::{Gamut, Radiance};
 use windows_text::FontSpec;
 
@@ -24,7 +23,7 @@ use windows_text::FontSpec;
 /// subtree. [`Scope::for_paint`](super::Scope::for_paint) pins the axis on the way in, so a
 /// palette reading `scope.width` in a colour method still cannot produce a width-dependent
 /// colour.
-pub trait Palette: Send + Sync + 'static {
+pub trait Palette: core::any::Any + Send + Sync + 'static {
     /// Returns the light a foreground role resolves to in `scope`.
     fn text(&self, role: Text, scope: Scope) -> Radiance;
     /// Returns the light a surface role resolves to in `scope`.
@@ -61,61 +60,21 @@ pub trait Palette: Send + Sync + 'static {
     fn content_peak_nits(&self, gamut: &Gamut) -> f32;
 }
 
-/// The installed palette. Written once; every resolve is one acquire load and a branch.
-static PALETTE: OnceLock<&'static dyn Palette> = OnceLock::new();
-
-/// Installs the application's palette. Call it once, before any role resolves.
-///
-/// Installing the same palette again succeeds and changes nothing.
-///
-/// Takes a `&'static` rather than a boxed value, so a palette is a `static` or a `LazyLock`
-/// and any leak is the caller's own decision at the call site.
-///
-/// # Panics
-///
-/// If a different palette is already installed: two palettes would mean two answers from a
-/// resolution whose contract is to be total.
-pub fn install(palette: &'static dyn Palette) {
-    if PALETTE.set(palette).is_err() {
-        assert!(
-            core::ptr::addr_eq(
-                core::ptr::from_ref(palette),
-                core::ptr::from_ref(*current())
-            ),
-            "a palette is already installed"
-        );
-    }
-}
-
-/// Returns whether a palette has been installed. What a diagnostic asks.
-#[must_use]
-pub fn installed() -> bool {
-    PALETTE.get().is_some()
-}
-
-fn current() -> &'static &'static dyn Palette {
-    PALETTE.get().expect(
-        "a palette must be installed before a role resolves: call \
-         windows_ui::role::install once at start-up",
-    )
-}
-
 /// Returns the light `role` resolves to in `scope`.
 ///
 /// Total: every pair has a value. The result is authored light — scene-referred, absolute
 /// cd/m² — and no display transform has run on it.
 ///
-/// # Panics
-///
-/// If no palette has been installed.
 #[must_use]
 pub fn resolve(role: Role, scope: Scope) -> Radiance {
-    let palette = *current();
+    let scope = scope.for_paint();
+    let palette = scope.palette.0;
     match role {
         Role::Text(text) => palette.text(text, scope),
         Role::Fill(fill) => palette.fill(fill, scope),
         Role::Stroke(stroke) => palette.stroke(stroke, scope),
         Role::Data(data) => palette.data(data),
+        Role::Custom(token) => token.resolve(scope).0,
     }
 }
 
@@ -125,38 +84,33 @@ pub fn resolve(role: Role, scope: Scope) -> Radiance {
 /// region, which has no [`Scope`] on the thread it draws on — reads this where it *can*
 /// resolve a scope and pins the answer, the way it already pins a type rung.
 ///
-/// # Panics
-///
-/// If no palette has been installed.
 #[must_use]
 pub fn emission(role: Role, scope: Scope) -> Emission {
-    current().emission(role, scope)
+    let scope = scope.for_paint();
+    match role {
+        Role::Custom(token) => token.resolve(scope).1,
+        _ => scope.palette.0.emission(role, scope),
+    }
 }
 
 /// Returns the font for a rung of the type ramp, resolved through the same scope the colours
 /// use.
 ///
-/// # Panics
-///
-/// If a built-in role resolves before a palette has been installed.
 #[must_use]
 pub fn typography(role: TypeRole, scope: Scope) -> FontSpec {
     match role {
         TypeRole::Custom(token) => token.resolve(scope),
-        _ => current().typography(role, scope),
+        _ => scope.palette.0.typography(role, scope),
     }
 }
 
 /// Returns a spacing, radius, row height or border width, in DIPs.
 ///
-/// # Panics
-///
-/// If a built-in metric resolves before a palette has been installed.
 #[must_use]
 pub fn metric(metric: Metric, scope: Scope) -> f32 {
     match metric {
         Metric::Custom(token) => token.resolve(scope),
-        _ => current().metric(metric, scope),
+        _ => scope.palette.0.metric(metric, scope),
     }
 }
 
@@ -167,12 +121,9 @@ pub fn metric(metric: Metric, scope: Scope) -> f32 {
 /// reach. Read from the palette rather than passed in, so the transform a window builds and
 /// the values the palette authors answer to one peak.
 ///
-/// # Panics
-///
-/// If no palette has been installed.
 #[must_use]
-pub fn content_peak_nits(gamut: &Gamut) -> f32 {
-    current().content_peak_nits(gamut)
+pub fn content_peak_nits(gamut: &Gamut, scope: Scope) -> f32 {
+    scope.palette.0.content_peak_nits(gamut)
 }
 
 /// Returns the light a chromatic role resolves to.
@@ -181,12 +132,9 @@ pub fn content_peak_nits(gamut: &Gamut) -> f32 {
 /// role that resolves the same everywhere. That is what lets a gradient be minted where there
 /// is no scope to resolve against — a resource, rather than a sprite inside a tree.
 ///
-/// # Panics
-///
-/// If no palette has been installed.
 #[must_use]
-pub fn data(role: DataRole) -> Radiance {
-    current().data(role)
+pub fn data(role: DataRole, scope: Scope) -> Radiance {
+    scope.palette.0.data(role)
 }
 
 // ── washes: derived, never stored ───────────────────────────────────────────────
@@ -227,5 +175,5 @@ pub fn accent_wash(alpha: f32, scope: Scope) -> Radiance {
 /// Returns the palette's detached-surface shadow, with the paint width pinned.
 #[must_use]
 pub fn shadow(scope: Scope) -> super::Shadow {
-    current().shadow(scope.for_paint())
+    scope.palette.0.shadow(scope.for_paint())
 }

@@ -153,7 +153,7 @@ impl Realizer<'_> {
             // No mask: the paint's own alpha is the shape.
             Mask::None => Ok((None, Route::Clip, NO_INSETS)),
 
-            Mask::Box { radius } => {
+            Mask::Box { radius } | Mask::Outline { radius, .. } => {
                 // The profile is clamped against the box before the raster is cut, not after.
                 // A nine-grid does not clamp its own insets: where two opposite insets exceed
                 // the extent the corner slices overlap, and a pill comes out as a lens and a
@@ -161,7 +161,22 @@ impl Realizer<'_> {
                 // longer than the slice reading it, so the tail of the curve lands in the
                 // stretched middle and smears — same shape, different cause. Cutting a
                 // smaller profile is one more cache key and the corners stay exact.
-                let key = BoxKey::new(fit(radius, node.size(), self.env.scale()), self.env.scale());
+                let width = match mask {
+                    Mask::Outline { width, .. } => width.max(0.0).min(
+                        (node.size().x.min(node.size().y) * 0.5 - 1.0 / self.env.scale()).max(0.0),
+                    ),
+                    _ => -1.0,
+                };
+                let open = match mask {
+                    Mask::Outline { open, .. } => *open,
+                    _ => None,
+                };
+                let key = BoxKey::outline(
+                    fit(radius, node.size(), self.env.scale()),
+                    width,
+                    open,
+                    self.env.scale(),
+                );
                 let (inset, inset_scale) = nine_slice(&key, self.env.scale());
                 let Some(cell) =
                     self.cells

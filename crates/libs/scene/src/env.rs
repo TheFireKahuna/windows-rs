@@ -23,6 +23,11 @@ pub struct Env {
 }
 
 impl Env {
+    /// The current display transform, for a window policy change.
+    pub const fn output(self) -> OutputTransform {
+        self.output
+    }
+
     /// Returns the environment at `dpi`, presenting through `output`.
     #[must_use]
     pub const fn new(dpi: f32, output: OutputTransform) -> Self {

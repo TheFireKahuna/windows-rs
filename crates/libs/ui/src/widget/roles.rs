@@ -27,11 +27,8 @@ pub const BUTTON: &[RoleSet] = &[
         text: Text::OnAccent,
         stroke: None,
     },
-    // No stroke, and that is a requirement rather than a preference. A stroked surface is
-    // an outer box in the stroke colour with the fill inset by a hairline over it, so the
-    // fill is what hides the stroke everywhere but the ring — and this row's fill is a
-    // wash. Given a stroke, the whole control reads as the solid accent the tint exists to
-    // avoid.
+    // The subtle variant is an unoutlined accent wash. Applications may combine
+    // translucent fills and real outlines in their own Chrome recipes.
     RoleSet {
         fill: Some(Fill::AccentSubtle),
         text: Text::Accent,
@@ -146,32 +143,6 @@ mod tests {
         }
         for at in [TRACK_OFF, TRACK_ON] {
             assert!((at as usize) < TRACK.len());
-        }
-    }
-
-    /// No row pairs a wash fill with a stroke.
-    ///
-    /// The two sprites a stroked surface expands to are an outer box in the stroke colour
-    /// and the fill inset by a hairline over it, so the fill is the only thing hiding the
-    /// stroke away from the ring. A translucent fill hides nothing and the control reads as
-    /// a solid stroke-coloured slab.
-    #[test]
-    fn no_row_puts_a_wash_over_a_stroke() {
-        let wash = |fill: Option<Fill>| matches!(fill, Some(Fill::Selected | Fill::AccentSubtle));
-        for (name, table) in [
-            ("BUTTON", BUTTON),
-            ("SURFACE", SURFACE),
-            ("TRACK", TRACK),
-            ("FIELD", FIELD),
-            ("OPTION", OPTION),
-            ("GROOVE", GROOVE),
-        ] {
-            for (at, row) in table.iter().enumerate() {
-                assert!(
-                    !(wash(row.fill) && row.stroke.is_some()),
-                    "{name}[{at}] puts a wash fill over a stroke"
-                );
-            }
         }
     }
 

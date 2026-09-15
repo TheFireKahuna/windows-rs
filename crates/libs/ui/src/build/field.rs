@@ -182,6 +182,13 @@ impl Host {
         self.uia_restale();
     }
 
+    pub(crate) fn retheme_fields(&mut self, root: Scope) {
+        for (_, row) in self.fields.iter_mut() {
+            row.style = row.style.in_theme(root);
+            row.dirty = true;
+        }
+    }
+
     pub(crate) fn publish_fields(&mut self) {
         // Split ownership instead of re-entering Host while shaping publishes geometry.
         let mut fields = core::mem::take(&mut self.fields);

@@ -10,7 +10,7 @@
 //! numbers, because realizing a colour cell mid-hover would create a surface on the
 //! interaction path.
 
-use super::{Interaction, Range, TURN_SPAN, angle_of, detent_delta, fraction_of, offset_of};
+use super::{Interaction, Range, TURN_SPAN, detent_delta, fraction_of, offset_of};
 use crate::gesture::{DragPhase, DragUpdate};
 use crate::input::Report;
 use windows_scene::{
@@ -38,7 +38,7 @@ impl Front<'_> {
 ///
 /// Every field is a number or an id. Roles, colours and closures stay on the app thread,
 /// which is the side that can resolve and call them.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct ChromeRow {
     pub id: ControlId,
     /// Nearest declared semantic hover scope, inherited through mounted children.
@@ -51,6 +51,7 @@ pub struct ChromeRow {
     /// The node a value moves, the inset it rests at, and the travel the last solve measured
     /// between those insets. Holding all three keeps the move to one multiply and one add,
     /// and keeps the router from asking the app thread for geometry.
+    pub scalar_parts: [Option<(NodeId, super::ScalarPart)>; 4],
     pub thumb: Option<NodeId>,
     /// Retained value stroke and its normalized origin.
     pub trail: Option<(NodeId, f32)>,
@@ -73,6 +74,7 @@ pub struct ChromeRow {
     /// Last application-authored fraction. Geometry-only updates repeat it, so adopting
     /// new geometry can preserve a newer pointer value without swallowing an external edit.
     pub source_fraction: f32,
+    pub revision: u64,
 }
 
 /// The hit target includes the half-thumb gutters; the value range does not.
@@ -88,7 +90,7 @@ fn slider_value_at(along: f32, span: f32, travel: f32, range: Range) -> f64 {
 impl ChromeRow {
     fn adopted(self, previous: Option<Self>) -> Self {
         let fraction = previous
-            .filter(|old| old.source_fraction == self.source_fraction)
+            .filter(|old| old.drive == self.drive && old.revision == self.revision)
             .map_or(self.source_fraction, |old| old.fraction);
         Self { fraction, ..self }
     }
@@ -109,9 +111,15 @@ pub enum What {
     /// A press and a release on the same control.
     Tapped,
     /// A value while it is being moved.
-    Changed(f64),
+    Scalar {
+        value: f64,
+        revision: u64,
+        commit: bool,
+    },
     /// The value it settled on. A canceled contact commits nothing.
     Committed(f64),
+    /// Capture was canceled; discard application preview state.
+    Canceled(u64),
     /// A two-axis drag moved. Raised only for a control that declared a handler for one.
     Dragged(DragUpdate),
     /// A two-axis drag ended. `commit` is false for a contact that was taken away, whose
@@ -161,6 +169,8 @@ pub enum Dragging {
 /// a write to whatever now occupies the slot.
 #[derive(Default)]
 pub struct Controls {
+    canceled: Option<(ControlId, u64)>,
+
     /// The store over the control id family the app thread mints. This side holds no `Ids`
     /// counter, so it can place a row but never mint an id.
     rows: Slots<Control, ChromeRow>,
@@ -229,6 +239,15 @@ impl Controls {
             // `Slots` compares the generation, so a row for a control whose slot has since
             // been recycled misses and is placed fresh.
             let held = self.rows.get(row.id).copied();
+            let superseded =
+                held.is_some_and(|old| old.drive != row.drive || old.revision != row.revision);
+            if superseded && self.pressed == Some(row.id) {
+                self.canceled = Some((row.id, row.revision));
+                self.pressed = None;
+                self.grabbed = None;
+                self.dragged = None;
+                self.wash(row.id, front)?;
+            }
             let row = row.adopted(held);
             if held.is_none_or(|old| {
                 (old.trail, old.thumb, old.rest, old.travel)
@@ -264,7 +283,19 @@ impl Controls {
             }
             self.rows.place(row.id, row);
             if held.is_none_or(|old| {
-                (old.rest, old.travel, old.fraction) != (row.rest, row.travel, row.fraction)
+                (
+                    old.rest,
+                    old.travel,
+                    old.fraction,
+                    old.scalar_parts,
+                    old.drive,
+                ) != (
+                    row.rest,
+                    row.travel,
+                    row.fraction,
+                    row.scalar_parts,
+                    row.drive,
+                )
             }) {
                 self.drive(
                     row.id,
@@ -280,6 +311,9 @@ impl Controls {
     /// Forgets a control. Anything still pointing at it becomes a miss.
     pub fn release(&mut self, id: ControlId) {
         self.rows.take(id);
+        if self.canceled.is_some_and(|(target, _)| target == id) {
+            self.canceled = None;
+        }
         if self.hovered == Some(id) {
             self.hovered = None;
         }
@@ -342,15 +376,10 @@ impl Controls {
                     if let Some(Interaction::Slide(range) | Interaction::Turn(range)) =
                         self.rows.get(target).and_then(|row| row.drive)
                     {
+                        let value = range.at(range.fraction(value));
                         self.drive(target, range.fraction(value), true, front)?;
-                        out.push(Intent {
-                            target,
-                            what: What::Changed(value),
-                        });
-                        out.push(Intent {
-                            target,
-                            what: What::Committed(value),
-                        });
+                        self.scalar_event(target, value, false, out);
+                        self.scalar_event(target, value, true, out);
                     }
                 }
                 Action::Invoke(target)
@@ -376,6 +405,21 @@ impl Controls {
         front: &mut Front<'_>,
         out: &mut Vec<Intent>,
     ) -> Result<()> {
+        if let Some((target, revision)) = self.canceled.take() {
+            out.push(Intent {
+                target,
+                what: What::Canceled(revision),
+            });
+        }
+        if let Some(target) = self.pressed.filter(|id| {
+            front
+                .scene
+                .hits()
+                .entry(*id)
+                .is_none_or(|entry| !entry.flags.contains(windows_scene::HitFlags::INTERACTIVE))
+        }) {
+            self.one(&Report::Canceled { target, contact: 0 }, front, out)?;
+        }
         for report in reports {
             self.one(report, front, out)?;
         }
@@ -414,6 +458,19 @@ impl Controls {
         Ok(())
     }
 
+    fn scalar_event(&self, target: ControlId, value: f64, commit: bool, out: &mut Vec<Intent>) {
+        if let Some(row) = self.rows.get(target) {
+            out.push(Intent {
+                target,
+                what: What::Scalar {
+                    value,
+                    revision: row.revision,
+                    commit,
+                },
+            });
+        }
+    }
+
     fn one(&mut self, report: &Report, front: &mut Front<'_>, out: &mut Vec<Intent>) -> Result<()> {
         match *report {
             Report::Redirect { .. } => {}
@@ -445,10 +502,7 @@ impl Controls {
                 if let Some(Interaction::Slide(range)) = self.rows.get(target).and_then(|r| r.drive)
                 {
                     let value = self.slide(target, sample.raw, range, false, front)?;
-                    out.push(Intent {
-                        target,
-                        what: What::Changed(value),
-                    });
+                    self.scalar_event(target, value, false, out);
                 }
             }
             Report::Released { target, at, .. } => {
@@ -481,19 +535,13 @@ impl Controls {
                     }),
                     Some(Interaction::Slide(range)) => {
                         let value = self.slide(target, at, range, false, front)?;
-                        out.push(Intent {
-                            target,
-                            what: What::Committed(value),
-                        });
+                        self.scalar_event(target, value, true, out);
                     }
                     // The fraction this table accumulated during the turn, not the bottom
                     // of the range.
                     Some(Interaction::Turn(range)) => {
                         let fraction = self.rows.get(target).map_or(0.0, |row| row.fraction);
-                        out.push(Intent {
-                            target,
-                            what: What::Committed(range.at(fraction)),
-                        });
+                        self.scalar_event(target, range.at(fraction), true, out);
                     }
                 }
             }
@@ -508,7 +556,16 @@ impl Controls {
                     && grabbed == target
                 {
                     self.drive(target, fraction, false, front)?;
+                    if let Some(Interaction::Slide(range) | Interaction::Turn(range)) =
+                        self.rows.get(target).and_then(|row| row.drive)
+                    {
+                        self.scalar_event(target, range.at(fraction), false, out);
+                    }
                 }
+                out.push(Intent {
+                    target,
+                    what: What::Canceled(self.rows.get(target).map_or(0, |row| row.revision)),
+                });
                 if let Some((_, decided)) = self.dragged.take().filter(|&(id, _)| id == target)
                     && decided
                 {
@@ -521,13 +578,13 @@ impl Controls {
             }
             // The thumb moves here, in this tick, before the number is queued.
             Report::Moved { target, sample, .. } => {
+                if self.pressed != Some(target) {
+                    return Ok(());
+                }
                 if let Some(Interaction::Slide(range)) = self.rows.get(target).and_then(|r| r.drive)
                 {
                     let value = self.slide(target, sample.raw, range, true, front)?;
-                    out.push(Intent {
-                        target,
-                        what: What::Changed(value),
-                    });
+                    self.scalar_event(target, value, false, out);
                 }
             }
             // A knob is dragged rather than slid: the update carries displacement from the
@@ -552,10 +609,7 @@ impl Controls {
                     // Upward is more, and the coordinate grows downward.
                     let value =
                         self.turn(target, from - update.delta.y / TURN_SPAN, range, front)?;
-                    out.push(Intent {
-                        target,
-                        what: What::Changed(value),
-                    });
+                    self.scalar_event(target, value, false, out);
                 }
             }
             Report::FocusChanged { to, .. } => self.move_ring(to, front)?,
@@ -571,10 +625,33 @@ impl Controls {
                     let from = self.rows.get(target).map_or(0.0, |row| row.fraction);
                     let value =
                         self.turn(target, from + detent_delta(range, steps), range, front)?;
-                    out.push(Intent {
-                        target,
-                        what: What::Changed(value),
-                    });
+                    self.scalar_event(target, value, false, out);
+                    self.scalar_event(target, value, true, out);
+                }
+            }
+            Report::Key {
+                target: Some(target),
+                event,
+            } => {
+                if event.kind == crate::input::KeyKind::Down && !event.mods.ctrl && !event.mods.alt
+                {
+                    if let Some(Interaction::Slide(range) | Interaction::Turn(range)) =
+                        self.rows.get(target).and_then(|r| r.drive)
+                    {
+                        let from = self.rows.get(target).unwrap().fraction;
+                        let fraction = match event.key {
+                            0x25 | 0x28 => Some(from - detent_delta(range, 1.0)),
+                            0x26 | 0x27 => Some(from + detent_delta(range, 1.0)),
+                            0x24 => Some(0.0),
+                            0x23 => Some(1.0),
+                            _ => None,
+                        };
+                        if let Some(fraction) = fraction {
+                            let value = self.turn(target, fraction, range, front)?;
+                            self.scalar_event(target, value, false, out);
+                            self.scalar_event(target, value, true, out);
+                        }
+                    }
                 }
             }
             // Listed rather than matched with `_`, so a new `Report` variant fails to
@@ -586,7 +663,7 @@ impl Controls {
             | Report::Buttons { .. }
             | Report::Gesture { .. }
             | Report::Wheel { .. }
-            | Report::Key { .. }
+            | Report::Key { target: None, .. }
             | Report::Escape { .. }
             | Report::Dismiss { .. } => {}
         }
@@ -646,6 +723,9 @@ impl Controls {
                 chrome(v)
             }
         };
+        for (node, part) in row.scalar_parts.into_iter().flatten() {
+            front.retarget(node, part.property(), motion(part.at(row.fraction)))?;
+        }
         let (fraction, thumb, rest, travel, drive) =
             (row.fraction, row.thumb, row.rest, row.travel, row.drive);
         let (Some(thumb), Some(drive)) = (thumb, drive) else {
@@ -654,12 +734,12 @@ impl Controls {
         match drive {
             // A press carries no value: a toggle's knob follows the application's own
             // channel, so this table does not write it.
-            Interaction::Press => Ok(()),
+            Interaction::Press => {
+                front.retarget(thumb, Prop::OffsetX, motion(rest + fraction * travel))
+            }
             // A turned part rotates through the constant sweep; a slid one travels the
             // extent the last solve measured for it.
-            Interaction::Turn(_) => {
-                front.retarget(thumb, Prop::RotationAngle, motion(angle_of(fraction)))
-            }
+            Interaction::Turn(_) => Ok(()),
             Interaction::Slide(range) => front.retarget(
                 thumb,
                 if range.vertical {
@@ -694,7 +774,13 @@ impl Controls {
         } else {
             (at.x - entry.x0, entry.x1 - entry.x0)
         };
-        let travel = self.rows.get(id).map_or(0.0, |row| row.travel);
+        let travel = self.rows.get(id).map_or(0.0, |row| {
+            if row.thumb.is_some() {
+                row.travel
+            } else {
+                span
+            }
+        });
         let value = slider_value_at(along, span, travel, range);
         self.drive(id, range.fraction(value), snap, front)?;
         Ok(value)
@@ -709,9 +795,9 @@ impl Controls {
         range: Range,
         front: &mut Front<'_>,
     ) -> Result<f64> {
-        let fraction = fraction.clamp(0.0, 1.0);
-        self.drive(id, fraction, false, front)?;
-        Ok(range.at(fraction))
+        let value = range.at(fraction);
+        self.drive(id, range.fraction(value), false, front)?;
+        Ok(value)
     }
 
     // ── the window's focus ring ───────────────────────────────────────────────────
@@ -951,6 +1037,7 @@ mod tests {
                     wash: None,
                     hover: 0.0,
                     press: 0.0,
+                    scalar_parts: [None; 4],
                     thumb: None,
                     trail: None,
                     rest: 0.0,
@@ -959,6 +1046,7 @@ mod tests {
                     drags: false,
                     fraction: 0.0,
                     source_fraction: 0.0,
+                    revision: 0,
                 },
             );
         }
@@ -1048,6 +1136,7 @@ mod tests {
             wash: None,
             hover: 0.0,
             press: 0.0,
+            scalar_parts: [None; 4],
             thumb: None,
             trail: None,
             rest: 0.0,
@@ -1056,6 +1145,7 @@ mod tests {
             drags: false,
             fraction: 0.25,
             source_fraction: 0.25,
+            revision: 0,
         };
         assert_eq!(source.adopted(None).fraction, 0.25);
         let dragged = ChromeRow {
@@ -1070,6 +1160,7 @@ mod tests {
         assert_eq!((resized.fraction, resized.travel), (0.75, 200.0));
         let edited = ChromeRow {
             source_fraction: 0.5,
+            revision: 1,
             ..source
         }
         .adopted(Some(resized));
@@ -1106,3 +1197,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "scalar_tests.rs"]
+mod scalar_tests;

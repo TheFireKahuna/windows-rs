@@ -19,6 +19,16 @@ pub struct LayoutDriver {
 }
 
 impl LayoutDriver {
+    /// Delivers completed edits through the shipping revision/deduplication path.
+    /// The caller supplies input-owned revisions; this does not simulate TSF or IME.
+    pub fn field_commit(&mut self, id: windows_scene::ControlId, revision: u64, text: &str) {
+        super::app::deliver_field_commits(&[crate::text_input::Commit {
+            id,
+            revision,
+            text: std::sync::Arc::from(text),
+        }]);
+    }
+
     /// Runs one production declaration pass and solves its geometry.
     ///
     /// The caller must clear `patch` before another flush, as with [`Host::flush`].

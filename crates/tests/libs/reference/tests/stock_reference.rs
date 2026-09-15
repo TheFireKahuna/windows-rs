@@ -4,6 +4,48 @@ use windows_core::*;
 use windows_reference::*;
 
 #[test]
+fn cache_reuses_released_storage() -> Result<()> {
+    let mut cache = ReferenceCache::default();
+    let first = cache.get(1.0_f32);
+    let address = first.as_raw();
+    drop(first);
+    for value in 0..1_000 {
+        let next = cache.get(value as f32);
+        assert_eq!(next.as_raw(), address);
+        assert_eq!(next.Value()?, value as f32);
+    }
+    Ok(())
+}
+
+#[test]
+fn cache_preserves_retained_values_through_eviction_and_drop() -> Result<()> {
+    let mut cache = ReferenceCache::default();
+    let retained: Vec<_> = (0..32).map(|value| cache.get(value)).collect();
+    drop(cache);
+    for (value, reference) in retained.iter().enumerate() {
+        assert_eq!(reference.Value()?, value as i32);
+    }
+    Ok(())
+}
+
+#[test]
+fn cache_waits_for_the_last_interface_reference() -> Result<()> {
+    let mut cache = ReferenceCache::default();
+    let first = cache.get(1_i32);
+    let address = first.as_raw();
+    let inspectable: IInspectable = first.cast()?;
+    drop(first);
+    let second = cache.get(2);
+    assert_ne!(second.as_raw(), address);
+    assert_eq!(inspectable.cast::<IReference<i32>>()?.Value()?, 1);
+    drop(inspectable);
+    let third = cache.get(3);
+    assert_eq!(third.as_raw(), address);
+    assert_eq!(second.Value()?, 2);
+    Ok(())
+}
+
+#[test]
 fn value_u8() -> Result<()> {
     let r = IReference::<u8>::from(255);
     assert_eq!(r.Value()?, 255);

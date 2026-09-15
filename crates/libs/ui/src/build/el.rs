@@ -8,9 +8,7 @@
 //! `El<Any>`. A method a kind cannot honour is absent rather than accepted and ignored, or
 //! clamped into a table row that renders as some other widget.
 
-use super::arena::{
-    Act, Build, ChanSource, HitSeed, MaskSeed, Part, Slot, SpriteSeed, TextSeed, Unit,
-};
+use super::arena::{Act, Build, ChanSource, HitSeed, MaskSeed, Part, Slot, SpriteSeed, TextSeed};
 use crate::gesture::{DragDecl, GestureDecl};
 use crate::layout::{Align, Edge, Len, Over, Preset, Rule, Track};
 use crate::role::{DataRole, Elevation, Fill, Metric, Role, Text, TypeRole, WidthClass};
@@ -139,13 +137,9 @@ impl<K> El<K> {
             b.push_seed(
                 self.at,
                 SpriteSeed {
-                    mask,
-                    role,
                     strength,
-                    ramp: None,
-                    region: None,
-                    part,
                     next: super::arena::NIL,
+                    ..SpriteSeed::new(mask, role, part)
                 },
             );
         });
@@ -170,7 +164,6 @@ impl<K> El<K> {
         self,
         prop: Prop,
         motion: Motion,
-        unit: Unit,
         v: impl Signal<T, M> + 'static,
     ) -> Self
     where
@@ -181,7 +174,7 @@ impl<K> El<K> {
         } else {
             ChanSource::Dynamic(Box::new(move || v.read().value()))
         };
-        Build::with(|b| b.push_chan(self.at, prop, motion, unit, source));
+        Build::with(|b| b.push_chan(self.at, prop, motion, source));
         self
     }
 
@@ -244,6 +237,8 @@ impl<K> El<K> {
                 variant,
                 radius,
                 attached: None,
+                selected: None,
+                disabled: None,
             });
         })
     }
@@ -282,6 +277,31 @@ impl<K> El<K> {
         })
     }
 
+    /// Declares a part driven by the nearest scalar control. Its property has one writer.
+    #[must_use]
+    pub fn scalar_part(self, part: crate::widget::ScalarPart) -> Self {
+        self.slot_mut(|s| s.scalar_part = Some(part))
+    }
+
+    /// Applies immutable chrome authored by a component recipe.
+    #[must_use]
+    pub fn appearance(self, chrome: Chrome) -> Self {
+        self.slot_mut(|s| s.chrome = Some(chrome))
+    }
+
+    /// Adds a rounded outline with a transparent interior, over any existing fill.
+    #[must_use]
+    pub fn outline(self, radius: Metric, role: Role, width: impl Into<Len>) -> Self {
+        self.sprite(
+            MaskSeed::Border {
+                radius,
+                width: width.into(),
+            },
+            role,
+            Part::Static,
+        )
+    }
+
     pub(crate) fn interaction(self, interaction: Interaction) -> Self {
         self.slot_mut(|s| s.interaction = Some(interaction))
     }
@@ -318,17 +338,16 @@ impl<K> El<K> {
             b.push_seed(
                 self.at,
                 SpriteSeed {
-                    mask: MaskSeed::Box {
-                        radius: Some(Len::Metric(radius)),
-                    },
-                    // Unread while `ramp` is set, and stated rather than left arbitrary so the
-                    // seed is meaningful if a ramp is ever cleared from one.
-                    role: Role::Fill(Fill::Surface),
                     strength: super::arena::FULL,
                     ramp: Some(id),
-                    region: None,
-                    part: Part::Static,
                     next: super::arena::NIL,
+                    ..SpriteSeed::new(
+                        MaskSeed::Box {
+                            radius: Some(Len::Metric(radius)),
+                        },
+                        Role::Fill(Fill::Surface),
+                        Part::Static,
+                    )
                 },
             );
         });
@@ -396,7 +415,7 @@ impl<K> El<K> {
     /// shadow, and the scene refuses a property whose owner the node does not carry.
     #[must_use]
     pub fn halo_lit<M>(self, lit: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::ShadowOpacity, Motion::Chrome, Unit::Direct, lit)
+        self.channel(Prop::ShadowOpacity, Motion::Chrome, lit)
     }
 
     /// Adds the plate a chromatic value sits on: a rounded box painting `strength` of `role`.
@@ -1047,8 +1066,15 @@ impl<K> El<K> {
         self
     }
 
+    /// Publishes an application validation message as UIA help text while present.
+    /// Parsing, validity and visual error presentation belong to the application.
+    #[must_use]
+    pub fn validation<M>(self, message: impl Signal<Option<&'static str>, M> + 'static) -> Self {
+        self.act(Act::Validation(Box::new(move || message.read())))
+    }
+
     /// Disables this control while `cond` holds, swapping its base roles and dropping its hit
-    /// flags. Model state rather than interaction chrome.
+    /// flags. Disabled state takes precedence over selection.
     #[must_use]
     pub fn disabled<M>(self, cond: impl Signal<bool, M> + 'static) -> Self {
         self.act(Act::DisabledWhen(Box::new(move || cond.read())))
@@ -1112,7 +1138,7 @@ impl<K> El<K> {
     /// A constant produces no `Cell` and no `Effect`; anything else becomes one `Effect`.
     #[must_use]
     pub fn opacity<M>(self, v: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::Opacity, Motion::Chrome, Unit::Direct, v)
+        self.channel(Prop::Opacity, Motion::Chrome, v)
     }
 
     /// Binds this node's rotation to `radians`.
@@ -1123,41 +1149,13 @@ impl<K> El<K> {
     /// [`turns`](Self::turns), so this thread and the router do not both drive it.
     #[must_use]
     pub fn rotation<M>(self, radians: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::RotationAngle, Motion::Chrome, Unit::Direct, radians)
+        self.channel(Prop::RotationAngle, Motion::Chrome, radians)
     }
 
     /// Sets the rotation centre in local DIPs. Layout changes snap the pivot.
     #[must_use]
     pub fn pivot<M>(self, point: impl Signal<Vector2, M> + 'static) -> Self {
-        self.channel(Prop::Center, Motion::Snap, Unit::Direct, point)
-    }
-
-    /// Binds how far a turned part is through its sweep, `0..=1`.
-    ///
-    /// The twin of [`along`](Self::along), and typed for the same reason. It opens a value
-    /// row, so exactly one of this thread and the router moves the part, and whichever does
-    /// applies the sweep through the same [`angle_of`](crate::widget::angle_of).
-    pub(crate) fn turns<M>(self, v: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::RotationAngle, Motion::Chrome, Unit::Turn, v)
-    }
-
-    /// Binds where a moving part sits along its track, `0..=1` of the room it has.
-    ///
-    /// The room is a layout output — the enclosing control's extent less this part's own — so
-    /// the channel records the fraction in [`Unit::Travel`] and the post-solve step
-    /// multiplies it out. Bound straight to an offset, the fraction would move the thumb by
-    /// one DIP.
-    ///
-    /// Typed rather than reached through [`channel`](Self::channel): a closure is itself a
-    /// value, so an inferred `T` is ambiguous between a signal of `f32` and a constant whose
-    /// value is that closure.
-    pub(crate) fn along<M>(self, vertical: bool, v: impl Signal<f32, M> + 'static) -> Self {
-        let prop = if vertical {
-            Prop::OffsetY
-        } else {
-            Prop::OffsetX
-        };
-        self.channel(prop, Motion::Chrome, Unit::Travel, v)
+        self.channel(Prop::Center, Motion::Snap, point)
     }
 
     /// Binds how far a level fills its bed, `0..=1`.
@@ -1165,7 +1163,7 @@ impl<K> El<K> {
     /// A scale and not an offset, so the fraction is already in the property's own unit: the
     /// bed is the node's own box, and a fraction of it needs nothing from layout.
     pub(crate) fn scale_x<M>(self, v: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::ScaleX, Motion::Chrome, Unit::Direct, v)
+        self.channel(Prop::ScaleX, Motion::Chrome, v)
     }
 
     pub(crate) fn hit(self, flags: HitFlags, uia: UiaRole) -> Self {
@@ -1238,6 +1236,69 @@ impl<K> El<K> {
 }
 
 impl El<Any> {
+    /// Gives a component vertical-turn behavior without prescribing its appearance.
+    #[must_use]
+    pub fn turn<M>(
+        self,
+        value: impl Signal<f64, M> + 'static,
+        range: crate::widget::Range,
+    ) -> Self {
+        self.scalar(value, Interaction::Turn(range), range)
+            .drag(DragDecl::turn())
+    }
+
+    /// A turn whose source carries an explicit replacement epoch. Stale queued edits are rejected.
+    #[must_use]
+    pub fn turn_source<M>(
+        self,
+        value: impl Signal<crate::widget::ScalarValue, M> + 'static,
+        range: crate::widget::Range,
+    ) -> Self {
+        self.interaction(Interaction::Turn(range))
+            .act(Act::ScalarSource(Box::new(move || {
+                let value = value.read();
+                (range.fraction(value.value), value.epoch)
+            })))
+            .slot_mut(|s| {
+                s.uia = UiaRole::Slider;
+                add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE);
+            })
+            .drag(DragDecl::turn())
+    }
+
+    /// Gives a component absolute slider behavior over its solved hit rectangle.
+    #[must_use]
+    pub fn slide<M>(
+        self,
+        value: impl Signal<f64, M> + 'static,
+        range: crate::widget::Range,
+    ) -> Self {
+        self.scalar(value, Interaction::Slide(range), range)
+            .gesture(GestureDecl::slider(range.vertical))
+    }
+
+    fn scalar<M>(
+        self,
+        value: impl Signal<f64, M> + 'static,
+        drive: Interaction,
+        range: crate::widget::Range,
+    ) -> Self {
+        self.interaction(drive)
+            .act(Act::ScalarSource(Box::new(move || {
+                (range.fraction(value.read()), 0)
+            })))
+            .slot_mut(|s| {
+                s.uia = UiaRole::Slider;
+                add_flags(s, HitFlags::GESTURE | HitFlags::INTERACTIVE);
+            })
+    }
+
+    /// Ends a scalar preview when capture is canceled. No model value is committed.
+    #[must_use]
+    pub fn on_cancel(self, f: impl Fn() + 'static) -> Self {
+        self.act(Act::Cancel(Box::new(f)))
+    }
+
     /// Seeds a bare node, for a caller that wants somewhere to hang overrides.
     ///
     /// On [`Any`] and not on `El<K>`: it answers a [`View`] whatever the kind, so offered
@@ -1282,16 +1343,14 @@ impl El<Region> {
             b.push_seed(
                 self.at,
                 SpriteSeed {
-                    mask: MaskSeed::Box { radius: None },
-                    role: Role::Fill(Fill::Surface),
                     strength: super::arena::FULL,
-                    ramp: None,
                     region: Some(sink),
-                    // Not interaction-sensitive: a region's pixels are the present thread's,
-                    // and a hover inside one is picked against its parts rather than by
-                    // re-resolving a colour here.
-                    part: Part::Static,
                     next: super::arena::NIL,
+                    ..SpriteSeed::new(
+                        MaskSeed::Box { radius: None },
+                        Role::Fill(Fill::Surface),
+                        Part::Static,
+                    )
                 },
             );
         });
@@ -1357,13 +1416,10 @@ impl El<Path> {
             b.push_seed(
                 self.at,
                 SpriteSeed {
-                    mask: MaskSeed::Shape { stroke },
-                    role: Role::Fill(Fill::Surface),
                     strength: super::arena::FULL,
                     ramp: Some(id),
-                    region: None,
-                    part,
                     next: super::arena::NIL,
+                    ..SpriteSeed::new(MaskSeed::Shape { stroke }, Role::Fill(Fill::Surface), part)
                 },
             );
         });
@@ -1374,15 +1430,16 @@ impl El<Path> {
             b.push_seed(
                 self.at,
                 SpriteSeed {
-                    mask: MaskSeed::Shape {
-                        stroke: Some(Metric::SliderRailH.into()),
-                    },
-                    role: Role::Fill(Fill::Accent),
                     strength: super::arena::FULL,
                     ramp,
-                    region: None,
-                    part: Part::Trail { origin },
                     next: super::arena::NIL,
+                    ..SpriteSeed::new(
+                        MaskSeed::Shape {
+                            stroke: Some(Metric::SliderRailH.into()),
+                        },
+                        Role::Fill(Fill::Accent),
+                        Part::Trail { origin },
+                    )
                 },
             )
         });
@@ -1401,12 +1458,12 @@ impl El<Path> {
 
     /// Outlines this node's geometry in `role`, `width` wide.
     #[must_use]
-    pub fn stroke(self, role: DataRole, width: impl Into<Len>) -> Self {
+    pub fn stroke(self, role: impl Into<Role>, width: impl Into<Len>) -> Self {
         self.sprite(
             MaskSeed::Shape {
                 stroke: Some(width.into()),
             },
-            Role::Data(role),
+            role.into(),
             Part::Border,
         )
     }
@@ -1476,13 +1533,13 @@ impl El<Path> {
     /// Binds the visible end of the path, in normalized path length.
     #[must_use]
     pub fn trim<M>(self, end: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::TrimEnd, Motion::Chrome, Unit::Direct, end)
+        self.channel(Prop::TrimEnd, Motion::Chrome, end)
     }
 
     /// Binds the stroke width.
     #[must_use]
     pub fn stroke_width<M>(self, w: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::StrokeThickness, Motion::Chrome, Unit::Direct, w)
+        self.channel(Prop::StrokeThickness, Motion::Chrome, w)
     }
 }
 

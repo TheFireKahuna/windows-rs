@@ -709,11 +709,23 @@ impl Scene {
         let Some(painted) = node.painted.as_ref() else {
             return;
         };
-        let Mask::Box { radius } = painted.mask else {
-            return;
+        let (radius, width) = match painted.mask {
+            Mask::Box { radius } => (radius, -1.0),
+            Mask::Outline { radius, width, .. } => (
+                radius,
+                width
+                    .max(0.0)
+                    .min((node.size().x.min(node.size().y) * 0.5 - 1.0 / env.scale()).max(0.0)),
+            ),
+            _ => return,
         };
-        let inset = crate::cache::BoxKey::new(
+        let inset = crate::cache::BoxKey::outline(
             crate::bind::fit(radius, node.size(), env.scale()),
+            width,
+            match painted.mask {
+                Mask::Outline { open, .. } => open,
+                _ => None,
+            },
             env.scale(),
         )
         .inset_px()

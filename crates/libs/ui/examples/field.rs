@@ -18,7 +18,7 @@ use windows_ui::widget::{button, field, label};
 use windows_window::Window;
 
 fn main() -> Result<()> {
-    let ui = Ui::install(&REFERENCE, AccentId(0), Density::Comfortable);
+    let ui = Ui::new(&REFERENCE, AccentId(0), Density::Comfortable);
     let commits = Arc::new(Mutex::new(Vec::<String>::new()));
     let ticks = Arc::new(AtomicU64::new(0));
     observe({

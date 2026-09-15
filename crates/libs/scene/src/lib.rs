@@ -67,12 +67,12 @@ use crate::tracker::{EventQueue, Events, TrackerState};
 use core::marker::PhantomData;
 use std::cell::RefCell;
 use std::rc::Rc;
+pub use windows_composition::ManipulationPointer;
 use windows_composition::{
     CompositionSurfaceBrush, ContainerVisual, DesktopWindowTarget, Stretch, Visual,
     VisualInteractionSource,
 };
 use windows_numerics::{Vector2, Vector3};
-pub use windows_composition::ManipulationPointer;
 
 /// Carries what the front half reports upward.
 ///
@@ -172,6 +172,7 @@ pub struct Scene {
     /// The window's ground: under every root, out of the arena, and not in the hit
     /// array. Held because a display change re-lights it and a resize re-places it.
     backdrop: backdrop::Backdrop,
+    ground: windows_composition::ContainerVisual,
     /// Every node with no parent node, in attachment order.
     ///
     /// [`audit`](Scene::audit) walks from these. A forest and not a tree: a slot root is a
@@ -252,6 +253,7 @@ impl Scene {
 
         Ok(Self {
             backdrop,
+            ground,
             content,
             overlays,
             target,
@@ -278,6 +280,18 @@ impl Scene {
     /// `index` is into the [`BackdropSpec::glows`] the scene was built with. A front-side
     /// write, like [`retarget`](Self::retarget): the backdrop carries no patch ops, so an
     /// application driving a glow from a `Cell` calls this from its effect.
+    /// Replaces the window ground within the caller's scene transaction.
+    pub fn set_backdrop(&mut self, spec: BackdropSpec, back: &Backends, env: Env) -> Result<()> {
+        let backdrop = backdrop::Backdrop::new(spec, back, env)?;
+        let layers = self.ground.children();
+        layers.remove_all();
+        for sprite in backdrop.sprites() {
+            layers.insert_at_top(&**sprite);
+        }
+        self.backdrop = backdrop;
+        Ok(())
+    }
+
     pub fn move_glow(&mut self, index: usize, at: Vector2) {
         self.backdrop.move_glow(index, at);
     }
@@ -441,9 +455,7 @@ impl Scene {
         self.cells.clear();
         self.env = Some(env);
         self.refresh(back, env)?;
-        self.events
-            .borrow_mut()
-            .push(SceneEvent::DeviceRebuilt);
+        self.events.borrow_mut().push(SceneEvent::DeviceRebuilt);
         Ok(())
     }
 

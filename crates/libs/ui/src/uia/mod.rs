@@ -362,7 +362,8 @@ impl Uia {
     pub fn observe(&mut self, intents: &[crate::widget::Intent]) {
         for intent in intents {
             match intent.what {
-                crate::widget::What::Changed(v) | crate::widget::What::Committed(v) => {
+                crate::widget::What::Scalar { value: v, .. }
+                | crate::widget::What::Committed(v) => {
                     self.set_value(intent.target, v);
                 }
                 crate::widget::What::Tapped => {
@@ -373,7 +374,8 @@ impl Uia {
                 // whatever the handler writes.
                 crate::widget::What::Dragged(_)
                 | crate::widget::What::DragEnded { .. }
-                | crate::widget::What::Hovered(_) => {}
+                | crate::widget::What::Hovered(_)
+                | crate::widget::What::Canceled(_) => {}
             }
         }
     }

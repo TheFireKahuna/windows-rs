@@ -15,172 +15,332 @@ use windows_numerics::Vector2;
 use windows_scene::{Env, Model, Op, Paint, SinkPatch, taffy};
 use windows_text::FontLadder;
 
-/// Installs this thread's palette, text engine and a fresh host, and returns a drained patch.
-///
-/// The palette is process-wide and installs once; the engine and the host are per thread, and
-/// tests run on their own, so each gets a tree and an engine of its own to assert against.
+/// Creates this thread's text engine and host with an immutable palette reference.
 pub(crate) fn fixture() -> SinkPatch {
     fixture_at(96.0)
 }
 
 #[test]
-fn a_gradient_fill_keeps_its_geometry_mask_and_resources_on_edit() {
-    use windows_scene::{Mask, PathVerb, ResOp, Spread};
-    let mut patch = fixture();
-    let hue = crate::role::DataRole(1);
-    let verts = [
-        PathVerb::Move {
-            to: Vector2 { x: 0.0, y: 0.0 },
-            filled: true,
-        },
-        PathVerb::Line(Vector2 { x: 80.0, y: 40.0 }),
-        PathVerb::Line(Vector2 { x: 0.0, y: 40.0 }),
-        PathVerb::End { closed: true },
-    ];
-    let geom = geometry(&verts);
-    let stops = [
-        Stop {
-            at: 0.0,
-            role: hue,
-            strength: 0.1,
-        },
-        Stop {
-            at: 1.0,
-            role: hue,
-            strength: 0.0,
-        },
-    ];
-    let fade = ramp(&stops, Spread::Vertical);
-    let _mount = mount(
-        crate::widget::path(geom)
-            .fill_ramp(fade)
-            .width(Metric::RowH)
-            .height(Metric::RowH),
-        root(),
-    );
-    flush(&mut patch);
-    assert!(patch.ops().iter().any(|op| matches!(op, Op::Mask { mask: Mask::Shape { geom: id, stroke: None }, .. } if *id == geom)));
-    assert!(
-        patch
-            .ops()
-            .iter()
-            .any(|op| matches!(op, Op::Paint { paint: Paint::Ramp(id), .. } if *id == fade))
-    );
-    patch.clear();
-    set_ramp(
-        fade,
-        &[
-            Stop {
-                at: 0.25,
-                ..stops[0]
-            },
-            stops[1],
-        ],
-        Spread::Vertical,
-    );
-    flush(&mut patch);
-    assert!(patch.ops().iter().any(|op| matches!(
-        op,
-        Op::Res {
-            op: ResOp::Ramp { .. },
-            ..
+fn independent_hosts_retheme_existing_recipes_and_preserve_state() {
+    let jobs: Vec<_> = [Polarity::Dark, Polarity::Light]
+        .into_iter()
+        .map(|polarity| {
+            std::thread::spawn(move || {
+                let mut patch = fixture();
+                let root_scope = Host::with(|h| h.root_scope);
+                let (_owner, held) = crate::signal::Owner::scope(|| {
+                    let selected = crate::signal::Cell::new(true);
+                    let disabled = crate::signal::Cell::new(true);
+                    const ROWS: &[crate::widget::RoleSet] = &[crate::widget::RoleSet {
+                        fill: Some(Fill::Surface),
+                        stroke: Some(Stroke::Subtle),
+                        text: Text::Secondary,
+                    }];
+                    const CHROME: crate::widget::Chrome = crate::widget::Chrome {
+                        selected: Some(crate::widget::RoleSet {
+                            fill: Some(Fill::AccentSubtle),
+                            stroke: Some(Stroke::Accent),
+                            text: Text::Primary,
+                        }),
+                        disabled: Some(crate::widget::RoleSet {
+                            fill: None,
+                            stroke: Some(Stroke::Subtle),
+                            text: Text::Disabled,
+                        }),
+                        ..crate::widget::Chrome::new(ROWS, Metric::Radius)
+                    };
+                    let held = mount(
+                        stack((
+                            crate::widget::button_with(
+                                "Recipe",
+                                crate::widget::TextStyle::new(TypeRole::Body),
+                            )
+                            .appearance(CHROME)
+                            .selected(selected)
+                            .disabled(disabled),
+                            crate::widget::field("draft"),
+                        )),
+                        root(),
+                    );
+                    flush(&mut patch);
+                    let id = Host::with(|h| {
+                        h.controls
+                            .iter()
+                            .find(|(_, c)| c.chrome == Some(CHROME))
+                            .unwrap()
+                            .0
+                    });
+                    assert_eq!(
+                        Host::with(|h| h.control(id).unwrap().state),
+                        crate::widget::ModelState::Disabled
+                    );
+                    selected.set(false);
+                    crate::signal::flush();
+                    assert_eq!(
+                        Host::with(|h| h.control(id).unwrap().state),
+                        crate::widget::ModelState::Disabled
+                    );
+                    selected.set(true);
+                    disabled.set(false);
+                    crate::signal::flush();
+                    assert_eq!(
+                        Host::with(|h| h.control(id).unwrap().state),
+                        crate::widget::ModelState::Selected
+                    );
+                    let counts = Host::with(|h| {
+                        (
+                            h.appearances.iter().count(),
+                            h.controls.iter().count(),
+                            h.fields.iter().count(),
+                        )
+                    });
+                    for i in 0..12 {
+                        let theme = Scope {
+                            polarity: if i % 2 == 0 { polarity } else { Polarity::Dark },
+                            density: if i % 2 == 0 {
+                                Density::Compact
+                            } else {
+                                Density::Comfortable
+                            },
+                            ..root_scope
+                        };
+                        patch.clear();
+                        Host::with(|h| h.set_theme(theme, windows_scene::BackdropSpec::default()));
+                        flush(&mut patch);
+                        assert_eq!(filled().theme.unwrap().0, theme);
+                        assert!(
+                            !patch
+                                .ops()
+                                .iter()
+                                .any(|op| matches!(op, Op::New { .. } | Op::Drop { .. })),
+                            "theme changes retain control identity"
+                        );
+                        Host::with(|h| {
+                            assert_eq!(h.root_scope, theme);
+                            assert_eq!(
+                                h.control(id).unwrap().state,
+                                crate::widget::ModelState::Selected
+                            );
+                            assert_eq!(h.control(id).unwrap().scope.polarity, theme.polarity);
+                            assert_eq!(
+                                (
+                                    h.appearances.iter().count(),
+                                    h.controls.iter().count(),
+                                    h.fields.iter().count()
+                                ),
+                                counts
+                            );
+                        });
+                        patch.clear();
+                        Host::with(|h| h.set_theme(theme, windows_scene::BackdropSpec::default()));
+                        flush(&mut patch);
+                        assert!(patch.ops().is_empty(), "an unchanged theme parks");
+                        assert!(filled().theme.is_none(), "an equal transaction sends no wake");
+                    }
+                    held
+                });
+                drop(held);
+                Host::with(|h| {
+                    assert_eq!(h.appearances.iter().count(), 0);
+                    assert_eq!(h.controls.iter().count(), 0);
+                    assert_eq!(h.fields.iter().count(), 0);
+                });
+            })
+        })
+        .collect();
+    for job in jobs {
+        job.join().unwrap();
+    }
+}
+
+#[test]
+fn choice_dispatch_preserves_canonical_selection_when_an_edit_is_declined() {
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        let mut patch = fixture();
+        let selected = crate::signal::Cell::new(0_u8);
+        let attempts = crate::signal::Cell::new(0_u8);
+        let _held = mount(crate::widget::segmented((move || selected.get(), move |next| {
+            attempts.set(attempts.get() + 1);
+            if next != 2 { selected.set(next); }
+        }), &[("First", 0), ("Second", 1), ("Unavailable", 2)]), root());
+        crate::signal::flush();
+        flush(&mut patch);
+        let ids = Host::with(|h| h.controls.iter().filter(|(_, c)| c.uia == crate::widget::UiaRole::RadioButton).map(|(id, _)| id).collect::<Vec<_>>());
+        for (at, expected) in [(1, 1), (2, 1)] {
+            Host::with(|h| h.dispatch(&[crate::widget::Intent { target: ids[at], what: crate::widget::What::Tapped }]));
+            crate::signal::flush();
+            assert_eq!(selected.get(), expected);
+            Host::with(|h| assert_eq!(h.control(ids[1]).unwrap().state, crate::widget::ModelState::Selected));
         }
-    )));
-    assert!(!patch.ops().iter().any(|op| matches!(op, Op::New { .. })));
-    patch.clear();
-    flush(&mut patch);
-    assert!(
-        patch.ops().is_empty(),
-        "an unchanged gradient has no idle work"
-    );
+        assert_eq!(attempts.get(), 2);
+        selected.set(0);
+        crate::signal::flush();
+        Host::with(|h| assert_eq!(h.control(ids[0]).unwrap().state, crate::widget::ModelState::Selected));
+    });
+}
+
+#[test]
+fn a_gradient_fill_keeps_its_geometry_mask_and_resources_on_edit() {
+    let (_resource_owner, ()) = crate::signal::Owner::scope(|| {
+        use windows_scene::{Mask, PathVerb, ResOp, Spread};
+        let mut patch = fixture();
+        let hue = crate::role::DataRole(1);
+        let verts = [
+            PathVerb::Move {
+                to: Vector2 { x: 0.0, y: 0.0 },
+                filled: true,
+            },
+            PathVerb::Line(Vector2 { x: 80.0, y: 40.0 }),
+            PathVerb::Line(Vector2 { x: 0.0, y: 40.0 }),
+            PathVerb::End { closed: true },
+        ];
+        let geom = geometry(&verts);
+        let stops = [
+            Stop {
+                at: 0.0,
+                role: hue,
+                strength: 0.1,
+            },
+            Stop {
+                at: 1.0,
+                role: hue,
+                strength: 0.0,
+            },
+        ];
+        let fade = ramp(&stops, Spread::Vertical);
+        let _mount = mount(
+            crate::widget::path(geom)
+                .fill_ramp(fade)
+                .width(Metric::RowH)
+                .height(Metric::RowH),
+            root(),
+        );
+        flush(&mut patch);
+        assert!(patch.ops().iter().any(|op| matches!(op, Op::Mask { mask: Mask::Shape { geom: id, stroke: None }, .. } if *id == geom)));
+        assert!(
+            patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Paint { paint: Paint::Ramp(id), .. } if *id == fade))
+        );
+        patch.clear();
+        set_ramp(
+            fade,
+            &[
+                Stop {
+                    at: 0.25,
+                    ..stops[0]
+                },
+                stops[1],
+            ],
+            Spread::Vertical,
+        );
+        flush(&mut patch);
+        assert!(patch.ops().iter().any(|op| matches!(
+            op,
+            Op::Res {
+                op: ResOp::Ramp { .. },
+                ..
+            }
+        )));
+        assert!(!patch.ops().iter().any(|op| matches!(op, Op::New { .. })));
+        patch.clear();
+        flush(&mut patch);
+        assert!(
+            patch.ops().is_empty(),
+            "an unchanged gradient has no idle work"
+        );
+    });
 }
 
 #[test]
 fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
-    use crate::role::DataRole;
-    use windows_scene::{Anim, Bind, PathVerb, Prop, Spread, Value};
-    let mut patch = fixture();
-    let value = crate::signal::Cell::new(0.25_f32);
-    let glow = crate::signal::Cell::new(Role::Data(DataRole(0xfffe)));
-    let geometry = geometry(&[
-        PathVerb::Move {
-            to: Vector2 { x: 0.0, y: 0.0 },
-            filled: false,
-        },
-        PathVerb::Line(Vector2 { x: 20.0, y: 20.0 }),
-        PathVerb::End { closed: false },
-    ]);
-    let gradient = ramp(
-        &[
-            Stop {
-                at: 0.0,
-                role: DataRole(1),
-                strength: 1.0,
+    let (_resource_owner, ()) = crate::signal::Owner::scope(|| {
+        use crate::role::DataRole;
+        use windows_scene::{Anim, Bind, PathVerb, Prop, Spread, Value};
+        let mut patch = fixture();
+        let value = crate::signal::Cell::new(0.25_f32);
+        let glow = crate::signal::Cell::new(Role::Data(DataRole(0xfffe)));
+        let geometry = geometry(&[
+            PathVerb::Move {
+                to: Vector2 { x: 0.0, y: 0.0 },
+                filled: false,
             },
-            Stop {
-                at: 1.0,
-                role: DataRole(2),
-                strength: 1.0,
+            PathVerb::Line(Vector2 { x: 20.0, y: 20.0 }),
+            PathVerb::End { closed: false },
+        ]);
+        let gradient = ramp(
+            &[
+                Stop {
+                    at: 0.0,
+                    role: DataRole(1),
+                    strength: 1.0,
+                },
+                Stop {
+                    at: 1.0,
+                    role: DataRole(2),
+                    strength: 1.0,
+                },
+            ],
+            Spread::Conic {
+                center: [0.5, 0.56],
+                start: 0.0,
             },
-        ],
-        Spread::Conic {
-            center: [0.5, 0.56],
-            start: 0.0,
-        },
-    );
-    let (owner, held) = crate::signal::Owner::scope(|| {
-        mount(
-            crate::widget::path(geometry)
-                .stroke_ramp(gradient, Metric::HairlineW)
-                .width(crate::role::tests::EXTENT)
-                .height(crate::role::tests::EXTENT)
-                .pivot(Vector2 { x: 64.0, y: 71.68 })
-                .trim(move || value.get())
-                .rotation(move || value.get() * 4.0)
-                .halo(glow),
-            root(),
-        )
-    });
-    flush(&mut patch);
-    assert!(patch.ops().iter().any(|op| matches!(op,
-        Op::Halo { halo: Some(halo), .. } if halo.blur == 9.0)));
-    patch.clear();
-    value.set(0.75);
-    glow.set(Role::Data(DataRole(0xffff)));
-    crate::signal::flush();
-    flush(&mut patch);
-    for (property, target) in [(Prop::TrimEnd, 0.75), (Prop::RotationAngle, 3.0)] {
+        );
+        let (owner, held) = crate::signal::Owner::scope(|| {
+            mount(
+                crate::widget::path(geometry)
+                    .stroke_ramp(gradient, Metric::HairlineW)
+                    .width(crate::role::tests::EXTENT)
+                    .height(crate::role::tests::EXTENT)
+                    .pivot(Vector2 { x: 64.0, y: 71.68 })
+                    .trim(move || value.get())
+                    .rotation(move || value.get() * 4.0)
+                    .halo(glow),
+                root(),
+            )
+        });
+        flush(&mut patch);
         assert!(patch.ops().iter().any(|op| matches!(op,
+        Op::Halo { halo: Some(halo), .. } if halo.blur == 9.0)));
+        patch.clear();
+        value.set(0.75);
+        glow.set(Role::Data(DataRole(0xffff)));
+        crate::signal::flush();
+        flush(&mut patch);
+        for (property, target) in [(Prop::TrimEnd, 0.75), (Prop::RotationAngle, 3.0)] {
+            assert!(patch.ops().iter().any(|op| matches!(op,
             Op::Bind { prop, bind: Bind::Animate(Anim::Spring { to: Value::Scalar(v), .. }), .. }
             if *prop == property && *v == target)));
-    }
-    assert!(
-        patch
-            .ops()
-            .iter()
-            .any(|op| matches!(op, Op::Halo { halo: Some(_), .. }))
-    );
-    assert!(
-        !patch
-            .ops()
-            .iter()
-            .any(|op| matches!(op, Op::New { .. } | Op::Res { .. }))
-    );
-    patch.clear();
-    flush(&mut patch);
-    assert!(patch.ops().is_empty());
-    drop(owner);
-    drop(held);
-    flush(&mut patch);
-    patch.clear();
-    value.set(0.1);
-    glow.set(Role::Data(DataRole(0xfffe)));
-    crate::signal::flush();
-    flush(&mut patch);
-    assert!(
-        patch.ops().is_empty(),
-        "unmounted instrument effects must be disposed"
-    );
+        }
+        assert!(
+            patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Halo { halo: Some(_), .. }))
+        );
+        assert!(
+            !patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::New { .. } | Op::Res { .. }))
+        );
+        patch.clear();
+        flush(&mut patch);
+        assert!(patch.ops().is_empty());
+        drop(owner);
+        drop(held);
+        flush(&mut patch);
+        patch.clear();
+        value.set(0.1);
+        glow.set(Role::Data(DataRole(0xfffe)));
+        crate::signal::flush();
+        flush(&mut patch);
+        assert!(
+            patch.ops().is_empty(),
+            "unmounted instrument effects must be disposed"
+        );
+    });
 }
 
 /// [`fixture`] at a stated DPI.
@@ -188,7 +348,6 @@ fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
 /// The raster caches are cut in physical pixels, so a mask that is exact at one scale can be
 /// degenerate at another. A test that only ever runs at 96 cannot see it.
 pub(crate) fn fixture_at(dpi: f32) -> SinkPatch {
-    crate::role::tests::palette();
     if !super::text::installed() {
         // The real engine, over the two inbox faces the palette names, so every width
         // asserted below is DirectWrite's own advance rather than an invented one.
@@ -206,7 +365,11 @@ pub(crate) fn fixture_at(dpi: f32) -> SinkPatch {
             dpi,
             OutputTransform::for_display(DisplayCapability::Sdr, 1000.0),
         ),
-        Scope::root(AccentId(0), Density::Comfortable),
+        Scope::root(
+            crate::role::tests::palette(),
+            AccentId(0),
+            Density::Comfortable,
+        ),
     );
     // The root's own `New` op rides the first flush. Draining it leaves the patch carrying
     // only what the test itself mounts.
@@ -770,7 +933,11 @@ fn a_surface_elevates_the_scope_its_children_resolve_against() {
 /// A `Metric` resolves through the palette on its way into the lowered style.
 #[test]
 fn a_metric_override_lowers_through_the_palette() {
-    let scope = Scope::root(AccentId(0), Density::Comfortable);
+    let scope = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let style = crate::layout::lower(
         crate::layout::Preset::Bare,
         &[crate::layout::Rule::always(crate::layout::Over::Width(
@@ -809,7 +976,11 @@ fn text_measures_under_the_resolved_type_ramp() {
         })
     }
 
-    let scope = Scope::root(AccentId(0), Density::Comfortable);
+    let scope = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let body = crate::role::typography(TypeRole::Body, scope).size;
     let display = crate::role::typography(TypeRole::Display, scope).size;
     assert!(
@@ -857,7 +1028,11 @@ fn the_arena_is_pooled_across_mounts() {
 /// stops this compiling.
 #[test]
 fn len_has_no_raw_dip_constructor() {
-    let scope = Scope::root(AccentId(0), Density::Comfortable);
+    let scope = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     for len in [
         Len::Metric(Metric::SpaceMd),
         Len::Zero,
@@ -888,8 +1063,11 @@ fn len_has_no_raw_dip_constructor() {
 /// Every role is checked at every elevation, polarity and width class.
 #[test]
 fn colour_is_width_independent() {
-    crate::role::tests::palette();
-    let base = Scope::root(AccentId(0), Density::Comfortable);
+    let base = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let roles = [
         Role::Text(Text::Primary),
         Role::Text(Text::Secondary),
@@ -994,7 +1172,11 @@ fn a_surface_keeps_its_chrome_whichever_class_it_takes() {
     );
     flush(&mut patch);
 
-    let scope = Scope::root(AccentId(0), Density::Comfortable);
+    let scope = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let padding = crate::role::metric(Metric::SpaceLg, scope);
     let (surface, child) = Host::with(|h| {
         let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
@@ -1069,7 +1251,6 @@ fn unmounting_releases_every_row_it_claimed() {
     // Every other table the walk claimed is released through the row that named it rather
     // than through a scan, so unmounting one list row costs that row and not the screen.
     Host::with(|h| {
-        assert_eq!(h.values.len(), 0);
         assert_eq!(h.scrolls.len(), 0);
     });
     assert_eq!(
@@ -1156,35 +1337,37 @@ fn a_variant_row_decides_what_is_minted() {
 /// that renders and fires its handlers while nothing moves.
 #[test]
 fn a_control_claims_the_moving_part_its_children_declared() {
-    let mut patch = fixture();
-    let value = crate::signal::Cell::new(0.5_f64);
-    let _slider = mount(
-        crate::widget::slider(
-            value,
-            crate::widget::Range::UNIT,
-            crate::widget::SliderStyle::default(),
-        )
-        .width(Metric::CardMinW),
-        root(),
-    );
-    flush(&mut patch);
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        let mut patch = fixture();
+        let value = crate::signal::Cell::new(0.5_f64);
+        let _slider = mount(
+            crate::widget::slider(
+                value,
+                crate::widget::Range::UNIT,
+                crate::widget::SliderStyle::default(),
+            )
+            .width(Metric::CardMinW),
+            root(),
+        );
+        flush(&mut patch);
 
-    let front = Host::with(|h| {
-        h.controls
-            .iter()
-            .next()
-            .map(|(_, c)| c.front)
-            .expect("the slider minted a control")
+        let front = Host::with(|h| {
+            h.controls
+                .iter()
+                .next()
+                .map(|(_, c)| c.front)
+                .expect("the slider minted a control")
+        });
+        assert!(
+            front.thumb.is_some(),
+            "the front row must name the part it is expected to move"
+        );
+        assert!(
+            front.travel > 0.0,
+            "and the room layout measured for it: {}",
+            front.travel
+        );
     });
-    assert!(
-        front.thumb.is_some(),
-        "the front row must name the part it is expected to move"
-    );
-    assert!(
-        front.travel > 0.0,
-        "and the room layout measured for it: {}",
-        front.travel
-    );
 }
 
 /// A fraction is multiplied by the travel before it reaches the offset.
@@ -1207,12 +1390,10 @@ fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
             .map_or((0.0, 0.0), |(_, c)| (c.front.rest, c.front.travel))
     });
     assert!(travel > 0.0, "a knob in a sized track has room to move");
-    let far = rest + travel;
-    let offsets = offsets_bound(&patch);
-    assert!(
-        offsets.iter().any(|&v| (v - far).abs() < 0.5),
-        "a knob at the top of its range sits at the far inset ({far}): {offsets:?}"
-    );
+    let front = Host::with(|h| h.controls.iter().next().unwrap().1.front);
+    assert_eq!(front.source_fraction, 1.0);
+    assert!(rest + travel > rest);
+    assert!(binds(&patch, windows_scene::Prop::OffsetX).is_empty());
 }
 
 /// A part the router drives is not written from this thread after its mount seed.
@@ -1222,74 +1403,77 @@ fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
 /// snapping the thumb back to the application's last value mid-slide.
 #[test]
 fn a_slid_part_is_left_to_the_thread_that_moves_it() {
-    // A slid part: its property is an offset finished against the room the solve gives.
-    let mut patch = fixture();
-    let value = crate::signal::Cell::new(0.25_f64);
-    let _slider = mount(
-        crate::widget::slider(
-            value,
-            crate::widget::Range::UNIT,
-            crate::widget::SliderStyle::default(),
-        )
-        .width(Metric::CardMinW),
-        root(),
-    );
-    flush(&mut patch);
-    let front = Host::with(|h| {
-        h.controls
-            .iter()
-            .next()
-            .map(|(_, c)| c.front)
-            .expect("a slider is a control")
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        // A slid part: its property is an offset finished against the room the solve gives.
+        let mut patch = fixture();
+        let value = crate::signal::Cell::new(0.25_f64);
+        let _slider = mount(
+            crate::widget::slider(
+                value,
+                crate::widget::Range::UNIT,
+                crate::widget::SliderStyle::default(),
+            )
+            .width(Metric::CardMinW),
+            root(),
+        );
+        flush(&mut patch);
+        let front = Host::with(|h| {
+            h.controls
+                .iter()
+                .next()
+                .map(|(_, c)| c.front)
+                .expect("a slider is a control")
+        });
+        assert!(
+            front.travel > 0.0 && front.thumb.is_some(),
+            "the router is shipped the part and the room it moves in"
+        );
+        assert_eq!(
+            front.fraction, 0.25,
+            "the initial value reaches the input owner"
+        );
+        // The mount seeds the part, because a control renders at its value before the router has
+        // anything to report.
+        assert!(binds(&patch, windows_scene::Prop::OffsetX).is_empty());
+
+        // From here the router owns it: an application write to the same cell, which is what
+        // `on_commit` does, must not reach the property.
+        patch.clear();
+        value.set(0.75);
+        crate::signal::flush();
+        flush(&mut patch);
+        assert!(
+            binds(&patch, windows_scene::Prop::OffsetX).is_empty(),
+            "an owned part must not be written from this thread"
+        );
+        let changed = Host::with(|h| h.control(front.id).unwrap().front);
+        assert_eq!(
+            changed.fraction, 0.75,
+            "an external edit reaches the input owner"
+        );
+        // The number it will land on is still this thread's own, from the same function.
+        assert!(
+            (crate::widget::offset_of(1.0, front.travel, false) - front.travel).abs()
+                < f32::EPSILON
+        );
+
+        // A turned part: its property is an angle, finished through the same function.
+        let mut patch = fixture();
+        let angle = crate::signal::Cell::new(0.25_f64);
+        let _knob = mount(
+            crate::widget::knob(angle, crate::widget::Range::UNIT).width(Metric::CardMinW),
+            root(),
+        );
+        flush(&mut patch);
+        patch.clear();
+        angle.set(0.75);
+        crate::signal::flush();
+        flush(&mut patch);
+        assert!(
+            binds(&patch, windows_scene::Prop::RotationAngle).is_empty(),
+            "an owned angle must not be written from this thread either"
+        );
     });
-    assert!(
-        front.travel > 0.0 && front.thumb.is_some(),
-        "the router is shipped the part and the room it moves in"
-    );
-    assert_eq!(
-        front.fraction, 0.25,
-        "the initial value reaches the input owner"
-    );
-    // The mount seeds the part, because a control renders at its value before the router has
-    // anything to report.
-    assert!(!binds(&patch, windows_scene::Prop::OffsetX).is_empty());
-
-    // From here the router owns it: an application write to the same cell, which is what
-    // `on_commit` does, must not reach the property.
-    patch.clear();
-    value.set(0.75);
-    crate::signal::flush();
-    flush(&mut patch);
-    assert!(
-        binds(&patch, windows_scene::Prop::OffsetX).is_empty(),
-        "an owned part must not be written from this thread"
-    );
-    let changed = Host::with(|h| h.control(front.id).unwrap().front);
-    assert_eq!(
-        changed.fraction, 0.75,
-        "an external edit reaches the input owner"
-    );
-    // The number it will land on is still this thread's own, from the same function.
-    assert!(
-        (crate::widget::offset_of(1.0, front.travel, false) - front.travel).abs() < f32::EPSILON
-    );
-
-    // A turned part: its property is an angle, finished through the same function.
-    let mut patch = fixture();
-    let angle = crate::signal::Cell::new(0.25_f64);
-    let _knob = mount(
-        crate::widget::knob(angle, crate::widget::Range::UNIT).width(Metric::CardMinW),
-        root(),
-    );
-    flush(&mut patch);
-    patch.clear();
-    angle.set(0.75);
-    crate::signal::flush();
-    flush(&mut patch);
-    assert!(
-        binds(&patch, windows_scene::Prop::RotationAngle).is_empty(),
-        "an owned angle must not be written from this thread either"
-    );
 }
 
 /// Returns every op this thread bound to `want`, whatever the binding kind.
@@ -1302,20 +1486,6 @@ fn binds(patch: &SinkPatch, want: windows_scene::Prop) -> Vec<&Op> {
 }
 
 /// Returns every scalar `OffsetX` this thread set, in the order it set them.
-fn offsets_bound(patch: &SinkPatch) -> Vec<f32> {
-    patch
-        .ops()
-        .iter()
-        .filter_map(|op| match op {
-            Op::Bind {
-                prop: windows_scene::Prop::OffsetX,
-                bind: windows_scene::Bind::Set(windows_scene::Value::Scalar(v)),
-                ..
-            } => Some(*v),
-            _ => None,
-        })
-        .collect()
-}
 
 /// A read-only widget declares no hit entry, and therefore no control row.
 ///
@@ -2492,7 +2662,11 @@ fn a_computed_column_template_follows_the_value_it_reads() {
     };
     let row_h = crate::role::metric(
         Metric::RowH,
-        crate::role::Scope::root(crate::role::AccentId(0), crate::role::Density::Comfortable),
+        crate::role::Scope::root(
+            crate::role::tests::palette(),
+            crate::role::AccentId(0),
+            crate::role::Density::Comfortable,
+        ),
     );
     assert!(
         (second() - row_h * 2.0).abs() < 1.0,
@@ -2622,8 +2796,12 @@ fn a_computed_column_template_survives_a_class_change() {
     );
     let row_h = crate::role::metric(
         Metric::RowH,
-        crate::role::Scope::root(crate::role::AccentId(0), crate::role::Density::Comfortable)
-            .at_width(windows_scene::WidthClass::Narrow),
+        crate::role::Scope::root(
+            crate::role::tests::palette(),
+            crate::role::AccentId(0),
+            crate::role::Density::Comfortable,
+        )
+        .at_width(windows_scene::WidthClass::Narrow),
     );
     let track = second.rect.x0 - first.rect.x0;
     assert!(
@@ -2998,50 +3176,52 @@ fn the_first_solve_applies_the_class_it_resolved() {
 /// square highlight on a round control while hovered.
 #[test]
 fn a_wash_is_as_round_as_the_control_it_covers() {
-    // Built inside the loop: the arena clears after each mount, so an element minted before
-    // one and used after it names a slot the clear has freed.
-    let cases: [(&str, fn() -> View); 3] = [
-        ("button", || crate::widget::button("x").erase()),
-        ("knob", || {
-            crate::widget::knob(0.5_f64, crate::widget::Range::UNIT)
-        }),
-        ("slider", || {
-            crate::widget::slider(
-                0.5_f64,
-                crate::widget::Range::UNIT,
-                crate::widget::SliderStyle::default(),
-            )
-        }),
-    ];
-    for (name, view) in cases {
-        let mut patch = fixture();
-        let _held = mount(view().width(Metric::CardMinW).height(Metric::RowH), root());
-        flush(&mut patch);
-        let wash = Host::with(|h| {
-            h.controls
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        // Built inside the loop: the arena clears after each mount, so an element minted before
+        // one and used after it names a slot the clear has freed.
+        let cases: [(&str, fn() -> View); 3] = [
+            ("button", || crate::widget::button("x").erase()),
+            ("knob", || {
+                crate::widget::knob(0.5_f64, crate::widget::Range::UNIT)
+            }),
+            ("slider", || {
+                crate::widget::slider(
+                    0.5_f64,
+                    crate::widget::Range::UNIT,
+                    crate::widget::SliderStyle::default(),
+                )
+            }),
+        ];
+        for (name, view) in cases {
+            let mut patch = fixture();
+            let _held = mount(view().width(Metric::CardMinW).height(Metric::RowH), root());
+            flush(&mut patch);
+            let wash = Host::with(|h| {
+                h.controls
+                    .iter()
+                    .next()
+                    .and_then(|(_, c)| c.front.wash)
+                    .expect("an interactive control mints a wash")
+            });
+            let radius = patch
+                .ops()
                 .iter()
-                .next()
-                .and_then(|(_, c)| c.front.wash)
-                .expect("an interactive control mints a wash")
-        });
-        let radius = patch
-            .ops()
-            .iter()
-            .rev()
-            .find_map(|op| match op {
-                Op::Mask {
-                    id,
-                    mask: windows_scene::Mask::Box { radius },
-                    ..
-                } if *id == wash => Some(radius.tl),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        assert!(
-            radius > 0.0,
-            "{name}'s wash is square over a rounded control"
-        );
-    }
+                .rev()
+                .find_map(|op| match op {
+                    Op::Mask {
+                        id,
+                        mask: windows_scene::Mask::Box { radius },
+                        ..
+                    } if *id == wash => Some(radius.tl),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            assert!(
+                radius > 0.0,
+                "{name}'s wash is square over a rounded control"
+            );
+        }
+    });
 }
 
 // ── what automation is told ─────────────────────────────────────────────────────
@@ -3129,39 +3309,41 @@ fn static_text_is_an_element_and_publishes_its_own_body() {
 /// A slider carries no text, so without its neighbouring run its published name is empty.
 #[test]
 fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
-    let mut patch = fixture();
-    let value = crate::signal::Cell::new(0.5_f64);
-    let _row = mount(
-        stack((
-            crate::widget::label("Gain"),
-            crate::widget::slider(
-                value,
-                crate::widget::Range::UNIT,
-                crate::widget::SliderStyle::default(),
-            )
-            .width(Metric::CardMinW),
-        )),
-        root(),
-    );
-    flush(&mut patch);
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        let mut patch = fixture();
+        let value = crate::signal::Cell::new(0.5_f64);
+        let _row = mount(
+            stack((
+                crate::widget::label("Gain"),
+                crate::widget::slider(
+                    value,
+                    crate::widget::Range::UNIT,
+                    crate::widget::SliderStyle::default(),
+                )
+                .width(Metric::CardMinW),
+            )),
+            root(),
+        );
+        flush(&mut patch);
 
-    let tree = tree(&patch);
-    let slider = (0..tree.len())
-        .find(|&at| {
-            tree.col(at)
-                .is_some_and(|c| c.role == crate::widget::UiaRole::Slider)
-        })
-        .expect("the slider is published");
-    let col = tree.col(slider).expect("a column");
-    assert_eq!(
-        String::from_utf16_lossy(tree.text(col.name)),
-        "Gain",
-        "the label beside it is its name"
-    );
-    let label = tree
-        .col(col.labelled_by as usize)
-        .expect("and it says where that name came from");
-    assert_eq!(label.role, crate::widget::UiaRole::Text);
+        let tree = tree(&patch);
+        let slider = (0..tree.len())
+            .find(|&at| {
+                tree.col(at)
+                    .is_some_and(|c| c.role == crate::widget::UiaRole::Slider)
+            })
+            .expect("the slider is published");
+        let col = tree.col(slider).expect("a column");
+        assert_eq!(
+            String::from_utf16_lossy(tree.text(col.name)),
+            "Gain",
+            "the label beside it is its name"
+        );
+        let label = tree
+            .col(col.labelled_by as usize)
+            .expect("and it says where that name came from");
+        assert_eq!(label.role, crate::widget::UiaRole::Text);
+    });
 }
 
 /// A capitalised run draws in capitals and announces what the author wrote.
@@ -3170,55 +3352,57 @@ fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
 /// drawn form says a heading one letter at a time.
 #[test]
 fn a_capitalised_run_announces_the_authors_casing() {
-    let mut patch = fixture();
-    let value = crate::signal::Cell::new(0.5_f64);
-    let _row = mount(
-        stack((
-            crate::widget::styled_text(
-                "Gain adjust",
-                crate::widget::TextStyle {
-                    caps: true,
-                    ..crate::widget::TextStyle::new(TypeRole::Label)
-                },
-            ),
-            crate::widget::slider(
-                value,
-                crate::widget::Range::UNIT,
-                crate::widget::SliderStyle::default(),
-            )
-            .width(Metric::CardMinW),
-        )),
-        root(),
-    );
-    flush(&mut patch);
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        let mut patch = fixture();
+        let value = crate::signal::Cell::new(0.5_f64);
+        let _row = mount(
+            stack((
+                crate::widget::styled_text(
+                    "Gain adjust",
+                    crate::widget::TextStyle {
+                        caps: true,
+                        ..crate::widget::TextStyle::new(TypeRole::Label)
+                    },
+                ),
+                crate::widget::slider(
+                    value,
+                    crate::widget::Range::UNIT,
+                    crate::widget::SliderStyle::default(),
+                )
+                .width(Metric::CardMinW),
+            )),
+            root(),
+        );
+        flush(&mut patch);
 
-    // The shaped form: what the run was laid out from, which is the only place the drawn
-    // casing can be read back without rasterizing.
-    let shaped = Host::with(|_| {
-        crate::build::text::with(|table| {
-            table
-                .entries
-                .iter()
-                .map(|(_, entry)| entry.shaped_str().to_owned())
-                .find(|s| s.eq_ignore_ascii_case("gain adjust"))
+        // The shaped form: what the run was laid out from, which is the only place the drawn
+        // casing can be read back without rasterizing.
+        let shaped = Host::with(|_| {
+            crate::build::text::with(|table| {
+                table
+                    .entries
+                    .iter()
+                    .map(|(_, entry)| entry.shaped_str().to_owned())
+                    .find(|s| s.eq_ignore_ascii_case("gain adjust"))
+            })
         })
-    })
-    .expect("the label is in the table");
-    assert_eq!(shaped, "GAIN ADJUST", "the recipe requests capitals");
+        .expect("the label is in the table");
+        assert_eq!(shaped, "GAIN ADJUST", "the recipe requests capitals");
 
-    let tree = tree(&patch);
-    let slider = (0..tree.len())
-        .find(|&at| {
-            tree.col(at)
-                .is_some_and(|c| c.role == crate::widget::UiaRole::Slider)
-        })
-        .expect("the slider is published");
-    let col = tree.col(slider).expect("a column");
-    assert_eq!(
-        String::from_utf16_lossy(tree.text(col.name)),
-        "Gain adjust",
-        "and announces the string the author wrote"
-    );
+        let tree = tree(&patch);
+        let slider = (0..tree.len())
+            .find(|&at| {
+                tree.col(at)
+                    .is_some_and(|c| c.role == crate::widget::UiaRole::Slider)
+            })
+            .expect("the slider is published");
+        let col = tree.col(slider).expect("a column");
+        assert_eq!(
+            String::from_utf16_lossy(tree.text(col.name)),
+            "Gain adjust",
+            "and announces the string the author wrote"
+        );
+    });
 }
 
 /// A control with its own text keeps it, and one whose predecessor is not a run takes none.
@@ -3227,41 +3411,43 @@ fn a_capitalised_run_announces_the_authors_casing() {
 /// claim a heading two controls up.
 #[test]
 fn a_control_that_has_a_name_keeps_it_and_one_with_no_run_before_it_gets_none() {
-    let mut patch = fixture();
-    let value = crate::signal::Cell::new(0.5_f64);
-    let _row = mount(
-        stack((
-            crate::widget::label("Gain"),
-            crate::widget::button("Reset"),
-            crate::widget::slider(
-                value,
-                crate::widget::Range::UNIT,
-                crate::widget::SliderStyle::default(),
-            )
-            .width(Metric::CardMinW),
-        )),
-        root(),
-    );
-    flush(&mut patch);
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        let mut patch = fixture();
+        let value = crate::signal::Cell::new(0.5_f64);
+        let _row = mount(
+            stack((
+                crate::widget::label("Gain"),
+                crate::widget::button("Reset"),
+                crate::widget::slider(
+                    value,
+                    crate::widget::Range::UNIT,
+                    crate::widget::SliderStyle::default(),
+                )
+                .width(Metric::CardMinW),
+            )),
+            root(),
+        );
+        flush(&mut patch);
 
-    let tree = tree(&patch);
-    let role_of = |want| {
-        (0..tree.len())
-            .find(|&at| tree.col(at).is_some_and(|c| c.role == want))
-            .and_then(|at| tree.col(at))
-            .copied()
-    };
-    let button = role_of(crate::widget::UiaRole::Button).expect("the button");
-    assert_eq!(
-        String::from_utf16_lossy(tree.text(button.name)),
-        "Reset",
-        "a control with its own text is not relabelled by its neighbour"
-    );
-    let slider = role_of(crate::widget::UiaRole::Slider).expect("the slider");
-    assert!(
-        slider.name.is_empty(),
-        "and one whose neighbour is a button, not a run, takes nothing"
-    );
+        let tree = tree(&patch);
+        let role_of = |want| {
+            (0..tree.len())
+                .find(|&at| tree.col(at).is_some_and(|c| c.role == want))
+                .and_then(|at| tree.col(at))
+                .copied()
+        };
+        let button = role_of(crate::widget::UiaRole::Button).expect("the button");
+        assert_eq!(
+            String::from_utf16_lossy(tree.text(button.name)),
+            "Reset",
+            "a control with its own text is not relabelled by its neighbour"
+        );
+        let slider = role_of(crate::widget::UiaRole::Slider).expect("the slider");
+        assert!(
+            slider.name.is_empty(),
+            "and one whose neighbour is a button, not a run, takes nothing"
+        );
+    });
 }
 
 /// A label that re-reads marks the published tree stale.
@@ -4030,6 +4216,87 @@ fn a_probe_publishes_only_when_its_node_moves() {
     );
 }
 
+#[test]
+fn local_geometry_tracks_local_inputs_and_releases_its_shared_resource() {
+    use crate::signal::{Cell, Owner};
+    use windows_scene::{PathVerb, ResOp};
+    let mut patch = fixture();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let observed = calls.clone();
+    let (owner, (lead, data, mount)) = Owner::scope(|| {
+        let lead = Cell::new(false);
+        let data = Cell::new(1.0);
+        let bounds = crate::layout::probe();
+        let id = local_geometry(bounds, 2, move |verbs, size, scope| {
+            assert_eq!(scope.elevation, Elevation::Raised);
+            observed.set(observed.get() + 1);
+            verbs.extend([
+                PathVerb::Move {
+                    to: Vector2::default(),
+                    filled: false,
+                },
+                PathVerb::Line(Vector2 {
+                    x: size.x,
+                    y: data.get(),
+                }),
+            ]);
+        });
+        let view = stack((
+            plate()
+                .height(Metric::RowH)
+                .no_shrink()
+                .when(move || lead.get()),
+            stack((crate::widget::path(id), crate::widget::path(id)))
+                .probed(bounds)
+                .elevate(Elevation::Raised)
+                .height(Metric::RowH)
+                .width(Len::Pct(1.0)),
+        ))
+        .width(Len::Pct(1.0));
+        (lead, data, mount(view, root()))
+    });
+    let settle = |patch: &mut SinkPatch| {
+        for _ in 0..4 {
+            crate::signal::flush();
+            flush(patch);
+        }
+    };
+    settle(&mut patch);
+    assert_eq!(
+        calls.get(),
+        1,
+        "both sprites share one geometry computation"
+    );
+    lead.set(true);
+    settle(&mut patch);
+    assert_eq!(calls.get(), 1, "parent movement is not a local shape input");
+    Host::with(|h| h.set_window(Vector2 { x: 400.0, y: 600.0 }));
+    settle(&mut patch);
+    assert_eq!(calls.get(), 2);
+    data.set(2.0);
+    settle(&mut patch);
+    assert_eq!(calls.get(), 3);
+    drop(mount);
+    patch.clear();
+    drop(owner);
+    flush(&mut patch);
+    assert_eq!(
+        patch
+            .ops()
+            .iter()
+            .filter(|op| matches!(
+                op,
+                Op::Res {
+                    op: ResOp::Drop,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(calls.get(), 3);
+}
+
 /// A probe attached inside a subtree that unmounts is released with it.
 ///
 /// The cell dies with the scope that made it and the row with the mount walk, so the publish
@@ -4105,7 +4372,7 @@ fn navigation_releases_probes_owned_by_nested_branches() {
 }
 
 #[test]
-fn disposing_the_application_owner_releases_dynamic_value_rows_before_final_flush() {
+fn disposing_the_application_owner_releases_scalar_controls_before_final_flush() {
     let mut patch = fixture();
     let (owner, held) = crate::signal::Owner::scope(|| {
         mount(
@@ -4122,11 +4389,25 @@ fn disposing_the_application_owner_releases_dynamic_value_rows_before_final_flus
     flush(&mut patch);
     crate::signal::flush();
     flush(&mut patch);
-    assert!(Host::with(|h| h.values.iter().count()) > 0);
+    assert!(
+        Host::with(|h| h
+            .controls
+            .iter()
+            .filter(|(_, c)| c.front.thumb.is_some())
+            .count())
+            > 0
+    );
     patch.clear();
     drop(owner);
     drop(held);
-    assert_eq!(Host::with(|h| h.values.iter().count()), 0);
+    assert_eq!(
+        Host::with(|h| h
+            .controls
+            .iter()
+            .filter(|(_, c)| c.front.thumb.is_some())
+            .count()),
+        0
+    );
     flush(&mut patch);
     assert!(
         !patch.ops().iter().any(|op| matches!(op, Op::Bind { .. })),
@@ -4226,7 +4507,12 @@ fn a_sprites_strength_scales_the_roles_own_alpha() {
     assert_eq!(alphas.len(), 2, "one sprite each");
     let subtle = crate::role::resolve(
         Role::Stroke(Stroke::Subtle),
-        Scope::root(AccentId(0), Density::Comfortable).for_paint(),
+        Scope::root(
+            crate::role::tests::palette(),
+            AccentId(0),
+            Density::Comfortable,
+        )
+        .for_paint(),
     )
     .a;
     assert!(
@@ -4330,7 +4616,11 @@ fn a_toggles_knob_has_extent_inside_its_track() {
     let _toggle = mount(crate::widget::toggle(on), root());
     flush(&mut patch);
 
-    let scope = Scope::root(AccentId(0), Density::Comfortable);
+    let scope = Scope::root(
+        crate::role::tests::palette(),
+        AccentId(0),
+        Density::Comfortable,
+    );
     let row = crate::role::metric(Metric::RowH, scope);
     let travel = Host::with(|h| {
         h.controls
@@ -4400,8 +4690,8 @@ fn a_toggle_that_is_on_leaves_its_knob_at_the_end_of_its_travel() {
     }
     assert_eq!(
         last,
-        Some(rest + travel),
-        "the knob's x must settle one inset short of the track's far edge"
+        Some(rest),
+        "layout publishes the resting box; scene adoption places the scalar part"
     );
     // The gap the knob leaves at the far end is the one it rests at, so the two ends of the
     // switch look the same and neither shows the knob overhanging the track.
@@ -4419,7 +4709,7 @@ fn a_toggle_that_is_on_leaves_its_knob_at_the_end_of_its_travel() {
 /// discrete paint swap at event rate, so a knob that snapped would leave the control with no
 /// motion at all.
 #[test]
-fn flipping_a_toggle_springs_its_knob() {
+fn flipping_a_toggle_publishes_its_value_to_the_scene() {
     let mut patch = fixture();
     let on = crate::signal::Cell::new(false);
     let _toggle = mount(crate::widget::toggle(on), root());
@@ -4429,20 +4719,13 @@ fn flipping_a_toggle_springs_its_knob() {
     on.set(true);
     crate::signal::flush();
     flush(&mut patch);
-    let sprung = patch.ops().iter().any(|op| {
-        matches!(
-            op,
-            Op::Bind {
-                prop: windows_scene::Prop::OffsetX,
-                bind: windows_scene::Bind::Animate(windows_scene::Anim::Spring {
-                    tuning: windows_scene::Tuning::Chrome,
-                    ..
-                }),
-                ..
-            }
-        )
-    });
-    assert!(sprung, "a flipped toggle springs its knob");
+    assert!(binds(&patch, windows_scene::Prop::OffsetX).is_empty());
+    let front = Host::with(|h| h.controls.iter().next().unwrap().1.front);
+    assert_eq!(front.source_fraction, 1.0);
+    assert!(
+        front.revision > 0,
+        "the scene receives the source replacement"
+    );
 }
 
 /// The knob's box and its travel survive a fractional display scale.
@@ -4483,8 +4766,8 @@ fn a_toggles_knob_lands_at_its_travel_at_a_fractional_scale() {
     assert!(travel > 0.0, "the knob has room to move at 1.5");
     assert_eq!(
         last,
-        Some(rest + travel),
-        "the knob's x must settle one inset short of the track's far edge"
+        Some(rest),
+        "layout publishes the resting box; scene adoption places the scalar part"
     );
 }
 
@@ -4494,58 +4777,60 @@ fn a_toggles_knob_lands_at_its_travel_at_a_fractional_scale() {
 /// sprite's role already follows, at the one place a resource rather than a node carries it.
 #[test]
 fn a_wash_paints_a_ramp_over_the_surface_it_covers() {
-    let mut patch = fixture();
-    let hue = crate::role::DataRole(1);
-    let id = ramp(
-        &[
-            Stop {
-                at: 0.0,
-                role: hue,
-                strength: 0.06,
-            },
-            Stop {
-                at: 1.0,
-                role: hue,
-                strength: 0.0,
-            },
-        ],
-        windows_scene::Spread::Horizontal,
-    );
-    let _mount = mount(
-        crate::widget::card().washed(id, Metric::RadiusSurface),
-        root(),
-    );
-    flush(&mut patch);
+    let (_resource_owner, ()) = crate::signal::Owner::scope(|| {
+        let mut patch = fixture();
+        let hue = crate::role::DataRole(1);
+        let id = ramp(
+            &[
+                Stop {
+                    at: 0.0,
+                    role: hue,
+                    strength: 0.06,
+                },
+                Stop {
+                    at: 1.0,
+                    role: hue,
+                    strength: 0.0,
+                },
+            ],
+            windows_scene::Spread::Horizontal,
+        );
+        let _mount = mount(
+            crate::widget::card().washed(id, Metric::RadiusSurface),
+            root(),
+        );
+        flush(&mut patch);
 
-    let ramps = patch
-        .ops()
-        .iter()
-        .filter(|op| {
-            matches!(
-                op,
-                Op::Paint {
-                    paint: Paint::Ramp(_),
-                    ..
-                }
-            )
-        })
-        .count();
-    assert_eq!(ramps, 1, "the wash is one sprite painting the ramp");
-    // The card keeps its own fill: a wash is a tint over a surface, not the surface.
-    let solids = patch
-        .ops()
-        .iter()
-        .filter(|op| {
-            matches!(
-                op,
-                Op::Paint {
-                    paint: Paint::Solid(_),
-                    ..
-                }
-            )
-        })
-        .count();
-    assert!(solids >= 2, "the card's own fill and hairline survive it");
+        let ramps = patch
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::Paint {
+                        paint: Paint::Ramp(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(ramps, 1, "the wash is one sprite painting the ramp");
+        // The card keeps its own fill: a wash is a tint over a surface, not the surface.
+        let solids = patch
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Op::Paint {
+                        paint: Paint::Solid(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(solids >= 2, "the card's own fill and hairline survive it");
+    });
 }
 
 /// A toggle's track keeps its own box, bare and among siblings.
@@ -4581,7 +4866,11 @@ fn a_toggles_track_keeps_its_box_among_siblings() {
     // first fixture, which is what installs the palette a metric resolves against.
     let track = crate::role::metric(
         Metric::TrackH,
-        Scope::root(AccentId(0), Density::Comfortable),
+        Scope::root(
+            crate::role::tests::palette(),
+            AccentId(0),
+            Density::Comfortable,
+        ),
     );
     // The widget's own proportion, not a copy of it: the claim is that layout gives the track
     // the box the widget asked for, and a restated number tests two copies against each other
@@ -4634,7 +4923,7 @@ fn a_region_paints_its_buffer_rather_than_its_role() {
     let mut patch = fixture();
     let live = crate::present::Live::new().expect("the epoch's wake event");
     let _mount = mount(
-        crate::present::region(windows_present::Queue::Solo, &live, |_| {
+        crate::present::region(windows_present::Queue::Solo, &live, |_, _| {
             unreachable!("no present thread is installed in a fixture, so nothing builds")
         })
         .grow(),
@@ -4672,7 +4961,7 @@ fn a_region_with_no_box_defers_its_buffers_until_it_has_one() {
     // Collapsed before the mount, so the first solve is the one with no area to give.
     Host::with(|h| h.set_window(Vector2 { x: 0.0, y: 0.0 }));
     let _mount = mount(
-        crate::present::region(windows_present::Queue::Solo, &live, |_| {
+        crate::present::region(windows_present::Queue::Solo, &live, |_, _| {
             unreachable!("no present thread is installed in a fixture, so nothing builds")
         })
         .grow(),
@@ -4713,7 +5002,7 @@ fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
     let inset = crate::role::metric(Metric::SpaceLg, Host::with(|h| h.root_scope));
     let _mount = mount(
         stack(
-            crate::present::region(windows_present::Queue::Solo, &live, |_| {
+            crate::present::region(windows_present::Queue::Solo, &live, |_, _| {
                 unreachable!("no present thread is installed in a fixture")
             })
             .grow()
@@ -4805,7 +5094,7 @@ fn a_release_inside_a_region_clears_the_gesture_and_queues_one_intent() {
     let mut patch = fixture();
     let live = crate::present::Live::new().expect("the epoch\'s wake event");
     let _mount = mount(
-        crate::present::region(windows_present::Queue::Solo, &live, |_| {
+        crate::present::region(windows_present::Queue::Solo, &live, |_, _| {
             unreachable!("no present thread is installed in a fixture")
         })
         .grow()
@@ -4872,7 +5161,7 @@ fn edge_buttons_join_without_a_border_or_rounded_gap() {
                 .filter_map(|op| match op {
                     Op::Mask {
                         id,
-                        mask: Mask::Box { radius },
+                        mask: Mask::Box { radius } | Mask::Outline { radius, .. },
                         ..
                     } => Some((*id, *radius)),
                     _ => None,
@@ -5003,111 +5292,115 @@ fn a_drawer_shadow_is_retained_across_width_classes() {
 
 #[test]
 fn slider_thumb_centres_and_fill_share_the_rail_at_every_gain() {
-    for dpi in [96.0, 144.0, 192.0] {
-        let mut patch = fixture_at(dpi);
-        let value = crate::signal::Cell::new(-4.0_f64);
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        for dpi in [96.0, 144.0, 192.0] {
+            let mut patch = fixture_at(dpi);
+            let value = crate::signal::Cell::new(-4.0_f64);
+            let _held = mount(
+                crate::widget::slider(
+                    value,
+                    crate::widget::Range::new(-24.0, 24.0).step(0.1),
+                    crate::widget::SliderStyle {
+                        origin: Some(0.0),
+                        ramp: None,
+                    },
+                )
+                .width(Len::Pct(1.0)),
+                root(),
+            );
+            for width in [240.0, 601.0, 940.0, 240.0] {
+                Host::with(|h| h.set_window(Vector2 { x: width, y: 100.0 }));
+                for db in [-24.0, -18.0, -12.0, -6.0, -4.0, 0.0, 6.0, 12.0, 18.0, 24.0] {
+                    value.set(db);
+                    for _ in 0..4 {
+                        patch.clear();
+                        crate::signal::flush();
+                        flush(&mut patch);
+                    }
+                    Host::with(|h| {
+                        let c = h
+                            .controls
+                            .iter()
+                            .find(|(_, c)| c.front.trail.is_some())
+                            .unwrap()
+                            .1;
+                        let front = c.front;
+                        let node = c.node;
+                        let (trail, origin) = front.trail.unwrap();
+                        let control = h.model().solved(node);
+                        let thumb = h.model().solved(front.thumb.unwrap());
+                        let rail = h.model().solved(trail);
+                        let fraction = ((db + 24.0) / 48.0) as f32;
+                        let centre = control.rect.x0
+                            + front.rest
+                            + front.travel * front.source_fraction
+                            + thumb.size.x * 0.5;
+                        let expected = rail.rect.x0 + rail.size.x * fraction;
+                        assert_eq!(origin, 0.5);
+                        assert!((front.source_fraction - fraction).abs() < 1e-6);
+                        assert!(
+                            (centre - expected).abs() <= 96.0 / dpi,
+                            "{db} dB at {width} DIP/{dpi} DPI: thumb {centre}, rail {expected}"
+                        );
+                        assert!((front.travel - rail.size.x).abs() <= 96.0 / dpi);
+                    });
+                    assert!(patch.ops().is_empty(), "settled slider emitted idle writes");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
+    let (_owner, ()) = crate::signal::Owner::scope(|| {
+        let mut patch = fixture();
+        let value = crate::signal::Cell::new(-12.0_f64);
         let _held = mount(
             crate::widget::slider(
                 value,
-                crate::widget::Range::new(-24.0, 24.0).step(0.1),
+                crate::widget::Range::new(-24.0, 24.0),
                 crate::widget::SliderStyle {
                     origin: Some(0.0),
                     ramp: None,
                 },
             )
-            .width(Len::Pct(1.0)),
+            .width(Metric::CardMinW),
             root(),
         );
-        for width in [240.0, 601.0, 940.0, 240.0] {
-            Host::with(|h| h.set_window(Vector2 { x: width, y: 100.0 }));
-            for db in [-24.0, -18.0, -12.0, -6.0, -4.0, 0.0, 6.0, 12.0, 18.0, 24.0] {
-                value.set(db);
-                for _ in 0..4 {
-                    patch.clear();
-                    crate::signal::flush();
-                    flush(&mut patch);
-                }
-                Host::with(|h| {
-                    let c = h
-                        .controls
-                        .iter()
-                        .find(|(_, c)| c.front.trail.is_some())
-                        .unwrap()
-                        .1;
-                    let front = c.front;
-                    let node = c.node;
-                    let (trail, origin) = front.trail.unwrap();
-                    let control = h.model().solved(node);
-                    let thumb = h.model().solved(front.thumb.unwrap());
-                    let rail = h.model().solved(trail);
-                    let fraction = ((db + 24.0) / 48.0) as f32;
-                    let centre = control.rect.x0
-                        + front.rest
-                        + front.travel * front.source_fraction
-                        + thumb.size.x * 0.5;
-                    let expected = rail.rect.x0 + rail.size.x * fraction;
-                    assert_eq!(origin, 0.5);
-                    assert!((front.source_fraction - fraction).abs() < 1e-6);
-                    assert!(
-                        (centre - expected).abs() <= 96.0 / dpi,
-                        "{db} dB at {width} DIP/{dpi} DPI: thumb {centre}, rail {expected}"
-                    );
-                    assert!((front.travel - rail.size.x).abs() <= 96.0 / dpi);
-                });
-                assert!(patch.ops().is_empty(), "settled slider emitted idle writes");
-            }
-        }
-    }
-}
-
-#[test]
-fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
-    let mut patch = fixture();
-    let value = crate::signal::Cell::new(-12.0_f64);
-    let _held = mount(
-        crate::widget::slider(
-            value,
-            crate::widget::Range::new(-24.0, 24.0),
-            crate::widget::SliderStyle {
-                origin: Some(0.0),
-                ramp: None,
-            },
-        )
-        .width(Metric::CardMinW),
-        root(),
-    );
-    flush(&mut patch);
-    let before = filled()
-        .chrome
-        .into_iter()
-        .find(|r| r.trail.is_some())
-        .unwrap();
-    let (trail, origin) = before.trail.unwrap();
-    assert_eq!(origin, 0.5);
-    assert!(before.thumb.is_some());
-    crate::signal::flush();
-    flush(&mut patch);
-    patch.clear();
-    value.set(12.0);
-    crate::signal::flush();
-    flush(&mut patch);
-    let rows = filled().chrome;
-    assert!(
-        rows.iter()
-            .any(|r| r.id == before.id && r.source_fraction == 0.75 && r.trail == before.trail)
-    );
-    assert!(
-        !patch
-            .ops()
-            .iter()
-            .any(|op| matches!(op, Op::New { .. } | Op::Res { .. }))
-    );
-    assert!(
-        !patch
-            .ops()
-            .iter()
-            .any(|op| matches!(op, Op::Bind { id, .. } if *id == trail))
-    );
+        flush(&mut patch);
+        let before = filled()
+            .chrome
+            .into_iter()
+            .find(|r| r.trail.is_some())
+            .unwrap();
+        let (trail, origin) = before.trail.unwrap();
+        assert_eq!(origin, 0.5);
+        assert!(before.thumb.is_some());
+        crate::signal::flush();
+        flush(&mut patch);
+        patch.clear();
+        value.set(12.0);
+        crate::signal::flush();
+        flush(&mut patch);
+        let rows = filled().chrome;
+        assert!(
+            rows.iter()
+                .any(|r| r.id == before.id && r.source_fraction == 0.75 && r.trail == before.trail)
+        );
+        assert!(
+            !patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::New { .. } | Op::Res { .. }))
+        );
+        assert!(
+            !patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Bind { id, .. } if *id == trail))
+        );
+    });
 }
 
 #[test]

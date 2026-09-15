@@ -37,6 +37,8 @@ pub struct Placed {
     /// drawing against this geometry resolves its own metrics at the same class, so both
     /// halves of one row come out at one density.
     pub class: WidthClass,
+    /// The actual enclosing scope, published after the first solve.
+    pub scope: Option<crate::role::Scope>,
 }
 
 impl From<Solved> for Placed {
@@ -46,6 +48,7 @@ impl From<Solved> for Placed {
             size: solved.size,
             local: solved.local,
             class: solved.class,
+            scope: None,
         }
     }
 }
@@ -108,4 +111,5 @@ impl Probe {
 pub(crate) struct ProbeRow {
     pub node: NodeId,
     pub cell: Cell<Placed>,
+    pub scope: crate::role::Scope,
 }

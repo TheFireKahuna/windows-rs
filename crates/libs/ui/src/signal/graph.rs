@@ -85,6 +85,7 @@ enum Kind {
     /// A cell. The payload is `RefCell<T>`, behind an `Rc` so a reader can take it out of
     /// the graph before running a closure over it.
     Source(Rc<dyn Any>),
+    Resource(Rc<dyn Any>),
     Memo(Rc<dyn MemoCell>),
     Effect(Rc<RefCell<dyn FnMut()>>),
     /// A node parked for reuse, holding nothing.
@@ -381,6 +382,20 @@ impl Graph {
 
 pub(super) fn source(value: Rc<dyn Any>) -> SignalId {
     with(|g| g.mint(Kind::Source(value)))
+}
+
+pub(super) fn resource(value: Rc<dyn Any>) -> SignalId {
+    with(|g| {
+        assert!(g.scope.is_some(), "a retained resource requires an Owner");
+        g.mint(Kind::Resource(value))
+    })
+}
+
+pub(super) fn read_resource(id: SignalId) -> Option<Rc<dyn Any>> {
+    with(|g| match g.node(id).map(|node| &node.kind) {
+        Some(Kind::Resource(value)) => Some(Rc::clone(value)),
+        _ => None,
+    })
 }
 
 pub(super) fn memo(cell: Rc<dyn MemoCell>) -> SignalId {

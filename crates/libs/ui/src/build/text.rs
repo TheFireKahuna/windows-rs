@@ -590,6 +590,18 @@ impl Table {
     /// # Panics
     ///
     /// If no shaping engine is installed on this thread.
+    pub(crate) fn retheme(&mut self, root: Scope, model: &mut Model) {
+        for (_, entry) in self.entries.iter_mut() {
+            entry.scope = entry.scope.in_theme(root);
+            entry.stale = true;
+            entry.sync(
+                self.engine.as_ref().expect(ENGINE),
+                model.solved(entry.node()).class,
+            );
+            entry.emit(self.engine.as_ref().expect(ENGINE), model);
+        }
+    }
+
     pub(crate) fn reemit(&mut self, model: &mut Model) {
         let Table {
             entries, engine, ..

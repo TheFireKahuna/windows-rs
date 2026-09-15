@@ -135,9 +135,30 @@ pub struct Chrome {
     pub radius: Metric,
     /// The flush edge has square corners and no border.
     pub attached: Option<crate::layout::Edge>,
+    pub selected: Option<RoleSet>,
+    pub disabled: Option<RoleSet>,
 }
 
 impl Chrome {
+    pub const fn new(roles: &'static [RoleSet], radius: Metric) -> Self {
+        Self {
+            roles,
+            variant: 0,
+            radius,
+            attached: None,
+            selected: None,
+            disabled: None,
+        }
+    }
+    pub fn in_state(self, state: ModelState) -> RoleSet {
+        match state {
+            ModelState::Selected => self.selected,
+            ModelState::Disabled => self.disabled,
+            ModelState::Rest => None,
+        }
+        .unwrap_or_else(|| self.roles().in_state(state))
+    }
+
     /// Returns the row this chrome selects.
     ///
     /// A variant index is minted by a method on the widget that owns the table, so an
@@ -298,6 +319,42 @@ impl Range {
         }
         // Snapped from `min` rather than from zero, so a range that does not start on a
         // multiple of the step still lands on values the caller named.
-        self.min + ((raw - self.min) / self.step).round() * self.step
+        (self.min + ((raw - self.min) / self.step).round() * self.step).clamp(self.min, self.max)
     }
+}
+
+/// A bounded scalar mapping, authored by a component and driven on the scene thread.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ScalarPart {
+    Rotation { from: f32, to: f32 },
+    TrimEnd,
+    Offset { vertical: bool, from: f32, to: f32 },
+}
+impl ScalarPart {
+    pub(crate) fn property(self) -> windows_scene::Prop {
+        use windows_scene::Prop;
+        match self {
+            Self::Rotation { .. } => Prop::RotationAngle,
+            Self::TrimEnd => Prop::TrimEnd,
+            Self::Offset { vertical: true, .. } => Prop::OffsetY,
+            Self::Offset {
+                vertical: false, ..
+            } => Prop::OffsetX,
+        }
+    }
+    pub(crate) fn at(self, fraction: f32) -> f32 {
+        match self {
+            Self::Rotation { from, to } | Self::Offset { from, to, .. } => {
+                from + (to - from) * fraction
+            }
+            Self::TrimEnd => fraction,
+        }
+    }
+}
+
+/// A readable scalar and the application epoch that owns it. Change the epoch on source replacement.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ScalarValue {
+    pub value: f64,
+    pub epoch: u64,
 }

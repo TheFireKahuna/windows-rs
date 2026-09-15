@@ -103,7 +103,50 @@ impl From<&HSTRING> for IReference<HSTRING> {
     }
 }
 
-// Internal stock implementation used to back `IReference::from`.
+/// A bounded cache for repeatedly passing boxed values to WinRT.
+///
+/// Boxes are rewritten only after every external COM reference has been released.
+/// If the consumer retains both cached boxes, the next value gets a fresh allocation;
+/// outstanding references keep their original values even after the cache is dropped.
+pub struct ReferenceCache<T: RuntimeType + Clone + 'static> {
+    slots: [Option<ComObject<StockReference<T>>>; 2],
+}
+
+impl<T: RuntimeType + Clone + 'static> Default for ReferenceCache<T> {
+    fn default() -> Self {
+        Self {
+            slots: [None, None],
+        }
+    }
+}
+
+impl<T: RuntimeType + Clone + 'static> ReferenceCache<T> {
+    /// Returns an immutable boxed value, reusing storage when it is exclusively owned.
+    pub fn get(&mut self, value: T) -> IReference<T> {
+        let index = self
+            .slots
+            .iter_mut()
+            .position(|slot| {
+                slot.as_mut()
+                    .is_none_or(|object| object.get_mut().is_some())
+            })
+            .unwrap_or(0);
+        let slot = &mut self.slots[index];
+        if let Some(inner) = slot.as_mut().and_then(ComObject::get_mut) {
+            inner.value = value;
+        } else {
+            *slot = Some(ComObject::new(StockReference { value }));
+        }
+        let inner = slot
+            .as_ref()
+            .unwrap()
+            .to_interface::<bindings::IReference<T>>();
+        // Same IID and transparent representation as in `IReference::from`.
+        unsafe { core::mem::transmute(inner) }
+    }
+}
+
+// Internal stock implementation used to back boxed references.
 struct StockReference<T>
 where
     T: RuntimeType + Clone + 'static,

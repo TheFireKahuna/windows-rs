@@ -26,13 +26,11 @@ use windows_scene::{
 
 /// Names the family of mount rows, whose ids are [`MountId`].
 ///
-/// [`Mount`], [`Value`], [`Scroll`] and [`Probe`] are markers rather than the row types
+/// [`Mount`], [`Scroll`] and [`Probe`] are markers rather than the row types
 /// themselves: an id belongs to a family, and one family can have more than one store — a
 /// control has a row here and a row on the front thread, over one set of ids.
 #[derive(Debug)]
 pub(crate) struct Mount;
-#[derive(Debug)]
-pub(crate) struct Value;
 #[derive(Debug)]
 pub(crate) struct Scroll;
 #[derive(Debug)]
@@ -44,7 +42,6 @@ pub(crate) struct Probe;
 pub(crate) struct Present;
 
 pub(crate) type MountId = Id<Mount>;
-pub(crate) type ValueId = Id<Value>;
 pub(crate) type ScrollId = Id<Scroll>;
 pub(crate) type ProbeId = Id<Probe>;
 pub(crate) type PresentId = Id<Present>;
@@ -63,12 +60,7 @@ pub(crate) struct MountRow {
     pub next: MountId,
     pub control: Option<ControlId>,
     pub text: Option<MeasureKey>,
-    /// Heads this node's chain of value rows.
-    ///
-    /// The unmount walks its own subtree's rows and releases exactly what they name, so
-    /// unmounting one row of a long list costs that row rather than a scan of the value and
-    /// scroll tables.
-    pub values: ValueId,
+    pub paints: NodeId,
     pub scroll: Option<ScrollId>,
     pub probe: Option<ProbeId>,
     pub region: Option<PresentId>,
@@ -81,6 +73,9 @@ pub(crate) struct MountRow {
 /// pixel. Nothing crosses that is not a number or an id — the wash opacities are resolved
 /// here, at mount, so the interaction path never realizes a colour cell.
 pub(crate) struct ControlRow {
+    pub source_epoch: u64,
+    pub validation: Option<&'static str>,
+    pub accepted_fraction: Option<f32>,
     pub node: NodeId,
     /// The parts a model-state change re-paints, addressed by id so the swap needs no
     /// search.
@@ -101,6 +96,7 @@ pub(crate) struct ControlRow {
     pub click: Option<Box<dyn Fn()>>,
     pub hovered: Option<crate::signal::Cell<bool>>,
     pub change: Option<Box<dyn Fn(f64)>>,
+    pub cancel: Option<Box<dyn Fn()>>,
     pub commit: Option<Box<dyn Fn(f64)>>,
     /// The two-axis drag's handler, where the application declared one.
     pub drag: Option<Box<dyn Fn(crate::widget::Dragging)>>,
@@ -127,51 +123,46 @@ pub(crate) struct ControlRow {
     pub key: Option<&'static str>,
 }
 
-/// Holds one moving part's fraction and the room it moves in.
-///
-/// The room is a layout output — the track's extent less the part's own — so a fraction
-/// cannot be lowered at mount. It is kept here and multiplied out after the solve, by
-/// [`publish_values`](Host::publish_values). The same number lets the front thread move the
-/// part without asking this thread for geometry.
-pub(crate) struct ValueRow {
-    /// The part that moves.
-    pub node: NodeId,
-    /// The box it moves in — the enclosing control, filled in when that control mounts.
-    pub track: NodeId,
-    pub control: Option<ControlId>,
-    /// Which unit the fraction is finished in: along a track, or around a sweep.
-    pub unit: crate::build::arena::Unit,
-    pub prop: Prop,
-    pub motion: crate::widget::Motion,
-    pub vertical: bool,
-    /// The last fraction anybody published, whether the app's channel or the router's.
-    pub fraction: f32,
-    /// Where the part sits at zero, in DIPs along its axis: the inset the track rests it at.
-    pub rest: f32,
-    /// The travel it was last published against, so a solve that moved nothing emits
-    /// nothing.
-    pub travel: f32,
-    /// Whether the router moves this part rather than this thread.
-    ///
-    /// The property has two possible writers and this field picks one. When it is set this
-    /// thread never binds the property: a solve that changed the room re-sends the room, and
-    /// the router re-drives the part from the fraction it holds, which is the newer of the
-    /// two.
-    pub front_driven: bool,
-    pub row: MountId,
-    /// The next value row of the same mount row, or [`Id::NONE`].
-    pub next: ValueId,
-}
+impl ControlRow {
+    pub(crate) fn repaint(&self, model: &mut Model) {
+        let Some(chrome) = self.chrome else { return };
+        let roles = chrome.in_state(self.state);
+        for (id, role) in [
+            (self.fill, roles.fill.map(Role::Fill)),
+            (self.label, Some(Role::Text(roles.text))),
+            (self.border, roles.stroke.map(Role::Stroke)),
+        ] {
+            paint(model, id, role, self.scope.for_paint());
+        }
+    }
 
-impl ValueRow {
-    /// Returns this row's fraction converted to the property's own unit.
-    ///
-    /// Reaches the same two conversions the front thread's driving path does, so a slid part
-    /// and a turned one agree on which way their value runs.
-    fn number(&self) -> f32 {
-        match self.unit {
-            crate::build::arena::Unit::Turn => crate::widget::angle_of(self.fraction),
-            _ => self.rest + crate::widget::offset_of(self.fraction, self.travel, self.vertical),
+    pub(crate) fn new(node: NodeId, scope: Scope) -> Self {
+        ControlRow {
+            source_epoch: 0,
+            validation: None,
+            accepted_fraction: None,
+            node,
+            fill: None,
+            label: None,
+            border: None,
+            // Nothing to light and nothing to move: a blocker is a rect in the hit array, and
+            // the front table's hover and press paths find no wash and no thumb here.
+            front: crate::widget::ChromeRow::default(),
+            chrome: None,
+            scope,
+            state: ModelState::Rest,
+            click: None,
+            hovered: None,
+            change: None,
+            cancel: None,
+            commit: None,
+            drag: None,
+            tip: None,
+            flyout: None,
+            uia: UiaRole::None,
+            name: None,
+            text: None,
+            key: None,
         }
     }
 }
@@ -203,12 +194,17 @@ pub(crate) struct OverlayEntry {
 
 /// Owns the model and the tables the app thread's half of the widget layer builds into.
 pub struct Host {
+    pub(crate) identity: Rc<()>,
+    pub(crate) ramps: Slots<windows_scene::Ramp, (Vec<super::Stop>, windows_scene::Spread)>,
     pub(crate) model: Model,
     window_size: crate::signal::Cell<Vector2>,
     _window_owner: crate::signal::Owner,
     pub(crate) popup_requests: Vec<crate::overlay::Request>,
     pub(crate) env: Env,
     pub(crate) root_scope: Scope,
+    pub(crate) appearances: Slots<windows_scene::Node, super::theme::Appearance>,
+    pub(crate) theme_update: Option<(Scope, windows_scene::BackdropSpec)>,
+    pub(crate) theme_backdrop: Option<windows_scene::BackdropSpec>,
     /// Mints mount-row ids.
     ///
     /// An `Ids` sits beside a store only where this thread owns that family's counter; a
@@ -239,8 +235,6 @@ pub struct Host {
     /// holding a row that names a destroyed sprite.
     pub(crate) released: Vec<ControlId>,
     /// Moving parts awaiting the travel only a solve can give them.
-    pub(crate) value_ids: Ids<Value>,
-    pub(crate) values: Slots<Value, ValueRow>,
     /// Trackers named here and created on the front thread, since an `InteractionTracker` is
     /// a composition object sourced from a visual.
     pub(crate) trackers: Vec<TrackerSpec>,
@@ -327,12 +321,17 @@ impl Host {
         let (window_owner, window_size) =
             crate::signal::Owner::scope(|| crate::signal::Cell::new(model.window()));
         let host = Self {
+            identity: Rc::new(()),
+            ramps: Slots::new(),
             window_size,
             _window_owner: window_owner,
             popup_requests: Vec::new(),
             model,
             env,
             root_scope,
+            appearances: Slots::new(),
+            theme_update: None,
+            theme_backdrop: None,
             mount_ids: Ids::new(),
             mounts: Slots::new(),
             control_ids: Ids::new(),
@@ -346,8 +345,6 @@ impl Host {
             states: Vec::new(),
             uia_stale: std::cell::Cell::new(true),
             released: Vec::new(),
-            value_ids: Ids::new(),
-            values: Slots::new(),
             trackers: Vec::new(),
             scroll_ids: Ids::new(),
             scrolls: Slots::new(),
@@ -446,6 +443,9 @@ impl Host {
     /// The caption registry is sent only when it differs from what the last fill sent: the
     /// three ids change when a title bar mounts and at no other time.
     pub(crate) fn fill(&mut self, down: &mut Down) {
+        for (_, control) in self.controls.iter_mut() {
+            control.accepted_fraction = None;
+        }
         down.field_sources.append(&mut self.field_sources);
         down.field_layouts.append(&mut self.field_layouts);
         down.field_commits.append(&mut self.field_commits);
@@ -467,6 +467,9 @@ impl Host {
                 .retain(|row| self.controls.get(row.id).is_some());
         }
         down.regions.append(&mut self.pending_regions);
+        if let Some(theme) = self.theme_update.take() {
+            down.theme = Some(theme);
+        }
         down.scrolls.append(&mut self.pending_scrolls);
         if self.caption != self.caption_sent {
             self.caption_sent = self.caption;
@@ -513,6 +516,9 @@ impl Host {
                     crate::signal::untracked(|| tip.append(&mut text));
                     out.intern(&text)
                 });
+            let help = control
+                .validation
+                .map_or(help, |message| out.intern(message));
             let value = match (control.uia, control.front.drive) {
                 (
                     _,
@@ -615,7 +621,7 @@ impl Host {
     /// nothing rather than a call into whatever occupies that slot.
     pub fn dispatch(&mut self, intents: &[crate::widget::Intent]) {
         for intent in intents {
-            let Some(control) = self.control(intent.target) else {
+            let Some(control) = self.control_mut(intent.target) else {
                 continue;
             };
             match intent.what {
@@ -629,11 +635,34 @@ impl Host {
                         click();
                     }
                 }
-                crate::widget::What::Changed(v) => {
-                    if let Some(change) = control.change.as_ref() {
-                        change(v);
+                crate::widget::What::Scalar {
+                    value,
+                    revision,
+                    commit,
+                } => {
+                    if control.front.revision == revision {
+                        if let Some(
+                            crate::widget::Interaction::Turn(range)
+                            | crate::widget::Interaction::Slide(range),
+                        ) = control.front.drive
+                        {
+                            control.accepted_fraction = Some(range.fraction(value));
+                        }
+                        if let Some(callback) = if commit {
+                            &control.commit
+                        } else {
+                            &control.change
+                        } {
+                            callback(value);
+                        }
                     }
                 }
+                crate::widget::What::Canceled(revision) if revision == control.front.revision => {
+                    if let Some(cancel) = control.cancel.as_ref() {
+                        cancel();
+                    }
+                }
+                crate::widget::What::Canceled(_) => {}
                 crate::widget::What::Committed(v) => {
                     if let Some(commit) = control.commit.as_ref() {
                         commit(v);
@@ -739,7 +768,8 @@ impl Host {
                 continue;
             };
             let (node, cell) = (probe.node, probe.cell);
-            let now = crate::layout::Placed::from(self.model.solved(node));
+            let mut now = crate::layout::Placed::from(self.model.solved(node));
+            now.scope = Some(probe.scope.at_width(now.class));
             // `set` gates on equality, which is what keeps a probe off the per-frame path: a
             // solve that moved nothing wakes nothing derived from this cell.
             if cell.alive() {
@@ -826,6 +856,7 @@ impl Host {
                         extent,
                         queue: row.queue,
                         build,
+                        theme: row.theme.clone(),
                     }
                 }
                 // The recorded extent is the only account of whether the box moved, so a
@@ -899,49 +930,15 @@ impl Host {
 
     // ── values ────────────────────────────────────────────────────────────────────
 
-    /// Opens a value row for a moving part, before the control that owns it is known.
-    ///
-    /// Threads the row onto its mount row's chain, so the unmount releases it without
-    /// searching the table.
-    pub(crate) fn mint_value(&mut self, row: ValueRow) -> ValueId {
-        let mount = row.row;
-        let head = self
-            .mounts
-            .get(mount)
-            .map_or(ValueId::NONE, |mount| mount.values);
-        let id = self
-            .values
-            .insert(&mut self.value_ids, ValueRow { next: head, ..row });
-        if let Some(mount) = self.mounts.get_mut(mount) {
-            mount.values = id;
-        }
-        id
-    }
-
-    fn value_mut(&mut self, id: ValueId) -> Option<&mut ValueRow> {
-        self.values.get_mut(id)
-    }
-
-    /// Names the control a moving part belongs to, the track it runs in, and which thread
-    /// moves it. Called when that control mounts, which is after the part's own row opened.
-    pub(crate) fn own_value(
-        &mut self,
-        id: ValueId,
-        control: ControlId,
-        track: NodeId,
-        front_driven: bool,
-    ) {
-        if let Some(value) = self.value_mut(id) {
-            value.control = Some(control);
-            value.track = track;
-            value.front_driven = front_driven;
-            let fraction = value.fraction;
-            self.publish_fraction(control, fraction);
-        }
-    }
-
-    fn publish_fraction(&mut self, id: ControlId, fraction: f32) {
+    pub(crate) fn publish_fraction(&mut self, id: ControlId, fraction: f32, epoch: u64) {
         if let Some(control) = self.control_mut(id) {
+            if control.source_epoch != epoch
+                || (control.front.source_fraction != fraction
+                    && control.accepted_fraction != Some(fraction))
+            {
+                control.front.revision = control.front.revision.wrapping_add(1);
+                control.source_epoch = epoch;
+            }
             control.front.fraction = fraction;
             control.front.source_fraction = fraction;
             let front = control.front;
@@ -949,120 +946,27 @@ impl Host {
         }
     }
 
-    /// Records a fraction, clamped to `0..=1`, and binds the property that finishes it: the
-    /// travel the last solve gave a slid part, or the constant sweep of a turned one.
-    ///
-    /// The only place on this thread that turns a fraction into a property. A part the router
-    /// drives receives the fraction through its chrome row and binds nothing here, so that
-    /// channel keeps one writer.
-    pub(crate) fn set_fraction(&mut self, id: ValueId, fraction: f32) {
-        let Some(value) = self.value_mut(id) else {
-            return;
-        };
-        value.fraction = fraction.clamp(0.0, 1.0);
-        if value.front_driven {
-            let (control, fraction) = (value.control, value.fraction);
-            if let Some(control) = control {
-                self.publish_fraction(control, fraction);
-            }
-            return;
-        }
-        let (node, prop, motion) = (value.node, value.prop, value.motion);
-        let number = value.number();
-        self.bind_number(node, prop, motion, number);
-    }
-
-    fn bind_number(
-        &mut self,
-        node: NodeId,
-        prop: Prop,
-        motion: crate::widget::Motion,
-        number: f32,
-    ) {
-        let value = windows_scene::Value::Scalar(number);
-        self.model.bind(
-            node,
-            prop,
-            match motion {
-                crate::widget::Motion::Snap => windows_scene::Bind::Set(value),
-                crate::widget::Motion::Chrome => {
-                    windows_scene::Bind::Animate(windows_scene::Anim::Spring {
-                        to: value,
-                        tuning: windows_scene::Tuning::Chrome,
-                        delay_ms: 0,
-                    })
-                }
-            },
-        );
-    }
-
-    /// Re-multiplies every slid part against the room the solve just measured for it.
-    ///
-    /// Runs after the solve, as shaped text and scroll extents do: the room is the track's
-    /// box less the part's own, and neither exists until layout has said so. The correction
-    /// snaps rather than springs, because a window resize moves geometry and not a value, so
-    /// no thumb on the screen animates.
-    ///
-    /// A part the router drives is corrected by sending it the new room rather than by
-    /// binding the property, which keeps one writer on that channel; the front side re-drives
-    /// from the fraction it holds, which is the newer of the two. A turned part has a
-    /// constant sweep and no room, and is skipped.
+    /// Publishes travel from solved boxes. Scene owns every value-driven property.
     fn publish_values(&mut self) {
-        // Walked by position and re-resolved through the id at each step: the body reaches
-        // into the model, a second field of `self`, so no borrow of the table is held across
-        // the walk. A position yields an id, so every row access stays checked.
-        for at in self.values.positions() {
-            let Some(id) = self.values.id_at(at) else {
+        for (_, control) in self.controls.iter_mut() {
+            let Some(node) = control.front.thumb else {
                 continue;
             };
-            let Some(value) = self.values.get(id) else {
-                continue;
+            let vertical = match control.front.drive {
+                Some(crate::widget::Interaction::Slide(range)) => range.vertical,
+                Some(crate::widget::Interaction::Press) => false,
+                _ => continue,
             };
-            if value.unit != crate::build::arena::Unit::Travel {
-                continue;
-            }
-            let (node, track, vertical) = (value.node, value.track, value.vertical);
             let axis = |v: Vector2| if vertical { v.y } else { v.x };
-            // The part is laid out at the start of the track, so the offset layout gave it is
-            // the track's own inset. A track is inset equally at both ends, so the room the
-            // part has is what is left once that inset is taken from each end and the part's
-            // own box from the middle. Measured against the track's outer box instead, a part
-            // at its maximum runs past the far inset by the width of the near one.
             let rest = axis(self.model.solved(node).local);
-            let travel = (axis(self.model.solved(track).size)
+            let travel = (axis(self.model.solved(control.node).size)
                 - rest * 2.0
                 - axis(self.model.solved(node).size))
             .max(0.0);
-            // Exact compare: both are recomputed from the same rects, so anything that moved
-            // at all is a different float and a tolerance would hide small real moves.
-            if (rest, travel) == (value.rest, value.travel) {
-                continue;
-            }
-            let (prop, fraction, control, front_driven) = (
-                value.prop,
-                value.fraction,
-                value.control,
-                value.front_driven,
-            );
-            if let Some(value) = self.values.get_mut(id) {
-                value.rest = rest;
-                value.travel = travel;
-            }
-            if !front_driven {
-                self.bind_number(
-                    node,
-                    prop,
-                    crate::widget::Motion::Snap,
-                    rest + crate::widget::offset_of(fraction, travel, vertical),
-                );
-            }
-            if let Some(id) = control
-                && let Some(control) = self.control_mut(id)
-            {
+            if (rest, travel) != (control.front.rest, control.front.travel) {
                 control.front.rest = rest;
                 control.front.travel = travel;
-                let front = control.front;
-                self.chrome.push(front);
+                self.chrome.push(control.front);
             }
         }
     }
@@ -1076,40 +980,21 @@ impl Host {
     /// and they read the same chrome row the mount painted from.
     pub(crate) fn set_state(&mut self, id: ControlId, state: Option<ModelState>) {
         let state = state.unwrap_or(ModelState::Rest);
-        let Some(control) = self.control(id) else {
+        let Some(control) = self.controls.get_mut(id) else {
             return;
         };
         if control.state == state {
             return;
         }
-        let chrome = control.chrome;
+        if state == ModelState::Disabled {
+            control.front.revision = control.front.revision.wrapping_add(1);
+            self.chrome.push(control.front);
+        }
         // Recorded whether or not there is anything to repaint: a control with no chrome row
         // still has an automation peer that reports checked, selected or unavailable.
         self.states.push((id, state));
-        let Some(control) = self.control(id) else {
-            return;
-        };
-        let Some(chrome) = chrome else {
-            // Nothing to swap: a control with no chrome row has no base paint of its own.
-            if let Some(control) = self.control_mut(id) {
-                control.state = state;
-            }
-            return;
-        };
-        let roles = chrome.roles().in_state(state);
-        let scope = control.scope.for_paint();
-        let (fill, label, border) = (control.fill, control.label, control.border);
-        if let Some(control) = self.control_mut(id) {
-            control.state = state;
-        }
-        paint(&mut self.model, fill, roles.fill.map(Role::Fill), scope);
-        paint(&mut self.model, label, Some(Role::Text(roles.text)), scope);
-        paint(
-            &mut self.model,
-            border,
-            roles.stroke.map(Role::Stroke),
-            scope,
-        );
+        control.state = state;
+        control.repaint(&mut self.model);
     }
 
     // ── unmount ───────────────────────────────────────────────────────────────────
@@ -1136,9 +1021,10 @@ impl Host {
             if let Some(key) = row.text {
                 super::text::try_with(|table| table.release(key, &mut self.model));
             }
-            let mut value = row.values;
-            while let Some(row) = self.values.remove(&mut self.value_ids, value) {
-                value = row.next;
+            let mut paint = row.paints;
+            while let Some(row) = self.appearances.take(paint) {
+                super::style::try_with(|table| table.take(paint));
+                paint = row.next;
             }
             if let Some(probe) = row.probe {
                 if let Some(probe) = self.probes.remove(&mut self.probe_ids, probe)
@@ -1208,6 +1094,7 @@ impl Host {
         if self.place_overlays() {
             self.model.solve(env);
         }
+        self.publish_masks();
         self.publish_fields();
         self.publish_overlay_entries();
         self.publish_probes();
@@ -1259,43 +1146,7 @@ impl Host {
     /// handlers, no chrome and no automation role: the router answers a press on a blocker
     /// from the hit flag alone, and focus cannot rest on it.
     pub(crate) fn mint_blocker(&mut self) -> ControlId {
-        self.mint_control(ControlRow {
-            node: NodeId::NONE,
-            fill: None,
-            label: None,
-            border: None,
-            // Nothing to light and nothing to move: a blocker is a rect in the hit array, and
-            // the front table's hover and press paths find no wash and no thumb here.
-            front: crate::widget::ChromeRow {
-                id: ControlId::default(),
-                wash: None,
-                hover_scope: None,
-                hover: 0.0,
-                press: 0.0,
-                thumb: None,
-                trail: None,
-                rest: 0.0,
-                travel: 0.0,
-                drive: None,
-                drags: false,
-                fraction: 0.0,
-                source_fraction: 0.0,
-            },
-            chrome: None,
-            scope: self.root_scope,
-            state: ModelState::Rest,
-            click: None,
-            hovered: None,
-            change: None,
-            commit: None,
-            drag: None,
-            tip: None,
-            flyout: None,
-            uia: UiaRole::None,
-            name: None,
-            text: None,
-            key: None,
-        })
+        self.mint_control(ControlRow::new(NodeId::NONE, self.root_scope))
     }
 
     /// Returns a clone of the control's flyout body, or `None` where it declared none.

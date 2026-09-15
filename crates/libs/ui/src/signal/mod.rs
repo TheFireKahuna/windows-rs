@@ -43,8 +43,8 @@ mod shared;
 mod tests;
 
 pub use epoch::Epoch;
-pub use graph::{SignalId, flush, live_nodes, set_waker, untracked};
 pub(crate) use graph::arm_posts;
+pub use graph::{SignalId, flush, live_nodes, set_waker, untracked};
 pub(crate) use shared::{PostGuard, PostWake};
 
 use core::any::Any;
@@ -328,7 +328,48 @@ impl Effect {
 /// unsubscribe.
 pub struct Owner(graph::OwnerId);
 
+/// An immutable, owner-scoped resource. Reads are untracked and never wake the graph.
+/// The handle is app-thread only; clone an owned value to hand it to another thread.
+pub struct Resource<T: 'static> {
+    id: SignalId,
+    marker: PhantomData<Rc<T>>,
+}
+
+impl<T> Copy for Resource<T> {}
+impl<T> Clone for Resource<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Resource<T> {
+    /// Borrows the live resource outside the graph borrow.
+    /// Panics if its owner has been disposed.
+    pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R {
+        let value = graph::read_resource(self.id).expect("the resource is live");
+        f(value
+            .downcast_ref::<T>()
+            .expect("the resource type is stable"))
+    }
+}
+
+impl<T: Clone> Resource<T> {
+    /// Takes an owned clone, without creating a signal dependency.
+    pub fn get(self) -> T {
+        self.with(Clone::clone)
+    }
+}
+
 impl Owner {
+    /// Retains `value` until the current owner is disposed, without creating a signal.
+    /// Panics outside an owner scope.
+    pub fn retain<T: 'static>(value: T) -> Resource<T> {
+        Resource {
+            id: graph::resource(Rc::new(value)),
+            marker: PhantomData,
+        }
+    }
+
     /// Runs `f` with a fresh scope installed, and returns the scope alongside `f`'s result.
     ///
     /// Dropping the returned `Owner` disposes everything `f` created.

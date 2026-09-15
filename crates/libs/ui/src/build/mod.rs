@@ -14,8 +14,11 @@ pub(crate) mod arena;
 mod children;
 mod el;
 pub(crate) mod field;
+mod geometry;
 mod host;
 mod mount;
+mod theme;
+pub use geometry::{local_geometries, local_geometry, path_with};
 mod style;
 #[cfg(test)]
 pub(crate) mod tests;

@@ -23,7 +23,7 @@
 
 use crate::gesture::GestureDecl;
 use crate::layout::{Len, Preset, Rule};
-use crate::role::{Elevation, Role, TypeRole};
+use crate::role::{Elevation, Metric, Role, TypeRole};
 use crate::widget::{Chrome, Flow, Interaction, Motion, StatePolicy, TextSource, UiaRole};
 use std::cell::RefCell;
 use windows_scene::{Bounds, Exit, GeomId, HitFlags, Prop, RampId, RegionId, Value};
@@ -98,6 +98,7 @@ pub(crate) struct Slot {
     pub chrome: Option<Chrome>,
     /// What a pointer means here, front-side. `None` is every non-value control.
     pub interaction: Option<Interaction>,
+    pub scalar_part: Option<crate::widget::ScalarPart>,
     /// Path geometry, in sprite-local DIPs. The one resource a widget names that this crate
     /// did not mint.
     pub geom: Option<GeomId>,
@@ -165,6 +166,7 @@ impl Default for Slot {
             state: StatePolicy::None,
             chrome: None,
             interaction: None,
+            scalar_part: None,
             geom: None,
             elevate: None,
             halo: None,
@@ -225,6 +227,20 @@ pub(crate) struct SpriteSeed {
     pub next: u32,
 }
 
+impl SpriteSeed {
+    pub(crate) const fn new(mask: MaskSeed, role: Role, part: Part) -> Self {
+        Self {
+            mask,
+            role,
+            part,
+            strength: FULL,
+            ramp: None,
+            region: None,
+            next: NIL,
+        }
+    }
+}
+
 /// A sprite that paints its role as resolved. What everything but a plate carries.
 pub(crate) const FULL: f32 = 1.0;
 
@@ -258,52 +274,40 @@ pub(crate) enum Part {
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum MaskSeed {
     /// A rounded rect. `None` is square.
-    Box { radius: Option<Len> },
+    Box {
+        radius: Option<Len>,
+    },
     /// A rounded rect whose radius is already resolved, for the one case where it is
     /// derived rather than named: a chrome fill sits a hairline inside its own border, so
     /// its radius is the surface's less that hairline and is not a [`Metric`] anybody owns.
-    Radius { dips: windows_scene::Corners },
+    Radius {
+        dips: windows_scene::Corners,
+    },
+    Outline {
+        radius: windows_scene::Corners,
+        width: f32,
+        open: Option<windows_scene::Side>,
+    },
+    Border {
+        radius: Metric,
+        width: Len,
+    },
     /// One shaped run, from the text side buffer at this index.
-    Run { text: u32 },
+    Run {
+        text: u32,
+    },
     /// The slot's own geometry, filled or outlined.
-    Shape { stroke: Option<Len> },
+    Shape {
+        stroke: Option<Len>,
+    },
     /// The paint's own alpha is the shape.
     Bare,
-}
-
-/// What unit a channel's number is in, and therefore who has to finish it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Unit {
-    /// The property's own. Written as read.
-    Direct,
-    /// `0..=1` of the room a moving part has along its track.
-    ///
-    /// A fraction cannot be lowered at mount, because the room is a **layout output**: the
-    /// track's extent less the part's own. The mount records the fraction and the post-solve
-    /// step multiplies it out, which also lets the front thread move the same part from the
-    /// same number without asking this thread for geometry.
-    Travel,
-    /// `0..=1` of a turned part's sweep, which is a constant.
-    ///
-    /// Not `Direct` even though the sweep needs nothing from layout: this opens the same
-    /// value row a slid part does, so one arbiter decides whether this thread or the router
-    /// moves it.
-    Turn,
-}
-
-impl Unit {
-    /// Whether a channel in this unit carries a **value** — something a pointer can move —
-    /// rather than a property the application simply sets.
-    pub(crate) const fn is_value(self) -> bool {
-        matches!(self, Self::Travel | Self::Turn)
-    }
 }
 
 /// A property awaiting the reactive lowering.
 pub(crate) struct ChanSeed {
     pub prop: Prop,
     pub motion: Motion,
-    pub unit: Unit,
     /// `Option` so mount can **move** a boxed reader into the effect that owns it from
     /// then on, rather than cloning one or borrowing the arena for the effect's life.
     pub source: Option<ChanSource>,
@@ -344,6 +348,7 @@ pub(crate) struct TextSeed {
 /// Handlers never cross the thread seam: they live in an app-thread table and reach the
 /// front thread as a presence bit in [`HitFlags`], which is what keeps `SinkPatch: Send`.
 pub(crate) enum Act {
+    Validation(Box<dyn Fn() -> Option<&'static str>>),
     FieldSource(TextSource),
     CommitText(std::rc::Rc<dyn Fn(&str)>),
     Popup {
@@ -355,6 +360,8 @@ pub(crate) enum Act {
     Escape(std::rc::Rc<dyn Fn()>),
     Click(Box<dyn Fn()>),
     ChangeF64(Box<dyn Fn(f64)>),
+    ScalarSource(Box<dyn Fn() -> (f32, u64)>),
+    Cancel(Box<dyn Fn()>),
     CommitF64(Box<dyn Fn(f64)>),
     /// A two-axis drag's handler. Declared beside the policy it acts on, so a handler
     /// cannot exist for a node that never declared a drag.
@@ -527,19 +534,11 @@ impl Build {
         }
     }
 
-    pub(crate) fn push_chan(
-        &mut self,
-        at: u32,
-        prop: Prop,
-        motion: Motion,
-        unit: Unit,
-        source: ChanSource,
-    ) {
+    pub(crate) fn push_chan(&mut self, at: u32, prop: Prop, motion: Motion, source: ChanSource) {
         let entry = self.chans.len() as u32;
         self.chans.push(ChanSeed {
             prop,
             motion,
-            unit,
             source: Some(source),
             next: NIL,
         });

@@ -12,13 +12,14 @@ mod state;
 mod text;
 
 pub use kind::{
-    Chrome, Interaction, ModelState, Motion, Range, RoleSet, StatePolicy, TURN_SPAN, TURN_SWEEP,
-    UiaRole, Wash, angle_of, detent_delta, fraction_of, offset_of,
+    Chrome, Interaction, ModelState, Motion, Range, RoleSet, ScalarPart, ScalarValue, StatePolicy,
+    TURN_SPAN, TURN_SWEEP, UiaRole, Wash, angle_of, detent_delta, fraction_of, offset_of,
 };
 pub use seed::{
-    SliderStyle, TextStyle, box_, button, caption, card, code, control_text, display, edge_button,
-    field, flyout, icon_button, knob, label, meter, micro, mono, note, panel, path, pills,
-    segmented, select, sheet, slider, styled_text, text, text_group, title, toggle, vertical_label,
+    Choice, SliderStyle, TextStyle, box_, button, button_with, caption, card, code, control_text,
+    display, edge_button, field, field_with, flyout, icon_button, knob, label, meter, micro, mono,
+    note, panel, path, pills, segmented, select, sheet, slider, styled_text, text, text_group,
+    title, toggle, vertical_label,
 };
 // `ChromeRow` is one row of a widget's colour table; `Controls` is the front thread's table
 // of live controls.

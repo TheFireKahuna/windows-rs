@@ -31,6 +31,11 @@
 //! Nothing crosses per published frame. A region that draws every refresh posts nothing to
 //! this side at all.
 
+mod published;
+pub use published::Published;
+/// Versioned window theme. Read only after its version changes.
+pub type Theme = Arc<Published<crate::role::Scope>>;
+
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -55,7 +60,7 @@ use crate::signal::PostWake;
 /// `FnOnce` and `Send`: it is called once, on the other thread, and the renderer it returns
 /// stays there. That is what lets a renderer hold device resources and anything else `!Send`
 /// — none of it is ever constructed on this side.
-pub type Build = Box<dyn FnOnce(&Gpu) -> Result<Box<dyn Frame>> + Send>;
+pub type Build = Box<dyn FnOnce(&Gpu, Theme) -> Result<Box<dyn Frame>> + Send>;
 
 /// The three handles a region shares with its producer, its renderer and its front half.
 ///
@@ -122,7 +127,7 @@ impl Live {
 /// # use windows_ui::present::Live;
 /// # fn spectrum() -> Box<dyn Frame> { unimplemented!() }
 /// # fn f(live: &Live) -> windows_ui::build::View {
-/// windows_ui::present::region(Queue::Solo, live, |_gpu| Ok(spectrum()))
+/// windows_ui::present::region(Queue::Solo, live, |_gpu, _theme| Ok(spectrum()))
 ///     .name("Composite response")
 ///     .grow()
 ///     .erase()
@@ -132,7 +137,7 @@ impl Live {
 pub fn region(
     queue: Queue,
     live: &Live,
-    build: impl FnOnce(&Gpu) -> Result<Box<dyn Frame>> + Send + 'static,
+    build: impl FnOnce(&Gpu, Theme) -> Result<Box<dyn Frame>> + Send + 'static,
 ) -> El<Region> {
     // Minted here rather than at mount, because the sprite that paints it is seeded in this
     // same call and a sprite names its paint at mint. The key is the sink's own number, so
@@ -173,6 +178,7 @@ pub(crate) struct RegionSeed {
 
 /// One mounted region, as the flush needs it.
 pub(crate) struct RegionRow {
+    pub theme: Theme,
     pub node: windows_scene::NodeId,
     pub sink: RegionId,
     pub key: RegionKey,
@@ -194,6 +200,8 @@ pub(crate) struct RegionRow {
 
 /// One mounted region, as the half that binds its surface needs it.
 pub(crate) struct RegionFront {
+    pub theme: Theme,
+    pub epoch: Arc<Epoch>,
     pub key: RegionKey,
     pub sink: RegionId,
     /// Whether a surface handle is bound to [`sink`](Self::sink), so a drop clears only a
@@ -225,6 +233,12 @@ pub(crate) struct Regions {
 }
 
 impl Regions {
+    pub(crate) fn retheme(&mut self, root: crate::role::Scope) {
+        for row in &self.rows {
+            row.theme.set(row.theme.get().in_theme(root));
+            row.epoch.bump();
+        }
+    }
     fn row(&mut self, key: RegionKey) -> Option<&mut RegionFront> {
         self.rows.iter_mut().find(|row| row.key == key)
     }
@@ -250,6 +264,10 @@ impl Regions {
 ///
 /// The compositor refused to release a surface, or a sprite painting with a dropped region
 /// could not be rebound.
+pub(crate) fn relight(output: windows_color::OutputTransform) {
+    with(|reg| reg.presenter.set_output_transform(output));
+}
+
 pub(crate) fn apply(
     regions: &mut Regions,
     ops: &mut Vec<RegionOp>,
@@ -267,9 +285,12 @@ pub(crate) fn apply(
                 extent,
                 queue,
                 build,
+                theme,
                 ..
             } => {
                 regions.rows.push(RegionFront {
+                    theme: theme.clone(),
+                    epoch: live.epoch.clone(),
                     key,
                     sink,
                     bound: false,
@@ -279,7 +300,10 @@ pub(crate) fn apply(
                 // The build closure is consumed whether or not a present thread is
                 // installed, so a region declared without one is inert rather than mounted
                 // by the next batch.
-                with(|reg| reg.presenter.mount(spec, epoch, input, build));
+                with(|reg| {
+                    reg.presenter
+                        .mount(spec, epoch, input, move |gpu: &Gpu| build(gpu, theme))
+                });
             }
             RegionOp::Resize { key, extent } => {
                 // In place: the surface handle survives a resize, so the binding this side
@@ -506,9 +530,9 @@ impl RegionRow {
 pub(crate) mod tests {
     use super::{Picks, RegionRow};
     use crate::build::{Host, mount, tests::fixture};
-    use windows_scene::ControlId;
     use crate::seam::{Down, RegionOp};
     use windows_numerics::Vector2;
+    use windows_scene::ControlId;
 
     /// Returns what the host has produced since the last call, as one batch.
     fn filled() -> Down {
@@ -541,7 +565,7 @@ pub(crate) mod tests {
         // Collapsed before the mount, so the first solve is the one with no area to give.
         Host::with(|h| h.set_window(Vector2 { x: 0.0, y: 0.0 }));
         let held = mount(
-            super::region(windows_present::Queue::Solo, &live, |_| {
+            super::region(windows_present::Queue::Solo, &live, |_, _| {
                 unreachable!("no present thread is installed in a fixture")
             })
             .grow(),
@@ -581,7 +605,7 @@ pub(crate) mod tests {
         let mut patch = fixture();
         let live = super::Live::new().expect("the epoch's wake event");
         let held = mount(
-            super::region(windows_present::Queue::Solo, &live, |_| {
+            super::region(windows_present::Queue::Solo, &live, |_, _| {
                 unreachable!("no present thread is installed in a fixture")
             })
             .grow(),

@@ -25,8 +25,7 @@ static HEADING: ScopedToken<FontSpec> = ScopedToken::new("heading", |scope| {
 
 #[test]
 fn application_tokens_are_total_without_palette_registration() {
-    assert!(!role::installed());
-    let scope = Scope::root(AccentId(0), Density::Comfortable);
+    let scope = Scope::root(&NoBuiltins, AccentId(0), Density::Comfortable);
     assert_eq!(
         role::metric(Metric::Custom(&HEIGHT), scope.at_width(WidthClass::Narrow)),
         190.0
@@ -44,7 +43,6 @@ fn application_tokens_are_total_without_palette_registration() {
         role::typography(TypeRole::Custom(&HEADING), scope),
         role::typography(TypeRole::Custom(&HEADING), compact)
     );
-    assert!(!role::installed());
 }
 
 #[test]
@@ -53,4 +51,17 @@ fn token_identity_is_the_static_not_the_name_or_resolved_value() {
     let second = Metric::Custom(&OTHER_HEIGHT);
     assert_ne!(first, second);
     assert_eq!(HashSet::from([first, first, second]).len(), 2);
+}
+
+struct NoBuiltins;
+impl role::Palette for NoBuiltins {
+    fn text(&self, _: role::Text, _: Scope) -> windows_color::Radiance { unreachable!() }
+    fn fill(&self, _: role::Fill, _: Scope) -> windows_color::Radiance { unreachable!() }
+    fn stroke(&self, _: role::Stroke, _: Scope) -> windows_color::Radiance { unreachable!() }
+    fn shadow(&self, _: Scope) -> role::Shadow { unreachable!() }
+    fn data(&self, _: role::DataRole) -> windows_color::Radiance { unreachable!() }
+    fn emission(&self, _: role::Role, _: Scope) -> role::Emission { unreachable!() }
+    fn typography(&self, _: TypeRole, _: Scope) -> FontSpec { unreachable!() }
+    fn metric(&self, _: Metric, _: Scope) -> f32 { unreachable!() }
+    fn content_peak_nits(&self, _: &windows_color::Gamut) -> f32 { unreachable!() }
 }

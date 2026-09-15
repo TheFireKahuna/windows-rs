@@ -147,6 +147,12 @@ pub enum Mask {
     /// A rounded rectangle, stretched from a nine-grid atlas cell so that one raster
     /// serves any size with exact corners.
     Box { radius: Corners },
+    /// An inset rounded outline with transparent interior; width is in DIPs.
+    Outline {
+        radius: Corners,
+        width: f32,
+        open: Option<Side>,
+    },
     /// One same-paint span of one shaped line, as a coverage tile. A run is one sprite
     /// whatever its glyph count, so a paragraph costs one visual per span rather than one
     /// per glyph, and one dirty region touches one visual per line.
@@ -170,7 +176,7 @@ impl Mask {
         match self {
             Self::Run(id) => Some(Holding::Run(id)),
             Self::Shape { geom, .. } => Some(Holding::Geom(geom)),
-            Self::Box { .. } | Self::None => None,
+            Self::Box { .. } | Self::Outline { .. } | Self::None => None,
         }
     }
 
@@ -185,7 +191,7 @@ impl Mask {
     #[must_use]
     pub const fn deps(self) -> GenMask {
         match self {
-            Self::Box { .. } | Self::Shape { .. } => GenMask::GEOMETRY,
+            Self::Box { .. } | Self::Outline { .. } | Self::Shape { .. } => GenMask::GEOMETRY,
             Self::Run(_) | Self::None => GenMask::NONE,
         }
     }
@@ -320,6 +326,14 @@ pub enum Clip {
     Geom(GeomId),
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Side {
+    Left,
+    Top,
+    Right,
+    Bottom,
+}
+
 /// Four corner radii, clockwise from the top left.
 ///
 /// A radius is capped by the platform at half the box on each axis, so a fully rounded box
@@ -440,6 +454,17 @@ impl Spread {
 /// on one axis and three on the other. Re-emission runs at event rate, not per frame.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PathVerb {
+    /// A complete rounded rectangle figure, using the shared platform geometry author.
+    RoundRect {
+        origin: Vector2,
+        size: Vector2,
+        radius: f32,
+    },
+    /// A complete open line figure, with no application-managed begin/end pair.
+    Segment {
+        from: Vector2,
+        to: Vector2,
+    },
     /// Starts a figure. `filled` decides whether it contributes to the fill region.
     Move {
         to: Vector2,
@@ -837,6 +862,11 @@ pub enum ResOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_figures_do_not_expand_the_retained_verb_record() {
+        assert_eq!(core::mem::size_of::<PathVerb>(), 28);
+    }
 
     #[test]
     fn a_linear_ramps_ends_span_the_box() {
