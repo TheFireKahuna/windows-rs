@@ -55,6 +55,15 @@ pub struct SliderStyle {
     pub ramp: Option<windows_scene::RampId>,
 }
 
+/// Construction-time dimensions and typography for a retained choice rail.
+#[derive(Copy, Clone, Debug)]
+pub struct ChoiceStyle {
+    pub radius: Metric,
+    pub height: Metric,
+    pub inset: Metric,
+    pub typography: TypeRole,
+}
+
 pub trait Choice<T> {
     fn selected(&self) -> T;
     fn choose(&self, value: T);
@@ -287,13 +296,16 @@ pub fn segmented<'a, T: Copy + PartialEq + 'static>(
     value: impl Choice<T> + Copy + 'static,
     options: &'static [(&'static str, T)],
 ) -> Element<'a> {
-    rail(
+    segmented_with(
         ui,
         value,
         options,
-        Metric::Radius,
-        Metric::SpaceSm,
-        TypeRole::Caption,
+        ChoiceStyle {
+            radius: Metric::Radius,
+            height: Metric::RowH,
+            inset: Metric::SpaceSm,
+            typography: TypeRole::Caption,
+        },
     )
 }
 pub fn pills<'a, T: Copy + PartialEq + 'static>(
@@ -301,26 +313,28 @@ pub fn pills<'a, T: Copy + PartialEq + 'static>(
     value: impl Choice<T> + Copy + 'static,
     options: &'static [(&'static str, T)],
 ) -> Element<'a> {
-    rail(
+    segmented_with(
         ui,
         value,
         options,
-        Metric::RadiusPill,
-        Metric::SpaceMd,
-        TypeRole::Body,
+        ChoiceStyle {
+            radius: Metric::RadiusPill,
+            height: Metric::RowH,
+            inset: Metric::SpaceMd,
+            typography: TypeRole::Body,
+        },
     )
 }
-fn rail<'a, T: Copy + PartialEq + 'static>(
+/// Builds the stock choice rail with application-owned sizing and text tokens.
+pub fn segmented_with<'a, T: Copy + PartialEq + 'static>(
     ui: &'a mut Ui<'_>,
     value: impl Choice<T> + Copy + 'static,
     options: &'static [(&'static str, T)],
-    radius: Metric,
-    inset: Metric,
-    ramp: TypeRole,
+    style: ChoiceStyle,
 ) -> Element<'a> {
     ui.node(Preset::Row)
-        .appearance(Chrome::new(roles::GROOVE[0], radius))
-        .height(Metric::RowH)
+        .appearance(Chrome::new(roles::GROOVE[0], style.radius))
+        .height(style.height)
         .padding(Len::Times(Metric::HairlineW, 2.0))
         .gap(Len::Zero)
         .align(Align::Stretch)
@@ -328,16 +342,16 @@ fn rail<'a, T: Copy + PartialEq + 'static>(
         .children(|ui| {
             for &(name, option) in options {
                 ui.control(
-                    Some(Chrome::new(roles::OPTION[0], radius)),
+                    Some(Chrome::new(roles::OPTION[0], style.radius)),
                     UiaRole::RadioButton,
                     |ui| {
-                        ui.text(TextStyle::new(ramp), name);
+                        ui.text(TextStyle::new(style.typography), name);
                     },
                 )
                 .selected(move || value.selected() == option)
                 .on_click(move || value.choose(option))
                 .min_height(Len::Zero)
-                .padding_xy(inset, Len::Zero);
+                .padding_xy(style.inset, Len::Zero);
             }
         })
 }
