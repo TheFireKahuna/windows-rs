@@ -87,6 +87,17 @@ pub(crate) struct Recipe {
     pub bound: Box<[Rule]>,
 }
 
+impl Recipe {
+    pub(crate) fn lower(&self, class: WidthClass) -> taffy::Style {
+        crate::layout::lower_with(
+            self.preset,
+            self.over.as_slice(),
+            &self.bound,
+            self.scope.at_width(class),
+        )
+    }
+}
+
 thread_local! {
     /// A recipe per node, keyed by ids the **model** mints.
     ///
@@ -117,12 +128,7 @@ pub(crate) fn try_with<R>(f: impl FnOnce(&mut Slots<Node, Recipe>) -> R) -> Opti
 pub(crate) fn restyle(node: NodeId, class: WidthClass) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get(node)?;
-        Some(crate::layout::lower_with(
-            recipe.preset,
-            recipe.over.as_slice(),
-            &recipe.bound,
-            recipe.scope.at_width(class),
-        ))
+        Some(recipe.lower(class))
     })
 }
 
@@ -142,12 +148,7 @@ pub(crate) fn bind(node: NodeId, class: WidthClass, extra: &[Rule]) -> Option<ta
     with(|table| {
         let recipe = table.get_mut(node)?;
         recipe.bound = extra.into();
-        Some(crate::layout::lower_with(
-            recipe.preset,
-            recipe.over.as_slice(),
-            extra,
-            recipe.scope.at_width(class),
-        ))
+        Some(recipe.lower(class))
     })
 }
 
@@ -167,12 +168,7 @@ pub(crate) fn bind(node: NodeId, class: WidthClass, extra: &[Rule]) -> Option<ta
 pub(crate) fn pin_width(node: NodeId, class: WidthClass, width: f32) -> Option<taffy::Style> {
     with(|table| {
         let recipe = table.get(node)?;
-        let mut style = crate::layout::lower_with(
-            recipe.preset,
-            recipe.over.as_slice(),
-            &recipe.bound,
-            recipe.scope.at_width(class),
-        );
+        let mut style = recipe.lower(class);
         style.size.width = taffy::Dimension::length(width);
         Some(style)
     })

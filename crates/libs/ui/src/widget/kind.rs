@@ -123,15 +123,11 @@ impl RoleSet {
     }
 }
 
-/// A widget's own surface: which `const` table it reads, which row of it, and how round it is.
-///
-/// The slot carries the row index rather than the sprites, so a variant modifier rewrites one
-/// byte and the mount reads the sprite count off the row. A row with no stroke mints one
-/// sprite fewer rather than an invisible one.
+/// A resolved component recipe. Variant selection happens during construction;
+/// runtime state changes resolve this row and its explicit state overrides.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Chrome {
-    pub roles: &'static [RoleSet],
-    pub variant: u8,
+    pub roles: RoleSet,
     pub radius: Metric,
     /// The flush edge has square corners and no border.
     pub attached: Option<crate::layout::Edge>,
@@ -140,10 +136,9 @@ pub struct Chrome {
 }
 
 impl Chrome {
-    pub const fn new(roles: &'static [RoleSet], radius: Metric) -> Self {
+    pub const fn new(roles: RoleSet, radius: Metric) -> Self {
         Self {
             roles,
-            variant: 0,
             radius,
             attached: None,
             selected: None,
@@ -156,27 +151,7 @@ impl Chrome {
             ModelState::Disabled => self.disabled,
             ModelState::Rest => None,
         }
-        .unwrap_or_else(|| self.roles().in_state(state))
-    }
-
-    /// Returns the row this chrome selects.
-    ///
-    /// A variant index is minted by a method on the widget that owns the table, so an
-    /// out-of-range index is a defect rather than a case. It clamps to the last row in
-    /// release, which renders the control as some other variant.
-    ///
-    /// # Panics
-    ///
-    /// In a debug build, if `variant` is past the end of `roles`.
-    #[must_use]
-    pub fn roles(self) -> RoleSet {
-        debug_assert!(
-            (self.variant as usize) < self.roles.len(),
-            "variant {} is past the end of this widget's own table",
-            self.variant
-        );
-        let at = (self.variant as usize).min(self.roles.len().saturating_sub(1));
-        self.roles[at]
+        .unwrap_or_else(|| self.roles.in_state(state))
     }
 }
 

@@ -766,7 +766,7 @@ const fn accent_wash() -> StatePolicy {
 
 const _: () = {
     // Every widget above names one of these tables, and a variant method addresses a row of
-    // it. `Chrome::roles` clamps to the last row, so an empty table would index out of
+    // it. Construction selects a row, so an empty table would index out of
     // bounds.
     assert!(!roles::BUTTON.is_empty());
     assert!(!roles::SURFACE.is_empty());

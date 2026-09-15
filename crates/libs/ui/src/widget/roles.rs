@@ -130,9 +130,7 @@ mod tests {
 
     /// Every named index addresses a row that exists.
     ///
-    /// An index past the end of its table is clamped by
-    /// [`Chrome::roles`](super::super::Chrome::roles) into whichever row is last, which
-    /// renders the control as some other variant.
+    /// Construction indexes directly; a missing named row is an authoring error.
     #[test]
     fn every_named_variant_indexes_its_own_table() {
         for at in [DEFAULT, ACCENT, ACCENT_SUBTLE, GHOST] {

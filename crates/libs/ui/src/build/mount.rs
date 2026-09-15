@@ -368,7 +368,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     let slot = b.nodes[at.at as usize];
     let scope = at.scope.in_theme(Host::with(|h| h.root_scope));
     let inner = slot.elevate.map_or(scope, |e| scope.elevate(e));
-    let roles = slot.chrome.map(Chrome::roles);
+    let roles = slot.chrome.map(|chrome| chrome.roles);
 
     // Counted through the chain rather than collected: a `Vec` of seeds here is one
     // allocation per node per mount, on the path a list row realized during a fling takes.
@@ -1237,7 +1237,7 @@ fn mount_control(
         // time and the chrome row it belongs to is not known until now. Without it a mount
         // and the first `set_state` disagree, and a control's label reads primary until
         // something selects or disables it.
-        if let Some(roles) = chrome.map(Chrome::roles) {
+        if let Some(roles) = chrome.map(|chrome| chrome.roles) {
             super::host::paint(
                 h.model(),
                 label,

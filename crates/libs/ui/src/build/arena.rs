@@ -68,6 +68,16 @@ impl Link {
     pub(crate) const fn is_empty(self) -> bool {
         self.head == NIL
     }
+
+    /// Appends an index and returns the prior tail that must link to it.
+    fn append(&mut self, at: u32) -> Option<u32> {
+        let prior = (!self.is_empty()).then_some(self.tail);
+        if prior.is_none() {
+            self.head = at;
+        }
+        self.tail = at;
+        prior
+    }
 }
 
 /// What a widget contributes: one node, as plain data.
@@ -93,8 +103,8 @@ pub(crate) struct Slot {
     pub state: StatePolicy,
     /// The widget's own surface, as a table row rather than as sprites.
     ///
-    /// Held unexpanded so a variant modifier rewrites one byte and the mount decides which
-    /// sprites the row implies: a ghost mints no fill because its row has none.
+    /// Holds the selected role row; mount decides which sprites that row implies.
+    /// A ghost mints no fill because its row has none.
     pub chrome: Option<Chrome>,
     /// What a pointer means here, front-side. `None` is every non-value control.
     pub interaction: Option<Interaction>,
@@ -507,14 +517,8 @@ impl Build {
         let entry = self.over.len() as u32;
         self.over.push(OverSeed { rule, next: NIL });
         let link = &mut self.nodes[at as usize].over;
-        if link.is_empty() {
-            *link = Link {
-                head: entry,
-                tail: entry,
-            };
-        } else {
-            self.over[link.tail as usize].next = entry;
-            link.tail = entry;
+        if let Some(tail) = link.append(entry) {
+            self.over[tail as usize].next = entry;
         }
     }
 
@@ -523,14 +527,8 @@ impl Build {
         let entry = self.seeds.len() as u32;
         self.seeds.push(seed);
         let link = &mut self.nodes[at as usize].seeds;
-        if link.is_empty() {
-            *link = Link {
-                head: entry,
-                tail: entry,
-            };
-        } else {
-            self.seeds[link.tail as usize].next = entry;
-            link.tail = entry;
+        if let Some(tail) = link.append(entry) {
+            self.seeds[tail as usize].next = entry;
         }
     }
 
@@ -543,14 +541,8 @@ impl Build {
             next: NIL,
         });
         let link = &mut self.nodes[at as usize].chans;
-        if link.is_empty() {
-            *link = Link {
-                head: entry,
-                tail: entry,
-            };
-        } else {
-            self.chans[link.tail as usize].next = entry;
-            link.tail = entry;
+        if let Some(tail) = link.append(entry) {
+            self.chans[tail as usize].next = entry;
         }
     }
 
@@ -561,14 +553,8 @@ impl Build {
             next: NIL,
         });
         let link = &mut self.nodes[at as usize].acts;
-        if link.is_empty() {
-            *link = Link {
-                head: entry,
-                tail: entry,
-            };
-        } else {
-            self.acts[link.tail as usize].next = entry;
-            link.tail = entry;
+        if let Some(tail) = link.append(entry) {
+            self.acts[tail as usize].next = entry;
         }
     }
 
@@ -644,20 +630,12 @@ impl Build {
         self.chain_seeds(link).count()
     }
 
-    pub(crate) fn chain_over(&self, link: Link) -> ChainIter<'_, OverSeed> {
-        ChainIter {
-            buffer: &self.over,
-            at: link.head,
-            next: |s| s.next,
-        }
+    pub(crate) fn chain_over(&self, link: Link) -> impl Iterator<Item = &OverSeed> + Clone {
+        chain(&self.over, link, |item| item.next)
     }
 
-    pub(crate) fn chain_seeds(&self, link: Link) -> ChainIter<'_, SpriteSeed> {
-        ChainIter {
-            buffer: &self.seeds,
-            at: link.head,
-            next: |s| s.next,
-        }
+    pub(crate) fn chain_seeds(&self, link: Link) -> impl Iterator<Item = &SpriteSeed> + Clone {
+        chain(&self.seeds, link, |item| item.next)
     }
 
     /// Takes the thread's arena, leaving a pooled empty one in its place.
@@ -689,26 +667,15 @@ impl Build {
     }
 }
 
-/// Walks an intrusive chain forward.
-///
-/// `Copy`, so a caller can walk the same chain twice — count, then fill — without asking the
-/// arena for it again.
-#[derive(Copy, Clone)]
-pub(crate) struct ChainIter<'a, T> {
-    buffer: &'a [T],
-    at: u32,
-    next: fn(&T) -> u32,
-}
-
-impl<'a, T> Iterator for ChainIter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<&'a T> {
-        if self.at == NIL {
+/// Walks a pooled intrusive chain without a separate iterator type.
+fn chain<T>(buffer: &[T], link: Link, next: fn(&T) -> u32) -> impl Iterator<Item = &T> + Clone {
+    let mut at = link.head;
+    std::iter::from_fn(move || {
+        if at == NIL {
             return None;
         }
-        let item = &self.buffer[self.at as usize];
-        self.at = (self.next)(item);
+        let item = &buffer[at as usize];
+        at = next(item);
         Some(item)
-    }
+    })
 }

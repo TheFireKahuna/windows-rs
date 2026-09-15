@@ -28,11 +28,11 @@ pub struct Path;
 /// `radius`, and no colour method at all — nothing on this side says what is in the pixels.
 #[derive(Copy, Clone, Debug)]
 pub struct Region;
-/// A widget reading the button role table. Owns the variant methods.
+/// A button recipe. Owns the stock button variant methods.
 ///
-/// The kind restricts those methods to elements whose chrome row comes from the button
-/// table. On a card the same index would select a row of the surface table and render a
-/// panel.
+/// These methods select stock button roles. Application recipes use `appearance`;
+/// applying a stock variant later replaces the base roles while retaining recipe geometry
+/// and explicit selected/disabled overrides.
 #[derive(Copy, Clone, Debug)]
 pub struct Button;
 
@@ -67,26 +67,6 @@ impl<K> core::fmt::Debug for El<K> {
 
 /// The application-facing element type.
 pub type View = El<Any>;
-
-/// Converts a channel argument into the scene's [`Value`].
-///
-/// Crate-private: every channel is reached through a named method, so the set of types a
-/// channel accepts is closed here rather than at the authoring surface.
-pub(crate) trait IntoValue: Copy + 'static {
-    fn value(self) -> Value;
-}
-
-impl IntoValue for f32 {
-    fn value(self) -> Value {
-        Value::Scalar(self)
-    }
-}
-
-impl IntoValue for Vector2 {
-    fn value(self) -> Value {
-        Value::Vec2(self)
-    }
-}
 
 impl<K> El<K> {
     pub(crate) const fn at_index(at: u32) -> Self {
@@ -165,14 +145,15 @@ impl<K> El<K> {
         prop: Prop,
         motion: Motion,
         v: impl Signal<T, M> + 'static,
+        value: impl Fn(T) -> Value + 'static,
     ) -> Self
     where
-        T: IntoValue,
+        T: Copy + 'static,
     {
         let source = if v.is_constant() {
-            ChanSource::Const(v.read().value())
+            ChanSource::Const(value(v.read()))
         } else {
-            ChanSource::Dynamic(Box::new(move || v.read().value()))
+            ChanSource::Dynamic(Box::new(move || value(v.read())))
         };
         Build::with(|b| b.push_chan(self.at, prop, motion, source));
         self
@@ -228,19 +209,9 @@ impl<K> El<K> {
         self
     }
 
-    /// Records the role table, variant index and corner radius this node's surface resolves
-    /// from.
+    /// Selects the component's role row before retaining its recipe.
     pub(crate) fn chrome(self, roles: &'static [RoleSet], variant: u8, radius: Metric) -> Self {
-        self.slot_mut(|s| {
-            s.chrome = Some(Chrome {
-                roles,
-                variant,
-                radius,
-                attached: None,
-                selected: None,
-                disabled: None,
-            });
-        })
+        self.appearance(Chrome::new(roles[variant as usize], radius))
     }
 
     /// Joins this surface to an edge without changing its layout or hit box.
@@ -250,30 +221,6 @@ impl<K> El<K> {
                 .as_mut()
                 .expect("attached surface has chrome")
                 .attached = Some(edge)
-        })
-    }
-
-    /// Selects which row of its own role table this widget reads.
-    ///
-    /// Writes one byte on the slot. Which sprites the row implies — a fill that is minted, a
-    /// stroke that is not — is decided at mount, so this may run in any order relative to the
-    /// other modifiers.
-    ///
-    /// # Panics
-    ///
-    /// If the node carries no role table. Reachable only from a kind that carries one
-    /// ([`Button`]). In a debug build, also if `at` is past the end of that table.
-    pub(crate) fn variant(self, at: u8) -> Self {
-        self.slot_mut(|s| {
-            let chrome = s
-                .chrome
-                .as_mut()
-                .expect("a variant belongs to a kind that carries a role table");
-            debug_assert!(
-                (at as usize) < chrome.roles.len(),
-                "variant {at} is past the end of this widget's own table"
-            );
-            chrome.variant = at;
         })
     }
 
@@ -415,7 +362,7 @@ impl<K> El<K> {
     /// shadow, and the scene refuses a property whose owner the node does not carry.
     #[must_use]
     pub fn halo_lit<M>(self, lit: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::ShadowOpacity, Motion::Chrome, lit)
+        self.channel(Prop::ShadowOpacity, Motion::Chrome, lit, Value::Scalar)
     }
 
     /// Adds the plate a chromatic value sits on: a rounded box painting `strength` of `role`.
@@ -1138,7 +1085,7 @@ impl<K> El<K> {
     /// A constant produces no `Cell` and no `Effect`; anything else becomes one `Effect`.
     #[must_use]
     pub fn opacity<M>(self, v: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::Opacity, Motion::Chrome, v)
+        self.channel(Prop::Opacity, Motion::Chrome, v, Value::Scalar)
     }
 
     /// Binds this node's rotation to `radians`.
@@ -1149,13 +1096,13 @@ impl<K> El<K> {
     /// [`turns`](Self::turns), so this thread and the router do not both drive it.
     #[must_use]
     pub fn rotation<M>(self, radians: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::RotationAngle, Motion::Chrome, radians)
+        self.channel(Prop::RotationAngle, Motion::Chrome, radians, Value::Scalar)
     }
 
     /// Sets the rotation centre in local DIPs. Layout changes snap the pivot.
     #[must_use]
     pub fn pivot<M>(self, point: impl Signal<Vector2, M> + 'static) -> Self {
-        self.channel(Prop::Center, Motion::Snap, point)
+        self.channel(Prop::Center, Motion::Snap, point, Value::Vec2)
     }
 
     /// Binds how far a level fills its bed, `0..=1`.
@@ -1163,7 +1110,7 @@ impl<K> El<K> {
     /// A scale and not an offset, so the fraction is already in the property's own unit: the
     /// bed is the node's own box, and a fraction of it needs nothing from layout.
     pub(crate) fn scale_x<M>(self, v: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::ScaleX, Motion::Chrome, v)
+        self.channel(Prop::ScaleX, Motion::Chrome, v, Value::Scalar)
     }
 
     pub(crate) fn hit(self, flags: HitFlags, uia: UiaRole) -> Self {
@@ -1379,6 +1326,13 @@ fn add_flags(slot: &mut Slot, flags: HitFlags) {
 /// On [`El<Button>`](Button) alone: these are the indices the button table has. A surface's
 /// variants are `card`, `panel` and `flyout`, separate functions over separate rows.
 impl El<Button> {
+    fn variant(self, at: u8) -> Self {
+        self.slot_mut(|s| {
+            s.chrome.as_mut().expect("button has chrome").roles =
+                crate::widget::roles::BUTTON[at as usize];
+        })
+    }
+
     /// Selects the accent fill, with text that reads on it.
     #[must_use]
     pub fn accent(self) -> Self {
@@ -1533,13 +1487,13 @@ impl El<Path> {
     /// Binds the visible end of the path, in normalized path length.
     #[must_use]
     pub fn trim<M>(self, end: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::TrimEnd, Motion::Chrome, end)
+        self.channel(Prop::TrimEnd, Motion::Chrome, end, Value::Scalar)
     }
 
     /// Binds the stroke width.
     #[must_use]
     pub fn stroke_width<M>(self, w: impl Signal<f32, M> + 'static) -> Self {
-        self.channel(Prop::StrokeThickness, Motion::Chrome, w)
+        self.channel(Prop::StrokeThickness, Motion::Chrome, w, Value::Scalar)
     }
 }
 

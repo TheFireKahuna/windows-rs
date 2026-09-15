@@ -47,7 +47,7 @@ fn independent_hosts_retheme_existing_recipes_and_preserve_state() {
                             stroke: Some(Stroke::Subtle),
                             text: Text::Disabled,
                         }),
-                        ..crate::widget::Chrome::new(ROWS, Metric::Radius)
+                        ..crate::widget::Chrome::new(ROWS[0], Metric::Radius)
                     };
                     let held = mount(
                         stack((

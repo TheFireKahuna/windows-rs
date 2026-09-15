@@ -27,10 +27,14 @@ impl Appearance {
         let Some(chrome) = self.chrome else { return };
         if self.wash {
             self.seed.mask = super::arena::MaskSeed::Radius {
-                dips: super::mount::surface_corners(crate::role::metric(chrome.radius, scope), Some(chrome)),
+                dips: super::mount::surface_corners(
+                    crate::role::metric(chrome.radius, scope),
+                    Some(chrome),
+                ),
             };
-        } else if let Some((_, seed)) = super::mount::chrome_seeds(self.roles, Some(chrome), scope, true)
-            .find(|(part, _)| *part == self.seed.part)
+        } else if let Some((_, seed)) =
+            super::mount::chrome_seeds(self.roles, Some(chrome), scope, true)
+                .find(|(part, _)| *part == self.seed.part)
         {
             self.seed = seed;
         }
@@ -99,12 +103,7 @@ impl Host {
         super::style::with(|table| {
             for (id, recipe) in table.iter_mut() {
                 recipe.scope = recipe.scope.in_theme(root);
-                let style = crate::layout::lower_with(
-                    recipe.preset,
-                    recipe.over.as_slice(),
-                    &recipe.bound,
-                    recipe.scope.at_width(self.model.solved(id).class),
-                );
+                let style = recipe.lower(self.model.solved(id).class);
                 self.model.style(id, &style);
             }
         });
