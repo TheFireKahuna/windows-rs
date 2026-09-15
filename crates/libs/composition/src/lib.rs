@@ -133,7 +133,7 @@ pub use clip::{Clip, CompositionClip, CompositionGeometricClip, InsetClip, Recta
 pub use idiom::Captured;
 #[cfg(feature = "system")]
 pub use interactions::{
-    BindingAxes, ChainingMode, Clamping, InertiaModifier, InteractionTracker, RedirectionMode,
+    BindingAxes, ChainingMode, Clamping, InertiaModifier, InteractionTracker, ManipulationPointer, RedirectionMode,
     RequestId, ScaleAnimationPolicy, SourceMode, TrackerEvent, VisualInteractionSource, WheelMode,
 };
 #[cfg(feature = "system")]

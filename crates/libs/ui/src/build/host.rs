@@ -452,6 +452,20 @@ impl Host {
         down.chrome.append(&mut self.chrome);
         down.gestures.append(&mut self.gestures);
         down.released.append(&mut self.released);
+        // A backpressured batch can contain a mount and its later unmount. Publish only
+        // live declarations: the scene has already destroyed retired nodes before adoption.
+        if !down.released.is_empty() {
+            down.chrome
+                .retain(|row| self.controls.get(row.id).is_some());
+            down.gestures
+                .retain(|(id, _)| self.controls.get(*id).is_some());
+            down.field_sources
+                .retain(|row| self.controls.get(row.id).is_some());
+            down.field_layouts
+                .retain(|row| self.controls.get(row.id).is_some());
+            down.field_commits
+                .retain(|row| self.controls.get(row.id).is_some());
+        }
         down.regions.append(&mut self.pending_regions);
         down.scrolls.append(&mut self.pending_scrolls);
         if self.caption != self.caption_sent {
@@ -1668,6 +1682,40 @@ mod tests {
     use super::*;
     use crate::build::{mount, tests::fixture};
     use crate::seam::Down;
+
+    #[test]
+    fn retirement_wins_when_mount_and_unmount_share_a_backpressured_batch() {
+        let mut patch = fixture();
+        let mut down = Down::default();
+        let root = Host::with(|h| h.model().root());
+        let held = mount(
+            crate::layout::stack((
+                crate::widget::button("Gain").erase(),
+                crate::widget::field("name").erase(),
+            )),
+            root,
+        );
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        assert!(!down.chrome.is_empty() && !down.field_sources.is_empty());
+        let old: Vec<_> = down.chrome.iter().map(|row| row.id).collect();
+        drop(held);
+        let _replacement = mount(crate::widget::button("replacement"), root);
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        assert!(old.iter().all(|id| down.released.contains(id)));
+        assert!(
+            !down.chrome.is_empty(),
+            "the replacement generation survives"
+        );
+        assert!(down.chrome.iter().all(|row| !old.contains(&row.id)));
+        assert!(down.gestures.iter().all(|(id, _)| !old.contains(id)));
+        assert!(down.field_sources.is_empty() && down.field_layouts.is_empty());
+    }
 
     /// A fill hands every buffer over and leaves the host with none of it.
     ///

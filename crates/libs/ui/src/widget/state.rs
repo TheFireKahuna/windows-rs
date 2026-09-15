@@ -196,6 +196,8 @@ impl Controls {
 
     /// Adopts the rows a mount produced or a solve corrected, as drained by the app thread
     /// alongside its patch.
+    /// `released` is the same patch's retirement list. Publication excludes those ids from
+    /// `rows`; adoption retires them before input can reach a destroyed visual.
     ///
     /// A geometry-only update preserves the pointer's fraction. A changed source fraction
     /// adopts the application's value, so another control or a document load reaches this
@@ -208,8 +210,22 @@ impl Controls {
     /// # Errors
     ///
     /// A retarget was refused by the compositor.
-    pub fn adopt(&mut self, rows: &[ChromeRow], front: &mut Front<'_>) -> Result<()> {
+    pub fn adopt(
+        &mut self,
+        rows: &[ChromeRow],
+        released: &[ControlId],
+        front: &mut Front<'_>,
+    ) -> Result<()> {
+        // Retirement is part of adoption, not an optional driver step. Late reports can
+        // never reach the visuals destroyed by this same patch.
+        for &id in released {
+            self.release(id);
+        }
         for &row in rows {
+            debug_assert!(
+                !released.contains(&row.id),
+                "a retired chrome row crossed the publication seam"
+            );
             // `Slots` compares the generation, so a row for a control whose slot has since
             // been recycled misses and is placed fresh.
             let held = self.rows.get(row.id).copied();
@@ -272,6 +288,12 @@ impl Controls {
         }
         if self.observed_hover == Some(id) {
             self.observed_hover = None;
+        }
+        if self.grabbed.is_some_and(|(target, _)| target == id) {
+            self.grabbed = None;
+        }
+        if self.dragged.is_some_and(|(target, _)| target == id) {
+            self.dragged = None;
         }
     }
 
@@ -394,12 +416,13 @@ impl Controls {
 
     fn one(&mut self, report: &Report, front: &mut Front<'_>, out: &mut Vec<Intent>) -> Result<()> {
         match *report {
+            Report::Redirect { .. } => {}
             // A single service can publish several of these, in the order the pointer
             // crossed them. Each is applied; a sub-frame traversal is absorbed by the
             // spring, which reaches about eight percent of its ramp before the next
             // retarget replaces it.
             Report::HoverChanged { from, to, .. } => {
-                self.hovered = to;
+                self.hovered = to.filter(|id| self.rows.get(*id).is_some());
                 self.observe_hover(to, out);
                 if let Some(from) = from {
                     self.wash(from, front)?;
@@ -409,6 +432,9 @@ impl Controls {
                 }
             }
             Report::Pressed { target, sample, .. } => {
+                if self.rows.get(target).is_none() {
+                    return Ok(());
+                }
                 self.pressed = Some(target);
                 // Where the value stood when the contact landed: a turn is measured from it.
                 self.grabbed = self.rows.get(target).map(|row| (target, row.fraction));
@@ -426,14 +452,14 @@ impl Controls {
                 }
             }
             Report::Released { target, at, .. } => {
-                let was = self.pressed.take() == Some(target);
-                self.grabbed = None;
-                self.wash(target, front)?;
                 // Scroll rails belong to the scroll front and carry no chrome row. Their
                 // release must not become a menu choice or an application click.
-                if !was || self.rows.get(target).is_none() {
+                if self.pressed != Some(target) || self.rows.get(target).is_none() {
                     return Ok(());
                 }
+                self.pressed = None;
+                self.grabbed = None;
+                self.wash(target, front)?;
                 // A drag that passed the threshold ends here and is not also a tap: the two
                 // are the same contact, and raising both would run the click handler at the
                 // end of every reorder.
@@ -474,6 +500,9 @@ impl Controls {
             // A cancel is not a release: nothing is committed, the value returns to where it
             // stood before the contact, and the wash is re-derived from this table's state.
             Report::Canceled { target, .. } => {
+                if self.pressed != Some(target) {
+                    return Ok(());
+                }
                 self.pressed = None;
                 if let Some((grabbed, fraction)) = self.grabbed.take()
                     && grabbed == target
@@ -740,6 +769,160 @@ const fn chrome(to: f32) -> Bind {
 mod tests {
     use super::*;
     use crate::gesture::Axis;
+
+    #[test]
+    fn unmount_retires_chrome_and_every_held_reference() {
+        use crate::build::{Host, mount, tests::fixture};
+        let mut patch = fixture();
+        let held = mount(
+            crate::widget::button("Gain"),
+            Host::with(|h| h.model().root()),
+        );
+        let mut down = crate::seam::Down::default();
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        let row = down
+            .chrome
+            .iter()
+            .find(|row| row.wash.is_some())
+            .copied()
+            .unwrap();
+        let mut controls = Controls::new();
+        controls.rows.place(row.id, row);
+        controls.hovered = Some(row.id);
+        controls.observed_hover = Some(row.id);
+        controls.pressed = Some(row.id);
+        controls.grabbed = Some((row.id, 0.5));
+        controls.dragged = Some((row.id, true));
+        down.clear();
+        drop(held);
+        Host::with(|h| {
+            h.flush(&mut patch);
+            h.fill(&mut down);
+        });
+        assert!(down.released.contains(&row.id));
+        for &id in &down.released {
+            controls.release(id);
+        }
+        assert!(
+            controls.rows.get(row.id).is_none(),
+            "late reports cannot find a destroyed wash"
+        );
+        assert!(controls.hovered.is_none() && controls.observed_hover.is_none());
+        assert!(
+            controls.pressed.is_none() && controls.grabbed.is_none() && controls.dragged.is_none()
+        );
+    }
+
+    #[test]
+    fn native_adoption_ignores_late_input_after_a_control_unmounts() -> Result<()> {
+        use crate::build::{Host, mount, tests::fixture};
+        use windows_window::{Apartment, Window, ensure_dispatcher_queue};
+        ensure_dispatcher_queue(Apartment::Asta)?;
+        let _ = fixture();
+        let (env, scope) = Host::with(|h| (h.env, h.root_scope));
+        let mut model = windows_scene::Model::new(crate::layout::root());
+        model.set_window(windows_numerics::Vector2 { x: 800.0, y: 600.0 });
+        Host::install(model, env, scope);
+        let window = Window::new("control lifetime regression")
+            .size_dips(800.0, 600.0)
+            .create()?;
+        let back = Backends::new(
+            windows_composition::Compositor::new()?,
+            &windows_d2d::Gpu::for_window()?,
+            windows_text::FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"]),
+        )?;
+        let mut scene = Scene::new_at(
+            window.handle(),
+            &back,
+            env,
+            windows_scene::BackdropSpec::default(),
+        )?;
+        let mut controls = Controls::new();
+        let mut down = crate::seam::Down::default();
+        let root = Host::with(|h| h.model().root());
+        let held = mount(crate::widget::button("Gain"), root);
+        Host::with(|h| {
+            h.flush(&mut down.patch);
+            h.fill(&mut down);
+        });
+        let id = down
+            .chrome
+            .iter()
+            .find(|row| row.wash.is_some())
+            .unwrap()
+            .id;
+        scene.apply(&mut down.patch, &back, env)?;
+        let mut front = Front {
+            scene: &mut scene,
+            back: &back,
+            env,
+        };
+        controls.adopt(&down.chrome, &down.released, &mut front)?;
+        let mut intents = Vec::new();
+        controls.tick(
+            &[Report::HoverChanged {
+                from: None,
+                to: Some(id),
+                at: Default::default(),
+                qpc: 0,
+            }],
+            &mut front,
+            &mut intents,
+        )?;
+        down.clear();
+        drop(held);
+        let _replacement = mount(crate::widget::button("replacement"), root);
+        Host::with(|h| {
+            h.flush(&mut down.patch);
+            h.fill(&mut down);
+        });
+        front.scene.apply(&mut down.patch, &back, env)?;
+        controls.adopt(&down.chrome, &down.released, &mut front)?;
+        intents.clear();
+        let replacement = down
+            .chrome
+            .iter()
+            .find(|row| row.wash.is_some())
+            .unwrap()
+            .id;
+        controls.pressed = Some(replacement);
+        controls.grabbed = Some((replacement, 0.5));
+        controls.dragged = Some((replacement, true));
+        controls.tick(
+            &[
+                Report::HoverChanged {
+                    from: Some(id),
+                    to: None,
+                    at: Default::default(),
+                    qpc: 0,
+                },
+                Report::Canceled {
+                    target: id,
+                    contact: 1,
+                },
+                Report::Released {
+                    target: id,
+                    contact: 1,
+                    at: Default::default(),
+                },
+            ],
+            &mut front,
+            &mut intents,
+        )?;
+        controls.automation(&[crate::uia::Action::Invoke(id)], &mut front, &mut intents)?;
+        assert!(
+            intents.is_empty(),
+            "retired generations cannot move visuals or invoke callbacks"
+        );
+        assert!(controls.rows.get(id).is_none());
+        assert_eq!(controls.pressed, Some(replacement));
+        assert_eq!(controls.grabbed, Some((replacement, 0.5)));
+        assert_eq!(controls.dragged, Some((replacement, true)));
+        Ok(())
+    }
 
     /// Two distinct control ids, minted rather than constructed: a slot and a generation are
     /// the arena's to assign and this crate cannot spell one.

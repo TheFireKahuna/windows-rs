@@ -161,6 +161,22 @@ impl TrackerState {
 }
 
 impl crate::Scene {
+    /// Offers a captured contact to a live tracker's compositor-owned input source.
+    pub fn redirect_manipulation<O>(
+        &self,
+        id: crate::sink::TrackerId<O>,
+        pointer: &windows_composition::ManipulationPointer,
+    ) -> windows_core::Result<()> {
+        if let Some(source) = self
+            .trackers
+            .get(id.raw)
+            .and_then(|state| state.source.as_ref())
+        {
+            source.try_redirect_for_manipulation(pointer)?;
+        }
+        Ok(())
+    }
+
     /// Returns the word `id` publishes its reported position into, or `None` where no such
     /// tracker is live.
     ///

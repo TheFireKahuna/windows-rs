@@ -107,10 +107,6 @@ impl Frame {
             for &(target, decl) in &inbound.gestures {
                 self.router.declare(target, decl);
             }
-            for &target in &inbound.released {
-                self.router.forget(target);
-                self.text.forget(target)?;
-            }
             if inbound.regions_changed {
                 self.picks.sync(&inbound.regions);
             }
@@ -129,6 +125,12 @@ impl Frame {
             }
             for layout in &inbound.field_layouts {
                 self.text.layout(layout);
+            }
+            // This mailbox also accumulates batches. Retirement wins over an earlier
+            // declaration, including a text source whose owner closed while input waited.
+            for &target in &inbound.released {
+                self.router.forget(target);
+                self.text.forget(target)?;
             }
             if let Some(seeds) = inbound.seeds.as_ref() {
                 self.uia.borrow_mut().publish(self.hits.entries(), seeds);

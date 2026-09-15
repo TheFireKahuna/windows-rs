@@ -822,6 +822,14 @@ pub(crate) fn front(
     }
     for report in reports {
         match *report {
+            Report::Redirect { target, pointer } => table.where_(
+                |row| row.control == Some(target),
+                |row| {
+                    if let Err(error) = front.scene.redirect_manipulation(row.front.tracker, &pointer) {
+                        failed.get_or_insert(error);
+                    }
+                },
+            ),
             Report::HoverChanged { from, to, .. } => {
                 for (id, over) in [(from, false), (to, true)] {
                     let Some(id) = id else { continue };

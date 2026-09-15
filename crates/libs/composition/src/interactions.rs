@@ -25,6 +25,25 @@ use super::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RequestId(pub i32);
 
+/// A pointer frame captured while its window message owns the system's input record.
+/// Passing the snapshot to the compositor thread avoids querying a retired pointer id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManipulationPointer(bindings::POINTER_INFO);
+
+// SAFETY: this is a copied input record. Its HWND and device handle are opaque identities;
+// no pointer is dereferenced, and redirection reads the record only for the duration of a call.
+unsafe impl Send for ManipulationPointer {}
+
+impl ManipulationPointer {
+    /// Captures the current frame on the thread handling this pointer's message.
+    pub fn capture(pointer_id: u32) -> Result<Self> {
+        let mut info = bindings::POINTER_INFO::default();
+        // SAFETY: the system validates the id and writes exactly one stack-owned record.
+        unsafe { bindings::GetPointerInfo(pointer_id, &mut info).ok()? };
+        Ok(Self(info))
+    }
+}
+
 /// Which manipulations an axis of a [`VisualInteractionSource`] drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceMode {
@@ -691,20 +710,12 @@ impl VisualInteractionSource {
     /// meaning the contact was never handed over. Treat the pointer as redirected only
     /// once the window stops being told about it.
     ///
-    /// `pointer_id` is the id a `WM_POINTER*` message carries; the contact's state is read
-    /// here. An `Err` is a pointer id the system no longer knows — the ordinary race
-    /// between a message being handled and the contact ending, not a failure to redirect.
-    pub fn try_redirect_for_manipulation(&self, pointer_id: u32) -> Result<()> {
-        let mut info = bindings::POINTER_INFO::default();
-        // SAFETY: `info` is a stack local of the layout the system writes, live for the
-        // whole call. `pointer_id` is validated by the system, so a stale or invented id
-        // fails the call rather than reading anything.
-        unsafe { bindings::GetPointerInfo(pointer_id, &mut info).ok()? };
-
+    /// The frame must be captured while handling its window message, before handing it
+    /// to the thread that owns this source.
+    pub fn try_redirect_for_manipulation(&self, pointer: &ManipulationPointer) -> Result<()> {
         let interop: bindings::IVisualInteractionSourceInterop = self.0.cast()?;
-        // SAFETY: `info` was just filled by the system and outlives the call, which reads it
-        // and retains nothing.
-        unsafe { interop.TryRedirectForManipulation(&info).ok() }
+        // SAFETY: the captured record outlives the call, which reads it and retains nothing.
+        unsafe { interop.TryRedirectForManipulation(&pointer.0).ok() }
     }
 }
 

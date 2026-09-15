@@ -244,7 +244,8 @@ impl<'a> Thread<'a> {
                 back: &self.backends,
                 env: self.env,
             };
-            self.controls.adopt(&down.chrome, &mut front)?;
+            self.controls
+                .adopt(&down.chrome, &down.released, &mut front)?;
         }
         self.scrolls.apply_ops(&mut down.scrolls);
         if let Some(ids) = down.caption {
@@ -403,6 +404,7 @@ impl<'a> Thread<'a> {
                                 | Report::Dragged { .. }
                                 | Report::Buttons { .. }
                                 | Report::Wheel { .. }
+                                | Report::Redirect { .. }
                         )
                     })
                     .copied(),

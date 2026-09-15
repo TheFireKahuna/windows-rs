@@ -468,9 +468,6 @@ impl<K> El<K> {
     /// Makes this container scroll: a tracker on its own box, and the content bound to it.
     pub(crate) fn scrolls(self, decl: crate::layout::ScrollDecl) -> Self {
         Build::with(|b| {
-            // Redirect hands touch to the tracker rather than to a recogniser, so a fling
-            // keeps running while the front thread is busy. Only a scroll surface sets it.
-            b.gesture_mut(self.at, |decl| decl.redirect = true);
             let slot = &mut b.nodes[self.at as usize];
             slot.scroll = Some(decl);
             add_flags(

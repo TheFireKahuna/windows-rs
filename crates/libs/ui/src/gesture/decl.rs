@@ -21,9 +21,6 @@ pub struct GestureDecl {
     /// A knob. Present means single-pointer rotation around a declared centre.
     pub pivot: Option<PivotDecl>,
     pub touch: TouchTargetDecl,
-    /// Hand touch to an `InteractionTracker` instead of to a recogniser. A scroll surface
-    /// wants this; a knob must not have it.
-    pub redirect: bool,
     /// A drag whose meaning depends on its direction.
     pub drag: Option<DragDecl>,
     /// Rotary interest — resolution and step for `RadialController`.
@@ -42,7 +39,6 @@ impl Default for GestureDecl {
             hold: HoldTuning::default(),
             pivot: None,
             touch: TouchTargetDecl::Inflate,
-            redirect: false,
             drag: None,
             rotary: None,
         }

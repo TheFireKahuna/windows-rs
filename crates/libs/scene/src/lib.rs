@@ -72,6 +72,7 @@ use windows_composition::{
     VisualInteractionSource,
 };
 use windows_numerics::{Vector2, Vector3};
+pub use windows_composition::ManipulationPointer;
 
 /// Carries what the front half reports upward.
 ///

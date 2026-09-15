@@ -19,6 +19,9 @@ use windows_scene::{ControlId, Point};
 
 /// What one contact is doing, and to what.
 pub struct Bound {
+    /// A touch offered to a scroll ancestor invokes its child only after a recognised tap.
+    pub scroll_touch: bool,
+    pub tapped: bool,
     pub target: ControlId,
     pub decl: GestureDecl,
     /// The contact's down point, in client DIPs, **raw** — a press target is a discrete
@@ -134,6 +137,8 @@ impl RecognizerPool {
         recognizer.configure(&decl)?;
         let drag = decl.drag.map(|drag| Drag::new(drag, origin));
         Ok(self.bound.entry(id).or_insert(Bound {
+            scroll_touch: false,
+            tapped: false,
             target,
             decl,
             origin,

@@ -58,6 +58,7 @@ mod dynamic;
 mod focus;
 mod inertia;
 mod sample;
+mod scroll;
 mod service;
 
 pub use capability::{Capability, Devices, Interaction};
@@ -95,6 +96,11 @@ use windows_window::{Tick, Wake, Window};
 /// exists only after the visual it belongs to, and can never be the cause of one.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Report {
+    /// Offers a touch press to its nearest scrolling ancestor. Scene-thread only.
+    Redirect {
+        target: ControlId,
+        pointer: windows_scene::ManipulationPointer,
+    },
     /// A hover boundary was crossed. One tick can publish several, in the order the pointer
     /// crossed them: a fast flick over a toolbar publishes every crossing on the path, and
     /// the layer that owns the chrome decides which of them light anything.
@@ -247,7 +253,7 @@ pub struct Router {
     /// The window's dial. `None` means no radial controller is attached.
     rotary: Option<Rotary>,
     rotations: Vec<Rotation>,
-    /// The contact that owns input while it is down.
+    /// The mouse contact holding explicit Win32 capture. Touch routing is system-owned.
     capture: Option<u32>,
     inertia: Inertia,
     capability: Capability,
@@ -408,8 +414,7 @@ impl Router {
         let mut ids = core::mem::take(&mut self.target_ids);
         self.pool.bound_to(target, &mut ids);
         for &id in &ids {
-            self.pool.release(id, true);
-            self.census.aborts += 1;
+            self.cancel_contact(id);
         }
         ids.clear();
         self.target_ids = ids;
@@ -522,15 +527,16 @@ impl Router {
                 }
                 Ok(())
             }
-            EventKind::CaptureLost if self.pool.live() > 0 || self.capture.is_some() => {
-                self.pool.release_all(true);
-                self.census.aborts += 1;
-                self.capture = None;
-                self.events.clear();
-                out.push(Report::CaptureLost);
+            EventKind::CaptureLost if event.id != 0 => {
+                self.abort(event.id, out);
                 Ok(())
             }
-            EventKind::CaptureLost => Ok(()),
+            EventKind::CaptureLost => {
+                if let Some(id) = self.capture {
+                    self.abort(id, out);
+                }
+                Ok(())
+            }
             EventKind::Wheel => self.wheel(event, hits, env, out),
         }
     }
@@ -591,18 +597,15 @@ impl Router {
         // press wash, holds its pool slot for the life of the window, and loses the tap,
         // because a tap is a press and a release on one control.
         let decl = self.decls.get(&hit.id).copied().unwrap_or_default();
-        // A scroll surface hands touch to its `InteractionTracker`, which keeps a fling
-        // running while the front thread is busy. The contact leaves this stack, so no up
-        // arrives here for it; `resolve_hover` reads the doorbell's own down state to cover
-        // that case.
-        if decl.redirect {
-            return Ok(());
-        }
-
-        self.capture = Some(event.id);
+        // Offer ordinary content touches to the nearest scroll ancestor. Keep the local
+        // recogniser until capture is actually lost: a tap may never become a manipulation.
+        let scroll = (event.ptype == PointerType::Touch && !rejected)
+            .then(|| scroll::touch(hits, hit, decl))
+            .flatten();
         // A contact routes to its down-window for its life. Mouse is the one device that can
         // leave the window without lifting, so capture is what keeps it routed here.
         if event.ptype == PointerType::Mouse {
+            self.capture = Some(event.id);
             // SAFETY: `SetCapture` takes the window handle by value and writes through no
             // pointer; a handle whose window has been destroyed fails the call rather than
             // being dereferenced.
@@ -611,17 +614,38 @@ impl Router {
             }
         }
 
-        self.pool
-            .bind(event.id, event.ptype, hit.id, decl, at, rejected)?;
-        self.census.bindings += 1;
-        if !rejected {
-            let point = event.point()?;
-            if let Some(bound) = self.pool.get(event.id) {
-                bound.recognizer().down(point)?;
+        let started = (|| {
+            self.pool
+                .bind(event.id, event.ptype, hit.id, decl, at, rejected)?;
+            if let Some(bound) = self.pool.get_mut(event.id) {
+                bound.scroll_touch = scroll.is_some();
             }
-            self.collect(event.id, out);
+            self.census.bindings += 1;
+            if !rejected {
+                let point = event.point()?;
+                if let Some(bound) = self.pool.get(event.id) {
+                    bound.recognizer().down(point)?;
+                }
+                self.collect(event.id, out);
+            }
+            if let Some(target) = scroll
+                && let Some(pointer) = event.manipulation.as_ref()
+            {
+                out.push(Report::Redirect {
+                    target,
+                    pointer: *pointer.as_ref().map_err(Clone::clone)?,
+                });
+            }
+            Ok(())
+        })();
+        if started.is_err() {
+            out.push(Report::Canceled {
+                target: hit.id,
+                contact: event.id,
+            });
+            self.cancel_contact(event.id);
         }
-        Ok(())
+        started
     }
 
     fn up(&mut self, event: PointerEvent, env: Env, out: &mut Vec<Report>) -> Result<()> {
@@ -639,15 +663,21 @@ impl Router {
             self.bell.release(event.id);
             return Ok(());
         };
-        let (target, rejected) = (bound.target, bound.rejected);
-        // Published before the recogniser is told, as the press is. The release clears the
-        // press wash, frees the binding and completes a tap, so a recogniser that refuses the
-        // final sample must not be able to suppress it.
-        out.push(Report::Released {
-            target,
-            contact: event.id,
-            at,
-        });
+        let (target, rejected, scroll_touch) = (bound.target, bound.rejected, bound.scroll_touch);
+        // Ordinary releases are unconditional. Scrollable touch content waits for the
+        // recogniser's tap decision, then clears its press through release or cancellation.
+        if rejected {
+            out.push(Report::Canceled {
+                target,
+                contact: event.id,
+            });
+        } else if !scroll_touch {
+            out.push(Report::Released {
+                target,
+                contact: event.id,
+                at,
+            });
+        }
         let fed = if rejected {
             Ok(())
         } else {
@@ -658,6 +688,24 @@ impl Router {
             })
         };
         self.collect(event.id, out);
+        // A quick swipe may finish before the compositor takes capture. Only an actual
+        // recogniser tap can invoke the child control in that case.
+        if scroll_touch {
+            out.push(
+                if self.pool.get(event.id).is_some_and(|bound| bound.tapped) {
+                    Report::Released {
+                        target,
+                        contact: event.id,
+                        at,
+                    }
+                } else {
+                    Report::Canceled {
+                        target,
+                        contact: event.id,
+                    }
+                },
+            );
+        }
         // Inertia keeps the binding alive: the contact is gone but its motion is not, and the
         // recogniser running that motion is the one being pumped.
         let inertial = self
@@ -682,6 +730,11 @@ impl Router {
                 contact: id,
             });
         }
+        self.cancel_contact(id);
+    }
+
+    /// The same teardown for an OS cancellation, an unmounted target, or a failed handoff.
+    fn cancel_contact(&mut self, id: u32) {
         self.pool.release(id, true);
         self.census.aborts += 1;
         if self.capture == Some(id) {
@@ -706,7 +759,10 @@ impl Router {
         let hit = hits.hit_with(at, event.ptype.contact(), &self.shadows);
         // A scroll surface's wheel belongs to its tracker: the source's `PointerWheelConfig`
         // takes it, and handling it front-side here would be a second scroll path.
-        if hit.is_some_and(|hit| hit.flags.contains(HitFlags::SCROLL)) {
+        if hit.is_some_and(|hit| {
+            (hit.flags.contains(HitFlags::SCROLL) || !hit.flags.contains(HitFlags::WHEEL))
+                && scroll::ancestor(hits, hit).is_some()
+        }) {
             return Ok(());
         }
         if let Some(hit) = hit
@@ -866,6 +922,7 @@ impl Router {
         let mut inertial = None;
         for event in recognised.drain(..) {
             match event {
+                Recognised::Tapped { .. } => bound.tapped = true,
                 Recognised::ManipulationStarted { .. } => bound.manipulating = true,
                 Recognised::ManipulationUpdated { .. } => {
                     // Restated per update rather than set once at down: the platform requires
@@ -917,9 +974,9 @@ impl Router {
     /// `PointerPoint`, so this per-frame path allocates nothing.
     fn resolve_hover(&mut self, hits: &HitTable, env: Env, out: &mut Vec<Report>, moved: bool) {
         // A contact owns the pointer while it is down: hover chrome must not chase a drag.
-        // `capture` covers a contact this router bound; `is_down` covers one it did not — a
-        // touch contact redirected to a scroll surface's tracker.
-        if self.capture.is_some() {
+        // The pool covers bound contacts; `is_down` covers a contact already handed to a
+        // scroll surface's tracker.
+        if self.pool.live() > 0 {
             return;
         }
         if self.bell.hovering().is_some_and(|id| self.bell.is_down(id)) {

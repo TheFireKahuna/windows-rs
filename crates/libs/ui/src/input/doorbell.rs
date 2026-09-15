@@ -202,6 +202,7 @@ pub struct PointerEvent {
     /// The recogniser's point, retained before the pump retrieves another message and the
     /// system may retire this pointer. Aborts and button changes need no recogniser point.
     point: Option<Result<PointerPoint>>,
+    pub(super) manipulation: Option<Result<windows_scene::ManipulationPointer>>,
 }
 
 impl PointerEvent {
@@ -474,6 +475,8 @@ impl Doorbell {
             horizontal: false,
             time: info.dwTime,
             point: matches!(kind, EventKind::Down | EventKind::Up).then(|| self.point(id, &info)),
+            manipulation: (kind == EventKind::Down && ptype == PointerType::Touch)
+                .then(|| windows_scene::ManipulationPointer::capture(id)),
         }));
         self.skip_frame(id);
         Some(0)
@@ -494,6 +497,7 @@ impl Doorbell {
             horizontal: false,
             time: 0,
             point: None,
+            manipulation: None,
         }));
     }
 
@@ -586,6 +590,7 @@ impl Doorbell {
             horizontal,
             time: if read { info.dwTime } else { 0 },
             point: Some(self.point(id, &info)),
+            manipulation: None,
         }));
         Some(0)
     }
@@ -827,6 +832,101 @@ const fn pointer_id(wparam: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_handoff_unmount_and_palm_release_preserve_contact_ownership() -> Result<()> {
+        use crate::gesture::GestureDecl;
+        use crate::input::{Report, Router};
+        use windows_scene::{Control, Env, HitTable, Ids};
+        use windows_window::{Apartment, Window, ensure_dispatcher_queue};
+        ensure_dispatcher_queue(Apartment::Asta)?;
+        let window = Window::new("contact lifetime regression")
+            .pointer_input()
+            .create()?;
+        let pacer = window.pacer()?;
+        let bell = Rc::new(Doorbell::new());
+        let mut router = Router::new(&bell, &window, pacer.wake())?;
+        let mut ids = Ids::<Control>::new();
+        let a = ids.mint();
+        let b = ids.mint();
+        let env = Env::new(
+            96.0,
+            windows_color::OutputTransform::for_display(
+                windows_color::DisplayCapability::Sdr,
+                1000.0,
+            ),
+        );
+        let hits = HitTable::default();
+        let event = |id, kind| PointerEvent {
+            id,
+            kind,
+            ptype: PointerType::Touch,
+            buttons: 0,
+            flags: PointerFlags(0),
+            x_px: 0,
+            y_px: 0,
+            wheel: 0,
+            horizontal: false,
+            time: 0,
+            point: None,
+            manipulation: None,
+        };
+        router.pool.bind(
+            1,
+            PointerType::Touch,
+            a,
+            GestureDecl::tap(),
+            Default::default(),
+            false,
+        )?;
+        router.pool.bind(
+            2,
+            PointerType::Touch,
+            b,
+            GestureDecl::tap(),
+            Default::default(),
+            true,
+        )?;
+        let mut out = Vec::new();
+        router.pointer(event(1, EventKind::CaptureLost), &hits, env, &mut out)?;
+        assert_eq!(
+            out,
+            [Report::Canceled {
+                target: a,
+                contact: 1
+            }]
+        );
+        assert!(router.pool.get(1).is_none() && router.pool.get(2).is_some());
+        out.clear();
+        router.pointer(event(0, EventKind::CaptureLost), &hits, env, &mut out)?;
+        assert!(
+            out.is_empty() && router.pool.get(2).is_some(),
+            "a delayed mouse capture notification cannot cancel touch"
+        );
+        router.up(event(2, EventKind::Up), env, &mut out)?;
+        assert_eq!(
+            out,
+            [Report::Canceled {
+                target: b,
+                contact: 2
+            }],
+            "a rejected palm never invokes a control"
+        );
+        router.pool.bind(
+            3,
+            PointerType::Mouse,
+            a,
+            GestureDecl::tap(),
+            Default::default(),
+            false,
+        )?;
+        router.capture = Some(3);
+        router.declare(a, GestureDecl::tap());
+        router.forget(a);
+        assert!(router.pool.get(3).is_none() && router.capture.is_none());
+        assert!(!router.decls.contains_key(&a));
+        Ok(())
+    }
 
     fn wparam(id: u32, flags: i32) -> usize {
         (id as usize) | ((flags as u32 as usize) << 16)
