@@ -32,8 +32,14 @@ use windows_numerics::Vector2;
 /// names a route. A clip-route sprite that later receives a trim, a dash phase or its own
 /// clip is promoted onto the capture with the same geometry, so a shape's clip colliding
 /// with the sink's own costs a promotion rather than a wrong render.
-pub(crate) fn route(stroke: Option<StrokeStyle>, draws_on: bool, clip_taken: bool) -> Route {
-    if stroke.is_some() || draws_on || clip_taken {
+/// A halo also requires brush alpha: clipping the visual cuts off its own shadow.
+pub(crate) fn route(
+    stroke: Option<StrokeStyle>,
+    draws_on: bool,
+    clip_taken: bool,
+    halo: bool,
+) -> Route {
+    if stroke.is_some() || draws_on || clip_taken || halo {
         Route::Capture
     } else {
         Route::Clip
@@ -182,7 +188,13 @@ impl Realizer<'_> {
 
             Mask::Shape { geom, stroke } => {
                 let clip_taken = node.clip.is_some();
-                match route(stroke, draws_on(node), clip_taken) {
+                // A geometric clip also clips this visual's shadow. A halo needs the
+                // shape in brush alpha so its falloff can extend past the filled outline.
+                let halo = node
+                    .painted
+                    .as_ref()
+                    .is_some_and(|painted| painted.halo.is_some());
+                match route(stroke, draws_on(node), clip_taken, halo) {
                     Route::Clip => {
                         self.geometric_clip(node, geom);
                         Ok((None, Route::Clip, NO_INSETS))
@@ -512,11 +524,25 @@ pub(crate) fn fit(radius: Corners, size: Vector2, scale: f32) -> Corners {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit, nine_slice};
+    use super::{fit, nine_slice, route};
     use crate::cache::BoxKey;
+    use crate::node::Route;
     use crate::quant::snap_detail;
     use crate::sink::Corners;
     use windows_numerics::Vector2;
+
+    #[test]
+    fn a_filled_shape_with_a_halo_uses_alpha_instead_of_clipping_its_shadow() {
+        assert!(matches!(route(None, false, false, false), Route::Clip));
+        for draws_on in [false, true] {
+            for clip_taken in [false, true] {
+                assert!(matches!(
+                    route(None, draws_on, clip_taken, true),
+                    Route::Capture
+                ));
+            }
+        }
+    }
 
     /// A rounded box's corner is cut whole and painted at the size it was drawn.
     ///

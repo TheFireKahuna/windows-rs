@@ -349,8 +349,10 @@ impl<K> El<K> {
     /// mistake rather than a no-op.
     ///
     /// The compositor derives the shape from the alpha the node already paints, so a halo
-    /// costs **no visual and no capture** — which is what makes one affordable on every card
-    /// in a chain. It casts from the node's fill, or from its glyphs where it paints no fill.
+    /// needs no extra visual or capture for boxes and glyphs. A filled path uses a retained
+    /// shape-alpha capture instead of a geometric clip, which would clip its own shadow;
+    /// keep small handles in small local boxes. It casts from the node's fill, or from its
+    /// glyphs where it paints no fill.
     ///
     /// A halo escapes the node's own box but not an explicit clip on an ancestor, so a halo
     /// inside a container that rounds its own corners is cut at that container.
