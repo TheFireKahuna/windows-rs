@@ -94,7 +94,7 @@ pub(crate) struct ControlRow {
     pub tip: Option<(Rc<TextSource>, crate::overlay::Side)>,
     pub flyout: Option<Rc<dyn Fn(&mut super::Ui<'_>)>>,
     pub uia: UiaRole,
-    pub name: Option<&'static str>,
+    pub name: Option<std::borrow::Cow<'static, str>>,
     /// The first text registered by this control's children supplies its accessible name
     /// where [`name`](Self::name) is unset. Nested controls register their own text.
     pub text: Option<MeasureKey>,
@@ -526,7 +526,7 @@ impl Host {
             if control.uia == UiaRole::None {
                 continue;
             }
-            let name = match control.name {
+            let name = match control.name.as_deref() {
                 Some(explicit) => out.intern(explicit),
                 // Interned rather than borrowed, so an explicit name and a derived one — which
                 // is not `'static` — take one path.
@@ -1214,8 +1214,8 @@ impl Host {
     }
 
     /// Returns the control's explicit accessible name, which a menu's type-ahead matches on.
-    pub(crate) fn name_of(&self, target: ControlId) -> Option<&'static str> {
-        self.control(target).and_then(|control| control.name)
+    pub(crate) fn name_of(&self, target: ControlId) -> Option<&str> {
+        self.control(target).and_then(|control| control.name.as_deref())
     }
 
     /// Pushes a placement row for the overlay opening at `depth`.

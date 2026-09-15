@@ -411,9 +411,10 @@ impl<K> Element<'_, K> {
         self
     }
 
-    pub fn name(mut self, name: &'static str) -> Self {
+    /// Literal names stay borrowed; generated names are released with the control.
+    pub fn name(mut self, name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         let id = self.control_id(HitFlags::UIA);
-        self.host.controls.get_mut(id).unwrap().name = Some(name);
+        self.host.controls.get_mut(id).unwrap().name = Some(name.into());
         self.host.uia_restale();
         self
     }
