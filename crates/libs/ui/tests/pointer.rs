@@ -360,19 +360,10 @@ fn a_refused_inertia_report_is_not_recorded_as_made() {
     );
 }
 
-/// Asserts that a press produces a release whatever its target declared and whatever the
-/// platform hands back for the contact.
-///
-/// A control that declares no gesture has no entry in the router's declaration table, so a
-/// down binds the contact regardless. Without that binding the up reports nothing, which
-/// latches the press wash, holds the pool slot for the life of the window, and loses the tap,
-/// since a tap is a press and a release on one control.
-///
-/// The target here declares nothing, and the tick is allowed to fail: a synthetic contact has
-/// no pointer behind it, so the platform hands back no point for it. A refused sample still
-/// must not delete a contact's end.
+/// Every reported press ends once, even without a gesture declaration. Failed pointer
+/// startup cancels immediately; a later up must not turn that failed press into a click.
 #[test]
-fn a_press_on_an_undeclared_target_still_reports_its_release() {
+fn an_undeclared_press_ends_even_when_pointer_startup_fails() {
     let bell = Rc::new(Doorbell::new());
     let window = window("windows-ui — undeclared release");
     let pacer = window.pacer().expect("a window can be paced");
@@ -399,7 +390,7 @@ fn a_press_on_an_undeclared_target_still_reports_its_release() {
 
     let mut reports = Vec::new();
     bell.wndproc(WM_POINTERDOWN, wparam(1, 0x2000), 0);
-    let _ = router.tick(&hits, env(), &mut reports);
+    let started = router.tick(&hits, env(), &mut reports);
     assert!(
         reports
             .iter()
@@ -407,19 +398,33 @@ fn a_press_on_an_undeclared_target_still_reports_its_release() {
         "the press was not reported at all: {reports:?}"
     );
     assert_eq!(
-        router.census().bindings,
-        1,
-        "a target that declared no gesture was pressed and never tracked, so nothing can \
-         account for its up"
+        reports
+            .iter()
+            .filter(
+                |report| matches!(report, Report::Canceled { target: id, .. } if *id == target())
+            )
+            .count(),
+        usize::from(started.is_err()),
+        "a failed startup must cancel its reported press exactly once"
     );
 
     reports.clear();
     bell.wndproc(WM_POINTERUP, wparam(1, 0), 0);
     let _ = router.tick(&hits, env(), &mut reports);
-    assert!(
+    assert_eq!(
         reports
             .iter()
-            .any(|report| matches!(report, Report::Released { .. })),
-        "the release was lost: {reports:?}"
+            .filter(
+                |report| matches!(report, Report::Released { target: id, .. } if *id == target())
+            )
+            .count(),
+        usize::from(started.is_ok()),
+        "only a successfully started contact can release: {reports:?}"
+    );
+    assert!(
+        !reports
+            .iter()
+            .any(|report| matches!(report, Report::Canceled { .. })),
+        "up must not cancel an ended contact again"
     );
 }

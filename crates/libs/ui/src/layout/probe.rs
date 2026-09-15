@@ -17,7 +17,7 @@
 use crate::role::WidthClass;
 use crate::signal::Cell;
 use windows_numerics::Vector2;
-use windows_scene::{NodeId, Rect, Solved};
+use windows_scene::{Rect, Solved};
 
 /// Where the solve put a node.
 ///
@@ -64,13 +64,13 @@ impl From<Solved> for Placed {
 /// ```no_run
 /// # use windows_ui::layout::{probe, stack};
 /// # use windows_ui::widget::{caption, shown};
-/// # fn f() -> windows_ui::build::View {
+/// # fn f(ui: &mut windows_ui::build::Ui<'_>) {
 /// let row = probe();
-/// stack((
-///     caption("a row").probed(row),
+/// stack(ui, |ui| {
+///     caption(ui, "a row").probed(row);
 ///     // Reads where the row landed, one tick later.
-///     caption(shown(move || row.get().rect.y0)),
-/// ))
+///     caption(ui, shown(move || row.get().rect.y0));
+/// });
 /// # }
 /// ```
 #[derive(Copy, Clone, Debug)]
@@ -102,14 +102,4 @@ impl Probe {
     pub(crate) const fn cell(self) -> Cell<Placed> {
         self.0
     }
-}
-
-/// One probed node, as the flush needs it.
-///
-/// Holds no copy of the last published box: [`Cell::set`] compares before it propagates, so
-/// the cell is the only record of whether this node moved.
-pub(crate) struct ProbeRow {
-    pub node: NodeId,
-    pub cell: Cell<Placed>,
-    pub scope: crate::role::Scope,
 }

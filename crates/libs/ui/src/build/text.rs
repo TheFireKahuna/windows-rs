@@ -26,15 +26,14 @@ use windows_text::{FontLadder, FontSpec, SegBuffers, ShapedRun, TextEngine};
 ///
 /// A coverage tile covers **one line**, so a run that can break needs one sprite per line.
 /// Wrapping and vertical text use a group; a horizontal static label costs one visual.
-/// Which case an entry takes is decided by the widget's seed rather than by its content.
+/// Which case an entry takes is decided by the widget's text recipe rather than by its content.
 enum Target {
     /// One line, always: the node is the sprite.
     Line {
         sprite: SpriteId,
         run: Option<RunId>,
     },
-    /// One sprite per line. A vertical label adds a box with exchanged axes around
-    /// its rotated sprite, so layout and paint describe the same extent.
+    /// One derived sprite per line, positioned within the measured owner.
     Wrapped {
         group: GroupId,
         lines: Vec<Line>,
@@ -43,10 +42,8 @@ enum Target {
 }
 
 struct Line {
-    layout: NodeId,
     sprite: SpriteId,
     run: RunId,
-    size: Vector2,
 }
 
 /// The string a run is laid out from.
@@ -62,24 +59,37 @@ pub(crate) enum Source {
     Owned(String),
 }
 
-impl From<&TextSource> for Source {
-    /// Snapshots a text source for the table.
-    ///
-    /// A static string crosses as a **borrow**; the other two hand over a string of their
-    /// own, so nothing is copied twice.
-    fn from(source: &TextSource) -> Self {
-        match source {
-            TextSource::Static(s) => Self::Static(s),
-            TextSource::Owned(s) => Self::Owned(s.clone()),
-            // The one allocation a reactive run makes at mount, and it is a buffer it keeps:
-            // every later change is written into it in place.
-            TextSource::Dynamic(_) => {
-                let mut owned = String::new();
-                source.append(&mut owned);
-                Self::Owned(owned)
-            }
-        }
+/// Moves initial text into the retained table and defers reactive reads until creation ends.
+pub(super) fn install(
+    host: &mut super::Host,
+    node: NodeId,
+    mut mint: Mint,
+    source: TextSource,
+) -> MeasureKey {
+    let read;
+    (mint.text, read) = match source {
+        TextSource::Static(text) => (Source::Static(text), None),
+        TextSource::Owned(text) => (Source::Owned(text), None),
+        TextSource::Dynamic(read) => (Source::Static(""), Some(read)),
+    };
+    let key = host.text.mint(mint);
+    host.mounts.get_mut(node).unwrap().text = Some(key);
+    host.model
+        .measure(node, windows_scene::MeasureCtx::Measured(key));
+    if let Some(read) = read {
+        let mut scratch = String::new();
+        host.bind_to(node, super::binding::Destination::Text, move || {
+            scratch.clear();
+            read(&mut scratch);
+            super::Host::with(|host| {
+                if let Some(node) = host.text.set_text(key, &scratch) {
+                    host.model.remeasure(node);
+                    host.uia_restale();
+                }
+            });
+        });
     }
+    key
 }
 
 impl Source {
@@ -633,8 +643,8 @@ impl Entry {
     /// Makes a single line's box exactly its coverage, and answers whether that moved a box.
     ///
     /// Only [`Target::Line`], because that is the case where **the node is the sprite**: a
-    /// wrapping run owns line sprites of its own and sizes each to its own tile
-    /// ([`line_style`]), so its node is free to be whatever the container makes it.
+    /// wrapping run owns derived line sprites sized to their coverage tiles, so its
+    /// node is free to be whatever the container makes it.
     ///
     /// A single line has no such sprite behind it, so a container that stretches its children
     /// stretches the tile, and the tile's brush fills — the glyphs smear across the whole
@@ -664,10 +674,9 @@ impl Entry {
             return false;
         }
         let class = model.solved(node).class;
-        let Some(recipe) = styles.get(node) else {
+        let Some(mut style) = styles.lower(node, class) else {
             return false;
         };
-        let mut style = recipe.lower(class);
         style.size.width = taffy::Dimension::length(ink);
         model.style(node, &style);
         true
@@ -754,47 +763,21 @@ fn publish_lines(
     let count = run.lines().len();
     while lines.len() > count {
         let line = lines.pop().expect("the vector is longer than the run");
-        model.destroy(line.layout, windows_scene::Exit::None);
+        model.destroy(line.sprite.node(), windows_scene::Exit::None);
         model.release(line.run);
     }
+    let mut top = 0.0;
     for index in 0..count {
         let shaped = emit(engine, run, index, model.glyphs());
         let size = shaped.ink.size;
         if let Some(line) = lines.get_mut(index) {
             model.set_run(line.run, shaped.segs, shaped.ink);
-            if line.size != size {
-                line.size = size;
-                model.style(line.sprite.node(), &oriented_line_style(size, vertical));
-                if vertical {
-                    model.style(
-                        line.layout,
-                        &line_style(Vector2 {
-                            x: size.y,
-                            y: size.x,
-                        }),
-                    );
-                }
-            }
         } else {
-            let after = lines.last().map(|line| line.layout);
-            let (sprite, layout) = if vertical {
-                let box_ = model.group(group, after);
-                model.style(
-                    box_.node(),
-                    &line_style(Vector2 {
-                        x: size.y,
-                        y: size.x,
-                    }),
-                );
-                (model.sprite(box_, None), box_.node())
-            } else {
-                let sprite = model.sprite(group, after);
-                (sprite, sprite.node())
-            };
+            let after = lines.last().map(|line| line.sprite.node());
+            let sprite = model.visual(group, after);
             let id = model.run(shaped.segs, shaped.ink);
             model.mask(sprite, Mask::Run(id));
             model.paint(sprite, windows_scene::Paint::Solid(light));
-            model.style(sprite.node(), &oriented_line_style(size, vertical));
             if vertical {
                 model.bind(
                     sprite.node(),
@@ -804,49 +787,27 @@ fn publish_lines(
                     )),
                 );
             }
-            lines.push(Line {
-                layout,
-                sprite,
-                run: id,
-                size,
-            });
+            lines.push(Line { sprite, run: id });
         }
+        // Rotation is about the origin: one line-height of rightward translation
+        // keeps vertical coverage inside the owner's axis-swapped extent.
+        model.visual_rect(
+            lines[index].sprite,
+            Vector2 {
+                x: if vertical { size.y } else { 0.0 },
+                y: top,
+            },
+            size,
+        );
+        top += if vertical { size.x } else { size.y };
     }
     true
-}
-
-/// Returns one line's box: exactly its coverage tile.
-///
-/// Built here rather than through the [`Layout`](crate::layout::Layout) vocabulary because the
-/// number is the text engine's rather than an author's. This is the lowering resolving a
-/// measurement rather than a widget expressing a size, and `Len` cannot say it.
-fn oriented_line_style(size: Vector2, vertical: bool) -> taffy::Style {
-    let mut style = line_style(size);
-    if vertical {
-        // Rotation is about the origin. Moving right by the line's height keeps
-        // the whole tile inside the measured, axis-swapped parent.
-        style.position = taffy::Position::Absolute;
-        style.inset.left = taffy::LengthPercentageAuto::length(size.y);
-        style.inset.top = taffy::LengthPercentageAuto::length(0.0);
-    }
-    style
-}
-
-fn line_style(size: Vector2) -> taffy::Style {
-    taffy::Style {
-        size: taffy::Size {
-            width: taffy::Dimension::length(size.x),
-            height: taffy::Dimension::length(size.y),
-        },
-        flex_shrink: 0.0,
-        ..taffy::Style::DEFAULT
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::{Host, mount};
+    use crate::build::Host;
     use crate::layout::{Align, Len, Track, grid};
     use crate::signal::Cell;
     use crate::widget::{TextStyle, button, shown, styled_text};
@@ -859,25 +820,26 @@ mod tests {
             let mut patch = crate::build::tests::fixture_at(dpi);
             let word = Cell::new(LONG);
             let root = Host::with(|h| h.model().root());
-            let held = mount(
-                grid((
-                    styled_text(
-                        shown(move || word.get()),
-                        TextStyle {
-                            flow: Flow::Ellipsis,
-                            ..TextStyle::new(TypeRole::Title)
-                        },
-                    )
-                    .clip()
-                    .min_width(Len::Zero)
-                    .height(crate::role::Metric::RowH),
-                    button("Bypass"),
-                ))
-                .cols([Track::MinMax(Len::Zero, 1.0), Track::Auto])
-                .width(Len::Pct(1.0))
-                .align(Align::Center),
-                root,
-            );
+            let held =
+                crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
+                    grid(ui, |ui| {
+                        styled_text(
+                            ui,
+                            shown(move || word.get()),
+                            TextStyle {
+                                flow: Flow::Ellipsis,
+                                ..TextStyle::new(TypeRole::Title)
+                            },
+                        )
+                        .clip()
+                        .min_width(Len::Zero)
+                        .height(crate::role::Metric::RowH);
+                        button(ui, "Bypass");
+                    })
+                    .cols([Track::MinMax(Len::Zero, 1.0), Track::Auto])
+                    .width(Len::Pct(1.0))
+                    .align(Align::Center);
+                });
             let mut retained = None;
             let mut narrow_count = 0;
             for (value, width) in [
@@ -918,11 +880,12 @@ mod tests {
                             "the sprite and coverage slot survive edits"
                         );
                         let allocated = h.model.solved(group.node()).size.x;
+                        let size = h.model.solved(line.sprite.node()).size;
                         assert!(allocated < width, "the control retains its track");
                         assert!(
-                            line.size.x <= allocated + 2.0,
+                            size.x <= allocated + 2.0,
                             "{dpi}: glyphs exceed {allocated}: {:?}",
-                            line.size
+                            size
                         );
                         let mut glyphs = SegBuffers::default();
                         entry.run.segments(0, &mut glyphs);

@@ -329,7 +329,13 @@ pub struct Effect {
     marker: PhantomData<*const ()>,
 }
 
+/// Detached graph payload, dropped after the caller releases its runtime borrow.
+pub(crate) type RetiredEffect = Rc<RefCell<dyn FnMut()>>;
+
 impl Effect {
+    pub(crate) fn retire(self) -> Option<RetiredEffect> {
+        graph::retire_effect(self.id)
+    }
     /// Runs `f` now, and again whenever what it read changes.
     pub fn new(f: impl FnMut() + 'static) -> Self {
         Self {

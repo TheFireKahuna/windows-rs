@@ -20,11 +20,11 @@
 //! are `Tab` and `Shift-Tab` under different names and there is no second order to keep in
 //! step with the first.
 
-use crate::build::{Any, El, View};
-use crate::layout::Preset;
+use crate::build::{Element, Ui};
+use crate::layout::Len;
 use crate::role::{Metric, TypeRole};
 use crate::signal::Signal;
-use crate::widget::{Interaction, UiaRole, roles};
+use crate::widget::{Chrome, TextStyle, UiaRole, Wash, roles};
 use windows_scene::HitFlags;
 
 /// One row of a menu.
@@ -178,93 +178,73 @@ pub fn answers(name: Option<&str>, key: char) -> bool {
         == Some(key)
 }
 
-/// Returns a menu's body, for [`El::flyout`](crate::build::El::flyout) or for an overlay
-/// opened directly.
-///
-/// `items` runs immediately and is never stored, so it is bounded by neither `'static` nor
-/// `Fn`. Taking a closure rather than a list is what lets a menu that reports state read that
-/// state as it opens: the overlay layer calls a flyout's body at open time, and an `El` is an
-/// index into an arena the next mount clears.
-#[must_use]
-pub fn menu(items: impl FnOnce() -> Vec<MenuItem>) -> View {
-    rows(items())
+/// Declares a menu under the current parent. Items are consumed synchronously.
+pub fn menu<'a>(ui: &'a mut Ui<'_>, items: impl FnOnce() -> Vec<MenuItem>) -> Element<'a> {
+    rows(ui, items())
 }
 
-/// Returns one item lowered to its widget.
-fn row(item: MenuItem) -> View {
+fn row(ui: &mut Ui<'_>, item: MenuItem) {
     let Some(label) = item.label() else {
-        // A rule: one hairline sprite, no hit entry, no focus stop, no automation peer.
-        return El::<Any>::seed(Preset::Bare)
-            .chrome(roles::SURFACE, roles::SURFACE_FLYOUT, Metric::BorderW)
-            .height(Metric::BorderW);
+        let elevation = ui.scope().elevation;
+        ui.surface(
+            Chrome::new(
+                roles::SURFACE[roles::SURFACE_FLYOUT as usize],
+                Metric::BorderW,
+            ),
+            elevation,
+            |_| {},
+        )
+        .padding(Len::Zero)
+        .gap(Len::Zero)
+        .min_height(Len::Zero)
+        .height(Metric::BorderW);
+        return;
     };
-    let uia = item.role();
-    let stop = item.is_stop();
-
-    let base = El::<Any>::seed(Preset::Bare)
-        .control()
-        .chrome(roles::OPTION, 0, Metric::Radius)
-        .state(crate::widget::StatePolicy::Wash {
-            hover: crate::widget::Wash::Ink,
-            press: crate::widget::Wash::Ink,
-        })
-        .row(El::<Any>::seed(Preset::Text).text_seed(
-            label.into(),
-            TypeRole::Body,
-            None,
-            crate::widget::Flow::Line,
-            false,
-        ));
-
-    // The label is also the accessible name, which is what `answers` matches on, so
-    // type-ahead selects from the same candidates the arrow keys walk.
-    let base = base.name(label);
-
-    // A disabled item keeps its row and its automation peer and loses its target. The focus
-    // order is the hit array filtered to `INTERACTIVE`, so dropping that flag is the skip.
-    let base = if stop {
-        base.hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, uia)
-    } else {
-        base.hit(HitFlags::UIA, uia)
-    };
-
+    let role = item.role();
+    let enabled = item.is_stop();
+    let base = ui
+        .control(
+            Some(Chrome::new(roles::OPTION[0], Metric::Radius)),
+            role,
+            |ui| {
+                ui.text(TextStyle::new(TypeRole::Body), label);
+            },
+        )
+        .wash(Wash::Ink)
+        .name(label)
+        .disabled(!enabled);
     match item {
-        MenuItem::Command { on_invoke, .. } => base.on_click(on_invoke),
+        MenuItem::Command { on_invoke, .. } => {
+            base.on_click(on_invoke);
+        }
         MenuItem::Check {
             checked, on_toggle, ..
-        } => base
-            .selected(checked)
-            .interaction(Interaction::Press)
-            .on_click(on_toggle),
+        } => {
+            base.selected(checked).on_click(on_toggle);
+        }
         MenuItem::Radio {
             selected,
             on_select,
             ..
-        } => base
-            .selected(selected)
-            .interaction(Interaction::Press)
-            .on_click(on_select),
-        // The nested list is the item's own flyout, so it opens through the overlay layer's
-        // ordinary path, anchored to this row.
-        MenuItem::Submenu { items, .. } => base.flyout(move || rows(items())),
-        // `Separator` is the only variant `label()` answers `None` for, and that arm
-        // returned above. Stated rather than folded into a catch-all, so a variant that
-        // grows a `None` label panics here instead of becoming an interactive row.
+        } => {
+            base.selected(selected).on_click(on_select);
+        }
+        MenuItem::Submenu { items, .. } => {
+            base.flyout(move |ui| {
+                rows(ui, items());
+            });
+        }
         MenuItem::Separator => unreachable!("a separator has no label and returned above"),
     }
 }
 
-/// Returns the menu surface holding `items`, shared by a menu and its submenus: a submenu is
-/// a menu anchored to the row that owns it and nested through the overlay stack.
-///
-/// Takes built items rather than a closure, so a boxed closure and a caller's own generic one
-/// reach this body without a second instantiation.
-fn rows(items: Vec<MenuItem>) -> View {
-    let rows: Vec<View> = items.into_iter().map(row).collect();
-    crate::widget::flyout()
-        .stack(rows)
-        // An automation container and nothing else: the items route the pointer, and a
-        // target over the whole menu would swallow the gaps between them.
+fn rows<'a>(ui: &'a mut Ui<'_>, items: Vec<MenuItem>) -> Element<'a> {
+    crate::widget::flyout(ui)
+        .stack(|ui| {
+            for item in items {
+                row(ui, item);
+            }
+        })
         .hit(HitFlags::NONE, UiaRole::Menu)
 }
 

@@ -287,12 +287,14 @@ impl Controls {
                     old.rest,
                     old.travel,
                     old.fraction,
+                    old.thumb,
                     old.scalar_parts,
                     old.drive,
                 ) != (
                     row.rest,
                     row.travel,
                     row.fraction,
+                    row.thumb,
                     row.scalar_parts,
                     row.drive,
                 )
@@ -858,11 +860,16 @@ mod tests {
 
     #[test]
     fn unmount_retires_chrome_and_every_held_reference() {
-        use crate::build::{Host, mount, tests::fixture};
+        use crate::build::{Host, tests::fixture};
         let mut patch = fixture();
-        let held = mount(
-            crate::widget::button("Gain"),
+        let held = crate::build::Ui::mount_at(
             Host::with(|h| h.model().root()),
+            None,
+            crate::build::root_scope(),
+            None,
+            |ui| {
+                crate::widget::button(ui, "Gain");
+            },
         );
         let mut down = crate::seam::Down::default();
         Host::flush(&mut patch);
@@ -904,7 +911,7 @@ mod tests {
 
     #[test]
     fn native_adoption_ignores_late_input_after_a_control_unmounts() -> Result<()> {
-        use crate::build::{Host, mount, tests::fixture};
+        use crate::build::{Host, tests::fixture};
         use windows_window::{Apartment, Window, ensure_dispatcher_queue};
         ensure_dispatcher_queue(Apartment::Asta)?;
         let _ = fixture();
@@ -930,7 +937,9 @@ mod tests {
         let mut controls = Controls::new();
         let mut down = crate::seam::Down::default();
         let root = Host::with(|h| h.model().root());
-        let held = mount(crate::widget::button("Gain"), root);
+        let held = crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
+            crate::widget::button(ui, "Gain");
+        });
         Host::flush(&mut down.patch);
         Host::with(|h| {
             h.fill(&mut down);
@@ -961,7 +970,10 @@ mod tests {
         )?;
         down.clear();
         drop(held);
-        let _replacement = mount(crate::widget::button("replacement"), root);
+        let _replacement =
+            crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
+                crate::widget::button(ui, "replacement");
+            });
         Host::flush(&mut down.patch);
         Host::with(|h| {
             h.fill(&mut down);

@@ -160,7 +160,7 @@ impl Track {
 /// How a container aligns all of its children.
 ///
 /// Alignment is a container property; the per-child escape is
-/// [`El::align_self`](crate::build::El::align_self).
+/// [`Element::align_self`](crate::build::Element::align_self).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Align {
     Start,

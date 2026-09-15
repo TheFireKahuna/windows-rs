@@ -48,7 +48,7 @@ use windows_present::{
 use windows_scene::{Backends, ControlId, Env, RegionId, Scene};
 use windows_window::Tick;
 
-use crate::build::{El, Region};
+use crate::build::{Element, Region, Ui};
 use crate::layout::{Len, Preset};
 use crate::role::Metric;
 use crate::seam::RegionOp;
@@ -126,31 +126,19 @@ impl Live {
 /// # use windows_present::{Frame, Gpu, Queue};
 /// # use windows_ui::present::Live;
 /// # fn spectrum() -> Box<dyn Frame> { unimplemented!() }
-/// # fn f(live: &Live) -> windows_ui::build::View {
-/// windows_ui::present::region(Queue::Solo, live, |_gpu, _theme| Ok(spectrum()))
+/// # fn f(ui: &mut windows_ui::build::Ui<'_>, live: &Live) {
+/// windows_ui::present::region(ui, Queue::Solo, live, |_gpu, _theme| Ok(spectrum()))
 ///     .name("Composite response")
-///     .grow()
-///     .erase()
+///     .grow();
 /// # }
 /// ```
-#[must_use]
-pub fn region(
+pub fn region<'a>(
+    ui: &'a mut Ui<'_>,
     queue: Queue,
     live: &Live,
     build: impl FnOnce(&Gpu, Theme) -> Result<Box<dyn Frame>> + Send + 'static,
-) -> El<Region> {
-    // Minted here rather than at mount, because the sprite that paints it is seeded in this
-    // same call and a sprite names its paint at mint. The key is the sink's own number, so
-    // the registry, the Direct2D tag and the statistics record all read one identity.
-    let sink = crate::build::region_sink();
-    let seed = RegionSeed {
-        sink,
-        key: key_of(sink),
-        queue,
-        live: live.clone(),
-        build: Some(Box::new(build)),
-    };
-    El::<Region>::region_seed(seed)
+) -> Element<'a, Region> {
+    ui.region(queue, live, build)
 }
 
 /// Returns the key that names the region painting `sink`.
@@ -159,35 +147,19 @@ pub fn region(
 /// the Direct2D tag that names a failed draw and the statistics record all read one
 /// identity. Both halves of the id are carried: a slot reused by a later region would
 /// otherwise take the key of the one before it.
-const fn key_of(sink: RegionId) -> RegionKey {
+pub(crate) const fn key_of(sink: RegionId) -> RegionKey {
     RegionKey(((sink.index() as u64) << 32) | sink.generation() as u64)
-}
-
-/// One region under construction, held out of line because a `Slot` is `Copy` and a
-/// renderer's builder is a boxed closure.
-pub(crate) struct RegionSeed {
-    pub sink: RegionId,
-    pub key: RegionKey,
-    pub queue: Queue,
-    pub live: Live,
-    /// Taken by the mount walk. A chain that is built and then discarded — a `switch` arm
-    /// that lost — drops it when the arena is cleared, so nothing is left registered for a
-    /// node that never existed.
-    pub build: Option<Build>,
 }
 
 /// One mounted region, as the flush needs it.
 pub(crate) struct RegionRow {
     pub theme: Theme,
-    pub node: windows_scene::NodeId,
     pub sink: RegionId,
     pub key: RegionKey,
     pub queue: Queue,
     pub live: Live,
-    /// The control this region occupies in the hit array, filled by the mount walk that
-    /// mints it. `None` for a region declared with no hit entry, which is nothing today: the
-    /// seed always mints one, because a surface the pointer cannot reach cannot be picked
-    /// inside either.
+    /// The control this region occupies in the hit array. Construction registers it
+    /// directly so pointer and accessibility queries can reach the presented content.
     pub control: Option<ControlId>,
     /// `Some` until the region is mounted on the present thread, which is the first flush
     /// that gives the node a box.
@@ -498,7 +470,7 @@ pub(crate) fn bind(
     failed.map_or(Ok(()), Err)
 }
 
-impl El<Region> {
+impl Element<'_, Region> {
     /// Rounds the region's own corners.
     ///
     /// The mask is this side's, not the renderer's: the buffer is a rectangle and the
@@ -529,7 +501,7 @@ impl RegionRow {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{Picks, RegionRow};
-    use crate::build::{Host, mount, tests::fixture};
+    use crate::build::{Host, tests::fixture};
     use crate::seam::{Down, RegionOp};
     use windows_numerics::Vector2;
     use windows_scene::ControlId;
@@ -564,12 +536,17 @@ pub(crate) mod tests {
         let live = super::Live::new().expect("the epoch's wake event");
         // Collapsed before the mount, so the first solve is the one with no area to give.
         Host::with(|h| h.set_window(Vector2 { x: 0.0, y: 0.0 }));
-        let held = mount(
-            super::region(windows_present::Queue::Solo, &live, |_, _| {
-                unreachable!("no present thread is installed in a fixture")
-            })
-            .grow(),
+        let held = crate::build::Ui::mount_at(
             Host::with(|h| h.model().root()),
+            None,
+            crate::build::root_scope(),
+            None,
+            |ui| {
+                super::region(ui, windows_present::Queue::Solo, &live, |_, _| {
+                    unreachable!("no present thread is installed in a fixture")
+                })
+                .grow();
+            },
         );
 
         Host::flush(&mut patch);
@@ -604,12 +581,17 @@ pub(crate) mod tests {
     fn the_pick_table_follows_the_region_edits() {
         let mut patch = fixture();
         let live = super::Live::new().expect("the epoch's wake event");
-        let held = mount(
-            super::region(windows_present::Queue::Solo, &live, |_, _| {
-                unreachable!("no present thread is installed in a fixture")
-            })
-            .grow(),
+        let held = crate::build::Ui::mount_at(
             Host::with(|h| h.model().root()),
+            None,
+            crate::build::root_scope(),
+            None,
+            |ui| {
+                super::region(ui, windows_present::Queue::Solo, &live, |_, _| {
+                    unreachable!("no present thread is installed in a fixture")
+                })
+                .grow();
+            },
         );
         Host::flush(&mut patch);
 

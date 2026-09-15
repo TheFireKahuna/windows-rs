@@ -23,7 +23,7 @@
 //! element declares a target, so the absence is structural rather than a flag to keep setting.
 
 use super::{Anchor, Kind, OverlayId, Overlays, Spec};
-use crate::build::{Host, View};
+use crate::build::{Host, Ui};
 use crate::seam::FocusOp;
 use windows_scene::{ControlId, DelayId, Exit, HitFlags};
 
@@ -61,6 +61,7 @@ enum Settled {
 /// tick's crossings left the pointer.
 #[derive(Default)]
 pub(super) struct Dwell {
+    runtime: u64,
     /// The target the pointer is resting on, what it is owed, and the delay counting down.
     pending: Option<(ControlId, Opens, DelayId)>,
     /// The description on screen, and which target it describes.
@@ -149,7 +150,9 @@ impl Overlays {
         // A submenu first: inside an open menu, an expandable row opens its list whether or
         // not it also carries a description.
         if self.expands(target) {
-            let delay = Host::with(|host| host.model().delay(SUBMENU_DELAY_MS));
+            let (delay, runtime) =
+                Host::with(|host| (host.model().delay(SUBMENU_DELAY_MS), host.identity));
+            self.dwell.runtime = runtime;
             self.dwell.pending = Some((target, Opens::Submenu, delay));
             return;
         }
@@ -167,7 +170,8 @@ impl Overlays {
             return;
         }
 
-        let delay = Host::with(|host| host.model().delay(TIP_DELAY_MS));
+        let (delay, runtime) = Host::with(|host| (host.model().delay(TIP_DELAY_MS), host.identity));
+        self.dwell.runtime = runtime;
         self.dwell.pending = Some((target, Opens::Tip, delay));
     }
 
@@ -233,7 +237,15 @@ impl Overlays {
             return;
         }
         self.dwell.pending = None;
-        Host::with(|host| host.model().delay_elapsed(delay));
+        if !Host::with(|host| {
+            if self.dwell.runtime != host.identity {
+                return false;
+            }
+            host.model().delay_elapsed(delay);
+            true
+        }) {
+            return;
+        }
         match opens {
             Opens::Submenu => {
                 // Anchored to the row's trailing edge, from which flip, slide and clamp move
@@ -272,8 +284,22 @@ impl Overlays {
     /// Cancels a pending delay, releasing its id and the frame clock it was holding.
     pub(super) fn cancel_dwell(&mut self) {
         if let Some((.., delay)) = self.dwell.pending.take() {
-            Host::with(|host| host.model().cancel_delay(delay));
+            Host::with(|host| {
+                if self.dwell.runtime == host.identity {
+                    host.model().cancel_delay(delay);
+                }
+            });
         }
+    }
+
+    pub(super) fn retire_dwell(&mut self, host: &mut Host) {
+        if let Some((.., delay)) = self.dwell.pending.take() {
+            if self.dwell.runtime == host.identity {
+                host.model().cancel_delay(delay);
+            }
+        }
+        self.dwell.tip = None;
+        self.dwell.settled = Settled::Unmoved;
     }
 
     /// Opens a description of `target` carrying `text`, seated on `side` of the control.
@@ -316,7 +342,7 @@ impl Overlays {
         let mut owned = String::new();
         text.append(&mut owned);
         let text = owned;
-        let overlay = self.open(spec, focus, || tip_body(text));
+        let overlay = self.open(spec, focus, |ui| tip_body(ui, text));
         self.dwell.tip = Some((target, overlay));
     }
 }
@@ -331,6 +357,8 @@ const TIP_GAP_DIPS: f32 = 4.0;
 ///
 /// Neither element declares a hit entry, so a tooltip contributes nothing to the array every
 /// pointer sample is resolved against and cannot be a target.
-fn tip_body(text: String) -> View {
-    crate::widget::flyout().stack(crate::widget::text(text))
+fn tip_body(ui: &mut Ui<'_>, text: String) {
+    crate::widget::flyout(ui).stack(|ui| {
+        crate::widget::text(ui, text);
+    });
 }

@@ -2,8 +2,8 @@
 //!
 //! [`LayoutTree`] implements taffy's low-level tree traits, so flexbox, CSS grid, block
 //! layout and the classifying container are all arms of one `compute_child_layout`. Styles
-//! are [`taffy::Style`] with no conversion layer, and every per-node table is a `Vec`
-//! indexed by the node's own dense id, so no node path hashes.
+//! occupy pooled solver records only for layout participants. The one ordered child tree
+//! also owns derived visuals, whose explicit geometry never enters taffy.
 //!
 //! The one layout mode this crate adds is [`LayoutKind::Responsive`]: a container that
 //! classifies its own inline size into a [`WidthClass`] for its subtree.
@@ -12,6 +12,7 @@ use crate::hit_build::HitDecl;
 use crate::id::Id;
 use crate::responsive::{Bounds, WidthClass};
 use crate::sink::NodeId;
+use core::cell::Cell;
 use taffy::{
     AvailableSpace, Cache, CacheTree, Display, Layout, LayoutBlockContainer,
     LayoutFlexboxContainer, LayoutGridContainer, LayoutInput, LayoutOutput, LayoutPartialTree,
@@ -196,19 +197,41 @@ pub enum LayoutKind {
 }
 
 #[derive(Debug)]
-pub(crate) struct LayoutNode {
+pub(crate) struct RetainedNode {
     /// This slot's own id. A `TaffyId` is a bare index and carries no generation, so it
     /// cannot name a node back to the layer above.
     pub(crate) id: NodeId,
+    layout: Option<usize>,
+    visual: VisualGeometry,
+    pub(crate) children: Vec<TaffyId>,
+    /// Dirty layout inputs clear this node and every ancestor cache.
+    pub(crate) parent: Option<TaffyId>,
+    pub(crate) live: bool,
+    pub(crate) hit: Option<HitDecl>,
+    pub(crate) input_suspended: bool,
+}
+
+/// Derived visuals occupy the owning tree, but never enter the layout solver.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub(crate) enum VisualGeometry {
+    #[default]
+    Unplaced,
+    Insets([f32; 4]),
+    Rect {
+        offset: Vector2,
+        size: Vector2,
+    },
+}
+
+#[derive(Debug)]
+struct LayoutData {
     style: Style,
     kind: LayoutKind,
     measure: MeasureCtx,
-    pub(crate) children: Vec<TaffyId>,
-    /// The node to walk up to when this one is dirtied. Taffy caches a node's output keyed
-    /// on its *input*, so a change here that leaves a parent's input alone — hiding a
-    /// child, re-measuring a leaf — leaves the parent's cached answer standing.
-    pub(crate) parent: Option<TaffyId>,
     cache: Cache,
+    /// Taffy enumerates children by index. Resume the filtered walk instead of
+    /// rescanning the owning child vector for every sibling.
+    child_cursor: Cell<(usize, usize)>,
     /// The class this node last resolved, for the hysteresis band. Unused on anything but a
     /// responsive node.
     class: WidthClass,
@@ -220,28 +243,35 @@ pub(crate) struct LayoutNode {
     hidden: bool,
     unrounded: Layout,
     solved: Layout,
-    pub(crate) live: bool,
-    pub(crate) hit: Option<HitDecl>,
-    pub(crate) input_suspended: bool,
 }
 
-impl Default for LayoutNode {
+impl Default for RetainedNode {
     fn default() -> Self {
         Self {
             id: NodeId::default(),
+            layout: None,
+            visual: VisualGeometry::default(),
+            children: Vec::new(),
+            parent: None,
+            live: false,
+            hit: None,
+            input_suspended: false,
+        }
+    }
+}
+
+impl Default for LayoutData {
+    fn default() -> Self {
+        Self {
             style: Style::DEFAULT,
             kind: LayoutKind::Container,
             measure: MeasureCtx::None,
-            children: Vec::new(),
-            parent: None,
             cache: Cache::new(),
+            child_cursor: Cell::new((0, 0)),
             class: WidthClass::default(),
             hidden: false,
             unrounded: Layout::with_order(0),
             solved: Layout::with_order(0),
-            live: false,
-            hit: None,
-            input_suspended: false,
         }
     }
 }
@@ -253,14 +283,17 @@ impl Default for LayoutNode {
 /// cost nothing.
 #[derive(Debug, Default)]
 pub struct LayoutTree {
-    pub(crate) nodes: Vec<LayoutNode>,
+    pub(crate) nodes: Vec<RetainedNode>,
+    layouts: Vec<LayoutData>,
+    free_layouts: Vec<usize>,
+    child_pool: Vec<Vec<TaffyId>>,
 }
 
 impl LayoutTree {
     /// Returns an empty retained tree.
     #[must_use]
     pub fn new() -> Self {
-        Self { nodes: Vec::new() }
+        Self::default()
     }
 
     /// Clears `id`'s cache and every cache above it.
@@ -274,33 +307,69 @@ impl LayoutTree {
             let Some(node) = self.nodes.get_mut(usize::from(current)) else {
                 return;
             };
-            node.cache.clear();
+            if let Some(layout) = node.layout {
+                self.layouts[layout].cache.clear();
+                self.layouts[layout].child_cursor.set((0, 0));
+            }
             next = node.parent;
         }
     }
 
-    fn slot(&mut self, node: NodeId) -> &mut LayoutNode {
+    fn slot(&mut self, node: NodeId) -> &mut RetainedNode {
         let index = node.index();
         if index >= self.nodes.len() {
-            self.nodes.resize_with(index + 1, LayoutNode::default);
+            self.nodes.resize_with(index + 1, RetainedNode::default);
         }
         &mut self.nodes[index]
     }
 
     /// Creates a node's layout slot, or resets a reused one.
     pub fn create(&mut self, node: NodeId, kind: LayoutKind) {
-        let slot = self.slot(node);
-        *slot = LayoutNode {
-            id: node,
+        self.create_visual(node);
+        let layout = self.free_layouts.pop().unwrap_or_else(|| {
+            self.layouts.push(LayoutData::default());
+            self.layouts.len() - 1
+        });
+        self.layouts[layout] = LayoutData {
             kind,
+            ..Default::default()
+        };
+        self.nodes[node.index()].layout = Some(layout);
+    }
+
+    pub(crate) fn create_visual(&mut self, node: NodeId) {
+        let slot = self.slot(node);
+        assert!(slot.layout.is_none(), "a live layout cannot be overwritten");
+        *slot = RetainedNode {
+            id: node,
             live: true,
             // The `Vec` keeps its allocation: ids are dense and reused, so the next mint
             // into this slot fills it again.
             children: core::mem::take(&mut slot.children),
-            ..LayoutNode::default()
+            ..RetainedNode::default()
         };
         slot.children.clear();
         self.mark_dirty(TaffyId::from(node.index()));
+    }
+
+    fn data_mut(&mut self, node: NodeId) -> &mut LayoutData {
+        let slot = &self.nodes[node.index()];
+        assert_eq!(slot.id, node, "a stale node cannot change layout");
+        &mut self.layouts[slot.layout.expect("derived visuals have explicit geometry")]
+    }
+
+    pub(crate) fn visual_geometry(&mut self, node: NodeId, geometry: VisualGeometry) -> bool {
+        let slot = &mut self.nodes[node.index()];
+        assert_eq!(slot.id, node);
+        assert!(
+            slot.layout.is_none(),
+            "layout nodes are positioned by the solver"
+        );
+        if slot.visual == geometry {
+            return false;
+        }
+        slot.visual = geometry;
+        true
     }
 
     /// Declares how a node lays its children out, leaving the rest of the slot alone, and
@@ -309,7 +378,7 @@ impl LayoutTree {
     /// Separate from [`create`](Self::create), which resets the slot: setting the kind
     /// composes in any order with pushing a style and setting children.
     pub fn set_kind(&mut self, node: NodeId, kind: LayoutKind) -> bool {
-        let slot = self.slot(node);
+        let slot = self.data_mut(node);
         if slot.kind == kind {
             return false;
         }
@@ -322,11 +391,20 @@ impl LayoutTree {
     /// slot is cleared rather than removed.
     pub fn destroy(&mut self, node: NodeId) {
         let id = TaffyId::from(node.index());
-        self.mark_dirty(id);
+        if self.nodes[node.index()].layout.is_some() {
+            self.mark_dirty(id);
+        }
         if let Some(slot) = self.nodes.get_mut(node.index()) {
             slot.children.clear();
+            if slot.children.capacity() != 0 {
+                self.child_pool.push(core::mem::take(&mut slot.children));
+            }
             slot.parent = None;
             slot.live = false;
+            if let Some(layout) = slot.layout.take() {
+                self.layouts[layout] = LayoutData::default();
+                self.free_layouts.push(layout);
+            }
         }
     }
 
@@ -335,7 +413,7 @@ impl LayoutTree {
     /// An equal style is dropped rather than pushed, so re-stating a style does not
     /// invalidate a subtree that did not change.
     pub fn set_style(&mut self, node: NodeId, style: &Style) -> bool {
-        let slot = self.slot(node);
+        let slot = self.data_mut(node);
         if &slot.style == style {
             return false;
         }
@@ -351,7 +429,7 @@ impl LayoutTree {
     /// carries what the node *is*, so a hidden grid comes back a grid and a style re-pushed
     /// while hidden does not reveal the node.
     pub fn set_hidden(&mut self, node: NodeId, hidden: bool) -> bool {
-        let slot = self.slot(node);
+        let slot = self.data_mut(node);
         if slot.hidden == hidden {
             return false;
         }
@@ -362,7 +440,7 @@ impl LayoutTree {
 
     /// Declares where a node's intrinsic size comes from.
     pub fn set_measure(&mut self, node: NodeId, ctx: MeasureCtx) {
-        let slot = self.slot(node);
+        let slot = self.data_mut(node);
         if slot.measure != ctx {
             slot.measure = ctx;
             self.mark_dirty(TaffyId::from(node.index()));
@@ -389,6 +467,11 @@ impl LayoutTree {
         if parent.is_none() {
             return;
         }
+        // Derived parts can change which node IDs are reused by containers. Recycle
+        // child storage by need rather than tying its capacity to an old node index.
+        if self.nodes[parent.index()].children.capacity() == 0 {
+            self.nodes[parent.index()].children = self.child_pool.pop().unwrap_or_default();
+        }
         let children = &mut self.nodes[parent.index()].children;
         let at = after.map_or(0, |after| {
             children
@@ -399,7 +482,12 @@ impl LayoutTree {
         });
         children.insert(at, TaffyId::from(id.index()));
         self.nodes[id.index()].parent = Some(TaffyId::from(parent.index()));
-        self.mark_dirty(TaffyId::from(parent.index()));
+        if let Some(layout) = self.nodes[parent.index()].layout {
+            self.layouts[layout].child_cursor.set((0, 0));
+        }
+        if self.nodes[id.index()].layout.is_some() {
+            self.mark_dirty(TaffyId::from(parent.index()));
+        }
     }
 
     pub(crate) fn unlink(&mut self, id: NodeId) {
@@ -407,7 +495,12 @@ impl LayoutTree {
             self.nodes[usize::from(parent)]
                 .children
                 .retain(|child| usize::from(*child) != id.index());
-            self.mark_dirty(parent);
+            if let Some(layout) = self.nodes[usize::from(parent)].layout {
+                self.layouts[layout].child_cursor.set((0, 0));
+            }
+            if self.nodes[id.index()].layout.is_some() {
+                self.mark_dirty(parent);
+            }
         }
     }
 
@@ -455,6 +548,7 @@ impl LayoutTree {
     ) {
         let mut solver = Solver {
             nodes: &mut self.nodes,
+            layouts: &mut self.layouts,
             ambient: WidthClass::default(),
             services,
         };
@@ -469,7 +563,7 @@ impl LayoutTree {
         );
 
         let (ox, oy) = (snap(origin.x, scale), snap(origin.y, scale));
-        solver.gather(taffy_root, ox, oy, scale, WidthClass::default(), out);
+        solver.gather(taffy_root, ox, oy, scale, WidthClass::default(), false, out);
         // A root has no parent to position it, so its offset within one is the origin it was
         // placed at. Taffy leaves that at zero; writing it here makes the placement reach the
         // compositor as the same offset bind every other node's does.
@@ -489,7 +583,8 @@ pub struct LayoutServices<'a> {
 }
 
 struct Solver<'a, 's> {
-    nodes: &'a mut [LayoutNode],
+    nodes: &'a mut [RetainedNode],
+    layouts: &'a mut [LayoutData],
     ambient: WidthClass,
     services: &'a mut LayoutServices<'s>,
 }
@@ -502,20 +597,63 @@ impl Solver<'_, '_> {
         oy: f32,
         scale: f32,
         class: WidthClass,
+        hidden: bool,
         out: &mut Vec<Solved>,
     ) {
         let index = usize::from(id);
         let Some(node) = self.nodes.get(index) else {
             return;
         };
-        let layout = node.solved;
+        let Some(at) = node.layout else {
+            let parent = node
+                .parent
+                .map(|id| &self.layouts[self.nodes[usize::from(id)].layout.unwrap()])
+                .unwrap();
+            let parent_size = parent.solved.size;
+            let (offset, size) = match node.visual {
+                VisualGeometry::Unplaced => return,
+                VisualGeometry::Insets([left, right, top, bottom]) => (
+                    Vector2 { x: left, y: top },
+                    Vector2 {
+                        x: (parent_size.width - left - right).max(0.0),
+                        y: (parent_size.height - top - bottom).max(0.0),
+                    },
+                ),
+                VisualGeometry::Rect { offset, size } => (offset, size),
+            };
+            let (offset, size) = if hidden {
+                (Vector2::zero(), Vector2::zero())
+            } else {
+                (offset, size)
+            };
+            let x0 = snap(ox + offset.x, scale);
+            let y0 = snap(oy + offset.y, scale);
+            let x1 = snap(ox + offset.x + size.x, scale);
+            let y1 = snap(oy + offset.y + size.y, scale);
+            out[index] = Solved {
+                rect: Rect::new(x0, y0, x1, y1),
+                local: Vector2 {
+                    x: snap(offset.x, scale),
+                    y: snap(offset.y, scale),
+                },
+                size: Vector2 {
+                    x: x1 - x0,
+                    y: y1 - y0,
+                },
+                class,
+                ..Solved::default()
+            };
+            return;
+        };
+        let data = &self.layouts[at];
+        let layout = data.solved;
         let (x, y) = (ox + layout.location.x, oy + layout.location.y);
         let (x0, y0) = (snap(x, scale), snap(y, scale));
         let (x1, y1) = (
             snap(x + layout.size.width, scale),
             snap(y + layout.size.height, scale),
         );
-        let overflow = node.style.overflow;
+        let overflow = data.style.overflow;
         out[index] = Solved {
             rect: Rect::new(x0, y0, x1, y1),
             local: Vector2 {
@@ -537,21 +675,37 @@ impl Solver<'_, '_> {
         // A responsive container classifies its size *for its subtree*: its own style was
         // lowered at the enclosing class, so the class changes on the way down to the
         // children and not for this node.
-        let inner = match node.kind {
-            LayoutKind::Responsive(_) => node.class,
+        let inner = match data.kind {
+            LayoutKind::Responsive(_) => data.class,
             LayoutKind::Container => class,
         };
         for &child in &node.children {
-            self.gather(child, x, y, scale, inner, out);
+            self.gather(
+                child,
+                x,
+                y,
+                scale,
+                inner,
+                hidden || data.hidden || data.style.display == Display::None,
+                out,
+            );
         }
     }
 
-    fn node(&self, id: TaffyId) -> &LayoutNode {
-        &self.nodes[usize::from(id)]
+    fn node(&self, id: TaffyId) -> &LayoutData {
+        &self.layouts[self.nodes[usize::from(id)].layout.unwrap()]
     }
 
-    fn node_mut(&mut self, id: TaffyId) -> &mut LayoutNode {
-        &mut self.nodes[usize::from(id)]
+    fn node_mut(&mut self, id: TaffyId) -> &mut LayoutData {
+        &mut self.layouts[self.nodes[usize::from(id)].layout.unwrap()]
+    }
+
+    fn children(&self, id: TaffyId) -> impl Iterator<Item = TaffyId> + '_ {
+        self.nodes[usize::from(id)]
+            .children
+            .iter()
+            .copied()
+            .filter(|child| self.nodes[usize::from(*child)].layout.is_some())
     }
 
     /// Re-lowers `id` at `class` and clears its cache, then descends.
@@ -567,7 +721,7 @@ impl Solver<'_, '_> {
         self.node_mut(id).cache.clear();
         // Taken out for the call and put back, so the callback does not borrow the tree the
         // node lookups around it borrow.
-        let node = self.node(id).id;
+        let node = self.nodes[usize::from(id)].id;
         if let Some(restyle) = self.services.restyle.as_mut() {
             if let Some(style) = restyle(node, class) {
                 self.node_mut(id).style = style;
@@ -576,14 +730,14 @@ impl Solver<'_, '_> {
         if matches!(self.node(id).kind, LayoutKind::Responsive(_)) {
             return;
         }
-        for index in 0..self.node(id).children.len() {
-            let child = self.node(id).children[index];
+        for index in 0..self.child_count(id) {
+            let child = self.get_child_id(id, index);
             self.reclass(child, class);
         }
     }
 
     fn measure_leaf(&mut self, id: TaffyId, inputs: LayoutInput) -> LayoutOutput {
-        let node = &self.nodes[usize::from(id)];
+        let node = &self.layouts[self.nodes[usize::from(id)].layout.unwrap()];
         let (style, ctx, class) = (&node.style, node.measure, self.ambient);
         let measure = &mut self.services.measure;
         let output = compute_leaf_layout(
@@ -639,8 +793,8 @@ impl Solver<'_, '_> {
         // no transition to re-lower against.
         if inputs.run_mode == RunMode::PerformLayout && class != previous {
             self.node_mut(id).class = class;
-            for index in 0..self.node(id).children.len() {
-                let child = self.node(id).children[index];
+            for index in 0..self.child_count(id) {
+                let child = self.get_child_id(id, index);
                 self.reclass(child, class);
             }
         }
@@ -663,22 +817,55 @@ impl Solver<'_, '_> {
     }
 }
 
+struct LayoutChildren<'a> {
+    children: core::slice::Iter<'a, TaffyId>,
+    nodes: &'a [RetainedNode],
+}
+
+impl Iterator for LayoutChildren<'_> {
+    type Item = TaffyId;
+    fn next(&mut self) -> Option<TaffyId> {
+        self.children
+            .find(|id| self.nodes[usize::from(**id)].layout.is_some())
+            .copied()
+    }
+}
+
 impl TraversePartialTree for Solver<'_, '_> {
     type ChildIter<'a>
-        = core::iter::Copied<core::slice::Iter<'a, TaffyId>>
+        = LayoutChildren<'a>
     where
         Self: 'a;
 
     fn child_ids(&self, parent: TaffyId) -> Self::ChildIter<'_> {
-        self.node(parent).children.iter().copied()
+        LayoutChildren {
+            children: self.nodes[usize::from(parent)].children.iter(),
+            nodes: self.nodes,
+        }
     }
 
     fn child_count(&self, parent: TaffyId) -> usize {
-        self.node(parent).children.len()
+        self.children(parent).count()
     }
 
     fn get_child_id(&self, parent: TaffyId, index: usize) -> TaffyId {
-        self.node(parent).children[index]
+        let cursor = &self.node(parent).child_cursor;
+        let (mut ordinal, mut physical) = cursor.get();
+        if index < ordinal {
+            (ordinal, physical) = (0, 0);
+        }
+        let children = &self.nodes[usize::from(parent)].children;
+        loop {
+            let child = children[physical];
+            if self.nodes[usize::from(child)].layout.is_some() {
+                if ordinal == index {
+                    cursor.set((ordinal, physical));
+                    return child;
+                }
+                ordinal += 1;
+            }
+            physical += 1;
+        }
     }
 }
 
@@ -890,14 +1077,30 @@ mod tests {
     #[test]
     fn a_hidden_node_keeps_its_slot_and_takes_no_space() {
         let (mut tree, root, kids) = tree_with_a_row();
+        let visual = NodeId::raw(5, 1);
+        tree.create_visual(visual);
+        tree.link(visual, kids[1], None);
+        tree.visual_geometry(
+            visual,
+            VisualGeometry::Rect {
+                offset: Vector2::zero(),
+                size: Vector2::new(20.0, 10.0),
+            },
+        );
         assert!(tree.set_hidden(kids[1], true));
         let mut out = Vec::new();
         tree.solve(root, Vector2 { x: 600.0, y: 400.0 }, 1.0, &mut out);
         assert_eq!(out[kids[2].index()].rect.x0, 100.0);
+        assert_eq!(out[visual.index()].size, Vector2::zero());
         // Hidden, not removed: unhiding restores it without anything being rebuilt.
         assert!(tree.set_hidden(kids[1], false));
         tree.solve(root, Vector2 { x: 600.0, y: 400.0 }, 1.0, &mut out);
         assert_eq!(out[kids[2].index()].rect.x0, 200.0);
+        assert_eq!(out[visual.index()].size, Vector2::new(20.0, 10.0));
+        // A visible zero-sized owner may still paint overflowing decoration.
+        tree.set_style(kids[1], &Style::DEFAULT);
+        tree.solve(root, Vector2 { x: 600.0, y: 400.0 }, 1.0, &mut out);
+        assert_eq!(out[visual.index()].size, Vector2::new(20.0, 10.0));
     }
 
     #[test]
@@ -916,7 +1119,9 @@ mod tests {
         tree.set_hidden(grid, true);
         tree.set_hidden(grid, false);
         assert_eq!(
-            tree.nodes[grid.index()].style.display,
+            tree.layouts[tree.nodes[grid.index()].layout.unwrap()]
+                .style
+                .display,
             Display::Grid,
             "hiding and showing rewrote the node's display"
         );

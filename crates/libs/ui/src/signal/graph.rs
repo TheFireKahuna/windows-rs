@@ -312,6 +312,18 @@ impl Graph {
     }
 
     fn attach(&mut self, scope: OwnerId, child: Child) {
+        // Replacing a binding retires its graph node before its owner. Reclaim those
+        // stale entries before growing, keeping lifetime storage bounded by live work.
+        if let Some(owner) = self.owners.get_mut(scope)
+            && owner.children.len() == owner.children.capacity()
+        {
+            let mut children = core::mem::take(&mut owner.children);
+            children.retain(|child| match *child {
+                Child::Signal(id) => self.node(id).is_some(),
+                Child::Owner(id) => self.owners.get(id).is_some(),
+            });
+            self.owners.get_mut(scope).unwrap().children = children;
+        }
         if let Some(owner) = self.owners.get_mut(scope) {
             owner.children.push(child);
         }
@@ -845,6 +857,14 @@ fn dispose_taking_payload(id: SignalId) -> Option<Kind> {
         Some(payload)
     })
     .flatten()
+}
+
+pub(super) fn retire_effect(id: SignalId) -> Option<Rc<RefCell<dyn FnMut()>>> {
+    match dispose_taking_payload(id) {
+        Some(Kind::Effect(callback, _)) => Some(callback),
+        None => None,
+        _ => unreachable!("an Effect names an effect node"),
+    }
 }
 
 /// Returns how many signal nodes are live on this thread.

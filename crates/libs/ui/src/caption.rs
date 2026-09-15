@@ -14,7 +14,7 @@
 //! control carries, so a window command hovers and presses down the path a button uses.
 //!
 //! An application declares a command where it authors the bar, with
-//! [`El::caption`](crate::build::El::caption). Both answers here are the driver's, resolved
+//! [`Element::caption`](crate::build::Element::caption). Both answers here are the driver's, resolved
 //! against the [`Registry`] copy the answering thread holds.
 
 use windows_scene::{ContactKind, ControlId, HitTable, Point, ScrollOffsets};
@@ -124,19 +124,19 @@ pub(crate) fn controls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::{Host, mount, tests::fixture};
+    use crate::build::{Host, tests::fixture};
     use crate::layout::row;
     use crate::widget::button;
     use windows_scene::{HitEntry, HitFlags, NO_ENTRY, NodeId, ShadowOffsets};
 
     /// A bar with the three commands and one ordinary control in it.
-    fn bar() -> crate::build::View {
-        row((
-            button("file").name("File"),
-            button("\u{2013}").caption(CaptionButton::Minimize),
-            button("\u{25a1}").caption(CaptionButton::Maximize),
-            button("\u{2715}").caption(CaptionButton::Close),
-        ))
+    fn bar<'a>(ui: &'a mut crate::build::Ui<'_>) -> crate::build::Element<'a> {
+        row(ui, |ui| {
+            button(ui, "file").name("File");
+            button(ui, "\u{2013}").caption(CaptionButton::Minimize);
+            button(ui, "\u{25a1}").caption(CaptionButton::Maximize);
+            button(ui, "\u{2715}").caption(CaptionButton::Close);
+        })
     }
 
     fn entry(id: ControlId, x0: f32, x1: f32) -> HitEntry {
@@ -162,7 +162,15 @@ mod tests {
     #[test]
     fn a_point_resolves_to_the_command_the_mount_declared() {
         let _patch = fixture();
-        let _mount = mount(bar(), Host::with(|h| h.model().root()));
+        let _mount = crate::build::Ui::mount_at(
+            Host::with(|h| h.model().root()),
+            None,
+            crate::build::root_scope(),
+            None,
+            |ui| {
+                bar(ui);
+            },
+        );
 
         let registry = Host::with(|h| h.caption);
         let [min, max, close] =
@@ -213,9 +221,17 @@ mod tests {
     #[test]
     fn an_undeclared_control_is_never_a_command() {
         let _patch = fixture();
-        let _mount = mount(
-            row((button("one"), button("two"))),
+        let _mount = crate::build::Ui::mount_at(
             Host::with(|h| h.model().root()),
+            None,
+            crate::build::root_scope(),
+            None,
+            |ui| {
+                row(ui, |ui| {
+                    button(ui, "one");
+                    button(ui, "two");
+                });
+            },
         );
 
         let registry = Host::with(|h| h.caption);
@@ -223,8 +239,14 @@ mod tests {
 
         let mut hits = HitTable::default();
         hits.replace(&[entry(ControlId::default(), 0.0, 60.0)]);
-        assert_eq!(hit(&hits, &ShadowOffsets::new(), &registry, 30.0, 16.0), CaptionHit::Client);
-        assert_eq!(hit(&hits, &ShadowOffsets::new(), &registry, 90.0, 16.0), CaptionHit::Drag);
+        assert_eq!(
+            hit(&hits, &ShadowOffsets::new(), &registry, 30.0, 16.0),
+            CaptionHit::Client
+        );
+        assert_eq!(
+            hit(&hits, &ShadowOffsets::new(), &registry, 90.0, 16.0),
+            CaptionHit::Drag
+        );
     }
 
     /// Maps a forwarded [`CaptionState`] onto control ids, so a command lights through the
@@ -232,7 +254,15 @@ mod tests {
     #[test]
     fn caption_state_names_the_controls_it_lights() {
         let _patch = fixture();
-        let _mount = mount(bar(), Host::with(|h| h.model().root()));
+        let _mount = crate::build::Ui::mount_at(
+            Host::with(|h| h.model().root()),
+            None,
+            crate::build::root_scope(),
+            None,
+            |ui| {
+                bar(ui);
+            },
+        );
         let registry = Host::with(|h| h.caption);
         let close = registry.id(CaptionButton::Close);
 
@@ -265,7 +295,10 @@ mod tests {
             hit(&hits, &ShadowOffsets::new(), &registry, 210.0, 16.0),
             CaptionHit::Button(CaptionButton::Close)
         );
-        assert_eq!(hit(&hits, &ShadowOffsets::new(), &registry, 90.0, 16.0), CaptionHit::Drag);
+        assert_eq!(
+            hit(&hits, &ShadowOffsets::new(), &registry, 90.0, 16.0),
+            CaptionHit::Drag
+        );
         assert_eq!(
             controls(
                 &registry,

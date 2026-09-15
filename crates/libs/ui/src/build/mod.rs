@@ -1,54 +1,26 @@
-//! The lowering: the build arena, the element, and the walk that turns both into `Model`
-//! calls.
-//!
-//! This module carries the chain from a builder call to a `SinkPatch`, over the alphabets
-//! below it — `taffy::Style`, the sink alphabet, `Bind` over `Prop`, `HitDecl`,
-//! `GestureDecl` — and the total function `resolve`. It adds no alphabet of its own.
-//!
-//! It is also the only code that touches `Model`. A widget is a data seed: it writes into
-//! the build arena, and it neither calls `Model`, nor resolves a `Radiance`, nor builds a
-//! `taffy::Style`.
-
-mod adapt;
-pub(crate) mod arena;
-mod children;
-mod el;
+//! Parent-first declarations write directly into retained records.
+mod binding;
+mod control;
+pub use control::Scalar;
 mod ui;
 pub use ui::{Element, Node, Ui};
+pub struct Any;
+pub struct Path;
+pub struct Region;
+pub struct Field;
 pub(crate) mod field;
 mod geometry;
 mod host;
 mod mount;
-mod theme;
-pub use geometry::{local_geometries, local_geometry, path_with, paths_with};
 mod style;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod text;
-
-pub use adapt::{Each, Switch, When, each, each_into, switch, when};
-pub use children::{Children, IntoChildren};
-pub use el::{Any, Button, El, Field, Path, Region, View};
+mod theme;
+#[cfg(any(test, feature = "test-support"))]
 pub use host::Host;
+#[cfg(not(any(test, feature = "test-support")))]
+pub(crate) use host::Host;
 pub(crate) use host::{Placement, ScrollId};
-pub(crate) use mount::region_sink;
-pub use mount::{Mount, Stop, geometry, mount, mount_at, ramp, root_scope, set_geometry, set_ramp};
-
-/// Names where a structural adapter builds: the group its rows or arms become children of,
-/// the sibling they sit after, and the scope they resolve against.
-///
-/// The parent is the enclosing container, not the adapter's own node, so the container the
-/// list was passed to lays the rows out: a `stack` stacks them, a grid flows them.
-///
-/// [`after`](Self::after) carries the adapter's identity in that child list. The adapter's
-/// own node stays there as a hidden anchor and every row is placed after it, so rows land
-/// between the anchor and whatever sibling follows. Two adjacent lists that are both empty
-/// would otherwise share a predecessor, and whichever filled second would land first.
-#[derive(Copy, Clone, Debug)]
-pub struct Site {
-    pub parent: windows_scene::GroupId,
-    /// The adapter's anchor: the node a first row or arm is placed after.
-    pub after: Option<windows_scene::NodeId>,
-    pub scope: crate::role::Scope,
-    pub(crate) hover_scope: Option<windows_scene::ControlId>,
-}
+pub(crate) use mount::Mount;
+pub use mount::{Stop, root_scope, set_geometry, set_ramp};

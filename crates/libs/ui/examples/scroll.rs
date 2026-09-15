@@ -11,7 +11,7 @@
 //! 3. The realized set stays bounded across ten thousand rows. The realized-row count is
 //!    reported at rest and at its peak.
 //!
-//! The run is the shipping one: [`Ui::run`] owns the window, the tick and their order, and
+//! The run is the shipping one: [`UiRuntime::run`] owns the window, the tick and their order, and
 //! the census is an observer over it. A loop written here to watch the tick would be a second
 //! implementation of that order, and the numbers it printed would be its own.
 //!
@@ -26,8 +26,7 @@ use windows_core::Result;
 use windows_d2d::Gpu;
 use windows_scene::{BackdropSpec, Backends};
 use windows_text::{FamilyId, FontLadder, FontSpec};
-use windows_ui::build::mount;
-use windows_ui::driver::{Observed, Ui, observe};
+use windows_ui::driver::{Observed, UiRuntime, observe};
 use windows_ui::input::Report;
 use windows_ui::layout::{ListSpec, list};
 use windows_ui::role::{
@@ -47,7 +46,7 @@ const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_POINTERWHEEL: u32 = 0x024E;
 
 fn main() -> Result<()> {
-    let ui = Ui::new(&REFERENCE, AccentId(0), Density::Comfortable);
+    let ui = UiRuntime::new(&REFERENCE, AccentId(0), Density::Comfortable);
     let seen = Rc::new(Seen::default());
     // Raw wheel messages, counted before the doorbell. A notch the compositor took and a
     // notch that never arrived both read as zero front-thread reports; this count separates
@@ -105,22 +104,18 @@ fn main() -> Result<()> {
             )
         },
         BackdropSpec::default(),
-        |ctx| {
-            mount(
-                list(
-                    || ListSpec::uniform(ROWS, Metric::RowH),
-                    |realized, out| {
-                        for run in realized.runs() {
-                            out.extend(run.map(|index| (index, index)));
-                        }
-                    },
-                    |index: &usize| label(format!("row {index}")),
-                )
-                // The root is a full-client stretching column, so the list states its share
-                // of the main axis and nothing about the window's extent.
-                .grow(),
-                ctx.root,
+        |ui, _ctx| {
+            list(
+                ui,
+                || ListSpec::uniform(ROWS, Metric::RowH),
+                |realized, out| {
+                    for run in realized.runs() {
+                        out.extend(run.map(|index| (index, index)));
+                    }
+                },
+                |ui, index: &usize| label(ui, format!("row {index}")).id(),
             )
+            .grow();
         },
     )?;
 

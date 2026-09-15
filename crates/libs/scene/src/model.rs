@@ -10,7 +10,7 @@
 use crate::env::Env;
 use crate::hit_build::{HitBuilder, HitDecl, HitEntry};
 use crate::id::{Id, Ids};
-use crate::layout::{LayoutKind, LayoutServices, LayoutTree, MeasureCtx, Solved};
+use crate::layout::{LayoutKind, LayoutServices, LayoutTree, MeasureCtx, Solved, VisualGeometry};
 use crate::patch::{Attach, Op, SinkPatch, Span};
 use crate::responsive::Bounds;
 use crate::sink::*;
@@ -146,6 +146,31 @@ impl Model {
 
     /// Mints a group under `parent`, above `after`. A group positions and clips its children
     /// and paints nothing.
+    pub fn last_child(&self, parent: NodeId) -> Option<NodeId> {
+        self.child_count(parent)
+            .checked_sub(1)
+            .map(|index| self.child(parent, index))
+    }
+
+    pub fn child_count(&self, parent: NodeId) -> usize {
+        if !self.ids.is_live(parent) {
+            return 0;
+        }
+        self.layout.nodes[parent.index()].children.len()
+    }
+
+    pub fn child(&self, parent: NodeId, index: usize) -> NodeId {
+        self.layout.child(parent, index)
+    }
+
+    /// Returns the live node's parent in the retained layout tree.
+    pub fn parent(&self, node: NodeId) -> Option<NodeId> {
+        self.ids.is_live(node).then_some(())?;
+        self.layout.nodes[node.index()]
+            .parent
+            .map(|parent| self.layout.nodes[usize::from(parent)].id)
+    }
+
     pub fn group(&mut self, parent: GroupId, after: Option<NodeId>) -> GroupId {
         GroupId(self.mint(NodeKind::Group, Attach::Node(parent.0), after))
     }
@@ -153,6 +178,30 @@ impl Model {
     /// Mints a sprite under `parent`, above `after`: one composition sprite visual on screen.
     pub fn sprite(&mut self, parent: GroupId, after: Option<NodeId>) -> SpriteId {
         SpriteId(self.mint(NodeKind::Sprite, Attach::Node(parent.0), after))
+    }
+
+    /// Creates an owned decorative visual without a layout declaration or solver cache.
+    /// Geometry is supplied explicitly, or by a scene-side property driver.
+    pub fn visual(&mut self, parent: GroupId, after: Option<NodeId>) -> SpriteId {
+        SpriteId(self.mint_node(NodeKind::Sprite, Attach::Node(parent.0), after, false))
+    }
+
+    /// Sets derived geometry in the owning group's local coordinates.
+    pub fn visual_rect(&mut self, id: SpriteId, offset: Vector2, size: Vector2) {
+        if self.ids.is_live(id.node()) {
+            self.solve_dirty |= self
+                .layout
+                .visual_geometry(id.node(), VisualGeometry::Rect { offset, size });
+        }
+    }
+
+    /// Fills the owning group with left, right, top and bottom insets in DIPs.
+    pub fn visual_insets(&mut self, id: SpriteId, insets: [f32; 4]) {
+        if self.ids.is_live(id.node()) {
+            self.solve_dirty |= self
+                .layout
+                .visual_geometry(id.node(), VisualGeometry::Insets(insets));
+        }
     }
 
     /// Mints a group with **no parent** — a flyout, a popup, a tooltip, a ghost.
@@ -249,13 +298,27 @@ impl Model {
     }
 
     fn mint(&mut self, kind: NodeKind, parent: Attach, after: Option<NodeId>) -> NodeId {
+        self.mint_node(kind, parent, after, true)
+    }
+
+    fn mint_node(
+        &mut self,
+        kind: NodeKind,
+        parent: Attach,
+        after: Option<NodeId>,
+        layout: bool,
+    ) -> NodeId {
         let id: NodeId = self.ids.mint();
         let index = id.index();
         // A reused slot must not be compared against its previous occupant's placement.
         if index < self.previous.len() {
             self.previous[index] = Solved::default();
         }
-        self.layout.create(id, LayoutKind::Container);
+        if layout {
+            self.layout.create(id, LayoutKind::Container);
+        } else {
+            self.layout.create_visual(id);
+        }
         self.layout
             .link(id, parent.node().unwrap_or(NodeId::NONE), after);
         self.pending.push_op(Op::New {
@@ -975,7 +1038,7 @@ mod tests {
         model.set_window(Vector2 { x: 400.0, y: 300.0 });
         let parent = model.group(model.root(), None);
         let child = model.sprite(parent, None);
-        let grandchild = model.sprite(parent, None);
+        let grandchild = model.visual(parent, None);
 
         let mut patch = SinkPatch::new();
         model.flush(&mut patch, env(), &mut Default::default());

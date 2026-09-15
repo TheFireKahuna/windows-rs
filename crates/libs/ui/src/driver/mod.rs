@@ -43,7 +43,7 @@ mod scene;
 #[cfg(feature = "test-support")]
 pub mod testing;
 
-use crate::build::Mount;
+use crate::build::Ui;
 use crate::input::Report;
 use crate::role::{AccentId, Density, Palette, Scope};
 pub use crate::seam::AppCensus;
@@ -55,36 +55,26 @@ use std::sync::Arc;
 use windows_color::OutputTransform;
 use windows_core::{Error, Result};
 use windows_numerics::Vector2;
-use windows_scene::{BackdropSpec, Backends, Census, Env, GroupId};
+use windows_scene::{BackdropSpec, Backends, Census, Env};
 use windows_window::{CaptionHit, CaptionState, E_HANDLE, Handoff, Watch, Window, WindowBuilder};
 
-/// The process-wide installs, and the root [`Scope`] they produce.
-///
-/// Constructed before any role resolves: resolving without a palette panics rather than
-/// inventing a colour, so a palette that arrives late is a start-up failure with a stack
-/// rather than a grey screen.
-///
-/// The root scope is reachable only through [`Ui::install`], so a caller needing a number
-/// before its window exists — a custom caption's band is stated in row heights, and a row
-/// height is the palette's answer at the root scope — has necessarily installed the palette
-/// already.
+/// Window runtime configuration and the root [`Scope`] it owns.
+/// Obtain the scope through [`root_scope`](Self::root_scope) when resolving application
+/// metrics before opening the window.
 #[derive(Copy, Clone)]
-pub struct Ui {
+pub struct UiRuntime {
     root_scope: Scope,
 }
 
 /// What the application's tree builder is handed, on the app thread.
 pub struct AppCtx {
-    /// The group the application mounts under: a full-client stretching column, so a shell
-    /// states `grow` and nothing about the window's own extent.
-    pub root: GroupId,
     /// The window's visibility, for a producer that should stop while nobody can see it.
     pub watch: Watch,
     /// The client area the window opened at, in DIPs.
     pub window_dips: Vector2,
 }
 
-impl Ui {
+impl UiRuntime {
     /// Starts an independent window with explicitly selected theme axes.
     pub const fn from_scope(root_scope: Scope) -> Self {
         Self { root_scope }
@@ -110,8 +100,8 @@ impl Ui {
     /// `backends` runs on the scene thread once the window exists: a system compositor needs
     /// a dispatcher queue on the calling thread, and the scene thread has made its own.
     ///
-    /// `mount` runs on the app thread once the scene exists. The [`Mount`] it returns is held
-    /// there until this call returns — dropping one unmounts its tree.
+    /// `mount` runs on the app thread with a borrowed authoring context once the scene
+    /// exists. The runtime owns the declared content and retires it during shutdown.
     ///
     /// `on_resize`, `on_scale_changed`, `on_caption_hit` and `on_caption_state` are attached
     /// here, after `window` is configured, so those four handlers are the driver's.
@@ -129,7 +119,7 @@ impl Ui {
         window: WindowBuilder,
         backends: impl FnOnce() -> Result<Backends> + Send + 'static,
         backdrop: BackdropSpec,
-        mount: impl FnOnce(AppCtx) -> Mount + Send + 'static,
+        mount: impl FnOnce(&mut Ui<'_>, AppCtx) + Send + 'static,
     ) -> Result<()> {
         let bell = Rc::new(crate::input::Doorbell::new());
         let uia = Rc::new(RefCell::new(crate::uia::Uia::new()));
@@ -415,7 +405,7 @@ thread_local! {
 ///
 /// The one optional process-wide install. It exists so that a census, a harness or a profile
 /// reads the **real** tick rather than a copy of it. Installed on the thread that will own the
-/// window, before [`Ui::run`].
+/// window, before [`UiRuntime::run`].
 ///
 /// The arguments are the tick's own buffers and are not held past the call, so an observer
 /// that counts allocates nothing. Installing a second replaces the first.

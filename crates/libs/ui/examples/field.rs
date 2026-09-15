@@ -8,8 +8,7 @@ use windows_core::Result;
 use windows_d2d::Gpu;
 use windows_scene::{BackdropSpec, Backends};
 use windows_text::{FamilyId, FontLadder, FontSpec};
-use windows_ui::build::mount;
-use windows_ui::driver::{Ui, observe};
+use windows_ui::driver::{UiRuntime, observe};
 use windows_ui::layout::{Len, scroll, spacer, stack};
 use windows_ui::role::*;
 use windows_ui::signal::Cell;
@@ -18,7 +17,7 @@ use windows_ui::widget::{button, field, label};
 use windows_window::Window;
 
 fn main() -> Result<()> {
-    let ui = Ui::new(&REFERENCE, AccentId(0), Density::Comfortable);
+    let ui = UiRuntime::new(&REFERENCE, AccentId(0), Density::Comfortable);
     let commits = Arc::new(Mutex::new(Vec::<String>::new()));
     let ticks = Arc::new(AtomicU64::new(0));
     observe({
@@ -92,39 +91,43 @@ fn main() -> Result<()> {
         },
         {
             let commits = commits.clone();
-            move |ctx| {
+            move |ui, _ctx| {
                 let source = Cell::new(String::new());
-                mount(
-                    stack((
-                        label("Text input proof"),
-                        field(windows_ui::widget::TextSource::Dynamic(Box::new(
-                            move |out| source.with(|s| out.push_str(s)),
-                        )))
-                        .name("Text")
-                        .on_commit(move |text| {
-                            commits.lock().unwrap().push(text.into());
-                            source.set(text.into());
-                        }),
-                        field("12.5").scope(InputScope::Number).name("Number"),
-                        field("https://newapo.dev")
-                            .scope(InputScope::Url)
-                            .name("URL"),
-                        field("search").scope(InputScope::Search).name("Search"),
-                        field("secret").scope(InputScope::Password).name("Password"),
-                        button("Replace text from model")
-                            .on_click(move || source.set("model replacement".into())),
-                        scroll(stack((
-                            label("Scroll to the field below"),
-                            spacer().height(Len::Times(Metric::RowH, 12.0)),
-                            field("scroll-contained input").name("Scrolled field"),
-                        )))
-                        .grow(),
-                    ))
-                    .gap(Metric::SpaceSm)
-                    .padding(Metric::SpaceMd)
-                    .grow(),
-                    ctx.root,
-                )
+                stack(ui, |ui| {
+                    label(ui, "Text input proof");
+                    field(
+                        ui,
+                        windows_ui::widget::TextSource::Dynamic(Box::new(move |out| {
+                            source.with(|s| out.push_str(s))
+                        })),
+                    )
+                    .name("Text")
+                    .on_commit(move |text| {
+                        commits.lock().unwrap().push(text.into());
+                        source.set(text.into());
+                    });
+                    field(ui, "12.5").scope(InputScope::Number).name("Number");
+                    field(ui, "https://newapo.dev")
+                        .scope(InputScope::Url)
+                        .name("URL");
+                    field(ui, "search").scope(InputScope::Search).name("Search");
+                    field(ui, "secret")
+                        .scope(InputScope::Password)
+                        .name("Password");
+                    button(ui, "Replace text from model")
+                        .on_click(move || source.set("model replacement".into()));
+                    scroll(ui, |ui| {
+                        stack(ui, |ui| {
+                            label(ui, "Scroll to the field below");
+                            spacer(ui).height(Len::Times(Metric::RowH, 12.0));
+                            field(ui, "scroll-contained input").name("Scrolled field");
+                        });
+                    })
+                    .grow();
+                })
+                .gap(Metric::SpaceSm)
+                .padding(Metric::SpaceMd)
+                .grow();
             }
         },
     )?;

@@ -10,7 +10,7 @@
 //! on the ops themselves or on where focus landed once they were applied.
 
 use super::*;
-use crate::build::{Any, El, mount};
+use crate::build::{Element, Ui};
 use crate::input::{FocusRing, KeyEvent, Mods, Move};
 use crate::layout::Preset;
 use crate::signal::live_nodes;
@@ -112,22 +112,29 @@ fn entries(patch: &SinkPatch) -> Vec<HitEntry> {
 }
 
 /// Returns a flyout surface with two focusable rows.
-fn body() -> View {
-    flyout().stack((button("Alpha"), button("Beta")))
+fn contents<'a>(ui: &'a mut Ui<'_>) -> Element<'a> {
+    flyout(ui).stack(|ui| {
+        button(ui, "Alpha");
+        button(ui, "Beta");
+    })
+}
+
+fn body(ui: &mut Ui<'_>) {
+    contents(ui);
 }
 
 /// Mounts a control to anchor against and returns its mount with the id it minted.
 fn invoker(patch: &mut SinkPatch) -> (Mount, ControlId) {
-    let mount = mount(
-        El::<Any>::seed(Preset::Bare)
-            .control()
+    let mount = Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+        ui.node(Preset::Bare)
             .name("Open")
             .hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, UiaRole::Button)
             .width(crate::role::Metric::CardMinW)
             .height(crate::role::Metric::RowH)
-            .row(text("Open")),
-        root(),
-    );
+            .row(|ui| {
+                text(ui, "Open");
+            });
+    });
     flush(patch);
     let id = entries(patch)
         .first()
@@ -449,16 +456,16 @@ fn a_second_tap_on_the_invoker_closes_what_it_opened() {
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
 
-    let mount = mount(
-        El::<Any>::seed(Preset::Bare)
-            .control()
+    let mount = Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+        ui.node(Preset::Bare)
             .hit(HitFlags::INTERACTIVE | HitFlags::GESTURE, UiaRole::ComboBox)
             .width(crate::role::Metric::CardMinW)
             .height(crate::role::Metric::RowH)
             .flyout(body)
-            .row(text("Pick")),
-        root(),
-    );
+            .row(|ui| {
+                text(ui, "Pick");
+            });
+    });
     flush(&mut patch);
     let target = entries(&patch)[0].id;
 
@@ -535,16 +542,16 @@ fn escape_closes_a_tooltip_even_though_it_pushes_no_scope() {
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
 
-    let mount = mount(
-        El::<Any>::seed(Preset::Bare)
-            .control()
+    let mount = Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+        ui.node(Preset::Bare)
             .hit(HitFlags::INTERACTIVE, UiaRole::Button)
             .width(crate::role::Metric::CardMinW)
             .height(crate::role::Metric::RowH)
             .tip("Undo (Ctrl+Z)")
-            .row(text("Undo")),
-        root(),
-    );
+            .row(|ui| {
+                text(ui, "Undo");
+            });
+    });
     flush(&mut patch);
     let target = entries(&patch)[0].id;
 
@@ -586,16 +593,16 @@ fn a_hover_starts_one_delay_and_leaving_cancels_it() {
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
 
-    let mount = mount(
-        El::<Any>::seed(Preset::Bare)
-            .control()
+    let mount = Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+        ui.node(Preset::Bare)
             .hit(HitFlags::INTERACTIVE, UiaRole::Button)
             .width(crate::role::Metric::CardMinW)
             .height(crate::role::Metric::RowH)
             .tip("Mute this processor")
-            .row(text("Mute")),
-        root(),
-    );
+            .row(|ui| {
+                text(ui, "Mute");
+            });
+    });
     flush(&mut patch);
     let target = entries(&patch)[0].id;
 
@@ -689,14 +696,15 @@ fn press(target: ControlId) -> Report {
 /// Mounts three described controls and returns the mount with their ids in array order.
 fn strip(patch: &mut SinkPatch, tips: [crate::widget::TextSource; 3]) -> (Mount, Vec<ControlId>) {
     let [a, b, c] = tips;
-    let mount = mount(
-        El::<Any>::seed(Preset::Bare).stack((
-            button("A").tip(a),
-            button("B").tip(b),
-            button("C").tip(c),
-        )),
-        root(),
-    );
+    let mount = Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+        ui.node(Preset::Bare).stack(|ui| {
+            button(ui, "A").tip(a);
+
+            button(ui, "B").tip(b);
+
+            button(ui, "C").tip(c);
+        });
+    });
     flush(patch);
     let ids: Vec<ControlId> = entries(patch).iter().map(|entry| entry.id).collect();
     assert_eq!(ids.len(), 3, "three described controls: {ids:?}");
@@ -713,19 +721,20 @@ fn a_description_opens_on_the_side_the_author_named() {
         let mut patch = fixture();
         let mut focus = Ring::default();
         let mut overlays = Overlays::new();
-        let described = El::<Any>::seed(Preset::Bare)
-            .control()
-            .hit(HitFlags::INTERACTIVE, UiaRole::Button)
-            .width(crate::role::Metric::CardMinW)
-            .height(crate::role::Metric::RowH);
-        let mount = mount(
+        let mount = Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+            let described = ui
+                .node(Preset::Bare)
+                .hit(HitFlags::INTERACTIVE, UiaRole::Button)
+                .width(crate::role::Metric::CardMinW)
+                .height(crate::role::Metric::RowH);
             match side {
                 Some(side) => described.tip_at(side, "Mute"),
                 None => described.tip("Mute"),
             }
-            .row(text("Mute")),
-            root(),
-        );
+            .row(|ui| {
+                text(ui, "Mute");
+            });
+        });
         flush(&mut patch);
         let target = entries(&patch)[0];
 
@@ -895,11 +904,14 @@ fn hovering_a_row_that_expands_opens_it_and_leaving_for_a_sibling_closes_it() {
     let mut overlays = Overlays::new();
 
     // A menu of two expandable rows, opened the ordinary way.
-    let menu_body = || {
-        flyout().stack((
-            button("Alpha").flyout(body).name("Alpha"),
-            button("Beta").flyout(body).name("Beta"),
-        ))
+    let menu_body = |ui: &mut Ui<'_>| {
+        {
+            flyout(ui).stack(|ui| {
+                button(ui, "Alpha").flyout(body).name("Alpha");
+
+                button(ui, "Beta").flyout(body).name("Beta");
+            })
+        };
     };
     let _menu = overlays.open(Spec::popup(), &mut focus.ops, menu_body);
     flush(&mut patch);
@@ -943,18 +955,29 @@ fn a_hover_open_closes_what_the_pointer_left_and_keeps_what_it_returned_to() {
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
 
-    let leaf = || flyout().stack((button("Leaf1").name("Leaf1"), button("Leaf2").name("Leaf2")));
-    let mid = move || {
-        flyout().stack((
-            button("Mid1").flyout(leaf).name("Mid1"),
-            button("Mid2").flyout(leaf).name("Mid2"),
-        ))
+    let leaf = |ui: &mut Ui<'_>| {
+        flyout(ui).stack(|ui| {
+            button(ui, "Leaf1").name("Leaf1");
+            button(ui, "Leaf2").name("Leaf2");
+        });
     };
-    let top = move || {
-        flyout().stack((
-            button("Top1").flyout(mid).name("Top1"),
-            button("Top2").flyout(mid).name("Top2"),
-        ))
+    let mid = move |ui: &mut Ui<'_>| {
+        {
+            flyout(ui).stack(|ui| {
+                button(ui, "Mid1").flyout(leaf).name("Mid1");
+
+                button(ui, "Mid2").flyout(leaf).name("Mid2");
+            })
+        };
+    };
+    let top = move |ui: &mut Ui<'_>| {
+        {
+            flyout(ui).stack(|ui| {
+                button(ui, "Top1").flyout(mid).name("Top1");
+
+                button(ui, "Top2").flyout(mid).name("Top2");
+            })
+        };
     };
     let _menu = overlays.open(Spec::popup(), &mut focus.ops, top);
     flush(&mut patch);
@@ -1002,11 +1025,14 @@ fn escape_takes_the_description_before_the_menu_under_it() {
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
 
-    let menu_body = || {
-        flyout().stack((
-            button("Alpha").name("Alpha").tip("describe alpha"),
-            button("Beta").name("Beta"),
-        ))
+    let menu_body = |ui: &mut Ui<'_>| {
+        {
+            flyout(ui).stack(|ui| {
+                button(ui, "Alpha").name("Alpha").tip("describe alpha");
+
+                button(ui, "Beta").name("Beta");
+            })
+        };
     };
     let _menu = overlays.open(Spec::popup(), &mut focus.ops, menu_body);
     flush(&mut patch);
@@ -1051,12 +1077,19 @@ fn closing_a_menu_cancels_the_dwell_it_started() {
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
 
-    let leaf = || flyout().stack(button("Leaf").name("Leaf"));
-    let menu_body = move || {
-        flyout().stack((
-            button("Alpha").flyout(leaf).name("Alpha"),
-            button("Beta").name("Beta"),
-        ))
+    let leaf = |ui: &mut Ui<'_>| {
+        flyout(ui).stack(|ui| {
+            button(ui, "Leaf").name("Leaf");
+        });
+    };
+    let menu_body = move |ui: &mut Ui<'_>| {
+        {
+            flyout(ui).stack(|ui| {
+                button(ui, "Alpha").flyout(leaf).name("Alpha");
+
+                button(ui, "Beta").name("Beta");
+            })
+        };
     };
     let _menu = overlays.open(Spec::popup(), &mut focus.ops, menu_body);
     flush(&mut patch);
@@ -1133,16 +1166,16 @@ fn dropping_the_stack_releases_a_pending_delay() {
     let mut patch = fixture();
     let mut focus = Ring::default();
 
-    let mount = mount(
-        El::<Any>::seed(Preset::Bare)
-            .control()
+    let mount = Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+        ui.node(Preset::Bare)
             .hit(HitFlags::INTERACTIVE, UiaRole::Button)
             .width(crate::role::Metric::CardMinW)
             .height(crate::role::Metric::RowH)
             .tip("Undo")
-            .row(text("Undo")),
-        root(),
-    );
+            .row(|ui| {
+                text(ui, "Undo");
+            });
+    });
     flush(&mut patch);
     let target = entries(&patch)[0].id;
 
@@ -1173,20 +1206,21 @@ fn a_declared_popup_preserves_intent_on_resize_and_disposes_on_dismissal() {
     let mut patch = fixture();
     let wanted = Cell::new(false);
     let narrow = Cell::new(true);
-    let host = mount(
-        button("Inspector")
+    let host = Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+        button(ui, "Inspector")
             .popup_when(
                 move || wanted.get() && narrow.get(),
                 Spec::popup().exit(Exit::Fade { ms: 200 }),
                 move || wanted.set(false),
-                || {
-                    let _local = Cell::new(1_u32);
-                    body()
+                |ui| {
+                    {
+                        let _local = Cell::new(1_u32);
+                        body(ui)
+                    };
                 },
             )
-            .width(Metric::CardMinW),
-        root(),
-    );
+            .width(Metric::CardMinW);
+    });
     flush(&mut patch);
     let invoker = entries(&patch)[0].id;
     let baseline = live_nodes();
@@ -1248,13 +1282,15 @@ fn a_drawer_viewport_sizes_from_window_input_and_clips_its_shadow() {
             Len::Metric(crate::role::tests::BOTTOM_BAND),
         ]),
         &mut focus.ops,
-        || {
-            crate::widget::sheet("drawer")
-                .shadowed(Edge::Left)
-                .width(Len::Pct(0.82))
-                .max_width(crate::role::tests::MAX_WIDTH)
-                .height(Len::Pct(1.0))
-                .probed(pane)
+        |ui| {
+            {
+                crate::widget::sheet(ui, "drawer")
+                    .shadowed(Edge::Left)
+                    .width(Len::Pct(0.82))
+                    .max_width(crate::role::tests::MAX_WIDTH)
+                    .height(Len::Pct(1.0))
+                    .probed(pane)
+            };
         },
     );
     for width in [1100.0, 1500.0, 500.0] {
@@ -1300,20 +1336,24 @@ fn a_scrolling_flyout_keeps_its_rail_above_the_choices() {
     let (_invoker, anchor) = invoker(&mut patch);
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
-    let id = overlays.open(Spec::flyout(anchor), &mut focus.ops, || {
-        flyout().stack(
-            scroll_with(
-                Reveal::Always,
-                stack((
-                    button("Alpha"),
-                    button("Beta"),
-                    button("Gamma"),
-                    button("Delta"),
-                )),
-            )
-            .height(Len::Times(Metric::RowH, 2.0))
-            .width(Len::Times(Metric::RowH, 11.0)),
-        )
+    let id = overlays.open(Spec::flyout(anchor), &mut focus.ops, |ui| {
+        {
+            flyout(ui).stack(|ui| {
+                scroll_with(ui, Reveal::Always, |ui| {
+                    stack(ui, |ui| {
+                        button(ui, "Alpha");
+
+                        button(ui, "Beta");
+
+                        button(ui, "Gamma");
+
+                        button(ui, "Delta");
+                    });
+                })
+                .height(Len::Times(Metric::RowH, 2.0))
+                .width(Len::Times(Metric::RowH, 11.0));
+            })
+        };
     });
     flush(&mut patch);
     let (grab, rect) = Host::with(|h| {
@@ -1349,13 +1389,18 @@ fn a_slide_waits_for_the_compositor_and_never_emits_per_frame_updates() {
     let mut focus = Ring::default();
     focus.seed(anchor);
     let mut overlays = Overlays::new();
-    let id = overlays.open(sliding_popup(), &mut focus.ops, || {
-        scroll(
-            stack((button("Alpha"), button("Beta")))
-                .height(Len::Times(crate::role::Metric::RowH, 37.5)),
-        )
-        .width(Len::Times(crate::role::Metric::RowH, 12.5))
-        .height(Len::Pct(1.0))
+    let id = overlays.open(sliding_popup(), &mut focus.ops, |ui| {
+        {
+            scroll(ui, |ui| {
+                stack(ui, |ui| {
+                    button(ui, "Alpha");
+                    button(ui, "Beta");
+                })
+                .height(Len::Times(crate::role::Metric::RowH, 37.5));
+            })
+            .width(Len::Times(crate::role::Metric::RowH, 12.5))
+            .height(Len::Pct(1.0))
+        };
     });
     let node = overlays.open[id.depth as usize]
         .mount
@@ -1462,10 +1507,12 @@ fn resizing_an_entering_popup_snaps_and_a_stale_completion_cannot_release_a_reop
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
     let open = |overlays: &mut Overlays, focus: &mut Ring| {
-        overlays.open(sliding_popup(), &mut focus.ops, || {
-            body()
-                .width(Len::Times(crate::role::Metric::RowH, 12.5))
-                .height(Len::Pct(1.0))
+        overlays.open(sliding_popup(), &mut focus.ops, |ui| {
+            {
+                contents(ui)
+                    .width(Len::Times(crate::role::Metric::RowH, 12.5))
+                    .height(Len::Pct(1.0))
+            };
         })
     };
     let id = open(&mut overlays, &mut focus);
@@ -1522,15 +1569,14 @@ fn a_window_presentation_switch_snaps_both_ways_and_keeps_the_next_dismissal_ani
     let window = Host::window_size();
     let wanted = Cell::new(true);
     let (_owner, _mount) = Owner::scope(|| {
-        mount(
-            button("Inspector").popup_when(
+        Ui::mount_at(root(), None, crate::build::root_scope(), None, |ui| {
+            button(ui, "Inspector").popup_when(
                 move || window.get().x < 1000.0 && wanted.get(),
                 sliding_popup(),
                 move || wanted.set(false),
                 body,
-            ),
-            root(),
-        )
+            );
+        })
     });
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
@@ -1663,12 +1709,16 @@ fn type_ahead_walks_the_items_of_the_topmost_overlay_and_cycles() {
     let mut focus = Ring::default();
     let mut overlays = Overlays::new();
 
-    let menu_body = || {
-        flyout().stack((
-            button("Alpha").name("Alpha"),
-            button("Almond").name("Almond"),
-            button("Beta").name("Beta"),
-        ))
+    let menu_body = |ui: &mut Ui<'_>| {
+        {
+            flyout(ui).stack(|ui| {
+                button(ui, "Alpha").name("Alpha");
+
+                button(ui, "Almond").name("Almond");
+
+                button(ui, "Beta").name("Beta");
+            })
+        };
     };
     let _menu = overlays.open(Spec::popup(), &mut focus.ops, menu_body);
     flush(&mut patch);

@@ -1,13 +1,12 @@
-//! The widget set: the seed functions an application calls, and the vocabulary they name.
+//! Stock retained recipes and the vocabulary shared by custom controls.
 //!
-//! A widget owns sprites, a hit entry and a role, so adding one changes this crate. A
-//! composition is an application-side function returning a tree of widgets, and it adds
-//! nothing here.
+//! Application components use the same direct writes, declaring their children through
+//! a borrowed `Ui` context.
 
 pub mod roles;
 
 mod kind;
-pub(crate) mod seed;
+mod recipes;
 mod state;
 mod text;
 
@@ -15,7 +14,7 @@ pub use kind::{
     Chrome, Interaction, ModelState, Motion, Range, RoleSet, ScalarPart, ScalarValue, StatePolicy,
     TURN_SPAN, TURN_SWEEP, UiaRole, Wash, angle_of, detent_delta, fraction_of, offset_of,
 };
-pub use seed::{
+pub use recipes::{
     Choice, SliderStyle, TextStyle, box_, button, button_with, caption, card, code, control_text,
     display, edge_button, field, field_with, flyout, icon_button, knob, label, meter, micro, mono,
     note, panel, path, pills, segmented, select, sheet, slider, styled_text, text, text_group,

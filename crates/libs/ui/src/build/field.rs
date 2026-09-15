@@ -39,6 +39,27 @@ pub(crate) struct Row {
 }
 
 impl Host {
+    pub(super) fn field_binding(
+        &mut self,
+        node: windows_scene::NodeId,
+        id: ControlId,
+        source: crate::widget::TextSource,
+    ) {
+        self.replace_binding(node, super::binding::Destination::Text);
+        match source {
+            crate::widget::TextSource::Static(text) => self.field_source(id, text),
+            crate::widget::TextSource::Owned(text) => self.field_source(id, &text),
+            crate::widget::TextSource::Dynamic(read) => {
+                let mut scratch = String::new();
+                self.bind_to(node, super::binding::Destination::Text, move || {
+                    scratch.clear();
+                    read(&mut scratch);
+                    Host::with(|host| host.field_source(id, &scratch));
+                });
+            }
+        }
+    }
+
     pub(crate) fn install_field(
         &mut self,
         id: ControlId,
@@ -48,14 +69,7 @@ impl Host {
         style: Scope,
         callback: Option<Rc<dyn Fn(&str)>>,
     ) {
-        let caret = self.model().sprite(group, None);
-        self.model().style(
-            caret.node(),
-            &taffy::Style {
-                position: taffy::Position::Absolute,
-                ..taffy::Style::DEFAULT
-            },
-        );
+        let caret = self.model().visual(group, None);
         self.model().mask(
             caret,
             Mask::Box {
@@ -375,14 +389,7 @@ fn decoration(
         Role::Fill(Fill::Selected)
     };
     while sprites.len() < rects.len() {
-        let sprite = model.sprite(group, None);
-        model.style(
-            sprite.node(),
-            &taffy::Style {
-                position: taffy::Position::Absolute,
-                ..taffy::Style::DEFAULT
-            },
-        );
+        let sprite = model.visual(group, None);
         model.mask(
             sprite,
             Mask::Box {
@@ -419,14 +426,17 @@ fn decoration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::{mount, tests::fixture};
+    use crate::build::tests::fixture;
     use crate::text_input::{Affinity, Command, Editor};
 
     #[test]
     fn field_shapes_on_app_reuses_clusters_for_selection_and_releases_on_unmount() {
         let mut patch = fixture();
         let root = Host::with(|h| h.model().root());
-        let mounted = mount(crate::widget::field("á😀ffi العربية"), root);
+        let mounted =
+            crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
+                crate::widget::field(ui, "á😀ffi العربية");
+            });
         Host::flush(&mut patch);
         let source = Host::with(|h| h.field_sources[0].clone());
         let mut editor = Editor::new(source.id, source.scope, &source.text);
@@ -462,10 +472,10 @@ mod tests {
     fn shorter_source_on_blur_releases_horizontal_scroll() {
         let mut patch = fixture();
         let root = Host::with(|h| h.model().root());
-        let _mounted = mount(
-            crate::widget::field("1234.56789123456789").width(crate::layout::Len::Pct(0.1)),
-            root,
-        );
+        let _mounted =
+            crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
+                crate::widget::field(ui, "1234.56789123456789").width(crate::layout::Len::Pct(0.1));
+            });
         Host::flush(&mut patch);
         let source = Host::with(|h| h.field_sources[0].clone());
         let mut editor = Editor::new(source.id, source.scope, &source.text);
@@ -522,12 +532,12 @@ mod tests {
     fn password_geometry_keeps_original_acp_and_uia_never_contains_plaintext() {
         let mut patch = fixture();
         let root = Host::with(|h| h.model().root());
-        let _mounted = mount(
-            crate::widget::field("á😀")
-                .scope(InputScope::Password)
-                .name("Password"),
-            root,
-        );
+        let _mounted =
+            crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
+                crate::widget::field(ui, "á😀")
+                    .scope(InputScope::Password)
+                    .name("Password");
+            });
         Host::flush(&mut patch);
         let source = Host::with(|h| h.field_sources[0].clone());
         let mut editor = Editor::new(source.id, source.scope, &source.text);

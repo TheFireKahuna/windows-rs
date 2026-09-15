@@ -1,25 +1,21 @@
-//! Tests for the build lowering, driven headless.
-//!
-//! `Model` owns no COM, so a whole mount runs with no window, no device and no compositor,
-//! and the ops it emits are read back off the patch.
-
-use super::arena::{Build, MaskSeed, Part};
+//! Retained construction, updates and disposal against the production runtime.
+fn create(body: impl FnOnce(&mut Ui<'_>)) -> super::mount::Mount {
+    Ui::mount_at(root(), None, root_scope(), None, body)
+}
 use super::*;
 use crate::layout::{Len, stack};
 use crate::role::{
     AccentId, Density, Elevation, Fill, Metric, Polarity, Role, Scope, Stroke, Text, TypeRole,
 };
-use crate::widget::{Flow, Motion, StatePolicy, Wash};
+use crate::widget::{Flow, Motion};
 use windows_color::{DisplayCapability, OutputTransform, Radiance};
 use windows_numerics::Vector2;
 use windows_scene::{Env, Model, Op, Paint, SinkPatch, taffy};
 use windows_text::FontLadder;
-
 /// Creates this thread's text engine and host with an immutable palette reference.
 pub(crate) fn fixture() -> SinkPatch {
     fixture_at(96.0)
 }
-
 #[test]
 fn independent_hosts_retheme_existing_recipes_and_preserve_state() {
     let jobs: Vec<_> = [Polarity::Dark, Polarity::Light]
@@ -49,24 +45,30 @@ fn independent_hosts_retheme_existing_recipes_and_preserve_state() {
                         }),
                         ..crate::widget::Chrome::new(ROWS[0], Metric::Radius)
                     };
-                    let held = mount(
-                        stack((
-                            crate::widget::button_with(
-                                "Recipe",
+                    let held = Ui::mount_at(root(), None, root_scope, None, |ui| {
+                        ui.stack(|ui| {
+                            ui.button(
+                                CHROME,
                                 crate::widget::TextStyle::new(TypeRole::Body),
+                                "Recipe",
                             )
-                            .appearance(CHROME)
                             .selected(selected)
-                            .disabled(disabled),
-                            crate::widget::field("draft"),
-                        )),
-                        root(),
-                    );
+                            .disabled(disabled);
+                            ui.field(
+                                crate::widget::Chrome::new(
+                                    crate::widget::roles::FIELD[0],
+                                    Metric::Radius,
+                                ),
+                                crate::widget::TextStyle::new(TypeRole::Body),
+                                "draft",
+                            );
+                        });
+                    });
                     flush(&mut patch);
                     let id = Host::with(|h| {
                         h.controls
                             .iter()
-                            .find(|(_, c)| c.chrome == Some(CHROME))
+                            .find(|(id, _)| h.chrome(*id) == Some(CHROME))
                             .unwrap()
                             .0
                     });
@@ -155,15 +157,15 @@ fn independent_hosts_retheme_existing_recipes_and_preserve_state() {
         job.join().unwrap();
     }
 }
-
 #[test]
 fn choice_dispatch_preserves_canonical_selection_when_an_edit_is_declined() {
     let (_owner, ()) = crate::signal::Owner::scope(|| {
         let mut patch = fixture();
         let selected = crate::signal::Cell::new(0_u8);
         let attempts = crate::signal::Cell::new(0_u8);
-        let _held = mount(
+        let _held = create(|ui| {
             crate::widget::segmented(
+                ui,
                 (
                     move || selected.get(),
                     move |next| {
@@ -174,9 +176,8 @@ fn choice_dispatch_preserves_canonical_selection_when_an_edit_is_declined() {
                     },
                 ),
                 &[("First", 0), ("Second", 1), ("Unavailable", 2)],
-            ),
-            root(),
-        );
+            );
+        });
         crate::signal::flush();
         flush(&mut patch);
         let ids = Host::with(|h| {
@@ -187,12 +188,10 @@ fn choice_dispatch_preserves_canonical_selection_when_an_edit_is_declined() {
                 .collect::<Vec<_>>()
         });
         for (at, expected) in [(1, 1), (2, 1)] {
-            Host::with(|h| {
-                h.dispatch(&[crate::widget::Intent {
-                    target: ids[at],
-                    what: crate::widget::What::Tapped,
-                }])
-            });
+            Host::dispatch(&[crate::widget::Intent {
+                target: ids[at],
+                what: crate::widget::What::Tapped,
+            }]);
             crate::signal::flush();
             assert_eq!(selected.get(), expected);
             Host::with(|h| {
@@ -213,7 +212,6 @@ fn choice_dispatch_preserves_canonical_selection_when_an_edit_is_declined() {
         });
     });
 }
-
 #[test]
 fn a_gradient_fill_keeps_its_geometry_mask_and_resources_on_edit() {
     let (_resource_owner, ()) = crate::signal::Owner::scope(|| {
@@ -229,7 +227,7 @@ fn a_gradient_fill_keeps_its_geometry_mask_and_resources_on_edit() {
             PathVerb::Line(Vector2 { x: 0.0, y: 40.0 }),
             PathVerb::End { closed: true },
         ];
-        let geom = geometry(&verts);
+        let mut geom = windows_scene::GeomId::NONE;
         let stops = [
             Stop {
                 at: 0.0,
@@ -242,22 +240,25 @@ fn a_gradient_fill_keeps_its_geometry_mask_and_resources_on_edit() {
                 strength: 0.0,
             },
         ];
-        let fade = ramp(&stops, Spread::Vertical);
-        let _mount = mount(
-            crate::widget::path(geom)
+        let mut fade = windows_scene::RampId::NONE;
+        let _mount = create(|ui| {
+            geom = ui.geometry(&verts);
+            fade = ui.ramp(&stops, Spread::Vertical);
+            ui.path(geom)
                 .fill_ramp(fade)
                 .width(Metric::RowH)
-                .height(Metric::RowH),
-            root(),
-        );
+                .height(Metric::RowH);
+        });
         flush(&mut patch);
-        assert!(patch.ops().iter().any(|op| matches!(op, Op::Mask { mask: Mask::Shape { geom: id, stroke: None }, .. } if *id == geom)));
         assert!(
             patch
                 .ops()
                 .iter()
-                .any(|op| matches!(op, Op::Paint { paint: Paint::Ramp(id), .. } if *id == fade))
+                .any(|op| matches!(op, Op::Mask { mask : Mask::Shape {
+            geom : id, stroke : None }, .. } if * id == geom))
         );
+        assert!(patch.ops().iter().any(|op| matches!(op, Op::Paint { paint :
+            Paint::Ramp(id), .. } if * id == fade)));
         patch.clear();
         set_ramp(
             fade,
@@ -287,7 +288,6 @@ fn a_gradient_fill_keeps_its_geometry_mask_and_resources_on_edit() {
         );
     });
 }
-
 #[test]
 fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
     let (_resource_owner, ()) = crate::signal::Owner::scope(|| {
@@ -296,57 +296,68 @@ fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
         let mut patch = fixture();
         let value = crate::signal::Cell::new(0.25_f32);
         let glow = crate::signal::Cell::new(Role::Data(DataRole(0xfffe)));
-        let geometry = geometry(&[
-            PathVerb::Move {
-                to: Vector2 { x: 0.0, y: 0.0 },
-                filled: false,
-            },
-            PathVerb::Line(Vector2 { x: 20.0, y: 20.0 }),
-            PathVerb::End { closed: false },
-        ]);
-        let gradient = ramp(
-            &[
-                Stop {
-                    at: 0.0,
-                    role: DataRole(1),
-                    strength: 1.0,
-                },
-                Stop {
-                    at: 1.0,
-                    role: DataRole(2),
-                    strength: 1.0,
-                },
-            ],
-            Spread::Conic {
-                center: [0.5, 0.56],
-                start: 0.0,
-            },
-        );
+        let mut geometry = windows_scene::GeomId::NONE;
+        let mut gradient = windows_scene::RampId::NONE;
         let (owner, held) = crate::signal::Owner::scope(|| {
-            mount(
-                crate::widget::path(geometry)
+            create(|ui| {
+                geometry = ui.geometry(&[
+                    PathVerb::Move {
+                        to: Vector2 { x: 0.0, y: 0.0 },
+                        filled: false,
+                    },
+                    PathVerb::Line(Vector2 { x: 20.0, y: 20.0 }),
+                    PathVerb::End { closed: false },
+                ]);
+                gradient = ui.ramp(
+                    &[
+                        Stop {
+                            at: 0.0,
+                            role: DataRole(1),
+                            strength: 1.0,
+                        },
+                        Stop {
+                            at: 1.0,
+                            role: DataRole(2),
+                            strength: 1.0,
+                        },
+                    ],
+                    Spread::Conic {
+                        center: [0.5, 0.56],
+                        start: 0.0,
+                    },
+                );
+                ui.path(geometry)
                     .stroke_ramp(gradient, Metric::HairlineW)
                     .width(crate::role::tests::EXTENT)
                     .height(crate::role::tests::EXTENT)
                     .pivot(Vector2 { x: 64.0, y: 71.68 })
                     .trim(move || value.get())
                     .rotation(move || value.get() * 4.0)
-                    .halo(glow),
-                root(),
-            )
+                    .halo(glow);
+            })
         });
         flush(&mut patch);
-        assert!(patch.ops().iter().any(|op| matches!(op,
-        Op::Halo { halo: Some(halo), .. } if halo.blur == 9.0)));
+        assert!(
+            patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Halo { halo : Some(halo), .. }
+            if halo.blur == 9.0))
+        );
         patch.clear();
         value.set(0.75);
         glow.set(Role::Data(DataRole(0xffff)));
         crate::signal::flush();
         flush(&mut patch);
         for (property, target) in [(Prop::TrimEnd, 0.75), (Prop::RotationAngle, 3.0)] {
-            assert!(patch.ops().iter().any(|op| matches!(op,
-            Op::Bind { prop, bind: Bind::Animate(Anim::Spring { to: Value::Scalar(v), .. }), .. }
-            if *prop == property && *v == target)));
+            assert!(
+                patch
+                    .ops()
+                    .iter()
+                    .any(|op| matches!(op, Op::Bind { prop, bind :
+                Bind::Animate(Anim::Spring { to : Value::Scalar(v), .. }), .. } if * prop
+                == property && * v == target))
+            );
         }
         assert!(
             patch
@@ -377,15 +388,11 @@ fn instrument_edit_retargets_trim_rotation_and_ink_halo_without_reminting() {
         );
     });
 }
-
 /// [`fixture`] at a stated DPI.
 ///
 /// The raster caches are cut in physical pixels, so a mask that is exact at one scale can be
 /// degenerate at another. A test that only ever runs at 96 cannot see it.
 pub(crate) fn fixture_at(dpi: f32) -> SinkPatch {
-    // The driver's own root, so a mount here is arranged exactly as a window arranges it. A
-    // root written here instead can differ — a flex row gives a mounted child its content
-    // width, which leaves a scroll viewport zero DIPs wide and hit-testing nothing.
     let mut model = Model::new(crate::layout::root());
     model.set_window(Vector2 { x: 800.0, y: 600.0 });
     Host::install(
@@ -401,22 +408,17 @@ pub(crate) fn fixture_at(dpi: f32) -> SinkPatch {
         ),
     );
     Host::install_text(FontLadder::new(["Segoe UI Variable Text", "Cascadia Mono"])).unwrap();
-    // The root's own `New` op rides the first flush. Draining it leaves the patch carrying
-    // only what the test itself mounts.
     let mut patch = SinkPatch::new();
     Host::flush(&mut patch);
     patch.clear();
     patch
 }
-
 fn flush(patch: &mut SinkPatch) {
     Host::flush(patch);
 }
-
 fn root() -> windows_scene::GroupId {
     Host::with(|h| h.model().root())
 }
-
 #[test]
 #[cfg(feature = "test-support")]
 fn hover_scope_reaches_dynamic_children_and_clears_on_unmount() {
@@ -425,21 +427,19 @@ fn hover_scope_reaches_dynamic_children_and_clears_on_unmount() {
     let mut patch = fixture();
     let (_owner, (hovered, added)) = Owner::scope(|| (Cell::new(false), Cell::new(false)));
     let (content, mounted) = Owner::scope(|| {
-        mount(
-            stack((
-                button("First").key("first"),
-                switch(
-                    move || added.get(),
-                    |added| {
-                        button(if *added { "Added" } else { "Initial" })
-                            .key("dynamic")
-                            .erase()
-                    },
-                ),
-            ))
-            .hover_scope(hovered),
-            root(),
-        )
+        create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .hover_scope(hovered)
+                .children(|ui| {
+                    button(ui, "First").key("first");
+                    ui.switch(
+                        move || added.get(),
+                        |ui, added| {
+                            button(ui, if *added { "Added" } else { "Initial" }).key("dynamic");
+                        },
+                    );
+                });
+        })
     });
     let mut driver = crate::driver::testing::LayoutDriver::default();
     for _ in 0..8 {
@@ -468,66 +468,54 @@ fn hover_scope_reaches_dynamic_children_and_clears_on_unmount() {
                     .1;
                 assert_eq!(row.front.hover_scope, Some(observer));
             }
-            h.dispatch(&[Intent {
-                target: observer,
-                what: What::Hovered(true),
-            }]);
         });
+        Host::dispatch(&[Intent {
+            target: observer,
+            what: What::Hovered(true),
+        }]);
         assert!(hovered.get());
     }
     drop(content);
     drop(mounted);
     assert!(!hovered.get(), "a surviving observer cell must be cleared");
-    Host::with(|h| {
-        h.dispatch(&[Intent {
-            target: observer,
-            what: What::Hovered(true),
-        }])
-    });
+    Host::dispatch(&[Intent {
+        target: observer,
+        what: What::Hovered(true),
+    }]);
     assert!(
         !hovered.get(),
         "an event queued before unmount must be ignored"
     );
 }
-
 /// Returns everything the host has produced since the last call, as one batch.
 fn filled() -> crate::seam::Down {
     let mut down = crate::seam::Down::default();
     Host::with(|h| h.fill(&mut down));
     down
 }
-
 /// Returns the pick table the regions declared so far, as the tick builds it.
 fn picks() -> crate::present::Picks {
     let mut picks = crate::present::Picks::default();
     picks.apply(&filled().regions);
     picks
 }
-
 /// Returns a bare rounded box, the smallest view that mints a sprite.
-fn plate() -> View {
-    El::<Any>::seed(crate::layout::Preset::Bare).sprite(
-        MaskSeed::Box {
-            radius: Some(Len::Metric(Metric::Radius)),
-        },
-        Role::Fill(Fill::Surface),
-        Part::Fill,
-    )
+fn plate<'a>(ui: &'a mut Ui<'_>) -> Element<'a> {
+    ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0)
 }
-
 #[test]
 fn vertical_labels_keep_their_rotated_extent_after_publish_and_updates() {
     for dpi in [96.0, 144.0, 192.0] {
         let mut patch = fixture_at(dpi);
         let word = crate::signal::Cell::new("Inspector");
-        let held = mount(
-            stack((
-                crate::widget::vertical_label(crate::widget::shown(move || word.get())),
-                crate::widget::label(crate::widget::shown(move || word.get())),
-            ))
-            .align(crate::layout::Align::Start),
-            root(),
-        );
+        let held = create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .align(crate::layout::Align::Start)
+                .children(|ui| {
+                    crate::widget::vertical_label(ui, crate::widget::shown(move || word.get()));
+                    crate::widget::label(ui, crate::widget::shown(move || word.get()));
+                });
+        });
         for (value, width) in [
             ("Inspector", 600.0),
             ("Longer inspector label", 900.0),
@@ -544,7 +532,7 @@ fn vertical_labels_keep_their_rotated_extent_after_publish_and_updates() {
                         .mounts
                         .iter()
                         .filter(|(_, m)| m.text.is_some())
-                        .map(|(_, m)| m.node)
+                        .map(|(node, _)| node)
                         .collect();
                     let key = h.mounts.iter().filter_map(|(_, m)| m.text).nth(1).unwrap();
                     let intrinsic = h.text.measure(windows_scene::MeasureIn {
@@ -576,19 +564,18 @@ fn vertical_labels_keep_their_rotated_extent_after_publish_and_updates() {
         drop(held);
     }
 }
-
 #[test]
 fn dynamic_labels_fit_replacement_text_without_previous_width_padding() {
     for dpi in [96.0, 144.0, 192.0] {
         let mut patch = fixture_at(dpi);
         let word = crate::signal::Cell::new("Inspector");
-        let held = mount(
-            stack(crate::widget::label(crate::widget::shown(move || {
-                word.get()
-            })))
-            .align(crate::layout::Align::Start),
-            root(),
-        );
+        let held = create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .align(crate::layout::Align::Start)
+                .children(|ui| {
+                    crate::widget::label(ui, crate::widget::shown(move || word.get()));
+                });
+        });
         for value in [
             "Inspector",
             "Longer inspector label",
@@ -603,7 +590,7 @@ fn dynamic_labels_fit_replacement_text_without_previous_width_padding() {
                 let (node, key) = h
                     .mounts
                     .iter()
-                    .find_map(|(_, m)| m.text.map(|k| (m.node, k)))
+                    .find_map(|(node, m)| m.text.map(|k| (node, k)))
                     .unwrap();
                 let actual = h.model().solved(node);
                 let expected = h.text.measure(windows_scene::MeasureIn {
@@ -628,16 +615,14 @@ fn dynamic_labels_fit_replacement_text_without_previous_width_padding() {
         drop(held);
     }
 }
-
-// ── lowering ─────────────────────────────────────────────────────────────────────
-
 /// A slot with one sprite and no children lowers to that sprite: one visual, no group.
 #[test]
 fn a_single_sprite_slot_costs_one_visual() {
     let mut patch = fixture();
-    let _mount = mount(plate(), root());
+    let _mount = Ui::mount_root(|ui| {
+        ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0);
+    });
     flush(&mut patch);
-
     let minted: Vec<_> = patch
         .ops()
         .iter()
@@ -648,16 +633,18 @@ fn a_single_sprite_slot_costs_one_visual() {
         .collect();
     assert_eq!(minted, vec![windows_scene::NodeKind::Sprite]);
 }
-
-/// A container mints a group, and its children land in paint order.
-///
-/// Child order is z-order, so the ops are asserted as a sequence rather than as a set.
+/// Parent-first construction preserves paint order without temporary child storage.
 #[test]
 fn children_mount_in_paint_order() {
     let mut patch = fixture();
-    let _mount = mount(stack((plate(), plate(), plate())), root());
+    let _mount = Ui::mount_root(|ui| {
+        ui.stack(|ui| {
+            for _ in 0..3 {
+                ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0);
+            }
+        });
+    });
     flush(&mut patch);
-
     let minted: Vec<_> = patch
         .ops()
         .iter()
@@ -682,45 +669,34 @@ fn children_mount_in_paint_order() {
     );
     assert_eq!(minted[3].1, Some(minted[2].0), "the third above the second");
 }
-
-/// A constant channel lowers to one `Set` at mount: no graph node, no effect.
-///
-/// A static screen therefore costs sprites and nothing else.
+/// A constant channel writes one `Set` without creating a graph node or effect.
 #[test]
 fn a_constant_channel_produces_no_effect() {
     let mut patch = fixture();
-    let _mount = mount(plate().opacity(0.5), root());
+    let before = crate::signal::live_nodes();
+    let _mount = Ui::mount_root(|ui| {
+        ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0)
+            .opacity(0.5);
+    });
     flush(&mut patch);
-
-    // `.opacity` declares `Motion::Chrome`, so a value routed through an effect arrives as a
-    // spring. A plain `Set` means the constant path was taken and no effect was created.
-    assert!(
-        !patch.ops().iter().any(|op| matches!(
-            op,
-            Op::Bind {
-                bind: windows_scene::Bind::Animate(_),
-                ..
-            }
-        )),
-        "a constant must not start an animation, and therefore must not have an effect"
+    assert_eq!(
+        crate::signal::live_nodes(),
+        before,
+        "a constant installs no graph effect"
     );
     let sets = patch
         .ops()
         .iter()
         .filter(|op| {
             matches!(
-                op,
-                Op::Bind {
-                    bind: windows_scene::Bind::Set(windows_scene::Value::Scalar(v)),
-                    prop: windows_scene::Prop::Opacity,
-                    ..
-                } if (*v - 0.5).abs() < f32::EPSILON
+                op, Op::Bind { bind :
+                windows_scene::Bind::Set(windows_scene::Value::Scalar(v)), prop :
+                windows_scene::Prop::Opacity, .. } if (* v - 0.5).abs() < f32::EPSILON
             )
         })
         .count();
     assert_eq!(sets, 1);
 }
-
 /// A reactive channel lowers to one effect, and writing its cell re-binds the property.
 #[test]
 fn a_reactive_channel_tracks_its_cell() {
@@ -728,39 +704,71 @@ fn a_reactive_channel_tracks_its_cell() {
     let alpha = crate::signal::Cell::new(0.25_f32);
     let reads = std::rc::Rc::new(std::cell::Cell::new(0));
     let read_count = reads.clone();
-    let mounted = mount(
-        plate()
-            .opacity(|| panic!("replaced writer ran"))
-            .opacity(move || {
-                read_count.set(read_count.get() + 1);
-                alpha.get()
-            }),
-        root(),
-    );
+    let replace = crate::signal::Cell::new(false);
+    let mut handle = None;
+    let mounted = create(|ui| {
+        handle = Some(
+            ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0)
+                .hide_if(|| panic!("replaced visibility writer ran"))
+                .hide_if(false)
+                .halo(|| panic!("replaced halo writer ran"))
+                .shadowed(crate::layout::Edge::Bottom)
+                .opacity(|| panic!("replaced writer ran"))
+                .opacity(move || {
+                    read_count.set(read_count.get() + 1);
+                    alpha.get()
+                })
+                .id(),
+        );
+        let handle = handle.unwrap();
+        ui.effect(move |ui| {
+            if replace.get() {
+                ui.edit(handle).unwrap().opacity(0.4);
+            }
+        });
+    });
     assert_eq!(reads.get(), 0, "creation does not execute UI bindings");
     flush(&mut patch);
+    assert!(
+        binds(&patch, windows_scene::Prop::Opacity)
+            .iter()
+            .all(|op| matches!(
+                op,
+                Op::Bind {
+                    bind: windows_scene::Bind::Set(_),
+                    ..
+                }
+            ))
+    );
     patch.clear();
-
     alpha.set(0.75);
     crate::signal::flush();
     flush(&mut patch);
-
     let bound = patch.ops().iter().any(|op| {
         matches!(
-            op,
-            Op::Bind {
-                bind: windows_scene::Bind::Animate(windows_scene::Anim::Spring {
-                    to: windows_scene::Value::Scalar(v),
-                    ..
-                }),
-                ..
-            } if (*v - 0.75).abs() < f32::EPSILON
+            op, Op::Bind { bind :
+            windows_scene::Bind::Animate(windows_scene::Anim::Spring { to :
+            windows_scene::Value::Scalar(v), .. }), .. } if (* v - 0.75).abs() <
+            f32::EPSILON
         )
     });
     assert!(bound, "a cell write must reach the sink it was bound to");
+    replace.set(true);
+    crate::signal::flush();
+    let before_replaced_source = reads.get();
+    alpha.set(0.1);
+    crate::signal::flush();
+    assert_eq!(
+        reads.get(),
+        before_replaced_source,
+        "live replacement disconnects the previous source"
+    );
     let retired = mounted.node();
     drop(mounted);
-    let replacement = mount(plate(), root());
+    let replacement = create(|ui| {
+        assert!(ui.edit(handle.unwrap()).is_none());
+        ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0);
+    });
     assert_eq!(retired.index(), replacement.node().index());
     assert_ne!(retired, replacement.node());
     let before = reads.get();
@@ -772,66 +780,19 @@ fn a_reactive_channel_tracks_its_cell() {
         "a retired binding must not read its source"
     );
 }
-
-/// A channel's first value is a state, not a transition into one.
-///
-/// Animating it would sweep every bound property up from whatever the compositor happens to
-/// hold — a meter would fill on mount — and a value the compositor never held is one a
-/// natural-motion spring cannot reliably start from, which is what left a layer declared
-/// invisible unable to come back.
-#[test]
-fn a_channel_lands_on_its_first_value_and_animates_to_every_later_one() {
-    let mut patch = fixture();
-    let alpha = crate::signal::Cell::new(0.0_f32);
-    let _mount = mount(plate().opacity(alpha), root());
-    flush(&mut patch);
-
-    let kinds: Vec<&str> = binds(&patch, windows_scene::Prop::Opacity)
-        .iter()
-        .map(|op| match op {
-            Op::Bind {
-                bind: windows_scene::Bind::Set(_),
-                ..
-            } => "set",
-            _ => "animate",
-        })
-        .collect();
-    assert_eq!(kinds, vec!["set"], "the mount lands, it does not fade in");
-
-    patch.clear();
-    alpha.set(1.0);
-    crate::signal::flush();
-    flush(&mut patch);
-    let kinds: Vec<&str> = binds(&patch, windows_scene::Prop::Opacity)
-        .iter()
-        .map(|op| match op {
-            Op::Bind {
-                bind: windows_scene::Bind::Set(_),
-                ..
-            } => "set",
-            _ => "animate",
-        })
-        .collect();
-    assert_eq!(kinds, vec!["animate"], "and every value after it is a move");
-}
-
 /// Editing data used by a channel must not restart unchanged chrome animations.
 #[test]
 fn unchanged_channel_output_does_not_retarget_and_keeps_tracking() {
     let mut patch = fixture();
     let state = crate::signal::Cell::new((true, 0_u32));
     let alternate = crate::signal::Cell::new(1.0_f32);
-    let _mount = mount(
-        plate().opacity(move || {
+    let _mount = create(|ui| {
+        plate(ui).opacity(move || {
             let (enabled, _) = state.get();
             if enabled { 1.0 } else { alternate.get() }
-        }),
-        root(),
-    );
+        });
+    });
     flush(&mut patch);
-
-    // An edit changes the source but leaves the card enabled. Switching sources
-    // at the same opacity must also track the newly read dependency.
     for next in [(true, 1), (true, 2), (false, 2)] {
         patch.clear();
         state.set(next);
@@ -839,7 +800,6 @@ fn unchanged_channel_output_does_not_retarget_and_keeps_tracking() {
         flush(&mut patch);
         assert!(binds(&patch, windows_scene::Prop::Opacity).is_empty());
     }
-
     patch.clear();
     alternate.set(0.45);
     crate::signal::flush();
@@ -855,7 +815,6 @@ fn unchanged_channel_output_does_not_retarget_and_keeps_tracking() {
         }]
     ));
 }
-
 /// A channel that fades to zero comes back.
 ///
 /// The tier crossfade in a channel graph is exactly this shape — one layer's opacity to zero
@@ -865,9 +824,10 @@ fn unchanged_channel_output_does_not_retarget_and_keeps_tracking() {
 fn an_opacity_that_reaches_zero_binds_again_on_the_way_back() {
     let mut patch = fixture();
     let alpha = crate::signal::Cell::new(1.0_f32);
-    let _mount = mount(plate().opacity(alpha), root());
+    let _mount = create(|ui| {
+        plate(ui).opacity(alpha);
+    });
     flush(&mut patch);
-
     let to = |patch: &SinkPatch| -> Vec<f32> {
         patch
             .ops()
@@ -886,35 +846,38 @@ fn an_opacity_that_reaches_zero_binds_again_on_the_way_back() {
             })
             .collect()
     };
-
     patch.clear();
     alpha.set(0.0);
     crate::signal::flush();
     flush(&mut patch);
     assert_eq!(to(&patch), vec![0.0], "the fade out is bound");
-
     patch.clear();
     alpha.set(1.0);
     crate::signal::flush();
     flush(&mut patch);
     assert_eq!(to(&patch), vec![1.0], "and so is the fade back in");
 }
-
 /// An interactive control mints exactly one extra visual, and parks it at zero opacity.
 ///
 /// The wash crossfades compositor-side, so hover costs one visual and no app-thread work.
 #[test]
 fn a_wash_is_one_extra_visual_parked_at_zero() {
     let mut patch = fixture();
-    let _mount = mount(
-        plate().state(StatePolicy::Wash {
-            hover: Wash::Ink,
-            press: Wash::Ink,
-        }),
-        root(),
-    );
+    let _mount = create(|ui| {
+        ui.control(
+            Some(crate::widget::Chrome::new(
+                crate::widget::RoleSet {
+                    fill: Some(Fill::Surface),
+                    stroke: None,
+                    text: Text::Primary,
+                },
+                Metric::Radius,
+            )),
+            crate::widget::UiaRole::Button,
+            |_| {},
+        );
+    });
     flush(&mut patch);
-
     let sprites = patch
         .ops()
         .iter()
@@ -929,15 +892,11 @@ fn a_wash_is_one_extra_visual_parked_at_zero() {
         })
         .count();
     assert_eq!(sprites, 2, "the fill, and the wash over it");
-
     let parked = patch.ops().iter().any(|op| {
         matches!(
-            op,
-            Op::Bind {
-                prop: windows_scene::Prop::Opacity,
-                bind: windows_scene::Bind::Set(windows_scene::Value::Scalar(v)),
-                ..
-            } if *v == 0.0
+            op, Op::Bind { prop : windows_scene::Prop::Opacity, bind :
+            windows_scene::Bind::Set(windows_scene::Value::Scalar(v)), .. } if * v ==
+            0.0
         )
     });
     assert!(
@@ -945,17 +904,22 @@ fn a_wash_is_one_extra_visual_parked_at_zero() {
         "a never-hovered wash must be invisible without animating there"
     );
 }
-
 /// A sprite's colour resolves through the palette at the scope its surface pushed.
 #[test]
 fn a_surface_elevates_the_scope_its_children_resolve_against() {
     let mut patch = fixture();
-    let _mount = mount(
-        stack((plate(), plate().elevate(Elevation::Raised).stack(plate()))),
-        root(),
-    );
+    let _mount = create(|ui| {
+        stack(ui, |ui| {
+            plate(ui);
+            ui.node(crate::layout::Preset::Stack)
+                .elevate(Elevation::Raised)
+                .plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0)
+                .children(|ui| {
+                    plate(ui);
+                });
+        });
+    });
     flush(&mut patch);
-
     let painted: Vec<Radiance> = patch
         .ops()
         .iter()
@@ -967,8 +931,6 @@ fn a_surface_elevates_the_scope_its_children_resolve_against() {
             _ => None,
         })
         .collect();
-    // A surface resolves its own chrome at the rung it pushed, so the same role paints one
-    // colour inside the push and another outside it.
     assert_eq!(
         painted.len(),
         3,
@@ -983,7 +945,6 @@ fn a_surface_elevates_the_scope_its_children_resolve_against() {
         "everything inside one push resolves at that rung"
     );
 }
-
 /// A `Metric` resolves through the palette on its way into the lowered style.
 #[test]
 fn a_metric_override_lowers_through_the_palette() {
@@ -1003,7 +964,6 @@ fn a_metric_override_lowers_through_the_palette() {
         "the width must be whatever the palette said, and nothing else"
     );
 }
-
 /// Text is measured under the type ramp the palette resolved for its role.
 ///
 /// The claim is the ratio between two rungs rather than an absolute width: the engine is
@@ -1012,22 +972,18 @@ fn a_metric_override_lowers_through_the_palette() {
 fn text_measures_under_the_resolved_type_ramp() {
     fn width_of(ramp: TypeRole) -> f32 {
         let mut patch = fixture();
-        let label = El::<Any>::seed(crate::layout::Preset::Text).text_seed(
-            crate::widget::TextSource::Static("hello"),
-            ramp,
-            Some(Role::Text(Text::Primary)),
-            Flow::Line,
-            false,
-        );
-        let _mount = mount(label, root());
+        let _mount = create(|ui| {
+            ui.text(
+                crate::widget::TextStyle::new(ramp).ink(Role::Text(Text::Primary)),
+                "hello",
+            );
+        });
         flush(&mut patch);
         Host::with(|h| {
-            let (_, row) = h.mounts.iter().last().expect("the label mounted");
-            let node = row.node;
+            let (node, _) = h.mounts.iter().last().expect("the label mounted");
             h.model().solved(node).size.x
         })
     }
-
     let scope = Scope::root(
         crate::role::tests::palette(),
         AccentId(0),
@@ -1039,13 +995,8 @@ fn text_measures_under_the_resolved_type_ramp() {
         display > body,
         "the ramp under test does not separate its rungs"
     );
-
     let (measured_body, measured_display) = (width_of(TypeRole::Body), width_of(TypeRole::Display));
     assert!(measured_body > 0.0, "the body rung measured nothing");
-
-    // One string, one face, two sizes: advances scale with the em, so the measured widths
-    // carry the ramp's own ratio. The tolerance covers hinting, which quantizes advances
-    // per size.
     let expected = display / body;
     let actual = measured_display / measured_body;
     assert!(
@@ -1054,62 +1005,6 @@ fn text_measures_under_the_resolved_type_ramp() {
          ({measured_display} / {measured_body})"
     );
 }
-
-/// Mounting twice reuses the arena rather than growing it: the second mount of the same
-/// shape allocates nothing.
-#[test]
-fn the_arena_is_pooled_across_mounts() {
-    let mut patch = fixture();
-    let _mount = mount(stack((plate(), plate())), root());
-    flush(&mut patch);
-    let high_water = Build::with(|b| b.nodes.capacity());
-    assert!(high_water > 0, "the arena kept its capacity");
-
-    let _mount = mount(stack((plate(), plate())), root());
-    flush(&mut patch);
-    assert_eq!(
-        Build::with(|b| b.nodes.capacity()),
-        high_water,
-        "a second mount of the same shape must not grow the arena"
-    );
-}
-
-/// `Len` carries no arbitrary DIP, so a widget can express only the palette's lengths.
-///
-/// The exhaustive match below is the whole vocabulary: a raw-DIP variant added to `Len`
-/// stops this compiling.
-#[test]
-fn len_has_no_raw_dip_constructor() {
-    let scope = Scope::root(
-        crate::role::tests::palette(),
-        AccentId(0),
-        Density::Comfortable,
-    );
-    for len in [
-        Len::Metric(Metric::SpaceMd),
-        Len::Zero,
-        Len::Pct(0.5),
-        Len::Times(Metric::RowH, 4.0),
-        Len::Auto,
-    ] {
-        // `Times` is a count of a metric, so it can say "four rows" and cannot say "twelve".
-        match len {
-            Len::Metric(_) | Len::Zero | Len::Pct(_) | Len::Times(..) | Len::Auto => {}
-        }
-        let _ = len.dimension(scope);
-    }
-    assert_eq!(
-        Len::Times(Metric::RowH, 4.0).dips(scope),
-        Some(crate::role::metric(Metric::RowH, scope) * 4.0)
-    );
-    assert_eq!(Len::Zero.dips(scope), Some(0.0));
-    assert_eq!(
-        Len::Auto.dips(scope),
-        None,
-        "auto is a question, not a length"
-    );
-}
-
 /// Colour does not read the width axis, so a resize re-lowers styles and rebinds no paint.
 ///
 /// Every role is checked at every elevation, polarity and width class.
@@ -1167,7 +1062,6 @@ fn colour_is_width_independent() {
         }
     }
 }
-
 /// A surface arranges its children in the class it was given, whatever chrome it carries.
 ///
 /// Chrome and layout class are separate fields, so the class always wins: a card whose chrome
@@ -1175,27 +1069,24 @@ fn colour_is_width_independent() {
 #[test]
 fn a_surface_arranges_its_children_as_it_was_told() {
     let mut patch = fixture();
-    let plates = || {
-        (
-            plate().width(Metric::CardMinW).height(Metric::CardMinH),
-            plate().width(Metric::CardMinW).height(Metric::CardMinH),
-        )
-    };
-    let _mount = mount(
-        El::<Any>::seed(crate::layout::Preset::Bare)
-            .surface(
-                Elevation::Raised,
-                crate::widget::roles::SURFACE_CARD,
+    let _mount = create(|ui| {
+        ui.surface(
+            crate::widget::Chrome::new(
+                crate::widget::roles::SURFACE[crate::widget::roles::SURFACE_CARD as usize],
                 Metric::Radius,
-            )
-            .row(plates()),
-        root(),
-    );
+            ),
+            Elevation::Raised,
+            |_| {},
+        )
+        .row(|_| {})
+        .children(|ui| {
+            plate(ui).width(Metric::CardMinW).height(Metric::CardMinH);
+            plate(ui).width(Metric::CardMinW).height(Metric::CardMinH);
+        });
+    });
     flush(&mut patch);
-
-    // Mounts are pushed in walk order, so the surface is first and its two children follow.
     let (a, b) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[1]), h.model().solved(nodes[2]))
     });
     assert!(
@@ -1207,23 +1098,25 @@ fn a_surface_arranges_its_children_as_it_was_told() {
         "children of a row share a baseline"
     );
 }
-
 /// A surface keeps its padding, scope push and fill whichever layout class it takes.
 #[test]
 fn a_surface_keeps_its_chrome_whichever_class_it_takes() {
     let mut patch = fixture();
-    let _mount = mount(
-        El::<Any>::seed(crate::layout::Preset::Bare)
-            .surface(
-                Elevation::Raised,
-                crate::widget::roles::SURFACE_CARD,
+    let _mount = create(|ui| {
+        ui.surface(
+            crate::widget::Chrome::new(
+                crate::widget::roles::SURFACE[crate::widget::roles::SURFACE_CARD as usize],
                 Metric::Radius,
-            )
-            .row(plate().width(Metric::CardMinW).height(Metric::CardMinH)),
-        root(),
-    );
+            ),
+            Elevation::Raised,
+            |_| {},
+        )
+        .row(|_| {})
+        .children(|ui| {
+            plate(ui).width(Metric::CardMinW).height(Metric::CardMinH);
+        });
+    });
     flush(&mut patch);
-
     let scope = Scope::root(
         crate::role::tests::palette(),
         AccentId(0),
@@ -1231,15 +1124,13 @@ fn a_surface_keeps_its_chrome_whichever_class_it_takes() {
     );
     let padding = crate::role::metric(Metric::SpaceLg, scope);
     let (surface, child) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[0]), h.model().solved(nodes[1]))
     });
     assert!(
         (child.rect.x0 - surface.rect.x0 - padding).abs() < 0.5,
         "the surface's padding must survive being told to be a row"
     );
-    // The surface's own fill seed survives too. The rung it resolves at is asserted by
-    // `a_surface_elevates_the_scope_its_children_resolve_against`.
     let painted = patch
         .ops()
         .iter()
@@ -1253,20 +1144,13 @@ fn a_surface_keeps_its_chrome_whichever_class_it_takes() {
             )
         })
         .count();
-    // A card's hairline is an outer box in the stroke colour with the fill inset over it,
-    // because the sprite alphabet has no outlined rectangle: two paints for the card and
-    // one for the child.
     assert_eq!(painted, 3, "the card's ring and fill, and the child's");
 }
-
 /// Motion is declared by the seed, so a channel's default is the same at every call site.
 #[test]
 fn motion_is_per_channel_and_not_per_call_site() {
     assert_eq!(Motion::default(), Motion::Snap);
 }
-
-// ── unmount ──────────────────────────────────────────────────────────────────────
-
 /// Dropping a mount releases every row the walk claimed.
 ///
 /// The scene nodes go away regardless, so a retained control row, style recipe or shaped run
@@ -1274,13 +1158,13 @@ fn motion_is_per_channel_and_not_per_call_site() {
 #[test]
 fn unmounting_releases_every_row_it_claimed() {
     let mut patch = fixture();
-    let mount = mount(crate::widget::button("Save"), root());
+    let mount = create(|ui| {
+        crate::widget::button(ui, "Save");
+    });
     flush(&mut patch);
-
     let (mounts, controls, runs) =
         Host::with(|h| (h.mounts.len(), h.controls.len(), h.text.entries.len()));
     assert!(mounts > 0 && controls == 1 && runs == 1);
-
     drop(mount);
     flush(&mut patch);
     let (mounts, controls, runs) =
@@ -1290,8 +1174,6 @@ fn unmounting_releases_every_row_it_claimed() {
         (0, 0, 0),
         "an unmount must release the style rows, the control rows and the runs"
     );
-    // Every other table the walk claimed is released through the row that named it rather
-    // than through a scan, so unmounting one list row costs that row and not the screen.
     Host::with(|h| {
         assert_eq!(h.scrolls.len(), 0);
     });
@@ -1300,8 +1182,6 @@ fn unmounting_releases_every_row_it_claimed() {
         0,
         "an unmount must release the style recipes"
     );
-
-    // One destroy op: it cascades on the far side, so a subtree cannot be half-gone.
     let drops = patch
         .ops()
         .iter()
@@ -1309,7 +1189,6 @@ fn unmounting_releases_every_row_it_claimed() {
         .count();
     assert_eq!(drops, 1);
 }
-
 #[test]
 fn a_variant_row_decides_what_is_minted() {
     fn sprites(patch: &SinkPatch) -> usize {
@@ -1327,14 +1206,16 @@ fn a_variant_row_decides_what_is_minted() {
             })
             .count()
     }
-
     let mut patch = fixture();
-    let _default = mount(crate::widget::button("x"), root());
+    let _default = create(|ui| {
+        crate::widget::button(ui, "x");
+    });
     flush(&mut patch);
     let full = sprites(&patch);
     patch.clear();
-
-    let _ghost = mount(crate::widget::button("x").ghost(), root());
+    let _ghost = create(|ui| {
+        crate::widget::button(ui, "x").ghost();
+    });
     flush(&mut patch);
     assert!(
         sprites(&patch) < full,
@@ -1342,9 +1223,6 @@ fn a_variant_row_decides_what_is_minted() {
         sprites(&patch)
     );
 }
-
-// ── value controls ───────────────────────────────────────────────────────────────
-
 /// A control claims the moving part its children declared, and the room the solve measured.
 ///
 /// The thumb is a child of the control, so the front-side row is where the router finds it.
@@ -1355,17 +1233,16 @@ fn a_control_claims_the_moving_part_its_children_declared() {
     let (_owner, ()) = crate::signal::Owner::scope(|| {
         let mut patch = fixture();
         let value = crate::signal::Cell::new(0.5_f64);
-        let _slider = mount(
+        let _slider = create(|ui| {
             crate::widget::slider(
+                ui,
                 value,
                 crate::widget::Range::UNIT,
                 crate::widget::SliderStyle::default(),
             )
-            .width(Metric::CardMinW),
-            root(),
-        );
+            .width(Metric::CardMinW);
+        });
         flush(&mut patch);
-
         let front = Host::with(|h| {
             h.controls
                 .iter()
@@ -1384,7 +1261,6 @@ fn a_control_claims_the_moving_part_its_children_declared() {
         );
     });
 }
-
 /// A fraction is multiplied by the travel before it reaches the offset.
 ///
 /// `Prop::OffsetX` is in DIPs, so a `0..=1` fraction bound to it raw moves a thumb by one DIP.
@@ -1395,9 +1271,10 @@ fn a_control_claims_the_moving_part_its_children_declared() {
 fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
     let mut patch = fixture();
     let on = crate::signal::Cell::new(true);
-    let _toggle = mount(crate::widget::toggle(on).width(Metric::CardMinW), root());
+    let _toggle = create(|ui| {
+        crate::widget::toggle(ui, on).width(Metric::CardMinW);
+    });
     flush(&mut patch);
-
     let (rest, travel) = Host::with(|h| {
         h.controls
             .iter()
@@ -1410,7 +1287,6 @@ fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
     assert!(rest + travel > rest);
     assert!(binds(&patch, windows_scene::Prop::OffsetX).is_empty());
 }
-
 /// A part the router drives is not written from this thread after its mount seed.
 ///
 /// The channel has one writer: the app thread ships the room the solve measured and the
@@ -1419,18 +1295,17 @@ fn a_fraction_reaches_the_offset_multiplied_by_its_room() {
 #[test]
 fn a_slid_part_is_left_to_the_thread_that_moves_it() {
     let (_owner, ()) = crate::signal::Owner::scope(|| {
-        // A slid part: its property is an offset finished against the room the solve gives.
         let mut patch = fixture();
         let value = crate::signal::Cell::new(0.25_f64);
-        let _slider = mount(
+        let _slider = create(|ui| {
             crate::widget::slider(
+                ui,
                 value,
                 crate::widget::Range::UNIT,
                 crate::widget::SliderStyle::default(),
             )
-            .width(Metric::CardMinW),
-            root(),
-        );
+            .width(Metric::CardMinW);
+        });
         flush(&mut patch);
         let front = Host::with(|h| {
             h.controls
@@ -1447,12 +1322,7 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
             front.fraction, 0.25,
             "the initial value reaches the input owner"
         );
-        // The mount seeds the part, because a control renders at its value before the router has
-        // anything to report.
         assert!(binds(&patch, windows_scene::Prop::OffsetX).is_empty());
-
-        // From here the router owns it: an application write to the same cell, which is what
-        // `on_commit` does, must not reach the property.
         patch.clear();
         value.set(0.75);
         crate::signal::flush();
@@ -1466,19 +1336,15 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
             changed.fraction, 0.75,
             "an external edit reaches the input owner"
         );
-        // The number it will land on is still this thread's own, from the same function.
         assert!(
             (crate::widget::offset_of(1.0, front.travel, false) - front.travel).abs()
                 < f32::EPSILON
         );
-
-        // A turned part: its property is an angle, finished through the same function.
         let mut patch = fixture();
         let angle = crate::signal::Cell::new(0.25_f64);
-        let _knob = mount(
-            crate::widget::knob(angle, crate::widget::Range::UNIT).width(Metric::CardMinW),
-            root(),
-        );
+        let _knob = create(|ui| {
+            crate::widget::knob(ui, angle, crate::widget::Range::UNIT).width(Metric::CardMinW);
+        });
         flush(&mut patch);
         patch.clear();
         angle.set(0.75);
@@ -1490,18 +1356,15 @@ fn a_slid_part_is_left_to_the_thread_that_moves_it() {
         );
     });
 }
-
 /// Returns every op this thread bound to `want`, whatever the binding kind.
 fn binds(patch: &SinkPatch, want: windows_scene::Prop) -> Vec<&Op> {
     patch
         .ops()
         .iter()
-        .filter(|op| matches!(op, Op::Bind { prop, .. } if *prop == want))
+        .filter(|op| matches!(op, Op::Bind { prop, .. } if * prop == want))
         .collect()
 }
-
 /// Returns every scalar `OffsetX` this thread set, in the order it set them.
-
 /// A read-only widget declares no hit entry, and therefore no control row.
 ///
 /// Meters are dense on screen, and each hit entry is one more rect every pointer sample is
@@ -1510,9 +1373,10 @@ fn binds(patch: &SinkPatch, want: windows_scene::Prop) -> Vec<&Op> {
 fn a_meter_is_not_a_control() {
     let mut patch = fixture();
     let level = crate::signal::Cell::new(0.4_f32);
-    let _meter = mount(crate::widget::meter(level), root());
+    let _meter = create(|ui| {
+        crate::widget::meter(ui, level);
+    });
     flush(&mut patch);
-
     let controls = Host::with(|h| h.controls.len());
     assert_eq!(controls, 0, "a meter must mint no control row");
     let entries = patch
@@ -1526,9 +1390,6 @@ fn a_meter_is_not_a_control() {
         .unwrap_or(0);
     assert_eq!(entries, 0, "and contribute nothing to the hit array");
 }
-
-// ── presence ─────────────────────────────────────────────────────────────────────
-
 /// A constant `.when(false)` contributes nothing: no node, no style, no shaped run.
 ///
 /// Hiding the element instead would cost a visual, a style, a mount row and, for a label,
@@ -1536,16 +1397,16 @@ fn a_meter_is_not_a_control() {
 #[test]
 fn a_constantly_absent_element_is_never_mounted() {
     let mut patch = fixture();
-    let _screen = mount(
-        stack((
-            plate(),
-            crate::widget::text("gone").when(false),
-            plate().when(true),
-        )),
-        root(),
-    );
+    let _screen = create(|ui| {
+        stack(ui, |ui| {
+            plate(ui);
+            ui.when(false, |ui| {
+                crate::widget::text(ui, "gone");
+            });
+            plate(ui);
+        });
+    });
     flush(&mut patch);
-
     let minted = patch
         .ops()
         .iter()
@@ -1558,9 +1419,6 @@ fn a_constantly_absent_element_is_never_mounted() {
         "an absent label must not shape its string"
     );
 }
-
-// ── structure ────────────────────────────────────────────────────────────────────
-
 /// A keyed list reorders survivors rather than reminting them, so a reorder is moves only.
 ///
 /// A filter keystroke therefore costs one move per row that changed place, not a rebuilt
@@ -1569,10 +1427,18 @@ fn a_constantly_absent_element_is_never_mounted() {
 fn a_keyed_list_moves_survivors_rather_than_reminting_them() {
     let mut patch = fixture();
     let items = crate::signal::Cell::new(vec![1_u32, 2, 3]);
-    let _list = mount(
-        stack(each(move || items.get(), |item| item, |_| plate())),
-        root(),
-    );
+    let _list = Ui::mount_root(|ui| {
+        ui.stack(|ui| {
+            ui.each(
+                move |out| out.extend(items.get()),
+                |item| item,
+                |ui, _| {
+                    ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0);
+                    ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0);
+                },
+            );
+        });
+    });
     flush(&mut patch);
     let minted = patch
         .ops()
@@ -1581,8 +1447,6 @@ fn a_keyed_list_moves_survivors_rather_than_reminting_them() {
         .count();
     assert!(minted >= 4, "a group and three rows: {minted}");
     patch.clear();
-
-    // The same three keys, reordered. Nothing is built and nothing is destroyed.
     items.set(vec![3, 1, 2]);
     crate::signal::flush();
     flush(&mut patch);
@@ -1599,22 +1463,25 @@ fn a_keyed_list_moves_survivors_rather_than_reminting_them() {
         "and it must actually move one"
     );
 }
-
 /// `when(false)` contributes nothing: no node, no layout participation, no placeholder.
 #[test]
 fn an_absent_branch_mints_nothing() {
     let mut patch = fixture();
     let showing = crate::signal::Cell::new(false);
-    let _branch = mount(stack(when(showing, plate)), root());
+    let _branch = Ui::mount_root(|ui| {
+        ui.stack(|ui| {
+            ui.when(showing, |ui| {
+                ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0);
+            });
+        });
+    });
     flush(&mut patch);
     let minted = patch
         .ops()
         .iter()
         .filter(|op| matches!(op, Op::New { .. }))
         .count();
-    // The container and the adapter's own group, and nothing for the absent arm.
     assert_eq!(minted, 2, "an absent arm must contribute no node");
-
     patch.clear();
     showing.set(true);
     crate::signal::flush();
@@ -1624,9 +1491,6 @@ fn an_absent_branch_mints_nothing() {
         "and it must arrive when the condition does"
     );
 }
-
-// ── text ─────────────────────────────────────────────────────────────────────────
-
 /// A run that can break costs one sprite per line; a single-line run costs one sprite.
 ///
 /// A coverage tile covers one line, so a wrapping caption needs several, and a `Flow::Line`
@@ -1634,7 +1498,9 @@ fn an_absent_branch_mints_nothing() {
 #[test]
 fn only_a_wrapping_run_costs_a_sprite_per_line() {
     let mut patch = fixture();
-    let _label = mount(crate::widget::text("a short label"), root());
+    let _label = create(|ui| {
+        crate::widget::text(ui, "a short label");
+    });
     flush(&mut patch);
     let minted = patch
         .ops()
@@ -1643,101 +1509,54 @@ fn only_a_wrapping_run_costs_a_sprite_per_line() {
         .count();
     assert_eq!(minted, 1, "a non-wrapping run is one visual");
 }
-
-/// Collecting a container's children uses the arena's own buffers, not a temporary `Vec`.
-///
-/// The mount walk runs for every row a list realizes during a fling and may not allocate,
-/// and a per-container temporary would cost one allocation per container per mount.
-#[test]
-fn collecting_children_uses_the_arenas_own_buffer() {
-    let mut patch = fixture();
-    let screen = || {
-        stack((
-            stack((plate(), plate(), plate())),
-            stack((plate(), plate())),
-            plate(),
-        ))
-    };
-
-    let first = mount(screen(), root());
-    flush(&mut patch);
-    let (kids, pending) = Build::with(|b| (b.kids.capacity(), b.pending.capacity()));
-    assert!(
-        kids > 0 && pending > 0,
-        "the child list and the stack it is collected on are both the arena's"
-    );
-    // Nothing is left standing on the stack once every container has taken its run.
-    assert_eq!(Build::with(|b| b.pending.len()), 0);
-    drop(first);
-
-    // The same shape again grows neither buffer, so a realized row costs the walk alone.
-    let second = mount(screen(), root());
-    flush(&mut patch);
-    assert_eq!(
-        Build::with(|b| (b.kids.capacity(), b.pending.capacity())),
-        (kids, pending),
-        "a second mount of the same shape must not grow the arena"
-    );
-    drop(second);
-}
-
-/// A warm mount allocates nothing, measured with the allocation counter.
-///
-/// A capacity check cannot see a temporary allocated and freed inside the call, so the count
-/// is what this asserts on. The counter is per thread and read either side of the mount
-/// statement, so it reports this mount's own allocations.
+/// Warm direct construction reuses retained storage without any allocation.
 #[test]
 fn a_warm_mount_allocates_nothing() {
     let mut patch = fixture();
-    let screen = || {
-        crate::widget::card().stack((
-            crate::widget::title("Effects"),
-            stack((plate(), plate(), plate())),
-            crate::widget::button("Apply"),
-        ))
+    let screen = |ui: &mut Ui<'_>| {
+        use crate::widget::{Chrome, TextStyle, roles};
+        ui.surface(
+            Chrome::new(
+                roles::SURFACE[roles::SURFACE_CARD as usize],
+                Metric::RadiusSurface,
+            ),
+            Elevation::Raised,
+            |ui| {
+                ui.text(TextStyle::new(TypeRole::Title), "Effects");
+                ui.stack(|ui| {
+                    for _ in 0..3 {
+                        ui.plate(Metric::Radius, Role::Fill(Fill::Surface), 1.0)
+                            .layout_when(crate::role::WidthClass::Narrow, |l| {
+                                l.width = Some(Metric::RowH.into())
+                            })
+                            .layout_when(crate::role::WidthClass::Wide, |l| {
+                                l.width = Some(Len::Times(Metric::RowH, 2.0))
+                            });
+                    }
+                });
+                ui.button(
+                    Chrome::new(roles::BUTTON[0], Metric::Radius),
+                    TextStyle::new(TypeRole::Body),
+                    "Apply",
+                );
+            },
+        );
     };
-
-    // The first mount grows the arena, the tables and the shaper's own buffers to high-water
-    // mark, which is the once-per-shape cost the count below excludes.
-    let warm = mount(screen(), root());
+    let scope = root_scope();
+    let warm = Ui::mount_at(root(), None, scope, None, screen);
     flush(&mut patch);
     drop(warm);
     flush(&mut patch);
-
     let before = crate::counting::allocations();
-    let second = mount(screen(), root());
+    let second = Ui::mount_at(root(), None, scope, None, screen);
     let during = crate::counting::allocations() - before;
     flush(&mut patch);
     drop(second);
-
     assert_eq!(
         during, 0,
-        "a warm mount allocated {during} times; the arena exists to make that zero"
+        "a warm mount allocated {during} times; direct construction must reuse its retained storage"
     );
 }
-
-/// Explicit grid placement appends into the arena's buffer rather than through a temporary.
-#[test]
-fn explicit_placement_appends_without_a_temporary() {
-    let mut patch = fixture();
-    let grid = crate::layout::grid(())
-        .at(0, 0, plate())
-        .at(0, 1, plate())
-        .at(1, 0, plate());
-    let _mount = mount(grid, root());
-    flush(&mut patch);
-
-    let minted = patch
-        .ops()
-        .iter()
-        .filter(|op| matches!(op, Op::New { .. }))
-        .count();
-    assert_eq!(minted, 4, "the grid and its three placed cells");
-    assert_eq!(Build::with(|b| b.pending.len()), 0);
-}
-
-// ── scroll ───────────────────────────────────────────────────────────────────────
-
 /// A scroll container binds its content and its thumb to one tracker, and never the viewport.
 ///
 /// The viewport carries the clip, so an offset on it would move the clip with the content.
@@ -1745,18 +1564,23 @@ fn explicit_placement_appends_without_a_temporary() {
 #[test]
 fn a_scroll_container_binds_its_content_and_its_thumb_to_one_tracker() {
     let mut patch = fixture();
-    let tall = || {
-        plate()
+    let tall = |ui: &mut Ui<'_>| {
+        plate(ui)
             .height(Metric::CardMinH)
-            .min_height(Metric::CardMinH)
+            .min_height(Metric::CardMinH);
     };
-    let _scroll = mount(
-        crate::layout::scroll((tall(), tall(), tall(), tall(), tall(), tall()))
-            .height(Metric::CardMinH),
-        root(),
-    );
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            tall(ui);
+            tall(ui);
+            tall(ui);
+            tall(ui);
+            tall(ui);
+            tall(ui);
+        })
+        .height(Metric::CardMinH);
+    });
     flush(&mut patch);
-
     let tracked: Vec<_> = patch
         .ops()
         .iter()
@@ -1778,26 +1602,17 @@ fn a_scroll_container_binds_its_content_and_its_thumb_to_one_tracker() {
         tracked[0].1, tracked[1].1,
         "both must ride the same tracker, or the thumb reports on something else"
     );
-
-    let viewport = Host::with(|h| h.mounts.iter().next().map(|(_, m)| m.node));
+    let viewport = Host::with(|h| h.mounts.iter().next().map(|(node, _)| node));
     assert!(
         tracked.iter().all(|(id, _)| Some(*id) != viewport),
         "the viewport clips, so it must not be the thing that moves"
     );
-
-    // The extent reached the tracker, and it came from the solve.
     assert!(
-        patch.ops().iter().any(|op| matches!(
-            op,
-            Op::Tracker {
-                op: windows_scene::TrackerOp::Bounds { max, .. },
-                ..
-            } if max.y > 0.0
-        )),
+        patch.ops().iter().any(|op| matches!(op, Op::Tracker { op :
+        windows_scene::TrackerOp::Bounds { max, .. }, .. } if max.y > 0.0)),
         "content taller than its viewport must give the tracker somewhere to go"
     );
 }
-
 /// A second flush with nothing moved re-publishes nothing.
 ///
 /// Scrolling moves compositor-side, and this step emits only when the extents change, so a
@@ -1805,10 +1620,12 @@ fn a_scroll_container_binds_its_content_and_its_thumb_to_one_tracker() {
 #[test]
 fn a_settled_scroll_container_emits_nothing() {
     let mut patch = fixture();
-    let _scroll = mount(
-        crate::layout::scroll(plate().height(Metric::CardMinH)).height(Metric::CardMinH),
-        root(),
-    );
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            plate(ui).height(Metric::CardMinH);
+        })
+        .height(Metric::CardMinH);
+    });
     flush(&mut patch);
     patch.clear();
     flush(&mut patch);
@@ -1818,7 +1635,6 @@ fn a_settled_scroll_container_emits_nothing() {
         patch.ops()
     );
 }
-
 /// Content taller than its viewport overflows, whether or not its children pin a minimum.
 ///
 /// A flex child shrinks to its parent by default, so a scroll container's content opts out
@@ -1826,25 +1642,27 @@ fn a_settled_scroll_container_emits_nothing() {
 #[test]
 fn a_scroll_containers_content_is_not_squeezed_into_its_viewport() {
     let mut patch = fixture();
-    let card = || plate().height(Metric::CardMinH);
-    let _scroll = mount(
-        crate::layout::scroll((card(), card(), card(), card(), card(), card()))
-            .height(Metric::CardMinH),
-        root(),
-    );
+    fn card<'a>(ui: &'a mut Ui<'_>) -> Element<'a> {
+        plate(ui).height(Metric::CardMinH)
+    }
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            card(ui);
+            card(ui);
+            card(ui);
+            card(ui);
+            card(ui);
+            card(ui);
+        })
+        .height(Metric::CardMinH);
+    });
     flush(&mut patch);
     assert!(
-        patch.ops().iter().any(|op| matches!(
-            op,
-            Op::Tracker {
-                op: windows_scene::TrackerOp::Bounds { max, .. },
-                ..
-            } if max.y > 0.0
-        )),
+        patch.ops().iter().any(|op| matches!(op, Op::Tracker { op :
+        windows_scene::TrackerOp::Bounds { max, .. }, .. } if max.y > 0.0)),
         "six cards in a one-card viewport gave the tracker nowhere to go"
     );
 }
-
 /// A scroll container's tracker is created, and created after its viewport is sized.
 ///
 /// A tracker that is only minted is a binding onto nothing. One created before the solve
@@ -1853,12 +1671,13 @@ fn a_scroll_containers_content_is_not_squeezed_into_its_viewport() {
 #[test]
 fn a_scroll_containers_tracker_is_created_after_its_viewport_is_sized() {
     let mut patch = fixture();
-    let _scroll = mount(
-        crate::layout::scroll(plate().height(Metric::CardMinH)).height(Metric::CardMinH),
-        root(),
-    );
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            plate(ui).height(Metric::CardMinH);
+        })
+        .height(Metric::CardMinH);
+    });
     flush(&mut patch);
-
     let viewport = Host::with(|h| {
         h.scrolls
             .iter()
@@ -1877,12 +1696,8 @@ fn a_scroll_containers_tracker_is_created_after_its_viewport_is_sized() {
     });
     let sized = patch.ops().iter().position(|op| {
         matches!(
-            op,
-            Op::Bind {
-                id,
-                prop: windows_scene::Prop::Size,
-                ..
-            } if *id == viewport
+            op, Op::Bind { id, prop : windows_scene::Prop::Size, .. } if * id ==
+            viewport
         )
     });
     let created = created.expect("the tracker was minted and never created");
@@ -1892,7 +1707,6 @@ fn a_scroll_containers_tracker_is_created_after_its_viewport_is_sized() {
         "the tracker was created at op {created}, before its viewport was sized at {sized}"
     );
 }
-
 /// The scrollbar is minted above the content, wins the hit array, and does not scroll.
 ///
 /// Child order is paint order and the order the hit array is scanned in, so a bar minted at
@@ -1902,16 +1716,19 @@ fn a_scroll_containers_tracker_is_created_after_its_viewport_is_sized() {
 #[test]
 fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
     let mut patch = fixture();
-    // One card is a target, so the hit array carries an entry that does resolve through the
-    // viewport's offset for the rail's opt-out to be measured against.
-    let card = || plate().height(Metric::CardMinH);
-    let _scroll = mount(
-        crate::layout::scroll((card().on_click(|| {}), card(), card(), card()))
-            .height(Metric::CardMinH),
-        root(),
-    );
+    fn card<'a>(ui: &'a mut Ui<'_>) -> Element<'a> {
+        plate(ui).height(Metric::CardMinH)
+    }
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            card(ui).on_click(|| {});
+            card(ui);
+            card(ui);
+            card(ui);
+        })
+        .height(Metric::CardMinH);
+    });
     flush(&mut patch);
-
     let (content, rail, viewport, grab) = Host::with(|h| {
         h.scrolls
             .iter()
@@ -1926,18 +1743,14 @@ fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
             })
             .expect("a scroll container was mounted")
     });
-
-    // Paint order: minted above the content rather than at the bottom of the viewport.
     assert!(
-        patch.ops().iter().any(|op| matches!(
-            op,
-            Op::New { id, after: Some(after), .. } if *id == rail && *after == content
-        )),
+        patch
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::New { id, after : Some(after), ..
+        } if * id == rail && * after == content)),
         "the scrollbar was minted under the content it reports on"
     );
-
-    // Hit order: the array is scanned from the end, so a later entry wins a point both cover,
-    // and the rail sits inside the viewport's own box everywhere.
     let entries = patch.hit_entries();
     let entry = |id| entries.iter().position(|e| e.id == id);
     let rail_at = entry(grab).expect("the rail is not in the hit array");
@@ -1951,7 +1764,6 @@ fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
         windows_scene::NodeId::NONE,
         "the rail moves with the content it reports on"
     );
-    // The card beside it does resolve through the offset, so the rail's flag is an opt-out.
     let scrolled = entries
         .iter()
         .filter(|entry| entry.scroll_src != windows_scene::NodeId::NONE)
@@ -1962,7 +1774,6 @@ fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
          nothing"
     );
 }
-
 /// A surface with nothing to scroll declares no rail hit entry.
 ///
 /// A rail entry left in place takes every press on the right edge of the content, where no
@@ -1970,12 +1781,13 @@ fn the_scrollbar_is_above_the_content_grabbable_and_pinned() {
 #[test]
 fn a_surface_that_does_not_overflow_has_no_grab_target() {
     let mut patch = fixture();
-    let _scroll = mount(
-        crate::layout::scroll(plate().height(Metric::SpaceLg)).height(Metric::CardMinH),
-        root(),
-    );
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            plate(ui).height(Metric::SpaceLg);
+        })
+        .height(Metric::CardMinH);
+    });
     flush(&mut patch);
-
     let grab = Host::with(|h| {
         h.scrolls
             .iter()
@@ -1988,7 +1800,6 @@ fn a_surface_that_does_not_overflow_has_no_grab_target() {
         "content that fits still put a scrollbar over its right edge"
     );
 }
-
 /// An on-demand thumb is bound to zero opacity at mount rather than shown and faded out.
 ///
 /// Content that fits never overflows, so a thumb visible for the first frame is a flash on
@@ -1996,24 +1807,20 @@ fn a_surface_that_does_not_overflow_has_no_grab_target() {
 #[test]
 fn an_on_demand_thumb_starts_concealed() {
     let mut patch = fixture();
-    let _scroll = mount(
-        crate::layout::scroll(plate().height(Metric::CardMinH)).height(Metric::CardMinH),
-        root(),
-    );
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            plate(ui).height(Metric::CardMinH);
+        })
+        .height(Metric::CardMinH);
+    });
     flush(&mut patch);
     assert!(
-        patch.ops().iter().any(|op| matches!(
-            op,
-            Op::Bind {
-                prop: windows_scene::Prop::Opacity,
-                bind: windows_scene::Bind::Set(windows_scene::Value::Scalar(v)),
-                ..
-            } if *v == 0.0
-        )),
+        patch.ops().iter().any(|op| matches!(op, Op::Bind { prop :
+        windows_scene::Prop::Opacity, bind :
+        windows_scene::Bind::Set(windows_scene::Value::Scalar(v)), .. } if * v == 0.0)),
         "the thumb was mounted visible"
     );
 }
-
 /// A moved pixel grid re-sends every run, and a settled publish sends none.
 ///
 /// Neither a pixel-grid change nor a rebuilt device moves a DIP, so the width gate that makes
@@ -2022,9 +1829,10 @@ fn an_on_demand_thumb_starts_concealed() {
 #[test]
 fn a_moved_pixel_grid_re_sends_every_run() {
     let mut patch = fixture();
-    let _held = mount(crate::widget::label("re-emit me"), root());
+    let _held = create(|ui| {
+        crate::widget::label(ui, "re-emit me");
+    });
     flush(&mut patch);
-
     let runs = |patch: &SinkPatch| {
         patch
             .ops()
@@ -2041,13 +1849,9 @@ fn a_moved_pixel_grid_re_sends_every_run() {
             .count()
     };
     assert!(runs(&patch) > 0, "the label never emitted a run at all");
-
-    // Settled: the ordinary publish is silent.
     patch.clear();
     flush(&mut patch);
     assert_eq!(runs(&patch), 0, "a settled label re-published its run");
-
-    // A grid that moved is not.
     patch.clear();
     Host::with(Host::reemit_text);
     flush(&mut patch);
@@ -2056,7 +1860,6 @@ fn a_moved_pixel_grid_re_sends_every_run() {
         "a re-emit sent nothing, so a display hop leaves every glyph at the old resolution"
     );
 }
-
 /// Every control declares a gesture, and nothing else does.
 ///
 /// `control()` sets `HitFlags::GESTURE`, which claims a gesture declaration behind the entry.
@@ -2068,7 +1871,9 @@ fn a_moved_pixel_grid_re_sends_every_run() {
 #[test]
 fn a_control_declares_the_default_gesture_and_a_label_declares_none() {
     let mut patch = fixture();
-    let _held = mount(crate::widget::button("press me"), root());
+    let _held = create(|ui| {
+        crate::widget::button(ui, "press me");
+    });
     flush(&mut patch);
     let declared = filled().gestures;
     assert_eq!(
@@ -2089,25 +1894,22 @@ fn a_control_declares_the_default_gesture_and_a_label_declares_none() {
             .any(|entry| entry.flags.contains(windows_scene::HitFlags::GESTURE)),
         "the entry does not claim the declaration that was just made for it"
     );
-
     let mut patch = fixture();
-    let _held = mount(crate::widget::label("just words"), root());
+    let _held = create(|ui| {
+        crate::widget::label(ui, "just words");
+    });
     flush(&mut patch);
     assert!(
         filled().gestures.is_empty(),
         "a static label was given a recogniser it can never use"
     );
 }
-
-// ── virtualization ───────────────────────────────────────────────────────────────
-
 /// Specifies a thousand-row list, in a viewport that shows about ten of them.
 const LIST: crate::layout::ListSpec = crate::layout::ListSpec {
     count: 1000,
     row_h: Metric::RowH,
     overscan: 2,
 };
-
 /// Settles a mounted list and returns the tracker driving it.
 ///
 /// Two flushes, because a viewport's height is a solve output: the first flush measures it
@@ -2125,31 +1927,36 @@ fn settle(patch: &mut SinkPatch) -> windows_scene::Id<windows_scene::Tracker> {
             .expect("the list mounted a scroll container")
     })
 }
-
 /// Mounts a virtualized list and returns the tracker driving it.
-fn virtualized(patch: &mut SinkPatch) -> windows_scene::Id<windows_scene::Tracker> {
-    let _held = mount(
+fn virtualized(
+    patch: &mut SinkPatch,
+) -> (
+    super::mount::Mount,
+    windows_scene::Id<windows_scene::Tracker>,
+) {
+    let _held = create(|ui| {
         crate::layout::list(
+            ui,
             || LIST,
             |realized, out| {
                 for run in realized.runs() {
                     out.extend(run.map(|index| (index, index)));
                 }
             },
-            |index: &usize| plate().name(if *index == 0 { "first" } else { "row" }),
+            |ui, index: &usize| {
+                plate(ui)
+                    .name(if *index == 0 { "first" } else { "row" })
+                    .id()
+            },
         )
-        .height(Metric::CardMinH),
-        root(),
-    )
-    .leak();
-    settle(patch)
+        .height(Metric::CardMinH);
+    });
+    (_held, settle(patch))
 }
-
 /// Returns how many rows the list realized, counted off the nodes the mount walk claimed.
 fn realized_rows() -> usize {
     Host::with(|h| h.mounts.iter().count())
 }
-
 /// Returns the travel the solve gave the tracker, read off the scroll row's last publish.
 ///
 /// A flush replaces the caller's buffer rather than appending to it, and the extent settles
@@ -2164,7 +1971,6 @@ fn published_extent() -> f32 {
             .expect("a scroll container was mounted")
     })
 }
-
 /// A thousand rows cost a screen's worth of nodes, each placed at its own index.
 ///
 /// Placement by index lets the realized set be several disjoint runs, and keeps the content's
@@ -2172,14 +1978,12 @@ fn published_extent() -> f32 {
 #[test]
 fn a_virtualized_list_realizes_a_screen_and_places_what_it_realized() {
     let mut patch = fixture();
-    virtualized(&mut patch);
-
+    let (_held, _) = virtualized(&mut patch);
     let rows = realized_rows();
     assert!(
         (5..40).contains(&rows),
         "a thousand-row list realized {rows} nodes"
     );
-
     let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
     let offsets: Vec<f32> = patch
         .ops()
@@ -2193,8 +1997,6 @@ fn a_virtualized_list_realizes_a_screen_and_places_what_it_realized() {
             _ => None,
         })
         .collect();
-    // Every row sits on a row-height boundary. A sequence of laid-out children would also
-    // reach past the fifth row, so the boundary is what separates placement from layout.
     assert!(
         offsets.iter().any(|y| *y > row_h * 4.0),
         "no row was placed past the fifth: {offsets:?}"
@@ -2206,15 +2008,12 @@ fn a_virtualized_list_realizes_a_screen_and_places_what_it_realized() {
             "a row landed off its own boundary at {y}"
         );
     }
-
-    // The extent the tracker was given is the whole list's, not the realized set's.
     let max = published_extent();
     assert!(
         max > row_h * (LIST.count as f32) * 0.9,
         "the tracker's travel was {max}, which is not a thousand rows"
     );
 }
-
 /// A reported position realizes the rows under it in the tick it arrived in, and leaves the
 /// extent alone.
 ///
@@ -2223,10 +2022,9 @@ fn a_virtualized_list_realizes_a_screen_and_places_what_it_realized() {
 #[test]
 fn a_reported_position_realizes_the_rows_under_it() {
     let mut patch = fixture();
-    let tracker = virtualized(&mut patch);
+    let (_mounted, tracker) = virtualized(&mut patch);
     let before = realized_rows();
     patch.clear();
-
     let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
     crate::layout::scroll_observe(&[windows_scene::SceneEvent::TrackerValues {
         tracker,
@@ -2238,10 +2036,6 @@ fn a_reported_position_realizes_the_rows_under_it() {
     }]);
     crate::signal::flush();
     flush(&mut patch);
-
-    // A window at the very top has its upper overscan clipped away and one in the middle does
-    // not, so the counts sit within the overscan of each other rather than equal. Neither
-    // grows with how far the list was scrolled.
     let after = realized_rows();
     assert!(
         after.abs_diff(before) <= LIST.overscan,
@@ -2259,12 +2053,9 @@ fn a_reported_position_realizes_the_rows_under_it() {
     );
     let placed = patch.ops().iter().any(|op| {
         matches!(
-            op,
-            Op::Bind {
-                prop: windows_scene::Prop::Offset,
-                bind: windows_scene::Bind::Set(windows_scene::Value::Vec2(at)),
-                ..
-            } if at.y > row_h * 400.0
+            op, Op::Bind { prop : windows_scene::Prop::Offset, bind :
+            windows_scene::Bind::Set(windows_scene::Value::Vec2(at)), .. } if at.y >
+            row_h * 400.0
         )
     });
     assert!(
@@ -2272,7 +2063,6 @@ fn a_reported_position_realizes_the_rows_under_it() {
         "nothing was realized where the content had moved to"
     );
 }
-
 /// A fling realizes the rows at its destination while keeping the rows it is leaving.
 ///
 /// The destination is known at the instant inertia begins, so those rows are realized while
@@ -2281,10 +2071,9 @@ fn a_reported_position_realizes_the_rows_under_it() {
 #[test]
 fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
     let mut patch = fixture();
-    let tracker = virtualized(&mut patch);
+    let (_mounted, tracker) = virtualized(&mut patch);
     let resting = realized_rows();
     patch.clear();
-
     let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
     let landing = row_h * 500.0;
     crate::layout::scroll_observe(&[windows_scene::SceneEvent::InertiaStarting {
@@ -2295,7 +2084,6 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
     }]);
     crate::signal::flush();
     flush(&mut patch);
-
     let flinging = realized_rows();
     assert!(
         flinging > resting,
@@ -2305,8 +2093,6 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
         flinging < resting * 5,
         "a fling realized {flinging} rows, which is not a bounded corridor"
     );
-    // Both ends exist at once: the destination was realized beside where the content still
-    // is, not instead of it.
     let offsets: Vec<f32> = patch
         .ops()
         .iter()
@@ -2323,8 +2109,6 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
         offsets.iter().any(|y| *y > landing * 0.9),
         "nothing was realized where the fling lands: {offsets:?}"
     );
-
-    // The prefetch is released once the tracker reports idle.
     patch.clear();
     crate::layout::scroll_observe(&[windows_scene::SceneEvent::TrackerPhase {
         tracker,
@@ -2338,7 +2122,6 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
         "a settled list is still holding its destination"
     );
 }
-
 /// A realized index the caller did not supply reserves its space and holds nothing.
 ///
 /// The placeholder sits where the row will be when the data arrives, so the extent and every
@@ -2346,19 +2129,20 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
 #[test]
 fn an_unsupplied_row_reserves_its_space() {
     let mut patch = fixture();
-    let _held = mount(
+    let _held = create(|ui| {
         crate::layout::list(
+            ui,
             || LIST,
-            // Nothing at all, at any position: the whole realized set is placeholders.
             |_, _: &mut Vec<(usize, usize)>| {},
-            |index: &usize| plate().name(if *index == 0 { "first" } else { "row" }),
+            |ui, index: &usize| {
+                plate(ui)
+                    .name(if *index == 0 { "first" } else { "row" })
+                    .id()
+            },
         )
-        .height(Metric::CardMinH),
-        root(),
-    )
-    .leak();
+        .height(Metric::CardMinH);
+    });
     settle(&mut patch);
-
     let rows = realized_rows();
     assert!(rows > 4, "a list of placeholders realized {rows} nodes");
     let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
@@ -2367,57 +2151,82 @@ fn an_unsupplied_row_reserves_its_space() {
         "a list of placeholders still has a thousand rows of extent"
     );
 }
-
-// ── modifier order ───────────────────────────────────────────────────────────────
-
 /// `no_inflate` reads the same before or after the handler that declares a hit target, and
 /// declares no target of its own.
 ///
-/// The arena's intrusive chains make modifiers order-independent, so a chain written either
-/// way round produces the same hit entry.
+/// Direct retained setters preserve the same hit flags in either order.
 #[test]
 fn declining_an_inflation_reads_the_same_in_either_order() {
-    fn inflates(view: View) -> Option<bool> {
+    fn inflates(view: impl FnOnce(&mut Ui<'_>)) -> Option<bool> {
         let mut patch = fixture();
-        let _held = mount(view, root());
+        let _held = create(|ui| {
+            view(ui);
+        });
         flush(&mut patch);
-        // Read off the hit array, which is what the router consults.
         patch
             .hit_entries()
             .first()
             .map(|entry| !entry.flags.contains(windows_scene::HitFlags::NO_INFLATE))
     }
-    assert_eq!(inflates(plate().no_inflate().on_click(|| {})), Some(false));
-    assert_eq!(inflates(plate().on_click(|| {}).no_inflate()), Some(false));
-    // On its own it is no target at all, so it costs neither a control row nor a slot in the
-    // array every pointer sample is resolved against.
-    assert_eq!(inflates(plate().no_inflate()), None);
+    assert_eq!(
+        inflates(|ui| {
+            plate(ui).no_inflate().on_click(|| {});
+        }),
+        Some(false)
+    );
+    assert_eq!(
+        inflates(|ui| {
+            plate(ui).on_click(|| {}).no_inflate();
+        }),
+        Some(false)
+    );
+    assert_eq!(
+        inflates(|ui| {
+            plate(ui).no_inflate();
+        }),
+        None
+    );
 }
-
-/// A value handler declares the hit target it needs, so it reaches the dispatch table.
-///
-/// The mount moves handlers into the dense table only for a node that has a hit entry. A
-/// handler on a node without one is freed with the arena and never reaches the table it is
-/// dispatched from, which reads at the call site as a control that does nothing.
+/// A replacement handler runs once, with no host borrow across application code.
 #[test]
 fn a_value_handler_declares_the_target_it_needs() {
     let mut patch = fixture();
-    let _held = mount(plate().on_change(|_| {}), root());
+    let called = crate::signal::Cell::new(0);
+    let _held = Ui::mount_root(|ui| {
+        ui.scalar(
+            None,
+            crate::widget::Interaction::Turn(crate::widget::Range::UNIT),
+            crate::widget::ScalarValue {
+                value: 0.0,
+                epoch: 0,
+            },
+            |_| {},
+        )
+        .on_change(|_| panic!("replaced handler ran"))
+        .on_change(move |_| {
+            assert!(Host::installed());
+            Host::with(|h| assert!(!h.model.root().node().is_none()));
+            called.set(called.get() + 1);
+        });
+    });
     flush(&mut patch);
-    let has = Host::with(|h| {
+    let (target, revision) = Host::with(|h| {
         h.controls
             .iter()
             .next()
-            .is_some_and(|(_, c)| c.change.is_some())
+            .map(|(id, row)| (id, row.front.revision))
+            .unwrap()
     });
-    assert!(
-        has,
-        "the handler must reach the table it is dispatched from"
-    );
+    Host::dispatch(&[crate::widget::Intent {
+        target,
+        what: crate::widget::What::Scalar {
+            value: 0.5,
+            revision,
+            commit: false,
+        },
+    }]);
+    assert_eq!(called.get(), 1);
 }
-
-// ── a style that follows a value follows its own scope ───────────────────────────
-
 /// A restyle re-lowers against the node's own scope, not the root's.
 ///
 /// A surface pushes a rung, and re-lowering from the root would lose the elevation silently,
@@ -2426,13 +2235,14 @@ fn a_value_handler_declares_the_target_it_needs() {
 fn a_restyle_lowers_against_the_node_that_owns_it() {
     let mut patch = fixture();
     let shown = crate::signal::Cell::new(true);
-    // Inside a card, so the scope the recipe carries is not the root's.
-    let _held = mount(
-        crate::widget::card().stack(plate().padding(Metric::SpaceLg).when(shown)),
-        root(),
-    );
+    let _held = create(|ui| {
+        crate::widget::card(ui).stack(|_| {}).children(|ui| {
+            plate(ui)
+                .padding(Metric::SpaceLg)
+                .hide_if(move || !(shown).get());
+        });
+    });
     flush(&mut patch);
-
     let root_scope = Host::with(|h| h.root_scope);
     let elevated = Host::with(|h| {
         let table = &h.styles;
@@ -2448,36 +2258,6 @@ fn a_restyle_lowers_against_the_node_that_owns_it() {
         "a restyle must read the node's own recipe rather than the root scope"
     );
 }
-
-/// The width class belongs to the solve and is never stored in the recipe re-lowering reads.
-///
-/// A second copy of the class in the recipe is a frame stale, so a container's own re-lower
-/// would disagree with the layout it was laid out under.
-#[test]
-fn a_recipe_holds_no_width_class() {
-    let mut patch = fixture();
-    let _held = mount(
-        crate::layout::responsive([600.0, 1000.0], plate().padding(Metric::SpaceLg)),
-        root(),
-    );
-    flush(&mut patch);
-
-    let root_width = Host::with(|h| h.root_scope.width);
-    assert!(
-        Host::with(|h| h
-            .styles
-            .iter()
-            .all(|(_, recipe)| recipe.scope.width == root_width)),
-        "a recipe stored a resolved class, which is the copy that goes stale"
-    );
-}
-
-// ── width variants ───────────────────────────────────────────────────────────────
-//
-// The fixture's window is 800 DIPs wide and the containers below fill it, so each test picks
-// a class by moving the thresholds rather than the window width. The class under test is then
-// readable from the thresholds at the call site.
-
 /// A width variant re-arranges a container without unmounting anything.
 ///
 /// The mount surviving is what makes a variant safe to evaluate during a resize drag: a
@@ -2486,33 +2266,31 @@ fn a_recipe_holds_no_width_class() {
 fn a_width_variant_re_arranges_without_unmounting() {
     let arrange = |bounds: [f32; 2]| {
         let mut patch = fixture();
-        let plates = || {
-            (
-                plate().width(Metric::CardMinW).height(Metric::CardMinH),
-                plate().width(Metric::CardMinW).height(Metric::CardMinH),
-            )
+        let plates = |ui: &mut Ui<'_>| {
+            plate(ui).width(Metric::CardMinW).height(Metric::CardMinH);
+            plate(ui).width(Metric::CardMinW).height(Metric::CardMinH);
         };
-        let _held = mount(
-            crate::layout::responsive(
-                bounds,
-                crate::layout::row(plates()).stack_when(windows_scene::WidthClass::Narrow),
-            )
-            .width(Len::Pct(1.0)),
-            root(),
-        );
+        let _held = create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .responsive(bounds)
+                .children(|ui| {
+                    ui.node(crate::layout::Preset::Row)
+                        .stack_when(windows_scene::WidthClass::Narrow)
+                        .children(|ui| {
+                            plates(ui);
+                        });
+                })
+                .width(Len::Pct(1.0));
+        });
         flush(&mut patch);
-        // The classifier, the row inside it, then its two children.
         Host::with(|h| {
-            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
             let (a, b) = (h.model().solved(nodes[2]), h.model().solved(nodes[3]));
             (a.rect, b.rect, h.mounts.len())
         })
     };
-
-    // 800 against [900, 1000] is Narrow; against [400, 600] it is Wide.
     let (narrow_a, narrow_b, narrow_mounts) = arrange([900.0, 1000.0]);
     let (wide_a, wide_b, wide_mounts) = arrange([400.0, 600.0]);
-
     assert!(
         narrow_b.y0 > narrow_a.y0 && (narrow_b.x0 - narrow_a.x0).abs() < 0.5,
         "at the narrow class the row must lay its children out down y"
@@ -2526,7 +2304,6 @@ fn a_width_variant_re_arranges_without_unmounting() {
         "a width variant changed the structure, which is the one thing it may not do"
     );
 }
-
 /// A single-line run's box is its own coverage, whatever its container does to its siblings.
 ///
 /// A `Flow::Line` run has no line sprite of its own: the node is the sprite, which keeps a
@@ -2540,19 +2317,17 @@ fn a_width_variant_re_arranges_without_unmounting() {
 #[test]
 fn a_single_line_run_is_as_wide_as_its_own_text() {
     let mut patch = fixture();
-    // `stack` stretches its children, which is the default.
-    let _held = mount(
-        stack((
-            crate::widget::text("a much longer line of text than the other one"),
-            crate::widget::text("short"),
-        ))
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                crate::widget::text(ui, "a much longer line of text than the other one");
+                crate::widget::text(ui, "short");
+            });
+    });
     flush(&mut patch);
-
     let (long, short) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (
             h.model().solved(nodes[1]).size.x,
             h.model().solved(nodes[2]).size.x,
@@ -2568,7 +2343,6 @@ fn a_single_line_run_is_as_wide_as_its_own_text() {
         "the longer run filled the container at {long} DIPs rather than measuring its text"
     );
 }
-
 /// A track sized by a fraction of its container is that fraction, not zero.
 ///
 /// `Len::dips` answers `None` for the two lengths with no intrinsic value, a percentage and
@@ -2579,30 +2353,27 @@ fn a_single_line_run_is_as_wide_as_its_own_text() {
 fn a_fractional_track_is_a_fraction_of_its_container() {
     use crate::layout::Track;
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::grid((
-            plate().height(Metric::CardMinH),
-            plate().height(Metric::CardMinH),
-        ))
-        .cols([Track::Fixed(Len::Pct(0.25)), Track::Fr(1.0)])
-        .gap(Len::Zero)
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Grid)
+            .cols([Track::Fixed(Len::Pct(0.25)), Track::Fr(1.0)])
+            .gap(Len::Zero)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                plate(ui).height(Metric::CardMinH);
+                plate(ui).height(Metric::CardMinH);
+            });
+    });
     flush(&mut patch);
-
     let (a, b) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[1]), h.model().solved(nodes[2]))
     });
-    // A quarter of the fixture's 800-DIP window.
     assert!(
         (b.rect.x0 - a.rect.x0 - 200.0).abs() < 1.0,
         "a 25% track collapsed: the second child began {} DIPs across",
         b.rect.x0 - a.rect.x0
     );
 }
-
 /// A class-gated column list replaces the template below it rather than extending it.
 ///
 /// `.cols(..).cols_when(..)` clears before it appends, so the wide arm holds two tracks and
@@ -2612,27 +2383,27 @@ fn a_fractional_track_is_a_fraction_of_its_container() {
 fn a_class_gated_column_list_replaces_the_one_below_it() {
     use crate::layout::Track;
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::responsive(
-            [400.0, 600.0],
-            crate::layout::grid((
-                plate().height(Metric::CardMinH),
-                plate().height(Metric::CardMinH),
-            ))
-            .cols([Track::Fr(1.0)])
-            .cols_when(
-                windows_scene::WidthClass::Wide,
-                [Track::Fr(1.0), Track::Fr(1.0)],
-            )
-            .gap(Len::Zero),
-        )
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .responsive([400.0, 600.0])
+            .children(|ui| {
+                ui.node(crate::layout::Preset::Grid)
+                    .cols([Track::Fr(1.0)])
+                    .cols_when(
+                        windows_scene::WidthClass::Wide,
+                        [Track::Fr(1.0), Track::Fr(1.0)],
+                    )
+                    .gap(Len::Zero)
+                    .children(|ui| {
+                        plate(ui).height(Metric::CardMinH);
+                        plate(ui).height(Metric::CardMinH);
+                    });
+            })
+            .width(Len::Pct(1.0));
+    });
     flush(&mut patch);
-
     let (a, b) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[2]), h.model().solved(nodes[3]))
     });
     let half = (b.rect.x0 - a.rect.x0 - 400.0).abs();
@@ -2643,38 +2414,38 @@ fn a_class_gated_column_list_replaces_the_one_below_it() {
         b.rect.x0 - a.rect.x0
     );
 }
-
 /// Computation, sparse class overrides and empty templates share one declaration.
 #[test]
 fn computed_layout_replacement_and_responsive_inheritance_preserve_nodes() {
-    use crate::layout::{Track, grid, responsive};
+    use crate::layout::Track;
     use crate::role::WidthClass::{Narrow, Wide};
     let mut patch = fixture();
     let rows = crate::signal::Cell::new(2.0_f32);
-    let _held = mount(
-        responsive(
-            [1000.0, 2000.0],
-            grid((
-                plate().height(Metric::CardMinH),
-                plate().height(Metric::CardMinH),
-            ))
-            .layout_from(|_| panic!("replaced layout writer ran"))
-            .layout_from(move |layout| {
-                let columns = layout.columns();
-                columns.clear();
-                columns.extend([
-                    Track::Fixed(Len::Times(Metric::RowH, rows.get())),
-                    Track::Fr(1.0),
-                ]);
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .responsive([1000.0, 2000.0])
+            .children(|ui| {
+                ui.node(crate::layout::Preset::Grid)
+                    .layout_from(|_| panic!("replaced layout writer ran"))
+                    .layout_from(move |layout| {
+                        let columns = layout.columns();
+                        columns.clear();
+                        columns.extend([
+                            Track::Fixed(Len::Times(Metric::RowH, rows.get())),
+                            Track::Fr(1.0),
+                        ]);
+                    })
+                    .cols_when(Narrow, [Track::Fr(1.0), Track::Fr(1.0)])
+                    .cols_when(Wide, [])
+                    .gap(Len::Zero)
+                    .width(Len::Pct(1.0))
+                    .children(|ui| {
+                        plate(ui).height(Metric::CardMinH);
+                        plate(ui).height(Metric::CardMinH);
+                    });
             })
-            .cols_when(Narrow, [Track::Fr(1.0), Track::Fr(1.0)])
-            .cols_when(Wide, [])
-            .gap(Len::Zero)
-            .width(Len::Pct(1.0)),
-        )
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+            .width(Len::Pct(1.0));
+    });
     let mut identities = None;
     for (width, count) in [
         (1500.0, 2.0),
@@ -2688,7 +2459,7 @@ fn computed_layout_replacement_and_responsive_inheritance_preserve_nodes() {
         crate::signal::flush();
         flush(&mut patch);
         Host::with(|h| {
-            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
             if let Some(before) = &identities {
                 assert_eq!(before, &nodes);
             }
@@ -2712,14 +2483,13 @@ fn computed_layout_replacement_and_responsive_inheritance_preserve_nodes() {
         });
     }
 }
-
 #[test]
 fn computed_rows_replace_the_template_without_remounting_children() {
-    use crate::layout::{Track, grid};
+    use crate::layout::Track;
     let mut patch = fixture();
     let fraction = crate::signal::Cell::new(0.25_f32);
-    let _held = mount(
-        grid((plate(), plate()))
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Grid)
             .rows([Track::Fr(1.0)])
             .layout_from(move |layout| {
                 let out = layout.rows();
@@ -2729,13 +2499,16 @@ fn computed_rows_replace_the_template_without_remounting_children() {
             .cols([Track::Fr(1.0)])
             .gap(Len::Zero)
             .height(Len::Pct(1.0))
-            .width(Len::Pct(1.0)),
-        root(),
-    );
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                plate(ui);
+                plate(ui);
+            });
+    });
     flush(&mut patch);
     let snapshot = || {
         Host::with(|h| {
-            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
             let a = h.model().solved(nodes[0]);
             let b = h.model().solved(nodes[2]);
             (nodes, (b.rect.y0 - a.rect.y0) / a.size.y)
@@ -2750,25 +2523,24 @@ fn computed_rows_replace_the_template_without_remounting_children() {
     assert_eq!(before, after);
     assert!((y - 0.75).abs() < 0.01);
 }
-
 #[test]
 fn keyed_tiles_fill_multiple_columns() {
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::tiles(
-            Len::Times(Metric::CardMinW, 0.75),
-            each_into(
+    let _held = create(|ui| {
+        crate::layout::tiles(ui, Len::Times(Metric::CardMinW, 0.75), |ui| {
+            ui.each(
                 |out| out.extend(0..4),
                 |i| i,
-                |_| plate().min_width(Len::Zero),
-            ),
-        )
-        .width(Len::Times(Metric::CardMinW, 2.0)),
-        root(),
-    );
+                |ui, _| {
+                    plate(ui).min_width(Len::Zero);
+                },
+            );
+        })
+        .width(Len::Times(Metric::CardMinW, 2.0));
+    });
     flush(&mut patch);
     let (a, b) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[2]), h.model().solved(nodes[3]))
     });
     assert!(
@@ -2777,29 +2549,27 @@ fn keyed_tiles_fill_multiple_columns() {
     );
     assert!((b.rect.y0 - a.rect.y0).abs() < 1.0);
 }
-
 /// `hide_when` takes the node out of the layout and leaves it in the tree.
 #[test]
 fn hide_when_removes_the_box_and_not_the_node() {
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::responsive(
-            [900.0, 1000.0],
-            stack((
-                plate().width(Metric::CardMinW).height(Metric::CardMinH),
-                plate()
-                    .width(Metric::CardMinW)
-                    .height(Metric::CardMinH)
-                    .hide_when(windows_scene::WidthClass::Narrow),
-            )),
-        )
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .responsive([900.0, 1000.0])
+            .children(|ui| {
+                stack(ui, |ui| {
+                    plate(ui).width(Metric::CardMinW).height(Metric::CardMinH);
+                    plate(ui)
+                        .width(Metric::CardMinW)
+                        .height(Metric::CardMinH)
+                        .hide_when(windows_scene::WidthClass::Narrow);
+                });
+            })
+            .width(Len::Pct(1.0));
+    });
     flush(&mut patch);
-
     let (hidden, mounts) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[3]), h.mounts.len())
     });
     assert!(
@@ -2811,23 +2581,24 @@ fn hide_when_removes_the_box_and_not_the_node() {
         "hiding is a style, so the node it hid is still mounted"
     );
 }
-
 #[test]
 fn unhandled_escape_follows_screen_visibility_and_mount_lifetime() {
     let mut patch = fixture();
     let hidden = crate::signal::Cell::new(false);
     let calls = std::rc::Rc::new(core::cell::Cell::new(0));
-    let held = mount(
-        stack(()).grow().hide_if(hidden).on_unhandled_escape({
-            let calls = calls.clone();
-            move || {
-                // Re-entering the host is legal: the handler is taken out first.
-                Host::with(|_| ());
-                calls.set(calls.get() + 1);
-            }
-        }),
-        root(),
-    );
+    let held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .grow()
+            .hide_if(hidden)
+            .on_unhandled_escape({
+                let calls = calls.clone();
+                move || {
+                    Host::with(|_| ());
+                    calls.set(calls.get() + 1);
+                }
+            })
+            .children(|_| {});
+    });
     flush(&mut patch);
     Host::with(|h| h.escape_handler()).unwrap()();
     assert_eq!(calls.get(), 1);
@@ -2842,7 +2613,6 @@ fn unhandled_escape_follows_screen_visibility_and_mount_lifetime() {
     drop(held);
     assert!(Host::with(|h| h.escape_handler()).is_none());
 }
-
 /// `float_when` takes the node out of flow, pins it to its edge and stretches the other axis.
 ///
 /// The pinned node keeps its own width and the sibling beside it keeps the whole container,
@@ -2851,25 +2621,25 @@ fn unhandled_escape_follows_screen_visibility_and_mount_lifetime() {
 fn float_when_pins_the_node_and_leaves_its_sibling_the_container() {
     use crate::layout::Edge;
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::responsive(
-            [900.0, 1000.0],
-            crate::layout::stack((
-                plate().height(Metric::CardMinH),
-                plate()
-                    .width(Metric::CardMinW)
-                    .float_when(windows_scene::WidthClass::Narrow, Edge::Right),
-            ))
-            .gap(Len::Zero),
-        )
-        .width(Len::Pct(1.0))
-        .height(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .responsive([900.0, 1000.0])
+            .children(|ui| {
+                ui.node(crate::layout::Preset::Stack)
+                    .gap(Len::Zero)
+                    .children(|ui| {
+                        plate(ui).height(Metric::CardMinH);
+                        plate(ui)
+                            .width(Metric::CardMinW)
+                            .float_when(windows_scene::WidthClass::Narrow, Edge::Right);
+                    });
+            })
+            .width(Len::Pct(1.0))
+            .height(Len::Pct(1.0));
+    });
     flush(&mut patch);
-
     let (lane, flow, floated) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (
             h.model().solved(nodes[1]),
             h.model().solved(nodes[2]),
@@ -2899,7 +2669,6 @@ fn float_when_pins_the_node_and_leaves_its_sibling_the_container() {
         lane.size.x
     );
 }
-
 /// A float is not confined by the placement its container states, in either order.
 ///
 /// The lane states `at(row, column)` for the docked case and the pane floats at the narrow
@@ -2911,42 +2680,34 @@ fn a_float_is_not_confined_by_its_containers_placement() {
     /// answers that child's solved box together with the grid's.
     fn boxes(float_first: bool) -> (windows_scene::Solved, windows_scene::Solved) {
         let mut patch = fixture();
-        let pane = plate().width(Metric::CardMinW);
-        // The two orders the override list can carry: the child's own rule is pushed where
-        // it is written, and the container's `Place` when the child is added.
-        let pane = if float_first {
-            pane.float_when(windows_scene::WidthClass::Narrow, Edge::Right)
-        } else {
-            pane
-        };
-        let _held = mount(
-            crate::layout::responsive(
-                [900.0, 1000.0],
-                crate::layout::grid(())
-                    .at(0, 0, plate().height(Metric::CardMinH))
-                    .at(
-                        0,
-                        1,
-                        if float_first {
-                            pane
-                        } else {
-                            pane.float_when(windows_scene::WidthClass::Narrow, Edge::Right)
-                        },
-                    )
-                    .cols([Track::Fr(1.0)])
-                    .gap(Len::Zero),
-            )
-            .width(Len::Pct(1.0))
-            .height(Len::Pct(1.0)),
-            root(),
-        );
+        let _held = create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .responsive([900.0, 1000.0])
+                .children(|ui| {
+                    ui.node(crate::layout::Preset::Grid)
+                        .cols([Track::Fr(1.0)])
+                        .gap(Len::Zero)
+                        .children(|ui| {
+                            plate(ui).height(Metric::CardMinH).at(0, 0);
+                            let pane = plate(ui).width(Metric::CardMinW);
+                            if float_first {
+                                pane.float_when(windows_scene::WidthClass::Narrow, Edge::Right)
+                                    .at(0, 1);
+                            } else {
+                                pane.at(0, 1)
+                                    .float_when(windows_scene::WidthClass::Narrow, Edge::Right);
+                            }
+                        });
+                })
+                .width(Len::Pct(1.0))
+                .height(Len::Pct(1.0));
+        });
         flush(&mut patch);
         Host::with(|h| {
-            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
             (h.model().solved(nodes[1]), h.model().solved(nodes[3]))
         })
     }
-
     for float_first in [true, false] {
         let (lane, floated) = boxes(float_first);
         assert!(
@@ -2965,7 +2726,6 @@ fn a_float_is_not_confined_by_its_containers_placement() {
         );
     }
 }
-
 /// `float_below` floats at every class under its floor, and only there.
 ///
 /// A class added to [`WidthClass`](windows_scene::WidthClass) must not leave the pane docked
@@ -2977,32 +2737,29 @@ fn float_below_floats_every_class_under_its_floor() {
     /// against `bounds`, and answers whether that part is out of flow.
     fn floats(bounds: [f32; 2]) -> bool {
         let mut patch = fixture();
-        let _held = mount(
-            crate::layout::responsive(
-                bounds,
-                crate::layout::stack((
-                    plate().height(Metric::CardMinH),
-                    plate()
-                        .width(Metric::CardMinW)
-                        .float_below(windows_scene::WidthClass::Wide, Edge::Right),
-                ))
-                .gap(Len::Zero),
-            )
-            .width(Len::Pct(1.0))
-            .height(Len::Pct(1.0)),
-            root(),
-        );
+        let _held = create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .responsive(bounds)
+                .children(|ui| {
+                    ui.node(crate::layout::Preset::Stack)
+                        .gap(Len::Zero)
+                        .children(|ui| {
+                            plate(ui).height(Metric::CardMinH);
+                            plate(ui)
+                                .width(Metric::CardMinW)
+                                .float_below(windows_scene::WidthClass::Wide, Edge::Right);
+                        });
+                })
+                .width(Len::Pct(1.0))
+                .height(Len::Pct(1.0));
+        });
         flush(&mut patch);
         Host::with(|h| {
-            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
             let (lane, floated) = (h.model().solved(nodes[1]), h.model().solved(nodes[3]));
-            // In flow the stack gives it the container's width and its own height; floated it
-            // is the other way round.
             (floated.rect.x1 - lane.rect.x1).abs() < 0.5 && floated.size.x < lane.size.x
         })
     }
-
-    // The fixture's window is 800 DIPs, so each set of bounds picks one class for it.
     assert!(
         floats([900.0, 1000.0]),
         "floating below Wide, so it must float at Narrow"
@@ -3016,7 +2773,6 @@ fn float_below_floats_every_class_under_its_floor() {
         "the floor itself is not below it, so the pane docks at Wide"
     );
 }
-
 /// `hide_below` hides at every class under its floor, and only there.
 ///
 /// A class added to [`WidthClass`](windows_scene::WidthClass) must not leave a subtree
@@ -3027,28 +2783,26 @@ fn hide_below_hides_every_class_under_its_floor() {
     /// against `bounds`, and answers whether the part occupies space.
     fn shown(bounds: [f32; 2]) -> bool {
         let mut patch = fixture();
-        let _held = mount(
-            crate::layout::responsive(
-                bounds,
-                stack((
-                    plate().width(Metric::CardMinW).height(Metric::CardMinH),
-                    plate()
-                        .width(Metric::CardMinW)
-                        .height(Metric::CardMinH)
-                        .hide_below(windows_scene::WidthClass::Wide),
-                )),
-            )
-            .width(Len::Pct(1.0)),
-            root(),
-        );
+        let _held = create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .responsive(bounds)
+                .children(|ui| {
+                    stack(ui, |ui| {
+                        plate(ui).width(Metric::CardMinW).height(Metric::CardMinH);
+                        plate(ui)
+                            .width(Metric::CardMinW)
+                            .height(Metric::CardMinH)
+                            .hide_below(windows_scene::WidthClass::Wide);
+                    });
+                })
+                .width(Len::Pct(1.0));
+        });
         flush(&mut patch);
         Host::with(|h| {
-            let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+            let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
             h.model().solved(nodes[3]).size.y > 0.5
         })
     }
-
-    // The fixture's window is 800 DIPs, so each set of bounds picks one class for it.
     assert!(
         !shown([900.0, 1000.0]),
         "hidden below Wide, so it must not lay out at Narrow"
@@ -3062,7 +2816,6 @@ fn hide_below_hides_every_class_under_its_floor() {
         "the floor itself is not below the floor: it must lay out at Wide"
     );
 }
-
 /// A fractional track divides the container and is not floored by its own content.
 ///
 /// A track floored at its content takes a scrolling column's full height as its minimum,
@@ -3071,25 +2824,24 @@ fn hide_below_hides_every_class_under_its_floor() {
 fn a_fractional_track_is_not_floored_by_its_own_content() {
     use crate::layout::Track;
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::grid((
-            plate().height(Metric::CardMinH),
-            // Six card heights of content in a track entitled to half of four.
-            stack([0; 6].map(|_| plate().height(Metric::CardMinH))),
-        ))
-        .rows([Track::Fr(1.0), Track::Fr(1.0)])
-        .gap(Len::Zero)
-        .height(Len::Times(Metric::CardMinH, 4.0))
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Grid)
+            .rows([Track::Fr(1.0), Track::Fr(1.0)])
+            .gap(Len::Zero)
+            .height(Len::Times(Metric::CardMinH, 4.0))
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                plate(ui).height(Metric::CardMinH);
+                stack(ui, |ui| {
+                    for _ in [0; 6] {
+                        plate(ui).height(Metric::CardMinH);
+                    }
+                });
+            });
+    });
     flush(&mut patch);
-
-    // Against the grid's own solved height rather than the height it stated: the root is the
-    // client area, so a grid taller than the window is shrunk to it before the tracks divide
-    // anything, and the claim is about the division and not about the total.
     let (grid, tall) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[0]), h.model().solved(nodes[2]))
     });
     let half = grid.size.y / 2.0;
@@ -3100,7 +2852,6 @@ fn a_fractional_track_is_not_floored_by_its_own_content() {
         tall.rect.y0 - grid.rect.y0
     );
 }
-
 /// The first solve applies the class it resolved, including when that class is `Medium`.
 ///
 /// A class matching the solver's own default for an unclassified node produces no transition,
@@ -3109,24 +2860,22 @@ fn a_fractional_track_is_not_floored_by_its_own_content() {
 #[test]
 fn the_first_solve_applies_the_class_it_resolved() {
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::responsive(
-            // 800 against these thresholds is Medium.
-            [600.0, 1000.0],
-            stack(
-                plate()
-                    .width(Metric::CardMinW)
-                    .height(Metric::CardMinH)
-                    .hide_when(windows_scene::WidthClass::Medium),
-            ),
-        )
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .responsive([600.0, 1000.0])
+            .children(|ui| {
+                stack(ui, |ui| {
+                    plate(ui)
+                        .width(Metric::CardMinW)
+                        .height(Metric::CardMinH)
+                        .hide_when(windows_scene::WidthClass::Medium);
+                });
+            })
+            .width(Len::Pct(1.0));
+    });
     flush(&mut patch);
-
     let hidden = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         h.model().solved(nodes[2])
     });
     assert!(
@@ -3134,9 +2883,6 @@ fn the_first_solve_applies_the_class_it_resolved() {
         "the class resolved on the first solve must reach the styles laid out on it"
     );
 }
-
-// ── the wash matches what it covers ──────────────────────────────────────────────
-
 /// Every washed control's wash carries the corner radius of the control under it.
 ///
 /// A wash crossfades over the surface it covers, so a radius it does not share paints a
@@ -3144,24 +2890,31 @@ fn the_first_solve_applies_the_class_it_resolved() {
 #[test]
 fn a_wash_is_as_round_as_the_control_it_covers() {
     let (_owner, ()) = crate::signal::Owner::scope(|| {
-        // Built inside the loop: the arena clears after each mount, so an element minted before
-        // one and used after it names a slot the clear has freed.
-        let cases: [(&str, fn() -> View); 3] = [
-            ("button", || crate::widget::button("x").erase()),
-            ("knob", || {
-                crate::widget::knob(0.5_f64, crate::widget::Range::UNIT)
+        let cases: [(&str, fn(&mut Ui<'_>)); 3] = [
+            ("button", |ui| {
+                crate::widget::button(ui, "x")
+                    .width(Metric::CardMinW)
+                    .height(Metric::RowH);
             }),
-            ("slider", || {
+            ("knob", |ui| {
+                crate::widget::knob(ui, 0.5_f64, crate::widget::Range::UNIT)
+                    .width(Metric::CardMinW)
+                    .height(Metric::RowH);
+            }),
+            ("slider", |ui| {
                 crate::widget::slider(
+                    ui,
                     0.5_f64,
                     crate::widget::Range::UNIT,
                     crate::widget::SliderStyle::default(),
                 )
+                .width(Metric::CardMinW)
+                .height(Metric::RowH);
             }),
         ];
         for (name, view) in cases {
             let mut patch = fixture();
-            let _held = mount(view().width(Metric::CardMinW).height(Metric::RowH), root());
+            let _held = create(view);
             flush(&mut patch);
             let wash = Host::with(|h| {
                 h.controls
@@ -3190,12 +2943,6 @@ fn a_wash_is_as_round_as_the_control_it_covers() {
         }
     });
 }
-
-// ── what automation is told ─────────────────────────────────────────────────────
-//
-// The seeds below are synthesised from the mount rows themselves, so what a client reads
-// is decided here rather than by the seeds a caller hands to `uia::Tree`.
-
 /// Returns the seeds this mount produced, with their names resolved out of the blob.
 fn seeds() -> Vec<(crate::widget::UiaRole, String, crate::uia::Value)> {
     let mut out = crate::uia::Seeds::default();
@@ -3209,14 +2956,12 @@ fn seeds() -> Vec<(crate::widget::UiaRole, String, crate::uia::Value)> {
         })
         .collect()
 }
-
 /// Returns the published tree this mount would produce.
 fn tree(patch: &SinkPatch) -> crate::uia::Tree {
     let mut out = crate::uia::Seeds::default();
     Host::with(|h| h.uia_seeds(&mut out));
     crate::uia::Tree::build(patch.hit_entries(), &out)
 }
-
 /// A control takes its name from the text its subtree laid out.
 ///
 /// A button's label is a child element rather than text on the control's own node, so a name
@@ -3224,9 +2969,10 @@ fn tree(patch: &SinkPatch) -> crate::uia::Tree {
 #[test]
 fn a_control_is_named_by_the_text_its_subtree_laid_out() {
     let mut patch = fixture();
-    let _button = mount(crate::widget::button("Mute"), root());
+    let _button = create(|ui| {
+        crate::widget::button(ui, "Mute");
+    });
     flush(&mut patch);
-
     let named = seeds();
     assert!(
         named.contains(&(
@@ -3237,7 +2983,6 @@ fn a_control_is_named_by_the_text_its_subtree_laid_out() {
         "a button takes its name from its label child: {named:?}"
     );
 }
-
 /// Static text is an automation element, and publishes its body as a text document.
 ///
 /// A run with no peer of its own leaves a screen of labels, headings and read-outs reading
@@ -3245,9 +2990,10 @@ fn a_control_is_named_by_the_text_its_subtree_laid_out() {
 #[test]
 fn static_text_is_an_element_and_publishes_its_own_body() {
     let mut patch = fixture();
-    let _text = mount(crate::widget::text("Output"), root());
+    let _text = create(|ui| {
+        crate::widget::text(ui, "Output");
+    });
     flush(&mut patch);
-
     let named = seeds();
     assert!(
         named.contains(&(
@@ -3257,7 +3003,6 @@ fn static_text_is_an_element_and_publishes_its_own_body() {
         )),
         "a run is an element, and its body is a text document: {named:?}"
     );
-
     let tree = tree(&patch);
     let at = (0..tree.len())
         .find(|&at| {
@@ -3270,7 +3015,6 @@ fn static_text_is_an_element_and_publishes_its_own_body() {
         "and it answers the pattern its body exists for"
     );
 }
-
 /// A control with no text of its own takes the name of the run before it.
 ///
 /// A slider carries no text, so without its neighbouring run its published name is empty.
@@ -3279,20 +3023,19 @@ fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
     let (_owner, ()) = crate::signal::Owner::scope(|| {
         let mut patch = fixture();
         let value = crate::signal::Cell::new(0.5_f64);
-        let _row = mount(
-            stack((
-                crate::widget::label("Gain"),
+        let _row = create(|ui| {
+            stack(ui, |ui| {
+                crate::widget::label(ui, "Gain");
                 crate::widget::slider(
+                    ui,
                     value,
                     crate::widget::Range::UNIT,
                     crate::widget::SliderStyle::default(),
                 )
-                .width(Metric::CardMinW),
-            )),
-            root(),
-        );
+                .width(Metric::CardMinW);
+            });
+        });
         flush(&mut patch);
-
         let tree = tree(&patch);
         let slider = (0..tree.len())
             .find(|&at| {
@@ -3312,7 +3055,6 @@ fn a_control_with_no_text_takes_the_name_of_the_run_beside_it() {
         assert_eq!(label.role, crate::widget::UiaRole::Text);
     });
 }
-
 /// A capitalised run draws in capitals and announces what the author wrote.
 ///
 /// Casing is a typographic treatment of the label rung, not a rename. A reader given the
@@ -3322,28 +3064,26 @@ fn a_capitalised_run_announces_the_authors_casing() {
     let (_owner, ()) = crate::signal::Owner::scope(|| {
         let mut patch = fixture();
         let value = crate::signal::Cell::new(0.5_f64);
-        let _row = mount(
-            stack((
+        let _row = create(|ui| {
+            stack(ui, |ui| {
                 crate::widget::styled_text(
+                    ui,
                     "Gain adjust",
                     crate::widget::TextStyle {
                         caps: true,
                         ..crate::widget::TextStyle::new(TypeRole::Label)
                     },
-                ),
+                );
                 crate::widget::slider(
+                    ui,
                     value,
                     crate::widget::Range::UNIT,
                     crate::widget::SliderStyle::default(),
                 )
-                .width(Metric::CardMinW),
-            )),
-            root(),
-        );
+                .width(Metric::CardMinW);
+            });
+        });
         flush(&mut patch);
-
-        // The shaped form: what the run was laid out from, which is the only place the drawn
-        // casing can be read back without rasterizing.
         let shaped = Host::with(|h| {
             h.text
                 .entries
@@ -3353,7 +3093,6 @@ fn a_capitalised_run_announces_the_authors_casing() {
         })
         .expect("the label is in the table");
         assert_eq!(shaped, "GAIN ADJUST", "the recipe requests capitals");
-
         let tree = tree(&patch);
         let slider = (0..tree.len())
             .find(|&at| {
@@ -3369,7 +3108,6 @@ fn a_capitalised_run_announces_the_authors_casing() {
         );
     });
 }
-
 /// A control with its own text keeps it, and one whose predecessor is not a run takes none.
 ///
 /// The neighbour rule reaches one element back, so it cannot relabel a named control or
@@ -3379,21 +3117,20 @@ fn a_control_that_has_a_name_keeps_it_and_one_with_no_run_before_it_gets_none() 
     let (_owner, ()) = crate::signal::Owner::scope(|| {
         let mut patch = fixture();
         let value = crate::signal::Cell::new(0.5_f64);
-        let _row = mount(
-            stack((
-                crate::widget::label("Gain"),
-                crate::widget::button("Reset"),
+        let _row = create(|ui| {
+            stack(ui, |ui| {
+                crate::widget::label(ui, "Gain");
+                crate::widget::button(ui, "Reset");
                 crate::widget::slider(
+                    ui,
                     value,
                     crate::widget::Range::UNIT,
                     crate::widget::SliderStyle::default(),
                 )
-                .width(Metric::CardMinW),
-            )),
-            root(),
-        );
+                .width(Metric::CardMinW);
+            });
+        });
         flush(&mut patch);
-
         let tree = tree(&patch);
         let role_of = |want| {
             (0..tree.len())
@@ -3414,7 +3151,6 @@ fn a_control_that_has_a_name_keeps_it_and_one_with_no_run_before_it_gets_none() 
         );
     });
 }
-
 /// A label that re-reads marks the published tree stale.
 ///
 /// A name is a copy in the published blob rather than a live property, so a changed string
@@ -3423,16 +3159,17 @@ fn a_control_that_has_a_name_keeps_it_and_one_with_no_run_before_it_gets_none() 
 fn a_label_that_changes_marks_the_accessible_tree_stale() {
     let mut patch = fixture();
     let caption = crate::signal::Cell::new("Off".to_owned());
-    let _text = mount(
-        crate::widget::text(crate::widget::reactive(move |out| {
-            caption.with(|s| out.push_str(s));
-        })),
-        root(),
-    );
+    let _text = create(|ui| {
+        crate::widget::text(
+            ui,
+            crate::widget::reactive(move |out| {
+                caption.with(|s| out.push_str(s));
+            }),
+        );
+    });
     flush(&mut patch);
     Host::with(|h| h.uia_published());
     assert!(!Host::with(|h| h.uia_stale()), "nothing has moved yet");
-
     caption.set("On".to_owned());
     crate::signal::flush();
     assert!(
@@ -3445,7 +3182,6 @@ fn a_label_that_changes_marks_the_accessible_tree_stale() {
         "and the next publish carries the new one: {named:?}"
     );
 }
-
 /// A readout renders its value, and follows it.
 ///
 /// [`shown`](crate::widget::shown) formats through `Display` straight into the run's buffer,
@@ -3454,17 +3190,15 @@ fn a_label_that_changes_marks_the_accessible_tree_stale() {
 fn a_shown_readout_renders_its_value_and_follows_it() {
     let mut patch = fixture();
     let count = crate::signal::Cell::new(7_usize);
-    let _text = mount(
-        crate::widget::mono(crate::widget::shown(move || count.get())),
-        root(),
-    );
+    let _text = create(|ui| {
+        crate::widget::mono(ui, crate::widget::shown(move || count.get()));
+    });
     flush(&mut patch);
     assert!(
         seeds().iter().any(|(_, name, _)| name == "7"),
         "the readout must show the value it was given: {:?}",
         seeds()
     );
-
     count.set(12);
     crate::signal::flush();
     assert!(
@@ -3473,7 +3207,6 @@ fn a_shown_readout_renders_its_value_and_follows_it() {
         seeds()
     );
 }
-
 /// A readout whose value moves but whose formatted text does not allocates nothing.
 ///
 /// `-6.031` and `-6.028` both format to `-6.0 dB`. The table declines to reshape a string
@@ -3483,32 +3216,28 @@ fn a_shown_readout_renders_its_value_and_follows_it() {
 #[test]
 fn a_readout_whose_text_does_not_move_allocates_nothing() {
     use core::fmt::Write;
-
     let mut patch = fixture();
     let level = crate::signal::Cell::new(-6.031_f64);
-    let _text = mount(
-        crate::widget::mono(crate::widget::reactive(move |out| {
-            let _ = write!(out, "{:.1} dB", level.get());
-        })),
-        root(),
-    );
+    let _text = create(|ui| {
+        crate::widget::mono(
+            ui,
+            crate::widget::reactive(move |out| {
+                let _ = write!(out, "{:.1} dB", level.get());
+            }),
+        );
+    });
     flush(&mut patch);
-    // One warm-up: the scratch buffer and the scheduler's own queues each reach their
-    // high-water mark once, and the count below is of the steady state after that.
     level.set(-6.030);
     crate::signal::flush();
-
     let before = crate::counting::allocations();
     level.set(-6.028);
     crate::signal::flush();
     let during = crate::counting::allocations() - before;
-
     assert_eq!(
         during, 0,
         "a readout settling on the same text allocated {during} times"
     );
 }
-
 /// A run bound to a memo follows it, as a run bound to a cell does.
 ///
 /// A memo is minted once and never rebuilt, so a run's binding tracks the memo rather than
@@ -3520,35 +3249,38 @@ fn a_run_bound_to_a_memo_follows_it() {
     let selected = crate::signal::Memo::new(move || selection.get());
     let runs = std::rc::Rc::new(std::cell::Cell::new(0_u32));
     let counter = std::rc::Rc::clone(&runs);
-    let _held = mount(
-        stack(crate::widget::text(crate::widget::reactive(move |out| {
-            counter.set(counter.get() + 1);
-            selected.with(|s| {
-                out.push_str(match s {
-                    Some(_) => "a much longer line of text than the other one",
-                    None => "x",
-                });
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                crate::widget::text(
+                    ui,
+                    crate::widget::reactive(move |out| {
+                        counter.set(counter.get() + 1);
+                        selected.with(|s| {
+                            out.push_str(match s {
+                                Some(_) => "a much longer line of text than the other one",
+                                None => "x",
+                            });
+                        });
+                    }),
+                );
             });
-        })))
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    });
     crate::signal::flush();
     flush(&mut patch);
     let run = Host::with(|h| {
         h.mounts
             .iter()
-            .map(|(_, m)| m.node)
+            .map(|(node, _)| node)
             .nth(1)
             .expect("the run")
     });
     let absent = Host::with(|h| h.model().solved(run).size.x);
-
     selection.set(Some(1));
     crate::signal::flush();
     flush(&mut patch);
     let present = Host::with(|h| h.model().solved(run).size.x);
-
     assert!(
         present > absent,
         "the run measured {absent} DIPs before the memo moved and {present} after, so the \
@@ -3556,7 +3288,6 @@ fn a_run_bound_to_a_memo_follows_it() {
         runs.get()
     );
 }
-
 /// A hidden subtree lays out as hidden all the way down, including a measurable leaf.
 ///
 /// Taffy descends into a hidden subtree with `RunMode::PerformHiddenLayout`, where a measure
@@ -3566,49 +3297,45 @@ fn a_run_bound_to_a_memo_follows_it() {
 #[test]
 fn a_hidden_subtree_does_not_measure_its_leaves() {
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::responsive(
-            [900.0, 1000.0],
-            stack((
-                crate::widget::caption("visible"),
-                stack(crate::widget::caption("hidden"))
-                    .hide_when(windows_scene::WidthClass::Narrow),
-            )),
-        )
-        .width(Len::Pct(1.0)),
-        root(),
-    );
-    // The assertion is that this returns at all.
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .responsive([900.0, 1000.0])
+            .children(|ui| {
+                stack(ui, |ui| {
+                    crate::widget::caption(ui, "visible");
+                    ui.node(crate::layout::Preset::Stack)
+                        .hide_when(windows_scene::WidthClass::Narrow)
+                        .children(|ui| {
+                            crate::widget::caption(ui, "hidden");
+                        });
+                });
+            })
+            .width(Len::Pct(1.0));
+    });
     flush(&mut patch);
 }
-
-// ── what a structural adapter contributes to its parent's layout ─────────────────
-//
-// An adapter parents its rows and arms straight to the container it was passed to, and adds
-// only a zero-size anchor for identity. A group of its own would impose that group's style on
-// everything below it: `Preset::Bare` is `Style::DEFAULT`, a content-sized flex row, so rows
-// would march across whatever their container was and an arm could not fill its box.
-
 /// A keyed list is laid out by the container it was passed to.
 ///
 /// The container here is a column, so its rows share a left edge and descend.
 #[test]
 fn a_keyed_list_lays_out_under_its_container() {
     let mut patch = fixture();
-    let _list = mount(
-        stack(each(
-            || (0_u32..3).collect(),
-            |item| item,
-            |_| plate().height(Metric::CardMinH),
-        ))
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _list = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                ui.each(
+                    |out: &mut Vec<u32>| out.extend(0..3),
+                    |item| item,
+                    |ui, _| {
+                        plate(ui).height(Metric::CardMinH);
+                    },
+                );
+            });
+    });
     flush(&mut patch);
-
-    // The stack, its adapter's anchor, then the three rows in mount order.
     let rows = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         [
             h.model().solved(nodes[2]),
             h.model().solved(nodes[3]),
@@ -3631,7 +3358,6 @@ fn a_keyed_list_lays_out_under_its_container() {
         );
     }
 }
-
 /// An adapter's anchor occupies no space in its parent's layout.
 ///
 /// The anchor is in the parent's child list to carry identity, so a list of two rows measures
@@ -3639,20 +3365,23 @@ fn a_keyed_list_lays_out_under_its_container() {
 #[test]
 fn an_adapters_anchor_takes_no_space() {
     let mut patch = fixture();
-    let _list = mount(
-        stack(each(
-            || (0_u32..2).collect(),
-            |item| item,
-            |_| plate().height(Metric::CardMinH),
-        ))
-        .gap(Len::Zero)
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _list = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .gap(Len::Zero)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                ui.each(
+                    |out: &mut Vec<u32>| out.extend(0..2),
+                    |item| item,
+                    |ui, _| {
+                        plate(ui).height(Metric::CardMinH);
+                    },
+                );
+            });
+    });
     flush(&mut patch);
-
     let (anchor, first, second) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (
             h.model().solved(nodes[1]),
             h.model().solved(nodes[2]),
@@ -3671,7 +3400,6 @@ fn an_adapters_anchor_takes_no_space() {
         second.rect.y0
     );
 }
-
 /// A `switch` arm fills the box it was placed in.
 ///
 /// The arm is a child of the container, so a `.grow()` on the arm reaches that container's
@@ -3679,16 +3407,22 @@ fn an_adapters_anchor_takes_no_space() {
 #[test]
 fn a_switch_arm_fills_the_box_it_was_placed_in() {
     let mut patch = fixture();
-    let _held = mount(
-        stack(switch(|| 0_u8, |_| plate().grow()))
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
             .height(Len::Pct(1.0))
-            .width(Len::Pct(1.0)),
-        root(),
-    );
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                ui.switch(
+                    || 0_u8,
+                    |ui, _| {
+                        plate(ui).grow();
+                    },
+                );
+            });
+    });
     flush(&mut patch);
-
     let (container, arm) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[0]), h.model().solved(nodes[2]))
     });
     assert!(
@@ -3698,7 +3432,6 @@ fn a_switch_arm_fills_the_box_it_was_placed_in() {
         container.size.y
     );
 }
-
 /// Two adjacent branches keep their declared order across both being empty.
 ///
 /// The anchor gives each adapter its own predecessor. Without one, two arms absent at mount
@@ -3711,28 +3444,27 @@ fn two_adjacent_branches_keep_their_order_across_being_empty() {
         crate::signal::Cell::new(false),
         crate::signal::Cell::new(false),
     );
-    let _held = mount(
-        stack((
-            when(first, || plate().height(Metric::CardMinH)),
-            when(second, || plate().height(Metric::CardMinH)),
-        ))
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                ui.when(first, |ui| {
+                    plate(ui).height(Metric::CardMinH);
+                });
+                ui.when(second, |ui| {
+                    plate(ui).height(Metric::CardMinH);
+                });
+            });
+    });
     flush(&mut patch);
-
-    // The lower one appears first, so nothing about the order can come from mount order.
     second.set(true);
     crate::signal::flush();
     flush(&mut patch);
     first.set(true);
     crate::signal::flush();
     flush(&mut patch);
-
     let (lower, upper) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
-        // The stack, two anchors, then `second`'s arm and `first`'s arm in the order they
-        // were filled.
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[3]), h.model().solved(nodes[4]))
     });
     assert!(
@@ -3743,7 +3475,6 @@ fn two_adjacent_branches_keep_their_order_across_being_empty() {
         lower.rect.y0
     );
 }
-
 /// A wrapping run breaks against the track it was placed in, and grows down when it does.
 ///
 /// The width alone settles nothing: a run laid out as a single line still has its node
@@ -3754,55 +3485,59 @@ fn two_adjacent_branches_keep_their_order_across_being_empty() {
 fn a_wrapping_run_breaks_against_its_column() {
     use crate::layout::Track;
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::grid((
-            plate().height(Metric::CardMinH),
-            stack(crate::widget::caption(
-                "Latency, initialization time and total CPU belong here — the figures the \
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Grid)
+            .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
+            .gap(Len::Zero)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                plate(ui).height(Metric::CardMinH);
+                stack(ui, |ui| {
+                    crate::widget::caption(
+                        ui,
+                        "Latency, initialization time and total CPU belong here — the figures the \
                  config format cannot tell you. They are left blank rather than invented.",
-            )),
-        ))
-        .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
-        .gap(Len::Zero)
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+                    );
+                });
+            });
+    });
     flush(&mut patch);
-
     let (column, run) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[2]), h.model().solved(nodes[3]))
     });
-    // A quarter of the fixture's 800-DIP window.
     assert!(
         column.size.x <= 200.0 + 1.0,
         "the prose column measured {} DIPs against a 200-DIP track, so it wrapped against \
          nothing and drew through the edge",
         column.size.x
     );
-    // That sentence is far longer than a 200-DIP line holds, so it cannot be one.
     assert!(
         run.size.y > 2.0 * run_line_height(),
         "the run is {} DIPs tall — a paragraph laid out as a single line",
         run.size.y
     );
 }
-
 #[test]
 fn source_text_preserves_lines_wraps_and_settles_after_replacement() {
     let mut patch = fixture();
     let value = crate::signal::Cell::new("[[block]]\nq = 4.125".to_string());
-    let _held = mount(
-        stack(crate::widget::code(crate::widget::reactive(move |out| {
-            value.with(|s| out.push_str(s));
-        })))
-        .width(Len::Pct(0.25))
-        .min_width(Len::Zero),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .width(Len::Pct(0.25))
+            .min_width(Len::Zero)
+            .children(|ui| {
+                crate::widget::code(
+                    ui,
+                    crate::widget::reactive(move |out| {
+                        value.with(|s| out.push_str(s));
+                    }),
+                );
+            });
+    });
     let size = || {
         Host::with(|h| {
-            let node = h.mounts.iter().nth(1).unwrap().1.node;
+            let node = h.mounts.iter().nth(1).unwrap().0;
             h.model().solved(node).size
         })
     };
@@ -3833,7 +3568,6 @@ fn source_text_preserves_lines_wraps_and_settles_after_replacement() {
         "unchanged source must emit no retained work"
     );
 }
-
 /// Returns one caption line's height at the fixture's scope, read from the palette's ramp.
 ///
 /// Reading it rather than writing it down keeps the assertions that use it moving with the
@@ -3841,7 +3575,6 @@ fn source_text_preserves_lines_wraps_and_settles_after_replacement() {
 fn run_line_height() -> f32 {
     Host::with(|h| crate::role::typography(crate::role::TypeRole::Caption, h.root_scope).size)
 }
-
 /// A wrapping run inside a `switch` arm breaks against its column.
 ///
 /// An arm is a child of the container, so a caption reaching layout through an adapter is
@@ -3850,29 +3583,39 @@ fn run_line_height() -> f32 {
 fn a_wrapping_run_inside_an_arm_breaks_against_its_column() {
     use crate::layout::Track;
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::grid((
-            plate().height(Metric::CardMinH),
-            stack(switch(
-                || 0_u8,
-                |_| {
-                    stack(crate::widget::caption(
-                        "Latency, initialization time and total CPU belong here — the figures \
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Grid)
+            .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
+            .gap(Len::Zero)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                plate(ui).height(Metric::CardMinH);
+                stack(
+                    ui,
+                    |ui| {
+                        ui.switch(
+                            || 0_u8,
+                            |ui, _| {
+                                stack(
+                                    ui,
+                                    |ui| {
+                                        crate::widget::caption(
+                                            ui,
+                                            "Latency, initialization time and total CPU belong here — the figures \
                          the config format cannot tell you. They are left blank rather than \
                          invented.",
-                    ))
-                },
-            )),
-        ))
-        .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
-        .gap(Len::Zero)
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+                                        );
+                                    },
+                                );
+                            },
+                        );
+                    },
+                );
+            });
+    });
     flush(&mut patch);
-
     let (column, arm) = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         (h.model().solved(nodes[2]), h.model().solved(nodes[4]))
     });
     assert!(
@@ -3886,7 +3629,6 @@ fn a_wrapping_run_inside_an_arm_breaks_against_its_column() {
         arm.size.x
     );
 }
-
 /// A wrapping run breaks against the room its containers' padding leaves it.
 ///
 /// A padded section inside a padded surface puts two insets between the prose and the column,
@@ -3896,27 +3638,31 @@ fn a_wrapping_run_inside_an_arm_breaks_against_its_column() {
 fn a_wrapping_run_breaks_inside_its_containers_padding() {
     use crate::layout::Track;
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::grid((
-            plate().height(Metric::CardMinH),
-            stack(
-                stack(crate::widget::caption(
-                    "Latency, initialization time and total CPU belong here — the figures the \
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Grid)
+            .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
+            .gap(Len::Zero)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                plate(ui).height(Metric::CardMinH);
+                ui.node(crate::layout::Preset::Stack)
+                    .padding(Len::Metric(Metric::SpaceLg))
+                    .children(|ui| {
+                        ui.node(crate::layout::Preset::Stack)
+                            .padding(Len::Metric(Metric::SpaceMd))
+                            .children(|ui| {
+                                crate::widget::caption(
+                                    ui,
+                                    "Latency, initialization time and total CPU belong here — the figures the \
                  config format cannot tell you. They are left blank rather than invented.",
-                ))
-                .padding(Len::Metric(Metric::SpaceMd)),
-            )
-            .padding(Len::Metric(Metric::SpaceLg)),
-        ))
-        .cols([Track::Fr(1.0), Track::Fixed(Len::Pct(0.25))])
-        .gap(Len::Zero)
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+                                );
+                            });
+                    });
+            });
+    });
     flush(&mut patch);
-
     let run = Host::with(|h| {
-        let nodes: Vec<_> = h.mounts.iter().map(|(_, m)| m.node).collect();
+        let nodes: Vec<_> = h.mounts.iter().map(|(node, _)| node).collect();
         h.model()
             .solved(*nodes.last().expect("the run is the deepest node"))
     });
@@ -3933,7 +3679,6 @@ fn a_wrapping_run_breaks_inside_its_containers_padding() {
         run.size.x
     );
 }
-
 /// A run that can break answers taffy's two intrinsic probes differently.
 ///
 /// `MeasureIn::available` carries `MinContent` and `MaxContent` apart rather than flattening
@@ -3946,18 +3691,17 @@ fn a_wrapping_run_breaks_inside_its_containers_padding() {
 #[test]
 fn the_two_intrinsic_probes_differ_for_a_run_that_can_break() {
     let mut patch = fixture();
-    let _held = mount(
-        stack((
+    let _held = create(|ui| {
+        stack(ui, |ui| {
             crate::widget::caption(
+                ui,
                 "Latency, initialization time and total CPU belong here — the figures the \
                  config format cannot tell you.",
-            ),
-            crate::widget::label("Bypassed"),
-        )),
-        root(),
-    );
+            );
+            crate::widget::label(ui, "Bypassed");
+        });
+    });
     flush(&mut patch);
-
     let keys: Vec<_> = Host::with(|h| h.mounts.iter().filter_map(|(_, m)| m.text).collect());
     assert_eq!(keys.len(), 2, "the two runs registered");
     let probe = |key, avail| {
@@ -3971,28 +3715,23 @@ fn the_two_intrinsic_probes_differ_for_a_run_that_can_break() {
         })
     };
     use windows_scene::Avail::{MaxContent, MinContent};
-
     let (prose_min, prose_max) = (probe(keys[0], MinContent), probe(keys[0], MaxContent));
     assert!(
         prose_min.x < prose_max.x,
         "the paragraph answered {} DIPs to both probes, so its min-content is its whole line",
         prose_min.x
     );
-    // Narrower and taller: a run measured at its longest word occupies several lines, and a
-    // width reported without the matching height is a box that clips its own text.
     assert!(
         prose_min.y > prose_max.y,
         "the paragraph reported one line's height ({}) at min-content",
         prose_min.y
     );
-
     let (label_min, label_max) = (probe(keys[1], MinContent), probe(keys[1], MaxContent));
     assert_eq!(
         label_min, label_max,
         "a single-line run has no break opportunity, so both probes are one answer"
     );
 }
-
 /// A scroll container inside a hidden subtree defers its tracker until it is shown, and
 /// creates one then.
 ///
@@ -4004,14 +3743,14 @@ fn the_two_intrinsic_probes_differ_for_a_run_that_can_break() {
 fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
     let hidden = crate::signal::Cell::new(true);
     let mut patch = fixture();
-    let _held = mount(
-        crate::layout::scroll(plate().height(Metric::CardMinH))
-            .height(Metric::CardMinH)
-            .hide_if(move || hidden.get()),
-        root(),
-    );
+    let _held = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            plate(ui).height(Metric::CardMinH);
+        })
+        .height(Metric::CardMinH)
+        .hide_if(move || hidden.get());
+    });
     flush(&mut patch);
-
     let creates = |patch: &SinkPatch| {
         patch
             .ops()
@@ -4032,17 +3771,12 @@ fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
         0,
         "a tracker was created against a viewport laid out at zero"
     );
-
     let content = Host::with(|h| h.scrolls.iter().next().unwrap().1.content);
     let content_binding = |patch: &SinkPatch| {
         patch.ops().iter().position(|op| {
             matches!(
-                op,
-                Op::Bind {
-                    id,
-                    prop: windows_scene::Prop::OffsetY,
-                    bind: windows_scene::Bind::Track { .. },
-                } if *id == content
+                op, Op::Bind { id, prop : windows_scene::Prop::OffsetY, bind :
+                windows_scene::Bind::Track { .. }, } if * id == content
             )
         })
     };
@@ -4050,7 +3784,6 @@ fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
         content_binding(&patch).is_none(),
         "a hidden scroll bound its content before its tracker existed"
     );
-
     patch.clear();
     hidden.set(false);
     crate::signal::flush();
@@ -4077,7 +3810,6 @@ fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
         content_binding(&patch).expect("revealing the scroll did not bind its content") > created,
         "the content binding preceded tracker creation and would be dropped by the scene"
     );
-
     patch.clear();
     flush(&mut patch);
     assert_eq!(creates(&patch), 0, "idle recreated the tracker");
@@ -4086,9 +3818,6 @@ fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
         "idle rebound the content"
     );
 }
-
-// ── reading back the boxes the solve produced ────────────────────────────────────
-
 /// A probe reports its node's solved box, as a signal.
 ///
 /// A gutter drawn beside independently-sized rows meets each row at its resolved centre, and
@@ -4098,16 +3827,15 @@ fn a_hidden_scroll_container_defers_its_tracker_until_it_is_shown() {
 fn a_probe_reports_where_the_solve_put_its_node() {
     let (first, second) = (crate::layout::probe(), crate::layout::probe());
     let mut patch = fixture();
-    let _held = mount(
-        stack((
-            plate().height(Metric::RowH).probed(first),
-            plate().height(Metric::CardMinH).probed(second),
-        ))
-        .gap(Len::Zero),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .gap(Len::Zero)
+            .children(|ui| {
+                plate(ui).height(Metric::RowH).probed(first);
+                plate(ui).height(Metric::CardMinH).probed(second);
+            });
+    });
     flush(&mut patch);
-
     let (a, b) = (first.get(), second.get());
     assert!(a.size.y > 0.0, "the first row was never reported");
     assert_eq!(
@@ -4126,7 +3854,6 @@ fn a_probe_reports_where_the_solve_put_its_node() {
         "the rows stretch to one column, so their widths agree"
     );
 }
-
 /// A probe writes only when its node's box moves.
 ///
 /// The equality gate keeps a probe off the per-frame path: a solve that moves nothing wakes
@@ -4137,19 +3864,18 @@ fn a_probe_publishes_only_when_its_node_moves() {
     let tall = crate::signal::Cell::new(false);
     let where_ = crate::layout::probe();
     let mut patch = fixture();
-    let _held = mount(
-        stack(
-            plate()
-                .height(Metric::RowH)
-                .no_shrink()
-                .when(move || !tall.get()),
-        )
-        .probed(where_)
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .probed(where_)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                plate(ui)
+                    .height(Metric::RowH)
+                    .no_shrink()
+                    .hide_if(move || tall.get());
+            });
+    });
     flush(&mut patch);
-
     let counted = std::rc::Rc::new(std::cell::Cell::new(0_u32));
     let seen = crate::signal::Memo::new({
         let counted = std::rc::Rc::clone(&counted);
@@ -4158,31 +3884,26 @@ fn a_probe_publishes_only_when_its_node_moves() {
             where_.get().size.y
         }
     });
-    seen.get();
+    let _ = seen.get();
     let after_first = counted.get();
-
-    // A flush that changes nothing must not disturb it.
     flush(&mut patch);
     crate::signal::flush();
-    seen.get();
+    let _ = seen.get();
     assert_eq!(
         counted.get(),
         after_first,
         "a solve that moved nothing still published a box"
     );
-
-    // A flush that does change the box must.
     tall.set(true);
     crate::signal::flush();
     flush(&mut patch);
     crate::signal::flush();
-    seen.get();
+    let _ = seen.get();
     assert!(
         counted.get() > after_first,
         "the node's height changed and the probe never said so"
     );
 }
-
 #[test]
 fn local_geometry_tracks_local_inputs_and_releases_its_shared_resource() {
     use crate::signal::{Cell, Owner};
@@ -4194,33 +3915,44 @@ fn local_geometry_tracks_local_inputs_and_releases_its_shared_resource() {
         let lead = Cell::new(false);
         let data = Cell::new(1.0);
         let bounds = crate::layout::probe();
-        let id = local_geometry(bounds, 2, move |verbs, size, scope| {
-            assert_eq!(scope.elevation, Elevation::Raised);
-            observed.set(observed.get() + 1);
-            verbs.extend([
-                PathVerb::Move {
-                    to: Vector2::default(),
-                    filled: false,
-                },
-                PathVerb::Line(Vector2 {
-                    x: size.x,
-                    y: data.get(),
-                }),
-            ]);
-        });
-        let view = stack((
-            plate()
-                .height(Metric::RowH)
-                .no_shrink()
-                .when(move || lead.get()),
-            stack((crate::widget::path(id), crate::widget::path(id)))
-                .probed(bounds)
-                .elevate(Elevation::Raised)
-                .height(Metric::RowH)
-                .width(Len::Pct(1.0)),
-        ))
-        .width(Len::Pct(1.0));
-        (lead, data, mount(view, root()))
+        let mut id = windows_scene::GeomId::NONE;
+        (
+            lead,
+            data,
+            create(|ui| {
+                id = ui.local_geometry(bounds, 2, move |verbs, size, scope| {
+                    assert_eq!(scope.elevation, Elevation::Raised);
+                    observed.set(observed.get() + 1);
+                    verbs.extend([
+                        PathVerb::Move {
+                            to: Vector2::default(),
+                            filled: false,
+                        },
+                        PathVerb::Line(Vector2 {
+                            x: size.x,
+                            y: data.get(),
+                        }),
+                    ]);
+                });
+                ui.node(crate::layout::Preset::Stack)
+                    .width(Len::Pct(1.0))
+                    .children(|ui| {
+                        plate(ui)
+                            .height(Metric::RowH)
+                            .no_shrink()
+                            .hide_if(move || !lead.get());
+                        ui.node(crate::layout::Preset::Stack)
+                            .probed(bounds)
+                            .elevate(Elevation::Raised)
+                            .height(Metric::RowH)
+                            .width(Len::Pct(1.0))
+                            .children(|ui| {
+                                ui.path(id);
+                                ui.path(id);
+                            });
+                    });
+            }),
+        )
     });
     let settle = |patch: &mut SinkPatch| {
         for _ in 0..4 {
@@ -4263,7 +3995,6 @@ fn local_geometry_tracks_local_inputs_and_releases_its_shared_resource() {
     );
     assert_eq!(calls.get(), 3);
 }
-
 #[test]
 fn final_layout_paths_share_the_batch_and_need_no_probe_or_memo() {
     use crate::signal::{Cell, Owner};
@@ -4274,31 +4005,29 @@ fn final_layout_paths_share_the_batch_and_need_no_probe_or_memo() {
     let (owner, (data, lead, held)) = Owner::scope(|| {
         let data = Cell::new(1.0);
         let lead = Cell::new(false);
-        let shape = path_with(1, move |out, size, _| {
-            seen.set(seen.get() + 1);
-            out.push(windows_scene::PathVerb::Line(Vector2::new(
-                size.x,
-                data.get(),
-            )));
-        })
-        .pivot_relative(Vector2::new(0.5, 0.25))
-        .width(Len::Pct(1.0))
-        .height(Metric::RowH);
-        let held = mount(
-            stack((
-                plate()
-                    .height(Metric::RowH)
-                    .no_shrink()
-                    .when(move || lead.get()),
-                shape,
-            ))
-            .width(Len::Pct(1.0)),
-            root(),
-        );
+        let held = create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .width(Len::Pct(1.0))
+                .children(|ui| {
+                    plate(ui)
+                        .height(Metric::RowH)
+                        .no_shrink()
+                        .hide_if(move || !lead.get());
+                    ui.path_with(1, move |out, size, _| {
+                        seen.set(seen.get() + 1);
+                        out.push(windows_scene::PathVerb::Line(Vector2::new(
+                            size.x,
+                            data.get(),
+                        )));
+                    })
+                    .pivot_relative(Vector2::new(0.5, 0.25))
+                    .width(Len::Pct(1.0))
+                    .height(Metric::RowH);
+                });
+        });
         (data, lead, held)
     });
     assert_eq!(Host::with(|h| h.probes.iter().count()), 0);
-    // Two source cells, one presence effect, one geometry resource and one draw effect.
     assert_eq!(crate::signal::live_nodes(), baseline + 5);
     flush(&mut patch);
     assert_eq!(
@@ -4309,14 +4038,19 @@ fn final_layout_paths_share_the_batch_and_need_no_probe_or_memo() {
     let node = Host::with(|h| h.geometry_jobs.iter().next().unwrap().0);
     let check = |patch: &SinkPatch| {
         let size = Host::with(|h| h.model().solved(node).size);
-        assert!(patch.ops().iter().any(|op| matches!(op,
-            Op::Bind { id, prop: windows_scene::Prop::Center, bind: windows_scene::Bind::Set(windows_scene::Value::Vec2(at)) }
-            if *id == node && *at == Vector2::new(size.x * 0.5, size.y * 0.25)
-        )), "the pivot uses the same settled box");
         assert!(
-            patch.ops().iter().any(|op| matches!(op,
-                Op::Res { op: windows_scene::ResOp::Geom { verbs }, .. } if verbs.len() == 1
-            )),
+            patch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Op::Bind { id, prop :
+            windows_scene::Prop::Center, bind :
+            windows_scene::Bind::Set(windows_scene::Value::Vec2(at)) } if * id == node &&
+            * at == Vector2::new(size.x * 0.5, size.y * 0.25))),
+            "the pivot uses the same settled box"
+        );
+        assert!(
+            patch.ops().iter().any(|op| matches!(op, Op::Res { op :
+            windows_scene::ResOp::Geom { verbs }, .. } if verbs.len() == 1)),
             "the path update is in the layout batch"
         );
     };
@@ -4379,67 +4113,36 @@ fn final_layout_paths_share_the_batch_and_need_no_probe_or_memo() {
     assert_eq!(crate::signal::live_nodes(), baseline);
     assert_eq!(Host::with(|h| h.geometry_jobs.iter().count()), 0);
 }
-
 #[test]
 fn geometry_rejects_signal_and_layout_mutation_before_it_happens() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     let mut patch = fixture();
     let (owner, (cell, held)) = crate::signal::Owner::scope(|| {
         let cell = crate::signal::Cell::new(1);
-        let view = path_with(1, move |out, _, _| {
-            assert!(catch_unwind(AssertUnwindSafe(|| cell.set(2))).is_err());
-            assert!(catch_unwind(AssertUnwindSafe(|| stack(()))).is_err());
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| Host::with(
-                    |h| h.set_window(Vector2::default())
-                )))
-                .is_err()
-            );
-            out.push(windows_scene::PathVerb::Line(Vector2::new(
-                cell.get() as f32,
-                0.0,
-            )));
-        });
-        (cell, mount(view, root()))
+        (
+            cell,
+            create(|ui| {
+                ui.path_with(1, move |out, _, _| {
+                    assert!(catch_unwind(AssertUnwindSafe(|| cell.set(2))).is_err());
+                    assert!(
+                        catch_unwind(AssertUnwindSafe(|| Host::with(
+                            |h| h.set_window(Vector2::default())
+                        )))
+                        .is_err()
+                    );
+                    out.push(windows_scene::PathVerb::Line(Vector2::new(
+                        cell.get() as f32,
+                        0.0,
+                    )));
+                });
+            }),
+        )
     });
     flush(&mut patch);
     assert_eq!(cell.get(), 1);
     drop(held);
     drop(owner);
 }
-
-#[test]
-fn local_path_and_pivot_reduce_retained_graph_nodes_from_five_to_two() {
-    let mut patch = fixture();
-    let measure = |legacy| {
-        let before = crate::signal::live_nodes();
-        let (owner, held) = crate::signal::Owner::scope(|| {
-            let shape = if legacy {
-                let bounds = crate::layout::probe();
-                let id = local_geometry(bounds, 1, |out, size, _| {
-                    out.push(windows_scene::PathVerb::Line(size));
-                });
-                crate::widget::path(id)
-                    .probed(bounds)
-                    .pivot(move || bounds.get().size * 0.5)
-            } else {
-                path_with(1, |out, size, _| {
-                    out.push(windows_scene::PathVerb::Line(size))
-                })
-                .pivot_relative(Vector2::new(0.5, 0.5))
-            };
-            mount(shape, root())
-        });
-        let count = crate::signal::live_nodes() - before;
-        drop(held);
-        drop(owner);
-        assert_eq!(crate::signal::live_nodes(), before);
-        count
-    };
-    assert_eq!((measure(true), measure(false)), (5, 2));
-    flush(&mut patch);
-}
-
 /// A probe attached inside a subtree that unmounts is released with it.
 ///
 /// The cell dies with the scope that made it and the row with the mount walk, so the publish
@@ -4450,26 +4153,27 @@ fn a_probe_survives_its_subtree_unmounting() {
     let shown = crate::signal::Cell::new(true);
     let where_ = crate::layout::probe();
     let mut patch = fixture();
-    let _held = mount(
-        stack(switch(
-            move || shown.get(),
-            move |on| {
-                if *on {
-                    plate().height(Metric::RowH).probed(where_).erase()
-                } else {
-                    crate::widget::caption("gone").erase()
-                }
-            },
-        ))
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                ui.switch(
+                    move || shown.get(),
+                    move |ui, on| {
+                        if *on {
+                            plate(ui).height(Metric::RowH).probed(where_)
+                        } else {
+                            crate::widget::caption(ui, "gone")
+                        };
+                    },
+                );
+            });
+    });
     flush(&mut patch);
     assert!(
         where_.get().size.y > 0.0,
         "the probed node was never solved"
     );
-
     shown.set(false);
     crate::signal::flush();
     flush(&mut patch);
@@ -4479,55 +4183,56 @@ fn a_probe_survives_its_subtree_unmounting() {
         "the probe row outlived the subtree that declared it"
     );
 }
-
 #[test]
 fn navigation_releases_probes_owned_by_nested_branches() {
     let shown = crate::signal::Cell::new(true);
     let mut patch = fixture();
-    let _held = mount(
-        stack(when(
-            move || shown.get(),
-            || {
-                stack(when(
-                    || true,
-                    || {
-                        let location = crate::layout::probe();
-                        plate().height(Metric::RowH).probed(location)
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .width(Len::Pct(1.0))
+            .children(|ui| {
+                ui.when(
+                    move || shown.get(),
+                    |ui| {
+                        stack(ui, |ui| {
+                            ui.when(
+                                || true,
+                                |ui| {
+                                    let location = crate::layout::probe();
+                                    plate(ui).height(Metric::RowH).probed(location);
+                                },
+                            );
+                        });
                     },
-                ))
-            },
-        ))
-        .width(Len::Pct(1.0)),
-        root(),
-    );
+                );
+            });
+    });
     flush(&mut patch);
     assert_eq!(Host::with(|h| h.probes.iter().count()), 1);
-
     shown.set(false);
     crate::signal::flush();
     flush(&mut patch);
     assert_eq!(Host::with(|h| h.probes.iter().count()), 0);
-
     shown.set(true);
     crate::signal::flush();
     flush(&mut patch);
     assert_eq!(Host::with(|h| h.probes.iter().count()), 1);
 }
-
 #[test]
 fn disposing_the_application_owner_releases_scalar_controls_before_final_flush() {
     let mut patch = fixture();
     let (owner, held) = crate::signal::Owner::scope(|| {
-        mount(
-            stack(when(
-                || true,
-                || {
-                    let value = crate::signal::Cell::new(true);
-                    crate::widget::toggle(value)
-                },
-            )),
-            root(),
-        )
+        create(|ui| {
+            stack(ui, |ui| {
+                ui.when(
+                    || true,
+                    |ui| {
+                        let value = crate::signal::Cell::new(true);
+                        crate::widget::toggle(ui, value);
+                    },
+                );
+            });
+        })
     });
     flush(&mut patch);
     crate::signal::flush();
@@ -4557,7 +4262,6 @@ fn disposing_the_application_owner_releases_scalar_controls_before_final_flush()
         "the final flush must not bind destroyed controls"
     );
 }
-
 /// A probed path revealed by `when` is given its container's whole inner width.
 ///
 /// The chain row's shape: an accent edge beside a grown column, whose body is mounted when
@@ -4569,42 +4273,43 @@ fn a_probed_path_revealed_by_when_fills_the_column_it_opens_in() {
     let (column, figure) = (crate::layout::probe(), crate::layout::probe());
     let open = crate::signal::Cell::new(false);
     let mut patch = fixture();
-    let _held = mount(
-        crate::widget::card()
-            .row((
-                plate().width(Len::Times(Metric::HairlineW, 3.0)),
-                stack((
-                    crate::widget::label("header"),
-                    when(open, move || {
-                        crate::widget::path(super::geometry(&[]))
-                            .stroke(crate::role::DataRole(0), Metric::HairlineW)
-                            .probed(figure)
-                            .width(Len::Pct(1.0))
-                            .height(Len::Times(Metric::RowH, 2.0))
-                            .erase()
-                    }),
-                ))
-                .probed(column)
-                .padding(Metric::SpaceSm)
-                .grow(),
-            ))
+    let _held = create(|ui| {
+        crate::widget::card(ui)
+            .row(|_| {})
             .padding(Len::Zero)
             .gap(Len::Zero)
             .align(crate::layout::Align::Stretch)
-            .min_height(Metric::RowH),
-        root(),
-    );
+            .min_height(Metric::RowH)
+            .children(|ui| {
+                plate(ui).width(Len::Times(Metric::HairlineW, 3.0));
+                ui.node(crate::layout::Preset::Stack)
+                    .probed(column)
+                    .padding(Metric::SpaceSm)
+                    .grow()
+                    .children(|ui| {
+                        crate::widget::label(ui, "header");
+                        ui.when(open, move |ui| {
+                            {
+                                let geom = ui.geometry(&[]);
+                                ui.path(geom)
+                            }
+                            .stroke(crate::role::DataRole(0), Metric::HairlineW)
+                            .probed(figure)
+                            .width(Len::Pct(1.0))
+                            .height(Len::Times(Metric::RowH, 2.0));
+                        });
+                    });
+            });
+    });
     flush(&mut patch);
     assert_eq!(
         figure.get().size.x,
         0.0,
         "the body is shut, so its figure has no box at all"
     );
-
     open.set(true);
     crate::signal::flush();
     flush(&mut patch);
-
     let padding = 2.0 * crate::role::metric(Metric::SpaceSm, Host::with(|h| h.root_scope));
     let (column, figure) = (column.get().size.x, figure.get().size.x);
     assert!(column > padding, "the column solved to {column}");
@@ -4613,7 +4318,6 @@ fn a_probed_path_revealed_by_when_fills_the_column_it_opens_in() {
         "the figure was given {figure} DIPs of a {column}-DIP column padded by {padding}"
     );
 }
-
 /// A sprite's strength scales the role's own alpha rather than replacing it.
 ///
 /// A hairline resolves to a wash already. Replacing its alpha with the strength would make
@@ -4622,20 +4326,13 @@ fn a_probed_path_revealed_by_when_fills_the_column_it_opens_in() {
 #[test]
 fn a_sprites_strength_scales_the_roles_own_alpha() {
     let mut patch = fixture();
-    let full = El::<Any>::seed(crate::layout::Preset::Bare).sprite(
-        MaskSeed::Box { radius: None },
-        Role::Stroke(Stroke::Subtle),
-        Part::Fill,
-    );
-    let half = El::<Any>::seed(crate::layout::Preset::Bare).sprite_at(
-        MaskSeed::Box { radius: None },
-        Role::Stroke(Stroke::Subtle),
-        Part::Fill,
-        0.5,
-    );
-    let _mount = mount(stack((full, half)), root());
+    let _mount = create(|ui| {
+        ui.stack(|ui| {
+            ui.plate(Len::Zero, Role::Stroke(Stroke::Subtle), 1.0);
+            ui.plate(Len::Zero, Role::Stroke(Stroke::Subtle), 0.5);
+        });
+    });
     flush(&mut patch);
-
     let alphas: Vec<f32> = patch
         .ops()
         .iter()
@@ -4669,7 +4366,6 @@ fn a_sprites_strength_scales_the_roles_own_alpha() {
         alphas[1]
     );
 }
-
 /// A ghost control that can be selected mints the sprite selection paints into.
 ///
 /// Its resting row carries no fill, so counting sprites off that row alone leaves selection
@@ -4693,30 +4389,38 @@ fn a_selectable_ghost_mints_the_fill_its_selected_state_needs() {
             })
             .count()
     };
-
-    let plain = mount(stack(crate::widget::button("plain").ghost()), root());
+    let chrome = crate::widget::Chrome::new(
+        crate::widget::roles::BUTTON[crate::widget::roles::GHOST as usize],
+        Metric::Radius,
+    );
+    let plain = create(|ui| {
+        ui.button(
+            chrome,
+            crate::widget::TextStyle::new(TypeRole::Body),
+            "plain",
+        );
+    });
     flush(&mut patch);
     let without = sprites(&patch);
     patch.clear();
     drop(plain);
-
-    let picks = mount(
-        stack(crate::widget::button("picks").ghost().selected(|| false)),
-        root(),
-    );
+    let picks = create(|ui| {
+        ui.button(
+            chrome,
+            crate::widget::TextStyle::new(TypeRole::Body),
+            "picks",
+        )
+        .selected(|| false);
+    });
     flush(&mut patch);
     let with = sprites(&patch);
     drop(picks);
-
-    // Exactly one more sprite: the fill the selected row supplies and the ghost row does not.
-    // A ghost that never declares selection must not pay for a sprite it can never show.
     assert_eq!(
         with,
         without + 1,
         "declaring selection costs one sprite, and declaring none costs zero"
     );
 }
-
 /// A scroll container clips its pixels, not only its hits.
 ///
 /// The solve marks an overflow container `bounded`, and the hit array reads that flag. Until
@@ -4725,19 +4429,21 @@ fn a_selectable_ghost_mints_the_fill_its_selected_state_needs() {
 #[test]
 fn a_scroll_container_clips_what_it_draws() {
     let mut patch = fixture();
-    let _mount = mount(
-        crate::layout::scroll(stack((plate(), plate(), plate()))).height(Len::Pct(1.0)),
-        root(),
-    );
+    let _mount = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            stack(ui, |ui| {
+                plate(ui);
+                plate(ui);
+                plate(ui);
+            });
+        })
+        .height(Len::Pct(1.0));
+    });
     flush(&mut patch);
-
     let clipped = patch.ops().iter().any(|op| {
         matches!(
-            op,
-            Op::Clip {
-                clip: windows_scene::Clip::Rect { r, b, .. },
-                ..
-            } if *r > 0.0 && *b > 0.0
+            op, Op::Clip { clip : windows_scene::Clip::Rect { r, b, .. }, .. } if * r
+            > 0.0 && * b > 0.0
         )
     });
     assert!(
@@ -4745,7 +4451,6 @@ fn a_scroll_container_clips_what_it_draws() {
         "the viewport must publish a clip at its own box, or its content draws outside it"
     );
 }
-
 /// A toggle's knob has extent, and its track is long enough to round as a stadium.
 ///
 /// A bare node has no intrinsic size, so a knob that states none solves to nothing: it is
@@ -4756,9 +4461,10 @@ fn a_scroll_container_clips_what_it_draws() {
 fn a_toggles_knob_has_extent_inside_its_track() {
     let mut patch = fixture();
     let on = crate::signal::Cell::new(true);
-    let _toggle = mount(crate::widget::toggle(on), root());
+    let _toggle = create(|ui| {
+        crate::widget::toggle(ui, on);
+    });
     flush(&mut patch);
-
     let scope = Scope::root(
         crate::role::tests::palette(),
         AccentId(0),
@@ -4775,21 +4481,16 @@ fn a_toggles_knob_has_extent_inside_its_track() {
         travel > 0.0,
         "a knob in a sized track has room to move, got {travel}"
     );
-    // The track's own width, which is what the travel would equal if the knob had no extent.
     let width = row * 1.7;
     assert!(
         travel < width - 1.0,
         "the knob must take room out of its own travel: travel {travel} against a {width} track"
     );
-    // The contract a pill radius carries: a control one row tall must be fully rounded by it.
-    // Above half a row the platform's per-axis cap differs between the axes and the corners
-    // meet in the middle, which renders the switch as a lens.
     assert!(
         crate::role::metric(Metric::RadiusPill, scope) * 2.0 <= row + 1e-3,
         "a pill radius above half a row cannot round a row-tall track as a stadium"
     );
 }
-
 /// A toggle that is on leaves its knob at the end of its travel, and nothing writes over it.
 ///
 /// The knob's position is an `OffsetX` the app thread binds from the value; the placement
@@ -4799,9 +4500,10 @@ fn a_toggles_knob_has_extent_inside_its_track() {
 fn a_toggle_that_is_on_leaves_its_knob_at_the_end_of_its_travel() {
     let mut patch = fixture();
     let on = crate::signal::Cell::new(true);
-    let _toggle = mount(crate::widget::toggle(on), root());
+    let _toggle = create(|ui| {
+        crate::widget::toggle(ui, on);
+    });
     flush(&mut patch);
-
     let (rest, travel, thumb, node) = Host::with(|h| {
         h.controls
             .iter()
@@ -4813,8 +4515,6 @@ fn a_toggle_that_is_on_leaves_its_knob_at_the_end_of_its_travel() {
     let thumb = thumb.expect("a toggle mints a knob");
     assert!(travel > 0.0, "the knob has room to move");
     assert!(rest > 0.0, "the knob is inset from the track's own edge");
-
-    // The last write to the knob's own x, in patch order.
     let mut last = None;
     for op in patch.ops() {
         match op {
@@ -4836,8 +4536,6 @@ fn a_toggle_that_is_on_leaves_its_knob_at_the_end_of_its_travel() {
         Some(rest),
         "layout publishes the resting box; scene adoption places the scalar part"
     );
-    // The gap the knob leaves at the far end is the one it rests at, so the two ends of the
-    // switch look the same and neither shows the knob overhanging the track.
     let (track, knob) = Host::with(|h| (h.model().solved(node).size, h.model().solved(thumb).size));
     assert!(
         ((track.x - (rest + travel) - knob.x) - rest).abs() <= 0.5,
@@ -4845,7 +4543,6 @@ fn a_toggle_that_is_on_leaves_its_knob_at_the_end_of_its_travel() {
         track.x - (rest + travel) - knob.x
     );
 }
-
 /// Flipping a toggle springs its knob rather than putting it at the far end in one frame.
 ///
 /// The knob's channel is the only thing about a switch that moves: the track's fill is a
@@ -4855,9 +4552,10 @@ fn a_toggle_that_is_on_leaves_its_knob_at_the_end_of_its_travel() {
 fn flipping_a_toggle_publishes_its_value_to_the_scene() {
     let mut patch = fixture();
     let on = crate::signal::Cell::new(false);
-    let _toggle = mount(crate::widget::toggle(on), root());
+    let _toggle = create(|ui| {
+        crate::widget::toggle(ui, on);
+    });
     flush(&mut patch);
-
     patch.clear();
     on.set(true);
     crate::signal::flush();
@@ -4870,7 +4568,6 @@ fn flipping_a_toggle_publishes_its_value_to_the_scene() {
         "the scene receives the source replacement"
     );
 }
-
 /// The knob's box and its travel survive a fractional display scale.
 ///
 /// Layout snaps to the physical grid, so a knob sized as a fraction of the row height lands
@@ -4881,9 +4578,10 @@ fn flipping_a_toggle_publishes_its_value_to_the_scene() {
 fn a_toggles_knob_lands_at_its_travel_at_a_fractional_scale() {
     let mut patch = fixture_at(144.0);
     let on = crate::signal::Cell::new(true);
-    let _toggle = mount(crate::widget::toggle(on), root());
+    let _toggle = create(|ui| {
+        crate::widget::toggle(ui, on);
+    });
     flush(&mut patch);
-
     let (rest, travel, thumb) = Host::with(|h| {
         h.controls.iter().next().map_or((0.0, 0.0, None), |(_, c)| {
             (c.front.rest, c.front.travel, c.front.thumb)
@@ -4913,7 +4611,6 @@ fn a_toggles_knob_lands_at_its_travel_at_a_fractional_scale() {
         "layout publishes the resting box; scene adoption places the scalar part"
     );
 }
-
 /// A washed surface paints a gradient over its own fill, resolved through the palette.
 ///
 /// The stops name roles and strengths, so no colour crosses the authoring seam — the rule a
@@ -4923,27 +4620,26 @@ fn a_wash_paints_a_ramp_over_the_surface_it_covers() {
     let (_resource_owner, ()) = crate::signal::Owner::scope(|| {
         let mut patch = fixture();
         let hue = crate::role::DataRole(1);
-        let id = ramp(
-            &[
-                Stop {
-                    at: 0.0,
-                    role: hue,
-                    strength: 0.06,
-                },
-                Stop {
-                    at: 1.0,
-                    role: hue,
-                    strength: 0.0,
-                },
-            ],
-            windows_scene::Spread::Horizontal,
-        );
-        let _mount = mount(
-            crate::widget::card().washed(id, Metric::RadiusSurface),
-            root(),
-        );
+        let mut id = windows_scene::RampId::NONE;
+        let _mount = create(|ui| {
+            id = ui.ramp(
+                &[
+                    Stop {
+                        at: 0.0,
+                        role: hue,
+                        strength: 0.06,
+                    },
+                    Stop {
+                        at: 1.0,
+                        role: hue,
+                        strength: 0.0,
+                    },
+                ],
+                windows_scene::Spread::Horizontal,
+            );
+            crate::widget::card(ui).washed(id, Metric::RadiusSurface);
+        });
         flush(&mut patch);
-
         let ramps = patch
             .ops()
             .iter()
@@ -4958,7 +4654,6 @@ fn a_wash_paints_a_ramp_over_the_surface_it_covers() {
             })
             .count();
         assert_eq!(ramps, 1, "the wash is one sprite painting the ramp");
-        // The card keeps its own fill: a wash is a tint over a surface, not the surface.
         let solids = patch
             .ops()
             .iter()
@@ -4975,7 +4670,6 @@ fn a_wash_paints_a_ramp_over_the_surface_it_covers() {
         assert!(solids >= 2, "the card's own fill and hairline survive it");
     });
 }
-
 /// A toggle's track keeps its own box, bare and among siblings.
 ///
 /// The widget states `RowH × 1.7` by `RowH` and nothing overrides it, but a flex row shrinks
@@ -4987,9 +4681,11 @@ fn a_wash_paints_a_ramp_over_the_surface_it_covers() {
 /// box measured only at 96 is not the box that ships.
 #[test]
 fn a_toggles_track_keeps_its_box_among_siblings() {
-    let track_box = |view: View| {
+    fn track_box(view: impl FnOnce(&mut Ui<'_>)) -> Vector2 {
         let mut patch = fixture_at(144.0);
-        let mount = mount(view, root());
+        let mount = create(|ui| {
+            view(ui);
+        });
         flush(&mut patch);
         let node = Host::with(|h| {
             h.controls
@@ -5001,12 +4697,11 @@ fn a_toggles_track_keeps_its_box_among_siblings() {
         let size = Host::with(|h| h.model().solved(node).size);
         drop(mount);
         size
-    };
-
+    }
     let on = crate::signal::Cell::new(true);
-    let bare = track_box(crate::widget::toggle(on));
-    // What the widget asks for, through the same metric it states it in. Read after the
-    // first fixture, which is what installs the palette a metric resolves against.
+    let bare = track_box(|ui| {
+        crate::widget::toggle(ui, on);
+    });
     let track = crate::role::metric(
         Metric::TrackH,
         Scope::root(
@@ -5015,31 +4710,26 @@ fn a_toggles_track_keeps_its_box_among_siblings() {
             Density::Comfortable,
         ),
     );
-    // The widget's own proportion, not a copy of it: the claim is that layout gives the track
-    // the box the widget asked for, and a restated number tests two copies against each other
-    // instead.
     let want = Vector2 {
-        x: track * crate::widget::seed::TRACK_ASPECT,
+        x: track * 1.7,
         y: track,
     };
-    // The shape of a chain row's header: a spacer takes the slack, and the toggle sits
-    // between a label and a fixed-width disclosure.
-    let among = track_box(
-        crate::layout::row((
-            crate::widget::title("Parametric EQ"),
-            crate::layout::spacer(),
-            crate::widget::label("All"),
-            crate::widget::toggle(on),
-            crate::widget::button("")
-                .ghost()
-                .width(Len::Times(Metric::RowH, 1.0))
-                .height(Len::Times(Metric::RowH, 1.0)),
-        ))
-        .gap(Len::Metric(Metric::SpaceSm))
-        .padding(Len::Metric(Metric::SpaceSm))
-        .align(crate::layout::Align::Center),
-    );
-
+    let among = track_box(|ui| {
+        ui.node(crate::layout::Preset::Row)
+            .gap(Len::Metric(Metric::SpaceSm))
+            .padding(Len::Metric(Metric::SpaceSm))
+            .align(crate::layout::Align::Center)
+            .children(|ui| {
+                crate::widget::title(ui, "Parametric EQ");
+                crate::layout::spacer(ui);
+                crate::widget::label(ui, "All");
+                crate::widget::toggle(ui, on);
+                crate::widget::button(ui, "")
+                    .ghost()
+                    .width(Len::Times(Metric::RowH, 1.0))
+                    .height(Len::Times(Metric::RowH, 1.0));
+            });
+    });
     let close = |got: Vector2, what: &str| {
         assert!(
             (got.x - want.x).abs() <= 1.0 && (got.y - want.y).abs() <= 1.0,
@@ -5048,13 +4738,11 @@ fn a_toggles_track_keeps_its_box_among_siblings() {
     };
     close(bare, "bare");
     close(among, "sibling");
-    // The two agree: a row full of neighbours does not take the track's width off it.
     assert!(
         (bare.x - among.x).abs() <= 1.0 && (bare.y - among.y).abs() <= 1.0,
         "the track is {bare:?} alone and {among:?} among siblings"
     );
 }
-
 /// A region paints its buffer and never a colour.
 ///
 /// The sprite carries a role, because a seed states one, but that role must not reach the
@@ -5065,15 +4753,13 @@ fn a_toggles_track_keeps_its_box_among_siblings() {
 fn a_region_paints_its_buffer_rather_than_its_role() {
     let mut patch = fixture();
     let live = crate::present::Live::new().expect("the epoch's wake event");
-    let _mount = mount(
-        crate::present::region(windows_present::Queue::Solo, &live, |_, _| {
+    let _mount = create(|ui| {
+        ui.region(windows_present::Queue::Solo, &live, |_, _| {
             unreachable!("no present thread is installed in a fixture, so nothing builds")
         })
-        .grow(),
-        root(),
-    );
+        .grow();
+    });
     flush(&mut patch);
-
     let presented = patch
         .ops()
         .iter()
@@ -5089,7 +4775,6 @@ fn a_region_paints_its_buffer_rather_than_its_role() {
         .count();
     assert_eq!(presented, 1, "the region is one sprite painting its buffer");
 }
-
 /// A region with no box stays pending rather than allocating buffers against zero.
 ///
 /// A node solves to no area before its first real solve, and inside anything the layout has
@@ -5101,22 +4786,19 @@ fn a_region_paints_its_buffer_rather_than_its_role() {
 fn a_region_with_no_box_defers_its_buffers_until_it_has_one() {
     let mut patch = fixture();
     let live = crate::present::Live::new().expect("the epoch's wake event");
-    // Collapsed before the mount, so the first solve is the one with no area to give.
     Host::with(|h| h.set_window(Vector2 { x: 0.0, y: 0.0 }));
-    let _mount = mount(
-        crate::present::region(windows_present::Queue::Solo, &live, |_, _| {
+    let _mount = create(|ui| {
+        ui.region(windows_present::Queue::Solo, &live, |_, _| {
             unreachable!("no present thread is installed in a fixture, so nothing builds")
         })
-        .grow(),
-        root(),
-    );
+        .grow();
+    });
     flush(&mut patch);
     assert_eq!(
         Host::with(|h| crate::present::tests::census(h)),
         (1, 1),
         "the region is declared, and with no box it has not been mounted"
     );
-
     Host::with(|h| h.set_window(Vector2 { x: 800.0, y: 600.0 }));
     flush(&mut patch);
     assert_eq!(
@@ -5125,7 +4807,6 @@ fn a_region_with_no_box_defers_its_buffers_until_it_has_one() {
         "the flush that gives the region a box is the flush that mounts it"
     );
 }
-
 /// A contact inside a region resolves to a part, and the renderer is told directly.
 ///
 /// The whole point of the path: the decision is written into the region's own input and its
@@ -5139,31 +4820,25 @@ fn a_region_with_no_box_defers_its_buffers_until_it_has_one() {
 #[test]
 fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
     use windows_present::{Part, Rect, SubId};
-
     let mut patch = fixture();
     let live = crate::present::Live::new().expect("the epoch\'s wake event");
     let inset = crate::role::metric(Metric::SpaceLg, Host::with(|h| h.root_scope));
-    let _mount = mount(
-        stack(
-            crate::present::region(windows_present::Queue::Solo, &live, |_, _| {
-                unreachable!("no present thread is installed in a fixture")
-            })
+    let _mount = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .padding(Metric::SpaceLg)
             .grow()
-            .erase(),
-        )
-        .padding(Metric::SpaceLg)
-        .grow(),
-        root(),
-    );
+            .children(|ui| {
+                ui.region(windows_present::Queue::Solo, &live, |_, _| {
+                    unreachable!("no present thread is installed in a fixture")
+                })
+                .grow();
+            });
+    });
     flush(&mut patch);
-
     let mut hits = windows_scene::HitTable::default();
     hits.replace(patch.hit_entries());
     let id = Host::with(|h| crate::present::tests::control(h)).expect("the region is a control");
     let mut picks = picks();
-
-    // Region-local, and deliberately narrow: at ten DIPs across, a point resolved in client
-    // space misses both.
     live.parts.publish(&[
         Part {
             id: SubId(0),
@@ -5174,7 +4849,6 @@ fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
             rect: Rect::new(10.0, 0.0, 20.0, 40.0),
         },
     ]);
-
     let mut intents = Vec::new();
     let at = windows_scene::Point {
         x: inset + 15.0,
@@ -5205,9 +4879,6 @@ fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
         intents.is_empty(),
         "a hover changes pixels and no document, so nothing is queued for the application"
     );
-
-    // Leaving clears both. A readout drawn at the last position the pointer held while it is
-    // elsewhere states a measurement nobody is taking.
     crate::present::pick(
         &[crate::input::Report::HoverChanged {
             from: Some(id),
@@ -5222,7 +4893,6 @@ fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
     assert_eq!(live.input.hover(), None);
     assert_eq!(live.input.cursor(), None);
 }
-
 /// A gesture that finishes inside a region clears the active part and tells the application
 /// which part it finished on.
 ///
@@ -5233,19 +4903,15 @@ fn a_contact_inside_a_region_picks_a_part_and_tells_its_renderer() {
 #[test]
 fn a_release_inside_a_region_clears_the_gesture_and_queues_one_intent() {
     use windows_present::{Part, Rect, SubId};
-
     let mut patch = fixture();
     let live = crate::present::Live::new().expect("the epoch\'s wake event");
-    let _mount = mount(
-        crate::present::region(windows_present::Queue::Solo, &live, |_, _| {
+    let _mount = create(|ui| {
+        ui.region(windows_present::Queue::Solo, &live, |_, _| {
             unreachable!("no present thread is installed in a fixture")
         })
-        .grow()
-        .erase(),
-        root(),
-    );
+        .grow();
+    });
     flush(&mut patch);
-
     let mut hits = windows_scene::HitTable::default();
     hits.replace(patch.hit_entries());
     let id = Host::with(|h| crate::present::tests::control(h)).expect("the region is a control");
@@ -5254,7 +4920,6 @@ fn a_release_inside_a_region_clears_the_gesture_and_queues_one_intent() {
         id: SubId(3),
         rect: Rect::new(0.0, 0.0, 100.0, 100.0),
     }]);
-
     let mut intents = Vec::new();
     crate::present::pick(
         &[crate::input::Report::Released {
@@ -5282,7 +4947,6 @@ fn a_release_inside_a_region_clears_the_gesture_and_queues_one_intent() {
         "the intent names the part the gesture finished on"
     );
 }
-
 /// An attached button's resting border and hover wash must end at the same square edge.
 #[test]
 fn edge_buttons_join_without_a_border_or_rounded_gap() {
@@ -5291,12 +4955,11 @@ fn edge_buttons_join_without_a_border_or_rounded_gap() {
     for dpi in [96.0, 144.0, 192.0] {
         for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
             let mut patch = fixture_at(dpi);
-            let _held = mount(
-                crate::widget::edge_button("", edge, crate::role::tests::CORNER)
+            let _held = create(|ui| {
+                crate::widget::edge_button(ui, "", edge, crate::role::tests::CORNER)
                     .width(Metric::CardMinW)
-                    .height(Metric::RowH),
-                root(),
-            );
+                    .height(Metric::RowH);
+            });
             flush(&mut patch);
             let boxes: Vec<_> = patch
                 .ops()
@@ -5370,29 +5033,29 @@ fn edge_buttons_join_without_a_border_or_rounded_gap() {
         }
     }
 }
-
 /// A responsive shadow changes visibility without reallocating or re-blurring its source.
 #[test]
 fn a_drawer_shadow_is_retained_across_width_classes() {
-    use crate::layout::{Edge, responsive};
+    use crate::layout::Edge;
     use crate::role::WidthClass;
     let mut patch = fixture();
-    let _held = mount(
-        responsive(
-            [1100.0, 1400.0],
-            stack(
-                crate::widget::sheet("shadow")
-                    .shadowed(Edge::Left)
-                    .cover()
-                    .hide_when(WidthClass::Wide),
-            )
+    let _held = create(|ui| {
+        ui.node(crate::layout::Preset::Stack)
+            .responsive([1100.0, 1400.0])
+            .children(|ui| {
+                ui.node(crate::layout::Preset::Stack)
+                    .width(Len::Pct(1.0))
+                    .height(Len::Pct(1.0))
+                    .children(|ui| {
+                        crate::widget::sheet(ui, "shadow")
+                            .shadowed(Edge::Left)
+                            .cover()
+                            .hide_when(WidthClass::Wide);
+                    });
+            })
             .width(Len::Pct(1.0))
-            .height(Len::Pct(1.0)),
-        )
-        .width(Len::Pct(1.0))
-        .height(Len::Pct(1.0)),
-        root(),
-    );
+            .height(Len::Pct(1.0));
+    });
     flush(&mut patch);
     let halos: Vec<_> = patch
         .ops()
@@ -5432,15 +5095,15 @@ fn a_drawer_shadow_is_retained_across_width_classes() {
         assert!(patch.ops().is_empty());
     }
 }
-
 #[test]
 fn slider_thumb_centres_and_fill_share_the_rail_at_every_gain() {
     let (_owner, ()) = crate::signal::Owner::scope(|| {
         for dpi in [96.0, 144.0, 192.0] {
             let mut patch = fixture_at(dpi);
             let value = crate::signal::Cell::new(-4.0_f64);
-            let _held = mount(
+            let _held = create(|ui| {
                 crate::widget::slider(
+                    ui,
                     value,
                     crate::widget::Range::new(-24.0, 24.0).step(0.1),
                     crate::widget::SliderStyle {
@@ -5448,9 +5111,8 @@ fn slider_thumb_centres_and_fill_share_the_rail_at_every_gain() {
                         ramp: None,
                     },
                 )
-                .width(Len::Pct(1.0)),
-                root(),
-            );
+                .width(Len::Pct(1.0));
+            });
             for width in [240.0, 601.0, 940.0, 240.0] {
                 Host::with(|h| h.set_window(Vector2 { x: width, y: 100.0 }));
                 for db in [-24.0, -18.0, -12.0, -6.0, -4.0, 0.0, 6.0, 12.0, 18.0, 24.0] {
@@ -5493,14 +5155,14 @@ fn slider_thumb_centres_and_fill_share_the_rail_at_every_gain() {
         }
     });
 }
-
 #[test]
 fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
     let (_owner, ()) = crate::signal::Owner::scope(|| {
         let mut patch = fixture();
         let value = crate::signal::Cell::new(-12.0_f64);
-        let _held = mount(
+        let _held = create(|ui| {
             crate::widget::slider(
+                ui,
                 value,
                 crate::widget::Range::new(-24.0, 24.0),
                 crate::widget::SliderStyle {
@@ -5508,9 +5170,8 @@ fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
                     ramp: None,
                 },
             )
-            .width(Metric::CardMinW),
-            root(),
-        );
+            .width(Metric::CardMinW);
+        });
         flush(&mut patch);
         let before = filled()
             .chrome
@@ -5541,11 +5202,11 @@ fn bipolar_slider_keeps_its_value_stroke_with_the_thumb_owner() {
             !patch
                 .ops()
                 .iter()
-                .any(|op| matches!(op, Op::Bind { id, .. } if *id == trail))
+                .any(|op| matches!(op, Op::Bind { id, .. } if * id ==
+            trail))
         );
     });
 }
-
 #[test]
 fn application_tokens_restyle_nested_scopes_without_remounting_or_idle_writes() {
     use crate::role::{ScopedToken, WidthClass};
@@ -5568,27 +5229,29 @@ fn application_tokens_restyle_nested_scopes_without_remounting_or_idle_writes() 
     });
     for dpi in [96.0, 144.0, 192.0] {
         let mut patch = fixture_at(dpi);
-        let _held = mount(
-            crate::layout::responsive(
-                [600.0, 1000.0],
-                stack((
-                    plate().width(Metric::Custom(&WIDTH)).height(Metric::RowH),
-                    styled_text(
-                        "Responsive typography",
-                        TextStyle::new(TypeRole::Custom(&TYPE)),
-                    ),
-                    crate::layout::responsive(
-                        [600.0, 1000.0],
-                        plate().width(Metric::Custom(&WIDTH)).height(Metric::RowH),
-                    )
-                    .width(Len::Pct(0.4)),
-                )),
-            )
-            .width(Len::Pct(1.0)),
-            root(),
-        );
+        let _held = create(|ui| {
+            ui.node(crate::layout::Preset::Stack)
+                .responsive([600.0, 1000.0])
+                .children(|ui| {
+                    stack(ui, |ui| {
+                        plate(ui).width(Metric::Custom(&WIDTH)).height(Metric::RowH);
+                        styled_text(
+                            ui,
+                            "Responsive typography",
+                            TextStyle::new(TypeRole::Custom(&TYPE)),
+                        );
+                        ui.node(crate::layout::Preset::Stack)
+                            .responsive([600.0, 1000.0])
+                            .children(|ui| {
+                                plate(ui).width(Metric::Custom(&WIDTH)).height(Metric::RowH);
+                            })
+                            .width(Len::Pct(0.4));
+                    });
+                })
+                .width(Len::Pct(1.0));
+        });
         flush(&mut patch);
-        let ids = Host::with(|h| h.mounts.iter().map(|(_, m)| m.node).collect::<Vec<_>>());
+        let ids = Host::with(|h| h.mounts.iter().map(|(node, _)| node).collect::<Vec<_>>());
         let mut narrow_text_width = None;
         for (width, expected, text_scale) in [
             (500.0, 111.0, 1.0),
@@ -5600,7 +5263,7 @@ fn application_tokens_restyle_nested_scopes_without_remounting_or_idle_writes() 
             Host::with(|h| h.model().set_window(Vector2 { x: width, y: 700.0 }));
             flush(&mut patch);
             Host::with(|h| {
-                let now = h.mounts.iter().map(|(_, m)| m.node).collect::<Vec<_>>();
+                let now = h.mounts.iter().map(|(node, _)| node).collect::<Vec<_>>();
                 assert_eq!(ids, now, "resize retains every node");
                 let measured = h.model().solved(ids[2]);
                 assert!(
@@ -5636,7 +5299,6 @@ fn application_tokens_restyle_nested_scopes_without_remounting_or_idle_writes() 
         }
     }
 }
-
 #[test]
 fn application_text_ink_survives_wrapping_and_ellipsis() {
     use crate::widget::{TextStyle, shown, styled_text};
@@ -5644,8 +5306,9 @@ fn application_text_ink_survives_wrapping_and_ellipsis() {
     for flow in [Flow::Wrap, Flow::Ellipsis] {
         let mut patch = fixture();
         let value = crate::signal::Cell::new("A chromatic application label");
-        let _held = mount(
+        let _held = create(|ui| {
             styled_text(
+                ui,
                 shown(move || value.get()),
                 TextStyle {
                     ink: Some(ink),
@@ -5653,9 +5316,8 @@ fn application_text_ink_survives_wrapping_and_ellipsis() {
                     ..TextStyle::new(TypeRole::Body)
                 },
             )
-            .width(Len::Pct(1.0)),
-            root(),
-        );
+            .width(Len::Pct(1.0));
+        });
         let expected = crate::role::resolve(ink, root_scope());
         let mut paints = 0;
         for width in [800.0, 80.0] {

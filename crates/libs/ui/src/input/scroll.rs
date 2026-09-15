@@ -34,20 +34,21 @@ pub(super) fn touch(hits: &HitTable, hit: Hit, decl: GestureDecl) -> Option<Cont
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::{Host, mount, tests::fixture};
+    use crate::build::{Host, tests::fixture};
     use crate::layout::{Len, scroll};
 
     #[test]
     fn content_touch_uses_the_nearest_mounted_scroll_but_editing_keeps_ownership() {
         let mut patch = fixture();
-        let _held = mount(
-            scroll(
-                scroll(crate::widget::button("band"))
-                    .height(Len::Times(crate::role::Metric::RowH, 6.0)),
-            )
-            .height(Len::Times(crate::role::Metric::RowH, 12.0)),
-            Host::with(|h| h.model().root()),
-        );
+        let _held = crate::build::Ui::mount_root(|ui| {
+            scroll(ui, |ui| {
+                scroll(ui, |ui| {
+                    crate::widget::button(ui, "band");
+                })
+                .height(Len::Times(crate::role::Metric::RowH, 6.0));
+            })
+            .height(Len::Times(crate::role::Metric::RowH, 12.0));
+        });
         let mut down = crate::seam::Down::default();
         Host::flush(&mut patch);
         Host::with(|h| {

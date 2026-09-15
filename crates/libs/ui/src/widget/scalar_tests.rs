@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    build::{Host, mount},
+    build::Host,
     input::{KeyEvent, KeyKind, Mods, PointerFlags, PointerType, Sample},
     signal::{Cell, Owner},
-    widget::{ScalarPart, ScalarValue},
+    widget::{ScalarPart, ScalarValue, TextStyle},
 };
 use windows_scene::{Model, Point};
 
@@ -45,11 +45,11 @@ fn drag(target: ControlId, fraction: f32) -> Report {
     Report::Dragged {
         target,
         contact: 1,
-        update: crate::gesture::DragUpdate {
-            phase: crate::gesture::DragPhase::Locked(crate::gesture::Axis::Vertical),
+        update: DragUpdate {
+            phase: DragPhase::Locked(crate::gesture::Axis::Vertical),
             delta: Point {
                 x: 0.0,
-                y: -fraction * crate::widget::TURN_SPAN,
+                y: -fraction * TURN_SPAN,
             },
             from: Point::default(),
             at: Point::default(),
@@ -93,42 +93,44 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
                 epoch: 0,
             });
             let accepted = Cell::new(0_usize);
-            let geom = crate::build::geometry(&[
-                windows_scene::PathVerb::Move {
-                    to: windows_numerics::Vector2::default(),
-                    filled: false,
-                },
-                windows_scene::PathVerb::Line(windows_numerics::Vector2 { x: 30.0, y: 30.0 }),
-                windows_scene::PathVerb::End { closed: false },
-            ]);
-            let root = Host::with(|h| h.model().root());
-            let _held = mount(
-                crate::layout::grid(())
-                    .at(
-                        0,
-                        0,
-                        crate::layout::grid(())
-                            .scalar_part(ScalarPart::Rotation { from: 0.0, to: 4.0 }),
-                    )
-                    .at(
-                        0,
-                        0,
-                        crate::widget::path(geom)
-                            .stroke(crate::role::DataRole(1), crate::role::Metric::HairlineW)
-                            .scalar_part(ScalarPart::TrimEnd),
-                    )
-                    .width(crate::role::Metric::CardMinW)
-                    .height(crate::role::Metric::CardMinW)
-                    .turn_source(source, crate::widget::Range::UNIT)
-                    .on_commit(move |value| {
-                        accepted.set(accepted.get() + 1);
-                        source.set(ScalarValue {
-                            value,
-                            epoch: source.get().epoch,
-                        });
-                    }),
-                root,
-            );
+            let shown = Cell::new(true);
+            let _held = crate::build::Ui::mount_root(|ui| {
+                let geom = ui.geometry(&[
+                    windows_scene::PathVerb::Move {
+                        to: windows_numerics::Vector2::default(),
+                        filled: false,
+                    },
+                    windows_scene::PathVerb::Line(windows_numerics::Vector2 { x: 30.0, y: 30.0 }),
+                    windows_scene::PathVerb::End { closed: false },
+                ]);
+                ui.scalar(None, Interaction::Turn(Range::UNIT), source, |ui| {
+                    ui.when(shown, move |ui| {
+                        ui.text(TextStyle::new(crate::role::TypeRole::Body), "value")
+                            .at(0, 0);
+                        ui.grid(|_| {})
+                            .thumb()
+                            .at(0, 0)
+                            .scalar_part(ScalarPart::Rotation { from: 0.0, to: 4.0 });
+                        ui.path(geom)
+                            .stroke(
+                                crate::role::Role::Data(crate::role::DataRole(1)),
+                                crate::role::Metric::HairlineW,
+                            )
+                            .at(0, 0)
+                            .scalar_part(ScalarPart::TrimEnd);
+                    });
+                })
+                .layout(|l| l.flow = Some(crate::layout::Preset::Grid))
+                .width(crate::role::Metric::CardMinW)
+                .height(crate::role::Metric::CardMinW)
+                .on_commit(move |value| {
+                    accepted.set(accepted.get() + 1);
+                    source.set(ScalarValue {
+                        value,
+                        epoch: source.get().epoch,
+                    });
+                });
+            });
             let mut controls = Controls::new();
             let mut down = crate::seam::Down::default();
             publish(&mut down, &mut controls, &mut front)?;
@@ -138,8 +140,29 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
                 .find(|r| r.scalar_parts.iter().flatten().count() == 2)
                 .unwrap();
             let id = row.id;
+            // Branch churn must release part slots and the control's accessible text.
+            for showing in [false, true].into_iter().cycle().take(12) {
+                shown.set(showing);
+                publish(&mut down, &mut controls, &mut front)?;
+                let row = controls.rows.get(id).unwrap();
+                assert_eq!(
+                    row.scalar_parts.iter().flatten().count(),
+                    if showing { 2 } else { 0 }
+                );
+                assert_eq!(row.thumb.is_some(), showing);
+                Host::with(|host| {
+                    let label = host
+                        .controls
+                        .get(id)
+                        .unwrap()
+                        .text
+                        .and_then(|key| host.text.str_of(key));
+                    assert_eq!(label, showing.then_some("value"));
+                });
+            }
             let mut out = Vec::with_capacity(32);
             let before = *front.scene.census();
+            assert_eq!(before.animations, 0, "initial control state must snap");
             controls.tick(&[press(id), drag(id, 0.25)], &mut front, &mut out)?;
             assert_eq!(source.get().value, 0.25, "app work is deliberately delayed");
             assert_eq!(controls.rows.get(id).unwrap().fraction, 0.5);
@@ -163,7 +186,7 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
             )?;
             // A second gesture starts before the application receives the first commit.
             controls.tick(&[press(id), drag(id, 0.25)], &mut front, &mut Vec::new())?;
-            Host::with(|h| h.dispatch(&out));
+            Host::dispatch(&out);
             assert_eq!(accepted.get(), 1);
             publish(&mut down, &mut controls, &mut front)?;
             assert_eq!(controls.pressed, Some(id));
@@ -188,7 +211,7 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
                 epoch: 1,
             });
             publish(&mut down, &mut controls, &mut front)?;
-            Host::with(|h| h.dispatch(&out));
+            Host::dispatch(&out);
             assert_eq!(accepted.get(), 1);
             assert_eq!(source.get().value, 0.5);
             // Cancellation restores the starting value and emits no accepted commit.
@@ -207,7 +230,7 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
             )?;
             assert_eq!(controls.rows.get(id).unwrap().fraction, 0.5);
             assert!(matches!(out.last().unwrap().what, What::Canceled(_)));
-            Host::with(|h| h.dispatch(&out));
+            Host::dispatch(&out);
             assert_eq!(accepted.get(), 1);
             // UIA, keyboard and rotary share snapping and produce one committed action each.
             out.clear();
@@ -247,7 +270,10 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
             ));
             // The stock switch uses the same scene-owned offset path.
             let on = Cell::new(false);
-            let _toggle = mount(crate::widget::toggle(on), root);
+            let root = Host::with(|h| h.model().root());
+            let _toggle = crate::build::Ui::mount_at(root, None, scope, None, |ui| {
+                ui.toggle(on);
+            });
             publish(&mut down, &mut controls, &mut front)?;
             let before = front.scene.census().animations;
             on.set(true);

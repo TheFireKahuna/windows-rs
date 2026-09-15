@@ -35,7 +35,7 @@ pub use anchor::{Align, Anchor, AnchorTo, Fit, Side, place};
 pub use menu::{MenuItem, menu};
 pub use tip::{SUBMENU_DELAY_MS, TIP_DELAY_MS, TIP_EXIT_MS};
 
-use crate::build::{Host, Mount, View, mount_at};
+use crate::build::{Host, Mount, Ui};
 use crate::gesture::Recognised;
 use crate::input::{KeyKind, Report, ScopeId};
 use crate::seam::FocusOp;
@@ -269,12 +269,12 @@ impl Spec {
     }
 }
 
-/// Event-rate changes from mounted popup declarations. A mount id rejects stale opens.
+/// Event-rate changes from popup declarations. The retained node id rejects stale opens.
 pub(crate) enum Request {
     Show {
         key: windows_scene::NodeId,
         spec: Spec,
-        body: std::rc::Rc<dyn Fn() -> View>,
+        body: std::rc::Rc<dyn Fn(&mut Ui<'_>)>,
         closed: std::rc::Rc<dyn Fn()>,
     },
     Close(windows_scene::NodeId),
@@ -298,6 +298,7 @@ struct Binding {
 /// Private, along with its fields. The `tip` child module is the only other reader.
 struct Open {
     generation: u32,
+    runtime: u64,
     binding: Option<Binding>,
     kind: Kind,
     dismiss: DismissPolicy,
@@ -321,6 +322,18 @@ struct Open {
 }
 
 impl Open {
+    fn retire(&mut self, host: &mut Host, depth: u32) {
+        if self.runtime != host.identity {
+            return;
+        }
+        if let Some(mount) = &mut self.mount {
+            mount.retire(host);
+        }
+        host.close_overlay_slot(self.root, self.blocker);
+        host.release_overlays_from(depth);
+        self.runtime = 0;
+    }
+
     /// Returns whether a hover opened it rather than an invoke.
     const fn by_dwell(&self) -> bool {
         matches!(self.opened, Opened::Dwelled)
@@ -389,19 +402,19 @@ impl Overlays {
     ///
     /// A kind that takes focus also contributes a full-window blocker entry and emits a
     /// [`FocusOp::PushScope`] named by that blocker, with the invoker as the scope's restore
-    /// target. `body` runs outside every host borrow, so it may build elements, read signals
-    /// and create effects that run immediately.
+    /// target. `body` writes through a borrowed creation context; UI effects wait until
+    /// that transaction releases the host.
     pub(crate) fn open(
         &mut self,
         spec: Spec,
         focus: &mut Vec<FocusOp>,
-        body: impl FnOnce() -> View,
+        body: impl FnOnce(&mut Ui<'_>),
     ) -> OverlayId {
         // The depth this one opens at, which is also its placement row. Both stacks are
         // pushed and truncated together, so one position indexes either.
         let at = self.open.len() as u32;
         // The blocker, the slot root and the placement row are minted under one host borrow.
-        let (blocker, root, at_scope) = Host::with(|host| {
+        let (blocker, root, at_scope, runtime) = Host::with(|host| {
             let blocker = spec.kind.takes_focus().map(|_| host.mint_blocker());
             let root = host.open_overlay_slot(blocker);
             host.open_overlay_placement(
@@ -415,7 +428,7 @@ impl Overlays {
                     at: Vector2 { x: 0.0, y: 0.0 },
                 },
             );
-            (blocker, root, host.root_scope)
+            (blocker, root, host.root_scope, host.identity)
         });
 
         let invoker = match spec.anchor.to {
@@ -444,6 +457,7 @@ impl Overlays {
         let generation = self.generation;
         self.open.push(Open {
             generation,
+            runtime,
             binding: None,
             kind: spec.kind,
             dismiss: spec.dismiss,
@@ -457,10 +471,12 @@ impl Overlays {
             last_typeahead: None,
         });
 
-        // Outside every host borrow above: `body` is application code that builds elements,
-        // reads signals, and runs any `Effect` it creates immediately.
-        let (owner, mount) =
-            Owner::scope(|| mount_at(body().exit(spec.exit), root, None, at_scope));
+        // The detached Owner and retained records share this creation transaction.
+        let (owner, mount) = Owner::scope(|| {
+            let mut mounted = Ui::mount_at(root, None, at_scope, None, body);
+            mounted.set_exit(spec.exit);
+            mounted
+        });
         if let Some(slide) = spec.slide {
             Host::with(|h| h.open_overlay_entry(at, mount.node(), slide));
         }
@@ -497,7 +513,7 @@ impl Overlays {
                         spec.slide = None;
                     }
                     if existing.is_none() && Host::with(|h| h.mounts.get(key).is_some()) {
-                        let id = self.open(spec, focus, move || body());
+                        let id = self.open(spec, focus, move |ui| body(ui));
                         self.open[id.depth as usize].binding = Some(Binding { key, closed });
                     }
                 }
@@ -571,14 +587,11 @@ impl Overlays {
                 depth,
                 generation: open.generation,
             });
-            // Two ordinary drops: the mount destroys the subtree with its exit, the owner
-            // disposes every signal the body created.
+            Host::with(|host| {
+                open.retire(host, depth);
+            });
             drop(open.mount);
             drop(open.owner);
-            Host::with(|host| {
-                host.close_overlay_slot(open.root, open.blocker);
-                host.release_overlays_from(depth);
-            });
             if let Some(binding) = open.binding {
                 (binding.closed)();
             }
@@ -826,7 +839,7 @@ impl Overlays {
         let Some(body) = Host::with(|host| host.flyout_of(target)) else {
             return;
         };
-        _ = self.open(spec, focus, || body());
+        _ = self.open(spec, focus, |ui| body(ui));
     }
 
     /// Applies scene events to the stack. Only [`SceneEvent::DelayElapsed`] is acted on.
@@ -856,17 +869,15 @@ impl Drop for Overlays {
     /// behind names a hit entry that has just gone, and a scope whose entry is absent bounds
     /// navigation to nothing, so `Tab` goes inert rather than walking the whole window.
     fn drop(&mut self) {
-        // A pending delay outlives the stack: its id stays claimed and its `Tick` holds the
-        // frame clock awake. Nothing else releases either.
-        self.cancel_dwell();
-        while let Some(open) = self.open.pop() {
-            drop(open.mount);
-            drop(open.owner);
-            let depth = self.open.len() as u32;
-            _ = Host::try_with(|host| {
-                host.close_overlay_slot(open.root, open.blocker);
-                host.release_overlays_from(depth);
-            });
+        _ = Host::try_with(|host| self.retire(host));
+    }
+}
+
+impl Overlays {
+    pub(crate) fn retire(&mut self, host: &mut Host) {
+        self.retire_dwell(host);
+        for (depth, open) in self.open.iter_mut().enumerate().rev() {
+            open.retire(host, depth as u32);
         }
     }
 }

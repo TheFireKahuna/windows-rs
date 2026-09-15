@@ -29,11 +29,11 @@ use windows_window::{CaptionState, Handoff, Tick, Wake, Window};
 /// Everything one input tick needs, in one place the window procedure can reach.
 ///
 /// A message handler is `'static`, so none of these can be a local in
-/// [`Ui::run`](super::Ui::run) borrowed by it.
+/// [`UiRuntime::run`](super::UiRuntime::run) borrowed by it.
 pub(super) struct Frame {
     pub scope: crate::role::Scope,
     /// The window, held rather than borrowed: the handler outlives every stack frame in
-    /// [`Ui::run`](super::Ui::run). The window's own state holds a weak reference back to
+    /// [`UiRuntime::run`](super::UiRuntime::run). The window's own state holds a weak reference back to
     /// this frame, so the two do not keep each other alive.
     pub window: Rc<Window>,
     pub links: Arc<Links>,

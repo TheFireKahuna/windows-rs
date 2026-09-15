@@ -9,7 +9,7 @@
 //! tracker and the binding.
 
 use crate::bindings::GestureSettings;
-use crate::build::{Any, El, Host, IntoChildren, View};
+use crate::build::{Element, Host, Node, Ui};
 use crate::gesture::{Commit, DragAxes, DragDecl, DragPhase, GestureDecl};
 use crate::input::Report;
 use crate::role::Metric;
@@ -19,7 +19,6 @@ use crate::widget::Front;
 use core::cell::RefCell;
 use core::ops::Range;
 use core::sync::atomic::Ordering;
-use std::rc::Rc;
 use windows_core::Result;
 use windows_numerics::Vector2;
 use windows_scene::{
@@ -156,33 +155,6 @@ pub fn rail_style() -> windows_scene::taffy::Style {
     }
 }
 
-/// Returns the thumb's own box inside the rail: as tall as `geom` says, at the top of its
-/// travel.
-///
-/// Built as a style rather than through the [`Layout`](super::Layout) vocabulary because the
-/// numbers are this component's own geometry, resolved from extents the solve produced, and
-/// [`Len`](super::Len) states no raw DIP. The thumb's offset is the tracker's alone: laying
-/// it out would leave layout and the tracker writing one channel between them.
-#[must_use]
-pub fn thumb_style(geom: ThumbGeom) -> windows_scene::taffy::Style {
-    use windows_scene::taffy;
-    use windows_scene::taffy::style_helpers::{TaffyAuto, TaffyZero};
-    taffy::Style {
-        position: taffy::Position::Absolute,
-        size: taffy::Size {
-            width: taffy::Dimension::length(THUMB_W),
-            height: taffy::Dimension::length(geom.thumb_h),
-        },
-        inset: taffy::Rect {
-            left: taffy::LengthPercentageAuto::AUTO,
-            right: taffy::LengthPercentageAuto::length(THUMB_MARGIN),
-            top: taffy::LengthPercentageAuto::ZERO,
-            bottom: taffy::LengthPercentageAuto::AUTO,
-        },
-        ..taffy::Style::DEFAULT
-    }
-}
-
 /// What a scroll container is declared with.
 ///
 /// The state travels with the reveal policy so that a list and the mount reporting into it
@@ -199,29 +171,23 @@ pub struct ScrollDecl {
 ///
 /// The children go into a content group of their own, because the viewport must not move:
 /// it is what clips, and an offset on it would take the clip with it.
-#[must_use]
-pub fn scroll(children: impl IntoChildren) -> View {
-    scroll_with(Reveal::default(), children)
+pub fn scroll<'a>(ui: &'a mut Ui<'_>, children: impl FnOnce(&mut Ui<'_>)) -> Element<'a> {
+    scroll_with(ui, Reveal::default(), children)
 }
 
-/// Returns a scrolling container with an explicit thumb reveal policy.
-#[must_use]
-pub fn scroll_with(reveal: Reveal, children: impl IntoChildren) -> View {
-    scroll_state(
+/// Creates a scrolling container with an explicit thumb reveal policy.
+pub fn scroll_with<'a>(
+    ui: &'a mut Ui<'_>,
+    reveal: Reveal,
+    children: impl FnOnce(&mut Ui<'_>),
+) -> Element<'a> {
+    ui.scroll(
         ScrollDecl {
             reveal,
             state: None,
         },
-        super::stack(children),
+        children,
     )
-}
-
-/// Wraps `content` in a viewport declared by `decl`.
-///
-/// The content never shrinks to its viewport: a flex child squeezed back to its parent never
-/// overflows, and a container with no overflow has no travel and no thumb.
-fn scroll_state(decl: ScrollDecl, content: El<Any>) -> View {
-    El::<Any>::viewport(decl, content.no_shrink())
 }
 
 // ── where the content is ─────────────────────────────────────────────────────────
@@ -484,81 +450,90 @@ pub fn realize(
 /// row's index is fixed for its life and its placement is written once. `items` must push
 /// the items it has for the runs it is handed **in ascending index order**; a realized index
 /// it does not supply gets a placeholder of the right height rather than a gap.
-#[must_use]
-pub fn list<T, V>(
+pub fn list<'a, T: 'static, K: 'static>(
+    ui: &'a mut Ui<'_>,
     spec: impl Fn() -> ListSpec + 'static,
     items: impl Fn(&Realized, &mut Vec<(usize, T)>) + 'static,
-    view: impl Fn(&T) -> El<V> + 'static,
-) -> View
-where
-    T: 'static,
-    V: 'static,
-{
+    view: impl Fn(&mut Ui<'_>, &T) -> Node<K> + 'static,
+) -> Element<'a> {
     let state = ScrollState::new();
+    let scope = ui.scope();
     let spec = Memo::new(spec);
-    // Its own memo, so a row's placement re-lowers on a density change and on nothing else —
-    // not when the count moves, which is most of what `spec` reports.
     let row_metric = Memo::new(move || spec.get().row_h);
     let realized = Memo::new(move || {
         let spec = spec.get();
-        // The root scope: a row height varies with density, a root axis, and not with the
-        // elevation or width a surface pushes.
-        let row_h = crate::role::metric(spec.row_h, Host::with(|h| h.root_scope));
         realize(
             state.offset(),
             state.target(),
             state.viewport(),
-            row_h,
+            crate::role::metric(spec.row_h, scope),
             &spec,
         )
     });
-
-    // Reused across reconciles, so the fill path allocates only until its high-water mark.
-    let supplied: Rc<RefCell<Vec<(usize, T)>>> = Rc::new(RefCell::new(Vec::new()));
-    // Keyed by index, and carrying it: the key is what recycles a row and the value is what
-    // places it, and a row's placement has to survive the reconcile that moved it.
-    let rows = crate::build::each_into(
-        move |out: &mut Vec<(usize, Option<T>)>| {
-            let realized = realized.get();
-            let mut supplied = supplied.borrow_mut();
-            supplied.clear();
-            items(&realized, &mut supplied);
-            let mut supplied = supplied.drain(..).peekable();
-            for run in realized.runs() {
-                for index in run {
-                    while supplied.peek().is_some_and(|&(at, _)| at < index) {
-                        supplied.next();
-                    }
-                    let item = match supplied.peek() {
-                        Some(&(at, _)) if at == index => supplied.next().map(|(_, item)| item),
-                        _ => None,
-                    };
-                    out.push((index, item));
-                }
-            }
-        },
-        // The index is the key and also what places the row: one field, projected.
-        |(index, _): &(usize, Option<T>)| index,
-        // A realized index the caller did not supply gets its space and nothing in it: the
-        // row is where it will be when the data arrives, and nothing invented stands in for
-        // the data.
-        move |(index, item): &(usize, Option<T>)| {
-            let at = *index as f32;
-            match item {
-                Some(item) => view(item).band_rows(at, move || row_metric.get()).erase(),
-                None => El::<Any>::seed_bare().band_rows(at, move || row_metric.get()),
-            }
-        },
-    );
-
-    scroll_state(
+    let supplied = RefCell::new(Vec::<(usize, T)>::new());
+    ui.scroll_content(
         ScrollDecl {
             reveal: Reveal::default(),
             state: Some(state),
         },
-        El::<Any>::seed_bare()
-            .height_rows(move || spec.get().row_h, move || spec.get().count as f32)
-            .contain(Preset::Bare, rows),
+        |ui| {
+            ui.node(Preset::Bare)
+                .no_shrink()
+                .layout_from(move |layout| {
+                    let spec = spec.get();
+                    layout.height = Some(super::Len::Times(spec.row_h, spec.count as f32));
+                })
+                .children(|ui| {
+                    ui.each(
+                        move |out: &mut Vec<(usize, Option<T>)>| {
+                            let realized = realized.get();
+                            let mut supplied = supplied.borrow_mut();
+                            supplied.clear();
+                            items(&realized, &mut supplied);
+                            let mut supplied = supplied.drain(..).peekable();
+                            for run in realized.runs() {
+                                for index in run {
+                                    while supplied.peek().is_some_and(|&(at, _)| at < index) {
+                                        supplied.next();
+                                    }
+                                    let item = match supplied.peek() {
+                                        Some(&(at, _)) if at == index => {
+                                            supplied.next().map(|(_, item)| item)
+                                        }
+                                        _ => None,
+                                    };
+                                    out.push((index, item));
+                                }
+                            }
+                        },
+                        |(index, _)| index,
+                        move |ui, (index, item)| {
+                            let at = *index as f32;
+                            let place = move |layout: &mut super::Layout| {
+                                let metric = row_metric.get();
+                                layout.position = Some(super::Position::Band {
+                                    at: super::Len::Times(metric, at),
+                                    height: metric.into(),
+                                });
+                            };
+                            match item {
+                                Some(item) => {
+                                    let node = view(ui, item);
+                                    ui.effect(move |ui| {
+                                        if let Some(row) = ui.edit(node) {
+                                            row.layout(place);
+                                        }
+                                    });
+                                }
+                                None => {
+                                    ui.node(Preset::Bare).layout_from(place);
+                                }
+                            }
+                        },
+                    );
+                })
+                .id()
+        },
     )
 }
 
@@ -962,7 +937,8 @@ pub(crate) fn grab_hit(id: ControlId) -> HitDecl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::{mount, tests::fixture};
+    use crate::build::tests::fixture;
+    use crate::driver::testing::LayoutDriver;
     use crate::layout::Len;
 
     #[test]
@@ -970,11 +946,12 @@ mod tests {
         let mut patch = fixture();
         let mut down = crate::seam::Down::default();
         let mut table = ScrollTable::default();
-        let root = Host::with(|h| h.model().root());
-        let ordinary = mount(
-            scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
-            root,
-        );
+        let ordinary = LayoutDriver::create(|ui| {
+            scroll(ui, |ui| {
+                ui.node(Preset::Bare)
+                    .height(Len::Times(Metric::RowH, 200.0));
+            });
+        });
         Host::flush(&mut patch);
         Host::with(|h| {
             h.fill(&mut down);
@@ -1014,8 +991,9 @@ mod tests {
             events.iter().all(|e| table.app_observes(e)),
             "unknown trackers remain available to other consumers"
         );
-        let _list = mount(
+        let _list = LayoutDriver::create(|ui| {
             list(
+                ui,
                 || SPEC,
                 |runs, items| {
                     for run in runs.runs() {
@@ -1024,10 +1002,9 @@ mod tests {
                         }
                     }
                 },
-                |_| El::<Any>::seed_bare(),
-            ),
-            root,
-        );
+                |ui, _| ui.node(Preset::Bare).id(),
+            );
+        });
         Host::flush(&mut patch);
         Host::with(|h| {
             h.fill(&mut down);
@@ -1066,10 +1043,12 @@ mod tests {
         let mut down = crate::seam::Down::default();
         let mut table = ScrollTable::default();
 
-        let held = mount(
-            scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
-            Host::with(|h| h.model().root()),
-        );
+        let held = LayoutDriver::create(|ui| {
+            scroll(ui, |ui| {
+                ui.node(Preset::Bare)
+                    .height(Len::Times(Metric::RowH, 200.0));
+            });
+        });
         Host::flush(&mut patch);
         Host::with(|h| {
             h.fill(&mut down);
@@ -1109,10 +1088,12 @@ mod tests {
         let mut down = crate::seam::Down::default();
         let mut table = ScrollTable::default();
 
-        let _held = mount(
-            scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
-            Host::with(|h| h.model().root()),
-        );
+        let _held = LayoutDriver::create(|ui| {
+            scroll(ui, |ui| {
+                ui.node(Preset::Bare)
+                    .height(Len::Times(Metric::RowH, 200.0));
+            });
+        });
         Host::flush(&mut patch);
         Host::with(|h| {
             h.fill(&mut down);

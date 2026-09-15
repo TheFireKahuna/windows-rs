@@ -28,7 +28,7 @@ use windows_window::Watch;
 
 /// What the input thread hands the app thread to start with.
 pub(super) struct Start {
-    pub mount: Box<dyn FnOnce(AppCtx) -> Mount + Send>,
+    pub mount: Box<dyn FnOnce(&mut crate::build::Ui<'_>, AppCtx) + Send>,
     pub root_scope: Scope,
     pub env: Env,
     pub window_dips: Vector2,
@@ -86,9 +86,6 @@ impl<'a> Thread<'a> {
 
         let mut model = Model::new(layout::root());
         model.set_window(start.window_dips);
-        // Taken before the model is handed over: the host keeps it privately from here on,
-        // and the root is what the application mounts under.
-        let root = model.root();
         Host::install(model, start.env, start.root_scope);
         Host::install_text(ladder)?;
 
@@ -103,10 +100,14 @@ impl<'a> Thread<'a> {
         let posts = signal::arm_posts(PostWake::Ring(Arc::clone(&links.app_ring)));
 
         let (owner, mounted) = signal::Owner::scope(|| {
-            (start.mount)(AppCtx {
-                root,
-                watch: start.watch,
-                window_dips: start.window_dips,
+            crate::build::Ui::mount_root(|ui| {
+                (start.mount)(
+                    ui,
+                    AppCtx {
+                        watch: start.watch,
+                        window_dips: start.window_dips,
+                    },
+                )
             })
         });
 
@@ -145,11 +146,15 @@ impl<'a> Thread<'a> {
         // The tree comes down on this thread, where the host lives, and its destroys ride
         // one last batch so the scene thread releases every visual and region before it
         // stops.
-        // Dispose dynamic mounts before destroying their parent visuals. Otherwise their
-        // value rows survive into the final geometry publish and bind destroyed nodes.
-        self.owner = None;
-        self.mounted = None;
+        Host::with(|host| {
+            self.overlays.retire(host);
+            if let Some(mount) = &mut self.mounted {
+                mount.retire(host);
+            }
+        });
         self.overlays = Overlays::new();
+        self.mounted = None;
+        self.owner = None;
         self.emit(true);
         Ok(())
     }
@@ -222,7 +227,7 @@ impl<'a> Thread<'a> {
         self.intents.extend_from_slice(&up.intents);
         self.overlays
             .keys(&up.reports, &mut self.focus, &mut self.intents);
-        Host::with(|h| h.dispatch(&self.intents));
+        Host::dispatch(&self.intents);
         // Overlay scopes turn Escape into their own report before it reaches this fallback,
         // so one press closes the overlay or the screen's inspector.
         for report in &up.reports {
@@ -370,7 +375,11 @@ mod tests {
             first: false,
             _posts: signal::arm_posts(PostWake::Ring(Arc::clone(&links.app_ring))),
         };
-        let (owner, _) = signal::Owner::scope(|| crate::build::geometry(&[]));
+        let (owner, _) = signal::Owner::scope(|| {
+            crate::build::Ui::mount_root(|ui| {
+                ui.geometry(&[]);
+            })
+        });
         thread.emit(true);
         assert!(thread.pending_flush);
         assert!(links.app_wants_down_spare.load(Ordering::Acquire));
@@ -423,16 +432,18 @@ mod tests {
             let calls = calls.clone();
             move || {
                 let source = signal::Cell::new(String::new());
-                crate::build::mount(
-                    crate::widget::field(crate::widget::TextSource::Dynamic(Box::new(
-                        move |out| source.with(|s| out.push_str(s)),
-                    )))
+                crate::build::Ui::mount_at(root, None, crate::build::root_scope(), None, |ui| {
+                    crate::widget::field(
+                        ui,
+                        crate::widget::TextSource::Dynamic(Box::new(move |out| {
+                            source.with(|s| out.push_str(s))
+                        })),
+                    )
                     .on_commit(move |text| {
                         calls.set(calls.get() + 1);
                         source.set(text.to_uppercase());
-                    }),
-                    root,
-                )
+                    });
+                })
             }
         });
         signal::flush();

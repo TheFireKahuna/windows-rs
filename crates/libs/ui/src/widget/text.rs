@@ -147,8 +147,8 @@ pub fn shown<T: Display>(f: impl Fn() -> T + 'static) -> TextSource {
 /// # #[derive(PartialEq)] struct Block { name: String }
 /// # #[derive(PartialEq)] enum Row { Processor(Block), Other }
 /// # impl Row { fn processor(&self) -> Option<&Block> { match self { Self::Processor(p) => Some(p), _ => None } } }
-/// # fn f(selected: Memo<Option<Row>>) {
-/// label(selected.about(Row::processor, |out, p| out.push_str(&p.name)));
+/// # fn f(ui: &mut windows_ui::build::Ui<'_>, selected: Memo<Option<Row>>) {
+/// label(ui, selected.about(Row::processor, |out, p| out.push_str(&p.name)));
 /// # }
 /// ```
 macro_rules! about {

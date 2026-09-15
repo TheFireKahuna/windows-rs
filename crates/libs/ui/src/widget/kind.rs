@@ -1,11 +1,11 @@
-//! The vocabulary the arena and the widgets both name: motion, state policy, colour rows,
+//! The vocabulary retained records and widget recipes share: motion, state policy, colour rows,
 //! automation roles, value ranges, and the arithmetic that places a moving part.
 
 use crate::role::{Fill, Metric, Stroke, Text};
 
 /// How a channel moves when its value changes.
 ///
-/// Declared per channel by the seed, so two call sites cannot disagree about one control: a
+/// Declared per channel by the recipe, so two call sites cannot disagree about one control: a
 /// meter level springs, and a slider thumb the application writes lands where it was put.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum Motion {
