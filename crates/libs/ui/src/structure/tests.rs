@@ -9,6 +9,18 @@ use crate::signal::{Cell, Owner, live_nodes};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+thread_local! {
+    static REMOVED: RefCell<Vec<char>> = const { RefCell::new(Vec::new()) };
+}
+
+struct Retained(char, Cell<i32>);
+impl Drop for Retained {
+    fn drop(&mut self) {
+        assert!(self.1.alive(), "result must drop before its signal scope");
+        REMOVED.with(|out| out.borrow_mut().push(self.0));
+    }
+}
+
 /// Runs a reconcile and records what each key was told to do.
 #[derive(Default)]
 struct Recorder {
@@ -18,19 +30,23 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn run(list: &mut Keyed<char>, next: &str) -> Self {
+    fn run(list: &mut Keyed<char, Retained>, next: &str) -> Self {
         // The item is its own key here, so the projection is the identity: no pair to
         // build, and nothing stored twice.
         let items: Vec<char> = next.chars().collect();
         let out = Rc::new(RefCell::new(Self::default()));
-        let (removed, built, placed) = (Rc::clone(&out), Rc::clone(&out), Rc::clone(&out));
+        let (built, placed) = (Rc::clone(&out), Rc::clone(&out));
+        REMOVED.with(|out| out.borrow_mut().clear());
         list.reconcile(
             &items,
             |item| item,
-            move |key| removed.borrow_mut().removed.push(*key),
-            move |key, _| built.borrow_mut().built.push(*key),
-            move |key, _, step, after| placed.borrow_mut().steps.push((*key, step, after)),
+            move |key, _| {
+                built.borrow_mut().built.push(*key);
+                Retained(*key, Cell::new(0))
+            },
+            move |row, _, step, after| placed.borrow_mut().steps.push((row.0, step, after)),
         );
+        out.borrow_mut().removed = REMOVED.with(|log| core::mem::take(&mut *log.borrow_mut()));
         Rc::try_unwrap(out)
             .unwrap_or_else(|_| unreachable!("the callbacks are dropped by now"))
             .into_inner()
@@ -159,11 +175,11 @@ fn a_departing_row_disposes_its_scope_and_a_surviving_one_does_not() {
     };
 
     let items: Vec<char> = "abc".chars().collect();
-    list.reconcile(&items, |item| item, |_| {}, build(&cells), |_, _, _, _| {});
+    list.reconcile(&items, |item| item, build(&cells), |_, _, _, _| {});
     assert_eq!(live_nodes(), baseline + 3);
 
     let items: Vec<char> = "ac".chars().collect();
-    list.reconcile(&items, |item| item, |_| {}, build(&cells), |_, _, _, _| {});
+    list.reconcile(&items, |item| item, build(&cells), |_, _, _, _| {});
     assert_eq!(
         live_nodes(),
         baseline + 2,
@@ -178,7 +194,7 @@ fn a_departing_row_disposes_its_scope_and_a_surviving_one_does_not() {
         .collect();
     assert_eq!(live, vec!['a', 'c']);
 
-    list.clear(|_| {});
+    list.clear();
     assert_eq!(live_nodes(), baseline);
 }
 
@@ -195,7 +211,6 @@ fn a_list_reconciled_from_inside_an_effect_does_not_grow_its_scope() {
             list.reconcile(
                 &items,
                 |item| item,
-                |_| {},
                 |_, _| {
                     let _ = Cell::new(0_i32);
                 },
@@ -207,7 +222,7 @@ fn a_list_reconciled_from_inside_an_effect_does_not_grow_its_scope() {
             baseline + 3,
             "only the live rows' cells remain"
         );
-        list.clear(|_| {});
+        list.clear();
     });
     drop(owner);
     assert_eq!(live_nodes(), baseline);
@@ -218,26 +233,26 @@ fn a_branch_builds_once_per_key_change_and_never_for_a_repeat() {
     let baseline = live_nodes();
     let (owner, ()) = Owner::scope(|| {
         let log = Rc::new(RefCell::new(Vec::<String>::new()));
-        let mut branch: Branch<&'static str> = Branch::new();
+        let mut branch: Branch<&'static str, Teardown> = Branch::new();
 
         let build = |log: &Rc<RefCell<Vec<String>>>| {
             let log = Rc::clone(log);
             move |key: &&'static str| {
                 log.borrow_mut().push(format!("build {key}"));
-                let _ = Cell::new(0_i32);
+                Teardown {
+                    key: *key,
+                    cell: Cell::new(0_i32),
+                    log: log.clone(),
+                }
             }
         };
-        let teardown = |log: &Rc<RefCell<Vec<String>>>| {
-            let log = Rc::clone(log);
-            move |key: &&'static str| log.borrow_mut().push(format!("teardown {key}"))
-        };
 
-        branch.set(Some("home"), teardown(&log), build(&log));
-        branch.set(Some("home"), teardown(&log), build(&log));
+        branch.set(Some("home"), build(&log));
+        branch.set(Some("home"), build(&log));
         assert_eq!(*log.borrow(), ["build home"], "a repeat is not a change");
         assert_eq!(live_nodes(), baseline + 1);
 
-        branch.set(Some("effects"), teardown(&log), build(&log));
+        branch.set(Some("effects"), build(&log));
         assert_eq!(
             *log.borrow(),
             ["build home", "teardown home", "build effects"],
@@ -249,11 +264,23 @@ fn a_branch_builds_once_per_key_change_and_never_for_a_repeat() {
             "the old arm's cell went with it"
         );
 
-        branch.close(teardown(&log));
+        branch.close();
         assert!(!branch.is_open());
         // Absence contributes nothing: no node, no placeholder.
         assert_eq!(live_nodes(), baseline);
     });
     drop(owner);
     assert_eq!(live_nodes(), baseline);
+}
+
+struct Teardown {
+    key: &'static str,
+    cell: Cell<i32>,
+    log: Rc<RefCell<Vec<String>>>,
+}
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        assert!(self.cell.alive());
+        self.log.borrow_mut().push(format!("teardown {}", self.key));
+    }
 }

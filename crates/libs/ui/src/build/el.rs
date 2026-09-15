@@ -1105,6 +1105,20 @@ impl<K> El<K> {
         self.channel(Prop::Center, Motion::Snap, point, Value::Vec2)
     }
 
+    /// Anchors rotation to a fraction of this node's final local size, without a signal.
+    #[must_use]
+    pub fn pivot_relative(self, fraction: Vector2) -> Self {
+        Build::with(|b| {
+            b.push_chan(
+                self.at,
+                Prop::Center,
+                Motion::Snap,
+                ChanSource::RelativePivot(fraction),
+            )
+        });
+        self
+    }
+
     /// Binds how far a level fills its bed, `0..=1`.
     ///
     /// A scale and not an offset, so the fraction is already in the property's own unit: the

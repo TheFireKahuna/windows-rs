@@ -14,8 +14,8 @@ fn publish(
 ) -> Result<()> {
     down.clear();
     crate::signal::flush();
+    Host::flush(&mut down.patch);
     Host::with(|h| {
-        h.flush(&mut down.patch);
         h.fill(down);
     });
     front.scene.apply(&mut down.patch, front.back, front.env)?;

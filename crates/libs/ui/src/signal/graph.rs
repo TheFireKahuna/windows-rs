@@ -80,14 +80,20 @@ pub(super) trait MemoCell {
     fn value(&self) -> &dyn Any;
 }
 
-/// The three node kinds.
+/// Effect queues share the graph; geometry runs only after layout settles.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Update,
+    Geometry,
+}
+
 enum Kind {
     /// A cell. The payload is `RefCell<T>`, behind an `Rc` so a reader can take it out of
     /// the graph before running a closure over it.
     Source(Rc<dyn Any>),
     Resource(Rc<dyn Any>),
     Memo(Rc<dyn MemoCell>),
-    Effect(Rc<RefCell<dyn FnMut()>>),
+    Effect(Rc<RefCell<dyn FnMut()>>, Phase),
     /// A node parked for reuse, holding nothing.
     ///
     /// A payload may own an [`Owner`](super::Owner) — a `Branch`'s arm and a `Keyed`'s row
@@ -149,7 +155,7 @@ struct Graph {
     scope: Option<OwnerId>,
     order: u64,
     /// Effects marked since the last pass.
-    queue: Vec<SignalId>,
+    queue: [Vec<SignalId>; 2],
     /// The pass being drained. Separate from `queue`, so a write from inside an effect
     /// appends to the *next* pass rather than to the one in progress.
     running: Vec<SignalId>,
@@ -177,7 +183,7 @@ thread_local! {
         observer: None,
         scope: None,
         order: 0,
-        queue: Vec::new(),
+        queue: [Vec::new(), Vec::new()],
         running: Vec::new(),
         stack: Vec::new(),
         staged: Vec::new(),
@@ -270,6 +276,7 @@ impl Graph {
     }
 
     fn mint(&mut self, kind: Kind) -> SignalId {
+        super::assert_writable();
         self.order += 1;
         let order = self.order;
         // A parked node keeps its `deps` and `subs` capacity, which is what makes the second
@@ -365,10 +372,13 @@ impl Graph {
             return;
         }
         node.state = state;
-        let queue = !node.queued && matches!(node.kind, Kind::Effect(_));
+        let queue = !node.queued && matches!(node.kind, Kind::Effect(..));
         if queue {
             node.queued = true;
-            self.queue.push(id);
+            let Kind::Effect(_, phase) = node.kind else {
+                unreachable!()
+            };
+            self.queue[phase as usize].push(id);
         }
         // Only a first raise propagates: a node already `Check` has already pushed `Check`
         // through everything below it, and promoting it to `Dirty` changes nothing there.
@@ -403,12 +413,24 @@ pub(super) fn memo(cell: Rc<dyn MemoCell>) -> SignalId {
     with(|g| g.mint(Kind::Memo(cell)))
 }
 
-pub(super) fn effect(f: Rc<RefCell<dyn FnMut()>>) -> SignalId {
-    let id = with(|g| g.mint(Kind::Effect(Rc::clone(&f))));
-    // The first run is what collects the dependency set; an effect that never ran would
-    // never be woken.
-    run_effect(id, &f);
+pub(super) fn effect(f: Rc<RefCell<dyn FnMut()>>, phase: Phase) -> SignalId {
+    let id = with(|g| g.mint(Kind::Effect(Rc::clone(&f), phase)));
+    if phase == Phase::Update {
+        run_effect(id, &f);
+    } else {
+        with(|g| {
+            g.node_mut(id).unwrap().queued = true;
+            g.queue[phase as usize].push(id);
+        });
+    }
     id
+}
+
+pub(crate) fn schedule(id: SignalId) {
+    with(|g| {
+        g.set_state(id, State::Dirty);
+        g.stack.clear();
+    });
 }
 
 // ── reading ─────────────────────────────────────────────────────────────────────
@@ -576,10 +598,10 @@ pub(super) fn invalidate(id: SignalId) {
             node.version = node.version.wrapping_add(1);
         }
         // Read before the marking, so the comparison afterwards reflects this write alone.
-        let idle = !g.flushing && g.queue.is_empty();
+        let idle = !g.flushing && g.queue.iter().all(Vec::is_empty);
         g.invalidate(id);
         g.stack.clear();
-        idle && !g.queue.is_empty()
+        idle && !g.queue.iter().all(Vec::is_empty)
     });
     // Outside the borrow: a waker is host code and may do anything, including write a signal.
     if acquired {
@@ -626,6 +648,14 @@ fn run_effect(id: SignalId, f: &Rc<RefCell<dyn FnMut()>>) {
 /// A call made while a flush is running returns immediately, leaving the work to the
 /// running flush.
 pub fn flush() -> bool {
+    flush_phase(Phase::Update) || with(|g| !g.queue[Phase::Geometry as usize].is_empty())
+}
+
+pub(crate) fn flush_geometry() {
+    flush_phase(Phase::Geometry);
+}
+
+fn flush_phase(phase: Phase) -> bool {
     if with(|g| core::mem::replace(&mut g.flushing, true)) {
         // A write from inside an effect appends to the queue the running flush picks up on
         // its next pass. Starting a second flush here would run effects out of creation
@@ -637,11 +667,13 @@ pub fn flush() -> bool {
     // worth solving asks this rather than solving on every wake.
     let mut worked = false;
     for pass in 0..MAX_PASSES {
-        worked |= apply_staged();
+        if phase == Phase::Update {
+            worked |= apply_staged();
+        }
 
         let empty = with(|g| {
             debug_assert!(g.running.is_empty());
-            core::mem::swap(&mut g.running, &mut g.queue);
+            core::mem::swap(&mut g.running, &mut g.queue[phase as usize]);
             // Creation order is the contract: a parent's effect writes the container a
             // child's effect fills. Sorting in place allocates nothing.
             let nodes = &g.nodes;
@@ -658,7 +690,7 @@ pub fn flush() -> bool {
         while let Some(id) = with(|g| g.running.get(i).copied()) {
             i += 1;
             let Some(f) = with(|g| match g.node(id).map(|node| &node.kind) {
-                Some(Kind::Effect(f)) => Some(Rc::clone(f)),
+                Some(Kind::Effect(f, _)) => Some(Rc::clone(f)),
                 // Disposed between being marked and being run, which is legal: an effect
                 // in one scope may dispose another.
                 _ => None,
@@ -692,7 +724,7 @@ pub fn flush() -> bool {
         with(|g| g.running.clear());
 
         debug_assert!(
-            pass + 1 < MAX_PASSES || with(|g| g.queue.is_empty()),
+            pass + 1 < MAX_PASSES || with(|g| g.queue[phase as usize].is_empty()),
             "signal flush did not settle in {MAX_PASSES} passes: an effect writes a cell it \
              also reads"
         );
@@ -726,6 +758,7 @@ fn apply_staged() -> bool {
 // ── scopes ──────────────────────────────────────────────────────────────────────
 
 pub(super) fn open_scope() -> OwnerId {
+    super::assert_writable();
     with(|g| {
         // A parked scope keeps its child list's capacity, which is what makes remounting a
         // screen free.

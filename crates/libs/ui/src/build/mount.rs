@@ -63,13 +63,13 @@ pub fn geometry(verbs: &[PathVerb]) -> GeomId {
 /// both halves of one row come out at one density.
 #[must_use]
 pub fn root_scope() -> Scope {
-    Host::with(|h| h.root_scope)
+    Host::with_output(|h| h.root_scope)
 }
 
 /// Re-points the geometry `id` names. Every sprite sharing the id moves together, whichever
 /// construction each one uses, so a curve's fill, stroke and glow cannot diverge.
 pub fn set_geometry(id: GeomId, verbs: &[PathVerb]) {
-    Host::with(|h| h.model().set_geometry(id, verbs));
+    Host::with_output(|h| h.model().set_geometry(id, verbs));
 }
 
 /// Mints the sink a presentation region's sprite paints. The buffer arrives out of band,
@@ -125,7 +125,7 @@ pub fn ramp(stops: &[Stop], spread: Spread) -> RampId {
 
 /// Re-points the gradient `id` names. Every sprite painting with it changes together.
 pub fn set_ramp(id: RampId, stops: &[Stop], spread: Spread) {
-    Host::with(|h| {
+    Host::with_output(|h| {
         if let Some((held, axis)) = h.ramps.get_mut(id) {
             held.clear();
             held.extend_from_slice(stops);
@@ -133,7 +133,7 @@ pub fn set_ramp(id: RampId, stops: &[Stop], spread: Spread) {
         }
     });
     with_resolved(stops, |resolved| {
-        Host::with(|h| h.model().set_ramp(id, resolved, spread));
+        Host::with_output(|h| h.model().set_ramp(id, resolved, spread));
     });
 }
 
@@ -551,7 +551,7 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     mount_style_acts(b, &slot, node, row);
 
     // ── channels: one reactive lowering ───────────────────────────────────────────
-    mount_channels(b, &slot, node, parts.fill);
+    mount_channels(b, &slot, node, parts.fill, inner);
 
     // ── measured text ─────────────────────────────────────────────────────────────
     if let Some((text, _)) = run {
@@ -663,6 +663,12 @@ fn walk(b: &mut Build, at: Where, rows: &mut Rows, claim: &mut Claim) -> NodeId 
     if let Some(bounds) = slot.responsive {
         let group = group.expect("a responsive container is a group");
         Host::with(|h| h.model().responsive(group, bounds));
+    }
+
+    if let Some(index) = slot.geometry_job {
+        if let Some(draw) = b.geometry_jobs[index as usize].take() {
+            super::geometry::mount(node, inner, draw);
+        }
     }
 
     // Last, and outside every borrow: an adapter builds application views, so it runs where
@@ -1517,7 +1523,19 @@ fn uia_only(flags: HitFlags) -> HitFlags {
 /// A constant becomes one `Bind::Set` at mount and produces no graph node, no `Effect` and
 /// no allocation, so static content costs one sprite and nothing else. Anything else becomes
 /// exactly one effect, and the boxed reader moves into it.
-fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteId>) {
+fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteId>, scope: Scope) {
+    let (mut pivots, mut relative) = (0, false);
+    let mut at = slot.chans.head;
+    while at != NIL {
+        let entry = &b.chans[at as usize];
+        pivots += usize::from(entry.prop == Prop::Center);
+        relative |= matches!(entry.source, Some(ChanSource::RelativePivot(_)));
+        at = entry.next;
+    }
+    assert!(
+        !relative || pivots == 1,
+        "a relative pivot cannot have another writer"
+    );
     let mut at = slot.chans.head;
     while at != NIL {
         let entry = &mut b.chans[at as usize];
@@ -1533,6 +1551,17 @@ fn mount_channels(b: &mut Build, slot: &Slot, node: NodeId, fill: Option<SpriteI
             _ => node,
         };
         match source {
+            Some(ChanSource::RelativePivot(pivot)) => Host::with(|h| {
+                h.geometry_jobs.place(
+                    node,
+                    super::geometry::Row {
+                        scope,
+                        local: None,
+                        effect: None,
+                        pivot: Some(pivot),
+                    },
+                );
+            }),
             Some(ChanSource::Const(constant)) => {
                 Host::with(|h| h.model().bind(node, prop, Bind::Set(constant)))
             }

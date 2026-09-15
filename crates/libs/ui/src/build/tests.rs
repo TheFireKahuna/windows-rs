@@ -374,13 +374,13 @@ pub(crate) fn fixture_at(dpi: f32) -> SinkPatch {
     // The root's own `New` op rides the first flush. Draining it leaves the patch carrying
     // only what the test itself mounts.
     let mut patch = SinkPatch::new();
-    Host::with(|h| h.flush(&mut patch));
+    Host::flush(&mut patch);
     patch.clear();
     patch
 }
 
 fn flush(patch: &mut SinkPatch) {
-    Host::with(|h| h.flush(patch));
+    Host::flush(patch);
 }
 
 fn root() -> windows_scene::GroupId {
@@ -4295,6 +4295,182 @@ fn local_geometry_tracks_local_inputs_and_releases_its_shared_resource() {
         1
     );
     assert_eq!(calls.get(), 3);
+}
+
+#[test]
+fn final_layout_paths_share_the_batch_and_need_no_probe_or_memo() {
+    use crate::signal::{Cell, Owner};
+    let mut patch = fixture();
+    let baseline = crate::signal::live_nodes();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = calls.clone();
+    let (owner, (data, lead, held)) = Owner::scope(|| {
+        let data = Cell::new(1.0);
+        let lead = Cell::new(false);
+        let shape = path_with(1, move |out, size, _| {
+            seen.set(seen.get() + 1);
+            out.push(windows_scene::PathVerb::Line(Vector2::new(
+                size.x,
+                data.get(),
+            )));
+        })
+        .pivot_relative(Vector2::new(0.5, 0.25))
+        .width(Len::Pct(1.0))
+        .height(Metric::RowH);
+        let held = mount(
+            stack((
+                plate()
+                    .height(Metric::RowH)
+                    .no_shrink()
+                    .when(move || lead.get()),
+                shape,
+            ))
+            .width(Len::Pct(1.0)),
+            root(),
+        );
+        (data, lead, held)
+    });
+    assert_eq!(Host::with(|h| h.probes.iter().count()), 0);
+    // Two source cells, one presence effect, one geometry resource and one draw effect.
+    assert_eq!(crate::signal::live_nodes(), baseline + 5);
+    flush(&mut patch);
+    assert_eq!(
+        calls.get(),
+        1,
+        "the first layout publishes its path immediately"
+    );
+    let node = Host::with(|h| h.geometry_jobs.iter().next().unwrap().0);
+    let check = |patch: &SinkPatch| {
+        let size = Host::with(|h| h.model().solved(node).size);
+        assert!(patch.ops().iter().any(|op| matches!(op,
+            Op::Bind { id, prop: windows_scene::Prop::Center, bind: windows_scene::Bind::Set(windows_scene::Value::Vec2(at)) }
+            if *id == node && *at == Vector2::new(size.x * 0.5, size.y * 0.25)
+        )), "the pivot uses the same settled box");
+        assert!(
+            patch.ops().iter().any(|op| matches!(op,
+                Op::Res { op: windows_scene::ResOp::Geom { verbs }, .. } if verbs.len() == 1
+            )),
+            "the path update is in the layout batch"
+        );
+    };
+    check(&patch);
+    patch.clear();
+    Host::with(|h| h.set_window(Vector2::new(400.0, 600.0)));
+    flush(&mut patch);
+    assert_eq!(calls.get(), 2);
+    check(&patch);
+    lead.set(true);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(calls.get(), 2, "translation cannot change local geometry");
+    data.set(2.0);
+    assert!(
+        crate::signal::flush(),
+        "data-only geometry work must wake the host"
+    );
+    assert_eq!(calls.get(), 2, "drawing waits for final layout");
+    flush(&mut patch);
+    assert_eq!(calls.get(), 3);
+    patch.clear();
+    flush(&mut patch);
+    let before = crate::counting::allocations();
+    for _ in 0..100 {
+        assert!(!crate::signal::flush());
+        flush(&mut patch);
+    }
+    assert_eq!(crate::counting::allocations(), before);
+    assert!(patch.is_empty());
+    for _ in 0..2 {
+        data.set(data.peek() + 1.0);
+        crate::signal::flush();
+        flush(&mut patch);
+        patch.clear();
+    }
+    let before = crate::counting::allocations();
+    for _ in 0..100 {
+        data.set(data.peek() + 1.0);
+        crate::signal::flush();
+        flush(&mut patch);
+        patch.clear();
+    }
+    assert_eq!(
+        crate::counting::allocations(),
+        before,
+        "warm data changes reuse both phases' buffers"
+    );
+    let drawn = calls.get();
+    data.set(3.0);
+    drop(held);
+    drop(owner);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(
+        calls.get(),
+        drawn,
+        "queued work cannot outlive its mounted owner"
+    );
+    assert_eq!(crate::signal::live_nodes(), baseline);
+    assert_eq!(Host::with(|h| h.geometry_jobs.iter().count()), 0);
+}
+
+#[test]
+fn geometry_rejects_signal_and_layout_mutation_before_it_happens() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let mut patch = fixture();
+    let (owner, (cell, held)) = crate::signal::Owner::scope(|| {
+        let cell = crate::signal::Cell::new(1);
+        let view = path_with(1, move |out, _, _| {
+            assert!(catch_unwind(AssertUnwindSafe(|| cell.set(2))).is_err());
+            assert!(catch_unwind(AssertUnwindSafe(|| stack(()))).is_err());
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| Host::with(
+                    |h| h.set_window(Vector2::default())
+                )))
+                .is_err()
+            );
+            out.push(windows_scene::PathVerb::Line(Vector2::new(
+                cell.get() as f32,
+                0.0,
+            )));
+        });
+        (cell, mount(view, root()))
+    });
+    flush(&mut patch);
+    assert_eq!(cell.get(), 1);
+    drop(held);
+    drop(owner);
+}
+
+#[test]
+fn local_path_and_pivot_reduce_retained_graph_nodes_from_five_to_two() {
+    let mut patch = fixture();
+    let measure = |legacy| {
+        let before = crate::signal::live_nodes();
+        let (owner, held) = crate::signal::Owner::scope(|| {
+            let shape = if legacy {
+                let bounds = crate::layout::probe();
+                let id = local_geometry(bounds, 1, |out, size, _| {
+                    out.push(windows_scene::PathVerb::Line(size));
+                });
+                crate::widget::path(id)
+                    .probed(bounds)
+                    .pivot(move || bounds.get().size * 0.5)
+            } else {
+                path_with(1, |out, size, _| {
+                    out.push(windows_scene::PathVerb::Line(size))
+                })
+                .pivot_relative(Vector2::new(0.5, 0.5))
+            };
+            mount(shape, root())
+        });
+        let count = crate::signal::live_nodes() - before;
+        drop(held);
+        drop(owner);
+        assert_eq!(crate::signal::live_nodes(), before);
+        count
+    };
+    assert_eq!((measure(true), measure(false)), (5, 2));
+    flush(&mut patch);
 }
 
 /// A probe attached inside a subtree that unmounts is released with it.

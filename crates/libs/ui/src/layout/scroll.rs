@@ -972,8 +972,8 @@ mod tests {
             scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
             root,
         );
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         table.apply_ops(&mut down.scrolls);
@@ -1002,8 +1002,8 @@ mod tests {
         assert!(events.iter().all(|e| !table.app_observes(e)));
         assert!(table.app_observes(&SceneEvent::DeviceRebuilt));
         drop(ordinary);
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         table.apply_ops(&mut down.scrolls);
@@ -1025,8 +1025,8 @@ mod tests {
             ),
             root,
         );
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         table.apply_ops(&mut down.scrolls);
@@ -1067,8 +1067,8 @@ mod tests {
             scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
             Host::with(|h| h.model().root()),
         );
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         assert!(
@@ -1082,16 +1082,17 @@ mod tests {
         table.apply_ops(&mut down.scrolls);
         assert_eq!(table.len(), 1);
 
+        Host::flush(&mut patch);
+
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         table.apply_ops(&mut down.scrolls);
         assert_eq!(table.len(), 1, "a settled container was added twice");
 
         drop(held);
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         table.apply_ops(&mut down.scrolls);
@@ -1109,8 +1110,8 @@ mod tests {
             scroll(El::<Any>::seed_bare().height(Len::Times(Metric::RowH, 200.0))),
             Host::with(|h| h.model().root()),
         );
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         table.apply_ops(&mut down.scrolls);
@@ -1121,8 +1122,8 @@ mod tests {
         );
 
         Host::with(|h| h.set_window(Vector2 { x: 400.0, y: 200.0 }));
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         assert!(

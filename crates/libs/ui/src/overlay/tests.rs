@@ -93,7 +93,7 @@ fn fixture() -> SinkPatch {
 }
 
 fn flush(patch: &mut SinkPatch) {
-    Host::with(|host| host.flush(patch));
+    Host::flush(patch);
 }
 
 fn root() -> GroupId {

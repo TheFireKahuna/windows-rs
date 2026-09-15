@@ -43,14 +43,36 @@ mod shared;
 mod tests;
 
 pub use epoch::Epoch;
-pub(crate) use graph::arm_posts;
 pub use graph::{SignalId, flush, live_nodes, set_waker, untracked};
+pub(crate) use graph::{arm_posts, flush_geometry};
 pub(crate) use shared::{PostGuard, PostWake};
 
 use core::any::Any;
 use core::cell::RefCell;
 use core::marker::PhantomData;
 use std::rc::Rc;
+
+thread_local! {
+    static READ_ONLY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+pub(crate) fn assert_writable() {
+    assert!(
+        !READ_ONLY.get(),
+        "geometry callbacks may only read signals and fill their output"
+    );
+}
+
+pub(crate) fn read_only<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            READ_ONLY.set(self.0);
+        }
+    }
+    let _reset = Reset(READ_ONLY.replace(true));
+    f()
+}
 
 /// A source cell. Reads track; writes invalidate subscribers.
 ///
@@ -120,6 +142,7 @@ impl<T: 'static> Cell<T> {
     /// Panics if the cell has been disposed, or if `f` reads or writes this same cell: the
     /// write borrow taken here is held for the duration of `f`.
     pub fn update(self, f: impl FnOnce(&mut T)) {
+        assert_writable();
         let value = graph::peek_source(self.id).expect("the cell is live");
         f(&mut downcast::<T>(&*value).borrow_mut());
         graph::invalidate(self.id);
@@ -168,6 +191,7 @@ impl<T: PartialEq + 'static> Cell<T> {
     /// The comparison gates everything downstream, so a derivation over a clamped input is
     /// not woken by a write the clamp absorbs.
     pub fn set(self, v: T) {
+        assert_writable();
         let value = graph::peek_source(self.id).expect("the cell is live");
         if write_slot(downcast::<T>(&*value), v) {
             graph::invalidate(self.id);
@@ -186,6 +210,7 @@ impl<T: PartialEq + Send + 'static> Cell<T> {
     /// A staged write allocates one box. A display-rate producer publishes through an
     /// [`Epoch`], which carries no value and allocates nothing.
     pub fn post(self, v: T) {
+        assert_writable();
         if graph::owns(self.id) {
             self.set(v);
             return;
@@ -308,9 +333,20 @@ impl Effect {
     /// Runs `f` now, and again whenever what it read changes.
     pub fn new(f: impl FnMut() + 'static) -> Self {
         Self {
-            id: graph::effect(Rc::new(RefCell::new(f))),
+            id: graph::effect(Rc::new(RefCell::new(f)), graph::Phase::Update),
             marker: PhantomData,
         }
+    }
+
+    pub(crate) fn geometry(f: impl FnMut() + 'static) -> Self {
+        Self {
+            id: graph::effect(Rc::new(RefCell::new(f)), graph::Phase::Geometry),
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn schedule(self) {
+        graph::schedule(self.id);
     }
 
     /// Returns this effect's identity.

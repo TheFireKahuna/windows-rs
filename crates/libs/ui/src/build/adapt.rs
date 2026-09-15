@@ -19,10 +19,6 @@ use crate::layout::Preset;
 use crate::signal::{Effect, Signal};
 use crate::structure::{Branch, Keyed, Step};
 use core::hash::Hash;
-use rustc_hash::FxHashMap;
-use std::cell::RefCell;
-use std::rc::Rc;
-use windows_scene::NodeId;
 
 /// A keyed list.
 ///
@@ -90,46 +86,26 @@ where
             // Detached from whatever scope runs the reconcile: rows belong to the list, and
             // a list driven from an effect would otherwise register every row it ever built
             // as a child of that effect.
-            let list = Rc::new(RefCell::new(Keyed::<K>::new()));
-            let mounts = Rc::new(RefCell::new(FxHashMap::<K, Mount>::default()));
-            let next = Rc::new(RefCell::new(Vec::<T>::new()));
+            let mut list = Keyed::<K, Mount>::new();
+            let mut next = Vec::<T>::new();
             Effect::new(move || {
-                let mut next = next.borrow_mut();
                 next.clear();
                 fill(&mut next);
-                let mut list = list.borrow_mut();
-                // The anchor, not the head of the container: rows share their parent with
-                // the container's static children, so starting from `None` would put the
-                // first row above everything written before the list.
-                let mut previous: Option<NodeId> = site.after;
+                let mut previous = site.after;
                 list.reconcile(
                     &next,
                     &key,
-                    |key| {
-                        mounts.borrow_mut().remove(key);
-                    },
-                    |key, item| {
-                        // Born at the anchor rather than at the head, so a new row exists
-                        // inside this list from the moment it is mounted. The pass below
-                        // places every insert afterwards.
-                        let mount = super::mount::mount_scoped(
+                    |_, item| {
+                        super::mount::mount_scoped(
                             view(item),
                             site.parent,
                             site.after,
                             site.scope,
                             site.hover_scope,
-                        );
-                        mounts.borrow_mut().insert(key.clone(), mount);
+                        )
                     },
-                    |key, _, step, _| {
-                        let mounts = mounts.borrow();
-                        let Some(mount) = mounts.get(key) else {
-                            return;
-                        };
+                    |mount, _, step, _| {
                         let node = mount.node();
-                        // A survivor already in place needs no op at all; the rest is the
-                        // minimal move set the reconciler computed, applied front to back
-                        // so the predecessor is already where it belongs.
                         if step != Step::Keep {
                             super::Host::with(|h| h.model().place(node, site.parent, previous));
                         }
@@ -206,30 +182,17 @@ fn switch_adapter<K: PartialEq + 'static>(
     view: impl Fn(&K) -> View + 'static,
 ) {
     out.push(El::<Any>::at_index(adapter(move |site| {
-        let branch = Rc::new(RefCell::new(Branch::<K>::new()));
-        let mount = Rc::new(RefCell::new(None::<Mount>));
+        let mut branch = Branch::<K, Mount>::new();
         Effect::new(move || {
-            let next = key();
-            branch.borrow_mut().set(
-                next,
-                |_| {
-                    // Dropped here rather than in the build below, so the outgoing arm's
-                    // nodes are gone before the incoming one is minted and the two never
-                    // both exist.
-                    mount.borrow_mut().take();
-                },
-                |key| {
-                    // The anchor is the whole of this arm's position: a branch has one arm
-                    // and no reorder pass to correct it afterwards.
-                    *mount.borrow_mut() = Some(super::mount::mount_scoped(
-                        view(key),
-                        site.parent,
-                        site.after,
-                        site.scope,
-                        site.hover_scope,
-                    ));
-                },
-            );
+            branch.set(key(), |key| {
+                super::mount::mount_scoped(
+                    view(key),
+                    site.parent,
+                    site.after,
+                    site.scope,
+                    site.hover_scope,
+                )
+            });
         });
     })));
 }

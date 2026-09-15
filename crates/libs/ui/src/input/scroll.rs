@@ -49,8 +49,8 @@ mod tests {
             Host::with(|h| h.model().root()),
         );
         let mut down = crate::seam::Down::default();
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         let mut hits = HitTable::default();

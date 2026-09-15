@@ -15,7 +15,7 @@
 //! | [`Keyed`] | a list whose items are inserted, removed and reordered | key delta + a longest increasing subsequence |
 //! | [`Branch`] | a subtree that is present or absent, or one of several | an [`Owner`] that exists or does not |
 //!
-//! Both own [`Owner`](crate::signal::Owner) scopes and nothing else, so disposing structure
+//! Both retain each build result beside its [`Owner`](crate::signal::Owner), so disposing structure
 //! is disposing scopes, exactly as it is for values. Neither knows what a widget is: the
 //! widget layer supplies the callbacks that turn a step into nodes, and it is the only
 //! layer that does.

@@ -282,8 +282,8 @@ impl<'a> Thread<'a> {
             .store(false, Ordering::Release);
         self.pending_flush = false;
         self.census.flushes += 1;
+        Host::flush(&mut down.patch);
         Host::with(|h| {
-            h.flush(&mut down.patch);
             h.fill(&mut down);
             if self.links.uia_listening.load(Ordering::Acquire)
                 && (h.uia_stale() || self.links.uia_requested.swap(false, Ordering::AcqRel))

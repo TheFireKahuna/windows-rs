@@ -929,7 +929,9 @@ mod tests {
                 crate::signal::flush();
                 Host::with(|h| {
                     h.model().set_window(Vector2 { x: width, y: 600.0 });
-                    h.flush(&mut patch);
+                });
+                Host::flush(&mut patch);
+                Host::with(|h| {
                     with(|table| {
                         let (key, entry) = table
                             .entries
@@ -976,9 +978,9 @@ mod tests {
                         }
                     });
                     patch.clear();
-                    h.flush(&mut patch);
-                    assert!(patch.is_empty(), "settled text emits no scene work");
                 });
+                Host::flush(&mut patch);
+                assert!(patch.is_empty(), "settled text emits no scene work");
             }
             drop(held);
         }

@@ -202,6 +202,7 @@ pub struct Host {
     pub(crate) popup_requests: Vec<crate::overlay::Request>,
     pub(crate) env: Env,
     pub(crate) root_scope: Scope,
+    pub(super) geometry_jobs: Slots<windows_scene::Node, super::geometry::Row>,
     pub(crate) appearances: Slots<windows_scene::Node, super::theme::Appearance>,
     pub(crate) theme_update: Option<(Scope, windows_scene::BackdropSpec)>,
     pub(crate) theme_backdrop: Option<windows_scene::BackdropSpec>,
@@ -316,6 +317,7 @@ impl Host {
     /// a run is thread-affine and an `Arc<Mutex<..>>` of one would not compile. Neither may
     /// reach the host, whose borrow the solve is already inside.
     pub fn install(mut model: Model, env: Env, root_scope: Scope) {
+        crate::signal::assert_writable();
         model.on_measure(|input: MeasureIn| super::text::measure(input));
         model.on_restyle(|node, class| super::style::restyle(node, class));
         let (window_owner, window_size) =
@@ -329,6 +331,7 @@ impl Host {
             model,
             env,
             root_scope,
+            geometry_jobs: Slots::new(),
             appearances: Slots::new(),
             theme_update: None,
             theme_backdrop: None,
@@ -389,6 +392,12 @@ impl Host {
     /// Panics if no host is installed, and separately if `f` re-enters the host. The message
     /// names which of the two happened, because the two have opposite fixes.
     pub fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        crate::signal::assert_writable();
+        Self::with_output(f)
+    }
+
+    // Only narrow geometry/paint publishers may enter while a draw callback is read-only.
+    pub(super) fn with_output<R>(f: impl FnOnce(&mut Self) -> R) -> R {
         match Self::access(f) {
             Ok(out) => out,
             Err(why) => panic!("{}", why.message()),
@@ -406,6 +415,7 @@ impl Host {
     /// Re-entry is asserted in debug builds rather than ignored: dropping a mount from inside
     /// a [`Host::with`] body leaks the whole subtree.
     pub fn try_with<R>(f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        crate::signal::assert_writable();
         match Self::access(f) {
             Ok(out) => Some(out),
             Err(why) => {
@@ -1007,6 +1017,7 @@ impl Host {
     pub(crate) fn unmount(&mut self, node: NodeId, exit: Exit, rows: MountId) {
         let mut at = rows;
         while let Some(row) = self.mounts.remove(&mut self.mount_ids, at) {
+            self.geometry_jobs.take(row.node);
             if row.popup {
                 self.request_popup(crate::overlay::Request::Close(at));
             }
@@ -1083,22 +1094,50 @@ impl Host {
     ///    labels', and the labels are placed in step 2. Placement moves an overlay and never
     ///    resizes one, so the third solve computes the sizes the second did and the sequence
     ///    terminates.
-    pub fn flush(&mut self, patch: &mut SinkPatch) {
-        self.census.flushes += 1;
-        let env = self.env;
-        self.size_overlay_viewports();
-        self.model.solve(env);
-        if self.publish_geometry() {
-            self.model.solve(env);
-        }
-        if self.place_overlays() {
-            self.model.solve(env);
-        }
-        self.publish_masks();
-        self.publish_fields();
-        self.publish_overlay_entries();
-        self.publish_probes();
-        self.model.flush(patch, env);
+    /// Finally, release the Host borrow to draw dirty paths from settled local boxes,
+    /// then emit their geometry and the layout together in the scene batch.
+    pub fn flush(patch: &mut SinkPatch) {
+        Self::with(|h| {
+            h.census.flushes += 1;
+            let env = h.env;
+            h.size_overlay_viewports();
+            h.model.solve(env);
+            if h.publish_geometry() {
+                h.model.solve(env);
+            }
+            if h.place_overlays() {
+                h.model.solve(env);
+            }
+            h.publish_masks();
+            h.publish_fields();
+            h.publish_overlay_entries();
+            h.publish_probes();
+            for (node, job) in h.geometry_jobs.iter_mut() {
+                let solved = h.model.solved(node);
+                let local = (
+                    solved.size,
+                    job.scope.in_theme(h.root_scope).at_width(solved.class),
+                );
+                if job.local != Some(local) {
+                    job.local = Some(local);
+                    if let Some(effect) = job.effect {
+                        effect.schedule();
+                    }
+                    if let Some(pivot) = job.pivot {
+                        h.model.bind(
+                            node,
+                            Prop::Center,
+                            windows_scene::Bind::Set(windows_scene::Value::Vec2(Vector2::new(
+                                local.0.x * pivot.x,
+                                local.0.y * pivot.y,
+                            ))),
+                        );
+                    }
+                }
+            }
+        });
+        crate::signal::flush_geometry();
+        Self::with(|h| h.model.flush(patch, h.env));
     }
 
     /// Publishes everything whose value is a function of the solve, and returns whether any
@@ -1546,16 +1585,16 @@ mod tests {
             )),
             root,
         );
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         assert!(!down.chrome.is_empty() && !down.field_sources.is_empty());
         let old: Vec<_> = down.chrome.iter().map(|row| row.id).collect();
         drop(held);
         let _replacement = mount(crate::widget::button("replacement"), root);
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         assert!(old.iter().all(|id| down.released.contains(id)));
@@ -1580,7 +1619,7 @@ mod tests {
             crate::widget::button("press me"),
             Host::with(|h| h.model().root()),
         );
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
 
         let mut down = Down::default();
         Host::with(|h| h.fill(&mut down));
@@ -1599,7 +1638,7 @@ mod tests {
         );
 
         drop(held);
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         let mut third = Down::default();
         Host::with(|h| h.fill(&mut third));
         assert_eq!(
@@ -1623,7 +1662,7 @@ mod tests {
             crate::widget::button("one"),
             Host::with(|h| h.model().root()),
         );
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         let mut down = Down::default();
         Host::with(|h| h.fill(&mut down));
         let first = down.gestures.len();
@@ -1632,7 +1671,7 @@ mod tests {
             crate::widget::button("two"),
             Host::with(|h| h.model().root()),
         );
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         Host::with(|h| h.fill(&mut down));
         assert_eq!(
             down.gestures.len(),
@@ -1651,7 +1690,7 @@ mod tests {
             ),
             Host::with(|h| h.model().root()),
         );
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
 
         let mut down = Down::default();
         Host::with(|h| h.fill(&mut down));
@@ -1662,7 +1701,7 @@ mod tests {
         );
 
         down.clear();
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         Host::with(|h| h.fill(&mut down));
         assert_eq!(down.caption, None, "an unchanged registry was resent");
     }

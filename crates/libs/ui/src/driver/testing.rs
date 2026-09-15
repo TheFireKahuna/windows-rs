@@ -35,7 +35,7 @@ impl LayoutDriver {
     /// A probe written by the solve can schedule work for the next pass.
     pub fn flush(&mut self, patch: &mut SinkPatch) {
         super::app::reconcile(&mut self.overlays, &mut self.focus);
-        Host::with(|host| host.flush(patch));
+        Host::flush(patch);
         // A native driver sends these to the input thread. Layout tests neither
         // apply them on the app thread nor claim to verify focus behavior.
         self.focus.clear();

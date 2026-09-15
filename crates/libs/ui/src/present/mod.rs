@@ -572,29 +572,29 @@ pub(crate) mod tests {
             Host::with(|h| h.model().root()),
         );
 
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         assert!(
             filled().regions.is_empty(),
             "a region with no box asked for buffers"
         );
 
         Host::with(|h| h.set_window(Vector2 { x: 800.0, y: 600.0 }));
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         let mounted = filled();
         assert_eq!(kinds(&mounted.regions), ["mount"]);
 
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         assert!(
             filled().regions.is_empty(),
             "a solve that moved nothing re-sent an extent"
         );
 
         Host::with(|h| h.set_window(Vector2 { x: 400.0, y: 300.0 }));
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         assert_eq!(kinds(&filled().regions), ["resize"]);
 
         drop(held);
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         assert_eq!(kinds(&filled().regions), ["drop"]);
     }
 
@@ -611,14 +611,14 @@ pub(crate) mod tests {
             .grow(),
             Host::with(|h| h.model().root()),
         );
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
 
         let mut picks = Picks::default();
         picks.apply(&filled().regions);
         assert_eq!(picks.len(), 1, "the mounted region cannot be picked inside");
 
         drop(held);
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         picks.apply(&filled().regions);
         assert_eq!(picks.len(), 0, "the dropped region is still pickable");
     }

@@ -18,32 +18,28 @@ use crate::signal::Owner;
 /// rows are: a branch driven from an effect would otherwise register every arm it ever
 /// built as a child of that effect's scope, and that list would grow for the life of the
 /// screen.
-pub struct Branch<K: PartialEq> {
-    key: Option<K>,
-    /// Dropping this scope disposes everything the showing arm created.
-    arm: Option<Owner>,
+pub struct Branch<K: PartialEq, V = ()> {
+    // Tuple order drops the result before the scope it was built in.
+    arm: Option<(K, V, Owner)>,
 }
 
-impl<K: PartialEq> Default for Branch<K> {
+impl<K: PartialEq, V> Default for Branch<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: PartialEq> Branch<K> {
+impl<K: PartialEq, V> Branch<K, V> {
     /// Creates a branch showing nothing.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            key: None,
-            arm: None,
-        }
+        Self { arm: None }
     }
 
-    /// Returns the key of the arm showing, or `None` where nothing is.
+    /// Returns the key of the showing arm.
     #[must_use]
     pub fn key(&self) -> Option<&K> {
-        self.key.as_ref()
+        self.arm.as_ref().map(|(key, _, _)| key)
     }
 
     /// Returns whether an arm is showing.
@@ -52,33 +48,22 @@ impl<K: PartialEq> Branch<K> {
         self.arm.is_some()
     }
 
-    /// Shows `key`'s arm, tearing down whatever was showing.
-    ///
-    /// Nothing happens where `key` is already the one showing, so this may be called from
-    /// an effect on every flush rather than only on a change. `teardown` is called with the
-    /// outgoing key while its nodes still exist; `build` is called inside the new arm's own
-    /// scope.
-    pub fn set(&mut self, key: Option<K>, teardown: impl FnOnce(&K), build: impl FnOnce(&K)) {
-        if self.key == key {
+    /// Retains the result of building inside a detached scope. A repeated key keeps
+    /// both the result and its scope. A replacement drops the result, then its scope,
+    /// before constructing the incoming arm.
+    pub fn set(&mut self, key: Option<K>, build: impl FnOnce(&K) -> V) {
+        if self.key() == key.as_ref() {
             return;
         }
-        if let Some(previous) = self.key.take() {
-            teardown(&previous);
-            // Dropped after the caller has removed its nodes, so an exit animation still
-            // has the sinks it animates.
-            self.arm = None;
-        }
+        self.close();
         if let Some(key) = key {
-            let (owner, ()) = Owner::detached(|| Owner::scope(|| build(&key)));
-            self.arm = Some(owner);
-            self.key = Some(key);
+            let (owner, value) = Owner::detached(|| Owner::scope(|| build(&key)));
+            self.arm = Some((key, value, owner));
         }
     }
 
-    /// Tears the current arm down and shows nothing.
-    pub fn close(&mut self, teardown: impl FnOnce(&K)) {
-        self.set(None, teardown, |_| {
-            unreachable!("no arm is built when closing")
-        });
+    /// Drops the retained result and its scope, showing nothing.
+    pub fn close(&mut self) {
+        self.arm = None;
     }
 }

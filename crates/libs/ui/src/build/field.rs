@@ -430,7 +430,7 @@ mod tests {
         let mut patch = fixture();
         let root = Host::with(|h| h.model().root());
         let mounted = mount(crate::widget::field("á😀ffi العربية"), root);
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         let source = Host::with(|h| h.field_sources[0].clone());
         let mut editor = Editor::new(source.id, source.scope, &source.text);
         editor.publish(true, false);
@@ -438,8 +438,8 @@ mod tests {
             for update in editor.updates.drain(..) {
                 h.field_update(&update);
             }
-            h.flush(&mut patch);
         });
+        Host::flush(&mut patch);
         let first = Host::with(|h| h.fields.get(source.id).unwrap().geometry.clone().unwrap());
         assert!(!first.clusters.is_empty());
         assert!(
@@ -452,8 +452,8 @@ mod tests {
             for update in editor.updates.drain(..) {
                 h.field_update(&update);
             }
-            h.flush(&mut patch);
         });
+        Host::flush(&mut patch);
         let second = Host::with(|h| h.fields.get(source.id).unwrap().geometry.clone().unwrap());
         assert!(Arc::ptr_eq(&first.clusters, &second.clusters));
         assert_eq!(editor.selection().affinity, Affinity::Upstream);
@@ -469,7 +469,7 @@ mod tests {
             crate::widget::field("1234.56789123456789").width(crate::layout::Len::Pct(0.1)),
             root,
         );
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         let source = Host::with(|h| h.field_sources[0].clone());
         let mut editor = Editor::new(source.id, source.scope, &source.text);
         editor.publish(true, false);
@@ -478,8 +478,8 @@ mod tests {
             for update in editor.updates.drain(..) {
                 h.field_update(&update);
             }
-            h.flush(&mut patch);
         });
+        Host::flush(&mut patch);
         editor.layout(Host::with(|h| {
             h.fields.get(source.id).unwrap().geometry.clone().unwrap()
         }));
@@ -488,7 +488,9 @@ mod tests {
             for update in editor.updates.drain(..) {
                 h.field_update(&update);
             }
-            h.flush(&mut patch);
+        });
+        Host::flush(&mut patch);
+        Host::with(|h| {
             assert!(h.fields.get(source.id).unwrap().scroll > 0.0);
         });
         editor.source(
@@ -508,7 +510,9 @@ mod tests {
                 );
                 h.field_update(&update);
             }
-            h.flush(&mut patch);
+        });
+        Host::flush(&mut patch);
+        Host::with(|h| {
             let row = h.fields.get(source.id).unwrap();
             assert_eq!(String::from_utf16_lossy(&row.text), "1235");
             assert_eq!(row.scroll, 0.0, "short text starts at the field inset");
@@ -527,7 +531,7 @@ mod tests {
                 .name("Password"),
             root,
         );
-        Host::with(|h| h.flush(&mut patch));
+        Host::flush(&mut patch);
         let source = Host::with(|h| h.field_sources[0].clone());
         let mut editor = Editor::new(source.id, source.scope, &source.text);
         editor.publish(true, false);
@@ -536,7 +540,9 @@ mod tests {
             for update in editor.updates.drain(..) {
                 h.field_update(&update);
             }
-            h.flush(&mut patch);
+        });
+        Host::flush(&mut patch);
+        Host::with(|h| {
             h.uia_seeds(&mut seeds);
         });
         let field = &seeds.fields[0];

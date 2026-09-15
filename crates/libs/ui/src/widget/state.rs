@@ -865,8 +865,8 @@ mod tests {
             Host::with(|h| h.model().root()),
         );
         let mut down = crate::seam::Down::default();
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         let row = down
@@ -884,8 +884,8 @@ mod tests {
         controls.dragged = Some((row.id, true));
         down.clear();
         drop(held);
+        Host::flush(&mut patch);
         Host::with(|h| {
-            h.flush(&mut patch);
             h.fill(&mut down);
         });
         assert!(down.released.contains(&row.id));
@@ -930,8 +930,8 @@ mod tests {
         let mut down = crate::seam::Down::default();
         let root = Host::with(|h| h.model().root());
         let held = mount(crate::widget::button("Gain"), root);
+        Host::flush(&mut down.patch);
         Host::with(|h| {
-            h.flush(&mut down.patch);
             h.fill(&mut down);
         });
         let id = down
@@ -961,8 +961,8 @@ mod tests {
         down.clear();
         drop(held);
         let _replacement = mount(crate::widget::button("replacement"), root);
+        Host::flush(&mut down.patch);
         Host::with(|h| {
-            h.flush(&mut down.patch);
             h.fill(&mut down);
         });
         front.scene.apply(&mut down.patch, &back, env)?;

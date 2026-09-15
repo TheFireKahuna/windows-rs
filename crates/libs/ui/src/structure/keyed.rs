@@ -101,17 +101,19 @@ pub enum Step {
 /// register every row it ever created as a child of the effect's own scope, and that list
 /// would grow for the life of the screen. A row belongs to this list, and this list to its
 /// parent scope.
-pub struct Keyed<K: Eq + Hash + Clone> {
+pub struct Keyed<K: Eq + Hash + Clone, V = ()> {
     /// The current order.
     keys: Vec<K>,
-    rows: FxHashMap<K, Row>,
+    rows: FxHashMap<K, Row<V>>,
     /// Bumped per reconcile and stamped on every key present in the new set, so a survivor
     /// is told from a departure in one pass per side with no set to allocate.
     epoch: u32,
     scratch: Scratch,
 }
 
-struct Row {
+struct Row<V> {
+    // Drop the mounted result while its signal scope is still alive.
+    value: V,
     /// Disposes everything this row's view created; dropping the row is the unmount.
     _owner: Owner,
     /// This row's index in `keys`.
@@ -130,13 +132,13 @@ struct Scratch {
     lis: Lis,
 }
 
-impl<K: Eq + Hash + Clone> Default for Keyed<K> {
+impl<K: Eq + Hash + Clone, V> Default for Keyed<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Eq + Hash + Clone> Keyed<K> {
+impl<K: Eq + Hash + Clone, V> Keyed<K, V> {
     /// Creates an empty list.
     #[must_use]
     pub fn new() -> Self {
@@ -166,11 +168,9 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
         self.keys.is_empty()
     }
 
-    /// Drops every row's scope, last first, calling `remove` with each key before that
-    /// row's scope goes. Unmounting a list is this call.
-    pub fn clear(&mut self, mut remove: impl FnMut(&K)) {
+    /// Drops each retained result before its scope, in reverse row order.
+    pub fn clear(&mut self) {
         while let Some(key) = self.keys.pop() {
-            remove(&key);
             self.rows.remove(&key);
         }
     }
@@ -181,10 +181,9 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
     ///   a key that is not `Copy` costs nothing to read four times and the identity may live
     ///   inside the item rather than beside it. Where the item is its own key, this is
     ///   `|item| item`.
-    /// - `remove` is called for every departing key, before anything is built.
     /// - `build` is called for every arriving key, **inside that key's own scope**, so
-    ///   everything it creates is disposed when the key later leaves.
-    /// - `place` is called once per key in `next`, front to back, with that key's [`Step`]
+    ///   its returned value and everything it creates are disposed when the key leaves.
+    /// - `place` receives the retained value once per item, front to back, with its [`Step`]
     ///   and the index in `next` of the key it follows — `None` at the head. Front to back
     ///   is what makes the predecessor already correct when a step is applied.
     ///
@@ -197,9 +196,8 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
         &mut self,
         next: &[T],
         key: impl Fn(&T) -> &K,
-        mut remove: impl FnMut(&K),
-        mut build: impl FnMut(&K, &T),
-        mut place: impl FnMut(&K, &T, Step, Option<usize>),
+        mut build: impl FnMut(&K, &T) -> V,
+        mut place: impl FnMut(&mut V, &T, Step, Option<usize>),
     ) {
         let Self {
             keys,
@@ -220,7 +218,6 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
         }
         for key in keys.drain(..) {
             if rows.get(&key).is_some_and(|row| row.epoch != epoch) {
-                remove(&key);
                 // Dropping the row drops its `Owner`, which disposes everything the row's
                 // view created, in reverse creation order.
                 rows.remove(&key);
@@ -238,10 +235,11 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
             } else {
                 // Detached: this row belongs to the list, not to whatever scope is running
                 // the reconcile.
-                let (owner, ()) = Owner::detached(|| Owner::scope(|| build(key, item)));
+                let (owner, value) = Owner::detached(|| Owner::scope(|| build(key, item)));
                 rows.insert(
                     key.clone(),
                     Row {
+                        value,
                         _owner: owner,
                         at: position,
                         epoch,
@@ -283,10 +281,16 @@ impl<K: Eq + Hash + Clone> Keyed<K> {
             };
             if let Some(row) = rows.get_mut(key) {
                 row.at = position;
+                place(&mut row.value, item, step, after);
             }
-            place(key, item, step, after);
         }
 
         keys.extend(next.iter().map(|item| key(item).clone()));
+    }
+}
+
+impl<K: Eq + Hash + Clone, V> Drop for Keyed<K, V> {
+    fn drop(&mut self) {
+        self.clear();
     }
 }

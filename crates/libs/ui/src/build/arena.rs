@@ -87,6 +87,7 @@ impl Link {
 /// a side buffer this points into.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Slot {
+    pub geometry_job: Option<u32>,
     pub field_scope: Option<crate::text_input::InputScope>,
     pub preset: Preset,
     pub over: Link,
@@ -164,6 +165,7 @@ pub(crate) struct Slot {
 impl Default for Slot {
     fn default() -> Self {
         Self {
+            geometry_job: None,
             field_scope: None,
             preset: Preset::Bare,
             over: Link::EMPTY,
@@ -331,6 +333,7 @@ pub(crate) struct ChanSeed {
 /// than once per widget.
 pub(crate) enum ChanSource {
     Const(Value),
+    RelativePivot(windows_numerics::Vector2),
     Dynamic(Box<dyn Fn() -> Value>),
 }
 
@@ -441,6 +444,7 @@ pub(crate) struct Build {
     /// Gesture declarations, out of line. See [`Slot::gesture`].
     pub gestures: Vec<GestureDecl>,
     /// Event-rate halo roles. Static halos keep their role inline in the slot.
+    pub geometry_jobs: Vec<Option<super::geometry::Draw>>,
     pub halo_roles: Vec<Option<Box<dyn Fn() -> Role>>>,
 }
 
@@ -463,6 +467,7 @@ impl Build {
     /// **`f` must not call application code.** The arena is borrowed for the length of the
     /// call, so anything that builds from inside `f` panics on the borrow.
     pub(crate) fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        crate::signal::assert_writable();
         CURRENT.with(|b| f(&mut b.borrow_mut()))
     }
 
@@ -483,6 +488,7 @@ impl Build {
         self.regions.clear();
         self.gestures.clear();
         self.halo_roles.clear();
+        self.geometry_jobs.clear();
     }
 
     /// Edits this node's gesture declaration, minting a default one where there is none.
@@ -645,6 +651,7 @@ impl Build {
     /// into the fresh one rather than corrupting this one. Both come from the same pool, so
     /// nesting costs no allocation in the steady state.
     pub(crate) fn take() -> Self {
+        crate::signal::assert_writable();
         CURRENT.with(|slot| core::mem::replace(&mut *slot.borrow_mut(), Self::spare()))
     }
 
