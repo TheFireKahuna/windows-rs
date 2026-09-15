@@ -225,8 +225,12 @@ impl<'a> Thread<'a> {
         // `Enter` reaches the handler a click reaches, through the one dispatch point.
         self.intents.clear();
         self.intents.extend_from_slice(&up.intents);
-        self.overlays
-            .keys(&up.reports, &mut self.focus, &mut self.intents);
+        key_intents(
+            &mut self.overlays,
+            &up.reports,
+            &mut self.focus,
+            &mut self.intents,
+        );
         Host::dispatch(&self.intents);
         // Overlay scopes turn Escape into their own report before it reaches this fallback,
         // so one press closes the overlay or the screen's inspector.
@@ -347,9 +351,140 @@ pub(super) fn deliver_field_commits(commits: &[crate::text_input::Commit]) {
     }
 }
 
+fn key_intents(
+    overlays: &mut Overlays,
+    reports: &[Report],
+    focus: &mut Vec<FocusOp>,
+    intents: &mut Vec<Intent>,
+) {
+    use crate::widget::{ModelState, UiaRole, What};
+    for report in reports {
+        let activation = matches!(report, Report::Key { event, .. }
+            if event.kind == KeyKind::Down && matches!(event.key, 0x0d | 0x20));
+        if activation
+            && matches!(report, Report::Key { event, .. }
+            if event.repeat || event.mods.ctrl || event.mods.alt)
+        {
+            continue;
+        }
+        let before = intents.len();
+        overlays.keys(core::slice::from_ref(report), focus, intents);
+        if activation
+            && intents.len() == before
+            && let Report::Key {
+                target: Some(target),
+                ..
+            } = *report
+            && Host::with(|h| {
+                h.control(target).is_some_and(|row| {
+                    row.state != ModelState::Disabled
+                        && matches!(
+                            row.uia,
+                            UiaRole::Button
+                                | UiaRole::CheckBox
+                                | UiaRole::RadioButton
+                                | UiaRole::ComboBox
+                        )
+                })
+            })
+        {
+            intents.push(Intent {
+                target,
+                what: What::Tapped,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_keys_activate_once_without_claiming_field_or_scalar_input() {
+        use crate::input::{KeyEvent, Mods};
+        use crate::widget::{What, button, field, knob};
+        let _patch = crate::build::tests::fixture();
+        let (_owner, mounted) = crate::signal::Owner::scope(|| {
+            crate::build::Ui::mount_root(|ui| {
+                button(ui, "Action").key("button");
+                button(ui, "Disabled").disabled(true).key("disabled");
+                field(ui, "Draft").key("field");
+                knob(ui, signal::Cell::new(0.5), crate::widget::Range::UNIT).key("scalar");
+            })
+        });
+        Host::flush(&mut windows_scene::SinkPatch::new());
+        let named = |name| {
+            Host::with(|h| {
+                h.controls
+                    .iter()
+                    .find(|(_, row)| row.key == Some(name))
+                    .unwrap()
+                    .0
+            })
+        };
+        let target = named("button");
+        let key = |target, key, kind, repeat, mods| Report::Key {
+            target: Some(target),
+            event: KeyEvent {
+                key,
+                kind,
+                repeat,
+                mods,
+            },
+        };
+        let mut overlays = Overlays::new();
+        let mut focus = Vec::new();
+        let mut intents = Vec::new();
+        for value in [0x0d, 0x20] {
+            key_intents(
+                &mut overlays,
+                &[
+                    key(target, value, KeyKind::Down, false, Mods::default()),
+                    key(target, value, KeyKind::Down, true, Mods::default()),
+                    key(target, value, KeyKind::Up, false, Mods::default()),
+                    key(target, value, KeyKind::Char, false, Mods::default()),
+                    key(
+                        target,
+                        value,
+                        KeyKind::Down,
+                        false,
+                        Mods {
+                            ctrl: true,
+                            ..Mods::default()
+                        },
+                    ),
+                ],
+                &mut focus,
+                &mut intents,
+            );
+        }
+        assert_eq!(
+            intents,
+            [Intent {
+                target,
+                what: What::Tapped
+            }; 2]
+        );
+        intents.clear();
+        for target in [named("disabled"), named("field"), named("scalar")] {
+            key_intents(
+                &mut overlays,
+                &[key(target, 0x0d, KeyKind::Down, false, Mods::default())],
+                &mut focus,
+                &mut intents,
+            );
+        }
+        assert!(intents.is_empty());
+        drop(mounted);
+        key_intents(
+            &mut overlays,
+            &[key(target, 0x20, KeyKind::Down, false, Mods::default())],
+            &mut focus,
+            &mut intents,
+        );
+        assert!(intents.is_empty());
+    }
 
     #[test]
     fn a_returned_spare_flushes_pending_geometry_without_another_edit() {

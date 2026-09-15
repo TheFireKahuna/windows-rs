@@ -7,7 +7,7 @@ use crate::{
 };
 use windows_scene::{Model, Point};
 
-fn publish(
+pub(super) fn publish(
     down: &mut crate::seam::Down,
     controls: &mut Controls,
     front: &mut Front<'_>,
@@ -22,7 +22,7 @@ fn publish(
     controls.adopt(&down.chrome, &down.released, front)
 }
 
-fn press(target: ControlId) -> Report {
+pub(super) fn press(target: ControlId) -> Report {
     Report::Pressed {
         target,
         contact: 1,

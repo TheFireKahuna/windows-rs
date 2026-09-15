@@ -689,6 +689,15 @@ impl<K> Element<'_, K> {
         map: impl Fn(T) -> Value + 'static,
     ) -> Self {
         let node = self.node.target.id();
+        assert!(
+            prop != Prop::Opacity
+                || self
+                    .node
+                    .hover_scope
+                    .and_then(|id| self.host.controls.get(id))
+                    .is_none_or(|row| row.front.reveal != node),
+            "an interaction reveal owns its opacity"
+        );
         if let Some(owner) = self.node.owner.and_then(|id| self.host.controls.get(id)) {
             assert!(
                 !owner
@@ -883,7 +892,7 @@ impl<K> Element<'_, K> {
         let scope = self.host.styles.get(group.node()).unwrap().scope;
         let control = self.host.mounts.get(group.node()).unwrap().control;
         let hover_scope = control
-            .filter(|id| self.host.controls.get(*id).unwrap().hovered.is_some())
+            .filter(|id| self.host.controls.get(*id).unwrap().front.hover_scope == Some(*id))
             .or(self.node.hover_scope);
         let after = self.host.model.last_child(group.node());
         create(&mut Ui {

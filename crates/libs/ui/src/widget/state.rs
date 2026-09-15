@@ -41,8 +41,12 @@ impl Front<'_> {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ChromeRow {
     pub id: ControlId,
-    /// Nearest declared semantic hover scope, inherited through mounted children.
+    /// Nearest interaction scope, inherited through mounted children.
     pub hover_scope: Option<ControlId>,
+    /// The scope's retained reveal target, or `NONE` when none is declared.
+    pub reveal: NodeId,
+    /// Whether scope edges also emit application hover intents.
+    pub observes_hover: bool,
     /// The sprite whose opacity hover and press ride. `None` for a control with no wash.
     pub wash: Option<SpriteId>,
     /// Resolved wash opacities.
@@ -176,6 +180,8 @@ pub struct Controls {
     rows: Slots<Control, ChromeRow>,
     hovered: Option<ControlId>,
     observed_hover: Option<ControlId>,
+    focused: Option<ControlId>,
+    revealed: [(ControlId, NodeId); 3],
     pressed: Option<ControlId>,
     /// The window's focus ring: one visual, sprung between controls. Focus is singular, so
     /// the ring is per window rather than per control, and moving it between two controls is
@@ -307,7 +313,7 @@ impl Controls {
                 )?;
             }
         }
-        Ok(())
+        self.refresh_reveals(front)
     }
 
     /// Forgets a control. Anything still pointing at it becomes a miss.
@@ -325,6 +331,9 @@ impl Controls {
         if self.observed_hover == Some(id) {
             self.observed_hover = None;
         }
+        if self.focused == Some(id) {
+            self.focused = None;
+        }
         if self.grabbed.is_some_and(|(target, _)| target == id) {
             self.grabbed = None;
         }
@@ -336,7 +345,7 @@ impl Controls {
     fn observe_hover(&mut self, target: Option<ControlId>, out: &mut Vec<Intent>) {
         let next = target
             .and_then(|id| self.rows.get(id)?.hover_scope)
-            .filter(|id| self.rows.get(*id).is_some());
+            .filter(|id| self.rows.get(*id).is_some_and(|row| row.observes_hover));
         if self.observed_hover == next {
             return;
         }
@@ -349,6 +358,37 @@ impl Controls {
             }
         }
         self.observed_hover = next;
+    }
+
+    fn refresh_reveals(&mut self, front: &mut Front<'_>) -> Result<()> {
+        let mut next = [(ControlId::NONE, NodeId::NONE); 3];
+        for (index, target) in [self.hovered, self.pressed, self.focused]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(scope) = target.and_then(|id| self.rows.get(id)?.hover_scope)
+                && let Some(row) = self.rows.get(scope)
+                && !row.reveal.is_none()
+                && !next.iter().any(|&(id, _)| id == scope)
+            {
+                next[index] = (scope, row.reveal);
+            }
+        }
+        for &(scope, node) in &self.revealed {
+            if !node.is_none()
+                && !next.contains(&(scope, node))
+                && self.rows.get(scope).is_some_and(|row| row.reveal == node)
+            {
+                front.retarget(node, Prop::Opacity, chrome(0.0))?;
+            }
+        }
+        for &(scope, node) in &next {
+            if !node.is_none() && !self.revealed.contains(&(scope, node)) {
+                front.retarget(node, Prop::Opacity, chrome(1.0))?;
+            }
+        }
+        self.revealed = next;
+        Ok(())
     }
 
     /// Records the window's focus ring visual, minted once by the window's owner.
@@ -425,7 +465,7 @@ impl Controls {
         for report in reports {
             self.one(report, front, out)?;
         }
-        Ok(())
+        self.refresh_reveals(front)
     }
 
     /// Sets hover and press for a control the router never sees the pointer over.
@@ -457,7 +497,7 @@ impl Controls {
         {
             self.wash(id, front)?;
         }
-        Ok(())
+        self.refresh_reveals(front)
     }
 
     fn scalar_event(&self, target: ControlId, value: f64, commit: bool, out: &mut Vec<Intent>) {
@@ -491,6 +531,7 @@ impl Controls {
                 }
             }
             Report::Pressed { target, sample, .. } => {
+                self.focused = None;
                 if self.rows.get(target).is_none() {
                     return Ok(());
                 }
@@ -614,7 +655,10 @@ impl Controls {
                     self.scalar_event(target, value, false, out);
                 }
             }
-            Report::FocusChanged { to, .. } => self.move_ring(to, front)?,
+            Report::FocusChanged { to, .. } => {
+                self.focused = to.filter(|id| self.rows.get(*id).is_some());
+                self.move_ring(to, front)?;
+            }
             // A dial reports detents, which are a delta: a step count applied as an
             // absolute position would send one click to an end stop.
             Report::Rotary {
@@ -1047,6 +1091,8 @@ mod tests {
                 ChromeRow {
                     id,
                     hover_scope,
+                    observes_hover: id == scope || id == other,
+                    reveal: NodeId::NONE,
                     wash: None,
                     hover: 0.0,
                     press: 0.0,
@@ -1145,6 +1191,8 @@ mod tests {
         let (id, _) = two();
         let source = ChromeRow {
             hover_scope: None,
+            observes_hover: false,
+            reveal: NodeId::NONE,
             id,
             wash: None,
             hover: 0.0,
@@ -1214,3 +1262,7 @@ mod tests {
 #[cfg(test)]
 #[path = "scalar_tests.rs"]
 mod scalar_tests;
+
+#[cfg(test)]
+#[path = "reveal_tests.rs"]
+mod reveal_tests;

@@ -969,6 +969,16 @@ impl Host {
         let mut parent = self.model.parent(node);
         while let Some(at) = parent {
             if let Some(owner) = self.mounts.get(at).and_then(|row| row.control) {
+                if let Some(scope) = self
+                    .controls
+                    .get(owner)
+                    .and_then(|row| row.front.hover_scope)
+                    && let Some(row) = self.controls.get_mut(scope)
+                    && row.front.reveal == node
+                {
+                    row.front.reveal = NodeId::NONE;
+                    row.dirty = true;
+                }
                 let replacement = text
                     .filter(|key| self.controls.get(owner).unwrap().text == Some(*key))
                     .map(|_| self.first_owned_text(at));

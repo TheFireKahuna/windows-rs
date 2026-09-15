@@ -639,7 +639,7 @@ impl<K> Element<'_, K> {
         );
         let row = self.host.controls.get_mut(id).unwrap();
         row.uia = role;
-        row.front.hover_scope = if row.hovered.is_some() {
+        row.front.hover_scope = if row.front.hover_scope == Some(id) {
             Some(id)
         } else {
             self.node.hover_scope
@@ -674,8 +674,53 @@ impl<K> Element<'_, K> {
         let id = self.control_id(HitFlags::INTERACTIVE);
         let row = self.host.controls.get_mut(id).unwrap();
         row.hovered = Some(hovered);
+        row.front.observes_hover = true;
         row.front.hover_scope = Some(id);
         row.dirty = true;
+        self
+    }
+    /// Groups hover, press and keyboard focus for one retained reveal target.
+    /// Declare the scope before mounting its children.
+    pub fn interaction_scope(mut self) -> Self {
+        let id = self.control_id(HitFlags::GESTURE);
+        let row = self.host.controls.get_mut(id).unwrap();
+        row.front.hover_scope = Some(id);
+        row.dirty = true;
+        self
+    }
+
+    /// Reveals this element while its enclosing interaction scope is active.
+    /// Each scope accepts one target, which must be mounted below the scope.
+    /// The front thread owns its opacity; layout and hit testing remain active.
+    pub fn reveal_on_interaction(self) -> Self {
+        let scope = self
+            .node
+            .hover_scope
+            .expect("a reveal requires an interaction scope");
+        let node = self.node.target.id();
+        let row = self.host.controls.get_mut(scope).unwrap();
+        assert!(
+            row.front.reveal.is_none() || row.front.reveal == node,
+            "one reveal target per scope"
+        );
+        if row.front.reveal == node {
+            return self;
+        }
+        assert!(
+            self.host.mounts.get(node).unwrap().channels
+                & (1 << windows_scene::Prop::Opacity as u8)
+                == 0,
+            "an interaction reveal requires unclaimed opacity"
+        );
+        let row = self.host.controls.get_mut(scope).unwrap();
+        row.front.reveal = node;
+        row.dirty = true;
+        self.host.set_channel(
+            node,
+            node,
+            windows_scene::Prop::Opacity,
+            windows_scene::Value::Scalar(0.0),
+        );
         self
     }
     pub fn on_unhandled_escape(self, callback: impl Fn() + 'static) -> Self {
