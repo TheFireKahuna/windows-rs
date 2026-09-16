@@ -278,11 +278,29 @@ pub fn root() -> taffy::Style {
 }
 
 /// A clipped popup viewport, sized from window input before any child is measured.
-pub(crate) fn viewport_style(size: windows_numerics::Vector2) -> taffy::Style {
+pub(crate) fn viewport_style(
+    size: windows_numerics::Vector2,
+    anchor: crate::overlay::Anchor,
+) -> taffy::Style {
+    use crate::overlay::{Align as AnchorAlign, Side};
+    let along = match anchor.align {
+        AnchorAlign::Start => Align::Start,
+        AnchorAlign::Center => Align::Center,
+        AnchorAlign::End => Align::End,
+    };
+    // The viewport fills the inset window; its content still follows the popup's anchor.
+    let (x, y) = match anchor.side {
+        Side::Center => (Align::Center, Align::Center),
+        Side::Left => (Align::Start, along),
+        Side::Right => (Align::End, along),
+        Side::Top => (along, Align::Start),
+        Side::Bottom => (along, Align::End),
+    };
     taffy::Style {
         display: taffy::Display::Flex,
         flex_direction: taffy::FlexDirection::Column,
-        align_items: Some(Align::End.items()),
+        align_items: Some(x.items()),
+        justify_content: Some(y.content()),
         size: taffy::Size {
             width: taffy::Dimension::length(size.x),
             height: taffy::Dimension::length(size.y),

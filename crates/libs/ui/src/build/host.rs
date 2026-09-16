@@ -1351,10 +1351,13 @@ impl Host {
             placement.bounds = Some(bounds);
             self.model.style(
                 placement.root.node(),
-                &crate::layout::viewport_style(Vector2 {
-                    x: bounds.x1 - bounds.x0,
-                    y: bounds.y1 - bounds.y0,
-                }),
+                &crate::layout::viewport_style(
+                    Vector2 {
+                        x: bounds.x1 - bounds.x0,
+                        y: bounds.y1 - bounds.y0,
+                    },
+                    placement.anchor,
+                ),
             );
         }
     }
