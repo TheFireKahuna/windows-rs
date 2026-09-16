@@ -1055,6 +1055,9 @@ impl Host {
             // A tracker is sourced from its viewport's visual, so it is dropped with the row
             // that named it.
             if let Some(scroll) = self.scrolls.take(at) {
+                // A mount can disappear before its first solve. Retire its deferred
+                // creation too, before the viewport and tracker slots are reused.
+                self.trackers.retain(|spec| spec.id.id() != scroll.tracker.id());
                 self.pending_scrolls.push(ScrollOp::Drop(at));
                 self.model.drop_tracker(scroll.tracker);
                 // The thumb's control belongs to this scroll record, so releasing it here

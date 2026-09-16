@@ -942,6 +942,21 @@ mod tests {
     use crate::layout::Len;
 
     #[test]
+    fn a_scroll_replaced_before_its_first_solve_never_creates_a_retired_tracker() {
+        let mut patch = fixture();
+        let mount = || LayoutDriver::create(|ui| {
+            scroll(ui, |ui| { ui.node(Preset::Bare).height(Len::Times(Metric::RowH, 200.0)); });
+        });
+        let retired = mount();
+        drop(retired);
+        let mut live = mount();
+        live.flush(&mut patch);
+        assert_eq!(patch.ops().iter().filter(|op| matches!(op,
+            windows_scene::Op::Tracker { op: windows_scene::TrackerOp::Create { .. }, .. }
+        )).count(), 1, "only the surviving viewport may create a tracker");
+    }
+
+    #[test]
     fn only_virtual_lists_forward_tracker_reports_to_the_app() {
         let mut patch = fixture();
         let mut down = crate::seam::Down::default();

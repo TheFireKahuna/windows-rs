@@ -586,6 +586,26 @@ fn a_ring_routed_burst_rings_the_graphs_thread_once() {
 }
 
 #[test]
+fn producer_completions_during_a_flush_belong_to_the_next_batch() {
+    let (_owner, level) = Owner::scope(|| {
+        let level = Cell::new(0_u32);
+        Effect::new(move || {
+            let value = level.get();
+            if value < 12 {
+                std::thread::spawn(move || level.post(value + 1))
+                    .join().expect("producer completion");
+            }
+        });
+        level
+    });
+    assert_eq!(level.peek(), 0, "the initial completion is staged");
+    for value in 1..=12 {
+        flush();
+        assert_eq!(level.peek(), value, "an in-flight completion must not extend this batch");
+    }
+}
+
+#[test]
 fn releasing_the_last_staged_write_releases_the_ring() {
     let ring = Arc::new(crate::seam::Ring::new().expect("an event is available"));
     let _registration = arm_posts(Arc::clone(&ring));
@@ -611,7 +631,16 @@ fn releasing_the_last_staged_write_releases_the_ring() {
         .expect("producer");
     assert!(ring.event().take(), "a disposed write left the ring held");
 
-    let _ = stale;
+    // The old producer can finish after a new occupant has already staged a write.
+    std::thread::spawn(move || stale.post(99))
+        .join()
+        .expect("late producer");
     flush();
     assert_eq!(fresh.peek(), 2);
+
+    ring.arm();
+    std::thread::spawn(move || stale.post(100))
+        .join()
+        .expect("late producer after drain");
+    assert!(!ring.event().take(), "a retired producer woke the graph");
 }

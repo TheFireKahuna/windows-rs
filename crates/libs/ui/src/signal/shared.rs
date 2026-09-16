@@ -71,6 +71,9 @@ struct Inbox(Vec<Pending>);
 
 #[derive(Default)]
 struct Pending {
+    /// Last disposed generation per slot. Late producer writes must not resurrect
+    /// that occupant or replace a newer pending write at the same index.
+    retired: Vec<u32>,
     /// Keyed by ids the owning graph minted, so a producer can only stage a write against a
     /// cell it was handed.
     slots: windows_scene::Slots<Signal, Apply>,
@@ -124,6 +127,9 @@ pub(super) fn arm(graph: u32, how: PostWake) -> PostGuard {
 pub(super) fn post(id: SignalId, apply: Apply) {
     let mut inbox = lock();
     let pending = inbox.pending(id.graph);
+    if pending.retired.get(id.id.index()).is_some_and(|generation| *generation >= id.id.generation()) {
+        return;
+    }
     if pending.slots.get(id.id).is_none() {
         pending.dirty.push(id);
     }
@@ -160,6 +166,11 @@ pub(super) fn take(graph: u32, out: &mut Vec<(SignalId, Apply)>) {
 pub(super) fn release(id: SignalId) {
     let mut inbox = lock();
     let pending = inbox.pending(id.graph);
+    let at = id.id.index();
+    if pending.retired.len() <= at {
+        pending.retired.resize(at + 1, 0);
+    }
+    pending.retired[at] = pending.retired[at].max(id.id.generation());
     if pending.slots.take(id.id).is_some()
         && let Some(at) = pending.dirty.iter().position(|dirty| *dirty == id)
     {

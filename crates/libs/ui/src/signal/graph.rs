@@ -677,12 +677,10 @@ fn flush_phase(phase: Phase) -> bool {
 
     // Whether a staged write landed or an effect ran: a host deciding whether the model is
     // worth solving asks this rather than solving on every wake.
-    let mut worked = false;
+    // Admit one producer batch per flush. Completions arriving while effects run
+    // own the next wake; they are not iterations of this graph's settling pass.
+    let mut worked = phase == Phase::Update && apply_staged();
     for pass in 0..MAX_PASSES {
-        if phase == Phase::Update {
-            worked |= apply_staged();
-        }
-
         let empty = with(|g| {
             debug_assert!(g.running.is_empty());
             core::mem::swap(&mut g.running, &mut g.queue[phase as usize]);
