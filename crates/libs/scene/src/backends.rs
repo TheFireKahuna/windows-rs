@@ -233,7 +233,7 @@ impl Backends {
     /// A composition gradient brush carries eight-bit stops, which quantizes a narrow alpha
     /// ramp to almost nothing; the FP16 strip carries colour and alpha in the same texels
     /// with no such floor. The strip is stretched to fill, so it carries none of the
-    /// sprite's extent and a resize re-rasterizes nothing.
+    /// sprite's extent. A consumer only updates it on resize if it authors a feather in DIPs.
     pub(crate) fn raster_ramp(
         &self,
         env: Env,
@@ -274,7 +274,13 @@ impl Backends {
         // amplitudes a glow is authored with.
         let px = match spread {
             Spread::Horizontal => (256, 1),
+            // Six-DIP feathers in a 480-DIP box need more than the two samples a
+            // 128-texel tile affords. Both paints use the same horizontal coverage.
+            Spread::HorizontalFeathered { .. } => (512, 1),
             Spread::Vertical => (1, 256),
+            // Colour is already resampled at 64 stops. Two texels per interval retain
+            // its profile without the previous 1-MiB tile's redundant vertical samples.
+            Spread::VerticalFeathered { .. } => (512, 128),
             Spread::DiagonalDown | Spread::DiagonalUp => (128, 128),
             Spread::Radial => (64, 64),
             Spread::Conic { .. } => unreachable!("conic ramp was rasterized above"),
@@ -304,6 +310,54 @@ impl Backends {
         self.draw(&surface, 96.0, |d| {
             d.clear(Scrgb::TRANSPARENT);
             let rect = windows_d2d::Rect::new(0.0, 0.0, w, h);
+            let feather = if let Spread::VerticalFeathered { edge }
+            | Spread::HorizontalFeathered { edge } = spread
+                && edge > 0.0
+            {
+                let edge = edge.clamp(0.0, 0.5);
+                let white = Scrgb {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                };
+                // Zero slope at either end avoids a visible seam into the full-strength
+                // body. Author coverage directly so colour resampling cannot widen it.
+                const STEPS: usize = 16;
+                let mut coverage = [Stop {
+                    at: 0.0,
+                    color: white,
+                }; 2 * (STEPS + 1)];
+                for i in 0..=STEPS {
+                    let t = i as f32 / STEPS as f32;
+                    let eased = t * t * (3.0 - 2.0 * t);
+                    let alpha = eased * eased;
+                    let color = Scrgb { a: alpha, ..white };
+                    coverage[i] = Stop {
+                        at: edge * t,
+                        color,
+                    };
+                    coverage[2 * STEPS + 1 - i] = Stop {
+                        at: 1.0 - edge * t,
+                        color,
+                    };
+                }
+                Some(self.gpu.ramp(
+                    &coverage,
+                    Vector2::new(0.5, 0.0),
+                    Vector2::new(w - 0.5, 0.0),
+                    Extend::Clamp,
+                )?)
+            } else {
+                None
+            };
+            let _coverage = feather.as_ref().map(|mask| {
+                d.layer(
+                    windows_d2d::Layer::mask_brush(mask)
+                        .bounds(rect)
+                        .replacing(),
+                )
+            });
             match spread.ends() {
                 Some((from, to)) => {
                     let ramp = self.gpu.ramp(

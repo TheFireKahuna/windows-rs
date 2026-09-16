@@ -410,14 +410,24 @@ pub enum Join {
 
 /// How a [`Paint::Ramp`]'s stops spread over the box they paint.
 ///
-/// Not a direction: [`Radial`](Self::Radial) has none. The four linear forms rasterize to a
-/// strip and the radial one to a square tile, and every one of them is stretched to fill, so
-/// none carries the sprite's extent and a resize costs nothing.
+/// Not a direction: [`Radial`](Self::Radial) has none. Axial forms rasterize to strips,
+/// diagonal/radial/conic forms to square tiles, and a feathered vertical ramp to a tile.
+/// All stretch to fill and carry no sprite extent; a DIP-sized feather is expressed by
+/// updating its normalized edge fraction when the consumer's width changes.
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub enum Spread {
     #[default]
     Horizontal,
+    /// Horizontal colour stops with the same edge coverage as `VerticalFeathered`.
+    HorizontalFeathered {
+        edge: f32,
+    },
     Vertical,
+    /// Vertical colour stops with squared-smoothstep alpha feathering at both horizontal edges.
+    /// `edge` is the fraction of the box each feather occupies, clamped to `0..=0.5`.
+    VerticalFeathered {
+        edge: f32,
+    },
     DiagonalDown,
     DiagonalUp,
     /// Outward from the centre. Stretched to fill, so a square profile becomes the
@@ -438,8 +448,8 @@ impl Spread {
     #[must_use]
     pub const fn ends(self) -> Option<([f32; 2], [f32; 2])> {
         match self {
-            Self::Horizontal => Some(([0.0, 0.5], [1.0, 0.5])),
-            Self::Vertical => Some(([0.5, 0.0], [0.5, 1.0])),
+            Self::Horizontal | Self::HorizontalFeathered { .. } => Some(([0.0, 0.5], [1.0, 0.5])),
+            Self::Vertical | Self::VerticalFeathered { .. } => Some(([0.5, 0.0], [0.5, 1.0])),
             Self::DiagonalDown => Some(([0.0, 0.0], [1.0, 1.0])),
             Self::DiagonalUp => Some(([0.0, 1.0], [1.0, 0.0])),
             Self::Radial | Self::Conic { .. } => None,
@@ -872,7 +882,9 @@ mod tests {
     fn a_linear_ramps_ends_span_the_box() {
         for spread in [
             Spread::Horizontal,
+            Spread::HorizontalFeathered { edge: 0.025 },
             Spread::Vertical,
+            Spread::VerticalFeathered { edge: 0.025 },
             Spread::DiagonalDown,
             Spread::DiagonalUp,
         ] {
