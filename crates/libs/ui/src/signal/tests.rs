@@ -644,3 +644,69 @@ fn releasing_the_last_staged_write_releases_the_ring() {
         .expect("late producer after drain");
     assert!(!ring.event().take(), "a retired producer woke the graph");
 }
+
+#[test]
+fn a_posted_value_that_did_not_move_stages_nothing_and_allocates_nothing() {
+    let (_owner, level) = Owner::scope(|| Cell::new(0_u32));
+    let posted = Posted::new(level);
+    let (staged, unchanged) = std::thread::spawn(move || {
+        assert!(posted.set(1), "the first value did not move");
+        let before = crate::counting::allocations();
+        let staged = (0..100).filter(|_| posted.set(1)).count();
+        (staged, crate::counting::allocations() - before)
+    })
+    .join()
+    .expect("the producer finished");
+    assert_eq!(staged, 0, "a value equal to the last one was staged");
+    assert_eq!(unchanged, 0, "an unchanged value allocated");
+    flush();
+    assert_eq!(level.peek(), 1);
+}
+
+#[test]
+fn the_producer_side_compare_is_what_removes_the_box_a_post_allocates() {
+    let (_owner, level) = Owner::scope(|| Cell::new(0_u32));
+    let posted = Posted::new(level);
+    let (bare, compared) = std::thread::spawn(move || {
+        let before = crate::counting::allocations();
+        for _ in 0..100 {
+            level.post(1);
+        }
+        let bare = crate::counting::allocations() - before;
+        posted.set(1);
+        let before = crate::counting::allocations();
+        for _ in 0..100 {
+            posted.set(1);
+        }
+        (bare, crate::counting::allocations() - before)
+    })
+    .join()
+    .expect("the producer finished");
+    assert!(bare >= 100, "a staged write allocated no box ({bare})");
+    assert_eq!(compared, 0, "the compared writes allocated");
+    flush();
+}
+
+#[test]
+fn a_probe_builds_the_owned_value_only_on_the_pass_that_moved() {
+    let (_owner, rows) = Owner::scope(|| Cell::new(Arc::<[u32]>::from([])));
+    let posted = Posted::new(rows);
+    let built = std::thread::spawn(move || {
+        let mut scratch = Vec::new();
+        let mut built = 0_u32;
+        for _ in 0..10 {
+            scratch.clear();
+            scratch.extend([7_u32, 8, 9]);
+            posted.set_by(scratch.as_slice(), || {
+                built += 1;
+                Arc::from(scratch.as_slice())
+            });
+        }
+        built
+    })
+    .join()
+    .expect("the producer finished");
+    assert_eq!(built, 1, "an unchanged slice was shared into a fresh Arc");
+    flush();
+    assert_eq!(&*rows.peek(), &[7, 8, 9]);
+}

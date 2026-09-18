@@ -1,4 +1,4 @@
-//! The vocabulary retained records and widget recipes share: motion, state policy, colour rows,
+//! The vocabulary retained records and widget recipes share: motion, colour rows,
 //! automation roles, value ranges, and the arithmetic that places a moving part.
 
 use crate::role::{Fill, Metric, Stroke, Text};
@@ -14,20 +14,6 @@ pub enum Motion {
     Snap,
     /// The channel springs to the new value.
     Chrome,
-}
-
-/// Whether a node has interaction chrome, and which wash it fades in.
-///
-/// Only a control that can be hovered mints the extra sprite. Text, captions, meters, paths
-/// and info rows are `None` and mint none.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-pub enum StatePolicy {
-    #[default]
-    None,
-    Wash {
-        hover: Wash,
-        press: Wash,
-    },
 }
 
 /// Which derived wash a state fades in.

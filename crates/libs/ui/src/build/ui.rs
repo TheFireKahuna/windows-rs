@@ -287,11 +287,15 @@ impl Ui<'_> {
             preset,
             scope: self.scope,
             layout: Declaration::default(),
+            pending: None,
         };
-        self.host
-            .model
-            .style(id, &recipe.lower(self.scope.width, None));
         self.host.styles.place(id, recipe);
+        self.host.mark_style(id, self.scope.width);
+        // The class this node's declaration is lowered at is the one its *builder* was in,
+        // and a responsive container reclasses its subtree only when its own class moves. A
+        // node mounted after the container settled would otherwise keep the builder's class
+        // for the rest of its life, so the solve's answer is compared against this one.
+        self.host.fresh.push((id, self.scope.width));
         Node {
             target,
             runtime: self.host.identity,
@@ -626,9 +630,7 @@ impl<K> Element<'_, K> {
             .get_mut(id)
             .expect("a live element owns its declaration");
         write(&mut recipe.layout.base);
-        self.host
-            .model
-            .style(id, &self.host.styles.lower(id, class).unwrap());
+        self.host.mark_style(id, class);
         self
     }
 
@@ -640,9 +642,7 @@ impl<K> Element<'_, K> {
         let id = self.node.target.id();
         let active = self.host.model.solved(id).class;
         write(self.host.styles.at(id, class));
-        self.host
-            .model
-            .style(id, &self.host.styles.lower(id, active).unwrap());
+        self.host.mark_style(id, active);
         self
     }
 
@@ -726,8 +726,7 @@ impl<K> Element<'_, K> {
                     let class = host.model.solved(node).class;
                     if let Some(recipe) = host.styles.get_mut(node) {
                         write(&mut recipe.layout.base);
-                        host.model
-                            .style(node, &host.styles.lower(node, class).unwrap());
+                        host.mark_style(node, class);
                     }
                 })
             });
@@ -765,6 +764,69 @@ impl<K> Element<'_, K> {
         self.host.probes.place(self.node.target.id(), probe.cell());
         self
     }
+
+    /// Makes this node the space `anchors` reports its keyed boxes in.
+    ///
+    /// One origin per set. Its own solved size and scope ride the same table, so a consumer
+    /// drawing over the set needs no second probe to rebase what it reads.
+    pub fn anchors_origin(self, anchors: crate::layout::Anchors) -> Self {
+        self.host
+            .anchor_origins
+            .place(self.node.target.id(), anchors.cell());
+        self
+    }
+
+    /// Reports this node's solved box into `anchors` under `key`.
+    ///
+    /// `key` is the application's own identity for what the node stands for, so a node
+    /// recycled onto another subject reports under the subject's key rather than the
+    /// node's. The attachment leaves the set when the node unmounts.
+    pub fn anchored(self, anchors: crate::layout::Anchors, key: u64) -> Self {
+        let node = self.node.target.id();
+        let set = anchors.id();
+        let members = &mut self.host.anchor_members;
+        match members
+            .iter_mut()
+            .find(|(owner, at, _)| *owner == set && *at == node)
+        {
+            Some(entry) => entry.2 = key,
+            None => members.push((set, node, key)),
+        }
+        self
+    }
+    /// Places this node at a normalized point of its parent, aligned by its own size.
+    ///
+    /// `x` and `y` are fractions of the parent's box. `align` says where the node's own
+    /// measured extent sits against that point on each axis:
+    /// [`Center`](crate::layout::Align::Center) centres it,
+    /// [`Start`](crate::layout::Align::Start) hangs it after the point and
+    /// [`End`](crate::layout::Align::End) ends it there. The size the alignment consumes is
+    /// the one the solve measured, so the node needs no stated extent and no containing cell.
+    ///
+    /// Out of flow, like every other anchored placement: the node takes no track and no
+    /// space from its siblings, and the parent is its containing block.
+    pub fn anchor(self, x: f32, y: f32, align: [crate::layout::Align; 2]) -> Self {
+        self.layout(|l| {
+            l.position = Some(crate::layout::Position::Anchor {
+                at: [x, y, x, y],
+                align,
+            })
+        })
+    }
+
+    /// Stretches this node across a normalized `[x0, y0, x1, y1]` region of its parent.
+    ///
+    /// The rect form of [`anchor`](Self::anchor): both edges of each axis are pinned, so
+    /// the node takes the region's extent rather than its own.
+    pub fn anchor_rect(self, at: [f32; 4]) -> Self {
+        self.layout(|l| {
+            l.position = Some(crate::layout::Position::Anchor {
+                at,
+                align: [crate::layout::Align::Stretch; 2],
+            })
+        })
+    }
+
     pub fn at(self, row: u16, column: u16) -> Self {
         self.layout(|l| {
             l.position = Some(crate::layout::Position::Grid {
@@ -819,6 +881,12 @@ impl Ui<'_> {
         )));
         id
     }
+    /// Draws one path from a probed box, in the geometry phase.
+    ///
+    /// The geometry phase runs after the flush has published every probe, so `fill` reads
+    /// the box **this** batch solved and its verbs reach the same scene patch. It may not
+    /// write layout, structure or application state; the phase guard holds reads open and
+    /// blocks writes.
     pub fn local_geometry(
         &mut self,
         bounds: crate::layout::Probe,
@@ -830,6 +898,13 @@ impl Ui<'_> {
             fill(verbs, size, scope)
         })[0]
     }
+    /// Draws several paths from one probed box, in the geometry phase.
+    ///
+    /// `bounds` is any probe, not this node's own: the box a set of figures has to agree
+    /// with is often a container none of them belongs to. Each path has its own buffer,
+    /// reserved once at `capacities` and reused, and the whole set is re-emitted when the
+    /// box or a tracked read inside `fill` moves. See [`local_geometry`](Self::local_geometry)
+    /// for the phase's contract.
     pub fn local_geometries<const N: usize>(
         &mut self,
         bounds: crate::layout::Probe,
@@ -853,6 +928,36 @@ impl Ui<'_> {
             };
             paths.iter_mut().for_each(Vec::clear);
             crate::signal::read_only(|| fill(&mut paths, size, scope));
+            for (id, verbs) in ids.into_iter().zip(&paths) {
+                super::set_geometry(id, verbs);
+            }
+        });
+        ids
+    }
+    /// Draws from one container's keyed anchor table, in the geometry phase.
+    ///
+    /// The [`Anchors`](crate::layout::Anchors) half of
+    /// [`local_geometries`](Self::local_geometries): the same phase, the same buffers and
+    /// the same equality cutoff, over a whole keyed set rather than one box. The table
+    /// carries the origin's size and scope, so `fill` needs no other argument.
+    pub fn anchored_geometries<const N: usize>(
+        &mut self,
+        anchors: crate::layout::Anchors,
+        capacities: [usize; N],
+        mut fill: impl FnMut(&mut [Vec<windows_scene::PathVerb>; N], &crate::layout::Table)
+        + 'static,
+    ) -> [windows_scene::GeomId; N] {
+        let ids = capacities.map(|_| self.geometry(&[]));
+        let mut paths = capacities.map(Vec::with_capacity);
+        let runtime = self.host.identity;
+        Effect::geometry(move || {
+            if Host::try_with(|host| host.identity == runtime) != Some(true) {
+                return;
+            }
+            paths.iter_mut().for_each(Vec::clear);
+            anchors.with(|table| {
+                crate::signal::read_only(|| fill(&mut paths, table));
+            });
             for (id, verbs) in ids.into_iter().zip(&paths) {
                 super::set_geometry(id, verbs);
             }
@@ -1023,14 +1128,6 @@ impl<K> Element<'_, K> {
     pub fn pinned(self, insets: [Len; 4]) -> Self {
         self.layout(|l| l.position = Some(crate::layout::Position::Absolute(insets)))
     }
-    pub fn band(self, at: impl Into<Len>, height: impl Into<Len>) -> Self {
-        self.layout(|l| {
-            l.position = Some(crate::layout::Position::Band {
-                at: at.into(),
-                height: height.into(),
-            })
-        })
-    }
     pub fn hide_if<M>(self, value: impl Signal<bool, M> + 'static) -> Self {
         if value.is_constant() {
             self.host
@@ -1045,7 +1142,7 @@ impl<K> Element<'_, K> {
                         let class = h.model.solved(node).class;
                         let recipe = h.styles.get_mut(node).unwrap();
                         recipe.layout.base.hidden = Some(hidden);
-                        h.model.style(node, &h.styles.lower(node, class).unwrap());
+                        h.mark_style(node, class);
                     });
                 });
             self
@@ -1132,9 +1229,7 @@ impl<K> Element<'_, K> {
         let recipe = self.host.styles.get_mut(node).unwrap();
         recipe.scope = recipe.scope.elevate(elevation);
         let scope = recipe.scope;
-        self.host
-            .model
-            .style(node, &self.host.styles.lower(node, scope.width).unwrap());
+        self.host.mark_style(node, scope.width);
         let mut paint = self.host.mounts.get(node).unwrap().paints;
         while let Some(row) = self.host.appearances.get_mut(paint) {
             row.scope = scope;

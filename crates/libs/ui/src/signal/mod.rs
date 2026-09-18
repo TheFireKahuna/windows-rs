@@ -11,10 +11,15 @@
 //! |---|---|---|
 //! | [`Cell`] | a source | never — it is written |
 //! | [`Memo`] | a pure derivation | lazily, when read and a dependency moved |
-//! | [`Effect`] | a leaf that touches the world | at the end of a flush, in creation order |
+//! | [`Effect`] | a leaf that touches the world | after the memos, in creation order |
 //!
 //! [`Owner`] is the disposal scope that owns all three. [`Epoch`] is the payload-free
 //! counterpart of a `Cell`, for a consumer that wants a wake rather than a value.
+//!
+//! Effects run on one of two phases. [`flush`] runs the update phase; a geometry effect is
+//! held back and run by the host once the solve has settled, so it reads a box from the
+//! solve it belongs to rather than from the one before it. [`flush`] answers `true` when a
+//! geometry effect is owed as well as when something moved.
 //!
 //! # Propagation is glitch-free
 //!
@@ -35,6 +40,10 @@
 //! that thread is rung, and the write lands at the top of its next flush. `Cell` is not
 //! `Sync`, and [`Memo`] and [`Effect`] are neither, so a handle cannot reach a graph on
 //! another thread by being shared into a closure.
+//!
+//! A staged write costs one box whether or not the value moved, because the cutoff runs on
+//! the consuming thread. [`Posted`] holds the producer's own copy beside the cell and
+//! compares before staging, for a producer on a stream that mostly repeats itself.
 
 mod epoch;
 mod graph;
@@ -222,6 +231,81 @@ impl<T: PartialEq + Send + 'static> Cell<T> {
                     .is_some_and(|slot| write_slot(slot, v))
             }),
         );
+    }
+}
+
+/// A [`Cell`] a producer thread writes, beside that thread's own copy of what it last
+/// wrote there.
+///
+/// [`Cell::post`] stages a boxed write whatever value it carries, and the equality cutoff
+/// runs on the consuming thread — after the box. The comparison here runs before it, on
+/// the producer's side: a value that did not move allocates nothing and raises no wake,
+/// and one that did costs what `post` costs.
+///
+/// `Send` and not `Sync`, like the cell it holds, so the copy belongs to the one thread
+/// that writes it.
+pub struct Posted<T: 'static> {
+    cell: Cell<T>,
+    /// What was last written through this handle. Borrowed only by the producer, which
+    /// owns it outright: `Posted` is not `Sync`, so no second thread holds a reference to
+    /// one.
+    last: RefCell<T>,
+}
+
+impl<T: PartialEq + Clone + Send + 'static> Posted<T> {
+    /// Takes the producer's handle on `cell`, reading the value it holds now.
+    ///
+    /// Called on the thread that owns the graph, which is the one that can read a cell.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cell` has been disposed.
+    #[must_use]
+    pub fn new(cell: Cell<T>) -> Self {
+        Self {
+            last: RefCell::new(cell.peek()),
+            cell,
+        }
+    }
+
+    /// Writes `v` where it differs from the last value written here, and answers whether
+    /// it did.
+    pub fn set(&self, v: T) -> bool {
+        let mut last = self.last.borrow_mut();
+        if *last == v {
+            return false;
+        }
+        self.cell.post(v.clone());
+        *last = v;
+        true
+    }
+
+    /// Writes what `next` answers where `probe` differs from the last value written here,
+    /// and answers whether it did.
+    ///
+    /// The comparison runs against `probe`, so a value whose owned form costs an
+    /// allocation — a slice shared into an `Arc`, a scratch buffer copied out — is built
+    /// only on the pass that moved. `probe` must be what `next` answers: the two are
+    /// compared and stored as one value.
+    pub fn set_by<U>(&self, probe: &U, next: impl FnOnce() -> T) -> bool
+    where
+        U: PartialEq + ?Sized,
+        T: core::borrow::Borrow<U>,
+    {
+        let mut last = self.last.borrow_mut();
+        if <T as core::borrow::Borrow<U>>::borrow(&last) == probe {
+            return false;
+        }
+        let v = next();
+        self.cell.post(v.clone());
+        *last = v;
+        true
+    }
+}
+
+impl<T: 'static> core::fmt::Debug for Posted<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Posted").field(&self.cell.id).finish()
     }
 }
 

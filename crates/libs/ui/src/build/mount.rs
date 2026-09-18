@@ -1,13 +1,13 @@
 //! Retained subtree lifetime and scene resource publication.
 use super::host::{ControlRow, Host};
-use super::theme::{HaloStyle, PaintMask};
+use super::theme::{Appearance, HaloStyle, Part, PaintMask, PaintSource};
 use crate::layout::Edge;
 use crate::role::{DataRole, Scope, Silhouette};
 use crate::widget::Chrome;
 use windows_color::Radiance;
 use windows_numerics::Vector2;
 use windows_scene::{
-    Bind, Cap, Corners, Exit, GeomId, GroupId, Halo, Join, Mask, NodeId, Paint, PathVerb, Prop,
+    Bind, Cap, Corners, Exit, GeomId, GroupId, Halo, Join, Mask, NodeId, PathVerb, Prop,
     RampId, Spread, SpriteId, Value,
 };
 
@@ -287,16 +287,28 @@ pub(super) fn install_scroll(
         let rail = h.model().group(viewport, Some(content));
         h.model().style(rail.node(), &crate::layout::rail_style());
         let thumb = h.model().visual(rail, None);
-        h.model().mask(
-            thumb,
-            Mask::Box {
-                radius: Corners::all(crate::layout::THUMB_W * 0.5),
+        // An ordinary appearance, so the one resolver that repaints every other sprite on a
+        // theme change repaints this one too. It hangs on no mount: the rail is model
+        // geometry rather than a declared node, and the scroll row releases it.
+        h.appearances.place(
+            thumb.node(),
+            Appearance {
+                id: thumb,
+                mask: PaintMask::Radius {
+                    dips: Corners::all(crate::layout::THUMB_W * 0.5),
+                },
+                source: PaintSource::Role(crate::role::Role::Text(crate::role::Text::Primary)),
+                part: Part::Static,
+                strength: THUMB_ALPHA,
+                geom: None,
+                scope,
+                surface: None,
+                halo: None,
+                next: NodeId::NONE,
+                wash: false,
             },
         );
-        h.model().paint(
-            thumb,
-            Paint::Solid(crate::role::ink(THUMB_ALPHA, scope.for_paint())),
-        );
+        h.appearances.get(thumb.node()).copied().unwrap().publish(h, true);
         // Hidden from the mount rather than shown and faded out: a surface whose content
         // fits never overflows, and a thumb visible for one frame to say so is a flash on
         // every screen that opens.

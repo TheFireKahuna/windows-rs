@@ -373,7 +373,7 @@ impl Uia {
                 // application's own subject, and the property that changed is announced by
                 // whatever the handler writes.
                 crate::widget::What::Dragged(_)
-                | crate::widget::What::DragEnded { .. }
+                | crate::widget::What::DragEnded(_)
                 | crate::widget::What::Hovered(_)
                 | crate::widget::What::Canceled(_) => {}
             }

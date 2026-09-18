@@ -651,7 +651,10 @@ fn run_effect(id: SignalId, f: &Rc<RefCell<dyn FnMut()>>) {
 }
 
 /// Applies staged cross-thread writes, resolves every marked memo and runs every marked
-/// effect, in creation order.
+/// update-phase effect, in creation order.
+///
+/// Returns whether anything moved *or* a geometry effect is owed, since a caller that
+/// solves on the answer has to solve before [`flush_geometry`] can report a settled box.
 ///
 /// Effects run after memos, so no effect observes a half-updated graph. A pass allocates
 /// nothing: both queues are drained rather than dropped, the staging buffer is swapped

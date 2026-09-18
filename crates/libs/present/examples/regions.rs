@@ -20,9 +20,10 @@ use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use windows_color::{DisplayCapability, OutputTransform, Radiance};
 use windows_composition::{Compositor, Stretch};
 use windows_present::{
-    Bound, Draw, Epoch, Extent, Frame, FrameCtx, Gpu, Presenter, Queue, Rect, RegionInput,
+    Bound, Draw, DrawCtx, Epoch, Extent, Frame, GateCtx, Gpu, Presenter, Queue, Rect, RegionInput,
     RegionKey, RegionSpec, Result, Tuning,
 };
+use windows_d2d::Solid;
 use windows_window::Window;
 
 /// Counts every message the window sees. Started once the bindings are in, so what it counts
@@ -191,22 +192,32 @@ struct Bars {
     /// Advanced once per `draw`, so a batch of three draws steps three frames and the eases
     /// run as though the calls arrived one per refresh.
     frame: u32,
+    /// Re-pointed per bar. Built from the gate, where the device is in scope, because the
+    /// draw may neither allocate nor reach one.
+    ink: Option<Solid>,
 }
 
 impl Bars {
     fn new(phase: f32) -> Self {
-        Self { phase, frame: 0 }
+        Self {
+            phase,
+            frame: 0,
+            ink: None,
+        }
     }
 }
 
 const BARS: usize = 48;
 
 impl Frame for Bars {
-    fn should_draw(&mut self, _ctx: FrameCtx<'_>) -> bool {
-        true
+    fn should_draw(&mut self, ctx: GateCtx<'_>) -> bool {
+        if self.ink.is_none() {
+            self.ink = ctx.device.solid(ctx.out.apply(Radiance::new(0.0, 0.0, 0.0, 1.0))).ok();
+        }
+        self.ink.is_some()
     }
 
-    fn draw(&mut self, ctx: FrameCtx<'_>, draw: &Draw<'_>) {
+    fn draw(&mut self, ctx: DrawCtx<'_>, draw: &Draw<'_>) {
         let t = self.frame as f32 / 60.0 + self.phase * 10.0;
         self.frame = self.frame.wrapping_add(1);
 
@@ -224,11 +235,12 @@ impl Frame for Bars {
             // Above diffuse white at the peaks, which the FP16 buffer and the output
             // transform carry.
             let lit = Radiance::new(30.0 + 150.0 * wave, 60.0 + 90.0 * wave, 180.0, 1.0);
-            let Ok(brush) = ctx.device.solid(ctx.out.apply(lit)) else {
+            let Some(brush) = self.ink.as_ref() else {
                 return;
             };
+            brush.set(ctx.out.apply(lit));
             let rect = Rect::new(x + 1.0, top, x + step - 1.0, h - 4.0);
-            draw.fill(draw.snap_rect(rect), &brush);
+            draw.fill(draw.snap_rect(rect), brush);
         }
     }
 
@@ -238,5 +250,9 @@ impl Frame for Bars {
 
     fn animating(&self) -> bool {
         true
+    }
+
+    fn device_reset(&mut self) {
+        self.ink = None;
     }
 }

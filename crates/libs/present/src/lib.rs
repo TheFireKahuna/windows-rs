@@ -26,6 +26,7 @@ mod bindings;
 
 mod device;
 mod frame;
+mod gate;
 mod group;
 mod pump;
 mod region;
@@ -38,7 +39,8 @@ pub(crate) use std::rc::Rc;
 pub(crate) use windows_core::Interface;
 
 pub use device::{Flushed, PresentationDevice};
-pub use frame::{Epoch, Frame, FrameCtx, Part, RegionInput, RegionParts, SubId};
+pub use frame::{DrawCtx, Epoch, Frame, GateCtx, Part, RegionInput, RegionParts, SubId};
+pub use gate::{Cached, Gate, Layer, Sources};
 pub use group::{
     Instance, Interrupt, Outcome, PresentStatistic, PresentTally, PresentationGroup, Queue,
 };
@@ -50,10 +52,10 @@ pub use region::{Extent, PresentationRegion, RegionKey, RegionSpec};
 // consumer's `Rect` and output transform are the same types the drawing crates accept.
 pub use windows_color::OutputTransform;
 pub use windows_core::Result;
-pub use windows_d2d::{Draw, Gpu, Rect};
+pub use windows_d2d::{Draw, Gpu, Opacity, Pass, Rect, Target};
 
 // Used across this crate's own modules, and by the drawing seam.
-pub(crate) use windows_d2d::{Loss, Opacity, Pass, PassError, Target};
+pub(crate) use windows_d2d::{Loss, PassError};
 pub(crate) use windows_window::Event;
 // The compositor clock this thread paces off and the scheduling class it asks for come from
 // `windows-window`, which owns both as properties of a window's lifetime. `Watch` is one

@@ -241,9 +241,15 @@ fn raw_sub(id: Option<SubId>) -> u32 {
     }
 }
 
-/// Carries everything a renderer is handed for one frame.
+/// Carries what a renderer is handed to decide whether this frame differs, and to build the
+/// device resources it will differ with.
+///
+/// The device is here and not in [`DrawCtx`] because the gate runs before the pass's own
+/// bracket opens, which is the one point in a pass where a second `BeginDraw` on this device
+/// is legal. A bracket opened from the draw discards every later draw of the batch, other
+/// regions' included, so the draw is handed no device to open one with.
 #[derive(Copy, Clone)]
-pub struct FrameCtx<'a> {
+pub struct GateCtx<'a> {
     /// The region's DIP box, and the display it is solved for. Every number a renderer
     /// lays out against comes from here, so the buffer's allocation and the coordinates
     /// drawn into it cannot disagree.
@@ -265,26 +271,61 @@ pub struct FrameCtx<'a> {
     pub input: &'a RegionInput,
 }
 
-impl FrameCtx<'_> {
-    /// Returns the region's width in DIPs.
-    #[must_use]
-    pub fn w(&self) -> f32 {
-        self.extent.w
-    }
+/// Carries what a renderer is handed to draw one frame: the same numbers as [`GateCtx`],
+/// without the device.
+#[derive(Copy, Clone)]
+pub struct DrawCtx<'a> {
+    /// The region's DIP box, and the display it is solved for.
+    pub extent: Extent,
+    /// The pass counter this frame belongs to.
+    pub tick: u64,
+    /// The transform every colour drawn this frame passes through.
+    pub out: OutputTransform,
+    /// What the front thread has decided about this region since the last frame.
+    pub input: &'a RegionInput,
+}
 
-    /// Returns the region's height in DIPs.
+impl<'a> GateCtx<'a> {
+    /// Returns the draw context for this frame: everything but the device.
     #[must_use]
-    pub fn h(&self) -> f32 {
-        self.extent.h
-    }
-
-    /// Returns the DIP-to-pixel factor, the scale a realization or a cached raster is keyed
-    /// on.
-    #[must_use]
-    pub fn scale(&self) -> f32 {
-        self.extent.scale()
+    pub fn draw_ctx(&self) -> DrawCtx<'a> {
+        DrawCtx {
+            extent: self.extent,
+            tick: self.tick,
+            out: self.out,
+            input: self.input,
+        }
     }
 }
+
+/// Answers a region's box in the units a renderer lays out in.
+macro_rules! box_accessors {
+    ($t:ident) => {
+        impl $t<'_> {
+            /// Returns the region's width in DIPs.
+            #[must_use]
+            pub fn w(&self) -> f32 {
+                self.extent.w
+            }
+
+            /// Returns the region's height in DIPs.
+            #[must_use]
+            pub fn h(&self) -> f32 {
+                self.extent.h
+            }
+
+            /// Returns the DIP-to-pixel factor, the scale a realization or a cached raster
+            /// is keyed on.
+            #[must_use]
+            pub fn scale(&self) -> f32 {
+                self.extent.scale()
+            }
+        }
+    };
+}
+
+box_accessors!(GateCtx);
+box_accessors!(DrawCtx);
 
 /// Draws one region's content, once per frame.
 ///
@@ -302,8 +343,10 @@ pub trait Frame {
     /// per-slot call would consume the change on the batch's first frame and report "nothing
     /// moved" for the rest of it.
     ///
-    /// Real-time: runs on the present thread's per-frame path and must not allocate.
-    fn should_draw(&mut self, ctx: FrameCtx<'_>) -> bool;
+    /// Real-time: runs on the present thread's per-frame path and must not allocate. The
+    /// exception is a cached resource's rebuild, which is what [`GateCtx`] carries a device
+    /// for and what [`Gate`](crate::Gate) and [`Layer`](crate::Layer) gate.
+    fn should_draw(&mut self, ctx: GateCtx<'_>) -> bool;
 
     /// Draws one frame.
     ///
@@ -316,7 +359,7 @@ pub trait Frame {
     ///
     /// Must not block. A later region's buffer acquisition can block with this pass's
     /// bracket already open, so time spent waiting here delays every region in the pass.
-    fn draw(&mut self, ctx: FrameCtx<'_>, draw: &Draw<'_>);
+    fn draw(&mut self, ctx: DrawCtx<'_>, draw: &Draw<'_>);
 
     /// Returns `true` when every pixel of the region's box is covered opaquely.
     ///

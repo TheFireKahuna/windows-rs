@@ -27,7 +27,7 @@ pub(super) fn install(host: &mut Host, node: windows_scene::NodeId, mut draw: Dr
     host.own_binding(node, None, effect);
     if let Some(row) = host.geometry_jobs.get_mut(node) {
         if let Some(previous) = row.effect.replace(effect).and_then(Effect::retire) {
-            host.retired.push(super::binding::Retired::Effect(previous));
+            host.retired.push(super::binding::Retired::new(previous));
         }
     } else {
         host.geometry_jobs.place(

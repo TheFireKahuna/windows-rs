@@ -1,21 +1,24 @@
 //! Engine-independent declarations, solve-time lengths and responsive layout.
 //!
 //! Containers write retained records through `Ui`; their child closures run synchronously.
-//! Named `Layout` fields resolve into private Taffy styles during solving.
+//! Named `Layout` fields lower into private Taffy styles once per transaction, however many
+//! setters wrote them, and never inside the solve.
 
+mod anchor;
 mod len;
 mod preset;
 mod probe;
 mod scroll;
 
+pub use anchor::{Anchored, Anchors, Table, anchors};
 pub use len::{Align, Len, Track};
 pub use preset::root;
 pub use preset::{Edge, Layout, Position, Preset};
 pub use probe::{Placed, Probe, probe};
 pub use scroll::{
-    ListSpec, Realized, Reveal, ScrollDecl, ScrollState, THUMB_MARGIN, THUMB_MIN_H, THUMB_W,
-    ThumbGeom, list, observe as scroll_observe, rail_style, realize, scroll, scroll_for_thumb_y,
-    scroll_with, thumb_geom, thumb_y_for_scroll, window,
+    ListSpec, ListState, Realized, Reveal, Rows, ScrollDecl, THUMB_MARGIN, THUMB_MIN_H, THUMB_W,
+    ThumbGeom, list, list_state, observe as scroll_observe, rail_style, realize, scroll,
+    scroll_for_thumb_y, scroll_list, scroll_with, thumb_geom, thumb_y_for_scroll, window,
 };
 pub(crate) use scroll::{ScrollRow, ScrollTable, front as scroll_front, grab_decl, grab_hit};
 

@@ -126,9 +126,10 @@ pub enum What {
     Canceled(u64),
     /// A two-axis drag moved. Raised only for a control that declared a handler for one.
     Dragged(DragUpdate),
-    /// A two-axis drag ended. `commit` is false for a contact that was taken away, whose
-    /// pre-drag value stands.
-    DragEnded { commit: bool },
+    /// A two-axis drag ended. `Some` carries the last sample it reported, whose
+    /// displacement takes effect; `None` is a contact that was taken away, whose pre-drag
+    /// value stands.
+    DragEnded(Option<DragUpdate>),
 }
 
 /// Returns the drag state a sample leaves behind: the control it is on, and whether the
@@ -150,18 +151,19 @@ fn dragging_after(
     (target, was || phase != DragPhase::Undecided)
 }
 
-/// What a declared two-axis drag reports to the application.
+/// What a gesture reports to the application, whatever the gesture moves.
 ///
-/// One enum rather than a handler per phase: a drag is a sequence with exactly one end, and
-/// two callbacks would let a caller register the moves and forget the release.
+/// One enum rather than a handler per phase: a gesture is a sequence with exactly one end,
+/// and separate callbacks would let a caller register the moves and forget the release. A
+/// scalar's payload is its value; a declared two-axis drag's is the sample it reported.
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Dragging {
-    /// The contact moved. The update carries the phase, the displacement **projected onto
-    /// the locked axis**, and whether this sample is the one that decided that axis.
-    Moved(DragUpdate),
-    /// The contact lifted: the drag's value takes effect.
-    Committed,
-    /// The contact was taken away: nothing takes effect, and what stood before the drag
+pub enum Gesturing<T> {
+    /// The gesture moved. A drag's update carries the phase, the displacement **projected
+    /// onto the locked axis**, and whether this sample is the one that decided that axis.
+    Moved(T),
+    /// The contact lifted: what it carries takes effect.
+    Committed(T),
+    /// The contact was taken away: nothing takes effect, and what stood before the gesture
     /// stands.
     Canceled,
 }
@@ -195,12 +197,14 @@ pub struct Controls {
     /// this fraction rather than accumulated onto the last one — which would drift by the
     /// samples the recogniser coalesced. A cancel restores the same fraction.
     grabbed: Option<(ControlId, f32)>,
-    /// The control a declared two-axis drag is running on, and whether it ever passed the
-    /// threshold.
+    /// The control a declared two-axis drag is running on, whether it ever passed the
+    /// threshold, and the last sample it raised.
     ///
     /// The flag is what separates a release that ends a drag from one that is a tap: below
     /// the threshold a drag has no axis and no meaning, so a nudge while clicking is a click.
-    dragged: Option<(ControlId, bool)>,
+    /// The sample is what the release carries, so a handler is not asked to remember the
+    /// displacement it was given one tick earlier.
+    dragged: Option<(ControlId, bool, DragUpdate)>,
 }
 
 impl Controls {
@@ -337,7 +341,7 @@ impl Controls {
         if self.grabbed.is_some_and(|(target, _)| target == id) {
             self.grabbed = None;
         }
-        if self.dragged.is_some_and(|(target, _)| target == id) {
+        if self.dragged.is_some_and(|(target, _, _)| target == id) {
             self.dragged = None;
         }
     }
@@ -560,12 +564,13 @@ impl Controls {
                 // A drag that passed the threshold ends here and is not also a tap: the two
                 // are the same contact, and raising both would run the click handler at the
                 // end of every reorder.
-                if let Some((_, decided)) = self.dragged.take().filter(|&(id, _)| id == target)
+                if let Some((_, decided, last)) =
+                    self.dragged.take().filter(|&(id, _, _)| id == target)
                     && decided
                 {
                     out.push(Intent {
                         target,
-                        what: What::DragEnded { commit: true },
+                        what: What::DragEnded(Some(last)),
                     });
                     return Ok(());
                 }
@@ -609,12 +614,13 @@ impl Controls {
                     target,
                     what: What::Canceled(self.rows.get(target).map_or(0, |row| row.revision)),
                 });
-                if let Some((_, decided)) = self.dragged.take().filter(|&(id, _)| id == target)
+                if let Some((_, decided, _)) =
+                    self.dragged.take().filter(|&(id, _, _)| id == target)
                     && decided
                 {
                     out.push(Intent {
                         target,
-                        what: What::DragEnded { commit: false },
+                        what: What::DragEnded(None),
                     });
                 }
                 self.wash(target, front)?;
@@ -638,7 +644,9 @@ impl Controls {
                 // is the application's own subject — a row's position in a list, a scope over
                 // channels — which this table holds no geometry for.
                 if self.rows.get(target).is_some_and(|r| r.drags) {
-                    self.dragged = Some(dragging_after(self.dragged, target, update.phase));
+                    let held = self.dragged.map(|(id, decided, _)| (id, decided));
+                    let (id, decided) = dragging_after(held, target, update.phase);
+                    self.dragged = Some((id, decided, update));
                     out.push(Intent {
                         target,
                         what: What::Dragged(update),
@@ -932,7 +940,7 @@ mod tests {
         controls.observed_hover = Some(row.id);
         controls.pressed = Some(row.id);
         controls.grabbed = Some((row.id, 0.5));
-        controls.dragged = Some((row.id, true));
+        controls.dragged = Some((row.id, true, undecided()));
         down.clear();
         drop(held);
         Host::flush(&mut patch);
@@ -1033,7 +1041,7 @@ mod tests {
             .id;
         controls.pressed = Some(replacement);
         controls.grabbed = Some((replacement, 0.5));
-        controls.dragged = Some((replacement, true));
+        controls.dragged = Some((replacement, true, undecided()));
         controls.tick(
             &[
                 Report::HoverChanged {
@@ -1063,8 +1071,19 @@ mod tests {
         assert!(controls.rows.get(id).is_none());
         assert_eq!(controls.pressed, Some(replacement));
         assert_eq!(controls.grabbed, Some((replacement, 0.5)));
-        assert_eq!(controls.dragged, Some((replacement, true)));
+        assert_eq!(controls.dragged, Some((replacement, true, undecided())));
         Ok(())
+    }
+
+    /// A drag sample that displaced nothing, for a held state a test sets up by hand.
+    fn undecided() -> DragUpdate {
+        DragUpdate {
+            phase: DragPhase::Undecided,
+            delta: windows_scene::Point::default(),
+            from: windows_scene::Point::default(),
+            at: windows_scene::Point::default(),
+            decided: false,
+        }
     }
 
     /// Two distinct control ids, minted rather than constructed: a slot and a generation are

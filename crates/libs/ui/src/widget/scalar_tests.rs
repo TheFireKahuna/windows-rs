@@ -3,7 +3,7 @@ use crate::{
     build::Host,
     input::{KeyEvent, KeyKind, Mods, PointerFlags, PointerType, Sample},
     signal::{Cell, Owner},
-    widget::{ScalarPart, ScalarValue, TextStyle},
+    widget::{Gesturing, ScalarPart, ScalarValue, TextStyle},
 };
 use windows_scene::{Model, Point};
 
@@ -93,6 +93,7 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
                 epoch: 0,
             });
             let accepted = Cell::new(0_usize);
+            let live = Cell::new(None::<f64>);
             let shown = Cell::new(true);
             let _held = crate::build::Ui::mount_root(|ui| {
                 let geom = ui.geometry(&[
@@ -123,12 +124,15 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
                 .layout(|l| l.flow = Some(crate::layout::Preset::Grid))
                 .width(crate::role::Metric::CardMinW)
                 .height(crate::role::Metric::CardMinW)
-                .on_commit(move |value| {
-                    accepted.set(accepted.get() + 1);
-                    source.set(ScalarValue {
-                        value,
-                        epoch: source.get().epoch,
-                    });
+                .live(live)
+                .on_gesture(move |phase| {
+                    if let Gesturing::Committed(value) = phase {
+                        accepted.set(accepted.get() + 1);
+                        source.set(ScalarValue {
+                            value,
+                            epoch: source.get().epoch,
+                        });
+                    }
                 });
             });
             let mut controls = Controls::new();
@@ -321,6 +325,70 @@ fn native_scalar_parts_keep_one_writer_and_reject_stale_commits() -> Result<()> 
                 crate::counting::allocations() - before,
                 0,
                 "unchanged flush/apply allocated"
+            );
+            // The in-flight value is readable for exactly as long as a gesture owns it.
+            assert_eq!(live.get(), None, "a settled control publishes no value");
+            out.clear();
+            controls.tick(&[press(id), drag(id, 0.1)], &mut front, &mut out)?;
+            Host::dispatch(&out);
+            let standing = f64::from(controls.rows.get(id).unwrap().fraction);
+            assert_eq!(
+                live.get(),
+                Some(standing),
+                "a moving gesture publishes the fraction the front thread stands at"
+            );
+            // Publication rides the existing dispatch, so a warm gesture still allocates
+            // nothing on this thread.
+            let before = crate::counting::allocations();
+            for step in 0..200 {
+                out.clear();
+                controls.tick(
+                    &[drag(id, if step % 2 == 0 { 0.2 } else { 0.1 })],
+                    &mut front,
+                    &mut out,
+                )?;
+                Host::dispatch(&out);
+            }
+            assert_eq!(
+                crate::counting::allocations() - before,
+                0,
+                "warm in-flight publication allocated"
+            );
+            assert!(live.get().is_some());
+            out.clear();
+            controls.tick(
+                &[Report::Canceled {
+                    target: id,
+                    contact: 1,
+                }],
+                &mut front,
+                &mut out,
+            )?;
+            Host::dispatch(&out);
+            assert_eq!(
+                live.get(),
+                None,
+                "a canceled gesture clears the value it was showing"
+            );
+            out.clear();
+            controls.tick(
+                &[
+                    press(id),
+                    drag(id, 0.1),
+                    Report::Released {
+                        target: id,
+                        contact: 1,
+                        at: Point::default(),
+                    },
+                ],
+                &mut front,
+                &mut out,
+            )?;
+            Host::dispatch(&out);
+            assert_eq!(
+                live.get(),
+                None,
+                "a committed gesture clears the value it was showing"
             );
             Ok(())
         });

@@ -28,7 +28,7 @@ use windows_scene::{BackdropSpec, Backends};
 use windows_text::{FamilyId, FontLadder, FontSpec};
 use windows_ui::driver::{Observed, UiRuntime, observe};
 use windows_ui::input::Report;
-use windows_ui::layout::{ListSpec, list};
+use windows_ui::layout::{ListSpec, list, list_state, scroll_list};
 use windows_ui::role::{
     AccentId, DataRole, Density, Emission, Fill, Metric, Palette, Polarity, Role, Scope, Stroke,
     Text, TypeRole, WidthClass,
@@ -105,16 +105,31 @@ fn main() -> Result<()> {
         },
         BackdropSpec::default(),
         |ui, _ctx| {
-            list(
-                ui,
-                || ListSpec::uniform(ROWS, Metric::RowH),
-                |realized, out| {
-                    for run in realized.runs() {
-                        out.extend(run.map(|index| (index, index)));
-                    }
-                },
-                |ui, index: &usize| label(ui, format!("row {index}")).id(),
-            )
+            // Every other row is two lines, so the run exercises the measured half of the
+            // extent table rather than a list the estimate happens to be right about.
+            let state = list_state();
+            scroll_list(ui, state, move |ui| {
+                list(
+                    ui,
+                    state,
+                    || ListSpec::new(Metric::RowH).estimate(1.5),
+                    |out| out.extend(0..ROWS as u64),
+                    |realized, out| {
+                        for run in realized.runs() {
+                            out.extend(run.map(|index| (index, index)));
+                        }
+                    },
+                    |ui, index: &usize| {
+                        let text = if index % 2 == 0 {
+                            format!("row {index}")
+                        } else {
+                            format!("row {index}
+and a second line")
+                        };
+                        label(ui, text).id()
+                    },
+                );
+            })
             .grow();
         },
     )?;

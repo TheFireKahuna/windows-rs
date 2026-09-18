@@ -186,6 +186,21 @@ impl Align {
         }
     }
 
+    /// Returns the fraction of an anchored node's own extent that lies before the point it
+    /// is anchored to.
+    ///
+    /// `None` where the axis has no single point to align against: `Stretch` pins both of
+    /// the anchor's edges, and `SpaceBetween` distributes slack one node has none of.
+    #[must_use]
+    pub(crate) const fn anchor_fraction(self) -> Option<f32> {
+        match self {
+            Self::Start => Some(0.0),
+            Self::Center => Some(0.5),
+            Self::End => Some(1.0),
+            Self::Stretch | Self::SpaceBetween => None,
+        }
+    }
+
     /// Returns the main-axis distribution for the container's content.
     #[must_use]
     pub(crate) const fn content(self) -> taffy::AlignContent {

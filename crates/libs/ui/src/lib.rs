@@ -24,9 +24,9 @@ pub mod structure;
 #[cfg(test)]
 mod counting;
 
-// The authoring surface: the build arena and the element, the length vocabulary and the
-// style presets, and the widget seeds over both. It declares into `windows-scene` and
-// resolves through `role`, and reaches no Windows surface of its own.
+// The authoring surface: the element, the length vocabulary and the style presets, and the
+// widget seeds over both. It declares into `windows-scene` and resolves through `role`, and
+// reaches no Windows surface of its own.
 #[deny(unsafe_code)]
 pub mod build;
 #[deny(unsafe_code)]

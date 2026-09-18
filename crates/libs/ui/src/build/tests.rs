@@ -957,7 +957,8 @@ fn a_metric_override_lowers_through_the_palette() {
         width: Some(Len::Metric(Metric::CardMinW)),
         ..Default::default()
     }
-    .lower(crate::layout::Preset::Bare, None, scope);
+    .lower(crate::layout::Preset::Bare, None, scope)
+    .0;
     assert_eq!(
         style.size.width,
         taffy::Dimension::length(crate::role::metric(Metric::CardMinW, scope)),
@@ -1509,6 +1510,255 @@ fn only_a_wrapping_run_costs_a_sprite_per_line() {
         .count();
     assert_eq!(minted, 1, "a non-wrapping run is one visual");
 }
+/// An anchored child solves to its parent's normalized point, aligned by its own size.
+///
+/// Two parent sizes, because the whole claim is that the point is a fraction of the parent
+/// and the pull-back is the measured child: a placement that happened to be right at one
+/// size and wrong at the other would be a fixed inset in disguise.
+#[test]
+fn an_anchored_child_solves_against_its_parent_and_its_own_size() {
+    use crate::layout::Align;
+    let mut patch = fixture();
+    let unit = Len::Times(Metric::RowH, 1.0);
+    let half = Len::Times(Metric::RowH, 0.5);
+    let mut ids = None;
+    let _mount = create(|ui| {
+        let mut inner = None;
+        let outer = ui
+            .stack(|ui| {
+                let centred = ui
+                    .node(crate::layout::Preset::Bare)
+                    .width(unit)
+                    .height(half)
+                    .anchor(0.5, 0.25, [Align::Center; 2])
+                    .id();
+                let ended = ui
+                    .node(crate::layout::Preset::Bare)
+                    .width(unit)
+                    .height(half)
+                    .anchor(1.0, 1.0, [Align::End; 2])
+                    .id();
+                let spanned = ui
+                    .node(crate::layout::Preset::Bare)
+                    .anchor_rect([0.25, 0.5, 0.75, 1.0])
+                    .id();
+                inner = Some((centred, ended, spanned));
+            })
+            .width(Len::Pct(1.0))
+            .height(Len::Pct(1.0))
+            .id();
+        ids = inner.map(|inner| (outer, inner));
+    });
+    let (outer, (centred, ended, spanned)) = ids.expect("the fixture mounted");
+    for window in [Vector2 { x: 400.0, y: 200.0 }, Vector2 { x: 260.0, y: 140.0 }] {
+        Host::with(|h| h.model.set_window(window));
+        flush(&mut patch);
+        let solved = |id: Node| Host::with(|h| h.model.solved(id.target.id()));
+        let parent = solved(outer);
+        let (w, h) = (parent.size.x, parent.size.y);
+        assert!(w > 0.0 && h > 0.0, "the parent has an extent: {parent:?}");
+        let centred = solved(centred);
+        assert!(
+            centred.size.x > 0.0
+                && (centred.rect.x0 + centred.size.x * 0.5 - (parent.rect.x0 + w * 0.5)).abs() < 1.0
+                && (centred.rect.y0 + centred.size.y * 0.5 - (parent.rect.y0 + h * 0.25)).abs()
+                    < 1.0,
+            "a centred anchor in {parent:?} landed at {centred:?}"
+        );
+        let ended = solved(ended);
+        assert!(
+            (ended.rect.x1 - parent.rect.x1).abs() < 1.0
+                && (ended.rect.y1 - parent.rect.y1).abs() < 1.0,
+            "an end-aligned anchor in {parent:?} landed at {ended:?}"
+        );
+        let spanned = solved(spanned);
+        assert!(
+            (spanned.rect.x0 - (parent.rect.x0 + w * 0.25)).abs() < 1.0
+                && (spanned.size.x - w * 0.5).abs() < 1.0
+                && (spanned.size.y - h * 0.5).abs() < 1.0,
+            "a stretched anchor in {parent:?} landed at {spanned:?}"
+        );
+    }
+    Host::with(|h| h.model.set_window(Vector2 { x: 800.0, y: 600.0 }));
+    flush(&mut patch);
+}
+/// An anchored control is a laid-out node, so it takes a hit entry at the box it was pulled
+/// back to.
+#[test]
+#[cfg(feature = "test-support")]
+fn an_anchored_control_takes_a_hit_entry_at_its_anchored_box() {
+    use crate::layout::Align;
+    use crate::widget::{Chrome, TextStyle, roles};
+    let mut patch = fixture();
+    let mut target = None;
+    let _mount = create(|ui| {
+        ui.stack(|ui| {
+            target = Some(
+                ui.button(
+                    Chrome::new(roles::BUTTON[0], Metric::Radius),
+                    TextStyle::new(TypeRole::Body),
+                    "Anchored",
+                )
+                .anchor(0.5, 0.5, [Align::Center; 2])
+                .id(),
+            );
+        })
+        .width(Len::Pct(1.0))
+        .height(Len::Pct(1.0));
+    });
+    flush(&mut patch);
+    let id = target.expect("the button mounted").target.id();
+    let solved = Host::with(|h| h.model.solved(id));
+    let control = Host::with(|h| h.mounts.get(id).and_then(|row| row.control))
+        .expect("a button owns a control");
+    let entry = patch
+        .hit_entries()
+        .iter()
+        .find(|entry| entry.id == control)
+        .copied()
+        .expect("an anchored control must reach the hit array");
+    assert!(
+        (entry.x0 - solved.rect.x0).abs() < 0.01 && (entry.y0 - solved.rect.y0).abs() < 0.01,
+        "the hit entry at {:?} disagrees with the anchored box {solved:?}",
+        (entry.x0, entry.y0)
+    );
+    let parent = Host::with(|h| h.model.solved(h.model.root().node()));
+    assert!(
+        solved.size.x > 0.0
+            && (solved.rect.x0 + solved.size.x * 0.5 - (parent.rect.x0 + parent.size.x * 0.5))
+                .abs()
+                < 1.0,
+        "the anchored control was not centred in {parent:?}: {solved:?}"
+    );
+}
+/// A keyed anchor set reads back parent-relative boxes and drops an unmounted key.
+#[test]
+fn an_anchor_set_reads_keyed_boxes_in_its_origin_space() {
+    use crate::layout::anchors;
+    use crate::signal::{Cell, Owner};
+    let mut patch = fixture();
+    let (_owner, (extra, set)) = Owner::scope(|| (Cell::new(true), anchors()));
+    let _mount = create(|ui| {
+        ui.stack(|ui| {
+            // Pushes the origin off the window's own corner, so rebasing is not the identity.
+            ui.node(crate::layout::Preset::Bare)
+                .height(Len::Times(Metric::RowH, 2.0));
+            ui.stack(|ui| {
+                ui.node(crate::layout::Preset::Bare)
+                    .height(Len::Times(Metric::RowH, 1.0))
+                    .anchored(set, 11);
+                ui.node(crate::layout::Preset::Bare)
+                    .height(Len::Times(Metric::RowH, 2.0))
+                    .anchored(set, 22);
+                ui.when(extra, move |ui| {
+                    ui.node(crate::layout::Preset::Bare)
+                        .height(Len::Times(Metric::RowH, 3.0))
+                        .anchored(set, 33);
+                });
+            })
+            .gap(Len::Zero)
+            .width(Len::Pct(1.0))
+            .anchors_origin(set);
+        })
+        .gap(Len::Zero);
+    });
+    flush(&mut patch);
+    let unit = Host::with(|h| crate::role::metric(Metric::RowH, h.root_scope));
+    set.with(|table| {
+        assert_eq!(table.len(), 3, "three keys attached");
+        assert!(table.size.x > 0.0, "the origin's own size rides the table");
+        let first = table.get(11).expect("key 11");
+        assert!(
+            first.y0.abs() < 0.01,
+            "the first row is at the origin's own top, not the window's: {first:?}"
+        );
+        let second = table.get(22).expect("key 22");
+        assert!(
+            (second.y0 - unit).abs() < 1.0 && (second.height() - unit * 2.0).abs() < 1.0,
+            "the second row is rebased onto the origin: {second:?}"
+        );
+        assert!((table.get(33).expect("key 33").y0 - unit * 3.0).abs() < 1.0);
+    });
+    extra.set(false);
+    flush(&mut patch);
+    set.with(|table| {
+        assert_eq!(table.len(), 2, "an unmounted key leaves the table");
+        assert_eq!(table.get(33), None, "a stale key answers nothing");
+    });
+}
+/// A settled anchor set publishes nothing and allocates nothing.
+#[test]
+fn a_settled_anchor_set_allocates_nothing() {
+    use crate::layout::anchors;
+    use crate::signal::Owner;
+    let mut patch = fixture();
+    let (_owner, set) = Owner::scope(anchors);
+    let _mount = create(|ui| {
+        ui.stack(|ui| {
+            for key in 0..8_u64 {
+                ui.node(crate::layout::Preset::Bare)
+                    .height(Len::Times(Metric::RowH, 1.0))
+                    .anchored(set, key);
+            }
+        })
+        .width(Len::Pct(1.0))
+        .anchors_origin(set);
+    });
+    flush(&mut patch);
+    flush(&mut patch);
+    let published = set.with(|table| table.len());
+    assert_eq!(published, 8, "every key published");
+    let before = crate::counting::allocations();
+    flush(&mut patch);
+    let during = crate::counting::allocations() - before;
+    assert_eq!(
+        during, 0,
+        "a settled anchor set allocated {during} times; publication must reuse its scratch"
+    );
+}
+/// Warm direct construction of a grid lowers each declaration once per transaction.
+///
+/// A grid's lowering pushes a template vector per axis, so the floor is two allocations per
+/// grid however the declaration was written. Anything above that floor is a lowering that a
+/// chained setter forced.
+#[test]
+fn a_warm_grid_mount_lowers_once_per_transaction() {
+    use crate::layout::Track;
+    const GRIDS: usize = 4;
+    let mut patch = fixture();
+    let screen = |ui: &mut Ui<'_>| {
+        ui.stack(|ui| {
+            for _ in 0..GRIDS {
+                ui.grid(|ui| {
+                    ui.node(crate::layout::Preset::Bare).at(0, 0);
+                })
+                .cols([Track::Fr(1.0)])
+                .rows([Track::Fr(1.0)])
+                .gap(Len::Zero)
+                .padding(Len::Zero)
+                .min_width(Len::Zero)
+                .min_height(Len::Zero)
+                .width(Len::Times(Metric::RowH, 4.0))
+                .height(Len::Times(Metric::RowH, 4.0))
+                .no_shrink();
+            }
+        });
+    };
+    let scope = root_scope();
+    let warm = Ui::mount_at(root(), None, scope, None, screen);
+    flush(&mut patch);
+    drop(warm);
+    flush(&mut patch);
+    let before = crate::counting::allocations();
+    let second = Ui::mount_at(root(), None, scope, None, screen);
+    let during = crate::counting::allocations() - before;
+    flush(&mut patch);
+    drop(second);
+    assert_eq!(
+        during, GRIDS * 2,
+        "a warm grid mount allocated {during} times for {GRIDS} grids; a declaration must lower          once per transaction, leaving only the two template vectors that lowering builds"
+    );
+}
 /// Warm direct construction reuses retained storage without any allocation.
 #[test]
 fn a_warm_mount_allocates_nothing() {
@@ -1904,21 +2154,27 @@ fn a_control_declares_the_default_gesture_and_a_label_declares_none() {
         "a static label was given a recogniser it can never use"
     );
 }
-/// Specifies a thousand-row list, in a viewport that shows about ten of them.
+/// How many rows the list fixtures hold, in a viewport that shows about ten of them.
+const ROWS: usize = 1000;
+/// Specifies the list the fixtures mount.
 const LIST: crate::layout::ListSpec = crate::layout::ListSpec {
-    count: 1000,
     row_h: Metric::RowH,
+    estimate: 1.0,
     overscan: 2,
 };
 /// Settles a mounted list and returns the tracker driving it.
 ///
-/// Two flushes, because a viewport's height is a solve output: the first flush measures it
-/// and the realization window it implies is resolved on the tick after. A running window
+/// Four flushes, because a variable-extent list settles in stages: the first measures the
+/// viewport, the second resolves the window that height implies, the third takes the rows'
+/// own boxes, and the fourth places them at the offsets those boxes gave. A running window
 /// mounts and resizes the same way.
 fn settle(patch: &mut SinkPatch) -> windows_scene::Id<windows_scene::Tracker> {
-    flush(patch);
-    crate::signal::flush();
-    flush(patch);
+    SETTLING.with(|ops| ops.borrow_mut().clear());
+    for _ in 0..4 {
+        crate::signal::flush();
+        flush(patch);
+        SETTLING.with(|ops| ops.borrow_mut().extend_from_slice(patch.ops()));
+    }
     Host::with(|h| {
         h.scrolls
             .iter()
@@ -1926,6 +2182,27 @@ fn settle(patch: &mut SinkPatch) -> windows_scene::Id<windows_scene::Tracker> {
             .map(|(_, row)| row.tracker.id())
             .expect("the list mounted a scroll container")
     })
+}
+// Every op the settling emitted, across all of its flushes. A flush replaces the caller's
+// buffer rather than appending to it, and a list settles over several: the rows are placed on
+// the flush that measured them and the one after emits nothing, so the placements survive
+// only here.
+thread_local! {
+    static SETTLING: core::cell::RefCell<Vec<Op>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+/// Runs `f` over every op the settling emitted.
+fn settled<R>(f: impl FnOnce(&[Op]) -> R) -> R {
+    SETTLING.with(|ops| f(&ops.borrow()))
+}
+// The state the last mounted list fixture was given, so a test can read its extent table and
+// drive its reveal without threading a handle out of the mount closure.
+thread_local! {
+    static LIST_STATE: core::cell::Cell<Option<crate::layout::ListState>> =
+        const { core::cell::Cell::new(None) };
+}
+/// Returns the state the last mounted list fixture was given.
+fn list_state() -> crate::layout::ListState {
+    LIST_STATE.with(core::cell::Cell::get).expect("a list was mounted")
 }
 /// Mounts a virtualized list and returns the tracker driving it.
 fn virtualized(
@@ -1935,27 +2212,43 @@ fn virtualized(
     windows_scene::Id<windows_scene::Tracker>,
 ) {
     let _held = create(|ui| {
-        crate::layout::list(
-            ui,
-            || LIST,
-            |realized, out| {
-                for run in realized.runs() {
-                    out.extend(run.map(|index| (index, index)));
-                }
-            },
-            |ui, index: &usize| {
-                plate(ui)
-                    .name(if *index == 0 { "first" } else { "row" })
-                    .id()
-            },
-        )
+        let state = crate::layout::list_state();
+        LIST_STATE.with(|held| held.set(Some(state)));
+        crate::layout::scroll_list(ui, state, move |ui| {
+            crate::layout::list(
+                ui,
+                state,
+                || LIST,
+                |out| out.extend(0..ROWS as u64),
+                |realized, out| {
+                    for run in realized.runs() {
+                        out.extend(run.map(|index| (index, index)));
+                    }
+                },
+                // Every other row is two deep, so the fixture exercises the measured half of
+                // the table rather than a list the estimate happens to be right about.
+                |ui, index: &usize| {
+                    plate(ui)
+                        .name(if *index == 0 { "first" } else { "row" })
+                        .height(if index % 2 == 0 {
+                            Len::from(Metric::RowH)
+                        } else {
+                            Len::Times(Metric::RowH, 2.0)
+                        })
+                        .id()
+                },
+            );
+        })
         .height(Metric::CardMinH);
     });
     (_held, settle(patch))
 }
-/// Returns how many rows the list realized, counted off the nodes the mount walk claimed.
+/// Returns how many rows the list realized, counted off the boxes it asked to have measured.
+///
+/// One attachment per realized row and none for anything else in these fixtures, and the
+/// list is what publishes them, so this counts the rows rather than the tree around them.
 fn realized_rows() -> usize {
-    Host::with(|h| h.mounts.iter().count())
+    Host::with(|h| h.anchor_members.len())
 }
 /// Returns the travel the solve gave the tracker, read off the scroll row's last publish.
 ///
@@ -1985,40 +2278,50 @@ fn a_virtualized_list_realizes_a_screen_and_places_what_it_realized() {
         "a thousand-row list realized {rows} nodes"
     );
     let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
-    let offsets: Vec<f32> = patch
-        .ops()
-        .iter()
-        .filter_map(|op| match op {
-            Op::Bind {
-                prop: windows_scene::Prop::Offset,
-                bind: windows_scene::Bind::Set(windows_scene::Value::Vec2(at)),
-                ..
-            } => Some(at.y),
-            _ => None,
-        })
-        .collect();
+    let offsets: Vec<f32> = settled(|ops| {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::Bind {
+                    prop: windows_scene::Prop::Offset,
+                    bind: windows_scene::Bind::Set(windows_scene::Value::Vec2(at)),
+                    ..
+                } => Some(at.y),
+                _ => None,
+            })
+            .collect()
+    });
     assert!(
         offsets.iter().any(|y| *y > row_h * 4.0),
         "no row was placed past the fifth: {offsets:?}"
     );
-    for y in &offsets {
-        let index = y / row_h;
-        assert!(
-            (index - index.round()).abs() < 0.01,
-            "a row landed off its own boundary at {y}"
-        );
-    }
+    // Every realized row sits at the offset the table gives its key, read off the solve
+    // rather than off the ops: the settling emitted a placement per correction, and only the
+    // last of them is where the row now is.
+    list_state().with_rows(|table| {
+        Host::with(|h| {
+            for &(_, node, key) in &h.anchor_members {
+                let at = table.index_of(key).expect("a realized row is in the list");
+                let local = h.model.solved(node).local.y;
+                assert!(
+                    (local - table.offset(at)).abs() < 0.01,
+                    "row {at} is at {local} and the table puts it at {}",
+                    table.offset(at)
+                );
+            }
+        });
+    });
     let max = published_extent();
     assert!(
-        max > row_h * (LIST.count as f32) * 0.9,
+        max > row_h * (ROWS as f32) * 0.9,
         "the tracker's travel was {max}, which is not a thousand rows"
     );
 }
-/// A reported position realizes the rows under it in the tick it arrived in, and leaves the
-/// extent alone.
+/// A reported position realizes the rows under it in the tick it arrived in, and asks the
+/// tracker for nothing.
 ///
-/// A content height that followed the realized set would move the maximum position on every
-/// frame of a fling, sliding the content under the user's finger.
+/// The extent is corrected as the rows it realized are measured; the position is not. A list
+/// that requested a position of its own while correcting would slide the content under a
+/// finger that had not moved.
 #[test]
 fn a_reported_position_realizes_the_rows_under_it() {
     let mut patch = fixture();
@@ -2037,19 +2340,17 @@ fn a_reported_position_realizes_the_rows_under_it() {
     crate::signal::flush();
     flush(&mut patch);
     let after = realized_rows();
+    // Bounded by the viewport and the overscan, not by how far the content moved. The top of
+    // the list carries overscan on one side only, so a window in the middle of it is the
+    // wider of the two.
     assert!(
-        after.abs_diff(before) <= LIST.overscan,
+        after <= before + 2 * LIST.overscan,
         "a scrolled list realized {after} rows against {before} at the top"
     );
-    assert!(
-        !patch.ops().iter().any(|op| matches!(
-            op,
-            Op::Tracker {
-                op: windows_scene::TrackerOp::Bounds { .. },
-                ..
-            }
-        )),
-        "scrolling moved the extent, so the maximum position is not a constant"
+    assert_eq!(
+        list_state().offset(),
+        row_h * 500.0,
+        "realizing wrote the position back rather than reading it"
     );
     let placed = patch.ops().iter().any(|op| {
         matches!(
@@ -2122,33 +2423,245 @@ fn a_fling_realizes_its_destination_without_dropping_where_it_is() {
         "a settled list is still holding its destination"
     );
 }
-/// A realized index the caller did not supply reserves its space and holds nothing.
+/// Reports `y` to the list's tracker and settles the tick it arrived in.
+fn scrolled_to(patch: &mut SinkPatch, tracker: windows_scene::Id<windows_scene::Tracker>, y: f32) {
+    crate::layout::scroll_observe(&[windows_scene::SceneEvent::TrackerValues {
+        tracker,
+        position: Vector2 { x: 0.0, y },
+        scale: 1.0,
+    }]);
+    crate::signal::flush();
+    flush(patch);
+    crate::signal::flush();
+    flush(patch);
+}
+/// Returns the keys the list has realized, from the boxes it asked to have measured.
+fn realized_keys() -> Vec<u64> {
+    Host::with(|h| h.anchor_members.iter().map(|&(_, _, key)| key).collect())
+}
+/// The window follows the measured extents down the list, and a row it keeps keeps its node.
 ///
-/// The placeholder sits where the row will be when the data arrives, so the extent and every
-/// row below it are already right, and nothing invented stands in for the data.
+/// Realization is keyed by the application's own identity rather than by index, so a row the
+/// window still covers after a move is a `Keep` in the reconcile: it holds its node, its
+/// owner and everything scoped to it, and only the rows at the edges are built and torn down.
 #[test]
-fn an_unsupplied_row_reserves_its_space() {
+fn a_moving_window_keeps_the_rows_it_still_covers() {
+    let mut patch = fixture();
+    let (_held, tracker) = virtualized(&mut patch);
+    let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
+    let mut seen = Vec::new();
+    for at in [0.0, row_h * 40.0, row_h * 41.0] {
+        scrolled_to(&mut patch, tracker, at);
+        let keys = realized_keys();
+        assert!(
+            (5..40).contains(&keys.len()),
+            "the window at {at} realized {} rows",
+            keys.len()
+        );
+        // The window covers the rows the table puts under the viewport, and the keys are the
+        // indices the fixture named them with.
+        list_state().with_rows(|table| {
+            let top = table.at(at);
+            assert!(
+                keys.contains(&(top as u64)),
+                "the row under {at} is {top}, which the window does not hold: {keys:?}"
+            );
+        });
+        seen.push(keys);
+    }
+    let nudged: Vec<u64> = seen[2]
+        .iter()
+        .copied()
+        .filter(|key| seen[1].contains(key))
+        .collect();
+    assert!(
+        nudged.len() + 2 >= seen[2].len(),
+        "a one-row nudge kept only {} of {} rows, so the window is re-keying rather than moving",
+        nudged.len(),
+        seen[2].len()
+    );
+    assert!(
+        seen[0].iter().all(|key| !seen[1].contains(key)),
+        "a forty-row move kept rows it had scrolled past"
+    );
+    let nodes = Host::with(|h| h.anchor_members.iter().map(|&(_, node, _)| node).count());
+    assert_eq!(nodes, seen[2].len(), "a key was attached under two nodes");
+}
+/// A measurement corrects the content's extent and never moves the tracker.
+///
+/// The extent is a layout output and the position is the compositor's; a correction that
+/// wrote the position back would slide the content under a finger that had not moved. During
+/// an interaction the extent is additionally held at what it was when the interaction began,
+/// so the maximum position climbs toward the truth and never steps back.
+#[test]
+fn a_correction_moves_the_extent_and_leaves_the_position_alone() {
+    let mut patch = fixture();
+    let (_held, tracker) = virtualized(&mut patch);
+    let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
+    let state = list_state();
+    // Every row the fixture realizes is measured, and the rows below are still the estimate,
+    // so the table is the two mixed and the extent is neither one alone.
+    let (measured, estimated) = list_state().with_rows(|table| {
+        (
+            (0..table.len()).filter(|&at| table.is_measured(at)).count(),
+            (0..table.len()).filter(|&at| !table.is_measured(at)).count(),
+        )
+    });
+    assert!(measured > 0 && estimated > 0, "nothing was left to correct");
+    let estimate_only = row_h * (ROWS as f32) * LIST.estimate;
+    let corrected = list_state().with_rows(|table| table.total());
+    assert!(
+        (corrected - estimate_only).abs() > row_h,
+        "the measurements did not move the extent off the estimate"
+    );
+
+    let at = row_h * 40.0;
+    scrolled_to(&mut patch, tracker, at);
+    assert_eq!(state.offset(), at, "a correction wrote the tracker's position");
+    let held = list_state().with_rows(|table| table.total());
+
+    // A manipulation begins, and the rows under it are measured taller than the estimate.
+    crate::layout::scroll_observe(&[windows_scene::SceneEvent::TrackerPhase {
+        tracker,
+        phase: windows_scene::Phase::Interacting,
+    }]);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(state.offset(), at, "entering a manipulation moved the position");
+    assert!(
+        published_extent() + state.viewport() >= held - row_h,
+        "the extent shrank under a manipulation"
+    );
+    for step in 1..=3u8 {
+        scrolled_to(&mut patch, tracker, at + row_h * f32::from(step));
+        assert!(
+            published_extent() + state.viewport() >= held - row_h,
+            "a correction at step {step} shortened the content mid-manipulation"
+        );
+    }
+    crate::layout::scroll_observe(&[windows_scene::SceneEvent::TrackerPhase {
+        tracker,
+        phase: windows_scene::Phase::Idle,
+    }]);
+    crate::signal::flush();
+    flush(&mut patch);
+    assert_eq!(
+        state.offset(),
+        at + row_h * 3.0,
+        "settling wrote the position rather than reading it"
+    );
+}
+/// Revealing a row outside the window asks the tracker to bring it into view.
+///
+/// A row that is not realized has no box and no hit entry, so it is asked for by key and the
+/// position is resolved from the extent table. The request goes to the compositor rather than
+/// into the position signal: the compositor owns where the content is, and the rows are
+/// realized from what it reports back.
+#[test]
+fn revealing_an_unrealized_row_asks_the_tracker_for_it() {
+    let mut patch = fixture();
+    let mut down = crate::seam::Down::default();
+    let (_held, _) = virtualized(&mut patch);
+    let state = list_state();
+    assert!(
+        !realized_keys().contains(&600),
+        "row 600 was already realized, so the reveal proves nothing"
+    );
+    state.reveal(600);
+    crate::signal::flush();
+    flush(&mut patch);
+    Host::with(|h| h.fill(&mut down));
+    let asked: Vec<f32> = down
+        .scrolls
+        .iter()
+        .filter_map(|op| match op {
+            crate::seam::ScrollOp::To { y, .. } => Some(*y),
+            _ => None,
+        })
+        .collect();
+    let want = state.with_rows(|table| table.offset(600));
+    assert_eq!(asked.len(), 1, "the reveal asked for {} positions", asked.len());
+    assert!(
+        asked[0] > 0.0 && asked[0] <= want,
+        "the reveal asked for {}, which does not bring row 600 into a viewport ending at {want}",
+        asked[0]
+    );
+    assert_eq!(state.offset(), 0.0, "the reveal wrote the position instead of asking for it");
+    // Asked once. A standing request would fight every later scroll.
+    down.scrolls.clear();
+    crate::signal::flush();
+    flush(&mut patch);
+    Host::with(|h| h.fill(&mut down));
+    assert!(
+        !down.scrolls.iter().any(|op| matches!(op, crate::seam::ScrollOp::To { .. })),
+        "the reveal asked again on the next flush"
+    );
+}
+/// A scroll inside the realized window allocates nothing.
+///
+/// Every step of the resolution is sized once and reused: the realized set is a fixed array,
+/// the extent table is the length of the list, the keys the fill pushes go into a pooled
+/// buffer, and the placements re-lower into storage the recipes already hold.
+#[test]
+fn a_warm_scroll_allocates_nothing() {
+    let mut patch = fixture();
+    let (_held, tracker) = virtualized(&mut patch);
+    let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
+    // Warm the path at the position the measurement is taken from, so the first arrival of a
+    // row and the first growth of every buffer are outside the count.
+    for step in 0..4u8 {
+        scrolled_to(&mut patch, tracker, row_h * (40.0 + f32::from(step)));
+    }
+    let before = crate::counting::allocations();
+    for step in 0..8u8 {
+        crate::layout::scroll_observe(&[windows_scene::SceneEvent::TrackerValues {
+            tracker,
+            position: Vector2 {
+                x: 0.0,
+                y: row_h * 43.0 + f32::from(step),
+            },
+            scale: 1.0,
+        }]);
+        crate::signal::flush();
+    }
+    let during = crate::counting::allocations() - before;
+    assert_eq!(
+        during, 0,
+        "eight reported positions inside one window allocated {during} times"
+    );
+}
+/// A row the caller supplies no data for holds the space the estimate gave it.
+///
+/// The extent table names every row the keys name, so the scrollbar and every offset below a
+/// row that has not arrived are the estimate's rather than a list one row shorter.
+#[test]
+fn a_row_with_no_data_still_holds_its_place() {
     let mut patch = fixture();
     let _held = create(|ui| {
-        crate::layout::list(
-            ui,
-            || LIST,
-            |_, _: &mut Vec<(usize, usize)>| {},
-            |ui, index: &usize| {
-                plate(ui)
-                    .name(if *index == 0 { "first" } else { "row" })
-                    .id()
-            },
-        )
+        let state = crate::layout::list_state();
+        LIST_STATE.with(|held| held.set(Some(state)));
+        crate::layout::scroll_list(ui, state, move |ui| {
+            crate::layout::list(
+                ui,
+                state,
+                || LIST,
+                |out| out.extend(0..ROWS as u64),
+                |_, _: &mut Vec<(usize, usize)>| {},
+                |ui, index: &usize| plate(ui).name(format!("row {index}")).id(),
+            );
+        })
         .height(Metric::CardMinH);
     });
     settle(&mut patch);
-    let rows = realized_rows();
-    assert!(rows > 4, "a list of placeholders realized {rows} nodes");
+    assert_eq!(
+        realized_rows(),
+        0,
+        "a list supplied with nothing mounted a row anyway"
+    );
     let row_h = crate::role::metric(Metric::RowH, Host::with(|h| h.root_scope));
     assert!(
-        published_extent() > row_h * (LIST.count as f32) * 0.9,
-        "a list of placeholders still has a thousand rows of extent"
+        published_extent() > row_h * (ROWS as f32) * 0.9,
+        "a list nothing has arrived for lost the extent its keys name"
     );
 }
 /// `no_inflate` reads the same before or after the handler that declares a hit target, and
@@ -2202,8 +2715,8 @@ fn a_value_handler_declares_the_target_it_needs() {
             },
             |_| {},
         )
-        .on_change(|_| panic!("replaced handler ran"))
-        .on_change(move |_| {
+        .on_gesture(|_| panic!("replaced handler ran"))
+        .on_gesture(move |_| {
             assert!(Host::installed());
             Host::with(|h| assert!(!h.model.root().node().is_none()));
             called.set(called.get() + 1);
@@ -2372,6 +2885,62 @@ fn a_fractional_track_is_a_fraction_of_its_container() {
         (b.rect.x0 - a.rect.x0 - 200.0).abs() < 1.0,
         "a 25% track collapsed: the second child began {} DIPs across",
         b.rect.x0 - a.rect.x0
+    );
+}
+/// Every row of a list comes out at the class its container settled at, whenever it arrived.
+///
+/// A responsive container reclasses its subtree on a *transition*, so a row realized while
+/// the container already stands at its class is never visited by that walk. Left there it
+/// would keep the class its builder was in for the rest of its life, and a virtualized list
+/// realizes every row but the first screenful after the container has settled.
+#[test]
+fn a_row_realized_after_its_container_settled_takes_that_containers_class() {
+    let mut patch = fixture();
+    let _held = create(|ui| {
+        let state = crate::layout::list_state();
+        LIST_STATE.with(|held| held.set(Some(state)));
+        // A quarter of an 800-DIP window, so the container settles Narrow while the root
+        // around it stays Wide.
+        ui.node(crate::layout::Preset::Stack)
+            .responsive([300.0, 600.0])
+            .children(move |ui| {
+                crate::layout::scroll_list(ui, state, move |ui| {
+                    crate::layout::list(
+                        ui,
+                        state,
+                        || LIST,
+                        |out| out.extend(0..ROWS as u64),
+                        |realized, out| {
+                            for run in realized.runs() {
+                                out.extend(run.map(|index| (index, index)));
+                            }
+                        },
+                        |ui, _: &usize| {
+                            plate(ui)
+                                .height(Metric::CardMinH)
+                                .layout_when(crate::role::WidthClass::Narrow, |l| {
+                                    l.height = Some(Len::Times(Metric::CardMinH, 2.0))
+                                })
+                                .id()
+                        },
+                    );
+                })
+                .height(Len::Times(Metric::CardMinH, 8.0));
+            })
+            .width(Len::Pct(0.25));
+    });
+    settle(&mut patch);
+    let heights: Vec<f32> = list_state().with_rows(|table| {
+        (0..table.len())
+            .filter(|&at| table.is_measured(at))
+            .map(|at| table.extent(at))
+            .collect()
+    });
+    assert!(heights.len() > 4, "only {} rows were measured", heights.len());
+    let first = heights[0];
+    assert!(
+        heights.iter().all(|&at| (at - first).abs() < 0.01),
+        "the rows came out at two heights, so one of them was built at the wrong class:          {heights:?}"
     );
 }
 /// A class-gated column list replaces the template below it rather than extending it.
@@ -5345,3 +5914,175 @@ fn application_text_ink_survives_wrapping_and_ellipsis() {
         assert!(paints > 0);
     }
 }
+
+#[test]
+fn a_blocker_and_a_scroll_rail_place_no_handler_row() {
+    let mut patch = fixture();
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            for _ in 0..6 {
+                plate(ui)
+                    .height(Metric::CardMinH)
+                    .min_height(Metric::CardMinH);
+            }
+        })
+        .height(Metric::CardMinH);
+    });
+    let blocker = Host::with(|h| h.mint_blocker());
+    flush(&mut patch);
+    Host::with(|h| {
+        assert!(
+            h.controls.iter().count() >= 2,
+            "the rail and the blocker are both controls"
+        );
+        assert_eq!(
+            h.handlers.placed(),
+            0,
+            "a control that declared no callback carries no handler row"
+        );
+        assert!(h.handlers(blocker).is_none());
+    });
+    let held = create(|ui| {
+        ui.button(
+            crate::widget::Chrome::new(crate::widget::roles::BUTTON[0], Metric::Radius),
+            crate::widget::TextStyle::new(TypeRole::Body),
+            "Apply",
+        )
+        .on_click(|| {});
+    });
+    flush(&mut patch);
+    Host::with(|h| {
+        assert_eq!(
+            h.handlers.placed(),
+            1,
+            "one declared handler places exactly one row"
+        );
+    });
+    drop(held);
+    flush(&mut patch);
+    Host::with(|h| {
+        assert_eq!(
+            h.handlers.placed(),
+            0,
+            "the row is vacated when its control is released"
+        );
+    });
+}
+
+#[test]
+fn a_theme_change_repaints_a_scroll_thumb_through_the_one_resolver() {
+    let mut patch = fixture();
+    let root_scope = Host::with(|h| h.root_scope);
+    let _scroll = create(|ui| {
+        crate::layout::scroll(ui, |ui| {
+            for _ in 0..6 {
+                plate(ui)
+                    .height(Metric::CardMinH)
+                    .min_height(Metric::CardMinH);
+            }
+        })
+        .height(Metric::CardMinH);
+    });
+    flush(&mut patch);
+    let thumb = Host::with(|h| {
+        h.scrolls
+            .iter()
+            .find_map(|(_, row)| row.thumb)
+            .expect("a scroll container mounts a thumb")
+    });
+    let painted = |patch: &SinkPatch| {
+        patch.ops().iter().find_map(|op| match op {
+            Op::Paint {
+                id,
+                paint: Paint::Solid(light),
+            } if *id == thumb => Some(*light),
+            _ => None,
+        })
+    };
+    let before = painted(&patch).expect("the thumb is painted at mount");
+    assert_eq!(
+        patch
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::Bind {
+                id,
+                prop: windows_scene::Prop::Opacity,
+                ..
+            } if *id == thumb.node()))
+            .count(),
+        1,
+        "the reveal policy is the thumb's only opacity writer"
+    );
+    patch.clear();
+    let theme = Scope {
+        polarity: Polarity::Light,
+        ..root_scope
+    };
+    Host::with(|h| h.set_theme(theme, windows_scene::BackdropSpec::default()));
+    flush(&mut patch);
+    let after = painted(&patch).expect("a theme change repaints the thumb");
+    assert!(
+        !patch.ops().iter().any(|op| matches!(op, Op::Bind {
+            id,
+            prop: windows_scene::Prop::Opacity,
+            ..
+        } if *id == thumb.node())),
+        "repainting a thumb does not touch what reveals it"
+    );
+    assert_ne!(before, after, "the thumb follows the theme");
+    assert_eq!(
+        after.a,
+        crate::role::ink(mount::THUMB_ALPHA, theme.for_paint()).a,
+        "the thumb keeps its own alpha across the change"
+    );
+}
+
+#[test]
+fn a_shape_strength_resolves_to_a_colour_and_binds_no_opacity() {
+    let (_resource_owner, ()) = crate::signal::Owner::scope(|| {
+        let mut patch = fixture();
+        let mut geom = windows_scene::GeomId::NONE;
+        let verts = [
+            windows_scene::PathVerb::Move {
+                to: Vector2 { x: 0.0, y: 0.0 },
+                filled: false,
+            },
+            windows_scene::PathVerb::Line(Vector2 { x: 8.0, y: 8.0 }),
+            windows_scene::PathVerb::End { closed: false },
+        ];
+        let _held = create(|ui| {
+            geom = ui.geometry(&verts);
+            ui.path(geom)
+                .stroke(Role::Stroke(Stroke::Subtle), Metric::HairlineW)
+                .strength(0.15)
+                .width(Metric::RowH)
+                .height(Metric::RowH);
+        });
+        flush(&mut patch);
+        let full = crate::role::resolve(Role::Stroke(Stroke::Subtle), Host::with(|h| h.root_scope));
+        let painted = patch
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                Op::Paint {
+                    paint: Paint::Solid(light),
+                    ..
+                } => Some(*light),
+                _ => None,
+            })
+            .find(|light| (light.a - full.a * 0.15).abs() < 1e-6)
+            .expect("a strength resolves into the painted colour");
+        assert!(painted.a < full.a, "the role is painted at a fraction");
+        assert!(
+            !patch.ops().iter().any(|op| matches!(
+                op,
+                Op::Bind {
+                    prop: windows_scene::Prop::Opacity,
+                    ..
+                }
+            )),
+            "a stated strength claims no opacity channel"
+        );
+    });
+}
+

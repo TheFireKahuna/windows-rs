@@ -2,6 +2,7 @@
 
 use super::{Align, Len, Track};
 use crate::role::{Metric, Scope};
+use windows_numerics::Vector2;
 use windows_scene::taffy;
 use windows_scene::taffy::style_helpers::{TaffyGridLine, TaffyZero};
 
@@ -39,9 +40,24 @@ pub enum Position {
     },
     Absolute([Len; 4]),
     Edge(Edge),
+    /// Out of flow, spanning the parent's width, with its top edge `at` below the parent's.
+    ///
+    /// The node's own height stands: a band says where a row begins and the row says how tall
+    /// it is, which is what lets a list of rows that differ in height be placed rather than
+    /// laid out.
     Band {
         at: Len,
-        height: Len,
+    },
+    /// Out of flow at a normalized region of the parent, aligned by the node's own size.
+    ///
+    /// `at` is `[x0, y0, x1, y1]` as fractions of the parent's box; a point is the two
+    /// edges of an axis stated equal. `align` says what the node does with the extent the
+    /// solve measures for it: [`Align::Stretch`] spans from one edge to the other, and
+    /// `Start`, `Center` or `End` keeps the measured extent and puts that much of it before
+    /// the point.
+    Anchor {
+        at: [f32; 4],
+        align: [Align; 2],
     },
 }
 
@@ -54,6 +70,13 @@ pub struct Layout {
     pub height: Option<Len>,
     pub min_width: Option<Len>,
     pub min_height: Option<Len>,
+    /// The accessible minimum height a recipe gives a control, which a stated `height` or
+    /// `min_height` replaces.
+    ///
+    /// Apart from `min_height` so the two can be told apart: a floor says how short this
+    /// kind of control may be when nobody has said, and an author who states either of the
+    /// other two has said.
+    pub floor: Option<Len>,
     pub max_width: Option<Len>,
     pub max_height: Option<Len>,
     pub padding: Option<[Len; 2]>,
@@ -81,12 +104,18 @@ impl Layout {
         self.rows.get_or_insert_default()
     }
 
+    /// Lowers the declaration into a solver style and the anchor fraction that goes with
+    /// it.
+    ///
+    /// The fraction is zero on both axes for every placement but
+    /// [`Position::Anchor`](Position::Anchor), whose alignment the solve applies once it has
+    /// measured the node.
     pub(crate) fn lower(
         &self,
         preset: Preset,
         variant: Option<&Self>,
         scope: Scope,
-    ) -> taffy::Style {
+    ) -> (taffy::Style, Vector2) {
         let preset = variant.and_then(|v| v.flow).or(self.flow).unwrap_or(preset);
         let grid = matches!(preset, Preset::Grid | Preset::Tiles);
         let row = matches!(preset, Preset::Row | Preset::Wrap);
@@ -152,6 +181,12 @@ impl Layout {
             if let Some(value) = value {
                 *out = value.dimension(scope);
             }
+        }
+        if selected(|l| l.min_height).is_none()
+            && selected(|l| l.height).is_none()
+            && let Some(floor) = selected(|l| l.floor)
+        {
+            style.min_size.height = floor.dimension(scope);
         }
         let padding = variant.and_then(|v| v.padding).or(self.padding);
         if let Some([x, y]) = padding {
@@ -223,6 +258,7 @@ impl Layout {
                     vec![Track::MinMax(min, 1.0).sizing(scope)],
                 ));
         }
+        let mut anchor = Vector2 { x: 0.0, y: 0.0 };
         let insets = match variant.and_then(|v| v.position).or(self.position) {
             Some(Position::Grid {
                 row,
@@ -245,9 +281,29 @@ impl Layout {
                 }] = Len::Auto;
                 Some(inset)
             }
-            Some(Position::Band { at, height }) => {
-                style.size.height = height.dimension(scope);
-                Some([Len::Zero, Len::Zero, at, Len::Auto])
+            Some(Position::Band { at }) => Some([Len::Zero, Len::Zero, at, Len::Auto]),
+            Some(Position::Anchor { at, align }) => {
+                let [x0, y0, x1, y1] = at;
+                let mut edges = [Len::Zero; 4];
+                for (axis, (near, far)) in [(x0, x1), (y0, y1)].into_iter().enumerate() {
+                    let (start, end) = (axis * 2, axis * 2 + 1);
+                    match align[axis].anchor_fraction() {
+                        Some(fraction) => {
+                            edges[start] = Len::Pct(near + fraction * (far - near));
+                            edges[end] = Len::Auto;
+                            if axis == 0 {
+                                anchor.x = fraction;
+                            } else {
+                                anchor.y = fraction;
+                            }
+                        }
+                        None => {
+                            edges[start] = Len::Pct(near);
+                            edges[end] = Len::Pct(1.0 - far);
+                        }
+                    }
+                }
+                Some([edges[0], edges[1], edges[2], edges[3]])
             }
             None | Some(Position::Flow) => None,
         };
@@ -260,7 +316,7 @@ impl Layout {
                 bottom: bottom.length_percentage_auto(scope),
             };
         }
-        style
+        (style, anchor)
     }
 }
 
@@ -279,7 +335,7 @@ pub fn root() -> taffy::Style {
 
 /// A clipped popup viewport, sized from window input before any child is measured.
 pub(crate) fn viewport_style(
-    size: windows_numerics::Vector2,
+    size: Vector2,
     anchor: crate::overlay::Anchor,
 ) -> taffy::Style {
     use crate::overlay::{Align as AnchorAlign, Side};

@@ -121,8 +121,7 @@ impl Appearance {
             PaintSource::Role(role) => Some((role, self.strength)),
             PaintSource::Owner(id) => host.controls.get(id).and_then(|owner| {
                 let roles = host.chrome(id)?.in_state(owner.state);
-                let role = part_role(self.part, roles);
-                role.map(|role| (role, 1.0))
+                part_role(self.part, roles).map(|role| (role, self.strength))
             }),
             PaintSource::Gradient(_) | PaintSource::Region(_) => None,
         };
@@ -210,6 +209,13 @@ pub(crate) struct Surface {
     wash: Wash,
     halo: Option<HaloStyle>,
     dirty: bool,
+    /// The sprites of this surface's derived parts, in Border, Fill, Wash order.
+    ///
+    /// Slots and not a search: the derived set is closed, so the slot a part answered from
+    /// last pass is where its sprite is, and a surface that keeps its parts never walks the
+    /// owner's paint chain. Here rather than on the mount, because a node with no chrome has
+    /// no derived part and no row in this table.
+    parts: [Option<SpriteId>; 3],
 }
 
 impl Host {
@@ -229,6 +235,7 @@ impl Host {
                     wash: Wash::Ink,
                     halo: None,
                     dirty: true,
+                    parts: [None; 3],
                 },
             );
         }
@@ -255,6 +262,11 @@ impl Host {
     }
 
     /// Resolve only changed owning records, after bindings and before layout/publication.
+    ///
+    /// The three derived parts are slots rather than a search: the set is closed, so a pass
+    /// decides which of the three this surface owns now and finds each previous sprite where
+    /// the last pass left it. A surface that keeps its parts touches its paint chain not at
+    /// all.
     pub(crate) fn publish_surfaces(&mut self) {
         if !core::mem::take(&mut self.surfaces_dirty) {
             return;
@@ -270,62 +282,30 @@ impl Host {
             let surface = *surface;
             let scope = self.styles.get(node).unwrap().scope;
             let control = self.mounts.get(node).and_then(|m| m.control);
-            let mut previous = NodeId::NONE;
-            let mut at = self.mounts.get(node).unwrap().paints;
-            let mut held = [None; 3];
-            while let Some(paint) = self.appearances.get(at).copied() {
-                let next = paint.next;
-                let slot = match paint.part {
-                    Part::Border => Some(0),
-                    Part::Fill => Some(1),
-                    Part::Wash => Some(2),
-                    _ => None,
-                };
-                if paint.surface == Some(node)
-                    && let Some(slot) = slot
-                {
-                    let needed = if slot == 2 {
-                        control.is_some() && surface.chrome.is_some()
-                    } else {
-                        chrome_parts(surface.chrome, surface.selectable)
-                            .any(|part| part == paint.part)
-                    };
-                    if needed {
-                        held[slot] = Some(paint.id);
-                    } else {
-                        if previous.is_none() {
-                            self.mounts.get_mut(node).unwrap().paints = next;
-                        } else {
-                            self.appearances.get_mut(previous).unwrap().next = next;
-                        }
-                        self.appearances.take(at);
-                        self.styles.take(at);
-                        self.model.destroy(at, windows_scene::Exit::None);
-                        at = next;
-                        continue;
-                    }
-                }
-                previous = at;
-                at = next;
-            }
             let mut after = None;
             for (slot, part) in [Part::Border, Part::Fill, Part::Wash]
                 .into_iter()
                 .enumerate()
             {
-                let Some(chrome) = surface.chrome else { break };
                 let wash = part == Part::Wash;
-                if if wash {
-                    control.is_none()
-                } else {
-                    !chrome_parts(Some(chrome), surface.selectable).any(|p| p == part)
-                } {
+                let held = self.surfaces.get(node).unwrap().parts[slot];
+                let Some(chrome) = surface.chrome.filter(|chrome| {
+                    if wash {
+                        control.is_some()
+                    } else {
+                        chrome_parts(Some(*chrome), surface.selectable).any(|p| p == part)
+                    }
+                }) else {
+                    if let Some(id) = held {
+                        self.drop_part(node, slot, id);
+                    }
                     continue;
-                }
-                let existing = held[slot];
-                let id = existing.unwrap_or_else(|| self.model.visual(surface.group, after));
+                };
+                let id = match held {
+                    Some(id) => id,
+                    None => self.model.visual(surface.group, after),
+                };
                 after = Some(id.node());
-                held[slot] = Some(id);
                 let role = if wash {
                     Some(match surface.wash {
                         Wash::Ink => Role::Text(crate::role::Text::Primary),
@@ -333,6 +313,18 @@ impl Host {
                     })
                 } else {
                     part_role(part, chrome.roles)
+                };
+                // A part with no role of its own resolves transparent; an owned one re-reads
+                // its role from the owner's state at every publication, so the whole of what
+                // that resolves to is what it paints.
+                let (source, strength) = match control.filter(|_| !wash) {
+                    Some(owner) => (PaintSource::Owner(owner), 1.0),
+                    None => (
+                        PaintSource::Role(
+                            role.unwrap_or(Role::Text(crate::role::Text::Primary)),
+                        ),
+                        f32::from(role.is_some()),
+                    ),
                 };
                 let paint = Appearance {
                     id,
@@ -346,18 +338,9 @@ impl Host {
                     } else {
                         chrome_mask(chrome, part, scope, surface.selectable)
                     },
-                    source: if wash {
-                        PaintSource::Role(role.unwrap())
-                    } else {
-                        control.map_or(
-                            PaintSource::Role(
-                                role.unwrap_or(Role::Text(crate::role::Text::Primary)),
-                            ),
-                            PaintSource::Owner,
-                        )
-                    },
+                    source,
                     part,
-                    strength: f32::from(role.is_some()),
+                    strength,
                     geom: None,
                     scope,
                     surface: Some(node),
@@ -374,8 +357,9 @@ impl Host {
                 };
                 paint.publish(self, true);
                 self.appearances.place(id.node(), paint);
-                if existing.is_none() {
+                if held.is_none() {
                     self.own_appearance(id, node);
+                    self.surfaces.get_mut(node).unwrap().parts[slot] = Some(id);
                     if wash {
                         self.model.bind(
                             id.node(),
@@ -386,10 +370,11 @@ impl Host {
                 }
             }
             if let Some(id) = control.filter(|_| surface.chrome.is_some()) {
+                let parts = self.surfaces.get(node).unwrap().parts;
                 let row = self.controls.get_mut(id).unwrap();
-                row.border = held[0];
-                row.fill = held[1];
-                row.front.wash = held[2];
+                row.border = parts[0];
+                row.fill = parts[1];
+                row.front.wash = parts[2];
                 row.dirty = true;
                 self.repaint_control(id);
             }
@@ -406,6 +391,33 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// Destroys a derived part this surface no longer owns, and unlinks it.
+    ///
+    /// The one walk of the paint chain left in this path, and it runs only where a chrome
+    /// change took a part away.
+    fn drop_part(&mut self, owner: NodeId, slot: usize, id: SpriteId) {
+        let at = id.node();
+        let mut previous = NodeId::NONE;
+        let mut link = self.mounts.get(owner).unwrap().paints;
+        while let Some(paint) = self.appearances.get(link) {
+            let next = paint.next;
+            if link == at {
+                if previous.is_none() {
+                    self.mounts.get_mut(owner).unwrap().paints = next;
+                } else {
+                    self.appearances.get_mut(previous).unwrap().next = next;
+                }
+                break;
+            }
+            previous = link;
+            link = next;
+        }
+        self.appearances.take(at);
+        self.styles.take(at);
+        self.model.destroy(at, windows_scene::Exit::None);
+        self.surfaces.get_mut(owner).unwrap().parts[slot] = None;
     }
 
     pub(crate) fn repaint_control(&mut self, id: ControlId) {
@@ -490,8 +502,8 @@ impl Host {
             };
             let recipe = self.styles.get_mut(id).unwrap();
             recipe.scope = recipe.scope.in_theme(root);
-            let style = self.styles.lower(id, self.model.solved(id).class).unwrap();
-            self.model.style(id, &style);
+            let class = self.model.solved(id).class;
+            self.mark_style(id, class);
         }
         // Copy each small recipe outside the table borrow; no callback or per-frame work.
         for index in self.appearances.positions() {
@@ -512,21 +524,29 @@ impl Host {
         for (_, control) in self.controls.iter_mut() {
             control.scope = control.scope.in_theme(root);
         }
-        for (_, scroll) in self.scrolls.iter() {
-            if let Some(thumb) = scroll.thumb {
-                let scope = scroll
-                    .grab
-                    .and_then(|id| self.controls.get(id))
-                    .map_or(root, |c| c.scope);
-                self.model.paint(
-                    thumb,
-                    Paint::Solid(crate::role::ink(
-                        super::mount::THUMB_ALPHA,
-                        scope.for_paint(),
-                    )),
-                );
-            }
-        }
         self.theme_update = Some((root, backdrop));
+    }
+}
+
+impl super::Element<'_, super::Path> {
+    /// Paints this shape at `strength` of the alpha its role resolves to.
+    ///
+    /// Folded into the colour at publication, so a shape drawn faintly costs no compositor
+    /// channel and leaves `Prop::Opacity` for a reveal to own.
+    ///
+    /// # Panics
+    ///
+    /// Panics where this shape has stated no paint: a strength scales a role, and there is
+    /// none to scale before one is named.
+    pub fn strength(self, strength: f32) -> Self {
+        let paint = self
+            .host
+            .appearances
+            .get_mut(self.node.target.id())
+            .expect("a strength scales a paint this shape has already stated");
+        paint.strength = strength;
+        let paint = *paint;
+        paint.publish(self.host, false);
+        self
     }
 }

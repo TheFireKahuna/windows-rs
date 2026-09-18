@@ -476,6 +476,12 @@ pub(crate) enum ScrollOp {
         id: ScrollId,
         geom: ThumbGeom,
     },
+    /// Where a list asked the tracker to put its content, so a row outside the realized
+    /// window can be brought into view.
+    To {
+        id: ScrollId,
+        y: f32,
+    },
     Drop(ScrollId),
 }
 

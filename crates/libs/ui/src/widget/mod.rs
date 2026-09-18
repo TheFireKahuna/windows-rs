@@ -11,8 +11,8 @@ mod state;
 mod text;
 
 pub use kind::{
-    Chrome, Interaction, ModelState, Motion, Range, RoleSet, ScalarPart, ScalarValue, StatePolicy,
-    TURN_SPAN, TURN_SWEEP, UiaRole, Wash, angle_of, detent_delta, fraction_of, offset_of,
+    Chrome, Interaction, ModelState, Motion, Range, RoleSet, ScalarPart, ScalarValue, TURN_SPAN,
+    TURN_SWEEP, UiaRole, Wash, angle_of, detent_delta, fraction_of, offset_of,
 };
 pub use recipes::{
     Choice, ChoiceStyle, SliderStyle, TextStyle, box_, button, button_with, caption, card, code,
@@ -22,5 +22,5 @@ pub use recipes::{
 };
 // `ChromeRow` is one row of a widget's colour table; `Controls` is the front thread's table
 // of live controls.
-pub use state::{ChromeRow, Controls, Dragging, Front, Intent, What};
+pub use state::{ChromeRow, Controls, Front, Gesturing, Intent, What};
 pub use text::{Flow, Shaped, TextSource, Written, reactive, shown};

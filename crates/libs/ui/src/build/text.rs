@@ -674,11 +674,12 @@ impl Entry {
             return false;
         }
         let class = model.solved(node).class;
-        let Some(mut style) = styles.lower(node, class) else {
+        let Some((mut style, anchor)) = styles.lower(node, class) else {
             return false;
         };
         style.size.width = taffy::Dimension::length(ink);
         model.style(node, &style);
+        model.anchor(node, anchor);
         true
     }
 

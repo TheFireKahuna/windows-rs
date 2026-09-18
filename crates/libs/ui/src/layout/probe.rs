@@ -6,13 +6,26 @@
 //! gutter beside a list of independently sized rows is the case: each wire meets its row at
 //! that row's resolved centre, and no container places both.
 //!
-//! # The value is one frame old
+//! # Which phase reads it decides which solve it reports
 //!
-//! The host writes a probe's cell during the flush; whatever reads it runs on the next
-//! tick. Producing declarations from a solve inside that same solve is a fixed point, so a
-//! probe reports where a node **was** put and a consumer draws against that. During a
-//! resize drag the consumer trails the probed node by one frame and lands with it when the
-//! drag stops.
+//! The host publishes every probe during the flush, after the last solve and before the
+//! signal graph's geometry phase runs. A geometry job therefore reads **this** batch's
+//! settled box and publishes path verbs in the same scene patch:
+//! [`Ui::local_geometry`](crate::build::Ui::local_geometry),
+//! [`Ui::local_geometries`](crate::build::Ui::local_geometries) and
+//! [`Ui::anchored_geometries`](crate::build::Ui::anchored_geometries) are that phase's entry
+//! points, and they are the ones to reach for when a second piece of geometry has to agree
+//! with a box in the frame it was solved in.
+//!
+//! An ordinary [`Effect`](crate::signal::Effect) or [`Memo`](crate::signal::Memo) is on the
+//! update phase, which ran before the publication, so it reports where the node **was** put
+//! and is woken for the next flush. Producing *declarations* from a solve inside that same
+//! solve is a fixed point, which is why the update phase cannot be moved: during a resize
+//! drag an update-phase consumer trails the probed node by one frame and lands with it when
+//! the drag stops.
+//!
+//! [`Anchors`](super::Anchors) covers the keyed case: many child boxes, in one container's
+//! own space, under the application's own identities.
 
 use crate::role::WidthClass;
 use crate::signal::Cell;
@@ -57,7 +70,8 @@ impl From<Solved> for Placed {
 ///
 /// A [`Cell`], so it reads like any other signal: an [`Effect`](crate::signal::Effect) over
 /// it re-runs when the node moves, and a [`Memo`](crate::signal::Memo) derived from it cuts
-/// off when it does not. `Copy`, and there is nothing to unsubscribe.
+/// off when it does not. `Copy`, and there is nothing to unsubscribe. The reader's phase
+/// decides which solve it reports.
 ///
 /// Minted inside the enclosing owner, so it is disposed with the component that made it.
 ///
@@ -68,7 +82,7 @@ impl From<Solved> for Placed {
 /// let row = probe();
 /// stack(ui, |ui| {
 ///     caption(ui, "a row").probed(row);
-///     // Reads where the row landed, one tick later.
+///     // An update-phase read, so it reports the previous solve.
 ///     caption(ui, shown(move || row.get().rect.y0));
 /// });
 /// # }

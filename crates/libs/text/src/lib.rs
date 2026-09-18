@@ -23,6 +23,8 @@ mod span;
 // Drawing a run needs a target, which comes from `windows-d2d`. Naming a font, shaping,
 // measuring and carrying a run as plain data need no drawing stack and stay ungated.
 #[cfg(feature = "d2d")]
+mod atlas;
+#[cfg(feature = "d2d")]
 mod glyph;
 
 // Re-exported crate-wide so each module reaches the generated types through
@@ -45,6 +47,8 @@ pub use hit::{Rect, TextHit};
 pub use shape::{Ink, LineMetrics, ShapedRun};
 pub use span::{GlyphSeg, SegBuffers, Span, Spans};
 
+#[cfg(feature = "d2d")]
+pub use atlas::{Placements, Tiles, Word};
 #[cfg(feature = "d2d")]
 pub use glyph::GlyphDraw;
 

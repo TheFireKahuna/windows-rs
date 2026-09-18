@@ -241,6 +241,10 @@ struct LayoutData {
     /// reversible without recording what the display *was*: a hidden grid comes back a
     /// grid, and a style re-pushed while hidden does not reveal the node.
     hidden: bool,
+    /// Fraction of the node's own solved size subtracted from where the style put it.
+    ///
+    /// Zero on both axes leaves the placement the style asked for.
+    anchor: Vector2,
     unrounded: Layout,
     solved: Layout,
 }
@@ -270,6 +274,7 @@ impl Default for LayoutData {
             child_cursor: Cell::new((0, 0)),
             class: WidthClass::default(),
             hidden: false,
+            anchor: Vector2 { x: 0.0, y: 0.0 },
             unrounded: Layout::with_order(0),
             solved: Layout::with_order(0),
         }
@@ -438,6 +443,26 @@ impl LayoutTree {
         true
     }
 
+    /// Pulls a node back by a fraction of its own solved size, and returns whether the
+    /// fraction changed.
+    ///
+    /// The style places one edge; this aligns the node's own extent around that edge, which
+    /// is the part no declaration can state because the extent is a layout output. `0.0`
+    /// leaves the edge where the style put it, `0.5` centres the node on it, `1.0` puts the
+    /// far edge there.
+    ///
+    /// **The node must be out of flow.** An in-flow node moves without its siblings
+    /// following, which leaves it overlapping them.
+    pub fn set_anchor(&mut self, node: NodeId, anchor: Vector2) -> bool {
+        let slot = self.data_mut(node);
+        if slot.anchor == anchor {
+            return false;
+        }
+        slot.anchor = anchor;
+        self.mark_dirty(TaffyId::from(node.index()));
+        true
+    }
+
     /// Declares where a node's intrinsic size comes from.
     pub fn set_measure(&mut self, node: NodeId, ctx: MeasureCtx) {
         let slot = self.data_mut(node);
@@ -578,8 +603,9 @@ impl LayoutTree {
 pub struct LayoutServices<'a> {
     /// Shaping and intrinsic measurement; absent for geometry-only trees.
     pub measure: Option<&'a mut dyn FnMut(MeasureIn) -> Vector2>,
-    /// Scope-dependent style resolution; absent when all styles are absolute.
-    pub restyle: Option<&'a mut dyn FnMut(NodeId, WidthClass) -> Option<Style>>,
+    /// Scope-dependent style resolution, answering the style and its anchor fraction;
+    /// absent when all styles are absolute.
+    pub restyle: Option<&'a mut dyn FnMut(NodeId, WidthClass) -> Option<(Style, Vector2)>>,
 }
 
 struct Solver<'a, 's> {
@@ -647,7 +673,14 @@ impl Solver<'_, '_> {
         };
         let data = &self.layouts[at];
         let layout = data.solved;
-        let (x, y) = (ox + layout.location.x, oy + layout.location.y);
+        // The anchor consumes the size the solve just measured, so it lands here rather than
+        // in the style: every consumer downstream — the offset op, the hit array, a clip —
+        // reads the one rect this walk writes.
+        let local = Vector2 {
+            x: layout.location.x - data.anchor.x * layout.size.width,
+            y: layout.location.y - data.anchor.y * layout.size.height,
+        };
+        let (x, y) = (ox + local.x, oy + local.y);
         let (x0, y0) = (snap(x, scale), snap(y, scale));
         let (x1, y1) = (
             snap(x + layout.size.width, scale),
@@ -657,8 +690,8 @@ impl Solver<'_, '_> {
         out[index] = Solved {
             rect: Rect::new(x0, y0, x1, y1),
             local: Vector2 {
-                x: snap(layout.location.x, scale),
-                y: snap(layout.location.y, scale),
+                x: snap(local.x, scale),
+                y: snap(local.y, scale),
             },
             size: Vector2 {
                 x: x1 - x0,
@@ -723,8 +756,10 @@ impl Solver<'_, '_> {
         // node lookups around it borrow.
         let node = self.nodes[usize::from(id)].id;
         if let Some(restyle) = self.services.restyle.as_mut() {
-            if let Some(style) = restyle(node, class) {
-                self.node_mut(id).style = style;
+            if let Some((style, anchor)) = restyle(node, class) {
+                let data = self.node_mut(id);
+                data.style = style;
+                data.anchor = anchor;
             }
         }
         if matches!(self.node(id).kind, LayoutKind::Responsive(_)) {

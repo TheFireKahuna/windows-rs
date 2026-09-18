@@ -5,7 +5,8 @@
 //! execute outside the host borrow. Layout uses borrowed services over the same stores.
 
 use crate::gesture::GestureDecl;
-use crate::role::Scope;
+use crate::layout::Table as AnchorTable;
+use crate::role::{Scope, WidthClass};
 use crate::seam::{Down, RegionOp, ScrollOp};
 use crate::widget::{ModelState, TextSource, UiaRole};
 use std::cell::RefCell;
@@ -48,10 +49,13 @@ impl MountRow {
 
 /// Holds one interactive node, addressed by the index inside its [`ControlId`].
 ///
-/// The handlers stay on this thread, the only one that may call them;
+/// Numbers and ids only, so the row is `Copy` and a control owns nothing through it;
+/// what a control's author declared lives in the [`Handlers`](super::binding::Handlers)
+/// row [`handlers`](Self::handlers) names, and a control that declared nothing names none.
 /// [`front`](Self::front) holds what the front thread needs during the tick that moves a
 /// pixel. Nothing crosses that is not a number or an id — the wash opacities are resolved
 /// here, at mount, so the interaction path never realizes a colour cell.
+#[derive(Copy, Clone)]
 pub(crate) struct ControlRow {
     pub(super) dirty: bool,
     pub(super) hit: Option<windows_scene::HitDecl>,
@@ -74,36 +78,33 @@ pub(crate) struct ControlRow {
     /// row rather than remembering what it painted.
     pub scope: Scope,
     pub state: ModelState,
-    pub click: Option<Rc<dyn Fn()>>,
     pub hovered: Option<crate::signal::Cell<bool>>,
-    pub change: Option<Rc<dyn Fn(f64)>>,
-    pub cancel: Option<Rc<dyn Fn()>>,
-    pub commit: Option<Rc<dyn Fn(f64)>>,
-    /// The two-axis drag's handler, where the application declared one.
-    pub drag: Option<Rc<dyn Fn(crate::widget::Dragging)>>,
-    /// The hover description and the side it opens on.
-    ///
-    /// `Rc` rather than `Box` for both this and [`flyout`](Self::flyout): building either
-    /// body is application code, so the overlay layer clones it out of the host's borrow
-    /// before running it. Both stay in the row, since a picker's flyout opens once per press
-    /// and not once per lifetime.
-    ///
-    /// The side is authored rather than derived: which side clears a control's neighbours
-    /// depends on the axis its author stacked them on, so a description below a toolbar
-    /// button clears its neighbours and the same one below a rail item lands on the next.
-    pub tip: Option<(Rc<TextSource>, crate::overlay::Side)>,
-    pub flyout: Option<Rc<dyn Fn(&mut super::Ui<'_>)>>,
+    /// Where this control's in-flight value is published, where the application asked to
+    /// read one. Written while a gesture moves and cleared when it ends, so a reader sees
+    /// a value only for as long as a pointer, a key or an automation client owns it.
+    pub live: Option<crate::signal::Cell<Option<f64>>>,
     pub uia: UiaRole,
-    pub name: Option<std::borrow::Cow<'static, str>>,
     /// The first text registered by this control's children supplies its accessible name
-    /// where [`name`](Self::name) is unset. Nested controls register their own text.
+    /// where the row's `name` is unset. Nested controls register their own text.
     pub text: Option<MeasureKey>,
     /// The automation-id segment. A `&'static str`, so mount builds nothing: the full path is
     /// materialized only when UI Automation asks for it, which is off every hot path.
     pub key: Option<&'static str>,
+    /// This control's handler row, where it has declared one.
+    pub(super) handlers: Option<u32>,
 }
 
 impl ControlRow {
+    /// Publishes the value of a gesture in flight, or `None` where none is.
+    ///
+    /// A disposed cell is skipped: an intent queued before this control's owner was
+    /// dropped names a cell that no longer exists.
+    pub(super) fn set_live(&self, value: Option<f64>) {
+        if let Some(cell) = self.live.filter(|cell| cell.alive()) {
+            cell.set(value);
+        }
+    }
+
     pub(crate) fn new(node: NodeId, scope: Scope) -> Self {
         ControlRow {
             dirty: false,
@@ -121,18 +122,12 @@ impl ControlRow {
             front: crate::widget::ChromeRow::default(),
             scope,
             state: ModelState::Rest,
-            click: None,
             hovered: None,
-            change: None,
-            cancel: None,
-            commit: None,
-            drag: None,
-            tip: None,
-            flyout: None,
+            live: None,
             uia: UiaRole::None,
-            name: None,
             text: None,
             key: None,
+            handlers: None,
         }
     }
 }
@@ -190,6 +185,8 @@ pub struct Host {
     pub(crate) mounts: Slots<windows_scene::Node, MountRow>,
     pub(crate) control_ids: Ids<windows_scene::Control>,
     pub(crate) controls: Slots<windows_scene::Control, ControlRow>,
+    /// Callbacks, descriptions and names, placed only for the controls that declare them.
+    pub(crate) handlers: super::binding::HandlerTable,
     pub(crate) fields: Slots<windows_scene::Control, super::field::Row>,
     pub(crate) field_sources: Vec<crate::text_input::Source>,
     pub(crate) field_layouts: Vec<crate::text_input::Layout>,
@@ -213,8 +210,27 @@ pub struct Host {
     /// a composition object sourced from a visual.
     pub(crate) trackers: Vec<TrackerSpec>,
     pub(crate) scrolls: Slots<windows_scene::Node, ScrollRow>,
+    /// Nodes whose declaration has changed and whose style has not been lowered yet.
+    ///
+    /// A chained setter writes one field; lowering builds a whole solver style and, on a
+    /// grid, two template vectors. Queuing the node instead means a declaration is lowered
+    /// once per transaction however many setters wrote it.
+    pub(crate) pending_styles: Vec<NodeId>,
     /// Nodes an application asked for the solved box of. Empty on most screens.
     pub(crate) probes: Slots<windows_scene::Node, crate::signal::Cell<crate::layout::Placed>>,
+    /// Anchor-set origins, keyed by the container whose space the set reports in.
+    pub(crate) anchor_origins: Slots<windows_scene::Node, crate::signal::Cell<AnchorTable>>,
+    /// Nodes created since the last solve, with the class their declaration was lowered at.
+    pub(crate) fresh: Vec<(NodeId, WidthClass)>,
+    /// Every attachment, tagged with the set it belongs to and in attachment order.
+    ///
+    /// One flat list rather than a map per set: an attachment is written once and read once
+    /// per flush, and publication walks it to drop the entries whose node has been unmounted,
+    /// which is the same pass that would have to check them anyway.
+    pub(crate) anchor_members: Vec<(crate::signal::SignalId, NodeId, u64)>,
+    /// The table publication builds before comparing it, kept so the steady state allocates
+    /// nothing.
+    anchor_scratch: AnchorTable,
     pub(crate) regions: Slots<windows_scene::Node, crate::present::RegionRow>,
     /// Which control is which window command, for the caption band to resolve a point
     /// through. Filled during creation by [`Element::caption`](super::Element::caption).
@@ -289,6 +305,7 @@ impl Host {
         let host = Self {
             root_pool: Vec::new(),
             bindings: super::binding::Bindings::default(),
+            handlers: super::binding::HandlerTable::default(),
             retired: Vec::new(),
             text: super::text::Table::default(),
             styles: super::style::Styles::default(),
@@ -322,7 +339,12 @@ impl Host {
             released: Vec::new(),
             trackers: Vec::new(),
             scrolls: Slots::new(),
+            pending_styles: Vec::new(),
             probes: Slots::new(),
+            anchor_origins: Slots::new(),
+            fresh: Vec::new(),
+            anchor_members: Vec::new(),
+            anchor_scratch: AnchorTable::default(),
             regions: Slots::new(),
             caption: crate::caption::Registry::default(),
             caption_sent: crate::caption::Registry::default(),
@@ -379,8 +401,8 @@ impl Host {
             if let crate::overlay::Request::Show { body, closed, .. } =
                 core::mem::replace(pending, request)
             {
-                self.retired.push(super::binding::Retired::Flyout(body));
-                self.retired.push(super::binding::Retired::Click(closed));
+                self.retired.push(super::binding::Retired::new(body));
+                self.retired.push(super::binding::Retired::new(closed));
             }
         } else {
             self.popup_requests.push(request);
@@ -447,7 +469,7 @@ impl Host {
 
     fn drop_retired() {
         while let Ok(Some(retired)) = Self::access(|host| host.retired.pop()) {
-            retired.release();
+            drop(retired);
         }
     }
 
@@ -526,7 +548,8 @@ impl Host {
             if control.uia == UiaRole::None {
                 continue;
             }
-            let name = match control.name.as_deref() {
+            let handlers = self.handlers(id);
+            let name = match handlers.and_then(|row| row.name.as_deref()) {
                 Some(explicit) => out.intern(explicit),
                 // Interned rather than borrowed, so an explicit name and a derived one — which
                 // is not `'static` — take one path.
@@ -539,9 +562,8 @@ impl Host {
             // A tooltip becomes the element's `HelpText`. Read untracked: this runs inside a
             // flush, and subscribing whatever effect is on the stack would rebuild a screen
             // when a tip changed.
-            let help = control
-                .tip
-                .as_ref()
+            let help = handlers
+                .and_then(|row| row.tip.as_ref())
                 .map_or_else(Default::default, |(tip, _)| {
                     let mut text = String::new();
                     crate::signal::untracked(|| tip.append(&mut text));
@@ -565,10 +587,10 @@ impl Host {
                 _ => Value::None,
             };
             let mut flags = ColFlags::NONE;
-            if control.flyout.is_some() {
+            if handlers.is_some_and(|row| row.flyout.is_some()) {
                 flags = flags | ColFlags::EXPANDS;
             }
-            if control.click.is_some()
+            if handlers.is_some_and(|row| row.click.is_some())
                 || control.front.drive.is_some()
                 || self.fields.get(id).is_some()
             {
@@ -642,15 +664,17 @@ impl Host {
     /// id does not match the slot's, so the lookup is a bounds-checked index that finds
     /// nothing rather than a call into whatever occupies that slot.
     pub fn dispatch(intents: &[crate::widget::Intent]) {
-        use crate::widget::{Dragging, What};
+        use crate::gesture::DragUpdate;
+        use crate::widget::{Gesturing, What};
         enum Call {
             Click(Rc<dyn Fn()>),
-            Value(Rc<dyn Fn(f64)>, f64),
-            Drag(Rc<dyn Fn(Dragging)>, Dragging),
+            Scalar(Rc<dyn Fn(Gesturing<f64>)>, Gesturing<f64>),
+            Drag(Rc<dyn Fn(Gesturing<DragUpdate>)>, Gesturing<DragUpdate>),
         }
         for intent in intents {
             let call = Self::with(|host| {
-                let control = host.control_mut(intent.target)?;
+                let id = intent.target;
+                let control = host.control_mut(id)?;
                 match intent.what {
                     What::Hovered(value) => {
                         if let Some(cell) = control.hovered.filter(|cell| cell.alive()) {
@@ -658,7 +682,7 @@ impl Host {
                         }
                         None
                     }
-                    What::Tapped => control.click.clone().map(Call::Click),
+                    What::Tapped => host.handlers(id)?.click.clone().map(Call::Click),
                     What::Scalar {
                         value,
                         revision,
@@ -671,30 +695,39 @@ impl Host {
                         {
                             control.accepted_fraction = Some(range.fraction(value));
                         }
-                        (if commit {
-                            &control.commit
+                        control.set_live((!commit).then_some(value));
+                        let phase = if commit {
+                            Gesturing::Committed(value)
                         } else {
-                            &control.change
-                        })
-                        .clone()
-                        .map(|f| Call::Value(f, value))
+                            Gesturing::Moved(value)
+                        };
+                        host.handlers(id)?.scalar.clone().map(|f| Call::Scalar(f, phase))
                     }
                     What::Canceled(revision) if revision == control.front.revision => {
-                        control.cancel.clone().map(Call::Click)
+                        control.set_live(None);
+                        host.handlers(id)?
+                            .scalar
+                            .clone()
+                            .map(|f| Call::Scalar(f, Gesturing::Canceled))
                     }
                     What::Scalar { .. } | What::Canceled(_) => None,
-                    What::Committed(value) => control.commit.clone().map(|f| Call::Value(f, value)),
-                    What::Dragged(update) => control
+                    What::Committed(value) => {
+                        control.set_live(None);
+                        host.handlers(id)?
+                            .scalar
+                            .clone()
+                            .map(|f| Call::Scalar(f, Gesturing::Committed(value)))
+                    }
+                    What::Dragged(update) => host.handlers(id)?
                         .drag
                         .clone()
-                        .map(|f| Call::Drag(f, Dragging::Moved(update))),
-                    What::DragEnded { commit } => control.drag.clone().map(|f| {
+                        .map(|f| Call::Drag(f, Gesturing::Moved(update))),
+                    What::DragEnded(last) => host.handlers(id)?.drag.clone().map(|f| {
                         Call::Drag(
                             f,
-                            if commit {
-                                Dragging::Committed
-                            } else {
-                                Dragging::Canceled
+                            match last {
+                                Some(update) => Gesturing::Committed(update),
+                                None => Gesturing::Canceled,
                             },
                         )
                     }),
@@ -702,8 +735,8 @@ impl Host {
             });
             match call {
                 Some(Call::Click(f)) => f(),
-                Some(Call::Value(f, value)) => f(value),
-                Some(Call::Drag(f, value)) => f(value),
+                Some(Call::Scalar(f, phase)) => f(phase),
+                Some(Call::Drag(f, phase)) => f(phase),
                 None => {}
             }
         }
@@ -714,7 +747,7 @@ impl Host {
         if let Some(row) = self.mounts.get_mut(row)
             && let Some(previous) = row.escape.replace(f)
         {
-            self.retired.push(super::binding::Retired::Escape(previous));
+            self.retired.push(super::binding::Retired::new(previous));
         }
     }
 
@@ -774,6 +807,59 @@ impl Host {
                 cell.set(now);
             }
         }
+    }
+
+    /// Publishes each anchor set's keyed boxes, in its origin container's own space.
+    ///
+    /// Unmounted attachments leave here rather than through a removal hook: an id carries a
+    /// generation, so the liveness check this pass already needs is also what bounds the
+    /// list. The table is compared before it is written, so a solve that moved nothing wakes
+    /// nothing derived from it.
+    fn publish_anchors(&mut self) {
+        if self.anchor_members.is_empty() && self.anchor_origins.is_empty() {
+            return;
+        }
+        let model = &self.model;
+        self.anchor_members
+            .retain(|&(_, node, _)| model.is_live(node));
+        let mut table = core::mem::take(&mut self.anchor_scratch);
+        for (node, cell) in self.anchor_origins.iter() {
+            if !cell.alive() {
+                continue;
+            }
+            let origin = self.model.solved(node);
+            let set = cell.id();
+            table.size = origin.size;
+            table.scope = self
+                .styles
+                .get(node)
+                .map(|recipe| recipe.scope.at_width(origin.class));
+            table.boxes.clear();
+            for &(owner, member, key) in &self.anchor_members {
+                if owner != set {
+                    continue;
+                }
+                let solved = self.model.solved(member);
+                table.boxes.push(crate::layout::Anchored {
+                    key,
+                    rect: windows_scene::Rect::new(
+                        solved.rect.x0 - origin.rect.x0,
+                        solved.rect.y0 - origin.rect.y0,
+                        solved.rect.x1 - origin.rect.x0,
+                        solved.rect.y1 - origin.rect.y0,
+                    ),
+                });
+            }
+            if cell.with(|published| *published != table) {
+                cell.update(|published| {
+                    published.size = table.size;
+                    published.scope = table.scope;
+                    published.boxes.clear();
+                    published.boxes.extend_from_slice(&table.boxes);
+                });
+            }
+        }
+        self.anchor_scratch = table;
     }
 
     /// Returns the control the first mounted region occupies. What a test names its target
@@ -868,7 +954,7 @@ impl Host {
     fn release_control(&mut self, id: ControlId) {
         if let Some(mut field) = self.fields.take(id) {
             if let Some(callback) = field.callback.take() {
-                self.retired.push(super::binding::Retired::Text(callback));
+                self.retired.push(super::binding::Retired::new(callback));
             }
         }
         self.field_sources.retain(|s| s.id != id);
@@ -880,7 +966,7 @@ impl Host {
             }
             self.released.push(id);
             self.uia_stale.set(true);
-            control.retire(&mut self.retired);
+            self.release_handlers(control.handlers);
         }
     }
 
@@ -1017,7 +1103,7 @@ impl Host {
             self.detach_control_part(at, row.text);
             self.retire_bindings(row.bindings);
             if let Some(escape) = row.escape {
-                self.retired.push(super::binding::Retired::Escape(escape));
+                self.retired.push(super::binding::Retired::new(escape));
             }
             self.geometry_jobs.take(at);
             self.surfaces.take(at);
@@ -1041,6 +1127,9 @@ impl Host {
             {
                 cell.set(crate::layout::Placed::default());
             }
+            // The attachments below it leave at the next publication, which is where an id's
+            // generation is checked; only the origin is held by node.
+            self.anchor_origins.take(at);
             // The drop is emitted first and the sink is released after: the region owns the
             // surface handle behind the brush this side is painting with, so the unmount
             // that closes it must be asked for before the claim on the sink goes.
@@ -1049,12 +1138,17 @@ impl Host {
                     .push(RegionOp::Drop { key: region.key });
                 self.model.release(region.sink);
                 if let Some(build) = region.build.take() {
-                    self.retired.push(super::binding::Retired::Region(build));
+                    self.retired.push(super::binding::Retired::new(build));
                 }
             }
             // A tracker is sourced from its viewport's visual, so it is dropped with the row
             // that named it.
             if let Some(scroll) = self.scrolls.take(at) {
+                // The thumb's appearance hangs on no mount, so it leaves with the row that
+                // named it rather than with the paint walk above.
+                if let Some(thumb) = scroll.thumb {
+                    self.appearances.take(thumb.node());
+                }
                 // A mount can disappear before its first solve. Retire its deferred
                 // creation too, before the viewport and tracker slots are reused.
                 self.trackers.retain(|spec| spec.id.id() != scroll.tracker.id());
@@ -1089,7 +1183,71 @@ impl Host {
     ///    terminates.
     /// Finally, release the Host borrow to draw dirty paths from settled local boxes,
     /// then emit their geometry and the layout together in the scene batch.
+    /// Queues `node`'s declaration to be lowered at `class` before the next solve.
+    ///
+    /// Restating the class on a node already queued replaces it, so the style the solve
+    /// reads is the one the last setter in the transaction asked for.
+    pub(crate) fn mark_style(&mut self, node: NodeId, class: WidthClass) {
+        let Some(recipe) = self.styles.get_mut(node) else {
+            return;
+        };
+        if recipe.pending.replace(class).is_none() {
+            self.pending_styles.push(node);
+        }
+    }
+
+    /// Lowers every queued declaration and pushes the style and anchor it resolves to.
+    ///
+    /// A node destroyed since it was queued reads back nothing: the id carries a
+    /// generation, so a recycled slot answers its own recipe and never this one.
+    /// Re-lowers every node this transaction created whose class the solve disagreed with,
+    /// and returns whether any style moved.
+    ///
+    /// A responsive container reclasses its subtree on a *transition*, so a node mounted
+    /// while the container already stands at its class is never visited by that walk. The
+    /// solve records the ambient class on every node it reaches, which is the answer to
+    /// compare the builder's against. Only a declaration that actually lowers differently is
+    /// re-queued, so a class-independent node costs the comparison and no re-solve.
+    fn reclass_fresh(&mut self) -> bool {
+        let mut fresh = core::mem::take(&mut self.fresh);
+        let mut owed = false;
+        for &(node, at) in &fresh {
+            let now = self.model.solved(node).class;
+
+            if now == at {
+                continue;
+            }
+            let (Some(was), Some(is)) = (self.styles.lower(node, at), self.styles.lower(node, now))
+            else {
+                continue;
+            };
+            if was != is {
+                self.mark_style(node, now);
+                owed = true;
+            }
+        }
+        fresh.clear();
+        self.fresh = fresh;
+        owed
+    }
+
+    pub(crate) fn lower_pending(&mut self) {
+        for index in 0..self.pending_styles.len() {
+            let node = self.pending_styles[index];
+            let Some(class) = self.styles.get_mut(node).and_then(|r| r.pending.take()) else {
+                continue;
+            };
+            let Some((style, anchor)) = self.styles.lower(node, class) else {
+                continue;
+            };
+            self.model.style(node, &style);
+            self.model.anchor(node, anchor);
+        }
+        self.pending_styles.clear();
+    }
+
     fn solve(&mut self) {
+        self.lower_pending();
         let mut measure = |input| self.text.measure(input);
         let mut restyle = |node, class| self.styles.lower(node, class);
         self.model.solve(
@@ -1108,6 +1266,9 @@ impl Host {
             h.publish_surfaces();
             h.size_overlay_viewports();
             h.solve();
+            if h.reclass_fresh() {
+                h.solve();
+            }
             if h.publish_geometry() {
                 h.solve();
             }
@@ -1118,6 +1279,7 @@ impl Host {
             h.publish_fields();
             h.publish_overlay_entries();
             h.publish_probes();
+            h.publish_anchors();
             for (node, job) in h.geometry_jobs.iter_mut() {
                 let solved = h.model.solved(node);
                 let local = (
@@ -1145,6 +1307,7 @@ impl Host {
         crate::signal::flush_geometry();
         Self::with(|h| {
             h.publish_channels();
+            h.lower_pending();
             let mut measure = |input| h.text.measure(input);
             let mut restyle = |node, class| h.styles.lower(node, class);
             h.model.flush(
@@ -1212,7 +1375,7 @@ impl Host {
     /// the host's borrow is released. The row keeps its own handle, since a picker's flyout
     /// opens once per press and not once per lifetime.
     pub(crate) fn flyout_of(&self, target: ControlId) -> Option<Rc<dyn Fn(&mut super::Ui<'_>)>> {
-        self.control(target).and_then(|c| c.flyout.clone())
+        self.handlers(target).and_then(|row| row.flyout.clone())
     }
 
     /// Returns a clone of the control's hover description and the side it opens on.
@@ -1223,12 +1386,12 @@ impl Host {
         &self,
         target: ControlId,
     ) -> Option<(Rc<TextSource>, crate::overlay::Side)> {
-        self.control(target).and_then(|c| c.tip.clone())
+        self.handlers(target).and_then(|row| row.tip.clone())
     }
 
     /// Returns the control's explicit accessible name, which a menu's type-ahead matches on.
     pub(crate) fn name_of(&self, target: ControlId) -> Option<&str> {
-        self.control(target).and_then(|control| control.name.as_deref())
+        self.handlers(target).and_then(|row| row.name.as_deref())
     }
 
     /// Pushes a placement row for the overlay opening at `depth`.
@@ -1476,6 +1639,11 @@ impl Host {
             // virtualized list cannot compute for itself.
             if let Some(state) = state {
                 state.resized(viewport_h);
+                // A row outside the realized window has no box and no hit entry, so bringing
+                // one into view is asked for by key and answered from the extent table.
+                if let Some(y) = state.take_reveal(viewport_h) {
+                    self.pending_scrolls.push(ScrollOp::To { id, y });
+                }
             }
             let geom = crate::layout::thumb_geom(viewport_h, self.model.solved(content).size.y);
             // Before the gate below, because a container whose content fits publishes the

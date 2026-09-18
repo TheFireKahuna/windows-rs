@@ -1,5 +1,5 @@
 //! Retained declarations with pooled responsive fields only where authored.
-use crate::layout::{Layout, Preset};
+use crate::layout::{Layout, Len, Preset};
 use crate::role::Scope;
 use windows_scene::{Node, NodeId, Slots, WidthClass, taffy};
 
@@ -13,10 +13,19 @@ pub(crate) struct Recipe {
     pub preset: Preset,
     pub scope: Scope,
     pub layout: Declaration,
+    /// The class this recipe is waiting to be lowered at, once for the whole transaction.
+    ///
+    /// Present exactly while the node sits in the host's pending list, so a chained setter
+    /// restates the class rather than queuing the node a second time.
+    pub pending: Option<WidthClass>,
 }
 
 impl Recipe {
-    pub(crate) fn lower(&self, class: WidthClass, variant: Option<&Layout>) -> taffy::Style {
+    pub(crate) fn lower(
+        &self,
+        class: WidthClass,
+        variant: Option<&Layout>,
+    ) -> (taffy::Style, windows_numerics::Vector2) {
         self.layout
             .base
             .lower(self.preset, variant, self.scope.at_width(class))
@@ -105,7 +114,12 @@ impl Styles {
         recipe.layout.variants = index;
         &mut self.variants[index as usize - 1].layout
     }
-    pub fn lower(&self, node: NodeId, class: WidthClass) -> Option<taffy::Style> {
+    /// Returns `node`'s solver style at `class`, with the anchor fraction it lowers to.
+    pub fn lower(
+        &self,
+        node: NodeId,
+        class: WidthClass,
+    ) -> Option<(taffy::Style, windows_numerics::Vector2)> {
         let recipe = self.recipes.get(node)?;
         let mut index = recipe.layout.variants;
         while index != 0 {
@@ -116,5 +130,21 @@ impl Styles {
             index = row.next;
         }
         Some(recipe.lower(class, None))
+    }
+}
+
+impl<K> super::Element<'_, K> {
+    /// States that this node adds nothing of its own: no gap, no padding, and no minimum.
+    ///
+    /// One token for the combination a compact container states together, and the way a
+    /// control says its size is exactly what its author gave it. The project rule that a
+    /// container meaning zero must state it holds — this states it.
+    pub fn tight(self) -> Self {
+        self.layout(|l| {
+            l.gap = Some(Len::Zero);
+            l.padding = Some([Len::Zero; 2]);
+            l.min_width = Some(Len::Zero);
+            l.min_height = Some(Len::Zero);
+        })
     }
 }

@@ -1,8 +1,8 @@
 //! Node-owned destinations. Writer slots and deferred destruction reuse host storage.
 use super::Host;
-use crate::signal::{Effect, RetiredEffect};
+use crate::signal::Effect;
 use std::rc::Rc;
-use windows_scene::{Anim, Bind, NodeId, Prop, Tuning, Value};
+use windows_scene::{Anim, Bind, ControlId, NodeId, Prop, Tuning, Value};
 
 #[derive(Copy, Clone, PartialEq)]
 pub(super) enum Destination {
@@ -30,58 +30,127 @@ pub(super) struct Bindings {
     free: Vec<usize>,
 }
 
-/// Existing allocations move here; no wrapper allocation is required for retirement.
-pub(super) enum Retired {
-    Region(crate::present::Build),
-    Text(Rc<dyn Fn(&str)>),
-    Effect(RetiredEffect),
-    Click(Rc<dyn Fn()>),
-    Change(Rc<dyn Fn(f64)>),
-    Drag(Rc<dyn Fn(crate::widget::Dragging)>),
-    Tip(Rc<crate::widget::TextSource>),
-    Flyout(Rc<dyn Fn(&mut super::Ui<'_>)>),
-    Escape(Rc<dyn Fn()>),
-}
+/// One value whose drop belongs outside the host's borrow, with its type erased.
+///
+/// Erasure rather than a variant per payload: dropping is the only thing ever done with
+/// one, and a named arm per kind makes every new handler cost a match arm as well as a
+/// setter. The box is the one allocation retirement makes, and a control's whole
+/// [`Handlers`] row travels in a single one.
+pub(super) struct Retired(#[expect(dead_code, reason = "held to drop")] Box<dyn std::any::Any>);
 
 impl Retired {
-    pub(super) fn release(self) {
-        match self {
-            Self::Region(value) => drop(value),
-            Self::Text(value) => drop(value),
-            Self::Effect(value) => drop(value),
-            Self::Click(value) => drop(value),
-            Self::Change(value) => drop(value),
-            Self::Drag(value) => drop(value),
-            Self::Tip(value) => drop(value),
-            Self::Flyout(value) => drop(value),
-            Self::Escape(value) => drop(value),
-        }
+    pub(super) fn new(value: impl std::any::Any) -> Self {
+        Self(Box::new(value))
     }
 }
 
-impl super::host::ControlRow {
-    pub(super) fn retire(mut self, pending: &mut Vec<Retired>) {
-        for callback in [self.click.take(), self.cancel.take()]
-            .into_iter()
-            .flatten()
-        {
-            pending.push(Retired::Click(callback));
+/// One control's application callbacks, held apart from its hot row.
+///
+/// Every field owns what it holds, which is what splits this from
+/// [`ControlRow`](super::host::ControlRow): that row is `Copy` and releasing a control is
+/// dropping this one. A control that declares no callback — a blocker, a scroll rail —
+/// places no row here at all.
+#[derive(Default)]
+pub(crate) struct Handlers {
+    pub click: Option<Rc<dyn Fn()>>,
+    /// The scalar gesture's handler, where the application declared one.
+    pub scalar: Option<Rc<dyn Fn(crate::widget::Gesturing<f64>)>>,
+    /// The two-axis drag's handler, where the application declared one.
+    pub drag: Option<Rc<dyn Fn(crate::widget::Gesturing<crate::gesture::DragUpdate>)>>,
+    /// The hover description and the side it opens on.
+    ///
+    /// `Rc` rather than `Box` for both this and [`flyout`](Self::flyout): building either
+    /// body is application code, so the overlay layer clones it out of the host's borrow
+    /// before running it. Both stay in the row, since a picker's flyout opens once per press
+    /// and not once per lifetime.
+    ///
+    /// The side is authored rather than derived: which side clears a control's neighbours
+    /// depends on the axis its author stacked them on, so a description below a toolbar
+    /// button clears its neighbours and the same one below a rail item lands on the next.
+    pub tip: Option<(Rc<crate::widget::TextSource>, crate::overlay::Side)>,
+    pub flyout: Option<Rc<dyn Fn(&mut super::Ui<'_>)>>,
+    pub name: Option<std::borrow::Cow<'static, str>>,
+}
+
+/// Handler rows and the indices free to take one.
+///
+/// A free list rather than a slotted table keyed by [`ControlId`]: a slotted one grows to
+/// the highest live control and holds a full-size vacant row for every control below it
+/// that declared nothing, which is the storage this table exists to not spend.
+#[derive(Default)]
+pub(crate) struct HandlerTable {
+    rows: Vec<Handlers>,
+    free: Vec<u32>,
+}
+
+impl HandlerTable {
+    /// Returns how many rows are placed, vacant ones included. What a test asks whether a
+    /// control paid handler storage with.
+    #[cfg(test)]
+    pub(crate) fn placed(&self) -> usize {
+        self.rows.len() - self.free.len()
+    }
+}
+
+impl Host {
+    /// Returns `id`'s handler row, placing one the first time it declares a handler.
+    ///
+    /// # Panics
+    ///
+    /// Panics where `id` names no live control. Every caller has just resolved the control
+    /// it is writing into.
+    fn handlers_mut(&mut self, id: ControlId) -> &mut Handlers {
+        let placed = self
+            .controls
+            .get(id)
+            .expect("a live control owns its handlers")
+            .handlers;
+        let at = match placed {
+            Some(at) => at,
+            None => {
+                let at = match self.handlers.free.pop() {
+                    Some(at) => at,
+                    None => {
+                        self.handlers.rows.push(Handlers::default());
+                        u32::try_from(self.handlers.rows.len() - 1)
+                            .expect("handler storage exhausted")
+                    }
+                };
+                self.controls.get_mut(id).unwrap().handlers = Some(at);
+                at
+            }
+        };
+        &mut self.handlers.rows[at as usize]
+    }
+
+    /// Returns `id`'s handler row, or `None` where it has none or the id is stale.
+    pub(crate) fn handlers(&self, id: ControlId) -> Option<&Handlers> {
+        let at = self.controls.get(id)?.handlers?;
+        Some(&self.handlers.rows[at as usize])
+    }
+
+    /// Installs one handler, retiring whatever it displaces.
+    ///
+    /// The displaced value is released outside this host's borrow, since dropping it runs
+    /// whatever the application captured. Repeating a setter therefore replaces.
+    pub(super) fn set_handler<T: 'static>(
+        &mut self,
+        id: ControlId,
+        pick: fn(&mut Handlers) -> &mut Option<T>,
+        value: T,
+    ) {
+        let displaced = pick(self.handlers_mut(id)).replace(value);
+        if let Some(displaced) = displaced {
+            self.retired.push(Retired::new(displaced));
         }
-        for callback in [self.change.take(), self.commit.take()]
-            .into_iter()
-            .flatten()
-        {
-            pending.push(Retired::Change(callback));
-        }
-        if let Some(callback) = self.drag.take() {
-            pending.push(Retired::Drag(callback));
-        }
-        if let Some((text, _)) = self.tip.take() {
-            pending.push(Retired::Tip(text));
-        }
-        if let Some(callback) = self.flyout.take() {
-            pending.push(Retired::Flyout(callback));
-        }
+    }
+
+    /// Vacates a released control's handler row, retiring what it held.
+    pub(super) fn release_handlers(&mut self, at: Option<u32>) {
+        let Some(at) = at else { return };
+        let row = core::mem::take(&mut self.handlers.rows[at as usize]);
+        self.handlers.free.push(at);
+        self.retired.push(Retired::new(row));
     }
 }
 
@@ -156,7 +225,7 @@ impl Host {
             link = row.next;
             if row.destination == Some(destination) {
                 if let Some(callback) = row.effect.retire() {
-                    self.retired.push(Retired::Effect(callback));
+                    self.retired.push(Retired::new(callback));
                 }
                 // Reuse this destination's slot when the next writer is installed.
                 return;
@@ -215,7 +284,7 @@ impl Host {
             let row = self.bindings.rows[index].take().unwrap();
             link = row.next;
             if let Some(callback) = row.effect.retire() {
-                self.retired.push(Retired::Effect(callback));
+                self.retired.push(Retired::new(callback));
             }
             self.bindings.free.push(index);
         }

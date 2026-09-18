@@ -11,9 +11,9 @@ use core::cell::Cell;
 ///
 /// One value rather than a size and a DPI that can be set apart: they change together, since
 /// a move to another display changes both, and a buffer allocated for one scale and drawn at
-/// another renders soft with nothing to report it. Every field of
-/// [`FrameCtx`](crate::FrameCtx) is derived from this, so the numbers a renderer reads cannot
-/// disagree with each other.
+/// another renders soft with nothing to report it. The box a renderer reads in
+/// [`GateCtx`](crate::GateCtx) and [`DrawCtx`](crate::DrawCtx) is this value, so the numbers
+/// it reads cannot disagree with each other.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Extent {
     /// Width in DIPs.

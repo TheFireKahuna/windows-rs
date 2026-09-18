@@ -49,7 +49,6 @@ impl Ui<'_> {
                 .thumb();
             })
             .selected(on)
-            .min_height(Len::Zero)
             .height(Metric::TrackH)
             .width(Len::Times(Metric::TrackH, 1.7))
             .padding(Len::Times(Metric::TrackH, 0.1))
@@ -190,7 +189,7 @@ impl Ui<'_> {
             node,
         }
         .layout(|layout| {
-            layout.min_height = Some(Metric::RowH.into());
+            layout.floor = Some(Metric::RowH.into());
             layout.padding = Some([Metric::SpaceMd.into(), Metric::SpaceXs.into()]);
             layout.gap = Some(Metric::SpaceSm.into());
             layout.justify = Some(Align::Center);
@@ -398,23 +397,15 @@ impl<K> Element<'_, K> {
 
     pub fn on_click(mut self, callback: impl Fn() + 'static) -> Self {
         let id = self.control_id(HitFlags::INTERACTIVE | HitFlags::GESTURE);
-        if let Some(old) = self
-            .host
-            .controls
-            .get_mut(id)
-            .unwrap()
-            .click
-            .replace(Rc::new(callback))
-        {
-            self.host.retired.push(Retired::Click(old));
-        }
+        self.host
+            .set_handler(id, |row| &mut row.click, Rc::new(callback) as Rc<dyn Fn()>);
         self
     }
 
     /// Literal names stay borrowed; generated names are released with the control.
     pub fn name(mut self, name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
         let id = self.control_id(HitFlags::UIA);
-        self.host.controls.get_mut(id).unwrap().name = Some(name.into());
+        self.host.set_handler(id, |row| &mut row.name, name.into());
         self.host.uia_restale();
         self
     }
@@ -476,46 +467,33 @@ impl<K> Element<'_, K> {
 }
 
 impl Element<'_, Scalar> {
-    pub fn on_change(mut self, callback: impl Fn(f64) + 'static) -> Self {
+    /// Installs the handler this control's gesture reports to.
+    ///
+    /// One handler for the three phases: a gesture is a sequence with exactly one end, and
+    /// a handler per phase would let a caller register the moves and forget the release.
+    pub fn on_gesture(
+        mut self,
+        callback: impl Fn(crate::widget::Gesturing<f64>) + 'static,
+    ) -> Self {
         let id = self.control_id(HitFlags::GESTURE);
-        if let Some(old) = self
-            .host
-            .controls
-            .get_mut(id)
-            .unwrap()
-            .change
-            .replace(Rc::new(callback))
-        {
-            self.host.retired.push(Retired::Change(old));
-        }
+        self.host
+            .set_handler(
+                id,
+                |row| &mut row.scalar,
+                Rc::new(callback) as Rc<dyn Fn(crate::widget::Gesturing<f64>)>,
+            );
         self
     }
-    pub fn on_commit(mut self, callback: impl Fn(f64) + 'static) -> Self {
+
+    /// Publishes this control's value while a gesture moves it, and clears `cell` when the
+    /// gesture commits or is canceled.
+    ///
+    /// The value a pointer, a key or an automation client is moving lives on the front
+    /// thread until the gesture ends, so a readout beside the control reads it here. The
+    /// document a commit will write states the value the gesture started from.
+    pub fn live(mut self, cell: crate::signal::Cell<Option<f64>>) -> Self {
         let id = self.control_id(HitFlags::GESTURE);
-        if let Some(old) = self
-            .host
-            .controls
-            .get_mut(id)
-            .unwrap()
-            .commit
-            .replace(Rc::new(callback))
-        {
-            self.host.retired.push(Retired::Change(old));
-        }
-        self
-    }
-    pub fn on_cancel(mut self, callback: impl Fn() + 'static) -> Self {
-        let id = self.control_id(HitFlags::GESTURE);
-        if let Some(old) = self
-            .host
-            .controls
-            .get_mut(id)
-            .unwrap()
-            .cancel
-            .replace(Rc::new(callback))
-        {
-            self.host.retired.push(Retired::Click(old));
-        }
+        self.host.controls.get_mut(id).unwrap().live = Some(cell);
         self
     }
 }
@@ -531,7 +509,7 @@ impl Element<'_, super::Field> {
             .callback
             .replace(Rc::new(callback))
         {
-            self.host.retired.push(Retired::Text(old));
+            self.host.retired.push(Retired::new(old));
         }
         self
     }
@@ -748,19 +726,15 @@ impl<K> Element<'_, K> {
     pub fn on_drag(
         mut self,
         decl: crate::gesture::DragDecl,
-        callback: impl Fn(crate::widget::Dragging) + 'static,
+        callback: impl Fn(crate::widget::Gesturing<crate::gesture::DragUpdate>) + 'static,
     ) -> Self {
         let id = self.control_id(HitFlags::GESTURE);
-        if let Some(old) = self
-            .host
-            .controls
-            .get_mut(id)
-            .unwrap()
-            .drag
-            .replace(Rc::new(callback))
-        {
-            self.host.retired.push(Retired::Drag(old));
-        }
+        self.host
+            .set_handler(
+            id,
+            |row| &mut row.drag,
+            Rc::new(callback) as Rc<dyn Fn(crate::widget::Gesturing<crate::gesture::DragUpdate>)>,
+        );
         self.drag(decl)
     }
     pub fn gesture(mut self, decl: crate::gesture::GestureDecl) -> Self {
@@ -773,30 +747,18 @@ impl<K> Element<'_, K> {
     }
     pub fn tip_at(mut self, side: crate::overlay::Side, text: impl Into<TextSource>) -> Self {
         let id = self.control_id(HitFlags::INTERACTIVE);
-        if let Some((old, _)) = self
-            .host
-            .controls
-            .get_mut(id)
-            .unwrap()
-            .tip
-            .replace((Rc::new(text.into()), side))
-        {
-            self.host.retired.push(Retired::Tip(old));
-        }
+        self.host
+            .set_handler(id, |row| &mut row.tip, (Rc::new(text.into()), side));
         self
     }
     pub fn flyout(mut self, body: impl Fn(&mut Ui<'_>) + 'static) -> Self {
         let id = self.control_id(HitFlags::GESTURE | HitFlags::INTERACTIVE);
-        if let Some(old) = self
-            .host
-            .controls
-            .get_mut(id)
-            .unwrap()
-            .flyout
-            .replace(Rc::new(body))
-        {
-            self.host.retired.push(Retired::Flyout(old));
-        }
+        self.host
+            .set_handler(
+            id,
+            |row| &mut row.flyout,
+            Rc::new(body) as Rc<dyn Fn(&mut Ui<'_>)>,
+        );
         self
     }
     pub fn popup_when<M>(
@@ -820,8 +782,8 @@ impl<K> Element<'_, K> {
                     closed,
                 }
             } else {
-                self.host.retired.push(Retired::Flyout(body));
-                self.host.retired.push(Retired::Click(closed));
+                self.host.retired.push(Retired::new(body));
+                self.host.retired.push(Retired::new(closed));
                 crate::overlay::Request::Close(node)
             };
             self.host.request_popup(request);

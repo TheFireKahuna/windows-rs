@@ -351,6 +351,18 @@ impl Model {
         }
     }
 
+    /// Pulls an out-of-flow node back by a fraction of its own solved size.
+    ///
+    /// The style places an edge and this aligns the node's extent around it, so a node
+    /// placed at a point of its parent can sit centred on that point without its size being
+    /// known when the placement is authored. See
+    /// [`LayoutTree::set_anchor`](crate::LayoutTree::set_anchor).
+    pub fn anchor(&mut self, id: NodeId, anchor: Vector2) {
+        if self.layout.set_anchor(id, anchor) {
+            self.solve_dirty = true;
+        }
+    }
+
     /// Makes a container classify its own inline size for its subtree, against `bounds`.
     ///
     /// Declares how the node lays out and nothing else, so it composes in any order with
@@ -899,6 +911,15 @@ impl Model {
         for index in 0..count {
             self.walk_hits(builder, self.layout.child(id, index), depth + 1);
         }
+    }
+
+    /// Returns whether `id` names a node that is still mounted.
+    ///
+    /// Ids carry a generation, so a handle kept across the unmount of what it named answers
+    /// `false` rather than the node that now occupies the slot.
+    #[must_use]
+    pub fn is_live(&self, id: NodeId) -> bool {
+        self.ids.is_live(id)
     }
 
     /// Returns `id`'s placement from the last solve, for a caller that needs geometry it

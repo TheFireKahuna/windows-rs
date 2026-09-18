@@ -14,7 +14,7 @@ use crate::gesture::{Commit, DragAxes, DragDecl, DragPhase, GestureDecl};
 use crate::input::Report;
 use crate::role::Metric;
 use crate::seam::{ScrollFront, ScrollOp};
-use crate::signal::{Cell, Memo};
+use crate::signal::{Cell, Effect, Memo};
 use crate::widget::Front;
 use core::cell::RefCell;
 use core::ops::Range;
@@ -26,7 +26,7 @@ use windows_scene::{
     TrackerRequest, Tuning, Value, unpack_offset,
 };
 
-use super::Preset;
+use super::{Len, Preset, Table, anchors, probe};
 
 /// When the thumb is visible.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -158,13 +158,13 @@ pub fn rail_style() -> windows_scene::taffy::Style {
 /// What a scroll container is declared with.
 ///
 /// The state travels with the reveal policy so that a list and the mount reporting into it
-/// share one [`ScrollState`]; a second handle would be a second answer to where the content
+/// share one [`ListState`]; a second handle would be a second answer to where the content
 /// is. Ordinary containers hold no application state; their position stays in the
 /// scene-side shadow shared with input hit testing.
 #[derive(Copy, Clone, Debug)]
 pub struct ScrollDecl {
     pub reveal: Reveal,
-    pub state: Option<ScrollState>,
+    pub state: Option<ListState>,
 }
 
 /// Returns a scrolling container over `children`, with the default reveal policy.
@@ -190,16 +190,20 @@ pub fn scroll_with<'a>(
     )
 }
 
-// ── where the content is ─────────────────────────────────────────────────────────
+// ── where the content is, and how tall it is ─────────────────────────────────────
 
-/// Where a scroll container's content is, as values rather than as events.
+/// Where a list's content is, and what the solve has measured of it.
 ///
 /// A tracker's own getter answers with what was last set rather than with what the
 /// compositor is evaluating, so the position reported in a [`SceneEvent`] is **the only
 /// trustworthy read of one**. [`observe`] writes what it was told into here, and everything
 /// above reads it as an ordinary signal — the realization window is a [`Memo`] over it.
+///
+/// The extent table rides here too, because the container and the band group it holds are
+/// two nodes and one list: the container reports where the content is, the band group states
+/// how tall it is, and a second handle would be a second answer to either.
 #[derive(Copy, Clone, Debug)]
-pub struct ScrollState {
+pub struct ListState {
     offset: Cell<f32>,
     /// Where inertia will rest, for as long as it is running.
     ///
@@ -208,25 +212,45 @@ pub struct ScrollState {
     target: Cell<Option<f32>>,
     /// The viewport's solved height.
     viewport: Cell<f32>,
+    /// The extent the content is held at until the tracker goes idle, in row heights.
+    ///
+    /// Zero while it is idle. A measurement landing mid-interaction may lengthen the content
+    /// and may never shorten it, so the maximum position climbs toward the truth and never
+    /// steps back under a moving finger.
+    held: Cell<f32>,
+    /// The row the list realizes wherever the content stands, under the application's own
+    /// identity for it.
+    ///
+    /// What keeps a focused row on the tree: an unrealized row has no node, so it has no hit
+    /// entry, no focus ring and nothing for the focus order to land on.
+    pinned: Cell<Option<u64>>,
+    /// The row to bring into view, cleared by the flush that asks for it.
+    reveal: Cell<Option<u64>>,
+    /// How far the band group sits below the top of the content, in DIPs.
+    ///
+    /// The rows are placed in the group's own space and the tracker reports the content's, so
+    /// this is what carries one into the other. Whatever the list is declared above — an
+    /// inset, a heading, a command — is ordinary flow content and this is its height.
+    lead: Cell<f32>,
+    rows: Cell<Rows>,
 }
 
-impl Default for ScrollState {
-    fn default() -> Self {
-        Self::new()
+/// Returns a list's state: at the origin, with nothing measured and nothing in flight.
+#[must_use]
+pub fn list_state() -> ListState {
+    ListState {
+        offset: Cell::new(0.0),
+        target: Cell::new(None),
+        viewport: Cell::new(0.0),
+        held: Cell::new(0.0),
+        pinned: Cell::new(None),
+        reveal: Cell::new(None),
+        lead: Cell::new(0.0),
+        rows: Cell::new(Rows::default()),
     }
 }
 
-impl ScrollState {
-    /// Returns a state at the origin, with no viewport height and nothing in flight.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            offset: Cell::new(0.0),
-            target: Cell::new(None),
-            viewport: Cell::new(0.0),
-        }
-    }
-
+impl ListState {
     /// Records the content offset the tracker reported.
     pub fn moved(self, y: f32) {
         self.offset.set(y);
@@ -240,9 +264,57 @@ impl ScrollState {
         self.target.set(Some(y));
     }
 
-    /// Clears the destination once inertia ends, leaving nothing ahead to realize.
+    /// Holds the content's extent where it now stands, for as long as the tracker is moving.
+    pub fn interacting(self) {
+        if self.held.peek() <= 0.0 {
+            self.held.set(self.rows.with(Rows::span));
+        }
+    }
+
+    /// Clears the destination and the held extent once the tracker stops, leaving nothing
+    /// ahead to realize and the measured extent free to shorten.
     pub fn settled(self) {
         self.target.set(None);
+        self.held.set(0.0);
+    }
+
+    /// Keeps the row `key` names realized, or releases the one that was.
+    pub fn pin(self, key: Option<u64>) {
+        self.pinned.set(key);
+    }
+
+    /// Asks the tracker to bring the row `key` names into view.
+    ///
+    /// The one place a list moves the content rather than reading where it is, and it is a
+    /// request rather than a write: the compositor owns the position, so the scroll is
+    /// animated by it and the rows are realized from what it reports back.
+    pub fn reveal(self, key: u64) {
+        self.reveal.set(Some(key));
+    }
+
+    /// Returns where the content has to stand for the revealed row to be inside a viewport of
+    /// `viewport_h`, taking the request.
+    ///
+    /// `None` where nothing was asked for, where the row has left the list, or where it is
+    /// already in view — a reveal that asked for the position the content already has would
+    /// interrupt whatever the user is doing to arrive where they are.
+    pub(crate) fn take_reveal(self, viewport_h: f32) -> Option<f32> {
+        let key = self.reveal.peek()?;
+        self.reveal.set(None);
+        let lead = self.lead.peek();
+        let now = self.offset.peek();
+        self.rows.with(|rows| {
+            let at = rows.index_of(key)?;
+            let top = lead + rows.offset(at);
+            let bottom = top + rows.extent(at);
+            if bottom > now + viewport_h {
+                Some((bottom - viewport_h).max(0.0))
+            } else if top < now {
+                Some(top)
+            } else {
+                None
+            }
+        })
     }
 
     /// Records the viewport's own height, from the solved layout.
@@ -267,21 +339,253 @@ impl ScrollState {
     pub fn viewport(self) -> f32 {
         self.viewport.get()
     }
+
+    /// Calls `f` with the extent table, registering a dependency for the reading effect or
+    /// memo.
+    ///
+    /// What a surface drawn beside the list resolves against: it answers for every row,
+    /// realized or not, where a realized row's own box answers only while it exists.
+    pub fn with_rows<R>(self, f: impl FnOnce(&Rows) -> R) -> R {
+        self.rows.with(f)
+    }
+
+    /// Returns the extent the content is laid out at, in row heights.
+    pub(crate) fn extent(self) -> f32 {
+        self.rows.with(Rows::span).max(self.held.get())
+    }
+}
+
+// ── the extent table ─────────────────────────────────────────────────────────────
+
+/// Where a list puts every row, whether it is realized or not.
+///
+/// **Offsets are counted in the list's own row height**, not in DIPs, so a placement is a
+/// [`Len::Times`] of the metric the list was declared with and re-lowers with the type ramp
+/// like any other length. [`Rows::unit`] carries what one of them measures, which is what
+/// turns a count back into the DIPs a pointer arrives in.
+///
+/// A row is either **estimated** — [`ListSpec::estimate`], until the solve has reported a box
+/// for it — or **measured**. A measurement is kept once taken, so a row scrolled out of the
+/// window and back does not revert to the estimate and the offsets above the viewport stop
+/// moving once they have been visited.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Rows {
+    /// One row height in DIPs, at the scope the band group was solved at. Zero until the
+    /// first solve has reported one.
+    unit: f32,
+    /// The application's identity for each row, in list order.
+    keys: Vec<u64>,
+    /// Each row's extent, in row heights.
+    extent: Vec<f32>,
+    /// Whether that extent is the solve's or the estimate.
+    measured: Vec<bool>,
+    /// `prefix[i]` is row `i`'s offset and `prefix[len]` is the whole list's extent, both in
+    /// row heights. One entry longer than [`Rows::keys`], so both answers are a lookup.
+    prefix: Vec<f32>,
+}
+
+impl Rows {
+    /// Returns how many rows the list has.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Returns whether the list has no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Returns what one row height measures, in DIPs, or zero before the first solve.
+    #[must_use]
+    pub fn unit(&self) -> f32 {
+        self.unit
+    }
+
+    /// Returns the position `key` holds in the list, or `None` where it holds none.
+    #[must_use]
+    pub fn index_of(&self, key: u64) -> Option<usize> {
+        self.keys.iter().position(|&k| k == key)
+    }
+
+    /// Returns the key at `index`, or `None` past the end of the list.
+    #[must_use]
+    pub fn key(&self, index: usize) -> Option<u64> {
+        self.keys.get(index).copied()
+    }
+
+    /// Returns row `index`'s top edge in DIPs, measured from the band group's own corner.
+    #[must_use]
+    pub fn offset(&self, index: usize) -> f32 {
+        self.prefix.get(index).copied().unwrap_or(0.0) * self.unit
+    }
+
+    /// Returns row `index`'s own height in DIPs.
+    #[must_use]
+    pub fn extent(&self, index: usize) -> f32 {
+        self.extent.get(index).copied().unwrap_or(0.0) * self.unit
+    }
+
+    /// Returns the whole list's height in DIPs.
+    #[must_use]
+    pub fn total(&self) -> f32 {
+        self.span() * self.unit
+    }
+
+    /// Returns whether row `index`'s extent is what the solve measured rather than the
+    /// estimate.
+    #[must_use]
+    pub fn is_measured(&self, index: usize) -> bool {
+        self.measured.get(index).copied().unwrap_or(false)
+    }
+
+    /// Returns the row the content position `y` falls in, clamped to the list.
+    ///
+    /// **Answers inside `0..len` at any `y`.** A tracker's position travels outside its
+    /// bounds during a manipulation — the overpan is the bounce — so this is asked about
+    /// positions past both ends of the content.
+    #[must_use]
+    pub fn at(&self, y: f32) -> usize {
+        if self.keys.is_empty() || self.unit <= 0.0 {
+            return 0;
+        }
+        let u = y / self.unit;
+        // `prefix` ascends, so the row is the last one whose offset is at or before `u`, and
+        // the search is over the offsets alone rather than over the whole table.
+        self.prefix[..self.keys.len()]
+            .partition_point(|&at| at <= u)
+            .saturating_sub(1)
+    }
+
+    /// Returns the first row whose top edge is at or below `y`, which is one past the last
+    /// row a span reaching `y` shows.
+    ///
+    /// At least one, so a viewport with no height still realizes the row under its top edge
+    /// and the list has something to measure before it has a scale.
+    fn past(&self, y: f32) -> usize {
+        let count = self.keys.len();
+        if count == 0 {
+            return 0;
+        }
+        if self.unit <= 0.0 {
+            return 1;
+        }
+        self.prefix[..count]
+            .partition_point(|&at| at < y / self.unit)
+            .max(1)
+    }
+
+    /// Returns the whole list's extent, in row heights.
+    fn span(&self) -> f32 {
+        self.prefix.last().copied().unwrap_or(0.0)
+    }
+
+    /// Returns row `index`'s offset in row heights, which is what a placement states.
+    fn units(&self, index: usize) -> f32 {
+        self.prefix.get(index).copied().unwrap_or(0.0)
+    }
+
+    /// Returns whether `keys` names a different list from the one held.
+    fn stale(&self, keys: &[u64]) -> bool {
+        self.keys != keys
+    }
+
+    /// Takes `keys` as the list, carrying each surviving key's measurement across.
+    ///
+    /// A key that was not in the list before is the estimate, and one that has left takes its
+    /// measurement with it. Reordering is therefore free of re-measurement, which is what
+    /// keeps a dragged row from changing height as it lands.
+    fn sync(&mut self, keys: &[u64], estimate: f32) {
+        let carried: Vec<(f32, bool)> = keys
+            .iter()
+            .map(|&key| {
+                self.index_of(key)
+                    .filter(|&at| self.measured[at])
+                    .map_or((estimate, false), |at| (self.extent[at], true))
+            })
+            .collect();
+        self.keys.clear();
+        self.keys.extend_from_slice(keys);
+        self.extent.clear();
+        self.measured.clear();
+        for (extent, measured) in carried {
+            self.extent.push(extent);
+            self.measured.push(measured);
+        }
+        self.rebuild();
+    }
+
+    /// Returns whether `table` reports a scale or an extent the held table does not have.
+    fn differs(&self, table: &Table, unit: f32) -> bool {
+        if self.unit != unit {
+            return true;
+        }
+        table.iter().any(|entry| {
+            self.index_of(entry.key).is_some_and(|at| {
+                measured_units(entry.rect, unit).is_some_and(|extent| self.extent[at] != extent)
+            })
+        })
+    }
+
+    /// Writes every realized row's measured extent, and the scale they were measured at.
+    ///
+    /// A key the table reports and the list does not hold is dropped: the two are published
+    /// by different passes of one flush, so a row can be measured on the solve that removed
+    /// it from the document.
+    fn absorb(&mut self, table: &Table, unit: f32) {
+        self.unit = unit;
+        for entry in table.iter() {
+            let Some(at) = self.index_of(entry.key) else {
+                continue;
+            };
+            let Some(extent) = measured_units(entry.rect, unit) else {
+                continue;
+            };
+            self.extent[at] = extent;
+            self.measured[at] = true;
+        }
+        self.rebuild();
+    }
+
+    /// Recomputes the offsets from the extents.
+    ///
+    /// One pass over the list and no allocation once the table has been sized: correcting a
+    /// row's extent moves every row below it, and a table that answered by summing on demand
+    /// would walk the list per row per placement.
+    fn rebuild(&mut self) {
+        let (extent, prefix) = (&self.extent, &mut self.prefix);
+        prefix.clear();
+        prefix.push(0.0);
+        let mut at = 0.0;
+        for &each in extent {
+            at += each;
+            prefix.push(at);
+        }
+    }
+}
+
+/// Returns `rect`'s height in row heights, or `None` where nothing has been measured.
+///
+/// A zero box is what a table reads before its node is solved, and a row of no height would
+/// stack every row below it on the same line.
+fn measured_units(rect: windows_scene::Rect, unit: f32) -> Option<f32> {
+    (unit > 0.0 && rect.y1 > rect.y0).then(|| (rect.y1 - rect.y0) / unit)
 }
 
 // ── virtualization ───────────────────────────────────────────────────────────────
 
 /// What a list needs to decide which rows exist.
 ///
-/// **Uniform extents.** With a fixed row height a row's offset is affine in its index and
-/// the maximum scroll position is a constant, so no estimate is corrected as rows realize
-/// and the maximum never shifts mid-fling.
+/// **Variable extents.** A row's own content decides how tall it is, so a realized row is
+/// what the solve measured and an unrealized one is [`ListSpec::estimate`]. Every extent is
+/// counted in [`ListSpec::row_h`], which is therefore the list's unit as well as its guess.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ListSpec {
-    /// How many rows the list has.
-    pub count: usize,
     /// The row height, as the palette's — so a list is as dense as the user asked for.
     pub row_h: Metric,
+    /// What a row the solve has not measured is assumed to be, in `row_h`.
+    pub estimate: f32,
     /// Rows realized beyond the viewport on each side. Two or three: enough that a row
     /// exists before it is looked at, few enough that a fling does not realize a screen it
     /// will never show.
@@ -292,17 +596,28 @@ pub struct ListSpec {
 const OVERSCAN: usize = 3;
 
 impl ListSpec {
-    /// Returns a list of `count` rows, each one [`Metric::RowH`](crate::role::Metric) tall.
+    /// Returns a list whose rows are one [`Metric::RowH`](crate::role::Metric) until they are
+    /// measured.
     ///
-    /// The height is a metric rather than a length, so the list is as dense as the user
-    /// asked for and re-lowers with the type ramp.
+    /// The height is a metric rather than a length, so the list is as dense as the user asked
+    /// for and re-lowers with the type ramp.
     #[must_use]
-    pub const fn uniform(count: usize, row_h: Metric) -> Self {
+    pub const fn new(row_h: Metric) -> Self {
         Self {
-            count,
             row_h,
+            estimate: 1.0,
             overscan: OVERSCAN,
         }
+    }
+
+    /// Returns the same list guessing `estimate` row heights for a row it has not measured.
+    ///
+    /// Worth stating where the rows are known to be taller than the metric they are counted
+    /// in: the guess is what the scrollbar reports until a row has been visited.
+    #[must_use]
+    pub const fn estimate(mut self, estimate: f32) -> Self {
+        self.estimate = estimate;
+        self
     }
 
     /// Returns the same list realizing `overscan` rows past each edge of the viewport.
@@ -319,9 +634,9 @@ impl ListSpec {
 /// the rows realized for it do not scale with the distance flung.
 const CORRIDOR: usize = 2;
 
-/// How many runs a realized set holds: the live window, the destination, and the corridor
-/// between them.
-const MAX_RUNS: usize = 2 + CORRIDOR;
+/// How many runs a realized set holds: the live window, the destination, the corridor
+/// between them, and the pinned row.
+const MAX_RUNS: usize = 3 + CORRIDOR;
 
 /// Which rows are worth existing, as a bounded set of runs.
 ///
@@ -394,25 +709,27 @@ impl Realized {
     }
 }
 
-/// Returns the rows worth realizing at `scroll_y`, plus `spec.overscan` on each side.
+/// Returns the rows worth realizing at `scroll_y`, plus `overscan` on each side.
 ///
-/// **The range is inside `0..spec.count` at any `scroll_y`.** A tracker's position travels
+/// **The range is inside `0..rows.len()` at any `scroll_y`.** A tracker's position travels
 /// outside its bounds during a manipulation — the overpan is the bounce — so this is asked
-/// about positions past the end of the content. A non-positive `row_h` or an empty list
-/// answers `0..0`.
+/// about positions past the end of the content. An empty list answers `0..0`.
 #[must_use]
-pub fn window(scroll_y: f32, viewport_h: f32, row_h: f32, spec: &ListSpec) -> Range<usize> {
-    if row_h <= 0.0 || spec.count == 0 {
+pub fn window(scroll_y: f32, viewport_h: f32, rows: &Rows, overscan: usize) -> Range<usize> {
+    let count = rows.len();
+    if count == 0 {
         return 0..0;
     }
-    let first = (((scroll_y / row_h).floor() as isize - spec.overscan as isize).max(0) as usize)
-        .min(spec.count);
-    let last = (((scroll_y + viewport_h) / row_h).ceil() as usize + spec.overscan).min(spec.count);
+    // A position past the end answers the last row, which is what makes the overpan realize
+    // the end of the list rather than nothing; the two clamps below are what keep the run
+    // inside it.
+    let first = rows.at(scroll_y).saturating_sub(overscan);
+    let last = (rows.past(scroll_y + viewport_h.max(0.0)) + overscan).min(count);
     first..last.max(first)
 }
 
-/// Returns the whole realized set: where the content is, where a fling is taking it, and a
-/// fixed number of samples of the path between.
+/// Returns the whole realized set: where the content is, where a fling is taking it, a fixed
+/// number of samples of the path between, and the row the list was told to keep.
 ///
 /// The corridor is sampled rather than swept, so a fling crossing three thousand rows
 /// realizes two windows and two overscan bands however far it travels. Allocates nothing.
@@ -421,120 +738,172 @@ pub fn realize(
     offset: f32,
     target: Option<f32>,
     viewport_h: f32,
-    row_h: f32,
+    pinned: Option<usize>,
+    rows: &Rows,
     spec: &ListSpec,
 ) -> Realized {
     let mut out = Realized::EMPTY;
-    out.push(window(offset, viewport_h, row_h, spec));
+    out.push(window(offset, viewport_h, rows, spec.overscan));
     if let Some(target) = target {
         for step in 1..=CORRIDOR {
             let at = offset + (target - offset) * (step as f32) / ((CORRIDOR + 1) as f32);
             // Zero height, so a sample is the overscan band around a point rather than a
             // second viewport's worth of rows nobody will look at.
-            out.push(window(at, 0.0, row_h, spec));
+            out.push(window(at, 0.0, rows, spec.overscan));
         }
-        out.push(window(target, viewport_h, row_h, spec));
+        out.push(window(target, viewport_h, rows, spec.overscan));
+    }
+    if let Some(pinned) = pinned.filter(|&at| at < rows.len()) {
+        out.push(pinned..pinned + 1);
     }
     out.merge();
     out
 }
 
-/// Returns a virtualized list: a scroll container whose rows exist only near the viewport.
+/// Returns a scrolling container driving `state`, for a [`list`] and whatever else the
+/// content carries.
 ///
-/// Rows are **placed rather than laid out** — each is absolute at its own index's offset, and
-/// the content group's height is the whole list's. So the scroll extent does not move when
-/// the realized window does, the maximum position stays the constant a uniform row height
-/// gives, and the realized set can be several disjoint runs rather than one contiguous span.
-///
-/// Rows are keyed by index and reconciled by the same keyed `each` as any other list, so a
-/// row's index is fixed for its life and its placement is written once. `items` must push
-/// the items it has for the runs it is handed **in ascending index order**; a realized index
-/// it does not supply gets a placeholder of the right height rather than a gap.
-pub fn list<'a, T: 'static, K: 'static>(
+/// The band group is one child among several, so a leading inset, a trailing command and the
+/// figures drawn over the rows stay ordinary flow content of one scroller.
+pub fn scroll_list<'a>(
     ui: &'a mut Ui<'_>,
-    spec: impl Fn() -> ListSpec + 'static,
-    items: impl Fn(&Realized, &mut Vec<(usize, T)>) + 'static,
-    view: impl Fn(&mut Ui<'_>, &T) -> Node<K> + 'static,
+    state: ListState,
+    children: impl FnOnce(&mut Ui<'_>),
 ) -> Element<'a> {
-    let state = ScrollState::new();
-    let scope = ui.scope();
-    let spec = Memo::new(spec);
-    let row_metric = Memo::new(move || spec.get().row_h);
-    let realized = Memo::new(move || {
-        let spec = spec.get();
-        realize(
-            state.offset(),
-            state.target(),
-            state.viewport(),
-            crate::role::metric(spec.row_h, scope),
-            &spec,
-        )
-    });
-    let supplied = RefCell::new(Vec::<(usize, T)>::new());
-    ui.scroll_content(
+    ui.scroll(
         ScrollDecl {
             reveal: Reveal::default(),
             state: Some(state),
         },
-        |ui| {
-            ui.node(Preset::Bare)
-                .no_shrink()
-                .layout_from(move |layout| {
-                    let spec = spec.get();
-                    layout.height = Some(super::Len::Times(spec.row_h, spec.count as f32));
-                })
-                .children(|ui| {
-                    ui.each(
-                        move |out: &mut Vec<(usize, Option<T>)>| {
-                            let realized = realized.get();
-                            let mut supplied = supplied.borrow_mut();
-                            supplied.clear();
-                            items(&realized, &mut supplied);
-                            let mut supplied = supplied.drain(..).peekable();
-                            for run in realized.runs() {
-                                for index in run {
-                                    while supplied.peek().is_some_and(|&(at, _)| at < index) {
-                                        supplied.next();
-                                    }
-                                    let item = match supplied.peek() {
-                                        Some(&(at, _)) if at == index => {
-                                            supplied.next().map(|(_, item)| item)
-                                        }
-                                        _ => None,
-                                    };
-                                    out.push((index, item));
-                                }
-                            }
-                        },
-                        |(index, _)| index,
-                        move |ui, (index, item)| {
-                            let at = *index as f32;
-                            let place = move |layout: &mut super::Layout| {
-                                let metric = row_metric.get();
-                                layout.position = Some(super::Position::Band {
-                                    at: super::Len::Times(metric, at),
-                                    height: metric.into(),
-                                });
-                            };
-                            match item {
-                                Some(item) => {
-                                    let node = view(ui, item);
-                                    ui.effect(move |ui| {
-                                        if let Some(row) = ui.edit(node) {
-                                            row.layout(place);
-                                        }
-                                    });
-                                }
-                                None => {
-                                    ui.node(Preset::Bare).layout_from(place);
-                                }
-                            }
-                        },
-                    );
-                })
-                .id()
-        },
+        children,
     )
+}
+
+/// Returns a virtualized band group: the rows near the viewport, each at its own measured
+/// offset, inside a box as tall as the whole list.
+///
+/// Rows are **placed rather than laid out** — each is absolute at the offset the extent table
+/// gives its key, and the group's own height is the whole list's — so the scroll extent does
+/// not move when the realized window does and the realized set can be several disjoint runs
+/// rather than one contiguous span.
+///
+/// `keys` names every row, in order, under the application's own identity; it is what the
+/// list's length and every row's place come from. `items` supplies the data for the runs it
+/// is handed, **in ascending index order**; an index it does not supply is not realized, and
+/// the space the table gives that row stays open. Rows are reconciled by the same keyed
+/// `each` as any other list, so a row surviving a move of the window keeps its node, its
+/// owner and everything scoped to it.
+///
+/// Each realized row's box is measured and written back into the table, which corrects the
+/// group's height progressively. The tracker's position is never written from here: a
+/// correction moves the maximum position and leaves the content where the compositor has it.
+pub fn list<'a, T: 'static, K: 'static>(
+    ui: &'a mut Ui<'_>,
+    state: ListState,
+    spec: impl Fn() -> ListSpec + 'static,
+    keys: impl Fn(&mut Vec<u64>) + 'static,
+    items: impl Fn(&Realized, &mut Vec<(usize, T)>) + 'static,
+    view: impl Fn(&mut Ui<'_>, &T) -> Node<K> + 'static,
+) -> Element<'a> {
+    let rows = state.rows;
+    let spec = Memo::new(spec);
+    let row_metric = Memo::new(move || spec.get().row_h);
+    // The band group's own boxes, which is how a row's measured height comes back. One table
+    // and one signal, so a row appearing wakes the measurement and a solve that moved nothing
+    // wakes neither it nor anything derived from the extents.
+    let boxes = anchors();
+    // Where the band group sits inside the content, so the window is resolved in the group's
+    // own space rather than the scroller's. A leading inset is ordinary flow content above it.
+    let lead = probe();
+
+    // The list's length and order. Read untracked and written only on a difference, so the
+    // extents this effect owns cannot wake it.
+    let named = RefCell::new(Vec::<u64>::new());
+    Effect::new(move || {
+        let estimate = spec.get().estimate;
+        let mut next = named.borrow_mut();
+        next.clear();
+        keys(&mut next);
+        if crate::signal::untracked(|| rows.with(|held| held.stale(&next))) {
+            rows.update(|held| held.sync(&next, estimate));
+        }
+    });
+
+    // Every realized row's measured height, at the scale the group was solved at, and how far
+    // the group itself sits below the top of the content.
+    Effect::new(move || {
+        state.lead.set(lead.get().local.y);
+        let metric = row_metric.get();
+        let moved = boxes.with(|table| {
+            table.scope.is_some_and(|scope| {
+                let unit = crate::role::metric(metric, scope);
+                crate::signal::untracked(|| rows.with(|held| held.differs(table, unit)))
+            })
+        });
+        if moved {
+            boxes.with(|table| {
+                let unit = crate::role::metric(metric, table.scope.expect("a measured table"));
+                rows.update(|held| held.absorb(table, unit));
+            });
+        }
+    });
+
+    let realized = Memo::new(move || {
+        let spec = spec.get();
+        let above = state.lead.get();
+        rows.with(|held| {
+            realize(
+                state.offset() - above,
+                state.target().map(|at| at - above),
+                state.viewport(),
+                state.pinned.get().and_then(|key| held.index_of(key)),
+                held,
+                &spec,
+            )
+        })
+    });
+    let supplied = RefCell::new(Vec::<(usize, T)>::new());
+    ui.node(Preset::Bare)
+        .no_shrink()
+        .anchors_origin(boxes)
+        .probed(lead)
+        .layout_from(move |layout| {
+            layout.height = Some(Len::Times(row_metric.get(), state.extent()));
+        })
+        .children(move |ui| {
+            ui.each(
+                move |out: &mut Vec<(u64, T)>| {
+                    let realized = realized.get();
+                    let mut supplied = supplied.borrow_mut();
+                    supplied.clear();
+                    items(&realized, &mut supplied);
+                    rows.with(|held| {
+                        for (index, item) in supplied.drain(..) {
+                            if let Some(key) = held.key(index) {
+                                out.push((key, item));
+                            }
+                        }
+                    });
+                },
+                |(key, _)| key,
+                move |ui, (key, item)| {
+                    let key = *key;
+                    let node = view(ui, item);
+                    ui.effect(move |ui| {
+                        let (metric, at) = (row_metric.get(), rows.with(|held| {
+                            held.index_of(key).map_or(0.0, |index| held.units(index))
+                        }));
+                        if let Some(row) = ui.edit(node) {
+                            row.anchored(boxes, key).layout(move |layout| {
+                                layout.position = Some(super::Position::Band {
+                                    at: Len::Times(metric, at),
+                                });
+                            });
+                        }
+                    });
+                },
+            );
+        })
 }
 
 // ── the front thread's half ──────────────────────────────────────────────────────
@@ -553,7 +922,7 @@ pub(crate) struct ScrollRow {
     /// The rail's, which is what a grab names. Minted only where there is a thumb.
     pub grab: Option<ControlId>,
     pub reveal: Reveal,
-    pub state: Option<ScrollState>,
+    pub state: Option<ListState>,
     /// What was last published, so a solve that moved nothing emits nothing.
     pub last: ThumbGeom,
     /// Whether the half that moves the thumb has been told this container exists.
@@ -565,6 +934,8 @@ pub(crate) struct ScrollRow {
 /// One scroll container, as the half that moves its thumb holds it.
 struct ScrollLive {
     front: ScrollFront,
+    /// Where the app half asked the content to go, until the next tick asks the compositor.
+    to: Option<f32>,
     /// Where the content stood when the current thumb grab began.
     grabbed_at: Option<f32>,
     /// What the thumb's opacity was last retargeted to, so an unchanged reason emits nothing.
@@ -645,6 +1016,7 @@ impl ScrollTable {
                     let shown = front.reveal == Reveal::Always;
                     self.rows.push(ScrollLive {
                         front,
+                        to: None,
                         grabbed_at: None,
                         shown,
                     });
@@ -652,6 +1024,11 @@ impl ScrollTable {
                 ScrollOp::Geom { id, geom } => {
                     if let Some(row) = self.rows.iter_mut().find(|row| row.front.id == id) {
                         row.front.last = geom;
+                    }
+                }
+                ScrollOp::To { id, y } => {
+                    if let Some(row) = self.rows.iter_mut().find(|row| row.front.id == id) {
+                        row.to = Some(y);
                     }
                 }
                 ScrollOp::Drop(id) => self.rows.retain(|row| row.front.id != id),
@@ -717,7 +1094,7 @@ impl ScrollRow {
     }
 }
 
-/// Records what the trackers reported into each container's [`ScrollState`].
+/// Records what the trackers reported into each container's [`ListState`].
 ///
 /// **Writes signals only**, and runs before the flush, so the realization window a reported
 /// position implies is resolved in the tick that position arrived in.
@@ -742,14 +1119,17 @@ pub fn observe(events: &[SceneEvent]) {
                         state.flinging_to(modified.y);
                     }
                 }),
-                SceneEvent::TrackerPhase {
-                    tracker,
-                    phase: windows_scene::Phase::Idle,
-                } => host.scroll_by_tracker(tracker, |row| {
-                    if let Some(state) = row.state {
-                        state.settled();
-                    }
-                }),
+                SceneEvent::TrackerPhase { tracker, phase } => {
+                    host.scroll_by_tracker(tracker, |row| {
+                        if let Some(state) = row.state {
+                            if phase == windows_scene::Phase::Idle {
+                                state.settled();
+                            } else {
+                                state.interacting();
+                            }
+                        }
+                    });
+                }
                 _ => {}
             }
         }
@@ -773,12 +1153,25 @@ pub(crate) fn front(
     table: &mut ScrollTable,
     front: &mut Front<'_>,
 ) -> Result<()> {
-    if events.is_empty() && reports.is_empty() {
+    if events.is_empty() && reports.is_empty() && table.rows.iter().all(|row| row.to.is_none()) {
         return Ok(());
     }
     // The first failure is kept and the rest of the tick still runs: a refused retarget on
     // one surface must not leave another's grab half-applied.
     let mut failed: Option<windows_core::Error> = None;
+    // Taken before the events, so a reveal and a phase edge in one tick leave the content
+    // where the reveal asked rather than where it stood.
+    for row in &mut table.rows {
+        if let Some(y) = row.to.take() {
+            if let Err(error) = front
+                .scene
+                .request(row.front.tracker, TrackerRequest::To(Vector2 { x: 0.0, y }))
+                .map(|_| ())
+            {
+                failed.get_or_insert(error);
+            }
+        }
+    }
     for event in events {
         let (tracker, moving) = match *event {
             SceneEvent::TrackerPhase { tracker, phase } => {
@@ -1007,18 +1400,23 @@ mod tests {
             "unknown trackers remain available to other consumers"
         );
         let _list = LayoutDriver::create(|ui| {
-            list(
-                ui,
-                || SPEC,
-                |runs, items| {
-                    for run in runs.runs() {
-                        for i in run {
-                            items.push((i, i));
+            let state = list_state();
+            scroll_list(ui, state, move |ui| {
+                list(
+                    ui,
+                    state,
+                    || SPEC,
+                    |out| out.extend(0..100u64),
+                    |runs, items| {
+                        for run in runs.runs() {
+                            for i in run {
+                                items.push((i, i));
+                            }
                         }
-                    }
-                },
-                |ui, _| ui.node(Preset::Bare).id(),
-            );
+                    },
+                    |ui, _| ui.node(Preset::Bare).id(),
+                );
+            });
         });
         Host::flush(&mut patch);
         Host::with(|h| {
@@ -1139,12 +1537,6 @@ mod tests {
         );
     }
 
-    const SPEC: ListSpec = ListSpec {
-        count: 100,
-        row_h: Metric::RowH,
-        overscan: 2,
-    };
-
     /// A viewport bigger than its content has no thumb, no travel and nothing to scroll.
     #[test]
     fn content_that_fits_has_no_scrollbar() {
@@ -1185,20 +1577,124 @@ mod tests {
         assert_eq!(scroll_for_thumb_y(300.0, g), 0.0);
     }
 
+    /// Returns a hundred-row table, every row `extent` row heights tall and measured.
+    fn uniform(extent: f32) -> Rows {
+        table(&(0..100).map(|_| extent).collect::<Vec<_>>())
+    }
+
+    /// Returns a table of the extents given, in row heights, at a 20-DIP row.
+    fn table(extents: &[f32]) -> Rows {
+        let mut rows = Rows {
+            unit: 20.0,
+            ..Rows::default()
+        };
+        rows.sync(&(0..extents.len() as u64).collect::<Vec<_>>(), 1.0);
+        rows.extent.clear();
+        rows.extent.extend_from_slice(extents);
+        rows.measured.iter_mut().for_each(|at| *at = true);
+        rows.rebuild();
+        rows
+    }
+
+    /// Offsets accumulate the extents ahead of each row, and the search inverts them.
+    ///
+    /// Answered from the prefix table rather than by summing, so a list of mixed extents
+    /// costs one lookup per row and one search per position however long it is.
+    #[test]
+    fn a_mixed_table_answers_both_directions_without_a_scan() {
+        let rows = table(&[1.0, 3.0, 0.5, 2.0]);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.offset(0), 0.0);
+        assert_eq!(rows.offset(1), 20.0);
+        assert_eq!(rows.offset(2), 80.0);
+        assert_eq!(rows.offset(3), 90.0);
+        assert_eq!(rows.total(), 130.0);
+        assert_eq!(rows.extent(1), 60.0);
+        // Each row's own band answers itself at both edges, and the boundary belongs to the
+        // row it opens.
+        for (index, y) in [(0, 0.0), (0, 19.0), (1, 20.0), (1, 79.0), (2, 80.0), (3, 90.0)] {
+            assert_eq!(rows.at(y), index, "position {y}");
+        }
+        assert_eq!(rows.at(-50.0), 0, "an overpan above the list answers its first row");
+        assert_eq!(rows.at(400.0), 3, "an overpan below it answers its last");
+    }
+
+    /// A measurement replaces the estimate, moves every row below it, and stays taken.
+    #[test]
+    fn a_measurement_moves_the_rows_below_it_and_is_kept() {
+        let mut rows = table(&[1.0, 1.0, 1.0]);
+        rows.measured.iter_mut().for_each(|at| *at = false);
+        let mut measured = Table::default();
+        measured.boxes.push(crate::layout::Anchored {
+            key: 1,
+            rect: windows_scene::Rect::new(0.0, 20.0, 100.0, 80.0),
+        });
+        assert!(rows.differs(&measured, 20.0));
+        rows.absorb(&measured, 20.0);
+        assert!(!rows.differs(&measured, 20.0), "the measurement did not land");
+        assert!(rows.is_measured(1) && !rows.is_measured(0));
+        assert_eq!(rows.offset(2), 80.0, "the row below kept the estimate's offset");
+        assert_eq!(rows.total(), 100.0);
+        // A key the table reports and the list does not hold is not an index into it.
+        let mut stray = Table::default();
+        stray.boxes.push(crate::layout::Anchored {
+            key: 99,
+            rect: windows_scene::Rect::new(0.0, 0.0, 100.0, 40.0),
+        });
+        assert!(!rows.differs(&stray, 20.0));
+    }
+
+    /// A row that survives a reorder carries its measurement to its new place, and a row that
+    /// arrives is the estimate.
+    #[test]
+    fn a_reorder_carries_each_measurement_with_its_row() {
+        let mut rows = table(&[1.0, 3.0]);
+        rows.sync(&[1, 7, 0], 2.0);
+        assert!(rows.is_measured(0) && rows.is_measured(2));
+        assert!(!rows.is_measured(1), "a row that was not in the list was measured");
+        assert_eq!(rows.extent(0), 60.0, "the tall row lost its measurement");
+        assert_eq!(rows.extent(1), 40.0, "the new row is not the estimate");
+        assert_eq!(rows.extent(2), 20.0);
+        assert_eq!(rows.total(), 120.0);
+    }
+
+    const SPEC: ListSpec = ListSpec {
+        row_h: Metric::RowH,
+        estimate: 1.0,
+        overscan: 2,
+    };
+
     /// The window covers the viewport, plus the overscan on each side, and never runs past
     /// the ends.
     #[test]
     fn the_realization_window_covers_the_viewport_and_is_clamped_at_both_ends() {
-        let top = window(0.0, 100.0, 20.0, &SPEC);
+        let rows = uniform(1.0);
+        let top = window(0.0, 100.0, &rows, SPEC.overscan);
         assert_eq!(top.start, 0, "the overscan cannot go negative");
         assert!(top.end >= 5 && top.end <= 8);
 
-        let middle = window(400.0, 100.0, 20.0, &SPEC);
+        let middle = window(400.0, 100.0, &rows, SPEC.overscan);
         assert_eq!(middle.start, 18, "twenty rows in, less two of overscan");
         assert_eq!(middle.end, 27, "five visible, plus two either side");
 
-        let bottom = window(1900.0, 100.0, 20.0, &SPEC);
+        let bottom = window(1900.0, 100.0, &rows, SPEC.overscan);
         assert_eq!(bottom.end, 100, "the overscan cannot go past the last row");
+    }
+
+    /// The window follows the extents rather than an index, so a tall row shows fewer.
+    #[test]
+    fn the_window_over_mixed_extents_follows_the_measurements() {
+        // Three shut rows, one five deep, then shut rows again: 20, 20, 20, 100, 20…
+        let mut extents = vec![1.0; 100];
+        extents[3] = 5.0;
+        let rows = table(&extents);
+        // A viewport of 100 DIPs opening at the tall row shows that row and one more.
+        let over = window(60.0, 100.0, &rows, 0);
+        assert_eq!(over, 3..4, "the open row did not take the viewport");
+        // The same viewport above it shows four.
+        assert_eq!(window(0.0, 100.0, &rows, 0), 0..4);
+        // And below it, where the rows are shut again, five.
+        assert_eq!(window(260.0, 100.0, &rows, 0), 9..14);
     }
 
     /// A tracker overpans past the end of the content, and the window stays inside the list.
@@ -1208,28 +1704,30 @@ mod tests {
     /// placement far past the end of the list.
     #[test]
     fn an_overpanned_window_stays_inside_the_list() {
-        let bounced = window(2100.0, 100.0, 20.0, &SPEC);
-        assert!(bounced.start <= SPEC.count && bounced.end <= SPEC.count);
-        assert!(
-            bounced.is_empty(),
-            "nothing past the end is worth realizing"
-        );
+        let rows = uniform(1.0);
+        let bounced = window(2100.0, 100.0, &rows, SPEC.overscan);
+        assert!(bounced.start <= rows.len() && bounced.end <= rows.len());
+        assert_eq!(bounced, 97..100, "the overpan realizes the end of the list");
     }
 
-    /// An empty list realizes nothing, and a zero row height does not divide by itself.
+    /// An empty list realizes nothing, and an unmeasured scale does not divide by itself.
     #[test]
     fn a_degenerate_list_realizes_nothing() {
-        let spec = ListSpec { count: 0, ..SPEC };
-        assert!(window(0.0, 100.0, 20.0, &spec).is_empty());
-        assert!(window(0.0, 100.0, 0.0, &ListSpec { count: 10, ..spec }).is_empty());
-        assert_eq!(realize(0.0, None, 100.0, 20.0, &spec).rows(), 0);
+        let empty = Rows::default();
+        assert!(window(0.0, 100.0, &empty, 2).is_empty());
+        assert_eq!(realize(0.0, None, 100.0, None, &empty, &SPEC).rows(), 0);
+        let unsolved = Rows {
+            unit: 0.0,
+            ..table(&[1.0; 10])
+        };
+        assert_eq!(unsolved.at(500.0), 0, "an unmeasured scale answers the first row");
     }
 
     /// At rest the realized set is exactly the live window: one run, no corridor, nothing
     /// realized ahead of a fling that is not happening.
     #[test]
     fn a_resting_list_realizes_one_run() {
-        let at_rest = realize(400.0, None, 100.0, 20.0, &SPEC);
+        let at_rest = realize(400.0, None, 100.0, None, &uniform(1.0), &SPEC);
         assert_eq!(at_rest.runs().count(), 1);
         assert_eq!(at_rest.runs().next().unwrap(), 18..27);
     }
@@ -1238,7 +1736,7 @@ mod tests {
     /// which is why the set is not one range.
     #[test]
     fn a_long_fling_realizes_its_destination_and_a_bounded_corridor() {
-        let flung = realize(0.0, Some(1900.0), 100.0, 20.0, &SPEC);
+        let flung = realize(0.0, Some(1900.0), 100.0, None, &uniform(1.0), &SPEC);
         assert!(flung.contains(0), "where the content still is");
         assert!(flung.contains(99), "where it is going");
         assert!(!flung.contains(50), "and not the whole path between");
@@ -1251,17 +1749,31 @@ mod tests {
     /// realizing the same rows twice.
     #[test]
     fn a_short_fling_coalesces_into_one_run() {
-        let nudged = realize(400.0, Some(440.0), 100.0, 20.0, &SPEC);
+        let nudged = realize(400.0, Some(440.0), 100.0, None, &uniform(1.0), &SPEC);
         assert_eq!(nudged.runs().count(), 1);
         let run = nudged.runs().next().unwrap();
         assert_eq!(run, 18..29);
+    }
+
+    /// A pinned row is realized wherever the content stands, and is its own run.
+    ///
+    /// What keeps a focused row on the tree: an unrealized row has no node, so it has
+    /// nothing for the focus order to land on and no ring to draw.
+    #[test]
+    fn a_pinned_row_is_realized_from_anywhere() {
+        let pinned = realize(1900.0, None, 100.0, Some(2), &uniform(1.0), &SPEC);
+        assert!(pinned.contains(2), "the pinned row was left unrealized");
+        assert!(pinned.contains(99), "the live window was dropped for it");
+        assert_eq!(pinned.runs().count(), 2);
+        let past = realize(0.0, None, 100.0, Some(500), &uniform(1.0), &SPEC);
+        assert_eq!(past.runs().count(), 1, "a pin past the end realized a row that is not there");
     }
 
     /// The runs come out ascending and disjoint however they went in, because the fill walks
     /// them in order and a supplied item is matched by a single forward scan.
     #[test]
     fn the_runs_are_ascending_and_disjoint() {
-        let flung = realize(1900.0, Some(0.0), 100.0, 20.0, &SPEC);
+        let flung = realize(1900.0, Some(0.0), 100.0, Some(50), &uniform(1.0), &SPEC);
         let mut last = 0;
         for run in flung.runs() {
             assert!(run.start >= last, "{run:?} after {last}");

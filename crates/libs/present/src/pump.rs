@@ -522,7 +522,7 @@ impl Pump {
         due.clear();
         poisoned.clear();
         for (i, m) in mounted.iter_mut().enumerate() {
-            let ctx = FrameCtx {
+            let ctx = GateCtx {
                 extent: m.region.extent(),
                 tick: *tick_count,
                 device: device.gpu(),
@@ -565,10 +565,9 @@ impl Pump {
                     m.opaque,
                     "a Frame's opacity decides its allocation and may not change after it"
                 );
-                let ctx = FrameCtx {
+                let ctx = DrawCtx {
                     extent: m.region.extent(),
                     tick: *tick_count,
-                    device: device.gpu(),
                     out: *out,
                     input: &m.input,
                 };
