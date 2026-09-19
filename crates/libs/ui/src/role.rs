@@ -244,10 +244,19 @@ pub enum TypeRole {
 /// A scalar the palette owns, in DIPs unless the name says otherwise.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Metric {
+    /// The spacing scale, narrowest first. A rung between two named ones carries both
+    /// names.
+    Space3xs,
+    Space2xs,
     SpaceXs,
+    SpaceXsSm,
     SpaceSm,
+    SpaceSmMd,
     SpaceMd,
+    SpaceMdLg,
     SpaceLg,
+    SpaceXl,
+    Space2xl,
     /// The radius of a control: a button, a field, a segmented option, a menu option.
     Radius,
     /// The radius of a surface: a card, a panel, a flyout, a plate.
@@ -292,7 +301,7 @@ pub enum Metric {
 
 /// How many metrics the palette owns outright, which is every variant but
 /// [`Custom`](Metric::Custom).
-pub const BUILTIN_METRICS: usize = 15;
+pub const BUILTIN_METRICS: usize = 22;
 
 impl Metric {
     /// Every palette-owned metric, in the order a cache row indexes them.
@@ -300,10 +309,17 @@ impl Metric {
     /// The solve caches exactly these per width class, so the array's order is the cache's
     /// layout and [`row`](Self::row) is its index.
     pub const BUILTIN: [Self; BUILTIN_METRICS] = [
+        Self::Space3xs,
+        Self::Space2xs,
         Self::SpaceXs,
+        Self::SpaceXsSm,
         Self::SpaceSm,
+        Self::SpaceSmMd,
         Self::SpaceMd,
+        Self::SpaceMdLg,
         Self::SpaceLg,
+        Self::SpaceXl,
+        Self::Space2xl,
         Self::Radius,
         Self::RadiusSurface,
         Self::RadiusPill,
@@ -324,21 +340,28 @@ impl Metric {
     #[must_use]
     pub const fn row(self) -> Option<usize> {
         Some(match self {
-            Self::SpaceXs => 0,
-            Self::SpaceSm => 1,
-            Self::SpaceMd => 2,
-            Self::SpaceLg => 3,
-            Self::Radius => 4,
-            Self::RadiusSurface => 5,
-            Self::RadiusPill => 6,
-            Self::RowH => 7,
-            Self::TrackH => 8,
-            Self::CardMinW => 9,
-            Self::CardMinH => 10,
-            Self::SliderRailH => 11,
-            Self::SliderThumb => 12,
-            Self::HairlineW => 13,
-            Self::BorderW => 14,
+            Self::Space3xs => 0,
+            Self::Space2xs => 1,
+            Self::SpaceXs => 2,
+            Self::SpaceXsSm => 3,
+            Self::SpaceSm => 4,
+            Self::SpaceSmMd => 5,
+            Self::SpaceMd => 6,
+            Self::SpaceMdLg => 7,
+            Self::SpaceLg => 8,
+            Self::SpaceXl => 9,
+            Self::Space2xl => 10,
+            Self::Radius => 11,
+            Self::RadiusSurface => 12,
+            Self::RadiusPill => 13,
+            Self::RowH => 14,
+            Self::TrackH => 15,
+            Self::CardMinW => 16,
+            Self::CardMinH => 17,
+            Self::SliderRailH => 18,
+            Self::SliderThumb => 19,
+            Self::HairlineW => 20,
+            Self::BorderW => 21,
             Self::Custom(_) => return None,
         })
     }

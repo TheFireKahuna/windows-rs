@@ -52,7 +52,7 @@ pub fn solve_root(host: &mut Host, root: NodeId) {
         let class = s.tree.class(root);
         let window = s.window;
         let pair = s.measure(root, class);
-        let at = s.geom(root).local;
+        let at = s.geom(root).at;
         let w = s.root_inline(root, class, pair, window.x);
         let pair_h = s.place(root, w, class);
         let h = s.root_block(root, class, pair_h, window.y);
@@ -433,6 +433,7 @@ impl Solver<'_> {
         }
         self.visits += 1;
         self.tree.set_class(n, class);
+        self.tree.c.flags[i] |= tree::PLACED;
         self.tree.c.geom[i].at_w = w;
         let l = self.layout(n);
         let inner = self.classify(n, &l, w, class);
@@ -554,17 +555,18 @@ impl Solver<'_> {
         // its derived sprites moved.
         let sunk = *flags & tree::SUNK != 0;
         *flags = if hidden { *flags | tree::SUNK } else { *flags & !tree::SUNK };
+        let placed = *flags & tree::PLACED != 0;
         let settled = !self.dirty(n) && self.published(n) && sunk == hidden;
         if settled && rect == held.rect {
             return;
         }
-        if settled && rect.width() == held.rect.width() && rect.height() == held.rect.height() {
+        if settled && h == held.at_h && !placed {
             // Only the origin moved, so every descendant keeps its offset and its extent.
             self.translate(n, local, parent, hidden);
             return;
         }
-        self.publish(n, local, rect);
-        self.tree.c.flags[i] &= !(tree::MEASURE | tree::DESC);
+        self.publish(n, local, parent, h, rect);
+        self.tree.c.flags[i] &= !(tree::MEASURE | tree::DESC | tree::PLACED);
         if hidden {
             let mut c = self.first(n);
             while !c.is_none() {
@@ -608,11 +610,17 @@ impl Solver<'_> {
     }
 
     /// Writes one node's published box and records it for the encode.
-    fn publish(&mut self, n: NodeId, local: Vector2, rect: Rect) {
+    ///
+    /// The offset is the box's own origin against the parent's box, which is where the
+    /// parent's visual sits. Snapping the offset by itself would put the visual a pixel off
+    /// the box wherever the parent's fraction and the child's round apart.
+    fn publish(&mut self, n: NodeId, at: Vector2, parent: Vector2, h: f32, rect: Rect) {
         let scale = self.scale;
         let g = &mut self.tree.c.geom[n.index()];
         g.rect = rect;
-        g.local = Vector2::new(snap(local.x, scale), snap(local.y, scale));
+        g.at = at;
+        g.at_h = h;
+        g.local = Vector2::new(rect.x0 - snap(parent.x, scale), rect.y0 - snap(parent.y, scale));
         g.size = Vector2::new(rect.width(), rect.height());
         self.tree.touch(n);
     }
@@ -626,15 +634,21 @@ impl Solver<'_> {
     }
 
     /// Re-publishes a subtree's boxes at a new origin.
+    ///
+    /// Every box is snapped again from the origin and extent the arrange used, not from the
+    /// snapped box it produced: a snapped offset added to a moved parent rounds differently
+    /// from the sum it stands for.
     fn translate(&mut self, n: NodeId, local: Vector2, parent: Vector2, hidden: bool) {
+        let hidden = hidden || self.hidden(n);
         let abs = Vector2::new(parent.x + local.x, parent.y + local.y);
         let held = self.geom(n);
-        let rect = self.box_at(abs, held.size.x, held.size.y);
-        self.publish(n, local, rect);
-        self.tree.c.flags[n.index()] &= !(tree::MEASURE | tree::DESC);
+        let (w, h) = if hidden { (0.0, 0.0) } else { (held.at_w, held.at_h) };
+        let rect = self.box_at(abs, w, h);
+        self.publish(n, local, parent, h, rect);
+        self.tree.c.flags[n.index()] &= !(tree::MEASURE | tree::DESC | tree::PLACED);
         let mut c = self.first(n);
         while !c.is_none() {
-            let at = self.geom(c).local;
+            let at = self.geom(c).at;
             self.translate(c, at, abs, hidden);
             c = self.next(c);
         }

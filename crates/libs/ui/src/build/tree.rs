@@ -53,6 +53,9 @@ pub(crate) const LIVE_ASSERTIVE: u32 = 2;
 /// Arranged away under a hidden ancestor, so this node's box and its derived sprites' take
 /// no pixels. Written by the arrange alone; [`HIDDEN`] is the authored bit.
 pub(crate) const SUNK: Bits = 1 << 25;
+/// Walk B wrote this node's width this pass, so the boxes under it are not where the last
+/// arrange left them even where its own snapped box is. Cleared by the arrange.
+pub(crate) const PLACED: Bits = 1 << 26;
 
 // ── the hit declaration, packed ─────────────────────────────────────────────────────
 
@@ -173,6 +176,11 @@ impl<T> core::ops::IndexMut<u32> for Pool<T> {
 
 /// What the solve wrote for one node.
 ///
+/// `rect` is the snapped box, and `local` and `size` are what the wire carries for it: the
+/// box's origin against the parent's box and the box's extent. `at` and `at_h` are the
+/// unsnapped origin and height walk C arranged the box from, kept so that a translate
+/// re-snaps from the same numbers a fresh arrange would and lands on the same pixels.
+///
 /// `pair` is the shrink contract's two answers per axis, `[min_w, nat_w, min_h, nat_h]`, and
 /// `at_w` the width the block pair was answered at, which is what lets walk B return without
 /// descending when the width handed down has not moved.
@@ -183,6 +191,8 @@ pub(crate) struct Geom {
     pub rect: Rect,
     pub pair: [f32; 4],
     pub at_w: f32,
+    pub at: Vector2,
+    pub at_h: f32,
 }
 
 /// What the last encode put on the wire for one node.

@@ -12,13 +12,14 @@
 //!  5. A reveal requires an interaction scope. [17-WIDGETS §8.5]
 //!  6. A control publishes its value into the application's cell. [17-WIDGETS §8.2]
 //!  7. Branch churn releases a control's accessible text. [09-AUTHORING §6]
+//!  8. An icon button is its side square and centres its mark, an oversize one included. [09-AUTHORING §4]
 
 use crate::build::Host;
 use crate::build::rig::Rig;
 use crate::build::tree::DERIVED;
-use crate::layout::Preset;
+use crate::layout::{Len, Preset};
 use crate::signal::Cell;
-use crate::widget::{Range, ScalarPart, UiaRole, knob, meter, text, toggle};
+use crate::widget::{Range, ScalarPart, UiaRole, icon_button, knob, meter, text, toggle};
 use windows_scene::{ContactKind, NodeId};
 
 /// Where `node`'s control stands in its own range, as the front thread is told.
@@ -128,3 +129,28 @@ fn branch_churn_releases_a_controls_accessible_text() {
     assert_eq!(rig.set(shown, true).runs(), ["Gain"], "the branch did not come back");
 }
 
+
+#[test]
+fn an_icon_button_is_its_side_square_and_centres_its_mark() {
+    // A mark inside the box and one past it: the button states no inset, so both sit on
+    // the box's centre rather than on an inset's.
+    for mark in [10.0f32, 24.0] {
+        let mut rig = Rig::new();
+        let (mut button, mut figure) = (None, None);
+        let _frame = rig.mount(|ui| {
+            let element = icon_button(ui, Len::dip(16.0), |ui| {
+                figure = Some(ui.node(Preset::Layer).size(Len::dip(mark)).id().into());
+            });
+            button = Some(element.id().into());
+        });
+        let (button, figure): (NodeId, NodeId) = (button.unwrap(), figure.unwrap());
+        let (outer, inner) = Host::with(|h| (h.geom(button).rect, h.geom(figure).rect));
+        assert_eq!((outer.width(), outer.height()), (16.0, 16.0), "mark {mark}: not its side square");
+        let inset = (16.0 - mark) / 2.0;
+        assert_eq!(
+            (inner.x0 - outer.x0, inner.y0 - outer.y0),
+            (inset, inset),
+            "mark {mark}: not on the box's centre"
+        );
+    }
+}

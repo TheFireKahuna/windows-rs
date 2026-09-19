@@ -261,20 +261,23 @@ pub fn edge_button<'a>(
     room(ui.button(chrome, TextStyle::new(TypeRole::Body), text))
 }
 
-/// A square ghost button carrying one glyph.
+/// A ghost button `side` square with `body` centred in it.
 ///
-/// The radius is a pill, which the compositor caps at half the box: a square box therefore rounds
-/// to a circle and a wider one to a stadium, which is what both want.
-pub fn icon_button<'a>(ui: &'a mut Ui<'_>, icon: GeomId) -> Element<'a> {
+/// The body is the mark the caller draws, sized by the caller or filling the box; the button
+/// states no inset, so a mark the size of the box is the box. A caller widening one side
+/// gets a stadium.
+pub fn icon_button<'a>(
+    ui: &'a mut Ui<'_>,
+    side: impl Into<Len> + Copy,
+    body: impl FnOnce(&mut Ui<'_>),
+) -> Element<'a> {
     let roles = roles::BUTTON[roles::GHOST as usize];
-    let button = ui.control(
-        Some(Chrome::new(roles, Metric::RadiusPill)),
-        UiaRole::Button,
-        |ui| {
-            ui.path(icon).ink().padding(Metric::SpaceXs);
-        },
-    );
-    as_layer(button).size(Metric::RowH).aspect(1.0)
+    let button = ui.control(Some(Chrome::new(roles, Metric::Radius)), UiaRole::Button, body);
+    as_layer(button)
+        .wash(roles::Wash::Ink)
+        .size(side)
+        .justify(Align::Center)
+        .align(Align::Center)
 }
 
 /// A button that opens `body` beneath it, announced as a combo box.

@@ -112,10 +112,17 @@ impl Palette for Reference {
         };
         match metric {
             Metric::Custom(token) => token.resolve(scope),
+            Metric::Space3xs => 1.0,
+            Metric::Space2xs => 2.0,
             Metric::SpaceXs => 4.0 * tight,
+            Metric::SpaceXsSm => 6.0 * tight,
             Metric::SpaceSm => 8.0 * tight,
+            Metric::SpaceSmMd => 10.0 * tight,
             Metric::SpaceMd => 12.0 * tight,
+            Metric::SpaceMdLg => 16.0 * tight,
             Metric::SpaceLg => 20.0 * tight,
+            Metric::SpaceXl => 28.0 * tight,
+            Metric::Space2xl => 40.0 * tight,
             Metric::Radius => 8.0,
             Metric::RadiusSurface => 8.0,
             Metric::RadiusPill => 8.0,

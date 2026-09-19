@@ -303,6 +303,52 @@ fn a_detached_root_gathers_absolutely_at_its_origin() {
     assert_eq!(geom(item).local, Vector2::zero());
 }
 
+/// A window whose first child is a tenth of it, so the row under it sits at a fraction of
+/// a pixel that the window height moves; the row holds one child centred in a box of odd
+/// height, so its offset is a fraction too. Answers the row and the child.
+fn fractional_column() -> [NodeId; 2] {
+    let root = fixture(96.0);
+    node(root, Preset::Layer, |l| l.height = Len::pct(0.1));
+    let row = node(root, Preset::Row, |l| {
+        l.width = Len::dip(200.0);
+        l.height = Len::dip(40.0);
+    });
+    let child = sized(row, 100.0, 19.5);
+    [row, child]
+}
+
+#[test]
+fn a_resized_tree_lands_where_a_fresh_one_does() {
+    let [_, child] = fractional_column();
+    window(600.0, 373.0);
+    solve();
+    let fresh = rect(child);
+    // The same tree, solved at another height first: the row's box keeps its size and
+    // moves by a fraction, which is the walk that translates it rather than arranging it.
+    let [_, child] = fractional_column();
+    solve();
+    Host::with(|h| h.tree.encode(&mut SinkPatch::default()));
+    window(600.0, 373.0);
+    solve();
+    assert_eq!(rect(child), fresh, "the translate landed off the fresh box");
+}
+
+#[test]
+fn the_offset_is_the_boxs_own_origin_against_its_parents() {
+    let [row, child] = fractional_column();
+    window(600.0, 373.0);
+    solve();
+    // The row sits at 37.3 and the child 10.25 inside it: the two fractions round apart, so
+    // an offset snapped on its own would put the visual a pixel off the box the hit entry
+    // and the clip describe.
+    let expected = Vector2::new(
+        rect(child).x0 - rect(row).x0,
+        rect(child).y0 - rect(row).y0,
+    );
+    assert_eq!(geom(child).local, expected);
+    assert_eq!(geom(child).local.y, 11.0);
+}
+
 /// A responsive container, its child, and a nested responsive container with a child.
 fn nested() -> [NodeId; 4] {
     let root = fixture(96.0);
@@ -749,7 +795,7 @@ fn a_warm_class_flip_allocates_nothing() {
 fn the_per_node_rows_are_the_size_the_arena_budgets_for() {
     assert_eq!(size_of::<Len>(), 8);
     assert!(size_of::<Layout>() <= 128, "{}", size_of::<Layout>());
-    assert_eq!(size_of::<Geom>(), 52);
+    assert_eq!(size_of::<Geom>(), 64);
 }
 
 #[test]
