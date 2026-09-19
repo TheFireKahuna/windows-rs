@@ -220,6 +220,7 @@ impl<K> Element<'_, K> {
         let node = self.node_id();
         let held = self.host().control_of(node);
         if !held.is_none() {
+            self.ui.control = held;
             return held;
         }
         let inherited = self.ui.control;
@@ -233,6 +234,9 @@ impl<K> Element<'_, K> {
         if let Some(row) = self.host().control_mut(id) {
             row.front.scope = inherited;
         }
+        // This element's own context, so children declared after the setter that minted the
+        // control attach to it: a part or a reveal below names the control above it.
+        self.ui.control = id;
         id
     }
 

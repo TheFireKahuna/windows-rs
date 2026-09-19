@@ -8,8 +8,33 @@
 
 use crate::build::Host;
 use crate::overlay::Overlays;
+use crate::role::Scope;
 use crate::seam::FocusOp;
-use windows_scene::SinkPatch;
+use crate::uia::{Snapshot, Tree};
+use windows_core::Result;
+use windows_scene::{Env, SinkPatch};
+use windows_text::FontLadder;
+
+/// Installs this thread's host as the app thread's start does: `env` and `scope` for the
+/// host, and a text engine over `ladder` for its table.
+pub fn install(env: Env, scope: Scope, ladder: FontLadder) -> Result<()> {
+    Host::install(env, scope);
+    Host::with(|h| h.text.install(ladder))
+}
+
+/// Returns the automation tree as a client adopts it, over the host as it stands.
+///
+/// The walk builds into the host's own patch, so it is answered between flushes and the
+/// buffers it filled are dropped rather than published.
+#[must_use]
+pub fn uia_tree() -> Tree {
+    let mut snapshot = Snapshot::default();
+    Host::with(|h| {
+        h.uia_entries(&mut snapshot);
+        h.pending.clear();
+    });
+    Tree::adopt(&snapshot)
+}
 
 /// Owns the app-side overlay lifecycle for a mounted layout under test.
 #[derive(Default)]

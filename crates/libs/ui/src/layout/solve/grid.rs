@@ -7,7 +7,7 @@
 
 use super::Solver;
 use super::flow::{STRIDE, distribute};
-use crate::layout::{Align, COLUMN_CAP, Layout, Position, Templates, Track, TrackMax, WidthClass};
+use crate::layout::{COLUMN_CAP, Layout, Position, Templates, Track, TrackMax, WidthClass};
 use windows_numerics::Vector2;
 use windows_scene::NodeId;
 
@@ -76,7 +76,7 @@ pub(crate) fn place(
     let mut groups = [0.0f32; COLUMN_CAP * STRIDE];
     size_columns(s, n, inner, iw, &tracks[..cols], base, count, &mut groups);
     let gaps = gap * cols.saturating_sub(1) as f32;
-    distribute(&mut groups[..cols * STRIDE], (iw - gaps).max(0.0));
+    resolve(&mut groups[..cols * STRIDE], (iw - gaps).max(0.0));
     let mut heights = [[0.0f32; 2]; ROW_CAP];
     let mut rows = 0usize;
     let mut k = 0usize;
@@ -128,7 +128,7 @@ pub(crate) fn arrange(
     let mut groups = [0.0f32; COLUMN_CAP * STRIDE];
     size_columns(s, n, inner, iw, &tracks[..cols], base, count, &mut groups);
     let gaps = gap * cols.saturating_sub(1) as f32;
-    distribute(&mut groups[..cols * STRIDE], (iw - gaps).max(0.0));
+    resolve(&mut groups[..cols * STRIDE], (iw - gaps).max(0.0));
     let mut pairs = [[0.0f32; 2]; ROW_CAP];
     let mut rows = 0usize;
     let mut k = 0usize;
@@ -302,7 +302,8 @@ fn span_height(heights: &[f32], rows: usize, row: u16, span: u16, gap: f32) -> f
 /// `room` is the container's inner height, known only when arranging, where the natural slot
 /// becomes the row's final height. Measuring passes `None`: a share of the leftover is then
 /// worth its floor and a percentage nothing. A row with no track, or a grid with no row
-/// template, keeps its content height and shares a stretching grid's leftover evenly.
+/// template, keeps its content height and shares the grid's leftover evenly: the rows fill
+/// the block room, and `align` seats each item inside its row.
 fn size_rows(
     s: &Solver<'_>,
     l: &Layout,
@@ -325,7 +326,7 @@ fn size_rows(
     let gaps = |rows: usize| gap * rows.saturating_sub(1) as f32;
     if stated == 0 {
         if let Some(room) = room {
-            stretch_rows(heights, rows, room - gaps(rows), l);
+            stretch_rows(heights, rows, room - gaps(rows));
         }
         return rows;
     }
@@ -346,7 +347,7 @@ fn size_rows(
         groups[j * STRIDE..][..STRIDE].copy_from_slice(&[least, nat, fr, max]);
     }
     if let Some(room) = room {
-        distribute(&mut groups[..rows * STRIDE], (room - gaps(rows)).max(0.0));
+        resolve(&mut groups[..rows * STRIDE], (room - gaps(rows)).max(0.0));
     }
     for j in 0..rows {
         heights[j] = [groups[j * STRIDE], groups[j * STRIDE + 1]];
@@ -354,9 +355,66 @@ fn size_rows(
     rows
 }
 
-/// Spreads a stretching grid's leftover block room evenly across its rows.
-fn stretch_rows(heights: &mut [[f32; 2]; ROW_CAP], rows: usize, room: f32, l: &Layout) {
-    if rows == 0 || l.align != Align::Stretch {
+/// Sizes tracks into `room`, one `[min, nat, fr, max]` each.
+///
+/// A track with no weight takes its natural extent and gives ground toward its minimum when
+/// the unweighted tracks overflow. A weighted track is a share of what they leave, by weight
+/// and floored at its own minimum, never a grower over its content: equal weights give equal
+/// tracks whatever they hold. One correction round: a track whose share falls under its
+/// minimum takes the minimum and the rest share what remains.
+fn resolve(groups: &mut [f32], room: f32) {
+    let n = groups.len() / STRIDE;
+    let (mut weight, mut held, mut fixed_nat, mut fixed_min) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for k in 0..n {
+        let [min, nat, fr, _] = [groups[k * STRIDE], groups[k * STRIDE + 1], groups[k * STRIDE + 2], 0.0];
+        if fr > 0.0 {
+            weight += fr;
+            held += min;
+        } else {
+            fixed_nat += nat;
+            fixed_min += min;
+        }
+    }
+    if weight <= 0.0 {
+        distribute(groups, room);
+        return;
+    }
+    let free = room - held;
+    if fixed_nat > free {
+        let deficit = fixed_nat - free;
+        let slack = fixed_nat - fixed_min;
+        for k in 0..n {
+            let (min, nat) = (groups[k * STRIDE], groups[k * STRIDE + 1]);
+            groups[k * STRIDE + 1] = if groups[k * STRIDE + 2] > 0.0 || slack <= 0.0 || deficit >= slack {
+                min
+            } else {
+                nat - deficit * ((nat - min) / slack)
+            };
+        }
+        return;
+    }
+    let mut free = room - fixed_nat;
+    let mut live = weight;
+    for k in 0..n {
+        let (min, fr) = (groups[k * STRIDE], groups[k * STRIDE + 2]);
+        if fr > 0.0 && free * (fr / live) < min {
+            groups[k * STRIDE + 1] = min;
+            groups[k * STRIDE + 2] = 0.0;
+            free -= min;
+            live -= fr;
+        }
+    }
+    for k in 0..n {
+        let fr = groups[k * STRIDE + 2];
+        if fr > 0.0 {
+            groups[k * STRIDE + 1] = if live > 0.0 { free * (fr / live) } else { groups[k * STRIDE] };
+        }
+    }
+}
+
+/// Spreads a grid's leftover block room evenly across its rows.
+fn stretch_rows(heights: &mut [[f32; 2]; ROW_CAP], rows: usize, room: f32) {
+    if rows == 0 {
         return;
     }
     let used: f32 = heights.iter().take(rows).map(|h| h[1]).sum();

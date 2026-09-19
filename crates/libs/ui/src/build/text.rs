@@ -299,8 +299,9 @@ impl Ui<'_> {
         self.text_owned(Some(owner), style, text)
     }
 
-    /// A run painted in its own stated ink, named for automation by `owner` where one is
-    /// given.
+    /// A run painted in its own stated ink where `owner` is `None`, and in `owner`'s chrome
+    /// ink where one is given. Either way it is the first run the enclosing control declares
+    /// that the control is named from.
     ///
     /// A run that can break mints one sprite per line under a column of its own; one that
     /// cannot **is** the sprite, which is the whole difference between the two targets.
@@ -339,7 +340,7 @@ impl Ui<'_> {
             target,
         };
         let key = install(self.host, node, mint, text.into());
-        if let Some(row) = self.host.control_mut(owner) {
+        if let Some(row) = self.host.control_mut(self.control) {
             // The first run a control declares is the one its name is read from.
             row.text.get_or_insert(key);
         }

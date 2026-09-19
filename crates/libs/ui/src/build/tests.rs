@@ -9,6 +9,10 @@
 //!
 //! The builder
 //!  3. Children are ordered bottom-first, and a later sibling sits above. [03-LAYOUT §7]
+//!  3a. A plate declared before the body stays beneath the body's first child. [03-LAYOUT §7]
+//!  3b. A node given no setter is measured on its first solve. [03-LAYOUT §3]
+//!  3c. A subtree hidden at mount takes its size when shown. [03-LAYOUT §3]
+//!  3d. A hidden subtree's derived sprites take no pixels. [03-LAYOUT §3]
 //!  4. A container's closure runs with that container as the parent. [09-AUTHORING §1]
 //!  5. Editing through an expired handle answers absence. [09-AUTHORING §2]
 //!  6. A constant false branch creates no content. [09-AUTHORING §5]
@@ -46,7 +50,7 @@ use super::host::Host;
 use super::rig::{Kind, Rig};
 use super::ui::Ui;
 use crate::layout::{Align, Len, Preset, scroll};
-use crate::role::Metric;
+use crate::role::{Fill, Metric, Role};
 use crate::signal::Cell;
 use crate::uia::{ColFlags, State};
 use crate::widget::{Intent, Range, UiaRole, What, button, knob, label, text};
@@ -128,6 +132,25 @@ fn children_are_ordered_bottom_first_and_a_later_sibling_sits_above() {
         Some(over),
         "the later sibling did not sit above"
     );
+}
+
+#[test]
+fn a_plate_declared_before_the_body_stays_beneath_the_bodys_first_child() {
+    let mut rig = Rig::new();
+    let (mut plated, mut child) = (None, None);
+    rig.mount(|ui| {
+        plated = Some(
+            ui.node(Preset::Stack)
+                .plate(Len::ZERO, Role::Fill(Fill::Surface), 1.0)
+                .children(|ui| child = Some(boxed(ui, 50.0, 20.0)))
+                .id()
+                .into(),
+        );
+    });
+    let (plated, child): (NodeId, NodeId) = (plated.unwrap(), child.unwrap());
+    let order: Vec<NodeId> = Host::with(|h| h.tree.children(plated).collect());
+    assert_eq!(order.len(), 2, "one plate and one child: {order:?}");
+    assert_eq!(order[1], child, "the body's first child sat beneath the plate");
 }
 
 #[test]
@@ -544,6 +567,19 @@ fn a_live_region_states_how_it_announces() {
     );
 }
 
+/// A group announced as one run is named by the run inside it.
+#[test]
+fn a_text_group_is_named_by_its_run() {
+    let mut rig = Rig::new();
+    let mut frame = rig.mount(|ui| {
+        crate::widget::text_group(ui).children(|ui| {
+            text(ui, "nothing here");
+        });
+    });
+    let row = frame.uia("nothing here").expect("the group published no element");
+    assert_eq!(row.role, UiaRole::Text);
+}
+
 #[test]
 fn a_selected_control_states_that_it_selects() {
     let mut rig = Rig::new();
@@ -559,29 +595,87 @@ fn a_selected_control_states_that_it_selects() {
     );
 }
 
-#[test]
-fn probe_publishers_tmp() {
-    for (what, body) in [("field", 0), ("scroll", 1), ("plain", 2)] {
-        let mut rig = Rig::new();
-        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rig.mount(|ui| match body {
-                0 => {
-                    crate::widget::field(ui, "draft");
-                }
-                1 => {
-                    scroll(ui, |ui| {
-                        for _ in 0..40 {
-                            boxed(ui, 100.0, 30.0);
-                        }
-                    })
-                    .height(Len::dip(120.0));
-                }
-                _ => {
-                    boxed(ui, 100.0, 30.0);
-                }
+/// The lane's edge tab: a grid row hidden while the pane is docked, holding a control with
+/// a glyph and a rotated label.
+fn tab_fixture(ui: &mut Ui<'_>, shown: Cell<bool>) -> (NodeId, NodeId) {
+    use crate::layout::{Edge, Track};
+    use crate::role::TypeRole;
+    use crate::widget::{TextStyle, edge_button, styled_text};
+    let (mut tab, mut lbl) = (None, None);
+    ui.node(Preset::Grid)
+        .rows([Track::fr(1.0), Track::fr(1.0)])
+        .cols([Track::fr(1.0)])
+        .children(|ui| {
+            ui.node(Preset::Row).at(1, 0).children(|ui| {
+                boxed(ui, 300.0, 100.0);
             });
-        }))
-        .is_ok();
-        println!("PUBLISHER {what} settled={ok}");
-    }
+            ui.node(Preset::Row)
+                .children(|ui| {
+                    ui.node(Preset::Layer).grow();
+                    ui.node(Preset::Stack).children(|ui| {
+                        ui.node(Preset::Layer).grow();
+                        tab = Some(
+                            edge_button(ui, "", Edge::Right, Metric::Radius)
+                                .name("Show")
+                                .stack(|ui| {
+                                    label(ui, "‹");
+                                    let vertical = TextStyle::new(TypeRole::Body).vertical(true);
+                                    lbl = Some(styled_text(ui, "Inspector", vertical).id().into());
+                                })
+                                .id()
+                                .into(),
+                        );
+                    });
+                })
+                .span(0, 0, 2, 1)
+                .align(Align::Stretch)
+                .hide_if(shown);
+        });
+    (tab.unwrap(), lbl.unwrap())
+}
+
+#[test]
+fn a_node_given_no_setter_is_measured_on_its_first_solve() {
+    let mut rig = Rig::at(1900.0, 1000.0, 1.5);
+    let mut ids = None;
+    rig.mount(|ui| ids = Some(tab_fixture(ui, Cell::new(false))));
+    let (tab, lbl) = ids.unwrap();
+    let (tab, lbl) = Host::with(|h| (h.geom(tab).rect, h.geom(lbl).rect));
+    assert!(tab.width() > 30.0 && tab.height() > 60.0, "the tab is its padding alone: {tab:?}");
+    assert!(lbl.height() > lbl.width() && lbl.width() > 0.0, "the label was not measured: {lbl:?}");
+}
+
+#[test]
+fn a_subtree_hidden_at_mount_takes_its_size_when_shown() {
+    let mut rig = Rig::at(1900.0, 1000.0, 1.5);
+    let shown = Cell::new(true);
+    let mut ids = None;
+    rig.mount(|ui| ids = Some(tab_fixture(ui, shown)));
+    let (tab, lbl) = ids.unwrap();
+    let mut visible = None;
+    rig.mount(|ui| visible = Some(tab_fixture(ui, Cell::new(false))));
+    let expect = Host::with(|h| h.geom(visible.unwrap().0).rect);
+    rig.set(shown, false);
+    let (got, lbl) = Host::with(|h| (h.geom(tab).rect, h.geom(lbl).rect));
+    // The second root is mounted beneath the first, so the origin differs and the box is
+    // what has to agree.
+    assert_eq!((got.width(), got.height(), got.x1), (expect.width(), expect.height(), expect.x1), "shown from a hidden mount: {got:?} vs {expect:?}");
+    assert!(lbl.width() > 0.0, "the label under it stayed unmeasured: {lbl:?}");
+}
+
+#[test]
+fn a_hidden_subtrees_derived_sprites_take_no_pixels() {
+    let mut rig = Rig::at(1900.0, 1000.0, 1.5);
+    let shown = Cell::new(false);
+    let mut ids = None;
+    rig.mount(|ui| ids = Some(tab_fixture(ui, shown)));
+    let (_, lbl) = ids.unwrap();
+    // The line tile under the text leaf carries its own rect, so it is the one to watch.
+    let tile = Host::with(|h| h.tree.children(lbl).next()).expect("a line tile");
+    let size = |n: NodeId| Host::with(|h| h.geom(n).size);
+    assert!(size(tile).x > 0.0 && size(tile).y > 0.0, "the tile has no ink: {:?}", size(tile));
+    rig.set(shown, true);
+    assert_eq!(size(tile), Vector2::zero(), "a hidden ancestor left the tile painting");
+    rig.set(shown, false);
+    assert!(size(tile).x > 0.0, "showing again did not restore the tile: {:?}", size(tile));
 }

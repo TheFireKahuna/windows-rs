@@ -10,7 +10,7 @@ use super::binding::{HandlerTable, Retired};
 use super::control::ControlRow;
 use super::hits::{self, HitBuilder};
 use super::tree::{self, Geom, Pool, Tree};
-use crate::layout::{Anchors, Len, Placed, Probe, Rect, solve};
+use crate::layout::{Align, Anchors, Len, Placed, Probe, Rect, solve};
 use crate::role::Scope;
 use crate::signal::Cell;
 use crate::widget::{ChromeRow, Gesturing, Intent, ModelState, ValueRow, What};
@@ -36,9 +36,9 @@ pub(crate) struct Placement {
     pub root: NodeId,
     pub blocker: Option<ControlId>,
     pub anchor: crate::overlay::Anchor,
-    /// The client box this overlay is inset into, resolved. Written into the root's own
-    /// authored extent before each solve.
-    pub viewport: Vector2,
+    /// The client box this overlay is inset into, resolved: its origin is where the insets
+    /// put it, and its extent is written into the root's own authored bounds before each solve.
+    pub viewport: Rect,
     pub at: Vector2,
     pub entry: Option<Entrance>,
 }
@@ -80,6 +80,9 @@ struct Side {
     origin: Option<Anchors>,
     /// A pivot stated as a fraction of this node's own solved box, resolved at publication.
     pivot: Option<Vector2>,
+    /// The centre the pivot last resolved to, so a box that did not move re-sends nothing.
+    /// `NaN` until the first publication.
+    centre: Vector2,
     /// A derived sprite's own geometry, which takes no space from its parent.
     visual: Visual,
     geometry: u32,
@@ -96,6 +99,7 @@ impl Default for Side {
             probe: None,
             origin: None,
             pivot: None,
+            centre: Vector2 { x: f32::NAN, y: f32::NAN },
             visual: Visual::Unplaced,
             geometry: tree::NONE,
             scroll: tree::NONE,
@@ -436,6 +440,9 @@ impl Host {
         let id = self.tree.mint(self.tree.c.scope[parent.index()]);
         self.tree.c.flags[id.index()] |= bits;
         self.tree.link(id, parent, after);
+        // A fresh slot's pair is zero and the link marked only the parent, so a node given no
+        // setter of its own would be measured from that zero.
+        self.tree.mark(id);
         self.pending.push(Op::New { id, kind, parent: Attach::Node(parent), after });
         id
     }
@@ -460,8 +467,17 @@ impl Host {
         SpriteId(self.mint_under(parent.0, after, NodeKind::Sprite, bits))
     }
 
+    /// Places a derived sprite at its own box.
+    ///
+    /// Written into the geometry column here as well as recorded on the side row: the box is
+    /// complete, so a sprite a publisher places after the solve crosses in the same flush,
+    /// and the visuals pass re-reads the row only to take a hidden one off the screen.
     pub(crate) fn visual_rect(&mut self, id: SpriteId, offset: Vector2, size: Vector2) {
         self.side_mut(id.0).visual = Visual::Rect(offset, size);
+        if self.tree.c.flags[id.0.index()] & tree::HIDDEN == 0 {
+            self.tree.c.geom[id.0.index()] = Geom { local: offset, size, ..Geom::default() };
+            self.tree.touch(id.0);
+        }
         self.tree.mark(id.0);
     }
 
@@ -531,13 +547,25 @@ impl Host {
         if !self.tree.is_live(id) {
             return;
         }
-        let flags = &mut self.tree.c.flags[id.index()];
-        *flags &= !(tree::HIT | tree::DECL);
+        let at = id.index();
+        let mut flags = self.tree.c.flags[at] & !(tree::HIT | tree::DECL);
+        let (mut control, mut inflate) = (self.tree.c.control[at], self.tree.c.inflate[at]);
         if let Some(decl) = decl {
-            *flags |= tree::HIT | (tree::pack_decl(decl.flags.bits()) << tree::DECL_SHIFT);
-            self.tree.c.control[id.index()] = decl.id;
-            self.tree.c.inflate[id.index()] = decl.touch_inflate.unwrap_or(f32::NAN);
+            flags |= tree::HIT | (tree::pack_decl(decl.flags.bits()) << tree::DECL_SHIFT);
+            control = decl.id;
+            inflate = decl.touch_inflate.unwrap_or(f32::NAN);
         }
+        // Idempotent: a publisher restating the declaration it made last flush rebuilds
+        // nothing. The inflation compares bitwise because its absent value is NaN.
+        if flags == self.tree.c.flags[at]
+            && control == self.tree.c.control[at]
+            && inflate.to_bits() == self.tree.c.inflate[at].to_bits()
+        {
+            return;
+        }
+        self.tree.c.flags[at] = flags;
+        self.tree.c.control[at] = control;
+        self.tree.c.inflate[at] = inflate;
         self.tree.hits_dirty = true;
     }
 
@@ -765,18 +793,21 @@ impl Host {
     /// Resolved here rather than carried as lengths, because the row the solve reads holds the
     /// number: the insets are stated against the window and the window is not a containing
     /// block the solve has yet walked.
-    pub(crate) fn overlay_viewport(&self, insets: Option<[Len; 4]>) -> Vector2 {
+    pub(crate) fn overlay_viewport(&self, insets: Option<[Len; 4]>) -> Rect {
         let window = self.window.get();
         let Some([left, top, right, bottom]) = insets else {
-            return window;
+            return Rect { x0: 0.0, y0: 0.0, x1: window.x, y1: window.y };
         };
         let (class, scope) = (self.tree.class(self.root), self.root_scope());
         let dip = |len: Len, basis: f32| {
-            len.resolve(&self.metrics, class, scope, basis).unwrap_or(0.0)
+            len.resolve(&self.metrics, class, scope, basis, self.env.scale()).unwrap_or(0.0)
         };
-        Vector2 {
-            x: (window.x - dip(left, window.x) - dip(right, window.x)).max(0.0),
-            y: (window.y - dip(top, window.y) - dip(bottom, window.y)).max(0.0),
+        let (x0, y0) = (dip(left, window.x), dip(top, window.y));
+        Rect {
+            x0,
+            y0,
+            x1: x0.max(window.x - dip(right, window.x)),
+            y1: y0.max(window.y - dip(bottom, window.y)),
         }
     }
 
@@ -893,40 +924,47 @@ impl Host {
 
     fn handler_for(&mut self, intent: &Intent) -> Option<Box<dyn FnOnce()>> {
         let row = self.control(intent.target)?;
-        let handlers = self.handlers.get(row.handlers)?;
+        let handlers = self.handlers.get(row.handlers);
         match intent.what {
+            // A hover has no handler: it writes the cell the control observes with, and the
+            // graph runs whatever reads it on the next pass.
+            What::Hovered(on) => {
+                if let Some(cell) = row.hovered.filter(|cell| cell.alive()) {
+                    cell.set(on);
+                }
+                None
+            }
             What::Tapped => {
-                let call = handlers.click.clone()?;
+                let call = handlers?.click.clone()?;
                 Some(Box::new(move || call()))
             }
             What::Scalar { value, commit, .. } => {
-                let call = handlers.scalar.clone()?;
+                let call = handlers?.scalar.clone()?;
                 let gesturing =
                     if commit { Gesturing::Committed(value) } else { Gesturing::Moved(value) };
                 Some(Box::new(move || call(gesturing)))
             }
             What::Canceled(_) => {
-                let call = handlers.scalar.clone()?;
+                let call = handlers?.scalar.clone()?;
                 Some(Box::new(move || call(Gesturing::Canceled)))
             }
             What::Dragged(update) => {
-                let call = handlers.drag.clone()?;
+                let call = handlers?.drag.clone()?;
                 Some(Box::new(move || call(Gesturing::Moved(update))))
             }
             // A canceled decided drag reports the end and nothing else: what stood before the
             // gesture stands.
             What::DragEnded(update) => {
-                let call = handlers.drag.clone()?;
+                let call = handlers?.drag.clone()?;
                 let gesturing = update.map_or(Gesturing::Canceled, Gesturing::Committed);
                 Some(Box::new(move || call(gesturing)))
             }
             // A presented region reports the part a gesture finished on. It reaches the same
             // handler a committed value does, carrying the part's index.
             What::Part(part) => {
-                let call = handlers.scalar.clone()?;
+                let call = handlers?.scalar.clone()?;
                 Some(Box::new(move || call(Gesturing::Committed(f64::from(part.0)))))
             }
-            What::Hovered(_) => None,
         }
     }
 
@@ -984,6 +1022,10 @@ impl Host {
         if let Some(escape) = side.escape {
             self.retired.push(Retired::new(escape));
         }
+        // A retired node has no box, and a probe reads a zero box wherever its node has none.
+        if let Some(probe) = side.probe.filter(|probe| probe.cell().alive()) {
+            probe.cell().set(crate::layout::Placed::default());
+        }
         self.geometry.release(side.geometry, &mut self.retired);
         if side.region != tree::NONE {
             // The drop is emitted first and the sink released after: the region owns the
@@ -1023,6 +1065,9 @@ impl Host {
             h.publish_surfaces();
             h.size_overlay_viewports();
             h.solve();
+            // A derived sprite's box is its owner's less the insets, so it is written from the
+            // solve before anything reads a sprite's box: the encode below, and the masks.
+            h.publish_visuals();
             // Ahead of the publishers: a tracker's source takes its hit region from the
             // viewport's size when it is created, so the solved boxes reach the patch before
             // any op that reads one. The encode after them emits only what they moved.
@@ -1038,7 +1083,6 @@ impl Host {
             h.publish_probes();
             h.publish_anchors();
             h.publish_pivots();
-            h.publish_visuals();
             h.schedule_geometry();
             // The predicate walks the flags column, so it is built only where it is asserted.
             #[cfg(debug_assertions)]
@@ -1075,9 +1119,22 @@ impl Host {
     fn size_overlay_viewports(&mut self) {
         for at in 0..self.overlays.len() {
             let (root, viewport) = (self.overlays[at].root, self.overlays[at].viewport);
+            // Anchored to the window, the root is the box the spec inset, and the side and
+            // alignment it seats on become the root's own: a drawer states its width as a
+            // share of that box and sits against the edge it was asked for. Anchored to a
+            // control or a point, the root is its content, bounded by that box, and the
+            // anchor seats the whole root.
+            let anchor = self.overlays[at].anchor;
+            let fills = matches!(anchor.to, crate::overlay::AnchorTo::Window);
+            let (w, h) = (viewport.width(), viewport.height());
             self.tree.author(root, |l| {
-                l.max_width = Len::dip(viewport.x);
-                l.max_height = Len::dip(viewport.y);
+                if fills {
+                    l.width = Len::dip(w);
+                    l.height = Len::dip(h);
+                    (l.align, l.justify) = seat(anchor.side, anchor.align);
+                }
+                l.max_width = Len::dip(w);
+                l.max_height = Len::dip(h);
             });
         }
     }
@@ -1094,19 +1151,23 @@ impl Host {
         for at in 0..self.sides.slots() {
             let Some(side) = self.sides.get(at) else { continue };
             let (node, visual) = (side.node, side.visual);
-            let hidden = self.tree.c.flags[node.index()] & tree::HIDDEN != 0;
+            let hidden = self.tree.c.flags[node.index()] & (tree::HIDDEN | tree::SUNK) != 0;
             let geom = match visual {
                 Visual::Unplaced => continue,
-                // Hidden is no box: the walks never see a derived sprite, so this is where it
-                // stops taking pixels.
+                // Hidden is no box, by its own bit or an ancestor's: the walks never see a
+                // derived sprite, so this is where it stops taking pixels.
                 _ if hidden => Geom::default(),
                 Visual::Rect(local, size) => Geom { local, size, ..Geom::default() },
                 Visual::Insets([l, t, r, b]) => {
                     let owner = self.tree.parent(node);
                     let box_ = self.tree.c.geom[owner.index()].size;
+                    // An owner narrower than its insets leaves no box, not a negative one.
                     Geom {
                         local: Vector2 { x: l, y: t },
-                        size: Vector2 { x: box_.x - l - r, y: box_.y - t - b },
+                        size: Vector2 {
+                            x: (box_.x - l - r).max(0.0),
+                            y: (box_.y - t - b).max(0.0),
+                        },
                         ..Geom::default()
                     }
                 }
@@ -1117,7 +1178,7 @@ impl Host {
     }
 
     /// The rect an overlay's anchor names, in absolute DIPs.
-    fn anchor_rect(&self, to: crate::overlay::AnchorTo, viewport: Vector2) -> Option<Rect> {
+    fn anchor_rect(&self, to: crate::overlay::AnchorTo, viewport: Rect) -> Option<Rect> {
         match to {
             crate::overlay::AnchorTo::Control(id) => {
                 let node = self.control(id)?.node;
@@ -1126,9 +1187,7 @@ impl Host {
             crate::overlay::AnchorTo::Point(at) => {
                 Some(Rect { x0: at.x, y0: at.y, x1: at.x, y1: at.y })
             }
-            crate::overlay::AnchorTo::Window => {
-                Some(Rect { x0: 0.0, y0: 0.0, x1: viewport.x, y1: viewport.y })
-            }
+            crate::overlay::AnchorTo::Window => Some(viewport),
         }
     }
 
@@ -1329,6 +1388,14 @@ impl Host {
             let Some(pivot) = pivot else { continue };
             let size = self.tree.c.geom[node.index()].size;
             let centre = Vector2 { x: size.x * pivot.x, y: size.y * pivot.y };
+            // Bitwise, so the unsent `NaN` never compares equal and a real centre always does.
+            let sent = side.centre;
+            if (centre.x.to_bits(), centre.y.to_bits()) == (sent.x.to_bits(), sent.y.to_bits()) {
+                continue;
+            }
+            if let Some(side) = self.sides.get_mut(at) {
+                side.centre = centre;
+            }
             self.bind(node, Prop::Center, Bind::Set(Value::Vec2(centre)));
         }
     }
@@ -1516,5 +1583,23 @@ impl Host {
             .map(|node| (node, self.tree.c.text[node.index()]))
             .filter(|&(_, key)| key != super::text::MeasureKey::NONE)
             .collect()
+    }
+}
+
+/// Returns the inline and block alignment a window-anchored root places its content with:
+/// the side it seats on, and where along that side it lines up.
+fn seat(side: crate::overlay::Side, along: crate::overlay::Align) -> (Align, Align) {
+    use crate::overlay::Side;
+    let along = match along {
+        crate::overlay::Align::Start => Align::Start,
+        crate::overlay::Align::Center => Align::Center,
+        crate::overlay::Align::End => Align::End,
+    };
+    match side {
+        Side::Left => (Align::Start, along),
+        Side::Right => (Align::End, along),
+        Side::Top => (along, Align::Start),
+        Side::Bottom => (along, Align::End),
+        Side::Center => (Align::Center, Align::Center),
     }
 }

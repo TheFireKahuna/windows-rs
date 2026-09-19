@@ -226,13 +226,20 @@ fn emit_uia(
         .unwrap_or_default();
     // Read untracked: this runs inside a flush, and subscribing whatever effect is on the
     // stack would rebuild a screen when a tip changed.
+    // A validation message is the help while it stands; the tip is the help otherwise.
     out.scratch.clear();
-    let has_help = walk.handlers.get(row.handlers).is_some_and(|handlers| {
-        handlers.tip.as_ref().is_some_and(|(text, _)| {
-            crate::signal::untracked(|| text.append(out.scratch));
+    let has_help = match row.validation {
+        Some(text) => {
+            out.scratch.push_str(text);
             true
-        })
-    });
+        }
+        None => walk.handlers.get(row.handlers).is_some_and(|handlers| {
+            handlers.tip.as_ref().is_some_and(|(text, _)| {
+                crate::signal::untracked(|| text.append(out.scratch));
+                true
+            })
+        }),
+    };
     // The editable body is a row of its own rather than a run in the pool, because the input
     // stack owns the text and automation reads the same UTF-16 buffer it does.
     let field = walk.fields.get(control);

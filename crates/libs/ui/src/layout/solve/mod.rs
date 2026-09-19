@@ -253,7 +253,7 @@ impl Solver<'_> {
     // ── length resolution ───────────────────────────────────────────────────────────
 
     pub(crate) fn len(&self, l: Len, class: WidthClass, basis: f32) -> Option<f32> {
-        l.resolve(self.rows, class, self.scope, basis)
+        l.resolve(self.rows, class, self.scope, basis, self.scale)
     }
 
     /// Returns the total padding this node adds on each axis.
@@ -381,6 +381,12 @@ impl Solver<'_> {
             [v, v]
         } else if let Some(v) = self.aspect_inline(&l, class) {
             [v, v]
+        } else if self.responsive(n) {
+            // Its width is its parent's to decide, and its content was just measured under
+            // the class that width will replace, so the content's extent stays here: what
+            // walk B hands down decides the class, and the children are measured again
+            // under it where it moved.
+            [0.0, 0.0]
         } else {
             [content[0] + pad_x, content[1] + pad_x]
         };
@@ -543,7 +549,12 @@ impl Solver<'_> {
         let abs = Vector2::new(parent.x + local.x, parent.y + local.y);
         let rect = self.box_at(abs, w, h);
         let held = self.geom(n);
-        let settled = !self.dirty(n) && self.published(n);
+        let flags = &mut self.tree.c.flags[i];
+        // A box that is only shown or only hidden keeps its rect, so the bit is what says
+        // its derived sprites moved.
+        let sunk = *flags & tree::SUNK != 0;
+        *flags = if hidden { *flags | tree::SUNK } else { *flags & !tree::SUNK };
+        let settled = !self.dirty(n) && self.published(n) && sunk == hidden;
         if settled && rect == held.rect {
             return;
         }
@@ -630,11 +641,15 @@ impl Solver<'_> {
         self.settle_derived(n);
     }
 
-    /// Clears the marks on the derived sprites the walks skip.
+    /// Clears the marks on the derived sprites the walks skip and hands them their parent's
+    /// [`SUNK`](tree::SUNK) bit.
     ///
     /// Their boxes are published from their parent's, and a mark left standing here would
-    /// leave a node claiming its input is unsolved after the publication ends.
+    /// leave a node claiming its input is unsolved after the publication ends. A derived
+    /// sprite carries its own rect, so a hidden parent's zero box alone would not stop it
+    /// painting.
     fn settle_derived(&mut self, n: NodeId) {
+        let sunk = self.tree.c.flags[n.index()] & tree::SUNK;
         let mut at = self.tree.links(n.index() as u32).first;
         while at != NO_LINK {
             let id = self.tree.id_at(at);
@@ -642,7 +657,8 @@ impl Solver<'_> {
             if self.laid_out(id) {
                 continue;
             }
-            self.tree.c.flags[id.index()] &= !(tree::MEASURE | tree::DESC);
+            let flags = &mut self.tree.c.flags[id.index()];
+            *flags = (*flags & !(tree::MEASURE | tree::DESC | tree::SUNK)) | sunk;
             self.settle_derived(id);
         }
     }

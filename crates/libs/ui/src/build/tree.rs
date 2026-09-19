@@ -50,6 +50,9 @@ const LIVE_SHIFT: u32 = 23;
 pub(crate) const LIVE_POLITE: u32 = 1;
 /// Announced by interrupting.
 pub(crate) const LIVE_ASSERTIVE: u32 = 2;
+/// Arranged away under a hidden ancestor, so this node's box and its derived sprites' take
+/// no pixels. Written by the arrange alone; [`HIDDEN`] is the authored bit.
+pub(crate) const SUNK: Bits = 1 << 25;
 
 // ── the hit declaration, packed ─────────────────────────────────────────────────────
 
@@ -390,6 +393,35 @@ impl Tree {
         }
     }
 
+    /// Marks `n` and every node under it, responsive containers included.
+    ///
+    /// Preorder over the links with no stack: down the first child, along the next sibling,
+    /// and up the parent until the walk is back at `n`.
+    #[cold]
+    pub fn mark_shown(&mut self, n: NodeId) {
+        let root = n.index() as u32;
+        let mut at = root;
+        loop {
+            self.mark(self.id_at(at));
+            let first = self.links(at).first;
+            if first != NO_LINK {
+                at = first;
+                continue;
+            }
+            loop {
+                if at == root {
+                    return;
+                }
+                let links = self.links(at);
+                if links.next != NO_LINK {
+                    at = links.next;
+                    break;
+                }
+                at = links.parent;
+            }
+        }
+    }
+
     pub fn class(&self, n: NodeId) -> WidthClass {
         WidthClass::from_bits((self.c.flags[n.index()] & CLASS) >> CLASS_SHIFT)
     }
@@ -421,7 +453,13 @@ impl Tree {
             // room and the walks skip it, so none of its flags is a layout input: a publisher
             // may hide one after the solve without asking for another.
             if bit & (SUSPENDED | POPUP) == 0 && held & DERIVED == 0 {
-                self.mark(n);
+                // A hidden subtree was arranged away without being measured, so showing it
+                // takes every node in it again, not only the one whose bit moved.
+                if bit & HIDDEN != 0 && !on {
+                    self.mark_shown(n);
+                } else {
+                    self.mark(n);
+                }
             }
             self.hits_dirty = true;
         }
@@ -494,6 +532,10 @@ impl Tree {
             let now = self.c.geom[id.index()];
             let was = self.c.published[id.index()];
             let bounded = self.c.flags[id.index()] & CLIP != 0;
+            // The array holds absolute rects, so a box that moved leaves it stale.
+            if now.local != was.local || now.size != was.size {
+                self.hits_dirty = true;
+            }
             if now.local != was.local {
                 patch.push(Op::Bind {
                     id,
@@ -508,7 +550,9 @@ impl Tree {
                     bind: Bind::Set(Value::Vec2(now.size)),
                 });
             }
-            if now.size != was.size || bounded != was.bounded {
+            // A clip is declared, not diffed, scene-side, and declaring the absence of one
+            // mints a side row on every node that never had one.
+            if bounded != was.bounded || (bounded && now.size != was.size) {
                 let clip = if bounded {
                     Clip::Rect {
                         l: 0.0,

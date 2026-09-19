@@ -968,6 +968,8 @@ pub(crate) struct ScrollRow {
     /// What was last published with it: a solve that moved nothing emits nothing, and
     /// [`ThumbGeom::UNSENT`] is what makes the first publication unconditional.
     pub last: ThumbGeom,
+    /// The view width the thumb was last placed against; its x offset is a function of it.
+    pub last_w: f32,
     /// The viewport node, whose solved size is the view extent.
     pub node: NodeId,
     /// The group the tracker's position is bound onto, whose solved height is the extent.
@@ -1024,6 +1026,11 @@ impl Ui<'_> {
         // Minted after the content, because child order is paint order: a bar declared before
         // the rows would be drawn under whatever the list paints over them.
         let (rail, thumb) = crate::build::mount::mount_scroll_chrome(host, node);
+        // Concealed until a reason reveals it: the front thread moves this channel from here,
+        // and it moves it from the state the mount left it in.
+        if decl.reveal == Reveal::OnDemand {
+            host.bind(thumb.0, Prop::Opacity, Bind::Set(Value::Scalar(0.0)));
+        }
         let hover = host.mint_control(ControlRow::blank(node, scope));
         let grab = host.mint_control(ControlRow::blank(rail, scope));
         // The surface itself is a target so a hover can reveal its bar and a wheel notch the
@@ -1047,6 +1054,7 @@ impl Ui<'_> {
         let at = host.scrolls.place(ScrollRow {
             front,
             last: ThumbGeom::UNSENT,
+            last_w: f32::NAN,
             node,
             content,
             rail,
@@ -1091,8 +1099,8 @@ impl Host {
             return;
         };
         let (front, content, rail, thumb) = (row.front, row.content, row.rail, row.thumb);
-        let (reveal, state, created, moved) =
-            (row.reveal, row.state, row.created, row.last != geom);
+        let (reveal, state, created) = (row.reveal, row.state, row.created);
+        let moved = row.last != geom || row.last_w != view.x;
         if !created {
             self.create_tracker(front.tracker, GroupId(front.viewport), Axes::VERTICAL);
             self.bind(
@@ -1101,22 +1109,22 @@ impl Host {
                 track(front.tracker, Affine::CONTENT),
             );
         }
-        // The thumb's map is a function of the extents, so it is re-bound whenever they move.
+        // Everything below is a function of the extents, so it is re-sent only when they move.
         if !created || moved {
             self.bind(thumb.0, Prop::OffsetY, track(front.tracker, geom.affine()));
+            self.tracker_bounds(
+                front.tracker,
+                Vector2 { x: 0.0, y: 0.0 },
+                Vector2 {
+                    x: 0.0,
+                    y: geom.max_scroll,
+                },
+            );
+            let shown = reveal != Reveal::Never && geom.overflow();
+            self.visual_rect(thumb, geom.offset(view.x), geom.size());
+            self.hide(thumb.0, !shown);
+            self.hit(rail, shown.then(|| grab_hit(front.grab)));
         }
-        self.tracker_bounds(
-            front.tracker,
-            Vector2 { x: 0.0, y: 0.0 },
-            Vector2 {
-                x: 0.0,
-                y: geom.max_scroll,
-            },
-        );
-        let shown = reveal != Reveal::Never && geom.overflow();
-        self.visual_rect(thumb, geom.offset(view.x), geom.size());
-        self.hide(thumb.0, !shown);
-        self.hit(rail, shown.then(|| grab_hit(front.grab)));
         if let Some(state) = state {
             state.resized(view.y);
             if let Some(to) = state.take_reveal(view.y) {
@@ -1133,6 +1141,7 @@ impl Host {
         } = self;
         if let Some(row) = scrolls.get_mut(at) {
             row.created = true;
+            row.last_w = view.x;
             row.publish(geom, scroll_ops);
         }
     }
@@ -2046,6 +2055,7 @@ mod tests {
                 grab: ControlId::raw(index + 100, 1),
             },
             last: ThumbGeom::UNSENT,
+            last_w: f32::NAN,
             node,
             content: NodeId::raw(index + 200, 1),
             rail: NodeId::raw(index + 300, 1),

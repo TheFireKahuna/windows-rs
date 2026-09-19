@@ -2318,6 +2318,44 @@ mod tests {
         assert!(rig.scene.nodes.has_aux(clipped), "a clip needs one");
     }
 
+    /// A halo casts at the blur it declared and at full opacity until a channel says
+    /// otherwise, and a rebind under a lost device restates the channel rather than the
+    /// declaration.
+    #[test]
+    fn a_declared_halo_seeds_its_channels_once_and_a_rebind_keeps_them() {
+        let Some(mut rig) = rig() else { return };
+        let mut patch = SinkPatch::default();
+        let id = rig.sprite(&mut patch, 40.0);
+        patch.push(Op::Mask {
+            id: SpriteId(id),
+            mask: FILL,
+        });
+        patch.push(Op::Paint {
+            id: SpriteId(id),
+            paint: Paint::Solid(Radiance::new(0.5, 0.5, 0.5, 1.0)),
+            halo: Some(Halo {
+                blur: 12.0,
+                tint: Radiance::new(0.2, 0.6, 0.9, 1.0),
+                offset: Vector2::zero(),
+            }),
+        });
+        rig.apply(&mut patch);
+        let blur = PROPS[Prop::BlurRadius as usize].chan;
+        assert_eq!(rig.scene.nodes.chan(id, blur), 12.0);
+        assert_eq!(rig.scene.nodes.chan(id, blur + 1), 1.0);
+        assert!(rig.scene.nodes.aux(id).is_some_and(|aux| aux.glow.is_some()));
+
+        patch.push(Op::Bind {
+            id,
+            prop: Prop::ShadowOpacity,
+            bind: Bind::Set(Value::Scalar(0.3)),
+        });
+        rig.apply(&mut patch);
+        rig.scene.device_lost(&rig.back, rig.env).expect("rebuilt");
+        assert_eq!(rig.scene.nodes.chan(id, blur + 1), 0.3);
+        assert_eq!(rig.scene.nodes.chan(id, blur), 12.0);
+    }
+
     #[test]
     fn a_restated_clip_writes_nothing_the_second_time() {
         let Some(mut rig) = rig() else { return };

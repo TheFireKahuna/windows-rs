@@ -34,6 +34,8 @@ enum Kind {
     Pct,
     /// `n` device-independent pixels.
     Dip,
+    /// `n` device pixels: a hairline that is one pixel at every scale.
+    Px,
 }
 
 /// No metric is subtracted from the resolved length.
@@ -96,6 +98,21 @@ impl Len {
         }
     }
 
+    /// Exactly `n` device pixels at whatever scale the window renders at.
+    ///
+    /// A one-DIP hairline is one pixel or two at 150 % by where it falls on the grid; this
+    /// is what a rule states so that it is one pixel everywhere. The solve snaps both edges
+    /// of a box, and an edge one whole pixel past a snapped edge snaps one pixel past it.
+    #[must_use]
+    pub const fn px(n: f32) -> Self {
+        Self {
+            kind: Kind::Px,
+            sub: NO_SUB,
+            token: 0,
+            n,
+        }
+    }
+
     /// `n` of `m`, end to end.
     ///
     /// Not a `const fn`: [`Metric::Custom`] registers its token on the way in, which the const
@@ -145,6 +162,7 @@ impl Len {
     /// `basis` is the containing block's extent on this axis, and a non-finite one leaves a
     /// percentage unresolved. `rows` is the host's metric table and `scope` the scope a
     /// registered token resolves against; a builtin metric is one index and one multiply.
+    /// `scale` is device pixels per DIP, which only a pixel length reads.
     #[must_use]
     pub(crate) fn resolve(
         self,
@@ -152,11 +170,13 @@ impl Len {
         class: WidthClass,
         scope: Scope,
         basis: f32,
+        scale: f32,
     ) -> Option<f32> {
         let base = match self.kind {
             Kind::Unset | Kind::Auto => return None,
             Kind::Zero => 0.0,
             Kind::Dip => self.n,
+            Kind::Px => self.n / scale,
             Kind::Pct => {
                 if !basis.is_finite() {
                     return None;
@@ -175,12 +195,12 @@ impl Len {
     ///
     /// The authority path: a metric resolves through the palette rather than out of the host's
     /// cached table, so a caller holding a scope and no solve answers the same number. A
-    /// percentage has no containing block here and a content-sized length has no content, so
-    /// both answer zero.
+    /// percentage has no containing block here, a content-sized length has no content and a
+    /// pixel length has no scale, so all three answer zero.
     #[must_use]
     pub fn dips(self, scope: Scope) -> f32 {
         let base = match self.kind {
-            Kind::Unset | Kind::Auto | Kind::Pct | Kind::Zero => 0.0,
+            Kind::Unset | Kind::Auto | Kind::Pct | Kind::Zero | Kind::Px => 0.0,
             Kind::Dip => self.n,
             Kind::Metric => named(self.token).map_or(0.0, |m| metric(m, scope)) * self.n,
         };

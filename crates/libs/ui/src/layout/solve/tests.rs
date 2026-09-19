@@ -221,6 +221,51 @@ fn a_class_flip_re_measures_a_leaf_whose_own_inputs_did_not_change() {
 }
 
 #[test]
+fn a_responsive_containers_first_class_never_floors_its_parent() {
+    let root = fixture(96.0);
+    // A fresh container's class is Wide until walk B hands it a width, so its first
+    // measure runs the row as a row; the stacked sum must not reach the parent as a floor.
+    let outer = node(root, Preset::Stack, |_| {});
+    let card = node(outer, Preset::Stack, |_| {});
+    responsive(card, [600.0, 1000.0]);
+    let row = node(card, Preset::Row, |l| {
+        l.stack_below = WidthClass::Narrow;
+        l.gap = Len::ZERO;
+    });
+    sized(row, 436.0, 20.0);
+    sized(row, 60.0, 20.0);
+    window(200.0, 400.0);
+    solve();
+    assert_eq!(geom(outer).size.x, 200.0, "the row's pre-flip sum floored the parent");
+    assert_eq!(geom(card).size.x, 200.0);
+    assert_eq!(rect(row).height(), 40.0, "the row did not stack under Narrow");
+}
+
+#[test]
+fn a_pixel_length_is_one_pixel_at_every_phase_where_a_dip_is_not() {
+    let root = fixture(144.0);
+    let scale = 1.5;
+    // Rules stacked under spacers that put them at every phase of the 1.5 grid.
+    let column = node(root, Preset::Stack, |l| l.gap = Len::ZERO);
+    let mut rules = Vec::new();
+    for lead in [0.0, 1.0, 2.0] {
+        sized(column, 100.0, lead);
+        rules.push((
+            node(column, Preset::Layer, |l| l.height = Len::px(1.0)),
+            node(column, Preset::Layer, |l| l.height = Len::dip(1.0)),
+        ));
+    }
+    solve();
+    let pixels = |n: NodeId| (rect(n).height() * scale).round();
+    let mut dip_phases = Vec::new();
+    for (px, dip) in rules {
+        assert_eq!(pixels(px), 1.0, "a pixel rule at {:?}", rect(px));
+        dip_phases.push(pixels(dip));
+    }
+    assert!(dip_phases.contains(&2.0), "a DIP hairline snapped to one pixel at every phase: {dip_phases:?}");
+}
+
+#[test]
 fn a_node_minted_after_a_solve_reaches_the_next_one() {
     let root = fixture(96.0);
     let mid = node(root, Preset::Stack, |_| {});
@@ -512,6 +557,38 @@ fn a_ladder_yields_one_two_and_three_columns_without_remounting() {
         Host::with(|h| h.tree.ids.live()),
         minted,
         "a class change mounted or unmounted a node"
+    );
+}
+
+/// Three weighted columns share a grid equally when their items state no minimum of their
+/// own, whatever their content: a full-width item contributes nothing, and a short label is
+/// below the share.
+#[test]
+fn equal_weights_give_equal_columns_over_unequal_content() {
+    let root = fixture(96.0);
+    let grid = node(root, Preset::Grid, |l| {
+        l.width = Len::dip(191.0);
+        l.gap = Len::dip(4.0);
+        l.set_cols([Track::fr(1.0); 3]);
+    });
+    let mut cells = [NodeId::NONE; 3];
+    for (k, w) in [30.0_f32, 20.0, 10.0].into_iter().enumerate() {
+        let cell = node(grid, Preset::Stack, |l| l.min_width = Len::ZERO);
+        let _ = node(cell, Preset::Layer, |l| {
+            l.width = Len::pct(1.0);
+            l.height = Len::dip(20.0);
+        });
+        let _ = node(cell, Preset::Layer, |l| {
+            l.width = Len::dip(w);
+            l.height = Len::dip(10.0);
+        });
+        cells[k] = cell;
+    }
+    solve();
+    let widths: Vec<f32> = cells.iter().map(|&c| geom(c).size.x).collect();
+    assert!(
+        widths.iter().all(|&w| (w - 61.0).abs() <= 1.0),
+        "columns are not equal: {widths:?}"
     );
 }
 

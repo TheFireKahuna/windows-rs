@@ -790,6 +790,20 @@ impl Overlays {
                 Request::Show { .. } => {}
             }
         }
+        // A declaration that unmounted takes its overlay with it: nothing will ask for the
+        // close, and the cell the closed callback would write may be gone with the page.
+        let dead = Host::with(|host| {
+            self.open
+                .iter()
+                .position(|open| open.binding_key().is_some_and(|key| !host.tree.is_live(key)))
+        });
+        if let Some(depth) = dead {
+            for open in &mut self.open[depth..] {
+                open.binding = None;
+                open.mount.set_exit(Exit::None);
+            }
+            self.truncate(depth, focus);
+        }
         !self.open.is_empty()
     }
 
@@ -1135,12 +1149,17 @@ impl Overlays {
         }
         self.dwell.showing = None;
         self.dwell.settled = None;
-        for mut open in self.open.drain(..).rev() {
-            open.mount.retire(host);
-            if let Some(blocker) = open.blocker {
+        for open in self.open.drain(..).rev() {
+            let Open { mut mount, blocker, root, owner, .. } = open;
+            mount.retire(host);
+            if let Some(blocker) = blocker {
                 host.release_control(blocker);
             }
-            host.unplace(open.root);
+            host.unplace(root);
+            // Dropped after the borrow: the owner disposes every signal the body created, and
+            // a payload of one may hold a mount, whose drop reaches for the host again.
+            host.retired.push(crate::build::binding::Retired::new(owner));
+            host.retired.push(crate::build::binding::Retired::new(mount));
         }
     }
 }

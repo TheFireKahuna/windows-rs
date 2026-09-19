@@ -546,17 +546,22 @@ impl<'a, K> Element<'a, K> {
     }
 
     /// Runs the body synchronously with this parent's declared scope and control ownership.
+    ///
+    /// The body's first node goes above whatever the parent already holds: a plate declared
+    /// before the body is a derived sprite at the bottom of the list, and a child minted at
+    /// the bottom would paint beneath it.
     pub fn children(self, create: impl FnOnce(&mut Ui<'_>)) -> Self {
         let node = self.node;
         let scope = self.ui.host.tree.c.scope[node.index()];
         let control = self.ui.control;
+        let after = self.ui.host.tree.children(node).last();
         // The parent's own list, not one of this container's: `root` is false here, so
         // nothing is pushed into it and a container costs no storage of its own.
         create(&mut Ui {
             host: &mut *self.ui.host,
             members: &mut *self.ui.members,
             parent: node,
-            after: None,
+            after,
             scope,
             control,
             root: false,

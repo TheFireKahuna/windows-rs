@@ -1290,8 +1290,18 @@ fn cast_shadow(
         Some(held) => {
             sprite.set_shadow(&held.shadow);
             let blur = PROPS[Prop::BlurRadius as usize].chan;
-            // The node's channels outlive the object they drive, so a rebind restates them
-            // rather than resetting to what the declaration asked for.
+            // The first declaration seeds the two channels from what it asked for. After
+            // that the channels outlive the object they drive, so a rebind restates them
+            // rather than resetting to the declaration.
+            if arena.aux(id).is_none_or(|aux| aux.glow.is_none()) {
+                let declared = match (paint, halo) {
+                    (Paint::Captured { blur, .. }, _) => *blur,
+                    (_, Some(halo)) => halo.blur,
+                    _ => 0.0,
+                };
+                arena.set_chan(id, blur, declared);
+                arena.set_chan(id, blur + 1, 1.0);
+            }
             held.shadow.set_blur_radius(arena.chan(id, blur));
             held.shadow.set_opacity(arena.chan(id, blur + 1));
         }
